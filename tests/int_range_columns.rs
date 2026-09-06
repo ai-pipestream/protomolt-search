@@ -142,6 +142,7 @@ fn range_field(column: &str, edges: &[f64]) -> RangeFacetField {
         column: column.to_string(),
         key: String::new(),
         edges: edges.to_vec(),
+        ..Default::default()
     }
 }
 

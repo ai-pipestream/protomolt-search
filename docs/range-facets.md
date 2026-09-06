@@ -1,4 +1,4 @@
-# Range facets: i64 columns, timestamps, and bucket counts
+# Range facets: exact numeric intervals and bucket counts
 
 Landed 2026-08-03 (track 1, increment 2 of the column plane).
 "How many results per year band, per citation band" — over a column
@@ -49,7 +49,7 @@ materialization hashes keep their existing semantics and remain unchanged.
 
 Presence costs one bit per row per integer column. It preserves the full
 protobuf signed domain without making a valid numeric value disappear. The
-separate unsigned column/query representation remains under development.
+unsigned column/query representation preserves the full u64 domain.
 
 The unsigned storage layer uses kind 11, with the same table and section
 widths as kind 10 but unsigned min/max and little-endian u64 values. Its empty
@@ -89,8 +89,9 @@ both topology and segment pruning use the same numeric meaning; see
 [CEL filters](cel-filters.md#numbers-compare-exactly-across-domains).
 Unhinted unsigned protobuf fields now map to the u64 family; explicitly signed
 hints retain their checked i64 conversion. [Value projections and materialized
-columns](cel-values.md) also retain uint values. Unsigned range facets
-and aggregation are not yet connected to the u64 family. The schema
+columns](cel-values.md) also retain uint values. Unsigned aggregates and
+range facets retain exact integer values and bounds. Statistical folds require
+explicit double conversion; unsigned scoring is not yet available. The schema
 report records the mapped query type and remaining restrictions. Use matching server and
 client builds for this feature: older protobuf readers can ignore the new
 request field, and older storage readers refuse kind 11.
@@ -168,24 +169,61 @@ The bucket rules are stated once and enforced everywhere:
   BEFORE its zero-term/k=0 early return and the nodes run it again: a
   malformed list refuses even when there is no match set to count.
 
-Column resolution follows the same order the score stages use: no
-`key` means the f64 table then the i64 table; a `key` means a
-map-numeric column and that key. i64 values are compared as `as f64`
-against the edges, which is what the edges are anyway — a bucket test
-uses order alone, and the cast preserves it.
+With an empty `key`, the named column may be f64, i64 or u64; a nonempty
+`key` selects a map-numeric entry. A column has one declared family per shard.
+Different shards may use different numeric families: an interval has the same
+numeric meaning for each, and all values compare exactly across domains.
+Integer values are never cast to f64 before bucket membership is decided.
+This also fixes legacy double-edge requests: for example, `i64::MAX` belongs
+below the exact double edge 2^63, and `u64::MAX` belongs below 2^64.
+
+### Typed edges (2026-09-05, feature branch)
+
+Supply either `edges` or `typed_edges`, never both. Each typed edge is a
+`FilterBound` with one int, uint or finite num value and `exclusive=false`.
+Range facets always use half-open intervals; the bound's exclusivity flag is
+not a way to change that rule. Mixed types are permitted, but numerically equal
+edges such as int(0), uint(0), and num(-0.0) cannot form separate boundaries.
+An unset value, nonfinite double, exclusive edge, duplicate or descending
+numeric edge refuses even when no documents match.
+
+For example, these protobuf text-format boundaries isolate the two largest
+unsigned integers without rounding:
+
+```protobuf
+typed_edges { uint: 18446744073709551614 }
+typed_edges { uint: 18446744073709551615 }
+typed_edges { num: 18446744073709551616 }
+```
+
+The last boundary, 2^64, is exactly representable as a double. To cover the
+whole unsigned domain, use uint(0) and num(2^64). To cover the whole signed
+domain, use int(-9223372036854775808) and num(9223372036854775808).
+
+For typed requests each `RangeBucket` echoes `typed_from` and `typed_to`.
+Those are authoritative. The old `from` and `to` doubles are display values
+and may coincide for a nonempty integer interval. Legacy requests retain their
+double boundaries and omit typed response fields. Use matching client and
+server builds: old nodes cannot execute typed requests, and relays or roots
+refuse responses that lack the requested exact bounds. No index format or
+materialization fingerprint changes are needed for this query feature.
 
 ## Distribution
 
 Bucket counts are additive: bucket *i* means the same interval on every
 shard because the coordinator forwards one edge list, so the merge is
-the positional per-bucket sum. There is no analog of the global-df
-trap, exactly as for plain facets.
+the positional per-bucket sum. Nodes, roots and relays share one interval
+implementation. Each merge checks the field and key, bucket count, and exact
+bounds against the request, including when only one child responds. An unknown
+child must supply no buckets. Count overflow refuses rather than wrapping.
+Nested relays may retain `known=false`; only the root applies the rule that
+at least one shard must resolve each requested column.
 
 `known` is per (column, key) per shard: a shard that cannot resolve the
 column answers `known: false` with no buckets, which is legitimate for
 a heterogeneous fleet (its documents genuinely hold no values — exact,
 not degraded). A column NO shard knows is REFUSED, naming the column
-and `--numeric-fields / --integer-fields / --map-numeric-fields`,
+and `--numeric-fields / --integer-fields / --unsigned-integer-fields / --map-numeric-fields`,
 because a typo'd histogram would otherwise read as "zero results in
 every band" — the same typo rule as fields, facets, and chains.
 

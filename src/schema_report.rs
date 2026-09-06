@@ -217,7 +217,7 @@ fn projection(
             constraints.push("Values above i64::MAX are refused by the current extractor.".into());
         }
         if representation == Query::UnsignedInteger {
-            constraints.push("Exact unsigned comparisons, presence, typed value projections, checked arithmetic and U64 materialization are supported; unsigned sorting and collapse retain typed keys; COUNT, SUM, MIN, MAX, CARDINALITY and exact percentiles preserve unsigned values; statistical folds require explicit double() conversion; unsigned range facets and scoring remain unavailable.".into());
+            constraints.push("Exact unsigned comparisons, presence, typed value projections, checked arithmetic and U64 materialization are supported; unsigned sorting and collapse retain typed keys; COUNT, SUM, MIN, MAX, CARDINALITY and exact percentiles preserve unsigned values; statistical folds require explicit double() conversion; range facets preserve exact typed bounds and unsigned values; unsigned scoring remains unavailable.".into());
         }
         if representation == Query::DenseVector {
             constraints.push(

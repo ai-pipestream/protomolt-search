@@ -445,3 +445,50 @@ whitespace checks, and descriptor comparison against `aa399e2` passed; the
 search, schema-report and mobile descriptors are unchanged. This remains a
 feature-branch checkpoint. The unsigned range-facet, scoring, wider protobuf
 shape, permission and document-lifecycle work is still incomplete.
+
+
+## Exact range-facet checkpoint (2026-09-05)
+
+Range facets now preserve each stored value's numeric domain. `typed_edges`
+accepts signed, unsigned and finite double bounds, with exact mixed-domain
+ordering and fixed half-open intervals. This includes the full signed and
+unsigned domains: the exclusive upper limits 2^63 and 2^64 are exactly
+representable doubles. Empty/unset, exclusive, nonfinite, duplicate or
+out-of-order edges refuse before a match set is read.
+
+Legacy double edges also compare exactly against integers. Previously,
+`i64::MAX` rounded up to 2^63 and disappeared from a bucket ending there;
+the value now remains below the edge. Typed responses echo authoritative
+`typed_from` and `typed_to` bounds alongside the old display doubles. A typed
+integer interval can have coincident display doubles without being empty.
+
+One interval implementation now serves node counting and both root and relay
+merges. Every child must echo the requested column, key and interval list;
+unknown children must return no buckets. Exact typed bounds cannot disappear
+through a relay. Counts use checked addition, and only the root requires at
+least one shard to resolve every column. Numeric families may differ between
+shards because each interval has the same exact numeric meaning across them.
+
+The independent test oracle uses doubled i128 values to represent both all
+64-bit integers and half-valued doubles exactly. It covers matching, filtered
+and empty sets; flat unary/streamed and nested relay queries; the fused lexical
+route; and flush, reopen, compaction and subsequent reopen on both layouts.
+Unit tests exercise malformed edges, corrupted child responses, unresolved
+columns and count overflow. This adds three protobuf fields, with no stored
+format or materialization fingerprint change. Existing descriptor declarations
+are preserved. See `docs/range-facets.md` for client requirements.
+
+The full objective remains open: unsigned score stages and full-width column
+statistics, remaining protobuf shapes, permission enforcement across every
+surface, and catalog-to-search identity and document-lifecycle integration
+still need implementation and evidence.
+
+Validation: 430 library tests, 542 integration tests across 95 targets, and
+11 embedded tests passed (983 total), with one existing sidecar conformance
+test ignored. The full suite needed no retries. All five Android/iOS Rust
+target checks passed, with the three existing relay dead-code warnings.
+Tests/examples compilation, formatting, vendored-proto byte identity and
+whitespace checks passed. Descriptor comparison against `6622053` confirms
+only `RangeFacetField.typed_edges` (4) and `RangeBucket.typed_from` (4) /
+`typed_to` (5) were added; existing declarations are unchanged. This is a
+feature-branch checkpoint, with no main merge or fleet operation.

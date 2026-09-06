@@ -89,7 +89,9 @@ the last child's, with the children's counts summed and one fingerprint
 required of all. Each child's terminal response merges by value into the
 one the parent reads as a shard's: the local top-k lists concatenated
 (the parent's global merge picks from the union), facet counts summed by
-value and range buckets by position, column-known flags ORed so the
+value and range buckets by position after checking each returned field, key
+and exact interval against the request. Range count overflow refuses. Typed
+bounds remain intact through nested relays. Column-known flags are ORed so the
 root's typo rule sees the subtree, segment counts added with a check. A
 facet no child knows stays unknown rather than refused, because the root
 decides over shards this relay does not see. Hits pass through whole,

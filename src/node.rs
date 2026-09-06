@@ -1569,50 +1569,29 @@ impl Bm25Shard {
         // the first edge or at/above the last is counted in NO bucket.
         // There are deliberately no implicit tail buckets — the caller
         // asked for these intervals and gets these intervals.
-        let bucket_counts = |value_of: &dyn Fn(u32) -> Option<f64>, edges: &[f64]| -> Vec<u64> {
-            let mut counts = vec![0u64; edges.len() - 1];
-            for (wi, &word) in bits.iter().enumerate() {
-                let mut w = word;
-                while w != 0 {
-                    let doc = (wi * 64) as u32 + w.trailing_zeros();
-                    if let Some(v) = value_of(doc) {
-                        let upper = edges.partition_point(|&e| e <= v);
-                        if upper > 0 && upper < edges.len() {
-                            counts[upper - 1] += 1;
-                        }
-                    }
-                    w &= w - 1;
-                }
-            }
-            counts
-        };
         let ranges = range_facet_fields
             .iter()
             .map(|req| {
+                let intervals = crate::rangefacet::Intervals::new(req)
+                    .expect("range facets validated before counting");
                 let source = self.resolve_range_column(&req.column, &req.key);
-                let Some(source) = source else {
-                    return crate::pb::RangeFacetCounts {
-                        column: req.column.clone(),
-                        key: req.key.clone(),
-                        known: false,
-                        buckets: Vec::new(),
-                    };
-                };
-                let counts = bucket_counts(&|doc| self.range_value(source, doc), &req.edges);
-                crate::pb::RangeFacetCounts {
-                    column: req.column.clone(),
-                    key: req.key.clone(),
-                    known: true,
-                    buckets: counts
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, count)| crate::pb::RangeBucket {
-                            from: req.edges[i],
-                            to: req.edges[i + 1],
-                            count,
-                        })
-                        .collect(),
+                let mut counts = vec![0u64; intervals.len()];
+                if let Some(source) = source {
+                    for (wi, &word) in bits.iter().enumerate() {
+                        let mut w = word;
+                        while w != 0 {
+                            let doc = (wi * 64) as u32 + w.trailing_zeros();
+                            if let Some(bucket) = self
+                                .range_value(source, doc)
+                                .and_then(|value| intervals.bucket(value))
+                            {
+                                counts[bucket] += 1;
+                            }
+                            w &= w - 1;
+                        }
+                    }
                 }
+                intervals.response(counts, source.is_some())
             })
             .collect();
         // Column stats: one value read per matched document per field,
@@ -1702,7 +1681,7 @@ impl Bm25Shard {
     }
 
     /// Resolve a range facet's column against THIS shard's tables:
-    /// with no key the f64 table then the i64 table (one name space
+    /// with no key the f64, i64 and u64 tables (one name space
     /// across kinds, so at most one answers), with a key the
     /// map-numeric column and its key ordinal. `None` = this shard
     /// cannot resolve it, which answers `known: false`.
@@ -1711,7 +1690,13 @@ impl Bm25Shard {
             if let Some(ni) = self.numeric_index(column) {
                 return Some(RangeSource::Numeric(ni));
             }
-            return self.integer_index(column).map(RangeSource::Integer);
+            return self
+                .integer_index(column)
+                .map(RangeSource::Integer)
+                .or_else(|| {
+                    self.unsigned_integer_index(column)
+                        .map(RangeSource::Unsigned)
+                });
         }
         let ci = self.map_numeric_index(column)?;
         let key_ord = self.map_numeric_key_ord(ci, key)?;
@@ -1721,18 +1706,16 @@ impl Bm25Shard {
         })
     }
 
-    /// A document's value for a resolved range source, on the bucket
-    /// scale. i64 values convert with `as f64`: bucketing is a
-    /// comparison against f64 edges, so the edges are the precision
-    /// limit either way, and the cast is monotone so ordering (which is
-    /// all a bucket test uses) is preserved.
-    fn range_value(&self, source: RangeSource, doc_id: u32) -> Option<f64> {
+    /// Keep each value in its numeric domain for exact interval comparison.
+    fn range_value(&self, source: RangeSource, doc_id: u32) -> Option<crate::filter::NumBound> {
+        use crate::filter::NumBound;
         match source {
-            RangeSource::Numeric(ni) => self.numeric_value(ni, doc_id),
-            RangeSource::Integer(ii) => self.integer_value(ii, doc_id).map(|v| v as f64),
-            RangeSource::MapKey { column, key_ord } => {
-                self.map_numeric_value(column, key_ord, doc_id)
-            }
+            RangeSource::Numeric(ni) => self.numeric_value(ni, doc_id).map(NumBound::F),
+            RangeSource::Integer(ii) => self.integer_value(ii, doc_id).map(NumBound::I),
+            RangeSource::Unsigned(ui) => self.unsigned_integer_value(ui, doc_id).map(NumBound::U),
+            RangeSource::MapKey { column, key_ord } => self
+                .map_numeric_value(column, key_ord, doc_id)
+                .map(NumBound::F),
         }
     }
 
@@ -1823,7 +1806,7 @@ impl Bm25Shard {
     }
 }
 
-/// A range facet's resolved column on THIS shard. The three shapes a
+/// A range facet's resolved column on THIS shard. The four shapes a
 /// bucketable value can live in; see [`Bm25Shard::resolve_range_column`].
 #[derive(Debug, Clone, Copy)]
 enum RangeSource {
@@ -1831,6 +1814,8 @@ enum RangeSource {
     Numeric(usize),
     /// Index into the shard's i64 table.
     Integer(usize),
+    /// Index into the shard's u64 table.
+    Unsigned(usize),
     /// A map-numeric column and a key ordinal in ITS key dictionary.
     MapKey {
         /// Index into the shard's map-numeric table.
@@ -1853,37 +1838,7 @@ pub(crate) fn validate_range_facet_fields(
     fields: &[crate::pb::RangeFacetField],
 ) -> Result<(), Status> {
     for req in fields {
-        if req.column.is_empty() {
-            return Err(Status::invalid_argument(
-                "range facet: a request names the column it buckets",
-            ));
-        }
-        let named = if req.key.is_empty() {
-            format!("{:?}", req.column)
-        } else {
-            format!("{:?}[{:?}]", req.column, req.key)
-        };
-        if req.edges.len() < 2 {
-            return Err(Status::invalid_argument(format!(
-                "range facet {named}: edges must hold at least 2 values (one bucket); \
-                 got {}",
-                req.edges.len()
-            )));
-        }
-        for (i, e) in req.edges.iter().enumerate() {
-            if !e.is_finite() {
-                return Err(Status::invalid_argument(format!(
-                    "range facet {named}: edge {i} is not finite"
-                )));
-            }
-            if i > 0 && *e <= req.edges[i - 1] {
-                return Err(Status::invalid_argument(format!(
-                    "range facet {named}: edges must be strictly ascending (edge {i} is \
-                     not above edge {})",
-                    i - 1
-                )));
-            }
-        }
+        crate::rangefacet::Intervals::new(req)?;
     }
     Ok(())
 }

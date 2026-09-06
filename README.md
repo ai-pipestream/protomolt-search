@@ -1222,6 +1222,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Exact range facets (2026-09-05, feature branch).** Typed signed, unsigned
+  and double bounds compare against stored values without integer rounding.
+  Range responses retain exact bounds; roots and nested relays verify each
+  interval and refuse count overflow. Legacy double edges also compare against
+  integers exactly. Index formats are unchanged; deploy matching server and
+  client builds for typed edges. See [range facets](docs/range-facets.md).
+
 - **Analyzer channel lifetime (2026-09-05, feature branch).** Sidecar channels
   are pooled within their creating Tokio runtime and released at shutdown.
   Replacing a client runtime no longer reuses a dead worker against a healthy

@@ -108,9 +108,8 @@ fn unsigned_descriptors_preserve_types_presence_and_oneof_selection() {
                     assert!(capabilities.contains(supported), "{capabilities}");
                 }
                 assert!(capabilities.contains("statistical folds require explicit double()"));
-                assert!(
-                    capabilities.contains("unsigned range facets and scoring remain unavailable")
-                );
+                assert!(capabilities
+                    .contains("range facets preserve exact typed bounds and unsigned values"));
             }
         }
     }

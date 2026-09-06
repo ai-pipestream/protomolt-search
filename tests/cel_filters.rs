@@ -626,6 +626,7 @@ async fn filters_narrow_facet_counts() {
                 column: "year".into(),
                 key: String::new(),
                 edges: vec![1990.0, 2000.0, 2030.0],
+                ..Default::default()
             }],
             filter: r#"court == "scotus""#.into(),
             ..Default::default()

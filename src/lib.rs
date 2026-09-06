@@ -71,6 +71,7 @@ pub mod proximity;
 pub mod quality;
 pub mod query;
 mod query_identity;
+mod rangefacet;
 pub mod rankdiff;
 pub mod relay;
 #[cfg(feature = "net")]

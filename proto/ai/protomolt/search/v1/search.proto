@@ -2956,13 +2956,12 @@ message HasPredicate {
 // One range-facet count request: a numeric-ish column plus the bucket
 // edges to count into.
 message RangeFacetField {
-  // The column to read: an f64 column (--numeric-fields) or an i64
-  // column (--integer-fields) when `key` is empty, resolved in that
-  // order; a map<string, f64> column (--map-numeric-fields) when `key`
-  // is set. i64 values are converted to double for bucketing.
+  // The column to read: f64, i64 or u64 when `key` is empty;
+  // map<string, f64> when `key` is set. Numeric values compare exactly
+  // across domains; integer values are never rounded through double.
   string column = 1;
   // For a map-numeric column, the key whose values are bucketed. Empty
-  // selects a plain (f64 or i64) column.
+  // selects a plain (f64, i64 or u64) column.
   string key = 2;
   // Bucket boundaries: at least 2, all finite, STRICTLY ascending —
   // anything else is INVALID_ARGUMENT naming the column, because a
@@ -2973,6 +2972,13 @@ message RangeFacetField {
   // at/above the last edge is counted in NO bucket. Explicit edges
   // only — if you want the tails, ask for them.
   repeated double edges = 3;
+  // Alternative exact numeric boundaries. Supply either edges or typed_edges,
+  // never both. At least two finite, strictly numerically ascending values
+  // are required. Every value must be set and exclusive must be false:
+  // intervals are always [lower, upper). Signed, unsigned and double edges
+  // may mix. For the full u64 domain use uint(0) through num(2^64), which
+  // is exactly representable. Requires matching server and client builds.
+  repeated FilterBound typed_edges = 4;
 }
 
 // One bucket's count within one range facet.
@@ -2983,6 +2989,11 @@ message RangeBucket {
   double to = 2;
   // Matching documents whose value falls in [from, to).
   uint64 count = 3;
+  // Exact edges when typed_edges was requested; both are absent for legacy
+  // double edges. These are authoritative; from/to are rounded display
+  // values for typed integer edges and may coincide for a nonempty interval.
+  FilterBound typed_from = 4;
+  FilterBound typed_to = 5;
 }
 
 // One requested range facet's counts, from one shard or merged.

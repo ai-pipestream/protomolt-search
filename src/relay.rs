@@ -1348,15 +1348,13 @@ pub fn merge_bm25_responses(
     shares: Vec<Bm25QueryResponse>,
 ) -> Result<Bm25QueryResponse, Status> {
     let facet_slots = req.facet_fields.len() + req.map_facet_fields.len();
-    let range_slots = req.range_facet_fields.len();
+    crate::node::validate_range_facet_fields(&req.range_facet_fields)?;
+    let mut range_shares = Vec::new();
     let mut hits = Vec::new();
     let mut facet_known = vec![false; facet_slots];
     let mut facet_names: Vec<(String, String)> = Vec::new();
     let mut facet_sums: Vec<HashMap<String, u64>> =
         (0..facet_slots).map(|_| HashMap::new()).collect();
-    let mut range_known = vec![false; range_slots];
-    let mut range_sums: Vec<Option<Vec<crate::pb::RangeBucket>>> = vec![None; range_slots];
-    let mut range_columns: Vec<(String, String)> = Vec::new();
     let mut stage_known = None;
     let mut geo_known = None;
     let mut filter_known = None;
@@ -1369,12 +1367,6 @@ pub fn merge_bm25_responses(
             return Err(Status::internal(format!(
                 "relay: child {shard} answered {} facet fields for {facet_slots} requested",
                 share.facets.len()
-            )));
-        }
-        if share.range_facets.len() != range_slots {
-            return Err(Status::internal(format!(
-                "relay: child {shard} answered {} range facets for {range_slots} requested",
-                share.range_facets.len()
             )));
         }
         for (fi, ff) in share.facets.iter().enumerate() {
@@ -1392,39 +1384,7 @@ pub fn merge_bm25_responses(
                 })?;
             }
         }
-        for (ri, rf) in share.range_facets.iter().enumerate() {
-            if range_columns.len() <= ri {
-                range_columns.push((rf.column.clone(), rf.key.clone()));
-            }
-            range_known[ri] |= rf.known;
-            if !rf.known {
-                continue;
-            }
-            match range_sums[ri].as_mut() {
-                None => range_sums[ri] = Some(rf.buckets.clone()),
-                Some(acc) => {
-                    if acc.len() != rf.buckets.len() {
-                        return Err(Status::internal(format!(
-                            "relay: child {shard} answered {} buckets on range facet {:?} \
-                             while an earlier child answered {}",
-                            rf.buckets.len(),
-                            rf.column,
-                            acc.len()
-                        )));
-                    }
-                    // The coordinator forwarded one edge list, so bucket
-                    // i is the same interval on every child.
-                    for (a, b) in acc.iter_mut().zip(&rf.buckets) {
-                        a.count = a.count.checked_add(b.count).ok_or_else(|| {
-                            Status::internal(format!(
-                                "relay: range facet {:?} bucket overflows u64 across children",
-                                rf.column
-                            ))
-                        })?;
-                    }
-                }
-            }
-        }
+        range_shares.push(share.range_facets);
         merge_known(
             "stage-column",
             shard,
@@ -1496,19 +1456,7 @@ pub fn merge_bm25_responses(
             }
         })
         .collect();
-    let range_facets = range_columns
-        .into_iter()
-        .zip(range_known)
-        .zip(range_sums)
-        .map(
-            |(((column, key), known), sums)| crate::pb::RangeFacetCounts {
-                column,
-                key,
-                known,
-                buckets: sums.unwrap_or_default(),
-            },
-        )
-        .collect();
+    let range_facets = crate::rangefacet::merge(&req.range_facet_fields, &range_shares, false)?;
     Ok(Bm25QueryResponse {
         hits,
         kth_best,
