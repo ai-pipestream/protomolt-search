@@ -50,18 +50,20 @@ The manifest encodes deterministically (fixed field order, one trailing
 newline), so a manifest that reaches a node as a protobuf frame hashes
 to the same digest as the file it was written from.
 
-**The copy runs under the shard's state read lock.** Queries proceed;
-ingest, deletes, and installs wait until the copy is done, which is what
-makes the hashes, the row counts, and the WAL cutoff describe one state.
-A shard with a WAL is copied only when the log holds nothing since the
-flush (a write that slipped in between is flushed again, up to eight
-times, then the export refuses as `ABORTED` naming the attempts). A
-shard without a WAL is copied under the write lock — nothing else can
-say whether its files are current — and its cutoff is zero with
-`wal_clocked=false`. `copy_millis` on the response is the time writes
-waited; on the test fixture (24 rows, four artifacts) it is under 10 ms,
-and it scales with the generation's bytes at the disk's sequential copy
-rate: budget one read plus one write of the shard.
+**The copy holds the seal mutex and shard state read lock.** Queries proceed;
+mutation and catalog publication wait. After acquiring both locks, export
+checks an internal flag proving the current state was flushed and, when a WAL
+exists, that it is clean. A write between flush and copy or a fresh unsealed
+tail triggers another flush, up to eight attempts, then `ABORTED`. The same
+check protects shards without WAL; their cutoff is zero with
+`wal_clocked=false`. `copy_millis` includes lock acquisition and any additional flush retries.
+Budget one read plus one write of the generation at the disk's copy rate.
+
+A bound, zero-row generation can export and install before any provider image
+exists. Its identity travels in an empty BM25 image or a format 2 segment
+catalog. See [empty generation bindings](empty-generation-binding.md) for
+validation, recovery and downgrade restrictions. Segment installs also check
+the whole-shard FP32 shape against provider images before replacing live data.
 
 A NAS path is the intended repository: export to it from the primary,
 install from it on every replica, keep it as the base image a

@@ -18,10 +18,12 @@ use serde::{Deserialize, Serialize};
 use crate::bm25::{self, Bm25Params, CorpusStats};
 use crate::exact_vectors::ExactVectorStore;
 use crate::live_docs::LiveDocs;
-use crate::postings::{Bm25Index, Bm25Reader};
+use crate::postings::{Bm25Index, Bm25Reader, StoredBinding};
 use crate::vector::{QualityContract, ScoreDirection, VectorIndex, VectorSearchOptions};
+use prost::Message;
 
-const SET_FORMAT: u32 = 1;
+const BASE_SET_FORMAT: u32 = 1;
+const SET_FORMAT: u32 = 2;
 const SET_FILE: &str = "segments.json";
 const SEGMENT_META_FILE: &str = "segment.json";
 
@@ -123,9 +125,69 @@ impl SegmentMetadata {
     }
 }
 
+/// Canonical protobuf binding and its checksum, published with the segment set.
+/// The payload uses the same six-field declaration as WAL and replica binding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SegmentBinding {
+    pub protobuf: Vec<u8>,
+    pub sha256: String,
+}
+
+impl SegmentBinding {
+    pub fn encode(binding: &StoredBinding) -> Result<Self, String> {
+        let protobuf = crate::pb::wal::LoggedBinding {
+            plan_fingerprint: binding.plan_fingerprint.clone(),
+            body_path: binding.body_path.clone(),
+            materialize_sha: binding.materialize_sha.clone(),
+            analysis_sha: binding.analysis_sha.clone(),
+            analysis_contract: binding.analysis_contract.clone(),
+            vector_binding: binding.vector_binding.clone(),
+        }
+        .encode_to_vec();
+        let value = Self {
+            sha256: crate::sha256::hex_digest(&protobuf),
+            protobuf,
+        };
+        value.decode()?;
+        Ok(value)
+    }
+
+    pub fn decode(&self) -> Result<StoredBinding, String> {
+        if self.sha256 != crate::sha256::hex_digest(&self.protobuf) {
+            return Err("segment binding checksum mismatch".into());
+        }
+        let value = crate::pb::wal::LoggedBinding::decode(self.protobuf.as_slice())
+            .map_err(|e| format!("invalid segment binding protobuf: {e}"))?;
+        if value.encode_to_vec() != self.protobuf
+            || value.plan_fingerprint.is_empty()
+            || value.body_path.is_empty()
+        {
+            return Err("segment binding must be canonical with a plan and body".into());
+        }
+        crate::mapped_analysis::decode_contract(
+            &value.analysis_sha,
+            &value.analysis_contract,
+            &value.body_path,
+        )?;
+        crate::mapped_vector::decode(&value.vector_binding, &value.plan_fingerprint)
+            .map_err(|e| e.to_string())?;
+        Ok(StoredBinding {
+            plan_fingerprint: value.plan_fingerprint,
+            body_path: value.body_path,
+            materialize_sha: value.materialize_sha,
+            analysis_sha: value.analysis_sha,
+            analysis_contract: value.analysis_contract,
+            vector_binding: value.vector_binding,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SegmentSetManifest {
     pub format: u32,
+    /// Generation-level metadata remains present even when no segment has rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<SegmentBinding>,
     pub epoch: u64,
     pub segments: Vec<SegmentMetadata>,
     /// The integer column a partitioned compaction ordered this set by
@@ -140,11 +202,24 @@ pub struct SegmentSetManifest {
 impl Default for SegmentSetManifest {
     fn default() -> Self {
         Self {
-            format: SET_FORMAT,
+            format: BASE_SET_FORMAT,
+            binding: None,
             epoch: 0,
             segments: Vec::new(),
             partition_key: None,
         }
+    }
+}
+
+impl SegmentSetManifest {
+    pub fn with_binding(mut self, binding: Option<&StoredBinding>) -> Result<Self, String> {
+        self.binding = binding.map(SegmentBinding::encode).transpose()?;
+        self.format = if self.binding.is_some() {
+            SET_FORMAT
+        } else {
+            BASE_SET_FORMAT
+        };
+        Ok(self)
     }
 }
 
@@ -198,6 +273,7 @@ struct OpenedSegment {
 
 pub struct OpenedSegmentSet {
     root: PathBuf,
+    binding: Option<StoredBinding>,
     manifest: SegmentSetManifest,
     /// The set's epoch as published. Opens at `manifest.epoch`; a
     /// compaction cutover raises it past the live set's before it
@@ -445,12 +521,34 @@ impl OpenedSegmentSet {
                 live_docs,
             }));
         }
+        let declared = manifest
+            .binding
+            .as_ref()
+            .map(SegmentBinding::decode)
+            .transpose()?;
+        let mut held = declared.clone().map(Some);
+        for segment in &segments {
+            let next = segment.bm25.binding().cloned();
+            match &held {
+                Some(expected) if expected != &next => return Err(
+                    "segment set mixes mapped bindings or disagrees with its generation binding"
+                        .into(),
+                ),
+                None => held = Some(next),
+                _ => {}
+            }
+        }
         Ok(Self {
             root,
+            binding: declared.or_else(|| held.flatten()),
             epoch: std::sync::atomic::AtomicU64::new(manifest.epoch),
             manifest,
             segments,
         })
+    }
+
+    pub fn binding(&self) -> Option<&StoredBinding> {
+        self.binding.as_ref()
     }
 
     /// Whether segment `i` is the same opened segment as `other`'s
@@ -797,6 +895,37 @@ impl SegmentCatalog {
         root.join("segments").join(id)
     }
 
+    /// Pin metadata by the same atomic manifest publication used for rows.
+    /// No independently mutable binding file can outlive or lag its generation.
+    pub fn publish_binding(
+        &self,
+        binding: &StoredBinding,
+    ) -> Result<Arc<OpenedSegmentSet>, String> {
+        let _guard = self
+            .update
+            .lock()
+            .map_err(|_| "segment update lock poisoned".to_string())?;
+        let current = self.snapshot();
+        match current.binding() {
+            Some(held) if held != binding => {
+                return Err("segment generation is bound to another mapping".into())
+            }
+            None if !current.is_empty() => {
+                return Err("cannot bind a populated unbound segment set".into())
+            }
+            _ => {}
+        }
+        if current.manifest().binding.is_some() {
+            return Ok(current);
+        }
+        let mut manifest = current.published_manifest().with_binding(Some(binding))?;
+        manifest.epoch = manifest
+            .epoch
+            .checked_add(1)
+            .ok_or("segment catalog epoch overflow")?;
+        self.publish(manifest)
+    }
+
     pub fn append(&self, source: SegmentSource<'_>) -> Result<Arc<OpenedSegmentSet>, String> {
         let _guard = self
             .update
@@ -828,8 +957,9 @@ impl SegmentCatalog {
         self.replace_many_for_compaction(input_ids, vec![source], None)
     }
 
-    /// Atomically replace compacted inputs with one or more dense immutable
-    /// outputs. Stable product identity remains in lineage, so outputs may use
+    /// Atomically replace compacted inputs with dense immutable outputs.
+    /// No output is needed when the inputs contain no live rows. Stable product
+    /// identity remains in lineage, so outputs may use
     /// fresh non-overlapping positional ranges. Every output belongs to one
     /// newer generation and their combined row count must equal the inputs'
     /// live row count.
@@ -845,9 +975,6 @@ impl SegmentCatalog {
             .map_err(|_| "segment update lock poisoned".to_string())?;
         if input_ids.is_empty() {
             return Err("compaction needs at least one input segment".into());
-        }
-        if sources.is_empty() {
-            return Err("compaction needs at least one output segment".into());
         }
         let current = self.snapshot();
         let wanted: BTreeSet<&str> = input_ids.iter().map(String::as_str).collect();
@@ -870,16 +997,17 @@ impl SegmentCatalog {
             .map(|segment| segment.generation)
             .max()
             .unwrap();
-        let output_generation = sources[0].generation;
-        if output_generation <= newest_generation {
-            return Err(format!(
-                "compaction output generation {} is not newer than input generation {newest_generation}",
-                output_generation
-            ));
+        let output_generation = sources.first().map(|source| source.generation);
+        if let Some(generation) = output_generation {
+            if generation <= newest_generation {
+                return Err(format!(
+                    "compaction output generation {generation} is not newer than input generation {newest_generation}"
+                ));
+            }
         }
         if sources
             .iter()
-            .any(|source| source.generation != output_generation)
+            .any(|source| Some(source.generation) != output_generation)
         {
             return Err("compaction outputs do not share one generation".into());
         }
@@ -917,7 +1045,9 @@ impl SegmentCatalog {
                 "compaction outputs have {output_rows} rows, expected {expected_rows} dense live rows"
             ));
         }
-        let mut manifest = current.published_manifest();
+        let mut manifest = current
+            .published_manifest()
+            .with_binding(current.binding())?;
         manifest.epoch = manifest
             .epoch
             .checked_add(1)
@@ -1130,11 +1260,18 @@ fn cleanup_staged(root: &Path, segments: &[SegmentMetadata]) {
 }
 
 fn validate_manifest(manifest: &SegmentSetManifest) -> Result<(), String> {
-    if manifest.format != SET_FORMAT {
+    if !(BASE_SET_FORMAT..=SET_FORMAT).contains(&manifest.format)
+        || (manifest.format == BASE_SET_FORMAT && manifest.binding.is_some())
+        || (manifest.format == SET_FORMAT && manifest.binding.is_none())
+    {
         return Err(format!(
-            "segment set format {} is unsupported; expected {SET_FORMAT}",
+            "segment set format {} or binding declaration is unsupported; expected format \
+             {BASE_SET_FORMAT} without a binding or {SET_FORMAT} with a binding",
             manifest.format
         ));
+    }
+    if let Some(binding) = &manifest.binding {
+        binding.decode()?;
     }
     let mut ids = BTreeSet::new();
     let mut previous_end = None;

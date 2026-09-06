@@ -1222,6 +1222,12 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Empty generation bindings (2026-09-06, feature branch).** Flush preserves
+  protobuf mapping identity before the first row, with WAL on or off. Empty
+  snapshots and full-deletion compaction retain binding and provider state;
+  export rechecks publication under its seal and state locks. See
+  [publication, recovery and compatibility](docs/empty-generation-binding.md).
+
 - **Stored vector bindings (2026-09-06, feature branch).** Mapped vector identity
   now travels with index images, WAL replay, compaction and replica catch-up,
   with exact receiver acknowledgement and old-reader version gates. Binding

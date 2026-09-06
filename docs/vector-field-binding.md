@@ -46,8 +46,9 @@ kind and WAL version gate.
 A plan response is not a credential, physical read claim or proof that a server
 is serving that plan. `StoredBinding` now retains this vector name alongside the
 plan fingerprint and body/analysis metadata. See the stored binding integration
-for replay, compaction and replica evidence, and the remaining rowless runtime
-generation publication gap when WAL is disabled.
+for replay, compaction and replica evidence.
+[Rowless generation publication](empty-generation-binding.md) now preserves the
+binding through flush and snapshots with WAL disabled.
 Read requests must name the field and nodes must verify it against that durable
 binding before a field grant can authorize vector selection or scoring.
 

@@ -3254,6 +3254,8 @@ pub(crate) struct ShardState {
     /// "no claim". Over-bumping is safe (a cache refetches); a missed
     /// bump is the only unsound direction.
     pub(crate) stats_epoch: u64,
+    /// True only after Flush persisted the current mutation state.
+    pub(crate) files_current: bool,
     pub(crate) stats_incarnation: crate::stats_identity::StatsIncarnation,
     /// A compaction cutover whose closing flush has not run yet
     /// (`docs/mutations.md`): the marker on disk says "roll back on
@@ -3271,6 +3273,7 @@ pub(crate) const STALE_STATS_EPOCH: &str = "stale stats epoch";
 impl ShardState {
     /// Never wrap a mutation version into one a coordinator may still hold.
     pub(crate) fn advance_stats_epoch(&mut self) {
+        self.files_current = false;
         if let Some(next) = self.stats_epoch.checked_add(1) {
             self.stats_epoch = next;
         } else {
@@ -3581,7 +3584,7 @@ pub fn recover_generation(index_path: &Path) -> Option<PathBuf> {
             let _ = std::fs::rename(&old, &snap);
         }
     }
-    generation_vector(&snap).exists().then_some(snap)
+    (generation_vector(&snap).exists() || generation_bm25(&snap).exists()).then_some(snap)
 }
 
 /// Build the manifest describing the shard's current provider state and
@@ -4754,6 +4757,7 @@ impl NodeServiceImpl {
                 parents: None,
                 mapped_binding,
                 stats_epoch: 1,
+                files_current: false,
                 stats_incarnation: Default::default(),
                 pending_compaction: None,
             })),
@@ -5445,6 +5449,13 @@ impl NodeServiceImpl {
     /// writer needs. `None` when there is nothing to seal.
     fn freeze_tail(&self) -> Result<Option<SealPlan>, Status> {
         let mut guard = write_shard(&self.state);
+        if let Some(binding) = guard.mapped_binding.clone() {
+            if let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_mut() {
+                shard
+                    .publish_binding(&binding)
+                    .map_err(Status::failed_precondition)?;
+            }
+        }
         let ShardState {
             bm25,
             index,
@@ -5676,6 +5687,9 @@ impl NodeServiceImpl {
         // from every future replay (reshard, recovery).
         {
             let mut guard = write_shard(&self.state);
+            if guard.mapped_binding.is_some() && guard.bm25.is_none() {
+                guard.bm25 = Some(self.new_builder(guard.generation.as_ref())?);
+            }
             if let Some(wal) = guard.wal.as_mut() {
                 wal.flush().map_err(|e| {
                     Status::internal(format!("wal fsync {}: {e}", wal.dir().display()))
@@ -5713,7 +5727,16 @@ impl NodeServiceImpl {
             }
         }
         if let Some(index) = guard.index.as_ref() {
-            if index.as_segmented().is_none() {
+            if let Some(provider) = index.as_segmented() {
+                // With no rows, no sealed image carries the provider state.
+                // Persist the empty tail so reopening without WAL retains its
+                // dimension and calibration, including after full compaction.
+                if index.is_empty() {
+                    provider.tail().write(&vector_path).map_err(|e| {
+                        Status::internal(format!("write {}: {e}", vector_path.display()))
+                    })?;
+                }
+            } else {
                 index.write(&vector_path).map_err(|e| {
                     Status::internal(format!("write {}: {e}", vector_path.display()))
                 })?;
@@ -5792,6 +5815,15 @@ impl NodeServiceImpl {
         if let Some(notify) = &self.flush_notify {
             notify.notify_one();
         }
+        // Writes arriving while the frozen segment was being written may
+        // occupy a new tail. They require another flush before snapshot copy.
+        guard.files_current = !matches!(guard.bm25.as_ref(), Some(Bm25Shard::Segmented(shard))
+            if shard.tail().next_doc_id() != 0 || shard.frozen().is_some())
+            && !guard
+                .index
+                .as_ref()
+                .and_then(VectorIndex::as_segmented)
+                .is_some_and(|provider| provider.tail().len() != 0 || provider.frozen().is_some());
         Ok(FlushResponse {
             path: vector_path.display().to_string(),
             num_vectors,
@@ -5978,13 +6010,21 @@ impl NodeServiceImpl {
         let bm25_tmp = generation_bm25(tmp_dir);
         let live_tmp = generation_live_docs(tmp_dir);
 
-        let loaded = VectorIndex::load(&self.config.vector_backend, &tv_tmp).map_err(|e| {
-            Status::invalid_argument(format!("snapshot is not a valid vector backend image: {e}"))
-        })?;
+        let loaded = if tv_tmp.exists() {
+            Some(
+                VectorIndex::load(&self.config.vector_backend, &tv_tmp).map_err(|e| {
+                    Status::invalid_argument(format!(
+                        "snapshot is not a valid vector backend image: {e}"
+                    ))
+                })?,
+            )
+        } else {
+            None
+        };
         // A snapshot installs only from the same provider state: kind and
         // scoring fingerprint (calibration included), or the fleet would
         // score one shard in another space (docs/mmap-vectors.md).
-        {
+        if let Some(loaded) = loaded.as_ref() {
             let incoming = loaded.descriptor();
             let guard = read_shard(&self.state);
             let serving_kind = guard
@@ -6022,6 +6062,9 @@ impl NodeServiceImpl {
             }
         }
         if with_exact_vectors {
+            let loaded = loaded.as_ref().ok_or_else(|| {
+                Status::invalid_argument("exact vectors require a provider image")
+            })?;
             let exact = ExactVectorStore::open(&exact_tmp).map_err(|e| {
                 Status::invalid_argument(format!(
                     "snapshot sidecar is not a valid exact-vector store: {e}"
@@ -6059,7 +6102,9 @@ impl NodeServiceImpl {
         } else {
             LiveDocs::default()
         };
-        if incoming_live_docs.persisted_rows() > (loaded.len() as u64).max(incoming_doc_rows) {
+        if incoming_live_docs.persisted_rows()
+            > (loaded.as_ref().map_or(0, |index| index.len() as u64)).max(incoming_doc_rows)
+        {
             return Err(Status::invalid_argument(
                 "snapshot live-row overlay exceeds every aligned artifact's row count",
             ));
@@ -6068,7 +6113,7 @@ impl NodeServiceImpl {
         let mut guard = write_shard(&self.state);
         // Scoring comparability: a shard with a locked backend configuration
         // only accepts an image with the identical scoring fingerprint.
-        if let Some(index) = guard.index.as_ref() {
+        if let (Some(index), Some(loaded)) = (guard.index.as_ref(), loaded.as_ref()) {
             let current = index.descriptor();
             let incoming = loaded.descriptor();
             if current.backend_kind != incoming.backend_kind
@@ -6116,12 +6161,12 @@ impl NodeServiceImpl {
             None
         };
         let num_documents = guard.bm25.as_ref().map_or(0, |b| b.doc_count());
-        let num_vectors = loaded.len() as u64;
+        let num_vectors = loaded.as_ref().map_or(0, |index| index.len() as u64);
         // Wholesale replace: the image's binding (usually none) is now
         // the shard's. A stale binding describing replaced columns
         // would lie.
         guard.mapped_binding = guard.bm25.as_ref().and_then(|b| b.binding().cloned());
-        guard.index = Some(loaded);
+        guard.index = loaded;
         guard.live_docs = incoming_live_docs;
         guard.parents = None;
         guard.generation = Some(snap.clone());
@@ -6222,14 +6267,10 @@ impl NodeServiceImpl {
     }
 
     /// `ExportSnapshot` (`docs/snapshots.md`): flush, then copy the
-    /// current generation into `directory` under the shard's read lock
-    /// and write the manifest beside it. The read lock is what makes the
-    /// hashes, the row counts, and the WAL cutoff describe one state:
-    /// queries proceed, writes wait for the copy. A shard with a WAL is
-    /// copied only when the log holds nothing since the flush (a write
-    /// that slips in between flushes again, a bounded number of times);
-    /// a shard without one is copied under the write lock, because
-    /// nothing else can tell whether its files are current.
+    /// current generation into `directory` under the seal mutex and shard
+    /// read lock, then write the manifest beside it. Files must still match
+    /// the flushed state, and any WAL must be clean. Intervening mutations
+    /// trigger a bounded flush retry, including when WAL is disabled.
     pub fn export_snapshot_blocking(
         &self,
         directory: &Path,
@@ -6260,26 +6301,15 @@ impl NodeServiceImpl {
         let mut attempts = 0u32;
         let (manifest, bytes) = loop {
             attempts += 1;
-            let guard = read_shard(&self.state);
-            match guard.wal.as_ref() {
-                Some(wal) if wal.is_dirty() => {
-                    drop(guard);
-                    if attempts >= 8 {
-                        return Err(Status::aborted(format!(
-                            "shard kept writing through {attempts} flushes; a snapshot copies \
-                             a flushed generation, retry when ingest pauses"
-                        )));
-                    }
-                    self.flush_index()?;
-                    continue;
-                }
-                Some(_) => break self.export_locked(&guard, &index_path, directory)?,
-                None => {
-                    drop(guard);
-                    let guard = write_shard(&self.state);
-                    break self.export_locked(&guard, &index_path, directory)?;
-                }
+            if let Some(copy) = self.export_if_flushed(&index_path, directory)? {
+                break copy;
             }
+            if attempts >= 8 {
+                return Err(Status::aborted(format!(
+                    "shard kept writing through {attempts} flushes; a snapshot copies a flushed generation, retry when ingest pauses"
+                )));
+            }
+            self.flush_index()?;
         };
         let copy_millis = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         let (manifest_path, manifest_sha256) = repo::write_manifest(directory, &manifest)
@@ -6295,6 +6325,21 @@ impl NodeServiceImpl {
         })
     }
 
+    /// Check after acquiring the seal fence and state guard. A mutation
+    /// between Flush and copy requires another flush, including without WAL.
+    fn export_if_flushed(
+        &self,
+        index_path: &Path,
+        directory: &Path,
+    ) -> Result<Option<(RepositoryManifest, u64)>, Status> {
+        let _sealing = self.seal_lock.lock().expect("seal lock poisoned");
+        let guard = read_shard(&self.state);
+        if !guard.files_current || guard.wal.as_ref().is_some_and(|wal| wal.is_dirty()) {
+            return Ok(None);
+        }
+        self.export_locked(&guard, index_path, directory).map(Some)
+    }
+
     /// The copy itself, under whichever lock the caller holds.
     fn export_locked(
         &self,
@@ -6306,16 +6351,47 @@ impl NodeServiceImpl {
         let mut sources: Vec<(String, PathBuf)> = Vec::new();
         if layout == LAYOUT_SEGMENTS {
             let root = segments_root(index_path);
-            for (name, path) in repo::walk_files(&root)
-                .map_err(|e| Status::internal(format!("walk {}: {e}", root.display())))?
-            {
-                sources.push((format!("{CATALOG_DIR}/{name}"), path));
+            let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
+                return Err(Status::internal("segment snapshot has no serving catalog"));
+            };
+            sources.push((
+                format!("{CATALOG_DIR}/segments.json"),
+                root.join("segments.json"),
+            ));
+            // Compaction can stage new segments while the serving catalog is
+            // pinned. Copy only its published artifacts, never staging files or
+            // retired segments discovered by walking the directory tree.
+            for metadata in &shard.snapshot().manifest().segments {
+                let directory = format!("segments/{}", metadata.segment_id);
+                sources.push((
+                    format!("{CATALOG_DIR}/{directory}/segment.json"),
+                    root.join(&directory).join("segment.json"),
+                ));
+                for artifact in [
+                    &metadata.vector,
+                    &metadata.exact_vectors,
+                    &metadata.bm25,
+                    &metadata.live_docs,
+                ] {
+                    if !artifact.file.is_empty() {
+                        let name = format!("{directory}/{}", artifact.file);
+                        sources.push((format!("{CATALOG_DIR}/{name}"), root.join(name)));
+                    }
+                }
             }
             for (name, path) in [
                 ("vector.index", index_path.to_path_buf()),
                 ("vectors.f32", exact_vector_sidecar_path(index_path)),
                 ("live-docs.bin", live_docs_sidecar_path(index_path)),
             ] {
+                // A standalone image from before the first seal is obsolete
+                // once sealed vector images define the serving generation.
+                if name == "vector.index"
+                    && matches!(guard.bm25.as_ref(), Some(Bm25Shard::Segmented(shard))
+                        if (0..shard.snapshot().len()).any(|i| shard.snapshot().vector(i).is_some()))
+                {
+                    continue;
+                }
                 if path.is_file() {
                     sources.push((name.to_string(), path));
                 }
@@ -6464,9 +6540,30 @@ impl NodeServiceImpl {
             return self.apply_segment_snapshot(tmp_dir, manifest);
         }
         if manifest.artifact("vector.index").is_none() {
-            return Err(Status::failed_precondition(
-                "snapshot has no provider image (vector.index); a single-image install needs one",
-            ));
+            if manifest.vector_rows != 0
+                || manifest.document_rows != 0
+                || manifest.live_rows != 0
+                || manifest.dim != 0
+                || !manifest.scoring_fingerprint.is_empty()
+                || manifest.artifact("vectors.f32").is_some()
+                || manifest.artifact("documents.bm25").is_none()
+                || generation_vector(tmp_dir).exists()
+                || generation_exact_vectors(tmp_dir).exists()
+            {
+                return Err(Status::failed_precondition(
+                    "a snapshot without a provider image must be an empty binding image",
+                ));
+            }
+            let image = Bm25Reader::open(&generation_bm25(tmp_dir)).map_err(|e| {
+                Status::invalid_argument(format!("invalid empty binding image: {e}"))
+            })?;
+            if image.next_doc_id() != 0 || image.binding().is_none() {
+                return Err(Status::failed_precondition(
+                    "a snapshot without a provider image requires a zero-row mapped binding",
+                ));
+            }
+            crate::segments::SegmentBinding::encode(image.binding().expect("checked above"))
+                .map_err(Status::invalid_argument)?;
         }
         {
             let guard = read_shard(&self.state);
@@ -6593,12 +6690,30 @@ impl NodeServiceImpl {
                 }
             }
         }
+        let sealed_vector_rows = (0..staged.len())
+            .filter_map(|i| staged.vector(i))
+            .map(|image| image.len())
+            .sum::<usize>();
+        let sealed_dim =
+            (0..staged.len()).find_map(|i| staged.vector(i).and_then(|image| image.dim_opt()));
+        let (vector_rows, vector_dim) = match sealed_dim {
+            Some(dim) => (sealed_vector_rows, Some(dim)),
+            None => (
+                plain_image.as_ref().map_or(0, |image| image.len()),
+                plain_image.as_ref().and_then(|image| image.dim_opt()),
+            ),
+        };
         if exact_tmp.exists() {
             let exact = ExactVectorStore::open(&exact_tmp).map_err(|e| {
                 Status::invalid_argument(format!(
                     "snapshot sidecar is not a valid exact-vector store: {e}"
                 ))
             })?;
+            if exact.len() != vector_rows || exact.dim() != vector_dim {
+                return Err(Status::invalid_argument(
+                    "snapshot exact-vector sidecar shape disagrees with its provider images",
+                ));
+            }
             exact.verify_payload().map_err(|e| {
                 Status::invalid_argument(format!(
                     "snapshot exact-vector integrity check failed: {e}"
@@ -6618,7 +6733,7 @@ impl NodeServiceImpl {
             .iter()
             .map(|segment| segment.rows)
             .sum::<u64>()
-            .max(plain_image.as_ref().map_or(0, |i| i.len() as u64));
+            .max(vector_rows as u64);
         if incoming_live.persisted_rows() > staged_rows {
             return Err(Status::invalid_argument(
                 "snapshot live-row overlay exceeds every aligned artifact's row count",
@@ -6677,14 +6792,7 @@ impl NodeServiceImpl {
         let shard = SegmentedShard::open_with(&root, tail, self.config.vector_load())
             .map_err(|e| Status::internal(format!("open installed catalog: {e}")))?;
         let set = shard.snapshot().clone();
-        let index = if path.exists() {
-            let mut loaded = VectorIndex::load(&self.config.vector_backend, &path)
-                .map_err(|e| Status::internal(format!("open installed {}: {e}", path.display())))?;
-            loaded
-                .prepare()
-                .map_err(|e| Status::internal(format!("prepare {}: {e}", path.display())))?;
-            Some(loaded)
-        } else if let Some(first) = (0..set.len()).find_map(|i| set.vector(i)) {
+        let index = if let Some(first) = (0..set.len()).find_map(|i| set.vector(i)) {
             let backend = first
                 .backend_config()
                 .map_err(|e| Status::internal(format!("segment vector backend: {e}")))?;
@@ -6696,6 +6804,13 @@ impl NodeServiceImpl {
             let provider = SegmentedProvider::open(set, tail_image)
                 .map_err(|e| Status::internal(format!("segment vectors: {e}")))?;
             Some(VectorIndex::from_provider(provider))
+        } else if path.exists() {
+            let mut loaded = VectorIndex::load(&self.config.vector_backend, &path)
+                .map_err(|e| Status::internal(format!("open installed {}: {e}", path.display())))?;
+            loaded
+                .prepare()
+                .map_err(|e| Status::internal(format!("prepare {}: {e}", path.display())))?;
+            Some(loaded)
         } else {
             None
         };
@@ -6814,6 +6929,7 @@ impl NodeServiceImpl {
             None => {
                 let built = build()?;
                 let adopted = Self::adopt_layout(guard.bm25.as_ref(), built)?;
+                guard.advance_stats_epoch();
                 guard.index = Some(adopted);
                 Ok(false)
             }
@@ -6913,6 +7029,10 @@ impl NodeServiceImpl {
                 "invalid input value at vector {vi}, coord {ci}: {v}"
             )));
         }
+        // Invalidate before the first mutation, including failures after a
+        // provider commit. Neither snapshot copy nor admitted physical reads
+        // may keep using the pre-append generation claim.
+        guard.advance_stats_epoch();
         let (first_id, index_bit_width, index_len) = {
             let index = match guard.index.as_mut() {
                 Some(index) => index,
@@ -9200,6 +9320,9 @@ impl NodeServiceImpl {
             crate::source_archive::validate_identity(identity, doc.source_chunk_ordinal)
                 .map_err(|error| Status::invalid_argument(error.to_string()))?;
         }
+        // Invalidate before any fallible mutation, including builder/provider
+        // creation; a refused append must not leave old files marked current.
+        guard.advance_stats_epoch();
         // A disk-resident shard that receives more documents is first
         // reloaded into the heap builder (the append path is
         // bulk-load: build in memory, flush back to v3).
@@ -9924,7 +10047,6 @@ impl NodeServiceImpl {
                 }),
             );
         }
-        guard.advance_stats_epoch();
         *added += 1;
         Ok(())
     }
@@ -10125,6 +10247,7 @@ impl NodeServiceImpl {
                     }),
                 );
                 guard.mapped_binding = Some(incoming);
+                guard.advance_stats_epoch();
                 Ok((extractor, analysis))
             }
         }
@@ -14221,6 +14344,7 @@ impl NodeServiceImpl {
                     }),
                 );
                 guard.mapped_binding = Some(incoming);
+                guard.advance_stats_epoch();
                 Ok(false)
             }
         }
@@ -15091,5 +15215,245 @@ mod vector_column_namespace_tests {
             node.validate_vector_column_name("distinct", Some(&store))
                 .unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_publication_tests {
+    use super::*;
+    use crate::postings::StoredBinding;
+
+    #[test]
+    fn configuring_and_appending_vectors_require_a_new_snapshot_flush() {
+        let root = std::env::temp_dir().join(format!(
+            "snapshot-vector-publication-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        for wal in [false, true] {
+            for layout in [Layout::SingleImage, Layout::Segments] {
+                let path = root.join(format!("{wal}-{layout:?}.tv"));
+                let service = NodeServiceImpl::open(
+                    NodeConfig {
+                        index_path: Some(path.clone()),
+                        layout,
+                        wal,
+                        ..Default::default()
+                    },
+                    None,
+                    false,
+                )
+                .unwrap();
+                service.flush_index().unwrap();
+                let epoch = read_shard(&service.state).stats_epoch;
+                service
+                    .apply_calibration(&SetCalibrationRequest {
+                        dim: 8,
+                        bit_width: 4,
+                        shift: vec![0.0; 8],
+                        scale: vec![1.0; 8],
+                    })
+                    .unwrap();
+                assert_ne!(read_shard(&service.state).stats_epoch, epoch);
+                let directory = root.join(format!("copy-{wal}-{layout:?}"));
+                std::fs::create_dir_all(&directory).unwrap();
+                assert!(service
+                    .export_if_flushed(&path, &directory)
+                    .unwrap()
+                    .is_none());
+                service.flush_index().unwrap();
+                let epoch = read_shard(&service.state).stats_epoch;
+                service
+                    .apply_batch(
+                        AddVectorsRequest {
+                            dim: 8,
+                            vectors: vec![0.25; 8],
+                        },
+                        None,
+                    )
+                    .unwrap();
+                assert_ne!(read_shard(&service.state).stats_epoch, epoch);
+                assert!(service
+                    .export_if_flushed(&path, &directory)
+                    .unwrap()
+                    .is_none());
+                assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+                service.flush_index().unwrap();
+                let (manifest, _) = service
+                    .export_if_flushed(&path, &directory)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(manifest.vector_rows, 1);
+                if manifest.layout == LAYOUT_SEGMENTS {
+                    let set = crate::segments::OpenedSegmentSet::open(directory.join(CATALOG_DIR))
+                        .unwrap();
+                    let image = set.vector(0).unwrap();
+                    assert_eq!(image.len(), 1);
+                    assert_eq!(image.dim_opt(), Some(8));
+                } else {
+                    let image = VectorIndex::load(
+                        &service.config.vector_backend,
+                        &directory.join("vector.index"),
+                    )
+                    .unwrap();
+                    assert_eq!(image.len(), 1);
+                    assert_eq!(image.dim_opt(), Some(8));
+                }
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn metadata_only_snapshots_reject_false_shape_claims_before_install() {
+        let root =
+            std::env::temp_dir().join(format!("snapshot-empty-shape-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source_path = root.join("source.tv");
+        let source = NodeServiceImpl::new(
+            None,
+            NodeConfig {
+                index_path: Some(source_path.clone()),
+                layout: Layout::SingleImage,
+                ..Default::default()
+            },
+        );
+        let binding = StoredBinding {
+            plan_fingerprint: "a".repeat(64),
+            body_path: "body".into(),
+            ..Default::default()
+        };
+        NodeServiceImpl::apply_binding_locked(&mut write_shard(&source.state), binding.clone())
+            .unwrap();
+        source.flush_index().unwrap();
+        let directory = root.join("repository");
+        std::fs::create_dir_all(&directory).unwrap();
+        let (manifest, _) = source
+            .export_if_flushed(&source_path, &directory)
+            .unwrap()
+            .unwrap();
+        let target_path = root.join("target.tv");
+        let target = NodeServiceImpl::new(
+            None,
+            NodeConfig {
+                index_path: Some(target_path.clone()),
+                layout: Layout::SingleImage,
+                ..Default::default()
+            },
+        );
+        for case in 0..5 {
+            let mut invalid = manifest.clone();
+            match case {
+                0 => invalid.vector_rows = 1,
+                1 => invalid.document_rows = 1,
+                2 => invalid.live_rows = 1,
+                3 => invalid.dim = 8,
+                _ => invalid.scoring_fingerprint = "invented".into(),
+            }
+            assert_eq!(
+                target
+                    .install_staged_repository(&directory, &invalid)
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::FailedPrecondition
+            );
+            assert!(read_shard(&target.state).mapped_binding.is_none());
+            assert!(!generation_dir(&target_path).exists());
+        }
+        target
+            .install_staged_repository(&directory, &manifest)
+            .unwrap();
+        assert_eq!(
+            read_shard(&target.state).mapped_binding,
+            Some(binding.clone())
+        );
+        drop(target);
+        // A crash after retiring the old generation but before adopting its
+        // replacement restores the BM25-only generation, including its binding.
+        std::fs::rename(
+            generation_dir(&target_path),
+            generation_old_dir(&target_path),
+        )
+        .unwrap();
+        let reopened = NodeServiceImpl::open(
+            NodeConfig {
+                index_path: Some(target_path),
+                layout: Layout::SingleImage,
+                ..Default::default()
+            },
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(read_shard(&reopened.state).mapped_binding, Some(binding));
+        assert!(read_shard(&reopened.state).index.is_none());
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn copy_rechecks_mutations_after_acquiring_the_seal_fence_with_or_without_wal() {
+        let root =
+            std::env::temp_dir().join(format!("snapshot-publication-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        for wal in [false, true] {
+            let path = root.join(format!("{wal}.tv"));
+            let service = NodeServiceImpl::new(
+                None,
+                NodeConfig {
+                    index_path: Some(path.clone()),
+                    layout: Layout::SingleImage,
+                    wal,
+                    ..Default::default()
+                },
+            );
+            let binding = crate::postings::StoredBinding {
+                plan_fingerprint: "a".repeat(64),
+                body_path: "body".into(),
+                ..Default::default()
+            };
+            NodeServiceImpl::apply_binding_locked(
+                &mut write_shard(&service.state),
+                binding.clone(),
+            )
+            .unwrap();
+            service.flush_index().unwrap();
+            let directory = root.join(format!("copy-{wal}"));
+            std::fs::create_dir_all(&directory).unwrap();
+            let sealing = service.seal_lock.lock().unwrap();
+            let copying = service.clone();
+            let copy_path = path.clone();
+            let copy_directory = directory.clone();
+            let copy =
+                std::thread::spawn(move || copying.export_if_flushed(&copy_path, &copy_directory));
+            // A real append after Flush, while publication is held out.
+            service
+                .apply_document_locked(
+                    &mut write_shard(&service.state),
+                    AddDocumentsRequest {
+                        text: "word".into(),
+                        ..Default::default()
+                    },
+                    crate::postings::AnalyzedDoc::body(vec![("word".into(), 1, vec![(0, 4)])], 1),
+                    None,
+                    None,
+                    &mut 0,
+                    &mut 0,
+                )
+                .unwrap();
+            drop(sealing);
+            assert!(copy.join().unwrap().unwrap().is_none());
+            assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+            service.flush_index().unwrap();
+            let (manifest, _) = service
+                .export_if_flushed(&path, &directory)
+                .unwrap()
+                .unwrap();
+            assert_eq!(manifest.document_rows, 1);
+            let image = Bm25Reader::open(&directory.join("documents.bm25")).unwrap();
+            assert_eq!(image.next_doc_id(), 1);
+            assert_eq!(image.binding(), Some(&binding));
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

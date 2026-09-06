@@ -102,6 +102,11 @@ scoring fingerprint, analysis fingerprints, and full SHA-256 of every
 artifact. `segments.json` names one immutable set of those segments. Opening a
 set verifies every hash and row count before it can serve.
 
+A mapped generation also publishes its binding in catalog format 2, independent
+of whether any segment has rows. Format 1 remains readable; every segment must
+agree on the complete binding. See [empty generation bindings](empty-generation-binding.md)
+for atomic publication, compaction and old-reader behavior.
+
 All segments in a set must use the same exhaustive, higher-is-better vector
 contract and the same scoring and analysis fingerprints. Positional ranges may
 not overlap. Stable product identity remains in document lineage rather than

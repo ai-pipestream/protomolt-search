@@ -801,13 +801,25 @@ async fn install_from_a_url_equals_the_source_and_resumes_with_range() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn segment_layout_exports_installs_reopens_and_never_mixes() {
     let dir = tempdir("segments");
-    let (source, source_handle, _) = source_shard(&dir, Layout::Segments).await;
+    let (source, source_handle, source_path) = source_shard(&dir, Layout::Segments).await;
     let want = signature(&source).await;
     let want_counts = counts(&health(&source).await);
+    let staging = pipestream_search::node::segments_root(&source_path).join("staging/unpublished");
+    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::write(
+        staging.join("partial-image"),
+        b"unpublished compaction output",
+    )
+    .unwrap();
     let repo_dir = dir.join("repo");
     let export = export_snapshot(&source, &repo_dir).await.unwrap();
     let manifest = manifest_of(&export);
     assert_eq!(manifest.layout, LAYOUT_SEGMENTS);
+    assert!(!manifest
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.file.contains("staging")));
+    assert!(!repo_dir.join("catalog/staging").exists());
     assert!(manifest.artifact("catalog/segments.json").is_some());
     assert!(
         manifest
@@ -835,6 +847,41 @@ async fn segment_layout_exports_installs_reopens_and_never_mixes() {
     assert_eq!(installed.num_documents, DOCS as u64);
     assert!(installed.path.ends_with(".segments"), "{}", installed.path);
     assert_eq!(counts(&health(&target).await), want_counts);
+    assert_eq!(signature(&target).await, want);
+    // Older exports may include a pre-seal standalone image alongside the
+    // catalog. Its row count must not replace the catalog's serving rows.
+    let legacy = dir.join("legacy-repository");
+    let mut legacy_manifest = manifest.clone();
+    for artifact in &manifest.artifacts {
+        let target = legacy.join(&artifact.file);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::copy(repo_dir.join(&artifact.file), target).unwrap();
+    }
+    let first_image = manifest
+        .artifacts
+        .iter()
+        .find(|artifact| {
+            artifact.file.starts_with("catalog/segments/")
+                && artifact.file.ends_with("/vector.index")
+        })
+        .unwrap();
+    legacy_manifest.artifacts.push(
+        repo::copy_and_hash(
+            &repo_dir.join(&first_image.file),
+            &legacy.join("vector.index"),
+            "vector.index",
+        )
+        .unwrap(),
+    );
+    let (_, legacy_digest) = repo::write_manifest(&legacy, &legacy_manifest).unwrap();
+    let installed = install(
+        &target,
+        Source::Directory(legacy.display().to_string()),
+        &legacy_digest,
+    )
+    .await
+    .unwrap();
+    assert_eq!(installed.num_vectors, DOCS as u64);
     assert_eq!(signature(&target).await, want);
     // Reopen from disk: the catalog is the layout, nothing converted.
     target_handle.abort();
@@ -985,4 +1032,48 @@ async fn the_manifest_cutoff_is_where_replication_resumes() {
     replica_handle.abort();
     primary_handle.abort();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn segment_snapshot_refuses_rehashed_misaligned_exact_rows_before_replacing_live_data() {
+    let dir = tempdir("exact-shape");
+    let (source, source_handle, _) = source_shard(&dir, Layout::Segments).await;
+    let repository = dir.join("repository");
+    let exported = export_snapshot(&source, &repository).await.unwrap();
+    let mut manifest = manifest_of(&exported);
+    // The live network source stays the receiver: refused installs must leave
+    // its existing query results and row counts intact.
+    let before = signature(&source).await;
+    for (dim, rows) in [(DIM, DOCS - 1), (DIM + 1, DOCS)] {
+        let path = repository.join("vectors.f32");
+        pipestream_search::exact_vectors::ExactVectorStore::from_values(dim, vec![0.0; dim * rows])
+            .unwrap()
+            .write(&path)
+            .unwrap();
+        let (bytes, sha256) = repo::hash_file(&path).unwrap();
+        let artifact = manifest
+            .artifacts
+            .iter_mut()
+            .find(|a| a.file == "vectors.f32")
+            .unwrap();
+        artifact.bytes = bytes;
+        artifact.sha256 = sha256;
+        let (_, digest) = repo::write_manifest(&repository, &manifest).unwrap();
+        let error = install(
+            &source,
+            Source::Directory(repository.display().to_string()),
+            &digest,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(
+            error.message().contains("sidecar shape disagrees"),
+            "{error}"
+        );
+        assert_eq!(signature(&source).await, before);
+    }
+    source_handle.abort();
+    let _ = source_handle.await;
+    std::fs::remove_dir_all(dir).unwrap();
 }

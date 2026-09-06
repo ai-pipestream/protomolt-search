@@ -976,6 +976,7 @@ text/lineage keys refuse during planning; mapped bind also checks configured and
 active stored columns. See [vector field binding](vector-field-binding.md).
 The [stored binding integration](vector-binding-storage.md) carries the vector
 identity through images, WAL, resharding and compaction and requires exact replica
-acknowledgement. Rowless runtime generation publication with WAL disabled and
-field-named query enforcement remain required work. Existing restricted
+acknowledgement. [Rowless generation publication](empty-generation-binding.md)
+now works through flush, restart and snapshots with WAL disabled. Field-named
+query enforcement remains required work. Existing restricted
 vector/query gates remain in place.

@@ -296,11 +296,19 @@ impl SegmentedShard {
         Self::from_catalog(catalog, tail)
     }
 
-    fn from_catalog(catalog: SegmentCatalog, tail: Bm25Store) -> Result<Self, String> {
+    fn from_catalog(catalog: SegmentCatalog, mut tail: Bm25Store) -> Result<Self, String> {
         if tail.next_doc_id() != 0 {
             return Err("a segmented shard's tail must start empty".to_string());
         }
         let set = catalog.snapshot();
+        if let Some(binding) = set.binding() {
+            if tail.binding().is_some_and(|held| held != binding) {
+                return Err("segment tail and generation mapped bindings disagree".into());
+            }
+            tail.set_binding(Some(binding.clone()));
+        } else if !set.is_empty() && tail.binding().is_some() {
+            return Err("a bound tail cannot label a populated unbound segment set".into());
+        }
         let mut shard = SegmentedShard {
             catalog,
             set,
@@ -541,6 +549,20 @@ impl SegmentedShard {
             .chain(std::iter::once((self.tail_base, &self.tail)))
     }
 
+    /// Publish binding metadata without dropping a frozen tail or moving rows.
+    pub fn publish_binding(&mut self, binding: &StoredBinding) -> Result<(), String> {
+        if self.binding().is_some_and(|held| held != binding) {
+            return Err("segment shard is bound to another mapping".into());
+        }
+        let published = self.catalog.publish_binding(binding)?;
+        if published.manifest().segments != self.set.manifest().segments {
+            return Err("segment rows changed during binding publication".into());
+        }
+        self.set = published;
+        self.tail.set_binding(Some(binding.clone()));
+        Ok(())
+    }
+
     pub fn catalog(&self) -> &SegmentCatalog {
         &self.catalog
     }
@@ -671,8 +693,9 @@ impl SegmentedShard {
     }
 
     pub fn binding(&self) -> Option<&StoredBinding> {
-        self.tail
+        self.set
             .binding()
+            .or_else(|| self.tail.binding())
             .or_else(|| self.frozen.as_ref().and_then(|f| f.store.binding()))
             .or_else(|| {
                 (!self.parts.is_empty())

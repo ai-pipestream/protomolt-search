@@ -1015,9 +1015,13 @@ impl NodeServiceImpl {
             // goes into a heap store rather than a spill builder, whose
             // directory would live under the generation directory the
             // cutover renames away.
-            Some(Bm25Shard::Building(
-                crate::node::heap_store(&self.config).map_err(Status::failed_precondition)?,
-            ))
+            let mut store =
+                crate::node::heap_store(&self.config).map_err(Status::failed_precondition)?;
+            store.set_binding(
+                crate::reshard::read_generation_binding(&pre.gen_dir)
+                    .map_err(Status::failed_precondition)?,
+            );
+            Some(Bm25Shard::Building(store))
         };
         let live_docs = LiveDocs::open(&live_path)
             .map_err(|e| Status::internal(format!("open {}: {e}", live_path.display())))?;
@@ -1033,6 +1037,7 @@ impl NodeServiceImpl {
                 parents: None,
                 mapped_binding,
                 stats_epoch: 0,
+                files_current: false,
                 stats_incarnation: Default::default(),
                 pending_compaction: None,
             },
@@ -1127,7 +1132,13 @@ impl NodeServiceImpl {
                 segments: staged.clone(),
                 partition_key: pre.partition.clone(),
                 ..Default::default()
-            };
+            }
+            .with_binding(
+                crate::reshard::read_generation_binding(&pre.gen_dir)
+                    .map_err(Status::failed_precondition)?
+                    .as_ref(),
+            )
+            .map_err(Status::failed_precondition)?;
             let catalog = SegmentCatalog::open_staged(&root, manifest, self.config.vector_load())
                 .map_err(|e| Status::internal(format!("open the compacted set: {e}")))?;
             let tail =
@@ -1140,6 +1151,10 @@ impl NodeServiceImpl {
             let mut index = None;
             let mut exact_vectors = None;
             if let Some(empty) = self.empty_configured_index(pre)? {
+                // Even an empty compacted generation replaces the old FP32
+                // sidecar at the closing flush. Leaving this absent retains
+                // the retired generation's rows on disk.
+                exact_vectors = Some(ExactVectorStore::empty(empty.dim_opt()));
                 let provider =
                     crate::segmented_vectors::SegmentedProvider::open(set.clone(), empty)
                         .map_err(|e| Status::internal(format!("segment vectors: {e}")))?;
@@ -1198,6 +1213,7 @@ impl NodeServiceImpl {
                     parents: None,
                     mapped_binding,
                     stats_epoch: 0,
+                    files_current: false,
                     stats_incarnation: Default::default(),
                     pending_compaction: None,
                 },

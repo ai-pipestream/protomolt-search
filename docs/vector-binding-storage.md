@@ -54,12 +54,10 @@ new durability receipt; existing WAL append and flush semantics still apply.
 
 ## Remaining integration
 
-An empty generation with WAL enabled recovers the binding from the log, even
-when no source document or BM25 image exists. With WAL disabled, a rowless
-runtime shard still has no generation-level metadata artifact: its binding is
-only in memory until a document-bearing image is written. Zero-row snapshot
-and generation publication need a common durable metadata contract. The empty
-store codec tests do not prove that this runtime publication exists.
+Empty runtime generations now publish the complete binding through `Flush` in
+both layouts, with or without WAL, and transfer it in zero-row snapshots.
+See [binding publication without source rows](empty-generation-binding.md) for
+the catalog format, recovery rules, compatibility limits and runtime tests.
 
 Read requests still need to name the vector field, and nodes must compare it
 with the binding under the same read guard used for selection and scoring.
