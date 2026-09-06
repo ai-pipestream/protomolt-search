@@ -8,6 +8,36 @@ use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor};
 use std::sync::OnceLock;
 use tonic::Status;
 
+/// Version probes are distinct from empty-term corpus statistics. Keeping this
+/// mode explicit prevents a version response from becoming a zero-valued share.
+pub fn validate_stats_request(request: &crate::pb::TermStatsRequest) -> Result<(), Status> {
+    if request.version_only && (!request.terms.is_empty() || !request.fields.is_empty()) {
+        return Err(Status::invalid_argument(
+            "a version-only probe cannot request terms or fields",
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_stats_mode(version_only: bool, response: &TermStatsResponse) -> Result<(), Status> {
+    if response.version_only != version_only {
+        return Err(Status::failed_precondition(
+            "statistics response mode mismatch; use matching node and coordinator builds",
+        ));
+    }
+    if version_only
+        && (response.doc_count != 0
+            || response.total_doc_length != 0
+            || !response.doc_frequencies.is_empty()
+            || !response.field_stats.is_empty())
+    {
+        return Err(Status::failed_precondition(
+            "a version-only probe returned corpus statistics",
+        ));
+    }
+    Ok(())
+}
+
 /// Cache identity derived from a validated protobuf visibility, never from a
 /// caller-supplied digest. Default is the unrestricted live document view.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]

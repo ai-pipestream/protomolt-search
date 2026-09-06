@@ -183,6 +183,13 @@ possessing a cursor grants no access. Client metadata cannot supply a trusted
 `AccessDecision` extension. A streamed query's nested collection must also agree
 with its authorized outer resource.
 
+Envelope format 2 separately hashes the request's physical read versions.
+These are checked after shard admission, before selection on a continuation.
+The separation preserves the pre-fan-out request/authority/topology rejection.
+Mutation or compaction invalidates the cursor even when its old boundary still
+matches. See [query read versions](query-read-versions.md); this is a data
+consistency guard, not document or field authorization for restricted queries.
+
 HMAC-SHA256 covers the versioned protobuf envelope and a domain separator; tags
 are compared with the existing constant-time comparison. Parsing is bounded and
 refuses noncanonical payloads and unknown versions. Keys are shared by clones

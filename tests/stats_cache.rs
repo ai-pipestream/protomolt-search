@@ -113,6 +113,7 @@ async fn term_stats_reports_an_epoch_that_ingest_advances() {
         let mut c = c.clone();
         async move {
             c.term_stats(TermStatsRequest {
+                version_only: false,
                 visibility: None,
                 terms: vec!["rust".into()],
                 fields: Vec::new(),
@@ -158,6 +159,7 @@ async fn bm25_query_enforces_the_stats_epoch_claim() {
     let mut client = NodeServiceClient::connect(addr).await.unwrap();
     let stats = client
         .term_stats(TermStatsRequest {
+            version_only: false,
             visibility: None,
             terms: vec!["rust".into()],
             fields: Vec::new(),
@@ -452,6 +454,7 @@ async fn replacement_node_refuses_stats_from_previous_lifetime() {
     let mut old = NodeServiceClient::connect(old_addr).await.unwrap();
     let mut new = NodeServiceClient::connect(new_addr).await.unwrap();
     let req = TermStatsRequest {
+        version_only: false,
         terms: vec!["rust".into()],
         ..Default::default()
     };

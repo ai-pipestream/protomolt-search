@@ -18,6 +18,7 @@ type NodeServer = NodeServiceServer<NodeServiceImpl>;
 struct Replaceable<S> {
     current: Arc<Mutex<S>>,
     before_score: Arc<Mutex<VecDeque<S>>>,
+    before_fetch: Arc<Mutex<VecDeque<S>>>,
     scoring_calls: Arc<AtomicUsize>,
 }
 
@@ -40,6 +41,11 @@ where
         std::task::Poll::Ready(Ok(()))
     }
     fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        if request.uri().path().ends_with("/FetchValues") {
+            if let Some(next) = self.before_fetch.lock().unwrap().pop_front() {
+                *self.current.lock().unwrap() = next;
+            }
+        }
         if [
             "Bm25Query",
             "Bm25QueryStream",
@@ -64,6 +70,7 @@ async fn node(texts: &[&str]) -> NodeServer {
         None,
         NodeConfig {
             analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
+            numeric_fields: vec!["boost".into()],
             ..Default::default()
         },
     ));
@@ -74,6 +81,10 @@ async fn node(texts: &[&str]) -> NodeServer {
                 .map(|text| AddDocumentsRequest {
                     analysis: Some(body_spec()),
                     text: (*text).into(),
+                    numerics: vec![pipestream_search::pb::NumericValue {
+                        field: "boost".into(),
+                        value: 1.0,
+                    }],
                     ..Default::default()
                 })
                 .collect::<Vec<_>>(),
@@ -93,6 +104,7 @@ async fn start(
     let service = Replaceable {
         current: Arc::new(Mutex::new(server)),
         before_score: Arc::new(Mutex::new(VecDeque::new())),
+        before_fetch: Arc::new(Mutex::new(VecDeque::new())),
         scoring_calls: Arc::new(AtomicUsize::new(0)),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -190,6 +202,7 @@ async fn every_lexical_scoring_route_rejects_another_lifetime() {
         .unwrap();
     let stats = client
         .term_stats(TermStatsRequest {
+            version_only: false,
             terms: vec!["rust".into()],
             ..Default::default()
         })
@@ -286,4 +299,250 @@ async fn every_lexical_scoring_route_rejects_another_lifetime() {
         assert!(error.message().starts_with("stale stats epoch"), "{error}");
     }
     handle.abort();
+}
+
+fn public_query() -> pipestream_search::pb::QueryRequest {
+    use pipestream_search::pb::*;
+    QueryRequest {
+        k: 1,
+        selection: Some(SelectionQuery {
+            node: Some(selection_query::Node::Search(SearchQuery {
+                id: "text".into(),
+                query: Some(search_query::Query::Lexical(LexicalQuery {
+                    text: "rust".into(),
+                    analysis: Some(body_spec()),
+                    ..Default::default()
+                })),
+            })),
+        }),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn public_query_value_fetch_keeps_the_preselection_lifetime() {
+    use pipestream_search::pb::{search_service_server::SearchService, *};
+    let (address, service, handle) = start(node(&["rust", "rust"]).await).await;
+    let coordinator = coordinator(address);
+    let mut query = public_query();
+    query.sort = vec![QuerySort {
+        column: "boost".into(),
+        descending: false,
+    }];
+    query.projections = vec![NamedProjection {
+        name: "boost".into(),
+        expression: "boost".into(),
+    }];
+    let baseline = SearchService::query(&coordinator, tonic::Request::new(query.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(baseline.hits.len(), 1);
+    let replacement = node(&["rust", "rust"]).await;
+    service.before_fetch.lock().unwrap().push_back(replacement);
+    let error = SearchService::query(&coordinator, tonic::Request::new(query))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        service.before_fetch.lock().unwrap().is_empty(),
+        "the test must reach the guarded value fetch"
+    );
+    handle.abort();
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn final_query_validation_rejects_a_retry_that_changed_the_read_generation() {
+    use pipestream_search::pb::search_service_server::SearchService;
+    for streaming in [false, true] {
+        let (address, service, handle) = start(node(&["rust", "rust"]).await).await;
+        let coordinator = coordinator(address);
+        let next = node(&["rust", "rust"]).await;
+        service.before_score.lock().unwrap().push_back(next);
+        if streaming {
+            use pipestream_search::pb::*;
+            use tokio_stream::StreamExt;
+            let mut stream = SearchService::query_stream(
+                &coordinator,
+                tonic::Request::new(QueryStreamRequest {
+                    query: Some(public_query()),
+                    timeout_ms: 10000,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+            let mut completion = None;
+            while let Some(event) = stream.next().await {
+                match event.unwrap().payload.unwrap() {
+                    query_stream_response::Payload::Revision(revision) => {
+                        assert_ne!(revision.phase, QueryStreamPhase::Final as i32)
+                    }
+                    query_stream_response::Payload::Completion(done) => completion = Some(done),
+                }
+            }
+            let done = completion.unwrap();
+            assert!(!done.completed);
+            assert!(done.response.is_none());
+            assert_eq!(done.error_code, tonic::Code::FailedPrecondition as u32);
+            assert!(done.error_message.contains("query data changed"));
+        } else {
+            let error = SearchService::query(&coordinator, tonic::Request::new(public_query()))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            assert!(error.message().contains("query data changed"));
+        }
+        assert!(
+            service.scoring_calls.load(Ordering::SeqCst) >= 2,
+            "the lexical delegate must retry successfully before the final read check"
+        );
+        handle.abort();
+        let _ = handle.await;
+    }
+}
+
+#[tokio::test]
+async fn cursor_rejects_a_new_lifetime_even_when_ids_and_scores_are_unchanged() {
+    use pipestream_search::pb::search_service_server::SearchService;
+    let (address, service, handle) = start(node(&["rust", "rust"]).await).await;
+    let coordinator = coordinator(address);
+    let first = SearchService::query(&coordinator, tonic::Request::new(public_query()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!first.next_cursor.is_empty());
+    *service.current.lock().unwrap() = node(&["rust", "rust"]).await;
+    let fresh = SearchService::query(&coordinator, tonic::Request::new(public_query()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first.hits, fresh.hits);
+    let mut resume = public_query();
+    resume.cursor = first.next_cursor;
+    let error = SearchService::query(&coordinator, tonic::Request::new(resume))
+        .await
+        .unwrap_err();
+    assert!(error.message().contains("cursor data context changed"));
+    handle.abort();
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn query_pins_a_reachable_replica_for_selection_values_and_cursor_continuation() {
+    use pipestream_search::pb::{search_service_server::SearchService, *};
+    let (replica, _, handle) = start(node(&["rust", "rust"]).await).await;
+    let unused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unavailable = format!("http://{}", unused.local_addr().unwrap());
+    drop(unused);
+    let coordinator = coordinator(unavailable)
+        .with_replicas(vec![Some(replica)])
+        .with_limits(pipestream_search::coordinator::FanoutLimits {
+            shard_deadline: Some(std::time::Duration::from_secs(2)),
+            hedge_delay: None,
+        });
+    let mut query = public_query();
+    query.sort = vec![QuerySort {
+        column: "boost".into(),
+        descending: false,
+    }];
+    query.projections = vec![NamedProjection {
+        name: "boost".into(),
+        expression: "boost".into(),
+    }];
+    let first = SearchService::query(&coordinator, tonic::Request::new(query.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first.hits[0].doc_id, 0);
+    assert_eq!(first.hits[0].projected.len(), 1);
+    query.cursor = first.next_cursor;
+    let next = SearchService::query(&coordinator, tonic::Request::new(query))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(next.hits[0].doc_id, 1);
+    handle.abort();
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn query_stream_deadline_includes_the_initial_version_probe() {
+    use pipestream_search::pb::{search_service_server::SearchService, *};
+    use tokio_stream::StreamExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let mut sockets = Vec::new();
+        loop {
+            sockets.push(listener.accept().await.unwrap().0);
+        }
+    });
+    let coordinator = coordinator(address);
+    let mut stream = SearchService::query_stream(
+        &coordinator,
+        tonic::Request::new(QueryStreamRequest {
+            query: Some(public_query()),
+            timeout_ms: 20,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    let completion = tokio::time::timeout(std::time::Duration::from_secs(2), async move {
+        while let Some(message) = stream.next().await {
+            if let query_stream_response::Payload::Completion(done) =
+                message.unwrap().payload.unwrap()
+            {
+                return done;
+            }
+        }
+        panic!("missing completion");
+    })
+    .await
+    .unwrap();
+    assert!(!completion.completed);
+    assert!(completion.response.is_none());
+    assert_eq!(completion.error_code, tonic::Code::DeadlineExceeded as u32);
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn query_cursor_versions_follow_child_replacement_through_nested_relays() {
+    use pipestream_search::pb::search_service_server::SearchService;
+    for levels in 1..=2 {
+        let (mut address, service, handle) = start(node(&["rust", "rust"]).await).await;
+        let mut relays = Vec::new();
+        for _ in 0..levels {
+            let (next, _, relay) = pipestream_search::harness::start_relay(vec![address]).await;
+            address = next;
+            relays.push(relay);
+        }
+        let coordinator = coordinator(address);
+        let first = SearchService::query(&coordinator, tonic::Request::new(public_query()))
+            .await
+            .unwrap()
+            .into_inner();
+        let replacement = node(&["rust", "rust"]).await;
+        *service.current.lock().unwrap() = replacement;
+        let mut query = public_query();
+        query.cursor = first.next_cursor;
+        let error = SearchService::query(&coordinator, tonic::Request::new(query))
+            .await
+            .unwrap_err();
+        assert!(
+            error.message().contains("cursor data context changed"),
+            "{error}"
+        );
+        for relay in relays {
+            relay.abort();
+            let _ = relay.await;
+        }
+        handle.abort();
+        let _ = handle.await;
+    }
 }

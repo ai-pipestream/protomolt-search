@@ -11,6 +11,9 @@ message QueryCursorEnvelope {
   bytes context_sha256 = 2;
   // Internal search-after boundary (rank, score/id or typed sort keys).
   string boundary = 3;
+  // Format 2: SHA-256 of QueryReadSet. Kept separate so request, authorization
+  // and topology mismatches can be rejected before contacting any shard.
+  bytes read_versions_sha256 = 4;
 }
 
 // The server derives this from its resolved request and authorization decision.
@@ -22,6 +25,17 @@ message QueryCursorContext {
   AccessDecision access = 3;
   uint64 topology_generation = 4;
   repeated QueryCursorRoute routes = 5;
+}
+
+// Physical data versions in the pinned coordinator's node order. Only its
+// digest enters the public cursor, never shard incarnations themselves.
+message QueryReadSet {
+  repeated QueryReadVersion versions = 1;
+}
+
+message QueryReadVersion {
+  uint64 epoch = 1;
+  bytes incarnation = 2;
 }
 
 // Exact routing order matters because physical ids and ties depend on it.

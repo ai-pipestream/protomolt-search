@@ -411,6 +411,10 @@ pub struct CoordinatorServiceImpl {
     stats_cache: Arc<crate::stats_cache::StatsCache>,
     document_visibility: Option<crate::pb::DocumentVisibility>,
     field_permissions: Option<crate::field_permissions::FieldScope>,
+    /// Versions captured before a public query starts, shared with every
+    /// delegate. Final disclosure verifies them again; value fetches require
+    /// them at the read boundary as well.
+    query_read_versions: Option<Arc<Vec<StatsClaim>>>,
     /// Optional distributed vector collection. The product coordinator calls
     /// it once as one provider; it never learns or re-fans its shard topology.
     #[cfg(feature = "net")]
@@ -1820,6 +1824,7 @@ impl CoordinatorServiceImpl {
             stats_cache,
             document_visibility: None,
             field_permissions: None,
+            query_read_versions: None,
             #[cfg(feature = "net")]
             clustered_vectors: None,
             dense_quality_profile: None,
@@ -2814,6 +2819,125 @@ impl CoordinatorServiceImpl {
     pub fn with_cursor_signing_key(mut self, key: [u8; 32]) -> Self {
         self.cursor_signer = Arc::new(crate::query_cursor::CursorSigner::from_key(key));
         self
+    }
+
+    /// Read fresh versions without using the statistics cache. A version-only
+    /// TermStats request is supported by nodes and relays, including shards
+    /// without lexical rows. Its version covers the shard's physical rows.
+    async fn read_query_versions(
+        &self,
+        allow_replicas: bool,
+    ) -> Result<Vec<(String, StatsClaim)>, Status> {
+        let scope = crate::visibility::VisibilityScope::new(self.document_visibility.as_ref())?;
+        let mut known = vec![false; scope.column_count()];
+        let mut tasks = tokio::task::JoinSet::new();
+        for (shard, node) in self.node_addrs.iter().enumerate() {
+            let primary = (node.clone(), self.node_client(node)?);
+            let replica = if allow_replicas {
+                self.replica_addrs
+                    .get(shard)
+                    .and_then(Option::as_ref)
+                    .map(|addr| self.node_client(addr).map(|link| (addr.clone(), link)))
+                    .transpose()?
+            } else {
+                None
+            };
+            let visibility = self.document_visibility.clone();
+            let limits = self.limits();
+            tasks.spawn(async move {
+                async fn read(
+                    (address, mut client): (String, crate::link::NodeLink),
+                    visibility: Option<crate::pb::DocumentVisibility>,
+                ) -> Result<(String, crate::pb::TermStatsResponse), Status> {
+                    let response = client.term_stats(TermStatsRequest {
+                        version_only: true,
+                        terms: Vec::new(), fields: Vec::new(), visibility,
+                    }).await?.into_inner();
+                    Ok((address, response))
+                }
+                let attempt = async move {
+                    let mut primary = Box::pin(read(primary, visibility.clone()));
+                    let Some(replica) = replica else { return primary.await; };
+                    if let Some(delay) = limits.hedge_delay {
+                        match tokio::time::timeout(delay, &mut primary).await {
+                            Ok(Ok(response)) => return Ok(response),
+                            Ok(Err(_)) => return read(replica, visibility).await,
+                            Err(_) => {}
+                        }
+                        let mut replica = Box::pin(read(replica, visibility));
+                        tokio::select! {
+                            result = &mut primary => match result { Ok(response) => Ok(response), Err(_) => replica.await },
+                            result = &mut replica => match result { Ok(response) => Ok(response), Err(_) => primary.await },
+                        }
+                    } else {
+                        match primary.await {
+                            Ok(response) => Ok(response),
+                            Err(_) => read(replica, visibility).await,
+                        }
+                    }
+                };
+                let result = match limits.shard_deadline {
+                    Some(deadline) => tokio::time::timeout(deadline, attempt).await
+                        .unwrap_or_else(|_| Err(Status::deadline_exceeded("query version probe exceeded the shard deadline"))),
+                    None => attempt.await,
+                };
+                (shard, result)
+            });
+        }
+        let mut versions = vec![None; self.node_addrs.len()];
+        while let Some(task) = tasks.join_next().await {
+            let (shard, response) = task
+                .map_err(|error| Status::internal(format!("query version task failed: {error}")))?;
+            let (address, response) = response?;
+            scope.validate_response(&response)?;
+            crate::visibility::validate_stats_mode(true, &response)?;
+            for (known, present) in known.iter_mut().zip(response.visibility_columns_known) {
+                *known |= present;
+            }
+            versions[shard] = Some((
+                address,
+                StatsClaim::required(response.stats_epoch, &response.stats_incarnation)?,
+            ));
+        }
+        self.check_visibility_columns(&known)?;
+        Ok(versions
+            .into_iter()
+            .map(|version| version.expect("every version task completed"))
+            .collect())
+    }
+
+    /// Capture before selection and validate after every phase. Every shard's
+    /// unchanged interval includes the interval between the two fan-outs;
+    /// mutations or lifetime replacement invalidate the response, never retry
+    /// just its value fetch against a newer version.
+    async fn execute_query(
+        &self,
+        mut request: crate::pb::QueryRequest,
+        access: Option<&crate::pb::AccessDecision>,
+    ) -> Result<crate::pb::QueryResponse, Status> {
+        let started = std::time::Instant::now();
+        let mut cursor = self.bind_query_cursor(&mut request, access)?;
+        let mut scoped = self.clone();
+        let reads = self.read_query_versions(true).await?;
+        let versions: Vec<StatsClaim> = reads.iter().map(|(_, version)| *version).collect();
+        cursor.bind_read_versions(&versions)?;
+        scoped.node_addrs = reads.iter().map(|(address, _)| address.clone()).collect();
+        // All phases use the admitted copy. A failure requires a new whole query.
+        scoped.replica_addrs.clear();
+        scoped.query_read_versions = Some(Arc::new(versions));
+        let result = crate::query::execute(&scoped, request).await;
+        if scoped.read_query_versions(false).await? != reads {
+            return Err(Status::failed_precondition(
+                "query data changed during execution; restart from the first page",
+            ));
+        }
+        let mut response = result?;
+        cursor.finish(&mut response)?;
+        response.served_topology_generation = scoped.topology_generation;
+        if let Some(profile) = response.profile.as_mut() {
+            profile.total_ms = started.elapsed().as_secs_f32() * 1000.0;
+        }
+        Ok(response)
     }
 
     fn bind_query_cursor(
@@ -4832,6 +4956,7 @@ impl CoordinatorServiceImpl {
                 continue;
             }
             let request = TermStatsRequest {
+                version_only: false,
                 visibility: self.document_visibility.clone(),
                 terms: Vec::new(),
                 fields: stats_fields.to_vec(),
@@ -5432,6 +5557,7 @@ impl CoordinatorServiceImpl {
                 tokio::spawn(async move {
                     client
                         .term_stats(TermStatsRequest {
+                            version_only: false,
                             visibility,
                             terms: terms_owned,
                             fields: Vec::new(),
@@ -8212,7 +8338,13 @@ impl CoordinatorServiceImpl {
         projections: &[crate::pb::CompiledProjection],
         stages: &[crate::pb::ScoreStage],
     ) -> Result<FetchedValues, Status> {
-        self.fetch_values_impl(ids, projections, stages, None).await
+        self.fetch_values_impl(
+            ids,
+            projections,
+            stages,
+            self.query_read_versions.as_deref().map(Vec::as_slice),
+        )
+        .await
     }
 
     /// Fetch against versions captured during selection. Claims must cover
@@ -11765,12 +11897,9 @@ impl SearchService for CoordinatorServiceImpl {
                 .extensions()
                 .get::<crate::pb::AccessDecision>()
                 .cloned();
-            let mut request = request.into_inner();
+            let request = request.into_inner();
             self.require_topology_generation(request.required_topology_generation)?;
-            let cursor = self.bind_query_cursor(&mut request, access.as_ref())?;
-            let mut response = crate::query::execute(self, request).await?;
-            cursor.finish(&mut response)?;
-            response.served_topology_generation = self.topology_generation;
+            let response = self.execute_query(request, access.as_ref()).await?;
             Ok(Response::new(response))
         })
         .await
@@ -11793,10 +11922,12 @@ impl SearchService for CoordinatorServiceImpl {
         let access = request.extensions().get::<crate::pb::AccessDecision>().cloned();
         let mut request = request.into_inner();
         let request_fingerprint = request.query.as_ref().map(|query| crate::sha256::hex_digest(&prost::Message::encode_to_vec(query))).unwrap_or_default();
-        let mut cursor = None;
         if let Some(query) = request.query.as_mut() {
             self.require_topology_generation(query.required_topology_generation)?;
-            cursor = Some(self.bind_query_cursor(query, access.as_ref())?);
+            // Reject collection, query, authority and topology mismatches before
+            // opening the stream. Keep the original token for the execution's
+            // data-version binding, which runs under the stream deadline.
+            self.bind_query_cursor(&mut query.clone(), access.as_ref())?;
             if query.explain {
                 return Err(Status::invalid_argument(
                     "explain is served on the unary Query route: a stream's revisions carry                      candidate hits without their trees, and a tree over a revision that a                      later one replaces would explain a score that was never served",
@@ -11851,7 +11982,7 @@ impl SearchService for CoordinatorServiceImpl {
                 .with_stream_search(true)
                 .with_bm25_stream(true)
                 .with_query_progress(progress_tx);
-            let mut execution = Box::pin(crate::query::execute(&runner, query));
+            let mut execution = Box::pin(runner.execute_query(query, access.as_ref()));
             let timeout =
                 (request.timeout_ms > 0).then(|| Duration::from_millis(request.timeout_ms));
             let deadline = async move {
@@ -11916,17 +12047,13 @@ impl SearchService for CoordinatorServiceImpl {
                         }
                     }
                     result = &mut execution => {
-                        let result = result.and_then(|mut response| {
-                            cursor.as_ref().expect("query was present").finish(&mut response)?;
-                            Ok(response)
-                        });
                         // The execution and the last collector update can
                         // become ready in the same scheduler turn. Drain the
                         // watch cell here so every scored stream exposes at
                         // least its last provisional collector order before
                         // the authoritative FINAL revision.
                         let pending_progress = progress_rx.borrow().clone();
-                        if let Some(progress) = pending_progress {
+                        if let Some(progress) = pending_progress.filter(|_| result.is_ok()) {
                             if !progress.scoring_fingerprint.is_empty()
                                 && !scoring_fingerprints.contains(&progress.scoring_fingerprint)
                             {

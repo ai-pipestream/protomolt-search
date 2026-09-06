@@ -61,8 +61,9 @@ impl CursorSigner {
             return Err(Status::failed_precondition("cursor integrity check failed or its signing key changed; restart from the first page"));
         }
         let envelope = QueryCursorEnvelope::decode(bytes.as_slice()).map_err(|_| bad())?;
-        if envelope.format_version != 1
+        if envelope.format_version != 2
             || envelope.context_sha256.len() != 32
+            || envelope.read_versions_sha256.len() != 32
             || envelope.boundary.is_empty()
             || envelope.encode_to_vec() != bytes
         {
@@ -117,6 +118,8 @@ fn decode_hex(text: &str) -> Option<Vec<u8>> {
 pub(crate) struct CursorBinding {
     signer: Arc<CursorSigner>,
     digest: Vec<u8>,
+    expected_read_digest: Option<Vec<u8>>,
+    read_digest: Option<Vec<u8>>,
 }
 impl CursorBinding {
     pub(crate) fn prepare(
@@ -136,19 +139,64 @@ impl CursorBinding {
         normalized.required_topology_generation = 0;
         context.query_sha256 = crate::sha256::digest(&normalized.encode_to_vec()).to_vec();
         let digest = crate::sha256::digest(&context.encode_to_vec()).to_vec();
+        let mut expected_read_digest = None;
         if !request.cursor.is_empty() {
             let envelope = signer.open(&request.cursor)?;
             if !crate::security::constant_time_eq(&envelope.context_sha256, &digest) {
-                return Err(Status::failed_precondition("cursor query, authorization or topology context changed; restart from the first page"));
+                return Err(Status::failed_precondition("cursor query, authorization, data or topology context changed; restart from the first page"));
             }
             request.cursor = envelope.boundary;
+            expected_read_digest = Some(envelope.read_versions_sha256);
         }
-        Ok(Self { signer, digest })
+        Ok(Self {
+            signer,
+            digest,
+            expected_read_digest,
+            read_digest: None,
+        })
+    }
+    pub(crate) fn bind_read_versions(
+        &mut self,
+        versions: &[crate::stats_identity::StatsClaim],
+    ) -> Result<(), Status> {
+        let mut read_set = crate::pb::QueryReadSet::default();
+        for version in versions {
+            crate::stats_identity::StatsClaim::required(version.epoch, &version.incarnation())?;
+            read_set.versions.push(crate::pb::QueryReadVersion {
+                epoch: version.epoch,
+                incarnation: version.incarnation(),
+            });
+        }
+        let digest = crate::sha256::digest(&read_set.encode_to_vec()).to_vec();
+        if self
+            .expected_read_digest
+            .as_ref()
+            .is_some_and(|expected| !crate::security::constant_time_eq(expected, &digest))
+        {
+            return Err(Status::failed_precondition(
+                "cursor data context changed; restart from the first page",
+            ));
+        }
+        if self
+            .read_digest
+            .as_ref()
+            .is_some_and(|held| held != &digest)
+        {
+            return Err(Status::failed_precondition(
+                "cursor read versions cannot change during execution",
+            ));
+        }
+        self.read_digest = Some(digest);
+        Ok(())
     }
     pub(crate) fn finish(&self, response: &mut QueryResponse) -> Result<(), Status> {
         if !response.next_cursor.is_empty() {
             response.next_cursor = self.signer.seal(QueryCursorEnvelope {
-                format_version: 1,
+                format_version: 2,
+                read_versions_sha256: self
+                    .read_digest
+                    .clone()
+                    .ok_or_else(|| Status::internal("cursor data versions were not bound"))?,
                 context_sha256: self.digest.clone(),
                 boundary: response.next_cursor.clone(),
             })?;
@@ -184,7 +232,7 @@ mod tests {
         }
     }
     fn issued(signer: Arc<CursorSigner>) -> String {
-        let binding = CursorBinding::prepare(
+        let mut binding = CursorBinding::prepare(
             signer,
             &mut QueryRequest {
                 k: 2,
@@ -197,8 +245,62 @@ mod tests {
             next_cursor: "tvq1:2:00000000:7".into(),
             ..Default::default()
         };
+        binding.bind_read_versions(&[]).unwrap();
         binding.finish(&mut response).unwrap();
         response.next_cursor
+    }
+
+    #[test]
+    fn read_versions_are_mandatory_ordered_and_cannot_be_rebound() {
+        use crate::stats_identity::StatsClaim;
+        let signer = Arc::new(CursorSigner::from_key([8; 32]));
+        let query = || QueryRequest {
+            k: 2,
+            ..Default::default()
+        };
+        let claims = vec![
+            StatsClaim::required(3, &[7; 32]).unwrap(),
+            StatsClaim::required(4, &[9; 32]).unwrap(),
+        ];
+        let mut binding = CursorBinding::prepare(signer.clone(), &mut query(), context()).unwrap();
+        let mut response = QueryResponse {
+            next_cursor: "tvq1:2:00000000:7".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            binding.finish(&mut response).unwrap_err().code(),
+            Code::Internal
+        );
+        binding.bind_read_versions(&claims).unwrap();
+        binding.finish(&mut response).unwrap();
+        let token = signer.open(&response.next_cursor).unwrap();
+        assert_eq!(token.format_version, 2);
+        assert_eq!(token.read_versions_sha256.len(), 32);
+        assert!(!token
+            .encode_to_vec()
+            .windows(32)
+            .any(|window| window == [7; 32] || window == [9; 32]));
+        let mut reversed = claims.clone();
+        reversed.reverse();
+        assert!(binding.bind_read_versions(&reversed).is_err());
+        for versions in [
+            claims.clone(),
+            reversed,
+            vec![claims[0]],
+            vec![StatsClaim::required(5, &[7; 32]).unwrap(), claims[1]],
+            vec![StatsClaim::required(3, &[6; 32]).unwrap(), claims[1]],
+            vec![StatsClaim::default(); 2],
+        ] {
+            let mut request = query();
+            request.cursor = response.next_cursor.clone();
+            // Static context still validates without contacting a shard.
+            let mut resumed =
+                CursorBinding::prepare(signer.clone(), &mut request, context()).unwrap();
+            assert_eq!(
+                resumed.bind_read_versions(&versions).is_ok(),
+                versions == claims
+            );
+        }
     }
 
     #[test]
@@ -312,16 +414,20 @@ mod tests {
             Code::InvalidArgument
         );
         let envelope = QueryCursorEnvelope {
-            format_version: 1,
+            format_version: 2,
+            read_versions_sha256: vec![2; 32],
             context_sha256: vec![1; 32],
             boundary: "b".into(),
         };
-        for change in 0..4 {
+        for change in 0..5 {
             let mut envelope = envelope.clone();
             match change {
-                0 => envelope.format_version = 2,
+                0 => envelope.format_version = 1,
                 1 => envelope.context_sha256.pop().map(|_| ()).unwrap(),
                 2 => envelope.boundary.clear(),
+                4 => {
+                    envelope.read_versions_sha256.pop();
+                }
                 _ => {}
             }
             let mut bytes = envelope.encode_to_vec();

@@ -2,8 +2,9 @@ mod common;
 
 use pipestream_search::{
     analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND},
+    coordinator::CoordinatorServiceImpl,
     node::{Layout, NodeConfig},
-    pb::{node_service_client::NodeServiceClient, *},
+    pb::{node_service_client::NodeServiceClient, search_service_server::SearchService, *},
     visibility::VisibilityScope,
 };
 use tonic::transport::Channel;
@@ -112,7 +113,8 @@ async fn visible_dictionaries_survive_segments_deletes_compaction_and_reopen() {
         let vectors = common::unit_vectors(rows.len(), DIM, 9036);
         let (shift, scale) = common::fit_calibration(DIM, 4, &vectors);
         let (addr, handle) = common::start_empty_node(cfg.clone()).await;
-        let mut client = NodeServiceClient::connect(addr).await.unwrap();
+        let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+        let coordinator = CoordinatorServiceImpl::new(vec![addr]);
         client
             .set_calibration(SetCalibrationRequest {
                 dim: DIM as u32,
@@ -219,12 +221,34 @@ async fn visible_dictionaries_survive_segments_deletes_compaction_and_reopen() {
         client.flush(FlushRequest {}).await.unwrap();
         assert_eq!(scan(&mut client, "body", 3).await, after);
         let before_compaction = visible_values(&mut client, 3).await;
+        let mut cursor_query = QueryRequest {
+            k: 1,
+            selection: Some(SelectionQuery {
+                node: Some(selection_query::Node::Filter(FilterQuery {
+                    id: "visible".into(),
+                    predicate: Some(filter_query::Predicate::Cel("audience == 'public'".into())),
+                })),
+            }),
+            ..Default::default()
+        };
+        let page = SearchService::query(&coordinator, tonic::Request::new(cursor_query.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!page.next_cursor.is_empty());
+        cursor_query.cursor = page.next_cursor;
         let compacted = client
             .compact_shard(CompactShardRequest::default())
             .await
             .unwrap()
             .into_inner();
         assert_eq!(compacted.tombstones_reclaimed, 2);
+        let stale_cursor = SearchService::query(&coordinator, tonic::Request::new(cursor_query))
+            .await
+            .unwrap_err();
+        assert!(stale_cursor
+            .message()
+            .contains("cursor data context changed"));
         assert_eq!(
             client
                 .fetch_values(before_compaction)

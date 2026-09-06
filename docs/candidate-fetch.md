@@ -34,20 +34,23 @@ lifetime refuses instead of fetching current values under an old selection.
 The coordinator also checks each response against the expected claim, so an
 older or faulty peer cannot silently ignore the request fields. Returned
 `FetchedValues.epochs` records the versions read. The existing `fetch_values`
-entry point remains an explicitly unpinned read, although it enforces any
-authority view bound to its coordinator. An unscoped call with no projections
-or stages skips fan-out and returns no version claims.
+entry point uses the query's admitted claims when called by the public query
+executor; standalone callers without a bound read set retain an unpinned read.
+Both enforce any authority view bound to their coordinator. An unscoped call
+with no projections or stages skips fan-out and returns no version claims.
 
 ## Integration boundary
 
-This is the shared value-fetch boundary, not completed public-query isolation.
-Restricted `Query` and `QueryStream` still refuse. Before enabling them, their
-planners must carry the mandatory view into every selection/statistics path and
+The public query executor now binds these reads to its admitted versions and
+validates the whole query again before completion; see
+[query read versions](query-read-versions.md). Restricted `Query` and
+`QueryStream` still refuse. Before enabling them, their planners must carry the
+mandatory view into every selection/statistics path and
 thread selection versions into all later reads, including vector rescoring,
 source fetch, lineage/collapse, sort and aggregation. Unary and provisional
 streamed hits, explanations and cursor continuations must apply field disclosure
-and current authority checks. The current unpinned public-query fetch calls do
-not become a cross-shard snapshot merely because responses now name versions.
+and current authority checks. Read-version validation rejects changed data;
+it does not retain a historical snapshot.
 
 The internal visibility and version fields are not credentials. Direct node
 authorization and remote delegation remain separate work. Relays still refuse

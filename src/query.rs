@@ -855,7 +855,7 @@ enum Shape<'a> {
 }
 
 /// Execute one public query by delegating to the ordinary routes.
-pub async fn execute(
+pub(crate) async fn execute(
     coordinator: &CoordinatorServiceImpl,
     req: QueryRequest,
 ) -> Result<QueryResponse, Status> {
@@ -868,8 +868,9 @@ pub async fn execute(
         .as_ref()
         .ok_or_else(|| refuse("a query needs a selection tree"))?;
     // A pool aggregation (docs/aggregations.md "Aggregating a query's
-    // pool") compiles before anything runs, so a bad spec refuses
-    // without a fan-out; the fold itself runs once the pool is fixed.
+    // pool") compiles before selection, so a bad spec refuses before
+    // searching shards; the public handler may already have probed read
+    // versions. The fold itself runs once the pool is fixed.
     let pool_aggregate = match req.aggregate.as_ref() {
         None => None,
         Some(aggregate) => {

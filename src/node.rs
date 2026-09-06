@@ -12863,12 +12863,25 @@ impl NodeService for NodeServiceImpl {
     ) -> Result<Response<TermStatsResponse>, Status> {
         crate::metrics::timed(Route::TermStats, request, |request| async move {
             let req = request.into_inner();
+            crate::visibility::validate_stats_request(&req)?;
             let scope = crate::visibility::VisibilityScope::new(req.visibility.as_ref())?;
             let visibility_filter = req
                 .visibility
                 .as_ref()
                 .and_then(|view| view.filter.as_ref());
             let guard = read_shard(&self.state);
+            if req.version_only {
+                let (_, visibility_columns_known) =
+                    filter_known_flags(guard.bm25.as_ref(), &[], visibility_filter);
+                return Ok(Response::new(TermStatsResponse {
+                    version_only: true,
+                    stats_epoch: guard.stats_epoch,
+                    stats_incarnation: guard.stats_incarnation.bytes()?,
+                    visibility_fingerprint: scope.fingerprint().to_vec(),
+                    visibility_columns_known,
+                    ..Default::default()
+                }));
+            }
             if guard
                 .bm25
                 .as_ref()
@@ -12971,6 +12984,7 @@ impl NodeService for NodeServiceImpl {
                     ),
                 };
             Ok(Response::new(TermStatsResponse {
+                version_only: false,
                 doc_count,
                 total_doc_length,
                 doc_frequencies,

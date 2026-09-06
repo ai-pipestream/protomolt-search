@@ -97,6 +97,7 @@ async fn descending_deletes_and_replacement_stay_hidden_after_reopen() {
         assert_eq!((health.live_docs, health.deleted_docs), (127, 4));
         let stats = node
             .term_stats(TermStatsRequest {
+                version_only: false,
                 visibility: None,
                 terms: vec!["common".into()],
                 ..Default::default()
@@ -247,6 +248,7 @@ async fn delete_and_append_then_replace_are_consistent_across_read_paths() {
     assert_eq!((health.live_docs, health.deleted_docs), (3, 1));
     let stats = node
         .term_stats(TermStatsRequest {
+            version_only: false,
             visibility: None,
             terms: vec!["common".into()],
             ..Default::default()

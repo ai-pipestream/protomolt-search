@@ -1550,8 +1550,8 @@ async fn a_changed_corpus_refuses_the_cursor() {
     .unwrap();
     assert!(!first.next_cursor.is_empty());
 
-    // Any ingest moves every BM25 score (N and avgdl change), so the
-    // boundary's exact score bits no longer match.
+    // Ingest changes the bound physical read version. Refuse the cursor
+    // before re-executing selection, even if its boundary could still match.
     let mut client = NodeServiceClient::connect(addrs[0].clone()).await.unwrap();
     let (tx, rx) = mpsc::channel(2);
     tx.send(AddDocumentsRequest {
@@ -1580,7 +1580,7 @@ async fn a_changed_corpus_refuses_the_cursor() {
     .unwrap_err();
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(
-        err.message().contains("changed under the cursor"),
+        err.message().contains("cursor data context changed"),
         "{}",
         err.message()
     );

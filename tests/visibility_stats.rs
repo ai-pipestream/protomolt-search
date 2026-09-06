@@ -15,6 +15,7 @@ const ROWS: [(&str, &str, &str); 4] = [
 
 fn request(view: Option<WireVisibility>) -> TermStatsRequest {
     TermStatsRequest {
+        version_only: false,
         terms: vec!["alpha".into(), "secret".into()],
         fields: vec![FieldTerms {
             field: "title".into(),
@@ -68,9 +69,17 @@ async fn stats(addr: &str, visibility: Option<WireVisibility>) -> TermStatsRespo
         .connect()
         .await
         .unwrap();
+    let mut probe_client = NodeServiceClient::new(channel.clone());
+    let probe_request = TermStatsRequest {
+        version_only: true,
+        visibility: visibility.clone().map(|view| DocumentVisibility {
+            filter: view.filter,
+        }),
+        ..Default::default()
+    };
     let mut client = tonic::client::Grpc::new(channel);
     client.ready().await.unwrap();
-    client
+    let actual: TermStatsResponse = client
         .unary(
             tonic::Request::new(WireStatsRequest {
                 terms: vec!["alpha".into(), "secret".into()],
@@ -87,7 +96,24 @@ async fn stats(addr: &str, visibility: Option<WireVisibility>) -> TermStatsRespo
         )
         .await
         .unwrap()
-        .into_inner()
+        .into_inner();
+    let probe = probe_client
+        .term_stats(probe_request)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(probe.version_only);
+    assert_eq!(probe.doc_count, 0);
+    assert_eq!(probe.total_doc_length, 0);
+    assert!(probe.doc_frequencies.is_empty() && probe.field_stats.is_empty());
+    assert_eq!(probe.stats_epoch, actual.stats_epoch);
+    assert_eq!(probe.stats_incarnation, actual.stats_incarnation);
+    assert_eq!(probe.visibility_fingerprint, actual.visibility_fingerprint);
+    assert_eq!(
+        probe.visibility_columns_known,
+        actual.visibility_columns_known
+    );
+    actual
 }
 
 async fn ingest(addr: &str, rows: &[(&str, &str, &str)]) {
@@ -300,6 +326,7 @@ async fn empty_and_malformed_views_cannot_become_an_unrestricted_request() {
         assert!(VisibilityScope::new(Some(&invalid)).is_err());
         let err = client
             .term_stats(TermStatsRequest {
+                version_only: false,
                 visibility: Some(invalid),
                 ..Default::default()
             })
@@ -413,4 +440,58 @@ async fn visibility_survives_tombstones_flush_compaction_and_reopen() {
         let _ = handle.await;
         std::fs::remove_dir_all(&dir).unwrap();
     }
+}
+
+#[tokio::test]
+async fn version_probe_works_during_bulk_build_and_rejects_statistics_inputs() {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("version-probe-bulk-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (addr, handle) = common::start_empty_node(NodeConfig {
+        index_path: Some(dir.join("shard.tv")),
+        layout: pipestream_search::node::Layout::SingleImage,
+        ..config()
+    })
+    .await;
+    ingest(&addr, &ROWS).await;
+    let mut client = NodeServiceClient::connect(addr).await.unwrap();
+    assert_eq!(
+        client
+            .term_stats(TermStatsRequest::default())
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    let probe = client
+        .term_stats(TermStatsRequest {
+            version_only: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(probe.version_only);
+    assert!(probe.stats_epoch > 0);
+    assert_eq!(probe.stats_incarnation.len(), 32);
+    assert_eq!(probe.doc_count, 0);
+    for fields in [false, true] {
+        let mut request = TermStatsRequest {
+            version_only: true,
+            ..Default::default()
+        };
+        if fields {
+            request.fields.push(Default::default());
+        } else {
+            request.terms.push("alpha".into());
+        }
+        assert_eq!(
+            client.term_stats(request).await.unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+    handle.abort();
+    let _ = handle.await;
+    std::fs::remove_dir_all(&dir).unwrap();
 }

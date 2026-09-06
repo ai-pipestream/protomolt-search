@@ -895,3 +895,31 @@ The first full library run exposed a metrics test that assumed its process-wide
 ingest counters started at zero. It now checks increments from the observed
 baseline, allowing other tests to ingest concurrently. The complete suite above
 passed after that test-isolation fix.
+
+
+## Query read-version checkpoint (2026-09-06)
+
+Public Query and QueryStream now capture shard versions before selection, pin
+the admitted primary or replica for all phases, fence candidate value reads and
+validate the full read set before final publication. Cursor format 2 binds
+continuations to that set; changed data requires restarting. Version-only
+TermStats probes avoid corpus scans and cannot enter the statistics cache.
+Relays propagate and validate this mode through their composite version tokens.
+See [query read versions](query-read-versions.md) for the exact guarantees,
+compatibility requirements and regression coverage.
+
+Restricted Query and QueryStream remain unavailable pending complete mandatory
+selection and field disclosure. This does not complete protobuf shape support,
+network delegation, stable identity or the conditional-write/durability work.
+
+Validation: 458 library tests, 621 integration tests across 108 targets and
+12 embedded tests passed (1,091 total). One existing live-sidecar conformance
+test remains ignored. All five Android/iOS Rust target checks, tests/examples
+compilation, formatting and vendored-proto checks passed. Descriptor comparison
+against `5b09cdb` confirms exactly three additive fields and two messages, with
+existing declarations unchanged. No fleet benchmark, deployment or device-runtime
+test ran; stored index and WAL formats are unchanged.
+
+The full integration pass initially found two compaction assertions expecting
+the older boundary error. They now require the earlier data-version refusal,
+and the affected group plus every remaining integration target passed.

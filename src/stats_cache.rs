@@ -205,6 +205,7 @@ impl StatsCache {
         scope: &VisibilityScope,
         resp: &crate::pb::TermStatsResponse,
     ) -> Result<(), Status> {
+        crate::visibility::validate_stats_mode(false, resp)?;
         scope.validate_response(resp)?;
         let claim = StatsClaim::required(resp.stats_epoch, &resp.stats_incarnation)?;
         if resp.stats_epoch == 0
@@ -299,6 +300,37 @@ mod scope_tests {
     };
 
     #[test]
+    fn version_probes_cannot_replace_or_evict_corpus_statistics() {
+        let cache = StatsCache::new(1);
+        let scope = VisibilityScope::default();
+        let response = TermStatsResponse {
+            stats_epoch: 4,
+            stats_incarnation: vec![1; 32],
+            doc_count: 17,
+            total_doc_length: 91,
+            ..Default::default()
+        };
+        cache.store_scoped(0, &[], &[], &scope, &response).unwrap();
+        let probe = TermStatsResponse {
+            version_only: true,
+            stats_epoch: 5,
+            stats_incarnation: vec![2; 32],
+            ..Default::default()
+        };
+        assert_eq!(
+            cache
+                .store_scoped(0, &[], &[], &scope, &probe)
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        let retained = cache.lookup_body_scoped(0, &[], &scope).unwrap();
+        assert_eq!(retained.doc_count, 17);
+        assert_eq!(retained.total_doc_length, 91);
+        assert_eq!(retained.epoch, StatsClaim::required(4, &[1; 32]).unwrap());
+    }
+
+    #[test]
     fn replacing_a_lifetime_at_the_same_epoch_evicts_all_views() {
         let cache = StatsCache::new(1);
         let view = DocumentVisibility {
@@ -319,6 +351,7 @@ mod scope_tests {
                     &[],
                     scope,
                     &TermStatsResponse {
+                        version_only: false,
                         stats_epoch: 3,
                         stats_incarnation: vec![1; 32],
                         doc_count: 2,
@@ -330,6 +363,7 @@ mod scope_tests {
                 .unwrap();
         }
         let mut next = TermStatsResponse {
+            version_only: false,
             stats_epoch: 3,
             stats_incarnation: vec![],
             doc_count: 7,
@@ -357,6 +391,7 @@ mod scope_tests {
             };
             let scope = VisibilityScope::new(Some(&view)).unwrap();
             let response = TermStatsResponse {
+                version_only: false,
                 stats_epoch: 1,
                 stats_incarnation: vec![1; 32],
                 doc_count: n,

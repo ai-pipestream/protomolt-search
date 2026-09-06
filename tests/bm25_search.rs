@@ -117,6 +117,7 @@ async fn ingest_through_mock_builds_postings() {
     let mut client = NodeServiceClient::connect(addr).await.unwrap();
     let stats = client
         .term_stats(TermStatsRequest {
+            version_only: false,
             visibility: None,
             terms: vec!["rust".into(), "vector".into(), "nope".into()],
             fields: Vec::new(),
@@ -716,6 +717,7 @@ async fn bm25_stream_candidates_end_in_a_scoring_certificate() {
     let mut client = NodeServiceClient::connect(addrs[0].clone()).await.unwrap();
     let stats = client
         .term_stats(TermStatsRequest {
+            version_only: false,
             visibility: None,
             terms: vec!["rust".into(), "search".into()],
             fields: Vec::new(),
@@ -817,6 +819,7 @@ async fn bm25_stream_stop_is_an_incomplete_certificate() {
     let mut client = NodeServiceClient::connect(addrs[0].clone()).await.unwrap();
     let stats = client
         .term_stats(TermStatsRequest {
+            version_only: false,
             visibility: None,
             terms: vec!["rust".into()],
             fields: Vec::new(),
@@ -889,6 +892,7 @@ async fn shard_local_stats_would_differ() {
         let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
         let stats = client
             .term_stats(TermStatsRequest {
+                version_only: false,
                 visibility: None,
                 terms: terms.clone(),
                 fields: Vec::new(),

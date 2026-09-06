@@ -586,6 +586,7 @@ pub fn merge_term_stats(
     request: &TermStatsRequest,
     children: &[TermStatsResponse],
 ) -> Result<TermStatsResponse, Status> {
+    crate::visibility::validate_stats_request(request)?;
     let scope = crate::visibility::VisibilityScope::new(request.visibility.as_ref())?;
     let mut visibility_columns_known = vec![false; scope.column_count()];
     if children.is_empty() {
@@ -610,6 +611,7 @@ pub fn merge_term_stats(
         .collect();
     for (shard, child) in children.iter().enumerate() {
         scope.validate_response(child)?;
+        crate::visibility::validate_stats_mode(request.version_only, child)?;
         for (known, child_known) in visibility_columns_known
             .iter_mut()
             .zip(&child.visibility_columns_known)
@@ -709,6 +711,7 @@ pub fn merge_term_stats(
         }
     }
     Ok(TermStatsResponse {
+        version_only: request.version_only,
         doc_count,
         total_doc_length,
         doc_frequencies,
@@ -1991,6 +1994,7 @@ impl NodeService for RelayService {
         crate::metrics::timed(Route::TermStats, request, |request| async move {
             let timeout = grpc_timeout(request.metadata());
             let req = request.into_inner();
+            crate::visibility::validate_stats_request(&req)?;
             crate::visibility::VisibilityScope::new(req.visibility.as_ref())?;
             let (pinned, frozen) = self.pin();
             let children = frozen.node_addresses().to_vec();
@@ -2712,6 +2716,7 @@ mod tests {
 
     fn share(doc_count: u64, dfs: &[u32], known: bool, positions: bool) -> TermStatsResponse {
         TermStatsResponse {
+            version_only: false,
             visibility_fingerprint: Vec::new(),
             visibility_columns_known: Vec::new(),
             doc_count,
@@ -2731,12 +2736,66 @@ mod tests {
 
     fn request() -> TermStatsRequest {
         TermStatsRequest {
+            version_only: false,
             visibility: None,
             terms: vec!["court".into(), "opinion".into()],
             fields: vec![crate::pb::FieldTerms {
                 field: "title".into(),
                 terms: vec!["court".into(), "opinion".into()],
             }],
+        }
+    }
+
+    #[test]
+    fn version_probes_refuse_legacy_mixed_or_nonempty_statistics() {
+        let request = TermStatsRequest {
+            version_only: true,
+            ..Default::default()
+        };
+        let probe = TermStatsResponse {
+            version_only: true,
+            stats_epoch: 3,
+            stats_incarnation: vec![1; 32],
+            ..Default::default()
+        };
+        let merged = merge_term_stats(&request, &[probe.clone(), probe.clone()]).unwrap();
+        assert!(merged.version_only);
+        assert_eq!(merged.doc_count, 0);
+        for case in 0..5 {
+            let mut malformed = probe.clone();
+            match case {
+                0 => malformed.version_only = false,
+                1 => malformed.doc_count = 1,
+                2 => malformed.total_doc_length = 1,
+                3 => malformed.doc_frequencies.push(0),
+                _ => malformed.field_stats.push(Default::default()),
+            }
+            assert_eq!(
+                merge_term_stats(&request, &[probe.clone(), malformed])
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::FailedPrecondition
+            );
+        }
+        assert_eq!(
+            merge_term_stats(&TermStatsRequest::default(), &[probe.clone()])
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        for fields in [false, true] {
+            let mut malformed = request.clone();
+            if fields {
+                malformed.fields.push(Default::default());
+            } else {
+                malformed.terms.push("term".into());
+            }
+            assert_eq!(
+                merge_term_stats(&malformed, &[probe.clone()])
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::InvalidArgument
+            );
         }
     }
 

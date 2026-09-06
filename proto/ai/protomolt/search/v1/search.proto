@@ -2522,6 +2522,10 @@ message TermStatsRequest {
   // the whole live lexical corpus. This is separate from the user's query
   // filter: a mandatory visibility restriction changes N, lengths and df.
   DocumentVisibility visibility = 3;
+  // Read only the physical version and visibility column metadata. Terms and
+  // fields must be empty. No corpus counts, lengths or posting scans are done;
+  // the response must echo this mode and must never populate a stats cache.
+  bool version_only = 4;
 }
 
 // A typed document membership restriction supplied by a trusted planner.
@@ -2595,6 +2599,9 @@ message TermStatsResponse {
   // 32-byte opaque lifetime identity, paired with the statistics epoch.
   // Nonzero claims require both; replacements generate a fresh identity.
   bytes stats_incarnation = 8;
+  // True only for a version-only probe: counts are zero and shares are empty,
+  // not measurements of an empty corpus. Ordinary stats consumers refuse it.
+  bool version_only = 9;
 }
 
 // Phase (c) of the distributed BM25 flow: score with GLOBAL stats.
@@ -5011,8 +5018,10 @@ message QueryRequest {
   // FAILED_PRECONDITION when it is gone or its score moved: search is
   // bitwise deterministic here, so an exact match is the corpus-state
   // check, and a mismatch means the corpus changed under the cursor.
-  // Documents ingested after the first page that rank before the
-  // boundary are skipped (standard search-after semantics).
+  // Public cursors also bind every configured shard's read version. Any data
+  // mutation, compaction or shard-lifetime change requires a fresh first page,
+  // even if the old boundary's id and score still match. No historical index
+  // image is retained by the cursor.
   //
   // Depth rules: a single-leaf query pages by fetching deeper (its
   // order is depth-independent by the exact top-k prefix property),

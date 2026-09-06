@@ -41,6 +41,14 @@ Hits are usable as a complete answer only when the terminal message says
 collector and provide a compatible scoring fingerprint. EOF is not a
 completion certificate.
 
+Final success also requires the [query read versions](query-read-versions.md)
+captured before selection to remain current after all phases. The stream's
+deadline includes these probes. A mutation can invalidate a request even if a
+lexical delegate successfully retried with newer statistics: the whole public
+query must restart. On failure, a queued collector update is not flushed as an
+extra revision, and no `FINAL` revision or successful response is published.
+Previously sent provisional revisions remain provisional and must be discarded.
+
 Deadline, missing shard, transport failure, analyzer drift, malformed request,
 or an incomplete provider certificate produces one well-formed terminal
 message with:

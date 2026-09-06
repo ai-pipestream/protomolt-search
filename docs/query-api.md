@@ -641,6 +641,11 @@ sort boundary to the resolved collection, complete authorization decision
 routes and the normalized query. It is not an authorization credential: every
 page must independently pass the current policy.
 
+Envelope format 2 additionally binds a separate digest of the physical read
+versions. Request/authority/topology checks still run before shard access;
+data-version validation follows the admission probes. Only the digests enter
+the public token, not the shard incarnations or private policy details.
+
 Repeat the query, page size, candidate depth, filters, projections, boosts,
 sorting, collapse and aggregation on each page. Only the cursor itself, trace
 `request_id`, observational `profile`, an equivalent collection default, and an
@@ -649,12 +654,15 @@ FAILED_PRECONDITION before execution, even if the old boundary still has the
 same score. Malformed tokens and old unsigned `tvq1:` / `tvqs2:` tokens require
 restarting at the first page. Unary and streaming pages share the same context.
 
-This is a live search-after cursor, not a point-in-time index snapshot. The
-existing score/id boundary check still refuses when the boundary disappears or
-its score changes. The envelope does not capture every data mutation or make
-physical ids stable through compaction; generation-consistent data views remain
-foundation work. A topology change always invalidates the token. Tokens have a
-64 KiB protobuf payload limit and are integrity protected, not encrypted.
+The cursor retains no historical index image. Any change in its bound physical
+versions, including compaction or node replacement with identical IDs and
+scores, requires a fresh first page. Old format-1 envelopes also require fresh
+pagination. The existing score/id boundary check remains an additional refusal.
+This prevents row reuse from being accepted as an old boundary; it does not
+turn a row locator into stable document identity or supply MVCC. See
+[query read versions](query-read-versions.md) for execution, replica and provider
+boundaries. A topology change always invalidates the token. Tokens have a 64 KiB
+protobuf payload limit and are integrity protected, not encrypted.
 
 By default the signing key is generated lazily from operating-system entropy and
 shared by clones of one coordinator. Dropping/restarting that coordinator loses
