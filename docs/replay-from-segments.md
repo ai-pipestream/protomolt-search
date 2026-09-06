@@ -146,6 +146,16 @@ The first pass reads columns only (the transposes are not needed), so
 it costs a scan of the column tables under `--from-segments`, and a WAL
 replay of the columns under the log replay.
 
+`--cut-rows` sets the child build's memory, not only the segment size:
+the build replays one cut into memory at about 70 KB per row (the
+document text, the transplanted spans and ordinals, the vector and the
+FP32 row), so a cut of 300,000 rows is about 21 GB and a cut of a
+million rows about 70 GB. On the archive (2026-09-06) a million-row
+cut put 42 GB into swap on a 61 GB machine and was stopped; 300,000
+rows per cut, about four segments per year in a band of eleven million
+documents, keeps the build in memory, and segment pruning by year is
+as sharp as with one segment per year.
+
 ## Partitioned compaction of a catalog without a log
 
 The children of a segmented split have no WAL: the spill logs build the
