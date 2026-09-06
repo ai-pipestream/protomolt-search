@@ -173,8 +173,23 @@ fn document(i: usize, archive: i64, with_code: bool) -> AddDocumentsRequest {
 /// segments per WAL bucket, a few deleted rows, flushed; returns the
 /// index path.
 async fn source_shard(dir: &Path, flush: bool) -> (PathBuf, String) {
-    let index_path = dir.join("archive.tv");
-    let (addr, _handle) = start_empty_node(config(index_path.clone())).await;
+    source_shard_at(dir, "archive.tv", 0, flush).await
+}
+
+/// A source shard whose slot offset is `slot_offset`: its log ids are
+/// global (offset plus local row) while its catalog labels are local.
+async fn source_shard_at(
+    dir: &Path,
+    name: &str,
+    slot_offset: u64,
+    flush: bool,
+) -> (PathBuf, String) {
+    let index_path = dir.join(name);
+    let (addr, _handle) = start_empty_node(NodeConfig {
+        slot_offset,
+        ..config(index_path.clone())
+    })
+    .await;
     let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
     client.set_calibration(calibration()).await.unwrap();
     let archive = Placement::validate(&old_tree())
@@ -204,7 +219,10 @@ async fn source_shard(dir: &Path, flush: bool) -> (PathBuf, String) {
     }
     client
         .delete_documents(DeleteDocumentsRequest {
-            doc_ids: vec![3, 77, 200, 359],
+            doc_ids: [3, 77, 200, 359]
+                .iter()
+                .map(|local| slot_offset + local)
+                .collect(),
             expected_wal_generation: None,
         })
         .await
@@ -859,6 +877,59 @@ async fn the_transplant_refuses_by_name() {
         err.contains("unsealed tail") && err.contains("flush"),
         "{err}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A source at a slot offset: its log ids are global and its catalog
+/// labels local, so the tail check, the log's deletes, and the spill's
+/// source ids all convert. Two sources, one at offset 0 and one at
+/// 10,000, split from the logs and from the segments place the same
+/// rows, the transplant counts both sources' live rows, and the
+/// deleted rows of the offset source are absent from its children.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_source_at_a_slot_offset_transplants_the_same_rows() {
+    let dir = tempdir("offset");
+    let (a_path, _a) = source_shard_at(&dir, "a.tv", 0, true).await;
+    let (b_path, _b) = source_shard_at(&dir, "b.tv", 10_000, true).await;
+    let gens = vec![
+        reshard::resolve_gen(&pipestream_search::wal::wal_dir(&a_path)).unwrap(),
+        reshard::resolve_gen(&pipestream_search::wal::wal_dir(&b_path)).unwrap(),
+    ];
+    let run = |out: &str, source: reshard::TreeRowSource| {
+        reshard::split_placement_tree_logs(
+            &gens,
+            &band_tree(),
+            &dir.join(out),
+            &[0, 1_000, 2_000],
+            None,
+            reshard::TreeSplitOptions {
+                source,
+                cut: reshard::SpillCut::Hash,
+                ..Default::default()
+            },
+            &mut analyzer(),
+        )
+    };
+    let by_logs = run("logs", reshard::TreeRowSource::Logs).unwrap();
+    let by_segments = run("segments", reshard::TreeRowSource::Segments).unwrap();
+    assert_eq!(by_segments.placed, by_logs.placed);
+    assert_eq!(by_segments.moved, by_logs.moved);
+    assert_eq!(by_segments.transplanted_rows, 2 * (N - 4) as u64);
+    assert_eq!(
+        by_logs.placed.iter().sum::<u64>(),
+        2 * (N - 4) as u64,
+        "both sources' live rows were placed"
+    );
+    // The same answers from the children, whichever source they came from.
+    let logs = serve(&by_logs).await;
+    let segments = serve(&by_segments).await;
+    same_answers(
+        &answers(&logs.coordinator).await,
+        &answers(&segments.coordinator).await,
+        "sources at slot offsets",
+    );
+    logs.stop();
+    segments.stop();
     let _ = std::fs::remove_dir_all(&dir);
 }
 

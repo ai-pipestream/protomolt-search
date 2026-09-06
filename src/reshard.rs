@@ -2603,10 +2603,11 @@ pub fn split_placement_tree_logs(
                             let bm25 = shard.set.bm25(i);
                             let rows = bm25.next_doc_id();
                             for row in 0..rows {
-                                let id = shard.set.metadata(i).base_label + u64::from(row);
-                                if !shard.is_live(i, row, id) {
+                                let label = shard.set.metadata(i).base_label + u64::from(row);
+                                if !shard.is_live(i, row, label) {
                                     continue;
                                 }
+                                let id = shard.slot_offset + label;
                                 let document = reconstruct_document(bm25, row, tables, false)?;
                                 let (index, _, _) = route(id, &document, None)?;
                                 match partition_key_of(&document, cut_column)? {
@@ -2846,10 +2847,11 @@ pub fn split_placement_tree_logs(
                     }
                     peak_transpose_bytes = peak_transpose_bytes.max(bytes);
                     for row in 0..rows {
-                        let id = meta.base_label + u64::from(row);
-                        if !shard.is_live(i, row, id) {
+                        let label = meta.base_label + u64::from(row);
+                        if !shard.is_live(i, row, label) {
                             continue;
                         }
+                        let id = shard.slot_offset + label;
                         if !seen.insert(id) {
                             return Err(format!(
                                 "live source id {id} appears in more than one source; the inputs \
@@ -3744,8 +3746,10 @@ struct SegmentSourceShard {
     /// written: a delete after a seal lands there, not in the segment's
     /// own sidecar.
     overlay: Option<crate::live_docs::LiveDocs>,
-    /// Rows the log deletes or replaces.
+    /// Rows the log deletes or replaces, as local labels.
     deleted: BTreeSet<u64>,
+    /// The shard's slot offset: a global id is the offset plus the label.
+    slot_offset: u64,
 }
 
 impl SegmentSourceShard {
@@ -3888,12 +3892,29 @@ fn open_segment_sources(
             rows = meta.end_label_exclusive()?;
         }
         let (watermark, deleted) = wal_row_watermark(gen, manifest.bucket_count)?;
-        if watermark > rows {
+        // The log's ids are global (the shard's slot offset plus the
+        // local row); the catalog's labels are local. Compare in local
+        // terms, and name a log whose ids sit below its own offset.
+        let local_watermark = if watermark == 0 {
+            0
+        } else {
+            watermark.checked_sub(manifest.slot_offset).ok_or_else(|| {
+                format!(
+                    "{}: the log holds rows through {} but its manifest places the shard at slot \
+                     offset {}; the log and its manifest disagree",
+                    gen.display(),
+                    watermark - 1,
+                    manifest.slot_offset
+                )
+            })?
+        };
+        if local_watermark > rows {
             return Err(format!(
-                "{}: the log holds rows through {} but the catalog at {} ends at {rows}; the \
-                 unsealed tail would be lost, flush the source first",
+                "{}: the log holds rows through {} (local row {}) but the catalog at {} ends at \
+                 {rows}; the unsealed tail would be lost, flush the source first",
                 gen.display(),
                 watermark - 1,
+                local_watermark - 1,
                 root.display()
             ));
         }
@@ -3991,12 +4012,28 @@ fn open_segment_sources(
         } else {
             None
         };
+        // The log names deleted and replaced rows by global id; the
+        // catalog's labels are local, so the set is kept in local terms.
+        let deleted = deleted
+            .into_iter()
+            .map(|id| {
+                id.checked_sub(manifest.slot_offset).ok_or_else(|| {
+                    format!(
+                        "{}: the log deletes row {id}, below the shard's slot offset {}; the log \
+                         and its manifest disagree",
+                        gen.display(),
+                        manifest.slot_offset
+                    )
+                })
+            })
+            .collect::<Result<BTreeSet<u64>, String>>()?;
         shards.push(SegmentSourceShard {
             gen: gen.clone(),
             root,
             set,
             overlay,
             deleted,
+            slot_offset: manifest.slot_offset,
         });
     }
     let tables = tables.ok_or_else(|| {
