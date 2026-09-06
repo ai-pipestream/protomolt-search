@@ -28,9 +28,11 @@ with the word:
 - **Shard** keeps its meaning: the unit of the stable-key hash split. A
   leaf is a set of shards; a partition is a predicate.
 
-Status, 2026-09-05: the contract, the tree, ingest evaluation, fan-out
-pruning, the dry run, and the offline placement split exist. The
-hitless leaf reshard still keys by hash; its section below says so.
+Status, 2026-09-06: the contract, the tree, ingest evaluation, fan-out
+pruning, the dry run, the offline placement split by code, the
+re-placement split under a new tree, and the node-side check of direct
+rows exist. The hitless leaf reshard still keys by hash; its section
+below says so.
 
 ## The tree
 
@@ -122,11 +124,33 @@ a value takes the code, one with the same code passes, one with another
 code is refused naming both. A node with the column declared and no
 leaf pinned refuses a direct `AddDocuments` without the value, naming
 the column and the flag. The log stores the value in place, so replay
-evaluates no CEL and a reopened shard answers the same browse. Both
-flags read `TURBOVEC_PLACEMENT_COLUMN` and `TURBOVEC_PLACEMENT_LEAF`
-and the config-file keys of the same names; the layout diagnostics
-report the pinned code and whether the shard's segments carry more than
-one (`placement_mixed`).
+evaluates no CEL and a reopened shard answers the same browse. The
+flags read `TURBOVEC_PLACEMENT_COLUMN`, `TURBOVEC_PLACEMENT_LEAF`, and
+`TURBOVEC_PLACEMENT_TREE`, and the config-file keys of the same names;
+the layout diagnostics report the pinned code and whether the shard's
+segments carry more than one (`placement_mixed`), and the fixed knob
+`placement_tree` names the pinned leaf when a tree is given.
+
+The code alone does not make the leaf's predicates true of the rows: a
+direct row with any values takes the code. `--placement-tree=<file>`
+gives the node the tree, from the coordinator's shard map (its
+`[placement]` table) or a file holding just that table, and the node
+then checks each direct row before it derives anything
+(`placement::PinnedLeaf`). At startup the pinned code must name a leaf
+of the tree, the tree's column must be the declared one, and a tree
+without a pinned leaf is refused, each by name. Per row the chain is
+evaluated the way the coordinator routes, over the values the row
+arrived with plus its value-dialect materialized columns and none of
+the quality or geography columns analysis adds later, so a routed row
+and a direct row are judged on the same values. A row the tree routes
+elsewhere is refused naming the node whose predicate sent it there (an
+earlier sibling that is true on the row, or a node on the pinned path
+that is false or unknown on it) and the leaf the row belongs to, with
+or without the pinned code on it. A logged record already passed, so
+replay and the compaction shadow do not evaluate again. With the tree
+on every shard, shard pruning and implied-clause dropping rest on
+something the shard enforces, not on the routing having been the only
+writer.
 
 ## Query
 
@@ -223,6 +247,34 @@ coverage, because routing under a tree is by code first and by hash
 inside the group. The written shard map carries `placement = <code>`
 for a child with one code; a child holding a range is left for the
 operator to place, since the map names one code per shard.
+
+A NEW tree is a re-placement split: `reshard::split_placement_tree_logs`
+(and `reshard --log=<gen> --placement-tree=<map or table> --out-dir=...
+--slot-base=B --slot-stride=S`, or `--logs=a,b,...` for the union of
+several shards) validates the tree, evaluates it on each live
+document's stored values the way the coordinator routes at ingest,
+rewrites the placement column to the code the tree assigns, and writes
+one child per leaf shard in leaf order (`reshard::tree_children`): a
+leaf with `shards = n` gets `n` children tiling the stable-key hash
+space as the coordinator's per-leaf routing does, `n` a power of two,
+and a row routed into such a leaf must carry a stable key or the split
+refuses by id (give the leaf one shard or rebuild through routed
+ingest). A vector row with no document cannot be evaluated and refuses
+by id. Rows are routed one WAL bucket at a time into per-child spill
+logs under `<out>/spill` (removed at the end), then each child's image
+is built from its spill, so memory is bounded by one bucket and then by
+the largest child, the shape a partitioned compaction uses. The
+written `shard-map.toml` carries the new tree under `[placement]` and
+one `[[shards]]` per child with its `placement` code and hash range,
+addresses left to fill in; each child serves under
+`--placement-column`, `--placement-leaf=<its code>`, and
+`--placement-tree=<that map>`, and a child's code that is no leaf of
+the old tree is refused by name if it is started under the old map.
+Documents are re-analyzed through the sidecar as in every replay. The
+split is offline: no live cutoff is recorded, so the sources must be
+quiescent. A child is one image, so the year cut inside a leaf is still
+`CompactShard` with `partition_column` on the served child
+(`docs/segment-pruning.md`).
 
 The hitless flow (tail while the parent serves, then freeze, catch up,
 publish) still partitions by the stable-key hash; keying its catch-up

@@ -166,6 +166,32 @@ pub fn load_shard_map(path: &std::path::Path) -> Result<ShardMap, String> {
     toml::from_str(&text).map_err(|e| format!("parse shard map {}: {e}", path.display()))
 }
 
+/// Read a placement tree for `--placement-tree`: the coordinator's shard
+/// map (its `[placement]` table) or a file holding just that table.
+/// A shard map without a tree, and a file that is neither, refuse by
+/// name.
+pub fn load_placement_tree(
+    path: &std::path::Path,
+) -> Result<crate::placement::PlacementTreeConfig, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("read placement tree {}: {e}", path.display()))?;
+    if let Ok(map) = toml::from_str::<ShardMap>(&text) {
+        return map.placement.ok_or_else(|| {
+            format!(
+                "placement tree {}: the shard map has no [placement] table",
+                path.display()
+            )
+        });
+    }
+    toml::from_str::<crate::placement::PlacementTreeConfig>(&text).map_err(|e| {
+        format!(
+            "parse placement tree {}: neither a shard map with a [placement] table nor a \
+             placement table on its own: {e}",
+            path.display()
+        )
+    })
+}
+
 /// Normalize one node address the same way at startup and during hot reload.
 pub fn normalize_addr(addr: String) -> String {
     normalize_addrs(vec![addr]).remove(0)
@@ -233,6 +259,11 @@ pub struct Config {
     /// (`--placement-leaf`). Fills the placement column on a direct
     /// ingest that lacks it and refuses another code.
     pub placement_leaf: Option<i64>,
+    /// Node: the pinned leaf with its tree (`--placement-tree=<file>`,
+    /// the coordinator's shard map or a file holding just the
+    /// `[placement]` table). The shard then refuses a direct row the
+    /// tree routes to another leaf. Needs `--placement-leaf`.
+    pub placement_tree: Option<std::sync::Arc<crate::placement::PinnedLeaf>>,
     /// Serve a shard whose BM25 bulk build was interrupted: a
     /// `.bm25.build` spill directory with no `.bm25` beside it.
     ///
@@ -533,6 +564,7 @@ struct FileConfig {
     shard_pruning: Option<bool>,
     placement_column: Option<String>,
     placement_leaf: Option<i64>,
+    placement_tree: Option<String>,
     allow_missing_bm25: Option<bool>,
     coalesce: Option<bool>,
     scan_parallel: Option<usize>,
@@ -1165,6 +1197,30 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             "--placement-leaf needs --placement-column, the column that holds the code".to_string(),
         );
     }
+    let placement_tree = match opt(
+        args,
+        "placement-tree",
+        "TURBOVEC_PLACEMENT_TREE",
+        file.placement_tree.as_deref(),
+    )
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty())
+    {
+        Some(path) => {
+            let (Some(column), Some(code)) = (placement_column.as_deref(), placement_leaf) else {
+                return Err(
+                    "--placement-tree needs --placement-leaf (and --placement-column): the \
+                     tree is checked on the leaf this shard pins"
+                        .to_string(),
+                );
+            };
+            let tree = load_placement_tree(std::path::Path::new(&path))?;
+            let pinned = crate::placement::PinnedLeaf::pin(&tree, column, code)
+                .map_err(|e| format!("placement tree {path}: {e}"))?;
+            Some(std::sync::Arc::new(pinned))
+        }
+        None => None,
+    };
     let allow_missing_bm25 = flag_present(args, "allow-missing-bm25")
         || match opt(
             args,
@@ -2352,6 +2408,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         shard_pruning,
         placement_column,
         placement_leaf,
+        placement_tree,
         allow_missing_bm25,
         coalesce,
         scan_parallel,
