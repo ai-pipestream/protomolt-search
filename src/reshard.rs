@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use crate::analyzer::SessionLayers;
 use crate::pb::wal::wal_record;
 use crate::pb::{AddDocumentsRequest, AnalysisSpec};
-use crate::postings::{AnalyzedDoc, SpillBuilder};
+use crate::postings::{AnalyzedDoc, AnalyzedField, SpillBuilder};
 use crate::vector::VectorIndex;
 use crate::wal::{self, RecordReader, WalManifest};
 
@@ -193,6 +193,11 @@ struct Replay {
     deleted: std::collections::BTreeSet<u64>,
     /// Stable product identities learned from routed WAL envelopes.
     stable_keys: BTreeMap<u64, Vec<u8>>,
+    /// global id -> the document's analyzed fields, table order, when
+    /// the replay carries a transplant sidecar
+    /// (`docs/replay-from-segments.md`) and the child build takes the
+    /// fields from here instead of the analyzer.
+    analyzed: BTreeMap<u64, Vec<AnalyzedField>>,
 }
 
 impl Replay {
@@ -201,6 +206,7 @@ impl Replay {
             self.vectors.remove(id);
             self.documents.remove(id);
             self.stable_keys.remove(id);
+            self.analyzed.remove(id);
         }
         self.deleted.clear();
     }
@@ -259,6 +265,33 @@ fn replay_buckets_through(
     upto_clock: u64,
     out: &mut Replay,
 ) -> Result<(), String> {
+    replay_buckets_routed(
+        gen,
+        buckets,
+        bucket_count,
+        dim,
+        vectors_only,
+        upto_clock,
+        true,
+        out,
+    )
+}
+
+/// [`replay_buckets_through`] with the hash-routing check optional: a
+/// spill a re-placement split cut by a column
+/// (`docs/replay-from-segments.md`) files records by value, not by id
+/// hash, and is the split's to replay; a node's log is always checked.
+#[allow(clippy::too_many_arguments)]
+fn replay_buckets_routed(
+    gen: &Path,
+    buckets: std::ops::Range<u32>,
+    bucket_count: usize,
+    dim: usize,
+    vectors_only: bool,
+    upto_clock: u64,
+    check_routing: bool,
+    out: &mut Replay,
+) -> Result<(), String> {
     for bucket in buckets {
         let path = wal::bucket_path(gen, bucket);
         if !path.exists() {
@@ -284,7 +317,7 @@ fn replay_buckets_through(
             }
             match record.op {
                 Some(wal_record::Op::AddVectors(a)) => {
-                    if bucket_of(a.first_id, bucket_count) as u32 != bucket {
+                    if check_routing && bucket_of(a.first_id, bucket_count) as u32 != bucket {
                         return Err(format!(
                             "replay {}: record id {} routes to bucket {}, not {bucket} — \
                              corrupt log or changed bucket geometry",
@@ -311,7 +344,7 @@ fn replay_buckets_through(
                             ));
                         }
                         let id = a.first_id + i as u64;
-                        if bucket_of(id, bucket_count) as u32 != bucket {
+                        if check_routing && bucket_of(id, bucket_count) as u32 != bucket {
                             return Err(format!(
                                 "replay {}: vector batch straddles WAL buckets at id {id}",
                                 path.display()
@@ -338,7 +371,7 @@ fn replay_buckets_through(
                     }
                 }
                 Some(wal_record::Op::AddDocuments(a)) => {
-                    if bucket_of(a.first_id, bucket_count) as u32 != bucket {
+                    if check_routing && bucket_of(a.first_id, bucket_count) as u32 != bucket {
                         return Err(format!(
                             "replay {}: document id {} routes to bucket {}, not {bucket}",
                             path.display(),
@@ -359,7 +392,7 @@ fn replay_buckets_through(
                     }
                     for (i, doc) in a.documents.into_iter().enumerate() {
                         let id = a.first_id + i as u64;
-                        if bucket_of(id, bucket_count) as u32 != bucket {
+                        if check_routing && bucket_of(id, bucket_count) as u32 != bucket {
                             return Err(format!(
                                 "replay {}: document batch straddles WAL buckets at id {id}",
                                 path.display()
@@ -556,6 +589,7 @@ fn build_child(
     pinned_fingerprints: Option<&[u64]>,
     binding: Option<&crate::postings::StoredBinding>,
     columns: Option<&ColumnTables>,
+    mut transplanted: Option<BTreeMap<u64, Vec<AnalyzedField>>>,
     analyze: &mut Analyzer,
 ) -> Result<ChildImage, String> {
     let dim = manifest.dim as usize;
@@ -592,6 +626,7 @@ fn build_child(
         .collect();
     let mut mapped: Vec<(u32, AddDocumentsRequest)> = Vec::with_capacity(documents.len());
     let mut row_parent_ids = parent_ids.clone();
+    let mut parent_of_local: BTreeMap<u32, u64> = BTreeMap::new();
     let mut spare = vectors.len() as u64;
     for (id, doc) in documents {
         let local = match slot_of.get(&id) {
@@ -602,6 +637,7 @@ fn build_child(
                 u32::try_from(spare - 1).map_err(|_| "document id space exceeds u32".to_string())?
             }
         };
+        parent_of_local.insert(local, id);
         mapped.push((local, doc));
     }
     mapped.sort_by_key(|(local, _)| *local);
@@ -881,7 +917,9 @@ fn build_child(
                 entries += 1 + mapped[end].1.fields.len();
                 end += 1;
             }
-            let analyzed = {
+            let analyzed = if transplanted.is_some() {
+                Vec::new()
+            } else {
                 let mut batch: Vec<(&str, Option<&AnalysisSpec>, SessionLayers)> =
                     Vec::with_capacity(entries);
                 for (_, d) in &mapped[i..end] {
@@ -911,7 +949,7 @@ fn build_child(
                 analyze(&batch)
                     .map_err(|e| format!("analyze batch at child slot {}: {e}", mapped[i].0))?
             };
-            if analyzed.len() != entries {
+            if transplanted.is_none() && analyzed.len() != entries {
                 return Err(format!(
                     "analyzer returned {} results for {entries} field texts",
                     analyzed.len()
@@ -919,10 +957,48 @@ fn build_child(
             }
             let mut results = analyzed.into_iter();
             for (local, doc) in &mut mapped[i..end] {
-                let mut body = results.next().expect("counted above");
-                let cased = body.cased.take();
-                let mut fields = vec![crate::postings::AnalyzedField::default(); table.len()];
-                fields[0] = body.into_body();
+                // Under a transplant the fields come from the spill's
+                // analysis sidecar, keyed by the source id
+                // (docs/replay-from-segments.md); the record carries no
+                // extra field texts, cased field, or phrases then, since
+                // those are fields of the table like any other.
+                let (mut fields, cased) = match transplanted.as_mut() {
+                    Some(map) => {
+                        let id = parent_of_local[local];
+                        let fields = map.remove(&id).ok_or_else(|| {
+                            format!(
+                                "record at child slot {local} (source id {id}) has no \
+                                 transplanted analysis in the spill sidecar"
+                            )
+                        })?;
+                        if fields.len() != table.len() {
+                            return Err(format!(
+                                "record at child slot {local} (source id {id}): {} transplanted \
+                                 fields for a table of {}",
+                                fields.len(),
+                                table.len()
+                            ));
+                        }
+                        if !doc.fields.is_empty()
+                            || !doc.cased_field.is_empty()
+                            || !doc.phrases.is_empty()
+                        {
+                            return Err(format!(
+                                "record at child slot {local} (source id {id}) carries field \
+                                 texts, a cased field, or phrases under a transplant"
+                            ));
+                        }
+                        (fields, None)
+                    }
+                    None => {
+                        let mut body = results.next().expect("counted above");
+                        let cased = body.cased.take();
+                        let mut fields =
+                            vec![crate::postings::AnalyzedField::default(); table.len()];
+                        fields[0] = body.into_body();
+                        (fields, cased)
+                    }
+                };
                 // The cased identity came out of the body's one pass; it
                 // lands at the field the record named (docs/dual-cased.md).
                 if !doc.cased_field.is_empty() {
@@ -1353,6 +1429,7 @@ fn finish_child_ordered(
             replay.vectors.len() + replay.documents.len()
         ));
     }
+    let transplanted = (!replay.analyzed.is_empty()).then(|| std::mem::take(&mut replay.analyzed));
     let mut child = build_child(
         manifest,
         vectors,
@@ -1362,6 +1439,7 @@ fn finish_child_ordered(
         pinned_fingerprints,
         binding,
         columns,
+        transplanted,
         analyze,
     )?;
     child.slot_offset = slot_offset;
@@ -1544,6 +1622,7 @@ pub fn split_logs(
                     documents: documents.into_iter().collect(),
                     deleted: Default::default(),
                     stable_keys: Default::default(),
+                    analyzed: Default::default(),
                 },
                 i,
                 out_dir,
@@ -2282,6 +2361,15 @@ pub struct TreeReshardOutput {
     pub peak_replay_rows: u64,
     /// The bucket count the spill logs were written with.
     pub spill_bucket_count: u32,
+    /// Where the documents' analyzed fields came from.
+    pub source: TreeRowSource,
+    /// How the spill was cut.
+    pub cut: SpillCut,
+    /// The largest transpose held at once, in bytes (0 under the log
+    /// replay): one field of one source segment at a time is the bound.
+    pub peak_transpose_bytes: u64,
+    /// Documents whose fields were transplanted (0 under the log replay).
+    pub transplanted_rows: u64,
 }
 
 /// How a re-placement split writes each child.
@@ -2301,13 +2389,19 @@ pub enum TreeChildLayout {
 }
 
 /// The knobs of a re-placement split.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeSplitOptions {
     pub layout: TreeChildLayout,
     /// log2 of the spill logs' bucket count; `None` takes the largest
     /// bucket count among the inputs, so a replay of one spill bucket is
-    /// bounded the way a replay of one source bucket is.
+    /// bounded the way a replay of one source bucket is. Ignored under
+    /// a column cut, whose bucket count the cut plan sets.
     pub spill_bucket_bits: Option<u32>,
+    /// Where each document's analyzed fields come from
+    /// (`docs/replay-from-segments.md`).
+    pub source: TreeRowSource,
+    /// How each child's spill is cut into buckets, and so into segments.
+    pub cut: SpillCut,
 }
 
 impl Default for TreeSplitOptions {
@@ -2315,6 +2409,8 @@ impl Default for TreeSplitOptions {
         Self {
             layout: TreeChildLayout::Segmented,
             spill_bucket_bits: None,
+            source: TreeRowSource::Logs,
+            cut: SpillCut::Hash,
         }
     }
 }
@@ -2413,10 +2509,163 @@ pub fn split_placement_tree_logs(
     let shards_of_leaf = |code: i64| children.iter().filter(|child| child.code == code).count();
 
     // Pass 1: route each live row under the new tree into its child's
-    // spill log, one WAL bucket in memory at a time.
+    // spill log, one WAL bucket (or one source segment) in memory at a
+    // time (`docs/replay-from-segments.md`).
     let spill_root = out_dir.join("spill");
-    let spill_bucket_bits = match options.spill_bucket_bits {
-        Some(bits) => {
+    if matches!(options.cut, SpillCut::Column { .. })
+        && matches!(options.layout, TreeChildLayout::SingleImage { .. })
+    {
+        return Err(
+            "a column cut orders a child's segments; it needs the segmented layout".to_string(),
+        );
+    }
+    let sources = match options.source {
+        TreeRowSource::Logs => None,
+        TreeRowSource::Segments => Some(open_segment_sources(gens)?),
+    };
+    if options.source == TreeRowSource::Segments {
+        if let Some(child) = children.iter().find(|child| shards_of_leaf(child.code) > 1) {
+            return Err(format!(
+                "leaf {:?} has {} shards, which are tiled by stable routing keys, and sealed \
+                 segments carry no routing keys; give the leaf one shard or split from the logs",
+                child.leaf,
+                shards_of_leaf(child.code)
+            ));
+        }
+    }
+    // Where a live row goes: the child index, the leaf, and whether its
+    // code changed.
+    let route = |id: u64,
+                 document: &AddDocumentsRequest,
+                 stable_key: Option<&Vec<u8>>|
+     -> Result<(usize, i64, bool), String> {
+        let carried = partition_key_of(document, &column)?;
+        let leaf = placement
+            .evaluate(document)
+            .map_err(|e| format!("live source id {id}: {e}"))?;
+        let moved = carried != Some(leaf.code);
+        let base = first_child_of_leaf(leaf.code).expect("children cover every leaf");
+        let n = shards_of_leaf(leaf.code);
+        let index = if n == 1 {
+            base
+        } else {
+            let Some(key) = stable_key.filter(|key| !key.is_empty()) else {
+                return Err(format!(
+                    "live source id {id} routes to leaf {:?}, which has {n} shards, and \
+                     carries no stable key to pick one by; give the leaf one shard or \
+                     rebuild the rows through routed ingest",
+                    leaf.name
+                ));
+            };
+            let hash = crate::coordinator::stable_routing_hash(key);
+            base + children[base..base + n]
+                .iter()
+                .position(|child| hash >= child.hash_lo && hash <= child.hash_hi)
+                .expect("the tiles cover the hash space")
+        };
+        Ok((index, leaf.code, moved))
+    };
+    // A column cut plans its buckets from a first pass over the columns.
+    let mut cut_plans: Option<Vec<ChildCutPlan>> = match &options.cut {
+        SpillCut::Hash => None,
+        SpillCut::Column {
+            column: cut_column,
+            rows_per_cut,
+        } => {
+            if *rows_per_cut == 0 {
+                return Err("a column cut needs a positive row bound".to_string());
+            }
+            if cut_column == &column {
+                return Err(format!(
+                    "the cut column {cut_column:?} is the placement column; every row of a \
+                     child carries one code there, cut by another column"
+                ));
+            }
+            let mut histograms: Vec<BTreeMap<i64, u64>> =
+                (0..children.len()).map(|_| BTreeMap::new()).collect();
+            let mut unkeyed = vec![0u64; children.len()];
+            match &sources {
+                Some((shards, tables)) => {
+                    if !tables
+                        .columns
+                        .integers
+                        .iter()
+                        .any(|name| name == cut_column)
+                    {
+                        return Err(format!(
+                            "the cut column {cut_column:?} is not an integer column of the \
+                             sources ({:?})",
+                            tables.columns.integers
+                        ));
+                    }
+                    for shard in shards {
+                        for i in 0..shard.set.len() {
+                            let bm25 = shard.set.bm25(i);
+                            let rows = bm25.next_doc_id();
+                            for row in 0..rows {
+                                let label = shard.set.metadata(i).base_label + u64::from(row);
+                                if !shard.is_live(i, row, label) {
+                                    continue;
+                                }
+                                let id = shard.slot_offset + label;
+                                let document = reconstruct_document(bm25, row, tables, false)?;
+                                let (index, _, _) = route(id, &document, None)?;
+                                match partition_key_of(&document, cut_column)? {
+                                    Some(key) => *histograms[index].entry(key).or_insert(0) += 1,
+                                    None => unkeyed[index] += 1,
+                                }
+                            }
+                        }
+                    }
+                }
+                None => {
+                    for gen in gens {
+                        let current = read_gen_manifest(gen)?;
+                        for bucket in 0..current.bucket_count {
+                            let mut replay = Replay::default();
+                            replay_buckets_through(
+                                gen,
+                                bucket..bucket + 1,
+                                current.bucket_count as usize,
+                                current.dim as usize,
+                                false,
+                                u64::MAX,
+                                &mut replay,
+                            )?;
+                            replay.compact();
+                            for (id, document) in &replay.documents {
+                                let (index, _, _) =
+                                    route(*id, document, replay.stable_keys.get(id))?;
+                                match partition_key_of(document, cut_column)? {
+                                    Some(key) => *histograms[index].entry(key).or_insert(0) += 1,
+                                    None => unkeyed[index] += 1,
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Some(plan_cuts(&histograms, &unkeyed, *rows_per_cut))
+        }
+    };
+    let spill_bucket_bits = match (&cut_plans, options.spill_bucket_bits) {
+        (Some(plans), _) => {
+            let widest = plans
+                .iter()
+                .map(|plan| plan.buckets)
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            let bits = widest.next_power_of_two().trailing_zeros();
+            if bits > 16 {
+                return Err(format!(
+                    "the column cut needs {widest} buckets in one child, above 65,536; raise the \
+                     row bound"
+                ));
+            }
+            bits
+        }
+        (None, Some(bits)) => {
             if bits > 16 {
                 return Err(format!(
                     "spill bucket bits {bits} exceed 16 (65,536 bucket files per child)"
@@ -2424,7 +2673,7 @@ pub fn split_placement_tree_logs(
             }
             bits
         }
-        None => {
+        (None, None) => {
             let mut widest = manifest.bucket_count;
             for gen in gens {
                 widest = widest.max(read_gen_manifest(gen)?.bucket_count);
@@ -2443,102 +2692,222 @@ pub fn split_placement_tree_logs(
             .map_err(|error| format!("create spill log {}: {error}", dir.display()))?;
         spills.push(writer);
     }
+    let mut sidecars: Vec<Vec<Option<std::io::BufWriter<std::fs::File>>>> = (0..children.len())
+        .map(|_| (0..spill_bucket_count).map(|_| None).collect())
+        .collect();
     let mut moved = 0u64;
     let mut placed = vec![0u64; children.len()];
+    let mut transplanted_rows = 0u64;
+    let mut peak_transpose_bytes = 0u64;
     let mut seen: BTreeSet<u64> = BTreeSet::new();
-    for gen in gens {
-        let current = read_gen_manifest(gen)?;
-        let bucket_count = current.bucket_count as usize;
-        let dim = current.dim as usize;
-        for bucket in 0..current.bucket_count {
-            let mut replay = Replay::default();
-            replay_buckets_through(
-                gen,
-                bucket..bucket + 1,
-                bucket_count,
-                dim,
-                false,
-                u64::MAX,
-                &mut replay,
-            )?;
-            replay.compact();
-            for id in child_order(&replay) {
-                if !seen.insert(id) {
-                    return Err(format!(
-                        "live source id {id} appears in more than one input generation; the \
-                         inputs overlap"
-                    ));
+    let cut_column: Option<&str> = match &options.cut {
+        SpillCut::Column { column, .. } => Some(column.as_str()),
+        SpillCut::Hash => None,
+    };
+    let rows_per_cut = match &options.cut {
+        SpillCut::Column { rows_per_cut, .. } => *rows_per_cut,
+        SpillCut::Hash => 0,
+    };
+    // File one routed row: its records into the child's spill, in the
+    // bucket the cut names (or the one the id hashes to), and its
+    // transplanted fields into the bucket's sidecar.
+    let mut file_row = |index: usize,
+                        id: u64,
+                        rewritten: AddDocumentsRequest,
+                        vector: Option<(Vec<f32>, u32)>,
+                        keys: Vec<Vec<u8>>,
+                        fields: Option<&[AnalyzedField]>|
+     -> Result<(), String> {
+        let bucket = match (cut_plans.as_mut(), cut_column) {
+            (Some(plans), Some(cut_column)) => {
+                let key = partition_key_of(&rewritten, cut_column)?;
+                Some(plans[index].bucket(key, rows_per_cut))
+            }
+            _ => None,
+        };
+        let document = wal_record::Op::AddDocuments(crate::pb::wal::LoggedAddDocuments {
+            source_references: Vec::new(),
+            first_id: id,
+            documents: vec![rewritten],
+            stable_routing_keys: keys.clone(),
+        });
+        match bucket {
+            Some(bucket) => spills[index].append_to_bucket(bucket, document),
+            None => spills[index].append(document),
+        }
+        .map_err(|error| format!("spill document {id}: {error}"))?;
+        if let Some((vector, dim)) = vector {
+            let record = wal_record::Op::AddVectors(crate::pb::wal::LoggedAddVectors {
+                first_id: id,
+                batch: Some(crate::pb::AddVectorsRequest {
+                    vectors: vector,
+                    dim,
+                }),
+                stable_routing_keys: keys,
+            });
+            match bucket {
+                Some(bucket) => spills[index].append_to_bucket(bucket, record),
+                None => spills[index].append(record),
+            }
+            .map_err(|error| format!("spill vector {id}: {error}"))?;
+        }
+        if let Some(fields) = fields {
+            let bucket = bucket.unwrap_or(bucket_of(id, spill_bucket_count as usize) as u32);
+            let slot = &mut sidecars[index][bucket as usize];
+            if slot.is_none() {
+                let path = analysis_sidecar_path(spills[index].dir(), bucket);
+                let file = std::fs::File::create(&path)
+                    .map_err(|error| format!("create {}: {error}", path.display()))?;
+                *slot = Some(std::io::BufWriter::with_capacity(1 << 20, file));
+            }
+            write_analysis_entry(slot.as_mut().expect("opened above"), id, fields)
+                .map_err(|error| format!("spill analysis of {id}: {error}"))?;
+        }
+        Ok(())
+    };
+    match &sources {
+        None => {
+            for gen in gens {
+                let current = read_gen_manifest(gen)?;
+                let bucket_count = current.bucket_count as usize;
+                let dim = current.dim as usize;
+                for bucket in 0..current.bucket_count {
+                    let mut replay = Replay::default();
+                    replay_buckets_through(
+                        gen,
+                        bucket..bucket + 1,
+                        bucket_count,
+                        dim,
+                        false,
+                        u64::MAX,
+                        &mut replay,
+                    )?;
+                    replay.compact();
+                    for id in child_order(&replay) {
+                        if !seen.insert(id) {
+                            return Err(format!(
+                                "live source id {id} appears in more than one input generation; \
+                                 the inputs overlap"
+                            ));
+                        }
+                        let Some(document) = replay.documents.get(&id) else {
+                            return Err(format!(
+                                "live source id {id} has a vector and no document; a re-placement \
+                                 split evaluates the tree on documents (a code-keyed split, \
+                                 --placement-ranges, routes such a row to its default child)"
+                            ));
+                        };
+                        let (index, code, changed) =
+                            route(id, document, replay.stable_keys.get(&id))?;
+                        if changed {
+                            moved += 1;
+                        }
+                        let mut rewritten = document.clone();
+                        rewritten.integers.retain(|value| value.field != column);
+                        rewritten.integers.push(crate::pb::IntegerValue {
+                            field: column.clone(),
+                            value: code,
+                        });
+                        let keys: Vec<Vec<u8>> =
+                            replay.stable_keys.get(&id).cloned().into_iter().collect();
+                        let vector = replay
+                            .vectors
+                            .get(&id)
+                            .map(|vector| (vector.clone(), current.dim));
+                        file_row(index, id, rewritten, vector, keys, None)?;
+                        placed[index] += 1;
+                    }
                 }
-                let Some(document) = replay.documents.get(&id) else {
-                    return Err(format!(
-                        "live source id {id} has a vector and no document; a re-placement \
-                         split evaluates the tree on documents (a code-keyed split, \
-                         --placement-ranges, routes such a row to its default child)"
-                    ));
-                };
-                let carried = partition_key_of(document, &column)?;
-                let leaf = placement
-                    .evaluate(document)
-                    .map_err(|e| format!("live source id {id}: {e}"))?;
-                if carried != Some(leaf.code) {
-                    moved += 1;
-                }
-                let base = first_child_of_leaf(leaf.code).expect("children cover every leaf");
-                let n = shards_of_leaf(leaf.code);
-                let index = if n == 1 {
-                    base
-                } else {
-                    let Some(key) = replay.stable_keys.get(&id).filter(|key| !key.is_empty())
-                    else {
+            }
+        }
+        Some((shards, tables)) => {
+            for shard in shards {
+                let current = read_gen_manifest(&shard.gen)?;
+                for i in 0..shard.set.len() {
+                    let meta = shard.set.metadata(i);
+                    let bm25 = shard.set.bm25(i);
+                    let exact = open_segment_exact(shard, i)?;
+                    let rows = bm25.next_doc_id();
+                    if u64::from(rows) != meta.rows {
                         return Err(format!(
-                            "live source id {id} routes to leaf {:?}, which has {n} shards, and \
-                             carries no stable key to pick one by; give the leaf one shard or \
-                             rebuild the rows through routed ingest",
-                            leaf.name
+                            "{} segment {}: the store has {rows} rows, the metadata {}",
+                            shard.root.display(),
+                            meta.segment_id,
+                            meta.rows
                         ));
-                    };
-                    let hash = crate::coordinator::stable_routing_hash(key);
-                    base + children[base..base + n]
-                        .iter()
-                        .position(|child| hash >= child.hash_lo && hash <= child.hash_hi)
-                        .expect("the tiles cover the hash space")
-                };
-                let mut rewritten = document.clone();
-                rewritten.integers.retain(|value| value.field != column);
-                rewritten.integers.push(crate::pb::IntegerValue {
-                    field: column.clone(),
-                    value: leaf.code,
-                });
-                let keys: Vec<Vec<u8>> = replay.stable_keys.get(&id).cloned().into_iter().collect();
-                spills[index]
-                    .append(wal_record::Op::AddDocuments(
-                        crate::pb::wal::LoggedAddDocuments {
-                            source_references: Vec::new(),
-                            first_id: id,
-                            documents: vec![rewritten],
-                            stable_routing_keys: keys.clone(),
-                        },
-                    ))
-                    .map_err(|error| format!("spill document {id}: {error}"))?;
-                if let Some(vector) = replay.vectors.get(&id) {
-                    spills[index]
-                        .append(wal_record::Op::AddVectors(
-                            crate::pb::wal::LoggedAddVectors {
-                                first_id: id,
-                                batch: Some(crate::pb::AddVectorsRequest {
-                                    vectors: vector.clone(),
-                                    dim: current.dim,
-                                }),
-                                stable_routing_keys: keys,
-                            },
-                        ))
-                        .map_err(|error| format!("spill vector {id}: {error}"))?;
+                    }
+                    let mut transposes = Vec::with_capacity(bm25.field_count());
+                    let mut bytes = 0u64;
+                    for f in 0..bm25.field_count() {
+                        let transpose = bm25.field(f).transpose().map_err(|e| {
+                            format!("{} segment {}: {e}", shard.root.display(), meta.segment_id)
+                        })?;
+                        bytes += transpose.bytes() as u64;
+                        transposes.push(transpose);
+                    }
+                    peak_transpose_bytes = peak_transpose_bytes.max(bytes);
+                    for row in 0..rows {
+                        let label = meta.base_label + u64::from(row);
+                        if !shard.is_live(i, row, label) {
+                            continue;
+                        }
+                        let id = shard.slot_offset + label;
+                        if !seen.insert(id) {
+                            return Err(format!(
+                                "live source id {id} appears in more than one source; the inputs \
+                                 overlap"
+                            ));
+                        }
+                        let document =
+                            reconstruct_document(bm25, row, tables, true).map_err(|e| {
+                                format!("{} segment {}: {e}", shard.root.display(), meta.segment_id)
+                            })?;
+                        let (index, code, changed) = route(id, &document, None)?;
+                        if changed {
+                            moved += 1;
+                        }
+                        let mut rewritten = document;
+                        rewritten.integers.retain(|value| value.field != column);
+                        rewritten.integers.push(crate::pb::IntegerValue {
+                            field: column.clone(),
+                            value: code,
+                        });
+                        let vector = exact.as_ref().map(|store| {
+                            (
+                                store.row_values(row as usize, row as usize + 1),
+                                current.dim,
+                            )
+                        });
+                        let fields: Vec<AnalyzedField> = transposes
+                            .iter()
+                            .map(|transpose| {
+                                transpose.field(row).ok_or_else(|| {
+                                    format!(
+                                        "{} segment {}: row {row} is past the transpose",
+                                        shard.root.display(),
+                                        meta.segment_id
+                                    )
+                                })
+                            })
+                            .collect::<Result<_, _>>()?;
+                        file_row(index, id, rewritten, vector, Vec::new(), Some(&fields))?;
+                        transplanted_rows += 1;
+                        placed[index] += 1;
+                    }
                 }
-                placed[index] += 1;
             }
         }
     }
     drop(seen);
+    for child in &mut sidecars {
+        for writer in child.iter_mut().flatten() {
+            use std::io::Write;
+            writer
+                .flush()
+                .map_err(|error| format!("flush analysis sidecar: {error}"))?;
+        }
+    }
+    drop(sidecars);
     let spill_dirs: Vec<PathBuf> = spills
         .iter_mut()
         .map(|writer| {
@@ -2549,6 +2918,24 @@ pub fn split_placement_tree_logs(
         })
         .collect::<Result<_, _>>()?;
     drop(spills);
+    let (pinned_fingerprints, pinned_columns, pinned_fields): (
+        Option<Vec<u64>>,
+        Option<ColumnTables>,
+        Option<Vec<String>>,
+    ) = match &sources {
+        Some((_, tables)) => (
+            Some(tables.fingerprints.clone()),
+            Some(tables.columns.clone()),
+            Some(tables.fields.clone()),
+        ),
+        None => (None, None, None),
+    };
+    let bm25_fields: Option<&[String]> = match &pinned_fields {
+        Some(fields) => Some(fields.as_slice()),
+        None => bm25_fields,
+    };
+    let check_routing = cut_plans.is_none();
+    drop(cut_plans);
 
     // Pass 2: each child from its spill.
     let dim = manifest.dim as usize;
@@ -2580,15 +2967,25 @@ pub fn split_placement_tree_logs(
             }
             for (index, (child, spill_dir)) in children.iter().zip(&spill_dirs).enumerate() {
                 let mut replay = Replay::default();
-                replay_buckets_through(
+                replay_buckets_routed(
                     spill_dir,
                     0..spill_bucket_count,
                     spill_bucket_count as usize,
                     dim,
                     false,
                     u64::MAX,
+                    check_routing,
                     &mut replay,
                 )?;
+                if sources.is_some() {
+                    for bucket in 0..spill_bucket_count {
+                        replay
+                            .analyzed
+                            .extend(read_analysis_file(&analysis_sidecar_path(
+                                spill_dir, bucket,
+                            ))?);
+                    }
+                }
                 replay.compact();
                 if replay.documents.len() as u64 != placed[index] {
                     return Err(format!(
@@ -2599,7 +2996,7 @@ pub fn split_placement_tree_logs(
                     ));
                 }
                 peak_replay_rows = peak_replay_rows.max(live_rows(&replay));
-                let image = finish_child(
+                let image = finish_child_pinned(
                     &manifest,
                     replay,
                     index,
@@ -2608,7 +3005,9 @@ pub fn split_placement_tree_logs(
                     child.hash_lo,
                     child.hash_hi,
                     bm25_fields,
+                    pinned_fingerprints.as_deref(),
                     binding.as_ref(),
+                    pinned_columns.as_ref(),
                     analyze,
                 )?;
                 check_slot_bound(
@@ -2646,15 +3045,20 @@ pub fn split_placement_tree_logs(
                 let mut vectors = 0u64;
                 for bucket in 0..spill_bucket_count {
                     let mut replay = Replay::default();
-                    replay_buckets_through(
+                    replay_buckets_routed(
                         spill_dir,
                         bucket..bucket + 1,
                         spill_bucket_count as usize,
                         dim,
                         false,
                         u64::MAX,
+                        check_routing,
                         &mut replay,
                     )?;
+                    if sources.is_some() {
+                        replay.analyzed =
+                            read_analysis_file(&analysis_sidecar_path(spill_dir, bucket))?;
+                    }
                     replay.compact();
                     let rows = live_rows(&replay);
                     peak_replay_rows = peak_replay_rows.max(rows);
@@ -2662,7 +3066,7 @@ pub fn split_placement_tree_logs(
                         continue;
                     }
                     let ordinal = segments[index];
-                    let image = finish_child(
+                    let image = finish_child_pinned(
                         &manifest,
                         replay,
                         ordinal,
@@ -2671,7 +3075,9 @@ pub fn split_placement_tree_logs(
                         child.hash_lo,
                         child.hash_hi,
                         bm25_fields,
+                        pinned_fingerprints.as_deref(),
                         binding.as_ref(),
+                        pinned_columns.as_ref(),
                         analyze,
                     )?;
                     let image_rows = image_rows(&image);
@@ -2718,7 +3124,7 @@ pub fn split_placement_tree_logs(
                             exact_vector_path: exact_path,
                             bm25_path,
                             live_docs_path: &live_path,
-                            partition_column: None,
+                            partition_column: cut_column,
                         })
                         .map_err(|error| {
                             format!(
@@ -2754,6 +3160,16 @@ pub fn split_placement_tree_logs(
                          routing counted {}",
                         child.leaf, placed[index]
                     ));
+                }
+                if let Some(column) = cut_column {
+                    catalog
+                        .publish_partition_key(Some(column.to_string()))
+                        .map_err(|error| {
+                            format!(
+                                "child {index} ({}): publish partition key: {error}",
+                                child.leaf
+                            )
+                        })?;
                 }
                 std::fs::remove_dir_all(&work)
                     .map_err(|error| format!("remove work {}: {error}", work.display()))?;
@@ -2797,6 +3213,10 @@ pub fn split_placement_tree_logs(
         segments,
         peak_replay_rows,
         spill_bucket_count,
+        source: options.source,
+        cut: options.cut,
+        peak_transpose_bytes,
+        transplanted_rows,
     })
 }
 
@@ -3130,6 +3550,710 @@ pub struct ColumnTables {
     pub integers: Vec<String>,
     pub unsigned_integers: Vec<String>,
     pub geo: Vec<String>,
+}
+
+// ---------------------------------------------------------------------
+// Replay from segments (docs/replay-from-segments.md)
+// ---------------------------------------------------------------------
+
+/// Where a re-placement split takes each document's analyzed fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TreeRowSource {
+    /// Replay the logs and analyze each document's text again.
+    #[default]
+    Logs,
+    /// Read the sealed segments beside each log: the postings transposed
+    /// per document, the columns, text, vectors and identities copied,
+    /// the analyzer not called.
+    Segments,
+}
+
+/// How a child's spill is cut into buckets, and so into segments.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SpillCut {
+    /// By id hash, one bucket per source bucket: each segment then
+    /// spans the column's range and a partitioned compaction follows.
+    #[default]
+    Hash,
+    /// By the integer column's value in ascending order, at most
+    /// `rows_per_cut` rows per cut, the rows without the column last:
+    /// the child comes out partitioned by the column.
+    Column { column: String, rows_per_cut: u64 },
+}
+
+/// One row's analyzed fields in the spill's analysis sidecar.
+fn write_analysis_entry(
+    out: &mut impl std::io::Write,
+    id: u64,
+    fields: &[AnalyzedField],
+) -> std::io::Result<()> {
+    out.write_all(&id.to_le_bytes())?;
+    out.write_all(&(fields.len() as u32).to_le_bytes())?;
+    for field in fields {
+        out.write_all(&field.length.to_le_bytes())?;
+        out.write_all(&[
+            u8::from(field.positions.is_some()),
+            u8::from(field.sentences.is_some()),
+        ])?;
+        out.write_all(&(field.terms.len() as u32).to_le_bytes())?;
+        for (i, (term, tf, spans)) in field.terms.iter().enumerate() {
+            let bytes = term.as_bytes();
+            let len = u16::try_from(bytes.len()).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "term longer than 65535 bytes",
+                )
+            })?;
+            out.write_all(&len.to_le_bytes())?;
+            out.write_all(bytes)?;
+            out.write_all(&tf.to_le_bytes())?;
+            out.write_all(&(spans.len() as u32).to_le_bytes())?;
+            for (start, end) in spans {
+                out.write_all(&start.to_le_bytes())?;
+                out.write_all(&end.to_le_bytes())?;
+            }
+            if let Some(positions) = &field.positions {
+                let ordinals = positions.get(i).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "positions table shorter than the term table",
+                    )
+                })?;
+                if ordinals.len() != spans.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "positions count differs from occurrence count",
+                    ));
+                }
+                for ordinal in ordinals {
+                    out.write_all(&ordinal.to_le_bytes())?;
+                }
+            }
+        }
+        if let Some(sentences) = &field.sentences {
+            out.write_all(&(sentences.len() as u32).to_le_bytes())?;
+            for (start, end) in sentences {
+                out.write_all(&start.to_le_bytes())?;
+                out.write_all(&end.to_le_bytes())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The sidecar of one spill bucket, keyed by source id.
+fn read_analysis_file(path: &Path) -> Result<BTreeMap<u64, Vec<AnalyzedField>>, String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    match std::fs::File::open(path) {
+        Ok(mut file) => file
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("read {}: {e}", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(format!("open {}: {e}", path.display())),
+    };
+    let mut at = 0usize;
+    let take = |at: &mut usize, n: usize| -> Result<&[u8], String> {
+        let end = at
+            .checked_add(n)
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| format!("{}: truncated analysis sidecar", path.display()))?;
+        let out = &bytes[*at..end];
+        *at = end;
+        Ok(out)
+    };
+    let u32_at = |at: &mut usize| -> Result<u32, String> {
+        Ok(u32::from_le_bytes(
+            take(at, 4)?.try_into().expect("four bytes"),
+        ))
+    };
+    let mut out = BTreeMap::new();
+    while at < bytes.len() {
+        let id = u64::from_le_bytes(take(&mut at, 8)?.try_into().expect("eight bytes"));
+        let n_fields = u32_at(&mut at)? as usize;
+        let mut fields = Vec::with_capacity(n_fields);
+        for _ in 0..n_fields {
+            let length = u32_at(&mut at)?;
+            let flags = take(&mut at, 2)?;
+            let (has_positions, has_sentences) = (flags[0] != 0, flags[1] != 0);
+            let n_terms = u32_at(&mut at)? as usize;
+            let mut terms = Vec::with_capacity(n_terms);
+            let mut positions = has_positions.then(|| Vec::with_capacity(n_terms));
+            for _ in 0..n_terms {
+                let len =
+                    u16::from_le_bytes(take(&mut at, 2)?.try_into().expect("two bytes")) as usize;
+                let term = std::str::from_utf8(take(&mut at, len)?)
+                    .map_err(|e| format!("{}: term is not UTF-8: {e}", path.display()))?
+                    .to_string();
+                let tf = u32_at(&mut at)?;
+                let n_occ = u32_at(&mut at)? as usize;
+                let mut spans = Vec::with_capacity(n_occ);
+                for _ in 0..n_occ {
+                    let start = u32_at(&mut at)?;
+                    let end = u32_at(&mut at)?;
+                    spans.push((start, end));
+                }
+                if let Some(positions) = positions.as_mut() {
+                    let mut ordinals = Vec::with_capacity(n_occ);
+                    for _ in 0..n_occ {
+                        ordinals.push(u32_at(&mut at)?);
+                    }
+                    positions.push(ordinals);
+                }
+                terms.push((term, tf, spans));
+            }
+            let sentences = if has_sentences {
+                let n = u32_at(&mut at)? as usize;
+                let mut table = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let start = u32_at(&mut at)?;
+                    let end = u32_at(&mut at)?;
+                    table.push((start, end));
+                }
+                Some(table)
+            } else {
+                None
+            };
+            fields.push(AnalyzedField {
+                terms,
+                length,
+                positions,
+                sentences,
+            });
+        }
+        if out.insert(id, fields).is_some() {
+            return Err(format!(
+                "{}: source id {id} has two analysis entries",
+                path.display()
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// The sidecar file of spill bucket `bucket` under a child's spill dir.
+fn analysis_sidecar_path(spill_dir: &Path, bucket: u32) -> PathBuf {
+    spill_dir.join(format!("analysis-{bucket:05}.bin"))
+}
+
+/// One source shard's catalog beside its log, with the rows its shard
+/// overlay and its log have deleted since the segments sealed.
+struct SegmentSourceShard {
+    gen: PathBuf,
+    root: PathBuf,
+    set: std::sync::Arc<crate::segments::OpenedSegmentSet>,
+    /// The shard-wide live-document overlay (`<index>.tv.live`), when
+    /// written: a delete after a seal lands there, not in the segment's
+    /// own sidecar.
+    overlay: Option<crate::live_docs::LiveDocs>,
+    /// Rows the log deletes or replaces, as local labels.
+    deleted: BTreeSet<u64>,
+    /// The shard's slot offset: a global id is the offset plus the label.
+    slot_offset: u64,
+}
+
+impl SegmentSourceShard {
+    /// Whether shard-local row `label` (segment `i`, row `row` in it) is
+    /// live: the segment's sidecar, the shard overlay, and the log agree.
+    fn is_live(&self, i: usize, row: u32, label: u64) -> bool {
+        if self.set.live_docs(i).is_deleted(row as usize) {
+            return false;
+        }
+        if let Some(overlay) = &self.overlay {
+            if overlay.is_deleted(label as usize) {
+                return false;
+            }
+        }
+        !self.deleted.contains(&label)
+    }
+}
+
+/// The tables every source shares, pinned on the children.
+struct SourceTables {
+    fields: Vec<String>,
+    fingerprints: Vec<u64>,
+    position_fields: Vec<String>,
+    sentence_fields: Vec<String>,
+    columns: ColumnTables,
+}
+
+/// The catalog root of the shard whose log generation is `gen`:
+/// `<index>.tv.wal/gen-N` -> `<index>.tv.segments`.
+fn segments_root_of_gen(gen: &Path) -> Result<PathBuf, String> {
+    let wal_dir = gen.parent().ok_or_else(|| {
+        format!(
+            "{}: a generation directory has a log directory above it",
+            gen.display()
+        )
+    })?;
+    let name = wal_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("{}: log directory has no name", wal_dir.display()))?;
+    let Some(index) = name.strip_suffix(".wal") else {
+        return Err(format!(
+            "{}: the log directory is not named <index>.wal, so the segment catalog beside it \
+             cannot be found; split from the logs instead",
+            wal_dir.display()
+        ));
+    };
+    let index_path = wal_dir.with_file_name(index);
+    Ok(crate::node::segments_root(&index_path))
+}
+
+/// `<index>.tv` of a catalog root `<index>.tv.segments`.
+fn index_path_of_root(root: &Path) -> PathBuf {
+    let name = root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix(".segments"))
+        .unwrap_or_default();
+    root.with_file_name(name)
+}
+
+/// The highest row the log has appended plus one, over its bucket
+/// files, and the rows its records delete or replace.
+fn wal_row_watermark(gen: &Path, bucket_count: u32) -> Result<(u64, BTreeSet<u64>), String> {
+    let mut watermark = 0u64;
+    let mut deleted = BTreeSet::new();
+    for bucket in 0..bucket_count {
+        let path = wal::bucket_path(gen, bucket);
+        if !path.exists() {
+            continue;
+        }
+        let mut reader =
+            RecordReader::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        while let Some(record) = reader
+            .next_record()
+            .map_err(|e| format!("read {}: {e}", path.display()))?
+        {
+            let end = match record.op {
+                Some(wal_record::Op::AddVectors(a)) => {
+                    let rows = a.batch.as_ref().map_or(0, |b| {
+                        if b.dim == 0 {
+                            0
+                        } else {
+                            (b.vectors.len() / b.dim as usize) as u64
+                        }
+                    });
+                    Some(a.first_id.saturating_add(rows))
+                }
+                Some(wal_record::Op::AddDocuments(a)) => {
+                    Some(a.first_id.saturating_add(a.documents.len() as u64))
+                }
+                Some(wal_record::Op::DeleteDocument(d)) => {
+                    deleted.insert(d.doc_id);
+                    None
+                }
+                Some(wal_record::Op::Replacement(r)) => {
+                    deleted.insert(r.old_doc_id);
+                    None
+                }
+                _ => None,
+            };
+            if let Some(end) = end {
+                watermark = watermark.max(end);
+            }
+        }
+    }
+    Ok((watermark, deleted))
+}
+
+/// Open the catalogs beside the logs and check what a child pins
+/// (`docs/replay-from-segments.md`, "The replay").
+fn open_segment_sources(
+    gens: &[PathBuf],
+) -> Result<(Vec<SegmentSourceShard>, SourceTables), String> {
+    let mut shards = Vec::with_capacity(gens.len());
+    let mut tables: Option<SourceTables> = None;
+    for gen in gens {
+        let root = segments_root_of_gen(gen)?;
+        if !root.exists() {
+            return Err(format!(
+                "{}: no segment catalog at {}; the source is a single image (or was never \
+                 flushed on the segment layout), split it from the logs",
+                gen.display(),
+                root.display()
+            ));
+        }
+        let set = std::sync::Arc::new(crate::segments::OpenedSegmentSet::open(&root)?);
+        let manifest = read_gen_manifest(gen)?;
+        let mut rows = 0u64;
+        for i in 0..set.len() {
+            let meta = set.metadata(i);
+            if meta.base_label != rows {
+                return Err(format!(
+                    "{}: segment {} starts at label {} but the segments before it end at {rows}",
+                    root.display(),
+                    meta.segment_id,
+                    meta.base_label
+                ));
+            }
+            rows = meta.end_label_exclusive()?;
+        }
+        let (watermark, deleted) = wal_row_watermark(gen, manifest.bucket_count)?;
+        // The log's ids are global (the shard's slot offset plus the
+        // local row); the catalog's labels are local. Compare in local
+        // terms, and name a log whose ids sit below its own offset.
+        let local_watermark = if watermark == 0 {
+            0
+        } else {
+            watermark.checked_sub(manifest.slot_offset).ok_or_else(|| {
+                format!(
+                    "{}: the log holds rows through {} but its manifest places the shard at slot \
+                     offset {}; the log and its manifest disagree",
+                    gen.display(),
+                    watermark - 1,
+                    manifest.slot_offset
+                )
+            })?
+        };
+        if local_watermark > rows {
+            return Err(format!(
+                "{}: the log holds rows through {} (local row {}) but the catalog at {} ends at \
+                 {rows}; the unsealed tail would be lost, flush the source first",
+                gen.display(),
+                watermark - 1,
+                local_watermark - 1,
+                root.display()
+            ));
+        }
+        for i in 0..set.len() {
+            let bm25 = set.bm25(i);
+            let fields: Vec<String> = (0..bm25.field_count())
+                .map(|f| bm25.field_name(f).to_string())
+                .collect();
+            let fingerprints: Vec<u64> = (0..bm25.field_count())
+                .map(|f| bm25.analysis_fingerprint(f))
+                .collect();
+            let position_fields: Vec<String> = (0..bm25.field_count())
+                .filter(|&f| bm25.field_has_positions(f))
+                .map(|f| bm25.field_name(f).to_string())
+                .collect();
+            let sentence_fields: Vec<String> = (0..bm25.field_count())
+                .filter(|&f| bm25.field_has_sentences(f))
+                .map(|f| bm25.field_name(f).to_string())
+                .collect();
+            let columns = ColumnTables {
+                facets: (0..bm25.facet_count())
+                    .map(|c| bm25.facet_name(c).to_string())
+                    .collect(),
+                numerics: (0..bm25.numeric_count())
+                    .map(|c| bm25.numeric_name(c).to_string())
+                    .collect(),
+                map_facets: (0..bm25.map_facet_count())
+                    .map(|c| bm25.map_facet_name(c).to_string())
+                    .collect(),
+                map_numerics: (0..bm25.map_numeric_count())
+                    .map(|c| bm25.map_numeric_name(c).to_string())
+                    .collect(),
+                integers: (0..bm25.integer_count())
+                    .map(|c| bm25.integer_name(c).to_string())
+                    .collect(),
+                unsigned_integers: (0..bm25.unsigned_integer_count())
+                    .map(|c| bm25.unsigned_integer_name(c).to_string())
+                    .collect(),
+                geo: (0..bm25.geo_count())
+                    .map(|c| bm25.geo_name(c).to_string())
+                    .collect(),
+            };
+            let this = SourceTables {
+                fields,
+                fingerprints,
+                position_fields,
+                sentence_fields,
+                columns,
+            };
+            match &tables {
+                None => tables = Some(this),
+                Some(first) => {
+                    let what = format!("{} segment {}", root.display(), set.metadata(i).segment_id);
+                    if first.fields != this.fields {
+                        return Err(format!(
+                            "{what}: field table {:?} differs from the first source's {:?}; a \
+                             child is one store and cannot mix tables",
+                            this.fields, first.fields
+                        ));
+                    }
+                    if first.fingerprints != this.fingerprints {
+                        return Err(format!(
+                            "{what}: analysis fingerprints {:?} differ from the first source's \
+                             {:?}; a child cannot mix analyzers, split from the logs to re-analyze",
+                            this.fingerprints, first.fingerprints
+                        ));
+                    }
+                    if first.position_fields != this.position_fields {
+                        return Err(format!(
+                            "{what}: positional fields {:?} differ from the first source's {:?}",
+                            this.position_fields, first.position_fields
+                        ));
+                    }
+                    if first.sentence_fields != this.sentence_fields {
+                        return Err(format!(
+                            "{what}: sentence fields {:?} differ from the first source's {:?}",
+                            this.sentence_fields, first.sentence_fields
+                        ));
+                    }
+                    if first.columns != this.columns {
+                        return Err(format!(
+                            "{what}: column tables differ from the first source's; a child is \
+                             one store and cannot mix column tables"
+                        ));
+                    }
+                }
+            }
+        }
+        let overlay_path = crate::node::live_docs_sidecar_path(&index_path_of_root(&root));
+        let overlay = if overlay_path.exists() {
+            Some(
+                crate::live_docs::LiveDocs::open(&overlay_path)
+                    .map_err(|e| format!("open {}: {e}", overlay_path.display()))?,
+            )
+        } else {
+            None
+        };
+        // The log names deleted and replaced rows by global id; the
+        // catalog's labels are local, so the set is kept in local terms.
+        let deleted = deleted
+            .into_iter()
+            .map(|id| {
+                id.checked_sub(manifest.slot_offset).ok_or_else(|| {
+                    format!(
+                        "{}: the log deletes row {id}, below the shard's slot offset {}; the log \
+                         and its manifest disagree",
+                        gen.display(),
+                        manifest.slot_offset
+                    )
+                })
+            })
+            .collect::<Result<BTreeSet<u64>, String>>()?;
+        shards.push(SegmentSourceShard {
+            gen: gen.clone(),
+            root,
+            set,
+            overlay,
+            deleted,
+            slot_offset: manifest.slot_offset,
+        });
+    }
+    let tables = tables.ok_or_else(|| {
+        "the sources have no sealed segment; there is nothing to transplant".to_string()
+    })?;
+    Ok((shards, tables))
+}
+
+/// The logged document row `row` of `bm25` stands for: its columns,
+/// and with `with_text` its text, lineage, source and identity too.
+fn reconstruct_document(
+    bm25: &crate::postings::Bm25Reader,
+    row: u32,
+    tables: &SourceTables,
+    with_text: bool,
+) -> Result<AddDocumentsRequest, String> {
+    use crate::postings::Bm25Index;
+    let mut doc = AddDocumentsRequest::default();
+    if with_text {
+        let text =
+            Bm25Index::text(bm25, row).ok_or_else(|| format!("row {row} has no stored text"))?;
+        doc.text = text;
+        doc.lineage = Bm25Index::lineage(bm25, row).map(|l| crate::pb::DocLineage {
+            parent_id: l.parent_id,
+            group_id: l.group_id,
+            span_start: l.span_start,
+            span_end: l.span_end,
+        });
+        if let Some((source, ordinal)) = bm25
+            .protobuf_source(row)
+            .map_err(|e| format!("row {row}: read original source: {e}"))?
+        {
+            doc.original_source = Some(source);
+            doc.source_chunk_ordinal = ordinal;
+        }
+        doc.identity = bm25.document_identity(row);
+        doc.position_fields = tables.position_fields.clone();
+        doc.sentence_fields = tables.sentence_fields.clone();
+    }
+    for (fi, name) in tables.columns.facets.iter().enumerate() {
+        if let Some(ord) = bm25.facet_ord(fi, row) {
+            doc.facets.push(crate::pb::FacetValue {
+                field: name.clone(),
+                value: bm25.facet_value(fi, ord).to_string(),
+            });
+        }
+    }
+    for (ni, name) in tables.columns.numerics.iter().enumerate() {
+        if let Some(value) = bm25.numeric_value(ni, row) {
+            doc.numerics.push(crate::pb::NumericValue {
+                field: name.clone(),
+                value,
+            });
+        }
+    }
+    for (ii, name) in tables.columns.integers.iter().enumerate() {
+        if let Some(value) = bm25.integer_value(ii, row) {
+            doc.integers.push(crate::pb::IntegerValue {
+                field: name.clone(),
+                value,
+            });
+        }
+    }
+    for (ui, name) in tables.columns.unsigned_integers.iter().enumerate() {
+        if let Some(value) = bm25.unsigned_integer_value(ui, row) {
+            doc.unsigned_integers.push(crate::pb::UnsignedIntegerValue {
+                field: name.clone(),
+                value,
+            });
+        }
+    }
+    for (gi, name) in tables.columns.geo.iter().enumerate() {
+        if let Some((lat, lon)) = bm25.geo_value(gi, row) {
+            doc.geo_points.push(crate::pb::GeoPointValue {
+                field: name.clone(),
+                lat,
+                lon,
+            });
+        }
+    }
+    for (ci, name) in tables.columns.map_facets.iter().enumerate() {
+        for (key_ord, key) in bm25.map_facet_keys(ci).iter().enumerate() {
+            if let Some(ord) = bm25.map_facet_value_ord(ci, key_ord as u32, row) {
+                doc.map_facets.push(crate::pb::MapFacetEntry {
+                    field: name.clone(),
+                    key: key.clone(),
+                    value: bm25.map_facet_value(ci, ord).to_string(),
+                });
+            }
+        }
+    }
+    for (ci, name) in tables.columns.map_numerics.iter().enumerate() {
+        for (key_ord, key) in bm25.map_numeric_keys(ci).iter().enumerate() {
+            if let Some(value) = bm25.map_numeric_value(ci, key_ord as u32, row) {
+                doc.map_numerics.push(crate::pb::MapNumericEntry {
+                    field: name.clone(),
+                    key: key.clone(),
+                    value,
+                });
+            }
+        }
+    }
+    Ok(doc)
+}
+
+/// The exact-vector sidecar of segment `i`, when the segment has vectors.
+fn open_segment_exact(
+    shard: &SegmentSourceShard,
+    i: usize,
+) -> Result<Option<crate::exact_vectors::ExactVectorStore>, String> {
+    let meta = shard.set.metadata(i);
+    if shard.set.vector(i).is_none() {
+        return Ok(None);
+    }
+    if meta.exact_vectors.file.is_empty() {
+        return Err(format!(
+            "{} segment {}: has a vector image but no exact-vector sidecar; a transplant copies \
+             FP32 rows, rebuild or backfill the source",
+            shard.root.display(),
+            meta.segment_id
+        ));
+    }
+    let path = crate::segments::SegmentCatalog::segment_dir(&shard.root, &meta.segment_id)
+        .join(&meta.exact_vectors.file);
+    let store = crate::exact_vectors::ExactVectorStore::open(&path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    if store.len() as u64 != meta.rows {
+        return Err(format!(
+            "{} segment {}: exact sidecar has {} rows, the segment {}",
+            shard.root.display(),
+            meta.segment_id,
+            store.len(),
+            meta.rows
+        ));
+    }
+    Ok(Some(store))
+}
+
+/// Where a child's rows go under a column cut: the cut of each value,
+/// a run longer than the bound split by row count, unkeyed rows last.
+#[derive(Debug, Clone, Default)]
+struct ChildCutPlan {
+    /// Inclusive upper key of each cut, ascending.
+    bounds: Vec<i64>,
+    /// A key whose run is longer than the bound: `(first cut, cuts)`.
+    long_runs: BTreeMap<i64, (u32, u32)>,
+    /// Rows of a long-run key filed so far, for the split by count.
+    filed: BTreeMap<i64, u64>,
+    /// The bucket for rows without the column.
+    unkeyed: u32,
+    /// Buckets in use, unkeyed included.
+    buckets: u32,
+}
+
+impl ChildCutPlan {
+    fn plan(histogram: &BTreeMap<i64, u64>, unkeyed_rows: u64, rows_per_cut: u64) -> Self {
+        let mut bounds = Vec::new();
+        let mut long_runs = BTreeMap::new();
+        let mut current = 0u64;
+        let mut open = false;
+        for (&key, &count) in histogram {
+            if count > rows_per_cut {
+                if open {
+                    bounds.push(key - 1);
+                    open = false;
+                    current = 0;
+                }
+                let cuts = count.div_ceil(rows_per_cut) as u32;
+                long_runs.insert(key, (bounds.len() as u32, cuts));
+                for _ in 0..cuts {
+                    bounds.push(key);
+                }
+                continue;
+            }
+            if open && current + count > rows_per_cut {
+                bounds.push(key - 1);
+                current = 0;
+            }
+            open = true;
+            current += count;
+        }
+        if open {
+            bounds.push(i64::MAX);
+        }
+        let keyed = bounds.len() as u32;
+        let has_unkeyed = unkeyed_rows > 0;
+        Self {
+            bounds,
+            long_runs,
+            filed: BTreeMap::new(),
+            unkeyed: keyed,
+            buckets: keyed + u32::from(has_unkeyed),
+        }
+    }
+
+    fn bucket(&mut self, key: Option<i64>, rows_per_cut: u64) -> u32 {
+        let Some(key) = key else {
+            return self.unkeyed;
+        };
+        if let Some(&(first, cuts)) = self.long_runs.get(&key) {
+            let filed = self.filed.entry(key).or_insert(0);
+            let cut = (*filed / rows_per_cut) as u32;
+            *filed += 1;
+            return first + cut.min(cuts - 1);
+        }
+        self.bounds.partition_point(|bound| *bound < key) as u32
+    }
+}
+
+/// Cut plans for every child from the (child, value) histograms.
+fn plan_cuts(
+    histograms: &[BTreeMap<i64, u64>],
+    unkeyed: &[u64],
+    rows_per_cut: u64,
+) -> Vec<ChildCutPlan> {
+    histograms
+        .iter()
+        .zip(unkeyed)
+        .map(|(histogram, &unkeyed)| ChildCutPlan::plan(histogram, unkeyed, rows_per_cut))
+        .collect()
 }
 
 /// The partition key of one logged document: its value in `column`,

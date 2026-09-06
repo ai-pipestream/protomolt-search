@@ -278,13 +278,23 @@ addresses left to fill in; each child serves under
 `--placement-leaf=<its code>`, and `--placement-tree=<that map>`, and a
 child's code that is no leaf of the old tree is refused by name if it
 is started under the old map. Documents are re-analyzed through the
-sidecar as in every replay. The split is offline: no live cutoff is
-recorded, so the sources must be quiescent. `--single-image=<max child
-rows>` writes one image per child instead, the shape the other splits
-write, and refuses a child above the bound before writing anything. A
-segment covers one hash bucket of the band, not a year range, so the
-year cut inside a leaf is still `CompactShard` with `partition_column`
-on the served child (`docs/segment-pruning.md`).
+sidecar as in every replay, unless `--from-segments` names the sealed
+segments beside each log as the source of every document's analyzed
+fields, columns, text, vectors and identities
+(`docs/replay-from-segments.md`): the analyzer is not called, the
+sources must be flushed (an unsealed tail is refused by name), and they
+must share one field table, one analysis fingerprint per field, and one
+set of column tables. The split is offline: no live cutoff is recorded,
+so the sources must be quiescent. `--single-image=<max child rows>`
+writes one image per child instead, the shape the other splits write,
+and refuses a child above the bound before writing anything. Under the
+hash cut a segment covers one hash bucket of the band, not a year range,
+so the year cut inside a leaf is `CompactShard` with `partition_column`
+on the served child (`docs/segment-pruning.md`); `--cut-column=year
+--cut-rows=<n>` cuts each child's spill by the year instead, so the
+child's segments come out in year order with partition summaries and
+the catalog names the partition key, the layout a compaction would have
+left.
 
 The hitless flow (tail while the parent serves, then freeze, catch up,
 publish) still partitions by the stable-key hash; keying its catch-up

@@ -1061,6 +1061,7 @@ async fn a_re_placement_split_puts_each_row_in_its_new_leaf() {
                 max_child_rows: largest_child,
             },
             spill_bucket_bits: Some(0),
+            ..Default::default()
         },
         &mut replay_analyzer(NATIVE_ANALYSIS_BACKEND),
     )
@@ -1088,6 +1089,7 @@ async fn a_re_placement_split_puts_each_row_in_its_new_leaf() {
                 max_child_rows: largest_child - 1,
             },
             spill_bucket_bits: None,
+            ..Default::default()
         },
         &mut replay_analyzer(NATIVE_ANALYSIS_BACKEND),
     )

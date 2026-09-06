@@ -350,7 +350,56 @@ connection with ENHANCE_YOUR_CALM: the bulk analysis path opened six
 streams per 32-entry batch and let each go with its trailers unread,
 a RST_STREAM on the wire, about 600 a second, past grpc-netty's
 rapid-reset guard. With the stream drained to the server's end
-(b0ee87c) the fourth attempt is running.
+(b0ee87c) the fourth attempt ran to the end: 4 h 45 min, 26 GB
+resident at the peak, six bands of 10.6M to 12.2M documents in 64
+segments each, 66,421,881 documents in all, the generation-10 archive
+to the document. krick-1 ran at a load of 1.2 on 32 cores while it
+did: the reshard's one thread at 0.6 of a core and the sidecar at
+1.5, the child build a serial round trip of 32 documents at a time.
+
+### Generation 11 on the bands
+
+The bands serve on krick-1 (:19411-:19416) under the split's own map
+(`root-map-v11.toml`, the relay on pi5v1 for `recent`) behind a root
+on :19393. One trap on the way: a child of the log replay declares its
+integer columns in the order its records list them (`year, placement,
+decided`), the source segments in the node's flag order (`year,
+decided, placement`), and a node compares a segment's tables with its
+own by position, so the bands open only under
+`--integer-fields=year,placement,decided`. The transplant replay
+below pins the sources' tables on the children instead.
+
+A re-placement renumbers: an archive document's id is its new band's
+slot, so the id-level comparison with the generation-10 root differs
+on every archive hit while the scores agree to the digit, and a
+fetched document is the same text under both ids (1085983 on the old
+shard 0, 39447484 on the `a2000` band, one SHA-256). The boolean shapes
+through :19393 cost what they cost through :19391 (0.2 to 0.9 s, a
+23 MB root). What the bands add is shard pruning on the archive, k =
+10, warm:
+
+| Filter | Generation 10 root | Generation 11 root |
+|---|---|---|
+| lexical, `year < 1990` | 90 ms, 7 shards, 197 of 322 segments skipped | 53 ms, 4 of 7 shards skipped, 192 segments consulted |
+| lexical, `year < 1940` | 100 ms, 7 shards | 42 ms, 6 of 7 shards skipped, 64 segments |
+| lexical, `year >= 2008 && year < 2015` | 49 ms, 7 shards | 58 ms, 1 shard skipped, 320 of 384 segments skipped |
+| lexical, `year >= 1976 && year < 1990` | 55 ms, 7 shards | 42 ms, 4 of 7 shards skipped |
+| dense, `year < 1990` | 255 ms, 7 shards | 286 ms, 4 of 7 shards skipped |
+
+The lexical shapes halve; the dense shapes do not move, because a
+dense scan's wall time is its slowest shard's and the surviving bands
+still scan every segment: the year cut inside a band is what the
+segment summaries need, and that is the transplant run below.
+
+### The transplant
+
+`reshard --from-segments --cut-column=year --cut-rows=1000000`
+(12e624c, `docs/replay-from-segments.md`) replays the same six logs
+with each document's analyzed fields copied from the source segments
+through a per-field transpose, the analyzer never called, and cuts
+each band's spill by year so the segments come out partitioned with
+summaries, no compaction step. Its run on the archive started at
+15:41 into `shards-v11/archive-fs`; its numbers go here.
 
 ## What remains
 
@@ -367,4 +416,9 @@ rapid-reset guard. With the stream drained to the server's end
   (`docs/segment-pruning.md`).
 - The boolean lexical clause's candidate walk (600 ms where the
   allowlist shape's block-max search takes 70-100 ms).
+- The log replay's children declare their column tables in record
+  order; they should pin the sources' order as the transplant does.
+- The partitioned compaction of a served catalog that has no log (the
+  split's children): the transplant fed into the shadow build,
+  designed in `docs/replay-from-segments.md`.
 - Control-plane leases for the scan rate.
