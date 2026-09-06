@@ -2288,9 +2288,10 @@ pub fn tree_children(placement: &crate::placement::Placement) -> Result<Vec<Tree
 /// no document cannot be evaluated and refuses the split by id. Memory
 /// is bounded by one WAL bucket during routing and by the largest child
 /// while its image is built: rows are spilled per child under
-/// `out_dir/spill` first, as a partitioned compaction does. Offline
+/// `out_dir/spill` first, as a partitioned compaction does, and under
+/// [`TreeChildLayout::Segmented`] (the default) each child is a catalog
+/// sealed one spill bucket at a time, so memory is one bucket. Offline
 /// only: no live cutoff is recorded, so the sources must be quiescent.
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 pub fn split_placement_tree_logs(
     gens: &[PathBuf],
