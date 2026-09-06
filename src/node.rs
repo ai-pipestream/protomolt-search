@@ -3237,6 +3237,49 @@ pub(crate) struct ShardState {
 pub(crate) const STALE_STATS_EPOCH: &str = "stale stats epoch";
 
 impl ShardState {
+    /// Check under the same guard that reads postings. A binding also pins fields
+    /// with no rows yet; a field name alone does not establish term identity.
+    fn check_query_analysis(&self, field: &str, offered: u64) -> Result<(), Status> {
+        let explicit = self
+            .mapped_binding
+            .as_ref()
+            .filter(|binding| !binding.analysis_sha.is_empty());
+        let bound = match explicit {
+            Some(binding) => crate::mapped_analysis::decode_contract(
+                &binding.analysis_sha,
+                &binding.analysis_contract,
+                &binding.body_path,
+            )
+            .map_err(Status::failed_precondition)?
+            .fields
+            .into_iter()
+            .find(|column| column.name == field)
+            .map(|column| crate::analyzer::analysis_fingerprint(column.analysis.as_ref())),
+            None => None,
+        };
+        let held = bound
+            .or_else(|| {
+                self.bm25.as_ref().and_then(|store| {
+                    store
+                        .field_index(field)
+                        .map(|fi| store.analysis_fingerprint(fi))
+                })
+            })
+            .unwrap_or(0);
+        if held != 0 && ((explicit.is_some() && offered == 0) || (offered != 0 && held != offered))
+        {
+            let reason = if offered == 0 {
+                "explicit mapped analysis cannot be omitted"
+            } else {
+                "the two score different term identities"
+            };
+            return Err(Status::failed_precondition(format!(
+                "field {field:?} was built with analyzer fingerprint {held:#x} but the query's terms were analyzed under {offered:#x}; {reason}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Enforce a scoring request's stats-epoch claim (see
     /// `Bm25QueryRequest.expected_stats_epoch`). Must be called under
     /// the same guard the scoring reads through — checking on one guard
@@ -6922,6 +6965,9 @@ impl NodeServiceImpl {
         }
         let guard = read_shard(&self.state);
         guard.check_stats_epoch(req.expected_stats_epoch)?;
+        for leg in &req.fields {
+            guard.check_query_analysis(&leg.field, leg.analysis_fingerprint)?;
+        }
         // Filled inside the scoring arm (the facet walk reuses the
         // resolved field views); a shard with no lexical half answers
         // every requested facet field as unknown.
@@ -6958,23 +7004,6 @@ impl NodeServiceImpl {
                 let mut leg_of_view: Vec<usize> = Vec::new();
                 for (li, leg) in req.fields.iter().enumerate() {
                     if let Some(fi) = store.field_index(&leg.field) {
-                        // Term identity is a contract, and the field
-                        // name does not carry it. A column built folded
-                        // and queried cased matches on name, scores
-                        // different terms, and returns a ranking that
-                        // looks perfectly reasonable. Refuse instead.
-                        let held = store.analysis_fingerprint(fi);
-                        if held != 0
-                            && leg.analysis_fingerprint != 0
-                            && held != leg.analysis_fingerprint
-                        {
-                            return Err(Status::failed_precondition(format!(
-                                "field {:?} was built with analyzer fingerprint {held:#x} but the \
-                                 query's terms were analyzed under {:#x}; the two score different \
-                                 term identities",
-                                leg.field, leg.analysis_fingerprint
-                            )));
-                        }
                         views.push(store.field_view(fi).expect("searchable, checked above"));
                         leg_of_view.push(li);
                     }
@@ -7332,6 +7361,7 @@ impl NodeServiceImpl {
         &self,
         vector: &[f32],
         terms: &[String],
+        analysis_fingerprint: u64,
         global_doc_count: u64,
         global_total_doc_length: u64,
         global_doc_frequencies: &[u32],
@@ -7341,6 +7371,9 @@ impl NodeServiceImpl {
         filters: &LegFilters<'_>,
     ) -> Result<LegResults, Status> {
         let guard = read_shard(&self.state);
+        if !terms.is_empty() {
+            guard.check_query_analysis("body", analysis_fingerprint)?;
+        }
         guard.check_stats_epoch(expected_stats_epoch)?;
         // One resolution for both legs (docs/vector-filters.md): the
         // allowlist the vector kernel scans under and the predicate the
@@ -7484,6 +7517,7 @@ impl NodeServiceImpl {
         let legs = self.compute_legs(
             &req.vector,
             &req.terms,
+            req.analysis_fingerprint,
             req.global_doc_count,
             req.global_total_doc_length,
             &req.global_doc_frequencies,
@@ -10652,6 +10686,7 @@ impl NodeService for NodeServiceImpl {
             }
             let geo_regions = validate_geo_filters(&req.geo_filters)?;
             let guard = read_shard(&self.state);
+            if !req.lexical_terms.is_empty() { guard.check_query_analysis("body", req.analysis_fingerprint)?; }
             let (geo_columns_known, filter_columns_known) =
                 filter_known_flags(guard.bm25.as_ref(), &req.geo_filters, req.filter.as_ref());
             let slot_offset = self.config.slot_offset;
@@ -11002,6 +11037,7 @@ impl NodeService for NodeServiceImpl {
     ) -> Result<Response<MembershipBitmapResponse>, Status> {
         let req = request.into_inner();
         let guard = read_shard(&self.state);
+        guard.check_query_analysis("body", req.analysis_fingerprint)?;
         let Some(shard) = guard.bm25.as_ref() else {
             return Ok(Response::new(MembershipBitmapResponse {
                 segments_total: 0,
@@ -13562,6 +13598,7 @@ impl NodeService for NodeServiceImpl {
                 let legs = service.compute_legs(
                     &req.vector,
                     &req.terms,
+                    req.analysis_fingerprint,
                     req.global_doc_count,
                     req.global_total_doc_length,
                     &req.global_doc_frequencies,
@@ -13902,6 +13939,7 @@ impl NodeServiceImpl {
         }
         let guard = read_shard(&self.state);
         guard.check_stats_epoch(req.expected_stats_epoch)?;
+        guard.check_query_analysis("body", req.analysis_fingerprint)?;
         // The request's filters, resolved ONCE against this shard's
         // tables and shared by facet counting and the scorers below —
         // one resolution, one truth (docs/geo-columns.md,
@@ -14346,6 +14384,7 @@ impl NodeServiceImpl {
         let offset = self.config.slot_offset;
         let guard = read_shard(&self.state);
         guard.check_stats_epoch(req.expected_stats_epoch)?;
+        guard.check_query_analysis("body", req.analysis_fingerprint)?;
         let (hits, stage_columns_known) = match guard.bm25.as_ref() {
             Some(store) => {
                 // Route global ids to this shard's local range.

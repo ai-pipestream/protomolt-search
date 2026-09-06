@@ -1222,6 +1222,14 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Query analyzer identity (2026-09-05, feature branch).** Flat BM25,
+  hybrid legs, candidate rescoring, lexical membership and lexical sorting now
+  carry the originating analyzer fingerprint. Explicit mapped fields require a
+  matching nonzero identity, including before the first indexed row; fused
+  fields enforce their own specifications. The coordinator preserves identity
+  through boosts, Boolean planning and relays. Legacy zero identities remain
+  unknown. See [query analysis](docs/descriptor-mappings.md#query-analysis-identity-2026-09-05-feature-branch).
+
 - **Explicit mapped text analysis (2026-09-05, feature branch).**
   `MappedBind.field_analysis` supplies specifications for every projected TEXT
   path, including native nested/wrapped non-body fields. The full resolved

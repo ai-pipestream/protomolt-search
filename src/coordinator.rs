@@ -3514,6 +3514,7 @@ impl CoordinatorServiceImpl {
         synonym_expansions: &mut Vec<crate::pb::SynonymExpansion>,
         explain: bool,
     ) -> Result<AggregatedHits, Status> {
+        let analysis_fingerprint = crate::analyzer::analysis_fingerprint(spec);
         // Edge-list validation needs no shard, so it must not hide
         // behind the zero-term early return below: a malformed request
         // refuses even when there is no match set to count. (The nodes
@@ -3575,6 +3576,7 @@ impl CoordinatorServiceImpl {
             match self
                 .bm25_query_round(
                     &terms,
+                    analysis_fingerprint,
                     k,
                     min_score,
                     &global,
@@ -3612,6 +3614,7 @@ impl CoordinatorServiceImpl {
     async fn bm25_query_round(
         &self,
         terms: &[String],
+        analysis_fingerprint: u64,
         k: u32,
         min_score: f32,
         global: &CorpusStats,
@@ -3654,6 +3657,7 @@ impl CoordinatorServiceImpl {
                 continue;
             }
             let request = Bm25QueryRequest {
+                analysis_fingerprint,
                 highlight: highlight.cloned(),
                 projections: projections.to_vec(),
                 terms: terms.to_vec(),
@@ -4882,6 +4886,7 @@ impl CoordinatorServiceImpl {
                 continue;
             }
             let request = Bm25QueryRequest {
+                analysis_fingerprint: 0,
                 highlight: highlight.cloned(),
                 projections: Vec::new(),
                 terms: Vec::new(),
@@ -5145,6 +5150,7 @@ impl CoordinatorServiceImpl {
         debug: bool,
         filters: &RequestFilters,
     ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
+        let analysis_fingerprint = crate::analyzer::analysis_fingerprint(spec);
         if k == 0 || vector.is_empty() {
             return Ok((Vec::new(), None));
         }
@@ -5174,19 +5180,46 @@ impl CoordinatorServiceImpl {
             let round = match legs.fusion_mode {
                 FusionMode::TwoLevel => {
                     self.fanout_hybrid_two_level(
-                        request_id, vector, k, &terms, &global, &claims, legs, debug, filters,
+                        request_id,
+                        vector,
+                        k,
+                        &terms,
+                        analysis_fingerprint,
+                        &global,
+                        &claims,
+                        legs,
+                        debug,
+                        filters,
                     )
                     .await
                 }
                 FusionMode::Decomposed => {
                     self.fanout_hybrid_decomposed(
-                        request_id, vector, k, &terms, &global, &claims, legs, debug, filters,
+                        request_id,
+                        vector,
+                        k,
+                        &terms,
+                        analysis_fingerprint,
+                        &global,
+                        &claims,
+                        legs,
+                        debug,
+                        filters,
                     )
                     .await
                 }
                 _ => {
                     self.fanout_hybrid_global_rank(
-                        request_id, vector, k, &terms, &global, &claims, legs, debug, filters,
+                        request_id,
+                        vector,
+                        k,
+                        &terms,
+                        analysis_fingerprint,
+                        &global,
+                        &claims,
+                        legs,
+                        debug,
+                        filters,
                     )
                     .await
                 }
@@ -5292,6 +5325,7 @@ impl CoordinatorServiceImpl {
         vector: &[f32],
         k: u32,
         terms: &[String],
+        analysis_fingerprint: u64,
         global: &CorpusStats,
         claims: &[u64],
         legs: HybridLegs,
@@ -5326,6 +5360,7 @@ impl CoordinatorServiceImpl {
                 continue;
             }
             let request = ShardLegsRequest {
+                analysis_fingerprint,
                 request_id: request_id.to_string(),
                 k: legs.leg_k,
                 vector: Vec::new(),
@@ -5469,6 +5504,7 @@ impl CoordinatorServiceImpl {
         vector: &[f32],
         k: u32,
         terms: &[String],
+        analysis_fingerprint: u64,
         global: &CorpusStats,
         claims: &[u64],
         legs: HybridLegs,
@@ -5479,7 +5515,16 @@ impl CoordinatorServiceImpl {
         if self.clustered_vectors.is_some() {
             return self
                 .clustered_hybrid_global_rank(
-                    request_id, vector, k, terms, global, claims, legs, debug, filters,
+                    request_id,
+                    vector,
+                    k,
+                    terms,
+                    analysis_fingerprint,
+                    global,
+                    claims,
+                    legs,
+                    debug,
+                    filters,
                 )
                 .await;
         }
@@ -5492,6 +5537,7 @@ impl CoordinatorServiceImpl {
                 continue;
             }
             let request = ShardLegsRequest {
+                analysis_fingerprint,
                 request_id: String::new(),
                 k: legs.leg_k,
                 vector: leg_vector.clone(),
@@ -5664,6 +5710,7 @@ impl CoordinatorServiceImpl {
         vector: &[f32],
         k: u32,
         terms: &[String],
+        analysis_fingerprint: u64,
         global: &CorpusStats,
         claims: &[u64],
         legs: HybridLegs,
@@ -5683,6 +5730,7 @@ impl CoordinatorServiceImpl {
                 continue;
             }
             let request = ShardLegsRequest {
+                analysis_fingerprint,
                 request_id: request_id.to_string(),
                 k: legs.leg_k,
                 vector: Vec::new(),
@@ -5828,6 +5876,7 @@ impl CoordinatorServiceImpl {
         vector: &[f32],
         k: u32,
         terms: &[String],
+        analysis_fingerprint: u64,
         global: &CorpusStats,
         claims: &[u64],
         legs: HybridLegs,
@@ -5838,7 +5887,16 @@ impl CoordinatorServiceImpl {
         if self.clustered_vectors.is_some() {
             return self
                 .clustered_hybrid_two_level(
-                    request_id, vector, k, terms, global, claims, legs, debug, filters,
+                    request_id,
+                    vector,
+                    k,
+                    terms,
+                    analysis_fingerprint,
+                    global,
+                    claims,
+                    legs,
+                    debug,
+                    filters,
                 )
                 .await;
         }
@@ -5852,6 +5910,7 @@ impl CoordinatorServiceImpl {
                 continue;
             }
             let request = HybridShardRequest {
+                analysis_fingerprint,
                 request_id: request_id.to_string(),
                 k: legs.leg_k,
                 vector: leg_vector.clone(),
@@ -6006,6 +6065,7 @@ impl CoordinatorServiceImpl {
         vector: &[f32],
         k: u32,
         terms: &[String],
+        analysis_fingerprint: u64,
         global: &CorpusStats,
         claims: &[u64],
         legs: HybridLegs,
@@ -6041,6 +6101,7 @@ impl CoordinatorServiceImpl {
                     continue;
                 }
                 let request = Bm25QueryRequest {
+                    analysis_fingerprint,
                     highlight: None,
                     projections: Vec::new(),
                     terms: terms.to_vec(),
@@ -6364,7 +6425,14 @@ impl CoordinatorServiceImpl {
             }
         }
         let rescored_b = self
-            .fanout_bm25_rescore_scores(terms, global, claims, rescore_ids, &[])
+            .fanout_bm25_rescore_scores(
+                terms,
+                analysis_fingerprint,
+                global,
+                claims,
+                rescore_ids,
+                &[],
+            )
             .await?;
         for (doc, shard, v) in rescore_docs {
             // Absent from the rescore response = no query term matches
@@ -6510,6 +6578,7 @@ impl CoordinatorServiceImpl {
     async fn fanout_bm25_rescore_scores(
         &self,
         terms: &[String],
+        analysis_fingerprint: u64,
         global: &CorpusStats,
         claims: &[u64],
         by_shard: HashMap<u32, Vec<u64>>,
@@ -6518,6 +6587,7 @@ impl CoordinatorServiceImpl {
         let mut tasks = Vec::with_capacity(by_shard.len());
         for (shard, ids) in by_shard {
             let request = Bm25RescoreRequest {
+                analysis_fingerprint,
                 terms: terms.to_vec(),
                 global_doc_count: global.doc_count,
                 global_total_doc_length: global.total_doc_length,
@@ -6571,6 +6641,7 @@ impl CoordinatorServiceImpl {
     async fn cascade_rescore_round(
         &self,
         terms: &[String],
+        analysis_fingerprint: u64,
         global: &CorpusStats,
         claims: &[u64],
         by_shard: &std::collections::HashMap<u32, Vec<u64>>,
@@ -6585,6 +6656,7 @@ impl CoordinatorServiceImpl {
         for (&shard, ids) in by_shard {
             let node = &self.node_addrs[shard as usize];
             let request = Bm25RescoreRequest {
+                analysis_fingerprint,
                 terms: terms.to_vec(),
                 global_doc_count: global.doc_count,
                 global_total_doc_length: global.total_doc_length,
@@ -7499,6 +7571,7 @@ impl CoordinatorServiceImpl {
         debug: bool,
         filters: &RequestFilters,
     ) -> Result<(Vec<CascadeHit>, Option<HybridDebug>), Status> {
+        let analysis_fingerprint = crate::analyzer::analysis_fingerprint(spec);
         if k == 0 || vector.is_empty() {
             return Ok((Vec::new(), None));
         }
@@ -7597,7 +7670,7 @@ impl CoordinatorServiceImpl {
             let stats_ms = t.elapsed().as_secs_f32() * 1e3;
             let t_rescore = std::time::Instant::now();
             match self
-                .cascade_rescore_round(&terms, &global, &claims, &by_shard)
+                .cascade_rescore_round(&terms, analysis_fingerprint, &global, &claims, &by_shard)
                 .await
             {
                 Err(e) if !fresh && is_stale_stats(&e) => {
@@ -7694,6 +7767,7 @@ impl CoordinatorServiceImpl {
         spec: Option<&crate::pb::AnalysisSpec>,
         ids: &[u64],
     ) -> Result<HashMap<u64, f32>, Status> {
+        let analysis_fingerprint = crate::analyzer::analysis_fingerprint(spec);
         if text.is_empty() {
             return Err(Status::invalid_argument(
                 "boost.text must be non-empty when boost is present",
@@ -7709,7 +7783,8 @@ impl CoordinatorServiceImpl {
                 terms.push(term);
             }
         }
-        self.lexical_signal_terms(&terms, ids, None).await
+        self.lexical_signal_terms(&terms, analysis_fingerprint, ids, None)
+            .await
     }
 
     /// Candidate-scoped lexical scoring when the planner already analyzed the
@@ -7719,11 +7794,18 @@ impl CoordinatorServiceImpl {
     pub async fn lexical_signal_terms(
         &self,
         terms: &[String],
+        analysis_fingerprint: u64,
         ids: &[u64],
         expected_epochs: Option<&[u64]>,
     ) -> Result<HashMap<u64, f32>, Status> {
-        self.lexical_signal_terms_with_stages(terms, ids, expected_epochs, &[])
-            .await
+        self.lexical_signal_terms_with_stages(
+            terms,
+            analysis_fingerprint,
+            ids,
+            expected_epochs,
+            &[],
+        )
+        .await
     }
 
     /// [`Self::lexical_signal_terms`] with the ordinary lexical score-stage
@@ -7731,6 +7813,7 @@ impl CoordinatorServiceImpl {
     pub async fn lexical_signal_terms_with_stages(
         &self,
         terms: &[String],
+        analysis_fingerprint: u64,
         ids: &[u64],
         expected_epochs: Option<&[u64]>,
         score_stages: &[crate::pb::ScoreStage],
@@ -7757,7 +7840,14 @@ impl CoordinatorServiceImpl {
             }
             let claims = if fresh { vec![0; epochs.len()] } else { epochs };
             match self
-                .fanout_bm25_rescore_scores(terms, &global, &claims, by_shard.clone(), score_stages)
+                .fanout_bm25_rescore_scores(
+                    terms,
+                    analysis_fingerprint,
+                    &global,
+                    &claims,
+                    by_shard.clone(),
+                    score_stages,
+                )
                 .await
             {
                 Err(e) if !fresh && is_stale_stats(&e) => {
@@ -8070,6 +8160,7 @@ impl CoordinatorServiceImpl {
         cascade_hits: &mut [CascadeHit],
         debug: &mut Option<HybridDebug>,
     ) -> Result<(), Status> {
+        let analysis_fingerprint = crate::analyzer::analysis_fingerprint(spec);
         if boost.text.is_empty() {
             return Err(Status::invalid_argument(
                 "boost.text must be non-empty when boost is present",
@@ -8128,7 +8219,14 @@ impl CoordinatorServiceImpl {
                 let (global, epochs) = self.body_stats(&terms, fresh).await?;
                 let claims = if fresh { vec![0; epochs.len()] } else { epochs };
                 match self
-                    .fanout_bm25_rescore_scores(&terms, &global, &claims, by_shard.clone(), &[])
+                    .fanout_bm25_rescore_scores(
+                        &terms,
+                        analysis_fingerprint,
+                        &global,
+                        &claims,
+                        by_shard.clone(),
+                        &[],
+                    )
                     .await
                 {
                     Err(e) if !fresh && is_stale_stats(&e) => {
@@ -8199,6 +8297,7 @@ impl CoordinatorServiceImpl {
         after: Option<BrowseAfter>,
         sort: &[crate::pb::BrowseSort],
         lexical_terms: &[String],
+        analysis_fingerprint: u64,
         filters: &RequestFilters,
     ) -> Result<BrowseRows, Status> {
         use crate::sortkeys::{cmp_rows, Key, Value};
@@ -8210,6 +8309,7 @@ impl CoordinatorServiceImpl {
                 continue;
             }
             let request = crate::pb::BrowseShardRequest {
+                analysis_fingerprint,
                 k,
                 after: after.as_ref().map_or(0, |a| a.id),
                 first_page: after.is_none(),
@@ -8526,6 +8626,7 @@ impl CoordinatorServiceImpl {
         text: &str,
         spec: Option<&crate::pb::AnalysisSpec>,
     ) -> Result<MembershipSet, Status> {
+        let analysis_fingerprint = crate::analyzer::analysis_fingerprint(spec);
         let terms = self.analyze_terms(text, spec).await?;
         if terms.is_empty() {
             return Ok(MembershipSet {
@@ -8537,6 +8638,7 @@ impl CoordinatorServiceImpl {
         for node in &self.node_addrs {
             let client = self.node_client(node);
             let request = crate::pb::LexicalBitmapRequest {
+                analysis_fingerprint,
                 terms: terms.clone(),
             };
             tasks.push(tokio::spawn(async move {

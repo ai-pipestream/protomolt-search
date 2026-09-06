@@ -924,6 +924,10 @@ message BrowseShardRequest {
   // has a posting (the BM25 positive-score set, exactly the
   // ResolveLexicalBitmap rule). Empty = no lexical predicate.
   repeated string lexical_terms = 9;
+  // Analyzer identity when lexical_terms is nonempty; unused for plain browse.
+  // Explicit mapped bindings require a matching nonzero value. On legacy
+  // bindings zero retains the unknown-analyzer behavior.
+  uint64 analysis_fingerprint = 10;
 }
 
 // One key of a sorted row on the wire, in the form the merge compares:
@@ -1032,6 +1036,10 @@ message LexicalBitmapRequest {
   // Coordinator-analyzed body terms. Membership is OR: a document belongs
   // when at least one term has a posting, matching BM25's positive-score set.
   repeated string terms = 1;
+  // Analyzer identity of the body terms (analyzer::analysis_fingerprint).
+  // Explicit mapped bindings require a matching nonzero value. On legacy
+  // bindings zero retains the unknown-analyzer behavior.
+  uint64 analysis_fingerprint = 2;
 }
 
 message VectorBitmapRequest {}
@@ -2688,6 +2696,11 @@ message Bm25QueryRequest {
   // that transformed the sum (docs/explain.md). Scores and order are
   // unchanged.
   bool explain = 22;
+  // Analyzer identity of the flat body terms (analyzer::analysis_fingerprint).
+  // Fused queries use Bm25FieldLeg.analysis_fingerprint instead.
+  // Explicit mapped bindings require a matching nonzero value. On legacy
+  // bindings zero retains the unknown-analyzer behavior.
+  uint64 analysis_fingerprint = 23;
 }
 
 // Internal exact phrase scoring request. `phrase_leg` indexes `query.fields`.
@@ -3152,9 +3165,9 @@ message Bm25FieldLeg {
   // the query when this disagrees with the analyzer its column was built
   // under, because the two would score different term identities against
   // one idf and report a confident wrong ranking rather than an error.
-  // 0 means the caller does not know its own analyzer and disables the
-  // check; a shard whose column predates fingerprints is 0 on its side
-  // and also does not enforce.
+  // Explicit mapped bindings require a matching nonzero identity. For legacy
+  // bindings, 0 means unknown and disables the check; a column predating
+  // fingerprints also does not enforce.
   uint64 analysis_fingerprint = 8;
   // Positional phrase constraint over `terms` (docs/phrase-proximity.md),
   // applied by the shard at the heap gate: a document enters the heap
@@ -4210,6 +4223,10 @@ message HybridShardRequest {
   // Compiled filter tree (see FilterExpr), ANDed with `geo_filters`
   // when both are set. Absent = no filter.
   FilterExpr filter = 15;
+  // Analyzer identity of the body terms (analyzer::analysis_fingerprint).
+  // Explicit mapped bindings require a matching nonzero value. On legacy
+  // bindings zero retains the unknown-analyzer behavior.
+  uint64 analysis_fingerprint = 16;
 }
 
 // One fused hit in a shard's hybrid result, with per-leg provenance.
@@ -4440,6 +4457,10 @@ message ShardLegsRequest {
   // Compiled filter tree (see FilterExpr), ANDed with `geo_filters`
   // when both are set. Absent = no filter.
   FilterExpr filter = 12;
+  // Analyzer identity of the body terms (analyzer::analysis_fingerprint).
+  // Explicit mapped bindings require a matching nonzero value. On legacy
+  // bindings zero retains the unknown-analyzer behavior.
+  uint64 analysis_fingerprint = 13;
 }
 
 // One raw leg hit.
@@ -4553,6 +4574,10 @@ message Bm25RescoreRequest {
   // Monotonic score-function stages, applied on the shard before the
   // final f32 conversion exactly as on the ordinary BM25 route.
   repeated ScoreStage score_stages = 9;
+  // Analyzer identity of the body terms (analyzer::analysis_fingerprint).
+  // Explicit mapped bindings require a matching nonzero value. On legacy
+  // bindings zero retains the unknown-analyzer behavior.
+  uint64 analysis_fingerprint = 10;
 }
 
 // BM25 scores for the requested candidates, doc id ascending.

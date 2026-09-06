@@ -50,6 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = NodeServiceClient::connect(format!("http://{node}")).await?;
 
     let single = Bm25QueryRequest {
+        analysis_fingerprint: 0,
         explain: false,
         highlight: None,
         projections: Vec::new(),
@@ -76,6 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Exactly what `fanout_bm25_fused` sends: the per-field stats move
     // into the leg and the flat fields go empty.
     let fused = Bm25QueryRequest {
+        analysis_fingerprint: 0,
         explain: false,
         highlight: None,
         projections: Vec::new(),

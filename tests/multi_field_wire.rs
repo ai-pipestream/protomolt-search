@@ -963,6 +963,7 @@ async fn a_column_queried_under_the_wrong_analyzer_is_refused() {
     assert_eq!(added.added, 3);
 
     let leg = |fingerprint: u64| Bm25QueryRequest {
+        analysis_fingerprint: 0,
         explain: false,
         highlight: None,
         projections: Vec::new(),

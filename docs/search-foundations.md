@@ -604,12 +604,16 @@ persisted storage. Planning rejects unusable identity projections and ignored
 well-known-component hints. Existing wrapper bindings require new plans and a
 rebuild from source; the column formats are unchanged.
 
-The wrapper lifecycle test also exposed a pre-existing mobile gap: MappedBind
-has no per-field AnalysisSpec for non-body text, whose current contract uses
-sidecar defaults. Native analysis correctly refuses an unspecified spec. The
-next mapped-analysis work must make those specifications explicit, persist the
-binding/replay semantics and cover both native and sidecar execution. It must
-not silently reuse the body's analyzer or weaken fingerprint validation.
+The wrapper lifecycle test exposed a mobile gap that the subsequent explicit
+mapped-analysis checkpoint addresses: `MappedBind.field_analysis` supplies all
+projected TEXT specifications, including non-body fields. The complete binding
+persists through restart, sealing, compaction, resharding and replication.
+Native validation runs before mutation, including absent fields. Legacy bindings
+retain body-only/default semantics; converting them requires a new binding and
+rebuild. The current query-analysis change carries the originating fingerprint
+through every lexical scoring and membership route and requires a matching
+nonzero identity for explicit bindings. Neither change silently substitutes the
+body's analyzer for another field. See [mapped analysis](descriptor-mappings.md#explicit-mapped-analysis-2026-09-05-feature-branch).
 
 Wrapper validation on 2026-09-05: 434 library tests, 559 integration tests
 across 98 targets and 11 embedded tests passed, with one existing sidecar test
@@ -620,3 +624,37 @@ not claim native non-body analysis support. Tests/examples compilation,
 formatting, vendored-proto identity, fixture regeneration and whitespace checks
 passed. Descriptor comparison confirms only additive INPUT=4 and
 FieldProjection.value_path=7 declarations. No fleet deployment or reindex ran.
+
+## Query analysis identity checkpoint (2026-09-05)
+
+The node now enforces analyzer identity on flat and fused BM25, candidate
+rescoring, both internal hybrid leg routes, lexical membership and lexical
+sorting. The originating specification travels through coordinator fan-out,
+Boolean planning/scoring, boosts and relays. Explicit mapped bindings reject
+missing identities and mismatches even before the first row; optional fields
+retain that rule after flush and reopen. Legacy unknown identities keep their
+existing semantics. The six additive request fields change no index format.
+Deploy matching clients and every coordinator/relay/node to enforce the contract
+throughout the path; this is not a mixed-version capability negotiation.
+
+`tests/query_analysis_identity.rs` checks identical terms under different
+specifications, zero identities, k=0 requests, empty bound shards, optional-field
+restart, all five hybrid modes, Boolean queries, sorting, boosts, cached-stat
+reuse, and unary flat/fused BM25 plus streamed flat BM25 through two relay
+levels. The existing multi-field error still explains that a mismatch scores
+different term identities.
+
+The full foundation objective remains open. Configurable projections for the
+remaining protobuf shapes, document/field grants across all disclosure paths,
+and catalog publication with stable identity, conditional writes, persistent
+idempotency and accepted/searchable/durable receipts are not completed by this
+checkpoint.
+
+Validation: 439 library tests, 569 integration tests across 100 targets, and
+11 embedded tests passed (1,019 total), with one existing sidecar conformance
+test ignored. The final suite passed without retries. All five Android/iOS Rust
+target checks passed with three existing relay dead-code warnings.
+Tests/examples compilation, formatting, vendored-proto byte identity and
+whitespace checks passed. Descriptor comparison against `47233a2` verifies
+exactly six additive uint64 request fields; existing declarations and stored
+formats are unchanged. These are local checks, not on-device or fleet results.

@@ -504,6 +504,7 @@ async fn spilled_shard_serves_facets_after_flush() {
     // come from the mmapped ords column.
     let resp = client
         .bm25_query(Bm25QueryRequest {
+            analysis_fingerprint: 0,
             explain: false,
             highlight: None,
             projections: Vec::new(),

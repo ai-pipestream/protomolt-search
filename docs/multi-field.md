@@ -135,6 +135,11 @@ exactly as it was for v5.
 Per-field analysis specs are part of the field table fingerprint. Query
 analysis must use each field's spec or term identity breaks; the shard
 rejects a query whose per-field fingerprints do not match its field table.
+Explicit mapped analysis also requires a nonzero query fingerprint, including
+on fields with no rows and metadata-only requests. Legacy unknown identities
+retain their existing behavior. The same identity travels with flat BM25,
+hybrid legs, rescoring and lexical membership/sorting; see
+[query analysis identity](descriptor-mappings.md#query-analysis-identity-2026-09-05-feature-branch).
 
 ## Stats: per-field globals, same invariant
 

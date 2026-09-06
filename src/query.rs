@@ -44,6 +44,7 @@ struct BooleanHit {
 enum PlannedSearchKind {
     Lexical {
         terms: Vec<String>,
+        analysis_fingerprint: u64,
         epochs: Vec<u64>,
         score_stages: Vec<crate::pb::ScoreStage>,
     },
@@ -131,6 +132,7 @@ fn plan_boolean_selection<'a>(
                             .await?;
                         let kind = PlannedSearchKind::Lexical {
                             terms: membership.terms.clone(),
+                            analysis_fingerprint: crate::analyzer::analysis_fingerprint(query.analysis.as_ref()),
                             epochs: membership.epochs.clone(),
                             score_stages: query.score_stages.clone(),
                         };
@@ -353,11 +355,18 @@ async fn score_boolean_plan(
             let scores = match &leaf.kind {
                 PlannedSearchKind::Lexical {
                     terms,
+                    analysis_fingerprint,
                     epochs,
                     score_stages,
                 } => {
                     coordinator
-                        .lexical_signal_terms_with_stages(terms, chunk, Some(epochs), score_stages)
+                        .lexical_signal_terms_with_stages(
+                            terms,
+                            *analysis_fingerprint,
+                            chunk,
+                            Some(epochs),
+                            score_stages,
+                        )
                         .await?
                 }
                 PlannedSearchKind::Dense { vector, exact_fp32 } => {
@@ -1242,6 +1251,7 @@ pub async fn execute(
                 cursor.as_ref(),
                 &compiled_projections,
                 Vec::new(),
+                0,
                 None,
                 "browse",
                 prof,
@@ -1297,6 +1307,7 @@ pub async fn execute(
                 cursor.as_ref(),
                 &compiled_projections,
                 terms,
+                crate::analyzer::analysis_fingerprint(query.analysis.as_ref()),
                 Some(id),
                 "browse_shard:lexical",
                 prof,
@@ -1909,6 +1920,7 @@ async fn execute_browse(
     cursor: Option<&Cursor>,
     compiled_projections: &[crate::pb::CompiledProjection],
     lexical_terms: Vec<String>,
+    analysis_fingerprint: u64,
     leaf_id: Option<&str>,
     executed: &str,
     mut prof: Option<crate::pb::QueryProfile>,
@@ -1960,7 +1972,14 @@ async fn execute_browse(
         let base_rank = cursor.map_or(0, |c| c.rank);
         let t_sel = std::time::Instant::now();
         let rows = coordinator
-            .fanout_browse(req.k, after, &sort, &lexical_terms, &compiled)
+            .fanout_browse(
+                req.k,
+                after,
+                &sort,
+                &lexical_terms,
+                analysis_fingerprint,
+                &compiled,
+            )
             .await?;
         if let Some(p) = prof.as_mut() {
             p.selection_ms = ms(t_sel);

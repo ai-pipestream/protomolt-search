@@ -466,6 +466,41 @@ Analyzer-name resolution remains explicit client work: the plan records labels,
 while `field_analysis` supplies the concrete specifications. Only legacy bindings
 leave non-body analysis to sidecar defaults.
 
+### Query analysis identity (2026-09-05, feature branch)
+
+A query's term strings do not establish how those strings were produced.
+`Bm25QueryRequest` (flat body), `Bm25RescoreRequest`, `HybridShardRequest`,
+`ShardLegsRequest`, `LexicalBitmapRequest` and lexical `BrowseShardRequest` now
+carry `analysis_fingerprint`. Fused BM25 keeps each field's existing fingerprint.
+The coordinator derives these identities from the originating `AnalysisSpec`
+and retains them through candidate rescoring, boosts, recursive Boolean
+membership/scoring, sorting and relay forwarding, including streamed BM25.
+
+A node with an explicit mapped analysis binding requires the matching nonzero
+fingerprint for the queried field. It checks the declared contract before any
+rows exist and under the same shard guard used to read postings; an omitted
+optional field cannot bypass the check. Flat and fused BM25 check even when
+`k=0` requests only metadata. Plain browse and a disabled lexical hybrid leg
+need no analyzer identity. A missing field on one shard retains the existing
+heterogeneous-field behavior; the coordinator still rejects fields no shard
+knows.
+
+Legacy bindings retain the old unknown-identity semantics: zero on either side
+does not establish a mismatch, while two known different identities refuse.
+Native query analysis still requires an explicit `AnalysisSpec`; it never
+silently adopts a binding's analyzer. These fingerprints identify the requested
+specification, not a sidecar binary or optional model's content.
+
+The six wire additions do not change stored index bytes or require a reindex.
+Deploy matching nodes, coordinators, relays and clients to enforce them:
+older intermediaries can discard unknown protobuf fields, and older nodes do
+not enforce this contract. A new node rejects the resulting zero against an
+explicit binding. The earlier explicit-binding storage migration still applies.
+Raw-term clients must declare the identity under which they produced the terms.
+`TermStats` remains keyed by literal field/term: its counts do not depend on how
+a term was produced, and cached statistics cannot waive scoring or membership
+validation.
+
 ## 5. Vendoring and the BYO-descriptor flow
 
 The exchange contract is vendored, never depended on:
