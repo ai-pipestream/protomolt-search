@@ -1315,17 +1315,42 @@ mod tests {
     /// Every route increments its own row and only its own row.
     #[test]
     fn routes_count_independently() {
+        // Other library tests serve real requests concurrently. Verify exact
+        // deltas in a process that runs only this test, without resetting or
+        // weakening assertions about the production registry.
+        const ISOLATED: &str = "PSEARCH_TEST_ISOLATED_ROUTE_COUNTERS";
+        if std::env::var_os(ISOLATED).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "metrics::tests::routes_count_independently",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated route counter test failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let before = render(&[]);
         let count = |page: &str, rpc: &str| -> u64 {
             sample(page, &format!("turbovec_requests_total{{rpc=\"{rpc}\"}} "))
         };
         inc_request(Route::Bm25Query);
         let after = render(&[]);
-        assert_eq!(
-            count(&after, "bm25_query"),
-            count(&before, "bm25_query") + 1
-        );
-        assert_eq!(count(&after, "term_stats"), count(&before, "term_stats"));
+        for (route, name, _) in REQUEST_ROUTES {
+            let increment = u64::from(route as usize == Route::Bm25Query as usize);
+            assert_eq!(
+                count(&after, name),
+                count(&before, name) + increment,
+                "{name}"
+            );
+        }
     }
 
     fn snapshot(route: Route) -> (u64, u64, u64, u64, [u64; N_CODES]) {
