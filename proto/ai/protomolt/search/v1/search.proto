@@ -2059,6 +2059,10 @@ message SearchRequest {
   // default; an unknown name, or no name where named collections exist
   // and no default is configured, refuses by name.
   string collection = 7;
+  // Exact indexed vector name. A named read requires a durable mapped binding
+  // and compatible read receipts from every product shard. Empty preserves
+  // legacy unrestricted selection; it cannot satisfy a field-restricted grant.
+  string field = 8;
 }
 
 // Client-facing search response.
@@ -5338,6 +5342,10 @@ message DenseQuery {
   // Candidate traversal contract. Unspecified preserves the historical exact
   // behavior; AUTO must be requested explicitly.
   DenseExecutionMode execution_mode = 4;
+  // Exact indexed vector name. A named read requires a durable mapped binding
+  // and compatible read receipts from every product shard. Empty preserves
+  // legacy unrestricted selection; it cannot satisfy a field-restricted grant.
+  string field = 5;
 }
 
 // A request for a measured candidate depth. Recall is expressed in parts per

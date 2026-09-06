@@ -388,6 +388,7 @@ async fn embedded_in_process_and_external_transports_are_bit_exact() {
     let routed_embedded = SearchService::search(
         &embedded_product,
         Request::new(SearchRequest {
+            field: String::new(),
             collection: String::new(),
             request_id: "clustered-route".to_string(),
             k: K as u32,
@@ -403,6 +404,7 @@ async fn embedded_in_process_and_external_transports_are_bit_exact() {
     let routed = SearchService::search(
         &product,
         Request::new(SearchRequest {
+            field: String::new(),
             collection: String::new(),
             request_id: "clustered-route".to_string(),
             k: K as u32,
@@ -428,6 +430,7 @@ async fn embedded_in_process_and_external_transports_are_bit_exact() {
     let routed_external = SearchService::search(
         &product_external,
         Request::new(SearchRequest {
+            field: String::new(),
             collection: String::new(),
             request_id: "clustered-route-external".to_string(),
             k: K as u32,

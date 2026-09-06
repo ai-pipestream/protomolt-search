@@ -531,6 +531,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             .max_encoding_message_size(cfg.max_message_bytes);
         let response = client
             .search(SearchRequest {
+                field: String::new(),
                 collection: String::new(),
                 request_id: String::new(),
                 k: 10,

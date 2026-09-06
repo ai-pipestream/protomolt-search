@@ -49,6 +49,7 @@ enum PlannedSearchKind {
         score_stages: Vec<crate::pb::ScoreStage>,
     },
     Dense {
+        field: String,
         vector: Vec<f32>,
         exact_fp32: bool,
     },
@@ -156,8 +157,9 @@ fn plan_boolean_selection<'a>(
                                 search.id
                             )));
                         }
-                        let membership = coordinator.vector_membership("").await?;
+                        let membership = coordinator.vector_membership(&query.field).await?;
                         let kind = PlannedSearchKind::Dense {
+                            field: query.field.clone(),
                             vector: query.vector.clone(),
                             exact_fp32: dense_score_mode(query)? == DenseScoreMode::Fp32Rerank,
                         };
@@ -369,14 +371,18 @@ async fn score_boolean_plan(
                         )
                         .await?
                 }
-                PlannedSearchKind::Dense { vector, exact_fp32 } => {
+                PlannedSearchKind::Dense {
+                    field,
+                    vector,
+                    exact_fp32,
+                } => {
                     if *exact_fp32 {
                         coordinator
-                            .exact_vector_scores(vector, chunk, "")
+                            .exact_vector_scores(vector, chunk, field)
                             .await?
                             .scores
                     } else {
-                        coordinator.dense_signal(vector, chunk, "").await?
+                        coordinator.dense_signal(vector, chunk, field).await?
                     }
                 }
             };
@@ -495,6 +501,7 @@ fn parse_boolean_boosts<'a>(
                     ));
                 }
                 BoostKind::Dense {
+                    field: &dense.field,
                     vector: &dense.vector,
                 }
             }
@@ -915,6 +922,14 @@ pub(crate) async fn execute(
         return execute_recursive_boolean(coordinator, req, &boolean).await;
     }
     let plan = parse_selection(selection)?;
+    let vector_coordinator;
+    let coordinator = match &plan.shape {
+        Shape::Dense { query, .. } | Shape::Composite { dense: query, .. } => {
+            vector_coordinator = coordinator.for_vector_field(&query.field)?;
+            &vector_coordinator
+        }
+        _ => coordinator,
+    };
     let filter = plan
         .cel
         .iter()
@@ -925,7 +940,10 @@ pub(crate) async fn execute(
         // The shards the plan's filter rules out before fan-out
         // (docs/placement.md); a plan without a filter skips none.
         let filters = crate::coordinator::RequestFilters::compile(&plan.geo_filters, &filter)?;
-        let (total, skipped) = coordinator.shard_prune_counts(&filters);
+        let (total, mut skipped) = coordinator.shard_prune_counts(&filters);
+        if coordinator.scoped_vector_scan() {
+            skipped = 0;
+        }
         p.shards_total = total;
         p.shards_skipped = skipped;
     }
@@ -1458,7 +1476,7 @@ pub(crate) async fn execute(
                 let t0 = std::time::Instant::now();
                 let ids: Vec<u64> = hits.iter().map(|hit| hit.doc_id).collect();
                 let reranked = coordinator
-                    .exact_vector_scores(&query.vector, &ids, "")
+                    .exact_vector_scores(&query.vector, &ids, &query.field)
                     .await?;
                 for hit in &mut hits {
                     let score = *reranked.scores.get(&hit.doc_id).ok_or_else(|| {
@@ -2598,6 +2616,7 @@ enum BoostKind<'a> {
         analysis: Option<crate::pb::AnalysisSpec>,
     },
     Dense {
+        field: &'a str,
         vector: &'a [f32],
     },
 }
@@ -2711,6 +2730,7 @@ fn parse_boosts<'a>(
                     )));
                 }
                 BoostKind::Dense {
+                    field: &dense.field,
                     vector: &dense.vector,
                 }
             }
@@ -2773,7 +2793,9 @@ async fn apply_boosts(
                     .lexical_signal(text, analysis.as_ref(), &ids)
                     .await?
             }
-            BoostKind::Dense { vector } => coordinator.dense_signal(vector, &ids, "").await?,
+            BoostKind::Dense { field, vector } => {
+                coordinator.dense_signal(vector, &ids, field).await?
+            }
         };
         for hit in hits[..window].iter_mut() {
             if let Some(score) = scores.get(&hit.doc_id) {

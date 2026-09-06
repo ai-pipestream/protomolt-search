@@ -415,6 +415,7 @@ pub struct CoordinatorServiceImpl {
     /// delegate. Final disclosure verifies them again; value fetches require
     /// them at the read boundary as well.
     query_read_versions: Option<Arc<Vec<StatsClaim>>>,
+    vector_read_field: Option<String>,
     /// Optional distributed vector collection. The product coordinator calls
     /// it once as one provider; it never learns or re-fans its shard topology.
     #[cfg(feature = "net")]
@@ -1826,6 +1827,7 @@ impl CoordinatorServiceImpl {
             document_visibility: None,
             field_permissions: None,
             query_read_versions: None,
+            vector_read_field: None,
             #[cfg(feature = "net")]
             clustered_vectors: None,
             dense_quality_profile: None,
@@ -1913,6 +1915,69 @@ impl CoordinatorServiceImpl {
         }
         scoped.document_visibility = view.cloned();
         Ok(scoped)
+    }
+
+    pub(crate) fn for_vector_field(&self, field: &str) -> Result<Self, Status> {
+        if let Some(fields) = &self.field_permissions {
+            fields.vector(field)?;
+        }
+        let mut scoped = self.clone();
+        scoped.vector_read_field = (!field.is_empty()).then(|| field.to_string());
+        Ok(scoped)
+    }
+
+    pub(crate) fn scoped_vector_scan(&self) -> bool {
+        self.vector_read_field.is_some()
+            || self.document_visibility.is_some()
+            || self.field_permissions.is_some()
+    }
+
+    fn check_vector_scan(&self, filters: &RequestFilters, collapse: bool) -> Result<(), Status> {
+        if let Some(fields) = &self.field_permissions {
+            fields.vector(self.vector_read_field.as_deref().unwrap_or(""))?;
+            fields.filter(&filters.geo, filters.tree.as_ref())?;
+            if collapse {
+                fields.dictionary("parent_id")?;
+            }
+        }
+        if self.scoped_vector_scan() && self.has_clustered_vectors() {
+            return Err(Status::failed_precondition(
+                "scoped vector scans require product-node read receipts",
+            ));
+        }
+        Ok(())
+    }
+
+    fn vector_read_barrier(
+        &self,
+    ) -> Result<Option<Arc<crate::vector_read::VectorReadBarrier>>, Status> {
+        if !self.scoped_vector_scan() {
+            return Ok(None);
+        }
+        let claims = self
+            .query_read_versions
+            .as_ref()
+            .filter(|claims| claims.len() == self.node_addrs.len())
+            .ok_or_else(|| {
+                Status::failed_precondition("vector scans require an admitted physical read set")
+            })?;
+        crate::vector_read::VectorReadBarrier::new(
+            self.vector_read_field.clone().unwrap_or_default(),
+            self.document_visibility.clone(),
+            claims.as_ref().clone(),
+        )
+        .map(Some)
+    }
+
+    fn vector_scan_mask(
+        &self,
+        filter: Option<&crate::pb::FilterExpr>,
+    ) -> Option<crate::placement::ShardMask> {
+        if self.scoped_vector_scan() {
+            None
+        } else {
+            self.shard_mask(filter)
+        }
     }
 
     fn visible_filter(
@@ -7065,12 +7130,23 @@ impl CoordinatorServiceImpl {
         tie_complete: bool,
         filters: &RequestFilters,
     ) -> Result<FanoutResult, Status> {
+        self.check_vector_scan(filters, false)?;
+        if self.scoped_vector_scan() && self.query_read_versions.is_none() {
+            let (pinned, reads) = self.pin_read_versions().await?;
+            let result =
+                Box::pin(pinned.fanout_search(request_id, vector, k, tie_complete, filters)).await;
+            pinned.validate_read_versions(&reads).await?;
+            return result;
+        }
         let n_nodes = self.node_addrs.len();
         if n_nodes == 0 {
             return Err(Status::failed_precondition("no shard nodes configured"));
         }
 
+        let admission = self.vector_read_barrier()?;
+        let mut workers = tokio::task::JoinSet::new();
         let ctx = ShardQueryCtx {
+            admission: admission.clone(),
             request_id: Arc::from(request_id),
             vector: Arc::new(vector.to_vec()),
             k,
@@ -7083,7 +7159,7 @@ impl CoordinatorServiceImpl {
             hedge_wins: Arc::new(AtomicU64::new(0)),
         };
         let (hedges, hedge_wins) = (Arc::clone(&ctx.hedges), Arc::clone(&ctx.hedge_wins));
-        let mask = self.shard_mask(filters.tree.as_ref());
+        let mask = self.vector_scan_mask(filters.tree.as_ref());
         let mut known = Self::filter_known(filters, mask.as_ref());
         let active = (0..n_nodes)
             .filter(|shard| !mask.as_ref().is_some_and(|m| m.skipped[*shard]))
@@ -7103,10 +7179,14 @@ impl CoordinatorServiceImpl {
             let ctx = ctx.clone();
             let limits = self.limits();
             let done_tx = done_tx.clone();
-            tokio::spawn(async move {
+            workers.spawn(async move {
                 let t0 = std::time::Instant::now();
+                let admission = ctx.admission.clone();
                 let result =
                     run_shard_with_hedge(shard as u32, primary, replica, ctx, limits).await;
+                if let (Some(admission), Err(error)) = (admission, &result) {
+                    admission.fail(error.clone());
+                }
                 let wall_ms = t0.elapsed().as_secs_f32() * 1e3;
                 let _ = done_tx.send((shard as u32, wall_ms, result)).await;
             });
@@ -7146,7 +7226,14 @@ impl CoordinatorServiceImpl {
                     shard_wall_ms.push((shard, wall_ms));
                 }
                 Some((shard, _, Err(e))) => {
-                    return Err(Status::internal(format!("shard {shard} failed: {e}")));
+                    return Err(Status::new(
+                        if admission.is_some() {
+                            e.code()
+                        } else {
+                            tonic::Code::Internal
+                        },
+                        format!("shard {shard} failed: {e}"),
+                    ));
                 }
                 None => {
                     return Err(Status::internal("fan-out completed without all shards"));
@@ -7206,6 +7293,8 @@ impl CoordinatorServiceImpl {
         filters: &RequestFilters,
         identity_limits: Option<crate::pb::StreamIdentityLimits>,
     ) -> Result<StreamFanout, Status> {
+        self.check_vector_scan(filters, collapse_parents)?;
+        let admission = self.vector_read_barrier()?;
         let n_nodes = self.node_addrs.len();
         let udp_socket = self.floor_socket().cloned();
         let (merged_tx, merged_rx) =
@@ -7214,7 +7303,7 @@ impl CoordinatorServiceImpl {
             Vec::with_capacity(n_nodes);
         let mut udp_lanes: Vec<Option<(u64, std::net::SocketAddr)>> = Vec::with_capacity(n_nodes);
         let mut readers = tokio::task::JoinSet::new();
-        let mask = self.shard_mask(filters.tree.as_ref());
+        let mask = self.vector_scan_mask(filters.tree.as_ref());
         for shard in 0..n_nodes {
             if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
                 floor_txs.push(None);
@@ -7229,7 +7318,10 @@ impl CoordinatorServiceImpl {
             req_tx
                 .try_send(StreamSearchRequest {
                     payload: Some(stream_search_request::Payload::Start(StartStreamSearch {
-                        read_context: None,
+                        read_context: admission
+                            .as_ref()
+                            .map(|barrier| barrier.context(shard))
+                            .transpose()?,
                         request_id: request_id.to_string(),
                         vector: vector.to_vec(),
                         initial_floor,
@@ -7244,37 +7336,53 @@ impl CoordinatorServiceImpl {
             floor_txs.push(Some(req_tx));
             udp_lanes.push(lane);
             let merged_tx = merged_tx.clone();
+            let admission = admission.clone();
+            let deadline = self.limits().shard_deadline.filter(|_| admission.is_some());
             readers.spawn(async move {
-                let mut inbound = match client
-                    .stream_search(Request::new(ReceiverStream::new(req_rx)))
-                    .await
-                {
-                    Ok(response) => response.into_inner(),
-                    Err(e) => {
-                        let _ = merged_tx.send((shard, Err(e))).await;
-                        return;
+                let read = async {
+                    let mut inbound = client
+                        .stream_search(Request::new(ReceiverStream::new(req_rx)))
+                        .await?
+                        .into_inner();
+                    if let Some(admission) = &admission {
+                        admission.admit(shard, &mut inbound).await?;
+                    }
+                    loop {
+                        match crate::vector_read::next(&mut inbound).await {
+                            Ok(Some(msg)) => {
+                                if merged_tx.send((shard, Ok(Some(msg)))).await.is_err() {
+                                    return Ok(());
+                                }
+                            }
+                            Ok(None) => {
+                                let _ = merged_tx.send((shard, Ok(None))).await;
+                                return Ok(());
+                            }
+                            Err(e) => return Err(e),
+                        }
                     }
                 };
-                loop {
-                    match inbound.message().await {
-                        Ok(Some(msg)) => {
-                            if merged_tx.send((shard, Ok(Some(msg)))).await.is_err() {
-                                return;
-                            }
-                        }
-                        Ok(None) => {
-                            let _ = merged_tx.send((shard, Ok(None))).await;
-                            return;
-                        }
-                        Err(e) => {
-                            let _ = merged_tx.send((shard, Err(e))).await;
-                            return;
-                        }
+                let result = if let Some(deadline) = deadline {
+                    tokio::time::timeout(deadline, read)
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(Status::deadline_exceeded(
+                                "vector stream exceeded shard deadline",
+                            ))
+                        })
+                } else {
+                    read.await
+                };
+                if let Err(error) = result {
+                    if let Some(admission) = &admission {
+                        admission.fail(error.clone());
                     }
+                    let _ = merged_tx.send((shard, Err(error))).await;
                 }
             });
         }
         Ok(StreamFanout {
+            scoped: admission.is_some(),
             readers,
             merged_rx,
             floor_txs,
@@ -7339,6 +7447,20 @@ impl CoordinatorServiceImpl {
         initial_floor: Option<f32>,
         filters: &RequestFilters,
     ) -> Result<StreamFanoutResult, Status> {
+        self.check_vector_scan(filters, false)?;
+        if self.scoped_vector_scan() && self.query_read_versions.is_none() {
+            let (pinned, reads) = self.pin_read_versions().await?;
+            let result = Box::pin(pinned.fanout_stream_search(
+                request_id,
+                vector,
+                k,
+                initial_floor,
+                filters,
+            ))
+            .await;
+            pinned.validate_read_versions(&reads).await?;
+            return result;
+        }
         let n_nodes = self.node_addrs.len();
         if n_nodes == 0 {
             return Err(Status::failed_precondition("no shard nodes configured"));
@@ -7349,6 +7471,11 @@ impl CoordinatorServiceImpl {
         // Without k the heap never fills, no floor ever rises, and
         // every shard would emit itself entirely for nothing.
         if k == 0 {
+            if self.scoped_vector_scan() {
+                return Err(Status::invalid_argument(
+                    "a scoped vector scan requires positive k",
+                ));
+            }
             return Ok(StreamFanoutResult {
                 hits: Vec::new(),
                 summaries: Vec::new(),
@@ -7356,7 +7483,7 @@ impl CoordinatorServiceImpl {
             });
         }
 
-        let mask = self.shard_mask(filters.tree.as_ref());
+        let mask = self.vector_scan_mask(filters.tree.as_ref());
         let mut known = Self::filter_known(filters, mask.as_ref());
         let identity_limits = crate::pb::StreamIdentityLimits {
             max_rows: k,
@@ -7571,6 +7698,15 @@ impl CoordinatorServiceImpl {
         k: u32,
         filters: &RequestFilters,
     ) -> Result<CollapseStreamResult, Status> {
+        self.check_vector_scan(filters, true)?;
+        if self.scoped_vector_scan() && self.query_read_versions.is_none() {
+            let (pinned, reads) = self.pin_read_versions().await?;
+            let result =
+                Box::pin(pinned.fanout_stream_search_collapse(request_id, vector, k, filters))
+                    .await;
+            pinned.validate_read_versions(&reads).await?;
+            return result;
+        }
         struct ParentAgg {
             best_score: f32,
             best_id: u64,
@@ -7581,6 +7717,11 @@ impl CoordinatorServiceImpl {
             return Err(Status::failed_precondition("no shard nodes configured"));
         }
         if k == 0 {
+            if self.scoped_vector_scan() {
+                return Err(Status::invalid_argument(
+                    "a scoped vector scan requires positive k",
+                ));
+            }
             return Ok(CollapseStreamResult {
                 hits: Vec::new(),
                 groups: Vec::new(),
@@ -7589,7 +7730,7 @@ impl CoordinatorServiceImpl {
                 floors_sent: 0,
             });
         }
-        let mask = self.shard_mask(filters.tree.as_ref());
+        let mask = self.vector_scan_mask(filters.tree.as_ref());
         let mut known = Self::filter_known(filters, mask.as_ref());
         let mut fanout = self.open_stream_fanout(request_id, vector, None, true, filters)?;
         let mut parents: HashMap<u64, ParentAgg> = HashMap::new();
@@ -7772,11 +7913,22 @@ impl CoordinatorServiceImpl {
         k: u32,
         filters: &RequestFilters,
     ) -> Result<FanoutResult, Status> {
+        self.check_vector_scan(filters, true)?;
+        if self.scoped_vector_scan() && self.query_read_versions.is_none() {
+            let (pinned, reads) = self.pin_read_versions().await?;
+            let result =
+                Box::pin(pinned.fanout_search_collapse(request_id, vector, k, filters)).await;
+            pinned.validate_read_versions(&reads).await?;
+            return result;
+        }
         let n_nodes = self.node_addrs.len();
         if n_nodes == 0 {
             return Err(Status::failed_precondition("no shard nodes configured"));
         }
+        let admission = self.vector_read_barrier()?;
+        let mut workers = tokio::task::JoinSet::new();
         let ctx = ShardQueryCtx {
+            admission: admission.clone(),
             request_id: Arc::from(request_id),
             vector: Arc::new(vector.to_vec()),
             k,
@@ -7789,7 +7941,7 @@ impl CoordinatorServiceImpl {
             hedge_wins: Arc::new(AtomicU64::new(0)),
         };
         let (hedges, hedge_wins) = (Arc::clone(&ctx.hedges), Arc::clone(&ctx.hedge_wins));
-        let mask = self.shard_mask(filters.tree.as_ref());
+        let mask = self.vector_scan_mask(filters.tree.as_ref());
         let mut known = Self::filter_known(filters, mask.as_ref());
         let active = (0..n_nodes)
             .filter(|shard| !mask.as_ref().is_some_and(|m| m.skipped[*shard]))
@@ -7809,10 +7961,14 @@ impl CoordinatorServiceImpl {
             let ctx = ctx.clone();
             let limits = self.limits();
             let done_tx = done_tx.clone();
-            tokio::spawn(async move {
+            workers.spawn(async move {
                 let t0 = std::time::Instant::now();
+                let admission = ctx.admission.clone();
                 let result =
                     run_shard_with_hedge(shard as u32, primary, replica, ctx, limits).await;
+                if let (Some(admission), Err(error)) = (admission, &result) {
+                    admission.fail(error.clone());
+                }
                 let wall_ms = t0.elapsed().as_secs_f32() * 1e3;
                 let _ = done_tx.send((shard as u32, wall_ms, result)).await;
             });
@@ -7863,7 +8019,14 @@ impl CoordinatorServiceImpl {
                     shard_wall_ms.push((shard, wall_ms));
                 }
                 Some((shard, _, Err(e))) => {
-                    return Err(Status::internal(format!("shard {shard} failed: {e}")));
+                    return Err(Status::new(
+                        if admission.is_some() {
+                            e.code()
+                        } else {
+                            tonic::Code::Internal
+                        },
+                        format!("shard {shard} failed: {e}"),
+                    ));
                 }
                 None => {
                     return Err(Status::internal("fan-out completed without all shards"));
@@ -9145,29 +9308,7 @@ impl CoordinatorServiceImpl {
         actual: Option<&crate::pb::MappedVectorBinding>,
         held: &mut Option<Option<crate::pb::MappedVectorBinding>>,
     ) -> Result<(), Status> {
-        if let Some(binding) = actual {
-            crate::mapped_vector::validate(binding, &binding.plan_fingerprint).map_err(
-                |error| {
-                    Status::failed_precondition(format!(
-                        "invalid node vector binding: {}",
-                        error.message()
-                    ))
-                },
-            )?;
-        }
-        if !field.is_empty() && actual.is_none_or(|binding| binding.field != field) {
-            return Err(Status::failed_precondition("node did not acknowledge the requested vector field; use matching node and coordinator builds"));
-        }
-        if let Some(expected) = held {
-            if expected.as_ref() != actual {
-                return Err(Status::failed_precondition(
-                    "vector reads crossed incompatible field bindings",
-                ));
-            }
-        } else {
-            *held = Some(actual.cloned());
-        }
-        Ok(())
+        crate::vector_read::check_binding(field, actual, held)
     }
 
     fn check_read_view(
@@ -10633,6 +10774,7 @@ fn decomposed_floor(s_lb: f64, wb_b1: f64, w_v: f64) -> f32 {
 /// and the decomposed hybrid — which differ only in what they do with
 /// the batches and which floor they derive.
 pub(crate) struct StreamFanout {
+    scoped: bool,
     // Own response readers so cancellation, setup failure and successful
     // completion all release the underlying RPC streams.
     readers: tokio::task::JoinSet<()>,
@@ -10839,7 +10981,14 @@ impl StreamFanout {
                 }
                 Ok(None)
             }
-            Err(e) => Err(Status::internal(format!("shard {shard} failed: {e}"))),
+            Err(e) => Err(Status::new(
+                if self.scoped {
+                    e.code()
+                } else {
+                    tonic::Code::Internal
+                },
+                format!("shard {shard} failed: {e}"),
+            )),
         }
     }
 }
@@ -10886,6 +11035,7 @@ async fn send_stream_stops(senders: Vec<mpsc::Sender<StreamSearchRequest>>) {
 /// (a hedged retry is just a second attempt with the same context).
 #[derive(Clone)]
 struct ShardQueryCtx {
+    admission: Option<Arc<crate::vector_read::VectorReadBarrier>>,
     request_id: Arc<str>,
     vector: Arc<Vec<f32>>,
     k: u32,
@@ -10929,7 +11079,11 @@ async fn run_shard_stream(
     req_tx
         .send(SearchShardRequest {
             payload: Some(search_shard_request::Payload::Start(StartShardSearch {
-                read_context: None,
+                read_context: ctx
+                    .admission
+                    .as_ref()
+                    .map(|barrier| barrier.context(shard as usize))
+                    .transpose()?,
                 request_id: ctx.request_id.to_string(),
                 k: ctx.k,
                 vector: ctx.vector.as_ref().clone(),
@@ -10945,6 +11099,10 @@ async fn run_shard_stream(
         .search_shard(ReceiverStream::new(req_rx))
         .await?
         .into_inner();
+
+    if let Some(admission) = &ctx.admission {
+        admission.admit(shard as usize, &mut responses).await?;
+    }
 
     // A late starter (a hedged replica) joins with the floor already
     // raised — seed it immediately instead of waiting for the next raise.
@@ -10969,7 +11127,7 @@ async fn run_shard_stream(
     });
 
     let result = loop {
-        match responses.message().await {
+        match crate::vector_read::next(&mut responses).await {
             Ok(Some(SearchShardResponse {
                 payload: Some(search_shard_response::Payload::FloorUpdate(u)),
             })) => {
@@ -11634,7 +11792,28 @@ impl SearchService for CoordinatorServiceImpl {
                 ))
                 .await;
             }
-            let req = request.into_inner();
+            let mut req = request.into_inner();
+            if !req.field.is_empty() {
+                let scoped = self.for_vector_field(&req.field)?;
+                req.field.clear();
+                return Box::pin(SearchService::search(
+                    &scoped,
+                    crate::metrics::nested(Request::new(req)),
+                ))
+                .await;
+            }
+            if self.scoped_vector_scan() && self.query_read_versions.is_none() {
+                let filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
+                self.check_vector_scan(&filters, req.collapse_parents)?;
+                let (pinned, reads) = self.pin_read_versions().await?;
+                let result = Box::pin(SearchService::search(
+                    &pinned,
+                    crate::metrics::nested(Request::new(req)),
+                ))
+                .await;
+                pinned.validate_read_versions(&reads).await?;
+                return result;
+            }
             let k = self.resolve_k(req.k)?;
             if req.vector.is_empty() {
                 return Err(Status::invalid_argument("empty query vector"));
@@ -11656,6 +11835,7 @@ impl SearchService for CoordinatorServiceImpl {
             // CEL text compiles ONCE, here, into the predicate IR the
             // shards execute; no shard ever sees CEL text.
             let filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
+            self.check_vector_scan(&filters, req.collapse_parents)?;
             // The fleet scores in one space or not at all: mixed provider
             // kinds or fingerprints are refused before any shard is asked
             // (docs/mmap-vectors.md).
@@ -13525,6 +13705,7 @@ mod stream_cancel_tests {
         let (request_tx, request_rx) = mpsc::channel(1);
         (
             StreamFanout {
+                scoped: false,
                 readers: tokio::task::JoinSet::new(),
                 merged_rx: rx,
                 floor_txs: vec![Some(request_tx)],
@@ -13948,6 +14129,7 @@ mod stream_cancel_tests {
         let (_merged_tx, merged_rx) = mpsc::channel(1);
         let token = 0x0A11_CE11_u64;
         let mut fanout = StreamFanout {
+            scoped: false,
             readers: tokio::task::JoinSet::new(),
             merged_rx,
             floor_txs: vec![Some(request_tx)],
@@ -13992,6 +14174,7 @@ mod stream_cancel_tests {
         let (_merged_tx, merged_rx) = mpsc::channel(1);
         let token = 0x0D09_CE11_u64;
         drop(StreamFanout {
+            scoped: false,
             readers: tokio::task::JoinSet::new(),
             merged_rx,
             floor_txs: vec![Some(request_tx)],

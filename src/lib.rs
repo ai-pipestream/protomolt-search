@@ -123,3 +123,5 @@ pub const MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
 pub const H2_STREAM_WINDOW: u32 = 2 * 1024 * 1024;
 /// See [`H2_STREAM_WINDOW`].
 pub const H2_CONN_WINDOW: u32 = 4 * 1024 * 1024;
+
+pub(crate) mod vector_read;
