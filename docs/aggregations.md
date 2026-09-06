@@ -272,7 +272,8 @@ rank; the unsigned value search uses raw u64 bits and returns `uint_value`.
 This does not change the existing multi-round query's snapshot semantics.
 MEAN/VARIANCE/STDDEV and fixed-width histograms still require explicit double
 expressions; calendar histograms require signed epoch-microsecond expressions.
-Typed unsigned range facets and scoring remain separate work. Relay coordinators
+Typed unsigned range facets preserve exact intervals. Unsigned score stages
+use the separately documented double arithmetic in [score functions](score-functions.md). Relay coordinators
 still refuse AggregateShard and QuantileCounts; this increment does not enable
 those relay routes.
 

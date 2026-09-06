@@ -3055,11 +3055,14 @@ enum ScoreOp {
   SCORE_OP_MULT_GEO_DECAY_MANHATTAN = 5;
 }
 
-// One stage of a score-function chain.
+// One stage of a score-function chain. Arithmetic is double precision;
+// signed and unsigned integer inputs and their extrema convert to double
+// for scoring only. Adjacent integers above 2^53 can have identical scores.
+// Use typed projections, filters or sorting when integer distinctions matter.
 message ScoreStage {
   // The transform. SCORE_OP_UNSPECIFIED is refused.
   ScoreOp op = 1;
-  // The numeric field (--numeric-fields) the stage reads — or, when
+  // The f64, i64 or u64 column the stage reads — or, when
   // `key` is set, the map-numeric column (--map-numeric-fields) whose
   // entry under that key it reads. A document without a value passes
   // through unchanged (identity) — exact, not degraded, and the same
@@ -3081,7 +3084,7 @@ message ScoreStage {
   string key = 6;
   // Decay origin latitude in degrees (MULT_GEO_DECAY_*): finite,
   // within [-90, 90]. `column` then names a geo-point column
-  // (--geo-fields), resolved after the f64 and i64 tables.
+  // (--geo-fields). Geo ops resolve only against the geo table.
   double origin_lat = 7;
   // Decay origin longitude in degrees (MULT_GEO_DECAY_*): finite,
   // within [-180, 180].
@@ -3306,7 +3309,8 @@ message ScoreStageExplain {
   // False when the document has no value for the column (or the shard
   // lacks it): the stage is identity and `input` is unset.
   bool present = 4;
-  // The column value read (for the geo ops, the distance in meters).
+  // The double input used for scoring, including the rounded conversion of
+  // an integer column (for geo ops, the distance in meters).
   double input = 5;
   // The factor (multiplicative ops) or addend (ADD_LINEAR) applied.
   double contribution = 6;

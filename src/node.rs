@@ -818,6 +818,16 @@ impl Bm25Shard {
         }
     }
 
+    /// Exact unsigned extrema; the inverted range (u64::MAX, 0) means empty.
+    fn unsigned_integer_min_max(&self, ui: usize) -> (u64, u64) {
+        match self {
+            Bm25Shard::Building(s) => s.unsigned_integer_min_max(ui),
+            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
+            Bm25Shard::Resident(r) => r.unsigned_integer_min_max(ui),
+            Bm25Shard::Segmented(g) => g.unsigned_integer_min_max(ui),
+        }
+    }
+
     /// `doc_id`'s value for integer field `ii`.
     fn integer_value(&self, ii: usize, doc_id: u32) -> Option<i64> {
         match self {
@@ -1744,20 +1754,20 @@ impl Bm25Shard {
                         };
                     }
                     let (column, min_max) = if key.is_empty() {
-                        // f64 table first, then i64: one name space
-                        // across kinds (config refuses collisions), so
-                        // at most one of the two ever answers.
-                        match self.numeric_index(column) {
-                            Some(ni) => {
-                                (Some(ColumnRef::Numeric(ni)), Some(self.numeric_min_max(ni)))
-                            }
-                            None => {
-                                let ii = self.integer_index(column);
-                                (
-                                    ii.map(ColumnRef::Integer),
-                                    ii.map(|ii| int_min_max_as_f64(self.integer_min_max(ii))),
-                                )
-                            }
+                        // Column names are unique across numeric families.
+                        if let Some(ni) = self.numeric_index(column) {
+                            (Some(ColumnRef::Numeric(ni)), Some(self.numeric_min_max(ni)))
+                        } else if let Some(ii) = self.integer_index(column) {
+                            (
+                                Some(ColumnRef::Integer(ii)),
+                                Some(int_min_max_as_f64(self.integer_min_max(ii))),
+                            )
+                        } else {
+                            let ui = self.unsigned_integer_index(column);
+                            (
+                                ui.map(ColumnRef::UnsignedInteger),
+                                ui.map(|ui| uint_min_max_as_f64(self.unsigned_integer_min_max(ui))),
+                            )
                         }
                     } else {
                         // Map stage: both the column and the key must
@@ -3080,6 +3090,16 @@ pub(crate) fn f64_order_bits(x: f64) -> u64 {
 /// range converts through the same monotone cast the values do, so the
 /// bound still dominates every converted value.
 fn int_min_max_as_f64((min, max): (i64, i64)) -> (f64, f64) {
+    if min > max {
+        (f64::NAN, f64::NAN)
+    } else {
+        (min as f64, max as f64)
+    }
+}
+
+/// Unsigned extrema on the score scale. Check emptiness before converting:
+/// u64::MAX rounds to 2^64 but remains a present value.
+fn uint_min_max_as_f64((min, max): (u64, u64)) -> (f64, f64) {
     if min > max {
         (f64::NAN, f64::NAN)
     } else {
@@ -13983,6 +14003,7 @@ impl NodeServiceImpl {
                     if key.is_empty() {
                         store.numeric_index(column).is_some()
                             || store.integer_index(column).is_some()
+                            || store.unsigned_integer_index(column).is_some()
                     } else {
                         store
                             .map_numeric_index(column)

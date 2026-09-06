@@ -1222,6 +1222,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Unsigned score stages (2026-09-05, feature branch).** Score chains,
+  explanations and stored-value signals now read u64 columns. Values and
+  extrema convert to the same double arithmetic, preserving pruning bounds;
+  absent values remain identity. Typed projections, filters and sorting retain
+  integer distinctions that score arithmetic may round. No wire declaration or
+  index format changes. See [unsigned scoring](docs/score-functions.md#unsigned-inputs-2026-09-05-feature-branch).
+
 - **Exact range facets (2026-09-05, feature branch).** Typed signed, unsigned
   and double bounds compare against stored values without integer rounding.
   Range responses retain exact bounds; roots and nested relays verify each

@@ -65,8 +65,9 @@ Their query representation remains `STRING_FACET`, so equality and sorting use
 string semantics. Unhinted unsigned fields instead use `UNSIGNED_INTEGER`
 query representation and full-domain u64 columns. Their constraints explicitly
 report typed value expressions, sorting, collapse, exact aggregates and range
-facets. Statistical folds require explicit double conversion; unsigned score
-stages remain unavailable.
+facets. Statistical folds require explicit double conversion. Score stages
+convert unsigned inputs and extrema to double arithmetic; the legacy
+`stats_fields` route still does not accept unsigned columns.
 
 Preservation means exact bytes in the retained original protobuf. Unknown fields
 share that rule. `PlanIndex` reports that legacy mapped ingest requires at least

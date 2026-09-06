@@ -492,3 +492,43 @@ whitespace checks passed. Descriptor comparison against `6622053` confirms
 only `RangeFacetField.typed_edges` (4) and `RangeBucket.typed_from` (4) /
 `typed_to` (5) were added; existing declarations are unchanged. This is a
 feature-branch checkpoint, with no main merge or fleet operation.
+
+
+## Unsigned scoring checkpoint (2026-09-05)
+
+`ColumnRef::UnsignedInteger` connects exact u64 storage reads to score-chain
+evaluation, explain inputs and contributions, and stored-value signal fetches.
+Node resolution now obtains unsigned extrema from heap, mapped and segmented
+stores and checks the inverted empty range before converting extrema to the
+score scale. The availability report includes unsigned columns independently
+of k or matches. A declared empty column stays known and contributes identity.
+
+This uses the existing double-precision stage contract. Values and extrema
+share one monotone conversion, so the same upper-bound proof applies to
+unsigned columns. Source values remain exact; scores and explain inputs may
+round adjacent large integers. The protobuf comments and schema report state
+that distinction, and the report still names unsigned `stats_fields` as
+unsupported. No wire declaration, stored format or fingerprint changes.
+
+The regression suite uses decimal parsing as an independent conversion oracle,
+checks contribution/evaluation agreement and bound dominance, and compares
+seeded/unseeded pruning with exhaustive scoring over 3,000 documents. Real
+nodes compare distributed scores with monolithic scores through nested relays,
+streamed responses, explain output, owner-node FetchValues signals and compaction on both
+layouts. A separate stable row projection identifies fixture documents after
+row renumbering. Explain contribution comparisons respect protobuf's signed
+zero normalization; nonzero contributions and final scores retain bitwise
+checks.
+
+Full-width column statistics, remaining protobuf shapes, field/document grants
+across all operations, and catalog-to-query identity, retries and durability
+remain part of the active objective.
+
+Validation: 430 library tests, 544 integration tests across 96 targets, and
+11 embedded tests passed (985 total), with one existing sidecar conformance
+test ignored. The full suite needed no retries. All five Android/iOS Rust
+target checks passed with the three existing relay dead-code warnings.
+Tests/examples compilation, formatting, vendored-proto byte identity and
+whitespace checks passed. The search, schema-report and mobile descriptors are
+identical to `a914507`. This remains a feature-branch checkpoint; no main merge,
+fleet deployment or corpus rebuild was performed.

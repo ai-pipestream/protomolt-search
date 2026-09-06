@@ -91,7 +91,8 @@ Unhinted unsigned protobuf fields now map to the u64 family; explicitly signed
 hints retain their checked i64 conversion. [Value projections and materialized
 columns](cel-values.md) also retain uint values. Unsigned aggregates and
 range facets retain exact integer values and bounds. Statistical folds require
-explicit double conversion; unsigned scoring is not yet available. The schema
+explicit double conversion; unsigned score stages use double arithmetic
+([score contract](score-functions.md#unsigned-inputs-2026-09-05-feature-branch)). The schema
 report records the mapped query type and remaining restrictions. Use matching server and
 client builds for this feature: older protobuf readers can ignore the new
 request field, and older storage readers refuse kind 11.

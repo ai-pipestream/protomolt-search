@@ -59,7 +59,7 @@ pub trait NumericRead {
 }
 
 /// A stage's resolved column on THIS shard: a plain f64 column, an
-/// i64 column, or a map-numeric column entry under a shard-local key
+/// i64/u64 column, or a map-numeric column entry under a shard-local key
 /// ordinal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnRef {
@@ -73,6 +73,10 @@ pub enum ColumnRef {
     /// STORAGE keeps — the point of the kind is that the value comes
     /// back intact, not that ln() suddenly has 64 bits.
     Integer(usize),
+    /// Index into the shard's u64 table. Values and extrema use the same
+    /// monotone conversion to f64 as signed columns; score arithmetic may
+    /// round adjacent large integers while storage remains exact.
+    UnsignedInteger(usize),
     /// A map-numeric column and a key ordinal in ITS key dictionary
     /// (ordinals are shard-local, like every dictionary here).
     MapKey {
@@ -143,7 +147,7 @@ pub struct Stage {
     pub column: Option<ColumnRef>,
     /// This shard's (min, max) over the read values — the whole column
     /// for a plain stage, the KEY's values for a map stage; NaN when
-    /// missing or empty (an i64 column's metadata arrives through the
+    /// missing or empty (an integer column's metadata arrives through the
     /// same monotone `as f64` cast its values do, and its empty range
     /// arrives as NaN). Feeds [`ScoreChain::bound`]. A geo stage leaves
     /// it (NaN, NaN): its bound is identity regardless of the column's
@@ -176,6 +180,9 @@ impl Stage {
         let x = match self.column {
             Some(ColumnRef::Numeric(ni)) => columns.value(ni, doc_id),
             Some(ColumnRef::Integer(ii)) => columns.int_value(ii, doc_id).map(|v| v as f64),
+            Some(ColumnRef::UnsignedInteger(ui)) => {
+                columns.uint_value(ui, doc_id).map(|v| v as f64)
+            }
             Some(ColumnRef::MapKey { column, key_ord }) => {
                 columns.map_value(column, key_ord, doc_id)
             }
@@ -211,6 +218,9 @@ impl Stage {
         match self.column {
             Some(ColumnRef::Numeric(ni)) => columns.value(ni, doc_id),
             Some(ColumnRef::Integer(ii)) => columns.int_value(ii, doc_id).map(|v| v as f64),
+            Some(ColumnRef::UnsignedInteger(ui)) => {
+                columns.uint_value(ui, doc_id).map(|v| v as f64)
+            }
             Some(ColumnRef::MapKey { column, key_ord }) => {
                 columns.map_value(column, key_ord, doc_id)
             }
@@ -259,6 +269,9 @@ impl ScoreChain {
             let x = match stage.column {
                 Some(ColumnRef::Numeric(ni)) => columns.value(ni, doc_id),
                 Some(ColumnRef::Integer(ii)) => columns.int_value(ii, doc_id).map(|v| v as f64),
+                Some(ColumnRef::UnsignedInteger(ui)) => {
+                    columns.uint_value(ui, doc_id).map(|v| v as f64)
+                }
                 Some(ColumnRef::MapKey { column, key_ord }) => {
                     columns.map_value(column, key_ord, doc_id)
                 }

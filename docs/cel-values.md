@@ -254,7 +254,8 @@ and `greatest`/`least`, and requires explicit double conversion for the other
 math functions. Unsigned sorting and collapse are supported with typed keys and results
 ([query contract](query-api.md#sorting)). Unsigned aggregate accumulators and exact percentiles preserve uint results
 ([aggregation contract](aggregations.md#11-unsigned-aggregates-2026-09-05-feature-branch));
-range facets and scoring remain separate work.
+range facets preserve typed bounds, while [score stages](score-functions.md)
+explicitly use double arithmetic for unsigned inputs.
 
 `tests/unsigned_values.rs` compares arithmetic against an independent u128
 oracle and stock CEL where CEL produces values. It covers numeric boundaries,

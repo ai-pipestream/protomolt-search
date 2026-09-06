@@ -119,3 +119,49 @@ sentinel and infinities break bounds), ride the WAL verbatim like
 facets and fields, and reshard replay re-derives the child's table from
 the records. min/max are computed at write time over present values and
 validated against a full scan at open.
+
+
+## Unsigned inputs (2026-09-05, feature branch)
+
+Scalar score stages now resolve f64, i64 or u64 columns when `key` is empty.
+Unsigned columns use the same `ScoreStage` contract as signed columns:
+`ADD_LINEAR`, `MULT_LOG` and `MULT_EXP_DECAY` run in double precision. The
+conversion happens at the scoring read, including `Stage.input` and
+`Stage.contribution`, so explain output and stored-value scorer signals use
+identical arithmetic. Map and geo stages retain their existing column families.
+The flat lexical route supports chains; fused lexical requests still refuse
+score-stage lists. Candidate value fetches supply unsigned-backed stage signals
+through the existing stored-value scorer path.
+
+A u64 value converts monotonically to double. Its column minimum and maximum
+use the same conversion when the node resolves pruning bounds. Check the empty
+integer range before conversion: `(u64::MAX, 0)` means no values, while
+`(u64::MAX, u64::MAX)` is one valid value. An empty or unknown column contributes
+identity; known flags still identify a declared empty column even at `k=0`.
+The root refuses a requested column no shard knows.
+
+Score precision is a separate contract from indexed value precision. For
+example, u64::MAX converts to 18446744073709551616 in a double score expression.
+Adjacent integers above 2^53 can produce the same score. The original u64
+remains intact in storage, typed projections, filters, range facets and sort
+keys. Use those typed operations when integer distinctions must affect
+selection or ordering. `ScoreStageExplain.input` describes the double actually
+used for scoring; it is not a lossless projection of the source value.
+Protobuf default-valued doubles normalize either signed zero on the wire, so
+an additive contribution of -0.0 may be reported as 0.0.
+
+`tests/unsigned_scoring.rs` checks input, contribution and score arithmetic
+against an independent decimal-to-double oracle. It compares seeded and
+unseeded pruned search with exhaustive search over 3,000 documents, and checks
+bounds across absent values, zero, the signed limit and the largest unsigned
+values. Distributed scores are compared bitwise with a monolithic index,
+including flat and nested relay queries, unary and streamed responses,
+explanations, owner-node stored-value fetches, empty-column metadata, and both storage
+layouts through flush, reopen, compaction and a second reopen. Logical row
+projections identify test documents across compaction; physical slot identity
+is not assumed stable.
+
+This is a query change: no protobuf field, index format or materialization
+fingerprint changed. The legacy `stats_fields`/`ColumnStats` route still does
+not accept unsigned columns. Exact unsigned aggregates are a separate route;
+statistical folds there require explicit double conversion.
