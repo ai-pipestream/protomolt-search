@@ -490,12 +490,15 @@ fn read_gens_binding(gens: &[PathBuf]) -> Result<Option<crate::postings::StoredB
                 materialize_sha: bind.materialize_sha,
                 analysis_sha: bind.analysis_sha,
                 analysis_contract: bind.analysis_contract,
+                vector_binding: bind.vector_binding,
             };
             crate::mapped_analysis::decode_contract(
                 &binding.analysis_sha,
                 &binding.analysis_contract,
                 &binding.body_path,
             )?;
+            crate::mapped_vector::decode(&binding.vector_binding, &binding.plan_fingerprint)
+                .map_err(|e| e.to_string())?;
             match &bound {
                 Some((first, first_gen)) if *first != binding => {
                     return Err(format!(

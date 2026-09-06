@@ -134,4 +134,6 @@ message LoggedBinding {
   string analysis_sha = 4;
   // Canonical serialized ai.protomolt.search.v1.MappedAnalysisContract.
   bytes analysis_contract = 5;
+  // Canonical ai.protomolt.search.v1.MappedVectorBinding; empty for legacy binds.
+  bytes vector_binding = 6;
 }

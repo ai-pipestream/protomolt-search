@@ -1222,6 +1222,11 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Stored vector bindings (2026-09-06, feature branch).** Mapped vector identity
+  now travels with index images, WAL replay, compaction and replica catch-up,
+  with exact receiver acknowledgement and old-reader version gates. Binding
+  cannot relabel a populated unbound shard or silently upgrade legacy metadata.
+  See [storage and remaining generation/query work](docs/vector-binding-storage.md).
 - **Vector field identity (2026-09-06, feature branch).** Indexing plans expose
   a typed vector binding with its indexed name, source path, dimension and plan
   fingerprint. Planning and mapped bind refuse names shared with other planes.

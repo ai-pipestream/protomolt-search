@@ -831,11 +831,12 @@ async fn wrapper_lifecycle(explicit: bool) {
                     .unwrap()
                     .unwrap();
                 assert_eq!(bound.analysis_sha.len(), 64);
+                assert!(!bound.vector_binding.is_empty());
                 assert_eq!(
                     pipestream_search::wal::read_manifest(&generation)
                         .unwrap()
                         .format_version,
-                    4
+                    5
                 );
             }
             if pass == 0 {

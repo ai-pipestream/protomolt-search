@@ -1190,6 +1190,8 @@ message ApplyWalBindingRequest {
   string analysis_sha = 5;
   // Canonical serialized MappedAnalysisContract; required with analysis_sha.
   bytes analysis_contract = 6;
+  // Canonical MappedVectorBinding; empty only for legacy bindings.
+  bytes vector_binding = 7;
 }
 
 message ApplyWalBindingResponse {
@@ -1197,6 +1199,8 @@ message ApplyWalBindingResponse {
   // Echo of the installed analysis contract. Explicit bindings require this
   // acknowledgement; an older receiver cannot acknowledge the new contract.
   string analysis_sha = 2;
+  // Exact installed vector binding. A sender requires this acknowledgement.
+  bytes vector_binding = 3;
 }
 
 message CompactShardRequest {

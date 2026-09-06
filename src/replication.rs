@@ -408,6 +408,7 @@ pub async fn sync_once(cursor: &ReplicaCursor) -> Result<ReplicaCursor, String> 
             }
             Some(wal_record::Op::Bind(binding)) => {
                 let analysis_sha = binding.analysis_sha.clone();
+                let vector_binding = binding.vector_binding.clone();
                 let response = replica
                     .apply_wal_binding(ApplyWalBindingRequest {
                         collection: String::new(),
@@ -416,12 +417,16 @@ pub async fn sync_once(cursor: &ReplicaCursor) -> Result<ReplicaCursor, String> 
                         materialize_sha: binding.materialize_sha,
                         analysis_sha: binding.analysis_sha,
                         analysis_contract: binding.analysis_contract,
+                        vector_binding: binding.vector_binding,
                     })
                     .await
                     .map_err(|error| format!("replicate mapped binding: {error}"))?
                     .into_inner();
                 if response.analysis_sha != analysis_sha {
                     return Err("replica did not acknowledge the mapped analysis contract; upgrade the receiver".into());
+                }
+                if response.vector_binding != vector_binding {
+                    return Err("replica did not acknowledge the mapped vector binding; upgrade the receiver".into());
                 }
                 changed |= !response.already_bound;
             }

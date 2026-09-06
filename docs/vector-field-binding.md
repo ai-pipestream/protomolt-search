@@ -36,16 +36,18 @@ unchanged; the derived message is not hashed recursively. Valid existing plans
 keep their fingerprints. A previously ambiguous plan must choose distinct
 indexing names; that intentional mapping change produces a different fingerprint.
 
-This increment adds one field and one message to the public protobuf contract.
-Stored index and WAL formats are unchanged.
+The initial planning increment added one field and one message to the public
+protobuf contract without changing storage. The subsequent
+[stored binding integration](vector-binding-storage.md) adds an index metadata
+kind and WAL version gate.
 
 ## Required runtime integration
 
 A plan response is not a credential, physical read claim or proof that a server
-is serving that plan. The durable `StoredBinding` currently keeps the plan's
-fingerprint and body/analysis metadata, but does not retain this vector name.
-The next integration must preserve the vector binding through initial bind,
-WAL replay, flush, compaction, snapshot/replica install and empty generations.
+is serving that plan. `StoredBinding` now retains this vector name alongside the
+plan fingerprint and body/analysis metadata. See the stored binding integration
+for replay, compaction and replica evidence, and the remaining rowless runtime
+generation publication gap when WAL is disabled.
 Read requests must name the field and nodes must verify it against that durable
 binding before a field grant can authorize vector selection or scoring.
 

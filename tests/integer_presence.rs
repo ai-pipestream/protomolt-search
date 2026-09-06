@@ -316,7 +316,7 @@ fn malformed_presence_and_value_bytes_refuse_before_serving() {
 }
 
 #[tokio::test]
-async fn old_integer_materialization_bindings_refuse_but_float_bindings_still_match() {
+async fn old_integer_materialization_hashes_refuse_but_float_hashes_still_match() {
     use pb::node_service_client::NodeServiceClient;
     use pipestream_search::{
         analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND},
@@ -369,6 +369,11 @@ async fn old_integer_materialization_bindings_refuse_but_float_bindings_still_ma
                 plan_fingerprint: plan.fingerprint.clone(),
                 body_path: "body".into(),
                 materialize_sha: legacy_hash.into(),
+                // Isolate materialization compatibility. Missing vector declarations
+                // have their own migration refusal test in mapped_ingest.
+                vector_binding: prost::Message::encode_to_vec(
+                    plan.vector_binding.as_ref().unwrap(),
+                ),
                 ..Default::default()
             })
             .await

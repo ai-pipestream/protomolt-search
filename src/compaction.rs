@@ -758,6 +758,7 @@ impl NodeServiceImpl {
                     materialize_sha: binding.materialize_sha.clone(),
                     analysis_sha: binding.analysis_sha.clone(),
                     analysis_contract: binding.analysis_contract.clone(),
+                    vector_binding: binding.vector_binding.clone(),
                 }))
                 .map_err(|e| Status::internal(format!("rewrite binding record: {e}")))?;
         }
@@ -1391,6 +1392,7 @@ impl NodeServiceImpl {
                         materialize_sha: bind.materialize_sha,
                         analysis_sha: bind.analysis_sha,
                         analysis_contract: bind.analysis_contract,
+                        vector_binding: bind.vector_binding,
                     },
                 )?;
             }

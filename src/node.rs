@@ -5733,7 +5733,7 @@ impl NodeServiceImpl {
         // Save the builder as v3 and immediately reopen it disk-resident:
         // after Flush a shard holds no postings or texts in heap.
         // Already-resident shards have nothing to write.
-        // The binding persists with the store bytes (the kind-6 table
+        // The binding persists with the store bytes (the kinded binding
         // entry), so the flushed file carries exactly what the shard is
         // bound to.
         let binding = guard.mapped_binding.clone();
@@ -10051,7 +10051,7 @@ impl NodeServiceImpl {
         }
         // The durable shard-level binding: the FIRST bind pins the
         // shard to this plan identity (recorded to the WAL now, to the
-        // store's kind-6 entry at flush), and every later bind must
+        // store's binding entry at flush), and every later bind must
         // match it exactly. An index only ever pairs with the plan it
         // was written under; changing the mapping is a rebuild, never a
         // rebind.
@@ -10061,6 +10061,11 @@ impl NodeServiceImpl {
             materialize_sha: materialize_sha(bind.materialize.as_ref()),
             analysis_sha: analysis.digest.clone(),
             analysis_contract: analysis.contract.clone(),
+            vector_binding: prost::Message::encode_to_vec(
+                plan.vector_binding
+                    .as_ref()
+                    .expect("derived vector binding"),
+            ),
         };
         let mut guard = write_shard(&self.state);
         let vector = plan
@@ -10087,6 +10092,9 @@ impl NodeServiceImpl {
                 if bound.analysis_sha != incoming.analysis_sha {
                     differs.push("the field analysis specs".to_string());
                 }
+                if bound.vector_binding != incoming.vector_binding {
+                    differs.push("the vector field binding".to_string());
+                }
                 if bound.materialize_sha != incoming.materialize_sha {
                     differs.push("the materialize spec".to_string());
                 }
@@ -10100,6 +10108,11 @@ impl NodeServiceImpl {
             }
             Some(_) => Ok((extractor, analysis)),
             None => {
+                if physical_rows(&guard) != 0 {
+                    return Err(Status::failed_precondition(
+                        "cannot bind a mapping to a populated unbound shard; rebuild from original documents",
+                    ));
+                }
                 wal_append_or_degrade(
                     &mut guard.wal,
                     wal_record::Op::Bind(crate::pb::wal::LoggedBinding {
@@ -10108,6 +10121,7 @@ impl NodeServiceImpl {
                         materialize_sha: incoming.materialize_sha.clone(),
                         analysis_sha: incoming.analysis_sha.clone(),
                         analysis_contract: incoming.analysis_contract.clone(),
+                        vector_binding: incoming.vector_binding.clone(),
                     }),
                 );
                 guard.mapped_binding = Some(incoming);
@@ -12037,14 +12051,22 @@ impl NodeService for NodeServiceImpl {
             materialize_sha: req.materialize_sha,
             analysis_sha: req.analysis_sha,
             analysis_contract: req.analysis_contract,
+            vector_binding: req.vector_binding,
         };
         let _mutation = self.mutation_gate.read().await;
         let mut guard = write_shard(&self.state);
         let analysis_sha = incoming.analysis_sha.clone();
+        let vector_binding = incoming.vector_binding.clone();
+        if let Some(vector) =
+            crate::mapped_vector::decode(&vector_binding, &incoming.plan_fingerprint)?
+        {
+            self.validate_vector_column_name(&vector.field, guard.bm25.as_ref())?;
+        }
         let already_bound = Self::apply_binding_locked(&mut guard, incoming)?;
         Ok(Response::new(crate::pb::ApplyWalBindingResponse {
             already_bound,
             analysis_sha,
+            vector_binding,
         }))
     }
 
@@ -14171,6 +14193,7 @@ impl NodeServiceImpl {
             &incoming.body_path,
         )
         .map_err(Status::invalid_argument)?;
+        crate::mapped_vector::decode(&incoming.vector_binding, &incoming.plan_fingerprint)?;
         match guard.mapped_binding.as_ref() {
             Some(bound) if *bound != incoming => Err(Status::failed_precondition(format!(
                 "replica is bound to plan {} body {:?}, source WAL requires plan {} body {:?}",
@@ -14194,6 +14217,7 @@ impl NodeServiceImpl {
                         materialize_sha: incoming.materialize_sha.clone(),
                         analysis_sha: incoming.analysis_sha.clone(),
                         analysis_contract: incoming.analysis_contract.clone(),
+                        vector_binding: incoming.vector_binding.clone(),
                     }),
                 );
                 guard.mapped_binding = Some(incoming);

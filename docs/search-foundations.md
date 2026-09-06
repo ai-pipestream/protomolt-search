@@ -974,5 +974,8 @@ Indexing plans now expose the vector plane's exact name, path, dimension and pla
 fingerprint as protobuf. Name collisions with other indexed planes and built-in
 text/lineage keys refuse during planning; mapped bind also checks configured and
 active stored columns. See [vector field binding](vector-field-binding.md).
-Durable storage/recovery of this binding and field-named query enforcement remain
-required work. Existing restricted vector/query gates remain in place.
+The [stored binding integration](vector-binding-storage.md) carries the vector
+identity through images, WAL, resharding and compaction and requires exact replica
+acknowledgement. Rowless runtime generation publication with WAL disabled and
+field-named query enforcement remain required work. Existing restricted
+vector/query gates remain in place.

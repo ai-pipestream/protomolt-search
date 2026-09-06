@@ -1226,6 +1226,9 @@ async fn lockstep_refusal_when_document_leg_is_ahead() {
     let (addr, _node) = start_empty_node(case_node_config(analysis)).await;
     seed_calibration(&addr).await;
 
+    // Bind while empty; this test targets alignment after an established bind.
+    ingest(&addr, bind(), vec![]).await.unwrap();
+
     let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
     let (tx, rx) = mpsc::channel(4);
     tx.send(AddDocumentsRequest {
@@ -1326,11 +1329,16 @@ fn expected_binding() -> pipestream_search::postings::StoredBinding {
         materialize_sha: String::new(),
         analysis_sha: String::new(),
         analysis_contract: Vec::new(),
+        vector_binding: derive_plan(&case_set(), "law.v1.Case")
+            .unwrap()
+            .vector_binding
+            .unwrap()
+            .encode_to_vec(),
     }
 }
 
 /// The first bind pins the shard to its plan durably: the flushed store
-/// carries the binding (the kind-6 column-table entry inside the v8
+/// carries the binding (the kind-13 column-table entry inside the v8
 /// integrity envelope), a restarted node adopts it from the file, and a
 /// bind under a different plan, a different body, or a different
 /// materialize spec refuses by name. Same-plan binds keep ingesting.
@@ -2067,4 +2075,246 @@ async fn vector_names_cannot_shadow_node_columns_outside_the_mapped_plan() {
     }
     mock.abort();
     let _ = mock.await;
+}
+
+#[tokio::test]
+async fn named_vector_binding_cannot_relabel_legacy_or_populated_shards() {
+    let (analysis, mock) = start_mock_analysis().await;
+    for legacy in [false, true] {
+        let (address, node) = start_empty_node(case_node_config(analysis.clone())).await;
+        let mut client = NodeServiceClient::connect(address.clone()).await.unwrap();
+        if legacy {
+            let expected = expected_binding();
+            client
+                .apply_wal_binding(pipestream_search::pb::ApplyWalBindingRequest {
+                    plan_fingerprint: expected.plan_fingerprint,
+                    body_path: expected.body_path,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        } else {
+            client
+                .add_documents(tokio_stream::iter([AddDocumentsRequest {
+                    text: "unmapped document".into(),
+                    ..Default::default()
+                }]))
+                .await
+                .unwrap();
+        }
+        expect_refusal(
+            ingest(&address, bind(), vec![]).await,
+            if legacy {
+                "vector field binding"
+            } else {
+                "populated unbound"
+            },
+        );
+        node.abort();
+        let _ = node.await;
+    }
+    mock.abort();
+    let _ = mock.await;
+}
+
+#[tokio::test]
+async fn empty_wal_generation_recovers_and_acknowledges_the_exact_vector_binding() {
+    use pipestream_search::{node::NodeServiceImpl, pb::node_service_server::NodeService};
+    let (analysis, mock) = start_mock_analysis().await;
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("mapped-vector-empty-wal-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    for layout in [
+        pipestream_search::node::Layout::SingleImage,
+        pipestream_search::node::Layout::Segments,
+    ] {
+        let path = root.join(format!("{layout:?}.tv"));
+        let config = NodeConfig {
+            index_path: Some(path.clone()),
+            layout,
+            wal: true,
+            ..case_node_config(analysis.clone())
+        };
+        let (address, node) = start_empty_node(config.clone()).await;
+        ingest(&address, bind(), vec![]).await.unwrap();
+        NodeServiceClient::connect(address)
+            .await
+            .unwrap()
+            .flush(pipestream_search::pb::FlushRequest {})
+            .await
+            .unwrap();
+        node.abort();
+        let _ = node.await;
+
+        // No first row or source descriptor exists to reconstruct this from.
+        let reopened = NodeServiceImpl::open(config, None, false).unwrap();
+        let expected = expected_binding();
+        let request = pipestream_search::pb::ApplyWalBindingRequest {
+            plan_fingerprint: expected.plan_fingerprint,
+            body_path: expected.body_path,
+            vector_binding: expected.vector_binding,
+            ..Default::default()
+        };
+        let response = reopened
+            .apply_wal_binding(Request::new(request.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.already_bound);
+        assert_eq!(response.vector_binding, request.vector_binding);
+        let mut missing = request.clone();
+        missing.vector_binding.clear();
+        assert_eq!(
+            reopened
+                .apply_wal_binding(Request::new(missing))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        let mut invalid = request;
+        invalid.vector_binding.extend([8, 1]);
+        assert_eq!(
+            reopened
+                .apply_wal_binding(Request::new(invalid))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        drop(reopened);
+    }
+    mock.abort();
+    let _ = mock.await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compaction_keeps_vector_bindings_in_images_and_rewritten_logs() {
+    use pipestream_search::node::{generation_bm25, generation_dir, segments_root, Layout};
+    let (analysis, mock) = start_mock_analysis().await;
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("mapped-vector-compaction-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    for layout in [Layout::SingleImage, Layout::Segments] {
+        for explicit in [false, true] {
+            let path = root.join(format!("{layout:?}-{explicit}.tv"));
+            let (address, node) = start_empty_node(NodeConfig {
+                index_path: Some(path.clone()),
+                layout,
+                wal: true,
+                ..case_node_config(analysis.clone())
+            })
+            .await;
+            seed_calibration(&address).await;
+            ingest(
+                &address,
+                if explicit { explicit_bind() } else { bind() },
+                (0..4).map(|i| doc(i).encode()).collect(),
+            )
+            .await
+            .unwrap();
+            let mut client = NodeServiceClient::connect(address.clone()).await.unwrap();
+            client
+                .flush(pipestream_search::pb::FlushRequest {})
+                .await
+                .unwrap();
+            let generation =
+                pipestream_search::reshard::resolve_gen(&pipestream_search::wal::wal_dir(&path))
+                    .unwrap();
+            let expected = pipestream_search::reshard::read_generation_binding(&generation)
+                .unwrap()
+                .unwrap();
+            assert!(!expected.vector_binding.is_empty());
+            client
+                .delete_documents(pipestream_search::pb::DeleteDocumentsRequest {
+                    doc_ids: vec![0],
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let compacted = client
+                .compact_shard(pipestream_search::pb::CompactShardRequest::default())
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(compacted.rows_after, 3);
+            assert_eq!(compacted.tombstones_reclaimed, 1);
+            let rewritten =
+                pipestream_search::reshard::resolve_gen(&pipestream_search::wal::wal_dir(&path))
+                    .unwrap();
+            assert_eq!(
+                pipestream_search::reshard::read_generation_binding(&rewritten).unwrap(),
+                Some(expected.clone())
+            );
+            match layout {
+                Layout::SingleImage => {
+                    let image = pipestream_search::postings::Bm25Reader::open(&generation_bm25(
+                        &generation_dir(&path),
+                    ))
+                    .unwrap();
+                    assert_eq!(image.binding(), Some(&expected));
+                }
+                Layout::Segments => {
+                    let set =
+                        pipestream_search::segments::OpenedSegmentSet::open(segments_root(&path))
+                            .unwrap();
+                    assert!(!set.is_empty());
+                    for part in 0..set.len() {
+                        assert_eq!(set.bm25(part).binding(), Some(&expected));
+                    }
+                }
+            }
+            // Install over the real snapshot stream, then reopen without WAL:
+            // only the transferred image can supply the binding on this receiver.
+            let target_config = NodeConfig {
+                index_path: Some(root.join(format!("snapshot-{layout:?}-{explicit}.tv"))),
+                layout,
+                wal: false,
+                ..case_node_config(analysis.clone())
+            };
+            let (target, receiver) = start_empty_node(target_config.clone()).await;
+            pipestream_search::snapshot::install_snapshot_from(
+                &target,
+                pipestream_search::pb::InstallSnapshotFromRequest {
+                    source: Some(
+                        pipestream_search::pb::install_snapshot_from_request::Source::PeerAddr(
+                            address.clone(),
+                        ),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            receiver.abort();
+            let _ = receiver.await;
+            let reopened =
+                pipestream_search::node::NodeServiceImpl::open(target_config, None, false).unwrap();
+            let acknowledged =
+                pipestream_search::pb::node_service_server::NodeService::apply_wal_binding(
+                    &reopened,
+                    Request::new(pipestream_search::pb::ApplyWalBindingRequest {
+                        plan_fingerprint: expected.plan_fingerprint,
+                        body_path: expected.body_path,
+                        materialize_sha: expected.materialize_sha,
+                        analysis_sha: expected.analysis_sha,
+                        analysis_contract: expected.analysis_contract,
+                        vector_binding: expected.vector_binding.clone(),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(acknowledged.already_bound);
+            assert_eq!(acknowledged.vector_binding, expected.vector_binding);
+            drop(reopened);
+            node.abort();
+            let _ = node.await;
+        }
+    }
+    mock.abort();
+    let _ = mock.await;
+    std::fs::remove_dir_all(root).unwrap();
 }

@@ -122,7 +122,9 @@ pub fn crc32(data: &[u8]) -> u32 {
 // ---------------------------------------------------------------------------
 
 /// Current on-disk format version (manifest `format_version`).
-pub const FORMAT_VERSION: u32 = 4;
+pub const FORMAT_VERSION: u32 = 5;
+/// Explicit mapped analysis first requires format 4.
+pub const ANALYSIS_FORMAT_VERSION: u32 = 4;
 /// Logical row identity requires format 3, independently of mapped analysis.
 pub const IDENTITY_FORMAT_VERSION: u32 = 3;
 /// Source references without logical row identity remain readable by format-2 binaries.
@@ -1198,21 +1200,29 @@ impl WalWriter {
                 &binding.body_path,
             )
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-            if !binding.analysis_sha.is_empty() {
+            let vector =
+                crate::mapped_vector::decode(&binding.vector_binding, &binding.plan_fingerprint)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            let required_version = if vector.is_some() {
+                FORMAT_VERSION
+            } else if !binding.analysis_sha.is_empty() {
                 if !crate::mapped_analysis::valid_digest(&binding.analysis_sha) {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         "invalid mapped analysis digest",
                     ));
                 }
-                // Persist the version gate before the new record. An older binary
-                // must never replay an explicit binding as a legacy body-only bind.
-                if self.manifest.format_version < FORMAT_VERSION {
-                    let mut upgraded = self.manifest.clone();
-                    upgraded.format_version = FORMAT_VERSION;
-                    write_manifest(&self.dir, &upgraded)?;
-                    self.manifest = upgraded;
-                }
+                ANALYSIS_FORMAT_VERSION
+            } else {
+                BASE_FORMAT_VERSION
+            };
+            // Persist the version gate before the record. Older binaries must
+            // refuse instead of replaying a named vector plane as an unnamed one.
+            if self.manifest.format_version < required_version {
+                let mut upgraded = self.manifest.clone();
+                upgraded.format_version = required_version;
+                write_manifest(&self.dir, &upgraded)?;
+                self.manifest = upgraded;
             }
         }
         if let wal_record::Op::AddDocuments(batch) = &mut op {
@@ -1468,6 +1478,52 @@ mod tests {
         assert_eq!(resumed.high_watermark(), 3);
         assert!(!resumed.has_legacy_clock_records());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn vector_binding_upgrades_before_append_and_invalid_bindings_leave_no_record() {
+        let dir = tempdir("mapped-vector");
+        let mut base = manifest(2);
+        base.format_version = ANALYSIS_FORMAT_VERSION;
+        let mut writer = WalWriter::create(&dir, base).unwrap();
+        let plan = crate::mapping::derive_plan(
+            include_bytes!("../tests/fixtures/vector-binding/descriptor.bin"),
+            "vector_binding.Named",
+        )
+        .unwrap();
+        let binding = crate::pb::wal::LoggedBinding {
+            plan_fingerprint: plan.fingerprint,
+            body_path: "body".into(),
+            vector_binding: plan.vector_binding.unwrap().encode_to_vec(),
+            ..Default::default()
+        };
+        for case in 0..3 {
+            let mut invalid = binding.clone();
+            match case {
+                0 => invalid.plan_fingerprint = "0".repeat(64),
+                1 => invalid.vector_binding.extend([8, 1]),
+                _ => invalid.vector_binding = vec![8, 2],
+            }
+            assert!(writer.append(wal_record::Op::Bind(invalid)).is_err());
+            assert_eq!(writer.high_watermark(), 0);
+            assert_eq!(read_manifest(writer.dir()).unwrap().format_version, 4);
+        }
+        writer
+            .append(wal_record::Op::Bind(binding.clone()))
+            .unwrap();
+        // The durable version gate must already be visible before a Flush.
+        assert_eq!(read_manifest(writer.dir()).unwrap().format_version, 5);
+        writer.flush().unwrap();
+        let generation = writer.dir().to_owned();
+        drop(writer);
+        let records = read_clocked_records(&generation, 0).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].op, Some(wal_record::Op::Bind(binding)));
+        let mut newer = read_manifest(&generation).unwrap();
+        newer.format_version = 6;
+        write_manifest(&generation, &newer).unwrap();
+        assert!(read_manifest(&generation).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn source_op(id: u64, source: &crate::pb::ProtobufSource) -> wal_record::Op {
