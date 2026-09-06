@@ -2965,19 +2965,44 @@ fn filter_known_flags(
     (geo, tree)
 }
 
-/// Remove generation tombstones from one postings view's corpus shares.
+/// Corpus shares after tombstones and the mandatory document view.
 fn live_field_stats(
     index: &dyn Bm25Index,
     terms: &[String],
     live_docs: &LiveDocs,
     slots: u32,
+    visibility: Option<&[bool]>,
 ) -> (u64, Vec<u32>) {
+    if let Some(visibility) = visibility {
+        let admitted = |slot: u32| {
+            !live_docs.is_deleted(slot as usize) && visibility.get(slot as usize) == Some(&true)
+        };
+        let total_doc_length = (0..slots)
+            .filter(|slot| admitted(*slot))
+            .map(|slot| u64::from(index.doc_length(slot)))
+            .sum();
+        let dfs = terms
+            .iter()
+            .map(|term| {
+                let mut df = 0;
+                index.for_each_doc_tf(term, &mut |doc, _| {
+                    if admitted(doc) {
+                        df += 1;
+                    }
+                });
+                df
+            })
+            .collect();
+        return (total_doc_length, dfs);
+    }
     if !live_docs.has_deletes() {
         return (
             index.total_doc_length(),
             terms.iter().map(|term| index.df(term)).collect(),
         );
     }
+    // Retain the unrestricted path's sparse tombstone length subtraction;
+    // summing live lengths would fault in every mapped length page needlessly.
     let deleted_length: u64 = (0..slots)
         .filter(|slot| live_docs.is_deleted(*slot as usize))
         .map(|slot| u64::from(index.doc_length(slot)))
@@ -2997,8 +3022,12 @@ fn live_field_stats(
     (index.total_doc_length().saturating_sub(deleted_length), dfs)
 }
 
-fn live_document_count(store: &Bm25Shard, live_docs: &LiveDocs) -> u64 {
-    if !live_docs.has_deletes() {
+fn live_document_count(
+    store: &Bm25Shard,
+    live_docs: &LiveDocs,
+    visibility: Option<&[bool]>,
+) -> u64 {
+    if !live_docs.has_deletes() && visibility.is_none() {
         return store.doc_count();
     }
     let views: Vec<_> = (0..store.field_count())
@@ -3007,6 +3036,7 @@ fn live_document_count(store: &Bm25Shard, live_docs: &LiveDocs) -> u64 {
     (0..store.next_doc_id())
         .filter(|slot| {
             !live_docs.is_deleted(*slot as usize)
+                && visibility.is_none_or(|allow| allow.get(*slot as usize) == Some(&true))
                 && views.iter().any(|view| view.doc_length(*slot) > 0)
         })
         .count() as u64
@@ -12743,81 +12773,121 @@ impl NodeService for NodeServiceImpl {
     ) -> Result<Response<TermStatsResponse>, Status> {
         crate::metrics::timed(Route::TermStats, request, |request| async move {
             let req = request.into_inner();
+            let scope = crate::visibility::VisibilityScope::new(req.visibility.as_ref())?;
+            let visibility_filter = req
+                .visibility
+                .as_ref()
+                .and_then(|view| view.filter.as_ref());
             let guard = read_shard(&self.state);
-            let (doc_count, total_doc_length, doc_frequencies, field_stats) = match guard
+            if guard
                 .bm25
                 .as_ref()
+                .is_some_and(|store| store.as_index().is_none())
             {
-                Some(store) => {
-                    let index = store.as_index().ok_or_else(|| {
-                        Status::failed_precondition("bm25 bulk build in progress; Flush first")
-                    })?;
-                    // Per-field shares: a shard without a named field
-                    // answers zeros — that IS its share of the globals.
-                    let field_stats = req
-                        .fields
-                        .iter()
-                        .map(|ft| match store.field_index(&ft.field) {
-                            Some(fi) => {
-                                let view = store
-                                    .field_view(fi)
-                                    .expect("as_index above proves the shard is searchable");
-                                let (total_doc_length, doc_frequencies) = live_field_stats(
-                                    view.as_ref(),
-                                    &ft.terms,
-                                    &guard.live_docs,
-                                    store.next_doc_id(),
-                                );
-                                crate::pb::FieldStats {
-                                    sentences: store.field_has_sentences(fi),
-                                    total_doc_length,
-                                    doc_frequencies,
-                                    known: true,
-                                    positions: store.field_has_positions(fi),
+                return Err(Status::failed_precondition(
+                    "bm25 bulk build in progress; Flush first",
+                ));
+            }
+            let (_, visibility_columns_known) =
+                filter_known_flags(guard.bm25.as_ref(), &[], visibility_filter);
+            let visibility = if visibility_filter.is_some() {
+                let slots = guard
+                    .bm25
+                    .as_ref()
+                    .map_or(0, |store| store.next_doc_id() as usize);
+                let (_, allow, _) = resolve_shard_filters(
+                    guard.bm25.as_ref(),
+                    None,
+                    slots,
+                    &[],
+                    &[],
+                    visibility_filter,
+                    self.knobs.segment_pruning(),
+                )?;
+                allow
+            } else {
+                None
+            };
+            let (doc_count, total_doc_length, doc_frequencies, field_stats) =
+                match guard.bm25.as_ref() {
+                    Some(store) => {
+                        let index = store.as_index().ok_or_else(|| {
+                            Status::failed_precondition("bm25 bulk build in progress; Flush first")
+                        })?;
+                        // Per-field shares: a shard without a named field
+                        // answers zeros — that IS its share of the globals.
+                        let field_stats = req
+                            .fields
+                            .iter()
+                            .map(|ft| match store.field_index(&ft.field) {
+                                Some(fi) => {
+                                    let view = store
+                                        .field_view(fi)
+                                        .expect("as_index above proves the shard is searchable");
+                                    let (total_doc_length, doc_frequencies) = live_field_stats(
+                                        view.as_ref(),
+                                        &ft.terms,
+                                        &guard.live_docs,
+                                        store.next_doc_id(),
+                                        visibility.as_deref(),
+                                    );
+                                    crate::pb::FieldStats {
+                                        sentences: store.field_has_sentences(fi),
+                                        total_doc_length,
+                                        doc_frequencies,
+                                        known: true,
+                                        positions: store.field_has_positions(fi),
+                                    }
                                 }
-                            }
-                            None => crate::pb::FieldStats {
+                                None => crate::pb::FieldStats {
+                                    sentences: false,
+                                    total_doc_length: 0,
+                                    doc_frequencies: vec![0; ft.terms.len()],
+                                    known: false,
+                                    positions: false,
+                                },
+                            })
+                            .collect();
+                        let (total_doc_length, doc_frequencies) = live_field_stats(
+                            index,
+                            &req.terms,
+                            &guard.live_docs,
+                            store.next_doc_id(),
+                            visibility.as_deref(),
+                        );
+                        (
+                            live_document_count(store, &guard.live_docs, visibility.as_deref()),
+                            total_doc_length,
+                            doc_frequencies,
+                            field_stats,
+                        )
+                    }
+                    None => (
+                        0,
+                        0,
+                        req.terms.iter().map(|_| 0).collect(),
+                        // No postings at all: this shard knows no field, which is
+                        // a different statement from "the field does not exist".
+                        req.fields
+                            .iter()
+                            .map(|ft| crate::pb::FieldStats {
                                 sentences: false,
                                 total_doc_length: 0,
                                 doc_frequencies: vec![0; ft.terms.len()],
                                 known: false,
                                 positions: false,
-                            },
-                        })
-                        .collect();
-                    let (total_doc_length, doc_frequencies) =
-                        live_field_stats(index, &req.terms, &guard.live_docs, store.next_doc_id());
-                    (
-                        live_document_count(store, &guard.live_docs),
-                        total_doc_length,
-                        doc_frequencies,
-                        field_stats,
-                    )
-                }
-                None => (
-                    0,
-                    0,
-                    req.terms.iter().map(|_| 0).collect(),
-                    // No postings at all: this shard knows no field, which is
-                    // a different statement from "the field does not exist".
-                    req.fields
-                        .iter()
-                        .map(|ft| crate::pb::FieldStats {
-                            sentences: false,
-                            total_doc_length: 0,
-                            doc_frequencies: vec![0; ft.terms.len()],
-                            known: false,
-                            positions: false,
-                        })
-                        .collect(),
-                ),
-            };
+                            })
+                            .collect(),
+                    ),
+                };
             Ok(Response::new(TermStatsResponse {
                 doc_count,
                 total_doc_length,
                 doc_frequencies,
                 field_stats,
                 stats_epoch: guard.stats_epoch,
+                visibility_fingerprint: scope.fingerprint().to_vec(),
+                visibility_columns_known,
             }))
         })
         .await

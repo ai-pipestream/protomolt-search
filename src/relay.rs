@@ -580,6 +580,8 @@ pub fn merge_term_stats(
     request: &TermStatsRequest,
     children: &[TermStatsResponse],
 ) -> Result<TermStatsResponse, Status> {
+    let scope = crate::visibility::VisibilityScope::new(request.visibility.as_ref())?;
+    let mut visibility_columns_known = vec![false; scope.column_count()];
     if children.is_empty() {
         return Err(Status::failed_precondition(
             "relay: TermStats over no children",
@@ -601,6 +603,13 @@ pub fn merge_term_stats(
         })
         .collect();
     for (shard, child) in children.iter().enumerate() {
+        scope.validate_response(child)?;
+        for (known, child_known) in visibility_columns_known
+            .iter_mut()
+            .zip(&child.visibility_columns_known)
+        {
+            *known |= child_known;
+        }
         doc_count = doc_count.checked_add(child.doc_count).ok_or_else(|| {
             Status::failed_precondition(format!(
                 "relay: document count sums past u64 at child {shard}"
@@ -699,6 +708,8 @@ pub fn merge_term_stats(
         doc_frequencies,
         field_stats,
         stats_epoch: 0,
+        visibility_fingerprint: scope.fingerprint().to_vec(),
+        visibility_columns_known,
     })
 }
 
@@ -1966,6 +1977,7 @@ impl NodeService for RelayService {
         crate::metrics::timed(Route::TermStats, request, |request| async move {
             let timeout = grpc_timeout(request.metadata());
             let req = request.into_inner();
+            crate::visibility::VisibilityScope::new(req.visibility.as_ref())?;
             let (pinned, frozen) = self.pin();
             let children = frozen.node_addresses().to_vec();
             if children.is_empty() {
@@ -2634,6 +2646,8 @@ mod tests {
 
     fn share(doc_count: u64, dfs: &[u32], known: bool, positions: bool) -> TermStatsResponse {
         TermStatsResponse {
+            visibility_fingerprint: Vec::new(),
+            visibility_columns_known: Vec::new(),
             doc_count,
             total_doc_length: doc_count * 10,
             doc_frequencies: dfs.to_vec(),
@@ -2650,6 +2664,7 @@ mod tests {
 
     fn request() -> TermStatsRequest {
         TermStatsRequest {
+            visibility: None,
             terms: vec!["court".into(), "opinion".into()],
             fields: vec![crate::pb::FieldTerms {
                 field: "title".into(),

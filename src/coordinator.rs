@@ -4728,6 +4728,7 @@ impl CoordinatorServiceImpl {
                 continue;
             }
             let request = TermStatsRequest {
+                visibility: None,
                 terms: Vec::new(),
                 fields: stats_fields.to_vec(),
             };
@@ -4756,8 +4757,9 @@ impl CoordinatorServiceImpl {
                     return Err(Status::internal("shard field stats df length mismatch"));
                 }
             }
-            self.stats_cache.store(i, &[], stats_fields, &resp);
+            self.stats_cache.store(i, &[], stats_fields, &resp)?;
             shares[i] = Some(crate::stats_cache::FusedShare {
+                visibility_columns_known: resp.visibility_columns_known.clone(),
                 epoch: resp.stats_epoch,
                 doc_count: resp.doc_count,
                 fields: resp
@@ -5317,6 +5319,7 @@ impl CoordinatorServiceImpl {
                 tokio::spawn(async move {
                     client
                         .term_stats(TermStatsRequest {
+                            visibility: None,
                             terms: terms_owned,
                             fields: Vec::new(),
                         })
@@ -5332,8 +5335,9 @@ impl CoordinatorServiceImpl {
             if resp.doc_frequencies.len() != terms.len() {
                 return Err(Status::internal("shard stats df length mismatch"));
             }
-            self.stats_cache.store(i, terms, &[], &resp);
+            self.stats_cache.store(i, terms, &[], &resp)?;
             shares[i] = Some(crate::stats_cache::BodyShare {
+                visibility_columns_known: resp.visibility_columns_known.clone(),
                 epoch: resp.stats_epoch,
                 doc_count: resp.doc_count,
                 total_doc_length: resp.total_doc_length,

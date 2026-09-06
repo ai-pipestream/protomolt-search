@@ -457,6 +457,7 @@ async fn facet_ingest_validation_refuses_bad_values() {
     let mut client = NodeServiceClient::connect(addr).await.unwrap();
     let stats = client
         .term_stats(pipestream_search::pb::TermStatsRequest {
+            visibility: None,
             terms: vec!["some".into()],
             fields: Vec::new(),
         })

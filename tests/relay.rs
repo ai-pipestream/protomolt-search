@@ -233,6 +233,7 @@ async fn add_documents(addr: &str, texts: &[&str]) {
 
 fn stats_request() -> TermStatsRequest {
     TermStatsRequest {
+        visibility: None,
         terms: vec!["court".into(), "opinion".into(), "absent".into()],
         fields: vec![FieldTerms {
             field: "body".into(),
@@ -994,6 +995,7 @@ async fn a_moved_child_refuses_the_relayed_claim_and_a_refetch_restores_it() {
         .await
         .unwrap();
     let request = TermStatsRequest {
+        visibility: None,
         terms: vec!["court".into()],
         fields: Vec::new(),
     };
@@ -1081,6 +1083,7 @@ async fn a_parent_stop_mid_stream_yields_an_incomplete_bm25_certificate() {
         .await
         .unwrap()
         .term_stats(TermStatsRequest {
+            visibility: None,
             terms: vec!["court".into()],
             fields: Vec::new(),
         })
@@ -1138,6 +1141,7 @@ async fn a_rescore_through_a_relay_routes_each_id_to_its_child() {
     let mut relay = NodeServiceClient::connect(relay_addr).await.unwrap();
     let stats = relay
         .term_stats(TermStatsRequest {
+            visibility: None,
             terms: vec!["court".into()],
             fields: Vec::new(),
         })

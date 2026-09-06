@@ -2515,6 +2515,19 @@ message TermStatsRequest {
   // docs/multi-field.md). A shard without a named field answers zeros
   // for it — that IS its share of the global stats.
   repeated FieldTerms fields = 2;
+  // The document view whose corpus statistics are requested. Absent means
+  // the whole live lexical corpus. This is separate from the user's query
+  // filter: a mandatory visibility restriction changes N, lengths and df.
+  DocumentVisibility visibility = 3;
+}
+
+// A typed document membership restriction supplied by a trusted planner.
+// This message is not an authorization credential. A present visibility must
+// contain a valid filter; only TRUE survives the filter's Kleene semantics.
+// The public authority still has to enforce the same restriction on every
+// selection and disclosure route before document grants can be advertised.
+message DocumentVisibility {
+  FilterExpr filter = 1;
 }
 
 // One field's share of the global stats (multi-field queries).
@@ -2566,6 +2579,17 @@ message TermStatsResponse {
   // scoring request. Always >= 1 (0 is reserved to mean "no claim" in
   // the echo).
   uint64 stats_epoch = 5;
+  // Empty for unrestricted requests. Otherwise SHA-256 of the UTF-8 domain
+  // "protomolt.search.document-visibility.v1\0" followed by the normalized
+  // DocumentVisibility encoding defined in docs/document-visibility.md:
+  // ascending active field numbers recursively, repeated order retained,
+  // implicit defaults omitted. A consumer must verify this before
+  // using or caching shares: older nodes can silently ignore request field 3.
+  bytes visibility_fingerprint = 6;
+  // Known-column handshake in filter walk_leaves order, including empty
+  // results. Relays OR these flags over children. A column unknown everywhere
+  // must be refused by the planner, not treated as an empty authorized corpus.
+  repeated bool visibility_columns_known = 7;
 }
 
 // Phase (c) of the distributed BM25 flow: score with GLOBAL stats.

@@ -76,6 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut client = NodeServiceClient::connect(node.clone()).await?;
         let r = client
             .term_stats(TermStatsRequest {
+                visibility: None,
                 terms: terms.clone(),
                 fields: vec![FieldTerms {
                     field: field.clone(),

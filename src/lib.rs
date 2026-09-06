@@ -97,6 +97,7 @@ mod stream_signal;
 pub mod synonyms;
 pub mod values;
 pub mod vector;
+pub mod visibility;
 pub mod vocab;
 pub mod wal;
 

@@ -70,6 +70,14 @@ everywhere and a typo check needs the field somewhere, and a mixture has
 no faithful spelling in one, so the relay refuses it by name. The epoch
 the relay reports is a token (below).
 
+When `TermStats.visibility` is present, every child must echo the requested
+[document visibility](document-visibility.md) fingerprint. A missing or
+different echo refuses, including a response from an older node that ignored
+the restriction. Visibility-column known flags are ORed across children; these
+are separate from the homogeneous field capability flags above. Counts and term
+frequencies describe the requested view, while the epoch still names the
+children's physical data state.
+
 `Health`. The children's reports merged into one: counts summed, the base
 slot the lowest child's, dimension and provider identity required to
 agree. The parent derives one contiguous id interval from a health

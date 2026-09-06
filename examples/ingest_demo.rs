@@ -96,6 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- What landed in the postings (TermStats) ---------------------------
     let stats = node_client
         .term_stats(TermStatsRequest {
+            visibility: None,
             terms: ["dog", "bark", "run", "runner", "fox", "kitchen"]
                 .iter()
                 .map(|s| s.to_string())

@@ -1222,6 +1222,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Visibility-scoped term statistics (2026-09-06, feature branch).** Nodes
+  compute corpus counts, lengths and term frequencies for a typed document
+  view; relays verify the view fingerprint, and caches separate views. Tests
+  compare a restricted corpus through storage lifecycle and relay levels.
+  Public document grants remain unfinished. See
+  [document visibility](docs/document-visibility.md).
+
 - **Diagnostics authorization (2026-09-05, feature branch).** All six
   coordinator diagnostics routes require admin grants for every served
   collection in addition to the operator flag. Responses and metrics streams

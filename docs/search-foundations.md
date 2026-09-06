@@ -14,7 +14,7 @@ establish completion of the three workstreams.
 | Original payload and descriptor identity survive storage and replay | Byte equality after restart, snapshots, replication, compaction and resharding, including unknown fields | Row-bearing sources survive image/WAL lifecycle byte-for-byte; the catalog retains zero-row sources across restart; catalog backup and publication remain |
 | Complete scalar, repeated, map, nested and well-known-type semantics | Projection and query conformance across supported syntax/edition and shape combinations | Incomplete; existing column-family restrictions remain |
 | Workspace and collection grants separate read, ingest and administration | Denial tests on every public and node entry point, default collection resolution and direct access | Public search and coordinator diagnostics enforce revisioned protobuf capabilities; direct node/cluster-control policy enforcement remains |
-| Document and field grants cover retrieval and disclosure | Selection, statistics, suggestions, facets, highlights, projections, source fetch, caches and cursors tested under distinct and revoked policies | Not implemented |
+| Document and field grants cover retrieval and disclosure | Selection, statistics, suggestions, facets, highlights, projections, source fetch, caches and cursors tested under distinct and revoked policies | Public grants remain unimplemented; internal visibility-scoped term statistics and cache isolation are available as prerequisites |
 | Stable document and chunk identity | Exact key lookup and returned identity unchanged through compaction, replay and resharding | Imported identities persist through image/WAL lifecycle, node fetch and lexical results; catalog publication and the other result routes remain |
 | Conditional writes and persistent idempotency | Concurrent version conflicts, repeated requests, key reuse with different payload, disconnected acknowledgment and restart tests | Collection-wide local source authority implemented; server routing and projection transactions remain |
 | Accepted, searchable and durable receipts | API states tied to actual transaction publication and persisted recovery boundaries, crash tests at each boundary | Local source acceptance has durable/volatile receipts and abrupt-process-exit coverage; searchable publication remains |
@@ -716,8 +716,9 @@ supply its complete collection membership, including the ring and gauge sources;
 the metrics registry is not tenant-scoped. Direct node/control membership and
 document/field grants remain unfinished. In particular, the next search-policy
 work must scope TermStats corpus counts and document frequencies as well as
-selection: the current request carries only terms/fields, and StatsCache keys
-shares by node, field and epoch. Filtering returned hits alone would still leak
+selection: at this checkpoint TermStats carried only terms/fields, and
+StatsCache keyed shares by node, field and epoch. The next increment below
+adds the document-view contract and separates its cached shares. Filtering returned hits alone would still leak
 restricted documents through ranking and statistics.
 
 Validation: 444 library tests, 586 integration tests across 102 targets and
@@ -728,3 +729,45 @@ Tests/examples compilation, formatting, vendored-proto byte identity and
 whitespace checks passed. Descriptor comparison against `b634bba` confirms all
 protobuf declarations are unchanged. These are local checks; no fleet service,
 index generation, or main-branch state changed.
+
+## Visibility statistics checkpoint (2026-09-06)
+
+A raw gRPC probe carrying the proposed visibility field reproduced the previous
+node silently returning three contributing documents where the restricted
+reference corpus had two. `TermStats` now accepts a typed `DocumentVisibility`,
+validates it before inspecting an empty or populated shard, and returns counts,
+lengths and document frequencies over the view intersected with tombstones.
+Its fingerprint echo lets a relay or cache refuse an older node that ignored
+the request. The wire contract has one new message and three additive fields.
+
+Nodes compute membership, statistics and data epoch under one read guard. Relay
+levels carry the same view and OR its known-column flags; missing or mismatched
+echoes refuse before merge. The statistics cache separates views, checks response
+shapes, bounds scope churn and clears all scopes when a node's epoch changes.
+Unrestricted callers retain their fast path and sparse tombstone-length
+subtraction. Tests compare exact statistics and score bits with a physically
+restricted corpus and cover both persisted layouts, deletes, compaction, reopen,
+relay levels and cache contamination attempts.
+
+This provides the statistics prerequisite, not public document or field grants.
+Public queries still request unrestricted statistics. The authority, mandatory
+selection, field-use/disclosure checks, suggestion dictionaries, source fetch,
+RAG context and node delegation still need integration. The view fingerprint
+is not a credential, a policy-decision cache key, or a replacement for the
+existing data epoch protocol. See [document visibility](document-visibility.md)
+for the wire identity, cold-request cost and exact boundary.
+
+The fingerprint uses recursively ascending active field numbers, not the order
+chosen by a generated encoder. An independently encoded unsigned oneof bound
+with an exclusive flag exposed the ordering difference; normalization and fixed
+wire/hash fixtures now pin the language-independent contract. The schema graph
+check refuses to add undefined protobuf map or extension ordering unnoticed.
+
+Validation: 448 library tests, 591 integration tests across 103 targets and
+11 embedded tests passed (1,050 total), with one existing sidecar conformance
+test ignored. The final suite passed without retries after the encoding fix.
+All five Android/iOS Rust target checks passed with three existing relay
+dead-code warnings per target. Tests/examples compilation, formatting,
+vendored-proto byte identity and whitespace checks passed. Descriptor comparison
+against `6631cb9` confirms exactly one new message and three additive fields;
+existing declarations are unchanged. No index format or fleet state changed.

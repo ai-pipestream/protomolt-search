@@ -273,6 +273,7 @@ async fn fused_distributed_equals_monolithic_over_the_wire() {
     let mut c0 = NodeServiceClient::connect(addrs[0].clone()).await.unwrap();
     let stats = c0
         .term_stats(TermStatsRequest {
+            visibility: None,
             terms: vec!["smith".into()],
             fields: vec![
                 FieldTerms {
@@ -905,6 +906,7 @@ async fn extra_fields_ride_the_analysis_stream_not_unary_calls() {
     // other name), body df("smith") = 1.
     let stats = client
         .term_stats(TermStatsRequest {
+            visibility: None,
             terms: vec!["smith".into()],
             fields: vec![FieldTerms {
                 field: "case_name".into(),

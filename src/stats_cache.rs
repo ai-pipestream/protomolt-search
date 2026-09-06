@@ -13,6 +13,11 @@
 //! costs one refused round trip, after which the coordinator refetches
 //! and repeats the query under today's uncached semantics.
 //!
+//! Shares are cached per node and validated document visibility. A response
+//! must echo its view fingerprint before insertion, and a restricted view
+//! cannot populate an unrestricted entry. Visibility is a data-view identity,
+//! not a substitute for the caller's current authorization decision.
+//!
 //! Shares are cached PER NODE rather than merged, because invalidation
 //! is per node: one shard taking an ingest batch must not evict seven
 //! other shards' shares. Epochs are process-local counters and are
@@ -20,9 +25,11 @@
 //! particular they are meaningless across a primary/replica pair, which
 //! is safe today because no BM25 request is hedged to a replica.
 
+use crate::visibility::VisibilityScope;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use tonic::Status;
 
 /// One field's share of the stats on one node (the named-field channel
 /// of `TermStatsRequest.fields`).
@@ -48,6 +55,7 @@ struct NodeShare {
     body_dfs: HashMap<String, u32>,
     /// Named-field channel, by field name.
     fields: HashMap<String, FieldShare>,
+    visibility_columns_known: Vec<bool>,
 }
 
 /// A body-channel lookup or fetch result for one node, everything a
@@ -60,6 +68,7 @@ pub struct BodyShare {
     pub total_doc_length: u64,
     /// Per requested term, in request order.
     pub dfs: Vec<u32>,
+    pub visibility_columns_known: Vec<bool>,
 }
 
 /// One field's slice of a fused-channel lookup, in request field order.
@@ -80,6 +89,7 @@ pub struct FusedShare {
     pub doc_count: u64,
     /// Parallel to the requested fields.
     pub fields: Vec<FusedFieldShare>,
+    pub visibility_columns_known: Vec<bool>,
 }
 
 /// Per-node term maps are bounded; on overflow the map is cleared and
@@ -88,10 +98,12 @@ pub struct FusedShare {
 /// channel per node is far past any realistic working set of query
 /// vocabulary.
 const MAX_TERMS_PER_CHANNEL: usize = 64 * 1024;
+/// Policy churn cannot leave an unbounded number of document views resident.
+const MAX_SCOPES_PER_NODE: usize = 32;
 
-/// The cache: one optional share per node, in shard order.
+/// The cache: bounded visibility scopes per node, in shard order.
 pub struct StatsCache {
-    nodes: Mutex<Vec<Option<NodeShare>>>,
+    nodes: Mutex<Vec<HashMap<VisibilityScope, NodeShare>>>,
     /// TermStats RPCs the coordinator actually issued. Written by the
     /// coordinator's fetch path, read by tests proving the hit path
     /// issues none.
@@ -101,7 +113,7 @@ pub struct StatsCache {
 impl StatsCache {
     pub fn new(n_nodes: usize) -> Self {
         Self {
-            nodes: Mutex::new((0..n_nodes).map(|_| None).collect()),
+            nodes: Mutex::new((0..n_nodes).map(|_| HashMap::new()).collect()),
             fetches: AtomicU64::new(0),
         }
     }
@@ -110,8 +122,17 @@ impl StatsCache {
     /// cached for this node (a partial answer would force a fetch
     /// anyway, and the fetch replies with every term at once).
     pub fn lookup_body(&self, node: usize, terms: &[String]) -> Option<BodyShare> {
+        self.lookup_body_scoped(node, terms, &VisibilityScope::default())
+    }
+
+    pub fn lookup_body_scoped(
+        &self,
+        node: usize,
+        terms: &[String],
+        scope: &VisibilityScope,
+    ) -> Option<BodyShare> {
         let guard = self.nodes.lock().expect("stats cache lock poisoned");
-        let share = guard.get(node)?.as_ref()?;
+        let share = guard.get(node)?.get(scope)?;
         let dfs = terms
             .iter()
             .map(|t| share.body_dfs.get(t).copied())
@@ -121,6 +142,7 @@ impl StatsCache {
             doc_count: share.doc_count,
             total_doc_length: share.body_total_len,
             dfs,
+            visibility_columns_known: share.visibility_columns_known.clone(),
         })
     }
 
@@ -131,8 +153,17 @@ impl StatsCache {
         node: usize,
         fields: &[crate::pb::FieldTerms],
     ) -> Option<FusedShare> {
+        self.lookup_fused_scoped(node, fields, &VisibilityScope::default())
+    }
+
+    pub fn lookup_fused_scoped(
+        &self,
+        node: usize,
+        fields: &[crate::pb::FieldTerms],
+        scope: &VisibilityScope,
+    ) -> Option<FusedShare> {
         let guard = self.nodes.lock().expect("stats cache lock poisoned");
-        let share = guard.get(node)?.as_ref()?;
+        let share = guard.get(node)?.get(scope)?;
         let mut out = Vec::with_capacity(fields.len());
         for ft in fields {
             let fs = share.fields.get(&ft.field)?;
@@ -152,37 +183,65 @@ impl StatsCache {
             epoch: share.epoch,
             doc_count: share.doc_count,
             fields: out,
+            visibility_columns_known: share.visibility_columns_known.clone(),
         })
     }
 
-    /// Record a node's `TermStats` response. Same epoch as cached:
-    /// merge (the response answers terms the cache lacked). Different
-    /// epoch: everything cached is stale, replace wholesale with just
-    /// this response's terms.
+    /// Record an unrestricted `TermStats` response. Same epoch and view:
+    /// merge terms the cache lacked. A changed epoch evicts every view of
+    /// this node. A malformed response leaves the cache unchanged.
     pub fn store(
         &self,
         node: usize,
         terms: &[String],
         fields: &[crate::pb::FieldTerms],
         resp: &crate::pb::TermStatsResponse,
-    ) {
+    ) -> Result<(), Status> {
+        self.store_scoped(node, terms, fields, &VisibilityScope::default(), resp)
+    }
+
+    /// Retain a validated share only under the view that requested it. A
+    /// response missing the visibility echo cannot populate either cache.
+    pub fn store_scoped(
+        &self,
+        node: usize,
+        terms: &[String],
+        fields: &[crate::pb::FieldTerms],
+        scope: &VisibilityScope,
+        resp: &crate::pb::TermStatsResponse,
+    ) -> Result<(), Status> {
+        scope.validate_response(resp)?;
+        if resp.stats_epoch == 0
+            || resp.doc_frequencies.len() != terms.len()
+            || resp.field_stats.len() != fields.len()
+            || fields
+                .iter()
+                .zip(&resp.field_stats)
+                .any(|(request, share)| request.terms.len() != share.doc_frequencies.len())
+        {
+            return Err(Status::failed_precondition(
+                "term statistics cache requires an epoch and complete response shapes",
+            ));
+        }
         let mut guard = self.nodes.lock().expect("stats cache lock poisoned");
         let Some(slot) = guard.get_mut(node) else {
-            return;
+            return Ok(());
         };
-        let share = match slot {
-            Some(s) if s.epoch == resp.stats_epoch => s,
-            _ => {
-                *slot = Some(NodeShare {
-                    epoch: resp.stats_epoch,
-                    doc_count: 0,
-                    body_total_len: 0,
-                    body_dfs: HashMap::new(),
-                    fields: HashMap::new(),
-                });
-                slot.as_mut().expect("just written")
-            }
-        };
+        // A data mutation invalidates every view of that node. View churn is
+        // bounded independently of the per-view term limits.
+        if slot.values().any(|share| share.epoch != resp.stats_epoch)
+            || (!slot.contains_key(scope) && slot.len() >= MAX_SCOPES_PER_NODE)
+        {
+            slot.clear();
+        }
+        let share = slot.entry(scope.clone()).or_insert_with(|| NodeShare {
+            epoch: resp.stats_epoch,
+            doc_count: 0,
+            body_total_len: 0,
+            body_dfs: HashMap::new(),
+            fields: HashMap::new(),
+            visibility_columns_known: resp.visibility_columns_known.clone(),
+        });
         share.doc_count = resp.doc_count;
         share.body_total_len = resp.total_doc_length;
         if share.body_dfs.len() + terms.len() > MAX_TERMS_PER_CHANNEL {
@@ -203,6 +262,7 @@ impl StatsCache {
                 entry.dfs.insert(t.clone(), *df);
             }
         }
+        Ok(())
     }
 
     /// Drop one node's share (a scoring request came back refused: the
@@ -210,7 +270,7 @@ impl StatsCache {
     pub fn invalidate(&self, node: usize) {
         let mut guard = self.nodes.lock().expect("stats cache lock poisoned");
         if let Some(slot) = guard.get_mut(node) {
-            *slot = None;
+            slot.clear();
         }
     }
 
@@ -218,7 +278,7 @@ impl StatsCache {
     pub fn invalidate_all(&self) {
         let mut guard = self.nodes.lock().expect("stats cache lock poisoned");
         for slot in guard.iter_mut() {
-            *slot = None;
+            slot.clear();
         }
     }
 
@@ -232,5 +292,51 @@ impl StatsCache {
     /// unchanged IS the cache working, and is what the tests assert.
     pub fn fetch_count(&self) -> u64 {
         self.fetches.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+    use crate::pb::{
+        filter_expr, DocumentVisibility, FacetPredicate, FilterExpr, TermStatsResponse,
+    };
+
+    #[test]
+    fn policy_churn_is_bounded_and_bad_shapes_do_not_poison_existing_shares() {
+        let cache = StatsCache::new(1);
+        for n in 0..1000 {
+            let view = DocumentVisibility {
+                filter: Some(FilterExpr {
+                    expr: Some(filter_expr::Expr::Facet(FacetPredicate {
+                        column: "tenant".into(),
+                        values: vec![n.to_string()],
+                    })),
+                }),
+            };
+            let scope = VisibilityScope::new(Some(&view)).unwrap();
+            let response = TermStatsResponse {
+                stats_epoch: 1,
+                doc_count: n,
+                visibility_fingerprint: scope.fingerprint().to_vec(),
+                visibility_columns_known: vec![true],
+                ..Default::default()
+            };
+            cache.store_scoped(0, &[], &[], &scope, &response).unwrap();
+            assert!(cache.nodes.lock().unwrap()[0].len() <= MAX_SCOPES_PER_NODE);
+            assert_eq!(
+                cache.lookup_body_scoped(0, &[], &scope).unwrap().doc_count,
+                n
+            );
+            let mut malformed = response;
+            malformed.doc_frequencies.push(1);
+            assert!(cache.store_scoped(0, &[], &[], &scope, &malformed).is_err());
+            assert_eq!(
+                cache.lookup_body_scoped(0, &[], &scope).unwrap().doc_count,
+                n
+            );
+        }
+        cache.invalidate(0);
+        assert!(cache.nodes.lock().unwrap()[0].is_empty());
     }
 }

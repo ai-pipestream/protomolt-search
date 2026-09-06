@@ -82,6 +82,7 @@ async fn native_streamed_ingest_and_query_share_term_identity() {
 
     let stats = client
         .term_stats(TermStatsRequest {
+            visibility: None,
             terms: vec!["run".into(), "rodriguez".into()],
             fields: Vec::new(),
         })
