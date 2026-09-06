@@ -3282,8 +3282,97 @@ impl ShardState {
         }
     }
 
-    /// Check under the same guard that reads postings. A binding also pins fields
-    /// with no rows yet; a field name alone does not establish term identity.
+    /// Resolve from the durable generation, never from a caller's field grant.
+    fn vector_binding(
+        &self,
+        field: &str,
+    ) -> Result<Option<crate::pb::MappedVectorBinding>, Status> {
+        let binding = self
+            .mapped_binding
+            .as_ref()
+            .map(|stored| {
+                crate::mapped_vector::decode(&stored.vector_binding, &stored.plan_fingerprint)
+                    .map_err(|error| {
+                        Status::failed_precondition(format!(
+                            "invalid stored vector binding: {}",
+                            error.message()
+                        ))
+                    })
+            })
+            .transpose()?
+            .flatten();
+        if !field.is_empty() && binding.as_ref().is_none_or(|held| held.field != field) {
+            return Err(Status::failed_precondition(
+                "requested vector field is not bound on this generation",
+            ));
+        }
+        if let Some(binding) = &binding {
+            if binding.declared_dimensions != 0 {
+                for dim in [
+                    self.index.as_ref().and_then(|index| index.dim_opt()),
+                    self.exact_vectors.as_ref().and_then(|exact| exact.dim()),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if dim != binding.declared_dimensions as usize {
+                        return Err(Status::failed_precondition(
+                            "vector shape disagrees with its durable field binding",
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(binding)
+    }
+
+    /// Evaluate authority predicates only for requested live slots. The FP32
+    /// path stays proportional to the candidate set, not the whole corpus.
+    fn vector_candidate_slots(
+        &self,
+        visibility: Option<&crate::pb::DocumentVisibility>,
+        ids: &[u64],
+        offset: u64,
+        rows: usize,
+    ) -> Result<Vec<usize>, Status> {
+        let restricted = visibility.is_some();
+        let store = self.bm25.as_ref();
+        if restricted && store.is_some_and(|store| store.as_index().is_none()) {
+            return Err(Status::failed_precondition(
+                "bm25 bulk build in progress; Flush before scoped vector scoring",
+            ));
+        }
+        let predicate = visibility.and_then(|view| view.filter.as_ref());
+        let filter = crate::filter::DocFilter {
+            pred: match (predicate, store) {
+                (Some(predicate), Some(store)) => Some(store.resolve_filter(predicate)?),
+                _ => None,
+            },
+            ..Default::default()
+        };
+        let mut seen = std::collections::HashSet::new();
+        Ok(ids
+            .iter()
+            .filter_map(|&id| {
+                let slot = usize::try_from(id.checked_sub(offset)?).ok()?;
+                if slot >= rows || self.live_docs.is_deleted(slot) || !seen.insert(slot) {
+                    return None;
+                }
+                if restricted
+                    && store.is_none_or(|store| {
+                        slot >= store.next_doc_id() as usize
+                            || !filter.passes(slot as u32, &ShardNumericRead(store))
+                    })
+                {
+                    return None;
+                }
+                Some(slot)
+            })
+            .collect())
+    }
+
+    /// Check under the postings read guard. A binding also pins fields with
+    /// no rows yet; a field name alone does not establish term identity.
     fn check_query_analysis(&self, field: &str, offered: u64) -> Result<(), Status> {
         let explicit = self
             .mapped_binding
@@ -11378,6 +11467,7 @@ impl NodeService for NodeServiceImpl {
         guard.check_query_analysis("body", req.analysis_fingerprint)?;
         let Some(shard) = guard.bm25.as_ref() else {
             return Ok(Response::new(MembershipBitmapResponse {
+                vector_binding: None,
                 visibility_fingerprint: scope.fingerprint().to_vec(),
                 visibility_columns_known,
                 segments_total: 0,
@@ -11450,6 +11540,7 @@ impl NodeService for NodeServiceImpl {
             });
         }
         Ok(Response::new(MembershipBitmapResponse {
+            vector_binding: None,
             visibility_fingerprint: scope.fingerprint().to_vec(),
             visibility_columns_known,
             base_label: self.config.slot_offset,
@@ -11469,6 +11560,7 @@ impl NodeService for NodeServiceImpl {
         let req = request.into_inner();
         let scope = crate::visibility::VisibilityScope::new(req.visibility.as_ref())?;
         let guard = read_shard(&self.state);
+        let vector_binding = guard.vector_binding(&req.field)?;
         let view_filter = req
             .visibility
             .as_ref()
@@ -11512,6 +11604,7 @@ impl NodeService for NodeServiceImpl {
             }
         }
         Ok(Response::new(MembershipBitmapResponse {
+            vector_binding,
             visibility_fingerprint: scope.fingerprint().to_vec(),
             visibility_columns_known,
             segments_total: 0,
@@ -13763,64 +13856,86 @@ impl NodeService for NodeServiceImpl {
             let req = request.into_inner();
             let offset = self.config.slot_offset;
             let state = self.state.clone();
-            let hits = tokio::task::spawn_blocking(move || -> Result<Vec<RawLegHit>, Status> {
-                let guard = read_shard(&state);
-                // A shard with no index holds none of the candidates.
-                let Some(index) = guard.index.as_ref() else {
-                    return Ok(Vec::new());
-                };
-                let Some(dim) = index.dim_opt() else {
-                    return Ok(Vec::new());
-                };
-                if req.vector.len() != dim {
-                    return Err(Status::invalid_argument(format!(
-                        "query vector has dim {}, index expects {dim}",
-                        req.vector.len()
-                    )));
-                }
-                if let Some((_, coord, value)) = first_invalid_coordinate(&req.vector, dim) {
-                    return Err(Status::invalid_argument(format!(
-                        "query coordinate {coord} is invalid: {value}"
-                    )));
-                }
-                // Route global ids into this shard's live slots; the mask
-                // names slots and is sized to the slot count (slots are
-                // dense on the mainline engine: no capacity/len split). The
-                // kernel short-circuits fully-masked SIMD blocks, so a tiny
-                // allowlist costs a mask walk, not a scan.
-                let n = index.len();
-                let mut mask = vec![false; index.len()];
-                let mut allowed = 0usize;
-                for &id in &req.candidate_ids {
-                    if id >= offset && id - offset < n as u64 {
-                        let slot = (id - offset) as usize;
-                        if !guard.live_docs.is_deleted(slot) && !mask[slot] {
-                            mask[slot] = true;
-                            allowed += 1;
-                        }
+            let response =
+                tokio::task::spawn_blocking(move || -> Result<VectorRescoreResponse, Status> {
+                    let scope = crate::visibility::VisibilityScope::new(req.visibility.as_ref())?;
+                    let guard = read_shard(&state);
+                    guard.check_stats_epoch(
+                        req.expected_stats_epoch,
+                        &req.expected_stats_incarnation,
+                    )?;
+                    let (_, visibility_columns_known) = filter_known_flags(
+                        guard.bm25.as_ref(),
+                        &[],
+                        req.visibility
+                            .as_ref()
+                            .and_then(|view| view.filter.as_ref()),
+                    );
+                    let mut response = VectorRescoreResponse {
+                        vector_binding: guard.vector_binding(&req.field)?,
+                        stats_epoch: guard.stats_epoch,
+                        stats_incarnation: guard.stats_incarnation.bytes()?,
+                        visibility_fingerprint: scope.fingerprint().to_vec(),
+                        visibility_columns_known,
+                        ..Default::default()
+                    };
+                    // A shard with no index holds none of the candidates.
+                    let Some(index) = guard.index.as_ref() else {
+                        return Ok(response);
+                    };
+                    let Some(dim) = index.dim_opt() else {
+                        return Ok(response);
+                    };
+                    if req.vector.len() != dim {
+                        return Err(Status::invalid_argument(format!(
+                            "query vector has dim {}, index expects {dim}",
+                            req.vector.len()
+                        )));
                     }
-                }
-                if allowed == 0 {
-                    return Ok(Vec::new());
-                }
-                let results = index
-                    .try_search_with_mask(&req.vector, allowed, Some(&mask))
-                    .map_err(|e| Status::invalid_argument(e.to_string()))?;
-                let hits = results
-                    .indices_for_query(0)
-                    .iter()
-                    .zip(results.scores_for_query(0))
-                    .filter(|&(&slot, _)| slot >= 0)
-                    .map(|(&slot, &score)| RawLegHit {
-                        doc_id: offset + slot as u64,
-                        score,
-                    })
-                    .collect();
-                Ok(hits)
-            })
-            .await
-            .map_err(|e| Status::internal(format!("vector rescore task failed: {e}")))??;
-            Ok(Response::new(VectorRescoreResponse { hits }))
+                    if let Some((_, coord, value)) = first_invalid_coordinate(&req.vector, dim) {
+                        return Err(Status::invalid_argument(format!(
+                            "query coordinate {coord} is invalid: {value}"
+                        )));
+                    }
+                    // Route global ids into this shard's live slots; the mask
+                    // names slots and is sized to the slot count (slots are
+                    // dense on the mainline engine: no capacity/len split). The
+                    // kernel short-circuits fully-masked SIMD blocks, so a tiny
+                    // allowlist costs a mask walk, not a scan.
+                    let n = index.len();
+                    let mut mask = vec![false; index.len()];
+                    let slots = guard.vector_candidate_slots(
+                        req.visibility.as_ref(),
+                        &req.candidate_ids,
+                        offset,
+                        n,
+                    )?;
+                    let allowed = slots.len();
+                    for slot in slots {
+                        mask[slot] = true;
+                    }
+                    if allowed == 0 {
+                        return Ok(response);
+                    }
+                    let results = index
+                        .try_search_with_mask(&req.vector, allowed, Some(&mask))
+                        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+                    let hits = results
+                        .indices_for_query(0)
+                        .iter()
+                        .zip(results.scores_for_query(0))
+                        .filter(|&(&slot, _)| slot >= 0)
+                        .map(|(&slot, &score)| RawLegHit {
+                            doc_id: offset + slot as u64,
+                            score,
+                        })
+                        .collect();
+                    response.hits = hits;
+                    Ok(response)
+                })
+                .await
+                .map_err(|e| Status::internal(format!("vector rescore task failed: {e}")))??;
+            Ok(Response::new(response))
         })
         .await
     }
@@ -13843,7 +13958,18 @@ impl NodeService for NodeServiceImpl {
             .map_err(|_| Status::unavailable("exact rerank worker budget closed"))?;
         let result = tokio::task::spawn_blocking(move || -> Result<ExactVectorRescoreResponse, Status> {
             let _permits = permits;
+            let scope = crate::visibility::VisibilityScope::new(req.visibility.as_ref())?;
             let guard = read_shard(&state);
+            guard.check_stats_epoch(req.expected_stats_epoch, &req.expected_stats_incarnation)?;
+            let (_, visibility_columns_known) = filter_known_flags(guard.bm25.as_ref(), &[],
+                req.visibility.as_ref().and_then(|view| view.filter.as_ref()));
+            let response = ExactVectorRescoreResponse {
+                vector_binding: guard.vector_binding(&req.field)?,
+                stats_epoch: guard.stats_epoch,
+                stats_incarnation: guard.stats_incarnation.bytes()?,
+                visibility_fingerprint: scope.fingerprint().to_vec(),
+                visibility_columns_known, ..Default::default()
+            };
             // Product shards may own exact rows for a clustered vector
             // collection without also serving a local provider image. The
             // product slot range is therefore the maximum aligned artifact,
@@ -13859,19 +13985,9 @@ impl NodeService for NodeServiceImpl {
                         .as_ref()
                         .map_or(0, |store| store.next_doc_id() as usize),
                 );
-            let mut slots = Vec::new();
-            let mut seen = vec![false; n];
-            for id in req.candidate_ids {
-                if id >= offset && id - offset < n as u64 {
-                    let slot = (id - offset) as usize;
-                    if !guard.live_docs.is_deleted(slot) && !seen[slot] {
-                        seen[slot] = true;
-                        slots.push(slot);
-                    }
-                }
-            }
+            let slots = guard.vector_candidate_slots(req.visibility.as_ref(), &req.candidate_ids, offset, n)?;
             if slots.is_empty() {
-                return Ok(ExactVectorRescoreResponse::default());
+                return Ok(response);
             }
             let exact = guard.exact_vectors.as_ref().ok_or_else(|| {
                 Status::failed_precondition(format!(
@@ -13919,6 +14035,7 @@ impl NodeService for NodeServiceImpl {
                 logical_bytes: scored.logical_bytes,
                 pages_touched: scored.pages_touched,
                 tasks: scored.tasks,
+                ..response
             })
         })
         .await

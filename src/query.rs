@@ -156,7 +156,7 @@ fn plan_boolean_selection<'a>(
                                 search.id
                             )));
                         }
-                        let membership = coordinator.vector_membership().await?;
+                        let membership = coordinator.vector_membership("").await?;
                         let kind = PlannedSearchKind::Dense {
                             vector: query.vector.clone(),
                             exact_fp32: dense_score_mode(query)? == DenseScoreMode::Fp32Rerank,
@@ -371,9 +371,12 @@ async fn score_boolean_plan(
                 }
                 PlannedSearchKind::Dense { vector, exact_fp32 } => {
                     if *exact_fp32 {
-                        coordinator.exact_vector_scores(vector, chunk).await?.scores
+                        coordinator
+                            .exact_vector_scores(vector, chunk, "")
+                            .await?
+                            .scores
                     } else {
-                        coordinator.dense_signal(vector, chunk).await?
+                        coordinator.dense_signal(vector, chunk, "").await?
                     }
                 }
             };
@@ -1454,7 +1457,9 @@ pub(crate) async fn execute(
             let route = if fp32_rerank {
                 let t0 = std::time::Instant::now();
                 let ids: Vec<u64> = hits.iter().map(|hit| hit.doc_id).collect();
-                let reranked = coordinator.exact_vector_scores(&query.vector, &ids).await?;
+                let reranked = coordinator
+                    .exact_vector_scores(&query.vector, &ids, "")
+                    .await?;
                 for hit in &mut hits {
                     let score = *reranked.scores.get(&hit.doc_id).ok_or_else(|| {
                         Status::failed_precondition(format!(
@@ -2768,7 +2773,7 @@ async fn apply_boosts(
                     .lexical_signal(text, analysis.as_ref(), &ids)
                     .await?
             }
-            BoostKind::Dense { vector } => coordinator.dense_signal(vector, &ids).await?,
+            BoostKind::Dense { vector } => coordinator.dense_signal(vector, &ids, "").await?,
         };
         for hit in hits[..window].iter_mut() {
             if let Some(score) = scores.get(&hit.doc_id) {

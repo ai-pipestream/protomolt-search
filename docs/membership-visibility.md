@@ -53,9 +53,10 @@ Empty lexical terms still perform that handshake when a view is present.
 User filter dependencies require field `USE` before membership fan-out. Lexical
 membership requires `USE` on `body`; disclosure is not needed merely to select
 IDs. The authority predicate may use a column the caller cannot name in their
-own filter. Vector-field grants still lack an explicit indexed field name in
-the current dense contract, so a field-restricted vector membership call refuses
-instead of inventing an implicit grant for the unnamed vector channel.
+own filter. [Field-aware vector reads](vector-field-reads.md) now require `USE`
+on the exact durable vector name for private membership and candidate scoring.
+Unnamed requests cannot satisfy a field grant. The public dense-clause contract
+and its remaining authorization integration are still unfinished.
 
 ## Integration boundary
 

@@ -220,6 +220,9 @@ impl FieldScope {
         Ok(())
     }
 
+    pub(crate) fn vector(&self, field: &str) -> Result<(), Status> {
+        self.require_use(field)
+    }
     pub(crate) fn lexical_membership(&self) -> Result<(), Status> {
         self.require_use("body")
     }

@@ -977,6 +977,8 @@ active stored columns. See [vector field binding](vector-field-binding.md).
 The [stored binding integration](vector-binding-storage.md) carries the vector
 identity through images, WAL, resharding and compaction and requires exact replica
 acknowledgement. [Rowless generation publication](empty-generation-binding.md)
-now works through flush, restart and snapshots with WAL disabled. Field-named
-query enforcement remains required work. Existing restricted
-vector/query gates remain in place.
+now works through flush, restart and snapshots with WAL disabled.
+[Field-aware vector reads](vector-field-reads.md) now enforce exact durable names,
+document views and physical versions for private membership and candidate
+scoring. Public dense-clause naming and the remaining restricted Query selection
+and disclosure boundaries remain required work; those public gates stay in place.

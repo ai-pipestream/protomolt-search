@@ -438,6 +438,7 @@ async fn vector_rescore_matches_full_search_bitwise() {
             .vector_rescore(VectorRescoreRequest {
                 vector: query.clone(),
                 candidate_ids: candidates,
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -461,6 +462,7 @@ async fn vector_rescore_matches_full_search_bitwise() {
             .vector_rescore(VectorRescoreRequest {
                 vector: query.clone(),
                 candidate_ids: vec![],
+                ..Default::default()
             })
             .await
             .unwrap()

@@ -49,13 +49,13 @@ plan fingerprint and body/analysis metadata. See the stored binding integration
 for replay, compaction and replica evidence.
 [Rowless generation publication](empty-generation-binding.md) now preserves the
 binding through flush and snapshots with WAL disabled.
-Read requests must name the field and nodes must verify it against that durable
-binding before a field grant can authorize vector selection or scoring.
+[Field-aware vector reads](vector-field-reads.md) now check the requested name
+against that durable binding for membership and candidate scoring, including
+empty results. Private execution enforces field Use and document selection.
 
 Raw vector-only indexing also needs an explicit field definition. Do not guess
 that its vector plane is `body`, a materialized scalar or a source-path alias.
-Field-restricted vector membership and the remaining restricted public query
-routes stay gated until this runtime contract and their other selection and
+Restricted public query routes stay gated until their other selection and
 disclosure boundaries are complete. This increment does not complete any of the
 three foundation objectives.
 

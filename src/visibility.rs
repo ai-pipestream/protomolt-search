@@ -238,6 +238,8 @@ macro_rules! scoped_read_responses {
 }
 scoped_read_responses!(
     MembershipBitmapResponse,
+    VectorRescoreResponse,
+    ExactVectorRescoreResponse,
     BrowseShardResponse,
     AggregateShardResponse,
     QuantileCountsResponse,

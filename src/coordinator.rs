@@ -6486,7 +6486,7 @@ impl CoordinatorServiceImpl {
         for &(doc, _, shard) in merged.iter().take(k as usize) {
             seed_ids.entry(shard).or_default().push(doc);
         }
-        let v_of = self.fanout_vector_rescore(vector, seed_ids).await?;
+        let v_of = self.fanout_vector_rescore(vector, seed_ids, "").await?;
 
         // Known fused LOWER bounds, tracked as a k-sized min-heap: its
         // root is s_lb, the k-th best known bound, and every pushed
@@ -6799,7 +6799,20 @@ impl CoordinatorServiceImpl {
         &self,
         vector: &[f32],
         by_shard: HashMap<u32, Vec<u64>>,
+        field: &str,
     ) -> Result<HashMap<u64, f32>, Status> {
+        if let Some(fields) = &self.field_permissions {
+            fields.vector(field)?;
+        }
+        if self.has_clustered_vectors()
+            && (!field.is_empty()
+                || self.document_visibility.is_some()
+                || self.field_permissions.is_some())
+        {
+            return Err(Status::failed_precondition(
+                "scoped vector scoring requires a product-node field binding",
+            ));
+        }
         #[cfg(feature = "net")]
         if let Some(clustered) = &self.clustered_vectors {
             let mut ids: Vec<u64> = by_shard.into_values().flatten().collect();
@@ -6842,29 +6855,61 @@ impl CoordinatorServiceImpl {
                 })
                 .collect();
         }
+        if self.query_read_versions.is_none() {
+            let (pinned, reads) = self.pin_read_versions().await?;
+            let result = Box::pin(pinned.fanout_vector_rescore(vector, by_shard, field)).await;
+            pinned.validate_read_versions(&reads).await?;
+            return result;
+        }
+        let scope = crate::visibility::VisibilityScope::new(self.document_visibility.as_ref())?;
+        let mut visibility_known = vec![false; scope.column_count()];
+        let mut by_shard = by_shard;
+        if !field.is_empty() || self.document_visibility.is_some() {
+            for shard in 0..self.node_addrs.len() {
+                by_shard.entry(shard as u32).or_default();
+            }
+        }
         let mut tasks = Vec::with_capacity(by_shard.len());
         for (shard, ids) in by_shard {
+            let claim = self.query_read_versions.as_ref().expect("pinned reads")[shard as usize];
+            let requested: std::collections::HashSet<u64> = ids.iter().copied().collect();
             let request = VectorRescoreRequest {
+                field: field.into(),
+                visibility: self.document_visibility.clone(),
+                expected_stats_epoch: claim.epoch,
+                expected_stats_incarnation: claim.incarnation(),
                 vector: vector.to_vec(),
                 candidate_ids: ids,
             };
             let mut client = self.node_client(&self.node_addrs[shard as usize])?;
-            tasks.push(tokio::spawn(async move {
-                client
-                    .vector_rescore(request)
-                    .await
-                    .map(|r| r.into_inner().hits)
-            }));
+            tasks.push((
+                shard as usize,
+                requested,
+                tokio::spawn(async move {
+                    client.vector_rescore(request).await.map(|r| r.into_inner())
+                }),
+            ));
         }
         let mut scores = HashMap::new();
-        for task in tasks {
-            let hits = task
+        let mut held_binding = None;
+        for (shard, requested, task) in tasks {
+            let response = task
                 .await
                 .map_err(|e| Status::internal(format!("vector rescore task failed: {e}")))??;
-            for hit in hits {
-                scores.insert(hit.doc_id, hit.score);
+            Self::check_vector_binding(field, response.vector_binding.as_ref(), &mut held_binding)?;
+            self.check_read_view(shard, &scope, &response, &mut visibility_known)?;
+            for hit in response.hits {
+                if !requested.contains(&hit.doc_id)
+                    || !hit.score.is_finite()
+                    || scores.insert(hit.doc_id, hit.score).is_some()
+                {
+                    return Err(Status::failed_precondition(
+                        "vector rescore returned an unrequested, duplicate or invalid score",
+                    ));
+                }
             }
         }
+        self.check_visibility_columns(&visibility_known)?;
         Ok(scores)
     }
 
@@ -8172,13 +8217,26 @@ impl CoordinatorServiceImpl {
         &self,
         vector: &[f32],
         ids: &[u64],
+        field: &str,
     ) -> Result<HashMap<u64, f32>, Status> {
+        if let Some(fields) = &self.field_permissions {
+            fields.vector(field)?;
+        }
+        if self.has_clustered_vectors()
+            && (!field.is_empty()
+                || self.document_visibility.is_some()
+                || self.field_permissions.is_some())
+        {
+            return Err(Status::failed_precondition(
+                "scoped vector scoring requires a product-node field binding",
+            ));
+        }
         if vector.is_empty() {
             return Err(Status::invalid_argument(
                 "a dense boost needs a non-empty vector",
             ));
         }
-        if ids.is_empty() {
+        if ids.is_empty() && field.is_empty() && self.document_visibility.is_none() {
             return Ok(HashMap::new());
         }
         #[cfg(feature = "net")]
@@ -8219,7 +8277,7 @@ impl CoordinatorServiceImpl {
         let by_shard: HashMap<u32, Vec<u64>> = (0..self.node_addrs.len())
             .map(|s| (s as u32, ids.to_vec()))
             .collect();
-        self.fanout_vector_rescore(vector, by_shard).await
+        self.fanout_vector_rescore(vector, by_shard, field).await
     }
 
     /// Score a fixed candidate set against the product-owned original FP32
@@ -8230,13 +8288,25 @@ impl CoordinatorServiceImpl {
         &self,
         vector: &[f32],
         ids: &[u64],
+        field: &str,
     ) -> Result<ExactRerankScores, Status> {
+        if let Some(fields) = &self.field_permissions {
+            fields.vector(field)?;
+        }
+        if self.query_read_versions.is_none() {
+            let (pinned, reads) = self.pin_read_versions().await?;
+            let result = Box::pin(pinned.exact_vector_scores(vector, ids, field)).await;
+            pinned.validate_read_versions(&reads).await?;
+            return result;
+        }
+        let scope = crate::visibility::VisibilityScope::new(self.document_visibility.as_ref())?;
+        let mut visibility_known = vec![false; scope.column_count()];
         if vector.is_empty() {
             return Err(Status::invalid_argument(
                 "FP32 rerank needs a non-empty query vector",
             ));
         }
-        if ids.is_empty() {
+        if ids.is_empty() && field.is_empty() && self.document_visibility.is_none() {
             return Ok(ExactRerankScores {
                 scores: HashMap::new(),
                 rows: 0,
@@ -8261,8 +8331,13 @@ impl CoordinatorServiceImpl {
             )));
         }
         let mut tasks = Vec::with_capacity(self.node_addrs.len());
-        for addr in &self.node_addrs {
+        for (shard, addr) in self.node_addrs.iter().enumerate() {
+            let claim = self.query_read_versions.as_ref().expect("pinned reads")[shard];
             let request = ExactVectorRescoreRequest {
+                field: field.into(),
+                visibility: self.document_visibility.clone(),
+                expected_stats_epoch: claim.epoch,
+                expected_stats_incarnation: claim.incarnation(),
                 vector: vector.to_vec(),
                 candidate_ids: requested.clone(),
                 max_logical_bytes: self.max_rerank_bytes,
@@ -8288,10 +8363,13 @@ impl CoordinatorServiceImpl {
         let mut observed_bytes = 0u64;
         let mut pages_touched = 0u64;
         let mut worker_tasks = 0u32;
-        for task in tasks {
+        let mut held_binding = None;
+        for (shard, task) in tasks.into_iter().enumerate() {
             let response = task.await.map_err(|e| {
                 Status::internal(format!("exact vector rescore task failed: {e}"))
             })??;
+            Self::check_vector_binding(field, response.vector_binding.as_ref(), &mut held_binding)?;
+            self.check_read_view(shard, &scope, &response, &mut visibility_known)?;
             observed_bytes = observed_bytes
                 .checked_add(response.logical_bytes)
                 .ok_or_else(|| Status::internal("exact rerank byte metrics overflow"))?;
@@ -8300,15 +8378,18 @@ impl CoordinatorServiceImpl {
                 .ok_or_else(|| Status::internal("exact rerank page metrics overflow"))?;
             worker_tasks = worker_tasks.saturating_add(response.tasks);
             for hit in response.hits {
-                if scores.insert(hit.doc_id, hit.score).is_some() {
+                if requested.binary_search(&hit.doc_id).is_err()
+                    || !hit.score.is_finite()
+                    || scores.insert(hit.doc_id, hit.score).is_some()
+                {
                     return Err(Status::failed_precondition(format!(
-                        "FP32 rerank candidate {} is owned by more than one product shard; \
-                         slot ranges overlap",
+                        "FP32 rerank returned an unrequested, duplicate or invalid score for candidate {}",
                         hit.doc_id
                     )));
                 }
             }
         }
+        self.check_visibility_columns(&visibility_known)?;
         if let Some(missing) = requested.iter().find(|id| !scores.contains_key(id)) {
             return Err(Status::failed_precondition(format!(
                 "FP32 rerank candidate {missing} has no exact-vector row on any product shard"
@@ -9043,6 +9124,7 @@ impl CoordinatorServiceImpl {
         response: crate::pb::FilterBitmapResponse,
     ) -> crate::pb::MembershipBitmapResponse {
         crate::pb::MembershipBitmapResponse {
+            vector_binding: None,
             base_label: response.base_label,
             label_count: response.label_count,
             bits: response.bits,
@@ -9053,6 +9135,36 @@ impl CoordinatorServiceImpl {
             segments_total: response.segments_total,
             segments_skipped: response.segments_skipped,
         }
+    }
+
+    fn check_vector_binding(
+        field: &str,
+        actual: Option<&crate::pb::MappedVectorBinding>,
+        held: &mut Option<Option<crate::pb::MappedVectorBinding>>,
+    ) -> Result<(), Status> {
+        if let Some(binding) = actual {
+            crate::mapped_vector::validate(binding, &binding.plan_fingerprint).map_err(
+                |error| {
+                    Status::failed_precondition(format!(
+                        "invalid node vector binding: {}",
+                        error.message()
+                    ))
+                },
+            )?;
+        }
+        if !field.is_empty() && actual.is_none_or(|binding| binding.field != field) {
+            return Err(Status::failed_precondition("node did not acknowledge the requested vector field; use matching node and coordinator builds"));
+        }
+        if let Some(expected) = held {
+            if expected.as_ref() != actual {
+                return Err(Status::failed_precondition(
+                    "vector reads crossed incompatible field bindings",
+                ));
+            }
+        } else {
+            *held = Some(actual.cloned());
+        }
+        Ok(())
     }
 
     fn check_read_view(
@@ -9224,11 +9336,9 @@ impl CoordinatorServiceImpl {
     /// Resolve every live provider-backed vector row. This is the membership
     /// rule of a dense Boolean clause; native scores are fetched only for the
     /// candidates that survive the Boolean set plan.
-    pub async fn vector_membership(&self) -> Result<MembershipSet, Status> {
-        if self.field_permissions.is_some() {
-            return Err(Status::permission_denied(
-                "vector membership requires an explicit vector-field permission contract",
-            ));
+    pub async fn vector_membership(&self, field: &str) -> Result<MembershipSet, Status> {
+        if let Some(fields) = &self.field_permissions {
+            fields.vector(field)?;
         }
         let scope = crate::visibility::VisibilityScope::new(self.document_visibility.as_ref())?;
         let mut visibility_known = vec![false; scope.column_count()];
@@ -9237,6 +9347,7 @@ impl CoordinatorServiceImpl {
             let client = self.node_client(node);
             let request = crate::pb::VectorBitmapRequest {
                 visibility: self.document_visibility.clone(),
+                field: field.to_string(),
             };
             tasks.push(tokio::spawn(async move {
                 client?
@@ -9246,10 +9357,12 @@ impl CoordinatorServiceImpl {
             }));
         }
         let mut merged = MembershipSet::default();
+        let mut held_binding = None;
         for (shard, task) in tasks.into_iter().enumerate() {
             let response = task.await.map_err(|error| {
                 Status::internal(format!("vector membership task failed: {error}"))
             })??;
+            Self::check_vector_binding(field, response.vector_binding.as_ref(), &mut held_binding)?;
             merged.epochs.push(self.check_read_view(
                 shard,
                 &scope,
@@ -14008,7 +14121,7 @@ mod candidate_fetch_tests {
         assert_eq!(denied.code(), tonic::Code::PermissionDenied);
         assert_eq!(denied.message(), "field access is not granted");
         assert_eq!(
-            reader.vector_membership().await.unwrap_err().code(),
+            reader.vector_membership("").await.unwrap_err().code(),
             tonic::Code::PermissionDenied
         );
         // Exercise the actual negative-only planner. Its starting universe must
@@ -14046,7 +14159,7 @@ mod candidate_fetch_tests {
         let mut document_reader = owner.for_access(Some(&doc_only), "bm25_search").unwrap();
         document_reader.query_read_versions = reader.query_read_versions.clone();
         assert_eq!(
-            document_reader.vector_membership().await.unwrap().epochs,
+            document_reader.vector_membership("").await.unwrap().epochs,
             universe.epochs
         );
         crate::link::NodeLink::local(nodes[0].clone())
@@ -14064,7 +14177,7 @@ mod candidate_fetch_tests {
                     .lexical_membership("alpha", Some(&crate::analyzer::body_spec()))
                     .await
                     .unwrap_err(),
-                _ => document_reader.vector_membership().await.unwrap_err(),
+                _ => document_reader.vector_membership("").await.unwrap_err(),
             };
             assert_eq!(error.code(), tonic::Code::FailedPrecondition);
             assert!(error
@@ -14083,7 +14196,7 @@ mod candidate_fetch_tests {
                     .lexical_membership("alpha", Some(&crate::analyzer::body_spec()))
                     .await
                     .unwrap_err(),
-                _ => unknown.vector_membership().await.unwrap_err(),
+                _ => unknown.vector_membership("").await.unwrap_err(),
             };
             assert_eq!(error.code(), tonic::Code::FailedPrecondition);
             assert!(!error.message().contains("private_column"));
@@ -14711,5 +14824,267 @@ mod lineage_read_tests {
         let error = unknown.lineage_key(&[], "parent_id").await.unwrap_err();
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         assert!(!error.message().contains("internal_secret"));
+    }
+}
+
+#[cfg(test)]
+mod vector_field_read_tests {
+    use super::*;
+    use crate::pb::node_service_server::NodeService;
+    use crate::pb::*;
+    use prost::Message;
+
+    fn node(offset: u64, fingerprint_override: bool) -> Arc<crate::node::NodeServiceImpl> {
+        let plan = crate::mapping::derive_plan(
+            include_bytes!("../tests/fixtures/vector-binding/descriptor.bin"),
+            "vector_binding.Named",
+        )
+        .unwrap();
+        let mut binding = plan.vector_binding.unwrap();
+        if fingerprint_override {
+            binding.plan_fingerprint = "b".repeat(64);
+        }
+        let mut store = crate::postings::Bm25Store::new().with_facets(&["audience"]);
+        store.set_binding(Some(crate::postings::StoredBinding {
+            plan_fingerprint: binding.plan_fingerprint.clone(),
+            body_path: "body".into(),
+            vector_binding: binding.encode_to_vec(),
+            ..Default::default()
+        }));
+        for row in 0..2 {
+            store.add_document(
+                row,
+                "word".into(),
+                crate::postings::AnalyzedDoc::body(vec![("word".into(), 1, vec![(0, 4)])], 1),
+            );
+            store.set_facet(0, row, if row == 0 { "public" } else { "private" });
+        }
+        let vectors = vec![0.25; 32];
+        let config = crate::vector::embedded_turbovec_config(4, &[0.0; 16], &[1.0; 16]).unwrap();
+        let mut index = crate::vector::VectorIndex::from_backend_config(16, &config).unwrap();
+        index.add(&vectors, 16).unwrap();
+        Arc::new(
+            crate::node::NodeServiceImpl::new(
+                Some(index),
+                crate::node::NodeConfig {
+                    slot_offset: offset,
+                    facet_fields: vec!["audience".into()],
+                    ..Default::default()
+                },
+            )
+            .with_bm25(Some(crate::node::Bm25Shard::Building(store)))
+            .with_exact_vectors(Some(
+                crate::exact_vectors::ExactVectorStore::from_values(16, vectors).unwrap(),
+            ))
+            .unwrap(),
+        )
+    }
+    fn access(field: &str, action: FieldAction) -> AccessDecision {
+        AccessDecision {
+            action: AccessAction::Search as i32,
+            document_visibility: Some(DocumentVisibility {
+                filter: crate::cel::compile_filter("audience == 'public'").unwrap(),
+            }),
+            field_permissions: Some(FieldPermissions {
+                grants: vec![FieldGrant {
+                    field: field.into(),
+                    actions: vec![action as i32],
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn vector_candidate_reads_enforce_actual_fields_views_and_versions() {
+        let nodes = vec![node(0, false), node(100, false)];
+        let owner = CoordinatorServiceImpl::with_local_nodes(nodes.clone());
+        let reader = owner
+            .for_access(Some(&access("semantic", FieldAction::Use)), "bm25_search")
+            .unwrap();
+        let vector = vec![0.25; 16];
+        let members = reader.vector_membership("semantic").await.unwrap();
+        assert_eq!(members.ids, [0, 100].into_iter().collect());
+        let scores = reader
+            .dense_signal(&vector, &[0, 1, 100, 101], "semantic")
+            .await
+            .unwrap();
+        assert_eq!(
+            scores
+                .keys()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            members.ids
+        );
+        let reference = owner
+            .dense_signal(&vector, &[0, 100], "semantic")
+            .await
+            .unwrap();
+        assert_eq!(scores, reference);
+        let exact = reader
+            .exact_vector_scores(&vector, &[0, 100], "semantic")
+            .await
+            .unwrap();
+        assert_eq!(exact.scores.len(), 2);
+        assert_eq!(exact.logical_bytes, 128);
+        assert!(reader
+            .dense_signal(&vector, &[], "semantic")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(reader
+            .exact_vector_scores(&vector, &[], "semantic")
+            .await
+            .unwrap()
+            .scores
+            .is_empty());
+        for decision in [
+            access("body", FieldAction::Use),
+            access("semantic", FieldAction::Disclose),
+        ] {
+            let denied = owner.for_access(Some(&decision), "bm25_search").unwrap();
+            assert_eq!(
+                denied
+                    .vector_membership("semantic")
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied
+            );
+            assert_eq!(
+                denied
+                    .dense_signal(&[], &[], "semantic")
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied
+            );
+            assert_eq!(
+                denied
+                    .exact_vector_scores(&[], &[], "semantic")
+                    .await
+                    .err()
+                    .unwrap()
+                    .code(),
+                tonic::Code::PermissionDenied
+            );
+        }
+        let alias = owner
+            .for_access(Some(&access("signal", FieldAction::Use)), "bm25_search")
+            .unwrap();
+        assert_eq!(
+            alias
+                .dense_signal(&vector, &[], "signal")
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            reader
+                .dense_signal(&vector, &[], "")
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        let (pinned, _) = reader.pin_read_versions().await.unwrap();
+        nodes[0]
+            .delete_documents(Request::new(DeleteDocumentsRequest {
+                doc_ids: vec![0],
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            pinned
+                .dense_signal(&vector, &[], "semantic")
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            pinned
+                .exact_vector_scores(&vector, &[], "semantic")
+                .await
+                .err()
+                .unwrap()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        // Other Query selection/disclosure paths still require their own audit.
+        assert!(owner
+            .for_access(Some(&access("semantic", FieldAction::Use)), "query")
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn empty_vector_reads_refuse_mixed_generations_and_missing_binding_receipts() {
+        let owner = CoordinatorServiceImpl::with_local_nodes(vec![node(0, false), node(100, true)]);
+        let vector = vec![0.25; 16];
+        assert_eq!(
+            owner
+                .vector_membership("semantic")
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            owner
+                .dense_signal(&vector, &[], "semantic")
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            owner
+                .exact_vector_scores(&vector, &[], "semantic")
+                .await
+                .err()
+                .unwrap()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        let binding = crate::mapping::derive_plan(
+            include_bytes!("../tests/fixtures/vector-binding/descriptor.bin"),
+            "vector_binding.Named",
+        )
+        .unwrap()
+        .vector_binding
+        .unwrap();
+        assert!(CoordinatorServiceImpl::check_vector_binding("semantic", None, &mut None).is_err());
+        let mut bad = binding.clone();
+        bad.field = "signal".into();
+        assert!(
+            CoordinatorServiceImpl::check_vector_binding("semantic", Some(&bad), &mut None)
+                .is_err()
+        );
+        let response = VectorRescoreResponse {
+            vector_binding: Some(binding),
+            ..Default::default()
+        };
+        assert!(owner
+            .check_read_view(
+                0,
+                &crate::visibility::VisibilityScope::default(),
+                &response,
+                &mut []
+            )
+            .is_err());
+        let unbound = CoordinatorServiceImpl::with_local_nodes(vec![Arc::new(
+            crate::node::NodeServiceImpl::new(None, Default::default()),
+        )]);
+        assert!(unbound
+            .dense_signal(&vector, &[], "semantic")
+            .await
+            .is_err());
+        assert!(unbound
+            .exact_vector_scores(&vector, &[], "semantic")
+            .await
+            .is_err());
     }
 }

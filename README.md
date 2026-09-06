@@ -1222,6 +1222,12 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Field-aware vector reads (2026-09-06, feature branch).** Membership and
+  native/FP32 candidate scoring resolve exact vector names from durable bindings,
+  apply authority views and validate physical read receipts, including empty
+  results. Private execution enforces field Use; restricted public Query remains
+  gated. See [vector read boundaries](docs/vector-field-reads.md).
+
 - **Empty generation bindings (2026-09-06, feature branch).** Flush preserves
   protobuf mapping identity before the first row, with WAL on or off. Empty
   snapshots and full-deletion compaction retain binding and provider state;

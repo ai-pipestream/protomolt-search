@@ -229,6 +229,7 @@ async fn seeded_install_serves_and_persists() {
             vector: query.clone(),
             candidate_ids: vec![100, 101],
             max_logical_bytes: 0,
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -291,6 +292,7 @@ async fn snapshot_live_overlay_is_installed_atomically_with_the_generation() {
             vector: query,
             candidate_ids: vec![100],
             max_logical_bytes: 0,
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -387,6 +389,7 @@ async fn unseeded_node_adopts_snapshot_calibration() {
             vector: query,
             candidate_ids: vec![0],
             max_logical_bytes: 0,
+            ..Default::default()
         })
         .await
         .unwrap_err();

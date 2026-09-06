@@ -1068,6 +1068,9 @@ message VectorBitmapRequest {
   // Restricted membership requires document metadata satisfying this predicate.
   // Unrestricted membership retains vector-only rows.
   DocumentVisibility visibility = 1;
+  // Exact indexed vector name. Empty retains unrestricted legacy selection.
+  // A named request requires the node's durable mapped vector declaration.
+  string field = 2;
 }
 
 message MembershipBitmapResponse {
@@ -1087,6 +1090,9 @@ message MembershipBitmapResponse {
   bytes stats_incarnation = 7;
   bytes visibility_fingerprint = 8;
   repeated bool visibility_columns_known = 9;
+  // Durable vector identity actually used by ResolveVectorBitmap. Absent on
+  // lexical membership and on legacy unnamed vector generations.
+  MappedVectorBinding vector_binding = 10;
 }
 
 // One column's aggregate over a filtered match set (docs/facets.md).
@@ -4780,6 +4786,15 @@ message VectorRescoreRequest {
   // Global candidate doc ids to score. Ids outside this shard's range,
   // or beyond its live slots, are ignored.
   repeated uint64 candidate_ids = 2;
+  // Exact indexed name, checked against the generation binding. Empty keeps
+  // legacy unrestricted behavior and cannot establish a field permission.
+  string field = 3;
+  // Authority predicate supplied by a trusted planner, not a credential.
+  DocumentVisibility visibility = 4;
+  // Both fields name the admitted physical version; zero/empty means no claim.
+  // The node checks the claim under the scoring guard, even for empty results.
+  uint64 expected_stats_epoch = 5;
+  bytes expected_stats_incarnation = 6;
 }
 
 // Scores for the requested candidates present on this shard, score
@@ -4787,6 +4802,12 @@ message VectorRescoreRequest {
 // the candidates).
 message VectorRescoreResponse {
   repeated RawLegHit hits = 1;
+  // Returned under the same read guard as scores, including empty results.
+  MappedVectorBinding vector_binding = 2;
+  uint64 stats_epoch = 3;
+  bytes stats_incarnation = 4;
+  bytes visibility_fingerprint = 5;
+  repeated bool visibility_columns_known = 6;
 }
 
 // Candidate-scoped original-vector scoring (see
@@ -4796,8 +4817,14 @@ message ExactVectorRescoreRequest {
   repeated uint64 candidate_ids = 2;
   // Per-shard logical row-byte ceiling. Zero means the caller already
   // enforced its own bound. A node refuses before touching row payload when
-  // its owned candidates exceed this value.
+  // its visible, live owned candidates exceed this value.
   uint64 max_logical_bytes = 3;
+  // Same field-name, authority-view and physical-version contract as
+  // VectorRescoreRequest. These checks precede reading any FP32 row payload.
+  string field = 4;
+  DocumentVisibility visibility = 5;
+  uint64 expected_stats_epoch = 6;
+  bytes expected_stats_incarnation = 7;
 }
 
 message ExactVectorRescoreResponse {
@@ -4806,6 +4833,12 @@ message ExactVectorRescoreResponse {
   uint64 logical_bytes = 2;
   uint64 pages_touched = 3;
   uint32 tasks = 4;
+  // Returned under the same read guard as FP32 scoring, including empty results.
+  MappedVectorBinding vector_binding = 5;
+  uint64 stats_epoch = 6;
+  bytes stats_incarnation = 7;
+  bytes visibility_fingerprint = 8;
+  repeated bool visibility_columns_known = 9;
 }
 
 // One cascade hit: the two leg scores as SEPARATE fields (no fused

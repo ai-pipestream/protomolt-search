@@ -89,7 +89,10 @@ async fn membership(
         .unwrap()
         .into_inner();
     let vector = client
-        .resolve_vector_bitmap(VectorBitmapRequest { visibility })
+        .resolve_vector_bitmap(VectorBitmapRequest {
+            visibility,
+            ..Default::default()
+        })
         .await
         .unwrap()
         .into_inner();
@@ -259,6 +262,7 @@ async fn vector_only_rows_have_no_authorized_document_membership() {
     let restricted = client
         .resolve_vector_bitmap(VectorBitmapRequest {
             visibility: Some(view("!has(audience)")),
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -310,7 +314,8 @@ async fn malformed_views_refuse_on_all_membership_routes_even_when_empty() {
         assert_eq!(
             client
                 .resolve_vector_bitmap(VectorBitmapRequest {
-                    visibility: Some(visibility)
+                    visibility: Some(visibility),
+                    ..Default::default()
                 })
                 .await
                 .unwrap_err()

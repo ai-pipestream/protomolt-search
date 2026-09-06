@@ -137,6 +137,7 @@ async fn descending_deletes_and_replacement_stay_hidden_after_reopen() {
                 vector: vector.to_vec(),
                 candidate_ids: (0..ROWS as u64).collect(),
                 max_logical_bytes: 0,
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -291,6 +292,7 @@ async fn delete_and_append_then_replace_are_consistent_across_read_paths() {
             vector: corpus[..DIM].to_vec(),
             candidate_ids: vec![0],
             max_logical_bytes: 0,
+            ..Default::default()
         })
         .await
         .unwrap()
