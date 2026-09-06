@@ -18,7 +18,7 @@
 //! unsupported construct and, where one exists, the supported way to
 //! ask for the same thing.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -34,57 +34,28 @@ use crate::pb::{
     SelectionOperator, SelectionQuery,
 };
 
-#[derive(Clone, Default)]
-struct BooleanHit {
-    score: f32,
-    signals: Vec<QuerySignal>,
-    matched: Vec<String>,
-}
-
-enum PlannedSearchKind {
-    Lexical {
-        terms: Vec<String>,
-        epochs: Vec<u64>,
-        score_stages: Vec<crate::pb::ScoreStage>,
-    },
-    Dense {
-        vector: Vec<f32>,
-        exact_fp32: bool,
-    },
-}
-
-struct PlannedSearchLeaf {
+/// One leaf of a compiled `BooleanQuery` as the coordinator names it:
+/// the request id its signal and provenance carry, whether a MUST/SHOULD
+/// chain reaches it, and the compiled filters of a filter leaf.
+struct BooleanLeafMeta {
     id: String,
-    /// Empty when `universal`.
-    membership: BTreeSet<u64>,
-    /// A dense clause matches every row that has a vector, which is
-    /// every live row on the mainline engine, so its membership is not
-    /// fetched: it is the universe, and the group's other clauses (or
-    /// the live-document bitmap, for a group of universal clauses) name
-    /// the rows. A row the rescore returns no product for has no vector
-    /// and is dropped from the group, the same rows the vector bitmap
-    /// used to exclude.
-    universal: bool,
-    kind: PlannedSearchKind,
+    positive: bool,
+    filters: Option<crate::coordinator::RequestFilters>,
+    /// The analyzed terms of a lexical leaf, the stats round's input.
+    terms: Option<Vec<String>>,
 }
 
-struct PlannedMatcher {
-    id: String,
-    membership: BTreeSet<u64>,
-    universal: bool,
-}
-
-struct PlannedBooleanNode {
-    /// Empty when `universal`.
-    membership: BTreeSet<u64>,
-    /// The node matches every row; only a lone dense clause is.
-    universal: bool,
-    searches: Vec<PlannedSearchLeaf>,
-    matchers: Vec<PlannedMatcher>,
-    membership_wire_bytes: u64,
-    /// Sealed segments the shards consulted and ruled out while
-    /// resolving this node's membership (docs/segment-pruning.md).
-    prune: crate::segment_prune::PruneStats,
+/// A `BooleanQuery` compiled once: the wire tree over indexed leaves
+/// in traversal order (a group's MUST, SHOULD, then MUST_NOT clauses,
+/// a nested group inline), which is the order signals sum in and
+/// provenance lists.
+struct CompiledBoolean {
+    root: crate::pb::BooleanPlanGroup,
+    leaves: Vec<crate::pb::BooleanPlanLeaf>,
+    meta: Vec<BooleanLeafMeta>,
+    /// The root group's MUST filter leaves: the AND spine placement
+    /// prunes shards by.
+    root_must_filters: Vec<usize>,
 }
 
 fn compile_boolean_filter(
@@ -106,23 +77,25 @@ fn compile_boolean_filter(
     crate::coordinator::RequestFilters::compile(&geo, cel)
 }
 
-fn plan_boolean_selection<'a>(
+fn compile_boolean_node<'a>(
     coordinator: &'a CoordinatorServiceImpl,
     selection: &'a SelectionQuery,
+    positive: bool,
     depth: usize,
-) -> Pin<Box<dyn Future<Output = Result<PlannedBooleanNode, Status>> + Send + 'a>> {
+    out: &'a mut CompiledBoolean,
+) -> Pin<Box<dyn Future<Output = Result<crate::pb::BooleanPlanNode, Status>> + Send + 'a>> {
     Box::pin(async move {
         if depth > 64 {
             return Err(refuse(
                 "boolean selection exceeds the 64-level recursion limit",
             ));
         }
-        match selection.node.as_ref().ok_or_else(|| refuse("empty selection node"))? {
+        let leaf = match selection.node.as_ref().ok_or_else(|| refuse("empty selection node"))? {
             selection_query::Node::Search(search) => {
                 if search.id.is_empty() {
                     return Err(refuse("a search clause needs a non-empty id"));
                 }
-                let (membership, kind) = match search.query.as_ref() {
+                match search.query.as_ref() {
                     Some(search_query::Query::Lexical(query)) => {
                         if query.text.is_empty() {
                             return Err(refuse(format!(
@@ -139,15 +112,29 @@ fn plan_boolean_selection<'a>(
                                 search.id
                             )));
                         }
-                        let membership = coordinator
-                            .lexical_membership(&query.text, query.analysis.as_ref())
+                        let terms = coordinator
+                            .analyze_terms(&query.text, query.analysis.as_ref())
                             .await?;
-                        let kind = PlannedSearchKind::Lexical {
-                            terms: membership.terms.clone(),
-                            epochs: membership.epochs.clone(),
-                            score_stages: query.score_stages.clone(),
-                        };
-                        (membership, kind)
+                        let params = coordinator.bm25_params();
+                        out.leaves.push(crate::pb::BooleanPlanLeaf {
+                            leaf: Some(crate::pb::boolean_plan_leaf::Leaf::Lexical(
+                                crate::pb::BooleanPlanLexical {
+                                    terms: terms.clone(),
+                                    global_doc_count: 0,
+                                    global_total_doc_length: 0,
+                                    global_doc_frequencies: Vec::new(),
+                                    k1: params.k1 as f32,
+                                    b: params.b as f32,
+                                    score_stages: query.score_stages.clone(),
+                                },
+                            )),
+                        });
+                        BooleanLeafMeta {
+                            id: search.id.clone(),
+                            positive,
+                            filters: None,
+                            terms: Some(terms),
+                        }
                     }
                     Some(search_query::Query::Dense(query)) => {
                         if query.quality.is_some() {
@@ -167,29 +154,21 @@ fn plan_boolean_selection<'a>(
                                 search.id
                             )));
                         }
-                        let kind = PlannedSearchKind::Dense {
-                            vector: query.vector.clone(),
-                            exact_fp32: dense_score_mode(query)? == DenseScoreMode::Fp32Rerank,
-                        };
-                        // The universe, not a fetched set: see
-                        // `PlannedSearchLeaf::universal`.
-                        return Ok(PlannedBooleanNode {
-                            membership: BTreeSet::new(),
-                            universal: true,
-                            searches: vec![PlannedSearchLeaf {
-                                id: search.id.clone(),
-                                membership: BTreeSet::new(),
-                                universal: true,
-                                kind,
-                            }],
-                            matchers: vec![PlannedMatcher {
-                                id: search.id.clone(),
-                                membership: BTreeSet::new(),
-                                universal: true,
-                            }],
-                            membership_wire_bytes: 0,
-                            prune: Default::default(),
+                        out.leaves.push(crate::pb::BooleanPlanLeaf {
+                            leaf: Some(crate::pb::boolean_plan_leaf::Leaf::Dense(
+                                crate::pb::BooleanPlanDense {
+                                    vector: query.vector.clone(),
+                                    exact_fp32: dense_score_mode(query)?
+                                        == DenseScoreMode::Fp32Rerank,
+                                },
+                            )),
                         });
+                        BooleanLeafMeta {
+                            id: search.id.clone(),
+                            positive,
+                            filters: None,
+                            terms: None,
+                        }
                     }
                     None => {
                         return Err(refuse(format!(
@@ -197,46 +176,27 @@ fn plan_boolean_selection<'a>(
                             search.id
                         )))
                     }
-                };
-                let ids = membership.ids;
-                Ok(PlannedBooleanNode {
-                    membership: ids.clone(),
-                    universal: false,
-                    searches: vec![PlannedSearchLeaf {
-                        id: search.id.clone(),
-                        membership: ids.clone(),
-                        universal: false,
-                        kind,
-                    }],
-                    matchers: vec![PlannedMatcher {
-                        id: search.id.clone(),
-                        membership: ids,
-                        universal: false,
-                    }],
-                    membership_wire_bytes: membership.wire_bytes,
-                    prune: membership.prune,
-                })
+                }
             }
             selection_query::Node::Filter(filter) => {
                 if filter.id.is_empty() {
                     return Err(refuse("a filter clause needs a non-empty id"));
                 }
-                let membership = coordinator
-                    .filter_membership(&compile_boolean_filter(filter)?)
-                    .await?;
-                let ids = membership.ids;
-                Ok(PlannedBooleanNode {
-                    membership: ids.clone(),
-                    universal: false,
-                    searches: Vec::new(),
-                    matchers: vec![PlannedMatcher {
-                        id: filter.id.clone(),
-                        membership: ids,
-                        universal: false,
-                    }],
-                    membership_wire_bytes: membership.wire_bytes,
-                    prune: membership.prune,
-                })
+                let filters = compile_boolean_filter(filter)?;
+                out.leaves.push(crate::pb::BooleanPlanLeaf {
+                    leaf: Some(crate::pb::boolean_plan_leaf::Leaf::Filter(
+                        crate::pb::BooleanPlanFilter {
+                            filter: filters.tree.clone(),
+                            geo_filters: filters.geo.clone(),
+                        },
+                    )),
+                });
+                BooleanLeafMeta {
+                    id: filter.id.clone(),
+                    positive,
+                    filters: Some(filters),
+                    terms: None,
+                }
             }
             selection_query::Node::Boolean(boolean) => {
                 if boolean.aggregate.is_some() {
@@ -244,20 +204,38 @@ fn plan_boolean_selection<'a>(
                         "aggregate belongs on the root BooleanQuery, not a nested clause",
                     ));
                 }
-                plan_boolean_group(coordinator, boolean, depth + 1).await
+                let group = compile_boolean_group(coordinator, boolean, positive, depth + 1, out, false)
+                    .await?;
+                return Ok(crate::pb::BooleanPlanNode {
+                    node: Some(crate::pb::boolean_plan_node::Node::Group(group)),
+                });
             }
-            selection_query::Node::Composite(_) => Err(refuse(
-                "inside recursive boolean selection, express hybrid membership as dense and lexical MUST/SHOULD clauses; legacy CompositeSearchStrategy remains supported as the top-level compatibility shape",
-            )),
-        }
+            selection_query::Node::Composite(_) => {
+                return Err(refuse(
+                    "inside recursive boolean selection, express hybrid membership as dense and lexical MUST/SHOULD clauses; legacy CompositeSearchStrategy remains supported as the top-level compatibility shape",
+                ))
+            }
+        };
+        out.meta.push(leaf);
+        let index = (out.leaves.len() - 1) as u32;
+        Ok(crate::pb::BooleanPlanNode {
+            node: Some(crate::pb::boolean_plan_node::Node::Leaf(index)),
+        })
     })
 }
 
-fn plan_boolean_group<'a>(
+/// Compile one group: its clauses in MUST, SHOULD, MUST_NOT order, the
+/// SHOULD minimum resolved (zero is one with only SHOULD clauses, else
+/// zero). `root` marks the request's root group, whose MUST filter
+/// leaves are the spine placement prunes shards by.
+fn compile_boolean_group<'a>(
     coordinator: &'a CoordinatorServiceImpl,
     boolean: &'a crate::pb::BooleanQuery,
+    positive: bool,
     depth: usize,
-) -> Pin<Box<dyn Future<Output = Result<PlannedBooleanNode, Status>> + Send + 'a>> {
+    out: &'a mut CompiledBoolean,
+    root: bool,
+) -> Pin<Box<dyn Future<Output = Result<crate::pb::BooleanPlanGroup, Status>> + Send + 'a>> {
     Box::pin(async move {
         if boolean.minimum_should_match as usize > boolean.should.len() {
             return Err(refuse(format!(
@@ -271,15 +249,25 @@ fn plan_boolean_group<'a>(
         }
         let mut must = Vec::with_capacity(boolean.must.len());
         for clause in &boolean.must {
-            must.push(plan_boolean_selection(coordinator, clause, depth).await?);
+            let node = compile_boolean_node(coordinator, clause, positive, depth, out).await?;
+            if root {
+                if let (
+                    Some(crate::pb::boolean_plan_node::Node::Leaf(index)),
+                    Some(selection_query::Node::Filter(_)),
+                ) = (node.node.as_ref(), clause.node.as_ref())
+                {
+                    out.root_must_filters.push(*index as usize);
+                }
+            }
+            must.push(node);
         }
         let mut should = Vec::with_capacity(boolean.should.len());
         for clause in &boolean.should {
-            should.push(plan_boolean_selection(coordinator, clause, depth).await?);
+            should.push(compile_boolean_node(coordinator, clause, positive, depth, out).await?);
         }
         let mut must_not = Vec::with_capacity(boolean.must_not.len());
         for clause in &boolean.must_not {
-            must_not.push(plan_boolean_selection(coordinator, clause, depth).await?);
+            must_not.push(compile_boolean_node(coordinator, clause, false, depth, out).await?);
         }
         let minimum_should_match = if boolean.minimum_should_match == 0
             && boolean.must.is_empty()
@@ -287,187 +275,65 @@ fn plan_boolean_group<'a>(
         {
             1
         } else {
-            boolean.minimum_should_match as usize
+            boolean.minimum_should_match
         };
-        // Seed MUST intersections from the cheapest bitmap, skipping the
-        // universal clauses (they contain every id). With no MUST, count
-        // SHOULD memberships directly, a universal SHOULD counting for
-        // every id; a group whose positive clauses are all universal, and
-        // a negative-only group, start from the live-document bitmap
-        // rather than a paged browse.
-        let universal_should = should.iter().filter(|clause| clause.universal).count();
-        let live_docs = |coordinator: &'a CoordinatorServiceImpl| async move {
-            let empty = crate::coordinator::RequestFilters::compile(&[], "")?;
-            Ok::<_, Status>(coordinator.filter_membership(&empty).await?.ids)
-        };
-        let mut membership = if let Some(seed) = must
-            .iter()
-            .filter(|clause| !clause.universal)
-            .min_by_key(|clause| clause.membership.len())
-        {
-            let mut ids = seed.membership.clone();
-            for clause in &must {
-                if !clause.universal && !std::ptr::eq(clause, seed) {
-                    ids.retain(|id| clause.membership.contains(id));
-                }
-            }
-            ids
-        } else if !must.is_empty()
-            || minimum_should_match == 0
-            || universal_should >= minimum_should_match
-        {
-            live_docs(coordinator).await?
-        } else {
-            let mut counts = BTreeMap::<u64, usize>::new();
-            for clause in should.iter().filter(|clause| !clause.universal) {
-                for &id in &clause.membership {
-                    *counts.entry(id).or_default() += 1;
-                }
-            }
-            counts
-                .into_iter()
-                .filter_map(|(id, count)| {
-                    (count + universal_should >= minimum_should_match).then_some(id)
-                })
-                .collect()
-        };
-        if !must.is_empty() && minimum_should_match > universal_should {
-            membership.retain(|id| {
-                universal_should
-                    + should
-                        .iter()
-                        .filter(|clause| !clause.universal && clause.membership.contains(id))
-                        .count()
-                    >= minimum_should_match
-            });
-        }
-        for clause in &must_not {
-            if clause.universal {
-                membership.clear();
-            } else {
-                membership.retain(|id| !clause.membership.contains(id));
-            }
-        }
-
-        let membership_wire_bytes =
-            must.iter()
-                .chain(&should)
-                .chain(&must_not)
-                .try_fold(0u64, |total, node| {
-                    total
-                        .checked_add(node.membership_wire_bytes)
-                        .ok_or_else(|| {
-                            Status::resource_exhausted("Boolean membership byte count overflow")
-                        })
-                })?;
-        let mut prune = crate::segment_prune::PruneStats::default();
-        for node in must.iter().chain(&should).chain(&must_not) {
-            prune.add(node.prune);
-        }
-        let mut searches = Vec::new();
-        let mut matchers = Vec::new();
-        for mut node in must.into_iter().chain(should) {
-            searches.append(&mut node.searches);
-            matchers.append(&mut node.matchers);
-        }
-        Ok(PlannedBooleanNode {
-            membership,
-            universal: false,
-            searches,
-            matchers,
-            membership_wire_bytes,
-            prune,
+        Ok(crate::pb::BooleanPlanGroup {
+            must,
+            should,
+            must_not,
+            minimum_should_match,
         })
     })
 }
 
-async fn score_boolean_plan(
+/// The stats round: every lexical leaf's global statistics under one
+/// epoch reading, and the per-shard claims the shards enforce (none
+/// after a fresh refetch). Two leaves that read different epochs for
+/// one shard saw a store move between them; the round refetches fresh
+/// once, the retry contract every stats consumer follows.
+async fn boolean_stats_round(
     coordinator: &CoordinatorServiceImpl,
-    plan: &PlannedBooleanNode,
-) -> Result<BTreeMap<u64, BooleanHit>, Status> {
-    let mut hits: BTreeMap<u64, BooleanHit> = plan
-        .membership
-        .iter()
-        .copied()
-        .map(|id| (id, BooleanHit::default()))
-        .collect();
-    for matcher in &plan.matchers {
-        if matcher.universal {
-            for hit in hits.values_mut() {
-                hit.matched.push(matcher.id.clone());
+    compiled: &CompiledBoolean,
+    fresh: &mut bool,
+) -> Result<(Vec<crate::pb::BooleanPlanLeaf>, Vec<u64>), Status> {
+    loop {
+        let mut leaves = compiled.leaves.clone();
+        let mut claims: Option<Vec<u64>> = None;
+        let mut moved = false;
+        for (leaf, meta) in leaves.iter_mut().zip(&compiled.meta) {
+            let Some(terms) = meta.terms.as_ref() else {
+                continue;
+            };
+            let Some(crate::pb::boolean_plan_leaf::Leaf::Lexical(lexical)) = leaf.leaf.as_mut()
+            else {
+                continue;
+            };
+            if terms.is_empty() {
+                continue;
             }
+            let (global, epochs) = coordinator.body_stats(terms, *fresh).await?;
+            lexical.global_doc_count = global.doc_count;
+            lexical.global_total_doc_length = global.total_doc_length;
+            lexical.global_doc_frequencies = global.dfs.clone();
+            match claims.as_ref() {
+                None => claims = Some(epochs),
+                Some(seen) if *seen != epochs => moved = true,
+                Some(_) => {}
+            }
+        }
+        if moved && !*fresh {
+            coordinator.invalidate_stats();
+            *fresh = true;
             continue;
         }
-        for &id in plan.membership.intersection(&matcher.membership) {
-            hits.get_mut(&id)
-                .expect("planned membership owns every matcher id")
-                .matched
-                .push(matcher.id.clone());
-        }
-    }
-    // Rows a universal dense clause returns no product for have no
-    // vector; they leave the group after every clause has scored.
-    let mut without_vector: Vec<u64> = Vec::new();
-    for leaf in &plan.searches {
-        let candidates: Vec<u64> = if leaf.universal {
-            plan.membership.iter().copied().collect()
+        let shards = coordinator.node_addresses().len();
+        let claims = if *fresh {
+            vec![0; shards]
         } else {
-            plan.membership
-                .intersection(&leaf.membership)
-                .copied()
-                .collect()
+            claims.unwrap_or_else(|| vec![0; shards])
         };
-        // Survivors go to the shards in `signal_batch` ids per rescore
-        // call, a wire bound, not max_k pieces: a lexical call is a
-        // cursor walk over its candidates and a dense call is one masked
-        // scan of the shard, so per-call cost is what the pieces multiply
-        // (docs/query-api.md, "Recursive boolean execution").
-        let batch = coordinator.signal_batch();
-        for chunk in candidates.chunks(batch.max(1)) {
-            let scores = match &leaf.kind {
-                PlannedSearchKind::Lexical {
-                    terms,
-                    epochs,
-                    score_stages,
-                } => {
-                    coordinator
-                        .lexical_signal_terms_with_stages(terms, chunk, Some(epochs), score_stages)
-                        .await?
-                }
-                PlannedSearchKind::Dense { vector, exact_fp32 } => {
-                    if *exact_fp32 {
-                        coordinator.exact_vector_scores(vector, chunk).await?.scores
-                    } else {
-                        coordinator.dense_signal(vector, chunk).await?
-                    }
-                }
-            };
-            for &id in chunk {
-                let Some(&score) = scores.get(&id) else {
-                    if leaf.universal {
-                        without_vector.push(id);
-                        continue;
-                    }
-                    return Err(Status::failed_precondition(format!(
-                        "boolean membership selected doc {id} for scoring clause {:?}, but candidate rescore did not return it",
-                        leaf.id
-                    )));
-                };
-                let hit = hits
-                    .get_mut(&id)
-                    .expect("planned membership owns every scored id");
-                hit.score += score;
-                hit.signals.push(QuerySignal {
-                    id: leaf.id.clone(),
-                    score,
-                });
-            }
-        }
+        return Ok((leaves, claims));
     }
-    for id in without_vector {
-        hits.remove(&id);
-    }
-    Ok(hits)
 }
 
 fn boolean_ids<'a>(
@@ -608,11 +474,6 @@ async fn execute_recursive_boolean(
             coordinator.max_k()
         )));
     }
-    if req.selection_k != 0 {
-        return Err(refuse(
-            "selection_k is not used by exact bitmap Boolean selection; leave it zero",
-        ));
-    }
     let cursor = if req.cursor.is_empty() {
         None
     } else {
@@ -657,50 +518,136 @@ async fn execute_recursive_boolean(
         _ => None,
     };
     let boosts = parse_boolean_boosts(&req.boosts, scorer.is_some(), scored)?;
-    let empty = crate::coordinator::RequestFilters::compile(&[], "")?;
-    let t_selection = std::time::Instant::now();
-    let (evaluated, plan_prune) = {
-        let mut attempt = 0;
-        loop {
-            let plan = plan_boolean_group(coordinator, boolean, 1).await?;
-            let _membership_wire_bytes = plan.membership_wire_bytes;
-            match score_boolean_plan(coordinator, &plan).await {
-                Err(status) if status.code() == tonic::Code::Aborted && attempt == 0 => {
-                    attempt += 1;
-                }
-                Err(status) if status.code() == tonic::Code::Aborted => {
-                    return Err(Status::failed_precondition(format!(
-                        "the lexical generation changed twice while planning this Boolean query; retry against a stable generation: {}",
-                        status.message()
-                    )));
-                }
-                Err(status) => return Err(status),
-                Ok(hits) => break (hits, plan.prune),
+    // The depth each shard answers: the page's absolute end, or, with a
+    // scorer or a boost to reorder, the whole pool they reorder
+    // (`selection_k`, the coordinator's max_k when zero).
+    let cursor_rank = cursor.as_ref().map_or(0, |c| c.rank);
+    let pooled = scorer.is_some() || !matches!(boosts, BoostPlan::None);
+    let depth = if pooled {
+        let pool = if req.selection_k == 0 {
+            coordinator.max_k()
+        } else {
+            req.selection_k
+        };
+        if pool < k {
+            return Err(refuse(format!(
+                "k ({k}) must not exceed selection_k ({pool}), the pool the scorer or boost \
+                 reorders"
+            )));
+        }
+        if pool > coordinator.max_k() {
+            return Err(refuse(format!(
+                "selection_k ({pool}) exceeds coordinator max_k ({})",
+                coordinator.max_k()
+            )));
+        }
+        if cursor_rank.saturating_add(k) > pool {
+            return Err(refuse(format!(
+                "the cursor at rank {cursor_rank} plus k ({k}) walks past the selection pool \
+                 ({pool}); raise selection_k or restart from the first page"
+            )));
+        }
+        pool
+    } else {
+        if req.selection_k != 0 {
+            return Err(refuse(
+                "selection_k names the pool a scorer or a boost reorders; without one, exact \
+                 Boolean selection pages its score order and selection_k must stay zero",
+            ));
+        }
+        cursor_rank.checked_add(k).ok_or_else(|| {
+            refuse("the cursor's rank plus k overflows the candidate depth")
+        })?
+    };
+    let aggregate_plan = match &boolean.aggregate {
+        Some(aggregate) => {
+            if !aggregate.filter.trim().is_empty() || !aggregate.geo_filters.is_empty() {
+                return Err(refuse(
+                    "BooleanQuery.aggregate uses the boolean match set; its own filter and geo_filters must be empty",
+                ));
             }
+            let compiled = crate::coordinator::compile_aggregations(aggregate)?;
+            let spec = crate::pb::BooleanShardAggregate {
+                aggregations: compiled.aggregations.clone(),
+                group_by: compiled.group_by.clone(),
+                max_groups: compiled.max_groups,
+                histograms: compiled.histograms.clone(),
+                percentiles: compiled.percentiles.clone(),
+            };
+            Some((spec, compiled))
+        }
+        None => None,
+    };
+    let t_selection = std::time::Instant::now();
+    let mut compiled = CompiledBoolean {
+        root: Default::default(),
+        leaves: Vec::new(),
+        meta: Vec::new(),
+        root_must_filters: Vec::new(),
+    };
+    compiled.root = compile_boolean_group(coordinator, boolean, true, 1, &mut compiled, true).await?;
+    let positive_lexical: Vec<usize> = compiled
+        .meta
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.positive && m.terms.is_some())
+        .map(|(i, _)| i)
+        .collect();
+    // Stats and evaluation run as a round: a stale-stats refusal reruns
+    // them once with fresh stats and no claim, the protocol every stats
+    // consumer follows.
+    let mut fresh = false;
+    let fanout = loop {
+        let (leaves, claims) = boolean_stats_round(coordinator, &compiled, &mut fresh).await?;
+        let plan = crate::coordinator::BooleanFanoutPlan {
+            root: compiled.root.clone(),
+            leaves,
+            filters: compiled.meta.iter().map(|m| m.filters.clone()).collect(),
+            root_must_filters: compiled.root_must_filters.clone(),
+            positive_lexical: positive_lexical.clone(),
+            depth,
+            aggregate: aggregate_plan.clone(),
+        };
+        match coordinator.evaluate_boolean_fanout(&plan, &claims).await {
+            Err(status) if !fresh && crate::coordinator::is_stale_stats(&status) => {
+                coordinator.invalidate_stats();
+                fresh = true;
+            }
+            Err(status) => return Err(status),
+            Ok(fanout) => break fanout,
         }
     };
-    let mut hits: Vec<QueryHit> = evaluated
+    let mut hits: Vec<QueryHit> = fanout
+        .candidates
         .into_iter()
-        .map(|(doc_id, hit)| QueryHit {
+        .map(|candidate| QueryHit {
             identity: None,
             snippets: Vec::new(),
             projected: Vec::new(),
-            doc_id,
-            score: hit.score,
+            doc_id: candidate.doc_id,
+            score: candidate.score,
             rank: 0,
-            signals: hit.signals,
-            matched: hit.matched,
+            signals: candidate
+                .signals
+                .iter()
+                .map(|signal| QuerySignal {
+                    id: compiled.meta[signal.leaf as usize].id.clone(),
+                    score: signal.score,
+                })
+                .collect(),
+            matched: candidate
+                .matched
+                .iter()
+                .map(|&leaf| &compiled.meta[leaf as usize])
+                .filter(|meta| meta.positive)
+                .map(|meta| meta.id.clone())
+                .collect(),
             sort_key: 0.0,
             sort_values: Vec::new(),
             dimensions: Vec::new(),
             explain: None,
         })
         .collect();
-    hits.sort_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
-            .then_with(|| a.doc_id.cmp(&b.doc_id))
-    });
     if req.explain {
         for hit in &mut hits {
             hit.explain = Some(crate::explain::boolean(hit));
@@ -709,12 +656,10 @@ async fn execute_recursive_boolean(
     let mut profile: Option<crate::pb::QueryProfile> = req.profile.then(Default::default);
     if let Some(profile) = profile.as_mut() {
         profile.selection_ms = ms(t_selection);
-        profile.segments_total = plan_prune.segments_total;
-        profile.segments_skipped = plan_prune.segments_skipped;
-        // A boolean root resolves each clause on its own shard set; the
-        // profile counts the topology and reports no plan-level skip.
-        let empty = crate::coordinator::RequestFilters::compile(&[], "")?;
-        profile.shards_total = coordinator.shard_prune_counts(&empty).0;
+        profile.segments_total = fanout.prune.segments_total;
+        profile.segments_skipped = fanout.prune.segments_skipped;
+        profile.shards_total = fanout.shards_total;
+        profile.shards_skipped = fanout.shards_skipped;
     }
     apply_boosts(
         coordinator,
@@ -736,22 +681,7 @@ async fn execute_recursive_boolean(
         let scorer_name: Option<String> = scorer.as_ref().map(|s| s.executed_suffix());
         crate::explain::finish(&mut hits, &window_boosts(&boosts), scorer_name.as_deref())?;
     }
-    let aggregate = if let Some(aggregate) = &boolean.aggregate {
-        if !aggregate.filter.trim().is_empty() || !aggregate.geo_filters.is_empty() {
-            return Err(refuse(
-                "BooleanQuery.aggregate uses the boolean match set; its own filter and geo_filters must be empty",
-            ));
-        }
-        let compiled = crate::coordinator::compile_aggregations(aggregate)?;
-        let ids: Vec<u64> = hits.iter().map(|hit| hit.doc_id).collect();
-        Some(
-            coordinator
-                .fanout_aggregate(&empty, &compiled, Some(&ids))
-                .await?,
-        )
-    } else {
-        None
-    };
+    let aggregate = fanout.aggregate;
     let (mut hits, next_cursor) = page(hits, k, cursor.as_ref())?;
     let compiled_projections = crate::coordinator::compile_projections(&req.projections)?;
     fill_projected(coordinator, &compiled_projections, &mut hits, &mut profile).await?;

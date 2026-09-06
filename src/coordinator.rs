@@ -479,7 +479,7 @@ fn floor_token() -> u64 {
 /// (`expected_stats_epoch = 0`) — the pre-cache semantics, which cannot
 /// be refused, so a shard under continuous ingest degrades to exactly
 /// the behavior it had before the cache existed instead of livelocking.
-fn is_stale_stats(status: &Status) -> bool {
+pub(crate) fn is_stale_stats(status: &Status) -> bool {
     status.code() == tonic::Code::FailedPrecondition
         && status.message().starts_with(crate::node::STALE_STATS_EPOCH)
 }
@@ -768,13 +768,14 @@ pub(crate) fn compile_projections(
 /// request names none (docs/aggregations.md "Cardinality").
 pub(crate) const DEFAULT_MAX_DISTINCT: u32 = 100_000;
 
+#[derive(Clone)]
 pub(crate) struct CompiledAggregate {
-    aggregations: Vec<crate::pb::CompiledAggregation>,
-    histograms: Vec<crate::pb::CompiledHistogram>,
-    percentiles: Vec<crate::pb::CompiledPercentile>,
-    percentile_specs: Vec<crate::pb::PercentileSpec>,
-    group_by: String,
-    max_groups: u32,
+    pub(crate) aggregations: Vec<crate::pb::CompiledAggregation>,
+    pub(crate) histograms: Vec<crate::pb::CompiledHistogram>,
+    pub(crate) percentiles: Vec<crate::pb::CompiledPercentile>,
+    pub(crate) percentile_specs: Vec<crate::pb::PercentileSpec>,
+    pub(crate) group_by: String,
+    pub(crate) max_groups: u32,
 }
 
 /// Compile the public aggregation list: names checked, ops decoded,
@@ -1682,6 +1683,43 @@ pub struct MembershipSet {
     /// resolving this set (docs/segment-pruning.md).
     pub prune: crate::segment_prune::PruneStats,
     pub(crate) ranges: Vec<(u64, u64)>,
+}
+
+/// Whose match set the percentile rounds count over: an id allowlist
+/// (the pooled shapes and the public route), or the planned Boolean
+/// tree the shards resolve again per round (`docs/query-api.md`).
+#[derive(Clone, Copy)]
+pub(crate) enum PercentileScope<'a> {
+    Ids(Option<&'a [u64]>),
+    Boolean(&'a [Option<crate::pb::BooleanShardRequest>]),
+}
+
+/// One planned `BooleanQuery` ready for the shards (`docs/query-api.md`,
+/// "Recursive boolean execution"): the wire tree with every filter
+/// leaf's full compiled tree, plus what the coordinator keeps beside
+/// it to prune per shard and to apply the typo rules.
+pub(crate) struct BooleanFanoutPlan {
+    pub root: crate::pb::BooleanPlanGroup,
+    pub leaves: Vec<crate::pb::BooleanPlanLeaf>,
+    /// Parallel to `leaves`: the compiled filters of a filter leaf.
+    pub filters: Vec<Option<RequestFilters>>,
+    /// Leaf indices of the root group's MUST filter leaves, in order:
+    /// the AND spine the placement tree prunes shards by.
+    pub root_must_filters: Vec<usize>,
+    /// Leaf indices of the lexical leaves a MUST/SHOULD chain reaches.
+    pub positive_lexical: Vec<usize>,
+    pub depth: u32,
+    pub aggregate: Option<(crate::pb::BooleanShardAggregate, CompiledAggregate)>,
+}
+
+/// The merged answer of one Boolean fan-out.
+pub(crate) struct BooleanFanout {
+    /// Score descending, doc id ascending, at most `depth`.
+    pub candidates: Vec<crate::pb::BooleanCandidate>,
+    pub prune: crate::segment_prune::PruneStats,
+    pub shards_total: u32,
+    pub shards_skipped: u32,
+    pub aggregate: Option<crate::pb::AggregateResponse>,
 }
 
 impl RequestFilters {
@@ -5373,7 +5411,7 @@ impl CoordinatorServiceImpl {
     /// valid at, for stamping onto the scoring requests as
     /// `expected_stats_epoch` (the enforcement that makes caching sound;
     /// see src/stats_cache.rs).
-    async fn body_stats(
+    pub(crate) async fn body_stats(
         &self,
         terms: &[String],
         fresh: bool,
@@ -8632,6 +8670,258 @@ impl CoordinatorServiceImpl {
         Ok(merged)
     }
 
+    /// One shard-side Boolean evaluation over the fleet
+    /// (`docs/query-api.md`, "Recursive boolean execution"). The root's
+    /// MUST filter leaves are the AND spine the placement tree prunes
+    /// shards by: a shard the spine excludes is not asked, and a leaf a
+    /// shard's placement implies is dropped from that shard's copy of
+    /// the leaf. Each consulted shard answers its best `depth` members;
+    /// the merge is the ranked union cut to `depth`. `claims[shard]` is
+    /// that shard's stats-epoch claim for the lexical leaves.
+    pub(crate) async fn evaluate_boolean_fanout(
+        &self,
+        plan: &BooleanFanoutPlan,
+        claims: &[u64],
+    ) -> Result<BooleanFanout, Status> {
+        use crate::pb::boolean_plan_leaf::Leaf as L;
+        if claims.len() != self.node_addrs.len() {
+            return Err(Status::internal(format!(
+                "Boolean fan-out has {} epoch claims for {} shards",
+                claims.len(),
+                self.node_addrs.len()
+            )));
+        }
+        // The spine: the root MUST filter leaves' trees conjoined, with
+        // each leaf's flags at a known offset of the conjunction's walk.
+        let mut spine_trees = Vec::new();
+        let mut spine_offsets: Vec<(usize, usize, usize)> = Vec::new();
+        let mut offset = 0usize;
+        for &leaf in &plan.root_must_filters {
+            let Some(tree) = plan.filters.get(leaf).and_then(|f| f.as_ref()?.tree.as_ref())
+            else {
+                continue;
+            };
+            let count = crate::filter::leaf_count(tree);
+            spine_offsets.push((leaf, offset, count));
+            spine_trees.push(tree.clone());
+            offset += count;
+        }
+        let spine = match spine_trees.len() {
+            0 => None,
+            1 => spine_trees.pop(),
+            _ => Some(crate::pb::FilterExpr {
+                expr: Some(crate::pb::filter_expr::Expr::And(crate::pb::FilterList {
+                    exprs: spine_trees,
+                })),
+            }),
+        };
+        let mask = self.shard_mask(spine.as_ref());
+        let shards_total = self.node_addrs.len() as u32;
+        let shards_skipped = mask.as_ref().map_or(0, |m| m.skipped_count());
+        // One known-column accumulator per filter leaf; the spine leaves
+        // learn what the mask resolved, at their own offsets.
+        let mut known: Vec<Option<FilterKnown>> = plan
+            .filters
+            .iter()
+            .map(|filters| filters.as_ref().map(FilterKnown::new))
+            .collect();
+        if let Some(mask) = mask.as_ref() {
+            for &(leaf, base, count) in &spine_offsets {
+                let Some(acc) = known[leaf].as_mut() else {
+                    continue;
+                };
+                let local: Vec<usize> = mask
+                    .known
+                    .iter()
+                    .filter(|&&index| index >= base && index < base + count)
+                    .map(|&index| index - base)
+                    .collect();
+                mark_known(&mut acc.tree, &local);
+                acc.kept = mask
+                    .implied
+                    .iter()
+                    .map(|dropped| {
+                        let local: Vec<usize> = dropped
+                            .iter()
+                            .filter(|&&index| index >= base && index < base + count)
+                            .map(|&index| index - base)
+                            .collect();
+                        (!local.is_empty())
+                            .then(|| (0..count).filter(|index| !local.contains(index)).collect())
+                    })
+                    .collect();
+            }
+        }
+        // Per shard: the plan with the spine leaves pruned of what the
+        // shard's placement implies.
+        let mut shard_requests: Vec<Option<crate::pb::BooleanShardRequest>> =
+            Vec::with_capacity(self.node_addrs.len());
+        for shard in 0..self.node_addrs.len() {
+            if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
+                shard_requests.push(None);
+                continue;
+            }
+            let mut leaves = plan.leaves.clone();
+            if let Some(mask) = mask.as_ref() {
+                for &(leaf, base, count) in &spine_offsets {
+                    let local: Vec<usize> = mask.implied[shard]
+                        .iter()
+                        .filter(|&&index| index >= base && index < base + count)
+                        .map(|&index| index - base)
+                        .collect();
+                    if local.is_empty() {
+                        continue;
+                    }
+                    if let Some(L::Filter(filter)) = leaves[leaf].leaf.as_mut() {
+                        filter.filter = filter
+                            .filter
+                            .as_ref()
+                            .and_then(|tree| crate::placement::without_leaves(tree, &local));
+                    }
+                }
+            }
+            shard_requests.push(Some(crate::pb::BooleanShardRequest {
+                root: Some(plan.root.clone()),
+                leaves,
+                depth: plan.depth,
+                expected_stats_epoch: claims[shard],
+                max_logical_bytes: self.max_rerank_bytes,
+                exact_batch: self.signal_batch() as u32,
+                aggregate: plan.aggregate.as_ref().map(|(spec, _)| spec.clone()),
+            }));
+        }
+        let mut tasks = Vec::with_capacity(self.node_addrs.len());
+        for (shard, request) in shard_requests.iter().enumerate() {
+            let Some(request) = request.clone() else {
+                continue;
+            };
+            let mut client = self.node_client(&self.node_addrs[shard])?;
+            let deadline = self.limits.shard_deadline;
+            tasks.push(tokio::spawn(async move {
+                let call = client.evaluate_boolean(request);
+                let response = match deadline {
+                    Some(limit) => tokio::time::timeout(limit, call)
+                        .await
+                        .map_err(|_| {
+                            Status::deadline_exceeded("boolean evaluation shard deadline exceeded")
+                        })?
+                        .map(tonic::Response::into_inner),
+                    None => call.await.map(tonic::Response::into_inner),
+                }?;
+                Ok::<_, Status>((shard, response))
+            }));
+        }
+        let mut candidates = Vec::new();
+        let mut prune = crate::segment_prune::PruneStats::default();
+        let mut stage_known: Vec<Option<Vec<bool>>> = plan.leaves.iter().map(|_| None).collect();
+        let mut folds = Vec::new();
+        for task in tasks {
+            let (shard, response) = task
+                .await
+                .map_err(|e| Status::internal(format!("boolean evaluation task failed: {e}")))??;
+            if response.filters_known.len() != plan.leaves.len()
+                || response.stages_known.len() != plan.leaves.len()
+            {
+                return Err(Status::internal(format!(
+                    "shard {shard} answered {} filter and {} stage flag lists for {} leaves",
+                    response.filters_known.len(),
+                    response.stages_known.len(),
+                    plan.leaves.len()
+                )));
+            }
+            for (index, flags) in response.filters_known.iter().enumerate() {
+                if let Some(acc) = known[index].as_mut() {
+                    acc.merge_shard(shard, &flags.geo_columns_known, &flags.filter_columns_known)?;
+                }
+            }
+            for &index in &plan.positive_lexical {
+                let Some(L::Lexical(lexical)) = plan.leaves[index].leaf.as_ref() else {
+                    continue;
+                };
+                let flags = &response.stages_known[index].stage_columns_known;
+                if flags.len() != lexical.score_stages.len() {
+                    return Err(Status::failed_precondition(format!(
+                        "shard {shard} returned {} stage-known flags for {} stages",
+                        flags.len(),
+                        lexical.score_stages.len()
+                    )));
+                }
+                let acc = stage_known[index].get_or_insert_with(|| vec![false; flags.len()]);
+                for (a, k) in acc.iter_mut().zip(flags) {
+                    *a |= *k;
+                }
+            }
+            candidates.extend(response.candidates);
+            prune.add(crate::segment_prune::PruneStats {
+                segments_total: response.segments_total,
+                segments_skipped: response.segments_skipped,
+            });
+            if let Some(fold) = response.aggregate {
+                folds.push((shard, fold));
+            }
+        }
+        for (index, acc) in known.iter().enumerate() {
+            if let (Some(acc), Some(filters)) = (acc, plan.filters[index].as_ref()) {
+                acc.refuse_unknown(filters)?;
+            }
+        }
+        for &index in &plan.positive_lexical {
+            let Some(L::Lexical(lexical)) = plan.leaves[index].leaf.as_ref() else {
+                continue;
+            };
+            let flags = stage_known[index]
+                .clone()
+                .unwrap_or_else(|| vec![false; lexical.score_stages.len()]);
+            for (stage, known) in lexical.score_stages.iter().zip(flags) {
+                if !known {
+                    return Err(Status::invalid_argument(format!(
+                        "no shard has numeric column {}: the score stage would be a silent no-op",
+                        stage.column
+                    )));
+                }
+            }
+        }
+        candidates.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.doc_id.cmp(&b.doc_id))
+        });
+        candidates.truncate(plan.depth as usize);
+        let aggregate = match plan.aggregate.as_ref() {
+            Some((_, compiled)) => {
+                let empty = RequestFilters::compile(&[], "")?;
+                Some(
+                    self.merge_aggregate_responses(
+                        &empty,
+                        compiled,
+                        None,
+                        folds,
+                        PercentileScope::Boolean(&shard_requests),
+                    )
+                    .await?,
+                )
+            }
+            None => None,
+        };
+        Ok(BooleanFanout {
+            candidates,
+            prune,
+            shards_total,
+            shards_skipped,
+            aggregate,
+        })
+    }
+
+    /// The BM25 parameters every lexical leaf scores under.
+    pub fn bm25_params(&self) -> Bm25Params {
+        self.bm25_params
+    }
+
+    /// Forget every cached term statistic (the stale-epoch retry).
+    pub(crate) fn invalidate_stats(&self) {
+        self.stats_cache.invalidate_all();
+    }
+
     /// The distinct body terms of one lexical clause under `spec`, in
     /// first-occurrence order: the membership vocabulary of the clause.
     pub async fn analyze_terms(
@@ -9319,12 +9609,10 @@ impl CoordinatorServiceImpl {
             aggregations,
             histograms,
             percentiles,
-            percentile_specs,
             group_by,
             max_groups,
+            ..
         } = compiled;
-        let grouping = !group_by.is_empty();
-        let group_cap = *max_groups as usize;
         let mask = self.shard_mask(filters.tree.as_ref());
         let mut tasks = Vec::with_capacity(self.node_addrs.len());
         for (shard, node) in self.node_addrs.iter().enumerate() {
@@ -9350,6 +9638,46 @@ impl CoordinatorServiceImpl {
                     .map(|r| (shard, r.into_inner()))
             }));
         }
+        let mut responses = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            responses.push(
+                task.await
+                    .map_err(|e| Status::internal(format!("aggregate task failed: {e}")))??,
+            );
+        }
+        self.merge_aggregate_responses(
+            filters,
+            compiled,
+            mask.as_ref(),
+            responses,
+            PercentileScope::Ids(doc_ids),
+        )
+        .await
+    }
+
+    /// The merge of the shards' folds (`AggregateShard` answers, or the
+    /// folds a Boolean evaluation carried) into one response: partials
+    /// fold in shard order, groups join by value, histograms sum by
+    /// bucket, and the percentiles converge over count-below rounds
+    /// under `scope`.
+    pub(crate) async fn merge_aggregate_responses(
+        &self,
+        filters: &RequestFilters,
+        compiled: &CompiledAggregate,
+        mask: Option<&crate::placement::ShardMask>,
+        responses: Vec<(usize, crate::pb::AggregateShardResponse)>,
+        scope: PercentileScope<'_>,
+    ) -> Result<crate::pb::AggregateResponse, Status> {
+        let CompiledAggregate {
+            aggregations,
+            histograms,
+            percentiles,
+            percentile_specs,
+            group_by,
+            max_groups,
+        } = compiled;
+        let grouping = !group_by.is_empty();
+        let group_cap = *max_groups as usize;
         // The same leaf enumeration the shards answer positionally:
         // aggregations first, then histograms.
         let mut leaves = Vec::new();
@@ -9361,7 +9689,7 @@ impl CoordinatorServiceImpl {
         {
             crate::values::column_leaves(expr, &mut leaves);
         }
-        let mut known = Self::filter_known(filters, mask.as_ref());
+        let mut known = Self::filter_known(filters, mask);
         let mut leaves_known = vec![false; leaves.len()];
         let mut group_column_known = !grouping;
         let mut matched = 0u64;
@@ -9377,10 +9705,7 @@ impl CoordinatorServiceImpl {
         let mut hist_present = vec![0u64; histograms.len()];
         let mut hist_unbucketable = vec![0u64; histograms.len()];
         let mut pct_merged: Vec<PctMerge> = percentiles.iter().map(|_| PctMerge::new()).collect();
-        for task in tasks {
-            let (shard, response) = task
-                .await
-                .map_err(|e| Status::internal(format!("aggregate task failed: {e}")))??;
+        for (shard, response) in responses {
             known.merge_shard(
                 shard,
                 &response.geo_columns_known,
@@ -9538,7 +9863,7 @@ impl CoordinatorServiceImpl {
             })
             .collect();
         let pct_results = self
-            .solve_percentiles(filters, percentile_specs, percentiles, &pct_merged, doc_ids)
+            .solve_percentiles(filters, percentile_specs, percentiles, &pct_merged, scope)
             .await?;
         Ok(crate::pb::AggregateResponse {
             results,
@@ -9561,7 +9886,7 @@ impl CoordinatorServiceImpl {
         specs: &[crate::pb::PercentileSpec],
         compiled: &[crate::pb::CompiledPercentile],
         merged: &[PctMerge],
-        doc_ids: Option<&[u64]>,
+        scope: PercentileScope<'_>,
     ) -> Result<Vec<crate::pb::PercentileResult>, Status> {
         struct Target {
             spec: usize,
@@ -9606,7 +9931,7 @@ impl CoordinatorServiceImpl {
                 })
                 .collect();
             let counts = self
-                .quantile_round(filters, compiled, &probes, doc_ids)
+                .quantile_round(filters, compiled, &probes, scope)
                 .await?;
             for (&i, (probe, count)) in active.iter().zip(probes.iter().zip(counts)) {
                 let t = &mut targets[i];
@@ -9668,7 +9993,7 @@ impl CoordinatorServiceImpl {
         filters: &RequestFilters,
         exprs: &[crate::pb::CompiledPercentile],
         targets: &[crate::pb::QuantileTarget],
-        doc_ids: Option<&[u64]>,
+        scope: PercentileScope<'_>,
     ) -> Result<Vec<u64>, Status> {
         let mask = self.shard_mask(filters.tree.as_ref());
         let mut tasks = Vec::with_capacity(self.node_addrs.len());
@@ -9676,13 +10001,31 @@ impl CoordinatorServiceImpl {
             if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
                 continue;
             }
-            let request = crate::pb::QuantileCountsRequest {
-                filter: Self::shard_filter_tree(filters, mask.as_ref(), shard),
-                geo_filters: filters.geo.clone(),
-                exprs: exprs.to_vec(),
-                targets: targets.to_vec(),
-                doc_ids: doc_ids.unwrap_or_default().to_vec(),
-                restrict_doc_ids: doc_ids.is_some(),
+            let request = match scope {
+                PercentileScope::Ids(doc_ids) => crate::pb::QuantileCountsRequest {
+                    filter: Self::shard_filter_tree(filters, mask.as_ref(), shard),
+                    geo_filters: filters.geo.clone(),
+                    exprs: exprs.to_vec(),
+                    targets: targets.to_vec(),
+                    doc_ids: doc_ids.unwrap_or_default().to_vec(),
+                    restrict_doc_ids: doc_ids.is_some(),
+                    boolean: None,
+                },
+                PercentileScope::Boolean(plans) => {
+                    // A shard the Boolean plan skipped counts nothing.
+                    let Some(plan) = plans.get(shard).and_then(|p| p.as_ref()) else {
+                        continue;
+                    };
+                    crate::pb::QuantileCountsRequest {
+                        filter: None,
+                        geo_filters: Vec::new(),
+                        exprs: exprs.to_vec(),
+                        targets: targets.to_vec(),
+                        doc_ids: Vec::new(),
+                        restrict_doc_ids: false,
+                        boolean: Some(plan.clone()),
+                    }
+                }
             };
             let client = self.node_client(node);
             tasks.push(tokio::spawn(async move {

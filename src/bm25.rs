@@ -245,6 +245,76 @@ pub fn score_candidates(
     slots.into_iter().flatten().collect()
 }
 
+/// [`score_candidates`] without the offsets: the summed BM25 score of
+/// each of `candidates` (local ids, sorted ascending, distinct), parallel
+/// to the input, `None` for a candidate no query term occurs in. The
+/// walk and the accumulation order are the same, so a score here is
+/// bitwise the score `score_candidates` computes for the same document;
+/// what this form saves is the per-document offset lists, which the
+/// shard-side Boolean planner scores millions of members without.
+pub fn score_candidates_plain(
+    store: &dyn Bm25Index,
+    terms: &[String],
+    stats: &CorpusStats,
+    params: Bm25Params,
+    candidates: &[u32],
+) -> Vec<Option<f64>> {
+    debug_assert_eq!(terms.len(), stats.dfs.len());
+    debug_assert!(candidates.windows(2).all(|w| w[0] < w[1]));
+    let avgdl = stats.avgdl();
+    let mut scores: Vec<Option<f64>> = vec![None; candidates.len()];
+    let mut cursors = Vec::new();
+    let mut all_have_impacts = true;
+    for (ti, term) in terms.iter().enumerate() {
+        if stats.dfs[ti] == 0 {
+            continue;
+        }
+        match store.impacts(term) {
+            Some(cursor) => cursors.push((ti, cursor)),
+            None => {
+                all_have_impacts = false;
+                break;
+            }
+        }
+    }
+    if all_have_impacts {
+        for (ti, mut cursor) in cursors {
+            let idf = idf(stats.doc_count, stats.dfs[ti]);
+            for (ci, &cand) in candidates.iter().enumerate() {
+                if cursor.exhausted() {
+                    break;
+                }
+                cursor.advance_shallow(cand);
+                if cursor.doc_id() == cand {
+                    let contribution =
+                        idf * tf_norm(params, cursor.tf(), store.doc_length(cand), avgdl);
+                    let entry = scores[ci].get_or_insert(0.0);
+                    *entry += contribution;
+                }
+            }
+        }
+        return scores;
+    }
+    for (ti, term) in terms.iter().enumerate() {
+        if stats.dfs[ti] == 0 {
+            continue;
+        }
+        let idf = idf(stats.doc_count, stats.dfs[ti]);
+        let mut ci = 0usize;
+        store.for_each_posting(term, &mut |doc_id, tf, _offsets| {
+            while ci < candidates.len() && candidates[ci] < doc_id {
+                ci += 1;
+            }
+            if ci < candidates.len() && candidates[ci] == doc_id {
+                let contribution = idf * tf_norm(params, tf, store.doc_length(doc_id), avgdl);
+                let entry = scores[ci].get_or_insert(0.0);
+                *entry += contribution;
+            }
+        });
+    }
+    scores
+}
+
 /// One (field, term) occurrence in a document, as the explain tree
 /// reports it (`docs/explain.md`): the raw inputs the contribution is
 /// computed from. `field` indexes the `fields` slice handed to

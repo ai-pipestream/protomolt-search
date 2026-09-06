@@ -27,6 +27,7 @@
 pub mod analyzer;
 pub mod authorization;
 pub mod bm25;
+pub mod boolean_bits;
 pub mod calendar;
 pub mod cel;
 pub mod chunked;
