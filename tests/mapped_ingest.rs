@@ -2038,3 +2038,33 @@ fn timestamp_projection_validates_instants_and_preserves_message_presence() {
         assert!(error.message().contains("created_at"), "{error}");
     }
 }
+
+#[tokio::test]
+async fn vector_names_cannot_shadow_node_columns_outside_the_mapped_plan() {
+    let (analysis, mock) = start_mock_analysis().await;
+    for family in 0..8 {
+        let mut config = case_node_config(analysis.clone());
+        let columns = match family {
+            0 => &mut config.bm25_fields,
+            1 => &mut config.facet_fields,
+            2 => &mut config.numeric_fields,
+            3 => &mut config.integer_fields,
+            4 => &mut config.unsigned_integer_fields,
+            5 => &mut config.map_facet_fields,
+            6 => &mut config.map_numeric_fields,
+            _ => &mut config.geo_fields,
+        };
+        columns.push("embedding".into());
+        let (address, node) = start_empty_node(config).await;
+        let error = ingest(&address, bind(), vec![]).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            error.message().contains("vector column"),
+            "family {family}: {error}"
+        );
+        node.abort();
+        let _ = node.await;
+    }
+    mock.abort();
+    let _ = mock.await;
+}

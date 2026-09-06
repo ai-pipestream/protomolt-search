@@ -1,0 +1,45 @@
+syntax = "proto3";
+package vector_binding;
+import "ai/protomolt/proto/index/hints/v1/indexing_hints.proto";
+message Named {
+  int64 id = 1;
+  string body = 2;
+  repeated float signal = 3 [
+    (ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_VECTOR,
+    (ai.protomolt.proto.index.hints.v1.index).name = "semantic",
+    (ai.protomolt.proto.index.hints.v1.index).vector_dims = 16
+  ];
+}
+message Collision {
+  int64 id = 1;
+  string body = 2;
+  int64 semantic = 3;
+  repeated float signal = 4 [
+    (ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_VECTOR,
+    (ai.protomolt.proto.index.hints.v1.index).name = "semantic"
+  ];
+}
+message ReservedBody {
+  int64 id = 1;
+  string content = 2;
+  repeated float signal = 3 [
+    (ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_VECTOR,
+    (ai.protomolt.proto.index.hints.v1.index).name = "body"
+  ];
+}
+message ReservedParent {
+  int64 id = 1;
+  string body = 2;
+  repeated float signal = 3 [
+    (ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_VECTOR,
+    (ai.protomolt.proto.index.hints.v1.index).name = "parent_id"
+  ];
+}
+message ReservedGroup {
+  int64 id = 1;
+  string body = 2;
+  repeated float signal = 3 [
+    (ai.protomolt.proto.index.hints.v1.index).type = INDEX_FIELD_TYPE_VECTOR,
+    (ai.protomolt.proto.index.hints.v1.index).name = "group_id"
+  ];
+}

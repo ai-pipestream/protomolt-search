@@ -59,6 +59,7 @@ pub mod link;
 pub mod live_docs;
 pub mod ltr;
 mod mapped_analysis;
+pub mod mapped_vector;
 pub mod mapping;
 pub mod merge;
 pub mod metrics;

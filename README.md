@@ -1222,6 +1222,12 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Vector field identity (2026-09-06, feature branch).** Indexing plans expose
+  a typed vector binding with its indexed name, source path, dimension and plan
+  fingerprint. Planning and mapped bind refuse names shared with other planes.
+  Durable binding and query enforcement remain in progress. See
+  [vector field binding](docs/vector-field-binding.md).
+
 - **Scoped lineage reads (2026-09-06, feature branch).** Candidate parent/group
   resolution applies document views and admitted physical versions. Collapse
   requests only its chosen key, with independent field use/disclosure checks.

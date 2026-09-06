@@ -9929,6 +9929,39 @@ impl NodeServiceImpl {
         Ok(())
     }
 
+    fn validate_vector_column_name(
+        &self,
+        name: &str,
+        store: Option<&Bm25Shard>,
+    ) -> Result<(), Status> {
+        let configured = self
+            .config
+            .bm25_fields
+            .iter()
+            .chain(&self.config.facet_fields)
+            .chain(&self.config.numeric_fields)
+            .chain(&self.config.integer_fields)
+            .chain(&self.config.unsigned_integer_fields)
+            .chain(&self.config.map_facet_fields)
+            .chain(&self.config.map_numeric_fields)
+            .chain(&self.config.geo_fields)
+            .any(|column| column == name);
+        let persisted = store.is_some_and(|store| {
+            (0..store.field_count()).any(|field| store.field_name(field) == name)
+                || store.numeric_index(name).is_some()
+                || store.integer_index(name).is_some()
+                || store.unsigned_integer_index(name).is_some()
+                || store.facet_index(name).is_some()
+                || store.map_numeric_index(name).is_some()
+                || store.map_facet_index(name).is_some()
+                || store.geo_index(name).is_some()
+        });
+        if configured || persisted {
+            return Err(Status::failed_precondition(format!("vector column {name:?} conflicts with a declared or stored text, scalar, map, or geo column; use distinct column names")));
+        }
+        Ok(())
+    }
+
     /// Validate one mapped bind against this shard: derive the plan
     /// (derivation is deterministic, so both sides compute it
     /// independently), hold it to the client's expected fingerprint,
@@ -10030,6 +10063,12 @@ impl NodeServiceImpl {
             analysis_contract: analysis.contract.clone(),
         };
         let mut guard = write_shard(&self.state);
+        let vector = plan
+            .vector_binding
+            .as_ref()
+            .expect("derived vector binding");
+        self.validate_vector_column_name(&vector.field, guard.bm25.as_ref())?;
+
         match &guard.mapped_binding {
             Some(bound) if *bound != incoming => {
                 let mut differs = Vec::new();
@@ -14998,5 +15037,35 @@ mod stats_lifetime_tests {
         assert_eq!(state.stats_epoch, 1);
         assert_ne!(state.stats_incarnation.bytes().unwrap(), previous);
         assert!(state.check_stats_epoch(1, &previous).is_err());
+    }
+}
+
+#[cfg(test)]
+mod vector_column_namespace_tests {
+    use super::*;
+    #[test]
+    fn active_store_columns_are_checked_even_if_the_config_does_not_declare_them() {
+        let node = NodeServiceImpl::new(None, NodeConfig::default());
+        let stores = [
+            Bm25Store::with_fields(&["body", "embedding"]),
+            Bm25Store::new().with_facets(&["embedding"]),
+            Bm25Store::new().with_numerics(&["embedding"]),
+            Bm25Store::new().with_integers(&["embedding"]),
+            Bm25Store::new().with_unsigned_integers(&["embedding"]),
+            Bm25Store::new().with_map_facets(&["embedding"]),
+            Bm25Store::new().with_map_numerics(&["embedding"]),
+            Bm25Store::new().with_geos(&["embedding"]),
+        ];
+        for store in stores {
+            let store = Bm25Shard::Building(store);
+            assert_eq!(
+                node.validate_vector_column_name("embedding", Some(&store))
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::FailedPrecondition
+            );
+            node.validate_vector_column_name("distinct", Some(&store))
+                .unwrap();
+        }
     }
 }

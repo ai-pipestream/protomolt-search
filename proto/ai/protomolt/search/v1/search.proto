@@ -6012,6 +6012,23 @@ message MappedPlan {
   // Exhaustive reachable schema graph and exact mapped projection paths.
   // This derived explanation does not change the projection fingerprint.
   SchemaReport schema_report = 10;
+
+  // Derived identity of the one vector plane. Names the indexed column rather
+  // than assuming a body field or a source-path alias. It is an explanation of
+  // the fingerprinted plan, not a credential or a runtime read-version claim.
+  MappedVectorBinding vector_binding = 11;
+}
+
+// Canonical vector identity derived from MappedPlan. The current plan supports
+// exactly one vector plane. Runtime enforcement must also verify the durable
+// shard binding; this message alone cannot authorize a request.
+message MappedVectorBinding {
+  uint32 format_version = 1;
+  string field = 2;
+  string source_path = 3;
+  // Zero means the descriptor leaves the dimension to the first document.
+  uint32 declared_dimensions = 4;
+  string plan_fingerprint = 5;
 }
 
 // One message on the IngestMapped stream: the bind first, then

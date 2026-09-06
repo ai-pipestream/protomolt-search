@@ -567,3 +567,12 @@ bytes.
   vector field and one document id is refused with the reason named, as
   the reference implementation already did. Silent candidate-picking is
   the failure mode this feature refuses to ship.
+
+
+## Vector column identity (2026-09-06, feature branch)
+
+`MappedPlan.vector_binding` provides a typed description of the derived vector
+plane. Vector inference runs before the column-name collision check, and the
+vector column must remain distinct from scalar/text/map/geo columns and built-in
+text/lineage keys. See [vector field binding](vector-field-binding.md) for
+compatibility and the remaining durable/query integration.

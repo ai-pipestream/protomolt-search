@@ -966,3 +966,13 @@ parent resolution use one collector that rejects unrequested keys, rows and
 duplicate ownership. See [lineage reads](lineage-reads.md) for evidence and the
 remaining generation-local fallback identity limitation. Source retrieval,
 remaining query permissions and remote delegation still need completion.
+
+
+## Explicit vector field identity (2026-09-06, feature branch)
+
+Indexing plans now expose the vector plane's exact name, path, dimension and plan
+fingerprint as protobuf. Name collisions with other indexed planes and built-in
+text/lineage keys refuse during planning; mapped bind also checks configured and
+active stored columns. See [vector field binding](vector-field-binding.md).
+Durable storage/recovery of this binding and field-named query enforcement remain
+required work. Existing restricted vector/query gates remain in place.

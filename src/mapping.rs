@@ -141,12 +141,17 @@ pub fn derive_plan(descriptor_set: &[u8], message_type: &str) -> Result<pb::Mapp
         )));
     }
 
+    let chunks_path = resolve_chunks(&fields)?;
+    let vector_path = resolve_vector(&mut fields, chunks_path.as_deref())?;
     let mut column_paths = HashMap::new();
     for field in &fields {
-        if field.family == pb::ColumnFamily::None as i32
-            || field.family == pb::ColumnFamily::Vector as i32
-        {
+        if field.family == pb::ColumnFamily::None as i32 {
             continue;
+        }
+        if field.family == pb::ColumnFamily::Vector as i32
+            && matches!(field.name.as_str(), "body" | "parent_id" | "group_id")
+        {
+            return Err(refuse_at(&field.path, "the vector column name conflicts with a built-in text or lineage field; choose a distinct indexing name hint"));
         }
         if let Some(previous) = column_paths.insert(&field.name, &field.path) {
             return Err(refuse(format!(
@@ -156,8 +161,6 @@ pub fn derive_plan(descriptor_set: &[u8], message_type: &str) -> Result<pb::Mapp
         }
     }
 
-    let chunks_path = resolve_chunks(&fields)?;
-    let vector_path = resolve_vector(&mut fields, chunks_path.as_deref())?;
     let doc_id_path = resolve_doc_id(&mut fields, chunks_path.as_deref())?;
     let chunk_id_path = resolve_chunk_id(&fields, chunks_path.as_deref())?;
 
@@ -205,8 +208,10 @@ pub fn derive_plan(descriptor_set: &[u8], message_type: &str) -> Result<pb::Mapp
         chunk_id_path: chunk_id_path.unwrap_or_default(),
         descriptor_sha256: sha256::hex_digest(descriptor_set),
         schema_report: None,
+        vector_binding: None,
     };
     plan.fingerprint = fingerprint(&plan, &set, &pool);
+    plan.vector_binding = Some(crate::mapped_vector::from_plan(&plan)?);
     let skipped_fields = index
         .messages
         .values()

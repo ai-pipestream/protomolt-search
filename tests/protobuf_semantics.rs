@@ -571,3 +571,113 @@ fn enum_aliases_use_the_first_declared_name_and_affect_identity() {
         "AVAILABLE"
     );
 }
+
+#[test]
+fn inferred_vector_columns_cannot_alias_scalar_columns_after_name_flattening() {
+    let mut input = schema();
+    let mut metadata = field("metadata", 3, Type::Message);
+    metadata.type_name = Some(".audit.Metadata".into());
+    input.file[0].message_type[0].field[2] = metadata;
+    let mut embedding = field("embedding", 1, Type::Float);
+    embedding.label = Some(Label::Repeated as i32);
+    input.file[0].message_type.push(DescriptorProto {
+        name: Some("Metadata".into()),
+        field: vec![embedding],
+        ..Default::default()
+    });
+    let valid = derive_plan(&input.encode_to_vec(), "audit.Doc").unwrap();
+    assert_eq!(
+        valid.vector_binding.as_ref().unwrap().field,
+        "metadata_embedding"
+    );
+    input.file[0].message_type[0]
+        .field
+        .push(field("metadata_embedding", 7, Type::Int64));
+    let error = derive_plan(&input.encode_to_vec(), "audit.Doc").unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(error.message().contains("both land column"));
+}
+
+#[test]
+fn vector_binding_names_the_derived_plane_and_refuses_forged_or_noncanonical_claims() {
+    use pipestream_search::{
+        mapped_vector,
+        pb::{ColumnFamily, MappedKind},
+    };
+    let plan = derive_plan(&schema().encode_to_vec(), "audit.Doc").unwrap();
+    let binding = plan.vector_binding.as_ref().unwrap();
+    assert_eq!(binding.format_version, 1);
+    assert_eq!(binding.field, "embedding");
+    assert_eq!(binding.source_path, "embedding");
+    assert_eq!(binding.declared_dimensions, 0);
+    assert_eq!(binding.plan_fingerprint, plan.fingerprint);
+    let wire = binding.encode_to_vec();
+    assert_eq!(
+        mapped_vector::decode(&wire, &plan.fingerprint)
+            .unwrap()
+            .as_ref(),
+        Some(binding)
+    );
+    assert!(mapped_vector::decode(&[], &plan.fingerprint)
+        .unwrap()
+        .is_none());
+    assert!(mapped_vector::decode(&wire, &"0".repeat(64)).is_err());
+    for suffix in [vec![8, 1], vec![80, 1], vec![18, 1, b'x']] {
+        let mut malformed = wire.clone();
+        malformed.extend(suffix);
+        assert!(mapped_vector::decode(&malformed, &plan.fingerprint).is_err());
+    }
+    for case in 0..7 {
+        let mut forged = binding.clone();
+        match case {
+            0 => forged.format_version = 0,
+            1 => forged.format_version = 2,
+            2 => forged.field.clear(),
+            3 => forged.source_path.clear(),
+            4 => forged.field = "body".into(),
+            5 => forged.field = "parent_id".into(),
+            _ => forged.field = "group_id".into(),
+        }
+        assert!(mapped_vector::validate(&forged, &plan.fingerprint).is_err());
+    }
+    for case in 0..5 {
+        let mut forged = plan.clone();
+        let vector = forged
+            .fields
+            .iter_mut()
+            .find(|field| field.path == plan.vector_path)
+            .unwrap();
+        match case {
+            0 => vector.family = ColumnFamily::F64 as i32,
+            1 => vector.kind = MappedKind::Float as i32,
+            2 => vector.vector_dims = 42,
+            3 => vector.name = "body".into(),
+            _ => forged.vector_path = "unrelated".into(),
+        }
+        assert!(mapped_vector::from_plan(&forged).is_err());
+    }
+}
+
+#[test]
+fn hinted_vector_names_remain_distinct_from_scalar_text_and_lineage_grants() {
+    let descriptor = include_bytes!("fixtures/vector-binding/descriptor.bin");
+    let plan = derive_plan(descriptor, "vector_binding.Named").unwrap();
+    let binding = plan.vector_binding.as_ref().unwrap();
+    assert_eq!(binding.field, "semantic");
+    assert_eq!(binding.source_path, "signal");
+    assert_eq!(binding.declared_dimensions, 16);
+    assert_eq!(binding.plan_fingerprint, plan.fingerprint);
+    for name in [
+        "Collision",
+        "ReservedBody",
+        "ReservedParent",
+        "ReservedGroup",
+    ] {
+        let error = derive_plan(descriptor, &format!("vector_binding.{name}")).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(
+            error.message().contains("both land column") || error.message().contains("built-in"),
+            "{name}: {error}"
+        );
+    }
+}
