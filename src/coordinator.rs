@@ -13222,6 +13222,7 @@ impl SearchService for CoordinatorServiceImpl {
                     .send(Ok(crate::pb::QueryStreamResponse {
                         payload: Some(crate::pb::query_stream_response::Payload::Completion(
                             crate::pb::QueryStreamCompletion {
+                                error_disclosure: crate::error_disclosure::status_detail(&status),
                                 completed: false,
                                 response: None,
                                 final_revision: revision,
@@ -13384,6 +13385,7 @@ impl SearchService for CoordinatorServiceImpl {
                                         payload: Some(
                                             crate::pb::query_stream_response::Payload::Completion(
                                                 crate::pb::QueryStreamCompletion {
+                                                    error_disclosure: None,
                                                     completed: true,
                                                     response: Some(response),
                                                     final_revision: revision,
@@ -13404,6 +13406,7 @@ impl SearchService for CoordinatorServiceImpl {
                                         payload: Some(
                                             crate::pb::query_stream_response::Payload::Completion(
                                                 crate::pb::QueryStreamCompletion {
+                                                    error_disclosure: crate::error_disclosure::status_detail(&status),
                                                     completed: false,
                                                     response: None,
                                                     final_revision: revision,
@@ -13431,6 +13434,7 @@ impl SearchService for CoordinatorServiceImpl {
                                 payload: Some(
                                     crate::pb::query_stream_response::Payload::Completion(
                                         crate::pb::QueryStreamCompletion {
+                                            error_disclosure: crate::error_disclosure::status_detail(&status),
                                             completed: false,
                                             response: None,
                                             final_revision: revision,

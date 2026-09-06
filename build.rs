@@ -21,6 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compile_protos(
             &[
                 "proto/ai/protomolt/search/v1/search.proto",
+                "proto/google/rpc/status.proto",
                 "proto/ai/protomolt/search/v1/authorization.proto",
                 "proto/ai/protomolt/search/v1/query_cursor.proto",
                 "proto/ai/protomolt/search/v1/source.proto",

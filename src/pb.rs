@@ -6,6 +6,11 @@
 
 tonic::include_proto!("ai.protomolt.search.v1");
 
+/// Standard rich gRPC error envelope, vendored from googleapis.
+pub mod google_rpc {
+    tonic::include_proto!("google.rpc");
+}
+
 pub mod storage {
     pub mod v1 {
         tonic::include_proto!("ai.protomolt.search.storage.v1");

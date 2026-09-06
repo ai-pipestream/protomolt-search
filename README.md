@@ -1222,6 +1222,11 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **2026-09-06 — Restricted search error disclosure.** Collection-boundary errors
+  with field or document restrictions carry safe messages and a protobuf
+  disclosure decision; stream failures cannot carry results or emit later hits.
+  Policy changes have a machine-readable reason. Authority errors before a grant
+  exists are also sanitized. See [Search error disclosure](docs/error-disclosure.md).
 - **2026-09-06 — Query execution disclosure and evidence scope.** The shared
   executor explicitly marks withheld physical metadata under document grants.
   Dense outcomes identify corpus versus selectivity-band benchmark evidence;

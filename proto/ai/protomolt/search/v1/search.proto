@@ -24,6 +24,7 @@ import "google/protobuf/timestamp.proto";
 import "ai/protomolt/search/v1/source.proto";
 import "ai/protomolt/search/v1/document_identity.proto";
 import "ai/protomolt/search/v1/schema_report.proto";
+import "ai/protomolt/search/v1/error_disclosure.proto";
 
 // NodeService is the internal shard-owner API. Exactly one node owns a given
 // shard; the coordinator is the only intended client.
@@ -5815,6 +5816,9 @@ message QueryStreamCompletion {
   // or shard failure, so clients never infer completeness from EOF.
   uint32 error_code = 5;
   string error_message = 6;
+  // Present when the failure carries a structured disclosure decision. Absent
+  // on success and on legacy/unrestricted failures without such a decision.
+  ErrorDisclosure error_disclosure = 7;
 }
 
 message QueryStreamResponse {

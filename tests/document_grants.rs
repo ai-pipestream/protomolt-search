@@ -368,7 +368,12 @@ async fn uncertified_routes_and_network_nodes_refuse_before_execution() {
         .await
         .unwrap_err();
     assert_eq!(error.code(), Code::FailedPrecondition);
-    assert!(error.message().contains("in-process"));
+    assert!(
+        pipestream_search::error_disclosure::status_detail(&error)
+            .unwrap()
+            .details_redacted
+    );
+    assert!(!error.message().contains("in-process"));
 }
 
 #[derive(Debug)]
@@ -490,7 +495,11 @@ async fn an_unbound_grant_column_refuses_even_empty_queries_without_naming_the_c
                 "fused={fused} text={text:?}: {error}"
             );
             assert!(!error.message().contains("policy_internal_column"));
-            assert!(error.message().contains("document grant"));
+            assert!(
+                pipestream_search::error_disclosure::status_detail(&error)
+                    .unwrap()
+                    .details_redacted
+            );
         }
     }
     let suggestion = SuggestRequest {
@@ -616,7 +625,15 @@ async fn dictionaries_and_expansions_disclose_only_the_authorized_corpus() {
             .await
             .unwrap_err();
         assert_eq!(actual.code(), expected.code());
-        assert_eq!(actual.message(), expected.message());
+        assert!(
+            pipestream_search::error_disclosure::status_detail(&actual)
+                .unwrap()
+                .details_redacted
+        );
+        assert_ne!(actual.message(), expected.message());
+        assert!(!actual.message().contains("body"));
+        assert!(!actual.message().contains("shard"));
+        assert!(!actual.message().contains("dictionary"));
         let mut revoked = policy();
         revoked.revision += 1;
         revoked.grants.remove(0);

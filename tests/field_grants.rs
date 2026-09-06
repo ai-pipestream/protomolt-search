@@ -79,6 +79,112 @@ fn query() -> Bm25SearchRequest {
         ..Default::default()
     }
 }
+
+#[derive(Debug)]
+struct DiagnosticFailureAfterAdmission {
+    inner: PolicyAuthority,
+    calls: AtomicUsize,
+    fail_at: usize,
+}
+impl Authorizer for DiagnosticFailureAfterAdmission {
+    fn authorize(
+        &self,
+        principal: &str,
+        collection: &str,
+        action: AccessAction,
+    ) -> Result<AccessDecision, Status> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) >= self.fail_at {
+            let mut error = Status::with_details(
+                Code::Internal,
+                "PRIVATE policy backend diagnostic",
+                b"PRIVATE detail bytes".to_vec().into(),
+            );
+            error
+                .metadata_mut()
+                .insert("x-policy-debug", "PRIVATE-header".parse().unwrap());
+            return Err(error);
+        }
+        self.inner.authorize(principal, collection, action)
+    }
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.inner.subscribe()
+    }
+}
+
+#[tokio::test]
+async fn restricted_collection_errors_do_not_disclose_late_diagnostics() {
+    use prost::Message;
+    let owner = cluster(false).await;
+    for (field_grant, document_grant) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let fields = field_grant.then(|| {
+            permissions(
+                &[("body", &[FieldAction::Use, FieldAction::Disclose])],
+                false,
+            )
+        });
+        let authority = Arc::new(DiagnosticFailureAfterAdmission {
+            inner: PolicyAuthority::new(policy(fields, document_grant)).unwrap(),
+            calls: AtomicUsize::new(0),
+            fail_at: 2,
+        });
+        let reader = service(owner.clone(), authority.clone());
+        let error = SearchService::bm25_search(&reader, request(query()))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            authority.calls.load(Ordering::SeqCst),
+            3,
+            "failure must occur after handler execution"
+        );
+        assert_eq!(error.code(), Code::Internal);
+        if field_grant || document_grant {
+            assert!(!error.message().contains("PRIVATE"));
+            assert!(error.metadata().is_empty());
+            let envelope = google_rpc::Status::decode(error.details()).unwrap();
+            assert_eq!(envelope.code, Code::Internal as i32);
+            assert_eq!(envelope.message, error.message());
+            assert_eq!(envelope.details.len(), 1);
+            assert_eq!(
+                envelope.details[0].type_url,
+                "type.googleapis.com/ai.protomolt.search.v1.ErrorDisclosure"
+            );
+            let detail = ErrorDisclosure::decode(envelope.details[0].value.as_slice()).unwrap();
+            assert!(detail.details_redacted);
+        } else {
+            assert!(error.message().contains("PRIVATE"));
+            assert_eq!(error.details(), b"PRIVATE detail bytes");
+            assert!(error.metadata().contains_key("x-policy-debug"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn authority_errors_before_a_grant_never_disclose_backend_details() {
+    use prost::Message;
+    for fail_at in [0, 1] {
+        let authority = Arc::new(DiagnosticFailureAfterAdmission {
+            inner: PolicyAuthority::new(policy(None, false)).unwrap(),
+            calls: AtomicUsize::new(0),
+            fail_at,
+        });
+        let reader = service(
+            CoordinatorServiceImpl::with_local_nodes(vec![]),
+            authority.clone(),
+        );
+        let error = SearchService::bm25_search(&reader, request(query()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::Internal);
+        assert_eq!(authority.calls.load(Ordering::SeqCst), fail_at + 1);
+        assert!(!error.message().contains("PRIVATE"));
+        assert!(error.metadata().is_empty());
+        let envelope = google_rpc::Status::decode(error.details()).unwrap();
+        let detail = ErrorDisclosure::decode(envelope.details[0].value.as_slice()).unwrap();
+        assert!(detail.details_redacted);
+    }
+}
 async fn cluster(streaming: bool) -> CoordinatorServiceImpl {
     cluster_subset(streaming, false, false).await
 }
@@ -1237,6 +1343,7 @@ async fn streaming_field_grants_redact_completion_and_deny_before_provisional_hi
                 assert!(!end.completed);
                 assert_eq!(end.error_code, Code::PermissionDenied as u32);
                 assert!(end.response.is_none());
+                assert!(end.error_disclosure.unwrap().details_redacted);
                 refused = true;
             }
         }

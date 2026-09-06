@@ -1054,7 +1054,17 @@ Successful terminal Query responses now apply document execution disclosure
 with explicit omission semantics and dense benchmark evidence scopes. The
 shared executor is covered across dense, lexical, Boolean and hybrid selection;
 see [Query execution disclosure](query-disclosure.md). The public document-query
-gate remains while error/provisional surfaces and the remaining full-query
+gate remains while provisional membership and the remaining full-query
 authorization cases are certified. The three-part foundation remains incomplete.
 The combined source with main `7b0faa9` passed 1,198 tests and all five mobile
 compile checks; the disclosure document records the validation scope.
+
+The collection boundary now sanitizes restricted search failures, including
+revocation errors and terminal stream failures, with an explicit protobuf
+disclosure decision. Authority errors before a grant exists are also sanitized.
+See [Search error disclosure](error-disclosure.md) for scope and terminal guards.
+This closes the error-diagnostic surface in this boundary; it does not open the
+public document-query gate or complete the three foundations.
+The error-disclosure checkpoint passed 1,207 tests and all five mobile compile
+checks against incorporated main `7b0faa9`; its document records the precise
+validation boundary and the updated error-contract assertions.

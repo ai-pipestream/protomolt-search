@@ -1,0 +1,21 @@
+syntax = "proto3";
+package ai.protomolt.search.v1;
+
+// Transport failures carry this message in a google.rpc.Status Any detail with
+// type URL type.googleapis.com/ai.protomolt.search.v1.ErrorDisclosure.
+// QueryStream embeds the same detail in its terminal failure certificate.
+message ErrorDisclosure {
+  // Raw handler message, transport metadata and detail payloads were withheld.
+  // The canonical gRPC code remains authoritative; this is not a retry grant.
+  bool details_redacted = 1;
+  // Additional machine-readable meaning when explicitly established by the
+  // authority. UNSPECIFIED means use the canonical gRPC code alone.
+  SearchErrorReason reason = 2;
+}
+
+enum SearchErrorReason {
+  SEARCH_ERROR_REASON_UNSPECIFIED = 0;
+  // The authority decision no longer matches current policy. Start a new
+  // authorized operation; an existing stream or cursor cannot retain its grant.
+  SEARCH_ERROR_REASON_ACCESS_POLICY_CHANGED = 1;
+}

@@ -53,8 +53,10 @@ its completion contract.
 ## Admission and validation boundary
 
 Public document-restricted Query remains gated. This change covers successful
-terminal response metadata in the shared executor; it does not certify error
-messages, provisional stream surfaces, or every remaining document-query shape.
+terminal response metadata in the shared executor. The separate
+[error disclosure boundary](error-disclosure.md) covers restricted collection
+failures. Provisional stream membership and every remaining document-query shape
+are not yet certified.
 Network delegation and stable identity on every public hit also remain open.
 
 The executor regression covers native and FP32 dense selection, lexical,

@@ -26,6 +26,7 @@
 //!   "whichever" dataset.
 
 use crate::authorization::{AccessPermit, AuthorizedStream};
+use crate::error_disclosure::{DisclosedQueryStream, ErrorScope};
 use crate::pb::AccessAction;
 use std::collections::BTreeMap;
 
@@ -384,7 +385,8 @@ impl CollectionSet {
                 .as_ref()
                 .expect("authenticated above")
                 .authorize(principal, collection, action)
-                .map(Some),
+                .map(Some)
+                .map_err(crate::error_disclosure::authorization_status),
             None => Ok(None),
         }
     }
@@ -397,7 +399,9 @@ impl CollectionSet {
     ) -> Result<(String, &'a CoordinatorServiceImpl, Option<AccessPermit>), Status> {
         let (name, target) = self.members.resolve(collection).map_err(|error| {
             if principal.is_some() {
-                Status::permission_denied("operation is not authorized for this collection")
+                crate::error_disclosure::authorization_status(Status::permission_denied(
+                    "operation is not authorized for this collection",
+                ))
             } else {
                 error
             }
@@ -589,7 +593,7 @@ macro_rules! search_service_over_collections {
         #[tonic::async_trait]
         impl SearchService for CollectionSet {
             type QueryStreamStream =
-                Guarded<AuthorizedStream<<CoordinatorServiceImpl as SearchService>::QueryStreamStream>>;
+                Guarded<DisclosedQueryStream<AuthorizedStream<<CoordinatorServiceImpl as SearchService>::QueryStreamStream>>>;
 
             $(
                 async fn $name(
@@ -599,9 +603,12 @@ macro_rules! search_service_over_collections {
                     let started = std::time::Instant::now();
                     let principal = self.authenticate(&request)?;
                     let (name, target, access) = self.resolve_authorized(principal.as_ref(), &request.get_ref().collection, AccessAction::$action)?;
-                    let target = target.for_access(access.as_ref().map(|p| p.decision()), stringify!($name))?;
+                    let error_scope = ErrorScope::new(access.as_ref().map(|p| p.decision()));
+                    let target = target.for_access(access.as_ref().map(|p| p.decision()), stringify!($name))
+                        .map_err(|error| error_scope.status(error))?;
                     let _permit =
-                        Self::admit_under(principal.as_ref(), &request, target.max_k())?;
+                        Self::admit_under(principal.as_ref(), &request, target.max_k())
+                            .map_err(|error| error_scope.status(error))?;
                     request.get_mut().collection = name.clone();
                     let k = request.get_ref().k().unwrap_or(0);
                     let who = principal.as_ref().map(|p| p.name.clone()).unwrap_or_default();
@@ -618,7 +625,7 @@ macro_rules! search_service_over_collections {
                             .map(|r| RecentFields::figures(r.get_ref()))
                             .map_err(Status::code),
                     );
-                    out
+                    out.map_err(|error| error_scope.status(error))
                 }
             )*
 
@@ -629,8 +636,11 @@ macro_rules! search_service_over_collections {
                 let started = std::time::Instant::now();
                 let principal = self.authenticate(&request)?;
                 let (name, target, access) = self.resolve_authorized(principal.as_ref(), &request.get_ref().collection, AccessAction::Search)?;
-                let target = target.for_access(access.as_ref().map(|p| p.decision()), "query_stream")?;
-                let permit = Self::admit_under(principal.as_ref(), &request, target.max_k())?;
+                let error_scope = ErrorScope::new(access.as_ref().map(|p| p.decision()));
+                let target = target.for_access(access.as_ref().map(|p| p.decision()), "query_stream")
+                    .map_err(|error| error_scope.status(error))?;
+                let permit = Self::admit_under(principal.as_ref(), &request, target.max_k())
+                    .map_err(|error| error_scope.status(error))?;
                 request.get_mut().collection = name.clone();
                 let k = request.get_ref().k().unwrap_or(0);
                 let who = principal.as_ref().map(|p| p.name.clone()).unwrap_or_default();
@@ -648,8 +658,9 @@ macro_rules! search_service_over_collections {
                         .map(|_| crate::diagnostics::RecentFigures::default())
                         .map_err(Status::code),
                 );
-                let response = response?;
-                Ok(response.map(|stream| Guarded::new(AuthorizedStream::new(stream, access), permit)))
+                let response = response.map_err(|error| error_scope.status(error))?;
+                Ok(response.map(|stream| Guarded::new(DisclosedQueryStream::new(
+                    AuthorizedStream::new(stream, access), error_scope), permit)))
             }
 
             async fn routed_ingest_mapped(

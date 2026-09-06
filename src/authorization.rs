@@ -257,6 +257,9 @@ impl AccessPermit {
         &self.decision
     }
     pub fn check(&self) -> Result<(), Status> {
+        if *self.revisions.borrow() != self.decision.policy_revision {
+            return Err(crate::error_disclosure::policy_changed());
+        }
         let current = self.authority.authorize(
             &self.decision.principal,
             &self.decision.collection,
@@ -264,9 +267,7 @@ impl AccessPermit {
                 .map_err(|_| Status::permission_denied("invalid authorization action"))?,
         )?;
         if current != self.decision || *self.revisions.borrow() != self.decision.policy_revision {
-            return Err(Status::permission_denied(
-                "access policy changed; start a new operation",
-            ));
+            return Err(crate::error_disclosure::policy_changed());
         }
         Ok(())
     }
