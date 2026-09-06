@@ -10,6 +10,16 @@ on:
 permissions:
   contents: read
 
+env:
+  # The runner's container has 10 CPUs and 20 GB; four compile jobs
+  # keep the test build's peak under that, and incremental artifacts
+  # are dead weight on a fresh container.
+  CARGO_BUILD_JOBS: "4"
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: never
+  CARGO_NET_RETRY: "5"
+  RUSTUP_MAX_RETRIES: "5"
+
 jobs:
   test:
     if: ${{ github.server_url != 'https://github.com' }}
@@ -17,15 +27,30 @@ jobs:
     steps:
       - uses: https://data.forgejo.org/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # The self-hosted runners map ubuntu-latest to the rokkon-ci image:
+      # root, no sudo, gcc and make but no rustup, protoc, or pkg-config.
+      # The job brings what it needs so it does not depend on the image.
       - name: Install build prerequisites
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler ripgrep
+          set -euo pipefail
+          if command -v sudo >/dev/null 2>&1; then SUDO=sudo; else SUDO=; fi
+          export DEBIAN_FRONTEND=noninteractive
+          $SUDO apt-get update
+          $SUDO apt-get install -y --no-install-recommends \
+            protobuf-compiler ripgrep curl ca-certificates git \
+            build-essential pkg-config cmake libssl-dev
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --no-modify-path --default-toolchain none
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
           rustup toolchain install 1.98.0 --profile minimal
           rustup default 1.98.0
           rustup target add aarch64-linux-android x86_64-linux-android \
             aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
           cargo install cargo-audit --locked --version 0.22.2
+          rustc --version && cargo --version && protoc --version && rg --version | head -1
 
       - name: Dependency and provenance gate
         run: scripts/check-dependencies.sh
