@@ -252,30 +252,81 @@ that holds the bitmaps, with the coordinator merging ranked candidates
 only.
 
 
+### The boolean shape by id, on one binary
+
+The next morning (2026-09-06) the fleet moved to one binary: main
+6141ca5 on the six archive nodes, the roots, and the Pi nodes (the
+relay's 5b42636 build is the same code, since the commits between the
+two touch documentation only). A direct root :19393 (the Pi nodes
+listed instead of the relay, pruning on) then took the boolean shape
+and the allowlist shape back to back, k = 10, with the root's peak
+resident size (`VmHWM`) read after each query:
+
+| Query | Boolean shape | Allowlist shape | Same ids | Root peak RSS after |
+|---|---|---|---|---|
+| lexical "grandfathered status" AND dense row 7 | 5.4 s | no such shape | | 1.5 GB |
+| lexical "qualified immunity" AND dense row 7 | 9.4 s | no such shape | | 2.6 GB |
+| lexical "qualified immunity", `court == "scotus"` | 866 ms | 79 ms | yes | 2.6 GB |
+| lexical "qualified immunity", `year >= 2018` | 3.4 s | 47 ms | yes | 2.6 GB |
+| dense row 7, `court == "scotus"` | 1.9 s | 588 ms | yes | 2.6 GB |
+| dense row 7, `year >= 2018` | 39.0 s | 830 ms | yes | 13.0 GB |
+| lexical "qualified immunity", `year < 2015` | 7.2 s | 66 ms (earlier run) | | 13.0 GB |
+| dense row 7, `year < 2015` | 177 s | 258 ms (earlier run) | | 49.6 GB |
+
+The top ten agree by id wherever the two shapes were run together, so
+the cost is the shape, not the answer. The two AND(search, dense)
+rows are the coordinator's set arithmetic over the lexical clause's
+membership (600k ids for "qualified immunity") followed by the
+per-shard rescore calls; the filter rows are the filter leaf's
+membership crossing the wire as a bitmap and living at the root as an
+id set, 49.6 GB for the 66M rows under `year < 2015`. The root was
+stopped after the run.
+
+With main 774da20 on the roots and the relay (the relay now forwards
+the bitmap and rescore routes, `docs/relay-coordinators.md`), the same
+boolean shapes go through the relay root :19391 and answer with the
+same ids as the direct root: 897 ms, 4.9 s, 2.1 s, and 47 s for the
+four filter rows above, measured while the archive re-placement split
+below was using the sidecar and most of krick-1's cores, so those
+times carry that load. The boolean planner's pushdown (the shard
+evaluates the planned tree and returns ranked candidates) is the
+follow-up that removes the id set; its numbers go here when it merges.
+
+### The archive in year bands
+
+The archive is one 66.4M-row default leaf. Its year histogram through
+the root (`Aggregate`, `double(year)`, `year < 2015`) puts 15M rows in
+2005-2014, 21.7M in 2000-2014, and 32.7M in 1990-2014, with 4.1M
+before 1900. Cut into six bands of about 11M each, the generation-11
+tree is `recent` (`year >= 2015`, the Pis), then `year >= 2008`,
+`year >= 2000`, `year >= 1990`, `year >= 1976`, `year >= 1940`, and the
+default leaf, one shard per band because `court_ingest` documents
+carry no stable key and a hash-tiled leaf needs one. The offline
+re-placement split (`reshard --logs=<six WALs> --placement-tree=...`,
+`docs/placement.md`, "Changing the tree") replays the six archive WALs
+(27 GB each), evaluates the new tree on each document, rewrites the
+placement column, and writes one image per band under
+`/work/court-corpus/shards-v11/archive` with a slot stride of
+16,777,216 so the bands sit below the recent group's slots at
+132,907,008. A first attempt with the old stride of 22,151,168 would
+have put the seventh child on the Pi range and was stopped after its
+routing pass (about seven minutes for the six logs, 155 GB of spill).
+
 ## What remains
 
 - Cutover: nothing was moved off the old ports. The old generation on
-  :19291 and :19300-19307 is untouched and can be stopped by the
-  operator once the new one is accepted; the Pis still run the old
-  nodes from `~/protomolt-search/shards` next to the new ones.
-- Relay composition of the bitmap routes and the diagnostics node
-  route, so filtered queries and shard diagnostics go through the root
-  over the relay (docs/relay-coordinators.md, "What is not composed yet").
-- A partitioned compaction per shard: the segments sealed in ingest
-  order, so the year summaries overlap and segment pruning has little to
-  skip inside a leaf (`docs/segment-pruning.md`).
-- The boolean route with a filter leaf is slow at 86M rows and can
-  take the coordinator down: the filter's match set becomes a
-  coordinator id set per query (35-75 s for a year range over tens of
-  millions of rows, 1 s for a court filter, 50 GB and an OOM kill for
-  66M rows), while the same filter as an AND-composite clause costs
-  15-735 ms through the relay (section above). The planner should push
-  a MUST filter leaf down as the sibling clauses' allowlist and keep
-  set algebra between search clauses on the shards.
-- Placement pruning only excludes a leaf whose own predicate
-  contradicts the filter: `year < 2015` skips the recent leaf, but
-  `year >= 2015` does not skip the archive, because the archive is the
-  default leaf and carries no predicate of its own.
-- Control-plane leases for the scan rate, and a uniform binary once the
-  root and nodes move to the current main (the relay alone runs 5b42636;
-  the proto is unchanged between the two, comments aside).
+  :19291 and :19300-19307 is untouched (its processes did not survive
+  the reboot of 2026-09-05) and the operator decides when the new one
+  replaces it; the Pis still hold the old nodes' files next to the new
+  ones.
+- The boolean route with a filter leaf or with set algebra between
+  search clauses builds a coordinator id set (the table above, up to
+  49.6 GB); the planner pushdown to the shards is in progress.
+- The year-band split of the archive is running; after it, each band
+  serves under `--placement-leaf` and `--placement-tree`, the root map
+  moves to generation 11, and a partitioned compaction by `year` inside
+  each band gives segment pruning something to skip within a leaf
+  (`docs/segment-pruning.md`).
+- The six archive nodes and the Pi nodes run 6141ca5 while the roots
+  and the relay run 774da20; the nodes move with the next roll.
+- Control-plane leases for the scan rate.
