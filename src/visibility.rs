@@ -245,5 +245,6 @@ scoped_read_responses!(
     BrowseShardResponse,
     AggregateShardResponse,
     QuantileCountsResponse,
-    ResolveParentsResponse
+    ResolveParentsResponse,
+    FetchValuesResponse
 );
