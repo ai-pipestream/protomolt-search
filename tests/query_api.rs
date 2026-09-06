@@ -1743,7 +1743,7 @@ async fn sorted_browse_orders_by_column_and_pages() {
         if resp.next_cursor.is_empty() {
             break;
         }
-        assert!(resp.next_cursor.starts_with("tvqs2:"), "sorted token");
+        assert!(resp.next_cursor.starts_with("pqc1:"), "sealed sorted token");
         cursor = resp.next_cursor;
     }
     assert_eq!(

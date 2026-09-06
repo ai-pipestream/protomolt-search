@@ -1222,6 +1222,12 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Bound query cursors (2026-09-05, feature branch).** Unary and streamed
+  `Query` now sign protobuf cursor envelopes and bind them to the resolved
+  collection, principal/workspace/policy revision, query and routing generation.
+  Context changes and tampering refuse before execution. Old paging tokens need
+  a fresh first page; indexes need no rebuild. See [paging](docs/query-api.md#paging).
+
 - **Query analyzer identity (2026-09-05, feature branch).** Flat BM25,
   hybrid legs, candidate rescoring, lexical membership and lexical sorting now
   carry the originating analyzer fingerprint. Explicit mapped fields require a

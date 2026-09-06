@@ -633,15 +633,37 @@ none. `executed` gains a `+collapse` suffix; the profile reports
 
 ## Paging
 
-`QueryRequest.cursor` / `QueryResponse.next_cursor` implement
-search-after paging (landed with increment 1). The token embeds the
-boundary hit's (absolute rank, exact score bits, doc id); the rest of
-the request must repeat the original query verbatim. Resumption
-re-finds the boundary hit bitwise — search here is deterministic, so
-exact equality is the corpus-state check — and refuses with
-FAILED_PRECONDITION when the boundary is gone or its score moved.
-Documents ingested after a page that rank before the boundary are
-skipped, as search-after semantics require.
+`QueryRequest.cursor` / `QueryResponse.next_cursor` implement search-after
+paging. Public tokens are opaque `pqc1:` envelopes: a canonical protobuf payload
+and an HMAC-SHA256 tag. The envelope binds the internal rank/score/id or typed
+sort boundary to the resolved collection, complete authorization decision
+(principal, workspace, action and policy revision), topology generation, ordered
+routes and the normalized query. It is not an authorization credential: every
+page must independently pass the current policy.
+
+Repeat the query, page size, candidate depth, filters, projections, boosts,
+sorting, collapse and aggregation on each page. Only the cursor itself, trace
+`request_id`, observational `profile`, an equivalent collection default, and an
+equivalent topology precondition may differ. Context mismatches fail with
+FAILED_PRECONDITION before execution, even if the old boundary still has the
+same score. Malformed tokens and old unsigned `tvq1:` / `tvqs2:` tokens require
+restarting at the first page. Unary and streaming pages share the same context.
+
+This is a live search-after cursor, not a point-in-time index snapshot. The
+existing score/id boundary check still refuses when the boundary disappears or
+its score changes. The envelope does not capture every data mutation or make
+physical ids stable through compaction; generation-consistent data views remain
+foundation work. A topology change always invalidates the token. Tokens have a
+64 KiB protobuf payload limit and are integrity protected, not encrypted.
+
+By default the signing key is generated lazily from operating-system entropy and
+shared by clones of one coordinator. Dropping/restarting that coordinator loses
+the key, so clients restart pagination. Library hosts may configure
+`CoordinatorServiceImpl::with_cursor_signing_key` with a retained 32-byte secret
+for equivalent serving instances. Those hosts must preserve the authority's
+monotonic revision history; sharing a key does not waive context validation.
+The command-line server currently uses ephemeral keys. See
+[security](security.md#query-cursor-context).
 
 Depth: a single-leaf query pages by fetching deeper (its order is
 depth-independent by the exact top-k prefix property), capped by
@@ -654,8 +676,8 @@ the pool is never silently deepened; exhaustion refuses and names
 always mints `next_cursor`; a short page provably has nothing after it
 at the served depth and mints none.
 
-A sorted query's token (`tvqs2:`) carries the boundary's keys and resumes
-strictly after them; a collapsed query's token is its last representative
+A sorted query's sealed boundary carries typed keys and resumes strictly
+after them; a collapsed query's token is its last representative
 and ranks count groups. A token from one shape refuses on another.
 
 A recursive boolean query rebuilds its exact bitmap plan and score order on

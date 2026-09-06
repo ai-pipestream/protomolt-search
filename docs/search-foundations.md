@@ -1,6 +1,7 @@
 # Search foundations
 
-Implementation branch: `feat/search-foundations`, based on `PRE_ASTRA`.
+Foundation work began on `feat/search-foundations` from `PRE_ASTRA`.
+Current implementation branch: `feat/protobuf-unsigned-numerics-2026-09`.
 This tracks the full requested foundation. Individual passing increments do not
 establish completion of the three workstreams.
 
@@ -658,3 +659,39 @@ Tests/examples compilation, formatting, vendored-proto byte identity and
 whitespace checks passed. Descriptor comparison against `47233a2` verifies
 exactly six additive uint64 request fields; existing declarations and stored
 formats are unchanged. These are local checks, not on-device or fleet results.
+
+
+## Query cursor context checkpoint (2026-09-05)
+
+Four regression tests reproduced unsigned cursors being accepted under another
+principal, a later policy revision, changed query text and a different topology
+generation while the boundary id/score remained unchanged. Public Query and
+QueryStream now retain the server's AccessDecision and wrap internal boundaries
+in integrity-protected protobuf envelopes. Request normalization permits only
+observational trace/profile changes and equivalent collection/topology defaults;
+query semantics and routing context remain bound. A mismatch refuses before
+execution or stream creation, and streamed nested collections are validated.
+
+Default keys are ephemeral per coordinator and shared by its clones. A library
+host can supply a retained key; no new persistent signing-key store or CLI key
+option is implied. Invalid, oversized, noncanonical and old unsigned tokens
+refuse. Tokens do not freeze index data or bind every shard data mutation, so
+this does not resolve compaction-safe pagination or the remaining stable-view
+work. Document/field grants, scoped statistics and caches, and durable catalog
+publication remain part of the full active objective.
+
+Validation: 443 library tests, 579 integration tests across 101 targets and
+11 embedded tests passed (1,033 total), with one existing sidecar conformance
+test ignored. All five Android/iOS Rust target checks passed with three existing
+relay dead-code warnings. Tests/examples compilation, formatting, vendored-proto
+byte identity and whitespace checks passed. The descriptor comparison against
+`836b9d8` confirms existing declarations are unchanged; only the three messages
+in `query_cursor.proto` are added. No index format or fleet state changed.
+
+The compaction fixtures retain one test key across coordinator instances so
+they still exercise the data-boundary refusal. Embedded/network conformance
+compares the full result apart from host-bound token bytes, verifies identical
+second pages using each host's token, and checks cross-host refusal. The unsigned
+ordering test inspects its typed boundary inside the new envelope and still
+stitches pages exactly. These fixture updates preserve the original correctness
+checks while accounting for the new cursor contract.

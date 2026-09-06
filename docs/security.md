@@ -159,6 +159,37 @@ The console (`docs/console-facade.md`) is the one client that holds the
 cluster credentials on a browser's behalf: it binds to loopback unless
 told otherwise, and whoever reaches it acts as its principal.
 
+## Query cursor context
+
+`Query` and `QueryStream` retain the server-issued `AccessDecision` when entering
+the coordinator, instead of losing it when unwrapping the request. The opaque
+cursor envelope in `query_cursor.proto` binds that decision, the resolved
+collection, normalized query and frozen routing map. A different principal,
+workspace, policy revision, query or map cannot resume a token just because a
+boundary score matches. The check precedes execution and stream creation.
+Current authorization still runs for every page and every disclosed stream item;
+possessing a cursor grants no access. Client metadata cannot supply a trusted
+`AccessDecision` extension. A streamed query's nested collection must also agree
+with its authorized outer resource.
+
+HMAC-SHA256 covers the versioned protobuf envelope and a domain separator; tags
+are compared with the existing constant-time comparison. Parsing is bounded and
+refuses noncanonical payloads and unknown versions. Keys are shared by clones
+of a coordinator, are redacted in debug output, and default to ephemeral
+32-byte secrets obtained through
+[getrandom 0.2.17](https://docs.rs/getrandom/0.2.17/getrandom/). Entropy failure
+refuses token issuance instead of using a predictable fallback. A library host
+can supply a retained key through `with_cursor_signing_key`; it must also retain
+the authority's revision history. The command-line server has no key-file or
+live key-rotation option. An ephemeral-key restart or a host key change requires
+fresh pagination. Tokens are not encrypted and are not durable index snapshots.
+
+This closes the cursor context gap; it does not implement document/field
+selection, scope term statistics or partition result caches for those policies.
+Those restrictions remain required across every disclosure route before granular
+grants can be advertised. See [paging](query-api.md#paging) for the live-data
+boundary and old-token migration.
+
 ## Quotas, per principal
 
 | quota | rule | on exceed |

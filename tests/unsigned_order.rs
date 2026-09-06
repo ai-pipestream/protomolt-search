@@ -136,10 +136,21 @@ async fn verify(coordinator: &CoordinatorServiceImpl) {
                     if response.next_cursor.is_empty() {
                         break;
                     }
-                    assert!(
-                        response.next_cursor.contains(":u"),
-                        "unsigned cursor encoding"
-                    );
+                    // Inspect the signed envelope's internal boundary for this
+                    // wire-format check; callers otherwise echo the opaque token.
+                    let payload = response
+                        .next_cursor
+                        .strip_prefix("pqc1:")
+                        .unwrap()
+                        .split_once(':')
+                        .unwrap()
+                        .0;
+                    let bytes: Vec<u8> = (0..payload.len())
+                        .step_by(2)
+                        .map(|i| u8::from_str_radix(&payload[i..i + 2], 16).unwrap())
+                        .collect();
+                    let envelope = pb::QueryCursorEnvelope::decode(bytes.as_slice()).unwrap();
+                    assert!(envelope.boundary.contains(":u"), "unsigned cursor encoding");
                     req.cursor = response.next_cursor;
                     assert!(paged.len() <= VALUES.len());
                 }

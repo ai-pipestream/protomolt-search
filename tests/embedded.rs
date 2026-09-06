@@ -227,16 +227,43 @@ async fn local_cluster_matches_network_service_and_streams_completion() {
         vec![0, 2, 100, 102]
     );
 
-    let dense_local = embedded
+    let mut dense_local = embedded
         .query(dense_query(corpus[..DIM].to_vec()))
         .await
         .unwrap();
-    let dense_network =
+    let mut dense_network =
         SearchService::query(&network, Request::new(dense_query(corpus[..DIM].to_vec())))
             .await
             .unwrap()
             .into_inner();
+    // Opaque cursors belong to each coordinator's key and routing context.
+    // Compare the entire result apart from those tokens, then prove that each
+    // token resumes the same second page and cannot cross into the other host.
+    let local_cursor = std::mem::take(&mut dense_local.next_cursor);
+    let network_cursor = std::mem::take(&mut dense_network.next_cursor);
+    assert!(!local_cursor.is_empty() && !network_cursor.is_empty());
+    assert_ne!(local_cursor, network_cursor);
     assert_eq!(dense_local, dense_network);
+    let resumed = |cursor| QueryRequest {
+        cursor,
+        ..dense_query(corpus[..DIM].to_vec())
+    };
+    assert_eq!(
+        embedded
+            .query(resumed(network_cursor.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    let local_second = embedded.query(resumed(local_cursor)).await.unwrap();
+    let network_second = SearchService::query(&network, Request::new(resumed(network_cursor)))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(local_second.hits.len(), 2);
+    assert!(local_second.next_cursor.is_empty());
+    assert_eq!(local_second, network_second);
 
     let mut stream = embedded
         .query_stream(QueryStreamRequest {

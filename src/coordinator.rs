@@ -355,6 +355,8 @@ pub struct CoordinatorServiceImpl {
     /// collection is refused by `admit`; a node reporting another is
     /// refused by `verify_collection_membership` and flagged in health.
     collection: String,
+    /// Public paging tokens share a key across clones, including hot snapshots.
+    cursor_signer: Arc<crate::query_cursor::CursorSigner>,
     /// TLS material for the channels to shards (`docs/security.md`);
     /// `None` uses the process-wide material when installed, plaintext
     /// otherwise.
@@ -1789,6 +1791,7 @@ impl CoordinatorServiceImpl {
         Self {
             node_addrs,
             collection: String::new(),
+            cursor_signer: Arc::new(crate::query_cursor::CursorSigner::default()),
             client_tls: None,
             udp_hmac_key: None,
             replica_addrs: Vec::new(),
@@ -2720,6 +2723,44 @@ impl CoordinatorServiceImpl {
     pub fn with_topology_generation(mut self, generation: u64) -> Self {
         self.topology_generation = generation;
         self
+    }
+
+    /// Supply a host-managed cursor signing key. Hosts sharing a key still need
+    /// identical request, authorization and routing contexts to resume a token.
+    /// Without this option the key is random and lost when the coordinator drops.
+    pub fn with_cursor_signing_key(mut self, key: [u8; 32]) -> Self {
+        self.cursor_signer = Arc::new(crate::query_cursor::CursorSigner::from_key(key));
+        self
+    }
+
+    fn bind_query_cursor(
+        &self,
+        request: &mut crate::pb::QueryRequest,
+        access: Option<&crate::pb::AccessDecision>,
+    ) -> Result<crate::query_cursor::CursorBinding, Status> {
+        self.admit(&request.collection)?;
+        let routes = self
+            .current_topology_routes()
+            .into_iter()
+            .map(|route| crate::pb::QueryCursorRoute {
+                address: route.addr,
+                replica: route.replica,
+                hash_start: route.hash_range.map(|range| range.0),
+                hash_end: route.hash_range.map(|range| range.1),
+                placement: route.placement,
+            })
+            .collect();
+        crate::query_cursor::CursorBinding::prepare(
+            self.cursor_signer.clone(),
+            request,
+            crate::pb::QueryCursorContext {
+                query_sha256: Vec::new(),
+                collection: self.collection.clone(),
+                access: access.cloned(),
+                topology_generation: self.topology_generation,
+                routes,
+            },
+        )
     }
 
     /// Name the collection this coordinator serves (`docs/collections.md`).
@@ -11492,9 +11533,15 @@ impl SearchService for CoordinatorServiceImpl {
                 ))
                 .await;
             }
-            let request = request.into_inner();
+            let access = request
+                .extensions()
+                .get::<crate::pb::AccessDecision>()
+                .cloned();
+            let mut request = request.into_inner();
             self.require_topology_generation(request.required_topology_generation)?;
+            let cursor = self.bind_query_cursor(&mut request, access.as_ref())?;
             let mut response = crate::query::execute(self, request).await?;
+            cursor.finish(&mut response)?;
             response.served_topology_generation = self.topology_generation;
             Ok(Response::new(response))
         })
@@ -11515,9 +11562,13 @@ impl SearchService for CoordinatorServiceImpl {
                 .await
                 .map(|response| response.map(crate::metrics::Timed::into_inner));
         }
-        let request = request.into_inner();
-        if let Some(query) = request.query.as_ref() {
+        let access = request.extensions().get::<crate::pb::AccessDecision>().cloned();
+        let mut request = request.into_inner();
+        let request_fingerprint = request.query.as_ref().map(|query| crate::sha256::hex_digest(&prost::Message::encode_to_vec(query))).unwrap_or_default();
+        let mut cursor = None;
+        if let Some(query) = request.query.as_mut() {
             self.require_topology_generation(query.required_topology_generation)?;
+            cursor = Some(self.bind_query_cursor(query, access.as_ref())?);
             if query.explain {
                 return Err(Status::invalid_argument(
                     "explain is served on the unary Query route: a stream's revisions carry                      candidate hits without their trees, and a tree over a revision that a                      later one replaces would explain a score that was never served",
@@ -11564,8 +11615,6 @@ impl SearchService for CoordinatorServiceImpl {
                     .await;
                 return;
             };
-            let request_fingerprint =
-                crate::sha256::hex_digest(&prost::Message::encode_to_vec(&query));
             let (progress_tx, mut progress_rx) = watch::channel(None);
             // Public streaming always takes the candidate protocols. The
             // ordinary Query adapter still owns validation, boosts, scorer,
@@ -11639,6 +11688,10 @@ impl SearchService for CoordinatorServiceImpl {
                         }
                     }
                     result = &mut execution => {
+                        let result = result.and_then(|mut response| {
+                            cursor.as_ref().expect("query was present").finish(&mut response)?;
+                            Ok(response)
+                        });
                         // The execution and the last collector update can
                         // become ready in the same scheduler turn. Drain the
                         // watch cell here so every scored stream exposes at

@@ -1,0 +1,34 @@
+syntax = "proto3";
+package ai.protomolt.search.v1;
+
+import "ai/protomolt/search/v1/authorization.proto";
+
+// Server cursor encoding, not a caller-supplied authorization credential.
+// Clients echo the opaque QueryResponse.next_cursor string without parsing it.
+message QueryCursorEnvelope {
+  uint32 format_version = 1;
+  // SHA-256 of QueryCursorContext, including the normalized original query.
+  bytes context_sha256 = 2;
+  // Internal search-after boundary (rank, score/id or typed sort keys).
+  string boundary = 3;
+}
+
+// The server derives this from its resolved request and authorization decision.
+// It hashes this message into the envelope; policy details are not put in tokens.
+message QueryCursorContext {
+  bytes query_sha256 = 1;
+  string collection = 2;
+  // Absent for anonymous/trusted local execution. Never read from client metadata.
+  AccessDecision access = 3;
+  uint64 topology_generation = 4;
+  repeated QueryCursorRoute routes = 5;
+}
+
+// Exact routing order matters because physical ids and ties depend on it.
+message QueryCursorRoute {
+  string address = 1;
+  optional string replica = 2;
+  optional uint64 hash_start = 3;
+  optional uint64 hash_end = 4;
+  optional int64 placement = 5;
+}

@@ -685,8 +685,11 @@ async fn run_online_compaction(layout: Layout) {
         .collect();
 
     // A cursor minted before the cutover; its boundary is the top hit
-    // for row 700's own vector, which the renumbering moves.
+    // for row 700's own vector, which the renumbering moves. Keep the test
+    // signing key stable across coordinator instances so the refusal below
+    // proves the data-boundary check rather than key rotation.
     let coordinator = CoordinatorServiceImpl::new(vec![addr.clone()])
+        .with_cursor_signing_key([0x43; 32])
         .with_bm25(Some(analysis.clone()), Default::default());
     let cursor_probe = row(700, false).vector.clone();
     let first_page = SearchService::query(
@@ -819,6 +822,7 @@ async fn run_online_compaction(layout: Layout) {
 
     // The cursor from the old generation refuses by name.
     let coordinator = CoordinatorServiceImpl::new(vec![addr.clone()])
+        .with_cursor_signing_key([0x43; 32])
         .with_bm25(Some(analysis.clone()), Default::default());
     let err = SearchService::query(
         &coordinator,

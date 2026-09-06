@@ -22,6 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &[
                 "proto/ai/protomolt/search/v1/search.proto",
                 "proto/ai/protomolt/search/v1/authorization.proto",
+                "proto/ai/protomolt/search/v1/query_cursor.proto",
                 "proto/ai/protomolt/search/v1/source.proto",
                 "proto/ai/protomolt/search/v1/document_write.proto",
                 "proto/ai/protomolt/search/v1/document_identity.proto",
