@@ -468,6 +468,7 @@ async fn the_shard_rpc_reports_counts_and_unknown_fields() {
     let want = brute_force(&corpus, "cou");
     let full = client
         .expand_term_prefix(ExpandTermPrefixRequest {
+            visibility: None,
             field: "body".into(),
             prefix: "cou".into(),
             cap: want.len() as u32,
@@ -480,6 +481,7 @@ async fn the_shard_rpc_reports_counts_and_unknown_fields() {
     assert_eq!(full.count as usize, want.len());
     let capped = client
         .expand_term_prefix(ExpandTermPrefixRequest {
+            visibility: None,
             field: "body".into(),
             prefix: "cou".into(),
             cap: 1,
@@ -491,6 +493,7 @@ async fn the_shard_rpc_reports_counts_and_unknown_fields() {
     assert_eq!(capped.count as usize, want.len());
     let unknown = client
         .expand_term_prefix(ExpandTermPrefixRequest {
+            visibility: None,
             field: "title".into(),
             prefix: "cou".into(),
             cap: 10,

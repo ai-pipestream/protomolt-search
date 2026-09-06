@@ -2,7 +2,7 @@
 
 The 2026-09-06 feature-branch increment adds a document view to the internal
 `TermStats` protocol. The subsequent [document-grant increment](document-grants.md)
-uses it for public BM25 over private in-process shards. Other restricted public
+uses it for public BM25 and dictionary routes over private in-process shards. Other restricted public
 routes and network collections refuse until their enforcement is implemented.
 A caller-supplied `DocumentVisibility` is not a credential.
 
@@ -78,9 +78,10 @@ encoded protobuf/hash vectors, including an unsigned oneof bound with its
 exclusive flag, and bounded scope churn. The fixtures specify the normalized
 wire bytes and hashes independently of the generated encoder.
 
-The private-shard BM25 path now consumes authority-issued document grants.
+Private-shard BM25, prefix expansion and suggestion paths now consume
+authority-issued document grants.
 Field grants and the remaining query paths still need mandatory visibility in
-selection, rescoring, term expansion, suggestions, facets, source/projection fetch
+selection, rescoring, facets, source/projection fetch
 and eventual RAG context.
 Field-use and field-disclosure checks must precede cache lookup. Public requests
 must not override a mandatory predicate or bypass it through a direct node

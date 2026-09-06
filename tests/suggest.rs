@@ -626,6 +626,7 @@ async fn the_tombstone_flag_reports_that_df_counts_deleted_rows() {
     // The shard reports its tombstone count with every answer.
     let shard = client
         .suggest_terms(SuggestTermsRequest {
+            visibility: None,
             field: "body".into(),
             prefix: "cou".into(),
             max_scan: 1000,
@@ -768,6 +769,7 @@ async fn past_the_scan_bound_refuses_with_the_count_and_materializes_nothing() {
     let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
     let bounded = client
         .suggest_terms(SuggestTermsRequest {
+            visibility: None,
             field: "body".into(),
             prefix: "t".into(),
             max_scan: 100,
@@ -780,6 +782,7 @@ async fn past_the_scan_bound_refuses_with_the_count_and_materializes_nothing() {
     assert!(bounded.entries.is_empty(), "past the bound nothing is sent");
     let full = client
         .suggest_terms(SuggestTermsRequest {
+            visibility: None,
             field: "body".into(),
             prefix: "t".into(),
             max_scan: 5000,

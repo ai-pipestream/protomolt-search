@@ -1,5 +1,11 @@
 # Autocomplete over the sorted dictionary
 
+Permission-scoped private-shard queries use the authorized live dictionary:
+hidden and deleted rows contribute neither terms nor df nor expansion-limit
+counts. This requires posting scans and a validated node visibility handshake;
+see [document grants](document-grants.md#permission-scoped-dictionaries-2026-09-06).
+The unrestricted dictionary behavior described below is unchanged.
+
 Landed 2026-09-04 (five-item build, L11). `SearchService.Suggest` completes a
 prefix against one indexed BM25 field's term dictionary, ranked by document
 frequency summed over the collection's shards. It is the suggester Lucene and

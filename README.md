@@ -1222,10 +1222,16 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Document-scoped dictionaries (2026-09-06, feature branch).** Autocomplete,
+  did-you-mean and BM25 prefix expansion use only live authorized documents.
+  Hidden vocabulary does not consume visible expansion limits; nodes echo the
+  applied view before coordinators merge terms. See
+  [document grants](docs/document-grants.md#permission-scoped-dictionaries-2026-09-06).
+
 - **Private-shard document grants (2026-09-06, feature branch).** Policy format 2
   binds a mandatory document view to public BM25 execution over private local
   shards, including scoped statistics, cache reuse and disclosure. Unsupported
-  routes, dictionary prefixes and network-backed deployments refuse restricted
+  routes and network-backed deployments refuse restricted
   decisions. The mobile library exposes an authenticated facade; field grants
   and broader retrieval/delegation remain unfinished. See
   [document grants](docs/document-grants.md).

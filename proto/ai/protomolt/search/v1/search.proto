@@ -3770,15 +3770,21 @@ message ExpandTermPrefixRequest {
   string prefix = 2;
   // Expansion cap; past it the shard reports the count and no terms.
   uint32 cap = 3;
+  // Mandatory planner view; absent retains the unrestricted dictionary.
+  DocumentVisibility visibility = 4;
 }
 
 message ExpandTermPrefixResponse {
   // Matching terms in byte order; empty when past the cap.
   repeated string terms = 1;
-  // Exact number of matching terms on this shard.
+  // Exact number of matching terms in the requested view on this shard.
   uint64 count = 2;
   // Whether this shard's field table has the field at all.
   bool known = 3;
+  // Echo of the applied view, including unknown indexed fields and over-cap responses.
+  bytes visibility_fingerprint = 4;
+  // One flag per filter leaf, in predicate walk order (as in TermStatsResponse).
+  repeated bool visibility_columns_known = 5;
 }
 
 // Shard-side autocomplete scan (docs/suggest.md): every term of one
@@ -3790,6 +3796,9 @@ message SuggestTermsRequest {
   string prefix = 2;
   // Scan bound; past it the shard reports the count and no entries.
   uint64 max_scan = 3;
+  // Mandatory planner view; scoped df excludes deleted and hidden rows.
+  // max_scan then bounds visible terms; determining visibility walks postings.
+  DocumentVisibility visibility = 4;
 }
 
 // One dictionary term under the prefix and its posting df on the shard.
@@ -3797,7 +3806,8 @@ message SuggestTermEntry {
   // The term as the dictionary holds it (a stem on a stemmed field).
   string term = 1;
   // Posting document frequency: the number of rows whose posting list
-  // holds the term, tombstoned rows included until compaction.
+  // holds the term. Scoped requests count live admitted rows; unrestricted
+  // requests include tombstoned rows until compaction.
   uint64 df = 2;
 }
 
@@ -3805,13 +3815,18 @@ message SuggestTermsResponse {
   // Matching terms in byte order with their df; empty when past the
   // scan bound.
   repeated SuggestTermEntry entries = 1;
-  // Exact number of matching terms on this shard.
+  // Exact number of matching terms in the requested view on this shard.
   uint64 count = 2;
   // Whether this shard's field table has the field at all.
   bool known = 3;
   // The shard's live-docs tombstone count. Non-zero means the df above
-  // still counts rows a delete removed from every search result.
+  // still counts rows a delete removed from every search result. Scoped
+  // responses use exact live df and set this physical counter to zero.
   uint64 tombstoned_rows = 4;
+  // Echo of the applied view, including unknown indexed fields and over-cap responses.
+  bytes visibility_fingerprint = 5;
+  // One flag per filter leaf, in predicate walk order (as in TermStatsResponse).
+  repeated bool visibility_columns_known = 6;
 }
 
 // Autocomplete over one field's dictionary (docs/suggest.md).

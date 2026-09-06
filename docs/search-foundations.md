@@ -14,7 +14,7 @@ establish completion of the three workstreams.
 | Original payload and descriptor identity survive storage and replay | Byte equality after restart, snapshots, replication, compaction and resharding, including unknown fields | Row-bearing sources survive image/WAL lifecycle byte-for-byte; the catalog retains zero-row sources across restart; catalog backup and publication remain |
 | Complete scalar, repeated, map, nested and well-known-type semantics | Projection and query conformance across supported syntax/edition and shape combinations | Incomplete; existing column-family restrictions remain |
 | Workspace and collection grants separate read, ingest and administration | Denial tests on every public and node entry point, default collection resolution and direct access | Public search and coordinator diagnostics enforce revisioned protobuf capabilities; direct node/cluster-control policy enforcement remains |
-| Document and field grants cover retrieval and disclosure | Selection, statistics, suggestions, facets, highlights, projections, source fetch, caches and cursors tested under distinct and revoked policies | Document grants enforce private-shard BM25 selection, statistics, cache separation and disclosure; other restricted routes/network deployments refuse; field grants remain unimplemented |
+| Document and field grants cover retrieval and disclosure | Selection, statistics, suggestions, facets, highlights, projections, source fetch, caches and cursors tested under distinct and revoked policies | Document grants enforce private-shard BM25 selection, statistics, caches, suggestions and prefix expansion; other restricted routes/network deployments refuse; field grants remain unimplemented |
 | Stable document and chunk identity | Exact key lookup and returned identity unchanged through compaction, replay and resharding | Imported identities persist through image/WAL lifecycle, node fetch and lexical results; catalog publication and the other result routes remain |
 | Conditional writes and persistent idempotency | Concurrent version conflicts, repeated requests, key reuse with different payload, disconnected acknowledgment and restart tests | Collection-wide local source authority implemented; server routing and projection transactions remain |
 | Accepted, searchable and durable receipts | API states tied to actual transaction publication and persisted recovery boundaries, crash tests at each boundary | Local source acceptance has durable/volatile receipts and abrupt-process-exit coverage; searchable publication remains |
@@ -823,3 +823,26 @@ against `5e18438` confirms three additive grant/redaction fields and the
 corresponding authorization import, with existing declarations unchanged.
 These are local checks; no fleet deployment or device runtime test ran. Stored
 index and WAL formats are unchanged.
+
+
+## Document-scoped dictionary checkpoint (2026-09-06)
+
+Private-shard `Suggest`, `TermSuggest` and BM25 prefix expansion now apply the
+authority's document view before counting terms and postings. Hidden-only and
+deleted-only terms do not consume expansion caps or influence suggestions.
+Every internal dictionary response must echo the requested view. The posting
+scan keeps bounded term storage through heap, mapped and merged segment cursors.
+
+This extends the previous grant checkpoint; network delegation, other retrieval
+routes, field grants, the remaining protobuf shapes and durable publication still
+require work. See [document grants](document-grants.md#permission-scoped-dictionaries-2026-09-06)
+for the execution cost and local test scope.
+
+
+Validation: 454 library tests, 603 integration tests across 106 targets, and
+12 embedded tests passed (1,069 total); one existing live-sidecar conformance
+test remains ignored. All five Android/iOS Rust target checks, tests/examples
+compilation, formatting and vendored-proto checks passed. Descriptor comparison
+against `2e30bdf` confirms exactly six additive dictionary visibility fields;
+existing declarations are unchanged. These are local checks, with no fleet or
+device-runtime validation. No stored index or WAL format changes were introduced.

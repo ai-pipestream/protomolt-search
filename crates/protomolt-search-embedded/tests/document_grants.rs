@@ -88,6 +88,25 @@ fn authorized_mobile_facade_preserves_private_shard_ownership() {
             assert_eq!(response.hits.len(), 1);
             assert_eq!(response.hits[0].doc_id, 0);
             assert!(response.execution_details_redacted);
+
+            for (prefix, count) in [("pri", 0), ("pu", 1)] {
+                let mut request = Request::new(SuggestRequest {
+                    field: "body".into(),
+                    prefix: prefix.into(),
+                    analysis: Some(body_spec()),
+                    ..Default::default()
+                });
+                request
+                    .metadata_mut()
+                    .insert("authorization", format!("Bearer {token}").parse().unwrap());
+                let response = SearchService::suggest(&facade, request)
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(response.suggestions.len(), count);
+                assert_eq!(response.dictionary_terms_with_prefix, count as u64);
+                assert!(!response.df_includes_tombstoned_rows);
+            }
             assert!(!runtime.allows_network());
         });
 }

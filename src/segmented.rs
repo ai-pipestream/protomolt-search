@@ -1177,6 +1177,34 @@ pub struct UnionField<'a> {
 }
 
 impl<'a> UnionField<'a> {
+    fn prefix_iter(&self, prefix: &str) -> Box<dyn Iterator<Item = String> + 'a> {
+        use std::{cmp::Reverse, collections::BinaryHeap};
+        let mut scans: Vec<_> = self
+            .parts()
+            .map(|(_, _, v)| v.prefix_iter(prefix))
+            .chain(self.heaps().map(|(_, v)| v.prefix_iter(prefix)))
+            .collect();
+        let mut heap = BinaryHeap::new();
+        for (i, scan) in scans.iter_mut().enumerate() {
+            if let Some(term) = scan.next() {
+                heap.push(Reverse((term, i)));
+            }
+        }
+        Box::new(std::iter::from_fn(move || {
+            let Reverse((term, i)) = heap.pop()?;
+            if let Some(next) = scans[i].next() {
+                heap.push(Reverse((next, i)));
+            }
+            while heap.peek().is_some_and(|Reverse((next, _))| next == &term) {
+                let Reverse((_, i)) = heap.pop().unwrap();
+                if let Some(next) = scans[i].next() {
+                    heap.push(Reverse((next, i)));
+                }
+            }
+            Some(term)
+        }))
+    }
+
     fn admits(&self, part: usize) -> bool {
         self.mask.as_ref().is_none_or(|mask| mask[part])
     }
@@ -1342,6 +1370,9 @@ impl Bm25Index for UnionField<'_> {
     fn doc_sentences(&self, doc_id: u32) -> Option<Vec<(u32, u32)>> {
         self.shard.field_doc_sentences(self.fi, doc_id)
     }
+    fn prefix_terms(&self, prefix: &str) -> Box<dyn Iterator<Item = String> + '_> {
+        self.prefix_iter(prefix)
+    }
     fn expand_prefix(&self, prefix: &str, cap: usize) -> Result<Vec<String>, usize> {
         let mut union: Vec<String> = Vec::new();
         let mut over: Option<usize> = None;
@@ -1463,6 +1494,9 @@ impl Bm25Index for SegmentedShard {
     fn doc_sentences(&self, doc_id: u32) -> Option<Vec<(u32, u32)>> {
         self.field_doc_sentences(0, doc_id)
     }
+    fn prefix_terms(&self, prefix: &str) -> Box<dyn Iterator<Item = String> + '_> {
+        self.field(0).prefix_iter(prefix)
+    }
     fn expand_prefix(&self, prefix: &str, cap: usize) -> Result<Vec<String>, usize> {
         self.field(0).expand_prefix(prefix, cap)
     }
@@ -1555,6 +1589,9 @@ impl Bm25Index for MaskedShard<'_> {
     }
     fn doc_sentences(&self, doc_id: u32) -> Option<Vec<(u32, u32)>> {
         self.shard.field_doc_sentences(0, doc_id)
+    }
+    fn prefix_terms(&self, prefix: &str) -> Box<dyn Iterator<Item = String> + '_> {
+        self.body().prefix_iter(prefix)
     }
     fn expand_prefix(&self, prefix: &str, cap: usize) -> Result<Vec<String>, usize> {
         self.body().expand_prefix(prefix, cap)

@@ -1,5 +1,11 @@
 # Prefix terms and string ranges
 
+Permission-scoped private-shard queries use the authorized live dictionary:
+hidden and deleted rows contribute neither terms nor df nor expansion-limit
+counts. This requires posting scans and a validated node visibility handshake;
+see [document grants](document-grants.md#permission-scoped-dictionaries-2026-09-06).
+The unrestricted dictionary behavior described below is unchanged.
+
 Implemented on branch 2026-09-02 (roadmap item 6). One structural fact underlies both
 features: every dictionary in a `.bm25` file is in **byte order**. The term
 directory always was (its lookup is a binary search); facet, map-key, and

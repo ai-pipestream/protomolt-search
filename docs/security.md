@@ -145,8 +145,9 @@ admitted mutations are not rolled back by revocation or a later stream error.
 
 Authorization precedes coordinator cache lookup. Revoked callers cannot retrieve
 a previous cached response through the public service. Mandatory document views
-use separate statistics entries on the certified private-shard BM25 path. Field
-policies, broader retrieval and network-node delegation remain unfinished;
+use separate statistics entries on the certified private-shard BM25 path.
+Dictionary routes apply the view before counting terms. Field policies, broader
+retrieval and network-node delegation remain unfinished;
 unsupported restricted routes refuse.
 
 Library hosts can retain `Arc<PolicyAuthority>` and call `replace`, or supply an
@@ -160,8 +161,9 @@ only the exact datasets/actions required. `mkcerts.sh` generates a policy for th
 fleet tools' unnamed dataset when creating a new file; it does not overwrite an
 existing file. This increment does not alter the separate node mTLS or cluster
 control membership rules. Document authorization is currently limited to the
-private-shard BM25 path. Field authorization and applying delegated policy on
-direct node calls remain unfinished; restricted network-backed collections refuse.
+private-shard BM25 and dictionary paths. Field authorization and applying
+delegated policy on direct node calls remain unfinished; restricted network-backed
+collections refuse.
 The console (`docs/console-facade.md`) is the one client that holds the
 cluster credentials on a browser's behalf: it binds to loopback unless
 told otherwise, and whoever reaches it acts as its principal.

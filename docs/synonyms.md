@@ -1,5 +1,11 @@
 # Synonyms and did-you-mean
 
+Permission-scoped private-shard queries use the authorized live dictionary:
+hidden and deleted rows contribute neither terms nor df nor expansion-limit
+counts. This requires posting scans and a validated node visibility handshake;
+see [document grants](document-grants.md#permission-scoped-dictionaries-2026-09-06).
+The unrestricted dictionary behavior described below is unchanged.
+
 Landed 2026-09-04 (L8 and the term suggester). Both are query-time
 rewrites over the dictionary and the analyzed query: nothing changes at
 ingest, no posting is added, and every result is the ordinary BM25 result

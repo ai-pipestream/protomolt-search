@@ -1872,7 +1872,7 @@ impl CoordinatorServiceImpl {
                 "document grants require search authorization",
             ));
         }
-        if route != "bm25_search" {
+        if !matches!(route, "bm25_search" | "suggest" | "term_suggest") {
             return Err(Status::permission_denied(
                 "this route does not yet enforce document grants",
             ));
@@ -4702,6 +4702,7 @@ impl CoordinatorServiceImpl {
             for (i, node) in self.node_addrs.iter().enumerate() {
                 let mut client = self.node_client(node)?;
                 let request = crate::pb::ExpandTermPrefixRequest {
+                    visibility: self.document_visibility.clone(),
                     field: field.to_string(),
                     prefix: normalized.clone(),
                     cap: cap as u32,
@@ -4717,11 +4718,21 @@ impl CoordinatorServiceImpl {
                 ));
             }
             let mut union = std::collections::BTreeSet::new();
+            let scope = crate::visibility::VisibilityScope::new(self.document_visibility.as_ref())?;
+            let mut visibility_known = vec![false; scope.column_count()];
             let mut known = false;
             for (shard, task) in tasks {
                 let resp = task.await.map_err(|e| {
                     Status::internal(format!("prefix expansion task failed: {e}"))
                 })??;
+                scope
+                    .validate_echo(&resp.visibility_fingerprint, &resp.visibility_columns_known)?;
+                for (known, present) in visibility_known
+                    .iter_mut()
+                    .zip(&resp.visibility_columns_known)
+                {
+                    *known |= present;
+                }
                 if !resp.known {
                     continue;
                 }
@@ -4736,6 +4747,7 @@ impl CoordinatorServiceImpl {
                 }
                 union.extend(resp.terms);
             }
+            self.check_visibility_columns(&visibility_known)?;
             if !known {
                 return Err(Status::invalid_argument(format!(
                     "no shard indexes field {field:?}; prefix {normalized:?} has no dictionary \
@@ -11194,14 +11206,6 @@ impl SearchService for CoordinatorServiceImpl {
                 .await;
             }
             let req = request.into_inner();
-            if self.document_visibility.is_some()
-                && (!req.prefixes.is_empty()
-                    || req.fields.iter().any(|field| !field.prefixes.is_empty()))
-            {
-                return Err(Status::permission_denied(
-                    "term prefix expansion does not yet enforce document grants",
-                ));
-            }
             let k = self.resolve_k(req.k)?;
             // A malformed HighlightSpec refuses here, before any shard is
             // asked, so an empty fleet answers the same as a full one
@@ -12317,6 +12321,7 @@ impl SearchService for CoordinatorServiceImpl {
             for (i, node) in self.node_addrs.iter().enumerate() {
                 let mut client = self.node_client(node)?;
                 let request = crate::pb::SuggestTermsRequest {
+                    visibility: self.document_visibility.clone(),
                     field: field.to_string(),
                     prefix: normalized.clone(),
                     max_scan: max_scan as u64,
@@ -12331,6 +12336,8 @@ impl SearchService for CoordinatorServiceImpl {
             // Term -> (summed df, shards holding it), in byte order.
             let mut union: std::collections::BTreeMap<String, (u64, u32)> =
                 std::collections::BTreeMap::new();
+            let scope = crate::visibility::VisibilityScope::new(self.document_visibility.as_ref())?;
+            let mut visibility_known = vec![false; scope.column_count()];
             let mut known = false;
             let mut tombstoned = false;
             for (shard, task) in tasks {
@@ -12338,6 +12345,14 @@ impl SearchService for CoordinatorServiceImpl {
                     .await
                     .map_err(|e| Status::internal(format!("suggest task failed: {e}")))??;
                 tombstoned |= resp.tombstoned_rows > 0;
+                scope
+                    .validate_echo(&resp.visibility_fingerprint, &resp.visibility_columns_known)?;
+                for (known, present) in visibility_known
+                    .iter_mut()
+                    .zip(&resp.visibility_columns_known)
+                {
+                    *known |= present;
+                }
                 if !resp.known {
                     continue;
                 }
@@ -12356,6 +12371,7 @@ impl SearchService for CoordinatorServiceImpl {
                     slot.1 += 1;
                 }
             }
+            self.check_visibility_columns(&visibility_known)?;
             if !known {
                 return Err(Status::invalid_argument(format!(
                     "no shard indexes field {field:?}; prefix {normalized:?} has no dictionary to \
@@ -12474,6 +12490,7 @@ impl SearchService for CoordinatorServiceImpl {
                 for (shard, node) in self.node_addrs.iter().enumerate() {
                     let mut client = self.node_client(node)?;
                     let request = crate::pb::SuggestTermsRequest {
+                        visibility: self.document_visibility.clone(),
                         field: field.clone(),
                         prefix: scan.clone(),
                         max_scan: max_scan as u64,
@@ -12490,6 +12507,8 @@ impl SearchService for CoordinatorServiceImpl {
             }
             let mut unions: Vec<std::collections::BTreeMap<String, (u64, u32)>> =
                 terms.iter().map(|_| Default::default()).collect();
+            let scope = crate::visibility::VisibilityScope::new(self.document_visibility.as_ref())?;
+            let mut visibility_known = vec![false; scope.column_count()];
             let mut known = false;
             let mut tombstoned = false;
             for (ti, shard, scan, task) in tasks {
@@ -12497,6 +12516,14 @@ impl SearchService for CoordinatorServiceImpl {
                     .await
                     .map_err(|e| Status::internal(format!("term suggest task failed: {e}")))??;
                 tombstoned |= resp.tombstoned_rows > 0;
+                scope
+                    .validate_echo(&resp.visibility_fingerprint, &resp.visibility_columns_known)?;
+                for (known, present) in visibility_known
+                    .iter_mut()
+                    .zip(&resp.visibility_columns_known)
+                {
+                    *known |= present;
+                }
                 if !resp.known {
                     continue;
                 }
@@ -12515,6 +12542,7 @@ impl SearchService for CoordinatorServiceImpl {
                     slot.1 += 1;
                 }
             }
+            self.check_visibility_columns(&visibility_known)?;
             if !known {
                 return Err(Status::invalid_argument(format!(
                     "no shard indexes field {field:?}; there is no dictionary to suggest from"

@@ -326,7 +326,7 @@ async fn caller_filters_and_context_cannot_replace_the_grant() {
 }
 
 #[tokio::test]
-async fn uncertified_routes_prefixes_and_network_nodes_refuse_before_execution() {
+async fn uncertified_routes_and_network_nodes_refuse_before_execution() {
     let (coordinator, _) = cluster(false, false).await;
     let cache = coordinator.stats_cache();
     let authority = Arc::new(PolicyAuthority::new(policy()).unwrap());
@@ -350,8 +350,6 @@ async fn uncertified_routes_prefixes_and_network_nodes_refuse_before_execution()
     denied!(variant_search, VariantSearchRequest::default());
     denied!(query, QueryRequest::default());
     denied!(aggregate, AggregateRequest::default());
-    denied!(suggest, SuggestRequest::default());
-    denied!(term_suggest, TermSuggestRequest::default());
     assert_eq!(
         SearchService::query_stream(&service, request(QueryStreamRequest::default(), "public"))
             .await
@@ -360,19 +358,6 @@ async fn uncertified_routes_prefixes_and_network_nodes_refuse_before_execution()
             .code(),
         Code::PermissionDenied
     );
-    for fused in [false, true] {
-        let mut q = query(fused);
-        let prefixes = vec![TermPrefix {
-            prefix: "sec".into(),
-            ..Default::default()
-        }];
-        if fused {
-            q.fields[0].prefixes = prefixes;
-        } else {
-            q.prefixes = prefixes;
-        }
-        denied!(bm25_search, q);
-    }
     assert_eq!(cache.fetch_count(), 0);
     let network = CollectionSet::single(CoordinatorServiceImpl::new(vec![
         "http://must-not-resolve.invalid:50051".into(),
@@ -411,16 +396,49 @@ impl Authorizer for MovingView {
 #[tokio::test]
 async fn a_changed_view_cannot_disclose_an_already_computed_response() {
     let (coordinator, _) = cluster(false, false).await;
-    let authority = Arc::new(MovingView {
-        authority: PolicyAuthority::new(policy()).unwrap(),
-        calls: AtomicUsize::new(0),
-    });
-    let service = CollectionSet::single(coordinator).with_principals(principals(authority));
-    let error = SearchService::bm25_search(&service, request(query(false), "public"))
-        .await
-        .unwrap_err();
-    assert_eq!(error.code(), Code::PermissionDenied);
-    assert!(error.message().contains("changed"));
+    for route in 0..3 {
+        let authority = Arc::new(MovingView {
+            authority: PolicyAuthority::new(policy()).unwrap(),
+            calls: AtomicUsize::new(0),
+        });
+        let service =
+            CollectionSet::single(coordinator.clone()).with_principals(principals(authority));
+        let error = match route {
+            0 => SearchService::bm25_search(&service, request(query(false), "public"))
+                .await
+                .unwrap_err(),
+            1 => SearchService::suggest(
+                &service,
+                request(
+                    SuggestRequest {
+                        field: "body".into(),
+                        prefix: "al".into(),
+                        analysis: Some(body_spec()),
+                        ..Default::default()
+                    },
+                    "public",
+                ),
+            )
+            .await
+            .unwrap_err(),
+            _ => SearchService::term_suggest(
+                &service,
+                request(
+                    TermSuggestRequest {
+                        field: "body".into(),
+                        text: "alpa".into(),
+                        analysis: Some(body_spec()),
+                        ..Default::default()
+                    },
+                    "public",
+                ),
+            )
+            .await
+            .unwrap_err(),
+        };
+        assert_eq!(error.code(), Code::PermissionDenied);
+        assert!(error.message().contains("changed"));
+    }
 }
 
 #[tokio::test]
@@ -456,5 +474,141 @@ async fn an_unbound_grant_column_refuses_even_empty_queries_without_naming_the_c
             assert!(!error.message().contains("policy_internal_column"));
             assert!(error.message().contains("document grant"));
         }
+    }
+    let suggestion = SuggestRequest {
+        field: "body".into(),
+        prefix: "al".into(),
+        analysis: Some(body_spec()),
+        ..Default::default()
+    };
+    let correction = TermSuggestRequest {
+        field: "body".into(),
+        text: "alpa".into(),
+        analysis: Some(body_spec()),
+        ..Default::default()
+    };
+    for error in [
+        SearchService::suggest(&service, request(suggestion, "public"))
+            .await
+            .unwrap_err(),
+        SearchService::term_suggest(&service, request(correction, "public"))
+            .await
+            .unwrap_err(),
+    ] {
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(!error.message().contains("policy_internal_column"));
+    }
+}
+
+#[tokio::test]
+async fn dictionaries_and_expansions_disclose_only_the_authorized_corpus() {
+    for streaming in [false, true] {
+        let (coordinator, nodes) = cluster(false, streaming).await;
+        let (reference, reference_nodes) = cluster(true, streaming).await;
+        let authority = Arc::new(PolicyAuthority::new(policy()).unwrap());
+        let service =
+            CollectionSet::single(coordinator).with_principals(principals(authority.clone()));
+        // A dense hidden dictionary must not consume a reader's visible cap.
+        for node in &nodes {
+            ingest(
+                node.clone(),
+                "albatross alchemy algebra algorithm alien secret",
+                "private",
+                "hidden",
+            )
+            .await;
+        }
+        for prefix in ["al", "se", "be"] {
+            let input = SuggestRequest {
+                field: "body".into(),
+                prefix: prefix.into(),
+                max_scan: 1,
+                analysis: Some(body_spec()),
+                ..Default::default()
+            };
+            let expected = SearchService::suggest(&reference, Request::new(input.clone()))
+                .await
+                .unwrap()
+                .into_inner();
+            let actual = SearchService::suggest(&service, request(input, "public"))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(actual, expected);
+            for fused in [false, true] {
+                let mut q = query(fused);
+                q.text.clear();
+                let prefixes = vec![TermPrefix {
+                    prefix: prefix.into(),
+                    max_expansions: 1,
+                }];
+                if fused {
+                    q.fields.truncate(1);
+                    q.fields[0].prefixes = prefixes;
+                } else {
+                    q.prefixes = prefixes;
+                }
+                let expected = SearchService::bm25_search(&reference, Request::new(q.clone()))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                let actual = SearchService::bm25_search(&service, request(q, "public"))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(actual.hits, expected.hits);
+                assert_eq!(actual.prefix_expansions, expected.prefix_expansions);
+            }
+        }
+        for text in ["secret", "secreu", "alpa", "alpha"] {
+            for mode in [TermSuggestMode::Missing, TermSuggestMode::Always] {
+                let input = TermSuggestRequest {
+                    field: "body".into(),
+                    text: text.into(),
+                    max_scan: 1,
+                    mode: mode as i32,
+                    analysis: Some(body_spec()),
+                    ..Default::default()
+                };
+                let expected = SearchService::term_suggest(&reference, Request::new(input.clone()))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                let actual = SearchService::term_suggest(&service, request(input, "public"))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(actual, expected);
+            }
+        }
+        for node in nodes.iter().chain(reference_nodes.iter()) {
+            ingest(node.clone(), "alpine", "public", "green").await;
+        }
+        let over = SuggestRequest {
+            field: "body".into(),
+            prefix: "al".into(),
+            max_scan: 1,
+            analysis: Some(body_spec()),
+            ..Default::default()
+        };
+        let expected = SearchService::suggest(&reference, Request::new(over.clone()))
+            .await
+            .unwrap_err();
+        let actual = SearchService::suggest(&service, request(over.clone(), "public"))
+            .await
+            .unwrap_err();
+        assert_eq!(actual.code(), expected.code());
+        assert_eq!(actual.message(), expected.message());
+        let mut revoked = policy();
+        revoked.revision += 1;
+        revoked.grants.remove(0);
+        authority.replace(revoked).unwrap();
+        assert_eq!(
+            SearchService::suggest(&service, request(over, "public"))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::PermissionDenied
+        );
     }
 }

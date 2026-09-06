@@ -685,6 +685,40 @@ pub trait Bm25Index {
     /// never the whole dictionary; past the bound nothing is
     /// materialized.
     fn suggest_prefix(&self, prefix: &str, max_scan: usize) -> Result<Vec<(String, u32)>, usize>;
+    /// Unique terms in byte order, retaining only a cursor per physical part.
+    fn prefix_terms(&self, prefix: &str) -> Box<dyn Iterator<Item = String> + '_>;
+
+    /// Count only admitted postings before applying the visible-term bound.
+    /// Hidden-only terms neither consume the bound nor appear in its count.
+    fn suggest_visible_prefix(
+        &self,
+        prefix: &str,
+        cap: usize,
+        admitted: &dyn Fn(u32) -> bool,
+    ) -> Result<Vec<(String, u32)>, usize> {
+        let mut entries = Vec::new();
+        let mut count = 0;
+        for term in self.prefix_terms(prefix) {
+            let mut df = 0;
+            self.for_each_doc_tf(&term, &mut |doc, _| {
+                if admitted(doc) {
+                    df += 1;
+                }
+            });
+            if df == 0 {
+                continue;
+            }
+            count += 1;
+            if count <= cap {
+                entries.push((term, df));
+            }
+        }
+        if count > cap {
+            Err(count)
+        } else {
+            Ok(entries)
+        }
+    }
 }
 
 /// One posting: a term occurrence set within one document.
@@ -3826,6 +3860,19 @@ pub struct StoreFieldView<'a> {
     field: &'a FieldStore,
 }
 
+impl<'a> StoreFieldView<'a> {
+    pub(crate) fn prefix_iter(&self, prefix: &str) -> Box<dyn Iterator<Item = String> + 'a> {
+        let prefix = prefix.to_owned();
+        Box::new(
+            self.field
+                .postings
+                .range(prefix.clone()..)
+                .take_while(move |(term, _)| term.starts_with(&prefix))
+                .map(|(term, _)| term.clone()),
+        )
+    }
+}
+
 impl Bm25Index for StoreFieldView<'_> {
     fn doc_count(&self) -> u64 {
         self.store.doc_count()
@@ -3896,6 +3943,9 @@ impl Bm25Index for StoreFieldView<'_> {
                 .cloned()
                 .unwrap_or_default(),
         )
+    }
+    fn prefix_terms(&self, prefix: &str) -> Box<dyn Iterator<Item = String> + '_> {
+        self.prefix_iter(prefix)
     }
     fn expand_prefix(&self, prefix: &str, cap: usize) -> Result<Vec<String>, usize> {
         let matches: Vec<&String> = self
@@ -3974,6 +4024,9 @@ impl Bm25Index for Bm25Store {
     }
     fn doc_sentences(&self, doc_id: u32) -> Option<Vec<(u32, u32)>> {
         self.field(0).doc_sentences(doc_id)
+    }
+    fn prefix_terms(&self, prefix: &str) -> Box<dyn Iterator<Item = String> + '_> {
+        self.field(0).prefix_iter(prefix)
     }
     fn expand_prefix(&self, prefix: &str, cap: usize) -> Result<Vec<String>, usize> {
         self.field(0).expand_prefix(prefix, cap)
@@ -9596,6 +9649,16 @@ pub struct FieldView<'a> {
 }
 
 impl<'a> FieldView<'a> {
+    pub(crate) fn prefix_iter(&self, prefix: &str) -> Box<dyn Iterator<Item = String> + 'a> {
+        let view = *self;
+        let prefix = prefix.to_owned();
+        Box::new(
+            (view.prefix_lower_bound(&prefix)..view.field.n_terms)
+                .map(move |i| String::from_utf8_lossy(view.directory_term(i)).into_owned())
+                .take_while(move |term| term.starts_with(&prefix)),
+        )
+    }
+
     /// [`Bm25Index::impacts`] with the cursor's borrow tied to the
     /// underlying reader rather than this view value, so a temporary
     /// view (`reader.field(0).impacts(..)`) can hand out a cursor.
@@ -9790,6 +9853,9 @@ impl Bm25Index for FieldView<'_> {
                 .collect(),
         )
     }
+    fn prefix_terms(&self, prefix: &str) -> Box<dyn Iterator<Item = String> + '_> {
+        self.prefix_iter(prefix)
+    }
     fn expand_prefix(&self, prefix: &str, cap: usize) -> Result<Vec<String>, usize> {
         let mut matches = Vec::new();
         let count = self.scan_prefix(prefix, |i, _, bytes| {
@@ -9914,6 +9980,9 @@ impl Bm25Index for Bm25Reader {
     }
     fn doc_sentences(&self, doc_id: u32) -> Option<Vec<(u32, u32)>> {
         self.field(0).doc_sentences(doc_id)
+    }
+    fn prefix_terms(&self, prefix: &str) -> Box<dyn Iterator<Item = String> + '_> {
+        self.field(0).prefix_iter(prefix)
     }
     fn expand_prefix(&self, prefix: &str, cap: usize) -> Result<Vec<String>, usize> {
         self.field(0).expand_prefix(prefix, cap)

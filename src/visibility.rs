@@ -75,14 +75,21 @@ impl VisibilityScope {
     /// Verify the echo even for empty results, before merging a response or
     /// populating a cache miss. Missing echoes from old nodes refuse closed.
     pub fn validate_response(&self, response: &TermStatsResponse) -> Result<(), Status> {
-        if response.visibility_fingerprint != self.fingerprint {
+        self.validate_echo(
+            &response.visibility_fingerprint,
+            &response.visibility_columns_known,
+        )
+    }
+
+    pub fn validate_echo(&self, fingerprint: &[u8], columns_known: &[bool]) -> Result<(), Status> {
+        if fingerprint != self.fingerprint {
             return Err(Status::failed_precondition(
-                "term statistics visibility mismatch; the node must apply the requested document view",
+                "document visibility mismatch; the node must apply the requested document view",
             ));
         }
-        if response.visibility_columns_known.len() != self.columns {
+        if columns_known.len() != self.columns {
             return Err(Status::failed_precondition(
-                "term statistics visibility column handshake has the wrong length",
+                "document visibility column handshake has the wrong length",
             ));
         }
         Ok(())
