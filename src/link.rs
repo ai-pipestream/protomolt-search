@@ -275,6 +275,7 @@ impl NodeLink {
         resolve_filter_bitmap: FilterBitmapRequest => FilterBitmapResponse,
         resolve_lexical_bitmap: LexicalBitmapRequest => MembershipBitmapResponse,
         resolve_vector_bitmap: VectorBitmapRequest => MembershipBitmapResponse,
+        evaluate_boolean: BooleanShardRequest => BooleanShardResponse,
         apply_wal_binding: ApplyWalBindingRequest => ApplyWalBindingResponse,
         health: HealthRequest => HealthResponse,
     }

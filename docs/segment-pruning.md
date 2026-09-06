@@ -60,16 +60,17 @@ On a segmented shard, a pruned segment is left out of:
 - **The slot loops.** A browse under a filter, `AggregateShard`, and
   `QuantileCounts` iterate the admitted slots and never evaluate the filter
   on a pruned segment's rows.
-- **The boolean planner.** `ResolveFilterBitmap` prunes as the vector scan
-  does. `ResolveLexicalBitmap` skips every sealed part in which none of the
-  clause's terms occur, from one dictionary lookup per term per part; an
-  intersection with an empty membership is empty, so a required lexical
-  clause rules those parts out of the group exactly. A dense clause in a
-  boolean group is scored over the survivors through `VectorRescore`,
-  which a node answers with one masked scan of its index: the survivors
-  are the allowlist, a sealed part in which none of them sits is not
-  opened, and a SIMD block with none is not read
-  (`docs/query-api.md`, "Recursive boolean execution").
+- **The boolean planner.** A shard resolves the tree's leaves itself
+  (`EvaluateBoolean`): a filter leaf prunes as the vector scan does, and a
+  lexical leaf skips every sealed part in which none of the clause's terms
+  occur, from one dictionary lookup per term per part; an intersection with
+  an empty membership is empty, so a required lexical clause rules those
+  parts out of the group exactly. A dense clause is scored over the members
+  in one masked pass of the index: the members are the allowlist, a sealed
+  part in which none of them sits is not opened, and a SIMD block with none
+  is not read (`docs/query-api.md`, "Recursive boolean execution"). The
+  profile sums the counts over the leaves, so a filter and a lexical clause
+  together report the sealed parts twice.
 
 The vector kernel still reads every row of a segment it opens: pruning removes
 whole segments, not rows. Within an opened segment the allowlist masks rows
