@@ -1242,14 +1242,680 @@ async fn a_rescore_through_a_relay_routes_each_id_to_its_child() {
         "the routed rescore equals the children's own answers"
     );
     assert!(!got.is_empty());
-    let err = relay
+    // An id in no child's range is another shard's: ignored, as a node
+    // ignores an id outside its own range (the boolean planner sends
+    // every shard every candidate).
+    let foreign = relay
         .bm25_rescore(rescore(vec![(LEX_LEAVES * LEX_ROWS + 10) as u64], claims))
+        .await
+        .expect("a foreign id is not this shard's to refuse")
+        .into_inner();
+    assert!(foreign.hits.is_empty());
+}
+
+// --- The vector-side routes, the bitmaps, the dictionaries ----------------
+
+/// `(vector id, score bits, parent id)` of a unary fan-out's hits.
+fn unary_bits(hits: &[ScoredHit]) -> Vec<(u64, u32, u64)> {
+    hits.iter()
+        .map(|h| (h.vector_id, h.score.to_bits(), h.parent_id))
+        .collect()
+}
+
+/// The cascade's gate over a fan-out's raw lists: every candidate at or
+/// above the k-th best score, shard assignments dropped. The raw lists
+/// themselves depend on which floors reached each leaf when; the gate
+/// is score-defined and must not depend on grouping.
+fn pool(result: &pipestream_search::coordinator::FanoutResult, k: usize) -> Vec<(u64, u32)> {
+    let mut all: Vec<(u64, f32)> = result
+        .shard_hits
+        .iter()
+        .flat_map(|(_, hits)| hits.iter().copied())
+        .collect();
+    all.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let boundary = all.get(k - 1).map_or(f32::NEG_INFINITY, |h| h.1);
+    let mut gate: Vec<(u64, u32)> = all
+        .into_iter()
+        .filter(|h| h.1 >= boundary)
+        .map(|(id, score)| (id, score.to_bits()))
+        .collect();
+    gate.sort_unstable();
+    gate
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unary_vector_search_through_relays_equals_the_flat_fanout() {
+    let leaves = leaves().await;
+    let l = &leaves.addrs;
+    let flat = CoordinatorServiceImpl::new(l.clone());
+    let a = relay_over(&[&l[0], &l[1]]).await;
+    let b = relay_over(&[&l[2], &l[3]]).await;
+    // Children out of slot order, relays out of order at the root; the
+    // groups are contiguous, as the routes routed by slot range require.
+    let p = relay_over(&[&l[3], &l[2]]).await;
+    let q = relay_over(&[&l[1], &l[0]]).await;
+    let top = relay_over(&[&a, &b]).await;
+    let trees = [
+        (
+            "one level",
+            CoordinatorServiceImpl::new(vec![a.clone(), b.clone()]),
+        ),
+        ("permuted", CoordinatorServiceImpl::new(vec![q, p])),
+        ("two levels", CoordinatorServiceImpl::new(vec![top])),
+    ];
+    let mut queries: Vec<(String, Vec<f32>)> = (0..4u64)
+        .map(|qi| (format!("q{qi}"), unit_vectors(1, DIM, 0x57AE_2E1A + qi)))
+        .collect();
+    let tie = leaves.corpus[TIE_SOURCE * DIM..(TIE_SOURCE + 1) * DIM].to_vec();
+    queries.push(("tie".to_string(), tie));
+    let filters = Default::default();
+    for (name, query) in &queries {
+        let want = monolithic_topk(&leaves.monolithic, query, K as usize);
+        for tie_complete in [false, true] {
+            let flat_result = flat
+                .fanout_search(name, query, K, tie_complete, &filters)
+                .await
+                .expect("flat unary fan-out");
+            assert_eq!(bits(&flat_result.hits), want, "{name}: flat != monolithic");
+            let flat_pool = pool(&flat_result, K as usize);
+            let flat_scanned: u64 = flat_result
+                .shard_stats
+                .iter()
+                .flatten()
+                .map(|s| s.candidates_collected)
+                .sum();
+            for (label, tree) in &trees {
+                let got = tree
+                    .fanout_search(name, query, K, tie_complete, &filters)
+                    .await
+                    .unwrap_or_else(|e| panic!("{name}: {label}: {e}"));
+                assert_eq!(
+                    bits(&got.hits),
+                    want,
+                    "{name}: {label} tie_complete={tie_complete}"
+                );
+                assert_eq!(
+                    pool(&got, K as usize),
+                    flat_pool,
+                    "{name}: {label} tie_complete={tie_complete}: the gate is the same set"
+                );
+                let scanned: u64 = got
+                    .shard_stats
+                    .iter()
+                    .flatten()
+                    .map(|s| s.candidates_collected)
+                    .sum();
+                assert!(
+                    scanned > 0 && scanned <= flat_scanned.max(scanned),
+                    "{name}: {label}: the relays' scan counters sum the leaves'"
+                );
+            }
+        }
+        // Collapse by parent: leaves without a document store parent
+        // themselves, and the relay concatenates the representatives.
+        let flat_collapse = flat
+            .fanout_search_collapse(name, query, K, &filters)
+            .await
+            .expect("flat collapse");
+        for (label, tree) in &trees {
+            let got = tree
+                .fanout_search_collapse(name, query, K, &filters)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {label}: {e}"));
+            assert_eq!(
+                unary_bits(&got.hits),
+                unary_bits(&flat_collapse.hits),
+                "{name}: {label}: collapse"
+            );
+        }
+    }
+}
+
+/// `(doc id, rank, vector score bits, bm25 score bits)`: a cascade hit
+/// without the shard index, which names the relay through a relay.
+fn cascade_bits(hits: &[pipestream_search::pb::CascadeHit]) -> Vec<(u64, u32, u32, u32)> {
+    hits.iter()
+        .map(|h| {
+            (
+                h.doc_id,
+                h.rank,
+                h.vector_score.to_bits(),
+                h.bm25_score.to_bits(),
+            )
+        })
+        .collect()
+}
+
+fn decomposed_legs() -> HybridLegs {
+    HybridLegs {
+        vector_weight: 0.6,
+        bm25_weight: 0.4,
+        fusion_mode: FusionMode::Decomposed,
+        ..rrf_legs()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cascade_and_decomposed_fusion_through_relays_equal_the_flat_fanout() {
+    let leaves = lexical_leaves(&[true; LEX_LEAVES]).await;
+    let l = &leaves.addrs;
+    let with_bm25 = |addrs: Vec<String>| {
+        CoordinatorServiceImpl::new(addrs)
+            .with_bm25(Some(leaves.analysis.clone()), Default::default())
+            .with_stream_search(true)
+    };
+    let a = relay_over(&[&l[0], &l[1]]).await;
+    let b = relay_over(&[&l[2], &l[3]]).await;
+    // Children out of slot order, relays out of order at the root; the
+    // groups are contiguous, as the routes routed by slot range require.
+    let p = relay_over(&[&l[3], &l[2]]).await;
+    let q = relay_over(&[&l[1], &l[0]]).await;
+    let top = relay_over(&[&a, &b]).await;
+    let trees: Vec<(&str, Vec<String>)> = vec![
+        ("one level", vec![a.clone(), b.clone()]),
+        ("permuted", vec![q, p]),
+        ("two levels", vec![top]),
+    ];
+    let flat = with_bm25(l.clone());
+    let filters = Default::default();
+    for (qi, text) in ["court", "zebra court", "opinion"].into_iter().enumerate() {
+        let query = leaves.corpus[qi * DIM..(qi + 1) * DIM].to_vec();
+        let (want_cascade, _) = flat
+            .fanout_cascade("c", text, &query, LEX_K, None, 0.0, false, &filters)
+            .await
+            .expect("flat cascade");
+        assert!(!want_cascade.is_empty(), "{text}: the cascade matched");
+        let (want_decomposed, _) = flat
+            .fanout_hybrid(
+                "d",
+                text,
+                &query,
+                LEX_K,
+                None,
+                decomposed_legs(),
+                false,
+                &filters,
+            )
+            .await
+            .expect("flat decomposed");
+        assert!(!want_decomposed.is_empty(), "{text}: decomposed matched");
+        for (name, roots) in &trees {
+            let relayed = with_bm25(roots.clone());
+            let (cascade, _) = relayed
+                .fanout_cascade("c", text, &query, LEX_K, None, 0.0, false, &filters)
+                .await
+                .unwrap_or_else(|e| panic!("{name} {text:?}: cascade: {e}"));
+            assert_eq!(
+                cascade_bits(&cascade),
+                cascade_bits(&want_cascade),
+                "{name} {text:?}: cascade"
+            );
+            let (decomposed, _) = relayed
+                .fanout_hybrid(
+                    "d",
+                    text,
+                    &query,
+                    LEX_K,
+                    None,
+                    decomposed_legs(),
+                    false,
+                    &filters,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{name} {text:?}: decomposed: {e}"));
+            assert_eq!(
+                hybrid_bits(&decomposed),
+                hybrid_bits(&want_decomposed),
+                "{name} {text:?}: decomposed fusion"
+            );
+        }
+    }
+}
+
+use pipestream_search::pb::{
+    filter_query, search_query, selection_query, BooleanQuery, CompositeSearchStrategy, DenseQuery,
+    FilterQuery, LexicalQuery, QueryHit, QueryRequest, SearchQuery, SelectionOperator,
+    SelectionQuery,
+};
+
+fn cel_clause(id: &str, cel: &str) -> SelectionQuery {
+    SelectionQuery {
+        node: Some(selection_query::Node::Filter(FilterQuery {
+            id: id.to_string(),
+            predicate: Some(filter_query::Predicate::Cel(cel.to_string())),
+        })),
+    }
+}
+
+fn lexical_clause(id: &str, text: &str) -> SelectionQuery {
+    SelectionQuery {
+        node: Some(selection_query::Node::Search(SearchQuery {
+            id: id.to_string(),
+            query: Some(search_query::Query::Lexical(LexicalQuery {
+                text: text.to_string(),
+                ..Default::default()
+            })),
+        })),
+    }
+}
+
+fn dense_clause(id: &str, vector: &[f32]) -> SelectionQuery {
+    SelectionQuery {
+        node: Some(selection_query::Node::Search(SearchQuery {
+            id: id.to_string(),
+            query: Some(search_query::Query::Dense(DenseQuery {
+                vector: vector.to_vec(),
+                ..Default::default()
+            })),
+        })),
+    }
+}
+
+/// A dense clause reranked on the original vectors (`ExactVectorRescore`).
+fn fp32_clause(id: &str, vector: &[f32]) -> SelectionQuery {
+    SelectionQuery {
+        node: Some(selection_query::Node::Search(SearchQuery {
+            id: id.to_string(),
+            query: Some(search_query::Query::Dense(DenseQuery {
+                vector: vector.to_vec(),
+                score_mode: pipestream_search::pb::DenseScoreMode::Fp32Rerank as i32,
+                ..Default::default()
+            })),
+        })),
+    }
+}
+
+fn and_filtered(filter: SelectionQuery, leaf: SelectionQuery) -> SelectionQuery {
+    SelectionQuery {
+        node: Some(selection_query::Node::Composite(CompositeSearchStrategy {
+            operator: SelectionOperator::And as i32,
+            clauses: vec![filter, leaf],
+            scoring: None,
+        })),
+    }
+}
+
+fn boolean(
+    must: Vec<SelectionQuery>,
+    should: Vec<SelectionQuery>,
+    must_not: Vec<SelectionQuery>,
+) -> SelectionQuery {
+    SelectionQuery {
+        node: Some(selection_query::Node::Boolean(BooleanQuery {
+            must,
+            should,
+            must_not,
+            minimum_should_match: 0,
+            aggregate: None,
+        })),
+    }
+}
+
+/// `(doc id, score bits, rank, matched clauses)`.
+fn query_bits(hits: &[QueryHit]) -> Vec<(u64, u32, u32, Vec<String>)> {
+    hits.iter()
+        .map(|h| (h.doc_id, h.score.to_bits(), h.rank, h.matched.clone()))
+        .collect()
+}
+
+async fn run_query(
+    coordinator: &CoordinatorServiceImpl,
+    selection: SelectionQuery,
+) -> Result<Vec<QueryHit>, tonic::Status> {
+    coordinator
+        .query(tonic::Request::new(QueryRequest {
+            request_id: "relayed".into(),
+            k: LEX_K,
+            selection: Some(selection),
+            ..Default::default()
+        }))
+        .await
+        .map(|r| r.into_inner().hits)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn filtered_and_boolean_queries_through_relays_equal_the_flat_fanout() {
+    let leaves = lexical_leaves(&[true; LEX_LEAVES]).await;
+    let l = &leaves.addrs;
+    let with_bm25 = |addrs: Vec<String>| {
+        CoordinatorServiceImpl::new(addrs)
+            .with_bm25(Some(leaves.analysis.clone()), Default::default())
+            .with_stream_search(true)
+    };
+    let a = relay_over(&[&l[0], &l[1]]).await;
+    let b = relay_over(&[&l[2], &l[3]]).await;
+    // Children out of slot order, relays out of order at the root; the
+    // groups are contiguous, as the routes routed by slot range require.
+    let p = relay_over(&[&l[3], &l[2]]).await;
+    let q = relay_over(&[&l[1], &l[0]]).await;
+    let top = relay_over(&[&a, &b]).await;
+    let trees: Vec<(&str, Vec<String>)> = vec![
+        ("one level", vec![a.clone(), b.clone()]),
+        ("permuted", vec![q, p]),
+        ("two levels", vec![top]),
+    ];
+    let flat = with_bm25(l.clone());
+    let vector = leaves.corpus[..DIM].to_vec();
+    let shapes: Vec<(&str, SelectionQuery)> = vec![
+        (
+            "filtered lexical",
+            and_filtered(
+                cel_clause("f", r#"court == "scotus""#),
+                lexical_clause("lex", "court"),
+            ),
+        ),
+        (
+            "filtered dense",
+            and_filtered(
+                cel_clause("f", r#"court == "ca9""#),
+                dense_clause("vec", &vector),
+            ),
+        ),
+        (
+            "boolean lexical must filter",
+            boolean(
+                vec![
+                    lexical_clause("lex", "court"),
+                    cel_clause("f", r#"court == "scotus""#),
+                ],
+                Vec::new(),
+                Vec::new(),
+            ),
+        ),
+        (
+            "boolean dense must filter",
+            boolean(
+                vec![
+                    dense_clause("vec", &vector),
+                    cel_clause("f", r#"court == "ca9""#),
+                ],
+                Vec::new(),
+                Vec::new(),
+            ),
+        ),
+        ("fp32 rerank", fp32_clause("vec", &vector)),
+        (
+            "boolean fp32 must filter",
+            boolean(
+                vec![
+                    fp32_clause("vec", &vector),
+                    cel_clause("f", r#"court == "scotus""#),
+                ],
+                Vec::new(),
+                Vec::new(),
+            ),
+        ),
+        (
+            "boolean should and must_not",
+            boolean(
+                vec![lexical_clause("lex", "court")],
+                vec![lexical_clause("z", "zebra"), dense_clause("vec", &vector)],
+                vec![cel_clause("f", r#"court == "ca9""#)],
+            ),
+        ),
+    ];
+    for (shape, selection) in &shapes {
+        let want = run_query(&flat, selection.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{shape}: flat: {e}"));
+        assert!(!want.is_empty(), "{shape}: the flat query matched");
+        for (name, roots) in &trees {
+            let relayed = with_bm25(roots.clone());
+            let got = run_query(&relayed, selection.clone())
+                .await
+                .unwrap_or_else(|e| panic!("{shape}: {name}: {e}"));
+            assert_eq!(query_bits(&got), query_bits(&want), "{shape}: {name}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bitmaps_through_a_relay_lie_over_the_children_and_refuse_a_gap() {
+    let leaves = lexical_leaves(&[true; LEX_LEAVES]).await;
+    let l = &leaves.addrs;
+    let relay_addr = relay_over(&[&l[1], &l[0]]).await;
+    let mut relay = NodeServiceClient::connect(relay_addr).await.unwrap();
+    let request = pipestream_search::pb::LexicalBitmapRequest {
+        terms: vec!["court".into()],
+    };
+    let through = relay
+        .resolve_lexical_bitmap(request.clone())
+        .await
+        .expect("relayed lexical bitmap")
+        .into_inner();
+    assert_eq!(through.base_label, 0);
+    assert_eq!(through.label_count, 2 * LEX_ROWS as u64);
+    assert_ne!(through.stats_epoch, 0, "the epoch is a relay token");
+    let mut want = vec![false; 2 * LEX_ROWS];
+    for (child, addr) in l.iter().take(2).enumerate() {
+        let direct = NodeServiceClient::connect(addr.clone())
+            .await
+            .unwrap()
+            .resolve_lexical_bitmap(request.clone())
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(direct.base_label, (child * LEX_ROWS) as u64);
+        for position in 0..direct.label_count as usize {
+            want[child * LEX_ROWS + position] =
+                direct.bits[position / 8] & (1 << (position % 8)) != 0;
+        }
+    }
+    let got: Vec<bool> = (0..2 * LEX_ROWS)
+        .map(|position| through.bits[position / 8] & (1 << (position % 8)) != 0)
+        .collect();
+    assert_eq!(
+        got, want,
+        "the relayed bitmap is the children's laid side by side"
+    );
+    assert!(got.iter().any(|&b| b), "the term matched");
+    // The token translates on a rescore that echoes it.
+    let stats = relay
+        .term_stats(TermStatsRequest {
+            terms: vec!["court".into()],
+            fields: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let members: Vec<u64> = got
+        .iter()
+        .enumerate()
+        .filter_map(|(id, &member)| member.then_some(id as u64))
+        .collect();
+    let rescored = relay
+        .bm25_rescore(pipestream_search::pb::Bm25RescoreRequest {
+            terms: vec!["court".into()],
+            global_doc_count: stats.doc_count,
+            global_total_doc_length: stats.total_doc_length,
+            global_doc_frequencies: stats.doc_frequencies.clone(),
+            candidate_ids: members.clone(),
+            k1: 1.2,
+            b: 0.75,
+            expected_stats_epoch: through.stats_epoch,
+            score_stages: Vec::new(),
+        })
+        .await
+        .expect("the bitmap's token is a claim the relay translates")
+        .into_inner();
+    assert_eq!(rescored.hits.len(), members.len());
+    // The filter and vector bitmaps share the layout.
+    let filtered = relay
+        .resolve_filter_bitmap(pipestream_search::pb::FilterBitmapRequest {
+            geo_filters: Vec::new(),
+            filter: pipestream_search::cel::compile_filter(r#"court == "scotus""#)
+                .expect("compiles"),
+        })
+        .await
+        .expect("relayed filter bitmap")
+        .into_inner();
+    assert_eq!(filtered.base_label, 0);
+    assert_eq!(filtered.label_count, 2 * LEX_ROWS as u64);
+    assert_eq!(filtered.filter_columns_known, vec![true]);
+    let scotus = (0..2 * LEX_ROWS)
+        .filter(|position| filtered.bits[position / 8] & (1 << (position % 8)) != 0)
+        .count();
+    assert_eq!(scotus, LEX_ROWS, "every other document is scotus");
+    let vectors = relay
+        .resolve_vector_bitmap(pipestream_search::pb::VectorBitmapRequest {})
+        .await
+        .expect("relayed vector bitmap")
+        .into_inner();
+    assert_eq!(vectors.label_count, 2 * LEX_ROWS as u64);
+    assert_eq!(vectors.stats_epoch, 0);
+
+    // A child past a gap: the layout the parent would derive is a lie,
+    // so the routes refuse by name.
+    let (gapped, _handle) = start_empty_node(NodeConfig {
+        slot_offset: (LEX_ROWS + 3) as u64,
+        analysis_addr: Some(leaves.analysis.clone()),
+        ..Default::default()
+    })
+    .await;
+    let relay_addr = relay_over(&[&l[0], &gapped]).await;
+    let mut relay = NodeServiceClient::connect(relay_addr).await.unwrap();
+    let err = relay
+        .resolve_vector_bitmap(pipestream_search::pb::VectorBitmapRequest {})
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("gap"), "{}", err.message());
+    let err = relay
+        .vector_rescore(pipestream_search::pb::VectorRescoreRequest {
+            vector: leaves.corpus[..DIM].to_vec(),
+            candidate_ids: vec![0],
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("gap"), "{}", err.message());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dictionaries_through_a_relay_are_the_union_of_the_children() {
+    let leaves = lexical_leaves(&[true; LEX_LEAVES]).await;
+    let l = &leaves.addrs;
+    let relay_addr = relay_over(&[&l[0], &l[1]]).await;
+    let mut relay = NodeServiceClient::connect(relay_addr).await.unwrap();
+    let mut children = Vec::new();
+    for addr in l.iter().take(2) {
+        children.push(NodeServiceClient::connect(addr.clone()).await.unwrap());
+    }
+    let expand = |cap: u32| pipestream_search::pb::ExpandTermPrefixRequest {
+        field: "body".into(),
+        prefix: "o".into(),
+        cap,
+    };
+    let mut union = std::collections::BTreeSet::new();
+    for child in children.iter_mut() {
+        let direct = child
+            .expand_term_prefix(expand(64))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(direct.known);
+        union.extend(direct.terms);
+    }
     assert!(
-        err.message().contains("no child's slot range"),
-        "{}",
-        err.message()
+        union.len() >= 2,
+        "the prefix expands to several terms: {union:?}"
     );
+    let through = relay
+        .expand_term_prefix(expand(64))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(through.known);
+    assert_eq!(through.count, union.len() as u64);
+    assert_eq!(through.terms, union.iter().cloned().collect::<Vec<_>>());
+    // Past the cap on the union: the count, no terms.
+    let past = relay
+        .expand_term_prefix(expand(union.len() as u32 - 1))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(past.count, union.len() as u64);
+    assert!(past.terms.is_empty());
+
+    let suggest = |max_scan: u64| pipestream_search::pb::SuggestTermsRequest {
+        field: "body".into(),
+        prefix: "o".into(),
+        max_scan,
+    };
+    let mut dfs: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for child in children.iter_mut() {
+        let direct = child.suggest_terms(suggest(64)).await.unwrap().into_inner();
+        for entry in direct.entries {
+            *dfs.entry(entry.term).or_default() += entry.df;
+        }
+    }
+    let through = relay.suggest_terms(suggest(64)).await.unwrap().into_inner();
+    assert!(through.known);
+    assert_eq!(through.count, dfs.len() as u64);
+    let got: Vec<(String, u64)> = through
+        .entries
+        .iter()
+        .map(|e| (e.term.clone(), e.df))
+        .collect();
+    let want: Vec<(String, u64)> = dfs.into_iter().collect();
+    assert_eq!(got, want, "entries in byte order with the df summed");
+    let err = relay
+        .expand_term_prefix(pipestream_search::pb::ExpandTermPrefixRequest {
+            field: "nope".into(),
+            prefix: "o".into(),
+            cap: 8,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!err.known, "a field no child indexes stays unknown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn diagnostics_through_the_root_merge_the_relay_children() {
+    use pipestream_search::pb::diagnostics_service_client::DiagnosticsServiceClient;
+    let leaves = lexical_leaves(&[true; LEX_LEAVES]).await;
+    let l = &leaves.addrs;
+    let relay_addr = relay_over(&[&l[0], &l[1]]).await;
+    let mut direct_rows = 0;
+    let mut direct_segments = 0;
+    for addr in l.iter().take(2) {
+        let layout = DiagnosticsServiceClient::connect(addr.clone())
+            .await
+            .unwrap()
+            .get_shard_diagnostics(pipestream_search::pb::ShardDiagnosticsRequest { shard: None })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(layout.shards.len(), 1);
+        direct_rows += layout.shards[0].rows;
+        direct_segments += layout.shards[0].segments.len();
+    }
+    assert!(direct_rows > 0, "the leaves report their rows");
+    let relayed = DiagnosticsServiceClient::connect(relay_addr.clone())
+        .await
+        .unwrap()
+        .get_shard_diagnostics(pipestream_search::pb::ShardDiagnosticsRequest { shard: None })
+        .await
+        .expect("the relay serves the diagnostics service")
+        .into_inner();
+    assert_eq!(relayed.shards.len(), 1, "one shard: the relay's");
+    let merged = &relayed.shards[0];
+    assert!(
+        merged.layout.starts_with("relay over 2 children"),
+        "{}",
+        merged.layout
+    );
+    assert_eq!(merged.rows, direct_rows);
+    assert_eq!(merged.segments.len(), direct_segments);
+    // Through the root: the relay's shard is the merged view, the leaf
+    // beside it is itself.
+    let root = CoordinatorServiceImpl::new(vec![relay_addr, l[2].clone()]);
+    let layouts = root.shard_diagnostics(None).await;
+    assert_eq!(layouts.len(), 2);
+    assert_eq!(layouts[0].shard, 0);
+    assert!(layouts[0].layout.starts_with("relay over 2 children"));
+    assert_eq!(layouts[0].rows, direct_rows);
+    assert_eq!(layouts[1].shard, 1);
+    assert!(layouts[1].rows > 0 && !layouts[1].layout.contains("relay"));
 }
