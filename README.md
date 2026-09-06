@@ -1222,6 +1222,12 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Scoped lineage reads (2026-09-06, feature branch).** Candidate parent/group
+  resolution applies document views and admitted physical versions. Collapse
+  requests only its chosen key, with independent field use/disclosure checks.
+  Clustered parent resolution retains batching through the same validator.
+  See [lineage reads](docs/lineage-reads.md).
+
 - **Scoped browse and aggregation (2026-09-06, feature branch).** Private
   Aggregate enforces document and field grants through percentile selection and
   final disclosure. Browse and aggregate reads share Query's physical-version

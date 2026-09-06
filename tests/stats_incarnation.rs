@@ -614,3 +614,34 @@ async fn aggregate_refuses_replacement_at_every_read_boundary() {
         let _ = handle.await;
     }
 }
+
+#[tokio::test]
+async fn public_query_collapse_refuses_lineage_from_a_replacement_lifetime() {
+    use pipestream_search::pb::{search_service_server::SearchService, CollapseSpec};
+    for column in ["parent_id", "group_id"] {
+        let (address, service, handle) = start(node(&["rust", "rust"]).await).await;
+        let mut query = public_query();
+        query.collapse = Some(CollapseSpec {
+            column: column.into(),
+            inner_hits: 2,
+        });
+        // The same request executes before replacement, proving this reaches lineage.
+        SearchService::query(
+            &coordinator(address.clone()),
+            tonic::Request::new(query.clone()),
+        )
+        .await
+        .unwrap();
+        service.before_reads.lock().unwrap().insert(
+            "ResolveParents".into(),
+            [Some(node(&["rust", "rust"]).await)].into(),
+        );
+        let error = SearchService::query(&coordinator(address), tonic::Request::new(query))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(service.before_reads.lock().unwrap()["ResolveParents"].is_empty());
+        handle.abort();
+        let _ = handle.await;
+    }
+}

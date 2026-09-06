@@ -3628,8 +3628,21 @@ message GetDocumentsResponse {
   repeated StoredDocument documents = 1;
 }
 
+// Candidate lineage read. An empty field list preserves the legacy request
+// meaning: both keys. Explicit projections disclose only the selected keys.
 message ResolveParentsRequest {
   repeated uint64 doc_ids = 1;
+  DocumentVisibility visibility = 2;
+  // Omit both for a standalone read, or supply the complete selection version.
+  uint64 expected_stats_epoch = 3;
+  bytes expected_stats_incarnation = 4;
+  repeated LineageField fields = 5;
+}
+
+enum LineageField {
+  LINEAGE_FIELD_UNSPECIFIED = 0;
+  LINEAGE_FIELD_PARENT_ID = 1;
+  LINEAGE_FIELD_GROUP_ID = 2;
 }
 
 message ResolvedParent {
@@ -3641,6 +3654,14 @@ message ResolvedParent {
 
 message ResolveParentsResponse {
   repeated ResolvedParent parents = 1;
+  // Read under the same shard lock as the candidate lineage keys.
+  uint64 stats_epoch = 2;
+  bytes stats_incarnation = 3;
+  bytes visibility_fingerprint = 4;
+  repeated bool visibility_columns_known = 5;
+  // Canonical ascending selection, even on empty replies. Unselected keys in
+  // ResolvedParent are zero and must not be interpreted as present values.
+  repeated LineageField fields = 6;
 }
 
 // Client-facing distributed BM25 request.

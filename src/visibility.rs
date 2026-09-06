@@ -240,5 +240,6 @@ scoped_read_responses!(
     MembershipBitmapResponse,
     BrowseShardResponse,
     AggregateShardResponse,
-    QuantileCountsResponse
+    QuantileCountsResponse,
+    ResolveParentsResponse
 );

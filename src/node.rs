@@ -13795,8 +13795,36 @@ impl NodeService for NodeServiceImpl {
         crate::metrics::timed(Route::ResolveParents, request, |request| async move {
             const SELF_PARENT_TAG: u64 = 1 << 63;
             let req = request.into_inner();
+            let scope = crate::visibility::VisibilityScope::new(req.visibility.as_ref())?;
+            let selection = crate::lineage::LineageSelection::new(&req.fields)?;
             let offset = self.config.slot_offset;
             let guard = read_shard(&self.state);
+            guard.check_stats_epoch(req.expected_stats_epoch, &req.expected_stats_incarnation)?;
+            let visibility = req
+                .visibility
+                .as_ref()
+                .and_then(|view| view.filter.as_ref());
+            let (_, visibility_columns_known) =
+                filter_known_flags(guard.bm25.as_ref(), &[], visibility);
+            if guard
+                .bm25
+                .as_ref()
+                .is_some_and(|store| store.as_index().is_none())
+            {
+                return Err(Status::failed_precondition(
+                    "bm25 bulk build in progress; Flush before reading lineage",
+                ));
+            }
+            let doc_filter = crate::filter::DocFilter {
+                deleted: None,
+                geo: Default::default(),
+                pred: guard
+                    .bm25
+                    .as_ref()
+                    .and_then(|store| visibility.map(|filter| store.resolve_filter(filter)))
+                    .transpose()?,
+                phrase: Vec::new(),
+            };
             let rows = guard
                 .index
                 .as_ref()
@@ -13809,7 +13837,11 @@ impl NodeService for NodeServiceImpl {
                 );
             let store = guard.bm25.as_ref().and_then(|store| store.as_index());
             let mut parents = Vec::new();
+            let mut seen = std::collections::HashSet::new();
             for doc_id in req.doc_ids {
+                if !seen.insert(doc_id) {
+                    continue;
+                }
                 let Some(local) = doc_id.checked_sub(offset) else {
                     continue;
                 };
@@ -13819,6 +13851,16 @@ impl NodeService for NodeServiceImpl {
                 if guard.live_docs.is_deleted(local as usize) {
                     continue;
                 }
+                if req.visibility.is_some() {
+                    let Some(metadata) = guard.bm25.as_ref() else {
+                        continue;
+                    };
+                    if local >= u64::from(metadata.next_doc_id())
+                        || !doc_filter.passes(local as u32, &ShardNumericRead(metadata))
+                    {
+                        continue;
+                    }
+                }
                 let lineage = u32::try_from(local)
                     .ok()
                     .and_then(|local| store.and_then(|store| store.lineage(local)));
@@ -13826,11 +13868,26 @@ impl NodeService for NodeServiceImpl {
                     lineage.map_or((SELF_PARENT_TAG | doc_id, 0), |l| (l.parent_id, l.group_id));
                 parents.push(ResolvedParent {
                     doc_id,
-                    parent_id,
-                    group_id,
+                    parent_id: if selection.contains(crate::pb::LineageField::ParentId) {
+                        parent_id
+                    } else {
+                        0
+                    },
+                    group_id: if selection.contains(crate::pb::LineageField::GroupId) {
+                        group_id
+                    } else {
+                        0
+                    },
                 });
             }
-            Ok(Response::new(ResolveParentsResponse { parents }))
+            Ok(Response::new(ResolveParentsResponse {
+                parents,
+                fields: selection.wire(),
+                stats_epoch: guard.stats_epoch,
+                stats_incarnation: guard.stats_incarnation.bytes()?,
+                visibility_fingerprint: scope.fingerprint().to_vec(),
+                visibility_columns_known,
+            }))
         })
         .await
     }

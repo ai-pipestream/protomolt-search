@@ -620,6 +620,7 @@ async fn observe(addrs: &[String], analysis: &str, queries: &[Vec<f32>]) -> Read
     let parents = nodes[0]
         .resolve_parents(ResolveParentsRequest {
             doc_ids: browse.doc_ids.clone(),
+            ..Default::default()
         })
         .await
         .unwrap()

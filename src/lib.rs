@@ -54,6 +54,7 @@ pub mod geo;
 pub mod harness;
 pub mod highlight;
 pub mod interleave;
+mod lineage;
 pub mod link;
 pub mod live_docs;
 pub mod ltr;

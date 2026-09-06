@@ -88,3 +88,9 @@ The first full library run exposed a metrics test that assumed its process-wide
 ingest counters started at zero. It now checks increments from the observed
 baseline, allowing other tests to ingest concurrently. The complete suite above
 passed after that test-isolation fix.
+
+
+[Candidate lineage reads](lineage-reads.md) now apply the mandatory document view
+and the query's admitted physical versions. Parent and group keys have separate
+field projections and use/disclosure checks. This prepares collapsed query
+execution; restricted public Query and QueryStream remain gated.

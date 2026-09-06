@@ -956,3 +956,13 @@ collection facade revalidates the full decision before disclosure. See
 [scoped folds](scoped-folds.md) for implementation, evidence and upgrade impact.
 Restricted public Query, other retrieval paths, network delegation and RAG remain
 unfinished; this increment does not complete the foundation objectives.
+
+
+## Scoped lineage reads (2026-09-06, feature branch)
+
+Candidate lineage resolution now enforces the authority view, admitted physical
+versions and explicit parent/group projections. Query collapse and clustered
+parent resolution use one collector that rejects unrequested keys, rows and
+duplicate ownership. See [lineage reads](lineage-reads.md) for evidence and the
+remaining generation-local fallback identity limitation. Source retrieval,
+remaining query permissions and remote delegation still need completion.

@@ -2098,8 +2098,7 @@ async fn collapse_keys(
 ) -> Result<std::collections::HashMap<u64, GroupKey>, Status> {
     let mut keys = std::collections::HashMap::with_capacity(ids.len());
     if column == "parent_id" || column == "group_id" {
-        for (id, (parent, group)) in coordinator.lineage_keys(ids).await? {
-            let v = if column == "parent_id" { parent } else { group };
+        for (id, v) in coordinator.lineage_key(ids, column).await? {
             keys.insert(id, GroupKey::UnsignedInteger(v));
         }
         return Ok(keys);

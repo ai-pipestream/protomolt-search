@@ -111,3 +111,9 @@ test ran; stored index and WAL formats are unchanged.
 The full integration pass initially found two compaction assertions expecting
 the older boundary error. They now require the earlier data-version refusal,
 and the affected group plus every remaining integration target passed.
+
+
+[Candidate lineage reads](lineage-reads.md) now apply the mandatory document view
+and the query's admitted physical versions. Parent and group keys have separate
+field projections and use/disclosure checks. This prepares collapsed query
+execution; restricted public Query and QueryStream remain gated.
