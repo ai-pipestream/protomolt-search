@@ -76,6 +76,9 @@
 #   NODE_EXTRA_ARGS / COORD_EXTRA_ARGS  extra flags appended to every
 #                  node / to the coordinator (word-split), e.g.
 #                  --placement-column=placement --placement-leaf=<code>
+#                  --placement-tree=<the coordinator's shard map>, the
+#                  last making the node refuse a direct row outside its
+#                  leaf's predicates (docs/placement.md)
 #   SHARD_MAP      the coordinator takes --shard-map=<toml> instead of
 #                  --nodes=$NODE_LIST
 #   CALIBRATION    an existing calibration.json the calibrate stage copies

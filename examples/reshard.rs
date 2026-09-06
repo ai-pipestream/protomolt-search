@@ -16,6 +16,14 @@
 //!     --out-dir=/data/split --slot-base=0 --slot-stride=25000000 \
 //!     --analysis-addr=http://localhost:50051
 //!
+//! # Re-place one shard (or the union of several) under a NEW tree: the tree
+//! # is evaluated on each document, its code rewritten, one child per leaf
+//! # shard (docs/placement.md, "Changing the tree"). The file is the
+//! # coordinator's shard map (its [placement] table) or just that table.
+//! reshard --log=/data/shard-0.vector.wal --placement-tree=/data/root-map-v11.toml \
+//!     --out-dir=/data/bands --slot-base=0 --slot-stride=25000000 \
+//!     --analysis-addr=http://localhost:50051
+//!
 //! # Merge several shards -> 1 (identical provider configuration required):
 //! reshard --logs=/data/shard-0.vector.wal,/data/shard-1.vector.wal --out-dir=/data/merged \
 //!     --analysis-addr=http://localhost:50051
@@ -55,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(
             "usage: reshard (--log=<wal dir|generation dir> --split=N | --logs=a,b,c) \
              --out-dir=<dir> [--slot-base=B] [--slot-stride=S] [--analysis-addr=ADDR] \
-             [--stable-routing]"
+             [--stable-routing] [--placement-tree=<file>]"
                 .into(),
         );
     }
@@ -108,6 +116,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .map_err(|e| format!("analysis sidecar at {addr}: {e}"))
     };
+
+    if let Some(tree_path) = opt("placement-tree") {
+        let generations = match (opt("logs"), opt("log")) {
+            (Some(logs), _) => logs
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| reshard::resolve_gen(Path::new(s)))
+                .collect::<Result<Vec<_>, _>>()?,
+            (None, Some(log)) => vec![reshard::resolve_gen(Path::new(&log))?],
+            (None, None) => return Err("a re-placement split needs --log or --logs".into()),
+        };
+        if vectors_only {
+            return Err(
+                "a re-placement split evaluates the tree on documents; drop --vectors-only".into(),
+            );
+        }
+        let tree = pipestream_search::config::load_placement_tree(Path::new(&tree_path))?;
+        let placement = pipestream_search::placement::Placement::validate(&tree)?;
+        let children = reshard::tree_children(&placement)?;
+        let slot_base: u64 = arg("slot-base", "0").parse()?;
+        let slot_stride: u64 = arg("slot-stride", "25000000").parse()?;
+        let slot_offsets: Vec<u64> = (0..children.len() as u64)
+            .map(|i| slot_base + i * slot_stride)
+            .collect();
+        for gen in &generations {
+            eprintln!("replaying {}", gen.display());
+        }
+        let placed = reshard::split_placement_tree_logs(
+            &generations,
+            &tree,
+            &out_dir,
+            &slot_offsets,
+            bm25_fields.as_deref(),
+            &mut analyze,
+        )?;
+        let map = reshard::tree_shard_map_toml(&placed, &tree)?;
+        let map_path = out_dir.join("shard-map.toml");
+        std::fs::write(&map_path, &map)?;
+        eprintln!("wrote {}", map_path.display());
+        eprintln!("{} documents changed code under the new tree", placed.moved);
+        for ((image, child), rows) in placed
+            .images
+            .children
+            .iter()
+            .zip(&placed.children)
+            .zip(&placed.placed)
+        {
+            eprintln!(
+                "child {}: leaf {} (placement {}), {rows} documents, {} vectors, slot_offset {}, \
+                 hash [{}, {}]",
+                image.vector_path.display(),
+                child.leaf,
+                child.code,
+                image.num_vectors,
+                image.slot_offset,
+                image.hash_lo,
+                image.hash_hi
+            );
+        }
+        println!(
+            "# node config: one [[shards]] block per child; add --placement-column={} \
+                  --placement-leaf=<placement> --placement-tree={} to each\n",
+            tree.column, tree_path
+        );
+        print!("{}", reshard::shards_toml(&placed.images));
+        println!(
+            "\n# coordinator shard map (also written to {})\n",
+            map_path.display()
+        );
+        print!("{map}");
+        return Ok(());
+    }
 
     let (output, live_cutoff) = match opt("logs") {
         Some(logs) => {

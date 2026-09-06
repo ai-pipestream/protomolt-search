@@ -2166,6 +2166,313 @@ pub fn placement_shard_map_toml(out: &PlacementReshardOutput) -> String {
     s
 }
 
+/// One child of a re-placement split (`docs/placement.md`, "Changing
+/// the tree"): the leaf it serves under the NEW tree and the stable-key
+/// hash range it takes inside that leaf (the full range on a one-shard
+/// leaf).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeChild {
+    /// Dotted leaf name under the new tree.
+    pub leaf: String,
+    /// The leaf's path code, which the child's rows carry after the
+    /// split and the shard map names as `placement`.
+    pub code: i64,
+    pub hash_lo: u64,
+    pub hash_hi: u64,
+}
+
+/// The result of a re-placement split: the images, the child list
+/// (parallel to `images.children`), and what moved.
+#[derive(Debug)]
+pub struct TreeReshardOutput {
+    pub images: ReshardOutput,
+    pub children: Vec<TreeChild>,
+    /// Live documents whose code under the new tree differs from the
+    /// code they carried (or that carried none).
+    pub moved: u64,
+    /// Live documents per child.
+    pub placed: Vec<u64>,
+}
+
+/// The children a tree implies: `shards` per leaf, in leaf (code) order,
+/// each leaf's shards tiling the stable-key hash space the way the
+/// coordinator routes inside a leaf (`route_stable_key_in`). A leaf's
+/// shard count must be a power of two for the tiles to be exact.
+pub fn tree_children(placement: &crate::placement::Placement) -> Result<Vec<TreeChild>, String> {
+    let mut out = Vec::new();
+    for leaf in placement.leaves() {
+        let n = leaf.shards.max(1) as usize;
+        if !n.is_power_of_two() {
+            return Err(format!(
+                "placement leaf {:?} has {n} shards; a re-placement split tiles a leaf's hash \
+                 space in powers of two",
+                leaf.name
+            ));
+        }
+        let shift = if n == 1 { 0 } else { 64 - n.trailing_zeros() };
+        for shard in 0..n {
+            let hash_lo = if n == 1 { 0 } else { (shard as u64) << shift };
+            let hash_hi = if shard + 1 == n {
+                u64::MAX
+            } else {
+                ((shard as u64 + 1) << shift) - 1
+            };
+            out.push(TreeChild {
+                leaf: leaf.name.clone(),
+                code: leaf.code,
+                hash_lo,
+                hash_hi,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Split one or more full-history generations under a NEW placement
+/// tree (`docs/placement.md`, "Changing the tree"): the tree is
+/// evaluated on each live document's stored values, the way the
+/// coordinator routes at ingest, the placement column is rewritten to
+/// the code the new tree assigns, and the document goes to the child
+/// serving that leaf (inside a leaf with several shards, by its stable
+/// key's hash, which each such row must then carry). A vector row with
+/// no document cannot be evaluated and refuses the split by id. Memory
+/// is bounded by one WAL bucket during routing and by the largest child
+/// while its image is built: rows are spilled per child under
+/// `out_dir/spill` first, as a partitioned compaction does. Offline
+/// only: no live cutoff is recorded, so the sources must be quiescent.
+#[allow(clippy::too_many_arguments)]
+pub fn split_placement_tree_logs(
+    gens: &[PathBuf],
+    tree: &crate::placement::PlacementTreeConfig,
+    out_dir: &Path,
+    slot_offsets: &[u64],
+    bm25_fields: Option<&[String]>,
+    analyze: &mut Analyzer,
+) -> Result<TreeReshardOutput, String> {
+    let placement = crate::placement::Placement::validate(tree)?;
+    let children = tree_children(&placement)?;
+    if slot_offsets.len() != children.len() {
+        return Err(format!(
+            "a re-placement split needs one slot offset per child: {} offsets for {} children \
+             ({} leaves, shards summed)",
+            slot_offsets.len(),
+            children.len(),
+            placement.leaves().len()
+        ));
+    }
+    let Some(first_gen) = gens.first() else {
+        return Err("a re-placement split requires at least one input generation".to_string());
+    };
+    let manifest = read_gen_manifest(first_gen)?;
+    let mut top_generation = manifest.generation;
+    for gen in gens {
+        let current = read_gen_manifest(gen)?;
+        require_backend_config(&current, gen)?;
+        require_complete_history(&current, gen)?;
+        if !same_backend_config(&manifest, &current) {
+            return Err(format!(
+                "{}: vector backend configuration differs from the first input",
+                gen.display()
+            ));
+        }
+        top_generation = top_generation.max(current.generation);
+    }
+    let binding = read_gens_binding(gens)?;
+    std::fs::create_dir_all(out_dir)
+        .map_err(|error| format!("mkdir {}: {error}", out_dir.display()))?;
+    let column = placement.column().to_string();
+    let first_child_of_leaf = |code: i64| children.iter().position(|child| child.code == code);
+    let shards_of_leaf = |code: i64| children.iter().filter(|child| child.code == code).count();
+
+    // Pass 1: route each live row under the new tree into its child's
+    // spill log, one WAL bucket in memory at a time.
+    let spill_root = out_dir.join("spill");
+    let mut spill_manifest = manifest.clone();
+    spill_manifest.bucket_bits = 0;
+    spill_manifest.bucket_count = 1;
+    let mut spills = Vec::with_capacity(children.len());
+    for index in 0..children.len() {
+        let dir = spill_root.join(format!("c{index:05}"));
+        let writer = wal::WalWriter::create(&dir, spill_manifest.clone())
+            .map_err(|error| format!("create spill log {}: {error}", dir.display()))?;
+        spills.push(writer);
+    }
+    let mut moved = 0u64;
+    let mut placed = vec![0u64; children.len()];
+    let mut seen: BTreeSet<u64> = BTreeSet::new();
+    for gen in gens {
+        let current = read_gen_manifest(gen)?;
+        let bucket_count = current.bucket_count as usize;
+        let dim = current.dim as usize;
+        for bucket in 0..current.bucket_count {
+            let mut replay = Replay::default();
+            replay_buckets_through(
+                gen,
+                bucket..bucket + 1,
+                bucket_count,
+                dim,
+                false,
+                u64::MAX,
+                &mut replay,
+            )?;
+            replay.compact();
+            for id in child_order(&replay) {
+                if !seen.insert(id) {
+                    return Err(format!(
+                        "live source id {id} appears in more than one input generation; the \
+                         inputs overlap"
+                    ));
+                }
+                let Some(document) = replay.documents.get(&id) else {
+                    return Err(format!(
+                        "live source id {id} has a vector and no document; a re-placement \
+                         split evaluates the tree on documents (a code-keyed split, \
+                         --placement-ranges, routes such a row to its default child)"
+                    ));
+                };
+                let carried = partition_key_of(document, &column)?;
+                let leaf = placement
+                    .evaluate(document)
+                    .map_err(|e| format!("live source id {id}: {e}"))?;
+                if carried != Some(leaf.code) {
+                    moved += 1;
+                }
+                let base = first_child_of_leaf(leaf.code).expect("children cover every leaf");
+                let n = shards_of_leaf(leaf.code);
+                let index = if n == 1 {
+                    base
+                } else {
+                    let Some(key) = replay.stable_keys.get(&id).filter(|key| !key.is_empty())
+                    else {
+                        return Err(format!(
+                            "live source id {id} routes to leaf {:?}, which has {n} shards, and \
+                             carries no stable key to pick one by; give the leaf one shard or \
+                             rebuild the rows through routed ingest",
+                            leaf.name
+                        ));
+                    };
+                    let hash = crate::coordinator::stable_routing_hash(key);
+                    base + children[base..base + n]
+                        .iter()
+                        .position(|child| hash >= child.hash_lo && hash <= child.hash_hi)
+                        .expect("the tiles cover the hash space")
+                };
+                let mut rewritten = document.clone();
+                rewritten.integers.retain(|value| value.field != column);
+                rewritten.integers.push(crate::pb::IntegerValue {
+                    field: column.clone(),
+                    value: leaf.code,
+                });
+                let keys: Vec<Vec<u8>> = replay.stable_keys.get(&id).cloned().into_iter().collect();
+                spills[index]
+                    .append(wal_record::Op::AddDocuments(
+                        crate::pb::wal::LoggedAddDocuments {
+                            source_references: Vec::new(),
+                            first_id: id,
+                            documents: vec![rewritten],
+                            stable_routing_keys: keys.clone(),
+                        },
+                    ))
+                    .map_err(|error| format!("spill document {id}: {error}"))?;
+                if let Some(vector) = replay.vectors.get(&id) {
+                    spills[index]
+                        .append(wal_record::Op::AddVectors(
+                            crate::pb::wal::LoggedAddVectors {
+                                first_id: id,
+                                batch: Some(crate::pb::AddVectorsRequest {
+                                    vectors: vector.clone(),
+                                    dim: current.dim,
+                                }),
+                                stable_routing_keys: keys,
+                            },
+                        ))
+                        .map_err(|error| format!("spill vector {id}: {error}"))?;
+                }
+                placed[index] += 1;
+            }
+        }
+    }
+    drop(seen);
+    let spill_dirs: Vec<PathBuf> = spills
+        .iter_mut()
+        .map(|writer| {
+            writer
+                .flush()
+                .map(|()| writer.dir().to_path_buf())
+                .map_err(|error| format!("flush spill log {}: {error}", writer.dir().display()))
+        })
+        .collect::<Result<_, _>>()?;
+    drop(spills);
+
+    // Pass 2: one image per child from its spill.
+    let dim = manifest.dim as usize;
+    let mut images = Vec::with_capacity(children.len());
+    for (index, (child, spill_dir)) in children.iter().zip(&spill_dirs).enumerate() {
+        let mut replay = Replay::default();
+        replay_buckets_through(spill_dir, 0..1, 1, dim, false, u64::MAX, &mut replay)?;
+        replay.compact();
+        if replay.documents.len() as u64 != placed[index] {
+            return Err(format!(
+                "child {index} ({}): the spill log holds {} documents, routing counted {}",
+                child.leaf,
+                replay.documents.len(),
+                placed[index]
+            ));
+        }
+        images.push(finish_child(
+            &manifest,
+            replay,
+            index,
+            out_dir,
+            slot_offsets[index],
+            child.hash_lo,
+            child.hash_hi,
+            bm25_fields,
+            binding.as_ref(),
+            analyze,
+        )?);
+    }
+    std::fs::remove_dir_all(&spill_root)
+        .map_err(|error| format!("remove spill {}: {error}", spill_root.display()))?;
+    Ok(TreeReshardOutput {
+        images: ReshardOutput {
+            generation: top_generation + 1,
+            children: images,
+        },
+        children,
+        moved,
+        placed,
+    })
+}
+
+/// The shard map for a re-placement split: the new tree under
+/// `[placement]`, one `[[shards]]` per child with its code and hash
+/// range, addresses left for the operator.
+pub fn tree_shard_map_toml(
+    out: &TreeReshardOutput,
+    tree: &crate::placement::PlacementTreeConfig,
+) -> Result<String, String> {
+    let map = crate::config::ShardMap {
+        generation: out.images.generation,
+        shards: out
+            .images
+            .children
+            .iter()
+            .zip(&out.children)
+            .map(|(image, child)| crate::config::ShardMapShard {
+                addr: "TODO".to_string(),
+                replica: None,
+                slot_offset: image.slot_offset,
+                hash_lo: Some(image.hash_lo),
+                hash_hi: Some(image.hash_hi),
+                placement: Some(child.code as u64),
+            })
+            .collect(),
+        placement: Some(tree.clone()),
+    };
+    toml::to_string(&map).map_err(|error| format!("render shard map: {error}"))
+}
+
 /// One live row of a compaction's dense image, in the order the sink
 /// receives them: new local slot order, which is also the order the
 /// rewritten log records them in.
