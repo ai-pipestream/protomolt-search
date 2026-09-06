@@ -1222,6 +1222,12 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Scoped vector scans (2026-09-06, feature branch).** Classic, coalesced,
+  collapsed and streaming node scans can acknowledge a durable field, authority
+  view and physical version before emitting data. Parent-map caching now checks
+  generation identity across build, publication and scan locks. Public Query
+  integration remains open. See [vector scan views](docs/vector-scan-views.md).
+
 - **Field-aware vector reads (2026-09-06, feature branch).** Membership and
   native/FP32 candidate scoring resolve exact vector names from durable bindings,
   apply authority views and validate physical read receipts, including empty

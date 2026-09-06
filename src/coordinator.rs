@@ -7229,6 +7229,7 @@ impl CoordinatorServiceImpl {
             req_tx
                 .try_send(StreamSearchRequest {
                     payload: Some(stream_search_request::Payload::Start(StartStreamSearch {
+                        read_context: None,
                         request_id: request_id.to_string(),
                         vector: vector.to_vec(),
                         initial_floor,
@@ -7504,7 +7505,9 @@ impl CoordinatorServiceImpl {
                         ))
                         .await;
                 }
-                Some(stream_search_response::Payload::Identities(_)) | None => {
+                Some(stream_search_response::Payload::Identities(_))
+                | Some(stream_search_response::Payload::ReadReady(_))
+                | None => {
                     return fanout
                         .cancel_with(Status::internal("unexpected message before IdentityReady"))
                         .await;
@@ -10926,6 +10929,7 @@ async fn run_shard_stream(
     req_tx
         .send(SearchShardRequest {
             payload: Some(search_shard_request::Payload::Start(StartShardSearch {
+                read_context: None,
                 request_id: ctx.request_id.to_string(),
                 k: ctx.k,
                 vector: ctx.vector.as_ref().clone(),

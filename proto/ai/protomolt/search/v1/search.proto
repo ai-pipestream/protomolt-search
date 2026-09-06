@@ -1407,6 +1407,28 @@ message SearchShardRequest {
 }
 
 // Opens a shard scan. Exactly one per `SearchShard` stream, first message.
+// Trusted planner context for a physical vector scan. This is not a credential.
+// Presence opts into ReadReady before any floor, candidate, or completion frame.
+message VectorReadContext {
+  // Exact indexed vector name; empty cannot satisfy a field-restricted grant.
+  string field = 1;
+  DocumentVisibility visibility = 2;
+  // Both identify the admitted physical version; zero/empty offers no claim.
+  uint64 expected_stats_epoch = 3;
+  bytes expected_stats_incarnation = 4;
+}
+
+// Resolved under the same read guard as the entire scan. A consumer requesting
+// a context must validate this receipt before using any subsequent scan data;
+// a legacy stream without it does not establish support for scoped reads.
+message VectorReadReceipt {
+  MappedVectorBinding vector_binding = 1;
+  uint64 stats_epoch = 2;
+  bytes stats_incarnation = 3;
+  bytes visibility_fingerprint = 4;
+  repeated bool visibility_columns_known = 5;
+}
+
 message StartShardSearch {
   // Coordinator-assigned id tying this shard scan to one logical query.
   // Opaque to the node; echoed in logs only.
@@ -1448,6 +1470,8 @@ message StartShardSearch {
   // Compiled filter tree (see FilterExpr), ANDed with `geo_filters`
   // when both are set. Absent = no filter.
   FilterExpr filter = 7;
+  // Opt-in field, authority-view and generation handshake before scan output.
+  VectorReadContext read_context = 8;
 }
 
 // A score floor: a lower bound on the global k-th best score. Flows both
@@ -1470,6 +1494,8 @@ message SearchShardResponse {
     // Terminal message: the shard's local top-k plus scan statistics.
     // Exactly one per stream; the server closes the stream after it.
     SearchShardDone done = 2;
+    // Exactly once and first when the Start supplies read_context.
+    VectorReadReceipt read_ready = 3;
   }
 }
 
@@ -1606,6 +1632,8 @@ message StartStreamSearch {
   // Absent preserves the Batch -> Summary protocol. A requesting client
   // must require IdentityReady; a legacy Summary is not identity support.
   StreamIdentityLimits identity_limits = 8;
+  // Opt-in field, authority-view and generation handshake before scan output.
+  VectorReadContext read_context = 9;
 }
 
 // Bounds for the post-scan identity exchange. All fields must be positive.
@@ -1675,6 +1703,8 @@ message StreamSearchResponse {
     // A stopped scan sends completed=false Summary directly instead.
     StreamIdentityReady identity_ready = 3;
     StreamIdentities identities = 4;
+    // Exactly once and first when the Start supplies read_context.
+    VectorReadReceipt read_ready = 5;
   }
 }
 

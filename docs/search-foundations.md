@@ -982,3 +982,13 @@ now works through flush, restart and snapshots with WAL disabled.
 document views and physical versions for private membership and candidate
 scoring. Public dense-clause naming and the remaining restricted Query selection
 and disclosure boundaries remain required work; those public gates stay in place.
+
+
+## Scoped vector scan protocol (2026-09-06, feature branch)
+
+Node scans now support an opt-in initial read receipt and enforce the supplied
+field, authority view and physical version before scan data. Parent-map cache
+publication and use are fenced against same-sized generation replacement. See
+[vector scan views](vector-scan-views.md) for the protocol, evidence and pending
+public coordinator and relay integration. This does not complete public Query
+authorization or stable public identity.

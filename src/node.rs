@@ -3237,9 +3237,8 @@ pub(crate) struct ShardState {
     /// the index it precedes. `None` when the shard runs without one.
     pub(crate) wal: Option<WalWriter>,
     /// Cached slot -> parent map for collapse scans (lineage parent_id
-    /// per slot). Self-validating: rebuilt whenever its length disagrees
-    /// with the index, cleared on snapshot install.
-    pub(crate) parents: Option<std::sync::Arc<Vec<u64>>>,
+    /// per slot), bound to the physical version that supplied the lineage.
+    pub(crate) parents: Option<ParentMap>,
     /// The shard's mapped-plan binding (`docs/descriptor-mappings.md`
     /// section 4a): RAM authority for the identity every mapped stream
     /// must match. Loaded from the store's kind-6 entry on attach,
@@ -3270,6 +3269,12 @@ pub(crate) struct ShardState {
 /// together.
 pub(crate) const STALE_STATS_EPOCH: &str = "stale stats epoch";
 
+#[derive(Clone)]
+pub(crate) struct ParentMap {
+    claim: crate::stats_identity::StatsClaim,
+    rows: Arc<Vec<u64>>,
+}
+
 impl ShardState {
     /// Never wrap a mutation version into one a coordinator may still hold.
     pub(crate) fn advance_stats_epoch(&mut self) {
@@ -3280,6 +3285,12 @@ impl ShardState {
             self.stats_incarnation = Default::default();
             self.stats_epoch = 1;
         }
+    }
+
+    fn publish_parent_map(&mut self, built: &ParentMap) -> Result<(), Status> {
+        self.check_stats_epoch(built.claim.epoch, &built.claim.incarnation())?;
+        self.parents = Some(built.clone());
+        Ok(())
     }
 
     /// Resolve from the durable generation, never from a caller's field grant.
@@ -3324,6 +3335,72 @@ impl ShardState {
             }
         }
         Ok(binding)
+    }
+
+    /// Capture proof of the physical view before any scan data is emitted.
+    fn vector_read_receipt(
+        &self,
+        context: Option<&crate::pb::VectorReadContext>,
+    ) -> Result<Option<crate::pb::VectorReadReceipt>, Status> {
+        let Some(context) = context else {
+            return Ok(None);
+        };
+        let scope = crate::visibility::VisibilityScope::new(context.visibility.as_ref())?;
+        self.check_stats_epoch(
+            context.expected_stats_epoch,
+            &context.expected_stats_incarnation,
+        )?;
+        let (_, visibility_columns_known) = filter_known_flags(
+            self.bm25.as_ref(),
+            &[],
+            context
+                .visibility
+                .as_ref()
+                .and_then(|view| view.filter.as_ref()),
+        );
+        Ok(Some(crate::pb::VectorReadReceipt {
+            vector_binding: self.vector_binding(&context.field)?,
+            stats_epoch: self.stats_epoch,
+            stats_incarnation: self.stats_incarnation.bytes()?,
+            visibility_fingerprint: scope.fingerprint().to_vec(),
+            visibility_columns_known,
+        }))
+    }
+
+    fn vector_scan_filters(
+        &self,
+        rows: usize,
+        geo_filters: &[crate::pb::GeoFilter],
+        geo_regions: &[crate::geo::GeoRegion],
+        user: Option<&crate::pb::FilterExpr>,
+        context: Option<&crate::pb::VectorReadContext>,
+        prune: bool,
+    ) -> Result<(ResolvedShardFilters, Option<crate::pb::VectorReadReceipt>), Status> {
+        let receipt = self.vector_read_receipt(context)?;
+        let visibility = context.and_then(|context| context.visibility.as_ref());
+        let combined = crate::visibility::intersect_filter(visibility, user.cloned())?;
+        let (filter, mut allow, stats) = resolve_shard_filters(
+            self.bm25.as_ref(),
+            self.live_docs.words(),
+            rows,
+            geo_filters,
+            geo_regions,
+            combined.as_ref(),
+            prune,
+        )?;
+        if visibility.is_some() {
+            // An absent authority column is not permission to include a vector
+            // with no document metadata, even for an IS MISSING predicate.
+            let documents = self
+                .bm25
+                .as_ref()
+                .map_or(0, |store| store.next_doc_id() as usize);
+            let allow = allow.get_or_insert_with(|| vec![true; rows]);
+            for live in allow.iter_mut().skip(documents) {
+                *live = false;
+            }
+        }
+        Ok(((filter, allow, stats), receipt))
     }
 
     /// Evaluate authority predicates only for requested live slots. The FP32
@@ -4338,6 +4415,8 @@ struct ScanOutcome {
 }
 
 struct ScanJob {
+    read_context: Option<crate::pb::VectorReadContext>,
+    ready_tx: mpsc::Sender<Result<SearchShardResponse, Status>>,
     vector: Vec<f32>,
     k: usize,
     tie_complete: bool,
@@ -4438,22 +4517,38 @@ fn run_scan_batch(
             ))));
             continue;
         }
-        let resolved = resolve_shard_filters(
-            guard.bm25.as_ref(),
-            guard.live_docs.words(),
+        let resolved = guard.vector_scan_filters(
             slots,
             &job.geo_filters,
             &job.geo_regions,
             job.filter.as_ref(),
+            job.read_context.as_ref(),
             segment_pruning,
         );
-        let (allow, prune) = match resolved {
-            Ok((_, allow, prune)) => (allow, prune),
+        let (allow, prune, receipt) = match resolved {
+            Ok(((_, allow, prune), receipt)) => (allow, prune, receipt),
             Err(e) => {
                 let _ = job.done.send(Err(e));
                 continue;
             }
         };
+        match receipt {
+            Some(receipt) => {
+                if job
+                    .ready_tx
+                    .blocking_send(Ok(SearchShardResponse {
+                        payload: Some(search_shard_response::Payload::ReadReady(receipt)),
+                    }))
+                    .is_err()
+                {
+                    let _ = job
+                        .done
+                        .send(Err(Status::cancelled("scoped scan response closed")));
+                    continue;
+                }
+            }
+            None => {}
+        }
         prunes.push(prune);
         knowns.push(filter_known_flags(
             guard.bm25.as_ref(),
@@ -5371,46 +5466,44 @@ impl NodeServiceImpl {
             .max_encoding_message_size(max_message_bytes)
     }
 
-    /// Validate an incoming `StartShardSearch` against the index shape.
-    /// turbovec panics on wrong-dim or non-finite queries; the service
-    /// turns both into `INVALID_ARGUMENT` before the scan starts.
-    /// The slot -> parent map for collapse scans: lineage `parent_id`
-    /// per slot, or a high-bit-tagged global id for slots without
-    /// lineage (self-parents; the tag keeps them disjoint from real
-    /// opinion ids). Cached on the shard and rebuilt whenever the index
-    /// length disagrees (append-only ingest makes length the only
-    /// staleness signal; snapshot installs clear the cache explicitly).
+    /// Capture lineage with its physical version. The cache publication and
+    /// each scan's final read guard must both still match that version.
     fn parent_map(
         state: &Arc<std::sync::RwLock<ShardState>>,
         slot_offset: u64,
         n: usize,
-    ) -> Arc<Vec<u64>> {
+    ) -> Result<ParentMap, Status> {
         const SELF_PARENT_TAG: u64 = 1 << 63;
-        {
-            let guard = read_shard(state);
-            if let Some(p) = guard.parents.as_ref() {
-                if p.len() == n {
-                    return Arc::clone(p);
-                }
-            }
-        }
         let built = {
             let guard = read_shard(state);
-            let store = guard.bm25.as_ref().and_then(|b| b.as_index());
-            let mut parents = Vec::with_capacity(n);
-            for slot in 0..n {
-                let parent = store
-                    .and_then(|s| s.lineage(slot as u32))
-                    .map(|l| l.parent_id)
-                    .unwrap_or(SELF_PARENT_TAG | (slot_offset + slot as u64));
-                parents.push(parent);
+            let claim = crate::stats_identity::StatsClaim::required(
+                guard.stats_epoch,
+                &guard.stats_incarnation.bytes()?,
+            )?;
+            if let Some(cached) = &guard.parents {
+                if cached.claim == claim && cached.rows.len() == n {
+                    return Ok(cached.clone());
+                }
             }
-            Arc::new(parents)
+            let store = guard.bm25.as_ref().and_then(|b| b.as_index());
+            let rows = (0..n)
+                .map(|slot| {
+                    store
+                        .and_then(|s| s.lineage(slot as u32))
+                        .map(|l| l.parent_id)
+                        .unwrap_or(SELF_PARENT_TAG | (slot_offset + slot as u64))
+                })
+                .collect();
+            ParentMap {
+                claim,
+                rows: Arc::new(rows),
+            }
         };
-        write_shard(state).parents = Some(Arc::clone(&built));
-        built
+        write_shard(state).publish_parent_map(&built)?;
+        Ok(built)
     }
 
+    /// Validate query coordinates before calling the vector kernel.
     fn validate_start(index: &VectorIndex, start: &StartShardSearch) -> Result<(), Status> {
         let dim = index
             .dim_opt()
@@ -10770,6 +10863,7 @@ impl NodeService for NodeServiceImpl {
                     }
                 };
 
+                let ready_tx = tx.clone();
                 // Collapse-by-parent scans run their own solo path: the
                 // collection semantics (one entry per parent, parent floors,
                 // saturation escalation) do not batch with plain scans.
@@ -10798,12 +10892,14 @@ impl NodeService for NodeServiceImpl {
                         };
                         // parent_map takes its own locks (read to build, write
                         // to cache), so the validation guard is dropped first.
-                        let parents = Self::parent_map(&state, slot_offset, n);
+                        let parents = Self::parent_map(&state, slot_offset, n)?;
                         let guard = read_shard(&state);
                         let index = guard.index.as_ref().ok_or_else(|| {
                             Status::failed_precondition("shard index disappeared mid-setup")
                         })?;
-                        if index.len() != parents.len() {
+                        guard
+                            .check_stats_epoch(parents.claim.epoch, &parents.claim.incarnation())?;
+                        if index.len() != parents.rows.len() {
                             return Err(Status::aborted(
                                 "shard grew between setup and scan; retry",
                             ));
@@ -10813,13 +10909,12 @@ impl NodeService for NodeServiceImpl {
                         // filter is the collapse of the filtered corpus —
                         // still every floor a valid lower bound, still no new
                         // pruning math.
-                        let (_, allow, prune) = resolve_shard_filters(
-                            guard.bm25.as_ref(),
-                            guard.live_docs.words(),
+                        let ((_, allow, prune), receipt) = guard.vector_scan_filters(
                             index.len(),
                             &start.geo_filters,
                             &geo_regions,
                             start.filter.as_ref(),
+                            start.read_context.as_ref(),
                             segment_pruning,
                         )?;
                         let known = filter_known_flags(
@@ -10827,12 +10922,21 @@ impl NodeService for NodeServiceImpl {
                             &start.geo_filters,
                             start.filter.as_ref(),
                         );
+                        if let Some(receipt) = receipt {
+                            ready_tx
+                                .blocking_send(Ok(SearchShardResponse {
+                                    payload: Some(search_shard_response::Payload::ReadReady(
+                                        receipt,
+                                    )),
+                                }))
+                                .map_err(|_| Status::cancelled("scoped scan response closed"))?;
+                        }
                         let (hits, mut stats) = chunked_topk_collapsed(
                             index,
                             &start.vector,
                             start.k as usize,
                             chunk_blocks,
-                            &parents,
+                            &parents.rows,
                             &mut external_floor,
                             &mut publish_floor,
                             allow.as_deref(),
@@ -10915,6 +11019,8 @@ impl NodeService for NodeServiceImpl {
                             Ok(()) => {
                                 let (done_tx, done_rx) = tokio::sync::oneshot::channel();
                                 let job = ScanJob {
+                                    read_context: start.read_context.clone(),
+                                    ready_tx: ready_tx.clone(),
                                     vector: start.vector.clone(),
                                     k: start.k as usize,
                                     tie_complete: start.tie_complete,
@@ -10957,13 +11063,12 @@ impl NodeService for NodeServiceImpl {
                                 )
                             })?;
                             Self::validate_start(index, &start)?;
-                            let (_, allow, prune) = resolve_shard_filters(
-                                guard.bm25.as_ref(),
-                                guard.live_docs.words(),
+                            let ((_, allow, prune), receipt) = guard.vector_scan_filters(
                                 index.len(),
                                 &start.geo_filters,
                                 &geo_regions,
                                 start.filter.as_ref(),
+                                start.read_context.as_ref(),
                                 segment_pruning,
                             )?;
                             let (geo_columns_known, filter_columns_known) = filter_known_flags(
@@ -10971,6 +11076,17 @@ impl NodeService for NodeServiceImpl {
                                 &start.geo_filters,
                                 start.filter.as_ref(),
                             );
+                            if let Some(receipt) = receipt {
+                                ready_tx
+                                    .blocking_send(Ok(SearchShardResponse {
+                                        payload: Some(search_shard_response::Payload::ReadReady(
+                                            receipt,
+                                        )),
+                                    }))
+                                    .map_err(|_| {
+                                        Status::cancelled("scoped scan response closed")
+                                    })?;
+                            }
                             let (hits, mut stats) = chunked_topk(
                                 index,
                                 &start.vector,
@@ -12521,7 +12637,7 @@ impl NodeService for NodeServiceImpl {
                                 let guard = read_shard(&state);
                                 guard.index.as_ref().map_or(0, |index| index.len())
                             };
-                            Some(Self::parent_map(&state, slot_offset, n))
+                            Some(Self::parent_map(&state, slot_offset, n)?)
                         } else {
                             None
                         };
@@ -12548,7 +12664,8 @@ impl NodeService for NodeServiceImpl {
                             )));
                         }
                         if let Some(p) = parents.as_ref() {
-                            if p.len() != index.len() {
+                            guard.check_stats_epoch(p.claim.epoch, &p.claim.incarnation())?;
+                            if p.rows.len() != index.len() {
                                 return Err(Status::aborted(
                                     "shard grew between setup and scan; retry",
                                 ));
@@ -12568,13 +12685,12 @@ impl NodeService for NodeServiceImpl {
                         // "live" means "survived the filters", so the
                         // completion certificate covers the filtered corpus
                         // and means exactly what it meant before.
-                        let (_, allow, prune) = resolve_shard_filters(
-                            guard.bm25.as_ref(),
-                            guard.live_docs.words(),
+                        let ((_, allow, prune), receipt) = guard.vector_scan_filters(
                             index.len(),
                             &start.geo_filters,
                             &geo_regions,
                             start.filter.as_ref(),
+                            start.read_context.as_ref(),
                             segment_pruning,
                         )?;
                         let (geo_columns_known, filter_columns_known) = filter_known_flags(
@@ -12583,6 +12699,11 @@ impl NodeService for NodeServiceImpl {
                             start.filter.as_ref(),
                         );
 
+                        if let Some(receipt) = receipt {
+                            scan_tx.blocking_send(Ok(StreamSearchResponse {
+                                payload: Some(stream_search_response::Payload::ReadReady(receipt)),
+                            })).map_err(|_| Status::cancelled("scoped scan response closed"))?;
+                        }
                         let mut options = VectorSearchOptions::new();
                         if let Some(a) = allow.as_deref() {
                             options = options.with_mask(a);
@@ -12617,8 +12738,8 @@ impl NodeService for NodeServiceImpl {
                                             &(slot_offset + slot as u64).to_le_bytes(),
                                         );
                                         hits.extend_from_slice(&score.to_le_bytes());
-                                        if let Some(p) = parents.as_deref() {
-                                            hits.extend_from_slice(&p[slot as usize].to_le_bytes());
+                                        if let Some(p) = parents.as_ref() {
+                                            hits.extend_from_slice(&p.rows[slot as usize].to_le_bytes());
                                         }
                                     }
                                     let sent = scan_tx.blocking_send(Ok(StreamSearchResponse {
@@ -15572,5 +15693,135 @@ mod snapshot_publication_tests {
             assert_eq!(image.binding(), Some(&binding));
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod vector_scan_view_tests {
+    use super::*;
+
+    #[test]
+    fn one_coalesced_pass_keeps_each_jobs_authority_and_rejects_only_the_bad_job() {
+        let mut store = crate::postings::Bm25Store::new().with_facets(&["audience"]);
+        for (row, audience) in ["public", "private"].into_iter().enumerate() {
+            store.add_document(
+                row as u32,
+                "word".into(),
+                crate::postings::AnalyzedDoc::body(vec![("word".into(), 1, vec![(0, 4)])], 1),
+            );
+            store.set_facet(0, row as u32, audience);
+        }
+        let mut index =
+            crate::vector::VectorIndex::create(crate::vector::EMBEDDED_TURBOVEC, 16, 4).unwrap();
+        index.add(&vec![0.25; 48], 16).unwrap(); // final row has no document metadata
+        let node = NodeServiceImpl::new(Some(index), Default::default())
+            .with_bm25(Some(Bm25Shard::Building(store)));
+        let mut jobs = Vec::new();
+        let mut outputs = Vec::new();
+        for (field, predicate, expected) in [
+            ("unbound", "audience == 'public'", None),
+            ("", "audience == 'public'", Some(vec![0])),
+            ("", "audience == 'private'", Some(vec![1])),
+            ("", "!has(audience)", Some(vec![])),
+        ] {
+            let context = crate::pb::VectorReadContext {
+                field: field.into(),
+                visibility: Some(crate::pb::DocumentVisibility {
+                    filter: crate::cel::compile_filter(predicate).unwrap(),
+                }),
+                ..Default::default()
+            };
+            let scope =
+                crate::visibility::VisibilityScope::new(context.visibility.as_ref()).unwrap();
+            let (ready_tx, ready_rx) = mpsc::channel(4);
+            let (done, outcome) = tokio::sync::oneshot::channel();
+            jobs.push(ScanJob {
+                read_context: Some(context),
+                ready_tx,
+                vector: vec![0.25; 16],
+                k: 10,
+                tie_complete: false,
+                geo_filters: vec![],
+                geo_regions: vec![],
+                filter: None,
+                external: Box::new(|| None),
+                publish: Box::new(|_| false),
+                done,
+            });
+            outputs.push((scope, expected, ready_rx, outcome));
+        }
+        run_scan_batch(&node.state, 1, true, jobs);
+        for (scope, expected, mut ready, outcome) in outputs {
+            let result = outcome.blocking_recv().unwrap();
+            if let Some(expected) = expected {
+                let search_shard_response::Payload::ReadReady(receipt) =
+                    ready.blocking_recv().unwrap().unwrap().payload.unwrap()
+                else {
+                    panic!("missing read receipt")
+                };
+                scope
+                    .validate_echo(
+                        &receipt.visibility_fingerprint,
+                        &receipt.visibility_columns_known,
+                    )
+                    .unwrap();
+                assert_eq!(receipt.visibility_columns_known, vec![true]);
+                assert_eq!(
+                    result
+                        .unwrap()
+                        .hits
+                        .into_iter()
+                        .map(|hit| hit.slot)
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+            } else {
+                assert_eq!(
+                    result.err().unwrap().code(),
+                    tonic::Code::FailedPrecondition
+                );
+                assert!(ready.blocking_recv().is_none());
+            }
+        }
+    }
+    #[test]
+    fn parent_cache_cannot_cross_same_sized_replacements_or_publish_an_old_build() {
+        fn store(parent: u64) -> Bm25Shard {
+            let mut store = crate::postings::Bm25Store::new();
+            store.add_document_with_lineage(
+                0,
+                "word".into(),
+                crate::postings::AnalyzedDoc::body(vec![("word".into(), 1, vec![(0, 4)])], 1),
+                Some(crate::postings::DocLineage {
+                    parent_id: parent,
+                    group_id: 0,
+                    span_start: 0,
+                    span_end: 4,
+                }),
+            );
+            Bm25Shard::Building(store)
+        }
+        let node = NodeServiceImpl::new(None, Default::default()).with_bm25(Some(store(10)));
+        let old = NodeServiceImpl::parent_map(&node.state, 100, 1).unwrap();
+        assert_eq!(old.rows.as_slice(), &[10]);
+        let node = node.with_bm25(Some(store(20)));
+        let fresh = NodeServiceImpl::parent_map(&node.state, 100, 1).unwrap();
+        assert_eq!(fresh.rows.as_slice(), &[20]);
+        assert_ne!(fresh.claim, old.claim);
+        let mut guard = write_shard(&node.state);
+        // This is the publication gap: an old read finishes building after
+        // a replacement and must not overwrite its cache with old lineage.
+        assert_eq!(
+            guard.publish_parent_map(&old).unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(guard.parents.as_ref().unwrap().rows.as_slice(), &[20]);
+        // The scan takes its final read guard after obtaining the cache.
+        assert!(guard
+            .check_stats_epoch(old.claim.epoch, &old.claim.incarnation())
+            .is_err());
+        guard
+            .check_stats_epoch(fresh.claim.epoch, &fresh.claim.incarnation())
+            .unwrap();
     }
 }

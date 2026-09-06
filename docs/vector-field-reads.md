@@ -42,6 +42,10 @@ exactly once. An invisible or absent candidate produces no node score, and the
 coordinator refuses an incomplete exact candidate set instead of returning a
 partial result.
 
+The [scan protocol integration](vector-scan-views.md) adds opt-in initial
+receipts to classic and streaming vector scans. Public coordinator integration
+remains required before those scans can serve restricted Query requests.
+
 ## Authorization boundary and compatibility
 
 Private coordinator execution requires `Use` on the requested vector field.

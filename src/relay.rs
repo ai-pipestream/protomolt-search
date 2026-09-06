@@ -1884,6 +1884,11 @@ impl NodeService for RelayService {
                     ))
                 }
             };
+            if start.read_context.is_some() {
+                return Err(Status::failed_precondition(
+                    "relay does not yet compose scoped vector read receipts",
+                ));
+            }
             if start.initial_floor.is_some_and(f32::is_nan) {
                 return Err(Status::invalid_argument("initial_floor must not be NaN"));
             }

@@ -238,6 +238,7 @@ macro_rules! scoped_read_responses {
 }
 scoped_read_responses!(
     MembershipBitmapResponse,
+    VectorReadReceipt,
     VectorRescoreResponse,
     ExactVectorRescoreResponse,
     BrowseShardResponse,

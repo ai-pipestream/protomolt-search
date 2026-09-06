@@ -70,6 +70,9 @@ async fn drive_scan(addr: &str, query: &[f32], inject_floor: Option<f32>) -> Sca
                         floor_updates_seen,
                     };
                 }
+                Some(search_shard_response::Payload::ReadReady(_)) => {
+                    panic!("legacy scan unexpectedly opted into a read context")
+                }
                 None => panic!("empty response payload"),
             },
             None => panic!("stream closed before Done"),
