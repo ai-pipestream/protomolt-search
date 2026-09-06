@@ -1964,19 +1964,13 @@ pub(crate) fn validate_geo_filter(
 /// dropped; `nanos` is non-negative in a valid Timestamp, so the drop
 /// always floors toward negative infinity and the unit contract holds
 /// on both sides of the epoch. Everything that could make the stored
-/// value a lie instead refuses: `nanos` outside its declared range,
-/// an overflowing conversion. Integer presence is tracked separately.
+/// value invalid instead refuses: seconds outside years 0001 through 9999
+/// or nanos outside [0, 1e9). Integer presence is tracked separately.
 pub(crate) fn timestamp_to_epoch_micros(
     field: &str,
     ts: &prost_types::Timestamp,
 ) -> Result<i64, Status> {
-    if !(0..1_000_000_000).contains(&ts.nanos) {
-        return Err(Status::invalid_argument(format!(
-            "timestamp field {field:?}: nanos {} is outside [0, 1e9) — not a valid \
-             google.protobuf.Timestamp",
-            ts.nanos
-        )));
-    }
+    crate::protobuf::validate_timestamp(field, ts)?;
     let micros = ts
         .seconds
         .checked_mul(1_000_000)

@@ -10,6 +10,29 @@ use prost_reflect::{
 };
 use tonic::Status;
 
+/// Validate Timestamp's semantic domain before deriving any index value.
+/// Protobuf decoding alone accepts every int64/int32 pair.
+pub(crate) fn validate_timestamp(
+    field: &str,
+    timestamp: &prost_types::Timestamp,
+) -> Result<(), Status> {
+    if !(-62_135_596_800..=253_402_300_799).contains(&timestamp.seconds) {
+        return Err(Status::invalid_argument(format!(
+            "timestamp field {field:?}: seconds {} is outside [-62135596800, 253402300799] \
+             (years 0001 through 9999), not a valid google.protobuf.Timestamp",
+            timestamp.seconds
+        )));
+    }
+    if !(0..1_000_000_000).contains(&timestamp.nanos) {
+        return Err(Status::invalid_argument(format!(
+            "timestamp field {field:?}: nanos {} is outside [0, 1e9), \
+             not a valid google.protobuf.Timestamp",
+            timestamp.nanos
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn decode(
     descriptor: MessageDescriptor,
     bytes: &[u8],
@@ -256,6 +279,40 @@ fn validate_value(value: &Value, path: &str) -> Result<(), Status> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn timestamp_domain_and_microsecond_floor() {
+        for (seconds, nanos, expected) in [
+            (-62_135_596_800, 0, -62_135_596_800_000_000),
+            (253_402_300_799, 999_999_999, 253_402_300_799_999_999),
+            (-1, 999_999_999, -1),
+            (-1, 1, -1_000_000),
+            (0, 999, 0),
+            (0, 1_000, 1),
+            (0, 0, 0),
+        ] {
+            let value = prost_types::Timestamp { seconds, nanos };
+            assert_eq!(
+                crate::node::timestamp_to_epoch_micros("instant", &value).unwrap(),
+                expected
+            );
+        }
+        for (seconds, nanos) in [
+            (-62_135_596_801, 999_999_999),
+            (253_402_300_800, 0),
+            (i64::MIN, 0),
+            (i64::MAX, 0),
+            (0, -1),
+            (0, 1_000_000_000),
+        ] {
+            let error = crate::node::timestamp_to_epoch_micros(
+                "instant",
+                &prost_types::Timestamp { seconds, nanos },
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        }
+    }
+
     use super::*;
     use prost_reflect::DescriptorPool;
     use serde_json::{json, Value as Json};

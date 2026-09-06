@@ -977,10 +977,23 @@ async fn timestamps_land_as_epoch_micros_in_the_integer_column() {
     let overflow = stamped("some text", i64::MAX, 0);
     let err = send(addr.clone(), vec![overflow]).await.unwrap_err();
     assert!(
-        err.message().contains("does not fit i64 epoch micros"),
+        err.message().contains("seconds") && err.message().contains("9999"),
         "{}",
         err.message()
     );
+
+    for (seconds, nanos) in [
+        (-62_135_596_801, 0),
+        (253_402_300_800, 0),
+        (i64::MIN, 0),
+        (0, 1_000_000_000),
+    ] {
+        let error = send(addr.clone(), vec![stamped("some text", seconds, nanos)])
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("filed_at"), "{error}");
+    }
 
     let bad_nanos = stamped("some text", JAN_2024, -1);
     let err = send(addr.clone(), vec![bad_nanos]).await.unwrap_err();

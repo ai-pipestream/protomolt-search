@@ -1824,3 +1824,123 @@ async fn chunked_refusals_name_document_chunk_and_field() {
     assert_eq!(response.added, 2);
     assert_eq!(response.parents, 1);
 }
+
+#[test]
+fn timestamp_projection_rejects_incompatible_named_descriptors() {
+    use pipestream_search::mapping::{derive_plan, describe_schema};
+    for change in 0..9 {
+        let mut set = FileDescriptorSet::decode(case_set().as_slice()).unwrap();
+        let timestamp = &mut set.file[0].message_type[0];
+        match change {
+            0 => {
+                timestamp.field.remove(0);
+            }
+            1 => timestamp.field[0].r#type = Some(Type::String as i32),
+            2 => timestamp.field[0].number = Some(3),
+            3 => timestamp.field[0].name = Some("renamed".into()),
+            4 => timestamp.field[0].label = Some(Label::Repeated as i32),
+            5 => timestamp.field[0].default_value = Some("9".into()),
+            6 => timestamp.field[0].r#type = Some(Type::Sint64 as i32),
+            7 => timestamp.field[1].r#type = Some(Type::Int64 as i32),
+            8 => {
+                timestamp
+                    .oneof_decl
+                    .push(prost_types::OneofDescriptorProto {
+                        name: Some("parts".into()),
+                        ..Default::default()
+                    });
+                timestamp.field[0].oneof_index = Some(0);
+                timestamp.field[1].oneof_index = Some(0);
+            }
+            _ => unreachable!(),
+        }
+        let bytes = set.encode_to_vec();
+        // These are valid user-defined protobuf schemas. They can be retained
+        // and described, but their name must not confer Timestamp projection.
+        describe_schema(&bytes, "law.v1.Case").unwrap();
+        let error = derive_plan(&bytes, "law.v1.Case")
+            .err()
+            .expect("invalid Timestamp shape");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("created_at"), "{change}: {error}");
+        assert!(error.message().contains("Timestamp"), "{change}: {error}");
+    }
+}
+
+#[test]
+fn timestamp_projection_validates_instants_and_preserves_message_presence() {
+    use pipestream_search::mapping::Extractor;
+    let extractor = Extractor::new(&case_set(), "law.v1.Case", "title").unwrap();
+    let base = CaseDoc {
+        id: Some("instant".into()),
+        title: Some("body".into()),
+        embedding: vec![1.0, 0.0],
+        ..Default::default()
+    };
+    let absent = extractor.extract(&base.encode()).unwrap();
+    assert!(absent[0].request.timestamps.is_empty());
+    for (seconds, nanos) in [
+        (-62_135_596_800, 0),
+        (253_402_300_799, 999_999_999),
+        (-1, 999_999_999),
+        (0, 0),
+        (0, 1),
+    ] {
+        // Use generated Timestamp encoding, including omitted scalar defaults,
+        // and compare the extracted value with the original typed instant.
+        let timestamp = prost_types::Timestamp { seconds, nanos };
+        let mut wire = base.encode();
+        w_msg(&mut wire, 6, &timestamp.encode_to_vec());
+        let rows = extractor.extract(&wire).unwrap();
+        assert_eq!(rows[0].request.timestamps[0].value, Some(timestamp));
+    }
+    let mut merged = base.encode();
+    w_msg(
+        &mut merged,
+        6,
+        &prost_types::Timestamp {
+            seconds: -1,
+            nanos: 0,
+        }
+        .encode_to_vec(),
+    );
+    w_msg(
+        &mut merged,
+        6,
+        &prost_types::Timestamp {
+            seconds: 0,
+            nanos: 999_999_999,
+        }
+        .encode_to_vec(),
+    );
+    let rows = extractor.extract(&merged).unwrap();
+    assert_eq!(
+        rows[0].request.timestamps[0].value,
+        Some(prost_types::Timestamp {
+            seconds: -1,
+            nanos: 999_999_999
+        })
+    );
+
+    for (seconds, nanos) in [
+        (-62_135_596_801, 0),
+        (253_402_300_800, 0),
+        (i64::MIN, 0),
+        (i64::MAX, 0),
+        (0, -1),
+        (0, 1_000_000_000),
+    ] {
+        let mut wire = base.encode();
+        w_msg(
+            &mut wire,
+            6,
+            &prost_types::Timestamp { seconds, nanos }.encode_to_vec(),
+        );
+        let error = extractor
+            .extract(&wire)
+            .err()
+            .expect("invalid Timestamp instant");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("created_at"), "{error}");
+    }
+}

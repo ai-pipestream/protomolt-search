@@ -42,6 +42,28 @@ The ownership move is decided (descriptor-derived mappings belong to
 pipestream-search, not turbovec-grpc), and the reference implementation
 is frozen in turbovec-grpc git history.
 
+## Timestamp projection validation (2026-09-05, feature branch)
+
+A DATE projection validates the descriptor's `seconds` field as int64 number 1
+and `nanos` as int32 number 2, both singular optional fields with default zero
+and no oneof membership. A matching type name alone is insufficient. Compatible
+proto2 descriptors are accepted; filenames, language options and extra source
+fields do not alter these requirements. Source-only description remains
+available for incompatible schemas. The extractor no longer substitutes zero
+for missing or incorrectly typed descriptor components.
+
+Mapped and direct timestamp ingest enforce protobuf's years 0001 through 9999
+and nonnegative nanos below one billion. An absent Timestamp remains absent;
+an explicitly present empty message is the epoch. Components merge before
+validation and projection. Queries retain the existing floor-to-microseconds
+contract; original source bytes retain nanoseconds.
+
+Valid projections, stored formats and plan fingerprints are unchanged. New
+planning refuses incompatible DATE descriptors. Previously accepted out-of-range
+instants in images are not rewritten; WAL replay containing them now refuses.
+Correct such source data and rebuild its generation instead of normalizing it
+silently. Unaffected generations do not need a rebuild for this validation fix.
+
 ## Unsigned numeric mapping (2026-09-05, feature branch)
 
 Unhinted `uint32`/`fixed32` fields derive `UINT32`; `uint64`/`fixed64` derive

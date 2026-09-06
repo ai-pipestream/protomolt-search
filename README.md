@@ -1222,6 +1222,12 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Timestamp semantics (2026-09-05, feature branch).** DATE plans verify the
+  descriptor components instead of trusting a well-known type name. Mapped and
+  direct ingest reject instants outside protobuf's domain; valid values retain
+  presence and the existing microsecond projection. Source-only inspection
+  remains available. See [descriptor mappings](docs/descriptor-mappings.md#timestamp-projection-validation-2026-09-05-feature-branch).
+
 - **Typed column statistics (2026-09-05, feature branch).** Signed and unsigned
   columns now return exact extrema and 128-bit sums alongside the existing
   double summaries. Count plus the exact sum defines an exact rational mean.

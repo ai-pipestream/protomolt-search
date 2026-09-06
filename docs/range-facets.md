@@ -117,16 +117,14 @@ timestamp kind, no timestamp read path, and nothing downstream that
 knows a column was fed by a clock: range facets and score stages over
 it work in epoch micros like any other integer.
 
-Micros because i64 micros spans roughly year -290307 to +294247, which
-covers every court date with six orders of magnitude to spare, while
-i64 nanos would run out in 2262. The sub-microsecond remainder is not
-representable and is dropped — `nanos` is non-negative in a valid
-Timestamp, so the drop always floors toward negative infinity and the
-unit contract reads the same on both sides of the epoch. A producer
-that needs nanosecond identity sends an `IntegerValue` and owns the
-unit itself. Everything that could make the stored number a lie
-refuses instead: `nanos` outside `[0, 1e9)`, a conversion that
-overflows i64.
+The accepted instant range is protobuf Timestamp's years 0001 through 9999:
+seconds in `[-62135596800, 253402300799]` and nanos in `[0, 999999999]`.
+The larger domain of an i64 microsecond column does not expand this range.
+Mapped DATE extraction and direct timestamp ingest enforce the same validation.
+The submicrosecond remainder is dropped, flooring toward negative infinity
+on both sides of the epoch. Original protobuf sources retain their nanos.
+Applications needing a different epoch, range or unit can use `IntegerValue`
+with an explicit application contract. See the [protobuf Timestamp definition](https://protobuf.dev/reference/protobuf/google.protobuf/#timestamp).
 
 The WAL keeps the request verbatim, so replay redoes the conversion
 from the same instant rather than copying a copy — and reshard derives

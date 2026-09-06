@@ -2139,8 +2139,8 @@ message UnsignedIntegerValue {
 // IntegerValue: the NODE converts the instant to EPOCH MICROSECONDS
 // and stores it in the named i64 column, so range facets and score
 // stages over the column work in epoch micros and nothing downstream
-// knows about timestamps. i64 micros spans roughly year -290307 to
-// +294247, which covers every court date by a wide margin.
+// knows about timestamps. The instant must be within protobuf Timestamp
+// years 0001 through 9999; the wider i64 column does not extend that domain.
 //
 // Sub-microsecond precision is NOT representable and is dropped: the
 // conversion floors toward negative infinity (nanos are always >= 0 in
@@ -2154,7 +2154,8 @@ message TimestampValue {
   // valued by both `integers` and `timestamps` in one document is
   // INVALID_ARGUMENT — a document holds one value per column.
   string field = 1;
-  // The instant. Refused when the epoch-micros conversion overflows i64.
+  // The instant. Seconds must be in [-62135596800, 253402300799] and
+  // nanos in [0, 999999999]. Invalid values return INVALID_ARGUMENT.
   google.protobuf.Timestamp value = 2;
 }
 

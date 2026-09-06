@@ -573,3 +573,24 @@ existing declarations are unchanged: ColumnStats adds value_type (8) and an
 exact_integer oneof with signed (9) and unsigned (10), plus the two four-field exact
 summary messages. This is a feature-branch checkpoint, with no main merge or
 fleet operation.
+
+Timestamp DATE projection now checks descriptor components before returning a
+plan and validates the protobuf instant domain during extraction. Direct
+TimestampValue ingest, placement extraction and WAL-derived resharding use the
+same value validation. Original-byte preservation remains separate: an
+incompatible named descriptor can still be inspected without an index plan.
+Regression tests first reproduced acceptance of malformed Timestamp descriptors
+and out-of-range mapped instants, then verified refusal alongside presence,
+merged components, valid endpoints and negative-time microsecond flooring.
+Valid plan fingerprints and stored representations are unchanged. See
+[Timestamp projection validation](descriptor-mappings.md#timestamp-projection-validation-2026-09-05-feature-branch)
+for recovery compatibility. This does not complete configurable well-known-type
+projections or the other foundation requirements above.
+
+Timestamp validation on 2026-09-05: 434 library tests, 548 integration tests
+across 97 targets and 11 embedded tests passed, with one existing sidecar test
+ignored and no retries. All five Android/iOS Rust target checks passed with the
+three existing relay dead-code warnings. Tests/examples compilation, formatting,
+vendored-proto identity and whitespace checks passed. Public protobuf
+declarations are unchanged; comments now document the accepted instant range.
+These are local checks, not on-device or fleet deployment evidence.

@@ -868,6 +868,11 @@ fn validate_hint(
             "a DATE hint requires a google.protobuf.Timestamp field",
         ));
     }
+    if hint.kind == pb::MappedKind::Date && !is_repeated(field) {
+        if let Shape::Message { entry, .. } = shape {
+            validate_timestamp_descriptor(entry.desc, path)?;
+        }
+    }
     if hint.kind == pb::MappedKind::Vector {
         let element_ok = matches!(shape, Shape::Scalar(Type::Float | Type::Double));
         if !is_repeated(field) || !element_ok {
@@ -919,6 +924,38 @@ fn validate_hint(
             return Err(refuse_at(
                 path,
                 format!("{role_name} requires an integer or string field"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A well-known name alone is not evidence of its wire or default semantics.
+/// Compatible proto2 descriptors are accepted, but their defaults must remain
+/// zero and the components must not select a oneof or repeat. Extra source
+/// fields remain preserved; only the two standard components project.
+fn validate_timestamp_descriptor(message: &DescriptorProto, path: &str) -> Result<(), Status> {
+    use prost_types::field_descriptor_proto::{Label, Type};
+    for (name, number, kind) in [("seconds", 1, Type::Int64), ("nanos", 2, Type::Int32)] {
+        let valid = message.field.iter().any(|field| {
+            field.name() == name
+                && field.number() == number
+                && field.r#type() == kind
+                && field.label() == Label::Optional
+                && field.oneof_index.is_none()
+                && field
+                    .default_value
+                    .as_deref()
+                    .is_none_or(|value| value.parse::<i64>() == Ok(0))
+        });
+        if !valid {
+            return Err(refuse_at(
+                path,
+                format!(
+                    "google.protobuf.Timestamp requires singular {name} = {number} of type {} \
+                 with default zero and no oneof",
+                    kind.as_str_name()
+                ),
             ));
         }
     }
@@ -2204,16 +2241,28 @@ fn project_leaf(leaf: &Leaf, value: &Value) -> Result<Slot, Status> {
         (Land::Uint, Value::U64(v)) => Slot::Uint(*v),
         (Land::Num, Value::F32(v)) => Slot::Num(f64::from(*v)),
         (Land::Num, Value::F64(v)) => Slot::Num(*v),
-        (Land::Date, Value::Message(v)) => Slot::Ts {
-            seconds: v
+        (Land::Date, Value::Message(v)) => {
+            let seconds = v
                 .get_field_by_name("seconds")
                 .and_then(|v| v.as_i64())
-                .unwrap_or_default(),
-            nanos: v
+                .ok_or_else(|| {
+                    refuse_at(
+                        &leaf.path,
+                        "Timestamp seconds does not match its descriptor",
+                    )
+                })?;
+            let nanos = v
                 .get_field_by_name("nanos")
                 .and_then(|v| v.as_i32())
-                .unwrap_or_default(),
-        },
+                .ok_or_else(|| {
+                    refuse_at(&leaf.path, "Timestamp nanos does not match its descriptor")
+                })?;
+            crate::protobuf::validate_timestamp(
+                &leaf.path,
+                &prost_types::Timestamp { seconds, nanos },
+            )?;
+            Slot::Ts { seconds, nanos }
+        }
         (Land::Vector, Value::List(values)) => Slot::Floats(
             values
                 .iter()

@@ -243,7 +243,7 @@ fn projection(
             }
         }
         if mapped.kind == pb::MappedKind::Date as i32 {
-            constraints.push("Timestamp queries use signed epoch microseconds; submicrosecond precision remains only in the original.".into());
+            constraints.push("Timestamp projections require seconds in [-62135596800, 253402300799] and nanos in [0, 999999999]. Queries use signed epoch microseconds; submicrosecond precision remains only in the original.".into());
         }
     } else if usage == Use::SourceOnly {
         constraints.push(if mapped.repeated {
