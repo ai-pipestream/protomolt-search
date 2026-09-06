@@ -8,8 +8,11 @@ on main.
 
 Status: proposal, 2026-09-05, reviewed. The restricted, read-only relay
 the review cleared exists (`relay-coordinators.md`: `StreamSearch`,
-`TermStats`, `Health`, a map interface with pinned revisions), and the
-keyword leg now runs through it (`Bm25Query`, `Bm25PhraseQuery`,
+`TermStats`, `Health`, a map interface with pinned revisions), the
+whole read surface now runs through it (as of 2026-09-06: `SearchShard`,
+the rescore routes, the bitmap routes, the dictionaries, and a merged
+`DiagnosticsService`, each with an equivalence test), and the
+keyword leg runs through it (`Bm25Query`, `Bm25PhraseQuery`,
 `Bm25QueryStream`, `Bm25Rescore`, `ShardLegs`, with the root's
 statistics forwarded unchanged and the epoch token translated per
 child); the rest of item 2 and item 3 are not built. The contract
@@ -57,7 +60,10 @@ coordinator to own.
 ## Item 2: a tree of coordinators
 
 Built so far: the restricted relay of `relay-coordinators.md`, with the
-vector stream and the keyword leg through it. What follows is the
+read surface through it: the vector stream and the unary scan, the
+keyword leg, the rescore and bitmap routes, the dictionaries, and
+diagnostics; ingest, aggregation, and fetches by id stay at the root.
+What follows is the
 design it grows toward; the review names the gates.
 
 ### The relay coordinator

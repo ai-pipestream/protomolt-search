@@ -1222,14 +1222,18 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
-- **Open: a pinned shard does not check a direct row against its leaf's
-  predicates (2026-09-05).** `--placement-leaf` fills the placement code on a
-  document that arrives without one, and the node knows only the code, not
-  the tree. A direct `AddDocuments` row outside the leaf's predicates is
-  accepted, and shard pruning and implied-clause dropping both trust the
-  leaf's bounds. Routed ingest cannot produce such a row. The fix is for the
-  node to learn its leaf's predicates from the published topology and refuse
-  the row by name. See [placement](docs/placement.md).
+- **Landed 2026-09-06: the read surface through a relay.** `SearchShard`
+  (the cascade's gate and the unary vector search), `VectorRescore` and
+  `ExactVectorRescore` (decomposed fusion, the FP32 rerank, a boolean
+  group's dense clause), the three bitmap routes (filtered top-level
+  queries and the recursive boolean planner), and the dictionaries
+  (`ExpandTermPrefix`, `SuggestTerms`) forward through a relay
+  coordinator, each with an equivalence test through one and two relay
+  levels. A relay also serves `DiagnosticsService`, answering the root
+  with its children's layouts merged into one. An id in no child's range
+  is dropped on the rescore routes, as a node drops one outside its own
+  range. Still refused: follow-up fetches by id, per-shard fusion, and
+  aggregation. [Relay coordinators](docs/relay-coordinators.md).
 
 - **Full-domain signed numeric columns (2026-09-05).** Integer presence now
   has its own bitmap, so `i64::MIN` survives ingest, materialization, querying,
@@ -1446,6 +1450,16 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   moves within a placement leaf's node set from those rates, excludes a
   device node by declaration, and moves nothing.
   [Bandwidth as the budget](docs/bandwidth-budget.md).
+
+- **Landed 2026-09-06: the tree on the shard, and a re-placement split.**
+  `--placement-tree=<map or table>` gives a pinned node its leaf's
+  predicates: the pinned code must be a leaf of the tree, and a direct row
+  the tree routes elsewhere is refused naming the node that sent it there
+  and the leaf it belongs to, on the values the coordinator routes on. The
+  offline `reshard --placement-tree=<file>` evaluates a NEW tree at replay,
+  rewrites each row's code, and writes one child per leaf shard with the
+  new shard map, spilling per child so memory follows the largest child.
+  [Placement trees](docs/placement.md).
 
 - **Landed 2026-09-05: placement ingest and shard pruning.** Under a
   placement tree the coordinator evaluates the tree per routed document

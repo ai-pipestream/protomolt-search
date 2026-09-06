@@ -36,10 +36,31 @@
 //!   are refused by name (a fold whose order the root pins, and a union
 //!   of values, are not this level's to compute). `Bm25Rescore` routes
 //!   each candidate id to the child whose slot range holds it.
+//! - `SearchShard` (the unary scan the cascade gates on): one child
+//!   stream per child, the parent's floor raises forwarded down and each
+//!   child's up, the children's terminal lists concatenated in score
+//!   order so the parent's merge and the cascade's score-defined pool
+//!   see the same union they see over leaves.
+//! - `VectorRescore` and `ExactVectorRescore`: each id routed to the
+//!   child whose slot range holds it, an id in no child's range dropped
+//!   as a node drops one outside its own range, hits merged in the order
+//!   a node answers in, byte and page counts summed with a check.
+//! - The bitmap routes (`ResolveFilterBitmap`, `ResolveLexicalBitmap`,
+//!   `ResolveVectorBitmap`): the children's bitmaps laid over the relay's
+//!   one contiguous slot range ([`concat_bitmaps`]), a gap refused by
+//!   name, known-column flags merged through each child's implied
+//!   leaves, and the lexical epoch reported as a relay token.
+//! - The dictionaries (`ExpandTermPrefix`, `SuggestTerms`): the union of
+//!   the children's terms in byte order with df summed, a child past the
+//!   cap or the scan bound making the relay answer as a node past it.
+//!
+//! The relay also serves `DiagnosticsService` on the same port
+//! ([`RelayDiagnostics`]): the root asks each shard's address for its
+//! layout, and the relay answers with its children's merged into one.
 //!
 //! Every other `NodeService` route refuses UNIMPLEMENTED naming the route
 //! and the relay: no ingest, no administration, no aggregation, no
-//! follow-up fetches through this level yet.
+//! per-shard fusion, and no follow-up fetches by id through this level.
 //!
 //! The relay never reads its shard map from a file or from the
 //! coordinator's authority directly. It consumes a [`MapSource`]: one
@@ -66,12 +87,13 @@ use crate::metrics::Route;
 use crate::node::STALE_STATS_EPOCH;
 use crate::pb::node_service_server::{NodeService, NodeServiceServer};
 use crate::pb::{
-    bm25_query_stream_request, bm25_query_stream_response, stream_search_request,
-    stream_search_response, Bm25PhraseQueryRequest, Bm25QueryRequest, Bm25QueryResponse,
-    Bm25QueryStreamRequest, Bm25QueryStreamResponse, Bm25RescoreRequest, Bm25RescoreResponse,
-    Bm25StreamCompletion, FloorUpdate, HealthRequest, HealthResponse, ShardLegsRequest,
-    ShardLegsResponse, StopBm25Query, StreamSearchRequest, StreamSearchResponse,
-    StreamSearchSummary, TermStatsRequest, TermStatsResponse,
+    bm25_query_stream_request, bm25_query_stream_response, search_shard_request,
+    search_shard_response, stream_search_request, stream_search_response, Bm25PhraseQueryRequest,
+    Bm25QueryRequest, Bm25QueryResponse, Bm25QueryStreamRequest, Bm25QueryStreamResponse,
+    Bm25RescoreRequest, Bm25RescoreResponse, Bm25StreamCompletion, FloorUpdate, HealthRequest,
+    HealthResponse, SearchShardRequest, SearchShardResponse, ShardLegsRequest, ShardLegsResponse,
+    StopBm25Query, StreamSearchRequest, StreamSearchResponse, StreamSearchSummary,
+    TermStatsRequest, TermStatsResponse,
 };
 
 /// Relay tokens retained per relay; the oldest is forgotten first. A
@@ -501,6 +523,109 @@ impl RelayService {
     }
 }
 
+/// The relay's `DiagnosticsService` (`docs/diagnostics.md`): the
+/// process's own knobs, metrics, and ring as any coordinator's, and one
+/// shard layout for the root, the children's merged
+/// ([`merge_shard_layouts`]). The root asks each shard's address for
+/// its layout, so a relay serves the service on the port the root
+/// already talks to.
+#[derive(Clone)]
+pub struct RelayDiagnostics {
+    relay: RelayService,
+    process: crate::diagnostics::CoordinatorDiagnostics,
+}
+
+impl RelayService {
+    /// The diagnostics service over this relay.
+    pub fn diagnostics(&self) -> RelayDiagnostics {
+        let base: CoordinatorServiceImpl = (**self.base()).clone();
+        RelayDiagnostics {
+            relay: self.clone(),
+            process: crate::diagnostics::CoordinatorDiagnostics::new(
+                vec![(String::new(), base)],
+                None,
+                Arc::new(crate::diagnostics::RecentRing::default()),
+            ),
+        }
+    }
+
+    pub fn diagnostics_server(
+        &self,
+        max_message_bytes: usize,
+    ) -> crate::pb::diagnostics_service_server::DiagnosticsServiceServer<RelayDiagnostics> {
+        self.diagnostics().into_server(max_message_bytes)
+    }
+}
+
+impl RelayDiagnostics {
+    pub fn into_server(
+        self,
+        max_message_bytes: usize,
+    ) -> crate::pb::diagnostics_service_server::DiagnosticsServiceServer<Self> {
+        crate::pb::diagnostics_service_server::DiagnosticsServiceServer::new(self)
+            .max_decoding_message_size(max_message_bytes)
+            .max_encoding_message_size(max_message_bytes)
+    }
+}
+
+#[tonic::async_trait]
+impl crate::pb::diagnostics_service_server::DiagnosticsService for RelayDiagnostics {
+    type StreamMetricsStream =
+        <crate::diagnostics::CoordinatorDiagnostics as crate::pb::diagnostics_service_server::DiagnosticsService>::StreamMetricsStream;
+
+    async fn get_runtime_knobs(
+        &self,
+        request: Request<crate::pb::GetRuntimeKnobsRequest>,
+    ) -> Result<Response<crate::pb::RuntimeKnobs>, Status> {
+        self.process.get_runtime_knobs(request).await
+    }
+
+    async fn set_runtime_knob(
+        &self,
+        request: Request<crate::pb::SetRuntimeKnobRequest>,
+    ) -> Result<Response<crate::pb::RuntimeKnobs>, Status> {
+        self.process.set_runtime_knob(request).await
+    }
+
+    async fn get_metrics_snapshot(
+        &self,
+        request: Request<crate::pb::MetricsSnapshotRequest>,
+    ) -> Result<Response<crate::pb::MetricsSnapshot>, Status> {
+        self.process.get_metrics_snapshot(request).await
+    }
+
+    async fn stream_metrics(
+        &self,
+        request: Request<crate::pb::StreamMetricsRequest>,
+    ) -> Result<Response<Self::StreamMetricsStream>, Status> {
+        self.process.stream_metrics(request).await
+    }
+
+    async fn get_shard_diagnostics(
+        &self,
+        request: Request<crate::pb::ShardDiagnosticsRequest>,
+    ) -> Result<Response<crate::pb::ShardDiagnostics>, Status> {
+        crate::metrics::timed(Route::GetShardDiagnostics, request, |_| async move {
+            let map = self.relay.map();
+            let children = self.relay.children();
+            let layouts = self.relay.base().shard_diagnostics(None).await;
+            Ok(Response::new(crate::pb::ShardDiagnostics {
+                process: self.relay.base().knobs().process().to_string(),
+                topology_generation: map.topology_generation,
+                shards: vec![merge_shard_layouts(&children, &layouts)],
+            }))
+        })
+        .await
+    }
+
+    async fn recent_queries(
+        &self,
+        request: Request<crate::pb::RecentQueriesRequest>,
+    ) -> Result<Response<crate::pb::RecentQueriesResponse>, Status> {
+        self.process.recent_queries(request).await
+    }
+}
+
 /// Apply one parent-facing datagram to the relay's stream registry.
 #[cfg(feature = "net")]
 fn apply_datagram(
@@ -562,9 +687,11 @@ fn grpc_timeout(metadata: &tonic::metadata::MetadataMap) -> Option<Duration> {
 fn refused(route: &str) -> Status {
     Status::unimplemented(format!(
         "relay: NodeService.{route} is not served by a relay coordinator; a relay forwards \
-         StreamSearch, TermStats, Health, GetVectorBackend, and the keyword leg (Bm25Query, \
-         Bm25PhraseQuery, Bm25QueryStream, Bm25Rescore, ShardLegs) only \
-         (docs/relay-coordinators.md)"
+         the read routes only: StreamSearch, SearchShard, TermStats, Health, \
+         GetVectorBackend, the keyword leg (Bm25Query, Bm25PhraseQuery, Bm25QueryStream, \
+         Bm25Rescore, ShardLegs), VectorRescore, ExactVectorRescore, the bitmap routes \
+         (ResolveFilterBitmap, ResolveLexicalBitmap, ResolveVectorBitmap), and the \
+         dictionaries (ExpandTermPrefix, SuggestTerms); see docs/relay-coordinators.md"
     ))
 }
 
@@ -2033,9 +2160,773 @@ impl RelayService {
     }
 }
 
+// --- The vector-side routes, the bitmap routes, and the dictionaries ---
+
+/// The known-column accumulator of one fan-out at this level: geo flags
+/// ORed, filter-leaf flags ORed over the request's tree with each
+/// child's answer mapped through the leaves its placement code implied
+/// away (`ShardMask::implied`: the child was sent a shorter tree and
+/// answers in that order), and the leaves the mask itself resolved
+/// marked from the start (`ShardMask::known`).
+struct KnownFlags {
+    geo: Vec<bool>,
+    tree: Vec<bool>,
+}
+
+impl KnownFlags {
+    fn new(filters: &RequestFilters, mask: Option<&crate::placement::ShardMask>) -> Self {
+        let leaves = filters.tree.as_ref().map_or(0, crate::filter::leaf_count);
+        let mut tree = vec![false; leaves];
+        if let Some(mask) = mask {
+            for &leaf in &mask.known {
+                if let Some(flag) = tree.get_mut(leaf) {
+                    *flag = true;
+                }
+            }
+        }
+        KnownFlags {
+            geo: vec![false; filters.geo.len()],
+            tree,
+        }
+    }
+
+    fn merge(
+        &mut self,
+        child: usize,
+        mask: Option<&crate::placement::ShardMask>,
+        geo: &[bool],
+        tree: &[bool],
+    ) -> Result<(), Status> {
+        if geo.len() != self.geo.len() {
+            return Err(Status::internal(format!(
+                "relay: child {child} answered {} geo-column flags for {} geo filters",
+                geo.len(),
+                self.geo.len()
+            )));
+        }
+        for (acc, k) in self.geo.iter_mut().zip(geo) {
+            *acc |= *k;
+        }
+        let dropped: &[usize] = mask
+            .and_then(|m| m.implied.get(child))
+            .map_or(&[], Vec::as_slice);
+        let kept: Vec<usize> = (0..self.tree.len())
+            .filter(|index| !dropped.contains(index))
+            .collect();
+        if tree.len() != kept.len() {
+            return Err(Status::internal(format!(
+                "relay: child {child} answered {} filter-leaf flags for the {} leaves it was \
+                 sent (of {})",
+                tree.len(),
+                kept.len(),
+                self.tree.len()
+            )));
+        }
+        for (&index, k) in kept.iter().zip(tree) {
+            self.tree[index] |= *k;
+        }
+        Ok(())
+    }
+}
+
+/// The slot range of each child, `(offset, span)`, from the children's
+/// health reports, with the contiguity rule applied: a gap or an overlap
+/// refuses by name, because an id routed by these ranges, or a bitmap
+/// laid out over them, would otherwise be wrong without a word.
+fn child_ranges(
+    collection: &str,
+    children: &[String],
+    reports: &[HealthResponse],
+) -> Result<Vec<(u64, u64)>, Status> {
+    merge_health(collection, children, reports)?;
+    Ok(reports
+        .iter()
+        .map(|r| (r.slot_offset, health_span(r)))
+        .collect())
+}
+
+/// Sort ids into the child whose slot range holds each. An id in no
+/// child's range is another shard's and is dropped, which is what a
+/// node does with an id outside its own range (the boolean planner and
+/// the exact rerank send every shard every candidate; the cascade routes
+/// by shard, and a relay is one shard to it).
+fn route_ids(ranges: &[(u64, u64)], ids: &[u64]) -> Result<Vec<Vec<u64>>, Status> {
+    let mut by_child: Vec<Vec<u64>> = vec![Vec::new(); ranges.len()];
+    for &id in ids {
+        if let Some(child) = child_of_id(ranges, id) {
+            by_child[child].push(id);
+        }
+    }
+    Ok(by_child)
+}
+
+/// Overflow-checked `u64` sum for a counter the children report.
+fn add_count(acc: &mut u64, share: u64, child: usize, what: &str) -> Result<(), Status> {
+    *acc = acc.checked_add(share).ok_or_else(|| {
+        Status::failed_precondition(format!("relay: child {child} overflows the summed {what}"))
+    })?;
+    Ok(())
+}
+
+/// Overflow-checked `u32` sum for a counter the children report.
+fn add_count32(acc: &mut u32, share: u32, child: usize, what: &str) -> Result<(), Status> {
+    *acc = acc.checked_add(share).ok_or_else(|| {
+        Status::failed_precondition(format!("relay: child {child} overflows the summed {what}"))
+    })?;
+    Ok(())
+}
+
+/// One child's packed bitmap as it came back, or nothing for a child the
+/// placement mask skipped (it contributes no member).
+pub struct ChildBitmap {
+    pub base_label: u64,
+    pub label_count: u64,
+    pub bits: Vec<u8>,
+}
+
+/// The children's bitmaps laid over the relay's one slot range: child
+/// `i`'s bits go at `offset_i - base` (its slot offset, which its
+/// `base_label` must equal), every range checked for its declared
+/// length and for zero padding, the relay's `label_count` running to
+/// the end of the last labelled child. Between a child's last label and
+/// the next child's first slot the bits are zero, which is what those
+/// unfilled slots hold on a node too. Returns `(base_label, label_count,
+/// bits)`.
+pub fn concat_bitmaps(
+    children: &[String],
+    ranges: &[(u64, u64)],
+    shares: &[Option<ChildBitmap>],
+) -> Result<(u64, u64, Vec<u8>), Status> {
+    let base = ranges
+        .iter()
+        .map(|&(offset, _)| offset)
+        .min()
+        .ok_or_else(|| Status::failed_precondition("relay: a relay coordinator has no children"))?;
+    let name = |child: usize| children.get(child).map_or("", String::as_str);
+    let mut total: u64 = 0;
+    for (child, share) in shares.iter().enumerate() {
+        let Some(share) = share else {
+            continue;
+        };
+        let (offset, span) = ranges[child];
+        if share.base_label != offset {
+            return Err(Status::failed_precondition(format!(
+                "relay: child {child} ({}) answered a bitmap based at label {} while its slot \
+                 range starts at {offset}",
+                name(child),
+                share.base_label
+            )));
+        }
+        if share.label_count > span {
+            return Err(Status::failed_precondition(format!(
+                "relay: child {child} ({}) answered {} labels over a slot range of {span}",
+                name(child),
+                share.label_count
+            )));
+        }
+        let expected = usize::try_from(share.label_count.div_ceil(8)).map_err(|_| {
+            Status::resource_exhausted("relay: membership bitmap does not fit usize")
+        })?;
+        if share.bits.len() != expected {
+            return Err(Status::internal(format!(
+                "relay: child {child} ({}) answered {} bitmap bytes for {} labels; expected \
+                 {expected}",
+                name(child),
+                share.bits.len(),
+                share.label_count
+            )));
+        }
+        if !share.label_count.is_multiple_of(8)
+            && share.bits.last().is_some_and(|last| {
+                let used = (share.label_count % 8) as u8;
+                *last & !((1u8 << used) - 1) != 0
+            })
+        {
+            return Err(Status::internal(format!(
+                "relay: child {child} ({}) sets padding bits beyond its label count",
+                name(child)
+            )));
+        }
+        let end = (offset - base)
+            .checked_add(share.label_count)
+            .ok_or_else(|| Status::internal("relay: membership label range overflows u64"))?;
+        total = total.max(end);
+    }
+    let bytes = usize::try_from(total.div_ceil(8)).map_err(|_| {
+        Status::resource_exhausted("relay: merged membership bitmap does not fit usize")
+    })?;
+    let mut bits = vec![0u8; bytes];
+    for (child, share) in shares.iter().enumerate() {
+        let Some(share) = share else {
+            continue;
+        };
+        let at = usize::try_from(ranges[child].0 - base)
+            .map_err(|_| Status::resource_exhausted("relay: bitmap offset does not fit usize"))?;
+        let count = usize::try_from(share.label_count).map_err(|_| {
+            Status::resource_exhausted("relay: bitmap label count does not fit usize")
+        })?;
+        or_bits(&mut bits, at, &share.bits, count);
+    }
+    Ok((base, total, bits))
+}
+
+/// OR `count` bits of `src` (LSB-first per byte, the wire packing) into
+/// `dst` starting at bit `at`. Byte-aligned placements copy whole bytes;
+/// the rest walk the set bits.
+fn or_bits(dst: &mut [u8], at: usize, src: &[u8], count: usize) {
+    if at.is_multiple_of(8) {
+        let first = at / 8;
+        for (i, byte) in src.iter().enumerate() {
+            dst[first + i] |= byte;
+        }
+        return;
+    }
+    for (byte_index, byte) in src.iter().copied().enumerate() {
+        let mut held = byte;
+        while held != 0 {
+            let bit = held.trailing_zeros() as usize;
+            let position = byte_index * 8 + bit;
+            if position < count {
+                let target = at + position;
+                dst[target / 8] |= 1 << (target % 8);
+            }
+            held &= held - 1;
+        }
+    }
+}
+
+/// The children's prefix expansions as one dictionary's: the union in
+/// byte order and its exact size when every child stayed within the
+/// cap; a child past the cap answers no terms and a count above it, and
+/// the relay then answers the largest such count (a lower bound on the
+/// subtree's, enough for the root's refusal) and no terms, as a node
+/// past the cap does. `known` when any child knows the field.
+pub fn merge_prefix_expansions(
+    cap: u32,
+    shares: &[crate::pb::ExpandTermPrefixResponse],
+) -> crate::pb::ExpandTermPrefixResponse {
+    let mut union = std::collections::BTreeSet::new();
+    let mut known = false;
+    let mut past_cap: u64 = 0;
+    for share in shares {
+        if !share.known {
+            continue;
+        }
+        known = true;
+        if share.count > u64::from(cap) {
+            past_cap = past_cap.max(share.count);
+            continue;
+        }
+        union.extend(share.terms.iter().cloned());
+    }
+    if past_cap > 0 {
+        return crate::pb::ExpandTermPrefixResponse {
+            terms: Vec::new(),
+            count: past_cap,
+            known,
+        };
+    }
+    let count = union.len() as u64;
+    crate::pb::ExpandTermPrefixResponse {
+        terms: if count > u64::from(cap) {
+            Vec::new()
+        } else {
+            union.into_iter().collect()
+        },
+        count,
+        known,
+    }
+}
+
+/// The children's dictionary scans as one: entries unioned in byte order
+/// with each term's df summed (checked), the tombstone count summed, the
+/// exact union size as the count within the bound; a child past the scan
+/// bound makes the relay answer the largest such count and no entries,
+/// as a node past the bound does.
+pub fn merge_suggest_terms(
+    max_scan: u64,
+    shares: &[crate::pb::SuggestTermsResponse],
+) -> Result<crate::pb::SuggestTermsResponse, Status> {
+    let mut union: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut known = false;
+    let mut tombstoned: u64 = 0;
+    let mut past_bound: u64 = 0;
+    for (child, share) in shares.iter().enumerate() {
+        add_count(
+            &mut tombstoned,
+            share.tombstoned_rows,
+            child,
+            "tombstone count",
+        )?;
+        if !share.known {
+            continue;
+        }
+        known = true;
+        if share.count > max_scan {
+            past_bound = past_bound.max(share.count);
+            continue;
+        }
+        for entry in &share.entries {
+            let df = union.entry(entry.term.clone()).or_insert(0);
+            add_count(df, entry.df, child, "posting frequency")?;
+        }
+    }
+    if past_bound > 0 {
+        return Ok(crate::pb::SuggestTermsResponse {
+            entries: Vec::new(),
+            count: past_bound,
+            known,
+            tombstoned_rows: tombstoned,
+        });
+    }
+    let count = union.len() as u64;
+    Ok(crate::pb::SuggestTermsResponse {
+        entries: if count > max_scan {
+            Vec::new()
+        } else {
+            union
+                .into_iter()
+                .map(|(term, df)| crate::pb::SuggestTermEntry { term, df })
+                .collect()
+        },
+        count,
+        known,
+        tombstoned_rows: tombstoned,
+    })
+}
+
+/// The children's layouts as the one shard the root lists
+/// (`docs/diagnostics.md`): counts summed, the children's segments
+/// concatenated with the child index in front of each segment id, the
+/// knobs true only when every child has them, one placement code when
+/// the children agree and `placement_mixed` when they do not, and a
+/// child whose diagnostics are unserved named in `layout`. The root
+/// relabels `shard` and `address` with the relay's.
+pub fn merge_shard_layouts(
+    children: &[String],
+    layouts: &[crate::pb::ShardLayoutDiagnostics],
+) -> crate::pb::ShardLayoutDiagnostics {
+    let mut merged = crate::pb::ShardLayoutDiagnostics {
+        layout: format!("relay over {} children", layouts.len()),
+        segment_pruning: !layouts.is_empty(),
+        floor_sharing: !layouts.is_empty(),
+        ..Default::default()
+    };
+    let mut notes = Vec::new();
+    let mut partition: Option<String> = None;
+    let mut fingerprint: Option<String> = None;
+    let mut placement: Option<(bool, u64)> = None;
+    for (child, layout) in layouts.iter().enumerate() {
+        let addr = children.get(child).map_or("", String::as_str);
+        let served = layout.layout == "segments" || layout.layout == "single-image";
+        if !served {
+            notes.push(format!(
+                "child {child} ({addr}) unserved: {}",
+                layout.layout
+            ));
+        }
+        merged.rows = merged.rows.saturating_add(layout.rows);
+        merged.live_rows = merged.live_rows.saturating_add(layout.live_rows);
+        merged.tombstones = merged.tombstones.saturating_add(layout.tombstones);
+        merged.tail_rows = merged.tail_rows.saturating_add(layout.tail_rows);
+        merged.catalog_epoch = merged.catalog_epoch.max(layout.catalog_epoch);
+        merged.segment_pruning &= layout.segment_pruning;
+        merged.floor_sharing &= layout.floor_sharing;
+        for segment in &layout.segments {
+            let mut segment = segment.clone();
+            segment.segment_id = format!("child{child}:{}", segment.segment_id);
+            merged.segments.push(segment);
+        }
+        if served {
+            match partition.as_ref() {
+                None => partition = Some(layout.partition_key.clone()),
+                Some(key) if *key != layout.partition_key => {
+                    notes.push(format!(
+                        "child {child} ({addr}) partition key {:?} differs from {key:?}",
+                        layout.partition_key
+                    ));
+                }
+                _ => {}
+            }
+            match fingerprint.as_ref() {
+                None => fingerprint = Some(layout.scoring_fingerprint.clone()),
+                Some(seen) if *seen != layout.scoring_fingerprint => {
+                    notes.push(format!(
+                        "child {child} ({addr}) scoring fingerprint {} differs from {seen}",
+                        layout.scoring_fingerprint
+                    ));
+                }
+                _ => {}
+            }
+            merged.placement_mixed |= layout.placement_mixed;
+            match placement {
+                None => placement = Some((layout.has_placement, layout.placement)),
+                Some(first) if first != (layout.has_placement, layout.placement) => {
+                    merged.placement_mixed = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    merged.partition_key = partition.unwrap_or_default();
+    merged.scoring_fingerprint = fingerprint.unwrap_or_default();
+    if let Some((has_placement, code)) = placement {
+        merged.has_placement = has_placement;
+        merged.placement = code;
+    }
+    if !notes.is_empty() {
+        merged.layout = format!("{}; {}", merged.layout, notes.join("; "));
+    }
+    merged
+}
+
+/// The children's stream and the parent's leg of one relayed
+/// `SearchShard`, dropped together: a return on any path closes the
+/// children's request channels and stops the readers.
+struct ShardLegs {
+    senders: Vec<Option<mpsc::Sender<SearchShardRequest>>>,
+    readers: Vec<tokio::task::JoinHandle<()>>,
+    parent: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for ShardLegs {
+    fn drop(&mut self) {
+        for reader in &self.readers {
+            reader.abort();
+        }
+        if let Some(parent) = &self.parent {
+            parent.abort();
+        }
+    }
+}
+
+enum ShardEvent {
+    Child(usize, Result<Option<SearchShardResponse>, Status>),
+    Parent(Option<Result<SearchShardRequest, Status>>),
+}
+
+fn shard_floor(floor: f32) -> SearchShardRequest {
+    SearchShardRequest {
+        payload: Some(search_shard_request::Payload::FloorUpdate(FloorUpdate {
+            floor,
+        })),
+    }
+}
+
+/// The forwarding loop of one relayed `SearchShard`: one child stream
+/// per child the placement mask keeps, the parent's floor raises
+/// forwarded to every child, each child's raises forwarded to the parent
+/// (a child's k-th best is a lower bound on the relay's, so the parent's
+/// running maximum only tightens), and the children's terminal lists
+/// concatenated in score order. The relay keeps no heap: the parent's
+/// merge picks the top-k from the union exactly as it does over leaves,
+/// and with `tie_complete` the union holds every child's boundary tie
+/// group, so the cascade's score-defined pool is the same set.
+#[allow(clippy::too_many_arguments)]
+async fn relay_shard_search(
+    coordinator: CoordinatorServiceImpl,
+    pinned: MapSnapshot,
+    mut map_changes: watch::Receiver<u64>,
+    start: crate::pb::StartShardSearch,
+    filters: RequestFilters,
+    mut inbound: Streaming<SearchShardRequest>,
+    tx: mpsc::Sender<Result<SearchShardResponse, Status>>,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<(), Status> {
+    map_changes.mark_unchanged();
+    if *map_changes.borrow() != pinned.control_revision {
+        map_changes.mark_changed();
+    }
+    let children = coordinator.node_addresses().to_vec();
+    let n = children.len();
+    if n == 0 {
+        return Err(Status::failed_precondition(
+            "relay: a relay coordinator has no children",
+        ));
+    }
+    let mask = coordinator.shard_mask(filters.tree.as_ref());
+    let mut known = KnownFlags::new(&filters, mask.as_ref());
+    let (event_tx, mut events) = mpsc::channel::<ShardEvent>(64);
+    let mut legs = ShardLegs {
+        senders: vec![None; n],
+        readers: Vec::with_capacity(n),
+        parent: None,
+    };
+    let mut remaining = 0;
+    for (child, addr) in children.iter().enumerate() {
+        if mask.as_ref().is_some_and(|m| m.skipped[child]) {
+            continue;
+        }
+        remaining += 1;
+        let (req_tx, req_rx) = mpsc::channel::<SearchShardRequest>(8);
+        let child_start = crate::pb::StartShardSearch {
+            request_id: start.request_id.clone(),
+            k: start.k,
+            vector: start.vector.clone(),
+            tie_complete: start.tie_complete,
+            collapse_parents: start.collapse_parents,
+            geo_filters: filters.geo.clone(),
+            filter: CoordinatorServiceImpl::shard_filter_tree(&filters, mask.as_ref(), child),
+        };
+        req_tx
+            .try_send(SearchShardRequest {
+                payload: Some(search_shard_request::Payload::Start(child_start)),
+            })
+            .map_err(|_| Status::internal("relay: child request channel refused the Start"))?;
+        legs.senders[child] = Some(req_tx);
+        let mut link = coordinator.node_client(addr)?;
+        let addr = addr.clone();
+        let events = event_tx.clone();
+        legs.readers.push(tokio::spawn(async move {
+            let mut request = Request::new(ReceiverStream::new(req_rx));
+            if let Some(at) = deadline {
+                request.set_timeout(at.saturating_duration_since(tokio::time::Instant::now()));
+            }
+            let mut stream = match link.search_shard(request).await {
+                Ok(response) => response.into_inner(),
+                Err(status) => {
+                    let _ = events
+                        .send(ShardEvent::Child(
+                            child,
+                            Err(child_error(child, &addr, "shard search", status)),
+                        ))
+                        .await;
+                    return;
+                }
+            };
+            loop {
+                let message = stream.message().await;
+                let terminal = !matches!(message, Ok(Some(_)))
+                    || matches!(
+                        message,
+                        Ok(Some(SearchShardResponse {
+                            payload: Some(search_shard_response::Payload::Done(_)),
+                        }))
+                    );
+                let message =
+                    message.map_err(|status| child_error(child, &addr, "shard search", status));
+                if events
+                    .send(ShardEvent::Child(child, message))
+                    .await
+                    .is_err()
+                    || terminal
+                {
+                    return;
+                }
+            }
+        }));
+    }
+    {
+        let events = event_tx;
+        legs.parent = Some(tokio::spawn(async move {
+            loop {
+                let message = inbound.message().await;
+                let terminal = !matches!(message, Ok(Some(_)));
+                let event = match message {
+                    Ok(Some(message)) => ShardEvent::Parent(Some(Ok(message))),
+                    Ok(None) => ShardEvent::Parent(None),
+                    Err(status) => ShardEvent::Parent(Some(Err(status))),
+                };
+                if events.send(event).await.is_err() || terminal {
+                    return;
+                }
+            }
+        }));
+    }
+    let mut hits: Vec<crate::pb::ScoredHit> = Vec::new();
+    let mut stats: Option<crate::pb::ShardScanStats> = None;
+    let mut done = vec![false; n];
+    let mut sleep = deadline.map(|at| Box::pin(tokio::time::sleep_until(at)));
+    while remaining > 0 {
+        let event = tokio::select! {
+            biased;
+            _ = async { sleep.as_mut().expect("guarded").await }, if sleep.is_some() => {
+                return Err(Status::deadline_exceeded(
+                    "relay: the parent's deadline passed before every child completed",
+                ));
+            }
+            moved = map_changes.changed() => match moved {
+                Ok(()) => {
+                    let revision = *map_changes.borrow_and_update();
+                    if revision == pinned.control_revision {
+                        continue;
+                    }
+                    return Err(Status::failed_precondition(format!(
+                        "relay: the shard map moved from revision {} (generation {}) to \
+                         revision {revision} during SearchShard; the scan was opened under the \
+                         older map and is not completed; retry under the current one",
+                        pinned.control_revision, pinned.topology_generation
+                    )));
+                }
+                Err(_) => {
+                    map_changes = watch::channel(pinned.control_revision).1;
+                    continue;
+                }
+            },
+            event = events.recv() => match event {
+                Some(event) => event,
+                None => {
+                    return Err(Status::internal(
+                        "relay: the child readers ended before every child completed",
+                    ))
+                }
+            },
+        };
+        match event {
+            ShardEvent::Parent(Some(Ok(SearchShardRequest {
+                payload: Some(search_shard_request::Payload::FloorUpdate(update)),
+            }))) => {
+                if update.floor.is_nan() {
+                    continue;
+                }
+                for sender in legs.senders.iter().flatten() {
+                    // Floors are monotone: a raise a full channel drops is
+                    // superseded by the next, and a closed child is done.
+                    let _ = sender.try_send(shard_floor(update.floor));
+                }
+            }
+            ShardEvent::Parent(Some(Ok(SearchShardRequest {
+                payload: Some(search_shard_request::Payload::Start(_)),
+            }))) => {
+                return Err(Status::invalid_argument(
+                    "relay: a stream carries one StartShardSearch; another arrived",
+                ));
+            }
+            ShardEvent::Parent(Some(Ok(_))) | ShardEvent::Parent(None) => {}
+            ShardEvent::Parent(Some(Err(status))) => {
+                return Err(Status::cancelled(format!(
+                    "relay: the parent's request leg failed: {}",
+                    status.message()
+                )));
+            }
+            ShardEvent::Child(
+                _,
+                Ok(Some(SearchShardResponse {
+                    payload: Some(search_shard_response::Payload::FloorUpdate(update)),
+                })),
+            ) => {
+                if tx
+                    .send(Ok(SearchShardResponse {
+                        payload: Some(search_shard_response::Payload::FloorUpdate(update)),
+                    }))
+                    .await
+                    .is_err()
+                {
+                    // The parent is gone: nobody reads what the children
+                    // still scan for.
+                    return Ok(());
+                }
+            }
+            ShardEvent::Child(
+                child,
+                Ok(Some(SearchShardResponse {
+                    payload: Some(search_shard_response::Payload::Done(share)),
+                })),
+            ) => {
+                if done[child] {
+                    return Err(Status::internal(format!(
+                        "relay: child {child} ({}) sent a terminal message twice",
+                        children[child]
+                    )));
+                }
+                done[child] = true;
+                remaining -= 1;
+                known.merge(
+                    child,
+                    mask.as_ref(),
+                    &share.geo_columns_known,
+                    &share.filter_columns_known,
+                )?;
+                if let Some(share) = share.stats {
+                    let acc = stats.get_or_insert_with(Default::default);
+                    add_count32(
+                        &mut acc.chunk_calls,
+                        share.chunk_calls,
+                        child,
+                        "chunk calls",
+                    )?;
+                    add_count(
+                        &mut acc.candidates_collected,
+                        share.candidates_collected,
+                        child,
+                        "candidate count",
+                    )?;
+                    add_count(
+                        &mut acc.floors_published,
+                        share.floors_published,
+                        child,
+                        "published floor count",
+                    )?;
+                    add_count(
+                        &mut acc.floor_updates_applied,
+                        share.floor_updates_applied,
+                        child,
+                        "applied floor count",
+                    )?;
+                    add_count(
+                        &mut acc.floors_offered,
+                        share.floors_offered,
+                        child,
+                        "offered floor count",
+                    )?;
+                    add_count32(
+                        &mut acc.segments_total,
+                        share.segments_total,
+                        child,
+                        "segment count",
+                    )?;
+                    add_count32(
+                        &mut acc.segments_skipped,
+                        share.segments_skipped,
+                        child,
+                        "skipped segment count",
+                    )?;
+                }
+                hits.extend(share.hits);
+            }
+            ShardEvent::Child(_, Ok(Some(_))) => {}
+            ShardEvent::Child(child, Ok(None)) => {
+                if !done[child] {
+                    return Err(Status::data_loss(format!(
+                        "relay: child {child} ({}) closed its stream before Done",
+                        children[child]
+                    )));
+                }
+            }
+            ShardEvent::Child(_, Err(status)) => return Err(status),
+        }
+    }
+    if *map_changes.borrow() != pinned.control_revision {
+        return Err(Status::failed_precondition(format!(
+            "relay: the shard map moved from revision {} (generation {}) during SearchShard; \
+             retry under the current one",
+            pinned.control_revision, pinned.topology_generation
+        )));
+    }
+    hits.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.vector_id.cmp(&b.vector_id))
+    });
+    let _ = tx
+        .send(Ok(SearchShardResponse {
+            payload: Some(search_shard_response::Payload::Done(
+                crate::pb::SearchShardDone {
+                    hits,
+                    stats,
+                    geo_columns_known: known.geo,
+                    filter_columns_known: known.tree,
+                },
+            )),
+        }))
+        .await;
+    Ok(())
+}
+
 #[tonic::async_trait]
 impl NodeService for RelayService {
-    type SearchShardStream = ReceiverStream<Result<crate::pb::SearchShardResponse, Status>>;
+    type SearchShardStream =
+        crate::metrics::Timed<ReceiverStream<Result<SearchShardResponse, Status>>>;
     type StreamSearchStream =
         crate::metrics::Timed<ReceiverStream<Result<StreamSearchResponse, Status>>>;
     type Bm25QueryStreamStream =
@@ -2242,9 +3133,56 @@ impl NodeService for RelayService {
 
     async fn search_shard(
         &self,
-        _request: Request<Streaming<crate::pb::SearchShardRequest>>,
+        request: Request<Streaming<SearchShardRequest>>,
     ) -> Result<Response<Self::SearchShardStream>, Status> {
-        Err(refused("SearchShard"))
+        crate::metrics::timed_stream(Route::SearchShard, request, |request| async move {
+            let deadline =
+                grpc_timeout(request.metadata()).map(|d| tokio::time::Instant::now() + d);
+            let mut inbound = request.into_inner();
+            let start = match inbound.message().await? {
+                Some(SearchShardRequest {
+                    payload: Some(search_shard_request::Payload::Start(start)),
+                }) => start,
+                _ => {
+                    return Err(Status::invalid_argument(
+                        "first SearchShardRequest must be StartShardSearch",
+                    ))
+                }
+            };
+            crate::node::validate_geo_filters(&start.geo_filters)?;
+            if let Some(f) = start.filter.as_ref() {
+                crate::filter::validate_filter(f)?;
+            }
+            let filters = RequestFilters {
+                geo: start.geo_filters.clone(),
+                tree: start.filter.clone(),
+            };
+            let (tx, rx) = mpsc::channel::<Result<SearchShardResponse, Status>>(64);
+            let (pinned, frozen) = self.pin();
+            let map_changes = self.inner.map.changes();
+            tokio::spawn(async move {
+                let work = relay_shard_search(
+                    frozen,
+                    pinned,
+                    map_changes,
+                    start,
+                    filters,
+                    inbound,
+                    tx.clone(),
+                    deadline,
+                );
+                let result = tokio::select! {
+                    _ = tx.closed() => Err(Status::cancelled("relay: parent response closed")),
+                    result = work => result,
+                };
+                if let Err(status) = result {
+                    let _ = tokio::time::timeout(Duration::from_millis(250), tx.send(Err(status)))
+                        .await;
+                }
+            });
+            Ok(Response::new(ReceiverStream::new(rx)))
+        })
+        .await
     }
 
     async fn add_vectors(
@@ -2454,16 +3392,90 @@ impl NodeService for RelayService {
 
     async fn expand_term_prefix(
         &self,
-        _request: Request<crate::pb::ExpandTermPrefixRequest>,
+        request: Request<crate::pb::ExpandTermPrefixRequest>,
     ) -> Result<Response<crate::pb::ExpandTermPrefixResponse>, Status> {
-        Err(refused("ExpandTermPrefix"))
+        crate::metrics::timed(Route::ExpandTermPrefix, request, |request| async move {
+            let timeout = grpc_timeout(request.metadata());
+            let req = request.into_inner();
+            let (pinned, frozen) = self.pin();
+            let children = frozen.node_addresses().to_vec();
+            if children.is_empty() {
+                return Err(Status::failed_precondition(
+                    "relay: a relay coordinator has no children",
+                ));
+            }
+            let mut tasks = Vec::with_capacity(children.len());
+            for (shard, addr) in children.iter().enumerate() {
+                let mut link = frozen.node_client(addr)?;
+                let child_req = req.clone();
+                let addr = addr.clone();
+                tasks.push(tokio::spawn(async move {
+                    let mut request = Request::new(child_req);
+                    if let Some(timeout) = timeout {
+                        request.set_timeout(timeout);
+                    }
+                    link.expand_term_prefix(request)
+                        .await
+                        .map(|r| r.into_inner())
+                        .map_err(|status| child_error(shard, &addr, "prefix expansion", status))
+                }));
+            }
+            let mut shares = Vec::with_capacity(children.len());
+            for task in tasks {
+                shares.push(
+                    task.await
+                        .map_err(|e| Status::internal(format!("relay prefix task: {e}")))??,
+                );
+            }
+            let merged = merge_prefix_expansions(req.cap, &shares);
+            self.still_current(&pinned, "ExpandTermPrefix")?;
+            Ok(Response::new(merged))
+        })
+        .await
     }
 
     async fn suggest_terms(
         &self,
-        _request: Request<crate::pb::SuggestTermsRequest>,
+        request: Request<crate::pb::SuggestTermsRequest>,
     ) -> Result<Response<crate::pb::SuggestTermsResponse>, Status> {
-        Err(refused("SuggestTerms"))
+        crate::metrics::timed(Route::SuggestTerms, request, |request| async move {
+            let timeout = grpc_timeout(request.metadata());
+            let req = request.into_inner();
+            let (pinned, frozen) = self.pin();
+            let children = frozen.node_addresses().to_vec();
+            if children.is_empty() {
+                return Err(Status::failed_precondition(
+                    "relay: a relay coordinator has no children",
+                ));
+            }
+            let mut tasks = Vec::with_capacity(children.len());
+            for (shard, addr) in children.iter().enumerate() {
+                let mut link = frozen.node_client(addr)?;
+                let child_req = req.clone();
+                let addr = addr.clone();
+                tasks.push(tokio::spawn(async move {
+                    let mut request = Request::new(child_req);
+                    if let Some(timeout) = timeout {
+                        request.set_timeout(timeout);
+                    }
+                    link.suggest_terms(request)
+                        .await
+                        .map(|r| r.into_inner())
+                        .map_err(|status| child_error(shard, &addr, "dictionary scan", status))
+                }));
+            }
+            let mut shares = Vec::with_capacity(children.len());
+            for task in tasks {
+                shares.push(
+                    task.await
+                        .map_err(|e| Status::internal(format!("relay suggest task: {e}")))??,
+                );
+            }
+            let merged = merge_suggest_terms(req.max_scan, &shares)?;
+            self.still_current(&pinned, "SuggestTerms")?;
+            Ok(Response::new(merged))
+        })
+        .await
     }
 
     async fn bm25_query(
@@ -2600,27 +3612,13 @@ impl NodeService for RelayService {
             }
             let claims = self.child_claims(req.expected_stats_epoch, children.len())?;
             // Each candidate goes to the child whose slot range holds it;
-            // the ranges come from the children's health reports.
+            // the ranges come from the children's health reports. An id
+            // in no child's range is another shard's, and is ignored as
+            // a node ignores an id outside its own range: the boolean
+            // planner sends every shard every candidate.
             let reports = self.children_health(&frozen, timeout).await?;
-            let ranges: Vec<(u64, u64)> = reports
-                .iter()
-                .map(|r| (r.slot_offset, health_span(r)))
-                .collect();
-            let mut by_child: Vec<Vec<u64>> = vec![Vec::new(); children.len()];
-            for &id in &req.candidate_ids {
-                match child_of_id(&ranges, id) {
-                    Some(child) => by_child[child].push(id),
-                    None => {
-                        return Err(Status::failed_precondition(format!(
-                            "relay: candidate id {id} is in no child's slot range {:?}",
-                            ranges
-                                .iter()
-                                .map(|(o, s)| format!("{o}..{}", o + s))
-                                .collect::<Vec<_>>()
-                        )));
-                    }
-                }
-            }
+            let ranges = child_ranges(&self.collection, &children, &reports)?;
+            let by_child = route_ids(&ranges, &req.candidate_ids)?;
             let mut tasks = Vec::with_capacity(children.len());
             for (shard, ids) in by_child.into_iter().enumerate() {
                 if ids.is_empty() {
@@ -2689,16 +3687,144 @@ impl NodeService for RelayService {
 
     async fn vector_rescore(
         &self,
-        _request: Request<crate::pb::VectorRescoreRequest>,
+        request: Request<crate::pb::VectorRescoreRequest>,
     ) -> Result<Response<crate::pb::VectorRescoreResponse>, Status> {
-        Err(refused("VectorRescore"))
+        crate::metrics::timed(Route::VectorRescore, request, |request| async move {
+            let timeout = grpc_timeout(request.metadata());
+            let req = request.into_inner();
+            let (pinned, frozen) = self.pin();
+            let children = frozen.node_addresses().to_vec();
+            if children.is_empty() {
+                return Err(Status::failed_precondition(
+                    "relay: a relay coordinator has no children",
+                ));
+            }
+            let reports = self.children_health(&frozen, timeout).await?;
+            let ranges = child_ranges(&self.collection, &children, &reports)?;
+            let by_child = route_ids(&ranges, &req.candidate_ids)?;
+            let mut tasks = Vec::with_capacity(children.len());
+            for (shard, ids) in by_child.into_iter().enumerate() {
+                if ids.is_empty() {
+                    continue;
+                }
+                let mut link = frozen.node_client(&children[shard])?;
+                let child_req = crate::pb::VectorRescoreRequest {
+                    vector: req.vector.clone(),
+                    candidate_ids: ids,
+                };
+                let addr = children[shard].clone();
+                tasks.push(tokio::spawn(async move {
+                    let mut request = Request::new(child_req);
+                    if let Some(timeout) = timeout {
+                        request.set_timeout(timeout);
+                    }
+                    link.vector_rescore(request)
+                        .await
+                        .map(|r| r.into_inner())
+                        .map_err(|status| child_error(shard, &addr, "vector rescore", status))
+                }));
+            }
+            let mut hits = Vec::new();
+            for task in tasks {
+                let share = task
+                    .await
+                    .map_err(|e| Status::internal(format!("relay vector rescore task: {e}")))??;
+                hits.extend(share.hits);
+            }
+            // Score descending, ids ascending: the order one node answers
+            // in, over the union of the children's.
+            hits.sort_by(|a, b| {
+                b.score
+                    .total_cmp(&a.score)
+                    .then_with(|| a.doc_id.cmp(&b.doc_id))
+            });
+            self.still_current(&pinned, "VectorRescore")?;
+            Ok(Response::new(crate::pb::VectorRescoreResponse { hits }))
+        })
+        .await
     }
 
     async fn exact_vector_rescore(
         &self,
-        _request: Request<crate::pb::ExactVectorRescoreRequest>,
+        request: Request<crate::pb::ExactVectorRescoreRequest>,
     ) -> Result<Response<crate::pb::ExactVectorRescoreResponse>, Status> {
-        Err(refused("ExactVectorRescore"))
+        crate::metrics::timed(Route::ExactVectorRescore, request, |request| async move {
+            let timeout = grpc_timeout(request.metadata());
+            let req = request.into_inner();
+            let (pinned, frozen) = self.pin();
+            let children = frozen.node_addresses().to_vec();
+            if children.is_empty() {
+                return Err(Status::failed_precondition(
+                    "relay: a relay coordinator has no children",
+                ));
+            }
+            // The root sends every candidate to every shard and each
+            // shard answers for the ids it owns; here the ids outside the
+            // children's ranges are the other shards' and are ignored the
+            // same way, and only a child that owns some is asked.
+            let reports = self.children_health(&frozen, timeout).await?;
+            let ranges = child_ranges(&self.collection, &children, &reports)?;
+            let mut requested = req.candidate_ids.clone();
+            let mut seen = std::collections::HashSet::with_capacity(requested.len());
+            requested.retain(|id| seen.insert(*id));
+            let by_child = route_ids(&ranges, &requested)?;
+            let mut tasks = Vec::with_capacity(children.len());
+            for (shard, ids) in by_child.into_iter().enumerate() {
+                if ids.is_empty() {
+                    continue;
+                }
+                let mut link = frozen.node_client(&children[shard])?;
+                let child_req = crate::pb::ExactVectorRescoreRequest {
+                    vector: req.vector.clone(),
+                    candidate_ids: ids,
+                    max_logical_bytes: req.max_logical_bytes,
+                };
+                let addr = children[shard].clone();
+                tasks.push(tokio::spawn(async move {
+                    let mut request = Request::new(child_req);
+                    if let Some(timeout) = timeout {
+                        request.set_timeout(timeout);
+                    }
+                    link.exact_vector_rescore(request)
+                        .await
+                        .map(|r| r.into_inner())
+                        .map_err(|status| child_error(shard, &addr, "exact vector rescore", status))
+                }));
+            }
+            let mut merged = crate::pb::ExactVectorRescoreResponse::default();
+            let mut by_id = HashMap::new();
+            for (i, task) in tasks.into_iter().enumerate() {
+                let share = task.await.map_err(|e| {
+                    Status::internal(format!("relay exact vector rescore task: {e}"))
+                })??;
+                add_count(
+                    &mut merged.logical_bytes,
+                    share.logical_bytes,
+                    i,
+                    "logical bytes",
+                )?;
+                add_count(
+                    &mut merged.pages_touched,
+                    share.pages_touched,
+                    i,
+                    "page count",
+                )?;
+                merged.tasks = merged.tasks.saturating_add(share.tasks);
+                for hit in share.hits {
+                    if by_id.insert(hit.doc_id, hit).is_some() {
+                        return Err(Status::failed_precondition(
+                            "relay: exact vector rescore candidate answered by more than one \
+                             child; slot ranges overlap",
+                        ));
+                    }
+                }
+            }
+            // One row per owned id, in request order, as a node answers.
+            merged.hits = requested.iter().filter_map(|id| by_id.remove(id)).collect();
+            self.still_current(&pinned, "ExactVectorRescore")?;
+            Ok(Response::new(merged))
+        })
+        .await
     }
 
     async fn hybrid_shard(
@@ -2783,23 +3909,240 @@ impl NodeService for RelayService {
 
     async fn resolve_filter_bitmap(
         &self,
-        _request: Request<crate::pb::FilterBitmapRequest>,
+        request: Request<crate::pb::FilterBitmapRequest>,
     ) -> Result<Response<crate::pb::FilterBitmapResponse>, Status> {
-        Err(refused("ResolveFilterBitmap"))
+        crate::metrics::timed(Route::ResolveFilterBitmap, request, |request| async move {
+            let timeout = grpc_timeout(request.metadata());
+            let req = request.into_inner();
+            crate::node::validate_geo_filters(&req.geo_filters)?;
+            if let Some(f) = req.filter.as_ref() {
+                crate::filter::validate_filter(f)?;
+            }
+            let filters = RequestFilters {
+                geo: req.geo_filters.clone(),
+                tree: req.filter.clone(),
+            };
+            let (pinned, frozen) = self.pin();
+            let children = frozen.node_addresses().to_vec();
+            if children.is_empty() {
+                return Err(Status::failed_precondition(
+                    "relay: a relay coordinator has no children",
+                ));
+            }
+            let reports = self.children_health(&frozen, timeout).await?;
+            let ranges = child_ranges(&self.collection, &children, &reports)?;
+            let mask = frozen.shard_mask(filters.tree.as_ref());
+            let mut known = KnownFlags::new(&filters, mask.as_ref());
+            let mut tasks = Vec::with_capacity(children.len());
+            for (shard, addr) in children.iter().enumerate() {
+                if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
+                    tasks.push(None);
+                    continue;
+                }
+                let mut link = frozen.node_client(addr)?;
+                let child_req = crate::pb::FilterBitmapRequest {
+                    geo_filters: filters.geo.clone(),
+                    filter: CoordinatorServiceImpl::shard_filter_tree(
+                        &filters,
+                        mask.as_ref(),
+                        shard,
+                    ),
+                };
+                let addr = addr.clone();
+                tasks.push(Some(tokio::spawn(async move {
+                    let mut request = Request::new(child_req);
+                    if let Some(timeout) = timeout {
+                        request.set_timeout(timeout);
+                    }
+                    link.resolve_filter_bitmap(request)
+                        .await
+                        .map(|r| r.into_inner())
+                        .map_err(|status| child_error(shard, &addr, "filter bitmap", status))
+                })));
+            }
+            let mut shares = Vec::with_capacity(children.len());
+            let mut segments_total: u32 = 0;
+            let mut segments_skipped: u32 = 0;
+            for (shard, task) in tasks.into_iter().enumerate() {
+                let Some(task) = task else {
+                    shares.push(None);
+                    continue;
+                };
+                let share = task
+                    .await
+                    .map_err(|e| Status::internal(format!("relay filter bitmap task: {e}")))??;
+                known.merge(
+                    shard,
+                    mask.as_ref(),
+                    &share.geo_columns_known,
+                    &share.filter_columns_known,
+                )?;
+                add_count32(
+                    &mut segments_total,
+                    share.segments_total,
+                    shard,
+                    "segment count",
+                )?;
+                add_count32(
+                    &mut segments_skipped,
+                    share.segments_skipped,
+                    shard,
+                    "skipped segment count",
+                )?;
+                shares.push(Some(ChildBitmap {
+                    base_label: share.base_label,
+                    label_count: share.label_count,
+                    bits: share.bits,
+                }));
+            }
+            let (base_label, label_count, bits) = concat_bitmaps(&children, &ranges, &shares)?;
+            self.still_current(&pinned, "ResolveFilterBitmap")?;
+            Ok(Response::new(crate::pb::FilterBitmapResponse {
+                base_label,
+                label_count,
+                bits,
+                geo_columns_known: known.geo,
+                filter_columns_known: known.tree,
+                segments_total,
+                segments_skipped,
+            }))
+        })
+        .await
     }
 
     async fn resolve_lexical_bitmap(
         &self,
-        _request: Request<crate::pb::LexicalBitmapRequest>,
+        request: Request<crate::pb::LexicalBitmapRequest>,
     ) -> Result<Response<crate::pb::MembershipBitmapResponse>, Status> {
-        Err(refused("ResolveLexicalBitmap"))
+        let timeout = grpc_timeout(request.metadata());
+        let req = request.into_inner();
+        let (pinned, frozen) = self.pin();
+        let children = frozen.node_addresses().to_vec();
+        if children.is_empty() {
+            return Err(Status::failed_precondition(
+                "relay: a relay coordinator has no children",
+            ));
+        }
+        let reports = self.children_health(&frozen, timeout).await?;
+        let ranges = child_ranges(&self.collection, &children, &reports)?;
+        let mut tasks = Vec::with_capacity(children.len());
+        for (shard, addr) in children.iter().enumerate() {
+            let mut link = frozen.node_client(addr)?;
+            let child_req = req.clone();
+            let addr = addr.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut request = Request::new(child_req);
+                if let Some(timeout) = timeout {
+                    request.set_timeout(timeout);
+                }
+                link.resolve_lexical_bitmap(request)
+                    .await
+                    .map(|r| r.into_inner())
+                    .map_err(|status| child_error(shard, &addr, "lexical bitmap", status))
+            }));
+        }
+        let mut shares = Vec::with_capacity(children.len());
+        let mut epochs = Vec::with_capacity(children.len());
+        let mut segments_total: u32 = 0;
+        let mut segments_skipped: u32 = 0;
+        for (shard, task) in tasks.into_iter().enumerate() {
+            let share = task
+                .await
+                .map_err(|e| Status::internal(format!("relay lexical bitmap task: {e}")))??;
+            epochs.push(share.stats_epoch);
+            add_count32(
+                &mut segments_total,
+                share.segments_total,
+                shard,
+                "segment count",
+            )?;
+            add_count32(
+                &mut segments_skipped,
+                share.segments_skipped,
+                shard,
+                "skipped segment count",
+            )?;
+            shares.push(Some(ChildBitmap {
+                base_label: share.base_label,
+                label_count: share.label_count,
+                bits: share.bits,
+            }));
+        }
+        let (base_label, label_count, bits) = concat_bitmaps(&children, &ranges, &shares)?;
+        self.still_current(&pinned, "ResolveLexicalBitmap")?;
+        // The epoch the membership was resolved at is a relay token over
+        // the children's, the one a rescore that echoes it translates.
+        let stats_epoch = self
+            .tokens
+            .lock()
+            .expect("relay token registry poisoned")
+            .allocate(TokenTuple {
+                collection: self.collection.clone(),
+                control_revision: pinned.control_revision,
+                topology_generation: pinned.topology_generation,
+                children,
+                epochs,
+            });
+        Ok(Response::new(crate::pb::MembershipBitmapResponse {
+            base_label,
+            label_count,
+            bits,
+            stats_epoch,
+            segments_total,
+            segments_skipped,
+        }))
     }
 
     async fn resolve_vector_bitmap(
         &self,
-        _request: Request<crate::pb::VectorBitmapRequest>,
+        request: Request<crate::pb::VectorBitmapRequest>,
     ) -> Result<Response<crate::pb::MembershipBitmapResponse>, Status> {
-        Err(refused("ResolveVectorBitmap"))
+        let timeout = grpc_timeout(request.metadata());
+        let (pinned, frozen) = self.pin();
+        let children = frozen.node_addresses().to_vec();
+        if children.is_empty() {
+            return Err(Status::failed_precondition(
+                "relay: a relay coordinator has no children",
+            ));
+        }
+        let reports = self.children_health(&frozen, timeout).await?;
+        let ranges = child_ranges(&self.collection, &children, &reports)?;
+        let mut tasks = Vec::with_capacity(children.len());
+        for (shard, addr) in children.iter().enumerate() {
+            let mut link = frozen.node_client(addr)?;
+            let addr = addr.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut request = Request::new(crate::pb::VectorBitmapRequest {});
+                if let Some(timeout) = timeout {
+                    request.set_timeout(timeout);
+                }
+                link.resolve_vector_bitmap(request)
+                    .await
+                    .map(|r| r.into_inner())
+                    .map_err(|status| child_error(shard, &addr, "vector bitmap", status))
+            }));
+        }
+        let mut shares = Vec::with_capacity(children.len());
+        for task in tasks {
+            let share = task
+                .await
+                .map_err(|e| Status::internal(format!("relay vector bitmap task: {e}")))??;
+            shares.push(Some(ChildBitmap {
+                base_label: share.base_label,
+                label_count: share.label_count,
+                bits: share.bits,
+            }));
+        }
+        let (base_label, label_count, bits) = concat_bitmaps(&children, &ranges, &shares)?;
+        self.still_current(&pinned, "ResolveVectorBitmap")?;
+        Ok(Response::new(crate::pb::MembershipBitmapResponse {
+            base_label,
+            label_count,
+            bits,
+            stats_epoch: 0,
+            segments_total: 0,
+            segments_skipped: 0,
+        }))
     }
 
     /// One shard-side Boolean evaluation over the children: the parent's

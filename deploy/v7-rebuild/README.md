@@ -289,6 +289,7 @@ fleet:
 | `INGEST_BLOCK` | rows per driver block (documents, then their vectors; driver default 8192) |
 | `INGEST_RESUME` | `1` passes `--resume`: a driver continues from the rows its node reports (documents and vectors), finishing a half-sent block's vectors first |
 | `MALLOC_ARENA_MAX` | glibc arenas per node (default 2 here): with the library default a node's resident set grows by a tail per seal |
+| `NODE_EXTRA_ARGS` / `COORD_EXTRA_ARGS` | extra flags for the nodes / the coordinator, word-split. A placed group's nodes take `--placement-column=placement --placement-leaf=<code> --placement-tree=$HOME/protomolt-search/root-map-v10.toml`: the code pins the leaf and the map (the coordinator's, with its `[placement]` table) lets the node refuse a direct row the tree routes elsewhere ([placement](../../docs/placement.md)) |
 
 A four-machine example (the plan in `sea-of-slop-search-parity/design-notes/
 fleet-4-machine-plan-2026-09.md`), with the sidecar, the coordinator, and

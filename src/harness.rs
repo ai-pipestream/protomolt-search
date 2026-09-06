@@ -310,6 +310,7 @@ pub async fn start_relay_over(
             .initial_stream_window_size(crate::H2_STREAM_WINDOW)
             .initial_connection_window_size(crate::H2_CONN_WINDOW)
             .add_service(relay.clone().into_server(MAX_MESSAGE_BYTES))
+            .add_service(relay.diagnostics_server(MAX_MESSAGE_BYTES))
             .serve_with_incoming(nodelay_incoming(listener)),
     );
     (format!("http://{addr}"), relay, handle)
