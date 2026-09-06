@@ -1,6 +1,8 @@
 syntax = "proto3";
 package ai.protomolt.search.v1;
 
+import "ai/protomolt/search/v1/search.proto";
+
 // Public service capabilities. No action implies another action.
 enum AccessAction {
   ACCESS_ACTION_UNSPECIFIED = 0;
@@ -22,6 +24,10 @@ message CollectionGrant {
   string workspace = 2;
   string collection = 3;
   repeated AccessAction actions = 4;
+  // Optional mandatory view for SEARCH only; requires policy format 2.
+  // Other actions remain independent and are not narrowed by this predicate.
+  // Absent means unrestricted documents. Present must contain a valid filter.
+  DocumentVisibility document_visibility = 5;
 }
 
 // A complete policy snapshot supplied by the workspace authority. Revision must
@@ -31,8 +37,9 @@ message AccessPolicy {
   uint64 revision = 1;
   repeated CollectionResource resources = 2;
   repeated CollectionGrant grants = 3;
-  // Required: 1 for this contract. Adding policy restrictions requires a new
-  // format version so older readers reject rather than ignore restrictions.
+  // Required: 1 for collection actions, 2 for mandatory document visibility.
+  // Format 1 refuses any document_visibility. Future restrictions require a
+  // new version so older readers reject rather than ignore them.
   uint32 format_version = 4;
 }
 
@@ -44,4 +51,7 @@ message AccessDecision {
   string workspace = 3;
   string collection = 4;
   AccessAction action = 5;
+  // Authority-supplied mandatory view. Private operation context, never taken
+  // from public client metadata. Consumers must enforce it or refuse the route.
+  DocumentVisibility document_visibility = 6;
 }

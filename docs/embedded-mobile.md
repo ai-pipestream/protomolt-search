@@ -35,6 +35,17 @@ see the proposed [device-shard integration contract](device-shards.md).
 The current package implements private local search; the collaboration transport
 is not implemented.
 
+## Authenticated delegation
+
+`EmbeddedSearch::authorized_service(Arc<Principals>)` exposes a `CollectionSet`
+with the public workspace/collection authority. The mobile package re-exports
+the principal and authority types. Keep the runtime's owner methods and raw
+`search_service()` handle private; they intentionally carry owner access.
+Policy format 2 can restrict `Bm25Search` to a mandatory document view. Other
+restricted routes and term-prefix expansion currently refuse. Field grants and
+collaborative network delegation remain unfinished. See
+[document grants](document-grants.md) for the exact supported boundary.
+
 ## Contract
 
 The runtime exposes all public search routes:

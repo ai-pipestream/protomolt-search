@@ -22,6 +22,7 @@ fn policy(revision: u64) -> AccessPolicy {
         grants: ["alice", "bob"]
             .into_iter()
             .map(|name| CollectionGrant {
+                document_visibility: None,
                 principal: name.into(),
                 workspace: "work".into(),
                 collection: "docs".into(),

@@ -1,10 +1,10 @@
 # Document visibility and term statistics
 
 The 2026-09-06 feature-branch increment adds a document view to the internal
-`TermStats` protocol. This is a prerequisite for document permissions, not a
-public grant implementation. `AccessPolicy` still accepts collection actions
-only. Public search still uses the unrestricted live corpus; a caller-supplied
-`DocumentVisibility` is not a credential.
+`TermStats` protocol. The subsequent [document-grant increment](document-grants.md)
+uses it for public BM25 over private in-process shards. Other restricted public
+routes and network collections refuse until their enforcement is implemented.
+A caller-supplied `DocumentVisibility` is not a credential.
 
 ## Contract
 
@@ -78,11 +78,12 @@ encoded protobuf/hash vectors, including an unsigned oneof bound with its
 exclusive flag, and bounded scope churn. The fixtures specify the normalized
 wire bytes and hashes independently of the generated encoder.
 
-The public authority still needs document and field grant contracts, and every
-query path must carry mandatory visibility into selection, rescoring, term
-expansion, suggestions, facets, source/projection fetch and eventual RAG context.
+The private-shard BM25 path now consumes authority-issued document grants.
+Field grants and the remaining query paths still need mandatory visibility in
+selection, rescoring, term expansion, suggestions, facets, source/projection fetch
+and eventual RAG context.
 Field-use and field-disclosure checks must precede cache lookup. Public requests
 must not override a mandatory predicate or bypass it through a direct node
-connection. Those requirements remain open; this increment does not enable
-restricted grants prematurely. No persisted index format changes or reindex
+connection. Those requirements remain open; uncertified restricted routes and
+network-backed collections refuse. No persisted index format changes or reindex
 are required for this protocol addition.

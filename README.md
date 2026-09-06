@@ -1222,6 +1222,14 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Private-shard document grants (2026-09-06, feature branch).** Policy format 2
+  binds a mandatory document view to public BM25 execution over private local
+  shards, including scoped statistics, cache reuse and disclosure. Unsupported
+  routes, dictionary prefixes and network-backed deployments refuse restricted
+  decisions. The mobile library exposes an authenticated facade; field grants
+  and broader retrieval/delegation remain unfinished. See
+  [document grants](docs/document-grants.md).
+
 - **Statistics lifetime fencing (2026-09-06, feature branch).** Statistics and
   lexical membership now identify the node lifetime as well as its mutation
   count. Cache reuse, relay translation, and all lexical scoring routes carry

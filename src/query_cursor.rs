@@ -168,6 +168,7 @@ mod tests {
             collection: "docs".into(),
             topology_generation: 9,
             access: Some(AccessDecision {
+                document_visibility: None,
                 policy_revision: 1,
                 principal: "alice".into(),
                 workspace: "work".into(),

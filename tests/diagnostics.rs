@@ -691,6 +691,7 @@ fn principals() -> Arc<Principals> {
         &[pipestream_search::pb::AccessAction::Search],
     );
     policy.grants.push(pipestream_search::pb::CollectionGrant {
+        document_visibility: None,
         principal: "ops".into(),
         workspace: policy.resources[0].workspace.clone(),
         collection: String::new(),

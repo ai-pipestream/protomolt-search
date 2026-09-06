@@ -409,6 +409,7 @@ pub struct CoordinatorServiceImpl {
     /// `stats_epoch` (src/stats_cache.rs). Sound because the nodes
     /// enforce the epoch claim on every scoring request built from it.
     stats_cache: Arc<crate::stats_cache::StatsCache>,
+    document_visibility: Option<crate::pb::DocumentVisibility>,
     /// Optional distributed vector collection. The product coordinator calls
     /// it once as one provider; it never learns or re-fans its shard topology.
     #[cfg(feature = "net")]
@@ -1813,6 +1814,7 @@ impl CoordinatorServiceImpl {
             floor_socket: Arc::new(std::sync::OnceLock::new()),
             floor_targets: Arc::new(Mutex::new(HashMap::new())),
             stats_cache,
+            document_visibility: None,
             #[cfg(feature = "net")]
             clustered_vectors: None,
             dense_quality_profile: None,
@@ -1851,6 +1853,78 @@ impl CoordinatorServiceImpl {
         coordinator.links = Arc::new(Mutex::new(links));
         coordinator.allow_network = false;
         coordinator
+    }
+
+    /// Bind an authority decision to a private execution clone. Every public
+    /// route calls this before work; uncertified restricted routes refuse.
+    pub(crate) fn for_access(
+        &self,
+        access: Option<&crate::pb::AccessDecision>,
+        route: &str,
+    ) -> Result<Self, Status> {
+        let mut scoped = self.clone();
+        let Some(view) = access.and_then(|a| a.document_visibility.as_ref()) else {
+            return Ok(scoped);
+        };
+        crate::visibility::VisibilityScope::new(Some(view))?;
+        if access.is_none_or(|a| a.action != crate::pb::AccessAction::Search as i32) {
+            return Err(Status::permission_denied(
+                "document grants require search authorization",
+            ));
+        }
+        if route != "bm25_search" {
+            return Err(Status::permission_denied(
+                "this route does not yet enforce document grants",
+            ));
+        }
+        if self.allow_network
+            || self.has_clustered_vectors()
+            || self.live_topology.is_some()
+            || self
+                .links
+                .lock()
+                .map_err(|_| Status::internal("node link cache lock poisoned"))?
+                .values()
+                .any(|link| !link.is_local())
+        {
+            return Err(Status::failed_precondition(
+                "document grants currently require private in-process shards",
+            ));
+        }
+        scoped.document_visibility = Some(view.clone());
+        Ok(scoped)
+    }
+
+    fn visible_filter(
+        &self,
+        user: Option<crate::pb::FilterExpr>,
+    ) -> Result<Option<crate::pb::FilterExpr>, Status> {
+        let Some(mandatory) = self
+            .document_visibility
+            .as_ref()
+            .and_then(|view| view.filter.as_ref())
+        else {
+            return Ok(user);
+        };
+        let filter = match user {
+            Some(user) => crate::pb::FilterExpr {
+                expr: Some(crate::pb::filter_expr::Expr::And(crate::pb::FilterList {
+                    exprs: vec![mandatory.clone(), user],
+                })),
+            },
+            None => mandatory.clone(),
+        };
+        crate::filter::validate_filter(&filter)?;
+        Ok(Some(filter))
+    }
+
+    fn check_visibility_columns(&self, known: &[bool]) -> Result<(), Status> {
+        if known.iter().any(|known| !known) {
+            return Err(Status::failed_precondition(
+                "document grant references a column unavailable in this collection",
+            ));
+        }
+        Ok(())
     }
 
     /// True only for coordinators that may create network transports.
@@ -3595,6 +3669,9 @@ impl CoordinatorServiceImpl {
         // agreement. Request metadata without scoring when analysis is empty.
         let k = if terms.is_empty() { 0 } else { k };
         if k == 0 && projections.is_empty() {
+            if self.document_visibility.is_some() {
+                self.body_stats(&[], false).await?;
+            }
             return Ok((
                 Vec::new(),
                 Vec::new(),
@@ -4220,6 +4297,9 @@ impl CoordinatorServiceImpl {
         }
         let t_analyzed = t0.elapsed();
         if k == 0 || field_terms.iter().all(|t| t.is_empty()) {
+            if self.document_visibility.is_some() {
+                self.body_stats(&[], false).await?;
+            }
             return Ok((
                 (
                     (Vec::new(), Vec::new(), Vec::new()),
@@ -4707,10 +4787,14 @@ impl CoordinatorServiceImpl {
         probe_from: usize,
     ) -> Result<FusedGlobals, Status> {
         let n = self.node_addrs.len();
+        let scope = crate::visibility::VisibilityScope::new(self.document_visibility.as_ref())?;
+        let mut visibility_known = vec![false; scope.column_count()];
         let mut shares: Vec<Option<crate::stats_cache::FusedShare>> = vec![None; n];
         if !fresh {
             for (i, share) in shares.iter_mut().enumerate() {
-                *share = self.stats_cache.lookup_fused(i, stats_fields);
+                *share = self
+                    .stats_cache
+                    .lookup_fused_scoped(i, stats_fields, &scope);
             }
         }
         let mut fetch_tasks = Vec::new();
@@ -4719,7 +4803,7 @@ impl CoordinatorServiceImpl {
                 continue;
             }
             let request = TermStatsRequest {
-                visibility: None,
+                visibility: self.document_visibility.clone(),
                 terms: Vec::new(),
                 fields: stats_fields.to_vec(),
             };
@@ -4748,7 +4832,8 @@ impl CoordinatorServiceImpl {
                     return Err(Status::internal("shard field stats df length mismatch"));
                 }
             }
-            self.stats_cache.store(i, &[], stats_fields, &resp)?;
+            self.stats_cache
+                .store_scoped(i, &[], stats_fields, &scope, &resp)?;
             shares[i] = Some(crate::stats_cache::FusedShare {
                 visibility_columns_known: resp.visibility_columns_known.clone(),
                 epoch: StatsClaim::required(resp.stats_epoch, &resp.stats_incarnation)?,
@@ -4777,6 +4862,9 @@ impl CoordinatorServiceImpl {
         let mut epochs = Vec::with_capacity(n);
         for share in shares {
             let s = share.expect("looked up or fetched above");
+            for (known, present) in visibility_known.iter_mut().zip(&s.visibility_columns_known) {
+                *known |= present;
+            }
             doc_count += s.doc_count;
             for (fi, fs) in s.fields.iter().enumerate() {
                 totals[fi] += fs.total_doc_length;
@@ -4789,6 +4877,7 @@ impl CoordinatorServiceImpl {
             }
             epochs.push(s.epoch);
         }
+        self.check_visibility_columns(&visibility_known)?;
         let unknown: Vec<&str> = stats_fields
             .iter()
             .zip(&known_somewhere)
@@ -5292,10 +5381,12 @@ impl CoordinatorServiceImpl {
         fresh: bool,
     ) -> Result<(CorpusStats, Vec<StatsClaim>), Status> {
         let n = self.node_addrs.len();
+        let scope = crate::visibility::VisibilityScope::new(self.document_visibility.as_ref())?;
+        let mut visibility_known = vec![false; scope.column_count()];
         let mut shares: Vec<Option<crate::stats_cache::BodyShare>> = vec![None; n];
         if !fresh {
             for (i, share) in shares.iter_mut().enumerate() {
-                *share = self.stats_cache.lookup_body(i, terms);
+                *share = self.stats_cache.lookup_body_scoped(i, terms, &scope);
             }
         }
         let mut fetch_tasks = Vec::new();
@@ -5304,6 +5395,7 @@ impl CoordinatorServiceImpl {
                 continue;
             }
             let terms_owned = terms.to_vec();
+            let visibility = self.document_visibility.clone();
             let mut client = self.node_client(&self.node_addrs[i])?;
             self.stats_cache.note_fetch();
             fetch_tasks.push((
@@ -5311,7 +5403,7 @@ impl CoordinatorServiceImpl {
                 tokio::spawn(async move {
                     client
                         .term_stats(TermStatsRequest {
-                            visibility: None,
+                            visibility,
                             terms: terms_owned,
                             fields: Vec::new(),
                         })
@@ -5327,7 +5419,8 @@ impl CoordinatorServiceImpl {
             if resp.doc_frequencies.len() != terms.len() {
                 return Err(Status::internal("shard stats df length mismatch"));
             }
-            self.stats_cache.store(i, terms, &[], &resp)?;
+            self.stats_cache
+                .store_scoped(i, terms, &[], &scope, &resp)?;
             shares[i] = Some(crate::stats_cache::BodyShare {
                 visibility_columns_known: resp.visibility_columns_known.clone(),
                 epoch: StatsClaim::required(resp.stats_epoch, &resp.stats_incarnation)?,
@@ -5344,6 +5437,9 @@ impl CoordinatorServiceImpl {
         let mut epochs = Vec::with_capacity(n);
         for share in shares {
             let s = share.expect("looked up or fetched above");
+            for (known, present) in visibility_known.iter_mut().zip(&s.visibility_columns_known) {
+                *known |= present;
+            }
             global.doc_count += s.doc_count;
             global.total_doc_length += s.total_doc_length;
             for (acc, df) in global.dfs.iter_mut().zip(&s.dfs) {
@@ -5351,6 +5447,7 @@ impl CoordinatorServiceImpl {
             }
             epochs.push(s.epoch);
         }
+        self.check_visibility_columns(&visibility_known)?;
         Ok((global, epochs))
     }
 
@@ -11097,6 +11194,14 @@ impl SearchService for CoordinatorServiceImpl {
                 .await;
             }
             let req = request.into_inner();
+            if self.document_visibility.is_some()
+                && (!req.prefixes.is_empty()
+                    || req.fields.iter().any(|field| !field.prefixes.is_empty()))
+            {
+                return Err(Status::permission_denied(
+                    "term prefix expansion does not yet enforce document grants",
+                ));
+            }
             let k = self.resolve_k(req.k)?;
             // A malformed HighlightSpec refuses here, before any shard is
             // asked, so an empty fleet answers the same as a full one
@@ -11112,7 +11217,7 @@ impl SearchService for CoordinatorServiceImpl {
             // CEL text compiles ONCE, here, into the predicate IR the
             // shards execute (docs/cel-filters.md): every shard sees the
             // same tree, and none ever sees CEL text.
-            let filter = crate::cel::compile_filter(&req.filter)?;
+            let filter = self.visible_filter(crate::cel::compile_filter(&req.filter)?)?;
             // Projection text compiles ONCE, here, into the ValueExpr IR
             // the shards resolve and evaluate (docs/cel-values.md).
             let projections = compile_projections(&req.projections)?;
@@ -11273,8 +11378,17 @@ impl SearchService for CoordinatorServiceImpl {
                 0.0
             };
             Ok(Response::new(Bm25SearchResponse {
-                segments_total: prune.segments_total,
-                segments_skipped: prune.segments_skipped,
+                execution_details_redacted: self.document_visibility.is_some(),
+                segments_total: if self.document_visibility.is_some() {
+                    0
+                } else {
+                    prune.segments_total
+                },
+                segments_skipped: if self.document_visibility.is_some() {
+                    0
+                } else {
+                    prune.segments_skipped
+                },
                 hits,
                 kth_best,
                 facets,
@@ -11340,6 +11454,7 @@ impl SearchService for CoordinatorServiceImpl {
             0.0
         };
         Ok(Response::new(Bm25SearchResponse {
+            execution_details_redacted: false,
             segments_total: 0,
             segments_skipped: 0,
             hits,

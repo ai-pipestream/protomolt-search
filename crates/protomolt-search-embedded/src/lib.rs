@@ -5,9 +5,12 @@
 //! bridges a stable product-named dependency without importing the server
 //! binary.
 
+pub use pipestream_search::authorization::{Authorizer, PolicyAuthority};
+pub use pipestream_search::collections::CollectionSet;
 pub use pipestream_search::coordinator::FanoutLimits;
 pub use pipestream_search::embedded::*;
 pub use pipestream_search::node::NodeConfig;
+pub use pipestream_search::security::{PrincipalConfig, Principals};
 pub use pipestream_search::{analyzer, bm25, pb, phrases, quality};
 
 mod mobile;

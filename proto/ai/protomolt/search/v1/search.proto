@@ -4038,6 +4038,10 @@ message Bm25SearchResponse {
   // (docs/segment-pruning.md); zero on shards without a segment catalog.
   uint32 segments_total = 10;
   uint32 segments_skipped = 11;
+  // Physical segment counts are withheld for a mandatory document view,
+  // because they describe storage that may contain unauthorized documents.
+  // When true, segments_total and segments_skipped are zero, not measurements.
+  bool execution_details_redacted = 12;
 }
 
 // How the coordinator fuses the per-shard leg results of a hybrid query.

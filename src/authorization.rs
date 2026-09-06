@@ -27,13 +27,14 @@ struct Policy {
     revision: u64,
     resources: BTreeMap<String, String>,
     grants: BTreeMap<(String, String), BTreeSet<i32>>,
+    views: BTreeMap<(String, String), crate::pb::DocumentVisibility>,
 }
 
 impl Policy {
     fn validate(input: AccessPolicy) -> Result<Self, String> {
-        if input.format_version != 1 {
+        if !matches!(input.format_version, 1 | 2) {
             return Err(format!(
-                "unsupported access policy format_version {}; expected 1",
+                "unsupported access policy format_version {}; expected 1 or 2",
                 input.format_version
             ));
         }
@@ -57,6 +58,7 @@ impl Policy {
             }
         }
         let mut grants = BTreeMap::new();
+        let mut views = BTreeMap::new();
         for grant in input.grants {
             if grant.principal.is_empty() {
                 return Err("access grant principal must be nonempty".into());
@@ -77,6 +79,17 @@ impl Policy {
                     return Err("access grant repeats an action".into());
                 }
             }
+            if let Some(view) = grant.document_visibility {
+                if input.format_version != 2 {
+                    return Err("document visibility requires access policy format 2".into());
+                }
+                if !actions.contains(&(AccessAction::Search as i32)) {
+                    return Err("document visibility requires an explicit search action".into());
+                }
+                crate::visibility::VisibilityScope::new(Some(&view))
+                    .map_err(|error| format!("invalid document grant: {}", error.message()))?;
+                views.insert((grant.principal.clone(), grant.collection.clone()), view);
+            }
             if grants
                 .insert((grant.principal, grant.collection), actions)
                 .is_some()
@@ -88,6 +101,7 @@ impl Policy {
             revision: input.revision,
             resources,
             grants,
+            views,
         })
     }
 }
@@ -148,6 +162,14 @@ impl Authorizer for PolicyAuthority {
             collection: collection.into(),
             workspace: policy.resources[collection].clone(),
             action: action as i32,
+            document_visibility: if action == AccessAction::Search {
+                policy
+                    .views
+                    .get(&(principal.to_owned(), collection.to_owned()))
+                    .cloned()
+            } else {
+                None
+            },
         })
     }
     fn subscribe(&self) -> watch::Receiver<u64> {
@@ -180,6 +202,15 @@ impl AccessPermit {
             || decision.policy_revision == 0
         {
             return Err(Status::permission_denied("invalid authorization decision"));
+        }
+        if decision.document_visibility.is_some() {
+            if action != AccessAction::Search {
+                return Err(Status::permission_denied(
+                    "document visibility requires a search decision",
+                ));
+            }
+            crate::visibility::VisibilityScope::new(decision.document_visibility.as_ref())
+                .map_err(|_| Status::permission_denied("invalid document visibility decision"))?;
         }
         let permit = Self {
             authority,

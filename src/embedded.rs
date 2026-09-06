@@ -295,11 +295,22 @@ impl EmbeddedSearch {
         self.nodes.len()
     }
 
-    /// The exact public service implementation used by the network server.
-    /// This exposes every current and future `SearchService` method without an
-    /// embedded-only protocol fork.
+    /// The raw coordinator for a trusted owner. It exposes every SearchService
+    /// method without authorization. Delegate untrusted requests through
+    /// [`Self::authorized_service`] instead.
     pub fn search_service(&self) -> &CoordinatorServiceImpl {
         &self.coordinator
+    }
+
+    /// An authenticated public facade over the private local shards. Give
+    /// untrusted callers this service rather than the owner/admin methods on
+    /// `EmbeddedSearch`. The supplied principals must have an explicit authority.
+    pub fn authorized_service(
+        &self,
+        principals: Arc<crate::security::Principals>,
+    ) -> crate::collections::CollectionSet {
+        crate::collections::CollectionSet::single(self.coordinator.clone())
+            .with_principals(principals)
     }
 
     /// Embedded construction hard-disables TCP fallback, DNS resolution, and

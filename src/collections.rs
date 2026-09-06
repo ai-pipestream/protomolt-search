@@ -599,7 +599,7 @@ macro_rules! search_service_over_collections {
                     let started = std::time::Instant::now();
                     let principal = self.authenticate(&request)?;
                     let (name, target, access) = self.resolve_authorized(principal.as_ref(), &request.get_ref().collection, AccessAction::$action)?;
-                    let target = target.clone();
+                    let target = target.for_access(access.as_ref().map(|p| p.decision()), stringify!($name))?;
                     let _permit =
                         Self::admit_under(principal.as_ref(), &request, target.max_k())?;
                     request.get_mut().collection = name.clone();
@@ -629,7 +629,7 @@ macro_rules! search_service_over_collections {
                 let started = std::time::Instant::now();
                 let principal = self.authenticate(&request)?;
                 let (name, target, access) = self.resolve_authorized(principal.as_ref(), &request.get_ref().collection, AccessAction::Search)?;
-                let target = target.clone();
+                let target = target.for_access(access.as_ref().map(|p| p.decision()), "query_stream")?;
                 let permit = Self::admit_under(principal.as_ref(), &request, target.max_k())?;
                 request.get_mut().collection = name.clone();
                 let k = request.get_ref().k().unwrap_or(0);
