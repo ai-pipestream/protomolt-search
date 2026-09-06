@@ -1360,6 +1360,16 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   authorization and durable-write work is tracked in
   [Search foundations](docs/search-foundations.md).
 
+- **Landed 2026-09-06: a dense Boolean clause is the bitmap of the live
+  vector rows.** The shard-side planner took a dense clause as the universe
+  and cut the group to the vector prefix afterwards, so an optional dense
+  clause dropped the documents without a vector, a dense MUST_NOT emptied
+  the group, and a vectors-only shard's rows were outside the universe. The
+  clause now resolves to the rows with a vector (the provider's row ranges,
+  no scan) and takes part in MUST, SHOULD, and MUST_NOT under the one group
+  rule; the universe is the shard's rows from either store
+  (`tests/boolean_pushdown.rs`, the uneven fleet). [Boolean execution](docs/query-api.md).
+
 - **Landed 2026-09-06: the boolean tree is evaluated on the shards.** The
   recursive planner fetched one membership bitmap per clause and held the
   match set as a coordinator id set: at 66 million members a filter clause

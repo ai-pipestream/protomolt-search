@@ -4,9 +4,10 @@
 //! One bit per local slot, packed 64 to a word. The set algebra a
 //! `BooleanQuery` needs is the word-wise AND, OR, AND NOT, and the
 //! "at least t of these" count for `minimum_should_match`. A dense
-//! clause is the universe and is not a bitmap: [`Membership`] tells
-//! the two apart so a universal clause costs no words and the group
-//! rules that mention it (`docs/query-api.md`) apply by name.
+//! clause is a bitmap like the others: the rows that hold a vector
+//! ([`Bits::ranges`] over the provider's vector rows), so a document
+//! without a vector and a row without a document take part in MUST,
+//! SHOULD, and MUST_NOT under one rule (`docs/query-api.md`).
 
 /// One bit per slot in `[0, len)`, packed 64 to a `u64` word. Bits at
 /// or past `len` are clear and stay clear through every operation.
@@ -40,6 +41,17 @@ impl Bits {
         let mut bits = Self::full(len);
         for slot in rows.min(len)..len {
             bits.clear(slot);
+        }
+        bits
+    }
+
+    /// The slots inside the `(base, rows)` ranges, within `len`.
+    pub fn ranges(len: usize, ranges: &[(usize, usize)]) -> Self {
+        let mut bits = Self::empty(len);
+        for &(base, rows) in ranges {
+            for slot in base.min(len)..base.saturating_add(rows).min(len) {
+                bits.set(slot);
+            }
         }
         bits
     }
@@ -211,88 +223,40 @@ impl Bits {
     }
 }
 
-/// A clause's membership on one shard: a bitmap, or the universe (a
-/// dense clause, which every row with a vector matches).
-#[derive(Debug, Clone)]
-pub enum Membership {
-    Universal,
-    Bits(Bits),
-}
-
-impl Membership {
-    pub fn is_universal(&self) -> bool {
-        matches!(self, Membership::Universal)
-    }
-
-    /// Whether `slot` is a member; the universe holds every slot.
-    pub fn test(&self, slot: usize) -> bool {
-        match self {
-            Membership::Universal => true,
-            Membership::Bits(bits) => bits.test(slot),
-        }
-    }
-}
-
-/// The group rule of `docs/query-api.md`: MUST intersects the
-/// non-universal required clauses; with none, the live set is the
-/// seed when a MUST exists, when the minimum is zero, or when the
-/// universal SHOULD clauses already meet it, and otherwise the SHOULD
-/// count decides; then the SHOULD minimum is enforced on a seeded set,
-/// and MUST_NOT subtracts (a universal MUST_NOT empties the group).
-/// `live` is the live-slot bitmap. Returns the members and whether the
-/// live set was consulted as the seed (the caller counts its segments
-/// the way the live-document bitmap route did).
+/// The group rule of `docs/query-api.md`: MUST intersects the required
+/// clauses; with none, the live set is the seed when the SHOULD minimum
+/// is zero and otherwise the SHOULD count decides; on a seeded set the
+/// SHOULD minimum is then enforced; MUST_NOT subtracts. `live` is the
+/// live-slot bitmap. Returns the members and whether the live set was
+/// consulted as the seed (the caller counts its segments the way the
+/// live-document bitmap route did).
 pub fn group_members(
-    must: &[Membership],
-    should: &[Membership],
-    must_not: &[Membership],
+    must: &[Bits],
+    should: &[Bits],
+    must_not: &[Bits],
     minimum_should_match: usize,
     live: &Bits,
 ) -> (Bits, bool) {
     let len = live.len();
-    let universal_should = should.iter().filter(|m| m.is_universal()).count();
-    let concrete_should: Vec<&Bits> = should
-        .iter()
-        .filter_map(|m| match m {
-            Membership::Bits(b) => Some(b),
-            Membership::Universal => None,
-        })
-        .collect();
+    let should_refs: Vec<&Bits> = should.iter().collect();
     let mut seeded_live = false;
-    let mut members = if must.iter().any(|m| !m.is_universal()) {
-        let mut out = Bits::full(len);
-        for m in must {
-            if let Membership::Bits(b) = m {
-                out.and_with(b);
-            }
+    let mut members = if let Some((first, rest)) = must.split_first() {
+        let mut out = first.clone();
+        for m in rest {
+            out.and_with(m);
         }
         out
-    } else if !must.is_empty()
-        || minimum_should_match == 0
-        || universal_should >= minimum_should_match
-    {
+    } else if minimum_should_match == 0 {
         seeded_live = true;
         live.clone()
     } else {
-        Bits::at_least(
-            &concrete_should,
-            minimum_should_match - universal_should,
-            len,
-        )
+        Bits::at_least(&should_refs, minimum_should_match, len)
     };
-    if !must.is_empty() && minimum_should_match > universal_should {
-        let admitted = Bits::at_least(
-            &concrete_should,
-            minimum_should_match - universal_should,
-            len,
-        );
-        members.and_with(&admitted);
+    if !must.is_empty() && minimum_should_match > 0 {
+        members.and_with(&Bits::at_least(&should_refs, minimum_should_match, len));
     }
     for m in must_not {
-        match m {
-            Membership::Universal => members.clear_all(),
-            Membership::Bits(b) => members.and_not(b),
-        }
+        members.and_not(m);
     }
     (members, seeded_live)
 }
@@ -343,46 +307,71 @@ mod tests {
     }
 
     #[test]
+    fn ranges_mark_the_rows_inside_each_range_within_the_length() {
+        let bits = Bits::ranges(200, &[(0, 3), (64, 2), (190, 20)]);
+        assert_eq!(
+            bits.iter().collect::<Vec<_>>(),
+            (0..3).chain(64..66).chain(190..200).collect::<Vec<_>>()
+        );
+        assert_eq!(Bits::ranges(10, &[]).count(), 0);
+        assert_eq!(Bits::ranges(10, &[(20, 5)]).count(), 0);
+    }
+
+    #[test]
     fn the_group_rule_follows_the_planner() {
         let live = Bits::live(Some(&[1 << 9]), 12);
-        let a = Membership::Bits(of(12, &[1, 2, 3, 9]));
-        let b = Membership::Bits(of(12, &[2, 3, 4]));
-        // MUST intersects; the universe is not a member set.
-        let (m, seeded) = group_members(
-            &[a.clone(), Membership::Universal, b.clone()],
-            &[],
+        let a = of(12, &[1, 2, 3, 9]);
+        let b = of(12, &[2, 3, 4]);
+        // The rows with a vector, as a dense clause resolves.
+        let vectors = of(12, &[0, 1, 2, 3, 4, 5]);
+        // MUST intersects; a dense clause is one more required set.
+        let (m, seeded) =
+            group_members(&[a.clone(), vectors.clone(), b.clone()], &[], &[], 0, &live);
+        assert_eq!(m.iter().collect::<Vec<_>>(), vec![2, 3]);
+        assert!(!seeded);
+        // A lone dense MUST: the rows with a vector, deleted rows included
+        // only through the live seed, which this shape does not consult.
+        let (m, seeded) = group_members(std::slice::from_ref(&vectors), &[], &[], 0, &live);
+        assert_eq!(m.iter().collect::<Vec<_>>(), vec![0, 1, 2, 3, 4, 5]);
+        assert!(!seeded);
+        // Only MUST_NOT: the live seed minus the clause.
+        let (m, seeded) = group_members(&[], &[], std::slice::from_ref(&vectors), 0, &live);
+        assert_eq!(m.iter().collect::<Vec<_>>(), vec![6, 7, 8, 10, 11]);
+        assert!(seeded);
+        // SHOULD count with a dense SHOULD counting for the vector rows.
+        let (m, seeded) =
+            group_members(&[], &[a.clone(), b.clone(), vectors.clone()], &[], 2, &live);
+        assert_eq!(m.iter().collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+        assert!(!seeded);
+        let (m, _) = group_members(&[], &[a.clone(), b.clone()], &[], 2, &live);
+        assert_eq!(m.iter().collect::<Vec<_>>(), vec![2, 3]);
+        // A MUST with an optional dense SHOULD keeps the rows without a
+        // vector: the minimum is zero, so the SHOULD admits nothing away.
+        let (m, _) = group_members(
+            std::slice::from_ref(&a),
+            std::slice::from_ref(&vectors),
             &[],
             0,
             &live,
         );
-        assert_eq!(m.iter().collect::<Vec<_>>(), vec![2, 3]);
-        assert!(!seeded);
-        // Only universal MUSTs: the live seed.
-        let (m, seeded) = group_members(&[Membership::Universal], &[], &[], 0, &live);
-        assert_eq!(m.count(), 11);
-        assert!(seeded);
-        // SHOULD count with a universal SHOULD counting for every slot.
-        let (m, seeded) = group_members(
-            &[],
-            &[a.clone(), b.clone(), Membership::Universal],
-            &[],
-            2,
-            &live,
-        );
-        assert_eq!(m.iter().collect::<Vec<_>>(), vec![1, 2, 3, 4, 9]);
-        assert!(!seeded);
-        let (m, _) = group_members(&[], &[a.clone(), b.clone()], &[], 2, &live);
-        assert_eq!(m.iter().collect::<Vec<_>>(), vec![2, 3]);
+        assert_eq!(m.iter().collect::<Vec<_>>(), vec![1, 2, 3, 9]);
         // MUST plus a SHOULD minimum, then MUST_NOT.
         let (m, _) = group_members(
             std::slice::from_ref(&a),
             std::slice::from_ref(&b),
-            &[Membership::Bits(of(12, &[3]))],
+            &[of(12, &[3])],
             1,
             &live,
         );
         assert_eq!(m.iter().collect::<Vec<_>>(), vec![2]);
-        let (m, _) = group_members(&[a], &[], &[Membership::Universal], 0, &live);
-        assert_eq!(m.count(), 0);
+        // MUST_NOT dense: the members without a vector remain.
+        let (m, _) = group_members(
+            std::slice::from_ref(&a),
+            &[],
+            std::slice::from_ref(&vectors),
+            0,
+            &live,
+        );
+        assert_eq!(m.iter().collect::<Vec<_>>(), vec![9]);
     }
 }

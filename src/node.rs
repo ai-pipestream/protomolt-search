@@ -13852,7 +13852,9 @@ impl NodeServiceImpl {
 
 /// One planned leaf resolved on this shard.
 struct EvaluatedLeaf {
-    membership: crate::boolean_bits::Membership,
+    /// The leaf's live members; a dense leaf's are the live rows that
+    /// hold a vector.
+    membership: crate::boolean_bits::Bits,
     /// Whether a MUST/SHOULD chain reaches the leaf; MUST_NOT leaves
     /// score nothing and name no provenance.
     positive: bool,
@@ -13861,15 +13863,14 @@ struct EvaluatedLeaf {
 
 /// The tree resolved on one shard.
 pub(crate) struct EvaluatedBoolean {
-    /// The root's members after the rows a positive dense leaf holds no
-    /// vector for left (the rule `docs/query-api.md` gives the vector
-    /// bitmap).
+    /// The root's members under the group rule of `docs/query-api.md`.
     pub(crate) members: crate::boolean_bits::Bits,
     leaves: Vec<EvaluatedLeaf>,
     /// Sealed segments consulted and ruled out, summed over the leaves,
     /// plus the live-document seed where the group rule consulted it.
     prune: crate::segment_prune::PruneStats,
-    /// The slot universe: this shard's document rows.
+    /// The slot universe: this shard's rows, documents with or without
+    /// a vector and vectors whose document has not arrived.
     n: usize,
 }
 
@@ -13945,26 +13946,25 @@ fn evaluate_group(
     leaves: &[EvaluatedLeaf],
     live: &crate::boolean_bits::Bits,
     seeded: &mut u32,
-) -> Result<crate::boolean_bits::Membership, Status> {
-    use crate::boolean_bits::Membership;
-    let resolve = |nodes: &[crate::pb::BooleanPlanNode],
-                   seeded: &mut u32|
-     -> Result<Vec<Membership>, Status> {
-        nodes
-            .iter()
-            .map(|node| match node.node.as_ref() {
-                Some(crate::pb::boolean_plan_node::Node::Group(child)) => {
-                    evaluate_group(child, leaves, live, seeded)
-                }
-                Some(crate::pb::boolean_plan_node::Node::Leaf(index)) => {
-                    Ok(leaves[*index as usize].membership.clone())
-                }
-                None => Err(Status::invalid_argument(
-                    "Boolean plan node is neither a group nor a leaf",
-                )),
-            })
-            .collect()
-    };
+) -> Result<crate::boolean_bits::Bits, Status> {
+    use crate::boolean_bits::Bits;
+    let resolve =
+        |nodes: &[crate::pb::BooleanPlanNode], seeded: &mut u32| -> Result<Vec<Bits>, Status> {
+            nodes
+                .iter()
+                .map(|node| match node.node.as_ref() {
+                    Some(crate::pb::boolean_plan_node::Node::Group(child)) => {
+                        evaluate_group(child, leaves, live, seeded)
+                    }
+                    Some(crate::pb::boolean_plan_node::Node::Leaf(index)) => {
+                        Ok(leaves[*index as usize].membership.clone())
+                    }
+                    None => Err(Status::invalid_argument(
+                        "Boolean plan node is neither a group nor a leaf",
+                    )),
+                })
+                .collect()
+        };
     let must = resolve(&group.must, seeded)?;
     let should = resolve(&group.should, seeded)?;
     let must_not = resolve(&group.must_not, seeded)?;
@@ -13978,7 +13978,7 @@ fn evaluate_group(
     if seeded_live {
         *seeded += 1;
     }
-    Ok(Membership::Bits(members))
+    Ok(members)
 }
 
 fn sealed_total(bm25: Option<&Bm25Shard>) -> u32 {
@@ -13994,7 +13994,7 @@ pub(crate) fn evaluate_boolean_membership(
     req: &crate::pb::BooleanShardRequest,
     prune_enabled: bool,
 ) -> Result<EvaluatedBoolean, Status> {
-    use crate::boolean_bits::{Bits, Membership};
+    use crate::boolean_bits::Bits;
     let root = req
         .root
         .as_ref()
@@ -14002,7 +14002,18 @@ pub(crate) fn evaluate_boolean_membership(
     let mut positive = vec![false; req.leaves.len()];
     mark_positive(req, root, true, 1, &mut positive)?;
     let bm25 = guard.bm25.as_ref();
-    let n = bm25.map_or(0, |store| store.next_doc_id() as usize);
+    // The universe is the shard's rows: the lexical store's documents
+    // (some without a vector) and the provider's vectors (some without a
+    // document yet), whichever reaches further.
+    let n = bm25
+        .map_or(0, |store| store.next_doc_id() as usize)
+        .max(guard.index.as_ref().map_or(0, VectorIndex::len))
+        .max(
+            guard
+                .exact_vectors
+                .as_ref()
+                .map_or(0, ExactVectorStore::len),
+        );
     let deleted = guard.live_docs.words();
     let live = Bits::live(deleted.as_deref().map(Vec::as_slice), n);
     let mut prune = crate::segment_prune::PruneStats::default();
@@ -14029,9 +14040,19 @@ pub(crate) fn evaluate_boolean_membership(
                     prune_enabled,
                 )?;
                 prune.add(stats);
-                Membership::Bits(
-                    allow.map_or_else(|| Bits::full(n), |allow| Bits::from_bools(&allow)),
-                )
+                match allow {
+                    None => Bits::full(n),
+                    Some(allow) => {
+                        if allow.len() != n {
+                            return Err(Status::internal(format!(
+                                "Boolean filter leaf {index} resolved {} slots over a universe \
+                                 of {n}",
+                                allow.len()
+                            )));
+                        }
+                        Bits::from_bools(&allow)
+                    }
+                }
             }
             Some(L::Lexical(lexical)) => {
                 let mut bits = Bits::empty(n);
@@ -14077,9 +14098,29 @@ pub(crate) fn evaluate_boolean_membership(
                         }
                     }
                 }
-                Membership::Bits(bits)
+                bits
             }
-            Some(L::Dense(_)) => Membership::Universal,
+            // The live rows that hold a vector: a document without one
+            // is outside the clause, a vector without a document inside.
+            Some(L::Dense(dense)) => {
+                let ranges = if dense.exact_fp32 {
+                    vec![(
+                        0,
+                        guard
+                            .exact_vectors
+                            .as_ref()
+                            .map_or(0, ExactVectorStore::len),
+                    )]
+                } else {
+                    guard
+                        .index
+                        .as_ref()
+                        .map_or_else(Vec::new, VectorIndex::vector_rows)
+                };
+                let mut bits = Bits::ranges(n, &ranges);
+                bits.and_with(&live);
+                bits
+            }
             None => {
                 return Err(Status::invalid_argument(format!(
                     "Boolean plan leaf {index} has no kind"
@@ -14093,33 +14134,12 @@ pub(crate) fn evaluate_boolean_membership(
         });
     }
     let mut seeded = 0u32;
-    let members = match evaluate_group(root, &leaves, &live, &mut seeded)? {
-        Membership::Bits(bits) => bits,
-        Membership::Universal => live.clone(),
-    };
+    let members = evaluate_group(root, &leaves, &live, &mut seeded)?;
     for _ in 0..seeded {
         prune.add(crate::segment_prune::PruneStats {
             segments_total: sealed_total(bm25),
             segments_skipped: 0,
         });
-    }
-    // Rows a positive dense leaf holds no vector for leave the group.
-    let mut members = members;
-    for (leaf, evaluated) in req.leaves.iter().zip(&leaves) {
-        if !evaluated.positive {
-            continue;
-        }
-        if let Some(crate::pb::boolean_plan_leaf::Leaf::Dense(dense)) = leaf.leaf.as_ref() {
-            let rows = if dense.exact_fp32 {
-                guard
-                    .exact_vectors
-                    .as_ref()
-                    .map_or(0, ExactVectorStore::len)
-            } else {
-                guard.index.as_ref().map_or(0, VectorIndex::len)
-            };
-            members.and_with(&Bits::prefix(n, rows));
-        }
     }
     Ok(EvaluatedBoolean {
         members,
@@ -14842,19 +14862,19 @@ impl NodeServiceImpl {
                 let mut acc = vec![0.0f32; n];
                 let mut scored = Bits::empty(n);
                 let member_slots: Vec<u32> = members.iter().map(|slot| slot as u32).collect();
+                // The slots of `slots` a leaf's membership holds.
+                let in_leaf = |slots: &[u32], leaf_index: usize| -> Vec<u32> {
+                    let bits = &evaluated.leaves[leaf_index].membership;
+                    slots
+                        .iter()
+                        .copied()
+                        .filter(|&slot| bits.test(slot as usize))
+                        .collect()
+                };
                 for &leaf_index in &scoring {
                     match req.leaves[leaf_index].leaf.as_ref() {
                         Some(L::Lexical(lexical)) => {
-                            let candidates: Vec<u32> = match &evaluated.leaves[leaf_index]
-                                .membership
-                            {
-                                crate::boolean_bits::Membership::Bits(bits) => member_slots
-                                    .iter()
-                                    .copied()
-                                    .filter(|&slot| bits.test(slot as usize))
-                                    .collect(),
-                                crate::boolean_bits::Membership::Universal => member_slots.clone(),
-                            };
+                            let candidates = in_leaf(&member_slots, leaf_index);
                             let (scores, known) =
                                 Self::boolean_lexical_scores(&guard, lexical, &candidates)?;
                             stages_known[leaf_index].stage_columns_known = known;
@@ -14871,23 +14891,26 @@ impl NodeServiceImpl {
                             }
                         }
                         Some(L::Dense(dense)) => {
+                            // The members inside the clause hold a vector
+                            // (the leaf's membership says so); a member
+                            // outside it, admitted by another clause,
+                            // takes no score from this one.
+                            let candidates = in_leaf(&member_slots, leaf_index);
                             let products = self.boolean_dense_each(
                                 &guard,
                                 dense,
-                                &member_slots,
+                                &candidates,
                                 &req,
                                 |slot, score| {
                                     acc[slot as usize] += score;
                                     scored.set(slot as usize);
                                 },
                             )?;
-                            // A member without a product left in the
-                            // membership step; here every member has one.
-                            if products != member_slots.len() {
+                            if products != candidates.len() {
                                 return Err(Status::internal(format!(
                                     "dense leaf {leaf_index} returned {products} products for \
-                                     {} members",
-                                    member_slots.len()
+                                     {} members holding a vector",
+                                    candidates.len()
                                 )));
                             }
                         }
@@ -14912,18 +14935,20 @@ impl NodeServiceImpl {
             slots.sort_unstable();
             slots
         };
+        // The candidates a leaf's membership holds, in candidate order.
+        let held = |slots: &[u32], leaf_index: usize| -> Vec<u32> {
+            let bits = &evaluated.leaves[leaf_index].membership;
+            slots
+                .iter()
+                .copied()
+                .filter(|&slot| bits.test(slot as usize))
+                .collect()
+        };
         let mut per_leaf: Vec<(usize, Vec<Option<f32>>)> = Vec::with_capacity(scoring.len());
         for &leaf_index in &scoring {
             let scores = match req.leaves[leaf_index].leaf.as_ref() {
                 Some(L::Lexical(lexical)) => {
-                    let in_leaf: Vec<u32> = match &evaluated.leaves[leaf_index].membership {
-                        crate::boolean_bits::Membership::Bits(bits) => candidate_slots
-                            .iter()
-                            .copied()
-                            .filter(|&slot| bits.test(slot as usize))
-                            .collect(),
-                        crate::boolean_bits::Membership::Universal => candidate_slots.clone(),
-                    };
+                    let in_leaf = held(&candidate_slots, leaf_index);
                     let (scores, known) = Self::boolean_lexical_scores(&guard, lexical, &in_leaf)?;
                     if scoring.len() == 1 {
                         stages_known[leaf_index].stage_columns_known = known;
@@ -14939,18 +14964,13 @@ impl NodeServiceImpl {
                     spread
                 }
                 Some(L::Dense(dense)) => {
+                    let in_leaf = held(&candidate_slots, leaf_index);
                     let mut spread = vec![None; candidate_slots.len()];
-                    self.boolean_dense_each(
-                        &guard,
-                        dense,
-                        &candidate_slots,
-                        &req,
-                        |slot, score| {
-                            if let Ok(position) = candidate_slots.binary_search(&slot) {
-                                spread[position] = Some(score);
-                            }
-                        },
-                    )?;
+                    self.boolean_dense_each(&guard, dense, &in_leaf, &req, |slot, score| {
+                        if let Ok(position) = candidate_slots.binary_search(&slot) {
+                            spread[position] = Some(score);
+                        }
+                    })?;
                     spread
                 }
                 _ => unreachable!("scoring leaves are lexical or dense"),

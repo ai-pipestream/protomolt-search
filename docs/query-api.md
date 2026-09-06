@@ -151,24 +151,28 @@ coordinator's `max_k` when zero, with `k <= selection_k <= max_k` and a
 cursor that must stay inside it. Without a scorer or a boost `selection_k`
 must stay zero.
 
-The group rule: MUST intersects the required clauses that are not universal;
-with none, the live-document set is the seed when a MUST exists, when the
-SHOULD minimum is zero, or when the universal SHOULD clauses already meet
-it, and otherwise the SHOULD count decides; on a seeded set the SHOULD
-minimum is then enforced; MUST_NOT subtracts, and a universal MUST_NOT
-empties the group. A zero minimum resolves to one with only SHOULD clauses.
+The group rule: MUST intersects the required clauses; with none, the
+live-document set is the seed when the SHOULD minimum is zero, and otherwise
+the SHOULD count decides; on a seeded set the SHOULD minimum is then
+enforced; MUST_NOT subtracts. A zero minimum resolves to one with only SHOULD
+clauses.
 BM25 uses the same global statistics as the ordinary lexical route, under
 the same stats-epoch claim: a shard whose store moved between the stats read
 and the evaluation refuses, the coordinator refetches fresh and repeats the
 round once without a claim, and a second refusal fails the request rather
 than combining generations.
 
-A dense clause's membership is not fetched: every row that has a vector
-matches it, so the clause is the universe and the group's other clauses (or
-the live-document set, for a group of universal clauses) name the rows. A row
-a positive dense clause holds no vector for leaves the group. A lone dense
-clause under a rare term therefore costs the term's bitmap and one masked
-pass, not the corpus's id list.
+A dense clause's membership is not fetched: on the shard it is the live
+rows that hold a vector, a bitmap the provider's row ranges give without a
+scan, and it takes part in the set algebra like any other clause. A document
+without a vector is outside the clause, so a MUST dense clause drops it, a
+SHOULD dense clause counts nothing for it (a MUST lexical clause with an
+optional dense clause keeps it, scored by the term alone), and a MUST_NOT
+dense clause keeps it. A vector whose document has not arrived, or a row on a
+vectors-only shard, is inside the clause and outside every lexical and filter
+clause. The universe on a shard is its rows, whichever store reaches
+further. A lone dense clause under a rare term therefore costs the term's
+bitmap and one masked pass, not the corpus's id list.
 
 Scoring on the shard is member-scoped on both kinds of clause. A lexical
 clause walks its postings against the sorted members (the `Bm25Rescore`

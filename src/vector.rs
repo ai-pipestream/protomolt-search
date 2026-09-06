@@ -389,6 +389,17 @@ impl VectorIndex {
         self.len() == 0
     }
 
+    /// The row ranges that hold vectors, `(base, rows)` in row order. A
+    /// single image is one range over its length; the segment layout
+    /// lists its parts with an image, the frozen image, and the tail, so
+    /// a sealed document-only segment's rows are absent.
+    pub fn vector_rows(&self) -> Vec<(usize, usize)> {
+        match self.as_segmented() {
+            Some(segmented) => segmented.vector_rows(),
+            None => vec![(0, self.len())],
+        }
+    }
+
     pub fn dimension(&self) -> Option<usize> {
         self.engine.dimension()
     }
