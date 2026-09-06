@@ -6,7 +6,7 @@ shard-side Boolean evaluation. The public package remains
 `ai.protomolt.search.v1`. This note describes the reconciliation; it is not a
 fleet deployment record or a claim that the foundations project is complete.
 
-The later field-authorization branch now incorporates main `a9bf470`, including
+The later field-authorization branch now incorporates main `3a15f9e`, including
 spill staging and relay fetches/folds. The route limitations below describe the
 original checkpoint; current relay support is recorded in
 [relay coordinators](relay-coordinators.md), and the later hybrid read contracts

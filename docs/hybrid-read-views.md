@@ -113,3 +113,6 @@ BM25 rescore changes add five fields without changing stored formats. Source,
 build and test hashes were unchanged through the final run, including the
 lexical-only allowlist optimization. No fleet action or measurement was performed
 by this task.
+
+Main `3a15f9e` subsequently adds benchmark documentation only and is also
+incorporated. The source/build/test hashes remain unchanged after that merge.
