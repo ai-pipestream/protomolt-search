@@ -1231,6 +1231,19 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   node to learn its leaf's predicates from the published topology and refuse
   the row by name. See [placement](docs/placement.md).
 
+- **Landed 2026-09-06: the read surface through a relay.** `SearchShard`
+  (the cascade's gate and the unary vector search), `VectorRescore` and
+  `ExactVectorRescore` (decomposed fusion, the FP32 rerank, a boolean
+  group's dense clause), the three bitmap routes (filtered top-level
+  queries and the recursive boolean planner), and the dictionaries
+  (`ExpandTermPrefix`, `SuggestTerms`) forward through a relay
+  coordinator, each with an equivalence test through one and two relay
+  levels. A relay also serves `DiagnosticsService`, answering the root
+  with its children's layouts merged into one. An id in no child's range
+  is dropped on the rescore routes, as a node drops one outside its own
+  range. Still refused: follow-up fetches by id, per-shard fusion, and
+  aggregation. [Relay coordinators](docs/relay-coordinators.md).
+
 - **Full-domain signed numeric columns (2026-09-05).** Integer presence now
   has its own bitmap, so `i64::MIN` survives ingest, materialization, querying,
   reopen and compaction. New files use kind 10; older readers refuse it.

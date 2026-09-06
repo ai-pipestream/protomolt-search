@@ -487,7 +487,8 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             secured_server(cfg.tls.as_ref(), true)?
                 .initial_stream_window_size(pipestream_search::H2_STREAM_WINDOW)
                 .initial_connection_window_size(pipestream_search::H2_CONN_WINDOW)
-                .add_service(relay.into_server(max))
+                .add_service(relay.clone().into_server(max))
+                .add_service(relay.diagnostics_server(max))
                 .serve_with_incoming_shutdown(harness::nodelay_incoming(listener), async move {
                     let _ = shutdown.wait_for(|v| *v).await;
                 }),

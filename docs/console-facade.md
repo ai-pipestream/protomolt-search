@@ -94,10 +94,10 @@ map from `GetShardDiagnostics` opens with the placement groups (one line
 per code served, the path it decodes to, the shards in it, a warning
 when a shard's rows carry more than one code) and draws each shard's
 sealed segments as bars, in green when a partitioned compaction gave
-them a range, with the summary on hover; a shard whose layout came back
-as a relay's refusal is marked as a relay, since a relay serves the
-node-facing surface only and its children are its own map
-(`docs/relay-coordinators.md`). The placement dry run panel takes a tree
+them a range, with the summary on hover; a relay's shard is the
+children's layouts merged into one, named `relay over N children`, with
+the children's segments under it and the child index in front of each
+segment id (`docs/relay-coordinators.md`). The placement dry run panel takes a tree
 in the shard map's `[placement]` shape (or as `PlacementTree` JSON) and
 an optional filter, calls `SearchService.PlanPlacement`, and lists rows
 and moving rows per shard and leaf with the totals; the balance dry run
