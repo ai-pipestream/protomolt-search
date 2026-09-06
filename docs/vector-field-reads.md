@@ -56,8 +56,8 @@ it and the returned binding are not authorization credentials.
 
 Private Query and QueryStream enforce field grants across selection, projection,
 inner-hit disclosure and revocation; public dense clauses name their indexed
-field. Document-restricted public queries remain gated pending the rest of their
-selection and execution-metadata audit. The clustered native-vector
+field. [Document-restricted queries](document-query-authorization.md) are also
+admitted on private shards. The clustered native-vector
 provider currently lacks this product-field receipt contract and refuses scoped
 scoring. Network delegation and direct-node authorization remain unfinished.
 These internal APIs must not be exposed as an alternate authorization path.
@@ -81,8 +81,8 @@ receipts and refusal after a deletion invalidates the admitted physical version.
 The coordinator's `vector_field_read_tests` use two private nodes to verify field
 Use versus Disclose, document selection, missing and incompatible bindings,
 empty reads, missing version receipts and stale generations. They also assert
-that restricted public Query remains gated until its remaining boundaries are
-implemented.
+that public Query and QueryStream admission retain the mandatory document view
+and exact field restrictions.
 
 Validation on 2026-09-06 passed 470 library tests, 649 integration tests across
 114 targets and 12 embedded tests (1,131 total), with one existing live-sidecar

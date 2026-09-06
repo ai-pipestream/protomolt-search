@@ -188,3 +188,8 @@ passed again; formatting, descriptor compatibility and whitespace checks also
 passed. Source-manifest comparison confirmed that this test was the only change
 to the validated source/build/dependency files. Production code and lockfiles
 remain exactly those from the full run.
+
+The subsequent [document-query admission increment](document-query-authorization.md)
+opens document-restricted Query and QueryStream on private in-process shards.
+The gates described in the historical checkpoints above are superseded for those
+routes; remote restricted execution remains unavailable.

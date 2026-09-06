@@ -3,7 +3,7 @@
 Execution metadata has a separate document-disclosure contract and dense
 benchmark provenance carries an explicit evidence scope. See
 [Query execution disclosure](query-disclosure.md) for omission semantics and
-the remaining public document-query admission boundary.
+the [private-shard document-query admission contract](document-query-authorization.md).
 
 Simple lexical selection returns the imported `DocumentIdentity` with each hit
 when present on the scored row. The terminal `QueryStream` response carries the
@@ -171,8 +171,8 @@ than combining generations.
 The shared [membership boundary](membership-visibility.md) now carries an
 independent mandatory document view and validates its response fingerprint and
 physical version before merging bits. Public query read sets reject changed
-membership immediately. Restricted public Query remains gated until its other
-phases also enforce the authority.
+membership immediately. The [private document-query contract](document-query-authorization.md)
+records how the other phases enforce the authority.
 
 Dense membership remains an explicit, field-bound bitmap built from actual
 vector image ranges; document-only segment gaps are excluded. A vector-only row

@@ -9,13 +9,12 @@ restrictions require a new policy format so older engines refuse them.
 
 Private in-process `Bm25Search`, `Suggest`, `TermSuggest` and
 [Aggregate](scoped-folds.md) enforce both document and field grants.
-`Query` and `QueryStream` now enforce field grants on private in-process shards
-when the decision has no mandatory document view. Document-restricted public
-queries and network-backed restricted collections still refuse until the
-remaining execution-metadata, selection and delegation work is certified.
-Successful terminal responses now have an explicit
-[document execution disclosure](query-disclosure.md) disposition; error and
-provisional surfaces remain part of the admission audit.
+`Query` and `QueryStream` enforce both document and field grants on private
+in-process shards. See [Document-authorized queries](document-query-authorization.md)
+for provisional, terminal and revocation coverage. Network-backed restricted
+collections still refuse until delegation and node authorization are complete.
+Successful responses follow [execution disclosure](query-disclosure.md), and
+failures follow the [error disclosure](error-disclosure.md) contract.
 This does not complete source-fetch or eventual RAG authorization.
 
 ## Names and actions
@@ -154,14 +153,12 @@ retrieval routes. Hosts provide protobuf policies or a trusted `Authorizer`.
 
 The [membership boundary](membership-visibility.md) checks user filter inputs
 and lexical body use before planning, independently of authority-owned predicate
-columns. A field-restricted vector membership call refuses until the dense
-contract names an explicit indexed vector field. This does not enable restricted
-public Query or QueryStream.
+columns. A field-restricted vector membership call requires an explicit durable indexed
+vector field. Public Query admission is described in the document-authorized query contract above.
 
 The [candidate value-fetch boundary](candidate-fetch.md) also checks an
 authority-bound coordinator's field policy before fetching projections and
-stored-value score dimensions. This prepares the later query phases; it does
-not enable restricted public `Query` or `QueryStream`.
+stored-value score dimensions. These checks also protect the corresponding public Query phases.
 
 Validation: 454 library tests, 610 integration tests across 107 targets, and
 12 embedded tests passed (1,076 total); one existing live-sidecar conformance
@@ -175,8 +172,7 @@ index and WAL formats are unchanged.
 
 [Candidate lineage reads](lineage-reads.md) now apply the mandatory document view
 and the query's admitted physical versions. Parent and group keys have separate
-field projections and use/disclosure checks. This prepares collapsed query
-execution; restricted public Query and QueryStream remain gated.
+field projections and use/disclosure checks. These checks also protect public document-restricted collapse.
 
 
 Validation of the public-query increment passed 487 library tests, 682

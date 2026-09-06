@@ -92,5 +92,4 @@ passed after that test-isolation fix.
 
 [Candidate lineage reads](lineage-reads.md) now apply the mandatory document view
 and the query's admitted physical versions. Parent and group keys have separate
-field projections and use/disclosure checks. This prepares collapsed query
-execution; restricted public Query and QueryStream remain gated.
+field projections and use/disclosure checks. These checks also protect the [public document-query paths](document-query-authorization.md).

@@ -40,9 +40,9 @@ contain an error code, error message or error disclosure. Malformed success
 certificates fail with `INTERNAL`.
 
 Successful response metadata has its separate [execution disclosure
-contract](query-disclosure.md). This increment does not certify provisional
-membership or every document-query shape: public document-restricted Query
-admission remains gated. Direct coordinator calls are internal APIs; external
+contract](query-disclosure.md). The subsequent [document-query admission increment](document-query-authorization.md)
+certifies provisional membership and opens private-shard document-restricted
+Query. This error-disclosure increment alone was not that admission decision. Direct coordinator calls are internal APIs; external
 HTTP adapters and mobile client error presentation are outside this audit.
 No stored format, service route or existing protobuf field number changes.
 

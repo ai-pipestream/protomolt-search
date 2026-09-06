@@ -102,8 +102,8 @@ candidate pool without widening it — the outcome stays `ANN` and says so.
 
 The measured recall belongs to the policy's benchmark cohort and selectivity
 band. Matching that band does not establish recall for every predicate with
-the same cardinality. Public document-restricted Query remains gated while its
-metadata disclosure and quality-claim contract are completed; the authority
+the same cardinality. [Document-restricted Query](document-query-authorization.md)
+retains that evidence scope and withholds physical metadata. The authority
 predicate must not be bypassed to select an unfiltered policy point.
 
 ## AUTO and FP32 rerank

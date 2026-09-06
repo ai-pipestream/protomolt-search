@@ -1,10 +1,9 @@
 # Search foundations
 
 Foundation work began on `feat/search-foundations` from `PRE_ASTRA`.
-Current implementation branch: `feat/query-field-authorization-2026-09`.
-This branch now incorporates main `7b0faa9`, including spill staging, relay
-fetch/fold integration and the bulk-analysis end-of-stream fix.
-The main reconciliation checkpoint remains `1565d07` on
+The document-query admission increment follows the field-authorization merge to
+main `c3783a2`, with all current replay, relay, dependency and CI changes included.
+The original main reconciliation checkpoint was `1565d07` on
 `feat/protobuf-unsigned-numerics-2026-09`, accepted for main on 2026-09-06.
 This tracks the full requested foundation. Individual passing increments do not
 establish completion of the three workstreams.
@@ -18,7 +17,7 @@ establish completion of the three workstreams.
 | Original payload and descriptor identity survive storage and replay | Byte equality after restart, snapshots, replication, compaction and resharding, including unknown fields | Row-bearing sources survive image/WAL lifecycle byte-for-byte; the catalog retains zero-row sources across restart; catalog backup and publication remain |
 | Complete scalar, repeated, map, nested and well-known-type semantics | Projection and query conformance across supported syntax/edition and shape combinations | Incomplete; existing column-family restrictions remain |
 | Workspace and collection grants separate read, ingest and administration | Denial tests on every public and node entry point, default collection resolution and direct access | Public search and coordinator diagnostics enforce revisioned protobuf capabilities; direct node/cluster-control policy enforcement remains |
-| Document and field grants cover retrieval and disclosure | Selection, statistics, suggestions, facets, highlights, projections, source fetch, caches and cursors tested under distinct and revoked policies | Document grants enforce private-shard BM25 selection, statistics, caches, suggestions and prefix expansion; field use/disclosure grants cover these routes; broader query and network enforcement remains |
+| Document and field grants cover retrieval and disclosure | Selection, statistics, suggestions, facets, highlights, projections, source fetch, caches and cursors tested under distinct and revoked policies | Private-shard Query/QueryStream and BM25, statistics, caches, suggestions and aggregates enforce document and field grants; remote and remaining direct-entry enforcement remains |
 | Stable document and chunk identity | Exact key lookup and returned identity unchanged through compaction, replay and resharding | Imported identities persist through image/WAL lifecycle, node fetch and lexical results; catalog publication and the other result routes remain |
 | Conditional writes and persistent idempotency | Concurrent version conflicts, repeated requests, key reuse with different payload, disconnected acknowledgment and restart tests | Collection-wide local source authority implemented; server routing and projection transactions remain |
 | Accepted, searchable and durable receipts | API states tied to actual transaction publication and persisted recovery boundaries, crash tests at each boundary | Local source acceptance has durable/volatile receipts and abrupt-process-exit coverage; searchable publication remains |
@@ -1068,3 +1067,16 @@ public document-query gate or complete the three foundations.
 The error-disclosure checkpoint passed 1,207 tests and all five mobile compile
 checks against incorporated main `7b0faa9`; its document records the precise
 validation boundary and the updated error-contract assertions.
+
+## Public document-query admission, 2026-09-06
+
+Private in-process Query and QueryStream now admit document views, with or
+without field grants. The new public matrix compares against a physically
+restricted corpus and checks every provisional revision, final hits and groups,
+aggregates, highlighting, explanation, pagination and post-provisional policy
+revocation. Dense/FP32 and all four hybrid strategies have scoped streaming
+coverage. See [Document-authorized queries](document-query-authorization.md).
+Remote and direct-node enforcement, remaining protobuf shape semantics and
+stable identity/publication remain required; the three-part goal is incomplete.
+The admission increment passed 1,217 tests and all five mobile compile targets
+against main `c3783a2`; the document-query contract records the validation scope.

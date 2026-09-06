@@ -1222,6 +1222,11 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **2026-09-06 — Document-authorized Query and QueryStream.** Private in-process
+  shards now accept mandatory document views with optional field grants. Tests
+  cover provisional membership, rich final answers, paging and policy changes
+  after provisional results. Remote restricted queries still refuse. See
+  [Document-authorized queries](docs/document-query-authorization.md).
 - **2026-09-06 — Field-authorization integration with current main.** The
   integration preserves main's segment replay and bounded split builds while
   adding scoped query admission, read receipts, dense evidence disclosure and

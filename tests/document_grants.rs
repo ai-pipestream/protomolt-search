@@ -350,15 +350,6 @@ async fn uncertified_routes_and_network_nodes_refuse_before_execution() {
     denied!(phrase_search, PhraseSearchRequest::default());
     denied!(hybrid_search, HybridSearchRequest::default());
     denied!(variant_search, VariantSearchRequest::default());
-    denied!(query, QueryRequest::default());
-    assert_eq!(
-        SearchService::query_stream(&service, request(QueryStreamRequest::default(), "public"))
-            .await
-            .err()
-            .unwrap()
-            .code(),
-        Code::PermissionDenied
-    );
     assert_eq!(cache.fetch_count(), 0);
     let network = CollectionSet::single(CoordinatorServiceImpl::new(vec![
         "http://must-not-resolve.invalid:50051".into(),
@@ -368,6 +359,21 @@ async fn uncertified_routes_and_network_nodes_refuse_before_execution() {
         .await
         .unwrap_err();
     assert_eq!(error.code(), Code::FailedPrecondition);
+    assert_eq!(
+        SearchService::query(&network, request(QueryRequest::default(), "public"))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    assert_eq!(
+        SearchService::query_stream(&network, request(QueryStreamRequest::default(), "public"))
+            .await
+            .err()
+            .unwrap()
+            .code(),
+        Code::FailedPrecondition
+    );
     assert!(
         pipestream_search::error_disclosure::status_detail(&error)
             .unwrap()

@@ -53,10 +53,10 @@ it is not a stable public document key. This change protects lineage reads from
 using old row locators against new physical data; it does not replace the stable
 identity and publication work.
 
-Restricted public Query/QueryStream remain gated while the remaining selection,
-scoring and disclosure paths are completed. The new request fields are trusted
-planner context, not credentials for direct-node access. Source retrieval,
-remote delegated authorization, provisional frames and RAG remain separate
+Private [document-restricted Query/QueryStream](document-query-authorization.md)
+use these reads with the selection, scoring and disclosure checks. The new
+request fields are trusted planner context, not credentials for direct-node
+access. Source retrieval, remote delegated authorization and RAG remain separate
 requirements. The original three foundation objectives remain unfinished.
 
 The protocol adds nine fields and one enum under `ai.protomolt.search.v1`.

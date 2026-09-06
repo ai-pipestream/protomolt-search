@@ -2044,13 +2044,10 @@ impl CoordinatorServiceImpl {
                 "restricted grants require search authorization",
             ));
         }
-        let field_query = view.is_none() && matches!(route, "query" | "query_stream");
-        if !field_query
-            && !matches!(
-                route,
-                "bm25_search" | "suggest" | "term_suggest" | "aggregate"
-            )
-        {
+        if !matches!(
+            route,
+            "query" | "query_stream" | "bm25_search" | "suggest" | "term_suggest" | "aggregate"
+        ) {
             return Err(Status::permission_denied(
                 "this route does not yet enforce document or field grants",
             ));
@@ -16140,9 +16137,7 @@ measured_recall_ppm = 980000
                     Some(crate::analyzer::NATIVE_ANALYSIS_BACKEND.into()),
                     Default::default(),
                 );
-        // Exercise the common unary/stream executor directly while the public
-        // document-query admission gate awaits the complete surface audit.
-        let reader = owner.for_access(Some(&decision), "bm25_search").unwrap();
+        let reader = owner.for_access(Some(&decision), "query").unwrap();
         let mut requests = vec![];
         for mode in [DenseScoreMode::Unspecified, DenseScoreMode::Fp32Rerank] {
             requests.push(QueryRequest {
@@ -16240,6 +16235,55 @@ measured_recall_ppm = 980000
                 assert_eq!(
                     execution.evidence_scope,
                     DenseEvidenceScope::NotApplicable as i32
+                );
+            }
+            use tokio_stream::StreamExt;
+            let mut stream_request = Request::new(QueryStreamRequest {
+                query: Some(request.clone()),
+                ..Default::default()
+            });
+            stream_request.extensions_mut().insert(decision.clone());
+            let mut stream = SearchService::query_stream(&reader, stream_request)
+                .await
+                .unwrap()
+                .into_inner();
+            let mut completed = false;
+            let mut provisional = false;
+            while let Some(event) = stream.next().await {
+                assert!(!completed);
+                match event.unwrap().payload.unwrap() {
+                    query_stream_response::Payload::Revision(revision) => {
+                        assert!(
+                            revision
+                                .hits
+                                .iter()
+                                .all(|hit| matches!(hit.doc_id, 0 | 100)),
+                            "{}: private provisional hit",
+                            raw.executed
+                        );
+                        provisional |= !revision.hits.is_empty()
+                            && revision.phase != QueryStreamPhase::Final as i32;
+                    }
+                    query_stream_response::Payload::Completion(end) => {
+                        assert!(end.completed, "{}: {}", raw.executed, end.error_message);
+                        let response = end.response.unwrap();
+                        assert_eq!(response.hits, raw.hits);
+                        assert!(response.execution_details_redacted);
+                        completed = true;
+                    }
+                }
+            }
+            assert!(completed);
+            // Single scored leaves have a streaming collector; composite
+            // membership can execute without publishing a provisional heap.
+            if matches!(
+                request.selection.as_ref().and_then(|s| s.node.as_ref()),
+                Some(selection_query::Node::Search(_))
+            ) {
+                assert!(
+                    provisional,
+                    "{} must exercise provisional results",
+                    raw.executed
                 );
             }
             let unrestricted = owner.execute_query(request, None).await.unwrap();
@@ -16698,10 +16742,17 @@ measured_recall_ppm = 980000
                 .code(),
             tonic::Code::FailedPrecondition
         );
-        // Other Query selection/disclosure paths still require their own audit.
-        assert!(owner
-            .for_access(Some(&access("semantic", FieldAction::Use)), "query")
-            .is_err());
+        let decision = access("semantic", FieldAction::Use);
+        for route in ["query", "query_stream"] {
+            let admitted = owner.for_access(Some(&decision), route).unwrap();
+            assert_eq!(admitted.document_visibility, decision.document_visibility);
+            assert!(admitted
+                .field_permissions
+                .as_ref()
+                .unwrap()
+                .vector("signal")
+                .is_err());
+        }
     }
 
     #[tokio::test]

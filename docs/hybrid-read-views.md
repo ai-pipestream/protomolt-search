@@ -46,8 +46,9 @@ The coordinator regressions exercise all four strategies, a disabled dense leg,
 an authorized source-path alias, and incompatible durable bindings of the same
 dimension.
 
-Document-restricted public Query remains gated. The selection and candidate authority checks here do not complete its
-public execution-metadata and quality-policy audit. Direct-node authorization, network delegation, and
+[Document-restricted public Query](document-query-authorization.md) now combines
+these checks with execution disclosure and provisional membership validation.
+Direct-node authorization, network delegation, and
 relay composition of streamed scan receipts remain separate unfinished work.
 These contexts are trusted-planner metadata, not credentials.
 
@@ -128,13 +129,14 @@ in force. Tests reproduce the previous 1,000,000 versus 500,000 ppm error and
 prove that the corrected key selects a different measured candidate depth.
 See [dense execution policy](dense-execution-policy.md) for the measurement scope.
 
-Public document Query is still gated. The shared executor now applies
+The shared executor applies
 document-specific disclosure to physical rerank work, shard/segment counts,
 corpus geometry, live filter ratios and free-form planner labels. The response
 marks omissions explicitly and retains traversal and benchmark provenance with
 an explicit evidence scope. A policy's measured recall cannot be upgraded to a
-guarantee for every document view in its selectivity band. Error and provisional
-surfaces still need certification; see [Query execution disclosure](query-disclosure.md).
+guarantee for every document view in its selectivity band. See
+[Query execution disclosure](query-disclosure.md) and the document-query admission
+contract for error and provisional surfaces.
 
 Validation: 494 library tests, 688 integration tests across 119 targets, and
 12 embedded tests passed (1,194 total, zero failed). The existing live OpenNLP
