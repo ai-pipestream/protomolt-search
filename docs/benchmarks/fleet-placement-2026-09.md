@@ -338,6 +338,20 @@ placement column, and writes one image per band under
 have put the seventh child on the Pi range and was stopped after its
 routing pass (about seven minutes for the six logs, 155 GB of spill).
 
+The second attempt wrote its spill with one bucket per child and then
+replayed a 10.6M-row band into one image: 50 GB resident plus 43 GB of
+swap on the 61 GB machine, stopped. The split now spills with the
+sources' bucket count (64 here) and builds each child as a segment
+catalog one bucket at a time (`docs/placement.md`, "Changing the
+tree"): the third attempt held 10 GB resident and built a 166k-row
+bucket segment in about 56 seconds, which puts the six bands at about
+six hours. It stopped twenty minutes in when the sidecar closed the
+connection with ENHANCE_YOUR_CALM: the bulk analysis path opened six
+streams per 32-entry batch and let each go with its trailers unread,
+a RST_STREAM on the wire, about 600 a second, past grpc-netty's
+rapid-reset guard. With the stream drained to the server's end
+(b0ee87c) the fourth attempt is running.
+
 ## What remains
 
 - Cutover: nothing was moved off the old ports. The old generation on
