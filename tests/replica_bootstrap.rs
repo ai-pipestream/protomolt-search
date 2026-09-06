@@ -372,13 +372,28 @@ async fn a_replica_bootstraps_from_the_primary_and_takes_over() {
         "the plan carries the published routes"
     );
 
-    // A keeps ingesting while B bootstraps.
+    // A keeps ingesting while B bootstraps: through the export below and
+    // B's install of the image. The writer stops once B has installed,
+    // so the catch-up that follows works a finite backlog and converges
+    // on any machine; a writer that ran on would set the replica's lag
+    // by the machine's speed alone (a catch-up round costs a log read,
+    // an apply, and a health probe, and on the CI container that was
+    // more than eight rows of a 15 ms writer, so the bounded loop gave
+    // the tick back with the replica 14 clocks behind). The step that
+    // makes A move on after B's install is the before_complete hook.
     let stop = Arc::new(AtomicBool::new(false));
     let ingested = Arc::new(AtomicU64::new(DOCS as u64));
     let ingest_loop = {
-        let (stop, ingested, addr) = (Arc::clone(&stop), Arc::clone(&ingested), addr_a.clone());
+        let (stop, ingested, addr, agent_b) = (
+            Arc::clone(&stop),
+            Arc::clone(&ingested),
+            addr_a.clone(),
+            agent_b.clone(),
+        );
         tokio::spawn(async move {
-            while !stop.load(Ordering::Relaxed) {
+            while !stop.load(Ordering::Relaxed)
+                && agent_b.stats().installs.load(Ordering::Relaxed) == 0
+            {
                 let i = ingested.load(Ordering::Relaxed) as usize;
                 ingest(&addr, i, i + 1).await;
                 ingested.store(i as u64 + 1, Ordering::Relaxed);
