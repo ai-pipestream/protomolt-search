@@ -230,6 +230,17 @@ impl SegmentedProvider {
         }
         out
     }
+
+    /// The row ranges that hold vectors, `(base, rows)` in row order: the
+    /// parts with an image, the frozen image, and the tail. A sealed
+    /// document-only segment's rows are not in the list, and neither are
+    /// the tail's documents whose vectors have not arrived.
+    pub fn vector_rows(&self) -> Vec<(usize, usize)> {
+        self.images()
+            .into_iter()
+            .map(|(base, rows, _)| (base, rows))
+            .collect()
+    }
 }
 
 impl VectorProvider for SegmentedProvider {

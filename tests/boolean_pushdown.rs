@@ -287,6 +287,264 @@ fn route_count(rpc: &str) -> u64 {
         .expect("the route is exported")
 }
 
+/// A fleet where vectors and documents do not line up: shard 0 holds
+/// documents whose last `VECTORLESS` rows never get a vector (a single
+/// image, since a segment seals documents with their vectors), and
+/// shard 1 holds `VECTOR_ONLY` vectors and no document at all.
+const VECTORLESS: usize = 400;
+const VECTOR_ONLY: usize = 300;
+
+async fn uneven_fleet(tag: &str) -> Fleet {
+    let dir = tempdir(tag);
+    let vectors = corpus();
+    let sample = &vectors[..vectors.len().min(64 * DIM)];
+    let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, sample);
+    let calibration = SetCalibrationRequest {
+        dim: DIM as u32,
+        bit_width: BIT_WIDTH as u32,
+        shift,
+        scale,
+    };
+    let mut addrs = Vec::new();
+    let mut handles = Vec::new();
+    // Shard 0: every row is a document, the first SHARD_ROWS - VECTORLESS
+    // of them with a vector.
+    let (addr, handle) = start_empty_node(NodeConfig {
+        layout: Layout::SingleImage,
+        seal_tail_docs: 0,
+        ..config(dir.join("shard-0.tv"), 0)
+    })
+    .await;
+    let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+    client.set_calibration(calibration.clone()).await.unwrap();
+    let with_vectors = SHARD_ROWS - VECTORLESS;
+    let (tx, rx) = mpsc::channel(SHARD_ROWS);
+    for i in 0..SHARD_ROWS {
+        tx.send(AddDocumentsRequest {
+            text: text(i),
+            analysis: Some(body_spec()),
+            integers: vec![IntegerValue {
+                field: "year".into(),
+                value: year(i),
+            }],
+            facets: vec![FacetValue {
+                field: "court".into(),
+                value: court(i).into(),
+            }],
+            numerics: vec![NumericValue {
+                field: "pages".into(),
+                value: pages(i),
+            }],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+    drop(tx);
+    client.add_documents(ReceiverStream::new(rx)).await.unwrap();
+    let (tx, rx) = mpsc::channel(2);
+    tx.send(AddVectorsRequest {
+        vectors: vectors[..with_vectors * DIM].to_vec(),
+        dim: DIM as u32,
+    })
+    .await
+    .unwrap();
+    drop(tx);
+    client.add_vectors(ReceiverStream::new(rx)).await.unwrap();
+    client.flush(FlushRequest {}).await.unwrap();
+    addrs.push(addr);
+    handles.push(handle);
+    // Shard 1: vectors only.
+    let (addr, handle) = start_empty_node(config(dir.join("shard-1.tv"), SHARD_ROWS as u64)).await;
+    let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+    client.set_calibration(calibration).await.unwrap();
+    let (tx, rx) = mpsc::channel(2);
+    tx.send(AddVectorsRequest {
+        vectors: vectors[SHARD_ROWS * DIM..(SHARD_ROWS + VECTOR_ONLY) * DIM].to_vec(),
+        dim: DIM as u32,
+    })
+    .await
+    .unwrap();
+    drop(tx);
+    client.add_vectors(ReceiverStream::new(rx)).await.unwrap();
+    client.flush(FlushRequest {}).await.unwrap();
+    addrs.push(addr);
+    handles.push(handle);
+    let coordinator = CoordinatorServiceImpl::new(addrs).with_bm25(
+        Some(NATIVE_ANALYSIS_BACKEND.to_string()),
+        Default::default(),
+    );
+    Fleet {
+        coordinator,
+        dir,
+        handles,
+    }
+}
+
+fn sorted(mut ids: Vec<u64>) -> Vec<u64> {
+    ids.sort_unstable();
+    ids
+}
+
+/// The group rule over rows a dense clause does not hold: a document
+/// without a vector is outside a dense clause and a vector without a
+/// document is inside it, in every position of the tree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dense_clause_holds_the_rows_with_a_vector_and_no_others() {
+    let fleet = uneven_fleet("uneven").await;
+    let c = &fleet.coordinator;
+    let k = ROWS as u32;
+    let with_vectors = SHARD_ROWS - VECTORLESS;
+    let zebra: Vec<u64> = (0..SHARD_ROWS as u64).filter(|i| i % 2 == 1).collect();
+    let zebra_with_vector: Vec<u64> = zebra
+        .iter()
+        .copied()
+        .filter(|&i| (i as usize) < with_vectors)
+        .collect();
+    let zebra_without_vector: Vec<u64> = zebra
+        .iter()
+        .copied()
+        .filter(|&i| (i as usize) >= with_vectors)
+        .collect();
+    let vector_rows: Vec<u64> = (0..with_vectors as u64)
+        .chain(SHARD_ROWS as u64..(SHARD_ROWS + VECTOR_ONLY) as u64)
+        .collect();
+    // The lexical route names the zebra documents, vector or not.
+    let plain = query(c, request(lexical("l", "zebra"), k)).await;
+    assert_eq!(sorted(ids(&plain.hits)), zebra, "the lexical oracle");
+    // MUST dense: the rows with a vector, the vectors-only shard's
+    // rows among them.
+    let must = query(
+        c,
+        request(boolean(vec![dense("v", 7)], vec![], vec![], 0, None), k),
+    )
+    .await;
+    assert_eq!(sorted(ids(&must.hits)), vector_rows, "MUST dense");
+    // MUST lexical, SHOULD dense: the optional clause admits nothing
+    // away, so the documents without a vector remain, scored by the
+    // lexical clause only.
+    let optional = query(
+        c,
+        request(
+            boolean(
+                vec![lexical("l", "zebra")],
+                vec![dense("v", 7)],
+                vec![],
+                0,
+                None,
+            ),
+            k,
+        ),
+    )
+    .await;
+    assert_eq!(
+        sorted(ids(&optional.hits)),
+        zebra,
+        "MUST lexical, SHOULD dense"
+    );
+    for hit in &optional.hits {
+        let has_vector = (hit.doc_id as usize) < with_vectors;
+        let signals: Vec<&str> = hit.signals.iter().map(|s| s.id.as_str()).collect();
+        let matched: Vec<&str> = hit.matched.iter().map(String::as_str).collect();
+        if has_vector {
+            assert_eq!(signals, vec!["l", "v"], "doc {} scores on both", hit.doc_id);
+            assert_eq!(matched, vec!["l", "v"]);
+        } else {
+            assert_eq!(signals, vec!["l"], "doc {} scores on the term", hit.doc_id);
+            assert_eq!(matched, vec!["l"]);
+        }
+    }
+    // SHOULD lexical or dense, one of them: the union.
+    let either = query(
+        c,
+        request(
+            boolean(
+                vec![],
+                vec![lexical("l", "zebra"), dense("v", 7)],
+                vec![],
+                1,
+                None,
+            ),
+            k,
+        ),
+    )
+    .await;
+    let mut union: Vec<u64> = zebra
+        .iter()
+        .copied()
+        .chain(vector_rows.iter().copied())
+        .collect();
+    union.sort_unstable();
+    union.dedup();
+    assert_eq!(
+        sorted(ids(&either.hits)),
+        union,
+        "SHOULD lexical, SHOULD dense"
+    );
+    // SHOULD lexical and dense, both: the zebra documents with a vector.
+    let both = query(
+        c,
+        request(
+            boolean(
+                vec![],
+                vec![lexical("l", "zebra"), dense("v", 7)],
+                vec![],
+                2,
+                None,
+            ),
+            k,
+        ),
+    )
+    .await;
+    assert_eq!(sorted(ids(&both.hits)), zebra_with_vector, "SHOULD both");
+    // MUST lexical, MUST_NOT dense: the zebra documents without a vector.
+    let excluded = query(
+        c,
+        request(
+            boolean(
+                vec![lexical("l", "zebra")],
+                vec![],
+                vec![dense("v", 7)],
+                0,
+                None,
+            ),
+            k,
+        ),
+    )
+    .await;
+    assert_eq!(
+        sorted(ids(&excluded.hits)),
+        zebra_without_vector,
+        "MUST lexical, MUST_NOT dense"
+    );
+    // A filter with a dense MUST_NOT: the filter's rows without a vector,
+    // on the documents shard only (a vector without a document has no
+    // year).
+    let filtered = query(
+        c,
+        request(
+            boolean(
+                vec![cel("f", "year >= 2010")],
+                vec![],
+                vec![dense("v", 7)],
+                0,
+                None,
+            ),
+            k,
+        ),
+    )
+    .await;
+    let expected: Vec<u64> = (with_vectors as u64..SHARD_ROWS as u64)
+        .filter(|&i| year(i as usize) >= 2010)
+        .collect();
+    assert_eq!(
+        sorted(ids(&filtered.hits)),
+        expected,
+        "filter, MUST_NOT dense"
+    );
+    fleet.stop();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_filter_and_a_search_equal_the_and_composite_without_a_bitmap_route() {
     let fleet = fleet("composite").await;

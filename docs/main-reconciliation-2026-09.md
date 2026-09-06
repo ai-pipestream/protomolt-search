@@ -55,9 +55,20 @@ members or add their signal/provenance to non-members. The single-dense fast
 path is used only when all selected members belong to that dense leaf.
 
 This retains main's shard-local wordwise evaluation and candidate-scoring
-improvements. Membership bitmaps do not return to the coordinator. The parallel
-Boolean audit should supply independent cases for nested groups, minimum-should-
-match, vector-only rows, vector-less documents and native/FP32 parity.
+improvements. Membership bitmaps do not return to the coordinator. The independent
+fix `7c44e282352aa4ccaf9ff3d1f608ffd9833c1b3c` is incorporated with the authority
+and receipt checks retained. Both Boolean membership and `ResolveVectorBitmap`
+use actual provider image ranges, not a prefix of the logical row extent.
+`tests/boolean_segment_gaps.rs` covers a document-only sealed segment between
+two vector-bearing segments plus a vector-bearing tail. Selecting FP32 scoring
+does not redefine membership; missing sidecar data must fail instead of silently
+dropping native vector rows.
+
+The segmented-gap regression constructs the provider and lexical shard directly.
+It does not certify reopening a mixed catalog with its whole-shard FP32 sidecar:
+the existing recovery code concatenates vector-bearing parts, while the sidecar
+shape check requires positional alignment. Supporting FP32 recovery across such
+gaps needs an explicit slot mapping or aligned storage, with recovery tests.
 
 ## Vector scan admission
 
@@ -75,9 +86,51 @@ all public hit forms and the remaining source durability work are separate.
 
 ## Integration order
 
-Keep this feature branch isolated while the combined tests run. The dense
-membership audit and bounded re-placement split can continue on their own
-branches. Recheck live main immediately before publishing this branch and again
+The combined tests passed; publishing this feature branch is separate from
+merging it to main. The bounded
+re-placement split remains on its own branch. Recheck live main immediately
+before publishing this branch and again
 before its eventual merge to main. Do not infer fleet readiness from a source
 merge or a launched restart; the other task owns that rollout and readiness
 verification.
+
+Fork E is parked at `eb45b61` on `feat/relay-folds-2026-09`; it is not
+incorporated here. Its coordinator fold helpers have no route integration or
+behavior tests. The resumed work must translate full epoch/incarnation claims,
+forward authority views and named field bindings, and validate each child's
+receipt before folding or disclosing values. Rebase those helpers onto this
+reconciled branch before route integration: retain unsigned scalar types,
+full-width integer partials and response type-agreement checks. Empty-id
+children still participate
+where field/view knowledge is required. `FetchValues`, `ResolveParents` and
+`BrowseShard` are public Query dependencies; their current refusals matter.
+`HybridShard` remains used by the partition-dependent two-level fusion mode,
+so its relay refusal stays.
+
+Treat Fork E's floating-point findings as proposed acceptance criteria until
+exercised by tests. Preserve leaf fold order for a bitwise claim, or document and
+test a numerical bound for regrouped double sum, mean and variance. A topology
+change must not silently weaken the public aggregation contract. Exact integer
+and set/count shapes also need overflow, schema, missing-child and multi-level
+composition tests before their routes are enabled.
+
+
+## Validation
+
+The reconciled source passed 486 library tests and 677 integration tests across
+118 targets, followed by 12 embedded tests: 1,175 passed, zero failed. The
+existing `native_matches_opennlp_contract` integration test remains ignored;
+it requires `OPENNLP_ANALYSIS_ADDR` and scans every Unicode scalar. Integration
+targets ran in groups of six with `CARGO_BUILD_JOBS=2` and four test threads.
+
+Descriptor comparison against main `5fdedf3` preserves every deployed protobuf
+declaration. Comparison against the previous feature checkpoint `67c0290`
+allows only the documented QuantileCounts visibility tag move. Source hashes
+were recorded before the full run and checked afterwards.
+
+All five embedded mobile compile targets pass: `aarch64-linux-android`,
+`x86_64-linux-android`, `aarch64-apple-ios`, `aarch64-apple-ios-sim` and
+`x86_64-apple-ios`. These are compile checks, not executions on phones.
+The tests/examples build check, formatting check, vendored-proto identity
+check and whitespace check also pass. No fleet operation or measurement was
+performed by this task.

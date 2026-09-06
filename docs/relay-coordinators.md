@@ -267,9 +267,11 @@ relay without touching relay code.
 
 What a general relay still needs beyond this scope, and why each waits:
 follow-up fetches routed by original id (`GetDocuments`, `FetchValues`,
-`ResolveParents`, `BrowseShard`: the public routes fetch documents from
-the root's own links today, so nothing asks a relay for them yet),
-per-shard fusion (`HybridShard`, superseded by the fused routes above),
+`ResolveParents`, `BrowseShard`: public Query uses `FetchValues`,
+`ResolveParents` and `BrowseShard` through the root's links, which can be
+relays; those shapes currently refuse), per-shard fusion (`HybridShard`
+still serves the partition-dependent two-level fusion mode and cannot
+be transparently regrouped),
 aggregation with the root's fold order preserved (`AggregateShard`,
 `QuantileCounts`, a `BooleanQuery.aggregate` inside `EvaluateBoolean`,
 and the `stats_fields` / `cardinality_fields` shapes: a fold in the

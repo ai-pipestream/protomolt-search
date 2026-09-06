@@ -169,7 +169,8 @@ physical version before merging bits. Public query read sets reject changed
 membership immediately. Restricted public Query remains gated until its other
 phases also enforce the authority.
 
-Dense membership remains an explicit, field-bound bitmap. A vector-only row
+Dense membership remains an explicit, field-bound bitmap built from actual
+vector image ranges; document-only segment gaps are excluded. A vector-only row
 can belong to a dense leaf without belonging to a lexical leaf; a document can
 lack a vector. Treating dense membership as the entire live-document universe
 would change SHOULD and MUST_NOT semantics. Membership receipts also prove the

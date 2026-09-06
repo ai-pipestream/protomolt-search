@@ -7656,7 +7656,7 @@ message BooleanCandidate {
   float score = 2;
   repeated BooleanSignal signals = 3;
   // Indices into BooleanShardRequest.leaves of the leaves whose
-  // membership holds this document (a dense leaf always does).
+  // membership holds this row; dense leaves include only rows with a vector.
   repeated uint32 matched = 4;
 }
 
