@@ -383,6 +383,17 @@ service NodeService {
   rpc ResolveLexicalBitmap(LexicalBitmapRequest) returns (MembershipBitmapResponse);
   rpc ResolveVectorBitmap(VectorBitmapRequest) returns (MembershipBitmapResponse);
 
+  // One recursive Boolean evaluation over this shard (docs/query-api.md,
+  // "Recursive boolean execution"). The coordinator sends the planned
+  // tree: analyzed terms with the global statistics they score under,
+  // dense vectors, compiled filters. The shard resolves each leaf over
+  // its bitmaps, applies the set algebra locally, scores the members
+  // for every scoring leaf, and answers with its best `depth` members
+  // by summed score. No membership crosses the wire; the coordinator
+  // merges ranked candidates only. An optional aggregate folds over the
+  // shard's match set in the same call.
+  rpc EvaluateBoolean(BooleanShardRequest) returns (BooleanShardResponse);
+
   // Export one durable WAL generation in generation-clock order for replica
   // or child catch-up. The node flushes before taking the high watermark;
   // every emitted record is therefore part of a complete durability point.
@@ -6839,6 +6850,11 @@ message QuantileCountsRequest {
   repeated QuantileTarget targets = 4;
   repeated uint64 doc_ids = 5;
   bool restrict_doc_ids = 6;
+  // When set, the admitted set is the match set of this planned Boolean
+  // tree (BooleanShardRequest, `depth`/`aggregate` ignored), resolved
+  // again on this shard for the round; `filter`, `geo_filters` and the
+  // id allowlist must then be empty.
+  BooleanShardRequest boolean = 7;
 }
 
 // One probe: an expression and a threshold in its order-bits domain.
@@ -7102,4 +7118,139 @@ message MaterializedColumn {
 
   // Target family. The evaluated type must match, per document.
   MaterializeKind kind = 3;
+}
+
+// ---------------------------------------------------------------------
+// Shard-side recursive Boolean evaluation (NodeService.EvaluateBoolean).
+// ---------------------------------------------------------------------
+
+// One planned leaf, referenced from the tree by index.
+message BooleanPlanLeaf {
+  oneof leaf {
+    BooleanPlanLexical lexical = 1;
+    BooleanPlanDense dense = 2;
+    BooleanPlanFilter filter = 3;
+  }
+}
+
+// A lexical clause: coordinator-analyzed body terms with the global
+// statistics they score under (see Bm25RescoreRequest). Membership is
+// the union of the terms' postings on this shard.
+message BooleanPlanLexical {
+  repeated string terms = 1;
+  uint64 global_doc_count = 2;
+  uint64 global_total_doc_length = 3;
+  repeated uint32 global_doc_frequencies = 4;
+  // BM25 k1 and b; 0 selects the defaults.
+  float k1 = 5;
+  float b = 6;
+  repeated ScoreStage score_stages = 7;
+}
+
+// A dense clause: the universe of rows with a vector. Scored with the
+// provider's calibrated products, or the FP32 rows when `exact_fp32`.
+message BooleanPlanDense {
+  repeated float vector = 1;
+  bool exact_fp32 = 2;
+}
+
+// A filter clause, compiled once at the coordinator and pruned per
+// shard of the leaves its placement leaf implies.
+message BooleanPlanFilter {
+  FilterExpr filter = 1;
+  repeated GeoFilter geo_filters = 2;
+}
+
+// A tree node: a nested group or a leaf index.
+message BooleanPlanNode {
+  oneof node {
+    BooleanPlanGroup group = 1;
+    uint32 leaf = 2;
+  }
+}
+
+// A group with the resolved minimum_should_match.
+message BooleanPlanGroup {
+  repeated BooleanPlanNode must = 1;
+  repeated BooleanPlanNode should = 2;
+  repeated BooleanPlanNode must_not = 3;
+  uint32 minimum_should_match = 4;
+}
+
+// The fold a shard runs over its match set (AggregateShardRequest
+// without the filters: the tree owns membership).
+message BooleanShardAggregate {
+  repeated CompiledAggregation aggregations = 1;
+  string group_by = 2;
+  uint32 max_groups = 3;
+  repeated CompiledHistogram histograms = 4;
+  repeated CompiledPercentile percentiles = 5;
+}
+
+message BooleanShardRequest {
+  BooleanPlanGroup root = 1;
+  repeated BooleanPlanLeaf leaves = 2;
+  // Candidates to answer with: the shard's best `depth` members by
+  // summed score, doc id ascending on ties. A zero depth is refused.
+  uint32 depth = 3;
+  // The stats-epoch claim for the lexical leaves' global statistics;
+  // 0 = no claim (see Bm25QueryRequest.expected_stats_epoch).
+  uint64 expected_stats_epoch = 4;
+  // Per-shard logical row-byte ceiling for one FP32 pass (see
+  // ExactVectorRescoreRequest.max_logical_bytes); 0 = none.
+  uint64 max_logical_bytes = 5;
+  // Members per FP32 scoring pass; 0 selects 10,000.
+  uint32 exact_batch = 6;
+  BooleanShardAggregate aggregate = 7;
+}
+
+// One scoring leaf's relevance for a candidate.
+message BooleanSignal {
+  // Index into BooleanShardRequest.leaves.
+  uint32 leaf = 1;
+  float score = 2;
+}
+
+// One candidate of the shard's answer.
+message BooleanCandidate {
+  uint64 doc_id = 1;
+  // The sum of the signals, in leaf order.
+  float score = 2;
+  repeated BooleanSignal signals = 3;
+  // Indices into BooleanShardRequest.leaves of the leaves whose
+  // membership holds this document (a dense leaf always does).
+  repeated uint32 matched = 4;
+}
+
+// A filter leaf's known-column handshake (see FilterBitmapResponse).
+message BooleanFilterKnown {
+  repeated bool geo_columns_known = 1;
+  repeated bool filter_columns_known = 2;
+}
+
+// A lexical leaf's score-stage handshake (see Bm25RescoreResponse).
+message BooleanStagesKnown {
+  repeated bool stage_columns_known = 1;
+}
+
+message BooleanShardResponse {
+  // Score descending, doc id ascending; at most `depth`.
+  repeated BooleanCandidate candidates = 1;
+  // Members of the root match set on this shard, after the rows a
+  // dense leaf holds no vector for left.
+  uint64 matched = 2;
+  // Sealed segments consulted and ruled out, summed over the leaves
+  // (docs/segment-pruning.md).
+  uint32 segments_total = 3;
+  uint32 segments_skipped = 4;
+  // The lexical store epoch the scoring ran under.
+  uint64 stats_epoch = 5;
+  // Parallel to the request's leaves; unset entries for non-filter
+  // leaves.
+  repeated BooleanFilterKnown filters_known = 6;
+  // Parallel to the request's leaves; unset entries for non-lexical
+  // leaves.
+  repeated BooleanStagesKnown stages_known = 7;
+  // The fold, when the request asked for one.
+  AggregateShardResponse aggregate = 8;
 }
