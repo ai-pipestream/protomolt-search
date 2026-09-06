@@ -816,3 +816,15 @@ browse and lexical selections, group representatives and inner hits, source-key
 reads after reopen and compaction on both layouts, and type disagreement with
 empty and populated results. This work changes query messages and execution;
 it introduces no persisted index format or mapping fingerprint change.
+
+
+## Field grants
+
+Private-shard Query and QueryStream enforce the authority's exact field grants
+before reading shard versions or running selection. See [Field grants](field-grants.md)
+for input checks, projections, sort/collapse keys, aggregate disclosure and
+revocation. `QueryResponse.field_details_redacted` marks withheld automatic
+identity, dictionary or stored-value dimension details. Scores and ranks remain
+unchanged; the remaining dimensions may not suffice to reconstruct those scores.
+The same rules cover collapse inner hits and streaming completion. Public queries
+with a mandatory document view and network delegation remain gated.

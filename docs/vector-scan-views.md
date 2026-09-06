@@ -61,9 +61,10 @@ sharing floors, merging candidates or publishing provisional results. Readers
 stop after their initial receipt until the whole read set is admitted; failures
 cancel peer work. Duplicate or unsolicited receipts also fail legacy streams.
 
-Restricted public Query/QueryStream remain gated until the full selection and
-disclosure audit is complete. Parent collapse requires both Use and Disclose on
-`parent_id`. Relays still refuse supplied scan contexts before contacting children;
+Private Query/QueryStream enforce field grants when no document view is attached.
+Document-restricted public queries remain gated until the full selection and
+execution-metadata audit is complete. Parent collapse requires both Use and
+Disclose on `parent_id`. Relays still refuse supplied scan contexts before contacting children;
 composing candidate-score receipts does not yet implement streamed receipt
 composition. See the [main reconciliation](main-reconciliation-2026-09.md) for
 current relay support and the QuantileCounts wire incompatibility. Direct-node

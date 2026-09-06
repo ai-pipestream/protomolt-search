@@ -1364,6 +1364,7 @@ pub(crate) async fn execute(
                 p.segments_total = response.segments_total;
                 p.segments_skipped = response.segments_skipped;
             }
+            let field_details_redacted = response.field_details_redacted;
             let synonym_expansions = response.synonym_expansions.clone();
             let mut hits: Vec<QueryHit> = response
                 .hits
@@ -1428,6 +1429,7 @@ pub(crate) async fn execute(
                 finish_prof(prof, t_total),
             );
             response.groups = groups;
+            response.field_details_redacted = field_details_redacted;
             response.synonym_expansions = synonym_expansions;
             response.aggregate =
                 aggregate_pool(coordinator, pool_aggregate.as_ref(), &pool_ids).await?;
@@ -2279,6 +2281,7 @@ fn done(
     profile: Option<crate::pb::QueryProfile>,
 ) -> QueryResponse {
     QueryResponse {
+        field_details_redacted: false,
         request_id,
         hits,
         executed: executed.to_string(),

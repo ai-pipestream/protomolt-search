@@ -1991,10 +1991,13 @@ impl CoordinatorServiceImpl {
                 "restricted grants require search authorization",
             ));
         }
-        if !matches!(
-            route,
-            "bm25_search" | "suggest" | "term_suggest" | "aggregate"
-        ) {
+        let field_query = view.is_none() && matches!(route, "query" | "query_stream");
+        if !field_query
+            && !matches!(
+                route,
+                "bm25_search" | "suggest" | "term_suggest" | "aggregate"
+            )
+        {
             return Err(Status::permission_denied(
                 "this route does not yet enforce document or field grants",
             ));
@@ -3161,6 +3164,11 @@ impl CoordinatorServiceImpl {
         mut request: crate::pb::QueryRequest,
         access: Option<&crate::pb::AccessDecision>,
     ) -> Result<crate::pb::QueryResponse, Status> {
+        let disclosure = self
+            .field_permissions
+            .as_ref()
+            .map(|fields| fields.query(&request))
+            .transpose()?;
         let started = std::time::Instant::now();
         let mut cursor = self.bind_query_cursor(&mut request, access)?;
         let (scoped, reads) = self.pin_read_versions().await?;
@@ -3173,6 +3181,9 @@ impl CoordinatorServiceImpl {
         let result = crate::query::execute(&scoped, request).await;
         scoped.validate_read_versions(&reads).await?;
         let mut response = result?;
+        if let Some(disclosure) = disclosure {
+            disclosure.apply(&mut response);
+        }
         cursor.finish(&mut response)?;
         response.served_topology_generation = scoped.topology_generation;
         if let Some(profile) = response.profile.as_mut() {
@@ -15666,6 +15677,59 @@ mod vector_field_read_tests {
                 ..Default::default()
             }),
             ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn public_field_granted_dense_queries_require_the_indexed_name() {
+        use crate::pb::{
+            search_query, selection_query, DenseQuery, QueryRequest, SearchQuery, SelectionQuery,
+        };
+        let owner =
+            CoordinatorServiceImpl::with_local_nodes(vec![node(0, false), node(100, false)]);
+        let mut decision = access("semantic", FieldAction::Use);
+        decision.document_visibility = None;
+        let reader = owner.for_access(Some(&decision), "query").unwrap();
+        for streaming in [false, true] {
+            let reader = reader.clone().with_stream_search(streaming);
+            for mode in [
+                crate::pb::DenseScoreMode::Native,
+                crate::pb::DenseScoreMode::Fp32Rerank,
+            ] {
+                let make_query = |field: &str| QueryRequest {
+                    k: 4,
+                    selection: Some(SelectionQuery {
+                        node: Some(selection_query::Node::Search(SearchQuery {
+                            id: "dense".into(),
+                            query: Some(search_query::Query::Dense(DenseQuery {
+                                field: field.into(),
+                                vector: vec![0.25; 16],
+                                score_mode: mode as i32,
+                                ..Default::default()
+                            })),
+                        })),
+                    }),
+                    ..Default::default()
+                };
+                let expected = SearchService::query(&owner, Request::new(make_query("semantic")))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                let actual = SearchService::query(&reader, Request::new(make_query("semantic")))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(actual.hits, expected.hits);
+                for field in ["", "signal", "body"] {
+                    assert_eq!(
+                        SearchService::query(&reader, Request::new(make_query(field)))
+                            .await
+                            .unwrap_err()
+                            .code(),
+                        tonic::Code::PermissionDenied
+                    );
+                }
+            }
         }
     }
 

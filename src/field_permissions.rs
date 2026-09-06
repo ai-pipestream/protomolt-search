@@ -3,6 +3,8 @@ use crate::{filter::LeafRef, pb::*, values::ValueLeaf};
 use std::collections::BTreeMap;
 use tonic::Status;
 
+mod query;
+
 #[derive(Clone, Debug)]
 pub(crate) struct FieldScope {
     grants: BTreeMap<String, u8>,

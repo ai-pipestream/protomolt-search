@@ -493,7 +493,7 @@ async fn document_and_field_grants_compose_and_dictionary_disclosure_is_explicit
             .await
             .unwrap_err()
             .code(),
-        Code::PermissionDenied
+        Code::InvalidArgument
     );
 }
 
@@ -924,5 +924,474 @@ async fn aggregate_field_inputs_require_use_and_disclose_before_reading() {
             .unwrap_err()
             .code(),
         Code::FailedPrecondition
+    );
+}
+
+fn public_query() -> QueryRequest {
+    QueryRequest {
+        k: 4,
+        selection: Some(SelectionQuery {
+            node: Some(selection_query::Node::Search(SearchQuery {
+                id: "lex".into(),
+                query: Some(search_query::Query::Lexical(LexicalQuery {
+                    text: "alpha".into(),
+                    analysis: Some(body_spec()),
+                    ..Default::default()
+                })),
+            })),
+        }),
+        ..Default::default()
+    }
+}
+fn stored_query() -> QueryRequest {
+    QueryRequest {
+        scorer: Some(CompositeScorer {
+            operation: CompositeScoreOperation::WeightedSum as i32,
+            dimensions: vec![ScoreDimension {
+                id: "stored".into(),
+                normalization: ScoreNormalization::None as i32,
+                source: Some(ScoreSignal {
+                    source: Some(score_signal::Source::BoundedValue(ScoreStage {
+                        column: "boost".into(),
+                        op: ScoreOp::AddLinear as i32,
+                        weight: 1.,
+                        ..Default::default()
+                    })),
+                }),
+                ..Default::default()
+            }],
+        }),
+        ..public_query()
+    }
+}
+fn field_reader(coordinator: CoordinatorServiceImpl, fields: FieldPermissions) -> CollectionSet {
+    service(
+        coordinator,
+        Arc::new(PolicyAuthority::new(policy(Some(fields), false)).unwrap()),
+    )
+}
+fn signature(response: &QueryResponse) -> Vec<(u64, u32)> {
+    response
+        .hits
+        .iter()
+        .map(|h| (h.doc_id, h.score.to_bits()))
+        .collect()
+}
+
+#[tokio::test]
+async fn public_query_redacts_stored_dimensions_and_inner_hit_identity_without_changing_scores() {
+    let owner = cluster_subset(true, false, true).await;
+    let request_body = QueryRequest {
+        collapse: Some(CollapseSpec {
+            column: "color".into(),
+            inner_hits: 2,
+        }),
+        k: 2,
+        selection_k: 4,
+        ..stored_query()
+    };
+    let expected = SearchService::query(&owner, Request::new(request_body.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(expected
+        .hits
+        .iter()
+        .all(|h| h.identity.is_some() && h.dimensions[0].raw.is_some()));
+    let reader = field_reader(
+        owner.clone(),
+        permissions(
+            &[
+                ("body", &[FieldAction::Use]),
+                ("boost", &[FieldAction::Use]),
+                ("color", &[FieldAction::Use, FieldAction::Disclose]),
+            ],
+            false,
+        ),
+    );
+    let explained = field_reader(
+        owner.clone(),
+        permissions(
+            &[
+                ("body", &[FieldAction::Use, FieldAction::Disclose]),
+                ("boost", &[FieldAction::Use]),
+                ("color", &[FieldAction::Use, FieldAction::Disclose]),
+            ],
+            false,
+        ),
+    );
+    assert_eq!(
+        SearchService::query(
+            &explained,
+            request(QueryRequest {
+                explain: true,
+                ..request_body.clone()
+            })
+        )
+        .await
+        .unwrap_err()
+        .code(),
+        Code::PermissionDenied
+    );
+    let actual = SearchService::query(&reader, request(request_body.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(signature(&actual), signature(&expected));
+    assert!(actual.field_details_redacted);
+    assert_eq!(actual.groups.len(), expected.groups.len());
+    for hit in actual
+        .hits
+        .iter()
+        .chain(actual.groups.iter().flat_map(|g| &g.hits))
+    {
+        assert!(hit.identity.is_none());
+        assert!(hit.dimensions.is_empty());
+    }
+    let reader = field_reader(
+        owner,
+        permissions(
+            &[
+                ("body", &[FieldAction::Use, FieldAction::Disclose]),
+                ("boost", &[FieldAction::Use, FieldAction::Disclose]),
+                ("color", &[FieldAction::Use, FieldAction::Disclose]),
+            ],
+            true,
+        ),
+    );
+    let actual = SearchService::query(&reader, request(request_body))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(actual.hits, expected.hits);
+    assert_eq!(actual.groups, expected.groups);
+    assert!(!actual.field_details_redacted);
+}
+
+#[tokio::test]
+async fn public_query_admits_every_field_before_statistics_or_selection() {
+    let owner = cluster(false).await;
+    let cache = owner.stats_cache();
+    let reader = field_reader(
+        owner.clone(),
+        permissions(&[("body", &[FieldAction::Use])], false),
+    );
+    let filter = SelectionQuery {
+        node: Some(selection_query::Node::Filter(FilterQuery {
+            id: "secret".into(),
+            predicate: Some(filter_query::Predicate::Cel(
+                "secret == 'private_value'".into(),
+            )),
+        })),
+    };
+    let mut denied = vec![stored_query()];
+    // MUST_NOT, nested children and disabled scorer dimensions all require Use.
+    denied.push(QueryRequest {
+        selection: Some(SelectionQuery {
+            node: Some(selection_query::Node::Boolean(BooleanQuery {
+                must: vec![public_query().selection.unwrap()],
+                must_not: vec![filter.clone()],
+                ..Default::default()
+            })),
+        }),
+        ..public_query()
+    });
+    denied.push(QueryRequest {
+        selection: Some(SelectionQuery {
+            node: Some(selection_query::Node::Composite(CompositeSearchStrategy {
+                operator: SelectionOperator::And as i32,
+                clauses: vec![public_query().selection.unwrap(), filter],
+                scoring: None,
+            })),
+        }),
+        ..public_query()
+    });
+    for spec in [
+        QueryRequest {
+            projections: vec![NamedProjection {
+                name: "leak".into(),
+                expression: "secret".into(),
+            }],
+            ..public_query()
+        },
+        QueryRequest {
+            sort: vec![QuerySort {
+                column: "secret".into(),
+                descending: false,
+            }],
+            ..public_query()
+        },
+        QueryRequest {
+            collapse: Some(CollapseSpec {
+                column: "secret".into(),
+                inner_hits: 2,
+            }),
+            ..public_query()
+        },
+        QueryRequest {
+            explain: true,
+            ..public_query()
+        },
+        QueryRequest {
+            highlight: Some(HighlightSpec::default()),
+            ..public_query()
+        },
+        QueryRequest {
+            aggregate: Some(AggregateRequest {
+                aggregations: vec![Aggregation {
+                    name: "leak".into(),
+                    op: AggregateOp::Sum as i32,
+                    expression: "boost".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..public_query()
+        },
+    ] {
+        denied.push(spec);
+    }
+    let mut disabled = stored_query();
+    disabled.scorer.as_mut().unwrap().dimensions[0].weight = Some(0.);
+    denied.push(disabled);
+    let mut boost = public_query();
+    boost.boosts.push(BoostQuery {
+        query: Some(SearchQuery {
+            id: "dense".into(),
+            query: Some(search_query::Query::Dense(DenseQuery {
+                field: "secret".into(),
+                vector: vec![0.25; 16],
+                ..Default::default()
+            })),
+        }),
+        ..Default::default()
+    });
+    denied.push(boost);
+    for spec in denied {
+        let error = SearchService::query(&reader, request(spec))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::PermissionDenied, "{error}");
+    }
+    assert_eq!(cache.fetch_count(), 0);
+}
+
+#[tokio::test]
+async fn streaming_field_grants_redact_completion_and_deny_before_provisional_hits() {
+    use tokio_stream::StreamExt;
+    let owner = cluster(true).await;
+    let reader = field_reader(
+        owner,
+        permissions(
+            &[
+                ("body", &[FieldAction::Use]),
+                ("boost", &[FieldAction::Use]),
+            ],
+            false,
+        ),
+    );
+    let mut stream = SearchService::query_stream(
+        &reader,
+        request(QueryStreamRequest {
+            query: Some(stored_query()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    let mut completed = false;
+    while let Some(event) = stream.next().await {
+        if let Some(query_stream_response::Payload::Completion(end)) = event.unwrap().payload {
+            assert!(end.completed, "{}", end.error_message);
+            let response = end.response.unwrap();
+            assert!(response.field_details_redacted);
+            assert!(response
+                .hits
+                .iter()
+                .all(|h| h.identity.is_none() && h.dimensions.is_empty()));
+            completed = true;
+        }
+    }
+    assert!(completed);
+    let mut denied = public_query();
+    denied.projections.push(NamedProjection {
+        name: "leak".into(),
+        expression: "secret".into(),
+    });
+    let mut stream = SearchService::query_stream(
+        &reader,
+        request(QueryStreamRequest {
+            query: Some(denied),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    let mut refused = false;
+    while let Some(event) = stream.next().await {
+        match event.unwrap().payload.unwrap() {
+            query_stream_response::Payload::Revision(revision) => assert!(revision.hits.is_empty()),
+            query_stream_response::Payload::Completion(end) => {
+                assert!(!end.completed);
+                assert_eq!(end.error_code, Code::PermissionDenied as u32);
+                assert!(end.response.is_none());
+                refused = true;
+            }
+        }
+    }
+    assert!(refused);
+}
+
+#[tokio::test]
+async fn field_granted_boolean_browse_and_boost_queries_match_unrestricted_execution() {
+    let owner = cluster(false).await;
+    let reader = field_reader(
+        owner.clone(),
+        permissions(
+            &[
+                ("body", &[FieldAction::Use, FieldAction::Disclose]),
+                ("color", &[FieldAction::Use, FieldAction::Disclose]),
+                ("boost", &[FieldAction::Use, FieldAction::Disclose]),
+            ],
+            true,
+        ),
+    );
+    let filter = SelectionQuery {
+        node: Some(selection_query::Node::Filter(FilterQuery {
+            id: "color".into(),
+            predicate: Some(filter_query::Predicate::Cel("color == 'red'".into())),
+        })),
+    };
+    let aggregate = AggregateRequest {
+        aggregations: vec![Aggregation {
+            name: "sum".into(),
+            expression: "boost".into(),
+            op: AggregateOp::Sum as i32,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let cases = [
+        QueryRequest {
+            selection: Some(SelectionQuery {
+                node: Some(selection_query::Node::Boolean(BooleanQuery {
+                    must: vec![public_query().selection.unwrap(), filter.clone()],
+                    aggregate: Some(aggregate.clone()),
+                    ..Default::default()
+                })),
+            }),
+            ..public_query()
+        },
+        QueryRequest {
+            selection: Some(filter),
+            sort: vec![QuerySort {
+                column: "boost".into(),
+                descending: true,
+            }],
+            projections: vec![NamedProjection {
+                name: "value".into(),
+                expression: "boost".into(),
+            }],
+            aggregate: Some(aggregate),
+            ..public_query()
+        },
+        QueryRequest {
+            boosts: vec![BoostQuery {
+                query: Some(SearchQuery {
+                    id: "boost".into(),
+                    query: Some(search_query::Query::Lexical(LexicalQuery {
+                        text: "beta".into(),
+                        ..Default::default()
+                    })),
+                }),
+                ..Default::default()
+            }],
+            ..public_query()
+        },
+    ];
+    for query in cases {
+        let expected = SearchService::query(&owner, Request::new(query.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        let actual = SearchService::query(&reader, request(query))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(actual.hits, expected.hits);
+        assert_eq!(actual.aggregate, expected.aggregate);
+        assert!(!actual.field_details_redacted);
+    }
+}
+
+#[tokio::test]
+async fn query_field_revocation_invalidates_cursors_and_pending_streams() {
+    use tokio_stream::StreamExt;
+    let owner = cluster(true).await;
+    let fields = permissions(&[("body", &[FieldAction::Use])], false);
+    let authority = Arc::new(PolicyAuthority::new(policy(Some(fields.clone()), false)).unwrap());
+    let reader = service(owner.clone(), authority.clone());
+    let query = QueryRequest {
+        k: 1,
+        ..public_query()
+    };
+    let first = SearchService::query(&reader, request(query.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!first.next_cursor.is_empty());
+    let mut stream = SearchService::query_stream(
+        &reader,
+        request(QueryStreamRequest {
+            query: Some(query.clone()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    let mut next = policy(
+        Some(permissions(
+            &[("body", &[FieldAction::Use, FieldAction::Disclose])],
+            true,
+        )),
+        false,
+    );
+    next.revision = 2;
+    authority.replace(next).unwrap();
+    assert_eq!(
+        stream.next().await.unwrap().unwrap_err().code(),
+        Code::PermissionDenied
+    );
+    assert!(stream.next().await.is_none());
+    assert_eq!(
+        SearchService::query(
+            &reader,
+            request(QueryRequest {
+                cursor: first.next_cursor,
+                ..query
+            })
+        )
+        .await
+        .unwrap_err()
+        .code(),
+        Code::FailedPrecondition
+    );
+    // Decisions are compared, even if a provider changes fields without a revision bump.
+    let reader = service(
+        owner,
+        Arc::new(MovingFields {
+            authority: PolicyAuthority::new(policy(Some(fields), false)).unwrap(),
+            calls: AtomicUsize::new(0),
+        }),
+    );
+    assert_eq!(
+        SearchService::query(&reader, request(public_query()))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
     );
 }

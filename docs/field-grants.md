@@ -7,11 +7,13 @@ with no grants means no field access. Formats 1 and 2 reject field permissions;
 format 3 can combine them with the format-2 mandatory document view. Future
 restrictions require a new policy format so older engines refuse them.
 
-The implemented boundary is private in-process `Bm25Search`, `Suggest`,
-`TermSuggest` and [Aggregate](scoped-folds.md). Other routes and network-backed
-restricted collections refuse,
-including a field restriction without a document predicate. This does not
-complete the broader query, delegation, source-fetch or RAG authorization work.
+Private in-process `Bm25Search`, `Suggest`, `TermSuggest` and
+[Aggregate](scoped-folds.md) enforce both document and field grants.
+`Query` and `QueryStream` now enforce field grants on private in-process shards
+when the decision has no mandatory document view. Document-restricted public
+queries and network-backed restricted collections still refuse until the
+remaining execution-metadata, selection and delegation work is certified.
+This does not complete source-fetch or eventual RAG authorization.
 
 ## Names and actions
 
@@ -96,8 +98,38 @@ Statistics remain keyed by document view and actual queried field. Field checks
 precede their reuse, and no result cache can authorize a request. The complete
 `AccessDecision` is checked again before disclosure. A field-policy change
 invalidates a computed result even if a faulty provider forgot to advance its
-revision. Restricted `Query` and `QueryStream` remain refused before cursor work;
-full query/cursor/RAG coverage must retain these same checks as it is enabled.
+revision. Query cursors bind the complete authority decision; a policy change
+requires a fresh first page. Authorized streams revalidate before disclosure,
+including an event already produced before revocation.
+
+## Query and QueryStream
+
+Query admission walks the entire selection tree, including negative Boolean
+clauses, nested composites and boost queries. It checks every input before
+pinning shard read versions. A disabled scorer dimension still needs `USE`,
+because disabled values participate in missing-value validation and provenance.
+Sorting and collapse reveal their keys, so both actions are required. Every
+projection and aggregate expression uses its compiled input columns, not its
+output alias. Named dense selection and boosts require the actual indexed field;
+an empty name or source-path alias cannot borrow another field's grant.
+
+Stored-value scorer dimensions normally expose raw per-document values and their
+normalized contributions. With `USE` alone they still contribute to ranking,
+but the public response omits their `DimensionScore` entries. Explicit explain
+requests require `DISCLOSE` for every scoring input, including stored dimensions.
+`QueryResponse.field_details_redacted` signals withheld automatic details; when
+it is set, the disclosed dimensions may be insufficient to reconstruct a score.
+`USE` permits scores and ranking derived from a field; this is not a promise
+that the caller cannot infer values through those allowed operations.
+
+The final disclosure pass covers representatives and all collapse inner hits.
+It removes raw document identities unless separately granted, filters automatic
+dictionary expansions and propagates redaction from the lexical adapter. It
+preserves row locators, scores, ranks, cursor boundaries and permitted values.
+QueryStream provisional revisions carry only locators and scores; its successful
+completion uses the same disclosure pass as unary Query. A denied field request
+cannot emit provisional hits. Policy replacement invalidates an outstanding
+stream or computed response even when the new policy is more permissive.
 
 ## Evidence and limits
 
@@ -105,7 +137,12 @@ full query/cursor/RAG coverage must retain these same checks as it is enabled.
 actions, query-only ranking, identity omission, fused field details, body versus
 auxiliary phrase fields, all current BM25 input categories, CEL aliases and map
 reads, dictionary disclosure, document/field composition, warm-cache denials,
-network refusal and policy changes before disclosure. The embedded facade test
+network refusal and policy changes before disclosure. Query cases compare scored,
+Boolean, browse, boosted and collapsed answers against unrestricted execution;
+they check raw-dimension and inner-hit redaction, explicit-explain denial,
+negative-clause/disabled-dimension admission, cursor invalidation and streaming
+revocation. Coordinator tests cover named native/FP32 selection in classic and
+streaming scan modes. The embedded facade test
 uses format 3 and verifies the same field denial without network dependencies.
 
 These grants do not configure the CLI's TOML adapter, authorize direct node or
@@ -137,3 +174,14 @@ index and WAL formats are unchanged.
 and the query's admitted physical versions. Parent and group keys have separate
 field projections and use/disclosure checks. This prepares collapsed query
 execution; restricted public Query and QueryStream remain gated.
+
+
+Validation of the public-query increment passed 487 library tests, 682
+integration tests across 118 targets, and 12 embedded tests (1,181 passed,
+zero failed). The existing exhaustive live-OpenNLP conformance test remains
+ignored because it requires its sidecar. All five Android/iOS compile targets,
+tests/examples compilation, formatting and vendored-proto identity checks pass.
+Descriptor comparison against `1565d07` preserves every existing declaration;
+the only wire addition is `QueryResponse.field_details_redacted = 12`.
+Source hashes were unchanged throughout the test and compile gates. These are
+local tests and mobile compile checks, not a fleet rollout or phone-runtime run.

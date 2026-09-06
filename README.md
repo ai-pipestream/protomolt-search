@@ -1222,6 +1222,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Query field grants (2026-09-06, feature branch).** Private-shard Query and
+  QueryStream admit all requested field inputs before reads and redact automatic
+  stored-value scorer details and raw identities from representatives and inner
+  hits. Explicit details require disclosure grants; cursors and streams retain
+  authority checks. Document-view and network query gates remain. See
+  [field grants](docs/field-grants.md).
+
 - **Main reconciliation (2026-09-06, feature branch).** Main through `5fdedf3`
   is integrated with physical read receipts, authority views and durable field
   bindings on the new relay and Boolean routes. Named vector scans use an

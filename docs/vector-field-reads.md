@@ -43,8 +43,9 @@ coordinator refuses an incomplete exact candidate set instead of returning a
 partial result.
 
 The [scan protocol integration](vector-scan-views.md) adds opt-in initial
-receipts to classic and streaming vector scans. Public coordinator integration
-remains required before those scans can serve restricted Query requests.
+receipts to classic and streaming vector scans. The coordinator admits every
+participating shard before using candidates. Private Query requests with field
+grants and no document view now use this boundary.
 
 ## Authorization boundary and compatibility
 
@@ -53,9 +54,10 @@ Private coordinator execution requires `Use` on the requested vector field.
 returning the stored vector. The document view is supplied by trusted planning;
 it and the returned binding are not authorization credentials.
 
-Restricted public Query and QueryStream remain gated. Their complete selection,
-projection, source, inner-hit and revocation boundaries still need integration,
-as does field naming on their public dense clauses. The clustered native-vector
+Private Query and QueryStream enforce field grants across selection, projection,
+inner-hit disclosure and revocation; public dense clauses name their indexed
+field. Document-restricted public queries remain gated pending the rest of their
+selection and execution-metadata audit. The clustered native-vector
 provider currently lacks this product-field receipt contract and refuses scoped
 scoring. Network delegation and direct-node authorization remain unfinished.
 These internal APIs must not be exposed as an alternate authorization path.

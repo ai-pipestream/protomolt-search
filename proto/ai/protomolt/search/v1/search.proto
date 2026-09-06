@@ -5642,6 +5642,11 @@ message QueryResponse {
   repeated QueryGroup groups = 10;
   // The synonym expansions of a lexical leaf (docs/synonyms.md).
   repeated SynonymExpansion synonym_expansions = 11;
+  // Authority withheld automatic field details (identity, dictionary expansions
+  // or stored-value scorer dimensions). Ranking is unchanged; omitted dimensions
+  // mean the disclosed response alone cannot reconstruct the score.
+  bool field_details_redacted = 12;
+
 }
 
 // One collapse group (QueryRequest.collapse).

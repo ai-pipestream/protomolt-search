@@ -1,7 +1,9 @@
 # Search foundations
 
 Foundation work began on `feat/search-foundations` from `PRE_ASTRA`.
-Current implementation branch: `feat/protobuf-unsigned-numerics-2026-09`.
+Current implementation branch: `feat/query-field-authorization-2026-09`.
+The main reconciliation checkpoint remains `1565d07` on
+`feat/protobuf-unsigned-numerics-2026-09` for independent review.
 This tracks the full requested foundation. Individual passing increments do not
 establish completion of the three workstreams.
 
@@ -992,3 +994,25 @@ publication and use are fenced against same-sized generation replacement. See
 [vector scan views](vector-scan-views.md) for the protocol, evidence and pending
 public coordinator and relay integration. This does not complete public Query
 authorization or stable public identity.
+
+
+## Public query field authorization, 2026-09-06
+
+Private in-process Query and QueryStream now admit complete field dependencies
+before physical read admission. Selection trees, negative clauses, boost queries,
+stored scorer dimensions, projections, sorting, collapse, aggregates and explicit
+explanations are covered. Automatic stored-value dimensions require disclosure
+permission to leave the service; redaction preserves ranking and is signaled by
+the additive QueryResponse flag. Representatives and inner hits share the final
+identity/dimension policy. Existing full-decision cursor and stream checks apply.
+
+The broad objective remains open. This enables field grants on public Query
+without a document view; document-restricted queries, remote delegation and
+node/control-plane authorization still need completion. The remaining protobuf
+shapes, stable result identity and durable publication requirements above remain
+unchanged.
+
+Validation passed 1,181 tests with one existing live-sidecar test ignored, plus
+all five mobile compile targets. The exact scope and evidence are recorded in
+[Field grants](field-grants.md). The source checkpoint remains separate from
+main and the earlier reconciliation branch.
