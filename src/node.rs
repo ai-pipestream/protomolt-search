@@ -1465,12 +1465,15 @@ impl Bm25Shard {
         stats_fields: &[String],
         cardinality_fields: &[String],
         filter: crate::bm25::FilterCtx,
-    ) -> (
-        Vec<crate::pb::FacetFieldCounts>,
-        Vec<crate::pb::RangeFacetCounts>,
-        Vec<crate::pb::ColumnStats>,
-        Vec<crate::pb::FacetDistinct>,
-    ) {
+    ) -> Result<
+        (
+            Vec<crate::pb::FacetFieldCounts>,
+            Vec<crate::pb::RangeFacetCounts>,
+            Vec<crate::pb::ColumnStats>,
+            Vec<crate::pb::FacetDistinct>,
+        ),
+        Status,
+    > {
         let n_slots = self.next_doc_id() as usize;
         let mut bits = vec![0u64; n_slots.div_ceil(64)];
         for &(view, terms) in views {
@@ -1611,45 +1614,30 @@ impl Bm25Shard {
         let stats = stats_fields
             .iter()
             .map(|name| {
-                let value_of: Box<dyn Fn(u32) -> Option<f64>> =
-                    if let Some(ni) = self.numeric_index(name) {
-                        Box::new(move |doc| self.numeric_value(ni, doc))
-                    } else if let Some(ii) = self.integer_index(name) {
-                        Box::new(move |doc| self.integer_value(ii, doc).map(|v| v as f64))
-                    } else {
-                        return crate::pb::ColumnStats {
-                            field: name.clone(),
-                            known: false,
-                            ..Default::default()
-                        };
-                    };
-                let mut out = crate::pb::ColumnStats {
-                    field: name.clone(),
-                    known: true,
-                    min: f64::INFINITY,
-                    max: f64::NEG_INFINITY,
-                    ..Default::default()
+                use crate::pb::ScalarValueType as Type;
+                let source = self.resolve_range_column(name, "");
+                let ty = match source {
+                    Some(RangeSource::Numeric(_)) => Type::Number,
+                    Some(RangeSource::Integer(_)) => Type::Integer,
+                    Some(RangeSource::Unsigned(_)) => Type::UnsignedInteger,
+                    _ => Type::Unspecified,
                 };
-                for (wi, &word) in bits.iter().enumerate() {
-                    let mut w = word;
-                    while w != 0 {
-                        let doc = (wi * 64) as u32 + w.trailing_zeros();
-                        if let Some(v) = value_of(doc) {
-                            out.count += 1;
-                            out.sum += v;
-                            out.min = out.min.min(v);
-                            out.max = out.max.max(v);
+                let mut out = crate::column_stats::Collector::new(name, ty);
+                if let Some(source) = source {
+                    for (wi, &word) in bits.iter().enumerate() {
+                        let mut w = word;
+                        while w != 0 {
+                            let doc = (wi * 64) as u32 + w.trailing_zeros();
+                            if let Some(value) = self.range_value(source, doc) {
+                                out.observe(value)?;
+                            }
+                            w &= w - 1;
                         }
-                        w &= w - 1;
                     }
                 }
-                if out.count == 0 {
-                    out.min = 0.0;
-                    out.max = 0.0;
-                }
-                out
+                out.finish()
             })
-            .collect();
+            .collect::<Result<Vec<_>, Status>>()?;
         // Distinct facet values in the match set: an ordinal bitset
         // over this shard's dictionary, then the VALUES — ordinals are
         // shard-local, so strings are the only union-able currency the
@@ -1687,7 +1675,7 @@ impl Bm25Shard {
                 }
             })
             .collect();
-        (out, ranges, stats, distinct)
+        Ok((out, ranges, stats, distinct))
     }
 
     /// Resolve a range facet's column against THIS shard's tables:
@@ -7096,7 +7084,7 @@ impl NodeServiceImpl {
                         &[],
                         &[],
                         filter_ctx,
-                    );
+                    )?;
                 }
                 // Leg list order is the pinned accumulation order; the
                 // coordinator sends the same order to every shard, so
@@ -13948,7 +13936,7 @@ impl NodeServiceImpl {
                     &req.stats_fields,
                     &req.cardinality_fields,
                     filter_ctx,
-                )
+                )?
             }
             _ => (
                 req.facet_fields

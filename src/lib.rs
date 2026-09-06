@@ -32,6 +32,7 @@ pub mod cel;
 pub mod chunked;
 pub mod clustered_turbovec;
 pub mod collections;
+mod column_stats;
 pub mod compaction;
 pub mod config;
 #[cfg(feature = "net")]

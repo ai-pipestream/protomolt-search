@@ -532,3 +532,44 @@ Tests/examples compilation, formatting, vendored-proto byte identity and
 whitespace checks passed. The search, schema-report and mobile descriptors are
 identical to `a914507`. This remains a feature-branch checkpoint; no main merge,
 fleet deployment or corpus rebuild was performed.
+
+
+## Typed column-statistics checkpoint (2026-09-05)
+
+`ColumnStats` now declares its numeric type and retains signed/unsigned extrema
+and a 128-bit exact sum in typed payloads. The width covers the full 64-bit
+value/count domain. Exact sum plus count supplies a rational mean; the old
+double fields remain approximate views with their existing fold order.
+Node collection and root merging share validation and exact sum encoding.
+Empty known columns retain type and payload, while unknown columns carry no
+values. Both extrema must be consistent with the count and exact sum.
+
+Root merging now rejects wrong field names, missing/mismatched type metadata,
+impossible or malformed summaries, count overflow and nonfinite floating sums.
+A concrete type mismatch refuses even with zero matches. This deliberately
+replaces implicit mixed signed/double aggregation with a single declared
+numeric family per field. Matching server/client builds are required. No
+stored format or mapping/materialization fingerprint changed.
+
+The new tests compare i128/u128 oracles against filtered and empty selections,
+reverse shard order, both layouts, reopen and compaction. They distinguish a
+declared empty column from an unknown column, verify signed and unsigned sums
+beyond 64 bits, exercise maximum-count protobuf roundtrips, and reject malformed
+partials and empty-match type conflicts. Existing double/signed summary tests
+also pass. Relay and fused/phrase statistics retain their existing refusals.
+
+The wider objective remains open: remaining protobuf shapes, complete grants
+across all public/node/control surfaces, and catalog publication into search
+with stable identity, conditional writes, idempotency and durability receipts
+still require implementation and end-to-end evidence.
+
+Validation: 433 library tests, 546 integration tests across 97 targets, and
+11 embedded tests passed (990 total), with one existing sidecar conformance
+test ignored. The full suite needed no retries. All five Android/iOS Rust
+target checks passed with three existing relay dead-code warnings.
+Tests/examples compilation, formatting, vendored-proto byte identity and
+whitespace checks passed. Descriptor comparison against `13303dd` confirms
+existing declarations are unchanged: ColumnStats adds value_type (8) and an
+exact_integer oneof with signed (9) and unsigned (10), plus the two four-field exact
+summary messages. This is a feature-branch checkpoint, with no main merge or
+fleet operation.

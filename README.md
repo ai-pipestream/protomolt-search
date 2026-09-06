@@ -1222,6 +1222,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Typed column statistics (2026-09-05, feature branch).** Signed and unsigned
+  columns now return exact extrema and 128-bit sums alongside the existing
+  double summaries. Count plus the exact sum defines an exact rational mean.
+  Nodes and roots validate typed summaries; mixed column families, malformed
+  partials and count/sum overflow refuse. Use matching server/client builds.
+  Stored formats are unchanged. See [column statistics](docs/facets.md#typed-integer-statistics-2026-09-05-feature-branch).
+
 - **Unsigned score stages (2026-09-05, feature branch).** Score chains,
   explanations and stored-value signals now read u64 columns. Values and
   extrema convert to the same double arithmetic, preserving pruning bounds;

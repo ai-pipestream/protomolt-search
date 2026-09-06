@@ -23,7 +23,10 @@ term's document run on every shard, once. Asking for none costs no extra work.
 Two more, over the same filtered match set and flat-route only:
 
 - `stats_fields`: per column, the count of documents holding a value plus min,
-  max, and sum, with mean computed at the coordinator.
+  max, and sum, with mean computed at the coordinator. Signed and unsigned
+  columns also carry typed extrema and 128-bit sums; use those exact values
+  instead of the approximate double summaries. The exact mean is sum/count.
+  See [typed statistics](../facets.md#typed-integer-statistics-2026-09-05-feature-branch).
 - `cardinality_fields`: exact distinct counts. Each shard reports the value
   strings in its match set, because ordinals are shard-local and values are the
   only currency a union can use, and the coordinator unions them. The cost is

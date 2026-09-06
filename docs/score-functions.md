@@ -162,6 +162,7 @@ projections identify test documents across compaction; physical slot identity
 is not assumed stable.
 
 This is a query change: no protobuf field, index format or materialization
-fingerprint changed. The legacy `stats_fields`/`ColumnStats` route still does
-not accept unsigned columns. Exact unsigned aggregates are a separate route;
-statistical folds there require explicit double conversion.
+fingerprint changed by unsigned scoring. The separate [column-statistics
+contract](facets.md#typed-integer-statistics-2026-09-05-feature-branch) now supports
+unsigned inputs with exact integer summaries. Expression-based statistical
+folds on `Aggregate` still require explicit double conversion.

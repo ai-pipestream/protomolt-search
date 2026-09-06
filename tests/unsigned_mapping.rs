@@ -104,6 +104,7 @@ fn unsigned_descriptors_preserve_types_presence_and_oneof_selection() {
                     "value projections",
                     "COUNT, SUM, MIN, MAX, CARDINALITY",
                     "exact percentiles",
+                    "Column statistics preserve typed extrema and exact 128-bit sums",
                     "score stages convert unsigned inputs and extrema to double arithmetic",
                 ] {
                     assert!(capabilities.contains(supported), "{capabilities}");

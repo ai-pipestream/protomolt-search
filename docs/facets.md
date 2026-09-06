@@ -140,6 +140,54 @@ them by name, like score stages), and both refuse a column no shard
 declares, naming the column and the knob. `tests/aggregations.rs`
 holds all of it, heterogeneous fleet included.
 
+## Typed integer statistics (2026-09-05, feature branch)
+
+`stats_fields` now accepts f64, i64 and u64 columns. Every known `ColumnStats`
+response carries `value_type`, even when the selected set has no values.
+Signed and unsigned responses also carry the matching `exact_integer` oneof:
+
+- `signed`: `SignedColumnStats` with i64 extrema and a signed 128-bit sum.
+  Reconstruct it as `(i128(sum_hi) << 64) | i128(sum_lo)`; the high word is
+  signed and the low word is unsigned.
+- `unsigned`: `UnsignedColumnStats` with u64 extrema and a u128 sum,
+  reconstructed as `(u128(sum_hi) << 64) | u128(sum_lo)`.
+
+The width covers every 64-bit input summed up to `u64::MAX` times. In
+particular, a sum outside i64 or u64 is still an exact result. For `count > 0`,
+the exact mean is the rational number `exact_sum / count`. A declared empty
+column retains its type and exact-summary message, with all values zero; an
+unknown column has `known=false`, `UNSPECIFIED` type and no exact summary.
+Missing documents never count as zero-valued documents.
+
+The original double `min`, `max`, `sum` and `mean` remain available as approximate
+views. Double sums retain the existing traversal and shard fold order, including
+for signed columns. They can round large integers and lose low bits during
+cancellation; use the typed summary for integer meaning. The exact summary is
+stable across partitioning and row reordering even when a double sum changes.
+Double columns retain floating-point summaries and have no integer payload.
+
+Before merging, the root verifies the returned field name, numeric type,
+summary shape, finite double values, count, and integer extrema/sum bounds.
+An exact sum must be possible for the reported count with both extrema present.
+Concrete types must agree across shards, even when one shard has no matching
+values. A missing column may join a known one. Malformed responses and type
+conflicts refuse; count overflow and nonfinite floating sums also refuse.
+This changes the previous mixed-f64/i64 behavior, which silently combined both
+as doubles. Use one declared family per field across the collection and deploy
+matching builds; old known-column responses lack required type metadata.
+
+The flat lexical path and its streamed equivalent share this implementation.
+Fused/phrase statistics and statistics through relay coordinators remain
+explicitly refused: this increment preserves the existing scope. Exact integer
+partials alone do not make the legacy floating summaries independent of relay
+fold order. `Aggregate` remains the expression-based aggregation route.
+
+No stored index format, descriptor-mapping fingerprint, or materialization
+fingerprint changes. Tests cover independent i128/u128 totals, absent and empty
+columns, type conflicts without matches, maximum-count wire roundtrips,
+malformed partials, overflow, shard-order changes and both storage layouts
+through reopen and compaction.
+
 ## What this deliberately does not do
 
 - No facet FILTERING yet ("court=scotus" narrowing the result set) —

@@ -1051,9 +1051,10 @@ message MembershipBitmapResponse {
 }
 
 // One column's aggregate over a filtered match set (docs/facets.md).
-// i64 columns aggregate through the same monotone f64 cast the column
-// metadata uses; sums are f64 by contract (an i64 sum can overflow any
-// integer width the wire offers, and the cast is the documented one).
+// Integer columns carry exact extrema and a 128-bit sum alongside legacy
+// double summaries. Divide the exact sum by count for an exact rational mean.
+// Matching node/client builds are required; concrete column types must agree
+// across shards, including shards with no matching values.
 message ColumnStats {
   string field = 1;
   // Whether this shard (node response) or ANY shard (public response)
@@ -1067,6 +1068,36 @@ message ColumnStats {
   double sum = 6;
   // Public response only: sum / count (0 when count is 0).
   double mean = 7;
+  // INTEGER, UNSIGNED_INTEGER or NUMBER when known; UNSPECIFIED otherwise.
+  ScalarValueType value_type = 8;
+  // Authoritative integer summary, present even at count=0 for a declared
+  // integer column. Absent for doubles and unknown columns. Legacy min/max/
+  // sum/mean remain double approximations, with sum folded in shard order.
+  oneof exact_integer {
+    SignedColumnStats signed = 9;
+    UnsignedColumnStats unsigned = 10;
+  }
+}
+
+// Exact signed statistics. All fields are zero when the enclosing count is
+// zero. Otherwise min/max are present extrema. Sum is a signed two's-complement
+// 128-bit integer: (sum_hi << 64) | sum_lo. This width covers every i64 value
+// summed up to u64::MAX times, including negative sums beyond i64::MIN.
+message SignedColumnStats {
+  int64 min = 1;
+  int64 max = 2;
+  sfixed64 sum_hi = 3;
+  fixed64 sum_lo = 4;
+}
+
+// Exact unsigned statistics. All fields are zero when the enclosing count is
+// zero. Otherwise min/max are present extrema. Sum is an unsigned 128-bit
+// integer: (sum_hi << 64) | sum_lo, covering u64::MAX values of u64::MAX.
+message UnsignedColumnStats {
+  uint64 min = 1;
+  uint64 max = 2;
+  fixed64 sum_hi = 3;
+  fixed64 sum_lo = 4;
 }
 
 // One shard's distinct facet VALUES over its filtered match set

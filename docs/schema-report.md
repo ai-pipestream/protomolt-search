@@ -66,8 +66,9 @@ string semantics. Unhinted unsigned fields instead use `UNSIGNED_INTEGER`
 query representation and full-domain u64 columns. Their constraints explicitly
 report typed value expressions, sorting, collapse, exact aggregates and range
 facets. Statistical folds require explicit double conversion. Score stages
-convert unsigned inputs and extrema to double arithmetic; the legacy
-`stats_fields` route still does not accept unsigned columns.
+convert unsigned inputs and extrema to double arithmetic. Signed and unsigned
+column statistics retain exact extrema and 128-bit sums; their double summary
+fields are approximate, and the exact mean is the sum divided by count.
 
 Preservation means exact bytes in the retained original protobuf. Unknown fields
 share that rule. `PlanIndex` reports that legacy mapped ingest requires at least

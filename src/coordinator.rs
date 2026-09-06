@@ -1319,50 +1319,7 @@ fn merge_column_stats(
     requested: &[String],
     shard_stats: &[Vec<crate::pb::ColumnStats>],
 ) -> Result<Vec<crate::pb::ColumnStats>, Status> {
-    let mut out: Vec<crate::pb::ColumnStats> = requested
-        .iter()
-        .map(|name| crate::pb::ColumnStats {
-            field: name.clone(),
-            known: false,
-            min: f64::INFINITY,
-            max: f64::NEG_INFINITY,
-            ..Default::default()
-        })
-        .collect();
-    for shard in shard_stats {
-        if shard.len() != requested.len() {
-            return Err(Status::internal(format!(
-                "shard answered {} stats columns for {} requested",
-                shard.len(),
-                requested.len()
-            )));
-        }
-        for (acc, s) in out.iter_mut().zip(shard) {
-            acc.known |= s.known;
-            if s.count > 0 {
-                acc.count += s.count;
-                acc.sum += s.sum;
-                acc.min = acc.min.min(s.min);
-                acc.max = acc.max.max(s.max);
-            }
-        }
-    }
-    for acc in &mut out {
-        if !acc.known {
-            return Err(Status::invalid_argument(format!(
-                "no shard has stats column {:?}: check the spelling, or the nodes' \
-                 --numeric-fields / --integer-fields",
-                acc.field
-            )));
-        }
-        if acc.count > 0 {
-            acc.mean = acc.sum / acc.count as f64;
-        } else {
-            acc.min = 0.0;
-            acc.max = 0.0;
-        }
-    }
-    Ok(out)
+    crate::column_stats::merge(requested, shard_stats)
 }
 
 /// Union per-shard distinct facet values into exact global
