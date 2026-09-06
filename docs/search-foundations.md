@@ -2,8 +2,8 @@
 
 Foundation work began on `feat/search-foundations` from `PRE_ASTRA`.
 Current implementation branch: `feat/query-field-authorization-2026-09`.
-This branch now incorporates main `3a15f9e`, including the spill staging and
-relay fetch/fold integration.
+This branch now incorporates main `7b0faa9`, including spill staging, relay
+fetch/fold integration and the bulk-analysis end-of-stream fix.
 The main reconciliation checkpoint remains `1565d07` on
 `feat/protobuf-unsigned-numerics-2026-09`, accepted for main on 2026-09-06.
 This tracks the full requested foundation. Individual passing increments do not
@@ -1049,3 +1049,12 @@ filter, or inflates selectivity with document-only rows. Regression tests prove
 the resulting candidate-depth choice. The increment passed 1,194 tests plus all
 five mobile compile checks; see [hybrid read views](hybrid-read-views.md). Public
 document-query metadata disclosure and the broader three-part goal remain open.
+
+Successful terminal Query responses now apply document execution disclosure
+with explicit omission semantics and dense benchmark evidence scopes. The
+shared executor is covered across dense, lexical, Boolean and hybrid selection;
+see [Query execution disclosure](query-disclosure.md). The public document-query
+gate remains while error/provisional surfaces and the remaining full-query
+authorization cases are certified. The three-part foundation remains incomplete.
+The combined source with main `7b0faa9` passed 1,198 tests and all five mobile
+compile checks; the disclosure document records the validation scope.

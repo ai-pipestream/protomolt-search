@@ -65,3 +65,15 @@ field, protobuf round-tripping, empty responses and repeated application.
 The existing measured dense-profile and ANN-policy suites assert evidence scope
 at real resolution boundaries. These are three additive fields and one enum;
 no existing field is renumbered, no route is added, and no stored format changes.
+
+## Validation, 2026-09-06
+
+The final source incorporates main `7b0faa9`, including the bulk-analysis
+end-of-stream fix. It passed 497 library tests, 689 integration tests across
+119 targets and 12 embedded tests: 1,198 passed, zero failed. The existing live
+OpenNLP conformance test remains ignored. All five Android/iOS compile checks,
+the tests/examples build, formatting, vendored-proto identity and whitespace
+checks passed. Descriptor comparisons against main `7b0faa9` and feature
+checkpoint `61b9e6f` preserve all existing declarations. The 329 recorded source,
+build and test files were unchanged through the final validation run. These are
+local tests and mobile compile checks, not device-runtime or fleet measurements.
