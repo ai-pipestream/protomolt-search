@@ -1222,6 +1222,12 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **2026-09-06 — Document-aware dense policy selection.** AUTO qualifies its
+  measured point using admitted vector rows, including the mandatory document
+  view when the caller supplies no filter. Document-only rows do not inflate
+  selectivity, and membership reads validate one physical read set. Public
+  document Query disclosure remains under audit. See
+  [dense execution policy](docs/dense-execution-policy.md).
 - **2026-09-06 — Scoped decomposed selection and lexical rescores.** The first
   lexical pass now applies the mandatory document view, preserving visible rank
   provenance. BM25 candidate rescores enforce that view before scoring and carry

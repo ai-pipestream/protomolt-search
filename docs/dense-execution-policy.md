@@ -75,9 +75,13 @@ whose bands overlap.
 5. The request key: `k` as sent (0 is refused — a policy point needs a
    number, not the coordinator's default), the candidate depth the request
    named in `selection_k` (0 when none), and the filter's live selectivity:
-   the coordinator resolves the request's filters to their membership across
-   the shards and takes admitted rows over corpus rows in parts per million
-   (1,000,000 when unfiltered).
+   the coordinator resolves the mandatory document view and caller filters
+   against live vector membership. It takes admitted vector rows over the
+   policy's physical vector corpus rows in parts per million. Documents without
+   vectors do not contribute. A document view applies even when the request
+   carries no filter; 1,000,000 is the shortcut only when both are absent.
+   The vector and document membership passes validate the same admitted
+   physical epochs and incarnations, including standalone planner calls.
 6. The point must match exactly: the same `k`, a band containing the live
    selectivity, and the named candidate depth. With no depth named, the point
    qualifies only when the policy measured exactly one depth for that `k` and
@@ -92,6 +96,12 @@ whose bands overlap.
 policy: the caller accepted the provider's traversal. It is still marked
 approximate, and `DENSE_SCORE_MODE_FP32_RERANK` on top of it rescores the
 candidate pool without widening it — the outcome stays `ANN` and says so.
+
+The measured recall belongs to the policy's benchmark cohort and selectivity
+band. Matching that band does not establish recall for every predicate with
+the same cardinality. Public document-restricted Query remains gated while its
+metadata disclosure and quality-claim contract are completed; the authority
+predicate must not be bypassed to select an unfiltered policy point.
 
 ## AUTO and FP32 rerank
 

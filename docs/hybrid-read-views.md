@@ -116,3 +116,34 @@ by this task.
 
 Main `3a15f9e` subsequently adds benchmark documentation only and is also
 incorporated. The source/build/test hashes remain unchanged after that merge.
+
+## Dense policy admission under a document view
+
+AUTO now measures the effective view against actual vector membership before
+matching an approximate traversal's policy point. An absent caller filter no
+longer turns a restricted view into an unfiltered request. Matching documents
+without vectors do not inflate selectivity. Both membership passes check the
+same physical read set; field Use, binding, authority and deletion checks remain
+in force. Tests reproduce the previous 1,000,000 versus 500,000 ppm error and
+prove that the corrected key selects a different measured candidate depth.
+See [dense execution policy](dense-execution-policy.md) for the measurement scope.
+
+Public document Query is still gated. Its response schema currently includes
+physical rerank work and shard/segment counts in `QueryProfile`, physical corpus
+rows and generation in `DenseQualityOutcome`, and a live filter ratio plus
+free-form planner text in `DenseExecutionOutcome`. `execute_query` applies field
+disclosure but does not yet apply a document-specific disposition to those
+surfaces. The next contract needs explicit omission semantics while retaining
+honest traversal and benchmark provenance. A policy's measured recall cannot
+be upgraded to a guarantee for every document view in its selectivity band.
+
+Validation: 494 library tests, 688 integration tests across 119 targets, and
+12 embedded tests passed (1,194 total, zero failed). The existing live OpenNLP
+conformance test remains ignored. All five Android/iOS compile checks, the
+tests/examples build, formatting, vendored-proto identity and whitespace checks
+passed. Source/build/test hashes remained unchanged throughout the final run.
+The first full library run exposed a process-global metrics assertion racing
+with concurrent query tests; that assertion now runs in an isolated test process
+and verifies every route's exact increment. Production metrics are unchanged.
+This increment changes no protobuf declaration or stored format. Mobile checks
+are compilation evidence, not device-runtime measurements.

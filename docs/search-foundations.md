@@ -1041,3 +1041,11 @@ scoring and return full physical/view receipts through nested relays. Cascade,
 decomposed and legacy boost consumers share field admission, receipt and returned
 ID validation. See [hybrid read views](hybrid-read-views.md). Public document-query
 execution metadata and quality-policy disclosure remain under audit.
+
+AUTO policy selection now counts admitted vector rows under both the mandatory
+document view and caller filters, with one validated physical read set. It no
+longer selects unfiltered policy evidence merely because the request omitted a
+filter, or inflates selectivity with document-only rows. Regression tests prove
+the resulting candidate-depth choice. The increment passed 1,194 tests plus all
+five mobile compile checks; see [hybrid read views](hybrid-read-views.md). Public
+document-query metadata disclosure and the broader three-part goal remain open.
