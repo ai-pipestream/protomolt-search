@@ -1004,7 +1004,7 @@ fn nearest_percentile_rank(p: f64, count: u64) -> u64 {
 }
 
 /// One percentile expression's merged phase-1 statistics.
-struct PctMerge {
+pub(crate) struct PctMerge {
     vt: Option<crate::pb::AggregateValueType>,
     present: u64,
     unrankable: u64,
@@ -1013,7 +1013,7 @@ struct PctMerge {
 }
 
 impl PctMerge {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             vt: None,
             present: 0,
@@ -1023,7 +1023,11 @@ impl PctMerge {
         }
     }
 
-    fn fold(&mut self, p: &crate::pb::PercentilePartial, name: &str) -> Result<(), Status> {
+    pub(crate) fn fold(
+        &mut self,
+        p: &crate::pb::PercentilePartial,
+        name: &str,
+    ) -> Result<(), Status> {
         use crate::pb::AggregateValueType as T;
         let vt = match T::try_from(p.vtype) {
             Ok(T::Absent) => return Ok(()),
@@ -1068,6 +1072,22 @@ impl PctMerge {
         })?;
         Ok(())
     }
+
+    /// The merged state as one shard's partial: what a relay answers
+    /// its parent after folding its children in child order, so the
+    /// parent folds it as it folds a shard's.
+    pub(crate) fn partial(&self) -> crate::pb::PercentilePartial {
+        crate::pb::PercentilePartial {
+            vtype: self
+                .vt
+                .unwrap_or(crate::pb::AggregateValueType::Absent)
+                .into(),
+            present: self.present,
+            unrankable: self.unrankable,
+            min_bits: self.min_bits,
+            max_bits: self.max_bits,
+        }
+    }
 }
 
 /// One aggregation's merged fleet-wide statistics: a type vote plus
@@ -1075,7 +1095,7 @@ impl PctMerge {
 /// shards that HELD values; the type vote counts on any shard whose
 /// columns resolve, so cross-shard type disagreement stays loud even
 /// when one side is empty.
-struct AggMerge {
+pub(crate) struct AggMerge {
     vt: Option<crate::pb::AggregateValueType>,
     present: u64,
     /// CARDINALITY: the fleet-wide union of the shards' distinct
@@ -1118,7 +1138,7 @@ impl Distinct {
 }
 
 impl AggMerge {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             vt: None,
             present: 0,
@@ -1151,7 +1171,7 @@ impl AggMerge {
 
     /// Fold one shard's partial in. Shard order is the caller's
     /// contract; every fold here is deterministic given that order.
-    fn fold(
+    pub(crate) fn fold(
         &mut self,
         p: &crate::pb::AggregatePartial,
         agg: &crate::pb::CompiledAggregation,
@@ -1268,6 +1288,34 @@ impl AggMerge {
             }
         }
         Ok(())
+    }
+
+    /// The merged state as one shard's partial (`PctMerge::partial`
+    /// says why): the exact int sum split into its halves, the
+    /// compensated double sum as its pair, the distinct sets as sorted
+    /// lists.
+    pub(crate) fn partial(&self) -> crate::pb::AggregatePartial {
+        crate::pb::AggregatePartial {
+            vtype: self
+                .vt
+                .unwrap_or(crate::pb::AggregateValueType::Absent)
+                .into(),
+            present: self.present,
+            int_sum_hi: (self.int_sum >> 64) as i64,
+            int_sum_lo: self.int_sum as u64,
+            double_sum: self.dsum,
+            double_compensation: self.dcomp,
+            int_min: self.int_min,
+            int_max: self.int_max,
+            double_min: self.dmin,
+            double_max: self.dmax,
+            mean: self.mean,
+            m2: self.m2,
+            distinct_ints: self.distinct.ints.iter().copied().collect(),
+            distinct_double_bits: self.distinct.doubles.iter().copied().collect(),
+            distinct_strings: self.distinct.strings.iter().cloned().collect(),
+            distinct_bools: self.distinct.bools.iter().copied().collect(),
+        }
     }
 
     /// The final result for one op. `present == 0` reports no value
