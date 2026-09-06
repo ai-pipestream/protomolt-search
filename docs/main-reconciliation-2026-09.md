@@ -6,8 +6,11 @@ shard-side Boolean evaluation. The public package remains
 `ai.protomolt.search.v1`. This note describes the reconciliation; it is not a
 fleet deployment record or a claim that the foundations project is complete.
 
-The later field-authorization branch now incorporates main `7b0faa9`, including
-spill staging, relay fetches/folds and the bulk-analysis end-of-stream fix.
+The field-authorization integration incorporates main `3103fe1`, including
+spill staging, relay fetches/folds, the bulk-analysis end-of-stream fix,
+segment-backed re-placement replay, source-id localization, bounded child
+builds, the refreshed lockfiles and the CI toolchain/protobuf prerequisites.
+It retains checkpoint `eb68322` and its restricted-error disclosure contract.
 The route limitations below describe the
 original checkpoint; current relay support is recorded in
 [relay coordinators](relay-coordinators.md), and the later hybrid read contracts
@@ -91,7 +94,7 @@ Restricted public Query/QueryStream remain gated pending the complete disclosure
 and field-grant audit. Direct-node authentication/delegation, stable identity on
 all public hit forms and the remaining source durability work are separate.
 
-## Integration order
+## Original checkpoint integration order
 
 **Accepted on 2026-09-06.** Checkpoint `1565d07` is accepted for main after
 independent review. The reconciliation hold is lifted. The integration task
@@ -103,16 +106,16 @@ not wait on the later field-authorization branch. The earlier checkpoint test
 results below do not substitute for testing the combined merge or verifying
 fleet readiness.
 
-The combined tests passed; publishing this feature branch is separate from
-merging it to main. The bounded
-re-placement split remains on its own branch. Recheck live main immediately
-before publishing this branch and again
-before its eventual merge to main. Do not infer fleet readiness from a source
+At the original checkpoint, publication preceded the main merge, and the
+bounded re-placement split was still separate. That split and the resumed relay
+work have since landed on main and are incorporated in this integration.
+Recheck live main before publication; these historical staging instructions do
+not impose a new reconciliation hold. Do not infer fleet readiness from a source
 merge or a launched restart; the other task owns that rollout and readiness
 verification.
 
-Fork E is parked at `eb45b61` on `feat/relay-folds-2026-09`; it is not
-incorporated here. Its coordinator fold helpers have no route integration or
+The original Fork E checkpoint was `eb45b61` on `feat/relay-folds-2026-09`;
+the following records its review requirements before its resumed work landed. Its coordinator fold helpers have no route integration or
 behavior tests. The resumed work must translate full epoch/incarnation claims,
 forward authority views and named field bindings, and validate each child's
 receipt before folding or disclosing values. Rebase those helpers onto this
@@ -132,7 +135,7 @@ and set/count shapes also need overflow, schema, missing-child and multi-level
 composition tests before their routes are enabled.
 
 
-## Validation
+## Original checkpoint validation
 
 The reconciled source passed 486 library tests and 677 integration tests across
 118 targets, followed by 12 embedded tests: 1,175 passed, zero failed. The
@@ -151,3 +154,29 @@ All five embedded mobile compile targets pass: `aarch64-linux-android`,
 The tests/examples build check, formatting check, vendored-proto identity
 check and whitespace check also pass. No fleet operation or measurement was
 performed by this task.
+
+## Field-authorization integration validation
+
+The combined source incorporates main `3103fe1` and feature checkpoint
+`eb68322`. Both merges were clean. Main's segment replay, source-id
+localization and bounded child builds are retained, along with the feature's
+field/document read receipts, query disclosure and structured errors. Public
+document-restricted Query admission remains gated; this source integration does
+not declare the broader protobuf, authorization and stable-identity foundations
+complete.
+
+Validation used main's refreshed dependency locks. It passed 504 library tests,
+695 integration tests across 120 targets, 12 embedded tests and two isolated
+IVF-provider tests: 1,213 passed, zero failed. The existing live OpenNLP
+conformance test remains ignored. The integration run includes all four new
+segment-replay regressions, 22 relay tests and the field/document grant suites.
+All five Android/iOS compile targets, the tests/examples build, formatting,
+vendored-proto identity, whitespace and dependency/provenance gates passed.
+The dependency audit retained its existing allowed maintenance warnings.
+
+Descriptor comparisons against main `3103fe1` and checkpoint `eb68322` preserve
+all existing declarations. The 344-file source/build/test/script/lock manifest
+was unchanged through the final run. The earlier validation run on the old
+locks was stopped when the refresh landed, and the library and integration
+suites were restarted on the new locks. These results are local validation;
+hosted CI and fleet deployment are separate outcomes.
