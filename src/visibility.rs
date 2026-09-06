@@ -38,6 +38,30 @@ pub fn validate_stats_mode(version_only: bool, response: &TermStatsResponse) -> 
     Ok(())
 }
 
+/// Intersect an authority view with user membership without treating the
+/// authority predicate as a field permission granted to the caller.
+pub fn intersect_filter(
+    view: Option<&DocumentVisibility>,
+    user: Option<crate::pb::FilterExpr>,
+) -> Result<Option<crate::pb::FilterExpr>, Status> {
+    VisibilityScope::new(view)?;
+    let result = match view.and_then(|view| view.filter.as_ref()) {
+        None => user,
+        Some(mandatory) => Some(match user {
+            None => mandatory.clone(),
+            Some(user) => crate::pb::FilterExpr {
+                expr: Some(crate::pb::filter_expr::Expr::And(crate::pb::FilterList {
+                    exprs: vec![mandatory.clone(), user],
+                })),
+            },
+        }),
+    };
+    if let Some(filter) = &result {
+        crate::filter::validate_filter(filter)?;
+    }
+    Ok(result)
+}
+
 /// Cache identity derived from a validated protobuf visibility, never from a
 /// caller-supplied digest. Default is the unrestricted live document view.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]

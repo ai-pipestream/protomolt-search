@@ -157,6 +157,26 @@ impl FieldScope {
                 self.require_disclose(&stage.column)?;
             }
         }
+        self.filter(geo_filters, user_filter)?;
+        self.fetch_values(projections, &[])?;
+        if let Some(highlight) = highlight {
+            if highlight.fields.is_empty() {
+                self.dictionary("body")?;
+            }
+            for field in &highlight.fields {
+                self.dictionary(field)?;
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn lexical_membership(&self) -> Result<(), Status> {
+        self.require_use("body")
+    }
+    pub(crate) fn filter(
+        &self,
+        geo_filters: &[GeoFilter],
+        user_filter: Option<&FilterExpr>,
+    ) -> Result<(), Status> {
         for geo in geo_filters {
             self.require_use(&geo.column)?;
         }
@@ -180,17 +200,9 @@ impl FieldScope {
                 return Err(Self::denied());
             }
         }
-        self.fetch_values(projections, &[])?;
-        if let Some(highlight) = highlight {
-            if highlight.fields.is_empty() {
-                self.dictionary("body")?;
-            }
-            for field in &highlight.fields {
-                self.dictionary(field)?;
-            }
-        }
         Ok(())
     }
+
     /// Stored-value dimensions use their inputs internally; projected values
     /// disclose them. Explanation disclosure is checked by the query planner.
     pub(crate) fn fetch_values(

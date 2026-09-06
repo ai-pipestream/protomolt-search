@@ -15,6 +15,10 @@ phases do not switch copies: losing the admitted copy requires a new whole
 query. Candidate `FetchValues` requests carry the admitted versions, which the
 node checks under the same read lock as visibility and values.
 
+[Membership reads](membership-visibility.md) also validate their complete version
+against the admitted read set before returning any row IDs to the planner.
+Filter and vector membership now return versions as well as lexical membership.
+
 After execution, fresh probes must match all admitted versions. A scoring retry
 that obtains newer statistics cannot turn an earlier selection into a successful
 mixed-generation result. Mutation, compaction or node replacement refuses the

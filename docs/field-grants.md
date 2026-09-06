@@ -111,6 +111,12 @@ These grants do not configure the CLI's TOML adapter, authorize direct node or
 cluster-control listeners, implement per-key map grants, or finish the other
 retrieval routes. Hosts provide protobuf policies or a trusted `Authorizer`.
 
+The [membership boundary](membership-visibility.md) checks user filter inputs
+and lexical body use before planning, independently of authority-owned predicate
+columns. A field-restricted vector membership call refuses until the dense
+contract names an explicit indexed vector field. This does not enable restricted
+public Query or QueryStream.
+
 The [candidate value-fetch boundary](candidate-fetch.md) also checks an
 authority-bound coordinator's field policy before fetching projections and
 stored-value score dimensions. This prepares the later query phases; it does

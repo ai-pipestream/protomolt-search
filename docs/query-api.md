@@ -134,6 +134,12 @@ same global statistics as the ordinary lexical route. A shard statistics epoch
 change aborts the attempt; the coordinator retries the complete plan once and
 then fails rather than combining generations.
 
+The shared [membership boundary](membership-visibility.md) now carries an
+independent mandatory document view and validates its response fingerprint and
+physical version before merging bits. Public query read sets reject changed
+membership immediately. Restricted public Query remains gated until its other
+phases also enforce the authority.
+
 This is exact set algebra, not a candidate-depth heuristic. ANN cannot certify
 recursive membership and is refused. Each leaf contributes its actual indexed
 domain: lexical and filter leaves contain document rows, while a dense leaf can

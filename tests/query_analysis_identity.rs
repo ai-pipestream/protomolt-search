@@ -244,6 +244,7 @@ async fn every_internal_lexical_route_checks_the_indexed_analysis() {
             expect(
                 client
                     .resolve_lexical_bitmap(LexicalBitmapRequest {
+                        visibility: None,
                         terms: vec!["word".into()],
                         analysis_fingerprint: fp,
                     })

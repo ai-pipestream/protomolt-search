@@ -923,3 +923,24 @@ test ran; stored index and WAL formats are unchanged.
 The full integration pass initially found two compaction assertions expecting
 the older boundary error. They now require the earlier data-version refusal,
 and the affected group plus every remaining integration target passed.
+
+
+## Document-scoped membership checkpoint (2026-09-06)
+
+Filter-universe, lexical and vector membership now carry the authority's document
+view and return its fingerprint plus a complete physical version. The coordinator
+validates those claims before merging any bitmap into a Boolean plan, including
+the universe used by a negative-only group. User field checks remain separate
+from the authority predicate, and vector-only rows cannot satisfy a document
+grant. See [membership visibility](membership-visibility.md) for evidence and
+the remaining public-query, vector-field and delegation boundaries.
+
+Validation: 460 library tests, 625 integration tests across 109 targets and
+12 embedded tests passed (1,097 total); one existing live-sidecar conformance
+test remains ignored. The coordinator's stale-membership test also passed after
+its fixture received wider shard spacing to preserve valid ranges after append.
+All five Android/iOS Rust target checks, tests/examples compilation, formatting
+and vendored-proto checks passed. Descriptor comparison against `e9873c1`
+confirms exactly nine additive fields with existing declarations unchanged.
+No fleet benchmark, deployment or device-runtime test ran. Stored index, WAL
+and original-source formats are unchanged.

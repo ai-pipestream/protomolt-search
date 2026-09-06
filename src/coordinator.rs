@@ -1630,10 +1630,11 @@ pub struct BrowseRows {
     pub sorted: bool,
 }
 
-/// One exact distributed membership bitmap decoded into stable product ids.
-/// `epochs` is populated for lexical membership, parallel to the coordinator's
-/// node order, so the scoring phase can refuse a store mutation between set
-/// planning and candidate rescoring.
+/// One exact distributed membership bitmap decoded into generation-local row IDs.
+/// `epochs` is parallel to the coordinator's node order on every route. A
+/// pruned filter shard (or a lexical request with no analyzed terms and no
+/// mandatory view) has no read claim. Query-bound reads must match the admitted
+/// read set before any bitmap enters the plan.
 #[derive(Debug, Clone, Default)]
 pub struct MembershipSet {
     pub ids: BTreeSet<u64>,
@@ -1915,23 +1916,7 @@ impl CoordinatorServiceImpl {
         &self,
         user: Option<crate::pb::FilterExpr>,
     ) -> Result<Option<crate::pb::FilterExpr>, Status> {
-        let Some(mandatory) = self
-            .document_visibility
-            .as_ref()
-            .and_then(|view| view.filter.as_ref())
-        else {
-            return Ok(user);
-        };
-        let filter = match user {
-            Some(user) => crate::pb::FilterExpr {
-                expr: Some(crate::pb::filter_expr::Expr::And(crate::pb::FilterList {
-                    exprs: vec![mandatory.clone(), user],
-                })),
-            },
-            None => mandatory.clone(),
-        };
-        crate::filter::validate_filter(&filter)?;
-        Ok(Some(filter))
+        crate::visibility::intersect_filter(self.document_visibility.as_ref(), user)
     }
 
     fn check_visibility_columns(&self, known: &[bool]) -> Result<(), Status> {
@@ -8922,33 +8907,92 @@ impl CoordinatorServiceImpl {
         Ok(())
     }
 
+    fn membership_from_filter(
+        response: crate::pb::FilterBitmapResponse,
+    ) -> crate::pb::MembershipBitmapResponse {
+        crate::pb::MembershipBitmapResponse {
+            base_label: response.base_label,
+            label_count: response.label_count,
+            bits: response.bits,
+            stats_epoch: response.stats_epoch,
+            stats_incarnation: response.stats_incarnation,
+            visibility_fingerprint: response.visibility_fingerprint,
+            visibility_columns_known: response.visibility_columns_known,
+            segments_total: response.segments_total,
+            segments_skipped: response.segments_skipped,
+        }
+    }
+
+    fn check_membership_view(
+        &self,
+        shard: usize,
+        scope: &crate::visibility::VisibilityScope,
+        response: &crate::pb::MembershipBitmapResponse,
+        known: &mut [bool],
+    ) -> Result<StatsClaim, Status> {
+        scope.validate_echo(
+            &response.visibility_fingerprint,
+            &response.visibility_columns_known,
+        )?;
+        let claim = StatsClaim::required(response.stats_epoch, &response.stats_incarnation)?;
+        if let Some(expected) = &self.query_read_versions {
+            if expected.get(shard) != Some(&claim) {
+                return Err(Status::failed_precondition(
+                    "query data changed during membership planning; restart from the first page",
+                ));
+            }
+        }
+        for (held, present) in known.iter_mut().zip(&response.visibility_columns_known) {
+            *held |= present;
+        }
+        Ok(claim)
+    }
+
     /// Resolve the live document universe, or one CEL/geo predicate, without
     /// paging through `max_k`-sized browse responses.
     pub async fn filter_membership(
         &self,
         filters: &RequestFilters,
     ) -> Result<MembershipSet, Status> {
-        let mask = self.shard_mask(filters.tree.as_ref());
+        if let Some(fields) = &self.field_permissions {
+            fields.filter(&filters.geo, filters.tree.as_ref())?;
+        }
+        let scope = crate::visibility::VisibilityScope::new(self.document_visibility.as_ref())?;
+        let mut visibility_known = vec![false; scope.column_count()];
+        // Every shard supplies the mandatory column handshake, even when the
+        // caller's predicate would prune it from the user-only membership.
+        let mask = self
+            .document_visibility
+            .is_none()
+            .then(|| self.shard_mask(filters.tree.as_ref()))
+            .flatten();
         let mut tasks = Vec::with_capacity(self.node_addrs.len());
         for (shard, node) in self.node_addrs.iter().enumerate() {
             if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
                 continue;
             }
             let request = crate::pb::FilterBitmapRequest {
+                visibility: self.document_visibility.clone(),
                 geo_filters: filters.geo.clone(),
                 filter: filters.tree.clone(),
             };
             let client = self.node_client(node);
-            tasks.push(tokio::spawn(async move {
-                client?
-                    .resolve_filter_bitmap(request)
-                    .await
-                    .map(|response| response.into_inner())
-            }));
+            tasks.push((
+                shard,
+                tokio::spawn(async move {
+                    client?
+                        .resolve_filter_bitmap(request)
+                        .await
+                        .map(|response| response.into_inner())
+                }),
+            ));
         }
         let mut known = Self::filter_known(filters, mask.as_ref());
-        let mut merged = MembershipSet::default();
-        for task in tasks {
+        let mut merged = MembershipSet {
+            epochs: vec![StatsClaim::default(); self.node_addrs.len()],
+            ..Default::default()
+        };
+        for (shard, task) in tasks {
             let response = task.await.map_err(|error| {
                 Status::internal(format!("filter membership task failed: {error}"))
             })??;
@@ -8957,19 +9001,12 @@ impl CoordinatorServiceImpl {
                 segments_total: response.segments_total,
                 segments_skipped: response.segments_skipped,
             });
-            Self::merge_membership_bitmap(
-                &mut merged,
-                &crate::pb::MembershipBitmapResponse {
-                    segments_total: 0,
-                    segments_skipped: 0,
-                    base_label: response.base_label,
-                    label_count: response.label_count,
-                    bits: response.bits,
-                    stats_epoch: 0,
-                    stats_incarnation: Vec::new(),
-                },
-            )?;
+            let response = Self::membership_from_filter(response);
+            merged.epochs[shard] =
+                self.check_membership_view(shard, &scope, &response, &mut visibility_known)?;
+            Self::merge_membership_bitmap(&mut merged, &response)?;
         }
+        self.check_visibility_columns(&visibility_known)?;
         known.refuse_unknown(filters)?;
         Ok(merged)
     }
@@ -9004,9 +9041,14 @@ impl CoordinatorServiceImpl {
         text: &str,
         spec: Option<&crate::pb::AnalysisSpec>,
     ) -> Result<MembershipSet, Status> {
+        if let Some(fields) = &self.field_permissions {
+            fields.lexical_membership()?;
+        }
+        let scope = crate::visibility::VisibilityScope::new(self.document_visibility.as_ref())?;
+        let mut visibility_known = vec![false; scope.column_count()];
         let analysis_fingerprint = crate::analyzer::analysis_fingerprint(spec);
         let terms = self.analyze_terms(text, spec).await?;
-        if terms.is_empty() {
+        if terms.is_empty() && self.document_visibility.is_none() {
             return Ok(MembershipSet {
                 epochs: vec![StatsClaim::default(); self.node_addrs.len()],
                 ..Default::default()
@@ -9016,6 +9058,7 @@ impl CoordinatorServiceImpl {
         for node in &self.node_addrs {
             let client = self.node_client(node);
             let request = crate::pb::LexicalBitmapRequest {
+                visibility: self.document_visibility.clone(),
                 analysis_fingerprint,
                 terms: terms.clone(),
             };
@@ -9027,13 +9070,15 @@ impl CoordinatorServiceImpl {
             }));
         }
         let mut merged = MembershipSet::default();
-        for task in tasks {
+        for (shard, task) in tasks.into_iter().enumerate() {
             let response = task.await.map_err(|error| {
                 Status::internal(format!("lexical membership task failed: {error}"))
             })??;
-            merged.epochs.push(StatsClaim::required(
-                response.stats_epoch,
-                &response.stats_incarnation,
+            merged.epochs.push(self.check_membership_view(
+                shard,
+                &scope,
+                &response,
+                &mut visibility_known,
             )?);
             merged.prune.add(crate::segment_prune::PruneStats {
                 segments_total: response.segments_total,
@@ -9041,6 +9086,7 @@ impl CoordinatorServiceImpl {
             });
             Self::merge_membership_bitmap(&mut merged, &response)?;
         }
+        self.check_visibility_columns(&visibility_known)?;
         merged.terms = terms;
         Ok(merged)
     }
@@ -9049,23 +9095,40 @@ impl CoordinatorServiceImpl {
     /// rule of a dense Boolean clause; native scores are fetched only for the
     /// candidates that survive the Boolean set plan.
     pub async fn vector_membership(&self) -> Result<MembershipSet, Status> {
+        if self.field_permissions.is_some() {
+            return Err(Status::permission_denied(
+                "vector membership requires an explicit vector-field permission contract",
+            ));
+        }
+        let scope = crate::visibility::VisibilityScope::new(self.document_visibility.as_ref())?;
+        let mut visibility_known = vec![false; scope.column_count()];
         let mut tasks = Vec::with_capacity(self.node_addrs.len());
         for node in &self.node_addrs {
             let client = self.node_client(node);
+            let request = crate::pb::VectorBitmapRequest {
+                visibility: self.document_visibility.clone(),
+            };
             tasks.push(tokio::spawn(async move {
                 client?
-                    .resolve_vector_bitmap(crate::pb::VectorBitmapRequest {})
+                    .resolve_vector_bitmap(request)
                     .await
                     .map(|response| response.into_inner())
             }));
         }
         let mut merged = MembershipSet::default();
-        for task in tasks {
+        for (shard, task) in tasks.into_iter().enumerate() {
             let response = task.await.map_err(|error| {
                 Status::internal(format!("vector membership task failed: {error}"))
             })??;
+            merged.epochs.push(self.check_membership_view(
+                shard,
+                &scope,
+                &response,
+                &mut visibility_known,
+            )?);
             Self::merge_membership_bitmap(&mut merged, &response)?;
         }
+        self.check_visibility_columns(&visibility_known)?;
         Ok(merged)
     }
 
@@ -9079,36 +9142,51 @@ impl CoordinatorServiceImpl {
         &self,
         filters: &RequestFilters,
     ) -> Result<Option<ClusteredLabelFilter>, Status> {
-        if filters.geo.is_empty() && filters.tree.is_none() {
+        if filters.geo.is_empty() && filters.tree.is_none() && self.document_visibility.is_none() {
             return Ok(None);
         }
 
-        let mask = self.shard_mask(filters.tree.as_ref());
+        if let Some(fields) = &self.field_permissions {
+            fields.filter(&filters.geo, filters.tree.as_ref())?;
+        }
+        let scope = crate::visibility::VisibilityScope::new(self.document_visibility.as_ref())?;
+        let mut visibility_known = vec![false; scope.column_count()];
+        let mask = self
+            .document_visibility
+            .is_none()
+            .then(|| self.shard_mask(filters.tree.as_ref()))
+            .flatten();
         let mut tasks = Vec::with_capacity(self.node_addrs.len());
         for (shard, node) in self.node_addrs.iter().enumerate() {
             if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
                 continue;
             }
             let request = crate::pb::FilterBitmapRequest {
+                visibility: self.document_visibility.clone(),
                 geo_filters: filters.geo.clone(),
                 filter: filters.tree.clone(),
             };
             let client = self.node_client(node);
-            tasks.push(tokio::spawn(async move {
-                client?
-                    .resolve_filter_bitmap(request)
-                    .await
-                    .map(|response| response.into_inner())
-            }));
+            tasks.push((
+                shard,
+                tokio::spawn(async move {
+                    client?
+                        .resolve_filter_bitmap(request)
+                        .await
+                        .map(|response| response.into_inner())
+                }),
+            ));
         }
 
         let mut known = Self::filter_known(filters, mask.as_ref());
         let mut bitmaps = Vec::with_capacity(tasks.len());
-        for task in tasks {
+        for (shard, task) in tasks {
             let response = task.await.map_err(|error| {
                 Status::internal(format!("filter bitmap task failed: {error}"))
             })??;
             known.merge(&response.geo_columns_known, &response.filter_columns_known)?;
+            let response = Self::membership_from_filter(response);
+            self.check_membership_view(shard, &scope, &response, &mut visibility_known)?;
             if response.label_count == 0 {
                 if !response.bits.is_empty() {
                     return Err(Status::internal(
@@ -9138,6 +9216,7 @@ impl CoordinatorServiceImpl {
                 bits: response.bits,
             });
         }
+        self.check_visibility_columns(&visibility_known)?;
         known.refuse_unknown(filters)?;
         bitmaps.sort_unstable_by_key(|bitmap| bitmap.base_label);
         for pair in bitmaps.windows(2) {
@@ -13684,6 +13763,228 @@ mod stream_cancel_tests {
 mod candidate_fetch_tests {
     use super::*;
     use crate::pb::*;
+
+    #[tokio::test]
+    async fn membership_planning_keeps_authority_separate_from_user_fields_and_versions() {
+        let mut nodes = Vec::new();
+        for shard in 0..2 {
+            let node = Arc::new(crate::node::NodeServiceImpl::new(
+                None,
+                crate::node::NodeConfig {
+                    slot_offset: shard * 100,
+                    analysis_addr: Some(crate::analyzer::NATIVE_ANALYSIS_BACKEND.into()),
+                    facet_fields: vec!["audience".into(), "color".into()],
+                    ..Default::default()
+                },
+            ));
+            crate::link::NodeLink::local(node.clone())
+                .add_documents(tokio_stream::iter(
+                    [("public", "red", "alpha"), ("private", "blue", "secret")]
+                        .into_iter()
+                        .map(|(audience, color, text)| AddDocumentsRequest {
+                            text: text.into(),
+                            analysis: Some(crate::analyzer::body_spec()),
+                            facets: vec![
+                                FacetValue {
+                                    field: "audience".into(),
+                                    value: audience.into(),
+                                },
+                                FacetValue {
+                                    field: "color".into(),
+                                    value: color.into(),
+                                },
+                            ],
+                            ..Default::default()
+                        }),
+                ))
+                .await
+                .unwrap();
+            nodes.push(node);
+        }
+        let owner = CoordinatorServiceImpl::with_local_nodes(nodes.clone()).with_bm25(
+            Some(crate::analyzer::NATIVE_ANALYSIS_BACKEND.into()),
+            Default::default(),
+        );
+        let access = AccessDecision {
+            action: AccessAction::Search as i32,
+            document_visibility: Some(DocumentVisibility {
+                filter: crate::cel::compile_filter("audience == 'public'").unwrap(),
+            }),
+            field_permissions: Some(FieldPermissions {
+                grants: ["body", "color"]
+                    .into_iter()
+                    .map(|field| FieldGrant {
+                        field: field.into(),
+                        actions: vec![FieldAction::Use as i32],
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut reader = owner.for_access(Some(&access), "bm25_search").unwrap();
+        reader.query_read_versions = Some(Arc::new(
+            reader
+                .read_query_versions(false)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(_, claim)| claim)
+                .collect(),
+        ));
+        let all = RequestFilters::default();
+        let universe = reader.filter_membership(&all).await.unwrap();
+        assert_eq!(universe.ids, [0, 100].into_iter().collect());
+        assert_eq!(universe.epochs.len(), 2);
+        let selected = reader
+            .lexical_membership("alpha", Some(&crate::analyzer::body_spec()))
+            .await
+            .unwrap();
+        assert_eq!(selected.ids, universe.ids);
+        assert_eq!(selected.epochs, universe.epochs);
+        assert!(reader
+            .lexical_membership("secret", Some(&crate::analyzer::body_spec()))
+            .await
+            .unwrap()
+            .ids
+            .is_empty());
+        assert!(reader
+            .filter_membership(&RequestFilters::compile(&[], "color == 'blue'").unwrap())
+            .await
+            .unwrap()
+            .ids
+            .is_empty());
+        let denied = reader
+            .filter_membership(&RequestFilters::compile(&[], "audience == 'public'").unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        assert_eq!(denied.message(), "field access is not granted");
+        assert_eq!(
+            reader.vector_membership().await.unwrap_err().code(),
+            tonic::Code::PermissionDenied
+        );
+        // Exercise the actual negative-only planner. Its starting universe must
+        // exclude private rows even when the negative clause matches no visible row.
+        let query = QueryRequest {
+            k: 4,
+            selection: Some(SelectionQuery {
+                node: Some(selection_query::Node::Boolean(BooleanQuery {
+                    must_not: vec![SelectionQuery {
+                        node: Some(selection_query::Node::Search(SearchQuery {
+                            id: "excluded".into(),
+                            query: Some(search_query::Query::Lexical(LexicalQuery {
+                                text: "secret".into(),
+                                analysis: Some(crate::analyzer::body_spec()),
+                                ..Default::default()
+                            })),
+                        })),
+                    }],
+                    ..Default::default()
+                })),
+            }),
+            ..Default::default()
+        };
+        let planned = crate::query::execute(&reader, query).await.unwrap();
+        assert_eq!(
+            planned
+                .hits
+                .iter()
+                .map(|hit| hit.doc_id)
+                .collect::<BTreeSet<_>>(),
+            universe.ids
+        );
+        let mut doc_only = access.clone();
+        doc_only.field_permissions = None;
+        let mut document_reader = owner.for_access(Some(&doc_only), "bm25_search").unwrap();
+        document_reader.query_read_versions = reader.query_read_versions.clone();
+        assert_eq!(
+            document_reader.vector_membership().await.unwrap().epochs,
+            universe.epochs
+        );
+        crate::link::NodeLink::local(nodes[0].clone())
+            .add_documents(tokio_stream::iter([AddDocumentsRequest {
+                text: "new".into(),
+                analysis: Some(crate::analyzer::body_spec()),
+                ..Default::default()
+            }]))
+            .await
+            .unwrap();
+        for kind in 0..3 {
+            let error = match kind {
+                0 => document_reader.filter_membership(&all).await.unwrap_err(),
+                1 => document_reader
+                    .lexical_membership("alpha", Some(&crate::analyzer::body_spec()))
+                    .await
+                    .unwrap_err(),
+                _ => document_reader.vector_membership().await.unwrap_err(),
+            };
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            assert!(error
+                .message()
+                .contains("query data changed during membership"));
+        }
+        let mut absent = doc_only;
+        absent.document_visibility = Some(DocumentVisibility {
+            filter: crate::cel::compile_filter("private_column == 'yes'").unwrap(),
+        });
+        let unknown = owner.for_access(Some(&absent), "bm25_search").unwrap();
+        for kind in 0..3 {
+            let error = match kind {
+                0 => unknown.filter_membership(&all).await.unwrap_err(),
+                1 => unknown
+                    .lexical_membership("alpha", Some(&crate::analyzer::body_spec()))
+                    .await
+                    .unwrap_err(),
+                _ => unknown.vector_membership().await.unwrap_err(),
+            };
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            assert!(!error.message().contains("private_column"));
+        }
+    }
+
+    #[test]
+    fn membership_view_validation_refuses_legacy_wrong_scope_and_incomplete_claims() {
+        let owner = CoordinatorServiceImpl::with_local_nodes(Vec::new());
+        let view = DocumentVisibility {
+            filter: crate::cel::compile_filter("audience == 'public'").unwrap(),
+        };
+        let scope = crate::visibility::VisibilityScope::new(Some(&view)).unwrap();
+        let valid = MembershipBitmapResponse {
+            stats_epoch: 4,
+            stats_incarnation: vec![1; 32],
+            visibility_fingerprint: scope.fingerprint().to_vec(),
+            visibility_columns_known: vec![true],
+            ..Default::default()
+        };
+        for case in 0..5 {
+            let mut malformed = valid.clone();
+            match case {
+                0 => malformed.visibility_fingerprint.clear(),
+                1 => malformed.visibility_columns_known.clear(),
+                2 => malformed.stats_epoch = 0,
+                3 => malformed.stats_incarnation.clear(),
+                _ => malformed.visibility_fingerprint[0] ^= 1,
+            }
+            let mut known = vec![false];
+            assert_eq!(
+                owner
+                    .check_membership_view(0, &scope, &malformed, &mut known)
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::FailedPrecondition
+            );
+            assert_eq!(known, vec![false]);
+        }
+        let mut known = vec![false];
+        assert_eq!(
+            owner
+                .check_membership_view(0, &scope, &valid, &mut known)
+                .unwrap(),
+            StatsClaim::required(4, &[1; 32]).unwrap()
+        );
+        assert_eq!(known, vec![true]);
+    }
 
     #[tokio::test]
     async fn candidate_fetch_enforces_authority_fields_and_documents_before_disclosure() {

@@ -11111,10 +11111,20 @@ impl NodeService for NodeServiceImpl {
     ) -> Result<Response<crate::pb::FilterBitmapResponse>, Status> {
         crate::metrics::timed(Route::ResolveFilterBitmap, request, |request| async move {
             let req = request.into_inner();
+            let scope = crate::visibility::VisibilityScope::new(req.visibility.as_ref())?;
+            let filter =
+                crate::visibility::intersect_filter(req.visibility.as_ref(), req.filter.clone())?;
             let geo_regions = validate_geo_filters(&req.geo_filters)?;
             let guard = read_shard(&self.state);
             let (geo_columns_known, filter_columns_known) =
                 filter_known_flags(guard.bm25.as_ref(), &req.geo_filters, req.filter.as_ref());
+            let (_, visibility_columns_known) = filter_known_flags(
+                guard.bm25.as_ref(),
+                &[],
+                req.visibility
+                    .as_ref()
+                    .and_then(|view| view.filter.as_ref()),
+            );
             let label_count = guard
                 .bm25
                 .as_ref()
@@ -11125,7 +11135,7 @@ impl NodeService for NodeServiceImpl {
                 label_count,
                 &req.geo_filters,
                 &geo_regions,
-                req.filter.as_ref(),
+                filter.as_ref(),
                 self.knobs.segment_pruning(),
             )?;
             let allow = allow.unwrap_or_else(|| vec![true; label_count]);
@@ -11136,6 +11146,10 @@ impl NodeService for NodeServiceImpl {
                 }
             }
             Ok(Response::new(crate::pb::FilterBitmapResponse {
+                stats_epoch: guard.stats_epoch,
+                stats_incarnation: guard.stats_incarnation.bytes()?,
+                visibility_fingerprint: scope.fingerprint().to_vec(),
+                visibility_columns_known,
                 base_label: self.config.slot_offset,
                 label_count: label_count as u64,
                 bits,
@@ -11153,10 +11167,19 @@ impl NodeService for NodeServiceImpl {
         request: Request<LexicalBitmapRequest>,
     ) -> Result<Response<MembershipBitmapResponse>, Status> {
         let req = request.into_inner();
+        let scope = crate::visibility::VisibilityScope::new(req.visibility.as_ref())?;
         let guard = read_shard(&self.state);
+        let view_filter = req
+            .visibility
+            .as_ref()
+            .and_then(|view| view.filter.as_ref());
+        let (_, visibility_columns_known) =
+            filter_known_flags(guard.bm25.as_ref(), &[], view_filter);
         guard.check_query_analysis("body", req.analysis_fingerprint)?;
         let Some(shard) = guard.bm25.as_ref() else {
             return Ok(Response::new(MembershipBitmapResponse {
+                visibility_fingerprint: scope.fingerprint().to_vec(),
+                visibility_columns_known,
                 segments_total: 0,
                 segments_skipped: 0,
                 base_label: self.config.slot_offset,
@@ -11171,6 +11194,20 @@ impl NodeService for NodeServiceImpl {
         })?;
         let label_count = usize::try_from(shard.next_doc_id())
             .map_err(|_| Status::resource_exhausted("lexical row count does not fit usize"))?;
+        let visible = if view_filter.is_some() {
+            resolve_shard_filters(
+                guard.bm25.as_ref(),
+                guard.live_docs.words(),
+                label_count,
+                &[],
+                &[],
+                view_filter,
+                self.knobs.segment_pruning(),
+            )?
+            .1
+        } else {
+            None
+        };
         // A sealed segment none of the terms occur in contributes no
         // member: the walk skips it and the count says so
         // (docs/segment-pruning.md). One dictionary lookup per term per
@@ -11202,12 +11239,19 @@ impl NodeService for NodeServiceImpl {
         for term in req.terms {
             index.for_each_doc_tf(&term, &mut |doc_id, _tf| {
                 let position = doc_id as usize;
-                if position < label_count && !guard.live_docs.is_deleted(position) {
+                if position < label_count
+                    && !guard.live_docs.is_deleted(position)
+                    && visible
+                        .as_ref()
+                        .is_none_or(|allowed| allowed.get(position) == Some(&true))
+                {
                     bits[position / 8] |= 1 << (position % 8);
                 }
             });
         }
         Ok(Response::new(MembershipBitmapResponse {
+            visibility_fingerprint: scope.fingerprint().to_vec(),
+            visibility_columns_known,
             base_label: self.config.slot_offset,
             label_count: label_count as u64,
             bits,
@@ -11220,10 +11264,36 @@ impl NodeService for NodeServiceImpl {
 
     async fn resolve_vector_bitmap(
         &self,
-        _request: Request<VectorBitmapRequest>,
+        request: Request<VectorBitmapRequest>,
     ) -> Result<Response<MembershipBitmapResponse>, Status> {
+        let req = request.into_inner();
+        let scope = crate::visibility::VisibilityScope::new(req.visibility.as_ref())?;
         let guard = read_shard(&self.state);
+        let view_filter = req
+            .visibility
+            .as_ref()
+            .and_then(|view| view.filter.as_ref());
+        let (_, visibility_columns_known) =
+            filter_known_flags(guard.bm25.as_ref(), &[], view_filter);
         let label_count = guard.index.as_ref().map_or(0, VectorIndex::len);
+        let visible = if view_filter.is_some() {
+            resolve_shard_filters(
+                guard.bm25.as_ref(),
+                guard.live_docs.words(),
+                label_count,
+                &[],
+                &[],
+                view_filter,
+                self.knobs.segment_pruning(),
+            )?
+            .1
+        } else {
+            None
+        };
+        let documents = guard
+            .bm25
+            .as_ref()
+            .map_or(0, |store| store.next_doc_id() as usize);
         let mut bits = vec![0xffu8; label_count.div_ceil(8)];
         if let Some(last) = bits.last_mut() {
             let used = label_count % 8;
@@ -11232,18 +11302,25 @@ impl NodeService for NodeServiceImpl {
             }
         }
         for position in 0..label_count {
-            if guard.live_docs.is_deleted(position) {
+            if guard.live_docs.is_deleted(position)
+                || (req.visibility.is_some() && position >= documents)
+                || visible
+                    .as_ref()
+                    .is_some_and(|allowed| allowed.get(position) != Some(&true))
+            {
                 bits[position / 8] &= !(1 << (position % 8));
             }
         }
         Ok(Response::new(MembershipBitmapResponse {
+            visibility_fingerprint: scope.fingerprint().to_vec(),
+            visibility_columns_known,
             segments_total: 0,
             segments_skipped: 0,
             base_label: self.config.slot_offset,
             label_count: label_count as u64,
             bits,
-            stats_epoch: 0,
-            stats_incarnation: Vec::new(),
+            stats_epoch: guard.stats_epoch,
+            stats_incarnation: guard.stats_incarnation.bytes()?,
         }))
     }
 

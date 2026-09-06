@@ -1222,6 +1222,12 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Document-scoped membership (2026-09-06, feature branch).** Boolean filter,
+  lexical and vector bitmaps apply the mandatory document view before leaving
+  the node. Coordinators verify the view and read version before planning;
+  vector-only rows cannot satisfy a document grant. Restricted public queries
+  remain gated. See [membership visibility](docs/membership-visibility.md).
+
 - **Query read versions (2026-09-06, feature branch).** Public unary and streamed
   queries capture shard versions before execution, use them for candidate value
   reads and verify them before the final result. Queries pin their admitted
