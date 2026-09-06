@@ -1,5 +1,10 @@
 # Public query contract
 
+Execution metadata has a separate document-disclosure contract and dense
+benchmark provenance carries an explicit evidence scope. See
+[Query execution disclosure](query-disclosure.md) for omission semantics and
+the remaining public document-query admission boundary.
+
 Simple lexical selection returns the imported `DocumentIdentity` with each hit
 when present on the scored row. The terminal `QueryStream` response carries the
 same identity. It is read with the score, without a later positional-ID lookup.

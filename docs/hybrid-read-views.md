@@ -128,14 +128,13 @@ in force. Tests reproduce the previous 1,000,000 versus 500,000 ppm error and
 prove that the corrected key selects a different measured candidate depth.
 See [dense execution policy](dense-execution-policy.md) for the measurement scope.
 
-Public document Query is still gated. Its response schema currently includes
-physical rerank work and shard/segment counts in `QueryProfile`, physical corpus
-rows and generation in `DenseQualityOutcome`, and a live filter ratio plus
-free-form planner text in `DenseExecutionOutcome`. `execute_query` applies field
-disclosure but does not yet apply a document-specific disposition to those
-surfaces. The next contract needs explicit omission semantics while retaining
-honest traversal and benchmark provenance. A policy's measured recall cannot
-be upgraded to a guarantee for every document view in its selectivity band.
+Public document Query is still gated. The shared executor now applies
+document-specific disclosure to physical rerank work, shard/segment counts,
+corpus geometry, live filter ratios and free-form planner labels. The response
+marks omissions explicitly and retains traversal and benchmark provenance with
+an explicit evidence scope. A policy's measured recall cannot be upgraded to a
+guarantee for every document view in its selectivity band. Error and provisional
+surfaces still need certification; see [Query execution disclosure](query-disclosure.md).
 
 Validation: 494 library tests, 688 integration tests across 119 targets, and
 12 embedded tests passed (1,194 total, zero failed). The existing live OpenNLP

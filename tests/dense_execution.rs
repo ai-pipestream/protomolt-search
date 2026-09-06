@@ -248,6 +248,10 @@ fn qualified_point() -> DensePolicyPoint {
 }
 
 fn assert_ann_through_policy(outcome: &DenseExecutionOutcome, policy: &DenseExecutionPolicy) {
+    assert_eq!(
+        outcome.evidence_scope,
+        pipestream_search::pb::DenseEvidenceScope::SelectivityBandBenchmark as i32
+    );
     assert_eq!(outcome.requested_mode, DenseExecutionMode::Auto as i32);
     assert_eq!(outcome.resolved_mode, DenseExecutionMode::Ann as i32);
     assert!(

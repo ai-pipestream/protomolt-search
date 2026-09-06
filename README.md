@@ -1222,6 +1222,11 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **2026-09-06 — Query execution disclosure and evidence scope.** The shared
+  executor explicitly marks withheld physical metadata under document grants.
+  Dense outcomes identify corpus versus selectivity-band benchmark evidence;
+  neither promises recall for every authority view. Public document Query
+  admission remains gated. See [Query execution disclosure](docs/query-disclosure.md).
 - **2026-09-06 — Document-aware dense policy selection.** AUTO qualifies its
   measured point using admitted vector rows, including the mandatory document
   view when the caller supplies no filter. Document-only rows do not inflate

@@ -77,6 +77,7 @@ pub mod proximity;
 pub mod quality;
 pub mod query;
 mod query_cursor;
+mod query_disclosure;
 mod query_identity;
 mod rangefacet;
 pub mod rankdiff;

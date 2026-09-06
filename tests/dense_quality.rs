@@ -561,6 +561,10 @@ async fn auto_with_fp32_rerank_resolves_the_depth_through_the_profile_default() 
         // Provenance: the same outcome an explicit policy reports, plus the
         // planner naming the profile and default that chose the depth.
         let outcome = auto.dense_quality.as_ref().expect("dense_quality set");
+        assert_eq!(
+            outcome.evidence_scope,
+            pipestream_search::pb::DenseEvidenceScope::CorpusBenchmark as i32
+        );
         assert_eq!(auto.dense_quality, explicit.dense_quality);
         assert_eq!(outcome.target_recall_ppm, DEFAULT_TARGET);
         assert_eq!(outcome.selection_k, point.candidates);

@@ -1567,6 +1567,7 @@ pub(crate) async fn execute(
             }
             response.dense_quality =
                 quality_resolution.map(|resolution| crate::pb::DenseQualityOutcome {
+                    evidence_scope: crate::pb::DenseEvidenceScope::CorpusBenchmark as i32,
                     target_recall_ppm: resolution.target_recall_ppm,
                     selection_k: resolution.selection_k,
                     profile_fingerprint: resolution.profile_fingerprint,
@@ -2282,6 +2283,7 @@ fn done(
 ) -> QueryResponse {
     QueryResponse {
         field_details_redacted: false,
+        execution_details_redacted: false,
         request_id,
         hits,
         executed: executed.to_string(),

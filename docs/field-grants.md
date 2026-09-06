@@ -13,6 +13,9 @@ Private in-process `Bm25Search`, `Suggest`, `TermSuggest` and
 when the decision has no mandatory document view. Document-restricted public
 queries and network-backed restricted collections still refuse until the
 remaining execution-metadata, selection and delegation work is certified.
+Successful terminal responses now have an explicit
+[document execution disclosure](query-disclosure.md) disposition; error and
+provisional surfaces remain part of the admission audit.
 This does not complete source-fetch or eventual RAG authorization.
 
 ## Names and actions

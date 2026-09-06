@@ -8,6 +8,9 @@ measured good enough at that exact request key. There is no interpolation
 between measured points, no default candidate depth, and no provider control
 (an IVF `nprobe`, a graph `ef`) hidden behind a fixed setting. Everything the
 planner decided is reported in `QueryResponse.dense_execution`.
+Document-scoped execution omits physical geometry and free-form labels with an
+explicit redaction flag; [Query execution disclosure](query-disclosure.md)
+defines what remains and how `evidence_scope` describes the benchmark.
 
 Today the product's own provider (embedded TurboVec, clustered TurboVec) is
 exhaustive, so AUTO resolves to `EXACT` everywhere in production, bitwise the

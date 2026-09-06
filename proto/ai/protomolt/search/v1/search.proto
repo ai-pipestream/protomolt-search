@@ -5663,7 +5663,11 @@ message QueryResponse {
   // or stored-value scorer dimensions). Ranking is unchanged; omitted dimensions
   // mean the disclosed response alone cannot reconstruct the score.
   bool field_details_redacted = 12;
-
+  // Document authority withheld physical execution details. Zeroed physical
+  // profile counters, corpus geometry, selectivity bands/ratios and empty
+  // operator labels/planner text mean omitted, not measured zero. Phase timing,
+  // traversal semantics, candidate depth and opaque evidence digests remain.
+  bool execution_details_redacted = 13;
 }
 
 // One collapse group (QueryRequest.collapse).
@@ -5682,6 +5686,19 @@ message QueryGroup {
   uint32 pool_hits = 4;
 }
 
+// Describes the evidence used to choose a depth, not a per-query recall
+// guarantee. Older servers omit this field and make no explicit scope claim.
+enum DenseEvidenceScope {
+  DENSE_EVIDENCE_SCOPE_UNSPECIFIED = 0;
+  DENSE_EVIDENCE_SCOPE_NOT_APPLICABLE = 1;
+  // Measured queries against the profile's whole corpus. A filtered request
+  // does not turn that measurement into recall on its filtered match set.
+  DENSE_EVIDENCE_SCOPE_CORPUS_BENCHMARK = 2;
+  // Measured queries in a selectivity band. Equal cardinality alone does not
+  // establish recall for every caller predicate or authority view in that band.
+  DENSE_EVIDENCE_SCOPE_SELECTIVITY_BAND_BENCHMARK = 3;
+}
+
 message DenseQualityOutcome {
   uint32 target_recall_ppm = 1;
   uint32 selection_k = 2;
@@ -5692,6 +5709,7 @@ message DenseQualityOutcome {
   uint64 corpus_rows = 7;
   string provider_backend = 8;
   string scoring_fingerprint = 9;
+  DenseEvidenceScope evidence_scope = 10;
 }
 
 message DenseExecutionOutcome {
@@ -5719,6 +5737,9 @@ message DenseExecutionOutcome {
   // the providers were asked for. Set whenever a policy was consulted.
   uint32 filter_selectivity_ppm = 11;
   uint32 candidate_depth = 12;
+  // NOT_APPLICABLE without a measured AUTO policy; otherwise the scope of the
+  // benchmark behind policy_point. FP32 depth evidence is in dense_quality.
+  DenseEvidenceScope evidence_scope = 13;
 }
 
 // One measured point of a dense execution policy

@@ -3237,6 +3237,9 @@ impl CoordinatorServiceImpl {
         if let Some(disclosure) = disclosure {
             disclosure.apply(&mut response);
         }
+        if self.document_visibility.is_some() {
+            crate::query_disclosure::redact_execution(&mut response);
+        }
         cursor.finish(&mut response)?;
         response.served_topology_generation = scoped.topology_generation;
         if let Some(profile) = response.profile.as_mut() {
@@ -3656,8 +3659,10 @@ impl CoordinatorServiceImpl {
             policy_point: None,
             filter_selectivity_ppm: 0,
             candidate_depth: 0,
+            evidence_scope: crate::pb::DenseEvidenceScope::NotApplicable as i32,
         };
         if let Some((hit, selectivity)) = qualified {
+            outcome.evidence_scope = crate::pb::DenseEvidenceScope::SelectivityBandBenchmark as i32;
             outcome.policy_id = hit.policy_id;
             outcome.policy_fingerprint = hit.policy_fingerprint;
             outcome.policy_point = Some(crate::pb::DensePolicyPoint {
@@ -16110,6 +16115,136 @@ measured_recall_ppm = 980000
             }),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn document_query_executor_redacts_physical_details_across_selection_shapes() {
+        use selection_score_strategy::Strategy;
+        let mut decision = access("semantic", FieldAction::Use);
+        decision
+            .field_permissions
+            .as_mut()
+            .unwrap()
+            .grants
+            .push(FieldGrant {
+                field: "body".into(),
+                actions: vec![FieldAction::Use as i32, FieldAction::Disclose as i32],
+            });
+        let owner =
+            CoordinatorServiceImpl::with_local_nodes(vec![node(0, false), node(100, false)])
+                .with_bm25(
+                    Some(crate::analyzer::NATIVE_ANALYSIS_BACKEND.into()),
+                    Default::default(),
+                );
+        // Exercise the common unary/stream executor directly while the public
+        // document-query admission gate awaits the complete surface audit.
+        let reader = owner.for_access(Some(&decision), "bm25_search").unwrap();
+        let mut requests = vec![];
+        for mode in [DenseScoreMode::Unspecified, DenseScoreMode::Fp32Rerank] {
+            requests.push(QueryRequest {
+                k: 4,
+                selection_k: 4,
+                selection: Some(SelectionQuery {
+                    node: Some(selection_query::Node::Search(SearchQuery {
+                        id: "dense".into(),
+                        query: Some(search_query::Query::Dense(DenseQuery {
+                            field: "semantic".into(),
+                            vector: vec![0.25; 16],
+                            score_mode: mode as i32,
+                            ..Default::default()
+                        })),
+                    })),
+                }),
+                ..Default::default()
+            });
+        }
+        for strategy in [
+            Strategy::Rrf(RrfScore::default()),
+            Strategy::ScoreBlend(BlendScore::default()),
+            Strategy::Decomposed(DecomposedScore::default()),
+            Strategy::Cascade(CascadeScore {
+                gate_id: "dense".into(),
+            }),
+        ] {
+            requests.push(hybrid_query(strategy, "semantic"));
+        }
+        let dense = requests[0].selection.clone().unwrap();
+        requests.push(QueryRequest {
+            k: 4,
+            selection: Some(SelectionQuery {
+                node: Some(selection_query::Node::Boolean(BooleanQuery {
+                    must: vec![dense],
+                    ..Default::default()
+                })),
+            }),
+            ..Default::default()
+        });
+        requests.push(QueryRequest {
+            k: 4,
+            selection: Some(SelectionQuery {
+                node: Some(selection_query::Node::Search(SearchQuery {
+                    id: "lexical".into(),
+                    query: Some(search_query::Query::Lexical(LexicalQuery {
+                        text: "word".into(),
+                        analysis: Some(crate::analyzer::body_spec()),
+                        ..Default::default()
+                    })),
+                })),
+            }),
+            ..Default::default()
+        });
+        let mut saw_physical_work = false;
+        for mut request in requests {
+            request.profile = true;
+            let (pinned, _) = reader.pin_read_versions().await.unwrap();
+            let raw = crate::query::execute(&pinned, request.clone())
+                .await
+                .unwrap();
+            let reply = reader
+                .execute_query(request.clone(), Some(&decision))
+                .await
+                .unwrap();
+            assert_eq!(reply.hits, raw.hits, "{}", reply.executed);
+            assert!(reply
+                .hits
+                .iter()
+                .all(|hit| hit.doc_id == 0 || hit.doc_id == 100));
+            assert!(reply.execution_details_redacted);
+            let profile = reply.profile.as_ref().unwrap();
+            saw_physical_work |= raw.profile.as_ref().unwrap().rerank_rows > 0;
+            assert_eq!(
+                (
+                    profile.rerank_rows,
+                    profile.rerank_logical_bytes,
+                    profile.rerank_pages
+                ),
+                (0, 0, 0)
+            );
+            assert_eq!(
+                (
+                    profile.rerank_tasks,
+                    profile.segments_total,
+                    profile.segments_skipped,
+                    profile.shards_total,
+                    profile.shards_skipped
+                ),
+                (0, 0, 0, 0, 0)
+            );
+            if let Some(execution) = reply.dense_execution {
+                assert!(execution.planner_reason.is_empty());
+                assert!(execution.exhaustive_completion);
+                assert_eq!(
+                    execution.evidence_scope,
+                    DenseEvidenceScope::NotApplicable as i32
+                );
+            }
+            let unrestricted = owner.execute_query(request, None).await.unwrap();
+            assert!(!unrestricted.execution_details_redacted);
+        }
+        assert!(
+            saw_physical_work,
+            "the test must exercise actual FP32 row reads"
+        );
     }
 
     #[tokio::test]
