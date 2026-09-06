@@ -888,10 +888,18 @@ async fn a_re_placement_split_puts_each_row_in_its_new_leaf() {
                     .unwrap_or_else(|| panic!("segment {i} of child {index} has no {name}"))
             };
             let placement = column("placement");
-            assert_eq!((placement.min, placement.max), (children[index].code, children[index].code));
+            assert_eq!(
+                (placement.min, placement.max),
+                (children[index].code, children[index].code)
+            );
             let year = column("year");
             let (lo, hi) = band_bounds[index];
-            assert!(year.min >= lo && year.max <= hi, "child {index} years {}..{}", year.min, year.max);
+            assert!(
+                year.min >= lo && year.max <= hi,
+                "child {index} years {}..{}",
+                year.min,
+                year.max
+            );
         }
         assert_eq!(rows, expected[index]);
         assert!(next_label <= 1_000);
@@ -1053,6 +1061,7 @@ async fn a_re_placement_split_puts_each_row_in_its_new_leaf() {
                 max_child_rows: largest_child,
             },
             spill_bucket_bits: Some(0),
+            ..Default::default()
         },
         &mut replay_analyzer(NATIVE_ANALYSIS_BACKEND),
     )
@@ -1080,12 +1089,14 @@ async fn a_re_placement_split_puts_each_row_in_its_new_leaf() {
                 max_child_rows: largest_child - 1,
             },
             spill_bucket_bits: None,
+            ..Default::default()
         },
         &mut replay_analyzer(NATIVE_ANALYSIS_BACKEND),
     )
     .unwrap_err();
     assert!(
-        err.contains("above the single-image bound") && !dir.join("bounded").join("shard-0.vector").exists(),
+        err.contains("above the single-image bound")
+            && !dir.join("bounded").join("shard-0.vector").exists(),
         "{err}"
     );
 

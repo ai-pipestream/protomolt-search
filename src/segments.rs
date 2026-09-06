@@ -895,6 +895,25 @@ impl SegmentCatalog {
         root.join("segments").join(id)
     }
 
+    /// Record the integer column the catalog's sealed segments are cut
+    /// by (`docs/replay-from-segments.md`, "Cutting the spill"): the
+    /// same atomic manifest publication a compaction uses, so a node
+    /// opening the catalog reports the partition key a partitioned
+    /// compaction would have left. `None` returns the catalog to the
+    /// bucket layout's declaration.
+    pub fn publish_partition_key(&self, key: Option<String>) -> Result<(), String> {
+        let current = self.snapshot();
+        let mut manifest = current
+            .published_manifest()
+            .with_binding(current.binding())?;
+        manifest.epoch = manifest
+            .epoch
+            .checked_add(1)
+            .ok_or("segment catalog epoch overflow")?;
+        manifest.partition_key = key;
+        self.publish(manifest).map(|_| ())
+    }
+
     /// Pin metadata by the same atomic manifest publication used for rows.
     /// No independently mutable binding file can outlive or lag its generation.
     pub fn publish_binding(

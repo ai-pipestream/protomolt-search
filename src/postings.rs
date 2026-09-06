@@ -9941,7 +9941,201 @@ impl Bm25Index for FieldView<'_> {
     }
 }
 
+/// One field of one sealed segment keyed by document instead of by
+/// term (`docs/replay-from-segments.md`, "The transpose"): the postings
+/// walked once in directory order and grouped by row, so a replay can
+/// take a document's analyzed field from the store without the
+/// analyzer. Flat arrays, one field of one segment at a time.
+pub struct FieldTranspose {
+    /// The directory's terms, in directory order.
+    terms: Vec<String>,
+    /// `(term index, tf, occurrence start, occurrence end, position start)`
+    /// per posting, grouped by row through `row_starts`.
+    entries: Vec<(u32, u32, u32, u32, u32)>,
+    /// Prefix table: row `r`'s entries are `entries[row_starts[r]..row_starts[r + 1]]`.
+    row_starts: Vec<u32>,
+    /// Every occurrence span, indexed by an entry's occurrence range.
+    occurrences: Vec<(u32, u32)>,
+    /// Every ordinal, parallel to `occurrences`, when the field has positions.
+    positions: Option<Vec<u32>>,
+    /// The field's doc-length table.
+    lengths: Vec<u32>,
+    /// Sentence tables per row, when the field has them.
+    sentences: Option<Vec<Vec<(u32, u32)>>>,
+}
+
+impl FieldTranspose {
+    /// Rows the transpose covers.
+    pub fn rows(&self) -> usize {
+        self.row_starts.len().saturating_sub(1)
+    }
+
+    /// Bytes the flat arrays take, the bound a replay reports.
+    pub fn bytes(&self) -> usize {
+        self.entries.len() * 20
+            + self.occurrences.len() * 8
+            + self.positions.as_ref().map_or(0, |p| p.len() * 4)
+            + self.row_starts.len() * 4
+            + self.lengths.len() * 4
+            + self.terms.iter().map(|t| t.len() + 24).sum::<usize>()
+            + self
+                .sentences
+                .as_ref()
+                .map_or(0, |s| s.iter().map(|t| t.len() * 8 + 24).sum())
+    }
+
+    /// Whether the field carries positions.
+    pub fn has_positions(&self) -> bool {
+        self.positions.is_some()
+    }
+
+    /// Whether the field carries sentence tables.
+    pub fn has_sentences(&self) -> bool {
+        self.sentences.is_some()
+    }
+
+    /// Row `row`'s analyzed field: its terms in directory order with
+    /// their tf and spans, the ordinals when the field has positions,
+    /// the sentence table when it has one, and the stored length. A row
+    /// with no term (an empty field) is a default field with its length.
+    pub fn field(&self, row: u32) -> Option<AnalyzedField> {
+        let r = row as usize;
+        if r + 1 >= self.row_starts.len() {
+            return None;
+        }
+        let (from, to) = (self.row_starts[r] as usize, self.row_starts[r + 1] as usize);
+        let mut terms: DocTerms = Vec::with_capacity(to - from);
+        let mut positions: Option<DocPositions> = self
+            .positions
+            .as_ref()
+            .map(|_| Vec::with_capacity(to - from));
+        for &(term, tf, occ_start, occ_end, pos_start) in &self.entries[from..to] {
+            let spans = self.occurrences[occ_start as usize..occ_end as usize].to_vec();
+            if let (Some(all), Some(out)) = (&self.positions, positions.as_mut()) {
+                let n = (occ_end - occ_start) as usize;
+                out.push(all[pos_start as usize..pos_start as usize + n].to_vec());
+            }
+            terms.push((self.terms[term as usize].clone(), tf, spans));
+        }
+        Some(AnalyzedField {
+            terms,
+            length: self.lengths.get(r).copied().unwrap_or(0),
+            positions,
+            sentences: self.sentences.as_ref().map(|s| s[r].clone()),
+        })
+    }
+}
+
 impl FieldView<'_> {
+    /// The field keyed by row (`docs/replay-from-segments.md`): one walk
+    /// of the directory in term order, then a counting sort of the
+    /// postings by row. Refused by name on a file without skip runs,
+    /// whose postings would have to be re-parsed per term.
+    pub fn transpose(&self) -> Result<FieldTranspose, String> {
+        let r = self.reader;
+        if !r.v5_runs {
+            return Err(format!(
+                "field {:?}: the store has no skip runs (a v3/v4 file); a transpose needs the \
+                 v5 directory, rebuild the source first",
+                self.field.name
+            ));
+        }
+        let rows = r.doc_count as usize;
+        let n_terms = self.field.n_terms;
+        let positions_section = self.field.positions_off.map(|off| off as usize);
+        let mut terms = Vec::with_capacity(n_terms as usize);
+        // First walk: count postings per row, and total occurrences.
+        let mut counts = vec![0u32; rows + 1];
+        let mut total_postings = 0usize;
+        let mut total_occurrences = 0usize;
+        for i in 0..n_terms {
+            let (bytes, doc_run_off, _, _, df) = r.directory_entry_v5(self.field, i);
+            terms.push(String::from_utf8_lossy(bytes).into_owned());
+            let doc_run_off = doc_run_off as usize;
+            for j in 0..df as usize {
+                let (doc, _, _) = r.v5_doc_entry(doc_run_off, j);
+                let slot = doc as usize;
+                if slot >= rows {
+                    return Err(format!(
+                        "field {:?}: term {:?} names row {doc} of a {rows}-row store",
+                        self.field.name, terms[i as usize]
+                    ));
+                }
+                counts[slot + 1] += 1;
+                total_postings += 1;
+            }
+            let occ_end = r.v5_occ_start(doc_run_off, df as usize, df as usize) as usize;
+            let occ_first = if df == 0 {
+                occ_end
+            } else {
+                r.v5_occ_start(doc_run_off, df as usize, 0) as usize
+            };
+            total_occurrences += occ_end - occ_first;
+        }
+        let mut row_starts = counts;
+        for slot in 1..row_starts.len() {
+            row_starts[slot] += row_starts[slot - 1];
+        }
+        // Second walk: place each posting at its row's cursor, copying
+        // its spans (and ordinals) into the flat arrays.
+        let mut cursors = row_starts.clone();
+        let mut entries = vec![(0u32, 0u32, 0u32, 0u32, 0u32); total_postings];
+        let mut occurrences: Vec<(u32, u32)> = Vec::with_capacity(total_occurrences);
+        let mut positions: Option<Vec<u32>> =
+            positions_section.map(|_| Vec::with_capacity(total_occurrences));
+        let positions_data =
+            positions_section.map(|section| section + 4 + 4 * (n_terms as usize + 1));
+        for i in 0..n_terms {
+            let (_, doc_run_off, _, occ_run_off, df) = r.directory_entry_v5(self.field, i);
+            let (doc_run_off, occ_run_off) = (doc_run_off as usize, occ_run_off as usize);
+            let base = positions_section.map(|section| r.u32_at(section + 4 + 4 * i as usize));
+            for j in 0..df as usize {
+                let (doc, tf, occ_start) = r.v5_doc_entry(doc_run_off, j);
+                let occ_end = r.v5_occ_start(doc_run_off, df as usize, j + 1);
+                let flat_start = occurrences.len() as u32;
+                for o in occ_start..occ_end {
+                    let e = occ_run_off + 8 * o as usize;
+                    occurrences.push((r.u32_at(e), r.u32_at(e + 4)));
+                }
+                let pos_start = positions.as_ref().map_or(0, |p| p.len() as u32);
+                if let (Some(out), Some(data), Some(base)) =
+                    (positions.as_mut(), positions_data, base)
+                {
+                    for o in occ_start..occ_end {
+                        out.push(r.u32_at(data + 4 * (base as usize + o as usize)));
+                    }
+                }
+                let slot = doc as usize;
+                let at = cursors[slot] as usize;
+                cursors[slot] += 1;
+                entries[at] = (i, tf, flat_start, occurrences.len() as u32, pos_start);
+            }
+        }
+        let fi = r
+            .fields
+            .iter()
+            .position(|f| std::ptr::eq(f, self.field))
+            .expect("a field view borrows one of its reader's fields");
+        let sentences = if self.field.sentences_off.is_some() {
+            let mut tables = Vec::with_capacity(rows);
+            for row in 0..rows as u32 {
+                tables.push(r.field_doc_sentences(fi, row).unwrap_or_default());
+            }
+            Some(tables)
+        } else {
+            None
+        };
+        Ok(FieldTranspose {
+            terms,
+            entries,
+            row_starts,
+            occurrences,
+            positions,
+            lengths: self.field.doc_lengths.clone(),
+            sentences,
+        })
+    }
+
     /// The directory entry's term bytes, on either directory shape.
     fn directory_term(&self, i: u32) -> &[u8] {
         let r = self.reader;

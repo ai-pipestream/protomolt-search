@@ -1192,7 +1192,29 @@ impl WalWriter {
     /// NOTE a `LoggedAddVectors` batch must not straddle buckets: the
     /// caller (the node) splits batches into per-vector records, so
     /// `first_id` routes the whole record.
-    pub fn append(&mut self, mut op: wal_record::Op) -> io::Result<()> {
+    /// Append `op` to `bucket` instead of the bucket its id hashes to.
+    /// For a log the writer owns outright and replays itself without the
+    /// hash-routing check (a re-placement split's spill cut by a column,
+    /// `docs/replay-from-segments.md`); a node's log is never written
+    /// this way, because its replay routes by the hash.
+    pub fn append_to_bucket(&mut self, bucket: u32, op: wal_record::Op) -> io::Result<()> {
+        if bucket >= self.manifest.bucket_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "bucket {bucket} is outside the log's {} buckets",
+                    self.manifest.bucket_count
+                ),
+            ));
+        }
+        self.append_routed(op, Some(bucket))
+    }
+
+    pub fn append(&mut self, op: wal_record::Op) -> io::Result<()> {
+        self.append_routed(op, None)
+    }
+
+    fn append_routed(&mut self, mut op: wal_record::Op, forced: Option<u32>) -> io::Result<()> {
         if let wal_record::Op::Bind(binding) = &op {
             crate::mapped_analysis::decode_contract(
                 &binding.analysis_sha,
@@ -1269,7 +1291,7 @@ impl WalWriter {
                     .intern_documents(batch)?;
             }
         }
-        let bucket = match &op {
+        let hashed = match &op {
             wal_record::Op::AddVectors(a) => {
                 Some(bucket_of(a.first_id, self.manifest.bucket_count as usize) as u32)
             }
@@ -1285,6 +1307,11 @@ impl WalWriter {
             wal_record::Op::Flush(_) | wal_record::Op::Snapshot(_) | wal_record::Op::Bind(_) => {
                 None
             }
+        };
+        // A forced bucket applies to record ops; markers keep their file.
+        let bucket = match (forced, hashed) {
+            (Some(forced), Some(_)) => Some(forced),
+            (_, hashed) => hashed,
         };
         let clock = self.next_clock;
         let result = match bucket {

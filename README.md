@@ -1450,6 +1450,20 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   Unsigned mapping and query support remain in progress. See [integer storage](docs/range-facets.md) and the
   [foundation status](docs/search-foundations.md).
 
+- **Landed 2026-09-06: a re-placement split replays from the segments.**
+  The split re-analyzed each document's text through the sidecar, a
+  re-ingest at 3,700 documents a second with the machine idle. With
+  `--from-segments` the child build takes each document's analyzed
+  fields from the source's sealed segments (the postings transposed
+  per row, one field of one segment at a time), with its columns, text,
+  vectors and identities, and the analyzer is not called; the sources
+  must be flushed and share one analyzer and one table, refused by name
+  otherwise. `--cut-column=year --cut-rows=<n>` cuts each child's spill
+  by the year instead of the id hash, so the children come out
+  partitioned with year-range summaries and need no compaction. The
+  served answers equal the re-analyzing split's bit for bit
+  (`tests/replay_from_segments.rs`). [Replay from segments](docs/replay-from-segments.md).
+
 - **Landed 2026-09-06: the fetches and folds through a relay.** A relay
   now serves the follow-ups the public Query route sends its shards
   (`GetDocuments`, `ResolveParents`, `FetchValues`, routed by child slot

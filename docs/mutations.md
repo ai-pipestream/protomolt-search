@@ -131,7 +131,10 @@ next partitioned compaction folds it in. An empty column keeps the bucket
 layout; a request without it on a partitioned shard returns the shard to
 the bucket layout. A double or facet column, a name that is not a column,
 a column no document carries, and the single-image layout are each
-rejected by name before any work.
+rejected by name before any work. A child of a segmented re-placement
+split has no log to replay; cut its spill by the column at the split
+(`docs/replay-from-segments.md`, "Cutting the spill") and it needs no
+compaction to be partitioned.
 
 Refused by name: an in-memory shard; a shard without a WAL; a generation
 with legacy unclocked records; a generation that began with preexisting

@@ -70,7 +70,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "usage: reshard (--log=<wal dir|generation dir> --split=N | --logs=a,b,c) \
              --out-dir=<dir> [--slot-base=B] [--slot-stride=S] [--analysis-addr=ADDR] \
              [--stable-routing] [--placement-tree=<file> [--single-image=<max child rows>] \
-             [--spill-bucket-bits=<bits>]]"
+             [--spill-bucket-bits=<bits>] [--from-segments] [--cut-column=<col> \
+             [--cut-rows=<n>]]]"
                 .into(),
         );
     }
@@ -162,6 +163,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let spill_bucket_bits = opt("spill-bucket-bits")
             .map(|bits| bits.parse::<u32>())
             .transpose()?;
+        // `--from-segments` takes each document's analyzed fields from the
+        // sealed segments beside the logs instead of the analyzer
+        // (docs/replay-from-segments.md); `--cut-column=<integer column>`
+        // with `--cut-rows=<n>` cuts each child's spill by the column's
+        // values so the children come out partitioned.
+        let source = if std::env::args().any(|a| a == "--from-segments") {
+            reshard::TreeRowSource::Segments
+        } else {
+            reshard::TreeRowSource::Logs
+        };
+        let cut = match opt("cut-column") {
+            Some(column) => reshard::SpillCut::Column {
+                column,
+                rows_per_cut: arg("cut-rows", "1000000").parse()?,
+            },
+            None => reshard::SpillCut::Hash,
+        };
         let placed = reshard::split_placement_tree_logs(
             &generations,
             &tree,
@@ -171,6 +189,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             reshard::TreeSplitOptions {
                 layout,
                 spill_bucket_bits,
+                source,
+                cut,
             },
             &mut analyze,
         )?;
@@ -182,6 +202,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "spill logs of {} buckets; the largest replay held {} rows ({:?})",
             placed.spill_bucket_count, placed.peak_replay_rows, placed.layout
+        );
+        eprintln!(
+            "analysis: {:?}, {} documents transplanted, largest transpose {} bytes; spill cut {:?}",
+            placed.source, placed.transplanted_rows, placed.peak_transpose_bytes, placed.cut
         );
         for (((image, child), rows), segments) in placed
             .images
