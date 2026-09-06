@@ -1315,6 +1315,11 @@ impl AggMerge {
             distinct_double_bits: self.distinct.doubles.iter().copied().collect(),
             distinct_strings: self.distinct.strings.iter().cloned().collect(),
             distinct_bools: self.distinct.bools.iter().copied().collect(),
+            uint_sum_hi: (self.uint_sum >> 64) as u64,
+            uint_sum_lo: self.uint_sum as u64,
+            uint_min: self.uint_min,
+            uint_max: self.uint_max,
+            distinct_uints: self.distinct.uints.iter().copied().collect(),
         }
     }
 

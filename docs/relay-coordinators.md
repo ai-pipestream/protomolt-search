@@ -192,11 +192,62 @@ diagnostics are unserved named in `layout`, which starts with `relay
 over N children`. Knobs, metrics, and the recent-request ring are the
 relay process's own.
 
+The fetches by id (`GetDocuments`, `ResolveParents`, `FetchValues`). Each
+id goes to the child whose slot range holds it (the ranges come from the
+children's health reports, as the rescore routes read them), and the
+answers come back in the caller's order: an id the caller repeats is
+answered once per occurrence, and an id in no child's range is left out,
+which is what a node does with an id outside its own range.
+`ResolveParents` and `FetchValues` ask every child, an empty id list
+included, because the known flags the root's typo rule runs on come from
+every shard and the read receipt needs every child's version;
+`GetDocuments` carries no receipt and asks only the children with ids.
+`FetchValues` ORs the stage and projection-leaf known flags and merges the
+projection types (children that know a column must agree on its type);
+`ResolveParents` requires each child to echo the request's lineage field
+selection. The receipt on each is a relay token over the children's
+versions, the relay's incarnation, and the fingerprint of the visibility
+the caller sent, which every child must echo (a child echoing another
+scope refuses by name); the parent's claim on the next call translates
+back into each child's claim.
+
+`BrowseShard`. Every child pages from the same boundary (a row's keys and
+id, which each child applies to its own rows), and the relay merges the
+pages in the request's sort order, then id (id order alone when unsorted,
+the order the root sorts a node's page in), cut to `k`, re-emitting each
+row's keys as its child sent them. Known flags OR; the sort column types
+must agree where known; segment counts add with a check. A cursor the
+root mints binds the read versions it saw, which under a relay root are
+relay tokens, so a cursor pages with the root that minted it.
+
+The folds (`AggregateShard`, `QuantileCounts`, and `BooleanQuery.aggregate`
+inside `EvaluateBoolean`). Every child folds the request as sent (an id
+list names rows a child may not serve, which it leaves out), and the relay
+folds the children's answers in child order through the root's own fold
+(`AggMerge`, `PctMerge`), then answers as one shard's partial: the exact
+int and unsigned sums as their words, the compensated double sum as its
+pair, the moments as Chan's merged state, extrema, the distinct sets as
+sorted lists; groups join by value, histograms sum by bucket, quantile
+counts add with a check. The caps a root applies (`max_groups`,
+`max_buckets`, `max_distinct`) apply at the relay, so it refuses where the
+root would. A Boolean quantile round translates the plan's claim per child
+as `EvaluateBoolean` does, and a Boolean aggregate's fold carries a
+receipt of its own, which the root checks as it checks a shard's.
+Exactness: a relay over a prefix of the root's shard order (one relay over
+all of its children, or relays nested in a chain) folds bit for bit as the
+root folds the shards, because folding a partial into an empty state
+copies it and the compensated sum of a state's pair is the state's sum.
+Relays side by side fold their doubles compensated at each level, which
+can differ from the flat fold in the last bit for a double sum, mean, or
+variance; counts, int and unsigned folds, extrema, histograms, percentile
+partials, and quantile counts are exact in any grouping, and so is a
+double sum whose values sum exactly.
+
 Every other `NodeService` route refuses UNIMPLEMENTED naming the route
-and the relay: no ingest, no administration, no snapshots, no
-aggregation, no follow-up fetches by id (`GetDocuments`,
-`ResolveParents`, `FetchValues`, `BrowseShard`), and no per-shard fusion
-(`HybridShard`) through this level.
+and the relay: no ingest, no administration, no snapshots, and no
+per-shard fusion (`HybridShard`: the two-level fusion mode fuses one list
+per shard at the root and is partition dependent by design, so a relay
+standing as one shard would change the answer; the fused routes compose).
 
 `GetVectorBackend`. The root's dense preflight asks each shard for its
 provider identity before a public query scores anything, so the relay
@@ -266,17 +317,13 @@ relay without touching relay code.
 ## What is not composed yet
 
 What a general relay still needs beyond this scope, and why each waits:
-follow-up fetches routed by original id (`GetDocuments`, `FetchValues`,
-`ResolveParents`, `BrowseShard`: public Query uses `FetchValues`,
-`ResolveParents` and `BrowseShard` through the root's links, which can be
-relays; those shapes currently refuse), per-shard fusion (`HybridShard`
-still serves the partition-dependent two-level fusion mode and cannot
-be transparently regrouped),
-aggregation with the root's fold order preserved (`AggregateShard`,
-`QuantileCounts`, a `BooleanQuery.aggregate` inside `EvaluateBoolean`,
-and the `stats_fields` / `cardinality_fields` shapes: a fold in the
-root's shard order and a union of values are not this level's to
-compute), bitmap routes over children whose slot ranges are
+per-shard fusion (`HybridShard` serves the partition-dependent two-level
+fusion mode and cannot be regrouped without changing the answer; the
+fused routes are the composed path), the `stats_fields` /
+`cardinality_fields` shapes on the keyword routes (a column statistic
+folds in the root's shard order and a union of values is not a sum of
+counts; the fold-state approach of `AggregateShard` would serve them and
+has not been applied), bitmap routes over children whose slot ranges are
 not contiguous (the contiguity rule stands), recursive ingest, and a
 wider statistics contract past `u32`. Each is a separate gate with its
 own equivalence test.
@@ -288,11 +335,21 @@ refusals, the contiguity rule; for the keyword leg: lexical queries on
 the unary and streaming routes with explain and facets, global-rank and
 score-blend hybrids, the stale-epoch refusal end to end and the refetch
 that restores it, a phrase under mixed positions, a stop mid-stream, and
-a rescore routed by id; and for the vector side: the unary scan with and
+a rescore routed by id; for the vector side: the unary scan with and
 without `tie_complete` and collapsed by parent, the cascade and
 decomposed fusion, filtered and recursive boolean queries with lexical,
 dense, and FP32-reranked clauses (the boolean tree evaluated on the
-children and merged), the boolean aggregate's refusal, the bitmaps laid
-over the children and
-the gap refusal, the dictionaries as the union of the children, and the
-diagnostics through the root).
+children and merged), the bitmaps laid over the children and the gap
+refusal, the dictionaries as the union of the children, and the
+diagnostics through the root; and for the fetches and folds: documents,
+lineage, and values by id through one and two levels equal to the
+children's answers in the caller's order with a repeated and a foreign
+id, the receipt's token translating back and a foreign incarnation
+refused, browse pages sorted and unsorted with a cursor through relay
+roots equal to the flat root, the aggregate with count, exact sums,
+extrema, cardinality, a group-by, a histogram, and exact percentiles
+through one level, permuted, and two levels equal to the flat root, the
+moments equal through a relay over all children and through a chain, and
+the Boolean aggregate through relays equal to the direct root). The
+receipt's refusals (a child off the scope, off the claim, or missing) are
+unit tests in `src/relay.rs`.
