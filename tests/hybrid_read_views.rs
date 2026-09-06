@@ -231,3 +231,128 @@ async fn an_empty_relay_child_cannot_hide_an_incompatible_binding() {
         handle.abort();
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_lexical_scores_filter_before_scoring_and_compose_full_read_receipts() {
+    let mut addresses = Vec::new();
+    let mut handles = Vec::new();
+    // Contiguous physical ranges are required for relay candidate routing.
+    for offset in [0, 4, 8] {
+        let (address, handle) = serve_node(leaf(offset, false, false).await).await;
+        addresses.push(address);
+        handles.push(handle);
+    }
+    let (left, _, handle) = start_relay(addresses[..2].to_vec()).await;
+    handles.push(handle);
+    let (root, _, handle) = start_relay(vec![left, addresses[2].clone()]).await;
+    handles.push(handle);
+    let mut client = NodeServiceClient::connect(root).await.unwrap();
+    let legs = request_for(&mut client).await;
+    let visibility = legs.read_context.as_ref().unwrap().visibility.clone();
+    let scope = VisibilityScope::new(visibility.as_ref()).unwrap();
+    let request = Bm25RescoreRequest {
+        terms: legs.terms.clone(),
+        global_doc_count: legs.global_doc_count,
+        global_total_doc_length: legs.global_total_doc_length,
+        global_doc_frequencies: legs.global_doc_frequencies.clone(),
+        candidate_ids: (0..12).chain([0, 999]).collect(),
+        expected_stats_epoch: legs.expected_stats_epoch,
+        expected_stats_incarnation: legs.expected_stats_incarnation.clone(),
+        visibility,
+        ..Default::default()
+    };
+    let expected = client
+        .shard_legs(legs)
+        .await
+        .unwrap()
+        .into_inner()
+        .bm25_hits;
+    for ids in [request.candidate_ids.clone(), vec![0], vec![]] {
+        let response = client
+            .bm25_rescore(Bm25RescoreRequest {
+                candidate_ids: ids.clone(),
+                ..request.clone()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        scope
+            .validate_echo(
+                &response.visibility_fingerprint,
+                &response.visibility_columns_known,
+            )
+            .unwrap();
+        assert_eq!(response.visibility_columns_known, vec![true]);
+        assert_eq!(response.stats_epoch, request.expected_stats_epoch);
+        assert_eq!(
+            response.stats_incarnation,
+            request.expected_stats_incarnation
+        );
+        assert_eq!(
+            response
+                .hits
+                .iter()
+                .map(|hit| (hit.doc_id, hit.score.to_bits()))
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .filter(|hit| ids.contains(&hit.doc_id))
+                .map(|hit| (hit.doc_id, hit.score.to_bits()))
+                .collect::<Vec<_>>()
+        );
+    }
+    assert_eq!(
+        expected.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(),
+        vec![0, 4, 8]
+    );
+    let mut child = NodeServiceClient::connect(addresses[0].clone())
+        .await
+        .unwrap();
+    let direct_stats = request_for(&mut child).await;
+    let direct = Bm25RescoreRequest {
+        expected_stats_epoch: direct_stats.expected_stats_epoch,
+        expected_stats_incarnation: direct_stats.expected_stats_incarnation,
+        candidate_ids: vec![],
+        ..request.clone()
+    };
+    for bad in [
+        Bm25RescoreRequest {
+            b: 1.5,
+            ..direct.clone()
+        },
+        Bm25RescoreRequest {
+            visibility: Some(DocumentVisibility { filter: None }),
+            ..direct.clone()
+        },
+    ] {
+        assert_eq!(
+            child.bm25_rescore(bad).await.unwrap_err().code(),
+            Code::InvalidArgument
+        );
+    }
+    child
+        .delete_documents(DeleteDocumentsRequest {
+            doc_ids: vec![0],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        child.bm25_rescore(direct).await.unwrap_err().code(),
+        Code::FailedPrecondition
+    );
+    assert_eq!(
+        client
+            .bm25_rescore(Bm25RescoreRequest {
+                candidate_ids: vec![],
+                ..request
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    for handle in handles {
+        handle.abort();
+    }
+}

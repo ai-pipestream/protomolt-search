@@ -1222,6 +1222,12 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **2026-09-06 — Scoped decomposed selection and lexical rescores.** The first
+  lexical pass now applies the mandatory document view, preserving visible rank
+  provenance. BM25 candidate rescores enforce that view before scoring and carry
+  physical/view receipts through relays; cascade and boosts share the same
+  validator. See [hybrid read views](docs/hybrid-read-views.md).
+
 - **2026-09-06 — Hybrid read bindings.** Raw hybrid legs and local two-level
   fusion carry the requested indexed vector field, authority view and full
   physical claim, with receipts checked across every shard. Relays compose the

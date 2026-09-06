@@ -4763,6 +4763,8 @@ message Bm25RescoreRequest {
   // 32-byte opaque lifetime identity, paired with the statistics epoch.
   // Nonzero claims require both; replacements generate a fresh identity.
   bytes expected_stats_incarnation = 11;
+  // Mandatory trusted-planner view, applied before candidate scoring.
+  DocumentVisibility visibility = 12;
 }
 
 // BM25 scores for the requested candidates, doc id ascending.
@@ -4772,6 +4774,11 @@ message Bm25RescoreResponse {
   // Per requested stage, true when this shard resolved its column.
   // The coordinator rejects a stage no shard resolves.
   repeated bool stage_columns_known = 2;
+  // Physical read and authority proof, including empty responses.
+  uint64 stats_epoch = 3;
+  bytes stats_incarnation = 4;
+  bytes visibility_fingerprint = 5;
+  repeated bool visibility_columns_known = 6;
 }
 
 // Candidate-scoped value evaluation (see NodeService.FetchValues).

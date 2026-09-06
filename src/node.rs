@@ -3422,9 +3422,9 @@ impl ShardState {
         Ok(((filter, allow, stats), receipt))
     }
 
-    /// Evaluate authority predicates only for requested live slots. The FP32
-    /// path stays proportional to the candidate set, not the whole corpus.
-    fn vector_candidate_slots(
+    /// Evaluate authority predicates only for requested live slots. Candidate
+    /// bookkeeping stays proportional to the request, not the whole corpus.
+    fn visible_candidate_slots(
         &self,
         visibility: Option<&crate::pb::DocumentVisibility>,
         ids: &[u64],
@@ -3435,7 +3435,7 @@ impl ShardState {
         let store = self.bm25.as_ref();
         if restricted && store.is_some_and(|store| store.as_index().is_none()) {
             return Err(Status::failed_precondition(
-                "bm25 bulk build in progress; Flush before scoped vector scoring",
+                "bm25 bulk build in progress; Flush before scoped candidate scoring",
             ));
         }
         let predicate = visibility.and_then(|view| view.filter.as_ref());
@@ -13761,7 +13761,7 @@ impl NodeService for NodeServiceImpl {
                     // allowlist costs a mask walk, not a scan.
                     let n = index.len();
                     let mut mask = vec![false; index.len()];
-                    let slots = guard.vector_candidate_slots(
+                    let slots = guard.visible_candidate_slots(
                         req.visibility.as_ref(),
                         &req.candidate_ids,
                         offset,
@@ -13842,7 +13842,7 @@ impl NodeService for NodeServiceImpl {
                         .as_ref()
                         .map_or(0, |store| store.next_doc_id() as usize),
                 );
-            let slots = guard.vector_candidate_slots(req.visibility.as_ref(), &req.candidate_ids, offset, n)?;
+            let slots = guard.visible_candidate_slots(req.visibility.as_ref(), &req.candidate_ids, offset, n)?;
             if slots.is_empty() {
                 return Ok(response);
             }
@@ -14856,18 +14856,8 @@ impl NodeServiceImpl {
             ));
         }
         let stage_specs = parse_score_stages(&req.score_stages)?;
-        let params = Bm25Params {
-            k1: if req.k1 == 0.0 {
-                bm25::DEFAULT_K1
-            } else {
-                f64::from(req.k1)
-            },
-            b: if req.b == 0.0 {
-                bm25::DEFAULT_B
-            } else {
-                f64::from(req.b)
-            },
-        };
+        let params = params_from(req.k1, req.b)?;
+        let scope = crate::visibility::VisibilityScope::new(req.visibility.as_ref())?;
         let stats = bm25::CorpusStats {
             doc_count: req.global_doc_count,
             total_doc_length: req.global_total_doc_length,
@@ -14877,15 +14867,25 @@ impl NodeServiceImpl {
         let guard = read_shard(&self.state);
         guard.check_stats_epoch(req.expected_stats_epoch, &req.expected_stats_incarnation)?;
         guard.check_query_analysis("body", req.analysis_fingerprint)?;
+        let (_, visibility_columns_known) = filter_known_flags(
+            guard.bm25.as_ref(),
+            &[],
+            req.visibility
+                .as_ref()
+                .and_then(|view| view.filter.as_ref()),
+        );
         let (hits, stage_columns_known) = match guard.bm25.as_ref() {
             Some(store) => {
                 // Route global ids to this shard's local range.
-                let local: Vec<u32> = req
-                    .candidate_ids
-                    .iter()
-                    .filter(|&&id| id >= offset && (id - offset) <= u64::from(u32::MAX))
-                    .filter(|&&id| !guard.live_docs.is_deleted((id - offset) as usize))
-                    .map(|id| (id - offset) as u32)
+                let local: Vec<u32> = guard
+                    .visible_candidate_slots(
+                        req.visibility.as_ref(),
+                        &req.candidate_ids,
+                        offset,
+                        store.next_doc_id() as usize,
+                    )?
+                    .into_iter()
+                    .map(|slot| slot as u32)
                     .collect();
                 let index = store.as_index().ok_or_else(|| {
                     Status::failed_precondition("bm25 bulk build in progress; Flush first")
@@ -14927,6 +14927,10 @@ impl NodeServiceImpl {
         Ok(Bm25RescoreResponse {
             hits,
             stage_columns_known,
+            stats_epoch: guard.stats_epoch,
+            stats_incarnation: guard.stats_incarnation.bytes()?,
+            visibility_fingerprint: scope.fingerprint().to_vec(),
+            visibility_columns_known,
         })
     }
 }

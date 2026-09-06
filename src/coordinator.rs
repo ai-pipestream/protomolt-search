@@ -6678,7 +6678,7 @@ impl CoordinatorServiceImpl {
         // is untouched by them: a filter only REMOVES documents, so
         // every bound that dominated the unfiltered corpus still
         // dominates the survivors (docs/vector-filters.md).
-        let mask = self.shard_mask(filters.tree.as_ref());
+        let mask = self.vector_scan_mask(filters.tree.as_ref());
         let mut known = Self::filter_known(filters, mask.as_ref());
         let w_v = f64::from(legs.vector_weight);
         let w_b = f64::from(legs.bm25_weight);
@@ -6693,68 +6693,70 @@ impl CoordinatorServiceImpl {
         let mut leg_counts: HashMap<u32, u32> = HashMap::new();
         let mut merged: Vec<(u64, f32, u32)> = Vec::new();
         if !terms.is_empty() {
+            let admission = self.vector_read_barrier()?;
             let mut leg_tasks = Vec::with_capacity(n_nodes);
             for (shard, node) in self.node_addrs.iter().enumerate() {
                 if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
                     continue;
                 }
-                let request = Bm25QueryRequest {
+                // Use the same guarded authority view as the vector pass.
+                // A private lexical winner must not set the visible leg's
+                // boundary or erase a visible document's rank provenance.
+                let request = ShardLegsRequest {
                     analysis_fingerprint,
-                    highlight: None,
-                    projections: Vec::new(),
-                    terms: terms.to_vec(),
+                    request_id: request_id.to_string(),
                     k: legs.leg_k,
+                    vector: Vec::new(),
+                    terms: terms.to_vec(),
                     global_doc_count: global.doc_count,
                     global_total_doc_length: global.total_doc_length,
                     global_doc_frequencies: global.dfs.clone(),
                     k1: self.bm25_params.k1 as f32,
                     b: self.bm25_params.b as f32,
-                    min_score: 0.0,
-                    fields: Vec::new(),
                     expected_stats_epoch: claims[shard].epoch,
                     expected_stats_incarnation: claims[shard].incarnation(),
-                    // Hybrid queries do not carry facets (yet): the
-                    // vector leg's match set is the whole corpus, so
-                    // "counts over the matches" has no single honest
-                    // answer there. Score stages likewise wait for the
-                    // hybrid composition story.
-                    facet_fields: Vec::new(),
-                    map_facet_fields: Vec::new(),
-                    range_facet_fields: Vec::new(),
-                    score_stages: Vec::new(),
-                    // The SAME filters the vector stream runs under, so
-                    // neither leg can contribute a document the other
-                    // would have removed.
                     geo_filters: filters.geo.clone(),
                     filter: Self::shard_filter_tree(filters, mask.as_ref(), shard),
-                    stats_fields: Vec::new(),
-                    cardinality_fields: Vec::new(),
-                    phrase: None,
-                    explain: false,
+                    read_context: admission.as_ref().map(|a| a.context(shard)).transpose()?,
                 };
                 let mut client = self.node_client(node)?;
                 leg_tasks.push(tokio::spawn(async move {
-                    client.bm25_query(request).await.map(|r| {
+                    client.shard_legs(request).await.map(|r| {
                         let r = r.into_inner();
                         (
                             shard as u32,
-                            r.hits,
+                            r.bm25_hits,
                             r.geo_columns_known,
                             r.filter_columns_known,
+                            r.read_receipt,
                         )
                     })
                 }));
             }
             for task in leg_tasks {
-                let (shard, hits, geo_known, filter_known) = task
+                let (shard, hits, geo_known, filter_known, receipt) = task
                     .await
                     .map_err(|e| Status::internal(format!("bm25 leg task failed: {e}")))??;
+                match (&admission, receipt.as_ref()) {
+                    (Some(admission), Some(receipt)) => {
+                        admission.accept(shard as usize, receipt)?
+                    }
+                    (None, None) => {}
+                    _ => {
+                        return Err(Status::failed_precondition(
+                            "decomposed leg read receipt mismatch",
+                        ))
+                    }
+                }
                 known.merge(&geo_known, &filter_known)?;
                 leg_counts.insert(shard, hits.len() as u32);
                 for h in &hits {
                     bm25_of.insert(h.doc_id, (h.score, shard));
                     merged.push((h.doc_id, h.score, shard));
                 }
+            }
+            if let Some(admission) = &admission {
+                admission.wait().await?;
             }
             merged.sort_by(|a, b| {
                 b.1.total_cmp(&a.1)
@@ -7236,8 +7238,58 @@ impl CoordinatorServiceImpl {
         by_shard: HashMap<u32, Vec<u64>>,
         score_stages: &[crate::pb::ScoreStage],
     ) -> Result<HashMap<u64, f32>, Status> {
+        let (scores, _) = self
+            .bm25_rescore_round(
+                terms,
+                analysis_fingerprint,
+                global,
+                claims,
+                &by_shard,
+                score_stages,
+            )
+            .await?;
+        Ok(scores
+            .into_iter()
+            .map(|(id, score)| (id, score as f32))
+            .collect())
+    }
+
+    /// Candidate-scoped lexical scoring shared by decomposed, cascade and
+    /// legacy boosts. Admission precedes scoring; every result carries the
+    /// authority view and the same physical claim as its global statistics.
+    #[allow(clippy::too_many_arguments)]
+    async fn bm25_rescore_round(
+        &self,
+        terms: &[String],
+        analysis_fingerprint: u64,
+        global: &CorpusStats,
+        claims: &[StatsClaim],
+        by_shard: &HashMap<u32, Vec<u64>>,
+        score_stages: &[crate::pb::ScoreStage],
+    ) -> Result<(HashMap<u64, f64>, HashMap<u32, (f32, u32)>), Status> {
+        if let Some(fields) = &self.field_permissions {
+            fields.lexical_scores(score_stages)?;
+        }
+        if claims.len() != self.node_addrs.len() {
+            return Err(Status::failed_precondition(
+                "BM25 rescore needs the complete statistics read set",
+            ));
+        }
+        let scope = crate::visibility::VisibilityScope::new(self.document_visibility.as_ref())?;
+        let mut visibility_known = vec![false; scope.column_count()];
+        let mut by_shard = by_shard.clone();
+        if self.document_visibility.is_some() || !score_stages.is_empty() {
+            // Empty owners still acknowledge authority and stage columns.
+            for shard in 0..self.node_addrs.len() {
+                by_shard.entry(shard as u32).or_default();
+            }
+        }
         let mut tasks = Vec::with_capacity(by_shard.len());
         for (shard, ids) in by_shard {
+            let node = self.node_addrs.get(shard as usize).ok_or_else(|| {
+                Status::failed_precondition("BM25 rescore candidate owner is outside the read set")
+            })?;
+            let requested: std::collections::HashSet<_> = ids.iter().copied().collect();
             let request = Bm25RescoreRequest {
                 analysis_fingerprint,
                 terms: terms.to_vec(),
@@ -7250,99 +7302,64 @@ impl CoordinatorServiceImpl {
                 expected_stats_epoch: claims[shard as usize].epoch,
                 expected_stats_incarnation: claims[shard as usize].incarnation(),
                 score_stages: score_stages.to_vec(),
+                visibility: self.document_visibility.clone(),
             };
-            let mut client = self.node_client(&self.node_addrs[shard as usize])?;
-            tasks.push(tokio::spawn(async move {
-                client.bm25_rescore(request).await.map(|r| r.into_inner())
-            }));
+            let mut client = self.node_client(node)?;
+            tasks.push((
+                shard,
+                requested,
+                tokio::spawn(async move {
+                    let started = std::time::Instant::now();
+                    client.bm25_rescore(request).await.map(|response| {
+                        (started.elapsed().as_secs_f32() * 1e3, response.into_inner())
+                    })
+                }),
+            ));
         }
         let mut scores = HashMap::new();
+        let mut debug = HashMap::new();
         let mut stage_known = vec![false; score_stages.len()];
-        for task in tasks {
-            let response = task
-                .await
-                .map_err(|e| Status::internal(format!("bm25 rescore task failed: {e}")))??;
-            if response.stage_columns_known.len() != score_stages.len() {
-                return Err(Status::failed_precondition(format!(
-                    "BM25 rescore returned {} stage-known flags for {} stages",
-                    response.stage_columns_known.len(),
-                    score_stages.len()
-                )));
+        for (shard, requested, task) in tasks {
+            let (rpc_ms, response) = task.await.map_err(|error| {
+                Status::internal(format!("BM25 rescore task failed: {error}"))
+            })??;
+            let claim =
+                self.check_read_view(shard as usize, &scope, &response, &mut visibility_known)?;
+            if claim != claims[shard as usize] {
+                return Err(Status::failed_precondition(
+                    "BM25 rescore changed its statistics read version",
+                ));
             }
-            for (known, shard_known) in stage_known.iter_mut().zip(&response.stage_columns_known) {
-                *known |= shard_known;
+            if response.stage_columns_known.len() != stage_known.len() {
+                return Err(Status::failed_precondition(
+                    "BM25 rescore stage-column handshake has the wrong length",
+                ));
             }
+            for (held, present) in stage_known.iter_mut().zip(&response.stage_columns_known) {
+                *held |= present;
+            }
+            debug.insert(shard, (rpc_ms, response.hits.len() as u32));
             for hit in response.hits {
-                scores.insert(hit.doc_id, hit.score);
+                if !requested.contains(&hit.doc_id)
+                    || !hit.score.is_finite()
+                    || scores.insert(hit.doc_id, f64::from(hit.score)).is_some()
+                {
+                    return Err(Status::failed_precondition(
+                        "BM25 rescore returned an unrequested, duplicate or nonfinite score",
+                    ));
+                }
             }
         }
+        self.check_visibility_columns(&visibility_known)?;
         for (stage, known) in score_stages.iter().zip(stage_known) {
             if !known {
                 return Err(Status::invalid_argument(format!(
                     "no shard has numeric column {}: the score stage would be a silent no-op",
-                    stage.column
+                    stage.column,
                 )));
             }
         }
-        Ok(scores)
-    }
-
-    /// One cascade phase-2 rescore fan-out: candidates routed to their
-    /// owning shards, scored with the GLOBAL stats. Returns doc -> BM25
-    /// score plus per-shard (rpc ms, hit count) for the debug surface.
-    /// `claims[shard]` travels as that shard's `expected_stats_epoch`.
-    async fn cascade_rescore_round(
-        &self,
-        terms: &[String],
-        analysis_fingerprint: u64,
-        global: &CorpusStats,
-        claims: &[StatsClaim],
-        by_shard: &std::collections::HashMap<u32, Vec<u64>>,
-    ) -> Result<
-        (
-            std::collections::HashMap<u64, f64>,
-            std::collections::HashMap<u32, (f32, u32)>,
-        ),
-        Status,
-    > {
-        let mut rescore_tasks = Vec::with_capacity(by_shard.len());
-        for (&shard, ids) in by_shard {
-            let node = &self.node_addrs[shard as usize];
-            let request = Bm25RescoreRequest {
-                analysis_fingerprint,
-                terms: terms.to_vec(),
-                global_doc_count: global.doc_count,
-                global_total_doc_length: global.total_doc_length,
-                global_doc_frequencies: global.dfs.clone(),
-                candidate_ids: ids.clone(),
-                k1: self.bm25_params.k1 as f32,
-                b: self.bm25_params.b as f32,
-                expected_stats_epoch: claims[shard as usize].epoch,
-                expected_stats_incarnation: claims[shard as usize].incarnation(),
-                score_stages: Vec::new(),
-            };
-            let mut client = self.node_client(node)?;
-            rescore_tasks.push(tokio::spawn(async move {
-                let t0 = std::time::Instant::now();
-                client
-                    .bm25_rescore(request)
-                    .await
-                    .map(|r| (shard, t0.elapsed().as_secs_f32() * 1e3, r.into_inner().hits))
-            }));
-        }
-        let mut bm25_of: std::collections::HashMap<u64, f64> = std::collections::HashMap::new();
-        let mut rescore_debug: std::collections::HashMap<u32, (f32, u32)> =
-            std::collections::HashMap::new();
-        for task in rescore_tasks {
-            let (shard, rpc_ms, hits) = task
-                .await
-                .map_err(|e| Status::internal(format!("bm25 rescore task failed: {e}")))??;
-            rescore_debug.insert(shard, (rpc_ms, hits.len() as u32));
-            for hit in hits {
-                bm25_of.insert(hit.doc_id, f64::from(hit.score));
-            }
-        }
-        Ok((bm25_of, rescore_debug))
+        Ok((scores, debug))
     }
 
     /// Build the tonic server for this service with explicit message size
@@ -8439,7 +8456,14 @@ impl CoordinatorServiceImpl {
             let stats_ms = t.elapsed().as_secs_f32() * 1e3;
             let t_rescore = std::time::Instant::now();
             match self
-                .cascade_rescore_round(&terms, analysis_fingerprint, &global, &claims, &by_shard)
+                .bm25_rescore_round(
+                    &terms,
+                    analysis_fingerprint,
+                    &global,
+                    &claims,
+                    &by_shard,
+                    &[],
+                )
                 .await
             {
                 Err(e) if !fresh && is_stale_stats(&e) => {
@@ -15660,6 +15684,15 @@ mod vector_field_read_tests {
         docs: u32,
         rows: usize,
     ) -> Arc<crate::node::NodeServiceImpl> {
+        node_rows_with_private_terms(offset, fingerprint_override, docs, rows, 1)
+    }
+    fn node_rows_with_private_terms(
+        offset: u64,
+        fingerprint_override: bool,
+        docs: u32,
+        rows: usize,
+        private_terms: u32,
+    ) -> Arc<crate::node::NodeServiceImpl> {
         let plan = crate::mapping::derive_plan(
             include_bytes!("../tests/fixtures/vector-binding/descriptor.bin"),
             "vector_binding.Named",
@@ -15677,10 +15710,18 @@ mod vector_field_read_tests {
             ..Default::default()
         }));
         for row in 0..docs {
+            let count = if row == 0 { 1 } else { private_terms };
             store.add_document(
                 row,
-                "word".into(),
-                crate::postings::AnalyzedDoc::body(vec![("word".into(), 1, vec![(0, 4)])], 1),
+                vec!["word"; count as usize].join(" "),
+                crate::postings::AnalyzedDoc::body(
+                    vec![(
+                        "word".into(),
+                        count,
+                        (0..count).map(|i| (i * 5, i * 5 + 4)).collect(),
+                    )],
+                    count,
+                ),
             );
             store.set_facet(0, row, if row == 0 { "public" } else { "private" });
         }
@@ -15981,6 +16022,168 @@ mod vector_field_read_tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn decomposed_lexical_admission_matches_a_physically_restricted_corpus() {
+        let reference = CoordinatorServiceImpl::with_local_nodes(vec![
+            node_rows(0, false, 1, 1),
+            node_rows(100, false, 1, 1),
+        ])
+        .with_bm25(
+            Some(crate::analyzer::NATIVE_ANALYSIS_BACKEND.into()),
+            Default::default(),
+        )
+        .for_vector_field("semantic")
+        .unwrap();
+        let mut decision = access("semantic", FieldAction::Use);
+        decision
+            .field_permissions
+            .as_mut()
+            .unwrap()
+            .grants
+            .push(FieldGrant {
+                field: "body".into(),
+                actions: vec![FieldAction::Use as i32],
+            });
+        let scoped = CoordinatorServiceImpl::with_local_nodes(vec![
+            node_rows_with_private_terms(0, false, 2, 2, 100),
+            node_rows_with_private_terms(100, false, 2, 2, 100),
+        ])
+        .with_bm25(
+            Some(crate::analyzer::NATIVE_ANALYSIS_BACKEND.into()),
+            Default::default(),
+        )
+        .for_access(Some(&decision), "bm25_search")
+        .unwrap()
+        .for_vector_field("semantic")
+        .unwrap();
+        let legs = HybridLegs {
+            leg_k: 1,
+            vector_weight: 1.0,
+            bm25_weight: 1.0,
+            rrf_k: 60.0,
+            fusion_mode: FusionMode::Decomposed,
+            normalization: fusion::Normalization::MinMax,
+            combination: fusion::Combination::Arithmetic,
+            min_vector_score: 0.0,
+        };
+        let expected = reference
+            .fanout_hybrid(
+                "restricted",
+                "word",
+                &[0.25; 16],
+                1,
+                Some(&crate::analyzer::body_spec()),
+                legs,
+                false,
+                &RequestFilters::default(),
+            )
+            .await
+            .unwrap()
+            .0;
+        let actual = scoped
+            .fanout_hybrid(
+                "scoped",
+                "word",
+                &[0.25; 16],
+                1,
+                Some(&crate::analyzer::body_spec()),
+                legs,
+                false,
+                &RequestFilters::default(),
+            )
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(expected[0].bm25_rank, Some(1));
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn lexical_candidate_round_enforces_views_fields_and_empty_read_versions() {
+        let nodes = vec![node(0, false), node(100, false)];
+        let owner = CoordinatorServiceImpl::with_local_nodes(nodes.clone());
+        let reader = owner
+            .for_access(Some(&access("body", FieldAction::Use)), "bm25_search")
+            .unwrap();
+        let terms = vec!["word".into()];
+        let (global, claims) = reader.body_stats(&terms, false).await.unwrap();
+        let (scores, debug) = reader
+            .bm25_rescore_round(
+                &terms,
+                0,
+                &global,
+                &claims,
+                &HashMap::from([(0, vec![0, 1, 0]), (1, vec![100, 101])]),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            scores
+                .keys()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [0, 100].into_iter().collect()
+        );
+        assert_eq!(debug.len(), 2);
+        assert!(debug.values().all(|(_, hits)| *hits == 1));
+        let (scores, debug) = reader
+            .bm25_rescore_round(&terms, 0, &global, &claims, &HashMap::new(), &[])
+            .await
+            .unwrap();
+        assert!(scores.is_empty());
+        assert_eq!(
+            debug.len(),
+            2,
+            "empty owners must acknowledge the authority view"
+        );
+        let denied = owner
+            .for_access(Some(&access("body", FieldAction::Disclose)), "bm25_search")
+            .unwrap();
+        assert_eq!(
+            denied
+                .bm25_rescore_round(&terms, 0, &global, &claims, &HashMap::new(), &[])
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            reader
+                .bm25_rescore_round(
+                    &terms,
+                    0,
+                    &global,
+                    &claims,
+                    &HashMap::new(),
+                    &[ScoreStage {
+                        column: "audience".into(),
+                        op: ScoreOp::AddLinear as i32,
+                        ..Default::default()
+                    },]
+                )
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        nodes[0]
+            .delete_documents(Request::new(DeleteDocumentsRequest {
+                doc_ids: vec![0],
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            reader
+                .bm25_rescore_round(&terms, 0, &global, &claims, &HashMap::new(), &[])
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
     }
 
     #[tokio::test]

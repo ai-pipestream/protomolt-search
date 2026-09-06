@@ -1215,6 +1215,7 @@ async fn a_rescore_through_a_relay_routes_each_id_to_its_child() {
     // Ids from both children, out of order.
     let ids: Vec<u64> = vec![LEX_ROWS as u64 + 3, 0, 4, LEX_ROWS as u64, 5];
     let rescore = |ids: Vec<u64>, claim: u64| pipestream_search::pb::Bm25RescoreRequest {
+        visibility: None,
         analysis_fingerprint: 0,
         terms: vec!["court".into()],
         global_doc_count: stats.doc_count,

@@ -3736,6 +3736,7 @@ impl NodeService for RelayService {
                     "relay: a relay coordinator has no children",
                 ));
             }
+            crate::visibility::VisibilityScope::new(req.visibility.as_ref())?;
             let claims = self.child_claims(
                 req.expected_stats_epoch,
                 &req.expected_stats_incarnation,
@@ -3751,16 +3752,14 @@ impl NodeService for RelayService {
             let by_child = route_ids(&ranges, &req.candidate_ids)?;
             let mut tasks = Vec::with_capacity(children.len());
             for (shard, ids) in by_child.into_iter().enumerate() {
-                if ids.is_empty() {
-                    continue;
-                }
+                let requested: std::collections::HashSet<_> = ids.iter().copied().collect();
                 let mut link = frozen.node_client(&children[shard])?;
                 let mut child_req = req.clone();
                 child_req.candidate_ids = ids;
                 child_req.expected_stats_epoch = claims[shard].epoch;
                 child_req.expected_stats_incarnation = claims[shard].incarnation();
                 let addr = children[shard].clone();
-                tasks.push(tokio::spawn(async move {
+                tasks.push((requested, tokio::spawn(async move {
                     let mut request = Request::new(child_req);
                     if let Some(timeout) = timeout {
                         request.set_timeout(timeout);
@@ -3769,11 +3768,12 @@ impl NodeService for RelayService {
                         .await
                         .map(|r| r.into_inner())
                         .map_err(|status| child_error(shard, &addr, "bm25 rescore", status))
-                }));
+                })));
             }
             let mut hits = Vec::new();
             let mut stage_known: Option<Vec<bool>> = None;
-            for (i, task) in tasks.into_iter().enumerate() {
+            let mut receipts = Vec::with_capacity(children.len());
+            for (i, (requested, task)) in tasks.into_iter().enumerate() {
                 let share = task
                     .await
                     .map_err(|e| Status::internal(format!("relay bm25 rescore task: {e}")))??;
@@ -3783,10 +3783,29 @@ impl NodeService for RelayService {
                     &mut stage_known,
                     &share.stage_columns_known,
                 )?;
+                let mut seen = std::collections::HashSet::new();
+                for hit in &share.hits {
+                    if !requested.contains(&hit.doc_id) || !hit.score.is_finite() || !seen.insert(hit.doc_id) {
+                        return Err(Status::failed_precondition("relay: BM25 child returned an unrequested, duplicate or nonfinite score"));
+                    }
+                }
+                receipts.push(read_metadata(&share));
                 hits.extend(share.hits);
             }
             self.still_current(&pinned, "Bm25Rescore")?;
+            let receipt = self.read_receipt(
+                &pinned,
+                children,
+                req.visibility.as_ref(),
+                Some(&claims),
+                &receipts,
+            )?;
+            hits.sort_by_key(|hit| hit.doc_id);
             Ok(Response::new(Bm25RescoreResponse {
+                stats_epoch: receipt.stats_epoch,
+                stats_incarnation: receipt.stats_incarnation,
+                visibility_fingerprint: receipt.visibility_fingerprint,
+                visibility_columns_known: receipt.visibility_columns_known,
                 hits,
                 stage_columns_known: stage_known
                     .unwrap_or_else(|| vec![false; req.score_stages.len()]),

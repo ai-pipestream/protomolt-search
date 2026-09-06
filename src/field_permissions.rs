@@ -242,6 +242,13 @@ impl FieldScope {
     pub(crate) fn vector(&self, field: &str) -> Result<(), Status> {
         self.require_use(field)
     }
+    pub(crate) fn lexical_scores(&self, stages: &[ScoreStage]) -> Result<(), Status> {
+        self.require_use("body")?;
+        for stage in stages {
+            self.require_use(&stage.column)?;
+        }
+        Ok(())
+    }
     pub(crate) fn lexical_membership(&self) -> Result<(), Status> {
         self.require_use("body")
     }

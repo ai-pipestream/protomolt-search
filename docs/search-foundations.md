@@ -1028,3 +1028,14 @@ and stream tests cover RRF, score blend, decomposed scoring and cascade, with
 same-dimension binding mismatches rejected before provisional hits. See
 [hybrid read views](hybrid-read-views.md). The broader document-query and network
 authorization work remains incomplete.
+
+## Decomposed document admission and lexical rescores
+
+The initial lexical pass of decomposed search now carries the authority view
+and read receipt through `ShardLegs`. It matches a physically restricted corpus,
+including lexical-rank provenance when private documents would dominate the
+retained list. BM25 candidate rescores apply the same mandatory view before
+scoring and return full physical/view receipts through nested relays. Cascade,
+decomposed and legacy boost consumers share field admission, receipt and returned
+ID validation. See [hybrid read views](hybrid-read-views.md). Public document-query
+execution metadata and quality-policy disclosure remain under audit.

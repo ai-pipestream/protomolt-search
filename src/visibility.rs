@@ -241,6 +241,7 @@ scoped_read_responses!(
     MembershipBitmapResponse,
     VectorReadReceipt,
     VectorRescoreResponse,
+    Bm25RescoreResponse,
     ExactVectorRescoreResponse,
     BrowseShardResponse,
     AggregateShardResponse,
