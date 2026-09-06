@@ -288,9 +288,35 @@ boolean shapes go through the relay root :19391 and answer with the
 same ids as the direct root: 897 ms, 4.9 s, 2.1 s, and 47 s for the
 four filter rows above, measured while the archive re-placement split
 below was using the sidecar and most of krick-1's cores, so those
-times carry that load. The boolean planner's pushdown (the shard
-evaluates the planned tree and returns ranked candidates) is the
-follow-up that removes the id set; its numbers go here when it merges.
+times carry that load.
+
+With main a9bf470 on every process (the boolean planner's pushdown of
+5fdedf3, the dense-membership rule of 7c44e28, GPT's scoped read
+contracts, the relay's fetch and fold routes), verified by checksum on
+each host, the same shapes through the relay root :19391, k = 10, idle
+fleet, the root's peak resident size read after each query:
+
+| Query | Boolean shape | Allowlist shape | Same ids | Root peak RSS after |
+|---|---|---|---|---|
+| lexical "grandfathered status" AND dense row 7 | 623 ms | no such shape | | 24 MB |
+| lexical "qualified immunity" AND dense row 7 | 421 ms | no such shape | | 24 MB |
+| lexical "qualified immunity", `court == "scotus"` | 621 ms | 96 ms | yes | 24 MB |
+| lexical "qualified immunity", `year >= 2018` | 667 ms | 70 ms | yes | 24 MB |
+| dense row 7, `court == "scotus"` | 597 ms | 556 ms | yes | 24 MB |
+| dense row 7, `year >= 2018` | 881 ms | 782 ms | yes | 24 MB |
+| lexical "qualified immunity", `year < 2015` | 209 ms (relay shard skipped) | | | 24 MB |
+| dense row 7, `year < 2015` | 321 ms (relay shard skipped) | | | 24 MB |
+
+The root's resident size no longer moves with the query: the tree is
+evaluated on the shards and only ranked candidates cross the wire. The
+`year < 2015` rows are the first where the placement tree prunes a
+shard on the boolean route (the relay over the recent group is not
+asked). The lexical boolean rows still cost more than the allowlist
+shape (about 600 ms against 70-100 ms): a boolean lexical clause is
+scored by the candidate walk over the members, while the allowlist
+shape runs the block-max search; that gap is the next thing to close
+on this route. The trimmed verification (`v10-verify.py`, root against
+the pruning-off root) agrees on every shape.
 
 ### The archive in year bands
 
@@ -319,14 +345,12 @@ routing pass (about seven minutes for the six logs, 155 GB of spill).
   the reboot of 2026-09-05) and the operator decides when the new one
   replaces it; the Pis still hold the old nodes' files next to the new
   ones.
-- The boolean route with a filter leaf or with set algebra between
-  search clauses builds a coordinator id set (the table above, up to
-  49.6 GB); the planner pushdown to the shards is in progress.
-- The year-band split of the archive is running; after it, each band
-  serves under `--placement-leaf` and `--placement-tree`, the root map
-  moves to generation 11, and a partitioned compaction by `year` inside
-  each band gives segment pruning something to skip within a leaf
+- The year-band split of the archive is running again on a9bf470 with
+  the segmented child layout; after it, each band serves under
+  `--placement-leaf` and `--placement-tree`, the root map moves to
+  generation 11, and a partitioned compaction by `year` inside each
+  band gives segment pruning something to skip within a leaf
   (`docs/segment-pruning.md`).
-- The six archive nodes and the Pi nodes run 6141ca5 while the roots
-  and the relay run 774da20; the nodes move with the next roll.
+- The boolean lexical clause's candidate walk (600 ms where the
+  allowlist shape's block-max search takes 70-100 ms).
 - Control-plane leases for the scan rate.
