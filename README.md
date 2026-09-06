@@ -1222,6 +1222,12 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Scoped browse and aggregation (2026-09-06, feature branch).** Private
+  Aggregate enforces document and field grants through percentile selection and
+  final disclosure. Browse and aggregate reads share Query's physical-version
+  guard; every percentile round requires the initial admitted shard version.
+  Restricted public Query remains gated. See [scoped folds](docs/scoped-folds.md).
+
 - **Document-scoped membership (2026-09-06, feature branch).** Boolean filter,
   lexical and vector bitmaps apply the mandatory document view before leaving
   the node. Coordinators verify the view and read version before planning;

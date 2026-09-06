@@ -7,8 +7,9 @@ with no grants means no field access. Formats 1 and 2 reject field permissions;
 format 3 can combine them with the format-2 mandatory document view. Future
 restrictions require a new policy format so older engines refuse them.
 
-The implemented boundary is private in-process `Bm25Search`, `Suggest` and
-`TermSuggest`. Other routes and network-backed restricted collections refuse,
+The implemented boundary is private in-process `Bm25Search`, `Suggest`,
+`TermSuggest` and [Aggregate](scoped-folds.md). Other routes and network-backed
+restricted collections refuse,
 including a field restriction without a document predicate. This does not
 complete the broader query, delegation, source-fetch or RAG authorization work.
 

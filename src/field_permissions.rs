@@ -169,6 +169,57 @@ impl FieldScope {
         }
         Ok(())
     }
+    pub(crate) fn browse(
+        &self,
+        filters: &crate::coordinator::RequestFilters,
+        sort: &[BrowseSort],
+        lexical_terms: &[String],
+    ) -> Result<(), Status> {
+        self.filter(&filters.geo, filters.tree.as_ref())?;
+        if !lexical_terms.is_empty() {
+            self.require_use("body")?;
+        }
+        for key in sort {
+            self.dictionary(&key.column)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn aggregate(
+        &self,
+        filters: &crate::coordinator::RequestFilters,
+        compiled: &crate::coordinator::CompiledAggregate,
+    ) -> Result<(), Status> {
+        let crate::coordinator::CompiledAggregate {
+            aggregations,
+            histograms,
+            percentiles,
+            group_by,
+            percentile_specs: _,
+            max_groups: _,
+        } = compiled;
+        self.filter(&filters.geo, filters.tree.as_ref())?;
+        if !group_by.is_empty() {
+            self.dictionary(group_by)?;
+        }
+        for expr in aggregations
+            .iter()
+            .filter_map(|a| a.expr.as_ref())
+            .chain(histograms.iter().filter_map(|h| h.expr.as_ref()))
+            .chain(percentiles.iter().filter_map(|p| p.expr.as_ref()))
+        {
+            let mut leaves = Vec::new();
+            crate::values::column_leaves(expr, &mut leaves);
+            for leaf in leaves {
+                let column = match leaf {
+                    ValueLeaf::Column(column) | ValueLeaf::Map { column, .. } => column,
+                };
+                self.dictionary(&column)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn lexical_membership(&self) -> Result<(), Status> {
         self.require_use("body")
     }

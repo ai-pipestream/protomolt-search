@@ -931,6 +931,11 @@ message BrowseShardRequest {
   // Explicit mapped bindings require a matching nonzero value. On legacy
   // bindings zero retains the unknown-analyzer behavior.
   uint64 analysis_fingerprint = 10;
+  // Authority-owned document view, separate from the user filter.
+  DocumentVisibility visibility = 11;
+  // Complete admitted read version. A standalone read may omit both fields.
+  uint64 expected_stats_epoch = 12;
+  bytes expected_stats_incarnation = 13;
 }
 
 // One key of a sorted row on the wire, in the form the merge compares:
@@ -1015,6 +1020,11 @@ message BrowseShardResponse {
   // Required for sorted responses, even when sort_rows is empty.
   repeated ScalarValueType sort_column_types = 11;
 
+  // The physical version and document view read under the same shard lock.
+  uint64 stats_epoch = 12;
+  bytes stats_incarnation = 13;
+  bytes visibility_fingerprint = 14;
+  repeated bool visibility_columns_known = 15;
 }
 
 message FilterBitmapRequest {
@@ -6990,6 +7000,11 @@ message AggregateShardRequest {
   repeated uint64 doc_ids = 8;
   // Distinguishes an intentionally empty allowlist from no allowlist.
   bool restrict_doc_ids = 9;
+  // Authority-owned document view, separate from the user filter.
+  DocumentVisibility visibility = 10;
+  // Complete admitted read version. A standalone read may omit both fields.
+  uint64 expected_stats_epoch = 11;
+  bytes expected_stats_incarnation = 12;
 }
 
 // One compiled percentile expression.
@@ -7075,6 +7090,11 @@ message AggregateShardResponse {
   // (docs/segment-pruning.md). The answer is the same with pruning off.
   uint32 segments_total = 11;
   uint32 segments_skipped = 12;
+  // The physical version and document view read under the same shard lock.
+  uint64 stats_epoch = 13;
+  bytes stats_incarnation = 14;
+  bytes visibility_fingerprint = 15;
+  repeated bool visibility_columns_known = 16;
 }
 
 // One shard's phase-1 percentile statistics.
@@ -7112,6 +7132,11 @@ message QuantileCountsRequest {
   repeated QuantileTarget targets = 4;
   repeated uint64 doc_ids = 5;
   bool restrict_doc_ids = 6;
+  // Authority-owned document view, separate from the user filter.
+  DocumentVisibility visibility = 7;
+  // Required complete read version admitted by the initial aggregate pass.
+  uint64 expected_stats_epoch = 8;
+  bytes expected_stats_incarnation = 9;
 }
 
 // One probe: an expression and a threshold in its order-bits domain.
@@ -7127,6 +7152,11 @@ message QuantileCountsResponse {
   // Per target, in request order: this shard's rankable values whose
   // order bits are at or below the threshold.
   repeated uint64 counts = 1;
+  // The physical version and document view read under the same shard lock.
+  uint64 stats_epoch = 2;
+  bytes stats_incarnation = 3;
+  bytes visibility_fingerprint = 4;
+  repeated bool visibility_columns_known = 5;
 }
 
 // One shard's partials for one facet value.

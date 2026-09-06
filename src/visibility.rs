@@ -214,3 +214,31 @@ mod tests {
         }
     }
 }
+
+/// Shared borrowed metadata from node reads. Body-shape validation remains the
+/// responsibility of each route's collector.
+pub(crate) struct ReadView<'a> {
+    pub epoch: u64,
+    pub incarnation: &'a [u8],
+    pub fingerprint: &'a [u8],
+    pub columns_known: &'a [bool],
+}
+pub(crate) trait ScopedReadResponse {
+    fn read_view(&self) -> ReadView<'_>;
+}
+macro_rules! scoped_read_responses {
+    ($($name:ident),+ $(,)?) => { $(
+        impl ScopedReadResponse for crate::pb::$name {
+            fn read_view(&self) -> ReadView<'_> {
+                ReadView { epoch: self.stats_epoch, incarnation: &self.stats_incarnation,
+                    fingerprint: &self.visibility_fingerprint, columns_known: &self.visibility_columns_known }
+            }
+        }
+    )+ };
+}
+scoped_read_responses!(
+    MembershipBitmapResponse,
+    BrowseShardResponse,
+    AggregateShardResponse,
+    QuantileCountsResponse
+);

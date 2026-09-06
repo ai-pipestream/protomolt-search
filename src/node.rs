@@ -10798,11 +10798,20 @@ impl NodeService for NodeServiceImpl {
     ) -> Result<Response<crate::pb::BrowseShardResponse>, Status> {
         crate::metrics::timed(Route::BrowseShard, request, |request| async move {
             let req = request.into_inner();
+            let scope = crate::visibility::VisibilityScope::new(req.visibility.as_ref())?;
+            let filter =
+                crate::visibility::intersect_filter(req.visibility.as_ref(), req.filter.clone())?;
             if req.k == 0 {
                 return Err(Status::invalid_argument("browse requires k > 0"));
             }
             let geo_regions = validate_geo_filters(&req.geo_filters)?;
             let guard = read_shard(&self.state);
+            guard.check_stats_epoch(req.expected_stats_epoch, &req.expected_stats_incarnation)?;
+            let (_, visibility_columns_known) = filter_known_flags(
+                guard.bm25.as_ref(),
+                &[],
+                req.visibility.as_ref().and_then(|view| view.filter.as_ref()),
+            );
             if !req.lexical_terms.is_empty() { guard.check_query_analysis("body", req.analysis_fingerprint)?; }
             let (geo_columns_known, filter_columns_known) =
                 filter_known_flags(guard.bm25.as_ref(), &req.geo_filters, req.filter.as_ref());
@@ -10811,6 +10820,10 @@ impl NodeService for NodeServiceImpl {
                 // A document-less shard admits nothing; its all-false known
                 // flags feed the coordinator's typo rule like everywhere.
                 return Ok(Response::new(crate::pb::BrowseShardResponse {
+                    stats_epoch: guard.stats_epoch,
+                    stats_incarnation: guard.stats_incarnation.bytes()?,
+                    visibility_fingerprint: scope.fingerprint().to_vec(),
+                    visibility_columns_known: visibility_columns_known.clone(),
                     segments_total: 0,
                     segments_skipped: 0,
                     doc_ids: Vec::new(),
@@ -10868,8 +10881,7 @@ impl NodeService for NodeServiceImpl {
             let doc_filter = crate::filter::DocFilter {
                 deleted: guard.live_docs.words(),
                 geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
-                pred: req
-                    .filter
+                pred: filter
                     .as_ref()
                     .map(|f| store.resolve_filter(f))
                     .transpose()?,
@@ -10935,6 +10947,10 @@ impl NodeService for NodeServiceImpl {
                     // key holds no value for it on any document, so it
                     // contributes no rows.
                     return Ok(Response::new(crate::pb::BrowseShardResponse {
+                        stats_epoch: guard.stats_epoch,
+                        stats_incarnation: guard.stats_incarnation.bytes()?,
+                        visibility_fingerprint: scope.fingerprint().to_vec(),
+                        visibility_columns_known: visibility_columns_known.clone(),
                         segments_total: prune.stats.segments_total,
                         segments_skipped: prune.stats.segments_skipped,
                         doc_ids: Vec::new(),
@@ -11072,6 +11088,10 @@ impl NodeService for NodeServiceImpl {
                     });
                 }
                 return Ok(Response::new(crate::pb::BrowseShardResponse {
+                    stats_epoch: guard.stats_epoch,
+                    stats_incarnation: guard.stats_incarnation.bytes()?,
+                    visibility_fingerprint: scope.fingerprint().to_vec(),
+                    visibility_columns_known: visibility_columns_known.clone(),
                     segments_total: prune.stats.segments_total,
                     segments_skipped: prune.stats.segments_skipped,
                     doc_ids,
@@ -11092,6 +11112,10 @@ impl NodeService for NodeServiceImpl {
                 }
             }
             Ok(Response::new(crate::pb::BrowseShardResponse {
+                stats_epoch: guard.stats_epoch,
+                stats_incarnation: guard.stats_incarnation.bytes()?,
+                visibility_fingerprint: scope.fingerprint().to_vec(),
+                visibility_columns_known: visibility_columns_known.clone(),
                 segments_total: prune.stats.segments_total,
                 segments_skipped: prune.stats.segments_skipped,
                 doc_ids,
@@ -11330,6 +11354,9 @@ impl NodeService for NodeServiceImpl {
     ) -> Result<Response<crate::pb::AggregateShardResponse>, Status> {
         crate::metrics::timed(Route::AggregateShard, request, |request| async move {
             let req = request.into_inner();
+            let scope = crate::visibility::VisibilityScope::new(req.visibility.as_ref())?;
+            let filter =
+                crate::visibility::intersect_filter(req.visibility.as_ref(), req.filter.clone())?;
             if req.aggregations.is_empty()
                 && req.histograms.is_empty()
                 && req.percentiles.is_empty()
@@ -11342,6 +11369,14 @@ impl NodeService for NodeServiceImpl {
             let group_cap = req.max_groups as usize;
             let geo_regions = validate_geo_filters(&req.geo_filters)?;
             let guard = read_shard(&self.state);
+            guard.check_stats_epoch(req.expected_stats_epoch, &req.expected_stats_incarnation)?;
+            let (_, visibility_columns_known) = filter_known_flags(
+                guard.bm25.as_ref(),
+                &[],
+                req.visibility
+                    .as_ref()
+                    .and_then(|view| view.filter.as_ref()),
+            );
             let (geo_columns_known, filter_columns_known) =
                 filter_known_flags(guard.bm25.as_ref(), &req.geo_filters, req.filter.as_ref());
             // Expression column leaves: aggregations first, then
@@ -11362,6 +11397,10 @@ impl NodeService for NodeServiceImpl {
                 // all-absent partials and all-false flags feed the merge
                 // and the typo rule like everywhere.
                 return Ok(Response::new(crate::pb::AggregateShardResponse {
+                    stats_epoch: guard.stats_epoch,
+                    stats_incarnation: guard.stats_incarnation.bytes()?,
+                    visibility_fingerprint: scope.fingerprint().to_vec(),
+                    visibility_columns_known: visibility_columns_known.clone(),
                     segments_total: 0,
                     segments_skipped: 0,
                     partials: req
@@ -11522,8 +11561,7 @@ impl NodeService for NodeServiceImpl {
             let doc_filter = crate::filter::DocFilter {
                 deleted: guard.live_docs.words(),
                 geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
-                pred: req
-                    .filter
+                pred: filter
                     .as_ref()
                     .map(|f| store.resolve_filter(f))
                     .transpose()?,
@@ -11665,6 +11703,10 @@ impl NodeService for NodeServiceImpl {
                 })
                 .unwrap_or_default();
             Ok(Response::new(crate::pb::AggregateShardResponse {
+                stats_epoch: guard.stats_epoch,
+                stats_incarnation: guard.stats_incarnation.bytes()?,
+                visibility_fingerprint: scope.fingerprint().to_vec(),
+                visibility_columns_known: visibility_columns_known.clone(),
                 segments_total: prune.stats.segments_total,
                 segments_skipped: prune.stats.segments_skipped,
                 partials: totals.iter().map(|acc| acc.partial(Some(store))).collect(),
@@ -11706,10 +11748,29 @@ impl NodeService for NodeServiceImpl {
     ) -> Result<Response<crate::pb::QuantileCountsResponse>, Status> {
         crate::metrics::timed(Route::QuantileCounts, request, |request| async move {
             let req = request.into_inner();
+            let scope = crate::visibility::VisibilityScope::new(req.visibility.as_ref())?;
+            let filter =
+                crate::visibility::intersect_filter(req.visibility.as_ref(), req.filter.clone())?;
             let geo_regions = validate_geo_filters(&req.geo_filters)?;
             let guard = read_shard(&self.state);
+            crate::stats_identity::StatsClaim::required(
+                req.expected_stats_epoch,
+                &req.expected_stats_incarnation,
+            )?;
+            guard.check_stats_epoch(req.expected_stats_epoch, &req.expected_stats_incarnation)?;
+            let (_, visibility_columns_known) = filter_known_flags(
+                guard.bm25.as_ref(),
+                &[],
+                req.visibility
+                    .as_ref()
+                    .and_then(|view| view.filter.as_ref()),
+            );
             let Some(store) = guard.bm25.as_ref() else {
                 return Ok(Response::new(crate::pb::QuantileCountsResponse {
+                    stats_epoch: guard.stats_epoch,
+                    stats_incarnation: guard.stats_incarnation.bytes()?,
+                    visibility_fingerprint: scope.fingerprint().to_vec(),
+                    visibility_columns_known: visibility_columns_known.clone(),
                     counts: vec![0; req.targets.len()],
                 }));
             };
@@ -11737,8 +11798,7 @@ impl NodeService for NodeServiceImpl {
             let doc_filter = crate::filter::DocFilter {
                 deleted: guard.live_docs.words(),
                 geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
-                pred: req
-                    .filter
+                pred: filter
                     .as_ref()
                     .map(|f| store.resolve_filter(f))
                     .transpose()?,
@@ -11787,7 +11847,13 @@ impl NodeService for NodeServiceImpl {
                     }
                 }
             }
-            Ok(Response::new(crate::pb::QuantileCountsResponse { counts }))
+            Ok(Response::new(crate::pb::QuantileCountsResponse {
+                stats_epoch: guard.stats_epoch,
+                stats_incarnation: guard.stats_incarnation.bytes()?,
+                visibility_fingerprint: scope.fingerprint().to_vec(),
+                visibility_columns_known: visibility_columns_known.clone(),
+                counts,
+            }))
         })
         .await
     }

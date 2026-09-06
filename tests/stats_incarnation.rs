@@ -20,6 +20,7 @@ struct Replaceable<S> {
     before_score: Arc<Mutex<VecDeque<S>>>,
     before_fetch: Arc<Mutex<VecDeque<S>>>,
     scoring_calls: Arc<AtomicUsize>,
+    before_reads: Arc<Mutex<std::collections::HashMap<String, VecDeque<Option<S>>>>>,
 }
 
 impl<S: tonic::server::NamedService> tonic::server::NamedService for Replaceable<S> {
@@ -41,6 +42,16 @@ where
         std::task::Poll::Ready(Ok(()))
     }
     fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        let route = request.uri().path().rsplit('/').next().unwrap();
+        if let Some(Some(next)) = self
+            .before_reads
+            .lock()
+            .unwrap()
+            .get_mut(route)
+            .and_then(VecDeque::pop_front)
+        {
+            *self.current.lock().unwrap() = next;
+        }
         if request.uri().path().ends_with("/FetchValues") {
             if let Some(next) = self.before_fetch.lock().unwrap().pop_front() {
                 *self.current.lock().unwrap() = next;
@@ -66,6 +77,9 @@ where
 }
 
 async fn node(texts: &[&str]) -> NodeServer {
+    node_values(texts, false).await
+}
+async fn node_values(texts: &[&str], varying: bool) -> NodeServer {
     let node = Arc::new(NodeServiceImpl::new(
         None,
         NodeConfig {
@@ -78,12 +92,13 @@ async fn node(texts: &[&str]) -> NodeServer {
         .add_documents(tokio_stream::iter(
             texts
                 .iter()
-                .map(|text| AddDocumentsRequest {
+                .enumerate()
+                .map(|(index, text)| AddDocumentsRequest {
                     analysis: Some(body_spec()),
                     text: (*text).into(),
                     numerics: vec![pipestream_search::pb::NumericValue {
                         field: "boost".into(),
-                        value: 1.0,
+                        value: if varying { (index + 1) as f64 } else { 1.0 },
                     }],
                     ..Default::default()
                 })
@@ -106,6 +121,7 @@ async fn start(
         before_score: Arc::new(Mutex::new(VecDeque::new())),
         before_fetch: Arc::new(Mutex::new(VecDeque::new())),
         scoring_calls: Arc::new(AtomicUsize::new(0)),
+        before_reads: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = format!("http://{}", listener.local_addr().unwrap());
@@ -542,6 +558,58 @@ async fn query_cursor_versions_follow_child_replacement_through_nested_relays() 
             relay.abort();
             let _ = relay.await;
         }
+        handle.abort();
+        let _ = handle.await;
+    }
+}
+
+#[tokio::test]
+async fn aggregate_refuses_replacement_at_every_read_boundary() {
+    use pipestream_search::pb::{
+        search_service_server::SearchService, AggregateOp, AggregateRequest, Aggregation,
+        PercentileSpec,
+    };
+    for (route, varying, skip) in [
+        ("AggregateShard", true, 0),
+        ("QuantileCounts", true, 0),
+        ("QuantileCounts", true, 1),
+        ("TermStats", false, 1),
+    ] {
+        let original = node_values(&["alpha", "beta", "gamma"], varying).await;
+        let replacement = node_values(&["alpha", "beta", "gamma"], varying).await;
+        let (address, service, handle) = start(original).await;
+        service.before_reads.lock().unwrap().insert(
+            route.into(),
+            (0..skip).map(|_| None).chain([Some(replacement)]).collect(),
+        );
+        let error = SearchService::aggregate(
+            &coordinator(address),
+            tonic::Request::new(AggregateRequest {
+                aggregations: vec![Aggregation {
+                    name: "count".into(),
+                    expression: "1".into(),
+                    op: AggregateOp::Count as i32,
+                    ..Default::default()
+                }],
+                percentiles: vec![PercentileSpec {
+                    name: "pct".into(),
+                    expression: "boost".into(),
+                    percentiles: vec![50.],
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.code(),
+            tonic::Code::FailedPrecondition,
+            "{route}: {error}"
+        );
+        assert!(
+            service.before_reads.lock().unwrap()[route].is_empty(),
+            "replacement must have happened at {route}"
+        );
         handle.abort();
         let _ = handle.await;
     }

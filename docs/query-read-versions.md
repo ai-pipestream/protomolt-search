@@ -18,6 +18,8 @@ node checks under the same read lock as visibility and values.
 [Membership reads](membership-visibility.md) also validate their complete version
 against the admitted read set before returning any row IDs to the planner.
 Filter and vector membership now return versions as well as lexical membership.
+[Browse and aggregation](scoped-folds.md) use this same read set, including every
+percentile round. Standalone execution admits and validates its own read set.
 
 After execution, fresh probes must match all admitted versions. A scoring retry
 that obtains newer statistics cannot turn an earlier selection into a successful

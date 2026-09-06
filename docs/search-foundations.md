@@ -944,3 +944,15 @@ and vendored-proto checks passed. Descriptor comparison against `e9873c1`
 confirms exactly nine additive fields with existing declarations unchanged.
 No fleet benchmark, deployment or device-runtime test ran. Stored index, WAL
 and original-source formats are unchanged.
+
+
+## Scoped browse and aggregation (2026-09-06, feature branch)
+
+Private Aggregate now enforces mandatory document selection and field use and
+disclosure checks. Browse, aggregate partials and every percentile round carry
+and validate the admitted physical versions and authority view. Final read-set
+validation covers all rounds, including the zero-round percentile case. The
+collection facade revalidates the full decision before disclosure. See
+[scoped folds](scoped-folds.md) for implementation, evidence and upgrade impact.
+Restricted public Query, other retrieval paths, network delegation and RAG remain
+unfinished; this increment does not complete the foundation objectives.

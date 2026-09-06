@@ -80,6 +80,13 @@ fn query() -> Bm25SearchRequest {
     }
 }
 async fn cluster(streaming: bool) -> CoordinatorServiceImpl {
+    cluster_subset(streaming, false, false).await
+}
+async fn cluster_subset(
+    streaming: bool,
+    public_only: bool,
+    varying: bool,
+) -> CoordinatorServiceImpl {
     let mut nodes = Vec::new();
     for offset in [0, 100] {
         let node = Arc::new(NodeServiceImpl::new(
@@ -102,6 +109,9 @@ async fn cluster(streaming: bool) -> CoordinatorServiceImpl {
         .into_iter()
         .enumerate()
         {
+            if public_only && audience != "public" {
+                continue;
+            }
             NodeLink::local(node.clone())
                 .add_documents(tokio_stream::iter([AddDocumentsRequest {
                     text: text.into(),
@@ -127,7 +137,7 @@ async fn cluster(streaming: bool) -> CoordinatorServiceImpl {
                     ],
                     numerics: vec![NumericValue {
                         field: "boost".into(),
-                        value: (i + 1) as f64,
+                        value: (i + 1) as f64 + if varying { offset as f64 } else { 0. },
                     }],
                     original_source: Some(common::protobuf_source(text, "source")),
                     identity: Some(DocumentIdentity {
@@ -607,7 +617,7 @@ impl Authorizer for MovingFields {
 #[tokio::test]
 async fn field_revocation_invalidates_computed_results_without_a_revision_bump() {
     let coordinator = cluster(false).await;
-    for route in 0..3 {
+    for route in 0..4 {
         let fields = permissions(
             &[("body", &[FieldAction::Use, FieldAction::Disclose])],
             true,
@@ -634,7 +644,7 @@ async fn field_revocation_invalidates_computed_results_without_a_revision_bump()
             )
             .await
             .unwrap_err(),
-            _ => SearchService::term_suggest(
+            2 => SearchService::term_suggest(
                 &reader,
                 request(TermSuggestRequest {
                     field: "body".into(),
@@ -645,6 +655,9 @@ async fn field_revocation_invalidates_computed_results_without_a_revision_bump()
             )
             .await
             .unwrap_err(),
+            _ => SearchService::aggregate(&reader, request(count_request()))
+                .await
+                .unwrap_err(),
         };
         assert_eq!(error.code(), Code::PermissionDenied);
         assert!(error.message().contains("changed"));
@@ -718,6 +731,195 @@ async fn numeric_use_does_not_grant_explanation_or_projection_and_network_bypass
     );
     assert_eq!(
         SearchService::bm25_search(&network, request(query()))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+}
+
+fn count_request() -> AggregateRequest {
+    AggregateRequest {
+        aggregations: vec![Aggregation {
+            name: "count".into(),
+            expression: "1".into(),
+            op: AggregateOp::Count as i32,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+fn aggregate_request() -> AggregateRequest {
+    AggregateRequest {
+        aggregations: [
+            ("count", "1", AggregateOp::Count),
+            ("sum", "boost", AggregateOp::Sum),
+            ("mean", "boost", AggregateOp::Mean),
+            ("colors", "color", AggregateOp::Cardinality),
+        ]
+        .into_iter()
+        .map(|(name, expression, op)| Aggregation {
+            name: name.into(),
+            expression: expression.into(),
+            op: op as i32,
+            ..Default::default()
+        })
+        .collect(),
+        group_by: "color".into(),
+        histograms: vec![HistogramSpec {
+            name: "buckets".into(),
+            expression: "boost".into(),
+            interval: 1.,
+            ..Default::default()
+        }],
+        percentiles: vec![PercentileSpec {
+            name: "percentiles".into(),
+            expression: "boost".into(),
+            percentiles: vec![0., 50., 75., 100.],
+        }],
+        ..Default::default()
+    }
+}
+#[tokio::test]
+async fn aggregates_match_a_physically_restricted_corpus_and_cannot_widen_the_view() {
+    let coordinator = cluster_subset(false, false, true).await;
+    let reference = cluster_subset(false, true, true).await;
+    let fields = permissions(
+        &[
+            ("boost", &[FieldAction::Use, FieldAction::Disclose]),
+            ("color", &[FieldAction::Use, FieldAction::Disclose]),
+        ],
+        false,
+    );
+    // A field-only grant retains all documents, with the same result as the owner.
+    let field_only = service(
+        coordinator.clone(),
+        Arc::new(PolicyAuthority::new(policy(Some(fields.clone()), false)).unwrap()),
+    );
+    let expected = SearchService::aggregate(&coordinator, Request::new(aggregate_request()))
+        .await
+        .unwrap()
+        .into_inner();
+    let actual = SearchService::aggregate(&field_only, request(aggregate_request()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(actual.results, expected.results);
+    assert_eq!(actual.percentiles, expected.percentiles);
+    assert_eq!(actual.matched, 4);
+    for field_policy in [None, Some(fields)] {
+        let reader = service(
+            coordinator.clone(),
+            Arc::new(PolicyAuthority::new(policy(field_policy, true)).unwrap()),
+        );
+        for filter in [
+            "",
+            "color == 'red'",
+            "color == 'blue'",
+            "color == 'red' || color == 'blue'",
+        ] {
+            let mut input = aggregate_request();
+            input.filter = filter.into();
+            let expected = SearchService::aggregate(&reference, Request::new(input.clone()))
+                .await
+                .unwrap()
+                .into_inner();
+            let actual = SearchService::aggregate(&reader, request(input))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(actual.matched, expected.matched);
+            assert_eq!(actual.results, expected.results);
+            assert_eq!(actual.groups, expected.groups);
+            assert_eq!(actual.histograms, expected.histograms);
+            assert_eq!(actual.percentiles, expected.percentiles);
+            assert_eq!(actual.ungrouped, expected.ungrouped);
+        }
+    }
+    let reader = service(
+        coordinator,
+        Arc::new(PolicyAuthority::new(policy(Some(FieldPermissions::default()), true)).unwrap()),
+    );
+    let result = SearchService::aggregate(&reader, request(count_request()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        result.matched, 2,
+        "constant count needs no user field grant; authority still filters"
+    );
+}
+#[tokio::test]
+async fn aggregate_field_inputs_require_use_and_disclose_before_reading() {
+    let coordinator = cluster(false).await;
+    // Exercise a populated statistics cache before denying inputs.
+    SearchService::bm25_search(&coordinator, Request::new(query()))
+        .await
+        .unwrap();
+    let mut inputs = vec![aggregate_request()];
+    for expression in ["secret", "true ? boost : secret", "metrics['hidden']"] {
+        let mut input = count_request();
+        input.aggregations[0].expression = expression.into();
+        inputs.push(input);
+    }
+    let mut input = count_request();
+    input.group_by = "secret".into();
+    inputs.push(input);
+    let mut input = count_request();
+    input.histograms = vec![HistogramSpec {
+        name: "hist".into(),
+        expression: "boost".into(),
+        interval: 1.,
+        ..Default::default()
+    }];
+    inputs.push(input);
+    let mut input = count_request();
+    input.percentiles = vec![PercentileSpec {
+        name: "pct".into(),
+        expression: "boost".into(),
+        percentiles: vec![50.],
+    }];
+    inputs.push(input);
+    let mut input = count_request();
+    input.filter = "audience == 'public'".into();
+    inputs.push(input);
+    let mut input = count_request();
+    input.geo_filters = vec![GeoFilter {
+        column: "location".into(),
+        region: Some(geo_filter::Region::Bbox(GeoBbox {
+            min_lat: -1.,
+            max_lat: 1.,
+            min_lon: -1.,
+            max_lon: 1.,
+        })),
+    }];
+    inputs.push(input);
+    for actions in [vec![], vec![FieldAction::Use], vec![FieldAction::Disclose]] {
+        let fields = if actions.is_empty() {
+            FieldPermissions::default()
+        } else {
+            permissions(&[("boost", &actions)], false)
+        };
+        let reader = service(
+            coordinator.clone(),
+            Arc::new(PolicyAuthority::new(policy(Some(fields), true)).unwrap()),
+        );
+        for input in &inputs {
+            let error = SearchService::aggregate(&reader, request(input.clone()))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), Code::PermissionDenied, "{input:?}: {error}");
+            assert!(!error.message().contains("secret"));
+            assert!(!error.message().contains("audience"));
+        }
+    }
+    let network = CoordinatorServiceImpl::new(vec!["http://must-not-resolve.invalid:50051".into()]);
+    let reader = service(
+        network,
+        Arc::new(PolicyAuthority::new(policy(None, true)).unwrap()),
+    );
+    assert_eq!(
+        SearchService::aggregate(&reader, request(count_request()))
             .await
             .unwrap_err()
             .code(),

@@ -351,7 +351,6 @@ async fn uncertified_routes_and_network_nodes_refuse_before_execution() {
     denied!(hybrid_search, HybridSearchRequest::default());
     denied!(variant_search, VariantSearchRequest::default());
     denied!(query, QueryRequest::default());
-    denied!(aggregate, AggregateRequest::default());
     assert_eq!(
         SearchService::query_stream(&service, request(QueryStreamRequest::default(), "public"))
             .await
@@ -398,7 +397,7 @@ impl Authorizer for MovingView {
 #[tokio::test]
 async fn a_changed_view_cannot_disclose_an_already_computed_response() {
     let (coordinator, _) = cluster(false, false).await;
-    for route in 0..3 {
+    for route in 0..4 {
         let authority = Arc::new(MovingView {
             authority: PolicyAuthority::new(policy()).unwrap(),
             calls: AtomicUsize::new(0),
@@ -423,13 +422,30 @@ async fn a_changed_view_cannot_disclose_an_already_computed_response() {
             )
             .await
             .unwrap_err(),
-            _ => SearchService::term_suggest(
+            2 => SearchService::term_suggest(
                 &service,
                 request(
                     TermSuggestRequest {
                         field: "body".into(),
                         text: "alpa".into(),
                         analysis: Some(body_spec()),
+                        ..Default::default()
+                    },
+                    "public",
+                ),
+            )
+            .await
+            .unwrap_err(),
+            _ => SearchService::aggregate(
+                &service,
+                request(
+                    AggregateRequest {
+                        aggregations: vec![Aggregation {
+                            name: "count".into(),
+                            expression: "1".into(),
+                            op: AggregateOp::Count as i32,
+                            ..Default::default()
+                        }],
                         ..Default::default()
                     },
                     "public",

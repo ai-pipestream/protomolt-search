@@ -18,6 +18,11 @@ aggregations, each `(name, expression, op)` where the expression is
 exactly the projection dialect — arithmetic, the conditional layer,
 `math.*` / `engine.*` functions, map reads, everything.
 
+Private authorized Aggregate applies mandatory document and field grants. Its
+initial pass, every percentile round and final validation use one admitted
+physical read set; changes require restarting the operation. See
+[scoped folds](scoped-folds.md) for the protocol and authorization boundary.
+
 ## 1. The contract: exact, deterministic, loud
 
 Search engines traditionally treat aggregations as estimates

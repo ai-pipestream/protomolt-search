@@ -148,9 +148,11 @@ Authorization precedes coordinator cache lookup. Revoked callers cannot retrieve
 a previous cached response through the public service. Mandatory document views
 use separate statistics entries on the certified private-shard BM25 path.
 Dictionary routes apply the view before counting terms. Format-3 field checks
-precede cache access and guard disclosure on these private-shard routes. Broader
-retrieval and network-node delegation remain unfinished;
-unsupported restricted routes refuse.
+precede cache access and guard disclosure on these private-shard routes.
+[Private Aggregate](scoped-folds.md) also enforces document selection and field
+inputs through every percentile round and rechecks authority before disclosure.
+Broader retrieval and network-node delegation remain unfinished; unsupported
+restricted routes refuse.
 
 Library hosts can retain `Arc<PolicyAuthority>` and call `replace`, or supply an
 `Authorizer` through `Principals::with_authorizer`. The command-line bearer file

@@ -768,12 +768,12 @@ pub(crate) fn compile_projections(
 pub(crate) const DEFAULT_MAX_DISTINCT: u32 = 100_000;
 
 pub(crate) struct CompiledAggregate {
-    aggregations: Vec<crate::pb::CompiledAggregation>,
-    histograms: Vec<crate::pb::CompiledHistogram>,
-    percentiles: Vec<crate::pb::CompiledPercentile>,
-    percentile_specs: Vec<crate::pb::PercentileSpec>,
-    group_by: String,
-    max_groups: u32,
+    pub(crate) aggregations: Vec<crate::pb::CompiledAggregation>,
+    pub(crate) histograms: Vec<crate::pb::CompiledHistogram>,
+    pub(crate) percentiles: Vec<crate::pb::CompiledPercentile>,
+    pub(crate) percentile_specs: Vec<crate::pb::PercentileSpec>,
+    pub(crate) group_by: String,
+    pub(crate) max_groups: u32,
 }
 
 /// Compile the public aggregation list: names checked, ops decoded,
@@ -1889,7 +1889,10 @@ impl CoordinatorServiceImpl {
                 "restricted grants require search authorization",
             ));
         }
-        if !matches!(route, "bm25_search" | "suggest" | "term_suggest") {
+        if !matches!(
+            route,
+            "bm25_search" | "suggest" | "term_suggest" | "aggregate"
+        ) {
             return Err(Status::permission_denied(
                 "this route does not yet enforce document or field grants",
             ));
@@ -2891,6 +2894,25 @@ impl CoordinatorServiceImpl {
             .collect())
     }
 
+    async fn pin_read_versions(&self) -> Result<(Self, Vec<(String, StatsClaim)>), Status> {
+        let reads = self.read_query_versions(true).await?;
+        let mut pinned = self.clone();
+        pinned.node_addrs = reads.iter().map(|(address, _)| address.clone()).collect();
+        pinned.replica_addrs.clear();
+        pinned.query_read_versions =
+            Some(Arc::new(reads.iter().map(|(_, claim)| *claim).collect()));
+        Ok((pinned, reads))
+    }
+
+    async fn validate_read_versions(&self, reads: &[(String, StatsClaim)]) -> Result<(), Status> {
+        if self.read_query_versions(false).await? != reads {
+            return Err(Status::failed_precondition(
+                "query data changed during execution; restart from the first page",
+            ));
+        }
+        Ok(())
+    }
+
     /// Capture before selection and validate after every phase. Every shard's
     /// unchanged interval includes the interval between the two fan-outs;
     /// mutations or lifetime replacement invalidate the response, never retry
@@ -2902,20 +2924,15 @@ impl CoordinatorServiceImpl {
     ) -> Result<crate::pb::QueryResponse, Status> {
         let started = std::time::Instant::now();
         let mut cursor = self.bind_query_cursor(&mut request, access)?;
-        let mut scoped = self.clone();
-        let reads = self.read_query_versions(true).await?;
-        let versions: Vec<StatsClaim> = reads.iter().map(|(_, version)| *version).collect();
-        cursor.bind_read_versions(&versions)?;
-        scoped.node_addrs = reads.iter().map(|(address, _)| address.clone()).collect();
-        // All phases use the admitted copy. A failure requires a new whole query.
-        scoped.replica_addrs.clear();
-        scoped.query_read_versions = Some(Arc::new(versions));
+        let (scoped, reads) = self.pin_read_versions().await?;
+        cursor.bind_read_versions(
+            scoped
+                .query_read_versions
+                .as_ref()
+                .expect("pinned read versions"),
+        )?;
         let result = crate::query::execute(&scoped, request).await;
-        if scoped.read_query_versions(false).await? != reads {
-            return Err(Status::failed_precondition(
-                "query data changed during execution; restart from the first page",
-            ));
-        }
+        scoped.validate_read_versions(&reads).await?;
         let mut response = result?;
         cursor.finish(&mut response)?;
         response.served_topology_generation = scoped.topology_generation;
@@ -8664,13 +8681,40 @@ impl CoordinatorServiceImpl {
     ) -> Result<BrowseRows, Status> {
         use crate::sortkeys::{cmp_rows, Key, Value};
         let k = self.resolve_k(k)?;
-        let mask = self.shard_mask(filters.tree.as_ref());
+        if let Some(fields) = &self.field_permissions {
+            fields.browse(filters, sort, lexical_terms)?;
+        }
+        if self.query_read_versions.is_none() {
+            let (pinned, reads) = self.pin_read_versions().await?;
+            let result = Box::pin(pinned.fanout_browse(
+                k,
+                after,
+                sort,
+                lexical_terms,
+                analysis_fingerprint,
+                filters,
+            ))
+            .await;
+            pinned.validate_read_versions(&reads).await?;
+            return result;
+        }
+        let scope = crate::visibility::VisibilityScope::new(self.document_visibility.as_ref())?;
+        let mut visibility_known = vec![false; scope.column_count()];
+        let mask = self
+            .document_visibility
+            .is_none()
+            .then(|| self.shard_mask(filters.tree.as_ref()))
+            .flatten();
         let mut tasks = Vec::with_capacity(self.node_addrs.len());
         for (shard, node) in self.node_addrs.iter().enumerate() {
             if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
                 continue;
             }
+            let claim = self.query_read_versions.as_ref().expect("pinned read set")[shard];
             let request = crate::pb::BrowseShardRequest {
+                visibility: self.document_visibility.clone(),
+                expected_stats_epoch: claim.epoch,
+                expected_stats_incarnation: claim.incarnation(),
                 analysis_fingerprint,
                 k,
                 after: after.as_ref().map_or(0, |a| a.id),
@@ -8685,9 +8729,12 @@ impl CoordinatorServiceImpl {
                 lexical_terms: lexical_terms.to_vec(),
             };
             let client = self.node_client(node);
-            tasks.push(tokio::spawn(async move {
-                client?.browse_shard(request).await.map(|r| r.into_inner())
-            }));
+            tasks.push((
+                shard,
+                tokio::spawn(
+                    async move { client?.browse_shard(request).await.map(|r| r.into_inner()) },
+                ),
+            ));
         }
         let mut known = Self::filter_known(filters, mask.as_ref());
         let mut sort_known = vec![false; sort.len()];
@@ -8699,10 +8746,11 @@ impl CoordinatorServiceImpl {
         }
         let mut rows: Vec<Row> = Vec::new();
         let mut prune = crate::segment_prune::PruneStats::default();
-        for task in tasks {
+        for (shard, task) in tasks {
             let response = task
                 .await
                 .map_err(|e| Status::internal(format!("browse task failed: {e}")))??;
+            self.check_read_view(shard, &scope, &response, &mut visibility_known)?;
             known.merge(&response.geo_columns_known, &response.filter_columns_known)?;
             prune.add(crate::segment_prune::PruneStats {
                 segments_total: response.segments_total,
@@ -8785,6 +8833,7 @@ impl CoordinatorServiceImpl {
                 rows.push(Row { keys, values, id });
             }
         }
+        self.check_visibility_columns(&visibility_known)?;
         known.refuse_unknown(filters)?;
         for (sort, known) in sort.iter().zip(&sort_known) {
             if !known {
@@ -8923,26 +8972,24 @@ impl CoordinatorServiceImpl {
         }
     }
 
-    fn check_membership_view(
+    fn check_read_view(
         &self,
         shard: usize,
         scope: &crate::visibility::VisibilityScope,
-        response: &crate::pb::MembershipBitmapResponse,
+        response: &impl crate::visibility::ScopedReadResponse,
         known: &mut [bool],
     ) -> Result<StatsClaim, Status> {
-        scope.validate_echo(
-            &response.visibility_fingerprint,
-            &response.visibility_columns_known,
-        )?;
-        let claim = StatsClaim::required(response.stats_epoch, &response.stats_incarnation)?;
+        let response = response.read_view();
+        scope.validate_echo(response.fingerprint, response.columns_known)?;
+        let claim = StatsClaim::required(response.epoch, response.incarnation)?;
         if let Some(expected) = &self.query_read_versions {
             if expected.get(shard) != Some(&claim) {
                 return Err(Status::failed_precondition(
-                    "query data changed during membership planning; restart from the first page",
+                    "query data changed during scoped read; restart from the first page",
                 ));
             }
         }
-        for (held, present) in known.iter_mut().zip(&response.visibility_columns_known) {
+        for (held, present) in known.iter_mut().zip(response.columns_known) {
             *held |= present;
         }
         Ok(claim)
@@ -9003,7 +9050,7 @@ impl CoordinatorServiceImpl {
             });
             let response = Self::membership_from_filter(response);
             merged.epochs[shard] =
-                self.check_membership_view(shard, &scope, &response, &mut visibility_known)?;
+                self.check_read_view(shard, &scope, &response, &mut visibility_known)?;
             Self::merge_membership_bitmap(&mut merged, &response)?;
         }
         self.check_visibility_columns(&visibility_known)?;
@@ -9074,7 +9121,7 @@ impl CoordinatorServiceImpl {
             let response = task.await.map_err(|error| {
                 Status::internal(format!("lexical membership task failed: {error}"))
             })??;
-            merged.epochs.push(self.check_membership_view(
+            merged.epochs.push(self.check_read_view(
                 shard,
                 &scope,
                 &response,
@@ -9120,7 +9167,7 @@ impl CoordinatorServiceImpl {
             let response = task.await.map_err(|error| {
                 Status::internal(format!("vector membership task failed: {error}"))
             })??;
-            merged.epochs.push(self.check_membership_view(
+            merged.epochs.push(self.check_read_view(
                 shard,
                 &scope,
                 &response,
@@ -9186,7 +9233,7 @@ impl CoordinatorServiceImpl {
             })??;
             known.merge(&response.geo_columns_known, &response.filter_columns_known)?;
             let response = Self::membership_from_filter(response);
-            self.check_membership_view(shard, &scope, &response, &mut visibility_known)?;
+            self.check_read_view(shard, &scope, &response, &mut visibility_known)?;
             if response.label_count == 0 {
                 if !response.bits.is_empty() {
                     return Err(Status::internal(
@@ -9737,6 +9784,17 @@ impl CoordinatorServiceImpl {
         compiled: &CompiledAggregate,
         doc_ids: Option<&[u64]>,
     ) -> Result<crate::pb::AggregateResponse, Status> {
+        if let Some(fields) = &self.field_permissions {
+            fields.aggregate(filters, compiled)?;
+        }
+        if self.query_read_versions.is_none() {
+            let (pinned, reads) = self.pin_read_versions().await?;
+            let result = Box::pin(pinned.fanout_aggregate(filters, compiled, doc_ids)).await;
+            pinned.validate_read_versions(&reads).await?;
+            return result;
+        }
+        let scope = crate::visibility::VisibilityScope::new(self.document_visibility.as_ref())?;
+        let mut visibility_known = vec![false; scope.column_count()];
         let CompiledAggregate {
             aggregations,
             histograms,
@@ -9747,13 +9805,21 @@ impl CoordinatorServiceImpl {
         } = compiled;
         let grouping = !group_by.is_empty();
         let group_cap = *max_groups as usize;
-        let mask = self.shard_mask(filters.tree.as_ref());
+        let mask = self
+            .document_visibility
+            .is_none()
+            .then(|| self.shard_mask(filters.tree.as_ref()))
+            .flatten();
         let mut tasks = Vec::with_capacity(self.node_addrs.len());
         for (shard, node) in self.node_addrs.iter().enumerate() {
             if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
                 continue;
             }
+            let claim = self.query_read_versions.as_ref().expect("pinned read set")[shard];
             let request = crate::pb::AggregateShardRequest {
+                visibility: self.document_visibility.clone(),
+                expected_stats_epoch: claim.epoch,
+                expected_stats_incarnation: claim.incarnation(),
                 filter: filters.tree.clone(),
                 geo_filters: filters.geo.clone(),
                 aggregations: aggregations.to_vec(),
@@ -9765,12 +9831,15 @@ impl CoordinatorServiceImpl {
                 restrict_doc_ids: doc_ids.is_some(),
             };
             let client = self.node_client(node);
-            tasks.push(tokio::spawn(async move {
-                client?
-                    .aggregate_shard(request)
-                    .await
-                    .map(|r| r.into_inner())
-            }));
+            tasks.push((
+                shard,
+                tokio::spawn(async move {
+                    client?
+                        .aggregate_shard(request)
+                        .await
+                        .map(|r| r.into_inner())
+                }),
+            ));
         }
         // The same leaf enumeration the shards answer positionally:
         // aggregations first, then histograms.
@@ -9799,10 +9868,11 @@ impl CoordinatorServiceImpl {
         let mut hist_present = vec![0u64; histograms.len()];
         let mut hist_unbucketable = vec![0u64; histograms.len()];
         let mut pct_merged: Vec<PctMerge> = percentiles.iter().map(|_| PctMerge::new()).collect();
-        for task in tasks {
+        for (shard, task) in tasks {
             let response = task
                 .await
                 .map_err(|e| Status::internal(format!("aggregate task failed: {e}")))??;
+            self.check_read_view(shard, &scope, &response, &mut visibility_known)?;
             known.merge(&response.geo_columns_known, &response.filter_columns_known)?;
             if response.expr_leaves_known.len() != leaves_known.len() {
                 return Err(Status::internal(format!(
@@ -9896,6 +9966,7 @@ impl CoordinatorServiceImpl {
                 }
             }
         }
+        self.check_visibility_columns(&visibility_known)?;
         known.refuse_unknown(filters)?;
         for (leaf, k) in leaves.iter().zip(&leaves_known) {
             if !k {
@@ -10090,13 +10161,26 @@ impl CoordinatorServiceImpl {
         targets: &[crate::pb::QuantileTarget],
         doc_ids: Option<&[u64]>,
     ) -> Result<Vec<u64>, Status> {
-        let mask = self.shard_mask(filters.tree.as_ref());
+        let scope = crate::visibility::VisibilityScope::new(self.document_visibility.as_ref())?;
+        let mut visibility_known = vec![false; scope.column_count()];
+        let claims = self
+            .query_read_versions
+            .as_ref()
+            .ok_or_else(|| Status::internal("quantile rounds require a pinned read set"))?;
+        let mask = self
+            .document_visibility
+            .is_none()
+            .then(|| self.shard_mask(filters.tree.as_ref()))
+            .flatten();
         let mut tasks = Vec::with_capacity(self.node_addrs.len());
         for (shard, node) in self.node_addrs.iter().enumerate() {
             if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
                 continue;
             }
             let request = crate::pb::QuantileCountsRequest {
+                visibility: self.document_visibility.clone(),
+                expected_stats_epoch: claims[shard].epoch,
+                expected_stats_incarnation: claims[shard].incarnation(),
                 filter: filters.tree.clone(),
                 geo_filters: filters.geo.clone(),
                 exprs: exprs.to_vec(),
@@ -10105,18 +10189,22 @@ impl CoordinatorServiceImpl {
                 restrict_doc_ids: doc_ids.is_some(),
             };
             let client = self.node_client(node);
-            tasks.push(tokio::spawn(async move {
-                client?
-                    .quantile_counts(request)
-                    .await
-                    .map(|r| r.into_inner())
-            }));
+            tasks.push((
+                shard,
+                tokio::spawn(async move {
+                    client?
+                        .quantile_counts(request)
+                        .await
+                        .map(|r| r.into_inner())
+                }),
+            ));
         }
         let mut totals = vec![0u64; targets.len()];
-        for task in tasks {
+        for (shard, task) in tasks {
             let response = task
                 .await
                 .map_err(|e| Status::internal(format!("quantile task failed: {e}")))??;
+            self.check_read_view(shard, &scope, &response, &mut visibility_known)?;
             if response.counts.len() != totals.len() {
                 return Err(Status::internal(format!(
                     "shard answered {} quantile counts for {} targets",
@@ -10128,6 +10216,7 @@ impl CoordinatorServiceImpl {
                 *total += *c;
             }
         }
+        self.check_visibility_columns(&visibility_known)?;
         Ok(totals)
     }
 
@@ -11218,6 +11307,9 @@ impl PlanCounter<'_> {
         let mut tasks = Vec::with_capacity(self.coordinator.node_addrs.len());
         for node in &self.coordinator.node_addrs {
             let request = crate::pb::AggregateShardRequest {
+                visibility: None,
+                expected_stats_epoch: 0,
+                expected_stats_incarnation: Vec::new(),
                 filter: filters.tree.clone(),
                 geo_filters: Vec::new(),
                 aggregations: vec![count.clone()],
@@ -13922,7 +14014,7 @@ mod candidate_fetch_tests {
             assert_eq!(error.code(), tonic::Code::FailedPrecondition);
             assert!(error
                 .message()
-                .contains("query data changed during membership"));
+                .contains("query data changed during scoped read"));
         }
         let mut absent = doc_only;
         absent.document_visibility = Some(DocumentVisibility {
@@ -13969,7 +14061,7 @@ mod candidate_fetch_tests {
             let mut known = vec![false];
             assert_eq!(
                 owner
-                    .check_membership_view(0, &scope, &malformed, &mut known)
+                    .check_read_view(0, &scope, &malformed, &mut known)
                     .unwrap_err()
                     .code(),
                 tonic::Code::FailedPrecondition
@@ -13979,7 +14071,7 @@ mod candidate_fetch_tests {
         let mut known = vec![false];
         assert_eq!(
             owner
-                .check_membership_view(0, &scope, &valid, &mut known)
+                .check_read_view(0, &scope, &valid, &mut known)
                 .unwrap(),
             StatsClaim::required(4, &[1; 32]).unwrap()
         );
@@ -14237,5 +14329,216 @@ mod unsigned_aggregate_tests {
             .unwrap_err()
             .message()
             .contains("sum overflows u128"));
+    }
+}
+
+#[cfg(test)]
+mod scoped_fold_tests {
+    use super::*;
+    use crate::pb::*;
+
+    #[tokio::test]
+    async fn browse_checks_fields_before_io_and_uses_the_authority_view() {
+        let node = Arc::new(crate::node::NodeServiceImpl::new(
+            None,
+            crate::node::NodeConfig {
+                analysis_addr: Some(crate::analyzer::NATIVE_ANALYSIS_BACKEND.into()),
+                facet_fields: vec!["audience".into(), "color".into()],
+                ..Default::default()
+            },
+        ));
+        let mut link = crate::link::NodeLink::local(node.clone());
+        for (audience, color) in [("public", "red"), ("private", "blue")] {
+            link.add_documents(tokio_stream::iter([AddDocumentsRequest {
+                text: "alpha".into(),
+                analysis: Some(crate::analyzer::body_spec()),
+                facets: vec![
+                    FacetValue {
+                        field: "audience".into(),
+                        value: audience.into(),
+                    },
+                    FacetValue {
+                        field: "color".into(),
+                        value: color.into(),
+                    },
+                ],
+                ..Default::default()
+            }]))
+            .await
+            .unwrap();
+        }
+        let owner = CoordinatorServiceImpl::with_local_nodes(vec![node]);
+        let access = AccessDecision {
+            action: AccessAction::Search as i32,
+            document_visibility: Some(DocumentVisibility {
+                filter: crate::cel::compile_filter("audience == 'public'").unwrap(),
+            }),
+            field_permissions: Some(FieldPermissions {
+                grants: vec![
+                    FieldGrant {
+                        field: "body".into(),
+                        actions: vec![FieldAction::Use as i32],
+                    },
+                    FieldGrant {
+                        field: "color".into(),
+                        actions: vec![FieldAction::Use as i32, FieldAction::Disclose as i32],
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let reader = owner.for_access(Some(&access), "aggregate").unwrap();
+        let sort = [BrowseSort {
+            column: "color".into(),
+            descending: false,
+        }];
+        let rows = reader
+            .fanout_browse(10, None, &sort, &[], 0, &RequestFilters::default())
+            .await
+            .unwrap();
+        assert_eq!(rows.ids, vec![0]);
+        assert_eq!(
+            rows.values,
+            vec![vec![crate::sortkeys::Value::Text("red".into())]]
+        );
+        assert!(reader
+            .fanout_browse(
+                10,
+                None,
+                &sort,
+                &[],
+                0,
+                &RequestFilters::compile(&[], "color == 'blue'").unwrap()
+            )
+            .await
+            .unwrap()
+            .ids
+            .is_empty());
+        let (pinned, _) = reader.pin_read_versions().await.unwrap();
+        link.add_documents(tokio_stream::iter([AddDocumentsRequest {
+            text: "changed".into(),
+            analysis: Some(crate::analyzer::body_spec()),
+            ..Default::default()
+        }]))
+        .await
+        .unwrap();
+        assert_eq!(
+            pinned
+                .fanout_browse(10, None, &[], &[], 0, &RequestFilters::default())
+                .await
+                .err()
+                .unwrap()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        // Even a broken transport must not be touched for a forbidden input.
+        let mut denied = reader;
+        denied.node_addrs = vec!["http://must-not-resolve.invalid:50051".into()];
+        for (sort, terms, filter) in [
+            (
+                vec![BrowseSort {
+                    column: "body".into(),
+                    descending: false,
+                }],
+                vec![],
+                "",
+            ),
+            (vec![], vec![], "audience == 'public'"),
+            (
+                vec![BrowseSort {
+                    column: "parent_id".into(),
+                    descending: false,
+                }],
+                vec![],
+                "",
+            ),
+        ] {
+            assert_eq!(
+                denied
+                    .fanout_browse(
+                        10,
+                        None,
+                        &sort,
+                        &terms,
+                        0,
+                        &RequestFilters::compile(&[], filter).unwrap()
+                    )
+                    .await
+                    .err()
+                    .unwrap()
+                    .code(),
+                tonic::Code::PermissionDenied
+            );
+        }
+        denied.field_permissions =
+            Some(crate::field_permissions::FieldScope::new(&FieldPermissions::default()).unwrap());
+        assert_eq!(
+            denied
+                .fanout_browse(
+                    10,
+                    None,
+                    &[],
+                    &["alpha".into()],
+                    0,
+                    &RequestFilters::default()
+                )
+                .await
+                .err()
+                .unwrap()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn fold_response_metadata_is_required_before_any_partial_is_merged() {
+        let view = DocumentVisibility {
+            filter: crate::cel::compile_filter("audience == 'public'").unwrap(),
+        };
+        let scope = crate::visibility::VisibilityScope::new(Some(&view)).unwrap();
+        let mut owner = CoordinatorServiceImpl::with_local_nodes(vec![]);
+        owner.query_read_versions =
+            Some(Arc::new(vec![StatsClaim::required(4, &[1; 32]).unwrap()]));
+        macro_rules! verify {
+            ($ty:ident) => {{
+                let valid = $ty {
+                    stats_epoch: 4,
+                    stats_incarnation: vec![1; 32],
+                    visibility_fingerprint: scope.fingerprint().to_vec(),
+                    visibility_columns_known: vec![true],
+                    ..Default::default()
+                };
+                for case in 0..7 {
+                    let mut response = valid.clone();
+                    match case {
+                        0 => response.visibility_fingerprint.clear(),
+                        1 => response.visibility_fingerprint = vec![5; 32],
+                        2 => response.visibility_columns_known.clear(),
+                        3 => response.stats_epoch = 0,
+                        4 => response.stats_incarnation.clear(),
+                        5 => response.stats_epoch += 1,
+                        _ => response.stats_incarnation = vec![2; 32],
+                    }
+                    let mut known = vec![false];
+                    assert_eq!(
+                        owner
+                            .check_read_view(0, &scope, &response, &mut known)
+                            .unwrap_err()
+                            .code(),
+                        tonic::Code::FailedPrecondition
+                    );
+                    assert_eq!(known, vec![false]);
+                }
+                let mut known = vec![false];
+                owner
+                    .check_read_view(0, &scope, &valid, &mut known)
+                    .unwrap();
+                assert_eq!(known, vec![true]);
+            }};
+        }
+        verify!(BrowseShardResponse);
+        verify!(AggregateShardResponse);
+        verify!(QuantileCountsResponse);
     }
 }

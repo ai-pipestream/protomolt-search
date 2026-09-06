@@ -1,9 +1,9 @@
 # Mandatory document grants
 
 The 2026-09-06 feature-branch increments add revisioned document grants to the
-public collection authority. Certified execution covers `Bm25Search`, `Suggest`
-and `TermSuggest` over private in-process shards. BM25 includes prefix expansion,
-flat and fused fields, the internal streaming scorer, facets, supported
+public collection authority. Certified execution covers `Bm25Search`, `Suggest`,
+`TermSuggest` and [Aggregate](scoped-folds.md) over private in-process shards.
+BM25 includes prefix expansion, flat and fused fields, the internal streaming scorer, facets, supported
 projections, snippets and score explains. Other retrieval routes, network-node
 delegation and RAG disclosure remain required work. [Field grants](field-grants.md)
 now apply to these same private-shard routes.
@@ -70,7 +70,7 @@ measurements, not a claim that no segments were consulted.
 ## Current boundaries
 
 A restricted search decision refuses `Search`, `PhraseSearch`, `HybridSearch`,
-`VariantSearch`, `Query`, `QueryStream` and `Aggregate` before execution.
+`VariantSearch`, `Query` and `QueryStream` before execution.
 The supported dictionary routes and BM25 prefix expansion apply the document view
 before counting terms or documents. Configured synonym rules continue to expand
 query terms independently of the corpus dictionary.
