@@ -329,6 +329,39 @@ async fn multiple_streams_keep_each_spec_with_its_own_documents() {
 }
 
 /// An empty batch opens no streams and returns nothing.
+/// The bulk path reads the server's end of stream before it lets a
+/// stream go. A stream dropped with its results in hand but the
+/// trailers unread is a RST_STREAM on the wire, and a replay that ends
+/// several hundred batch streams a second that way trips the sidecar's
+/// rapid-reset guard (the archive split of 2026-09-06 died twenty
+/// minutes in with ENHANCE_YOUR_CALM). The mock holds each stream open
+/// after its last result: the batch must not complete until the server
+/// ends the streams, and must complete once it does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_batch_waits_for_the_servers_end_of_stream() {
+    use pipestream_search::harness::mock_analysis::start_mock_analysis_gated;
+    let (addr, gate, server) = start_mock_analysis_gated().await;
+    let docs: Vec<(
+        &str,
+        Option<&AnalysisSpec>,
+        pipestream_search::analyzer::SessionLayers,
+    )> = TEXTS[..3]
+        .iter()
+        .map(|t| (*t, None, Default::default()))
+        .collect();
+    let mut call = Box::pin(analyze_batch_streams(&addr, &docs, 2));
+    let early = tokio::time::timeout(std::time::Duration::from_millis(300), &mut call).await;
+    assert!(
+        early.is_err(),
+        "the batch completed while the server still held its streams open"
+    );
+    // Two streams for three documents: one permit each.
+    gate.add_permits(2);
+    let batch = call.await.unwrap();
+    assert_eq!(batch.len(), 3);
+    server.abort();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_empty_batch_is_not_an_error() {
     let (addr, server) = start_mock_analysis().await;

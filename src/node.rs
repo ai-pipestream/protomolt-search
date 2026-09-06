@@ -10667,6 +10667,9 @@ impl NodeServiceImpl {
                         while pending.len() > results.len() {
                             store_result(&mut results, session.next().await?)?;
                         }
+                        // Every result is in hand; read the server's end
+                        // so the stream closes without a reset.
+                        session.drain_to_end().await?;
                         self.advance_apply(
                             &mut pending,
                             &mut results,

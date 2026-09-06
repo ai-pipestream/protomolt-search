@@ -1377,7 +1377,26 @@ impl AnalyzeStream {
             take(self.next().await?, &mut out)?;
             received += 1;
         }
+        self.drain_to_end().await?;
         Ok(out)
+    }
+
+    /// Read the server's end of the stream once every result is in
+    /// hand. A stream dropped with its trailers unread is a
+    /// RST_STREAM on the wire, and a bulk replay that ends thousands
+    /// of batch streams a minute that way trips the sidecar's
+    /// rapid-reset guard: the archive split of 2026-09-06 died twenty
+    /// minutes in with ENHANCE_YOUR_CALM (RESOURCE_EXHAUSTED at the
+    /// client) after about 600 stream resets a second. A result after
+    /// the last expected one is a protocol error, named.
+    pub async fn drain_to_end(&mut self) -> Result<(), Status> {
+        match self.next().await? {
+            None => Ok(()),
+            Some((sequence, _)) => Err(Status::internal(format!(
+                "analysis stream answered sequence {sequence} after every submitted document \
+                 was answered"
+            ))),
+        }
     }
 
     /// Half-close the submission side. Once every [`submitter`] clone

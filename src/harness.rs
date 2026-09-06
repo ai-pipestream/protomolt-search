@@ -463,6 +463,11 @@ pub mod mock_analysis {
         /// no analysis (docs/highlighting.md).
         pub calls: Arc<AtomicU64>,
         unary_delay: Option<(Duration, AnalysisDelayProbe)>,
+        /// When set, an `AnalyzeStream` call sends its last result and
+        /// then holds its response stream open until a permit arrives:
+        /// the shape that shows whether a client reads the server's end
+        /// of stream or lets the stream go with the trailers unread.
+        pub stream_end_gate: Option<Arc<tokio::sync::Semaphore>>,
     }
 
     impl Default for MockAnalysis {
@@ -473,6 +478,7 @@ pub mod mock_analysis {
                 dual_identity: true,
                 calls: Arc::new(AtomicU64::new(0)),
                 unary_delay: None,
+                stream_end_gate: None,
             }
         }
     }
@@ -768,6 +774,7 @@ pub mod mock_analysis {
             let sentence_layer = self.sentence_layer;
             let dual_identity = self.dual_identity;
             let calls = self.calls.clone();
+            let gate = self.stream_end_gate.clone();
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<AnalyzeStreamResponse, Status>>(16);
             tokio::spawn(async move {
                 let mut options: Option<AnalysisOptions> = None;
@@ -843,6 +850,12 @@ pub mod mock_analysis {
                 if let Some(last) = held {
                     let _ = tx.send(Ok(last)).await;
                 }
+                if let Some(gate) = gate {
+                    // Hold the stream open past its last result until the
+                    // test releases it; the sender drops after.
+                    let permit = gate.acquire().await;
+                    drop(permit);
+                }
             });
             Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
         }
@@ -862,6 +875,23 @@ pub mod mock_analysis {
     /// Start the mock on 127.0.0.1:0; returns its `http://` address.
     pub async fn start_mock_analysis() -> (String, JoinHandle<Result<(), TransportError>>) {
         start_mock(MockAnalysis::default()).await
+    }
+
+    /// A mock whose `AnalyzeStream` calls hold their response stream
+    /// open after the last result until the returned gate grants a
+    /// permit (one per stream).
+    pub async fn start_mock_analysis_gated() -> (
+        String,
+        Arc<tokio::sync::Semaphore>,
+        JoinHandle<Result<(), TransportError>>,
+    ) {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (addr, handle) = start_mock(MockAnalysis {
+            stream_end_gate: Some(Arc::clone(&gate)),
+            ..MockAnalysis::default()
+        })
+        .await;
+        (addr, gate, handle)
     }
 
     /// A normal mock whose unary `Analyze` method pauses for `delay`.
