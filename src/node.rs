@@ -551,6 +551,7 @@ struct LegResults {
     bm25: RawLeg,
     geo_columns_known: Vec<bool>,
     filter_columns_known: Vec<bool>,
+    read_receipt: Option<crate::pb::VectorReadReceipt>,
 }
 
 /// The BM25 half's two storage shapes: the heap builder used during
@@ -7805,6 +7806,7 @@ impl NodeServiceImpl {
         expected_stats_epoch: u64,
         expected_stats_incarnation: &[u8],
         filters: &LegFilters<'_>,
+        read_context: Option<&crate::pb::VectorReadContext>,
     ) -> Result<LegResults, Status> {
         let guard = read_shard(&self.state);
         if !terms.is_empty() {
@@ -7818,13 +7820,12 @@ impl NodeServiceImpl {
         let (geo_columns_known, filter_columns_known) =
             filter_known_flags(guard.bm25.as_ref(), filters.geo, filters.tree);
         let slots = guard.index.as_ref().map_or(0, |index| index.len());
-        let (doc_filter, allow, _prune) = resolve_shard_filters(
-            guard.bm25.as_ref(),
-            guard.live_docs.words(),
+        let ((doc_filter, allow, _prune), read_receipt) = guard.vector_scan_filters(
             slots,
             filters.geo,
             &filters.regions,
             filters.tree,
+            read_context,
             self.knobs.segment_pruning(),
         )?;
 
@@ -7923,6 +7924,7 @@ impl NodeServiceImpl {
             bm25: bm25_leg,
             geo_columns_known,
             filter_columns_known,
+            read_receipt,
         })
     }
 
@@ -7966,6 +7968,7 @@ impl NodeServiceImpl {
                 regions: geo_regions,
                 tree: req.filter.as_ref(),
             },
+            req.read_context.as_ref(),
         )?;
         let geo_columns_known = legs.geo_columns_known;
         let filter_columns_known = legs.filter_columns_known;
@@ -7998,6 +8001,7 @@ impl NodeServiceImpl {
                 .collect(),
             geo_columns_known,
             filter_columns_known,
+            read_receipt: legs.read_receipt,
         })
     }
 }
@@ -14093,6 +14097,7 @@ impl NodeService for NodeServiceImpl {
                         regions: geo_regions,
                         tree: req.filter.as_ref(),
                     },
+                    req.read_context.as_ref(),
                 )?;
                 Ok(ShardLegsResponse {
                     vector_hits: legs
@@ -14113,6 +14118,7 @@ impl NodeService for NodeServiceImpl {
                         .collect(),
                     geo_columns_known: legs.geo_columns_known,
                     filter_columns_known: legs.filter_columns_known,
+                    read_receipt: legs.read_receipt,
                 })
             })
             .await

@@ -3,7 +3,7 @@
 Foundation work began on `feat/search-foundations` from `PRE_ASTRA`.
 Current implementation branch: `feat/query-field-authorization-2026-09`.
 The main reconciliation checkpoint remains `1565d07` on
-`feat/protobuf-unsigned-numerics-2026-09` for independent review.
+`feat/protobuf-unsigned-numerics-2026-09`, accepted for main on 2026-09-06.
 This tracks the full requested foundation. Individual passing increments do not
 establish completion of the three workstreams.
 
@@ -1016,3 +1016,15 @@ Validation passed 1,181 tests with one existing live-sidecar test ignored, plus
 all five mobile compile targets. The exact scope and evidence are recorded in
 [Field grants](field-grants.md). The source checkpoint remains separate from
 main and the earlier reconciliation branch.
+
+## Hybrid field-binding integration
+
+The raw hybrid selection routes now carry the same durable field/view/version
+contract as direct vector reads. Raw legs compose receipts through relays;
+local two-level fusion captures its receipt under the same guard as both lists.
+All participating shards, including empty or disabled legs, acknowledge the
+binding before the coordinator publishes results. Public field-granted query
+and stream tests cover RRF, score blend, decomposed scoring and cascade, with
+same-dimension binding mismatches rejected before provisional hits. See
+[hybrid read views](hybrid-read-views.md). The broader document-query and network
+authorization work remains incomplete.

@@ -91,3 +91,6 @@ compilation, formatting and vendored-proto identity checks passed. Descriptor
 comparison against `7fddc56` confirms exactly twenty additive fields with all
 existing declarations unchanged. Source, build and test hashes were unchanged
 through validation. No fleet benchmark, deployment or device-runtime test ran.
+
+The [hybrid read integration](hybrid-read-views.md) extends these receipts to raw
+hybrid legs and local fusion, with relay composition for the raw-leg route.

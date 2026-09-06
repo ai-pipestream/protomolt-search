@@ -5680,6 +5680,16 @@ impl CoordinatorServiceImpl {
         debug: bool,
         filters: &RequestFilters,
     ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
+        self.check_vector_scan(filters, false)?;
+        if self.scoped_vector_scan() && self.query_read_versions.is_none() {
+            let (pinned, reads) = self.pin_read_versions().await?;
+            let result = Box::pin(
+                pinned.fanout_hybrid(request_id, text, vector, k, spec, legs, debug, filters),
+            )
+            .await;
+            pinned.validate_read_versions(&reads).await?;
+            return result;
+        }
         let analysis_fingerprint = crate::analyzer::analysis_fingerprint(spec);
         if k == 0 || vector.is_empty() {
             return Ok((Vec::new(), None));
@@ -5901,6 +5911,7 @@ impl CoordinatorServiceImpl {
                 continue;
             }
             let request = ShardLegsRequest {
+                read_context: None,
                 analysis_fingerprint,
                 request_id: request_id.to_string(),
                 k: legs.leg_k,
@@ -6076,13 +6087,15 @@ impl CoordinatorServiceImpl {
         }
         let t_legs = std::time::Instant::now();
         let (leg_vector, leg_terms, leg_dfs) = leg_payloads(vector, terms, global, legs);
-        let mask = self.shard_mask(filters.tree.as_ref());
+        let admission = self.vector_read_barrier()?;
+        let mask = self.vector_scan_mask(filters.tree.as_ref());
         let mut shard_tasks = Vec::with_capacity(self.node_addrs.len());
         for (shard, node) in self.node_addrs.iter().enumerate() {
             if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
                 continue;
             }
             let request = ShardLegsRequest {
+                read_context: admission.as_ref().map(|a| a.context(shard)).transpose()?,
                 analysis_fingerprint,
                 request_id: String::new(),
                 k: legs.leg_k,
@@ -6119,6 +6132,15 @@ impl CoordinatorServiceImpl {
             let (shard, rpc_ms, response) = task
                 .await
                 .map_err(|e| Status::internal(format!("shard legs task failed: {e}")))??;
+            match (&admission, response.read_receipt.as_ref()) {
+                (Some(admission), Some(receipt)) => admission.accept(shard as usize, receipt)?,
+                (None, None) => {}
+                _ => {
+                    return Err(Status::failed_precondition(
+                        "hybrid leg read receipt mismatch",
+                    ))
+                }
+            }
             known.merge_shard(
                 shard as usize,
                 &response.geo_columns_known,
@@ -6159,6 +6181,9 @@ impl CoordinatorServiceImpl {
 
         // A filter name NO shard resolves is a typo, and it would read
         // as an honest empty result set on both legs at once.
+        if let Some(admission) = &admission {
+            admission.wait().await?;
+        }
         known.refuse_unknown(filters)?;
 
         let legs_ms = t_legs.elapsed().as_secs_f32() * 1e3;
@@ -6281,6 +6306,7 @@ impl CoordinatorServiceImpl {
                 continue;
             }
             let request = ShardLegsRequest {
+                read_context: None,
                 analysis_fingerprint,
                 request_id: request_id.to_string(),
                 k: legs.leg_k,
@@ -6459,13 +6485,15 @@ impl CoordinatorServiceImpl {
         let t_legs = std::time::Instant::now();
         // Level one: per-shard local fusion.
         let (leg_vector, leg_terms, leg_dfs) = leg_payloads(vector, terms, global, legs);
-        let mask = self.shard_mask(filters.tree.as_ref());
+        let admission = self.vector_read_barrier()?;
+        let mask = self.vector_scan_mask(filters.tree.as_ref());
         let mut shard_tasks = Vec::with_capacity(self.node_addrs.len());
         for (shard, node) in self.node_addrs.iter().enumerate() {
             if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
                 continue;
             }
             let request = HybridShardRequest {
+                read_context: admission.as_ref().map(|a| a.context(shard)).transpose()?,
                 analysis_fingerprint,
                 request_id: request_id.to_string(),
                 k: legs.leg_k,
@@ -6495,6 +6523,7 @@ impl CoordinatorServiceImpl {
                         r.hits,
                         r.geo_columns_known,
                         r.filter_columns_known,
+                        r.read_receipt,
                     )
                 })
             }));
@@ -6503,9 +6532,18 @@ impl CoordinatorServiceImpl {
         let mut shard_debug: Vec<HybridShardDebug> = Vec::new();
         let mut known = Self::filter_known(filters, mask.as_ref());
         for task in shard_tasks {
-            let (shard, rpc_ms, mut hits, geo_known, filter_known) = task
+            let (shard, rpc_ms, mut hits, geo_known, filter_known, receipt) = task
                 .await
                 .map_err(|e| Status::internal(format!("hybrid shard task failed: {e}")))??;
+            match (&admission, receipt.as_ref()) {
+                (Some(admission), Some(receipt)) => admission.accept(shard as usize, receipt)?,
+                (None, None) => {}
+                _ => {
+                    return Err(Status::failed_precondition(
+                        "hybrid fusion read receipt mismatch",
+                    ))
+                }
+            }
             known.merge(&geo_known, &filter_known)?;
             // Vector-score floor: drop non-qualifying docs from the
             // shard's fused list before level-two fusion.
@@ -6524,6 +6562,9 @@ impl CoordinatorServiceImpl {
                 });
             }
             shard_lists.push((shard, hits));
+        }
+        if let Some(admission) = &admission {
+            admission.wait().await?;
         }
         known.refuse_unknown(filters)?;
         let legs_ms = t_legs.elapsed().as_secs_f32() * 1e3;
@@ -15728,6 +15769,215 @@ mod vector_field_read_tests {
                             .code(),
                         tonic::Code::PermissionDenied
                     );
+                }
+            }
+        }
+    }
+
+    fn hybrid_query(strategy: selection_score_strategy::Strategy, field: &str) -> QueryRequest {
+        let operator = if matches!(strategy, selection_score_strategy::Strategy::Cascade(_)) {
+            SelectionOperator::Unspecified
+        } else {
+            SelectionOperator::Or
+        };
+        QueryRequest {
+            k: 4,
+            selection: Some(SelectionQuery {
+                node: Some(selection_query::Node::Composite(CompositeSearchStrategy {
+                    operator: operator as i32,
+                    clauses: vec![
+                        SelectionQuery {
+                            node: Some(selection_query::Node::Search(SearchQuery {
+                                id: "dense".into(),
+                                query: Some(search_query::Query::Dense(DenseQuery {
+                                    field: field.into(),
+                                    vector: vec![0.25; 16],
+                                    ..Default::default()
+                                })),
+                            })),
+                        },
+                        SelectionQuery {
+                            node: Some(selection_query::Node::Search(SearchQuery {
+                                id: "lexical".into(),
+                                query: Some(search_query::Query::Lexical(LexicalQuery {
+                                    text: "word".into(),
+                                    analysis: Some(crate::analyzer::body_spec()),
+                                    ..Default::default()
+                                })),
+                            })),
+                        },
+                    ],
+                    scoring: Some(SelectionScoreStrategy {
+                        strategy: Some(strategy),
+                    }),
+                })),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn public_hybrid_field_grants_validate_actual_bindings_in_every_fusion_mode() {
+        use selection_score_strategy::Strategy;
+        let mut decision = access("semantic", FieldAction::Use);
+        decision.document_visibility = None;
+        decision.field_permissions.as_mut().unwrap().grants.extend([
+            FieldGrant {
+                field: "body".into(),
+                actions: vec![FieldAction::Use as i32],
+            },
+            // A permitted name is still not proof the shard indexed that field.
+            FieldGrant {
+                field: "signal".into(),
+                actions: vec![FieldAction::Use as i32],
+            },
+        ]);
+        let cluster = |different| {
+            CoordinatorServiceImpl::with_local_nodes(vec![node(0, false), node(100, different)])
+                .with_bm25(
+                    Some(crate::analyzer::NATIVE_ANALYSIS_BACKEND.into()),
+                    Default::default(),
+                )
+        };
+        let owner = cluster(false);
+        let reader = owner.for_access(Some(&decision), "query").unwrap();
+        let incompatible = cluster(true).for_access(Some(&decision), "query").unwrap();
+        for strategy in [
+            Strategy::Rrf(RrfScore::default()),
+            Strategy::Rrf(RrfScore {
+                dense_weight: Some(0.0),
+                ..Default::default()
+            }),
+            Strategy::ScoreBlend(BlendScore::default()),
+            Strategy::Decomposed(DecomposedScore::default()),
+            Strategy::Cascade(CascadeScore {
+                gate_id: "dense".into(),
+            }),
+        ] {
+            let query = hybrid_query(strategy, "semantic");
+            let expected = SearchService::query(&owner, Request::new(query.clone()))
+                .await
+                .unwrap()
+                .into_inner();
+            let actual = SearchService::query(&reader, Request::new(query.clone()))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(!actual.hits.is_empty());
+            assert_eq!(actual.hits, expected.hits);
+            let error = SearchService::query(&incompatible, Request::new(query.clone()))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+            assert!(error.message().contains("binding"), "{error}");
+            use tokio_stream::StreamExt;
+            let mut stream = SearchService::query_stream(
+                &incompatible,
+                Request::new(QueryStreamRequest {
+                    query: Some(query.clone()),
+                    timeout_ms: 5_000,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+            let mut failed = false;
+            while let Some(frame) = stream.next().await {
+                match frame.unwrap().payload.unwrap() {
+                    query_stream_response::Payload::Revision(revision) => {
+                        assert!(revision.hits.is_empty())
+                    }
+                    query_stream_response::Payload::Completion(completion) => {
+                        assert!(!completion.completed);
+                        assert!(completion.response.is_none());
+                        assert_eq!(
+                            completion.error_code,
+                            tonic::Code::FailedPrecondition as u32
+                        );
+                        failed = true;
+                    }
+                }
+            }
+            assert!(failed);
+            let mut alias = query;
+            let Some(selection_query::Node::Composite(composite)) =
+                alias.selection.as_mut().unwrap().node.as_mut()
+            else {
+                unreachable!()
+            };
+            let Some(selection_query::Node::Search(leaf)) = composite.clauses[0].node.as_mut()
+            else {
+                unreachable!()
+            };
+            let Some(search_query::Query::Dense(dense)) = leaf.query.as_mut() else {
+                unreachable!()
+            };
+            dense.field = "signal".into();
+            let error = SearchService::query(&reader, Request::new(alias))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fused_legs_admit_empty_shards_and_apply_the_document_view_to_both_lists() {
+        let mut decision = access("semantic", FieldAction::Use);
+        decision
+            .field_permissions
+            .as_mut()
+            .unwrap()
+            .grants
+            .push(FieldGrant {
+                field: "body".into(),
+                actions: vec![FieldAction::Use as i32],
+            });
+        for mode in [FusionMode::GlobalRank, FusionMode::TwoLevel] {
+            for empty_incompatible in [false, true] {
+                let nodes = vec![node(0, false), node_rows(100, empty_incompatible, 0, 0)];
+                let reader = CoordinatorServiceImpl::with_local_nodes(nodes)
+                    .with_bm25(
+                        Some(crate::analyzer::NATIVE_ANALYSIS_BACKEND.into()),
+                        Default::default(),
+                    )
+                    .for_access(Some(&decision), "bm25_search")
+                    .unwrap()
+                    .for_vector_field("semantic")
+                    .unwrap();
+                let result = reader
+                    .fanout_hybrid(
+                        "scoped-legs",
+                        "word",
+                        &[0.25; 16],
+                        4,
+                        Some(&crate::analyzer::body_spec()),
+                        HybridLegs {
+                            leg_k: 4,
+                            vector_weight: 1.0,
+                            bm25_weight: 1.0,
+                            rrf_k: 60.0,
+                            fusion_mode: mode,
+                            normalization: fusion::Normalization::MinMax,
+                            combination: fusion::Combination::Arithmetic,
+                            min_vector_score: 0.0,
+                        },
+                        false,
+                        &RequestFilters::default(),
+                    )
+                    .await;
+                if empty_incompatible {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+                    assert!(error.message().contains("binding"), "{error}");
+                } else {
+                    let hits = result.unwrap().0;
+                    assert_eq!(
+                        hits.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(),
+                        vec![0]
+                    );
+                    assert!(hits[0].vector_rank.is_some());
+                    assert!(hits[0].bm25_rank.is_some());
                 }
             }
         }

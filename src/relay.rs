@@ -4040,12 +4040,30 @@ impl NodeService for RelayService {
                 &req.expected_stats_incarnation,
                 children.len(),
             )?;
+            let read_claims = req
+                .read_context
+                .as_ref()
+                .map(|context| {
+                    crate::visibility::VisibilityScope::new(context.visibility.as_ref())?;
+                    self.child_claims(
+                        context.expected_stats_epoch,
+                        &context.expected_stats_incarnation,
+                        children.len(),
+                    )
+                })
+                .transpose()?;
             let mut tasks = Vec::with_capacity(children.len());
             for (shard, addr) in children.iter().enumerate() {
                 let mut link = frozen.node_client(addr)?;
                 let mut child_req = req.clone();
                 child_req.expected_stats_epoch = claims[shard].epoch;
                 child_req.expected_stats_incarnation = claims[shard].incarnation();
+                if let (Some(context), Some(read_claims)) =
+                    (&mut child_req.read_context, &read_claims)
+                {
+                    context.expected_stats_epoch = read_claims[shard].epoch;
+                    context.expected_stats_incarnation = read_claims[shard].incarnation();
+                }
                 let addr = addr.clone();
                 tasks.push(tokio::spawn(async move {
                     let mut request = Request::new(child_req);
@@ -4065,10 +4083,28 @@ impl NodeService for RelayService {
             let mut merged = ShardLegsResponse::default();
             let mut geo_known = None;
             let mut filter_known = None;
+            let mut receipts = Vec::with_capacity(children.len());
+            let mut binding = None;
             for (shard, task) in tasks.into_iter().enumerate() {
                 let share = task
                     .await
                     .map_err(|e| Status::internal(format!("relay shard legs task: {e}")))??;
+                match (&req.read_context, share.read_receipt.as_ref()) {
+                    (Some(context), Some(receipt)) => {
+                        crate::vector_read::check_binding(
+                            &context.field,
+                            receipt.vector_binding.as_ref(),
+                            &mut binding,
+                        )?;
+                        receipts.push(receipt.clone());
+                    }
+                    (None, None) => {}
+                    _ => {
+                        return Err(Status::failed_precondition(
+                            "relay: hybrid leg read receipt mismatch",
+                        ))
+                    }
+                }
                 merge_known(
                     "geo-column",
                     shard,
@@ -4086,6 +4122,17 @@ impl NodeService for RelayService {
             }
             merged.geo_columns_known = geo_known.unwrap_or_default();
             merged.filter_columns_known = filter_known.unwrap_or_default();
+            if let Some(context) = &req.read_context {
+                let mut receipt = self.read_receipt(
+                    &pinned,
+                    children,
+                    context.visibility.as_ref(),
+                    read_claims.as_deref(),
+                    &receipts,
+                )?;
+                receipt.vector_binding = binding.flatten();
+                merged.read_receipt = Some(receipt);
+            }
             self.still_current(&pinned, "ShardLegs")?;
             Ok(Response::new(merged))
         })

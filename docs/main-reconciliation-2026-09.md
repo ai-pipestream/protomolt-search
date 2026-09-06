@@ -86,6 +86,16 @@ all public hit forms and the remaining source durability work are separate.
 
 ## Integration order
 
+**Accepted on 2026-09-06.** Checkpoint `1565d07` is accepted for main after
+independent review. The reconciliation hold is lifted. The integration task
+may advance main to that checkpoint, merge spill staging `39e9c0f` and relay
+folds `1f6d576`, validate the combined tree and push both remotes, then build
+and roll the fleet and execute the planned year-band split and partitioned
+compaction using the operational readiness and cutover checks. Those steps do
+not wait on the later field-authorization branch. The earlier checkpoint test
+results below do not substitute for testing the combined merge or verifying
+fleet readiness.
+
 The combined tests passed; publishing this feature branch is separate from
 merging it to main. The bounded
 re-placement split remains on its own branch. Recheck live main immediately

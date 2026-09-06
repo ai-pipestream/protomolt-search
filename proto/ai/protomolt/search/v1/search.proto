@@ -4396,6 +4396,8 @@ message HybridShardRequest {
   // 32-byte opaque lifetime identity, paired with the statistics epoch.
   // Nonzero claims require both; replacements generate a fresh identity.
   bytes expected_stats_incarnation = 17;
+  // Same opt-in read contract as ShardLegsRequest; both legs share the view.
+  VectorReadContext read_context = 18;
 }
 
 // One fused hit in a shard's hybrid result, with per-leg provenance.
@@ -4428,6 +4430,8 @@ message HybridShardResponse {
   // would otherwise read as an honest empty result set.
   repeated bool geo_columns_known = 2;
   repeated bool filter_columns_known = 3;
+  // Captured with the local fusion inputs under one physical read guard.
+  VectorReadReceipt read_receipt = 4;
 }
 
 // A second-pass lexical boost applied AFTER fusion (the rescore-window
@@ -4633,6 +4637,10 @@ message ShardLegsRequest {
   // 32-byte opaque lifetime identity, paired with the statistics epoch.
   // Nonzero claims require both; replacements generate a fresh identity.
   bytes expected_stats_incarnation = 14;
+  // Trusted planner's vector field, authority view and physical read claim.
+  // Applies to both legs, including empty or disabled legs. An opt-in caller
+  // must validate read_receipt before consuming the response.
+  VectorReadContext read_context = 15;
 }
 
 // One raw leg hit.
@@ -4658,6 +4666,8 @@ message ShardLegsResponse {
   // would otherwise read as an honest empty result set.
   repeated bool geo_columns_known = 3;
   repeated bool filter_columns_known = 4;
+  // Captured under the same read guard as both raw lists, when requested.
+  VectorReadReceipt read_receipt = 5;
 }
 
 // Pushes one TQ+ calibration to every shard (see

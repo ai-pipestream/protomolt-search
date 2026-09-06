@@ -1222,6 +1222,12 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **2026-09-06 — Hybrid read bindings.** Raw hybrid legs and local two-level
+  fusion carry the requested indexed vector field, authority view and full
+  physical claim, with receipts checked across every shard. Relays compose the
+  raw-leg receipts, including empty children. This closes the field-granted
+  composite-query binding gap. See [hybrid read views](docs/hybrid-read-views.md).
+
 - **Query field grants (2026-09-06, feature branch).** Private-shard Query and
   QueryStream admit all requested field inputs before reads and redact automatic
   stored-value scorer details and raw identities from representatives and inner

@@ -185,3 +185,8 @@ Descriptor comparison against `1565d07` preserves every existing declaration;
 the only wire addition is `QueryResponse.field_details_redacted = 12`.
 Source hashes were unchanged throughout the test and compile gates. These are
 local tests and mobile compile checks, not a fleet rollout or phone-runtime run.
+
+The subsequent [hybrid read integration](hybrid-read-views.md) closes the raw-leg
+selection seam: a permitted vector field must match the actual durable binding
+on every shard, including disabled dense legs and empty children. Public
+composite-query regressions cover RRF, blend, decomposed scoring and cascade.
