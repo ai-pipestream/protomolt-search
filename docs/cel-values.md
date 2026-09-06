@@ -168,6 +168,12 @@ paths (one compile, one resolve rule, the same typo refusal), and
 `tests/cel_values.rs` holds the browse path to the lexical route's
 values; hits return them as `QueryHit.projected`.
 
+The shared fetch boundary now supports mandatory document views and selection
+version claims, and validates the version and view of every response. See
+[candidate value reads](candidate-fetch.md) for the protocol, upgrade requirement
+and remaining public-query integration. Unpinned fetch calls do not establish a
+selection snapshot.
+
 ## 5. Ingest-time materialized columns
 
 `AddDocumentsRequest.materialize` declares derived columns:

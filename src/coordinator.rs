@@ -721,6 +721,9 @@ pub struct FetchedValues {
     /// Per stage: doc -> identity-score contribution. A doc absent
     /// from a map has no value for that stage's column.
     pub stage_rows: Vec<HashMap<u64, f64>>,
+    /// Versions read, in node order. Empty only when an unscoped request had
+    /// neither projections nor stages and performed no fan-out.
+    pub epochs: Vec<StatsClaim>,
 }
 
 /// Compile the public projection list (docs/cel-values.md): names
@@ -8209,24 +8212,71 @@ impl CoordinatorServiceImpl {
         projections: &[crate::pb::CompiledProjection],
         stages: &[crate::pb::ScoreStage],
     ) -> Result<FetchedValues, Status> {
+        self.fetch_values_impl(ids, projections, stages, None).await
+    }
+
+    /// Fetch against versions captured during selection. Claims must cover
+    /// every node in this pinned coordinator's order; an absent claim is an
+    /// error, not permission to read a newer generation.
+    pub async fn fetch_values_at(
+        &self,
+        ids: &[u64],
+        projections: &[crate::pb::CompiledProjection],
+        stages: &[crate::pb::ScoreStage],
+        epochs: &[StatsClaim],
+    ) -> Result<FetchedValues, Status> {
+        if epochs.len() != self.node_addrs.len() || epochs.iter().any(|claim| claim.epoch == 0) {
+            return Err(Status::failed_precondition(
+                "candidate fetch requires one complete selection claim per node",
+            ));
+        }
+        for claim in epochs {
+            StatsClaim::required(claim.epoch, &claim.incarnation())?;
+        }
+        self.fetch_values_impl(ids, projections, stages, Some(epochs))
+            .await
+    }
+
+    async fn fetch_values_impl(
+        &self,
+        ids: &[u64],
+        projections: &[crate::pb::CompiledProjection],
+        stages: &[crate::pb::ScoreStage],
+        epochs: Option<&[StatsClaim]>,
+    ) -> Result<FetchedValues, Status> {
+        if let Some(fields) = &self.field_permissions {
+            fields.fetch_values(projections, stages)?;
+        }
+        let scope = crate::visibility::VisibilityScope::new(self.document_visibility.as_ref())?;
+        let mut visibility_known = vec![false; scope.column_count()];
+        let candidates: std::collections::HashSet<u64> = ids.iter().copied().collect();
         // Stage parameters validate here too, so a malformed stage is
         // refused by name before any fan-out.
         crate::node::parse_score_stages(stages)?;
         let mut out = FetchedValues {
             rows: HashMap::new(),
             stage_rows: vec![HashMap::new(); stages.len()],
+            epochs: Vec::with_capacity(self.node_addrs.len()),
         };
         // An empty candidate list still fans out when anything was
         // named: the typo rules run on the flags, not the rows.
-        if projections.is_empty() && stages.is_empty() {
+        if projections.is_empty()
+            && stages.is_empty()
+            && epochs.is_none()
+            && self.document_visibility.is_none()
+        {
             return Ok(out);
         }
         let mut tasks = Vec::with_capacity(self.node_addrs.len());
-        for node in &self.node_addrs {
+        for (shard, node) in self.node_addrs.iter().enumerate() {
+            let claim = epochs.map_or(StatsClaim::default(), |epochs| epochs[shard]);
             let request = crate::pb::FetchValuesRequest {
                 candidate_ids: ids.to_vec(),
                 projections: projections.to_vec(),
                 stages: stages.to_vec(),
+                visibility: self.document_visibility.clone(),
+                expected_stats_epoch: claim.epoch,
+                expected_stats_incarnation: claim.incarnation(),
             };
             let mut client = self.node_client(node)?;
             tasks.push(tokio::spawn(async move {
@@ -8245,10 +8295,24 @@ impl CoordinatorServiceImpl {
         let mut stage_known = vec![false; stages.len()];
         let mut projection_known = vec![false; projection_leaves.len()];
         let mut projection_types = vec![crate::pb::ScalarValueType::Unspecified; projections.len()];
-        for task in tasks {
+        for (shard, task) in tasks.into_iter().enumerate() {
             let resp = task
                 .await
                 .map_err(|e| Status::internal(format!("fetch values task failed: {e}")))??;
+            scope.validate_echo(&resp.visibility_fingerprint, &resp.visibility_columns_known)?;
+            let claim = StatsClaim::required(resp.stats_epoch, &resp.stats_incarnation)?;
+            if epochs.is_some_and(|epochs| epochs[shard] != claim) {
+                return Err(Status::failed_precondition(
+                    "candidate fetch returned a different selection version",
+                ));
+            }
+            out.epochs.push(claim);
+            for (known, shard) in visibility_known
+                .iter_mut()
+                .zip(&resp.visibility_columns_known)
+            {
+                *known |= shard;
+            }
             if resp.projection_types.len() != projections.len()
                 || resp.projection_leaves_known.len() != projection_leaves.len()
                 || resp.stage_columns_known.len() != stages.len()
@@ -8270,6 +8334,11 @@ impl CoordinatorServiceImpl {
                 *known |= shard;
             }
             for row in resp.rows {
+                if !candidates.contains(&row.doc_id) || out.rows.contains_key(&row.doc_id) {
+                    return Err(Status::failed_precondition(
+                        "candidate fetch returned an unrequested or duplicate row",
+                    ));
+                }
                 if row.values.len() != projections.len() || row.stage_values.len() != stages.len() {
                     return Err(Status::failed_precondition(
                         "shard returned a projection row with the wrong width",
@@ -8277,13 +8346,22 @@ impl CoordinatorServiceImpl {
                 }
                 crate::values::validate_projection_row(&row.values, &resp.projection_types)?;
                 for (i, sv) in row.stage_values.iter().enumerate() {
-                    if let Some(crate::pb::projected_value::Value::DoubleValue(v)) = sv.value {
-                        out.stage_rows[i].insert(row.doc_id, v);
+                    match sv.value {
+                        Some(crate::pb::projected_value::Value::DoubleValue(v)) => {
+                            out.stage_rows[i].insert(row.doc_id, v);
+                        }
+                        None => {}
+                        _ => {
+                            return Err(Status::failed_precondition(
+                                "candidate fetch returned a nonnumeric stage contribution",
+                            ))
+                        }
                     }
                 }
                 out.rows.insert(row.doc_id, row.values);
             }
         }
+        self.check_visibility_columns(&visibility_known)?;
         for (stage, known) in stages.iter().zip(&stage_known) {
             if !known {
                 return Err(Status::invalid_argument(format!(
@@ -13472,6 +13550,113 @@ mod stream_cancel_tests {
             crate::stream_signal::decode(&frame),
             Some(crate::stream_signal::StreamSignal::Cancel { token })
         );
+    }
+}
+
+#[cfg(test)]
+mod candidate_fetch_tests {
+    use super::*;
+    use crate::pb::*;
+
+    #[tokio::test]
+    async fn candidate_fetch_enforces_authority_fields_and_documents_before_disclosure() {
+        let node = Arc::new(crate::node::NodeServiceImpl::new(
+            None,
+            crate::node::NodeConfig {
+                analysis_addr: Some(crate::analyzer::NATIVE_ANALYSIS_BACKEND.into()),
+                facet_fields: vec!["audience".into(), "color".into()],
+                numeric_fields: vec!["boost".into()],
+                ..Default::default()
+            },
+        ));
+        crate::link::NodeLink::local(node.clone())
+            .add_documents(tokio_stream::iter(
+                [("public", "red"), ("private", "secret")]
+                    .into_iter()
+                    .map(|(audience, color)| AddDocumentsRequest {
+                        text: "alpha".into(),
+                        analysis: Some(crate::analyzer::body_spec()),
+                        facets: vec![
+                            FacetValue {
+                                field: "audience".into(),
+                                value: audience.into(),
+                            },
+                            FacetValue {
+                                field: "color".into(),
+                                value: color.into(),
+                            },
+                        ],
+                        numerics: vec![NumericValue {
+                            field: "boost".into(),
+                            value: 2.0,
+                        }],
+                        ..Default::default()
+                    }),
+            ))
+            .await
+            .unwrap();
+        let owner = CoordinatorServiceImpl::with_local_nodes(vec![node]);
+        let access = AccessDecision {
+            action: AccessAction::Search as i32,
+            document_visibility: Some(DocumentVisibility {
+                filter: crate::cel::compile_filter("audience == 'public'").unwrap(),
+            }),
+            field_permissions: Some(FieldPermissions {
+                grants: vec![
+                    FieldGrant {
+                        field: "color".into(),
+                        actions: vec![FieldAction::Use as i32, FieldAction::Disclose as i32],
+                    },
+                    FieldGrant {
+                        field: "boost".into(),
+                        actions: vec![FieldAction::Use as i32],
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // The same authority-bound clone used by certified public routes.
+        // Query remains refused until all of its phases consume this context.
+        let reader = owner.for_access(Some(&access), "bm25_search").unwrap();
+        let projection = |expr: &str| CompiledProjection {
+            name: "color".into(),
+            expr: Some(crate::cel::compile_value(expr).unwrap()),
+        };
+        let stages = vec![ScoreStage {
+            column: "boost".into(),
+            op: ScoreOp::AddLinear as i32,
+            weight: 1.0,
+            ..Default::default()
+        }];
+        let rows = reader
+            .fetch_values(&[0, 1], &[projection("color")], &stages)
+            .await
+            .unwrap();
+        assert_eq!(rows.rows.len(), 1);
+        assert!(rows.rows.contains_key(&0));
+        assert_eq!(rows.stage_rows[0].len(), 1);
+        assert!(rows.stage_rows[0].contains_key(&0));
+        for forbidden in ["audience", "boost", "true ? color : audience"] {
+            let error = reader
+                .fetch_values(&[], &[projection(forbidden)], &[])
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.code(), tonic::Code::PermissionDenied);
+            assert_eq!(error.message(), "field access is not granted");
+        }
+        let mut unknown = access;
+        unknown.document_visibility.as_mut().unwrap().filter =
+            crate::cel::compile_filter("absent == 'public'").unwrap();
+        let reader = owner.for_access(Some(&unknown), "bm25_search").unwrap();
+        let error = reader
+            .fetch_values(&[], &[projection("color")], &[])
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(!error.message().contains("absent"));
     }
 }
 

@@ -180,6 +180,27 @@ impl FieldScope {
                 return Err(Self::denied());
             }
         }
+        self.fetch_values(projections, &[])?;
+        if let Some(highlight) = highlight {
+            if highlight.fields.is_empty() {
+                self.dictionary("body")?;
+            }
+            for field in &highlight.fields {
+                self.dictionary(field)?;
+            }
+        }
+        Ok(())
+    }
+    /// Stored-value dimensions use their inputs internally; projected values
+    /// disclose them. Explanation disclosure is checked by the query planner.
+    pub(crate) fn fetch_values(
+        &self,
+        projections: &[CompiledProjection],
+        stages: &[ScoreStage],
+    ) -> Result<(), Status> {
+        for stage in stages {
+            self.require_use(&stage.column)?;
+        }
         for projection in projections {
             let mut leaves = Vec::new();
             if let Some(expr) = &projection.expr {
@@ -190,14 +211,6 @@ impl FieldScope {
                     ValueLeaf::Column(column) | ValueLeaf::Map { column, .. } => column,
                 };
                 self.dictionary(&column)?;
-            }
-        }
-        if let Some(highlight) = highlight {
-            if highlight.fields.is_empty() {
-                self.dictionary("body")?;
-            }
-            for field in &highlight.fields {
-                self.dictionary(field)?;
             }
         }
         Ok(())

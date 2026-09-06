@@ -4671,6 +4671,13 @@ message FetchValuesRequest {
   // is absent — identity, which a stored-value scorer dimension reads
   // as a missing signal. Parameters follow the stage admission rules.
   repeated ScoreStage stages = 3;
+  // Mandatory planner-owned document view, evaluated with the value reads under
+  // one shard read lock. This internal context does not authenticate the caller.
+  DocumentVisibility visibility = 4;
+  // Optional selection-time claim. Both fields must be supplied together;
+  // mutation, compaction or a new shard lifetime refuses before reading values.
+  uint64 expected_stats_epoch = 5;
+  bytes expected_stats_incarnation = 6;
 }
 
 // One candidate's evaluated values.
@@ -4702,7 +4709,11 @@ message FetchValuesResponse {
   // UNSPECIFIED means the expression is absent everywhere on this shard.
   // Coordinators require compatible types before publishing rows.
   repeated ScalarValueType projection_types = 4;
-
+  // The view and shard version actually used, including for an empty response.
+  bytes visibility_fingerprint = 5;
+  repeated bool visibility_columns_known = 6;
+  uint64 stats_epoch = 7;
+  bytes stats_incarnation = 8;
 }
 
 // Candidate-scoped vector scoring (see NodeService.VectorRescore).

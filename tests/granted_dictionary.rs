@@ -46,6 +46,42 @@ async fn scan(
     response
 }
 
+async fn visible_values(
+    client: &mut NodeServiceClient<Channel>,
+    count: usize,
+) -> FetchValuesRequest {
+    let request = FetchValuesRequest {
+        candidate_ids: (0..5).collect(),
+        projections: vec![CompiledProjection {
+            name: "audience".into(),
+            expr: Some(pipestream_search::cel::compile_value("audience").unwrap()),
+        }],
+        visibility: Some(visibility("audience")),
+        ..Default::default()
+    };
+    let response = client
+        .fetch_values(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    VisibilityScope::new(request.visibility.as_ref())
+        .unwrap()
+        .validate_echo(
+            &response.visibility_fingerprint,
+            &response.visibility_columns_known,
+        )
+        .unwrap();
+    assert_eq!(response.rows.len(), count);
+    assert!(response.rows.iter().all(
+        |row| row.values[0].value == Some(projected_value::Value::StringValue("public".into()))
+    ));
+    FetchValuesRequest {
+        expected_stats_epoch: response.stats_epoch,
+        expected_stats_incarnation: response.stats_incarnation,
+        ..request
+    }
+}
+
 #[tokio::test]
 async fn visible_dictionaries_survive_segments_deletes_compaction_and_reopen() {
     let rows = [
@@ -122,6 +158,7 @@ async fn visible_dictionaries_survive_segments_deletes_compaction_and_reopen() {
             client.flush(FlushRequest {}).await.unwrap();
         }
         // The segmented case still includes sealed parts and a live tail.
+        visible_values(&mut client, 4).await;
         for field in ["body", "title"] {
             let full = scan(&mut client, field, 3).await;
             assert_eq!(
@@ -181,12 +218,22 @@ async fn visible_dictionaries_survive_segments_deletes_compaction_and_reopen() {
         assert_eq!(scan(&mut client, "body", 3).await, after);
         client.flush(FlushRequest {}).await.unwrap();
         assert_eq!(scan(&mut client, "body", 3).await, after);
+        let before_compaction = visible_values(&mut client, 3).await;
         let compacted = client
             .compact_shard(CompactShardRequest::default())
             .await
             .unwrap()
             .into_inner();
         assert_eq!(compacted.tombstones_reclaimed, 2);
+        assert_eq!(
+            client
+                .fetch_values(before_compaction)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        let before_restart = visible_values(&mut client, 3).await;
         assert_eq!(scan(&mut client, "body", 3).await, after);
         client.flush(FlushRequest {}).await.unwrap();
         drop(client);
@@ -194,6 +241,15 @@ async fn visible_dictionaries_survive_segments_deletes_compaction_and_reopen() {
         let _ = handle.await;
         let (addr, handle) = common::start_opened_node(cfg).await;
         let mut client = NodeServiceClient::connect(addr).await.unwrap();
+        assert_eq!(
+            client
+                .fetch_values(before_restart)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        visible_values(&mut client, 3).await;
         assert_eq!(scan(&mut client, "body", 3).await, after);
         assert_eq!(scan(&mut client, "title", 3).await, after);
         let unknown = scan(&mut client, "not_indexed", 3).await;

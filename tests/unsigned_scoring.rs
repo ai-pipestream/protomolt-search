@@ -293,6 +293,7 @@ async fn verify(addresses: Vec<String>, mono: String) {
                     name: "row".into(),
                     expr: Some(pipestream_search::cel::compile_value("row").unwrap()),
                 }],
+                ..Default::default()
             })
             .await
             .unwrap()

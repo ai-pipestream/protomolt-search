@@ -869,3 +869,29 @@ against `7e9496b` confirms exactly three additive fields, two field-policy
 messages and one action enum; existing declarations are unchanged. These are
 local checks, with no fleet deployment or device-runtime validation. Stored
 index and WAL formats are unchanged.
+
+## Candidate value-fetch checkpoint (2026-09-06)
+
+The shared `FetchValues` boundary applies a mandatory document view under the
+same shard lock as the value read, and accepts a complete selection-time shard
+version. The coordinator checks the view/version echo, field dependencies and
+returned row ownership before publishing values. Stale compaction/restart claims
+refuse, including for empty fetches. See [candidate value reads](candidate-fetch.md).
+
+This does not enable restricted public queries. Their selection, rescoring,
+lineage, aggregation, source reads, streams and cursors still need one enforced
+execution context. The broader protobuf, authorization and durable-publication
+goal remains open.
+
+Validation: 455 library tests, 614 integration tests across 108 targets, and
+12 embedded tests passed (1,081 total); one existing live-sidecar conformance
+test remains ignored. All five Android/iOS Rust target checks, tests/examples
+compilation, formatting and vendored-proto checks passed. Descriptor comparison
+against `0841f6a` confirms exactly seven additive candidate-fetch fields with
+existing declarations unchanged. No fleet deployment or device-runtime test ran.
+Stored index and WAL formats are unchanged.
+
+The first full library run exposed a metrics test that assumed its process-wide
+ingest counters started at zero. It now checks increments from the observed
+baseline, allowing other tests to ingest concurrently. The complete suite above
+passed after that test-isolation fix.

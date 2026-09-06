@@ -13283,7 +13283,25 @@ impl NodeService for NodeServiceImpl {
                     // Stage parameters validate everywhere they arrive; a
                     // malformed stage is a request error, not a shard gap.
                     let specs = parse_score_stages(&req.stages)?;
+                    let scope = crate::visibility::VisibilityScope::new(req.visibility.as_ref())?;
+                    let visibility = req
+                        .visibility
+                        .as_ref()
+                        .and_then(|view| view.filter.as_ref());
                     let guard = read_shard(&state);
+                    guard.check_stats_epoch(
+                        req.expected_stats_epoch,
+                        &req.expected_stats_incarnation,
+                    )?;
+                    let (_, visibility_columns_known) =
+                        filter_known_flags(guard.bm25.as_ref(), &[], visibility);
+                    let mut response = crate::pb::FetchValuesResponse {
+                        stats_epoch: guard.stats_epoch,
+                        stats_incarnation: guard.stats_incarnation.bytes()?,
+                        visibility_fingerprint: scope.fingerprint().to_vec(),
+                        visibility_columns_known,
+                        ..Default::default()
+                    };
                     let projection_leaves = {
                         let mut leaves = Vec::new();
                         for p in &req.projections {
@@ -13296,12 +13314,23 @@ impl NodeService for NodeServiceImpl {
                     // No column tables at all: this shard holds none of the
                     // candidates' values and resolves no column.
                     let Some(store) = guard.bm25.as_ref() else {
-                        return Ok(crate::pb::FetchValuesResponse {
-                            rows: Vec::new(),
-                            stage_columns_known: vec![false; req.stages.len()],
-                            projection_leaves_known: vec![false; projection_leaves.len()],
-                            projection_types: vec![0; req.projections.len()],
-                        });
+                        response.stage_columns_known = vec![false; req.stages.len()];
+                        response.projection_leaves_known = vec![false; projection_leaves.len()];
+                        response.projection_types = vec![0; req.projections.len()];
+                        return Ok(response);
+                    };
+                    if store.as_index().is_none() {
+                        return Err(Status::failed_precondition(
+                            "bm25 bulk build in progress; Flush before fetching values",
+                        ));
+                    }
+                    let doc_filter = crate::filter::DocFilter {
+                        deleted: None,
+                        geo: Default::default(),
+                        pred: visibility
+                            .map(|filter| store.resolve_filter(filter))
+                            .transpose()?,
+                        phrase: Vec::new(),
                     };
                     let projection_leaves_known: Vec<bool> = projection_leaves
                         .iter()
@@ -13339,6 +13368,7 @@ impl NodeService for NodeServiceImpl {
                             id >= offset
                                 && id - offset < n
                                 && !guard.live_docs.is_deleted((id - offset) as usize)
+                                && doc_filter.passes((id - offset) as u32, &numeric_read)
                         })
                         .collect();
                     ids.sort_unstable();
@@ -13370,12 +13400,11 @@ impl NodeService for NodeServiceImpl {
                             }
                         })
                         .collect();
-                    Ok(crate::pb::FetchValuesResponse {
-                        rows,
-                        stage_columns_known,
-                        projection_leaves_known,
-                        projection_types,
-                    })
+                    response.rows = rows;
+                    response.stage_columns_known = stage_columns_known;
+                    response.projection_leaves_known = projection_leaves_known;
+                    response.projection_types = projection_types;
+                    Ok(response)
                 },
             )
             .await

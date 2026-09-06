@@ -1222,6 +1222,12 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Candidate value-read guards (2026-09-06, feature branch).** Stored-value
+  fetches apply a planner-owned document view under the read lock and can require
+  the selection's shard versions. Coordinators validate response versions and
+  field inputs. Public query isolation still needs end-to-end integration. See
+  [candidate value reads](docs/candidate-fetch.md).
+
 - **Private-shard field grants (2026-09-06, feature branch).** Policy format 3
   separates using a field from disclosing its values. BM25, autocomplete and
   did-you-mean check field inputs before execution, redact automatic details

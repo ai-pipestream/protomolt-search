@@ -1205,6 +1205,9 @@ mod tests {
     /// after counters in provider order.
     #[test]
     fn page_shape_is_exposition_text() {
+        let before = render(&[]);
+        let documents = sample(&before, "turbovec_documents_added_total ");
+        let vectors = sample(&before, "turbovec_vectors_added_total ");
         inc_request(Route::SearchShard);
         inc_request(Route::SearchShard);
         add_ingested(3, 7);
@@ -1224,8 +1227,9 @@ mod tests {
         ];
         let page = render(&gauges);
         assert!(sample(&page, "turbovec_requests_total{rpc=\"search_shard\"} ") >= 2);
-        assert!(page.contains("turbovec_documents_added_total 3"));
-        assert!(page.contains("turbovec_vectors_added_total 7"));
+        // Other tests can ingest concurrently into these process-wide counters.
+        assert!(sample(&page, "turbovec_documents_added_total ") >= documents + 3);
+        assert!(sample(&page, "turbovec_vectors_added_total ") >= vectors + 7);
         assert!(page.contains("turbovec_shard_vectors{slot_offset=\"0\"} 42"));
         assert!(page.contains("turbovec_shard_vectors{slot_offset=\"1000\"} 7"));
         assert!(page.contains("turbovec_shard_documents{slot_offset=\"0\"} 17"));

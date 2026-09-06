@@ -111,6 +111,11 @@ These grants do not configure the CLI's TOML adapter, authorize direct node or
 cluster-control listeners, implement per-key map grants, or finish the other
 retrieval routes. Hosts provide protobuf policies or a trusted `Authorizer`.
 
+The [candidate value-fetch boundary](candidate-fetch.md) also checks an
+authority-bound coordinator's field policy before fetching projections and
+stored-value score dimensions. This prepares the later query phases; it does
+not enable restricted public `Query` or `QueryStream`.
+
 Validation: 454 library tests, 610 integration tests across 107 targets, and
 12 embedded tests passed (1,076 total); one existing live-sidecar conformance
 test remains ignored. All five Android/iOS Rust target checks, tests/examples
