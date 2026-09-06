@@ -58,9 +58,26 @@
 //! ([`RelayDiagnostics`]): the root asks each shard's address for its
 //! layout, and the relay answers with its children's merged into one.
 //!
+//! - The fetches by id (`GetDocuments`, `ResolveParents`, `FetchValues`):
+//!   each id routed to the child whose slot range holds it, the answers
+//!   put back in the caller's order (an id repeated answered once per
+//!   occurrence, a foreign id left out, as a node does), the known flags
+//!   and projection types merged, and the read receipt a relay token
+//!   over the children's versions (`read_receipt`).
+//! - `BrowseShard`: every child pages from the same boundary, the rows
+//!   merged in the request's sort order (id order unsorted) and cut to
+//!   `k`, the sort column types agreeing where known.
+//! - The folds (`AggregateShard`, `QuantileCounts` with or without a
+//!   Boolean plan, and `BooleanQuery.aggregate` inside `EvaluateBoolean`):
+//!   the children's partials folded in child order through the root's
+//!   own fold ([`merge_aggregate_shares`]) and answered as one shard's
+//!   partial, the caps applied where the root applies them.
+//!
 //! Every other `NodeService` route refuses UNIMPLEMENTED naming the route
-//! and the relay: no ingest, no administration, no aggregation, no
-//! per-shard fusion, and no follow-up fetches by id through this level.
+//! and the relay: no ingest, no administration, and no per-shard fusion
+//! (`HybridShard`: the two-level mode fuses one list per shard at the
+//! root and is partition dependent by design, so a relay standing as one
+//! shard would change the answer).
 //!
 //! The relay never reads its shard map from a file or from the
 //! coordinator's authority directly. It consumes a [`MapSource`]: one
@@ -764,8 +781,10 @@ fn refused(route: &str) -> Status {
          the read routes only: StreamSearch, SearchShard, TermStats, Health, \
          GetVectorBackend, the keyword leg (Bm25Query, Bm25PhraseQuery, Bm25QueryStream, \
          Bm25Rescore, ShardLegs), VectorRescore, ExactVectorRescore, the bitmap routes \
-         (ResolveFilterBitmap, ResolveLexicalBitmap, ResolveVectorBitmap), and the \
-         dictionaries (ExpandTermPrefix, SuggestTerms); see docs/relay-coordinators.md"
+         (ResolveFilterBitmap, ResolveLexicalBitmap, ResolveVectorBitmap), the \
+         dictionaries (ExpandTermPrefix, SuggestTerms), the fetches by id (GetDocuments, \
+         ResolveParents, FetchValues, BrowseShard), the folds (AggregateShard, \
+         QuantileCounts, EvaluateBoolean); see docs/relay-coordinators.md"
     ))
 }
 
@@ -2988,7 +3007,454 @@ async fn relay_shard_search(
     Ok(())
 }
 
+/// One request per child (`None` asks that child nothing), the answers
+/// paired with their child index in child order; a child's error is
+/// named by child and address.
+async fn fan_out<Req, Resp, F, Fut>(
+    frozen: &CoordinatorServiceImpl,
+    children: &[String],
+    requests: Vec<Option<Req>>,
+    timeout: Option<Duration>,
+    route: &'static str,
+    call: F,
+) -> Result<Vec<(usize, Resp)>, Status>
+where
+    Req: Send + 'static,
+    Resp: Send + 'static,
+    F: Fn(crate::link::NodeLink, Request<Req>) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = Result<Response<Resp>, Status>> + Send + 'static,
+{
+    let mut tasks = Vec::with_capacity(children.len());
+    for (shard, child_req) in requests.into_iter().enumerate() {
+        let Some(child_req) = child_req else {
+            continue;
+        };
+        let link = frozen.node_client(&children[shard])?;
+        let addr = children[shard].clone();
+        let call = call.clone();
+        tasks.push((
+            shard,
+            tokio::spawn(async move {
+                let mut request = Request::new(child_req);
+                if let Some(timeout) = timeout {
+                    request.set_timeout(timeout);
+                }
+                call(link, request)
+                    .await
+                    .map(|r| r.into_inner())
+                    .map_err(|status| child_error(shard, &addr, route, status))
+            }),
+        ));
+    }
+    let mut out = Vec::with_capacity(tasks.len());
+    for (shard, task) in tasks {
+        let share = task
+            .await
+            .map_err(|e| Status::internal(format!("relay {route} task: {e}")))??;
+        out.push((shard, share));
+    }
+    Ok(out)
+}
+
+/// The children's answers put back in the caller's id order, each
+/// occurrence of an id served once, the way a node answers a list that
+/// repeats an id. An id no child answered is absent, as a node leaves
+/// out an id it does not serve.
+fn in_caller_order<T>(ids: &[u64], items: Vec<T>, id_of: impl Fn(&T) -> u64) -> Vec<T> {
+    let mut by_id: HashMap<u64, VecDeque<T>> = HashMap::new();
+    for item in items {
+        by_id.entry(id_of(&item)).or_default().push_back(item);
+    }
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Some(item) = by_id.get_mut(id).and_then(VecDeque::pop_front) {
+            out.push(item);
+        }
+    }
+    out
+}
+
+/// A per-column scalar type the children report beside a known flag:
+/// the children that know the column must agree on the type, and a
+/// child that does not know it reports `Unspecified`.
+fn merge_column_types(
+    what: &str,
+    shard: usize,
+    acc: &mut Option<Vec<i32>>,
+    share: &[i32],
+) -> Result<(), Status> {
+    match acc {
+        None => *acc = Some(share.to_vec()),
+        Some(types) => {
+            if types.len() != share.len() {
+                return Err(Status::internal(format!(
+                    "relay: child {shard} answered {} {what} types while an earlier child \
+                     answered {}",
+                    share.len(),
+                    types.len()
+                )));
+            }
+            let unspecified = crate::pb::ScalarValueType::Unspecified as i32;
+            for (column, (held, &reported)) in types.iter_mut().zip(share).enumerate() {
+                if reported == unspecified {
+                    continue;
+                }
+                if *held == unspecified {
+                    *held = reported;
+                } else if *held != reported {
+                    return Err(Status::failed_precondition(format!(
+                        "relay: child {shard} types {what} column {column} as {reported} while \
+                         an earlier child typed it {held}; the column families diverge across \
+                         the children"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The children's `AggregateShard` answers folded into one shard's
+/// answer, in child order: each partial folds through the root's own
+/// fold ([`crate::coordinator::AggMerge`]) and comes back out as a
+/// partial, groups join by value, histograms sum by bucket, percentile
+/// partials fold, the match counts add with a check, and the known
+/// flags OR as every child sizes them. The caps a root applies
+/// (`max_groups`, `max_buckets`, `max_distinct`) apply here, so a relay
+/// refuses where the root would. The receipt fields are the caller's to
+/// fill. A relay whose children are a prefix of the root's shard order
+/// (one relay over all of them, or a chain) folds bit for bit as the
+/// root folds the shards; relays side by side fold their doubles
+/// compensated at each level, which can differ from the flat fold in
+/// the last bit (ints, counts, extrema, histograms, and percentile
+/// partials are exact in any grouping).
+pub fn merge_aggregate_shares(
+    aggregations: &[crate::pb::CompiledAggregation],
+    group_by: &str,
+    max_groups: u32,
+    histograms: &[crate::pb::CompiledHistogram],
+    percentiles: &[crate::pb::CompiledPercentile],
+    shares: &[crate::pb::AggregateShardResponse],
+) -> Result<crate::pb::AggregateShardResponse, Status> {
+    use crate::coordinator::{AggMerge, PctMerge};
+    use std::collections::BTreeMap;
+    let mut geo_known: Option<Vec<bool>> = None;
+    let mut filter_known: Option<Vec<bool>> = None;
+    let mut leaves_known: Option<Vec<bool>> = None;
+    let mut matched = 0u64;
+    let mut ungrouped = 0u64;
+    let mut group_column_known = false;
+    let mut merged: Vec<AggMerge> = aggregations.iter().map(|_| AggMerge::new()).collect();
+    let mut groups: BTreeMap<String, (u64, Vec<AggMerge>)> = BTreeMap::new();
+    let mut buckets: Vec<BTreeMap<i64, u64>> = histograms.iter().map(|_| BTreeMap::new()).collect();
+    let mut present = vec![0u64; histograms.len()];
+    let mut unbucketable = vec![0u64; histograms.len()];
+    let mut pct: Vec<PctMerge> = percentiles.iter().map(|_| PctMerge::new()).collect();
+    let mut segments_total = 0u32;
+    let mut segments_skipped = 0u32;
+    for (child, share) in shares.iter().enumerate() {
+        merge_known("geo", child, &mut geo_known, &share.geo_columns_known)?;
+        merge_known(
+            "filter",
+            child,
+            &mut filter_known,
+            &share.filter_columns_known,
+        )?;
+        merge_known(
+            "expression-leaf",
+            child,
+            &mut leaves_known,
+            &share.expr_leaves_known,
+        )?;
+        if share.partials.len() != aggregations.len() {
+            return Err(Status::internal(format!(
+                "relay: child {child} answered {} aggregation partials for {} aggregations",
+                share.partials.len(),
+                aggregations.len()
+            )));
+        }
+        if share.histograms.len() != histograms.len() {
+            return Err(Status::internal(format!(
+                "relay: child {child} answered {} histograms for {} requested",
+                share.histograms.len(),
+                histograms.len()
+            )));
+        }
+        if share.percentile_partials.len() != percentiles.len() {
+            return Err(Status::internal(format!(
+                "relay: child {child} answered {} percentile partials for {} requested",
+                share.percentile_partials.len(),
+                percentiles.len()
+            )));
+        }
+        group_column_known |= share.group_column_known;
+        add_count(&mut matched, share.matched, child, "aggregate match count")?;
+        add_count(&mut ungrouped, share.ungrouped, child, "ungrouped count")?;
+        add_count32(
+            &mut segments_total,
+            share.segments_total,
+            child,
+            "segment count",
+        )?;
+        add_count32(
+            &mut segments_skipped,
+            share.segments_skipped,
+            child,
+            "skipped segment count",
+        )?;
+        for (m, (p, agg)) in merged
+            .iter_mut()
+            .zip(share.partials.iter().zip(aggregations))
+        {
+            m.fold(p, agg)?;
+        }
+        for group in &share.groups {
+            if group.partials.len() != aggregations.len() {
+                return Err(Status::internal(format!(
+                    "relay: child {child} answered {} group partials for {} aggregations",
+                    group.partials.len(),
+                    aggregations.len()
+                )));
+            }
+            let entry = groups
+                .entry(group.value.clone())
+                .or_insert_with(|| (0, aggregations.iter().map(|_| AggMerge::new()).collect()));
+            add_count(&mut entry.0, group.matched, child, "group match count")?;
+            for (m, (p, agg)) in entry
+                .1
+                .iter_mut()
+                .zip(group.partials.iter().zip(aggregations))
+            {
+                m.fold(p, agg)?;
+            }
+            if groups.len() > max_groups as usize {
+                return Err(Status::failed_precondition(format!(
+                    "group_by {group_by:?} exceeds {max_groups} distinct values across the \
+                     relay's children; tighten the filter or raise max_groups"
+                )));
+            }
+        }
+        for (i, (hist, spec)) in share.histograms.iter().zip(histograms).enumerate() {
+            if hist.bucket_index.len() != hist.bucket_count.len() {
+                return Err(Status::internal(format!(
+                    "relay: child {child} answered a histogram with mismatched columns"
+                )));
+            }
+            add_count(
+                &mut present[i],
+                hist.present,
+                child,
+                "histogram present count",
+            )?;
+            add_count(
+                &mut unbucketable[i],
+                hist.unbucketable,
+                child,
+                "histogram unbucketable count",
+            )?;
+            for (&index, &count) in hist.bucket_index.iter().zip(&hist.bucket_count) {
+                add_count(
+                    buckets[i].entry(index).or_insert(0),
+                    count,
+                    child,
+                    "histogram bucket count",
+                )?;
+            }
+            if buckets[i].len() > spec.max_buckets as usize {
+                return Err(Status::failed_precondition(format!(
+                    "histogram {:?} exceeds {} buckets across the relay's children; use a \
+                     coarser interval or a tighter filter",
+                    spec.name, spec.max_buckets
+                )));
+            }
+        }
+        for (m, (p, spec)) in pct
+            .iter_mut()
+            .zip(share.percentile_partials.iter().zip(percentiles))
+        {
+            m.fold(p, &spec.name)?;
+        }
+    }
+    Ok(crate::pb::AggregateShardResponse {
+        partials: merged.iter().map(AggMerge::partial).collect(),
+        matched,
+        geo_columns_known: geo_known.unwrap_or_default(),
+        filter_columns_known: filter_known.unwrap_or_default(),
+        expr_leaves_known: leaves_known.unwrap_or_default(),
+        groups: groups
+            .into_iter()
+            .map(|(value, (matched, ms))| crate::pb::AggregateShardGroup {
+                value,
+                matched,
+                partials: ms.iter().map(AggMerge::partial).collect(),
+            })
+            .collect(),
+        ungrouped,
+        group_column_known,
+        histograms: buckets
+            .iter()
+            .enumerate()
+            .map(|(i, b)| crate::pb::ShardHistogram {
+                bucket_index: b.keys().copied().collect(),
+                bucket_count: b.values().copied().collect(),
+                present: present[i],
+                unbucketable: unbucketable[i],
+            })
+            .collect(),
+        percentile_partials: pct.iter().map(PctMerge::partial).collect(),
+        segments_total,
+        segments_skipped,
+        stats_epoch: 0,
+        stats_incarnation: Vec::new(),
+        visibility_fingerprint: Vec::new(),
+        visibility_columns_known: Vec::new(),
+    })
+}
+
+/// The children's browse pages as one page: the rows sorted by the
+/// request's keys then id (id order alone when unsorted, the order the
+/// root sorts a node's page in), cut to `k`, each row's keys re-emitted
+/// as its child sent them; known flags OR, the sort column types must
+/// agree where known, segment counts add with a check. The receipt
+/// fields are the caller's to fill.
+pub fn merge_browse_pages(
+    req: &crate::pb::BrowseShardRequest,
+    shares: &[crate::pb::BrowseShardResponse],
+) -> Result<crate::pb::BrowseShardResponse, Status> {
+    use crate::sortkeys::{cmp_rows, Key};
+    struct Row {
+        keys: Vec<Key>,
+        id: u64,
+        row: Option<crate::pb::SortKeyRow>,
+    }
+    let sorted = !req.sort.is_empty();
+    let mut geo_known: Option<Vec<bool>> = None;
+    let mut filter_known: Option<Vec<bool>> = None;
+    let mut sort_known: Option<Vec<bool>> = None;
+    let mut sort_types: Option<Vec<i32>> = None;
+    let mut segments_total = 0u32;
+    let mut segments_skipped = 0u32;
+    let mut rows: Vec<Row> = Vec::new();
+    for (child, share) in shares.iter().enumerate() {
+        merge_known("geo", child, &mut geo_known, &share.geo_columns_known)?;
+        merge_known(
+            "filter",
+            child,
+            &mut filter_known,
+            &share.filter_columns_known,
+        )?;
+        merge_known(
+            "sort-column",
+            child,
+            &mut sort_known,
+            &share.sort_columns_known,
+        )?;
+        merge_column_types("sort", child, &mut sort_types, &share.sort_column_types)?;
+        add_count32(
+            &mut segments_total,
+            share.segments_total,
+            child,
+            "segment count",
+        )?;
+        add_count32(
+            &mut segments_skipped,
+            share.segments_skipped,
+            child,
+            "skipped segment count",
+        )?;
+        if !sorted {
+            rows.extend(share.doc_ids.iter().map(|&id| Row {
+                keys: Vec::new(),
+                id,
+                row: None,
+            }));
+            continue;
+        }
+        if share.sort_rows.len() != share.doc_ids.len() {
+            return Err(Status::internal(format!(
+                "relay: child {child} answered a sorted browse with {} key rows for {} ids",
+                share.sort_rows.len(),
+                share.doc_ids.len()
+            )));
+        }
+        for (&id, row) in share.doc_ids.iter().zip(&share.sort_rows) {
+            let keys: Option<Vec<Key>> = row.keys.iter().map(Key::from_pb).collect();
+            let Some(keys) = keys else {
+                return Err(Status::internal(format!(
+                    "relay: child {child} answered a sorted browse with an empty key"
+                )));
+            };
+            if keys.len() != req.sort.len() {
+                return Err(Status::internal(format!(
+                    "relay: child {child} answered {} keys for {} sort columns",
+                    keys.len(),
+                    req.sort.len()
+                )));
+            }
+            rows.push(Row {
+                keys,
+                id,
+                row: Some(row.clone()),
+            });
+        }
+    }
+    let descending: Vec<bool> = req.sort.iter().map(|s| s.descending).collect();
+    rows.sort_by(|a, b| cmp_rows(&a.keys, a.id, &b.keys, b.id, &descending));
+    rows.truncate(req.k as usize);
+    Ok(crate::pb::BrowseShardResponse {
+        doc_ids: rows.iter().map(|r| r.id).collect(),
+        geo_columns_known: geo_known.unwrap_or_default(),
+        filter_columns_known: filter_known.unwrap_or_default(),
+        sort_rows: if sorted {
+            rows.into_iter().filter_map(|r| r.row).collect()
+        } else {
+            Vec::new()
+        },
+        sort_columns_known: sort_known.unwrap_or_default(),
+        segments_total,
+        segments_skipped,
+        sort_column_types: sort_types.unwrap_or_default(),
+        stats_epoch: 0,
+        stats_incarnation: Vec::new(),
+        visibility_fingerprint: Vec::new(),
+        visibility_columns_known: Vec::new(),
+    })
+}
+
+impl RelayService {
+    /// The children, the map they were pinned under, and the parent's
+    /// claim translated per child: the opening every composed unary
+    /// route shares.
+    fn open_children(
+        &self,
+        route: &str,
+        visibility: Option<&crate::pb::DocumentVisibility>,
+        epoch: u64,
+        incarnation: &[u8],
+    ) -> Result<
+        (
+            MapSnapshot,
+            CoordinatorServiceImpl,
+            Vec<String>,
+            Vec<StatsClaim>,
+        ),
+        Status,
+    > {
+        crate::visibility::VisibilityScope::new(visibility)?;
+        let (pinned, frozen) = self.pin();
+        let children = frozen.node_addresses().to_vec();
+        if children.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "relay: a relay coordinator has no children ({route})"
+            )));
+        }
+        let claims = self.child_claims(epoch, incarnation, children.len())?;
+        Ok((pinned, frozen, children, claims))
+    }
+}
+
 #[tonic::async_trait]
+
 impl NodeService for RelayService {
     type SearchShardStream =
         crate::metrics::Timed<ReceiverStream<Result<SearchShardResponse, Status>>>;
@@ -3710,16 +4176,115 @@ impl NodeService for RelayService {
 
     async fn get_documents(
         &self,
-        _request: Request<crate::pb::GetDocumentsRequest>,
+        request: Request<crate::pb::GetDocumentsRequest>,
     ) -> Result<Response<crate::pb::GetDocumentsResponse>, Status> {
-        Err(refused("GetDocuments"))
+        crate::metrics::timed(Route::GetDocuments, request, |request| async move {
+            let timeout = grpc_timeout(request.metadata());
+            let req = request.into_inner();
+            let (pinned, frozen, children, _) = self.open_children("GetDocuments", None, 0, &[])?;
+            // Each id goes to the child whose slot range holds it; a
+            // child asked for none is not asked.
+            let reports = self.children_health(&frozen, timeout).await?;
+            let ranges = child_ranges(&self.collection, &children, &reports)?;
+            let requests = route_ids(&ranges, &req.doc_ids)?
+                .into_iter()
+                .map(|doc_ids| {
+                    (!doc_ids.is_empty()).then_some(crate::pb::GetDocumentsRequest { doc_ids })
+                })
+                .collect();
+            let shares = fan_out(
+                &frozen,
+                &children,
+                requests,
+                timeout,
+                "get documents",
+                |mut link, request| async move { link.get_documents(request).await },
+            )
+            .await?;
+            let documents = in_caller_order(
+                &req.doc_ids,
+                shares
+                    .into_iter()
+                    .flat_map(|(_, share)| share.documents)
+                    .collect(),
+                |d| d.doc_id,
+            );
+            self.still_current(&pinned, "GetDocuments")?;
+            Ok(Response::new(crate::pb::GetDocumentsResponse { documents }))
+        })
+        .await
     }
 
     async fn resolve_parents(
         &self,
-        _request: Request<crate::pb::ResolveParentsRequest>,
+        request: Request<crate::pb::ResolveParentsRequest>,
     ) -> Result<Response<crate::pb::ResolveParentsResponse>, Status> {
-        Err(refused("ResolveParents"))
+        crate::metrics::timed(Route::ResolveParents, request, |request| async move {
+            let timeout = grpc_timeout(request.metadata());
+            let req = request.into_inner();
+            let (pinned, frozen, children, claims) = self.open_children(
+                "ResolveParents",
+                req.visibility.as_ref(),
+                req.expected_stats_epoch,
+                &req.expected_stats_incarnation,
+            )?;
+            // Ids routed by slot range; every child answers, an empty
+            // list included, since the receipt needs every child.
+            let reports = self.children_health(&frozen, timeout).await?;
+            let ranges = child_ranges(&self.collection, &children, &reports)?;
+            let requests = route_ids(&ranges, &req.doc_ids)?
+                .into_iter()
+                .enumerate()
+                .map(|(shard, doc_ids)| {
+                    Some(crate::pb::ResolveParentsRequest {
+                        doc_ids,
+                        visibility: req.visibility.clone(),
+                        expected_stats_epoch: claims[shard].epoch,
+                        expected_stats_incarnation: claims[shard].incarnation(),
+                        fields: req.fields.clone(),
+                    })
+                })
+                .collect();
+            let shares = fan_out(
+                &frozen,
+                &children,
+                requests,
+                timeout,
+                "resolve parents",
+                |mut link, request| async move { link.resolve_parents(request).await },
+            )
+            .await?;
+            let mut receipts = Vec::with_capacity(children.len());
+            let mut parents = Vec::new();
+            for (shard, share) in shares {
+                if share.fields != req.fields {
+                    return Err(Status::failed_precondition(format!(
+                        "relay: child {shard} answered lineage fields {:?} for a request \
+                         naming {:?}",
+                        share.fields, req.fields
+                    )));
+                }
+                receipts.push(read_metadata(&share));
+                parents.extend(share.parents);
+            }
+            let parents = in_caller_order(&req.doc_ids, parents, |p| p.doc_id);
+            let receipt = self.read_receipt(
+                &pinned,
+                children,
+                req.visibility.as_ref(),
+                Some(&claims),
+                &receipts,
+            )?;
+            Ok(Response::new(crate::pb::ResolveParentsResponse {
+                parents,
+                stats_epoch: receipt.stats_epoch,
+                stats_incarnation: receipt.stats_incarnation,
+                visibility_fingerprint: receipt.visibility_fingerprint,
+                visibility_columns_known: receipt.visibility_columns_known,
+                fields: req.fields,
+            }))
+        })
+        .await
     }
 
     async fn bm25_rescore(
@@ -3816,23 +4381,235 @@ impl NodeService for RelayService {
 
     async fn fetch_values(
         &self,
-        _request: Request<crate::pb::FetchValuesRequest>,
+        request: Request<crate::pb::FetchValuesRequest>,
     ) -> Result<Response<crate::pb::FetchValuesResponse>, Status> {
-        Err(refused("FetchValues"))
+        crate::metrics::timed(Route::FetchValues, request, |request| async move {
+            let timeout = grpc_timeout(request.metadata());
+            let req = request.into_inner();
+            let (pinned, frozen, children, claims) = self.open_children(
+                "FetchValues",
+                req.visibility.as_ref(),
+                req.expected_stats_epoch,
+                &req.expected_stats_incarnation,
+            )?;
+            // Ids routed by slot range; every child answers, since the
+            // known flags the root's typo rule runs on come from every
+            // shard, candidates or none.
+            let reports = self.children_health(&frozen, timeout).await?;
+            let ranges = child_ranges(&self.collection, &children, &reports)?;
+            let requests = route_ids(&ranges, &req.candidate_ids)?
+                .into_iter()
+                .enumerate()
+                .map(|(shard, candidate_ids)| {
+                    Some(crate::pb::FetchValuesRequest {
+                        candidate_ids,
+                        projections: req.projections.clone(),
+                        stages: req.stages.clone(),
+                        visibility: req.visibility.clone(),
+                        expected_stats_epoch: claims[shard].epoch,
+                        expected_stats_incarnation: claims[shard].incarnation(),
+                    })
+                })
+                .collect();
+            let shares = fan_out(
+                &frozen,
+                &children,
+                requests,
+                timeout,
+                "fetch values",
+                |mut link, request| async move { link.fetch_values(request).await },
+            )
+            .await?;
+            let mut receipts = Vec::with_capacity(children.len());
+            let mut stage_known: Option<Vec<bool>> = None;
+            let mut projection_known: Option<Vec<bool>> = None;
+            let mut projection_types =
+                vec![crate::pb::ScalarValueType::Unspecified; req.projections.len()];
+            let mut rows = Vec::new();
+            for (shard, share) in shares {
+                merge_known(
+                    "stage-column",
+                    shard,
+                    &mut stage_known,
+                    &share.stage_columns_known,
+                )?;
+                merge_known(
+                    "projection-leaf",
+                    shard,
+                    &mut projection_known,
+                    &share.projection_leaves_known,
+                )?;
+                crate::values::merge_projection_types(
+                    &req.projections,
+                    &mut projection_types,
+                    &share.projection_types,
+                )?;
+                receipts.push(read_metadata(&share));
+                rows.extend(share.rows);
+            }
+            let rows = in_caller_order(&req.candidate_ids, rows, |r| r.doc_id);
+            let receipt = self.read_receipt(
+                &pinned,
+                children,
+                req.visibility.as_ref(),
+                Some(&claims),
+                &receipts,
+            )?;
+            Ok(Response::new(crate::pb::FetchValuesResponse {
+                rows,
+                stage_columns_known: stage_known.unwrap_or_default(),
+                projection_leaves_known: projection_known.unwrap_or_default(),
+                projection_types: projection_types.into_iter().map(i32::from).collect(),
+                visibility_fingerprint: receipt.visibility_fingerprint,
+                visibility_columns_known: receipt.visibility_columns_known,
+                stats_epoch: receipt.stats_epoch,
+                stats_incarnation: receipt.stats_incarnation,
+            }))
+        })
+        .await
     }
 
     async fn aggregate_shard(
         &self,
-        _request: Request<crate::pb::AggregateShardRequest>,
+        request: Request<crate::pb::AggregateShardRequest>,
     ) -> Result<Response<crate::pb::AggregateShardResponse>, Status> {
-        Err(refused("AggregateShard"))
+        crate::metrics::timed(Route::AggregateShard, request, |request| async move {
+            let timeout = grpc_timeout(request.metadata());
+            let req = request.into_inner();
+            let (pinned, frozen, children, claims) = self.open_children(
+                "AggregateShard",
+                req.visibility.as_ref(),
+                req.expected_stats_epoch,
+                &req.expected_stats_incarnation,
+            )?;
+            // Every child folds the request as sent; an id list names
+            // rows a child may not serve, which it leaves out as a node
+            // leaves out an id outside its range.
+            let requests = claims
+                .iter()
+                .map(|claim| {
+                    let mut child_req = req.clone();
+                    child_req.expected_stats_epoch = claim.epoch;
+                    child_req.expected_stats_incarnation = claim.incarnation();
+                    Some(child_req)
+                })
+                .collect();
+            let shares: Vec<crate::pb::AggregateShardResponse> = fan_out(
+                &frozen,
+                &children,
+                requests,
+                timeout,
+                "aggregate",
+                |mut link, request| async move { link.aggregate_shard(request).await },
+            )
+            .await?
+            .into_iter()
+            .map(|(_, share)| share)
+            .collect();
+            let mut merged = merge_aggregate_shares(
+                &req.aggregations,
+                &req.group_by,
+                req.max_groups,
+                &req.histograms,
+                &req.percentiles,
+                &shares,
+            )?;
+            let receipt = self.read_receipt(
+                &pinned,
+                children,
+                req.visibility.as_ref(),
+                Some(&claims),
+                &shares,
+            )?;
+            merged.stats_epoch = receipt.stats_epoch;
+            merged.stats_incarnation = receipt.stats_incarnation;
+            merged.visibility_fingerprint = receipt.visibility_fingerprint;
+            merged.visibility_columns_known = receipt.visibility_columns_known;
+            Ok(Response::new(merged))
+        })
+        .await
     }
 
     async fn quantile_counts(
         &self,
-        _request: Request<crate::pb::QuantileCountsRequest>,
+        request: Request<crate::pb::QuantileCountsRequest>,
     ) -> Result<Response<crate::pb::QuantileCountsResponse>, Status> {
-        Err(refused("QuantileCounts"))
+        crate::metrics::timed(Route::QuantileCounts, request, |request| async move {
+            let timeout = grpc_timeout(request.metadata());
+            let req = request.into_inner();
+            let (pinned, frozen, children, claims) = self.open_children(
+                "QuantileCounts",
+                req.visibility.as_ref(),
+                req.expected_stats_epoch,
+                &req.expected_stats_incarnation,
+            )?;
+            // A Boolean round carries the plan's own claim, translated
+            // per child as the plan route translates it.
+            let plan_claims = match req.boolean.as_ref() {
+                Some(plan) => Some(self.child_claims(
+                    plan.expected_stats_epoch,
+                    &plan.expected_stats_incarnation,
+                    children.len(),
+                )?),
+                None => None,
+            };
+            let requests = claims
+                .iter()
+                .enumerate()
+                .map(|(shard, claim)| {
+                    let mut child_req = req.clone();
+                    child_req.expected_stats_epoch = claim.epoch;
+                    child_req.expected_stats_incarnation = claim.incarnation();
+                    if let (Some(plan), Some(plan_claims)) =
+                        (child_req.boolean.as_mut(), plan_claims.as_ref())
+                    {
+                        plan.expected_stats_epoch = plan_claims[shard].epoch;
+                        plan.expected_stats_incarnation = plan_claims[shard].incarnation();
+                    }
+                    Some(child_req)
+                })
+                .collect();
+            let shares: Vec<crate::pb::QuantileCountsResponse> = fan_out(
+                &frozen,
+                &children,
+                requests,
+                timeout,
+                "quantile counts",
+                |mut link, request| async move { link.quantile_counts(request).await },
+            )
+            .await?
+            .into_iter()
+            .map(|(_, share)| share)
+            .collect();
+            let mut counts = vec![0u64; req.targets.len()];
+            for (shard, share) in shares.iter().enumerate() {
+                if share.counts.len() != counts.len() {
+                    return Err(Status::internal(format!(
+                        "relay: child {shard} answered {} quantile counts for {} targets",
+                        share.counts.len(),
+                        counts.len()
+                    )));
+                }
+                for (total, &count) in counts.iter_mut().zip(&share.counts) {
+                    add_count(total, count, shard, "quantile count")?;
+                }
+            }
+            let receipt = self.read_receipt(
+                &pinned,
+                children,
+                req.visibility.as_ref(),
+                Some(&claims),
+                &shares,
+            )?;
+            Ok(Response::new(crate::pb::QuantileCountsResponse {
+                counts,
+                stats_epoch: receipt.stats_epoch,
+                stats_incarnation: receipt.stats_incarnation,
+                visibility_fingerprint: receipt.visibility_fingerprint,
+                visibility_columns_known: receipt.visibility_columns_known,
+            }))
+        })
+        .await
     }
 
     async fn vector_rescore(
@@ -4037,7 +4814,12 @@ impl NodeService for RelayService {
         &self,
         _request: Request<crate::pb::HybridShardRequest>,
     ) -> Result<Response<crate::pb::HybridShardResponse>, Status> {
-        Err(refused("HybridShard"))
+        Err(Status::unimplemented(
+            "relay: NodeService.HybridShard is not served by a relay coordinator: two-level \
+             fusion fuses one list per shard at the root and is partition dependent by \
+             design, so a relay standing as one shard would change the answer; use the \
+             fused routes (ShardLegs, the cascade) through a relay",
+        ))
     }
 
     async fn shard_legs(
@@ -4160,9 +4942,58 @@ impl NodeService for RelayService {
 
     async fn browse_shard(
         &self,
-        _request: Request<crate::pb::BrowseShardRequest>,
+        request: Request<crate::pb::BrowseShardRequest>,
     ) -> Result<Response<crate::pb::BrowseShardResponse>, Status> {
-        Err(refused("BrowseShard"))
+        crate::metrics::timed(Route::BrowseShard, request, |request| async move {
+            let timeout = grpc_timeout(request.metadata());
+            let req = request.into_inner();
+            if req.k == 0 {
+                return Err(Status::invalid_argument("browse requires k > 0"));
+            }
+            let (pinned, frozen, children, claims) = self.open_children(
+                "BrowseShard",
+                req.visibility.as_ref(),
+                req.expected_stats_epoch,
+                &req.expected_stats_incarnation,
+            )?;
+            // The boundary is a row's keys and id, which each child
+            // applies to its rows as sent.
+            let requests = claims
+                .iter()
+                .map(|claim| {
+                    let mut child_req = req.clone();
+                    child_req.expected_stats_epoch = claim.epoch;
+                    child_req.expected_stats_incarnation = claim.incarnation();
+                    Some(child_req)
+                })
+                .collect();
+            let shares: Vec<crate::pb::BrowseShardResponse> = fan_out(
+                &frozen,
+                &children,
+                requests,
+                timeout,
+                "browse",
+                |mut link, request| async move { link.browse_shard(request).await },
+            )
+            .await?
+            .into_iter()
+            .map(|(_, share)| share)
+            .collect();
+            let mut merged = merge_browse_pages(&req, &shares)?;
+            let receipt = self.read_receipt(
+                &pinned,
+                children,
+                req.visibility.as_ref(),
+                Some(&claims),
+                &shares,
+            )?;
+            merged.stats_epoch = receipt.stats_epoch;
+            merged.stats_incarnation = receipt.stats_incarnation;
+            merged.visibility_fingerprint = receipt.visibility_fingerprint;
+            merged.visibility_columns_known = receipt.visibility_columns_known;
+            Ok(Response::new(merged))
+        })
+        .await
     }
 
     async fn resolve_filter_bitmap(
@@ -4462,12 +5293,6 @@ impl NodeService for RelayService {
         crate::metrics::timed(Route::EvaluateBoolean, request, |request| async move {
             let timeout = grpc_timeout(request.metadata());
             let req = request.into_inner();
-            if req.aggregate.is_some() {
-                return Err(Status::unimplemented(
-                    "relay: BooleanQuery.aggregate is not composed through a relay (the fold \
-                     order is the root's); aggregate through a root over the shards directly",
-                ));
-            }
             if req.depth == 0 {
                 return Err(Status::invalid_argument(
                     "EvaluateBoolean: depth 0 asks for no candidates",
@@ -4548,6 +5373,43 @@ impl NodeService for RelayService {
             receipt.vector_binding = binding.flatten();
             merged.stats_epoch = receipt.stats_epoch;
             merged.read_receipt = Some(receipt);
+            // The root aggregate each child folded over its match set,
+            // folded in child order, with a receipt of its own the root
+            // checks as it checks a shard's.
+            if let Some(spec) = req.aggregate.as_ref() {
+                let folds = shares
+                    .iter()
+                    .enumerate()
+                    .map(|(shard, share)| {
+                        share.aggregate.clone().ok_or_else(|| {
+                            Status::failed_precondition(format!(
+                                "relay: child {shard} answered no aggregate fold for a Boolean \
+                                 plan that asked for one"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, Status>>()?;
+                let mut fold = merge_aggregate_shares(
+                    &spec.aggregations,
+                    &spec.group_by,
+                    spec.max_groups,
+                    &spec.histograms,
+                    &spec.percentiles,
+                    &folds,
+                )?;
+                let fold_receipt = self.read_receipt(
+                    &pinned,
+                    self.children(),
+                    req.visibility.as_ref(),
+                    Some(&claims),
+                    &folds,
+                )?;
+                fold.stats_epoch = fold_receipt.stats_epoch;
+                fold.stats_incarnation = fold_receipt.stats_incarnation;
+                fold.visibility_fingerprint = fold_receipt.visibility_fingerprint;
+                fold.visibility_columns_known = fold_receipt.visibility_columns_known;
+                merged.aggregate = Some(fold);
+            }
             Ok(Response::new(merged))
         })
         .await
@@ -4589,6 +5451,122 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    /// A fixed map over two named children, for the receipt checks
+    /// that need a relay and no network.
+    struct FixedMap(MapSnapshot);
+
+    impl MapSource for FixedMap {
+        fn current(&self) -> MapSnapshot {
+            self.0.clone()
+        }
+
+        fn changes(&self) -> watch::Receiver<u64> {
+            let (tx, rx) = watch::channel(self.0.control_revision);
+            std::mem::forget(tx);
+            rx
+        }
+    }
+
+    fn fixed_relay() -> RelayService {
+        let children = vec!["a".to_string(), "b".to_string()];
+        let routes = children
+            .iter()
+            .map(|addr| TopologyRoute {
+                addr: addr.clone(),
+                replica: None,
+                hash_range: None,
+                placement: None,
+            })
+            .collect();
+        let map = MapSnapshot {
+            control_revision: 3,
+            topology_generation: 3,
+            map: Arc::new(RelayMap {
+                routes,
+                placement: None,
+            }),
+        };
+        RelayService::with_map(
+            Arc::new(CoordinatorServiceImpl::new(children)),
+            Arc::new(FixedMap(map)),
+        )
+    }
+
+    fn child_receipt(epoch: u64, fingerprint: &[u8]) -> crate::pb::VectorReadReceipt {
+        crate::pb::VectorReadReceipt {
+            vector_binding: None,
+            stats_epoch: epoch,
+            stats_incarnation: vec![7; 32],
+            visibility_fingerprint: fingerprint.to_vec(),
+            visibility_columns_known: Vec::new(),
+        }
+    }
+
+    /// The receipt every composed route folds its children's read views
+    /// through: a child echoing another visibility fingerprint, or a
+    /// version other than the claim the parent's token stands for,
+    /// refuses by name; agreeing children yield one relay token.
+    #[test]
+    fn a_read_receipt_refuses_a_child_off_the_scope_or_off_the_claim() {
+        let relay = fixed_relay();
+        let (pinned, _) = relay.pin();
+        let children = relay.children();
+        let scope = crate::visibility::VisibilityScope::new(None).unwrap();
+        let fingerprint = scope.fingerprint().to_vec();
+        let good = [
+            child_receipt(4, &fingerprint),
+            child_receipt(9, &fingerprint),
+        ];
+        let receipt = relay
+            .read_receipt(&pinned, children.clone(), None, None, &good)
+            .expect("agreeing children");
+        assert_ne!(receipt.stats_epoch, 0);
+        assert_eq!(receipt.stats_incarnation.len(), 32);
+        assert_eq!(receipt.visibility_fingerprint, fingerprint);
+        let claims = relay.translate_epoch(receipt.stats_epoch).unwrap();
+        assert_eq!(
+            claims.iter().map(|c| c.epoch).collect::<Vec<_>>(),
+            vec![4, 9],
+            "the token stands for each child's version"
+        );
+        // Under the token's claims the same children pass; a child at
+        // another version is a changed read.
+        relay
+            .read_receipt(&pinned, children.clone(), None, Some(&claims), &good)
+            .expect("the claimed versions");
+        let moved = [
+            child_receipt(4, &fingerprint),
+            child_receipt(10, &fingerprint),
+        ];
+        let err = relay
+            .read_receipt(&pinned, children.clone(), None, Some(&claims), &moved)
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("read version changed"),
+            "{}",
+            err.message()
+        );
+        // A child echoing another fingerprint answered another scope.
+        let mut other = fingerprint.clone();
+        other.push(1);
+        let off_scope = [child_receipt(4, &fingerprint), child_receipt(9, &other)];
+        let err = relay
+            .read_receipt(&pinned, children.clone(), None, None, &off_scope)
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            tonic::Code::FailedPrecondition,
+            "{}",
+            err.message()
+        );
+        // A child that did not answer leaves the receipt unfounded.
+        let err = relay
+            .read_receipt(&pinned, children, None, None, &good[..1])
+            .unwrap_err();
+        assert!(err.message().contains("every child"), "{}", err.message());
     }
 
     #[test]
@@ -4717,7 +5695,7 @@ mod tests {
             );
         }
         assert_eq!(
-            merge_term_stats(&TermStatsRequest::default(), &[probe.clone()])
+            merge_term_stats(&TermStatsRequest::default(), std::slice::from_ref(&probe))
                 .unwrap_err()
                 .code(),
             tonic::Code::FailedPrecondition
@@ -4730,7 +5708,7 @@ mod tests {
                 malformed.terms.push("term".into());
             }
             assert_eq!(
-                merge_term_stats(&malformed, &[probe.clone()])
+                merge_term_stats(&malformed, std::slice::from_ref(&probe))
                     .unwrap_err()
                     .code(),
                 tonic::Code::InvalidArgument

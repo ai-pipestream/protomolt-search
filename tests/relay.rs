@@ -575,13 +575,17 @@ async fn unsupported_routes_refuse_by_name() {
     let leaves = leaves().await;
     let relay_addr = relay_over(&[&leaves.addrs[0]]).await;
     let mut client = NodeServiceClient::connect(relay_addr).await.unwrap();
+    // Two-level fusion is partition dependent by design, so a relay
+    // standing as one shard refuses it by name and says why.
     let err = client
-        .get_documents(pipestream_search::pb::GetDocumentsRequest::default())
+        .hybrid_shard(pipestream_search::pb::HybridShardRequest::default())
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::Unimplemented);
     assert!(
-        err.message().contains("relay") && err.message().contains("GetDocuments"),
+        err.message().contains("relay")
+            && err.message().contains("HybridShard")
+            && err.message().contains("partition"),
         "{}",
         err.message()
     );
@@ -803,9 +807,57 @@ async fn add_vectors(addr: &str, vectors: Vec<f32>) {
     client.add_vectors(ReceiverStream::new(rx)).await.unwrap();
 }
 
-/// Four leaves with documents, a facet, and vectors aligned by id, on
-/// contiguous slot ranges; `positions[leaf]` gives the leaf positions on
-/// the body field.
+/// `year` and `pages` of global row `i`: an integer column and a double
+/// column with values exact in binary, so a fold over them is exact in
+/// any grouping and a fold through relays can be compared bit for bit.
+fn year_of(i: usize) -> i64 {
+    2000 + i as i64
+}
+
+fn pages_of(i: usize) -> f64 {
+    i as f64 * 1.5
+}
+
+/// The faceted documents with the `year` and `pages` columns set from
+/// the global row index (`leaf * LEX_ROWS + i`).
+async fn add_columned_documents(addr: &str, leaf: usize, texts: &[String]) {
+    let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
+    let (tx, rx) = mpsc::channel(4);
+    let texts = texts.to_vec();
+    let feeder = tokio::spawn(async move {
+        for (i, text) in texts.into_iter().enumerate() {
+            let row = leaf * LEX_ROWS + i;
+            tx.send(AddDocumentsRequest {
+                text,
+                facets: vec![FacetValue {
+                    field: "court".into(),
+                    value: if i % 2 == 0 {
+                        "scotus".into()
+                    } else {
+                        "ca9".into()
+                    },
+                }],
+                integers: vec![pipestream_search::pb::IntegerValue {
+                    field: "year".into(),
+                    value: year_of(row),
+                }],
+                numerics: vec![pipestream_search::pb::NumericValue {
+                    field: "pages".into(),
+                    value: pages_of(row),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+    });
+    client.add_documents(ReceiverStream::new(rx)).await.unwrap();
+    feeder.await.unwrap();
+}
+
+/// Four leaves with documents, a facet, the `year` and `pages` columns,
+/// and vectors aligned by id, on contiguous slot ranges;
+/// `positions[leaf]` gives the leaf positions on the body field.
 async fn lexical_leaves(positions: &[bool; LEX_LEAVES]) -> LexicalLeaves {
     let (analysis, mock) = start_mock_analysis().await;
     let corpus = unit_vectors(LEX_LEAVES * LEX_ROWS, DIM, 0x1E7A_2E1A);
@@ -816,6 +868,8 @@ async fn lexical_leaves(positions: &[bool; LEX_LEAVES]) -> LexicalLeaves {
             slot_offset: (leaf * LEX_ROWS) as u64,
             analysis_addr: Some(analysis.clone()),
             facet_fields: vec!["court".into()],
+            integer_fields: vec!["year".into()],
+            numeric_fields: vec!["pages".into()],
             position_fields: if positions[leaf] {
                 vec!["body".into()]
             } else {
@@ -825,7 +879,7 @@ async fn lexical_leaves(positions: &[bool; LEX_LEAVES]) -> LexicalLeaves {
         })
         .await;
         set_calibration(&addr, &shift, &scale).await;
-        add_faceted_documents(&addr, &lexical_texts(leaf)).await;
+        add_columned_documents(&addr, leaf, &lexical_texts(leaf)).await;
         add_vectors(
             &addr,
             corpus[leaf * LEX_ROWS * DIM..(leaf + 1) * LEX_ROWS * DIM].to_vec(),
@@ -1583,15 +1637,27 @@ async fn run_query(
     coordinator: &CoordinatorServiceImpl,
     selection: SelectionQuery,
 ) -> Result<Vec<QueryHit>, tonic::Status> {
-    coordinator
-        .query(tonic::Request::new(QueryRequest {
+    run_request(
+        coordinator,
+        QueryRequest {
             request_id: "relayed".into(),
             k: LEX_K,
             selection: Some(selection),
             ..Default::default()
-        }))
+        },
+    )
+    .await
+    .map(|r| r.hits)
+}
+
+async fn run_request(
+    coordinator: &CoordinatorServiceImpl,
+    request: QueryRequest,
+) -> Result<pipestream_search::pb::QueryResponse, tonic::Status> {
+    coordinator
+        .query(tonic::Request::new(request))
         .await
-        .map(|r| r.into_inner().hits)
+        .map(|r| r.into_inner())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1693,8 +1759,69 @@ async fn filtered_and_boolean_queries_through_relays_equal_the_flat_fanout() {
 /// A root aggregate on a boolean tree folds on the shards in the root's
 /// shard order; a relay does not compose that fold and says so by name,
 /// while the flat fleet serves it.
+fn aggregation(
+    name: &str,
+    expression: &str,
+    op: pipestream_search::pb::AggregateOp,
+) -> pipestream_search::pb::Aggregation {
+    pipestream_search::pb::Aggregation {
+        name: name.into(),
+        expression: expression.into(),
+        op: op as i32,
+        max_distinct: 0,
+    }
+}
+
+/// Count, the exact int folds, an exact double sum, a facet group-by, a
+/// histogram, and exact percentiles: the folds a relay reproduces bit
+/// for bit in any grouping of its children.
+fn exact_aggregate(filter: &str) -> pipestream_search::pb::AggregateRequest {
+    use pipestream_search::pb::AggregateOp as Op;
+    pipestream_search::pb::AggregateRequest {
+        filter: filter.into(),
+        aggregations: vec![
+            aggregation("n", "1", Op::Count),
+            aggregation("ysum", "year", Op::Sum),
+            aggregation("ymin", "year", Op::Min),
+            aggregation("ymax", "year", Op::Max),
+            aggregation("psum", "pages", Op::Sum),
+            aggregation("courts", "court", Op::Cardinality),
+        ],
+        group_by: "court".into(),
+        max_groups: 8,
+        histograms: vec![pipestream_search::pb::HistogramSpec {
+            name: "page_bands".into(),
+            expression: "pages".into(),
+            interval: 6.0,
+            max_buckets: 16,
+            ..Default::default()
+        }],
+        percentiles: vec![pipestream_search::pb::PercentileSpec {
+            name: "pages".into(),
+            expression: "pages".into(),
+            percentiles: vec![50.0, 90.0],
+        }],
+        ..Default::default()
+    }
+}
+
+/// The relay trees the fold and fetch tests run under: one level in
+/// order, one level permuted, and two levels (a chain).
+async fn relay_trees(l: &[String]) -> Vec<(&'static str, Vec<String>)> {
+    let a = relay_over(&[&l[0], &l[1]]).await;
+    let b = relay_over(&[&l[2], &l[3]]).await;
+    let p = relay_over(&[&l[3], &l[2]]).await;
+    let q = relay_over(&[&l[1], &l[0]]).await;
+    let top = relay_over(&[&a, &b]).await;
+    vec![
+        ("one level", vec![a, b]),
+        ("permuted", vec![q, p]),
+        ("two levels", vec![top]),
+    ]
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_boolean_aggregate_through_a_relay_refuses_by_name() {
+async fn a_boolean_aggregate_through_relays_equals_the_direct_root() {
     let leaves = lexical_leaves(&[true; LEX_LEAVES]).await;
     let l = &leaves.addrs;
     let with_bm25 = |addrs: Vec<String>| {
@@ -1702,41 +1829,399 @@ async fn a_boolean_aggregate_through_a_relay_refuses_by_name() {
             .with_bm25(Some(leaves.analysis.clone()), Default::default())
             .with_stream_search(true)
     };
-    let aggregate = pipestream_search::pb::AggregateRequest {
-        aggregations: vec![pipestream_search::pb::Aggregation {
-            name: "n".into(),
-            expression: "1".into(),
-            op: pipestream_search::pb::AggregateOp::Count as i32,
-            max_distinct: 0,
-        }],
-        ..Default::default()
-    };
     let selection = SelectionQuery {
         node: Some(selection_query::Node::Boolean(
             pipestream_search::pb::BooleanQuery {
                 must: vec![
                     lexical_clause("lex", "court"),
-                    cel_clause("f", r#"court == "scotus""#),
+                    cel_clause("f", "year >= 2002"),
                 ],
                 should: Vec::new(),
                 must_not: Vec::new(),
                 minimum_should_match: 0,
-                aggregate: Some(aggregate),
+                aggregate: Some(exact_aggregate("")),
             },
         )),
     };
     let flat = with_bm25(l.clone());
-    let want = run_query(&flat, selection.clone()).await.expect("flat");
-    assert!(!want.is_empty());
+    let want = run_query_full(&flat, selection.clone())
+        .await
+        .expect("flat");
+    let aggregate = want.aggregate.as_ref().expect("the flat root folds");
+    assert!(!want.hits.is_empty());
+    assert!(aggregate.matched > 0 && aggregate.groups.len() == 2);
+    for (name, children) in relay_trees(l).await {
+        let relayed = with_bm25(children);
+        let through = run_query_full(&relayed, selection.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(
+            query_bits(&through.hits),
+            query_bits(&want.hits),
+            "{name}: hits"
+        );
+        assert_eq!(
+            through.aggregate, want.aggregate,
+            "{name}: the Boolean fold"
+        );
+    }
+}
+
+async fn run_query_full(
+    coordinator: &CoordinatorServiceImpl,
+    selection: SelectionQuery,
+) -> Result<pipestream_search::pb::QueryResponse, tonic::Status> {
+    run_request(
+        coordinator,
+        QueryRequest {
+            request_id: "relayed".into(),
+            k: LEX_K,
+            selection: Some(selection),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn aggregates_through_relays_equal_the_flat_root() {
+    use pipestream_search::pb::AggregateOp as Op;
+    let leaves = lexical_leaves(&[true; LEX_LEAVES]).await;
+    let l = &leaves.addrs;
+    let with_bm25 = |addrs: Vec<String>| {
+        CoordinatorServiceImpl::new(addrs)
+            .with_bm25(Some(leaves.analysis.clone()), Default::default())
+            .with_stream_search(true)
+    };
+    let flat = with_bm25(l.clone());
+    let request = exact_aggregate("year >= 2002");
+    let want = flat
+        .aggregate(tonic::Request::new(request.clone()))
+        .await
+        .expect("flat")
+        .into_inner();
+    assert_eq!(want.matched, (LEX_LEAVES * LEX_ROWS - 2) as u64);
+    assert_eq!(want.groups.len(), 2);
+    assert!(!want.histograms[0].buckets.is_empty());
+    assert_eq!(want.percentiles[0].values.len(), 2);
+    for (name, children) in relay_trees(l).await {
+        let relayed = with_bm25(children);
+        let through = relayed
+            .aggregate(tonic::Request::new(request.clone()))
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+            .into_inner();
+        assert_eq!(through, want, "{name}: the fold");
+    }
+    // The moment folds (mean, variance) are exact through a chain: a
+    // relay over every child, or relays nested one under another, fold
+    // in the root's own order, so the merged state is the root's.
+    let moments = pipestream_search::pb::AggregateRequest {
+        filter: "year >= 2001".into(),
+        aggregations: vec![
+            aggregation("pmean", "pages", Op::Mean),
+            aggregation("pvar", "pages", Op::Variance),
+        ],
+        ..Default::default()
+    };
+    let want = flat
+        .aggregate(tonic::Request::new(moments.clone()))
+        .await
+        .expect("flat moments")
+        .into_inner();
+    let all = relay_over(&[&l[0], &l[1], &l[2], &l[3]]).await;
     let a = relay_over(&[&l[0], &l[1]]).await;
-    let relayed = with_bm25(vec![a, l[2].clone(), l[3].clone()]);
-    let err = run_query(&relayed, selection).await.unwrap_err();
-    assert_eq!(err.code(), tonic::Code::Unimplemented, "{}", err.message());
-    assert!(
-        err.message().contains("relay") && err.message().contains("aggregate"),
-        "{}",
-        err.message()
-    );
+    let chain = relay_over(&[&a]).await;
+    for (name, children) in [
+        ("one relay over all", vec![all]),
+        ("a chain", vec![chain, l[2].clone(), l[3].clone()]),
+    ] {
+        let relayed = with_bm25(children);
+        let through = relayed
+            .aggregate(tonic::Request::new(moments.clone()))
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+            .into_inner();
+        assert_eq!(through, want, "{name}: the moments");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn browse_pages_and_projections_through_relays_equal_the_flat_root() {
+    let leaves = lexical_leaves(&[true; LEX_LEAVES]).await;
+    let l = &leaves.addrs;
+    let with_bm25 = |addrs: Vec<String>| {
+        CoordinatorServiceImpl::new(addrs)
+            .with_bm25(Some(leaves.analysis.clone()), Default::default())
+            .with_stream_search(true)
+    };
+    let flat = with_bm25(l.clone());
+    let page = |cursor: String, sort: Vec<pipestream_search::pb::QuerySort>| QueryRequest {
+        request_id: "browse".into(),
+        k: 5,
+        selection: Some(cel_clause("f", "year >= 2003")),
+        sort,
+        cursor,
+        projections: vec![
+            pipestream_search::pb::NamedProjection {
+                name: "pages".into(),
+                expression: "pages".into(),
+            },
+            pipestream_search::pb::NamedProjection {
+                name: "year".into(),
+                expression: "year".into(),
+            },
+        ],
+        ..Default::default()
+    };
+    let by_year = vec![pipestream_search::pb::QuerySort {
+        column: "year".into(),
+        descending: true,
+    }];
+    let seen = |hits: &[QueryHit]| -> Vec<(
+        u64,
+        u32,
+        Vec<pipestream_search::pb::SortValue>,
+        Vec<pipestream_search::pb::ProjectedValue>,
+    )> {
+        hits.iter()
+            .map(|h| (h.doc_id, h.rank, h.sort_values.clone(), h.projected.clone()))
+            .collect()
+    };
+    let trees = relay_trees(l).await;
+    for (label, sort) in [("sorted", by_year), ("by id", Vec::new())] {
+        let first = run_request(&flat, page(String::new(), sort.clone()))
+            .await
+            .expect("flat first page");
+        assert_eq!(first.hits.len(), 5, "{label}: the first page is full");
+        assert!(!first.next_cursor.is_empty(), "{label}: a next page");
+        let second = run_request(&flat, page(first.next_cursor.clone(), sort.clone()))
+            .await
+            .expect("flat second page");
+        assert!(!second.hits.is_empty());
+        for (name, children) in &trees {
+            let relayed = with_bm25(children.clone());
+            let through = run_request(&relayed, page(String::new(), sort.clone()))
+                .await
+                .unwrap_or_else(|e| panic!("{name} {label}: {e}"));
+            assert_eq!(
+                seen(&through.hits),
+                seen(&first.hits),
+                "{name} {label}: page one"
+            );
+            // A cursor binds the read versions of the root that minted
+            // it (relay tokens under a relay root), so each root pages
+            // with its own; the pages agree.
+            assert!(
+                !through.next_cursor.is_empty(),
+                "{name} {label}: a next page"
+            );
+            let through = run_request(&relayed, page(through.next_cursor.clone(), sort.clone()))
+                .await
+                .unwrap_or_else(|e| panic!("{name} {label}: page two: {e}"));
+            assert_eq!(
+                seen(&through.hits),
+                seen(&second.hits),
+                "{name} {label}: page two"
+            );
+        }
+    }
+}
+
+/// The fetches by id a relay routes to the child whose slot range holds
+/// each id: answers in the caller's order, an id repeated answered once
+/// per occurrence, a foreign id left out, and the read receipt carried
+/// as a relay token the relay translates back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fetches_by_id_through_relays_equal_the_children() {
+    use pipestream_search::pb::{
+        CompiledProjection, FetchValuesRequest, GetDocumentsRequest, LineageField,
+        ResolveParentsRequest,
+    };
+    let leaves = lexical_leaves(&[true; LEX_LEAVES]).await;
+    let l = &leaves.addrs;
+    let a = relay_over(&[&l[0], &l[1]]).await;
+    let b = relay_over(&[&l[2], &l[3]]).await;
+    let top = relay_over(&[&a, &b]).await;
+    let rows = LEX_ROWS as u64;
+    // Across the children, out of order, one repeated, one foreign.
+    let ids: Vec<u64> = vec![rows + 3, 1, 1, 3 * rows + 2, 5 * rows, 2 * rows + 1, 0];
+    let child_of = |id: u64| (id / rows) as usize;
+    let visibility = Some(pipestream_search::pb::DocumentVisibility {
+        filter: pipestream_search::cel::compile_filter("court == 'scotus'").unwrap(),
+    });
+    let projections = vec![
+        CompiledProjection {
+            name: "year".into(),
+            expr: Some(pipestream_search::cel::compile_value("year").unwrap()),
+        },
+        CompiledProjection {
+            name: "pages".into(),
+            expr: Some(pipestream_search::cel::compile_value("pages").unwrap()),
+        },
+    ];
+    let fields = vec![LineageField::ParentId as i32, LineageField::GroupId as i32];
+    for (name, relay_addr, children) in [
+        ("one level", a.clone(), 0..2),
+        ("two levels", top.clone(), 0..4),
+    ] {
+        let mut relay = NodeServiceClient::connect(relay_addr).await.unwrap();
+        // The answer a node gives each id, in the caller's order, from
+        // the child that serves it.
+        let mut documents = Vec::new();
+        let mut parents = Vec::new();
+        let mut values = Vec::new();
+        let mut direct_receipt = None;
+        for &id in &ids {
+            let child = child_of(id);
+            if !children.contains(&child) {
+                continue;
+            }
+            let mut node = NodeServiceClient::connect(l[child].clone()).await.unwrap();
+            documents.extend(
+                node.get_documents(GetDocumentsRequest { doc_ids: vec![id] })
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .documents,
+            );
+            parents.extend(
+                node.resolve_parents(ResolveParentsRequest {
+                    doc_ids: vec![id],
+                    visibility: visibility.clone(),
+                    fields: fields.clone(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .parents,
+            );
+            let fetched = node
+                .fetch_values(FetchValuesRequest {
+                    candidate_ids: vec![id],
+                    projections: projections.clone(),
+                    visibility: visibility.clone(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            values.extend(fetched.rows);
+            direct_receipt = Some((
+                fetched.visibility_fingerprint,
+                fetched.visibility_columns_known,
+                fetched.projection_types,
+                fetched.projection_leaves_known,
+            ));
+        }
+        let served = ids
+            .iter()
+            .filter(|&&id| children.contains(&child_of(id)))
+            .count();
+        assert!(served < ids.len(), "{name}: an id is foreign");
+        assert_eq!(documents.len(), served, "{name}: the foreign id is absent");
+        let through = relay
+            .get_documents(GetDocumentsRequest {
+                doc_ids: ids.clone(),
+            })
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+            .into_inner();
+        assert_eq!(through.documents, documents, "{name}: GetDocuments");
+        let through = relay
+            .resolve_parents(ResolveParentsRequest {
+                doc_ids: ids.clone(),
+                visibility: visibility.clone(),
+                fields: fields.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+            .into_inner();
+        assert_eq!(through.parents, parents, "{name}: ResolveParents");
+        assert_eq!(through.fields, fields, "{name}: the lineage fields echo");
+        assert_ne!(through.stats_epoch, 0, "{name}: a relay token");
+        assert_eq!(
+            through.stats_incarnation.len(),
+            32,
+            "{name}: the relay's incarnation"
+        );
+        let (fingerprint, known, types, leaves_known) = direct_receipt.expect("a child answered");
+        assert_eq!(
+            through.visibility_fingerprint, fingerprint,
+            "{name}: the visibility echo"
+        );
+        assert_eq!(through.visibility_columns_known, known);
+        // The token translates back into each child's claim; a claim
+        // the relay did not issue refuses by name.
+        let claimed = relay
+            .resolve_parents(ResolveParentsRequest {
+                doc_ids: ids.clone(),
+                visibility: visibility.clone(),
+                fields: fields.clone(),
+                expected_stats_epoch: through.stats_epoch,
+                expected_stats_incarnation: through.stats_incarnation.clone(),
+            })
+            .await
+            .unwrap_or_else(|e| panic!("{name}: the relay's own claim: {e}"))
+            .into_inner();
+        assert_eq!(claimed.parents, parents, "{name}: under the claim");
+        let mut foreign = through.stats_incarnation.clone();
+        foreign[0] ^= 0xff;
+        let err = relay
+            .resolve_parents(ResolveParentsRequest {
+                doc_ids: ids.clone(),
+                visibility: visibility.clone(),
+                fields: fields.clone(),
+                expected_stats_epoch: through.stats_epoch,
+                expected_stats_incarnation: foreign,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            tonic::Code::FailedPrecondition,
+            "{name}: {}",
+            err.message()
+        );
+        let through = relay
+            .fetch_values(FetchValuesRequest {
+                candidate_ids: ids.clone(),
+                projections: projections.clone(),
+                visibility: visibility.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+            .into_inner();
+        assert_eq!(through.rows, values, "{name}: FetchValues");
+        assert_eq!(
+            through.projection_types, types,
+            "{name}: the projection types"
+        );
+        assert_eq!(through.projection_leaves_known, leaves_known);
+        assert_eq!(through.visibility_fingerprint, fingerprint);
+        assert_ne!(through.stats_epoch, 0);
+        assert_eq!(through.stats_incarnation.len(), 32);
+        // A stage on a column no child knows: false, for the root's
+        // typo rule, not a refusal from this level.
+        let unknown = relay
+            .fetch_values(FetchValuesRequest {
+                candidate_ids: vec![1],
+                stages: vec![pipestream_search::pb::ScoreStage {
+                    op: pipestream_search::pb::ScoreOp::MultLog as i32,
+                    column: "nowhere".into(),
+                    weight: 1.0,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+            .into_inner();
+        assert_eq!(unknown.stage_columns_known, vec![false], "{name}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

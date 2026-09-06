@@ -1469,6 +1469,20 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   Unsigned mapping and query support remain in progress. See [integer storage](docs/range-facets.md) and the
   [foundation status](docs/search-foundations.md).
 
+- **Landed 2026-09-06: the fetches and folds through a relay.** A relay
+  now serves the follow-ups the public Query route sends its shards
+  (`GetDocuments`, `ResolveParents`, `FetchValues`, routed by child slot
+  range and answered in the caller's order; `BrowseShard`, the children's
+  pages merged in sort order and cut to `k`) and the folds (`AggregateShard`,
+  `QuantileCounts` with or without a Boolean plan, `BooleanQuery.aggregate`
+  inside `EvaluateBoolean`), folding the children's partials in child order
+  through the root's own fold and answering as one shard's partial. The
+  read receipt on each is a relay token the relay translates back, the
+  visibility fingerprint every child must echo, and the binding checks the
+  other read routes apply. `HybridShard` keeps refusing, with the reason:
+  two-level fusion is partition dependent by design. Bit for bit through
+  one and two levels (`tests/relay.rs`). [Relay coordinators](docs/relay-coordinators.md).
+
 - **Landed 2026-09-06: the read surface through a relay.** `SearchShard`
   (the cascade's gate and the unary vector search), `VectorRescore` and
   `ExactVectorRescore` (decomposed fusion, the FP32 rerank, a boolean

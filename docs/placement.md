@@ -260,21 +260,31 @@ space as the coordinator's per-leaf routing does, `n` a power of two,
 and a row routed into such a leaf must carry a stable key or the split
 refuses by id (give the leaf one shard or rebuild through routed
 ingest). A vector row with no document cannot be evaluated and refuses
-by id. Rows are routed one WAL bucket at a time into per-child spill
-logs under `<out>/spill` (removed at the end), then each child's image
-is built from its spill, so memory is bounded by one bucket and then by
-the largest child, the shape a partitioned compaction uses. The
-written `shard-map.toml` carries the new tree under `[placement]` and
-one `[[shards]]` per child with its `placement` code and hash range,
+by id. Rows are routed one source WAL bucket at a time into per-child
+spill logs under `<out>/spill` (removed at the end), written with the
+widest bucket count among the sources (`--spill-bucket-bits` overrides
+it), and each child is then built from its spill one bucket at a time:
+every non-empty bucket seals as one segment of the child's catalog
+(`<out>/shard-<i>.tv.segments`, `docs/immutable-segments.md`), so
+memory is one bucket's rows plus one segment build, never a child. On
+the fleet's archive (six sources of 64 buckets, 11M rows per band) that
+is about 170,000 rows per replay instead of 11M; the first run of this
+split wrote one-bucket spills and held a band at once, 50 GB on a 61 GB
+machine. A child with no rows is an empty catalog. The written
+`shard-map.toml` carries the new tree under `[placement]` and one
+`[[shards]]` per child with its `placement` code and hash range,
 addresses left to fill in; each child serves under
-`--placement-column`, `--placement-leaf=<its code>`, and
-`--placement-tree=<that map>`, and a child's code that is no leaf of
-the old tree is refused by name if it is started under the old map.
-Documents are re-analyzed through the sidecar as in every replay. The
-split is offline: no live cutoff is recorded, so the sources must be
-quiescent. A child is one image, so the year cut inside a leaf is still
-`CompactShard` with `partition_column` on the served child
-(`docs/segment-pruning.md`).
+`--index=<out>/shard-<i>.tv`, `--placement-column`,
+`--placement-leaf=<its code>`, and `--placement-tree=<that map>`, and a
+child's code that is no leaf of the old tree is refused by name if it
+is started under the old map. Documents are re-analyzed through the
+sidecar as in every replay. The split is offline: no live cutoff is
+recorded, so the sources must be quiescent. `--single-image=<max child
+rows>` writes one image per child instead, the shape the other splits
+write, and refuses a child above the bound before writing anything. A
+segment covers one hash bucket of the band, not a year range, so the
+year cut inside a leaf is still `CompactShard` with `partition_column`
+on the served child (`docs/segment-pruning.md`).
 
 The hitless flow (tail while the parent serves, then freeze, catch up,
 publish) still partitions by the stable-key hash; keying its catch-up

@@ -77,7 +77,8 @@ private lexical winner can no longer occupy the retained list and erase a
 visible document's lexical-rank provenance. The regression compares complete
 hits and scores against a physically restricted corpus with private rows that
 would otherwise dominate lexical selection. Scoped shard admission also uses
-the same unpruned read set as the vector stream.
+the same unpruned read set as the vector stream. Lexical-only and disabled legs
+build their predicate and receipt without a corpus-sized vector allowlist.
 
 `Bm25RescoreRequest.visibility = 12` applies the trusted planner's document view
 before candidate scoring. Responses carry the physical epoch, incarnation,
@@ -92,9 +93,23 @@ response against both the global-statistics claim and any root read set, and
 rejects foreign, duplicate and nonfinite scores. Scoped or staged rescores
 contact empty candidate owners to validate authority and stage columns. Relays
 include every child in the receipt and reject child scores outside the IDs sent
-to that child. All-visible responses retain their existing score semantics.
+to that child. Valid unrestricted requests retain their existing score semantics.
 
 New coordinators require these receipts from every scoring node. Earlier nodes
 cannot silently satisfy that contract. Upgrade nodes and coordinators together;
 these five additive protobuf fields do not change any stored source or index
 format. No new route or public document-query permission is enabled here.
+
+## Validation after main integration, 2026-09-06
+
+The final source incorporates main `a9bf470`, including spill staging and the
+relay fetch/fold work. It passed 492 library tests, 688 integration tests across
+119 targets and 12 embedded tests: 1,192 passed, zero failed. The existing live
+OpenNLP Unicode conformance test remains ignored. All five Android/iOS compile
+checks, the tests/examples build, formatting, vendored-proto identity and
+whitespace checks passed. Descriptor comparisons against main `a9bf470` and the
+previous feature checkpoint `716f02a` preserve all existing declarations. The
+BM25 rescore changes add five fields without changing stored formats. Source,
+build and test hashes were unchanged through the final run, including the
+lexical-only allowlist optimization. No fleet action or measurement was performed
+by this task.

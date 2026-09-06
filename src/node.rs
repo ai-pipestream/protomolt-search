@@ -7819,7 +7819,13 @@ impl NodeServiceImpl {
         // halves of a fused list cannot disagree about what matched.
         let (geo_columns_known, filter_columns_known) =
             filter_known_flags(guard.bm25.as_ref(), filters.geo, filters.tree);
-        let slots = guard.index.as_ref().map_or(0, |index| index.len());
+        // A lexical-only or disabled leg needs the predicate and receipt,
+        // but must not allocate a vector mask proportional to the corpus.
+        let slots = if k > 0 && !vector.is_empty() {
+            guard.index.as_ref().map_or(0, |index| index.len())
+        } else {
+            0
+        };
         let ((doc_filter, allow, _prune), read_receipt) = guard.vector_scan_filters(
             slots,
             filters.geo,

@@ -2,6 +2,8 @@
 
 Foundation work began on `feat/search-foundations` from `PRE_ASTRA`.
 Current implementation branch: `feat/query-field-authorization-2026-09`.
+This branch now incorporates main `a9bf470`, including the spill staging and
+relay fetch/fold integration.
 The main reconciliation checkpoint remains `1565d07` on
 `feat/protobuf-unsigned-numerics-2026-09`, accepted for main on 2026-09-06.
 This tracks the full requested foundation. Individual passing increments do not

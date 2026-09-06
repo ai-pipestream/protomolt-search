@@ -1,10 +1,16 @@
 # Main reconciliation, 2026-09-06
 
-This feature branch incorporates main through `5fdedf324f190d83434f950af0f8d3c994163d73`.
+Checkpoint `1565d07` incorporated main through `5fdedf324f190d83434f950af0f8d3c994163d73`.
 It includes the placement trust checks, the expanded relay read routes and
 shard-side Boolean evaluation. The public package remains
 `ai.protomolt.search.v1`. This note describes the reconciliation; it is not a
 fleet deployment record or a claim that the foundations project is complete.
+
+The later field-authorization branch now incorporates main `a9bf470`, including
+spill staging and relay fetches/folds. The route limitations below describe the
+original checkpoint; current relay support is recorded in
+[relay coordinators](relay-coordinators.md), and the later hybrid read contracts
+are in [hybrid read views](hybrid-read-views.md).
 
 ## Contracts to retain on subsequent merges
 

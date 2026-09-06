@@ -24,6 +24,12 @@
 //!     --out-dir=/data/bands --slot-base=0 --slot-stride=25000000 \
 //!     --analysis-addr=http://localhost:50051
 //!
+//! A re-placement split writes each child as a segment catalog
+//! (`<out>/shard-<i>.tv.segments`, served with `--index=<out>/shard-<i>.tv`),
+//! one sealed segment per spill bucket, so memory is one bucket of one child;
+//! `--single-image=<max child rows>` writes one image per child instead and
+//! refuses a child above the bound.
+//!
 //! # Merge several shards -> 1 (identical provider configuration required):
 //! reshard --logs=/data/shard-0.vector.wal,/data/shard-1.vector.wal --out-dir=/data/merged \
 //!     --analysis-addr=http://localhost:50051
@@ -63,7 +69,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(
             "usage: reshard (--log=<wal dir|generation dir> --split=N | --logs=a,b,c) \
              --out-dir=<dir> [--slot-base=B] [--slot-stride=S] [--analysis-addr=ADDR] \
-             [--stable-routing] [--placement-tree=<file>]"
+             [--stable-routing] [--placement-tree=<file> [--single-image=<max child rows>] \
+             [--spill-bucket-bits=<bits>]]"
                 .into(),
         );
     }
@@ -144,12 +151,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for gen in &generations {
             eprintln!("replaying {}", gen.display());
         }
+        let layout = match opt("single-image") {
+            Some(bound) => reshard::TreeChildLayout::SingleImage {
+                max_child_rows: bound.parse().map_err(|error| {
+                    format!("--single-image takes the most rows a child may have: {error}")
+                })?,
+            },
+            None => reshard::TreeChildLayout::Segmented,
+        };
+        let spill_bucket_bits = opt("spill-bucket-bits")
+            .map(|bits| bits.parse::<u32>())
+            .transpose()?;
         let placed = reshard::split_placement_tree_logs(
             &generations,
             &tree,
             &out_dir,
             &slot_offsets,
             bm25_fields.as_deref(),
+            reshard::TreeSplitOptions {
+                layout,
+                spill_bucket_bits,
+            },
             &mut analyze,
         )?;
         let map = reshard::tree_shard_map_toml(&placed, &tree)?;
@@ -157,16 +179,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::write(&map_path, &map)?;
         eprintln!("wrote {}", map_path.display());
         eprintln!("{} documents changed code under the new tree", placed.moved);
-        for ((image, child), rows) in placed
+        eprintln!(
+            "spill logs of {} buckets; the largest replay held {} rows ({:?})",
+            placed.spill_bucket_count, placed.peak_replay_rows, placed.layout
+        );
+        for (((image, child), rows), segments) in placed
             .images
             .children
             .iter()
             .zip(&placed.children)
             .zip(&placed.placed)
+            .zip(&placed.segments)
         {
             eprintln!(
-                "child {}: leaf {} (placement {}), {rows} documents, {} vectors, slot_offset {}, \
-                 hash [{}, {}]",
+                "child {}: leaf {} (placement {}), {rows} documents, {} vectors, {segments} \
+                 segments, slot_offset {}, hash [{}, {}]",
                 image.vector_path.display(),
                 child.leaf,
                 child.code,
