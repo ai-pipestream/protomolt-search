@@ -2260,6 +2260,12 @@ pub struct TreeChild {
 /// (parallel to `images.children`), and what moved.
 #[derive(Debug)]
 pub struct TreeReshardOutput {
+    /// One entry per child. Under [`TreeChildLayout::Segmented`] a child's
+    /// `vector_path` is the index path a node serves (`<out>/shard-<i>.tv`,
+    /// its catalog beside it under `.segments`), `bm25_path` is `None`, and
+    /// the id maps are empty: the segments' own metadata carry the rows.
+    /// Under [`TreeChildLayout::SingleImage`] the entries are the images
+    /// as any split writes them.
     pub images: ReshardOutput,
     pub children: Vec<TreeChild>,
     /// Live documents whose code under the new tree differs from the
@@ -2267,6 +2273,50 @@ pub struct TreeReshardOutput {
     pub moved: u64,
     /// Live documents per child.
     pub placed: Vec<u64>,
+    /// How the children were written.
+    pub layout: TreeChildLayout,
+    /// Sealed segments per child (1 per child under a single image).
+    pub segments: Vec<usize>,
+    /// The most live source rows any one replay held: one spill bucket
+    /// under the segmented layout, one child under a single image.
+    pub peak_replay_rows: u64,
+    /// The bucket count the spill logs were written with.
+    pub spill_bucket_count: u32,
+}
+
+/// How a re-placement split writes each child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeChildLayout {
+    /// A segment catalog per child (`<out>/shard-<i>.tv.segments`,
+    /// `docs/immutable-segments.md`): the child's spill log replays one
+    /// WAL bucket at a time and each non-empty bucket seals as one
+    /// segment, so memory is one bucket's rows plus one segment build,
+    /// and a node starts on the child with `--index=<out>/shard-<i>.tv`.
+    Segmented,
+    /// One image per child, the way the other splits write: the child's
+    /// rows are held together while the image is built. The caller states
+    /// the most rows a child may have; a larger child is refused by name
+    /// before any image is written.
+    SingleImage { max_child_rows: u64 },
+}
+
+/// The knobs of a re-placement split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreeSplitOptions {
+    pub layout: TreeChildLayout,
+    /// log2 of the spill logs' bucket count; `None` takes the largest
+    /// bucket count among the inputs, so a replay of one spill bucket is
+    /// bounded the way a replay of one source bucket is.
+    pub spill_bucket_bits: Option<u32>,
+}
+
+impl Default for TreeSplitOptions {
+    fn default() -> Self {
+        Self {
+            layout: TreeChildLayout::Segmented,
+            spill_bucket_bits: None,
+        }
+    }
 }
 
 /// The children a tree implies: `shards` per leaf, in leaf (code) order,
@@ -2313,7 +2363,9 @@ pub fn tree_children(placement: &crate::placement::Placement) -> Result<Vec<Tree
 /// no document cannot be evaluated and refuses the split by id. Memory
 /// is bounded by one WAL bucket during routing and by the largest child
 /// while its image is built: rows are spilled per child under
-/// `out_dir/spill` first, as a partitioned compaction does. Offline
+/// `out_dir/spill` first, as a partitioned compaction does, and under
+/// [`TreeChildLayout::Segmented`] (the default) each child is a catalog
+/// sealed one spill bucket at a time, so memory is one bucket. Offline
 /// only: no live cutoff is recorded, so the sources must be quiescent.
 #[allow(clippy::too_many_arguments)]
 pub fn split_placement_tree_logs(
@@ -2322,6 +2374,7 @@ pub fn split_placement_tree_logs(
     out_dir: &Path,
     slot_offsets: &[u64],
     bm25_fields: Option<&[String]>,
+    options: TreeSplitOptions,
     analyze: &mut Analyzer,
 ) -> Result<TreeReshardOutput, String> {
     let placement = crate::placement::Placement::validate(tree)?;
@@ -2362,9 +2415,27 @@ pub fn split_placement_tree_logs(
     // Pass 1: route each live row under the new tree into its child's
     // spill log, one WAL bucket in memory at a time.
     let spill_root = out_dir.join("spill");
+    let spill_bucket_bits = match options.spill_bucket_bits {
+        Some(bits) => {
+            if bits > 16 {
+                return Err(format!(
+                    "spill bucket bits {bits} exceed 16 (65,536 bucket files per child)"
+                ));
+            }
+            bits
+        }
+        None => {
+            let mut widest = manifest.bucket_count;
+            for gen in gens {
+                widest = widest.max(read_gen_manifest(gen)?.bucket_count);
+            }
+            widest.trailing_zeros()
+        }
+    };
     let mut spill_manifest = manifest.clone();
-    spill_manifest.bucket_bits = 0;
-    spill_manifest.bucket_count = 1;
+    spill_manifest.bucket_bits = spill_bucket_bits;
+    spill_manifest.bucket_count = 1u32 << spill_bucket_bits;
+    let spill_bucket_count = spill_manifest.bucket_count;
     let mut spills = Vec::with_capacity(children.len());
     for index in 0..children.len() {
         let dir = spill_root.join(format!("c{index:05}"));
@@ -2479,45 +2550,282 @@ pub fn split_placement_tree_logs(
         .collect::<Result<_, _>>()?;
     drop(spills);
 
-    // Pass 2: one image per child from its spill.
+    // Pass 2: each child from its spill.
     let dim = manifest.dim as usize;
+    let generation = top_generation
+        .checked_add(1)
+        .ok_or_else(|| "re-placement split generation overflow".to_string())?;
+    // A child's rows take slots from its offset up to the next offset
+    // above it; the last child is unbounded.
+    let slot_bound = |index: usize| -> Option<u64> {
+        slot_offsets
+            .iter()
+            .copied()
+            .filter(|offset| *offset > slot_offsets[index])
+            .min()
+    };
     let mut images = Vec::with_capacity(children.len());
-    for (index, (child, spill_dir)) in children.iter().zip(&spill_dirs).enumerate() {
-        let mut replay = Replay::default();
-        replay_buckets_through(spill_dir, 0..1, 1, dim, false, u64::MAX, &mut replay)?;
-        replay.compact();
-        if replay.documents.len() as u64 != placed[index] {
-            return Err(format!(
-                "child {index} ({}): the spill log holds {} documents, routing counted {}",
-                child.leaf,
-                replay.documents.len(),
-                placed[index]
-            ));
+    let mut segments = vec![0usize; children.len()];
+    let mut peak_replay_rows = 0u64;
+    match options.layout {
+        TreeChildLayout::SingleImage { max_child_rows } => {
+            for (index, child) in children.iter().enumerate() {
+                if placed[index] > max_child_rows {
+                    return Err(format!(
+                        "child {index} ({}) has {} documents, above the single-image bound of \
+                         {max_child_rows}; use the segmented layout or raise the bound",
+                        child.leaf, placed[index]
+                    ));
+                }
+            }
+            for (index, (child, spill_dir)) in children.iter().zip(&spill_dirs).enumerate() {
+                let mut replay = Replay::default();
+                replay_buckets_through(
+                    spill_dir,
+                    0..spill_bucket_count,
+                    spill_bucket_count as usize,
+                    dim,
+                    false,
+                    u64::MAX,
+                    &mut replay,
+                )?;
+                replay.compact();
+                if replay.documents.len() as u64 != placed[index] {
+                    return Err(format!(
+                        "child {index} ({}): the spill log holds {} documents, routing counted {}",
+                        child.leaf,
+                        replay.documents.len(),
+                        placed[index]
+                    ));
+                }
+                peak_replay_rows = peak_replay_rows.max(live_rows(&replay));
+                let image = finish_child(
+                    &manifest,
+                    replay,
+                    index,
+                    out_dir,
+                    slot_offsets[index],
+                    child.hash_lo,
+                    child.hash_hi,
+                    bm25_fields,
+                    binding.as_ref(),
+                    analyze,
+                )?;
+                check_slot_bound(index, &child.leaf, image.slot_offset, image_rows(&image), slot_bound(index))?;
+                segments[index] = 1;
+                images.push(image);
+            }
         }
-        images.push(finish_child(
-            &manifest,
-            replay,
-            index,
-            out_dir,
-            slot_offsets[index],
-            child.hash_lo,
-            child.hash_hi,
-            bm25_fields,
-            binding.as_ref(),
-            analyze,
-        )?);
+        TreeChildLayout::Segmented => {
+            let backend_kind = manifest.backend_config()?.backend_kind;
+            let work_root = out_dir.join("work");
+            for (index, (child, spill_dir)) in children.iter().zip(&spill_dirs).enumerate() {
+                let index_path = out_dir.join(format!("shard-{index}.tv"));
+                let root = crate::node::segments_root(&index_path);
+                if root.exists() {
+                    return Err(format!(
+                        "child {index} ({}): {} already exists; a re-placement split writes a \
+                         fresh catalog",
+                        child.leaf,
+                        root.display()
+                    ));
+                }
+                let catalog = crate::segments::SegmentCatalog::open(&root)?;
+                let work = work_root.join(format!("c{index:05}"));
+                std::fs::create_dir_all(&work)
+                    .map_err(|error| format!("mkdir {}: {error}", work.display()))?;
+                let bound = slot_bound(index);
+                let mut next_slot = slot_offsets[index];
+                let mut documents = 0u64;
+                let mut vectors = 0u64;
+                for bucket in 0..spill_bucket_count {
+                    let mut replay = Replay::default();
+                    replay_buckets_through(
+                        spill_dir,
+                        bucket..bucket + 1,
+                        spill_bucket_count as usize,
+                        dim,
+                        false,
+                        u64::MAX,
+                        &mut replay,
+                    )?;
+                    replay.compact();
+                    let rows = live_rows(&replay);
+                    peak_replay_rows = peak_replay_rows.max(rows);
+                    if rows == 0 {
+                        continue;
+                    }
+                    let ordinal = segments[index];
+                    let image = finish_child(
+                        &manifest,
+                        replay,
+                        ordinal,
+                        &work,
+                        next_slot,
+                        child.hash_lo,
+                        child.hash_hi,
+                        bm25_fields,
+                        binding.as_ref(),
+                        analyze,
+                    )?;
+                    let image_rows = image_rows(&image);
+                    check_slot_bound(index, &child.leaf, next_slot, image_rows, bound)?;
+                    if image.num_vectors != 0 && image.num_vectors != image.num_documents {
+                        return Err(format!(
+                            "child {index} ({}) bucket {bucket}: {} vectors but {} documents; a \
+                             sealed segment is aligned (one document per vector) or has no \
+                             vectors at all",
+                            child.leaf, image.num_vectors, image.num_documents
+                        ));
+                    }
+                    let Some(bm25_path) = image.bm25_path.as_deref() else {
+                        return Err(format!(
+                            "child {index} ({}) bucket {bucket}: no BM25 image was written for \
+                             {} documents",
+                            child.leaf, image.num_documents
+                        ));
+                    };
+                    let live_path = crate::node::live_docs_sidecar_path(&image.vector_path);
+                    crate::live_docs::LiveDocs::default()
+                        .write(&live_path, image_rows)
+                        .map_err(|error| {
+                            format!("write live docs {}: {error}", live_path.display())
+                        })?;
+                    let segment_id = format!("g{generation}-c{index}-p{ordinal}");
+                    let (vector_path, exact_path) = if image.num_vectors == 0 {
+                        (None, None)
+                    } else {
+                        (
+                            Some(image.vector_path.as_path()),
+                            Some(image.exact_vector_path.as_path()),
+                        )
+                    };
+                    catalog
+                        .append(crate::segments::SegmentSource {
+                            segment_id: &segment_id,
+                            generation,
+                            // Labels are shard-local: the node adds its
+                            // slot offset when it serves the catalog.
+                            base_label: next_slot - slot_offsets[index],
+                            backend_kind: &backend_kind,
+                            vector_path,
+                            exact_vector_path: exact_path,
+                            bm25_path,
+                            live_docs_path: &live_path,
+                            partition_column: None,
+                        })
+                        .map_err(|error| {
+                            format!("child {index} ({}): seal segment {segment_id}: {error}", child.leaf)
+                        })?;
+                    for path in [
+                        Some(image.vector_path.as_path()),
+                        Some(image.exact_vector_path.as_path()),
+                        Some(bm25_path),
+                        Some(live_path.as_path()),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        if path.exists() {
+                            std::fs::remove_file(path).map_err(|error| {
+                                format!("remove staged {}: {error}", path.display())
+                            })?;
+                        }
+                    }
+                    next_slot = next_slot
+                        .checked_add(image_rows)
+                        .ok_or_else(|| "re-placement split slot overflow".to_string())?;
+                    documents += image.num_documents;
+                    vectors += image.num_vectors;
+                    segments[index] += 1;
+                }
+                if documents != placed[index] {
+                    return Err(format!(
+                        "child {index} ({}): the sealed segments hold {documents} documents, \
+                         routing counted {}",
+                        child.leaf, placed[index]
+                    ));
+                }
+                std::fs::remove_dir_all(&work)
+                    .map_err(|error| format!("remove work {}: {error}", work.display()))?;
+                eprintln!(
+                    "reshard: child {index} ({}): {vectors} vectors, {documents} documents in {} \
+                     segments -> {}",
+                    child.leaf,
+                    segments[index],
+                    index_path.display()
+                );
+                images.push(ChildImage {
+                    vector_path: index_path,
+                    exact_vector_path: root,
+                    bm25_path: None,
+                    slot_offset: slot_offsets[index],
+                    hash_lo: child.hash_lo,
+                    hash_hi: child.hash_hi,
+                    num_vectors: vectors,
+                    num_documents: documents,
+                    parent_ids: Vec::new(),
+                    row_parent_ids: Vec::new(),
+                });
+            }
+            if work_root.exists() {
+                std::fs::remove_dir_all(&work_root)
+                    .map_err(|error| format!("remove work {}: {error}", work_root.display()))?;
+            }
+        }
     }
     std::fs::remove_dir_all(&spill_root)
         .map_err(|error| format!("remove spill {}: {error}", spill_root.display()))?;
     Ok(TreeReshardOutput {
         images: ReshardOutput {
-            generation: top_generation + 1,
+            generation,
             children: images,
         },
         children,
         moved,
         placed,
+        layout: options.layout,
+        segments,
+        peak_replay_rows,
+        spill_bucket_count,
     })
+}
+
+/// The live source rows a replay holds (vectors and documents by id).
+fn live_rows(replay: &Replay) -> u64 {
+    replay
+        .vectors
+        .keys()
+        .chain(replay.documents.keys())
+        .collect::<BTreeSet<_>>()
+        .len() as u64
+}
+
+/// The slots an image takes.
+fn image_rows(image: &ChildImage) -> u64 {
+    image.num_vectors.max(image.num_documents)
+}
+
+/// A child's slots must end at or before the next child's offset.
+fn check_slot_bound(
+    index: usize,
+    leaf: &str,
+    base: u64,
+    rows: u64,
+    bound: Option<u64>,
+) -> Result<(), String> {
+    let end = base
+        .checked_add(rows)
+        .ok_or_else(|| "re-placement split slot overflow".to_string())?;
+    if let Some(bound) = bound {
+        if end > bound {
+            return Err(format!(
+                "child {index} ({leaf}) needs slots through {end}, past the next child's offset \
+                 {bound}; widen the slot stride"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The shard map for a re-placement split: the new tree under
