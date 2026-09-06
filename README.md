@@ -1222,6 +1222,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Main reconciliation (2026-09-06, feature branch).** Main through `5fdedf3`
+  is integrated with physical read receipts, authority views and durable field
+  bindings on the new relay and Boolean routes. Named vector scans use an
+  all-node admission barrier. The QuantileCounts tag collision requires rebuilding
+  older feature clients. Validation is in progress; see the
+  [reconciliation and handoff](docs/main-reconciliation-2026-09.md).
+
 - **Scoped vector scans (2026-09-06, feature branch).** Classic, coalesced,
   collapsed and streaming node scans can acknowledge a durable field, authority
   view and physical version before emitting data. Parent-map caching now checks
@@ -1579,6 +1586,23 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   require a source rebuild before v3 writes. The full protobuf-shape,
   authorization and durable-write work is tracked in
   [Search foundations](docs/search-foundations.md).
+
+- **Landed 2026-09-06: the boolean tree is evaluated on the shards.** The
+  recursive planner fetched one membership bitmap per clause and held the
+  match set as a coordinator id set: at 66 million members a filter clause
+  took 50 GB and minutes and could take the coordinator down
+  (`docs/benchmarks/fleet-placement-2026-09.md`). The coordinator now
+  compiles the tree once and sends it to each consulted shard through
+  `EvaluateBoolean`; a shard resolves the clauses over its bitmaps, applies
+  the group rule on the words, scores the members for each scoring clause
+  (one streaming pass per dense clause, the candidate walk per lexical
+  clause), runs a root aggregate over its match set, and answers its best
+  `depth` members; the coordinator merges ranked candidates and no
+  membership crosses the wire. The root's MUST filter clauses prune shards
+  by placement. A relay composes the route; a root aggregate through a
+  relay is refused by name. `selection_k` names the pool a scorer or a
+  boost reorders. Answers are identical to the AND-composite shapes
+  (`tests/boolean_pushdown.rs`, `tests/relay.rs`). [Boolean execution](docs/query-api.md).
 
 - **Landed 2026-09-05: the boolean group's survivors are scored in one call,
   and implied clauses are dropped per shard.** The BM25 candidate scorer

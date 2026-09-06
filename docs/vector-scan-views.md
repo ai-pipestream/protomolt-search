@@ -54,13 +54,20 @@ view, column handshake and admitted version, and only then consume scan output.
 It must require every participating shard to finish. Receiving a receipt alone
 is not successful scan completion or durable storage acknowledgment.
 
-Current public coordinator routes still send no read context, and restricted
-public Query/QueryStream remain gated. Dense-clause field naming, coordinator
-receipt validation before floor sharing or provisional disclosure, field grants
-on parent/identity output, and full public-query authorization remain required
-integration work. The relay currently refuses a supplied read context before
-contacting children; composing child physical claims needs an explicit contract.
-Direct-node authorization and network delegation remain separate work.
+The coordinator now supplies read contexts for named or authority-scoped vector
+scans. `SearchRequest.field` and `DenseQuery.field` carry the indexed name through
+selection and candidate scoring. A barrier validates all initial receipts before
+sharing floors, merging candidates or publishing provisional results. Readers
+stop after their initial receipt until the whole read set is admitted; failures
+cancel peer work. Duplicate or unsolicited receipts also fail legacy streams.
+
+Restricted public Query/QueryStream remain gated until the full selection and
+disclosure audit is complete. Parent collapse requires both Use and Disclose on
+`parent_id`. Relays still refuse supplied scan contexts before contacting children;
+composing candidate-score receipts does not yet implement streamed receipt
+composition. See the [main reconciliation](main-reconciliation-2026-09.md) for
+current relay support and the QuantileCounts wire incompatibility. Direct-node
+authorization and network delegation remain separate work.
 
 Requests without `read_context` retain their existing response sequence, without
 ReadReady. The change adds two messages and four fields, including two oneof

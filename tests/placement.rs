@@ -630,7 +630,7 @@ async fn a_direct_ingest_takes_the_pinned_leaf_or_is_refused_by_name() {
 /// Every pruning shape: the shards consulted and the shards the plan's
 /// filter rules out, on the four leaves (old, recent.scotus,
 /// recent.rest, other). The root default carries no bound and is never
-/// skipped; a boolean root reports no plan-level skip.
+/// skipped; a boolean root prunes by its root MUST filter leaves.
 fn cases() -> Vec<(&'static str, SelectionQuery, u32)> {
     vec![
         (
@@ -686,10 +686,12 @@ fn cases() -> Vec<(&'static str, SelectionQuery, u32)> {
         ),
         ("browse not", cel("f", "!(year >= 2020)"), 0),
         ("browse has", cel("f", "has(year)"), 0),
+        // A boolean root's MUST filter leaves prune like the AND
+        // wrapper's: the old leaf is not asked for year >= 2020.
         (
             "boolean",
             boolean(vec![cel("f", "year >= 2020"), lexical("l", "search")]),
-            0,
+            1,
         ),
         // Clauses a leaf implies are dropped from that shard's tree
         // (docs/placement.md, "Implied clauses"): the recent leaves
@@ -725,10 +727,12 @@ fn cases() -> Vec<(&'static str, SelectionQuery, u32)> {
             ]),
             1,
         ),
+        // The boolean root's MUST filter leaves are the spine the
+        // placement tree prunes by: the old leaf is not asked.
         (
             "boolean implied",
             boolean(vec![cel("f", "year >= 2010"), lexical("l", "search")]),
-            0,
+            1,
         ),
     ]
 }

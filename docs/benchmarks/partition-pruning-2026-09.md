@@ -122,3 +122,41 @@ shape before the numbers above:
   segment out, and the rescore of survivors reads only the parts and
   blocks the survivors sit in.
 
+
+## 2026-09-06: the boolean tree evaluated on the shard
+
+The same bench after the boolean planner moved to the shards
+(`EvaluateBoolean`, `docs/query-api.md` "Recursive boolean execution"):
+the coordinator sends the planned tree once, the shard resolves the
+clauses over its bitmaps and scores the members in one pass per clause,
+and only the best `depth` candidates come back. Same machine, same
+corpus rule, fresh run (ingest 59.3 s, compaction 335.8 s). The two
+filtered shapes are new to the bench: a MUST filter under a common term
+and under a dense clause, the shapes that took the fleet's coordinator
+down at 66 million rows (`fleet-placement-2026-09.md`).
+
+| case | layout | segments skipped / total | p50 before (ms) | p50 after (ms) | p90 after (ms) | p50 pruning off (ms) |
+|---|---|---:|---:|---:|---:|---:|
+| boolean AND(rare term, dense) | bucket | 0 / 16 | 143.3 | 7.2 | 7.6 | 7.2 |
+| boolean AND(common term, dense) | bucket | 0 / 16 | 2103.0 | 54.0 | 57.6 | 55.8 |
+| boolean MUST(common term, year >= 2010) | bucket | 0 / 32 | not in the bench | 36.3 | 36.6 | 36.4 |
+| boolean MUST(dense, year >= 2010) | bucket | 0 / 16 | not in the bench | 41.5 | 41.8 | 41.8 |
+| boolean AND(rare term, dense) | partitioned | 0 / 20 | 150.6 | 6.9 | 7.3 | 7.0 |
+| boolean AND(common term, dense) | partitioned | 0 / 20 | 2083.8 | 54.9 | 55.2 | 55.0 |
+| boolean MUST(common term, year >= 2010) | partitioned | 15 / 40 | not in the bench | 11.2 | 11.3 | 27.0 |
+| boolean MUST(dense, year >= 2010) | partitioned | 15 / 20 | not in the bench | 9.6 | 9.7 | 25.5 |
+
+The other cases are within noise of the tables above. Equality held as
+before: pruning on and off, and the two layouts, answer the same hits,
+score bits, order, and counts; `signal_batch` at 10,000 and at `max_k`
+answer the same bits (the knob now sizes only an FP32 clause's pieces).
+
+What the numbers show: the dense clause of a boolean group is one
+streaming pass of the shard under the members as the allowlist (the
+same pass a filtered `Search` runs), so AND(common term, dense) over
+600,000 members costs about what a filtered dense search costs, not
+sixty masked rescore calls and a coordinator id set; AND(rare term,
+dense) is the rare term's postings and a sparse pass. A MUST filter now
+prunes segments on the shard (the filter leaf and the lexical leaf are
+counted apart, hence 15 of 40), and the filtered dense shape at 25%
+selectivity is under 10 ms on the partitioned layout.

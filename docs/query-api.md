@@ -125,14 +125,43 @@ no node in `must_not` may match, and at least `minimum_should_match` nodes in
 clauses and to zero when a MUST clause already establishes membership. A value
 larger than the SHOULD list is invalid.
 
-The planner resolves compact membership bitmaps at the shards. It analyzes each
-lexical clause once, intersects required clauses starting with the smallest
-estimated set, counts SHOULD membership only when needed, subtracts MUST_NOT,
-and uses the live-document bitmap only for a negative-only group. It then runs
-BM25, score stages, and vector scoring only for the surviving ids. BM25 uses the
-same global statistics as the ordinary lexical route. A shard statistics epoch
-change aborts the attempt; the coordinator retries the complete plan once and
-then fails rather than combining generations.
+The coordinator compiles the tree once and the shards evaluate it. Each
+lexical clause is analyzed once and its global statistics are read from the
+term-stats cache; each filter clause is compiled once into the predicate IR;
+a dense clause carries its vector. The planned tree goes to every consulted
+shard in one `EvaluateBoolean` call, with the leaves in traversal order (a
+group's MUST, SHOULD, then MUST_NOT clauses, a nested group inline). A shard
+resolves each leaf over its own bitmaps (a filter through the same allowlist
+the vector scan gates with, a lexical clause as the union of its terms'
+postings, a dense clause as the universe of rows with a vector), applies the
+group rule below on the words, scores the members for every scoring clause,
+and answers its best `depth` members by summed score, doc id ascending on
+ties, each with its per-clause signals and the clauses whose membership holds
+it. The coordinator merges the shards' lists by the same order and cuts them
+to `depth`. No membership crosses the wire: what a filter excludes is never
+materialized anywhere but in a shard's own bitmap, and the coordinator holds
+at most `depth` candidates per shard. Until 2026-09-06 every clause's
+membership came back as a bitmap and the coordinator held the match set as an
+id set, which at 66 million members took 50 GB and minutes
+(`docs/benchmarks/fleet-placement-2026-09.md`).
+
+`depth` is the page's absolute end (the cursor's rank plus `k`), or, when a
+scorer or a boost reorders, the pool they reorder: `selection_k`, the
+coordinator's `max_k` when zero, with `k <= selection_k <= max_k` and a
+cursor that must stay inside it. Without a scorer or a boost `selection_k`
+must stay zero.
+
+The group rule: MUST intersects required membership sets. With no MUST,
+SHOULD membership counts establish the minimum; a negative-only group starts
+from live document rows. MUST_NOT subtracts its actual membership. A zero
+minimum resolves to one with only SHOULD clauses. Dense membership includes
+live vector-only rows when no document view is required. Scoring and provenance
+use the intersection of the final group members with each individual leaf.
+BM25 uses the same global statistics as the ordinary lexical route, under
+the same stats-epoch claim: a shard whose store moved between the stats read
+and the evaluation refuses, the coordinator refetches fresh and repeats the
+round once with a fresh complete epoch/incarnation claim, and a second refusal fails the request rather
+than combining generations.
 
 The shared [membership boundary](membership-visibility.md) now carries an
 independent mandatory document view and validates its response fingerprint and
@@ -146,41 +175,43 @@ lack a vector. Treating dense membership as the entire live-document universe
 would change SHOULD and MUST_NOT semantics. Membership receipts also prove the
 field binding and authority view before the set participates in Boolean algebra.
 
-Scoring the survivors is candidate-scoped on both kinds of clause. A lexical
-clause goes through `Bm25Rescore`: per term, one cursor walks the sorted
-candidates through the postings' skip runs, and each match lands in the slot
-of its candidate, so a call costs the candidates plus the matched postings and
-comes back doc id ascending. A dense clause goes through `VectorRescore`: the
-candidates become the shard's allowlist and the node runs one masked scan of
-its index, the same kernel and the same calibrated products a full search
-emits, with the sealed parts and SIMD blocks no candidate sits in left unread.
-The coordinator sends a shard's survivors in `signal_batch` ids per call
-(`--signal-batch`, default 10,000, live as a coordinator knob), its own
-setting rather than `max_k`; the answer does not depend on the batch
-(`tests/boolean_masked.rs`), and on the local benchmark pieces of 10,000 and
-one call per shard are within 6% of each other, since a piece pipelines the
-wire with the shard's work. Until 2026-09-05 the lexical scorer searched its
-growing result list on every match, quadratic in the candidates of one call,
-and the survivors went out in `max_k` pieces to keep each call small: a
-600,000-row membership over 2,000,000 rows spent about 2 s in that search
-(`docs/benchmarks/partition-pruning-2026-09.md`).
+Scoring on the shard is member-scoped on both kinds of clause. A lexical
+clause walks its postings against the sorted members (the `Bm25Rescore`
+walk, without the offsets), then the score stages. A dense clause is one
+streaming pass of the provider index under the members as the allowlist,
+the same kernel and the same calibrated products a full search emits, with
+the sealed parts and SIMD blocks no member sits in left unread; when the
+dense clause is the only scoring clause the pass raises its own floor and
+answers the top `depth` directly, ties at the floor included. An FP32 clause
+scores the members in `signal_batch` pieces under the coordinator's byte
+ceiling (`--signal-batch`, default 10,000, live as a coordinator knob); the
+knob has no other use since the shards score their own members
+(`tests/boolean_masked.rs` pins that the answer does not depend on it).
 
-This is exact set algebra, not a candidate-depth heuristic. ANN cannot certify
-recursive membership and is refused. Each leaf contributes its actual indexed
-domain: lexical and filter leaves contain document rows, while a dense leaf can
-also contain a live vector-only row. Intersections naturally remove rows absent
-from a required domain. Matching positive search-clause scores sum unless the
-request supplies the generic composite scorer. Filter clauses and negative
-search clauses contribute membership and provenance but no score. Dense and
-lexical clauses in the same boolean group are the recursive hybrid form; the
-older `CompositeSearchStrategy` remains a top-level compatibility route for
-RRF, score blend, decomposed, and cascade.
+Placement (`docs/placement.md`): the root group's MUST filter clauses are the
+AND spine the placement tree prunes by. A shard the spine excludes is not
+asked, and a clause a shard's placement leaf implies is dropped from that
+shard's copy of the leaf, with the known-column handshake mapped back. A
+filter clause anywhere else in the tree is sent whole.
 
-An optional `BooleanQuery.aggregate` folds over the complete match set before
-paging. Its own filter and geo fields must be empty because the boolean tree
-already owns membership. Nested aggregations are refused. `selection_k` is
-unused and must remain zero because this planner does not truncate a candidate
-pool.
+Provenance: matching positive search-clause scores sum in leaf order unless
+the request supplies the generic composite scorer. Filter clauses and
+negative search clauses contribute membership and provenance but no score;
+a member no positive scoring clause matches has a zero score, no signal,
+and follows the scored members in id order. Dense and lexical clauses in
+the same boolean group are the recursive hybrid form; the older
+`CompositeSearchStrategy` remains a top-level compatibility route for RRF,
+score blend, decomposed, and cascade. ANN cannot certify recursive
+membership and is refused.
+
+An optional `BooleanQuery.aggregate` folds on each shard over that shard's
+match set, in the same call, and merges at the coordinator as the
+`Aggregate` route merges; the percentile rounds send the planned tree back
+to the shards, which resolve the membership again per round. Its own filter
+and geo fields must be empty because the boolean tree already owns
+membership. Nested aggregations are refused. Through a relay coordinator
+the aggregate is refused by name (`docs/relay-coordinators.md`); the
+query without it relays.
 
 ## Boost phase
 

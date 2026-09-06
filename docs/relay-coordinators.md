@@ -157,8 +157,19 @@ health reports, so a gap or an overlap refuses by name before any bit is
 placed. The filter route sends each child the tree with its implied
 clauses removed and merges the flags back over the request's tree; the
 lexical route's `stats_epoch` is a relay token (below), which a rescore
-that echoes it translates. With these the recursive boolean planner and
-a filtered top-level query run through a relay unchanged.
+that echoes it translates. With these a filtered top-level query runs
+through a relay unchanged.
+
+`EvaluateBoolean`. The recursive boolean planner sends each shard the
+planned tree and takes back that shard's best `depth` members
+(`docs/query-api.md`, "Recursive boolean execution"). A relay forwards
+the tree to every child with the parent's stats claim translated into
+each child's, and answers the ranked union of the children's lists cut
+to `depth` (score descending, then id, the root's own order), the match
+and segment counts summed, and each leaf's known-column and score-stage
+flags joined. The answer's `stats_epoch` is a relay token. A tree that
+carries a root aggregate is refused by name: the fold's order is the
+root's, and this level does not compute it.
 
 The dictionaries. `ExpandTermPrefix` answers the union of the children's
 terms in byte order and its exact size while every child is within the
@@ -260,9 +271,10 @@ follow-up fetches routed by original id (`GetDocuments`, `FetchValues`,
 the root's own links today, so nothing asks a relay for them yet),
 per-shard fusion (`HybridShard`, superseded by the fused routes above),
 aggregation with the root's fold order preserved (`AggregateShard`,
-`QuantileCounts`, and the `stats_fields` / `cardinality_fields` shapes:
-a fold in the root's shard order and a union of values are not this
-level's to compute), bitmap routes over children whose slot ranges are
+`QuantileCounts`, a `BooleanQuery.aggregate` inside `EvaluateBoolean`,
+and the `stats_fields` / `cardinality_fields` shapes: a fold in the
+root's shard order and a union of values are not this level's to
+compute), bitmap routes over children whose slot ranges are
 not contiguous (the contiguity rule stands), recursive ingest, and a
 wider statistics contract past `u32`. Each is a separate gate with its
 own equivalence test.
@@ -277,6 +289,8 @@ that restores it, a phrase under mixed positions, a stop mid-stream, and
 a rescore routed by id; and for the vector side: the unary scan with and
 without `tie_complete` and collapsed by parent, the cascade and
 decomposed fusion, filtered and recursive boolean queries with lexical,
-dense, and FP32-reranked clauses, the bitmaps laid over the children and
+dense, and FP32-reranked clauses (the boolean tree evaluated on the
+children and merged), the boolean aggregate's refusal, the bitmaps laid
+over the children and
 the gap refusal, the dictionaries as the union of the children, and the
 diagnostics through the root).

@@ -1614,6 +1614,116 @@ fn merge_known(
 /// flags ORed, segment counts added with a check. A facet no child knows
 /// stays `known = false` for the root's typo rule; refusing it here
 /// would answer for shards this relay does not see.
+/// The ranked union of the children's Boolean answers cut to `depth`,
+/// score descending then doc id ascending (the root's own order), with
+/// the match counts and segment counts summed and each leaf's known
+/// flags joined by OR. A child answering a flag list of another shape
+/// than the request's leaves is a protocol break.
+pub fn merge_boolean_responses(
+    req: &crate::pb::BooleanShardRequest,
+    shares: &[crate::pb::BooleanShardResponse],
+) -> Result<crate::pb::BooleanShardResponse, Status> {
+    let leaves = req.leaves.len();
+    let mut candidates = Vec::new();
+    let mut matched = 0u64;
+    let mut segments_total = 0u32;
+    let mut segments_skipped = 0u32;
+    let mut filters_known: Vec<Option<crate::pb::BooleanFilterKnown>> = vec![None; leaves];
+    let mut stages_known: Vec<Option<crate::pb::BooleanStagesKnown>> = vec![None; leaves];
+    for (shard, share) in shares.iter().enumerate() {
+        if share.filters_known.len() != leaves || share.stages_known.len() != leaves {
+            return Err(Status::internal(format!(
+                "relay: child {shard} answered {} filter and {} stage flag lists for {leaves} leaves",
+                share.filters_known.len(),
+                share.stages_known.len()
+            )));
+        }
+        candidates.extend(share.candidates.iter().cloned());
+        matched = matched.checked_add(share.matched).ok_or_else(|| {
+            Status::internal("relay: Boolean match count overflows u64 across children")
+        })?;
+        segments_total = segments_total.saturating_add(share.segments_total);
+        segments_skipped = segments_skipped.saturating_add(share.segments_skipped);
+        for (index, known) in share.filters_known.iter().enumerate() {
+            join_flags(&mut filters_known[index], known, |acc, k| {
+                or_flags(
+                    &mut acc.geo_columns_known,
+                    &k.geo_columns_known,
+                    shard,
+                    "geo",
+                )?;
+                or_flags(
+                    &mut acc.filter_columns_known,
+                    &k.filter_columns_known,
+                    shard,
+                    "filter-leaf",
+                )
+            })?;
+        }
+        for (index, known) in share.stages_known.iter().enumerate() {
+            join_flags(&mut stages_known[index], known, |acc, k| {
+                or_flags(
+                    &mut acc.stage_columns_known,
+                    &k.stage_columns_known,
+                    shard,
+                    "stage",
+                )
+            })?;
+        }
+    }
+    candidates.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.doc_id.cmp(&b.doc_id))
+    });
+    candidates.truncate(req.depth as usize);
+    Ok(crate::pb::BooleanShardResponse {
+        read_receipt: None,
+        candidates,
+        matched,
+        segments_total,
+        segments_skipped,
+        stats_epoch: 0,
+        filters_known: filters_known
+            .into_iter()
+            .map(Option::unwrap_or_default)
+            .collect(),
+        stages_known: stages_known
+            .into_iter()
+            .map(Option::unwrap_or_default)
+            .collect(),
+        aggregate: None,
+    })
+}
+
+fn join_flags<T: Clone>(
+    acc: &mut Option<T>,
+    share: &T,
+    join: impl FnOnce(&mut T, &T) -> Result<(), Status>,
+) -> Result<(), Status> {
+    match acc {
+        None => {
+            *acc = Some(share.clone());
+            Ok(())
+        }
+        Some(acc) => join(acc, share),
+    }
+}
+
+fn or_flags(acc: &mut [bool], share: &[bool], shard: usize, what: &str) -> Result<(), Status> {
+    if acc.len() != share.len() {
+        return Err(Status::internal(format!(
+            "relay: child {shard} answered {} {what} flags while an earlier child answered {}",
+            share.len(),
+            acc.len()
+        )));
+    }
+    for (a, k) in acc.iter_mut().zip(share) {
+        *a |= *k;
+    }
+    Ok(())
+}
+
 pub fn merge_bm25_responses(
     req: &Bm25QueryRequest,
     shares: Vec<Bm25QueryResponse>,
@@ -4272,6 +4382,109 @@ impl NodeService for RelayService {
             segments_total: 0,
             segments_skipped: 0,
         }))
+    }
+
+    /// One shard-side Boolean evaluation over the children: the parent's
+    /// stats claim translates per child, each child answers its best
+    /// `depth`, and the merge is the ranked union cut to `depth` with the
+    /// counts summed and the known flags joined. An aggregate is not
+    /// composed here (the fold order is the root's) and refuses by name.
+    async fn evaluate_boolean(
+        &self,
+        request: Request<crate::pb::BooleanShardRequest>,
+    ) -> Result<Response<crate::pb::BooleanShardResponse>, Status> {
+        crate::metrics::timed(Route::EvaluateBoolean, request, |request| async move {
+            let timeout = grpc_timeout(request.metadata());
+            let req = request.into_inner();
+            if req.aggregate.is_some() {
+                return Err(Status::unimplemented(
+                    "relay: BooleanQuery.aggregate is not composed through a relay (the fold \
+                     order is the root's); aggregate through a root over the shards directly",
+                ));
+            }
+            if req.depth == 0 {
+                return Err(Status::invalid_argument(
+                    "EvaluateBoolean: depth 0 asks for no candidates",
+                ));
+            }
+            let (pinned, frozen) = self.pin();
+            let children = frozen.node_addresses().to_vec();
+            if children.is_empty() {
+                return Err(Status::failed_precondition(
+                    "relay: a relay coordinator has no children",
+                ));
+            }
+            let claims = self.child_claims(
+                req.expected_stats_epoch,
+                &req.expected_stats_incarnation,
+                children.len(),
+            )?;
+            let mut tasks = Vec::with_capacity(children.len());
+            for (shard, addr) in children.iter().enumerate() {
+                let mut link = frozen.node_client(addr)?;
+                let mut child_req = req.clone();
+                child_req.expected_stats_epoch = claims[shard].epoch;
+                child_req.expected_stats_incarnation = claims[shard].incarnation();
+                let addr = addr.clone();
+                tasks.push(tokio::spawn(async move {
+                    let mut request = Request::new(child_req);
+                    if let Some(timeout) = timeout {
+                        request.set_timeout(timeout);
+                    }
+                    link.evaluate_boolean(request)
+                        .await
+                        .map(|r| r.into_inner())
+                        .map_err(|status| child_error(shard, &addr, "boolean evaluation", status))
+                }));
+            }
+            let mut shares = Vec::with_capacity(children.len());
+            for task in tasks {
+                shares.push(
+                    task.await
+                        .map_err(|e| Status::internal(format!("relay boolean task: {e}")))??,
+                );
+            }
+            let mut merged = merge_boolean_responses(&req, &shares)?;
+            self.still_current(&pinned, "EvaluateBoolean")?;
+            let receipts = shares
+                .iter()
+                .map(|share| {
+                    let receipt = share.read_receipt.clone().ok_or_else(|| {
+                        Status::failed_precondition("relay child omitted Boolean read receipt")
+                    })?;
+                    if receipt.stats_epoch != share.stats_epoch {
+                        return Err(Status::failed_precondition(
+                            "Boolean receipt epoch mismatch",
+                        ));
+                    }
+                    Ok(receipt)
+                })
+                .collect::<Result<Vec<_>, Status>>()?;
+            let mut receipt = self.read_receipt(
+                &pinned,
+                children,
+                req.visibility.as_ref(),
+                Some(&claims),
+                &receipts,
+            )?;
+            let mut binding = None;
+            for leaf in &req.leaves {
+                if let Some(crate::pb::boolean_plan_leaf::Leaf::Dense(dense)) = leaf.leaf.as_ref() {
+                    for child in &receipts {
+                        crate::vector_read::check_binding(
+                            &dense.field,
+                            child.vector_binding.as_ref(),
+                            &mut binding,
+                        )?;
+                    }
+                }
+            }
+            receipt.vector_binding = binding.flatten();
+            merged.stats_epoch = receipt.stats_epoch;
+            merged.read_receipt = Some(receipt);
+            Ok(Response::new(merged))
+        })
+        .await
     }
 
     async fn apply_wal_binding(

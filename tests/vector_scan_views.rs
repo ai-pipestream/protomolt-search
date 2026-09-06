@@ -634,6 +634,48 @@ async fn relay_read_routes_preserve_scoped_receipts_through_two_levels() {
                 &suggest.visibility_columns_known,
             )
             .unwrap();
+        let boolean = client
+            .evaluate_boolean(BooleanShardRequest {
+                root: Some(BooleanPlanGroup {
+                    must: vec![BooleanPlanNode {
+                        node: Some(boolean_plan_node::Node::Leaf(0)),
+                    }],
+                    ..Default::default()
+                }),
+                leaves: vec![BooleanPlanLeaf {
+                    leaf: Some(boolean_plan_leaf::Leaf::Dense(BooleanPlanDense {
+                        field: "semantic".into(),
+                        vector: fixture.vector.clone(),
+                        exact_fp32: false,
+                    })),
+                }],
+                depth: 4,
+                visibility: visibility.clone(),
+                expected_stats_epoch: stats.stats_epoch,
+                expected_stats_incarnation: stats.stats_incarnation.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            boolean
+                .candidates
+                .iter()
+                .map(|candidate| candidate.doc_id)
+                .collect::<Vec<_>>(),
+            [100]
+        );
+        let receipt = boolean.read_receipt.unwrap();
+        assert_eq!(receipt.stats_epoch, stats.stats_epoch);
+        assert_eq!(receipt.stats_incarnation, stats.stats_incarnation);
+        assert_eq!(receipt.vector_binding.as_ref(), Some(&fixture.binding));
+        scope
+            .validate_echo(
+                &receipt.visibility_fingerprint,
+                &receipt.visibility_columns_known,
+            )
+            .unwrap();
         let refused = client
             .vector_rescore(VectorRescoreRequest {
                 field: "wrong".into(),

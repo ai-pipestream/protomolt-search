@@ -113,12 +113,15 @@ pub enum Route {
     DescribeSchema,
     /// `ClusterControl.PlanBalance` (docs/bandwidth-budget.md).
     PlanBalance,
+    /// `NodeService.EvaluateBoolean` (docs/query-api.md, "Recursive
+    /// boolean execution").
+    EvaluateBoolean,
 }
 
 /// Route names as they appear in the `rpc` label, parallel to the
 /// counter tables, with whether the route answers with a response
 /// stream (and so reports two latency phases).
-const REQUEST_ROUTES: [(Route, &str, bool); 65] = [
+const REQUEST_ROUTES: [(Route, &str, bool); 66] = [
     (Route::SearchShard, "search_shard", true),
     (Route::StreamSearch, "stream_search", true),
     (Route::BrowseShard, "browse_shard", false),
@@ -192,6 +195,7 @@ const REQUEST_ROUTES: [(Route, &str, bool); 65] = [
     (Route::PlanPlacement, "plan_placement", false),
     (Route::DescribeSchema, "describe_schema", false),
     (Route::PlanBalance, "plan_balance", false),
+    (Route::EvaluateBoolean, "evaluate_boolean", false),
 ];
 
 const N_ROUTES: usize = REQUEST_ROUTES.len();

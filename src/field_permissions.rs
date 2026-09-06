@@ -220,6 +220,23 @@ impl FieldScope {
         Ok(())
     }
 
+    pub(crate) fn boolean_leaf(&self, leaf: &BooleanPlanLeaf) -> Result<(), Status> {
+        match leaf.leaf.as_ref() {
+            Some(boolean_plan_leaf::Leaf::Lexical(leaf)) => {
+                self.require_use("body")?;
+                for stage in &leaf.score_stages {
+                    self.require_use(&stage.column)?;
+                }
+                Ok(())
+            }
+            Some(boolean_plan_leaf::Leaf::Dense(leaf)) => self.vector(&leaf.field),
+            Some(boolean_plan_leaf::Leaf::Filter(leaf)) => {
+                self.filter(&leaf.geo_filters, leaf.filter.as_ref())
+            }
+            None => Err(Status::invalid_argument("Boolean leaf has no kind")),
+        }
+    }
+
     pub(crate) fn vector(&self, field: &str) -> Result<(), Status> {
         self.require_use(field)
     }
