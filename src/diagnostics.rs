@@ -96,6 +96,14 @@ const HEDGE_DELAY_MS: KnobSpec = KnobSpec {
     description: "Wait on a shard's primary before racing its replica; 0 disables hedging \
                   (--hedge-delay-ms).",
 };
+const SIGNAL_BATCH: KnobSpec = KnobSpec {
+    name: "signal_batch",
+    scope: KnobScope::Coordinator,
+    kind: KnobKind::Int,
+    description: "Candidate ids per rescore call (Bm25Rescore, VectorRescore) when a boolean \
+                  group scores a clause over its surviving ids; the pieces multiply per-call \
+                  cost, and max_k pieces are the earlier behavior (--signal-batch).",
+};
 const SHARD_PRUNING: KnobSpec = KnobSpec {
     name: "shard_pruning",
     scope: KnobScope::Coordinator,
@@ -121,6 +129,8 @@ pub struct CoordinatorKnobValues {
     /// 0 means no hedging.
     pub hedge_delay_ms: u64,
     pub shard_pruning: bool,
+    /// Candidate ids per rescore call; at least 1.
+    pub signal_batch: u32,
 }
 
 enum Live {
@@ -136,6 +146,7 @@ enum Live {
         max_k: AtomicU32,
         hedge_delay_ms: AtomicU64,
         shard_pruning: AtomicBool,
+        signal_batch: AtomicU32,
         startup: CoordinatorKnobValues,
     },
 }
@@ -211,6 +222,7 @@ impl Knobs {
                 max_k: AtomicU32::new(values.max_k),
                 hedge_delay_ms: AtomicU64::new(values.hedge_delay_ms),
                 shard_pruning: AtomicBool::new(values.shard_pruning),
+                signal_batch: AtomicU32::new(values.signal_batch),
                 startup: values,
             },
             fixed: std::sync::RwLock::new(
@@ -301,6 +313,15 @@ impl Knobs {
         }
     }
 
+    /// Candidate ids per rescore call (coordinator only; 0 on a node,
+    /// which has no such knob).
+    pub fn signal_batch(&self) -> u32 {
+        match &self.live {
+            Live::Coordinator { signal_batch, .. } => signal_batch.load(Ordering::Relaxed),
+            Live::Node { .. } => 0,
+        }
+    }
+
     pub fn hedge_delay(&self) -> Option<Duration> {
         match &self.live {
             Live::Coordinator { hedge_delay_ms, .. } => {
@@ -366,6 +387,11 @@ impl Knobs {
                     &SHARD_PRUNING,
                     self.shard_pruning().to_string(),
                     startup.shard_pruning.to_string(),
+                ),
+                entry(
+                    &SIGNAL_BATCH,
+                    self.signal_batch().to_string(),
+                    startup.signal_batch.to_string(),
                 ),
             ],
         }
@@ -459,6 +485,7 @@ impl Knobs {
                 max_k,
                 hedge_delay_ms,
                 shard_pruning,
+                signal_batch,
                 ..
             } => match name {
                 "max_k" => {
@@ -477,6 +504,16 @@ impl Knobs {
                 }
                 "shard_pruning" => {
                     shard_pruning.store(parse_bool(name, value)?, Ordering::Relaxed);
+                    Ok(())
+                }
+                "signal_batch" => {
+                    let parsed = parse_u32(name, value)?;
+                    if parsed == 0 {
+                        return Err(Status::invalid_argument(
+                            "knob \"signal_batch\": 0 is not a batch; give the ids per call",
+                        ));
+                    }
+                    signal_batch.store(parsed, Ordering::Relaxed);
                     Ok(())
                 }
                 other => self.reject(other),
@@ -1000,6 +1037,7 @@ mod tests {
                 max_k: 100,
                 hedge_delay_ms: 0,
                 shard_pruning: true,
+                signal_batch: 10_000,
             },
             Vec::new(),
         );

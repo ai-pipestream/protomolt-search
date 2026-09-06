@@ -12,6 +12,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{transport::Channel, Code, Status};
 
 struct Fixture {
+    address: String,
     root: std::path::PathBuf,
     client: NodeServiceClient<Channel>,
     task: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
@@ -54,7 +55,7 @@ async fn fixture(layout: Layout, coalesce: bool) -> Fixture {
         ..Default::default()
     })
     .await;
-    let mut client = NodeServiceClient::connect(addr).await.unwrap();
+    let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
     let vectors = common::unit_vectors(4, 16, 64022);
     let vector = vectors[16..32].to_vec(); // the best match is private
     let (shift, scale) = common::fit_calibration(16, 4, &vectors);
@@ -132,6 +133,7 @@ async fn fixture(layout: Layout, coalesce: bool) -> Fixture {
         .unwrap()
         .into_inner();
     Fixture {
+        address: addr,
         root,
         client,
         task,
@@ -470,4 +472,265 @@ async fn relay_refuses_a_scoped_scan_before_dialing_any_children() {
     assert_eq!(response.unwrap_err().code(), Code::FailedPrecondition);
     task.abort();
     let _ = task.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_read_routes_preserve_scoped_receipts_through_two_levels() {
+    let mut fixture = fixture(Layout::SingleImage, false).await;
+    let (first, _, first_task) =
+        pipestream_search::harness::start_relay(vec![fixture.address.clone()]).await;
+    let (second, _, second_task) =
+        pipestream_search::harness::start_relay(vec![first.clone()]).await;
+    let visibility = fixture.context.visibility.clone();
+    let scope = VisibilityScope::new(visibility.as_ref()).unwrap();
+    let mut last_claim = None;
+    for address in [fixture.address.clone(), first, second.clone()] {
+        let mut client = NodeServiceClient::connect(address).await.unwrap();
+        let stats = client
+            .term_stats(TermStatsRequest {
+                version_only: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let native = client
+            .vector_rescore(VectorRescoreRequest {
+                vector: fixture.vector.clone(),
+                candidate_ids: vec![100, 101, 102, 103],
+                field: "semantic".into(),
+                visibility: visibility.clone(),
+                expected_stats_epoch: stats.stats_epoch,
+                expected_stats_incarnation: stats.stats_incarnation.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            native.hits.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(),
+            [100]
+        );
+        assert_eq!(native.vector_binding.as_ref(), Some(&fixture.binding));
+        assert_eq!(native.stats_epoch, stats.stats_epoch);
+        assert_eq!(native.stats_incarnation, stats.stats_incarnation);
+        scope
+            .validate_echo(
+                &native.visibility_fingerprint,
+                &native.visibility_columns_known,
+            )
+            .unwrap();
+        let exact = client
+            .exact_vector_rescore(ExactVectorRescoreRequest {
+                vector: fixture.vector.clone(),
+                candidate_ids: vec![100, 101, 102, 103],
+                field: "semantic".into(),
+                visibility: visibility.clone(),
+                expected_stats_epoch: stats.stats_epoch,
+                expected_stats_incarnation: stats.stats_incarnation.clone(),
+                max_logical_bytes: 64,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            exact.hits.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(),
+            [100]
+        );
+        assert_eq!(exact.logical_bytes, 64);
+        assert_eq!(exact.vector_binding.as_ref(), Some(&fixture.binding));
+        assert_eq!(exact.stats_epoch, stats.stats_epoch);
+        scope
+            .validate_echo(
+                &exact.visibility_fingerprint,
+                &exact.visibility_columns_known,
+            )
+            .unwrap();
+        let dense = client
+            .resolve_vector_bitmap(VectorBitmapRequest {
+                field: "semantic".into(),
+                visibility: visibility.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(dense.base_label, 100);
+        assert_eq!(dense.bits, [1]);
+        assert_eq!(dense.vector_binding.as_ref(), Some(&fixture.binding));
+        assert_eq!(dense.stats_epoch, stats.stats_epoch);
+        scope
+            .validate_echo(
+                &dense.visibility_fingerprint,
+                &dense.visibility_columns_known,
+            )
+            .unwrap();
+        let lexical = client
+            .resolve_lexical_bitmap(LexicalBitmapRequest {
+                terms: vec!["word".into()],
+                visibility: visibility.clone(),
+                analysis_fingerprint: pipestream_search::analyzer::analysis_fingerprint(Some(
+                    &body_spec(),
+                )),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(lexical.bits, [1]);
+        assert_eq!(lexical.stats_epoch, stats.stats_epoch);
+        scope
+            .validate_echo(
+                &lexical.visibility_fingerprint,
+                &lexical.visibility_columns_known,
+            )
+            .unwrap();
+        let filtered = client
+            .resolve_filter_bitmap(FilterBitmapRequest {
+                visibility: visibility.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(filtered.bits, [1]);
+        assert_eq!(filtered.stats_epoch, stats.stats_epoch);
+        scope
+            .validate_echo(
+                &filtered.visibility_fingerprint,
+                &filtered.visibility_columns_known,
+            )
+            .unwrap();
+        let prefix = client
+            .expand_term_prefix(ExpandTermPrefixRequest {
+                field: "body".into(),
+                prefix: "wo".into(),
+                cap: 10,
+                visibility: visibility.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(prefix.terms, ["word"]);
+        scope
+            .validate_echo(
+                &prefix.visibility_fingerprint,
+                &prefix.visibility_columns_known,
+            )
+            .unwrap();
+        let suggest = client
+            .suggest_terms(SuggestTermsRequest {
+                field: "body".into(),
+                prefix: "wo".into(),
+                visibility: visibility.clone(),
+                max_scan: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(suggest.entries.len(), 1);
+        assert_eq!(suggest.entries[0].df, 1);
+        scope
+            .validate_echo(
+                &suggest.visibility_fingerprint,
+                &suggest.visibility_columns_known,
+            )
+            .unwrap();
+        let refused = client
+            .vector_rescore(VectorRescoreRequest {
+                field: "wrong".into(),
+                vector: fixture.vector.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), Code::FailedPrecondition);
+        last_claim = Some(stats);
+    }
+    fixture
+        .client
+        .delete_documents(DeleteDocumentsRequest {
+            doc_ids: vec![100],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let stats = last_claim.unwrap();
+    let refused = NodeServiceClient::connect(second)
+        .await
+        .unwrap()
+        .vector_rescore(VectorRescoreRequest {
+            field: "semantic".into(),
+            vector: fixture.vector.clone(),
+            visibility,
+            expected_stats_epoch: stats.stats_epoch,
+            expected_stats_incarnation: stats.stats_incarnation,
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::FailedPrecondition);
+    first_task.abort();
+    second_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn public_named_dense_selection_matches_the_legacy_field_and_refuses_an_alias() {
+    use pipestream_search::{
+        coordinator::CoordinatorServiceImpl, pb::search_service_server::SearchService,
+    };
+    let fixture = fixture(Layout::SingleImage, false).await;
+    for streaming in [false, true] {
+        let coordinator = CoordinatorServiceImpl::new(vec![fixture.address.clone()])
+            .with_stream_search(streaming)
+            .with_bm25(Some(NATIVE_ANALYSIS_BACKEND.into()), Default::default());
+        let request = SearchRequest {
+            vector: fixture.vector.clone(),
+            k: 4,
+            ..Default::default()
+        };
+        let legacy = coordinator
+            .search(tonic::Request::new(request.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        let named = coordinator
+            .search(tonic::Request::new(SearchRequest {
+                field: "semantic".into(),
+                ..request.clone()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(legacy.hits, named.hits);
+        let wrong = coordinator
+            .search(tonic::Request::new(SearchRequest {
+                field: "signal".into(),
+                ..request
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(wrong.code(), Code::FailedPrecondition);
+        for field in ["", "semantic", "signal"] {
+            let query = QueryRequest {
+                k: 4,
+                selection_k: 4,
+                selection: Some(SelectionQuery {
+                    node: Some(selection_query::Node::Search(SearchQuery {
+                        id: "dense".into(),
+                        query: Some(search_query::Query::Dense(DenseQuery {
+                            field: field.into(),
+                            vector: fixture.vector.clone(),
+                            ..Default::default()
+                        })),
+                    })),
+                }),
+                ..Default::default()
+            };
+            let response = coordinator.query(tonic::Request::new(query)).await;
+            if field == "signal" {
+                assert_eq!(response.unwrap_err().code(), Code::FailedPrecondition);
+            } else {
+                assert_eq!(response.unwrap().into_inner().hits.len(), legacy.hits.len());
+            }
+        }
+    }
 }

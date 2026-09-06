@@ -21,7 +21,7 @@ use pipestream_search::pb::{
     PlanPlacementRequest, PlanPlacementResponse, SetCalibrationRequest,
 };
 use pipestream_search::placement::{
-    encode, subtree_range, PlacementNodeConfig, PlacementTreeConfig,
+    encode, subtree_range, PinnedLeaf, Placement, PlacementNodeConfig, PlacementTreeConfig,
 };
 use pipestream_search::postings::AnalyzedDoc;
 use pipestream_search::vector::{VectorIndex, EMBEDDED_TURBOVEC};
@@ -626,5 +626,373 @@ async fn a_placement_split_routes_by_code_and_reconstructs_the_parent() {
     )
     .unwrap_err();
     assert!(err.contains("slot offset"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------
+// The re-placement split: a NEW tree evaluated at replay
+// ---------------------------------------------------------------------
+
+/// The tree the rows were logged under: one default leaf, "archive",
+/// at root index 1 (a predicate nobody matches sits before it).
+fn old_tree() -> PlacementTreeConfig {
+    PlacementTreeConfig {
+        column: "placement".into(),
+        level_bits: BITS,
+        nodes: vec![node("ancient", Some("year < 1500")), node("archive", None)],
+    }
+}
+
+/// The new tree: year bands. "mid" sits at root index 1, the code the
+/// archive rows carried, so the rows of 2000..2014 keep their code and
+/// the others change it; "old" at index 2 is no leaf of the old tree.
+fn band_tree() -> PlacementTreeConfig {
+    PlacementTreeConfig {
+        column: "placement".into(),
+        level_bits: BITS,
+        nodes: vec![
+            node("recent", Some("year >= 2015")),
+            node("mid", Some("year >= 2000")),
+            node("old", None),
+        ],
+    }
+}
+
+fn band_of(year: i64) -> usize {
+    if year >= 2015 {
+        0
+    } else if year >= 2000 {
+        1
+    } else {
+        2
+    }
+}
+
+/// Row `i`'s year: 1980..2029 cycling; every ninth row carries no code.
+fn band_year(i: usize) -> i64 {
+    1980 + (i % 50) as i64
+}
+
+/// A WAL-backed shard whose rows carry `year` and the old tree's default
+/// code (every ninth row carries none), analyzed natively so the
+/// children can be served and queried without a sidecar.
+async fn banded_shard(dir: &Path, corpus: &[f32]) -> PathBuf {
+    let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &corpus[..DIM * 64]);
+    let index_path = dir.join("archive.tv");
+    let (addr, _handle) = start_empty_node(NodeConfig {
+        index_path: Some(index_path.clone()),
+        layout: Layout::SingleImage,
+        analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
+        wal: true,
+        wal_buckets: 4,
+        integer_fields: vec!["year".to_string(), "placement".to_string()],
+        ..Default::default()
+    })
+    .await;
+    let mut client = NodeServiceClient::connect(addr).await.unwrap();
+    client
+        .set_calibration(SetCalibrationRequest {
+            dim: DIM as u32,
+            bit_width: BIT_WIDTH as u32,
+            shift,
+            scale,
+        })
+        .await
+        .unwrap();
+    let archive = Placement::validate(&old_tree())
+        .unwrap()
+        .leaf_by_name("archive")
+        .unwrap()
+        .code;
+    let (tx, rx) = mpsc::channel(8);
+    tokio::spawn(async move {
+        for i in 0..N {
+            let mut integers = vec![IntegerValue {
+                field: "year".into(),
+                value: band_year(i),
+            }];
+            if !i.is_multiple_of(9) {
+                integers.push(IntegerValue {
+                    field: "placement".into(),
+                    value: archive,
+                });
+            }
+            tx.send(AddDocumentsRequest {
+                text: format!("opinion {i} decided in {}", band_year(i)),
+                analysis: Some(body_spec()),
+                integers,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+    });
+    let added = client
+        .add_documents(ReceiverStream::new(rx))
+        .await
+        .unwrap()
+        .into_inner()
+        .added;
+    assert_eq!(added as usize, N);
+    let (tx, rx) = mpsc::channel(8);
+    let vectors = corpus.to_vec();
+    tokio::spawn(async move {
+        for chunk in vectors.chunks(50 * DIM) {
+            tx.send(AddVectorsRequest {
+                vectors: chunk.to_vec(),
+                dim: 0,
+            })
+            .await
+            .unwrap();
+        }
+    });
+    let added = client
+        .add_vectors(ReceiverStream::new(rx))
+        .await
+        .unwrap()
+        .into_inner()
+        .added;
+    assert_eq!(added as usize, N);
+    assert!(
+        client
+            .flush(FlushRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .written
+    );
+    index_path
+}
+
+async fn count_where(c: &CoordinatorServiceImpl, cel: &str, pruning_expected: u32) -> Vec<u64> {
+    use pipestream_search::pb::{selection_query, FilterQuery, QueryRequest, SelectionQuery};
+    let response = SearchService::query(
+        c,
+        Request::new(QueryRequest {
+            request_id: "bands".into(),
+            k: N as u32,
+            profile: true,
+            selection: Some(SelectionQuery {
+                node: Some(selection_query::Node::Filter(FilterQuery {
+                    id: "f".into(),
+                    predicate: Some(pipestream_search::pb::filter_query::Predicate::Cel(
+                        cel.to_string(),
+                    )),
+                })),
+            }),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    let skipped = response
+        .profile
+        .as_ref()
+        .map(|p| p.shards_skipped)
+        .unwrap_or_default();
+    assert_eq!(skipped, pruning_expected, "{cel}: shards skipped");
+    let mut ids: Vec<u64> = response.hits.iter().map(|h| h.doc_id).collect();
+    ids.sort_unstable();
+    ids
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_re_placement_split_puts_each_row_in_its_new_leaf() {
+    let dir = tempdir("replace");
+    let corpus = unit_vectors(N, DIM, 0x9A1E_0002);
+    let index_path = banded_shard(&dir, &corpus).await;
+    let gen = reshard::resolve_gen(&pipestream_search::wal::wal_dir(&index_path)).unwrap();
+    let tree = band_tree();
+    let placement = Placement::validate(&tree).unwrap();
+    let children = reshard::tree_children(&placement).unwrap();
+    assert_eq!(
+        children
+            .iter()
+            .map(|c| (c.leaf.as_str(), c.hash_lo, c.hash_hi))
+            .collect::<Vec<_>>(),
+        [
+            ("recent", 0, u64::MAX),
+            ("mid", 0, u64::MAX),
+            ("old", 0, u64::MAX)
+        ]
+    );
+    let out = reshard::split_placement_tree_logs(
+        std::slice::from_ref(&gen),
+        &tree,
+        &dir.join("bands"),
+        &[0, 1_000, 2_000],
+        None,
+        &mut replay_analyzer(NATIVE_ANALYSIS_BACKEND),
+    )
+    .unwrap();
+    assert_eq!(out.children, children);
+    assert!(!dir.join("bands").join("spill").exists(), "spill removed");
+
+    // Every row is in the band its year names; the rows that changed
+    // code are the ones outside 2000..2014 plus the codeless rows in it.
+    let mut expected = [0u64; 3];
+    let mut moved = 0u64;
+    for i in 0..N {
+        let band = band_of(band_year(i));
+        expected[band] += 1;
+        if band != 1 || i.is_multiple_of(9) {
+            moved += 1;
+        }
+    }
+    assert_eq!(out.placed, expected.to_vec());
+    assert_eq!(out.moved, moved);
+    for (index, child) in out.images.children.iter().enumerate() {
+        assert_eq!(child.num_documents, expected[index], "child {index}");
+        assert_eq!(child.num_vectors, expected[index], "child {index}");
+        assert_eq!(child.slot_offset, index as u64 * 1_000);
+        for &parent in &child.row_parent_ids {
+            assert_eq!(band_of(band_year(parent as usize)), index, "row {parent}");
+        }
+    }
+    let map = reshard::tree_shard_map_toml(&out, &tree).unwrap();
+    let parsed: pipestream_search::config::ShardMap = toml::from_str(&map).unwrap();
+    assert_eq!(parsed.placement.as_ref(), Some(&tree));
+    assert_eq!(
+        parsed
+            .shards
+            .iter()
+            .map(|s| (s.slot_offset, s.placement))
+            .collect::<Vec<_>>(),
+        children
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i as u64 * 1_000, Some(c.code as u64)))
+            .collect::<Vec<_>>()
+    );
+
+    // Serve the children pinned with the new tree, and put a coordinator
+    // over them with the same tree: the rewritten codes are what the
+    // column holds, and the band predicates prune.
+    let mut addrs = Vec::new();
+    let mut handles = Vec::new();
+    for (image, child) in out.images.children.iter().zip(&children) {
+        let (addr, handle) = pipestream_search::harness::start_opened_node(NodeConfig {
+            index_path: Some(image.vector_path.clone()),
+            slot_offset: image.slot_offset,
+            layout: Layout::SingleImage,
+            analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
+            integer_fields: vec!["year".to_string(), "placement".to_string()],
+            placement_column: Some("placement".into()),
+            placement_leaf: Some(child.code),
+            placement_tree: Some(std::sync::Arc::new(
+                PinnedLeaf::pin(&tree, "placement", child.code).unwrap(),
+            )),
+            ..Default::default()
+        })
+        .await;
+        addrs.push(addr);
+        handles.push(handle);
+    }
+    let codes: Vec<Option<i64>> = children.iter().map(|c| Some(c.code)).collect();
+    let coordinator = |pruning: bool| {
+        CoordinatorServiceImpl::new(addrs.clone())
+            .with_bm25(
+                Some(NATIVE_ANALYSIS_BACKEND.to_string()),
+                Default::default(),
+            )
+            .with_topology_generation(out.images.generation)
+            .with_shard_pruning(pruning)
+            .with_hot_topology_placed(
+                vec![Some((0, u64::MAX)); 3],
+                Some((tree.clone(), codes.clone())),
+            )
+            .unwrap()
+    };
+    let pruned = coordinator(true);
+    let plain = coordinator(false);
+    for (child, rows) in children.iter().zip(&expected) {
+        let under = count_where(&pruned, &format!("placement == {}", child.code), 2).await;
+        assert_eq!(under.len() as u64, *rows, "leaf {}", child.leaf);
+    }
+    // "year < 1995": recent and mid cannot hold a row; "year < 2005":
+    // recent cannot; "year >= 2015": no leaf's own predicate contradicts
+    // it (old is the default and carries none). The answer is the same
+    // with pruning off.
+    for (cel, skipped) in [("year < 1995", 2), ("year < 2005", 1), ("year >= 2015", 0)] {
+        let with = count_where(&pruned, cel, skipped).await;
+        let without = count_where(&plain, cel, 0).await;
+        assert_eq!(with, without, "{cel}");
+        assert!(!with.is_empty(), "{cel}");
+    }
+
+    // A served band refuses a direct row from another band by name, and
+    // a child's code is not a leaf of the old tree, so serving it under
+    // the old map is refused at startup.
+    let mut client = NodeServiceClient::connect(addrs[0].clone()).await.unwrap();
+    let (tx, rx) = mpsc::channel(1);
+    tx.send(AddDocumentsRequest {
+        text: "a 1990 opinion sent to the recent band".into(),
+        analysis: Some(body_spec()),
+        integers: vec![IntegerValue {
+            field: "year".into(),
+            value: 1990,
+        }],
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    drop(tx);
+    let err = client
+        .add_documents(ReceiverStream::new(rx))
+        .await
+        .unwrap_err();
+    assert!(
+        err.message()
+            .contains("node \"recent\" (year >= 2015) is false")
+            && err.message().contains("leaf \"old\""),
+        "{}",
+        err.message()
+    );
+    let err = PinnedLeaf::pin(&old_tree(), "placement", children[2].code).unwrap_err();
+    assert!(err.contains("is not a leaf"), "{err}");
+
+    // Refusals: the wrong number of slot offsets, a leaf with a shard
+    // count the hash space cannot tile, and a vectors-only source.
+    let err = reshard::split_placement_tree_logs(
+        std::slice::from_ref(&gen),
+        &tree,
+        &dir.join("offsets"),
+        &[0, 1_000],
+        None,
+        &mut replay_analyzer(NATIVE_ANALYSIS_BACKEND),
+    )
+    .unwrap_err();
+    assert!(err.contains("one slot offset per child"), "{err}");
+    let mut three = band_tree();
+    three.nodes[0].shards = 3;
+    let err = reshard::tree_children(&Placement::validate(&three).unwrap()).unwrap_err();
+    assert!(err.contains("\"recent\" has 3 shards"), "{err}");
+    let mut two = band_tree();
+    two.nodes[0].shards = 2;
+    let tiles = reshard::tree_children(&Placement::validate(&two).unwrap()).unwrap();
+    assert_eq!(tiles.len(), 4);
+    assert_eq!((tiles[0].hash_lo, tiles[0].hash_hi), (0, u64::MAX / 2));
+    assert_eq!(
+        (tiles[1].hash_lo, tiles[1].hash_hi),
+        (u64::MAX / 2 + 1, u64::MAX)
+    );
+    let err = reshard::split_placement_tree_logs(
+        std::slice::from_ref(&gen),
+        &two,
+        &dir.join("two"),
+        &[0, 1_000, 2_000, 3_000],
+        None,
+        &mut replay_analyzer(NATIVE_ANALYSIS_BACKEND),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("carries no stable key") && err.contains("\"recent\", which has 2 shards"),
+        "{err}"
+    );
+
+    for handle in handles {
+        handle.abort();
+    }
     std::fs::remove_dir_all(&dir).ok();
 }

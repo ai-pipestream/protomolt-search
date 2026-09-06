@@ -72,3 +72,53 @@ What the numbers show: on the bucket layout every segment holds every year, so a
   logs, then seals 20 segments. Rows with equal keys move to the next
   partition as a unit, which is why 40 years at 50,000 rows each cut into 20
   segments of two years rather than 16 of the bound.
+
+## 2026-09-05, evening: the boolean cases after the candidate scorer fix
+
+Same machine, same corpus and command (2,000,000 rows, dimension 128 at 4
+bits, seal bound 125,000, 20 queries per case), main with the linear BM25
+candidate scorer, the `signal_batch` knob, and the dense clause's
+membership as the universe (`docs/query-api.md`, "Recursive boolean
+execution"). Ingest 60.8 s, compaction 288.7 s. The other rows did not move
+and are not repeated.
+
+| case | layout | before p50 (ms) | after p50 (ms) | after p90 (ms) |
+|---|---|---:|---:|---:|
+| boolean AND(rare term, dense) | bucket | 143.3 | 18.9 | 19.6 |
+| boolean AND(rare term, dense) | partitioned | 150.6 | 18.8 | 19.1 |
+| boolean AND(common term, dense) | bucket | 2103.0 | 1334.2 | 1361.9 |
+| boolean AND(common term, dense) | partitioned | 2083.8 | 1270.4 | 1290.4 |
+
+Survivors sent in pieces of 10,000 ids per rescore call against one call
+per shard, partitioned layout:
+
+| case | pieces of 10,000 p50 (ms) | one call p50 (ms) |
+|---|---:|---:|
+| boolean AND(rare term, dense) | 18.6 | 18.8 |
+| boolean AND(common term, dense) | 1199.1 | 1270.4 |
+
+What moved, measured with phase traces on a 400,000-row run of the same
+shape before the numbers above:
+
+- **The earlier finding named the wrong clause.** The dense clause was
+  already one masked scan of the shard per rescore call (13.7 ms for
+  120,000 survivors of 400,000 rows). The 2 s went to the lexical clause:
+  the BM25 candidate scorer searched its growing result list on every
+  match, quadratic in the candidates of one call (25 ms per piece of
+  10,000, 60 pieces for a 600,000-row membership). Each match now lands
+  in its candidate's slot.
+- **The rare-term case paid for a list of every id.** A dense clause's
+  membership was fetched as the corpus's id set (2,000,000 ids, 16 MB on
+  the wire and a tree of them at the coordinator) before the intersection
+  with a 2,000-row term. The clause is now the universe and the term's
+  bitmap names the rows: 143 ms to 19 ms.
+- **What remains is the coordinator's set arithmetic** over 600,000 ids:
+  the membership tree built from the bitmaps, one hit record per member
+  with its signals, and the sort for the page. Pieces of 10,000 pipeline
+  the wire with the shard's work and edge out one call. A sorted-vector
+  membership and slot-indexed hits are the next step on this shape.
+- **Segment skipping still does not apply** to these two cases, as the
+  earlier note says: a keyword clause without a range predicate rules no
+  segment out, and the rescore of survivors reads only the parts and
+  blocks the survivors sit in.
+

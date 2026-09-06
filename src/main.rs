@@ -249,6 +249,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 unsigned_integer_fields: cfg.unsigned_integer_fields.clone(),
                 placement_column: cfg.placement_column.clone(),
                 placement_leaf: cfg.placement_leaf,
+                placement_tree: cfg.placement_tree.clone(),
                 geo_fields: cfg.geo_fields.clone(),
                 wal: shard.wal,
                 wal_buckets: shard.wal_buckets,
@@ -347,6 +348,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             unsigned_integer_fields: cfg.unsigned_integer_fields.clone(),
             placement_column: cfg.placement_column.clone(),
             placement_leaf: cfg.placement_leaf,
+            placement_tree: cfg.placement_tree.clone(),
             geo_fields: cfg.geo_fields.clone(),
             position_fields: cfg.position_fields.clone(),
             bigram_fields: cfg.bigram_fields.clone(),
@@ -489,7 +491,8 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             secured_server(cfg.tls.as_ref(), true)?
                 .initial_stream_window_size(pipestream_search::H2_STREAM_WINDOW)
                 .initial_connection_window_size(pipestream_search::H2_CONN_WINDOW)
-                .add_service(relay.into_server(max))
+                .add_service(relay.clone().into_server(max))
+                .add_service(relay.diagnostics_server(max))
                 .serve_with_incoming_shutdown(harness::nodelay_incoming(listener), async move {
                     let _ = shutdown.wait_for(|v| *v).await;
                 }),
@@ -723,6 +726,7 @@ async fn build_corpus(
         .with_stream_search(cfg.stream_search)
         .with_bm25_stream(cfg.bm25_stream)
         .with_max_k(cfg.max_k)
+        .with_signal_batch(cfg.signal_batch)
         .with_shard_pruning(cfg.shard_pruning)
         .with_max_rerank_bytes(cfg.max_rerank_bytes)
         .with_topology_generation(dataset.shard_map.map_or(0, |map| map.generation))

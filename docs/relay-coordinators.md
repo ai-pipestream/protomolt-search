@@ -120,12 +120,79 @@ monolith orders them. The streaming route and the fused routes order by
 id and by competition rank in both shapes, and the exactness gate covers
 them bit for bit.
 
+`SearchShard`. The unary vector scan the cascade gates on and the plain
+vector `Search` runs without `--stream-search`. The relay opens one
+`SearchShard` stream per child (a child the placement mask rules out is
+not asked), forwards the parent's floor raises to every child and each
+child's raises to the parent (a child's k-th best is a lower bound on
+the relay's, so the parent's running maximum only tightens), and, once
+every child has sent its terminal message, answers one `Done`: the
+children's local lists concatenated in score order (ties by id), the
+scan counters summed with a check, the column-known flags merged through
+each child's implied leaves. The relay keeps no heap and does not
+truncate: the parent's merge picks the top-k from the union exactly as
+it does over leaves, and with `tie_complete` the union holds every
+child's boundary tie group, so the cascade's score-defined pool is the
+same set it is over leaves. A child error, a child closing before
+`Done`, the parent's deadline, or a map move fails the attempt by name.
+
+`VectorRescore` and `ExactVectorRescore`. Each candidate id is routed to
+the child whose slot range holds it; an id in no child's range is
+another shard's and is dropped, as a node drops an id outside its own
+range (the boolean planner and the FP32 rerank send every shard every
+candidate; the cascade routes by shard, and a relay is one shard to it).
+`Bm25Rescore` follows the same rule. Hits merge in the order a node
+answers in (score descending, then id; request order for the exact
+route), and the exact route's byte and page counts are summed with a
+check.
+
+The bitmap routes. `ResolveFilterBitmap`, `ResolveLexicalBitmap`, and
+`ResolveVectorBitmap` answer one packed bitmap over the relay's slot
+range: each child's bitmap is laid at its slot offset (which its
+`base_label` must equal), lengths and zero padding are checked, the
+relay's `label_count` runs to the last labelled child, and the slots
+between a child's last label and the next child's first are zero, as
+they are on a node. The contiguity rule applies through the children's
+health reports, so a gap or an overlap refuses by name before any bit is
+placed. The filter route sends each child the tree with its implied
+clauses removed and merges the flags back over the request's tree; the
+lexical route's `stats_epoch` is a relay token (below), which a rescore
+that echoes it translates. With these the recursive boolean planner and
+a filtered top-level query run through a relay unchanged.
+
+The dictionaries. `ExpandTermPrefix` answers the union of the children's
+terms in byte order and its exact size while every child is within the
+cap; a child past the cap answers a count above it and no terms, and the
+relay then does the same with the largest such count, which is a lower
+bound on the subtree's and enough for the root's refusal. `SuggestTerms`
+unions the entries with each term's df summed (checked) and the
+tombstone counts added; a child past the scan bound is treated the same
+way. A field no child knows stays unknown for the root's typo rule.
+
+Diagnostics. The relay serves `DiagnosticsService` on the port the root
+already talks to, because the root asks each shard's address for its
+layout (`docs/diagnostics.md`). Its `GetShardDiagnostics` answers one
+layout, the children's merged: rows, live rows, tombstones, and tail
+rows summed, the children's segments concatenated with the child index
+in front of each segment id, `segment_pruning` and `floor_sharing` true
+only when every child has them, one placement code when the children
+agree and `placement_mixed` when they do not, and a child whose
+diagnostics are unserved named in `layout`, which starts with `relay
+over N children`. Knobs, metrics, and the recent-request ring are the
+relay process's own.
+
 Every other `NodeService` route refuses UNIMPLEMENTED naming the route
 and the relay: no ingest, no administration, no snapshots, no
-aggregation, no dictionary routes, no follow-up fetches by id, and no
-per-shard fusion (`HybridShard`) or unary vector search (`SearchShard`)
-through this level. The cascade's vector gate takes `SearchShard`, so a
-cascade does not run through a relay yet; its rescoring half does.
+aggregation, no follow-up fetches by id (`GetDocuments`,
+`ResolveParents`, `FetchValues`, `BrowseShard`), and no per-shard fusion
+(`HybridShard`) through this level.
+
+`GetVectorBackend`. The root's dense preflight asks each shard for its
+provider identity before a public query scores anything, so the relay
+answers with the descriptor and configuration its children share and
+their vector counts summed. A child without a backend, or one whose
+descriptor or configuration differs from child 0's, refuses by name: a
+relay presents one provider identity, never a mixture behind one answer.
 
 ## The epoch token
 
@@ -187,19 +254,29 @@ relay without touching relay code.
 
 ## What is not composed yet
 
-The review names what a general relay needs beyond this scope and why:
-follow-up fetches routed by original id, the unary vector search the
-cascade gates on, per-shard fusion, bitmap routes over sparse ranges,
-aggregation with the root's fold order preserved (column statistics and
-cardinalities included), bounded dictionaries, recursive ingest, and a
+What a general relay still needs beyond this scope, and why each waits:
+follow-up fetches routed by original id (`GetDocuments`, `FetchValues`,
+`ResolveParents`, `BrowseShard`: the public routes fetch documents from
+the root's own links today, so nothing asks a relay for them yet),
+per-shard fusion (`HybridShard`, superseded by the fused routes above),
+aggregation with the root's fold order preserved (`AggregateShard`,
+`QuantileCounts`, and the `stats_fields` / `cardinality_fields` shapes:
+a fold in the root's shard order and a union of values are not this
+level's to compute), bitmap routes over children whose slot ranges are
+not contiguous (the contiguity rule stands), recursive ingest, and a
 wider statistics contract past `u32`. Each is a separate gate with its
 own equivalence test.
 
 Reference: `tests/relay.rs` (flat, one-level, and two-level execution
 bit for bit, ties across relays, an initial floor, the token and the
 child's enforcement, a map move, a child error, a parent's stop, the
-refusals, the contiguity rule; and for the keyword leg: lexical queries
-on the unary and streaming routes with explain and facets, global-rank
-and score-blend hybrids, the stale-epoch refusal end to end and the
-refetch that restores it, a phrase under mixed positions, a stop
-mid-stream, and a rescore routed by id).
+refusals, the contiguity rule; for the keyword leg: lexical queries on
+the unary and streaming routes with explain and facets, global-rank and
+score-blend hybrids, the stale-epoch refusal end to end and the refetch
+that restores it, a phrase under mixed positions, a stop mid-stream, and
+a rescore routed by id; and for the vector side: the unary scan with and
+without `tie_complete` and collapsed by parent, the cascade and
+decomposed fusion, filtered and recursive boolean queries with lexical,
+dense, and FP32-reranked clauses, the bitmaps laid over the children and
+the gap refusal, the dictionaries as the union of the children, and the
+diagnostics through the root).

@@ -227,6 +227,17 @@ fn node_knobs(config: &NodeConfig) -> crate::diagnostics::Knobs {
                 .unwrap_or_default(),
             description: "The placement code this shard serves (--placement-leaf).",
         },
+        FixedKnob {
+            name: "placement_tree",
+            kind: KnobKind::String,
+            value: config
+                .placement_tree
+                .as_ref()
+                .map(|pinned| pinned.leaf().name.clone())
+                .unwrap_or_default(),
+            description: "The pinned leaf's name under the tree this shard checks direct \
+                          rows against (--placement-tree); empty without a tree.",
+        },
     ];
     Knobs::node(
         process,
@@ -383,6 +394,12 @@ pub struct NodeConfig {
     /// on a document that lacks it and rejects one that carries another
     /// code. Needs `placement_column`.
     pub placement_leaf: Option<i64>,
+    /// The placement tree the pinned leaf belongs to
+    /// (`--placement-tree`, docs/placement.md): with it the shard checks
+    /// each direct row's values against the predicates on the leaf's
+    /// path and refuses a row the tree routes elsewhere. Needs
+    /// `placement_leaf`.
+    pub placement_tree: Option<Arc<crate::placement::PinnedLeaf>>,
     /// The geo-point column table for NEW builders
     /// (`docs/geo-columns.md`). Same rules as `facet_fields`; the
     /// columns geo FILTERS and distance-decay stages read.
@@ -491,6 +508,7 @@ impl Default for NodeConfig {
             unsigned_integer_fields: Vec::new(),
             placement_column: None,
             placement_leaf: None,
+            placement_tree: None,
             geo_fields: Vec::new(),
             position_fields: Vec::new(),
             sentence_fields: Vec::new(),
@@ -8877,6 +8895,36 @@ impl NodeServiceImpl {
         Ok(columns)
     }
 
+    /// The pinned leaf's predicates (`docs/placement.md`) on a document
+    /// as it arrived, before this shard derives anything: the same
+    /// values the coordinator routes on, its value-dialect columns
+    /// included, and none of the quality or geography columns analysis
+    /// adds later. Runs on live ingest only; a logged record already
+    /// passed, so replay and the compaction shadow skip it.
+    fn check_placement(&self, doc: &AddDocumentsRequest) -> Result<(), Status> {
+        let Some(pinned) = self.config.placement_tree.as_ref() else {
+            return Ok(());
+        };
+        let outcome = match doc.materialize.as_ref() {
+            Some(spec) if !spec.columns.is_empty() => {
+                let compiled = self.compiled_materialize(spec)?;
+                let mut routed = doc.clone();
+                routed.materialize = None;
+                let routed = apply_materialize(routed, &compiled)?;
+                pinned.check(&routed)
+            }
+            _ => pinned.check(doc),
+        };
+        outcome.map_err(|reason| {
+            Status::invalid_argument(format!(
+                "{reason}; this shard pins leaf {} (--placement-leaf) under the tree in \
+                 --placement-tree, so route the document through the coordinator or send it \
+                 to a shard of its leaf",
+                pinned.leaf().code
+            ))
+        })
+    }
+
     /// The placement rule (`docs/placement.md`) on a document about to
     /// be applied. With a leaf pinned, a document without a value for
     /// the placement column takes the shard's code and one with another
@@ -9451,6 +9499,7 @@ impl NodeServiceImpl {
         // take the one path they already took. Clearing the spec is what
         // makes replay exact — the logged request carries the values, so
         // replay never calls the sidecar and never derives twice.
+        self.check_placement(&doc)?;
         let (doc, analyzed) = self.materialize_document(doc, analyzed)?;
         let _mutation = self.mutation_gate.read().await;
         let mut guard = write_shard(&self.state);

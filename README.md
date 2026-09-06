@@ -1442,6 +1442,19 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   Unsigned mapping and query support remain in progress. See [integer storage](docs/range-facets.md) and the
   [foundation status](docs/search-foundations.md).
 
+- **Landed 2026-09-06: the read surface through a relay.** `SearchShard`
+  (the cascade's gate and the unary vector search), `VectorRescore` and
+  `ExactVectorRescore` (decomposed fusion, the FP32 rerank, a boolean
+  group's dense clause), the three bitmap routes (filtered top-level
+  queries and the recursive boolean planner), and the dictionaries
+  (`ExpandTermPrefix`, `SuggestTerms`) forward through a relay
+  coordinator, each with an equivalence test through one and two relay
+  levels. A relay also serves `DiagnosticsService`, answering the root
+  with its children's layouts merged into one. An id in no child's range
+  is dropped on the rescore routes, as a node drops one outside its own
+  range. Still refused: follow-up fetches by id, per-shard fusion, and
+  aggregation. [Relay coordinators](docs/relay-coordinators.md).
+
 - **Full-domain signed numeric columns (2026-09-05).** Integer presence now
   has its own bitmap, so `i64::MIN` survives ingest, materialization, querying,
   reopen and compaction. New files use kind 10; older readers refuse it.
@@ -1567,6 +1580,22 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   authorization and durable-write work is tracked in
   [Search foundations](docs/search-foundations.md).
 
+- **Landed 2026-09-05: the boolean group's survivors are scored in one call,
+  and implied clauses are dropped per shard.** The BM25 candidate scorer
+  searched its growing result list on every match, quadratic in the
+  candidates of one call, which is why a boolean group sent its survivors to
+  the shards in `max_k` pieces; it now lands each match in its candidate's
+  slot, the coordinator sends a shard's survivors in `signal_batch` ids per
+  call (its own knob, no longer `max_k`), and a dense clause's
+  membership is the universe rather than a fetched list of every id. The
+  keyword-gated dense cases over 2,000,000 rows drop accordingly
+  (`docs/benchmarks/partition-pruning-2026-09.md`, the dated section). Under a placement tree a
+  consulted shard is sent the request filter without the clauses its leaf
+  implies, one bitmap less per implied clause, with the known handshake
+  mapped back. Answers are identical either way (`tests/boolean_masked.rs`,
+  `tests/placement.rs`). [Boolean execution](docs/query-api.md),
+  [Placement trees](docs/placement.md).
+
 - **Landed 2026-09-05: dense identity on product-owned nodes.** Classic and
   coalesced top-k capture source identity with their scored snapshot. Streaming
   top-k resolves only winners through a bounded exchange on the same stream,
@@ -1641,6 +1670,16 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   moves within a placement leaf's node set from those rates, excludes a
   device node by declaration, and moves nothing.
   [Bandwidth as the budget](docs/bandwidth-budget.md).
+
+- **Landed 2026-09-06: the tree on the shard, and a re-placement split.**
+  `--placement-tree=<map or table>` gives a pinned node its leaf's
+  predicates: the pinned code must be a leaf of the tree, and a direct row
+  the tree routes elsewhere is refused naming the node that sent it there
+  and the leaf it belongs to, on the values the coordinator routes on. The
+  offline `reshard --placement-tree=<file>` evaluates a NEW tree at replay,
+  rewrites each row's code, and writes one child per leaf shard with the
+  new shard map, spilling per child so memory follows the largest child.
+  [Placement trees](docs/placement.md).
 
 - **Landed 2026-09-05: placement ingest and shard pruning.** Under a
   placement tree the coordinator evaluates the tree per routed document

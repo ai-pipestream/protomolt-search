@@ -181,6 +181,7 @@ fn dense_leaf(
         node: Some(selection_query::Node::Search(SearchQuery {
             id: "vec".into(),
             query: Some(search_query::Query::Dense(DenseQuery {
+                field: String::new(),
                 vector: vector.to_vec(),
                 execution_mode: execution as i32,
                 score_mode: score as i32,

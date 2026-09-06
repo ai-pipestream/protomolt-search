@@ -353,7 +353,8 @@ async fn score_boolean_plan(
             .intersection(&leaf.membership)
             .copied()
             .collect();
-        for chunk in candidates.chunks(coordinator.max_k() as usize) {
+        // Rescore batching is a wire bound independent of result depth.
+        for chunk in candidates.chunks(coordinator.signal_batch().max(1)) {
             let scores = match &leaf.kind {
                 PlannedSearchKind::Lexical {
                     terms,

@@ -691,7 +691,74 @@ fn cases() -> Vec<(&'static str, SelectionQuery, u32)> {
             boolean(vec![cel("f", "year >= 2020"), lexical("l", "search")]),
             0,
         ),
+        // Clauses a leaf implies are dropped from that shard's tree
+        // (docs/placement.md, "Implied clauses"): the recent leaves
+        // receive no `year` clause here, old is ruled out, other keeps it.
+        (
+            "dense >= 2015 implied",
+            and(vec![cel("f", "year >= 2015"), dense("v")]),
+            1,
+        ),
+        (
+            "dense scotus implied",
+            and(vec![cel("f", "court_code == \"scotus\""), dense("v")]),
+            0,
+        ),
+        (
+            "dense has year implied",
+            and(vec![cel("f", "has(year)"), dense("v")]),
+            0,
+        ),
+        (
+            "dense implied under or",
+            and(vec![
+                cel("f", "year >= 2015 || court_code == \"ca9\""),
+                dense("v"),
+            ]),
+            0,
+        ),
+        (
+            "lexical whole tree implied",
+            and(vec![
+                cel("f", "year >= 2010 && has(court_code)"),
+                lexical("l", "search"),
+            ]),
+            1,
+        ),
+        (
+            "boolean implied",
+            boolean(vec![cel("f", "year >= 2010"), lexical("l", "search")]),
+            0,
+        ),
     ]
+}
+
+/// The mask the pruning coordinator computes for the shapes above: which
+/// clauses each consulted shard is spared. The wire cannot show a
+/// dropped clause, so this reads the verdict the fan-out reads.
+#[test]
+fn the_recent_leaves_are_spared_the_clauses_they_imply() {
+    use pipestream_search::cel::compile_filter;
+    use pipestream_search::placement::ShardMask;
+    let placement = Placement::validate(&tree()).unwrap();
+    let codes: Vec<Option<i64>> = codes().into_iter().map(Some).collect();
+    let filter = compile_filter("year >= 2010 && has(court_code)")
+        .unwrap()
+        .unwrap();
+    let mask = ShardMask::compute(&placement, &codes, &filter);
+    // LEAVES order: old, recent.scotus, recent.rest, other.
+    assert_eq!(mask.skipped, vec![true, false, false, false]);
+    assert_eq!(
+        mask.filter_for(1, &filter),
+        None,
+        "scotus pins year and court"
+    );
+    let rest = mask.filter_for(2, &filter).unwrap();
+    assert!(matches!(
+        rest.expr,
+        Some(pipestream_search::pb::filter_expr::Expr::Has(_))
+    ));
+    assert_eq!(mask.filter_for(3, &filter), Some(filter.clone()));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -836,6 +903,290 @@ async fn document_evaluation_agrees_with_the_shards() {
         assert_eq!(got, expected, "{predicate}");
     }
 
+    for (_, handle) in nodes {
+        handle.abort();
+    }
+}
+
+// ---------------------------------------------------------------------
+// The tree on the node: --placement-tree
+// ---------------------------------------------------------------------
+
+fn pinned(code: i64) -> std::sync::Arc<pipestream_search::placement::PinnedLeaf> {
+    std::sync::Arc::new(
+        pipestream_search::placement::PinnedLeaf::pin(&tree(), COLUMN, code).unwrap(),
+    )
+}
+
+#[test]
+fn a_pinned_leaf_is_validated_by_name() {
+    use pipestream_search::placement::PinnedLeaf;
+    let old = codes()[0];
+    let leaf = PinnedLeaf::pin(&tree(), COLUMN, old).unwrap();
+    assert_eq!(leaf.leaf().name, "old");
+    assert_eq!(leaf.placement().leaves().len(), 4);
+    let err = PinnedLeaf::pin(&tree(), "elsewhere", old).unwrap_err();
+    assert!(
+        err.contains("column \"placement\"") && err.contains("--placement-column \"elsewhere\""),
+        "{err}"
+    );
+    let err = PinnedLeaf::pin(&tree(), COLUMN, old + 7).unwrap_err();
+    assert!(
+        err.contains(&format!("--placement-leaf {} is not a leaf", old + 7))
+            && err.contains("recent.scotus =")
+            && err.contains("other ="),
+        "{err}"
+    );
+    // A tree that fails validation refuses before the code is looked at.
+    let mut broken = tree();
+    broken.nodes[0].cel = Some("year <".into());
+    let err = PinnedLeaf::pin(&broken, COLUMN, old).unwrap_err();
+    assert!(err.contains("node \"old\""), "{err}");
+}
+
+#[test]
+fn a_placement_tree_file_is_the_map_or_the_table_alone() {
+    use pipestream_search::config::load_placement_tree;
+    let dir = tempdir("tree-file");
+    let map = dir.join("map.toml");
+    std::fs::write(
+        &map,
+        r#"
+generation = 3
+
+[[shards]]
+addr = "127.0.0.1:19300"
+slot_offset = 0
+placement = 0
+
+[placement]
+column = "placement"
+
+[[placement.nodes]]
+name = "old"
+cel = "year < 2000"
+shards = 1
+
+[[placement.nodes]]
+name = "rest"
+shards = 1
+"#,
+    )
+    .unwrap();
+    let from_map = load_placement_tree(&map).unwrap();
+    assert_eq!(from_map.nodes.len(), 2);
+    let table = dir.join("tree.toml");
+    std::fs::write(
+        &table,
+        r#"
+column = "placement"
+
+[[nodes]]
+name = "old"
+cel = "year < 2000"
+shards = 1
+
+[[nodes]]
+name = "rest"
+shards = 1
+"#,
+    )
+    .unwrap();
+    assert_eq!(load_placement_tree(&table).unwrap(), from_map);
+    let bare = dir.join("bare.toml");
+    std::fs::write(&bare, "generation = 3\n\n[[shards]]\naddr = \"a:1\"\n").unwrap();
+    let err = load_placement_tree(&bare).unwrap_err();
+    assert!(err.contains("no [placement] table"), "{err}");
+    let junk = dir.join("junk.toml");
+    std::fs::write(&junk, "nodes = 4\n").unwrap();
+    let err = load_placement_tree(&junk).unwrap_err();
+    assert!(err.contains("neither a shard map"), "{err}");
+    let err = load_placement_tree(&dir.join("absent.toml")).unwrap_err();
+    assert!(err.contains("read placement tree"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pinned_shard_with_the_tree_refuses_a_row_the_tree_routes_elsewhere() {
+    let dir = tempdir("tree-direct");
+    let old = codes()[0];
+    let rest = codes()[2];
+    let (old_node, old_handle) = start_empty_node(NodeConfig {
+        index_path: Some(dir.join("old.tv")),
+        wal: true,
+        placement_tree: Some(pinned(old)),
+        ..config(Some(old), 0)
+    })
+    .await;
+    let (rest_node, rest_handle) = start_empty_node(NodeConfig {
+        placement_tree: Some(pinned(rest)),
+        ..config(Some(rest), 1_000)
+    })
+    .await;
+
+    let doc = |year: Option<i64>, court: &str, code: Option<i64>| {
+        let mut integers = Vec::new();
+        if let Some(year) = year {
+            integers.push(IntegerValue {
+                field: "year".into(),
+                value: year,
+            });
+        }
+        if let Some(code) = code {
+            integers.push(IntegerValue {
+                field: COLUMN.into(),
+                value: code,
+            });
+        }
+        AddDocumentsRequest {
+            text: "a direct opinion about search".into(),
+            analysis: Some(body_spec()),
+            facets: vec![FacetValue {
+                field: "court_code".into(),
+                value: court.into(),
+            }],
+            integers,
+            ..Default::default()
+        }
+    };
+    let add = |addr: String, req: AddDocumentsRequest| async move {
+        let mut client = NodeServiceClient::connect(addr).await.unwrap();
+        let (tx, rx) = mpsc::channel(2);
+        tx.send(req).await.unwrap();
+        drop(tx);
+        client
+            .add_documents(ReceiverStream::new(rx))
+            .await
+            .map(|r| r.into_inner())
+    };
+    let refused = |err: tonic::Status, needles: &[&str]| {
+        assert_eq!(
+            err.code(),
+            tonic::Code::InvalidArgument,
+            "{}",
+            err.message()
+        );
+        for needle in needles {
+            assert!(
+                err.message().contains(needle),
+                "missing {needle:?} in {}",
+                err.message()
+            );
+        }
+    };
+
+    // The leaf "old" (year < 2000): a row the predicate holds on passes
+    // with or without the code; a row it is false on is refused naming
+    // the node, the outcome, and the leaf the row belongs to, whether or
+    // not it carries the pinned code; a row with no year is unknown and
+    // belongs to the root default.
+    add(old_node.clone(), doc(Some(1990), "ca9", None))
+        .await
+        .unwrap();
+    add(old_node.clone(), doc(Some(1985), "ca9", Some(old)))
+        .await
+        .unwrap();
+    let err = add(old_node.clone(), doc(Some(2021), "ca9", None))
+        .await
+        .unwrap_err();
+    refused(
+        err,
+        &[
+            "node \"old\" (year < 2000) is false",
+            "leaf \"recent.rest\"",
+            &format!("pinned leaf \"old\" (code {old})"),
+            "--placement-tree",
+        ],
+    );
+    let err = add(old_node.clone(), doc(Some(2021), "ca9", Some(old)))
+        .await
+        .unwrap_err();
+    refused(err, &["node \"old\" (year < 2000) is false"]);
+    let err = add(old_node.clone(), doc(None, "ca9", None))
+        .await
+        .unwrap_err();
+    refused(
+        err,
+        &["node \"old\" (year < 2000) is unknown", "leaf \"other\""],
+    );
+    // A code from another leaf is still refused by the code rule.
+    let err = add(old_node.clone(), doc(Some(1990), "ca9", Some(rest)))
+        .await
+        .unwrap_err();
+    refused(err, &[&format!("carries code {rest}")]);
+    assert_eq!(health_docs(&old_node).await, 2);
+
+    // The leaf "recent.rest": an earlier node at either level that is
+    // true on the row names itself.
+    add(rest_node.clone(), doc(Some(2021), "ca9", None))
+        .await
+        .unwrap();
+    let err = add(rest_node.clone(), doc(Some(2021), "scotus", None))
+        .await
+        .unwrap_err();
+    refused(
+        err,
+        &[
+            "node \"recent.scotus\" (court_code == \"scotus\") is true",
+            "leaf \"recent.scotus\"",
+        ],
+    );
+    let err = add(rest_node.clone(), doc(Some(1990), "ca9", None))
+        .await
+        .unwrap_err();
+    refused(err, &["node \"old\" (year < 2000) is true", "leaf \"old\""]);
+    assert_eq!(health_docs(&rest_node).await, 1);
+
+    // Replay is not re-checked: flush, reopen with the tree, same rows.
+    NodeServiceClient::connect(old_node.clone())
+        .await
+        .unwrap()
+        .flush(FlushRequest {})
+        .await
+        .unwrap();
+    old_handle.abort();
+    rest_handle.abort();
+    let (reopened, reopened_handle) = start_opened_node(NodeConfig {
+        index_path: Some(dir.join("old.tv")),
+        wal: true,
+        placement_tree: Some(pinned(old)),
+        ..config(Some(old), 0)
+    })
+    .await;
+    assert_eq!(health_docs(&reopened).await, 2);
+    let c = CoordinatorServiceImpl::new(vec![reopened.clone()]).with_bm25(
+        Some(NATIVE_ANALYSIS_BACKEND.to_string()),
+        Default::default(),
+    );
+    assert_eq!(leaf_ids(&c, old).await, vec![0, 1]);
+    reopened_handle.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn routed_ingest_passes_the_tree_check_on_every_leaf() {
+    // One node per leaf, each pinned with the tree; the coordinator's
+    // routing and the node's check agree on every document, so the
+    // counts are the ones routing alone produced.
+    let mut nodes = Vec::new();
+    for (i, code) in codes().into_iter().enumerate() {
+        let served = start_empty_node(NodeConfig {
+            placement_tree: Some(pinned(code)),
+            ..config(Some(code), 1_000 * i as u64)
+        })
+        .await;
+        calibrate(&served.0).await;
+        nodes.push(served);
+    }
+    let addrs: Vec<String> = nodes.iter().map(|n| n.0.clone()).collect();
+    let c = coordinator(&addrs, true);
+    let all: Vec<usize> = (0..corpus().len()).collect();
+    let response = routed(&c, &all).await.unwrap();
+    assert_eq!(response.added as usize, corpus().len());
+    for (leaf, name) in LEAVES.iter().enumerate() {
+        let expected = corpus().iter().filter(|(_, _, l)| *l == *name).count() as u64;
+        assert_eq!(health_docs(&addrs[leaf]).await, expected, "leaf {name}");
+    }
     for (_, handle) in nodes {
         handle.abort();
     }

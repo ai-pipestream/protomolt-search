@@ -237,6 +237,7 @@ macro_rules! scoped_read_responses {
     )+ };
 }
 scoped_read_responses!(
+    FilterBitmapResponse,
     MembershipBitmapResponse,
     VectorReadReceipt,
     VectorRescoreResponse,

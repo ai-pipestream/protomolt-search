@@ -65,8 +65,11 @@ On a segmented shard, a pruned segment is left out of:
   clause's terms occur, from one dictionary lookup per term per part; an
   intersection with an empty membership is empty, so a required lexical
   clause rules those parts out of the group exactly. A dense clause in a
-  boolean group is scored per surviving id and never scans, so a keyword
-  clause gates it by construction.
+  boolean group is scored over the survivors through `VectorRescore`,
+  which a node answers with one masked scan of its index: the survivors
+  are the allowlist, a sealed part in which none of them sits is not
+  opened, and a SIMD block with none is not read
+  (`docs/query-api.md`, "Recursive boolean execution").
 
 The vector kernel still reads every row of a segment it opens: pruning removes
 whole segments, not rows. Within an opened segment the allowlist masks rows

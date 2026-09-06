@@ -339,7 +339,7 @@ mod tests {
                 6 => bad.visibility_fingerprint.clear(),
                 7 => bad.visibility_fingerprint = vec![9; 32],
                 8 => bad.visibility_columns_known.clear(),
-                _ => bad.vector_binding.as_mut().unwrap().version += 1,
+                _ => bad.vector_binding.as_mut().unwrap().format_version += 1,
             }
             assert!(barrier
                 .admit(1, &mut tokio_stream::iter([Ok(frame(receipts[1].clone()))]))

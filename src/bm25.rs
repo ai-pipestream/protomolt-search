@@ -188,11 +188,24 @@ pub fn score_candidates(
             }
         }
     }
-    let mut docs: Vec<ScoredDoc> = Vec::new();
+    // One slot per sorted candidate: a match lands at the candidate's
+    // position, so accumulation is O(1) per posting and the result comes
+    // out doc id ascending. (The earlier form searched the growing result
+    // list for the candidate on every match, quadratic in the candidates
+    // of one call: 10,000 candidates cost 25 ms, and a membership of
+    // 600,000 sent in max_k pieces cost 2 s of that search alone.)
+    let mut slots: Vec<Option<ScoredDoc>> = candidates.iter().map(|_| None).collect();
+    fn slot(slots: &mut [Option<ScoredDoc>], ci: usize, doc_id: u32) -> &mut ScoredDoc {
+        slots[ci].get_or_insert_with(|| ScoredDoc {
+            doc_id,
+            score: 0.0,
+            term_offsets: Vec::new(),
+        })
+    }
     if all_have_impacts {
         for (ti, mut cursor) in cursors {
             let idf = idf(stats.doc_count, stats.dfs[ti]);
-            for &cand in &candidates {
+            for (ci, &cand) in candidates.iter().enumerate() {
                 if cursor.exhausted() {
                     break;
                 }
@@ -200,23 +213,13 @@ pub fn score_candidates(
                 if cursor.doc_id() == cand {
                     let contribution =
                         idf * tf_norm(params, cursor.tf(), store.doc_length(cand), avgdl);
-                    let entry = match docs.iter_mut().find(|d| d.doc_id == cand) {
-                        Some(d) => d,
-                        None => {
-                            docs.push(ScoredDoc {
-                                doc_id: cand,
-                                score: 0.0,
-                                term_offsets: Vec::new(),
-                            });
-                            docs.last_mut().expect("just pushed")
-                        }
-                    };
+                    let entry = slot(&mut slots, ci, cand);
                     entry.score += contribution;
                     entry.term_offsets.push((ti, cursor.offsets()));
                 }
             }
         }
-        return docs;
+        return slots.into_iter().flatten().collect();
     }
 
     for (ti, term) in terms.iter().enumerate() {
@@ -233,23 +236,13 @@ pub fn score_candidates(
             }
             if ci < candidates.len() && candidates[ci] == doc_id {
                 let contribution = idf * tf_norm(params, tf, store.doc_length(doc_id), avgdl);
-                let entry = match docs.iter_mut().find(|d| d.doc_id == doc_id) {
-                    Some(d) => d,
-                    None => {
-                        docs.push(ScoredDoc {
-                            doc_id,
-                            score: 0.0,
-                            term_offsets: Vec::new(),
-                        });
-                        docs.last_mut().expect("just pushed")
-                    }
-                };
+                let entry = slot(&mut slots, ci, doc_id);
                 entry.score += contribution;
                 entry.term_offsets.push((ti, offsets.to_vec()));
             }
         });
     }
-    docs
+    slots.into_iter().flatten().collect()
 }
 
 /// One (field, term) occurrence in a document, as the explain tree

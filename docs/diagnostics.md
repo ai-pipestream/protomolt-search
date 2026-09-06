@@ -66,6 +66,7 @@ value that does not parse for the knob's kind returns
 | `max_k` | coordinator | int | yes | Largest `k` a request may ask for, and the depth an omitted `k` runs at (`--max-k`). Zero is rejected. |
 | `hedge_delay_ms` | coordinator | int | yes | Wait on a shard's primary before racing its replica; 0 disables hedging. |
 | `shard_pruning` | coordinator | bool | yes | Skip shards whose placement leaf rules out the request's filter before fan-out (`--shard-pruning`, `docs/placement.md`). |
+| `signal_batch` | coordinator | int | yes | Candidate ids per rescore call (`Bm25Rescore`, `VectorRescore`) when a boolean group scores a clause over its surviving ids (`--signal-batch`, `docs/query-api.md`). Zero is rejected. |
 | `chunk_blocks`, `block_max`, `coalesce`, `scan_parallel`, `rerank_parallel`, `layout`, `vector_mmap`, `seal_tail_docs`, `bit_width`, `slot_offset`, `collection`, `vector_backend`, `placement_column`, `placement_leaf` | node | | no | Read at startup. |
 | `collection`, `nodes`, `replicas`, `stream_search`, `bm25_stream`, `max_rerank_bytes`, `shard_deadline_ms`, `dense_execution_policy` | coordinator | | no | Read at startup. |
 

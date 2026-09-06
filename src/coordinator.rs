@@ -113,6 +113,16 @@ static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// Bounds the coordinator's heap and keeps the shared floor rising: an
 /// unbounded k would hold the floor at -inf and stream every shard dry.
 pub const DEFAULT_MAX_K: u32 = 10_000;
+/// Candidate ids per rescore call (`Bm25Rescore`, `VectorRescore`) when a
+/// boolean group scores a clause over its surviving ids. A lexical call
+/// is one cursor walk over its candidates and a dense call is one masked
+/// scan of the shard, so the pieces only pipeline the wire with the
+/// shards' work: on the local benchmark a 600,000-row membership over
+/// 2,000,000 rows scored in 1.20 s at pieces of 10,000 and 1.27 s in one
+/// call (docs/benchmarks/partition-pruning-2026-09.md). The knob exists
+/// so the batch is its own setting and not `max_k`; this default is the
+/// measured one.
+pub const DEFAULT_SIGNAL_BATCH: u32 = 10_000;
 pub const DEFAULT_MAX_RERANK_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Per-shard timing controls for the fan-out (all off by default).
@@ -1671,6 +1681,11 @@ struct FilterKnown {
     geo: Vec<bool>,
     tree: Vec<bool>,
     leaves: usize,
+    /// Per shard, the request-tree indices of the leaves that shard's
+    /// tree keeps, when its placement leaf implied some
+    /// (`ShardMask::implied`); the shard's flags come back in that
+    /// shorter order and are mapped through it. `None`: the full tree.
+    kept: Vec<Option<Vec<usize>>>,
 }
 
 impl FilterKnown {
@@ -1680,11 +1695,28 @@ impl FilterKnown {
             geo: vec![false; filters.geo.len()],
             tree: vec![false; leaves],
             leaves,
+            kept: Vec::new(),
         }
     }
 
-    /// Fold one shard's answer in.
+    /// Fold one shard's answer in, flags over the full request tree.
     fn merge(&mut self, geo: &[bool], tree: &[bool]) -> Result<(), Status> {
+        self.merge_kept(geo, tree, None)
+    }
+
+    /// Fold `shard`'s answer in; its tree flags are over the tree that
+    /// shard received, which [`Self::merge_pruned`] recorded.
+    fn merge_shard(&mut self, shard: usize, geo: &[bool], tree: &[bool]) -> Result<(), Status> {
+        let kept = self.kept.get(shard).and_then(|k| k.clone());
+        self.merge_kept(geo, tree, kept.as_deref())
+    }
+
+    fn merge_kept(
+        &mut self,
+        geo: &[bool],
+        tree: &[bool],
+        kept: Option<&[usize]>,
+    ) -> Result<(), Status> {
         if geo.len() != self.geo.len() {
             return Err(Status::internal(format!(
                 "shard answered {} geo-column flags for {} filters",
@@ -1692,20 +1724,38 @@ impl FilterKnown {
                 self.geo.len()
             )));
         }
-        if tree.len() != self.leaves {
-            return Err(Status::internal(format!(
-                "shard answered {} filter-leaf flags for {} leaves",
-                tree.len(),
-                self.leaves
-            )));
-        }
         for (acc, k) in self.geo.iter_mut().zip(geo) {
             *acc |= *k;
         }
-        for (acc, k) in self.tree.iter_mut().zip(tree) {
-            *acc |= *k;
+        match kept {
+            Some(kept) if tree.len() == kept.len() => {
+                for (&index, k) in kept.iter().zip(tree) {
+                    if let Some(acc) = self.tree.get_mut(index) {
+                        *acc |= *k;
+                    }
+                }
+                Ok(())
+            }
+            Some(kept) => Err(Status::internal(format!(
+                "shard answered {} filter-leaf flags for the {} leaves it was sent (of {})",
+                tree.len(),
+                kept.len(),
+                self.leaves
+            ))),
+            None => {
+                if tree.len() != self.leaves {
+                    return Err(Status::internal(format!(
+                        "shard answered {} filter-leaf flags for {} leaves",
+                        tree.len(),
+                        self.leaves
+                    )));
+                }
+                for (acc, k) in self.tree.iter_mut().zip(tree) {
+                    *acc |= *k;
+                }
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     /// Count the filter leaves that excluded a shard before fan-out as
@@ -1714,6 +1764,17 @@ impl FilterKnown {
     fn merge_pruned(&mut self, mask: Option<&crate::placement::ShardMask>) {
         if let Some(mask) = mask {
             mark_known(&mut self.tree, &mask.known);
+            self.kept = mask
+                .implied
+                .iter()
+                .map(|dropped| {
+                    (!dropped.is_empty()).then(|| {
+                        (0..self.leaves)
+                            .filter(|index| !dropped.contains(index))
+                            .collect()
+                    })
+                })
+                .collect();
         }
     }
 
@@ -1815,6 +1876,7 @@ impl CoordinatorServiceImpl {
                     max_k: DEFAULT_MAX_K,
                     hedge_delay_ms: 0,
                     shard_pruning: true,
+                    signal_batch: DEFAULT_SIGNAL_BATCH,
                 },
                 Vec::new(),
             )),
@@ -2289,6 +2351,35 @@ impl CoordinatorServiceImpl {
         ))
     }
 
+    /// The filter tree to send to `shard`: the request's tree with the
+    /// clauses the shard's placement leaf implies removed
+    /// (`docs/placement.md`, "Implied clauses"); the tree as it is with
+    /// no tree, no mask, or nothing implied. Same answer either way, one
+    /// bitmap less to resolve on the shard.
+    pub(crate) fn shard_filter_tree(
+        filters: &RequestFilters,
+        mask: Option<&crate::placement::ShardMask>,
+        shard: usize,
+    ) -> Option<crate::pb::FilterExpr> {
+        match (filters.tree.as_ref(), mask) {
+            (Some(tree), Some(mask)) => mask.filter_for(shard, tree),
+            (tree, _) => tree.cloned(),
+        }
+    }
+
+    /// [`Self::shard_filter_tree`] for every shard of the topology, for
+    /// a context that outlives the mask (a stream and its hedge leg must
+    /// send one shard the identical tree).
+    fn shard_filter_trees(
+        &self,
+        filters: &RequestFilters,
+        mask: Option<&crate::placement::ShardMask>,
+    ) -> Vec<Option<crate::pb::FilterExpr>> {
+        (0..self.node_addrs.len())
+            .map(|shard| Self::shard_filter_tree(filters, mask, shard))
+            .collect()
+    }
+
     /// `(shards in the topology, shards the filter skips)` for a profile.
     pub fn shard_prune_counts(&self, filters: &RequestFilters) -> (u32, u32) {
         let total = self.node_addrs.len() as u32;
@@ -2452,29 +2543,66 @@ impl CoordinatorServiceImpl {
     /// omitting `k` runs at). Zero is rejected at config parse time, so
     /// this takes the already-validated value.
     pub fn with_max_k(mut self, max_k: u32) -> Self {
-        self.rebuild_knobs(max_k, self.knobs.hedge_delay(), self.knobs.shard_pruning());
+        self.rebuild_knobs(
+            max_k,
+            self.knobs.hedge_delay(),
+            self.knobs.shard_pruning(),
+            self.knobs.signal_batch(),
+        );
         self.refresh_fixed_knobs();
         self
+    }
+
+    /// Candidate ids per rescore call for a boolean group's clauses
+    /// ([`DEFAULT_SIGNAL_BATCH`]). Zero is rejected at config parse
+    /// time. Live afterwards as the `signal_batch` knob; `max_k` is the
+    /// earlier behavior for an A/B.
+    pub fn with_signal_batch(mut self, batch: u32) -> Self {
+        self.rebuild_knobs(
+            self.knobs.max_k(),
+            self.knobs.hedge_delay(),
+            self.knobs.shard_pruning(),
+            batch,
+        );
+        self.refresh_fixed_knobs();
+        self
+    }
+
+    /// Ids per rescore call, live.
+    pub fn signal_batch(&self) -> usize {
+        self.knobs.signal_batch().max(1) as usize
     }
 
     /// Whether a filtered request skips the shards its placement leaf
     /// rules out (`docs/placement.md`); `false` is the A/B switch and
     /// changes no answer. Live afterwards as the `shard_pruning` knob.
     pub fn with_shard_pruning(mut self, enabled: bool) -> Self {
-        self.rebuild_knobs(self.knobs.max_k(), self.knobs.hedge_delay(), enabled);
+        self.rebuild_knobs(
+            self.knobs.max_k(),
+            self.knobs.hedge_delay(),
+            enabled,
+            self.knobs.signal_batch(),
+        );
         self.refresh_fixed_knobs();
         self
     }
 
     /// Builders run before the coordinator is shared, so a knob change
     /// at build time replaces the set; the live values carry over.
-    fn rebuild_knobs(&mut self, max_k: u32, hedge_delay: Option<Duration>, shard_pruning: bool) {
+    fn rebuild_knobs(
+        &mut self,
+        max_k: u32,
+        hedge_delay: Option<Duration>,
+        shard_pruning: bool,
+        signal_batch: u32,
+    ) {
         self.knobs = Arc::new(crate::diagnostics::Knobs::coordinator(
             self.knobs.process().to_string(),
             crate::diagnostics::CoordinatorKnobValues {
                 max_k,
                 hedge_delay_ms: hedge_delay.map_or(0, |d| d.as_millis() as u64),
                 shard_pruning,
+                signal_batch,
             },
             Vec::new(),
         ));
@@ -2679,6 +2807,7 @@ impl CoordinatorServiceImpl {
             self.knobs.max_k(),
             limits.hedge_delay,
             self.knobs.shard_pruning(),
+            self.knobs.signal_batch(),
         );
         self.refresh_fixed_knobs();
         self
@@ -5729,7 +5858,7 @@ impl CoordinatorServiceImpl {
                 expected_stats_epoch: claims[shard].epoch,
                 expected_stats_incarnation: claims[shard].incarnation(),
                 geo_filters: filters.geo.clone(),
-                filter: filters.tree.clone(),
+                filter: Self::shard_filter_tree(filters, mask.as_ref(), shard),
             };
             let mut client = self.node_client(node)?;
             shard_tasks.push(tokio::spawn(async move {
@@ -5747,7 +5876,11 @@ impl CoordinatorServiceImpl {
             let (shard, elapsed, response) = task
                 .await
                 .map_err(|error| Status::internal(format!("shard legs task failed: {error}")))??;
-            known.merge(&response.geo_columns_known, &response.filter_columns_known)?;
+            known.merge_shard(
+                shard as usize,
+                &response.geo_columns_known,
+                &response.filter_columns_known,
+            )?;
             for hit in &response.bm25_hits {
                 owner.entry(hit.doc_id).or_insert(shard);
             }
@@ -5907,7 +6040,7 @@ impl CoordinatorServiceImpl {
                 expected_stats_epoch: claims[shard].epoch,
                 expected_stats_incarnation: claims[shard].incarnation(),
                 geo_filters: filters.geo.clone(),
-                filter: filters.tree.clone(),
+                filter: Self::shard_filter_tree(filters, mask.as_ref(), shard),
             };
             let mut client = self.node_client(node)?;
             shard_tasks.push(tokio::spawn(async move {
@@ -5930,7 +6063,11 @@ impl CoordinatorServiceImpl {
             let (shard, rpc_ms, response) = task
                 .await
                 .map_err(|e| Status::internal(format!("shard legs task failed: {e}")))??;
-            known.merge(&response.geo_columns_known, &response.filter_columns_known)?;
+            known.merge_shard(
+                shard as usize,
+                &response.geo_columns_known,
+                &response.filter_columns_known,
+            )?;
             if debug {
                 shard_debug.push(HybridShardDebug {
                     shard,
@@ -6101,7 +6238,7 @@ impl CoordinatorServiceImpl {
                 expected_stats_epoch: claims[shard].epoch,
                 expected_stats_incarnation: claims[shard].incarnation(),
                 geo_filters: filters.geo.clone(),
-                filter: filters.tree.clone(),
+                filter: Self::shard_filter_tree(filters, mask.as_ref(), shard),
             };
             let mut client = self.node_client(node)?;
             tasks.push(tokio::spawn(async move {
@@ -6119,7 +6256,11 @@ impl CoordinatorServiceImpl {
             let (shard, elapsed, response) = task
                 .await
                 .map_err(|error| Status::internal(format!("shard legs task failed: {error}")))??;
-            known.merge(&response.geo_columns_known, &response.filter_columns_known)?;
+            known.merge_shard(
+                shard as usize,
+                &response.geo_columns_known,
+                &response.filter_columns_known,
+            )?;
             let vector_leg = vector_legs[shard as usize].clone();
             let bm25_leg: Vec<(u64, f64)> = response
                 .bm25_hits
@@ -6285,7 +6426,7 @@ impl CoordinatorServiceImpl {
                 expected_stats_epoch: claims[shard].epoch,
                 expected_stats_incarnation: claims[shard].incarnation(),
                 geo_filters: filters.geo.clone(),
-                filter: filters.tree.clone(),
+                filter: Self::shard_filter_tree(filters, mask.as_ref(), shard),
             };
             let mut client = self.node_client(node)?;
             shard_tasks.push(tokio::spawn(async move {
@@ -6488,7 +6629,7 @@ impl CoordinatorServiceImpl {
                     // neither leg can contribute a document the other
                     // would have removed.
                     geo_filters: filters.geo.clone(),
-                    filter: filters.tree.clone(),
+                    filter: Self::shard_filter_tree(filters, mask.as_ref(), shard),
                     stats_fields: Vec::new(),
                     cardinality_fields: Vec::new(),
                     phrase: None,
@@ -6551,7 +6692,13 @@ impl CoordinatorServiceImpl {
         for &(doc, _, shard) in merged.iter().take(k as usize) {
             seed_ids.entry(shard).or_default().push(doc);
         }
-        let v_of = self.fanout_vector_rescore(vector, seed_ids, "").await?;
+        let v_of = self
+            .fanout_vector_rescore(
+                vector,
+                seed_ids,
+                self.vector_read_field.as_deref().unwrap_or(""),
+            )
+            .await?;
 
         // Known fused LOWER bounds, tracked as a k-sized min-heap: its
         // root is s_lb, the k-th best known bound, and every pushed
@@ -6721,9 +6868,11 @@ impl CoordinatorServiceImpl {
                             ));
                             return fanout.cancel_with(status).await;
                         }
-                        if let Err(error) =
-                            known.merge(&summary.geo_columns_known, &summary.filter_columns_known)
-                        {
+                        if let Err(error) = known.merge_shard(
+                            shard,
+                            &summary.geo_columns_known,
+                            &summary.filter_columns_known,
+                        ) {
                             return fanout.cancel_with(error).await;
                         }
                         summaries[shard] = Some(summary);
@@ -7145,6 +7294,7 @@ impl CoordinatorServiceImpl {
 
         let admission = self.vector_read_barrier()?;
         let mut workers = tokio::task::JoinSet::new();
+        let mask = self.vector_scan_mask(filters.tree.as_ref());
         let ctx = ShardQueryCtx {
             admission: admission.clone(),
             request_id: Arc::from(request_id),
@@ -7153,13 +7303,13 @@ impl CoordinatorServiceImpl {
             tie_complete,
             collapse: false,
             filters: Arc::new(filters.clone()),
+            shard_filters: Arc::new(self.shard_filter_trees(filters, mask.as_ref())),
             tracker: Arc::new(Mutex::new(FloorTracker::new())),
             gfloor: Arc::new(watch::channel(f32::NEG_INFINITY).0),
             hedges: Arc::new(AtomicU64::new(0)),
             hedge_wins: Arc::new(AtomicU64::new(0)),
         };
         let (hedges, hedge_wins) = (Arc::clone(&ctx.hedges), Arc::clone(&ctx.hedge_wins));
-        let mask = self.vector_scan_mask(filters.tree.as_ref());
         let mut known = Self::filter_known(filters, mask.as_ref());
         let active = (0..n_nodes)
             .filter(|shard| !mask.as_ref().is_some_and(|m| m.skipped[*shard]))
@@ -7209,7 +7359,11 @@ impl CoordinatorServiceImpl {
         for _ in 0..active {
             match done_rx.recv().await {
                 Some((shard, wall_ms, Ok(done))) => {
-                    known.merge(&done.geo_columns_known, &done.filter_columns_known)?;
+                    known.merge_shard(
+                        shard as usize,
+                        &done.geo_columns_known,
+                        &done.filter_columns_known,
+                    )?;
                     for hit in &done.hits {
                         if let Some(identity) = hit.identity.as_ref() {
                             identities.insert((shard, hit.vector_id), identity.clone());
@@ -7328,7 +7482,7 @@ impl CoordinatorServiceImpl {
                         floor_token: lane.map_or(0, |(token, _)| token),
                         collapse_parents,
                         geo_filters: filters.geo.clone(),
-                        filter: filters.tree.clone(),
+                        filter: Self::shard_filter_tree(filters, mask.as_ref(), shard),
                         identity_limits: identity_limits.clone(),
                     })),
                 })
@@ -7617,9 +7771,11 @@ impl CoordinatorServiceImpl {
                     // The vector leg's half of the typo handshake: a
                     // filter column no shard resolves must refuse even
                     // when the stream completed cleanly.
-                    if let Err(e) =
-                        known.merge(&summary.geo_columns_known, &summary.filter_columns_known)
-                    {
+                    if let Err(e) = known.merge_shard(
+                        shard,
+                        &summary.geo_columns_known,
+                        &summary.filter_columns_known,
+                    ) {
                         return fanout.cancel_with(e).await;
                     }
                     summaries[shard] = Some(summary);
@@ -7820,9 +7976,11 @@ impl CoordinatorServiceImpl {
                     // The vector leg's half of the typo handshake: a
                     // filter column no shard resolves must refuse even
                     // when the stream completed cleanly.
-                    if let Err(e) =
-                        known.merge(&summary.geo_columns_known, &summary.filter_columns_known)
-                    {
+                    if let Err(e) = known.merge_shard(
+                        shard,
+                        &summary.geo_columns_known,
+                        &summary.filter_columns_known,
+                    ) {
                         return fanout.cancel_with(e).await;
                     }
                     summaries[shard] = Some(summary);
@@ -7927,6 +8085,7 @@ impl CoordinatorServiceImpl {
         }
         let admission = self.vector_read_barrier()?;
         let mut workers = tokio::task::JoinSet::new();
+        let mask = self.vector_scan_mask(filters.tree.as_ref());
         let ctx = ShardQueryCtx {
             admission: admission.clone(),
             request_id: Arc::from(request_id),
@@ -7935,13 +8094,13 @@ impl CoordinatorServiceImpl {
             tie_complete: false,
             collapse: true,
             filters: Arc::new(filters.clone()),
+            shard_filters: Arc::new(self.shard_filter_trees(filters, mask.as_ref())),
             tracker: Arc::new(Mutex::new(FloorTracker::new())),
             gfloor: Arc::new(watch::channel(f32::NEG_INFINITY).0),
             hedges: Arc::new(AtomicU64::new(0)),
             hedge_wins: Arc::new(AtomicU64::new(0)),
         };
         let (hedges, hedge_wins) = (Arc::clone(&ctx.hedges), Arc::clone(&ctx.hedge_wins));
-        let mask = self.vector_scan_mask(filters.tree.as_ref());
         let mut known = Self::filter_known(filters, mask.as_ref());
         let active = (0..n_nodes)
             .filter(|shard| !mask.as_ref().is_some_and(|m| m.skipped[*shard]))
@@ -7994,7 +8153,11 @@ impl CoordinatorServiceImpl {
         for _ in 0..active {
             match done_rx.recv().await {
                 Some((shard, wall_ms, Ok(done))) => {
-                    known.merge(&done.geo_columns_known, &done.filter_columns_known)?;
+                    known.merge_shard(
+                        shard as usize,
+                        &done.geo_columns_known,
+                        &done.filter_columns_known,
+                    )?;
                     shard_hits.push((
                         shard,
                         done.hits.iter().map(|h| (h.vector_id, h.score)).collect(),
@@ -8967,7 +9130,7 @@ impl CoordinatorServiceImpl {
                 after: after.as_ref().map_or(0, |a| a.id),
                 first_page: after.is_none(),
                 geo_filters: filters.geo.clone(),
-                filter: filters.tree.clone(),
+                filter: Self::shard_filter_tree(filters, mask.as_ref(), shard),
                 sort: sort.to_vec(),
                 after_keys: after
                     .as_ref()
@@ -8998,7 +9161,11 @@ impl CoordinatorServiceImpl {
                 .await
                 .map_err(|e| Status::internal(format!("browse task failed: {e}")))??;
             self.check_read_view(shard, &scope, &response, &mut visibility_known)?;
-            known.merge(&response.geo_columns_known, &response.filter_columns_known)?;
+            known.merge_shard(
+                shard,
+                &response.geo_columns_known,
+                &response.filter_columns_known,
+            )?;
             prune.add(crate::segment_prune::PruneStats {
                 segments_total: response.segments_total,
                 segments_skipped: response.segments_skipped,
@@ -9360,7 +9527,7 @@ impl CoordinatorServiceImpl {
             let request = crate::pb::FilterBitmapRequest {
                 visibility: self.document_visibility.clone(),
                 geo_filters: filters.geo.clone(),
-                filter: filters.tree.clone(),
+                filter: Self::shard_filter_tree(filters, mask.as_ref(), shard),
             };
             let client = self.node_client(node);
             tasks.push((
@@ -9382,7 +9549,11 @@ impl CoordinatorServiceImpl {
             let response = task.await.map_err(|error| {
                 Status::internal(format!("filter membership task failed: {error}"))
             })??;
-            known.merge(&response.geo_columns_known, &response.filter_columns_known)?;
+            known.merge_shard(
+                shard,
+                &response.geo_columns_known,
+                &response.filter_columns_known,
+            )?;
             merged.prune.add(crate::segment_prune::PruneStats {
                 segments_total: response.segments_total,
                 segments_skipped: response.segments_skipped,
@@ -9551,7 +9722,7 @@ impl CoordinatorServiceImpl {
             let request = crate::pb::FilterBitmapRequest {
                 visibility: self.document_visibility.clone(),
                 geo_filters: filters.geo.clone(),
-                filter: filters.tree.clone(),
+                filter: Self::shard_filter_tree(filters, mask.as_ref(), shard),
             };
             let client = self.node_client(node);
             tasks.push((
@@ -9571,7 +9742,11 @@ impl CoordinatorServiceImpl {
             let response = task.await.map_err(|error| {
                 Status::internal(format!("filter bitmap task failed: {error}"))
             })??;
-            known.merge(&response.geo_columns_known, &response.filter_columns_known)?;
+            known.merge_shard(
+                shard,
+                &response.geo_columns_known,
+                &response.filter_columns_known,
+            )?;
             let response = Self::membership_from_filter(response);
             self.check_read_view(shard, &scope, &response, &mut visibility_known)?;
             if response.label_count == 0 {
@@ -10132,7 +10307,7 @@ impl CoordinatorServiceImpl {
                 visibility: self.document_visibility.clone(),
                 expected_stats_epoch: claim.epoch,
                 expected_stats_incarnation: claim.incarnation(),
-                filter: filters.tree.clone(),
+                filter: Self::shard_filter_tree(filters, mask.as_ref(), shard),
                 geo_filters: filters.geo.clone(),
                 aggregations: aggregations.to_vec(),
                 group_by: group_by.to_string(),
@@ -10185,7 +10360,11 @@ impl CoordinatorServiceImpl {
                 .await
                 .map_err(|e| Status::internal(format!("aggregate task failed: {e}")))??;
             self.check_read_view(shard, &scope, &response, &mut visibility_known)?;
-            known.merge(&response.geo_columns_known, &response.filter_columns_known)?;
+            known.merge_shard(
+                shard,
+                &response.geo_columns_known,
+                &response.filter_columns_known,
+            )?;
             if response.expr_leaves_known.len() != leaves_known.len() {
                 return Err(Status::internal(format!(
                     "shard answered {} expression-leaf flags for {} leaves",
@@ -10493,7 +10672,7 @@ impl CoordinatorServiceImpl {
                 visibility: self.document_visibility.clone(),
                 expected_stats_epoch: claims[shard].epoch,
                 expected_stats_incarnation: claims[shard].incarnation(),
-                filter: filters.tree.clone(),
+                filter: Self::shard_filter_tree(filters, mask.as_ref(), shard),
                 geo_filters: filters.geo.clone(),
                 exprs: exprs.to_vec(),
                 targets: targets.to_vec(),
@@ -11046,6 +11225,10 @@ struct ShardQueryCtx {
     /// every shard (and to a hedge leg, which must run the identical
     /// query or its result would not be interchangeable).
     filters: Arc<RequestFilters>,
+    /// Per shard, the filter tree that shard receives: the request's
+    /// tree with the clauses its placement leaf implies removed. A hedge
+    /// leg reads the same entry as its primary.
+    shard_filters: Arc<Vec<Option<crate::pb::FilterExpr>>>,
     /// Merges every shard's published floor into the running global max.
     tracker: Arc<Mutex<FloorTracker>>,
     /// Conflating broadcast cell for the global floor: pumps write raises
@@ -11090,7 +11273,7 @@ async fn run_shard_stream(
                 tie_complete: ctx.tie_complete,
                 collapse_parents: ctx.collapse,
                 geo_filters: ctx.filters.geo.clone(),
-                filter: ctx.filters.tree.clone(),
+                filter: ctx.shard_filters.get(shard as usize).cloned().flatten(),
             })),
         })
         .await
@@ -15273,5 +15456,119 @@ mod vector_field_read_tests {
             .exact_vector_scores(&vector, &[], "semantic")
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn every_scoped_scan_mode_uses_the_same_authorized_read_set() {
+        let owner =
+            CoordinatorServiceImpl::with_local_nodes(vec![node(0, false), node(100, false)]);
+        let mut decision = access("semantic", FieldAction::Use);
+        decision
+            .field_permissions
+            .as_mut()
+            .unwrap()
+            .grants
+            .push(FieldGrant {
+                field: "parent_id".into(),
+                actions: vec![FieldAction::Use as i32, FieldAction::Disclose as i32],
+            });
+        let reader = owner
+            .for_access(Some(&decision), "bm25_search")
+            .unwrap()
+            .for_vector_field("semantic")
+            .unwrap();
+        let vector = vec![0.25; 16];
+        let filters = RequestFilters::compile(&[], "").unwrap();
+        let classic = reader
+            .fanout_search("scoped-classic", &vector, 4, false, &filters)
+            .await
+            .unwrap();
+        let streaming = reader
+            .fanout_stream_search("scoped-stream", &vector, 4, None, &filters)
+            .await
+            .unwrap();
+        let collapsed = reader
+            .fanout_search_collapse("scoped-collapse", &vector, 4, &filters)
+            .await
+            .unwrap();
+        let stream_collapsed = reader
+            .fanout_stream_search_collapse("scoped-stream-collapse", &vector, 4, &filters)
+            .await
+            .unwrap();
+        let reference = owner
+            .dense_signal(&vector, &[0, 100], "semantic")
+            .await
+            .unwrap();
+        for hits in [
+            &classic.hits,
+            &streaming.hits,
+            &collapsed.hits,
+            &stream_collapsed.hits,
+        ] {
+            assert_eq!(hits.len(), 2);
+            for hit in hits {
+                assert_eq!(hit.score.to_bits(), reference[&hit.vector_id].to_bits());
+            }
+        }
+        let forbidden = RequestFilters::compile(&[], "audience == 'private'").unwrap();
+        assert_eq!(
+            reader
+                .fanout_search("denied-filter", &vector, 4, false, &forbidden)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        let no_parent = owner
+            .for_access(Some(&access("semantic", FieldAction::Use)), "bm25_search")
+            .unwrap()
+            .for_vector_field("semantic")
+            .unwrap();
+        assert_eq!(
+            no_parent
+                .fanout_search_collapse("denied-parent", &vector, 4, &filters)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+
+    #[tokio::test]
+    async fn incompatible_scan_receipts_refuse_before_provisional_disclosure() {
+        let (progress, observed) = watch::channel(None);
+        let reader =
+            CoordinatorServiceImpl::with_local_nodes(vec![node(0, false), node(100, true)])
+                .for_vector_field("semantic")
+                .unwrap()
+                .with_query_progress(progress);
+        let filters = RequestFilters::compile(&[], "").unwrap();
+        let error = reader
+            .fanout_stream_search("mixed-bindings", &[0.25; 16], 4, None, &filters)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(observed.borrow().is_none());
+        let nodes = vec![node(0, false), node(100, false)];
+        let reader = CoordinatorServiceImpl::with_local_nodes(nodes.clone())
+            .for_vector_field("semantic")
+            .unwrap();
+        let (pinned, _) = reader.pin_read_versions().await.unwrap();
+        nodes[0]
+            .delete_documents(Request::new(DeleteDocumentsRequest {
+                doc_ids: vec![0],
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            pinned
+                .fanout_search("stale-read", &[0.25; 16], 4, false, &filters)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
     }
 }
