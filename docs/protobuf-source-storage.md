@@ -62,6 +62,14 @@ positions for `commit_rows` at that snapshot's epoch, not a public identity or
 authorization grant. Neither lookup establishes the catalog's current version,
 searchable receipts, mutable-tail coordination or workspace/collection policy.
 
+The combined checkpoint incorporates main through `8d32a72`. Validation passed
+559 unit tests, 809 tests across 140 integration targets, 13 embedded tests and
+two IVF adapter tests. All five mobile targets compiled; protobuf field
+preservation, vendored contracts, examples and formatting passed. The run used
+an 8 GiB aggregate memory limit with swap disabled. Tests cover sparse binary
+keys, multiple versions, legacy upgrade, checksum-valid corrupt lookup metadata,
+budget refusal, pinned segment views and lookup after compaction renumbers rows.
+
 The current TVBM2508 writer adds a kind-9 column-table entry named
 `protobuf-sources`. Its offset and length address the final payload section.
 The archive begins with `PMSOURCE`, a little-endian u64 protobuf-index length,

@@ -248,6 +248,31 @@ Next, projection publication must consume accepted versions, replace all chunks
 atomically, and return stable document/chunk identity through every result path.
 The searchable state must reflect that publication, including recovery.
 
+### Runtime publication constraints
+
+The foundation branch can prepare a complete accepted projection, resolve an
+exact key to sealed rows, and commit new segments with old-row retirements in
+one segment manifest. Those components are not yet a document publisher.
+`ShardState` also owns mutable/frozen tails, the generation-wide live-row mask,
+the exact-vector store and read-version metadata. A segment epoch alone does
+not fence those states. Activation must prepare and switch their coherent view,
+and every serving route must observe or validate that view before returning a
+final result. A document spanning shards needs a collection publication decision;
+independent shard acknowledgments cannot establish an atomic visible version.
+
+Exact vectors are another integration constraint. `ExactVectorStore::append`
+currently copies a mapped payload into a new spilling file, and startup can
+concatenate sealed FP32 files into a whole-shard sidecar. A publisher must reuse
+the existing segment files instead of doing either operation for every logical
+write. The reader must retain physical row positions, including segments without
+vectors, rather than treating only vector-bearing segments as one dense row set.
+
+Recovery must join the catalog's immutable accepted history to the actual
+committed index manifests before reporting publication. Empty projections and
+deletions need explicit outcomes even when they add no rows. A cursor advanced
+after an ingest or flush is not that evidence, and the original persistent
+acceptance/retry decision must remain distinct from later publication status.
+
 The catalog is outside current index snapshots, replica bootstrap and row
 resharding. Those operations do not constitute a backup or migration of this
 authority. Until a coordinated backup/export protocol exists, retain the catalog
