@@ -70,7 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "usage: reshard (--log=<wal dir|generation dir> --split=N | --logs=a,b,c) \
              --out-dir=<dir> [--slot-base=B] [--slot-stride=S] [--analysis-addr=ADDR] \
              [--stable-routing] [--placement-tree=<file> [--single-image=<max child rows>] \
-             [--spill-bucket-bits=<bits>] [--from-segments] [--cut-column=<col> \
+             [--spill-bucket-bits=<bits>] [--from-segments] [--only-child=<index>] [--cut-column=<col> \
              [--cut-rows=<n>]]]"
                 .into(),
         );
@@ -180,6 +180,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             None => reshard::SpillCut::Hash,
         };
+        // `--only-child=<index>` builds one child of the tree and leaves
+        // the others' catalogs as they are (a child redone after a
+        // failed build); the routing pass still covers every child.
+        let only_child = opt("only-child")
+            .map(|index| {
+                index.parse::<usize>().map_err(|error| {
+                    format!("--only-child takes the child's index in leaf order: {error}")
+                })
+            })
+            .transpose()?;
         let placed = reshard::split_placement_tree_logs(
             &generations,
             &tree,
@@ -191,6 +201,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 spill_bucket_bits,
                 source,
                 cut,
+                only_child,
             },
             &mut analyze,
         )?;

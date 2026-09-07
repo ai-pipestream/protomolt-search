@@ -2402,6 +2402,13 @@ pub struct TreeSplitOptions {
     pub source: TreeRowSource,
     /// How each child's spill is cut into buckets, and so into segments.
     pub cut: SpillCut,
+    /// Build only this child (by index in leaf order) and leave the
+    /// others' catalogs unwritten: the routing pass still spills every
+    /// child, so the rows and the map are the full split's, but a
+    /// child whose build failed (an out-of-memory kill on the archive,
+    /// 2026-09-06) is redone without the five that finished. Segmented
+    /// layout only; a single-image split is refused by name.
+    pub only_child: Option<usize>,
 }
 
 impl Default for TreeSplitOptions {
@@ -2411,6 +2418,7 @@ impl Default for TreeSplitOptions {
             spill_bucket_bits: None,
             source: TreeRowSource::Logs,
             cut: SpillCut::Hash,
+            only_child: None,
         }
     }
 }
@@ -2475,6 +2483,21 @@ pub fn split_placement_tree_logs(
 ) -> Result<TreeReshardOutput, String> {
     let placement = crate::placement::Placement::validate(tree)?;
     let children = tree_children(&placement)?;
+    if let Some(only) = options.only_child {
+        if matches!(options.layout, TreeChildLayout::SingleImage { .. }) {
+            return Err(
+                "--only-child builds one segmented child; a single-image split writes every child"
+                    .to_string(),
+            );
+        }
+        if only >= children.len() {
+            return Err(format!(
+                "--only-child={only} names no child; the tree has {} leaf shards (0..{})",
+                children.len(),
+                children.len().saturating_sub(1)
+            ));
+        }
+    }
     if slot_offsets.len() != children.len() {
         return Err(format!(
             "a re-placement split needs one slot offset per child: {} offsets for {} children \
@@ -3027,6 +3050,25 @@ pub fn split_placement_tree_logs(
             for (index, (child, spill_dir)) in children.iter().zip(&spill_dirs).enumerate() {
                 let index_path = out_dir.join(format!("shard-{index}.tv"));
                 let root = crate::node::segments_root(&index_path);
+                if options.only_child.is_some_and(|only| only != index) {
+                    eprintln!(
+                        "reshard: child {index} ({}): not built (--only-child names another child)",
+                        child.leaf
+                    );
+                    images.push(ChildImage {
+                        vector_path: index_path,
+                        exact_vector_path: root,
+                        bm25_path: None,
+                        slot_offset: slot_offsets[index],
+                        hash_lo: child.hash_lo,
+                        hash_hi: child.hash_hi,
+                        num_vectors: 0,
+                        num_documents: 0,
+                        parent_ids: Vec::new(),
+                        row_parent_ids: Vec::new(),
+                    });
+                    continue;
+                }
                 if root.exists() {
                     return Err(format!(
                         "child {index} ({}): {} already exists; a re-placement split writes a \

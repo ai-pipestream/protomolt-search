@@ -933,6 +933,145 @@ async fn a_source_at_a_slot_offset_transplants_the_same_rows() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Serve one child of a split alone, pinned to its leaf, under a root
+/// over that one shard.
+async fn serve_child(out: &reshard::TreeReshardOutput, index: usize) -> Served {
+    let tree = band_tree();
+    let image = &out.images.children[index];
+    let child = &out.children[index];
+    let (addr, handle) = pipestream_search::harness::start_opened_node(NodeConfig {
+        slot_offset: image.slot_offset,
+        placement_column: Some("placement".into()),
+        placement_leaf: Some(child.code),
+        placement_tree: Some(std::sync::Arc::new(
+            PinnedLeaf::pin(&tree, "placement", child.code).unwrap(),
+        )),
+        ..config(image.vector_path.clone())
+    })
+    .await;
+    // A placed root wants a shard for every leaf of the tree; one child
+    // served alone sits under a plain root, and the node itself keeps
+    // the leaf's pin.
+    let coordinator = CoordinatorServiceImpl::new(vec![addr]).with_bm25(
+        Some(NATIVE_ANALYSIS_BACKEND.to_string()),
+        Default::default(),
+    );
+    Served {
+        coordinator,
+        handles: vec![handle],
+    }
+}
+
+/// One child rebuilt alone: the routing pass covers every child and the
+/// counts are the full split's, but only the named child's catalog is
+/// written, and served alone it answers as the full split's child does.
+/// A single-image split and an index past the tree are refused by name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_child_is_built_alone_and_equals_the_full_splits() {
+    let dir = tempdir("onlychild");
+    let (index_path, _addr) = source_shard(&dir, true).await;
+    let gen = reshard::resolve_gen(&pipestream_search::wal::wal_dir(&index_path)).unwrap();
+    let cut = || reshard::SpillCut::Column {
+        column: "year".into(),
+        rows_per_cut: 30,
+    };
+    let full = split(
+        &gen,
+        &dir.join("full"),
+        reshard::TreeRowSource::Segments,
+        cut(),
+    )
+    .unwrap();
+    let one = reshard::split_placement_tree_logs(
+        std::slice::from_ref(&gen),
+        &band_tree(),
+        &dir.join("one"),
+        &[0, 1_000, 2_000],
+        None,
+        reshard::TreeSplitOptions {
+            source: reshard::TreeRowSource::Segments,
+            cut: cut(),
+            only_child: Some(1),
+            ..Default::default()
+        },
+        &mut analyzer(),
+    )
+    .unwrap();
+    assert_eq!(
+        one.placed, full.placed,
+        "the routing pass covers every child"
+    );
+    assert_eq!(one.segments[1], full.segments[1]);
+    for (index, image) in one.images.children.iter().enumerate() {
+        let root = pipestream_search::node::segments_root(&image.vector_path);
+        assert_eq!(root.exists(), index == 1, "child {index}'s catalog");
+    }
+    let full_child = serve_child(&full, 1).await;
+    let one_child = serve_child(&one, 1).await;
+    // The battery is written for the fleet; on one leaf some of its
+    // queries have no rows to answer with (a facet value of another
+    // leaf), and those must be empty on both sides. The rest compare as
+    // the fleet's do.
+    let full_answers = answers(&full_child.coordinator).await;
+    let one_answers = answers(&one_child.coordinator).await;
+    let mut compared = Vec::new();
+    let mut compared_one = Vec::new();
+    for ((name, x), (_, y)) in full_answers.iter().zip(&one_answers) {
+        if x.hits.is_empty() || y.hits.is_empty() {
+            assert!(
+                x.hits.is_empty() && y.hits.is_empty(),
+                "the child built alone: {name} answers on one side only"
+            );
+            continue;
+        }
+        compared.push((*name, x.clone()));
+        compared_one.push((*name, y.clone()));
+    }
+    assert!(
+        compared.len() >= 4,
+        "the leaf answers enough of the battery to compare ({} shapes)",
+        compared.len()
+    );
+    same_answers(&compared, &compared_one, "the child built alone");
+    full_child.stop();
+    one_child.stop();
+
+    let past = reshard::split_placement_tree_logs(
+        std::slice::from_ref(&gen),
+        &band_tree(),
+        &dir.join("past"),
+        &[0, 1_000, 2_000],
+        None,
+        reshard::TreeSplitOptions {
+            source: reshard::TreeRowSource::Segments,
+            cut: cut(),
+            only_child: Some(9),
+            ..Default::default()
+        },
+        &mut analyzer(),
+    )
+    .unwrap_err();
+    assert!(past.contains("names no child"), "{past}");
+    let single = reshard::split_placement_tree_logs(
+        std::slice::from_ref(&gen),
+        &band_tree(),
+        &dir.join("single"),
+        &[0, 1_000, 2_000],
+        None,
+        reshard::TreeSplitOptions {
+            layout: reshard::TreeChildLayout::SingleImage {
+                max_child_rows: 1_000,
+            },
+            only_child: Some(1),
+            ..Default::default()
+        },
+        &mut analyzer(),
+    )
+    .unwrap_err();
+    assert!(single.contains("single-image"), "{single}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sources_with_different_analyzers_are_refused() {
     let dir = tempdir("mixed");
