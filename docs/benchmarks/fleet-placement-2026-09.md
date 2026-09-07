@@ -432,25 +432,26 @@ lineage, document key, version and chunk ordinal compared) finds no
 difference. Through the generation-11 root, k = 10, warm, against the
 generation-10 root on the same binary:
 
-| Filter | Generation 10 | Generation 11, six bands year-cut |
+| Filter | Generation 10, warm | Generation 11, six bands year-cut |
 |---|---|---|
-| lexical, `year >= 2012 && year < 2013` | 291 ms, 236 of 322 segments skipped | 35 ms, 321 of 326 skipped |
-| lexical, `year >= 1985 && year < 1986` | 241 ms | 37 ms, 202 of 205 skipped, 4 shards skipped |
-| lexical, `year < 1940` | 410 ms | 41 ms, 6 of 7 shards skipped |
-| dense, `year >= 2012 && year < 2013` | 2.9 s | 79 ms |
-| dense, `year >= 1985 && year < 1986` | 2.2 s | 65 ms |
-| dense, `year >= 1995 && year < 1998` | 714 ms | 137 ms |
-| dense, `year < 1990` | 854 ms | 257 ms, 4 of 7 shards skipped |
+| lexical, `year >= 2012 && year < 2013` | 42 ms, 236 of 322 segments skipped | 35 ms, 321 of 326 skipped |
+| lexical, `year >= 1985 && year < 1986` | 49 ms | 37 ms, 202 of 205 skipped, 4 shards skipped |
+| lexical, `year < 1940` | 100 ms | 41 ms, 6 of 7 shards skipped |
+| dense, `year >= 2012 && year < 2013` | 160 ms (2.9 s cold) | 79 ms |
+| dense, `year >= 1985 && year < 1986` | 244 ms (2.2 s cold) | 65 ms |
+| dense, `year >= 1995 && year < 1998` | 714 ms cold | 137 ms |
+| dense, `year < 1990` | 255 ms | 257 ms, 4 of 7 shards skipped |
 | dense, `year >= 2008 && year < 2015` (one whole band) | 249 ms | 239 ms |
 
 A filter narrower than a band is where the year cut pays: the dense
 scan reads only the segments whose year range the filter admits, so a
-one-year filter costs a fortieth of what it did and a three-year range
-a fifth; a filter that is a whole band gains nothing inside it, as
-expected, and shard pruning is what it gains. The boolean shapes
-through this root cost what they cost before (0.24 to 0.88 s, a 23 MB
-root). The generation-10 column was taken right after its nodes
-reopened, so its dense times are on the cold side.
+one-year dense filter costs a half to a quarter of the warm
+generation-10 shape and a twentieth to a fortieth of its cold one; the
+lexical shapes were already cheap on generation 10 through the
+per-column summaries and gain less. A filter that is a whole band, or
+a wide range across bands, gains nothing inside a band, as expected,
+and shard pruning is what it gains. The boolean shapes through this
+root cost what they cost before (0.24 to 0.88 s, a 23 MB root).
 
 ## What remains
 
