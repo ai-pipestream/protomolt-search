@@ -192,9 +192,45 @@ being written (dirty pages the kernel writes back at its own pace).
 row counts, so buckets build in any order and append in bucket order,
 and the catalog is byte for byte the one-thread build's
 (`tests/replay_from_segments.rs`). The build's memory is `n` buckets'
-replays, so the budget rule is `n × rows per bucket × 40-70 KB` under
-the limit; the log replay analyzes through one sidecar session and
-refuses more than one thread by name.
+replays plus the backlog of sealed buckets waiting on the ordered
+append; `--build-queue=<n>` bounds that backlog (default the thread
+count, zero refused by name): a worker waits for backlog space before
+claiming its next bucket, and the appender takes the results in plan
+order. A finished bucket waits as its id maps (16 bytes a row), so the
+backlog is cheap beside an in-flight replay, but unbounded it could
+hold a whole child.
+
+`--build-memory=<MiB>` makes the budget rule a refusal instead of an
+operator's arithmetic. After the routing pass, each child's spill
+counts are on hand, and the build refuses by name — the budget, the
+estimate, and the cause — when the largest bucket of a child to be
+built (its rows x 70 KiB, the conservative end of the band above) is
+over the budget, or when the thread count times it is. One thread
+still replays one bucket, so the single-bucket rule applies at
+`--build-threads=1` too. Nothing is lowered to fit: the operator
+raises the budget, lowers the thread count, or cuts finer. The budget
+covers the bucket replays (the anonymous memory), not the mapped
+sources and page cache the cgroup row of the table above shows; a
+single image has no buckets and refuses the flag by name. Without the
+flag nothing is enforced.
+
+The two passes do not overlap: a spill bucket takes rows from the
+first source segment to the last (every row files to its child and
+bucket as the routing pass walks the sources), so no bucket is
+complete until the pass ends, and the per-bucket slot ranges that let
+buckets seal in any order come from the spill's final counts. Both
+seams would need a two-phase spill or per-bucket completion barriers
+to move earlier; the bound is inside the build pass instead, between
+the workers and the ordered appender.
+
+There is no resume. An interrupted build leaves either a torn staging
+directory (never adopted, `tests/derived_columns.rs`) or a partial
+catalog, and the next run refuses a child whose catalog root already
+exists, by name; the recovery is a fresh output directory (or
+`--only-child` into one), which the byte-for-byte property makes as
+good as a resume. Skipping sealed buckets would need a partial-catalog
+adoption path that verifies each sealed segment's identity before
+trusting it; nothing here needs it.
 
 ## Deriving columns on the way through
 
@@ -232,8 +268,8 @@ plan is recorded here so the next step starts from the same transpose.
 
 `src/postings.rs` (`FieldView::transpose`, `FieldTranspose`),
 `src/reshard.rs` (`TreeRowSource`, `SpillCut`, the analysis sidecar,
-`build_child` with transplanted fields), `src/wal.rs`
-(`WalWriter::append_to_bucket`), `src/segments.rs`
+`build_child` with transplanted fields, `BUILD_BYTES_PER_ROW`),
+`src/wal.rs` (`WalWriter::append_to_bucket`), `src/segments.rs`
 (`SegmentCatalog::publish_partition_key`), `examples/reshard.rs`
-(`--from-segments`, `--cut-column`, `--cut-rows`),
-`tests/replay_from_segments.rs`.
+(`--from-segments`, `--cut-column`, `--cut-rows`, `--build-threads`,
+`--build-queue`, `--build-memory`), `tests/replay_from_segments.rs`.

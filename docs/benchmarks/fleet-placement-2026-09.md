@@ -584,15 +584,39 @@ MemoryAccounting=yes`, the cgroup's `memory.stat` sampled every 5 s):
 | page release, no limit | 11 min 51 s | 2.8 GB | 14.9 GB | 26.7 GB |
 | page release, `MemoryMax=8G` `MemorySwapMax=0` | 11 min 50 s | 2.8 GB | 9.7 GB (pages the serving nodes had charged elsewhere) | 8.0 GB, swap 0 |
 | page release, `--build-threads=4`, `MemoryMax=8G` `MemorySwapMax=0` | 8 min 5 s | 3.8 GB | 8.8 GB | 8.0 GB, swap 0 |
+| 16305a3, one thread, `--build-memory=8192`, `MemoryMax=8G` | 11 min 48 s | 2.8 GB | 8.4 GB | 8.0 GB, swap 0 |
+| 16305a3, `--build-threads=4`, `--build-memory=16384`, `MemoryMax=8G` | 8 min 12 s | 3.8 GB | 8.4 GB | 8.0 GB, swap 0 |
 
 Every run's catalog is byte for byte the proof's (sha256 over the 321
-files of `shard-6.tv.segments`). Throughput is the source read plus
-the child build: 11.07 million rows read and 1.95 million sealed in
-about 12 minutes, 15,700 source rows per second single-threaded; four
-build threads seal the child in 8 min 5 s inside the same 8 GiB budget
-(the routing pass is unchanged, the child build goes from about 6.5
-minutes to under 3; anonymous peak 3.8 GB, one bucket's replay per
-thread).
+files of `shard-6.tv.segments`); the two 16305a3 rows are the bounded
+build (a queue of sealed buckets between the workers and the ordered
+appender, the memory budget checked against the spill's per-bucket
+counts) and they match the unlimited threaded row above. Throughput is
+the source read plus the child build: 11.07 million rows read and 1.95
+million sealed in about 12 minutes, 15,700 source rows per second
+single-threaded; four build threads seal the child in 8 min 5 s inside
+the same 8 GiB budget (the routing pass is unchanged, the child build
+goes from about 6.5 minutes to under 3; anonymous peak 3.8 GB, one
+bucket's replay per thread).
+
+The budget rule is now the tool's, not the operator's:
+`--build-memory=<MiB>` is checked after the routing pass against the
+spill's own counts at the conservative 70 KiB a row
+(`docs/replay-from-segments.md`). The same proof input with
+`--build-threads=4 --build-memory=4096` ran the routing pass (5 min
+47 s) and then refused, before any bucket was built:
+
+```text
+child 6 (archive) bucket 31: 30922 documents at 70 KiB a row is about
+2114 MiB, and 4 build threads need 8456 MiB at once, over
+--build-memory=4096 MiB; lower --build-threads, raise the budget, or
+cut finer (--cut-rows) -- the thread count is not lowered for you
+```
+
+(The estimate is about twice the 1 GB a 30,000-row bucket actually
+replays into, which is the point of taking the band's conservative
+end: the 16 GiB row above passes the check while the 8 GiB scope does
+the real bounding.)
 
 ### The boolean lexical clause: where the 600 ms is (2026-09-07)
 

@@ -2386,6 +2386,13 @@ pub struct TreeChild {
 /// threads to the appending one.
 type BuiltBuckets = BTreeMap<usize, Result<(ChildImage, u64), String>>;
 
+/// The bytes a spilled row costs the child build while its bucket is
+/// replayed: the conservative end of the documented 40-70 KB band
+/// (docs/replay-from-segments.md): the document text, the transplanted
+/// spans and ordinals, the vector and the FP32 row. The build-memory
+/// budget is checked against it.
+pub const BUILD_BYTES_PER_ROW: u64 = 70 * 1024;
+
 /// The result of a re-placement split: the images, the child list
 /// (parallel to `images.children`), and what moved.
 #[derive(Debug)]
@@ -2486,6 +2493,21 @@ pub struct TreeSplitOptions {
     /// byte. The log replay analyzes through one sidecar session and
     /// refuses more than one.
     pub build_threads: usize,
+    /// Sealed-but-unappended bucket images a threaded build holds at
+    /// once (`--build-queue`): a worker waits for backlog space before
+    /// claiming its next bucket, so the build holds the threads'
+    /// in-flight replays plus a backlog of at most this many finished
+    /// images' id maps (plus one per thread when all finish at once).
+    /// `None` takes the thread count; zero is refused.
+    pub build_queue: Option<usize>,
+    /// The build pass's anonymous-memory budget in bytes
+    /// (`--build-memory`, segmented layout only): after the routing
+    /// pass, each child's spill counts at [`BUILD_BYTES_PER_ROW`] a row
+    /// must fit it — the largest bucket alone, and the thread count
+    /// times it. A plan that cannot fit is refused by name; neither
+    /// the thread count nor the queue depth is lowered to make it fit.
+    /// `None` enforces nothing.
+    pub build_memory: Option<u64>,
 }
 
 impl Default for TreeSplitOptions {
@@ -2500,6 +2522,8 @@ impl Default for TreeSplitOptions {
             derived: None,
             derive: Vec::new(),
             build_threads: 1,
+            build_queue: None,
+            build_memory: None,
         }
     }
 }
@@ -2595,6 +2619,18 @@ pub fn split_placement_tree_logs(
                 options.build_threads
             ));
         }
+    }
+    if options.build_queue == Some(0) {
+        return Err("--build-queue=0 holds no finished bucket; give it one or more".to_string());
+    }
+    if options.build_memory.is_some()
+        && matches!(options.layout, TreeChildLayout::SingleImage { .. })
+    {
+        return Err(
+            "--build-memory sizes the segmented build's bucket replays; a single-image child \
+             is one replay, bounded by --single-image=<rows>"
+                .to_string(),
+        );
     }
     if slot_offsets.len() != children.len() {
         return Err(format!(
@@ -3260,6 +3296,55 @@ pub fn split_placement_tree_logs(
     let check_routing = cut_plans.is_none();
     drop(cut_plans);
 
+    // The build-memory budget, against the spill's own per-bucket row
+    // counts now that routing is done: the largest bucket of each child
+    // to be built must fit alone (one thread still replays one bucket),
+    // and the thread count times it must fit together. A plan that
+    // cannot fit is refused by name; nothing is lowered to fit.
+    if let Some(budget) = options.build_memory {
+        let threads = options.build_threads.max(1) as u64;
+        for (index, child) in children.iter().enumerate() {
+            if options.only_child.is_some_and(|only| only != index) {
+                continue;
+            }
+            let Some((bucket, &rows)) = bucket_docs[index]
+                .iter()
+                .enumerate()
+                .filter(|(_, &n)| n > 0)
+                .max_by_key(|(_, &n)| n)
+            else {
+                continue;
+            };
+            let estimate = rows.saturating_mul(BUILD_BYTES_PER_ROW);
+            if estimate > budget {
+                return Err(format!(
+                    "child {index} ({}) bucket {bucket}: {rows} documents at {} KiB a row (the \
+                     conservative end of the 40-70 KB band) is about {} MiB, over \
+                     --build-memory={} MiB for a single bucket; raise the budget or cut finer \
+                     (--cut-rows)",
+                    child.leaf,
+                    BUILD_BYTES_PER_ROW / 1024,
+                    estimate.div_ceil(1 << 20),
+                    budget / (1 << 20)
+                ));
+            }
+            let need = estimate.saturating_mul(threads);
+            if need > budget {
+                return Err(format!(
+                    "child {index} ({}) bucket {bucket}: {rows} documents at {} KiB a row is \
+                     about {} MiB, and {threads} build threads need {} MiB at once, over \
+                     --build-memory={} MiB; lower --build-threads, raise the budget, or cut \
+                     finer (--cut-rows) -- the thread count is not lowered for you",
+                    child.leaf,
+                    BUILD_BYTES_PER_ROW / 1024,
+                    estimate.div_ceil(1 << 20),
+                    need.div_ceil(1 << 20),
+                    budget / (1 << 20)
+                ));
+            }
+        }
+    }
+
     // Pass 2: each child from its spill.
     let dim = manifest.dim as usize;
     let generation = top_generation
@@ -3551,6 +3636,19 @@ pub fn split_placement_tree_logs(
                         std::sync::Mutex::new(BTreeMap::new());
                     let ready = std::sync::Condvar::new();
                     let threads = options.build_threads.min(plan.len().max(1));
+                    // The backlog of sealed buckets waiting on the
+                    // ordered append is bounded: a worker waits for
+                    // space BEFORE claiming a bucket, never while
+                    // holding a finished one (the appender takes them
+                    // in plan order, so a worker holding the wanted
+                    // bucket while it waits for space would deadlock).
+                    // Workers may all pass the check at once, so the
+                    // backlog can reach the queue plus the thread
+                    // count; the replays in flight stay the threads'.
+                    let queue = options
+                        .build_queue
+                        .unwrap_or(options.build_threads)
+                        .min(plan.len().max(1));
                     let outcome: Result<(), String> = std::thread::scope(|scope| {
                         for _ in 0..threads {
                             scope.spawn(|| {
@@ -3564,6 +3662,23 @@ pub fn split_placement_tree_logs(
                                         .to_string())
                                 };
                                 loop {
+                                    if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                                        break;
+                                    }
+                                    {
+                                        let mut guard = done.lock().expect("bucket results");
+                                        while guard.len() >= queue
+                                            && !stop.load(std::sync::atomic::Ordering::SeqCst)
+                                        {
+                                            guard = ready
+                                                .wait_timeout(
+                                                    guard,
+                                                    std::time::Duration::from_millis(200),
+                                                )
+                                                .expect("bucket results")
+                                                .0;
+                                        }
+                                    }
                                     if stop.load(std::sync::atomic::Ordering::SeqCst) {
                                         break;
                                     }
@@ -3616,6 +3731,7 @@ pub fn split_placement_tree_logs(
                                         .0;
                                 }
                             };
+                            ready.notify_all();
                             let placed_rows = result.and_then(|(image, rows)| {
                                 peak_replay_rows = peak_replay_rows.max(rows);
                                 place(bucket, ordinal, slot, image)
