@@ -1718,7 +1718,7 @@ fn compile_value_ast(ast: &Ast, depth: usize) -> Result<(pb::ValueExpr, Option<V
             // reserved: a column named "math" or "engine" still READS
             // (no parentheses), it just cannot be a call receiver.
             if let Some(Ast::Ident(ns)) = args.first() {
-                if ns == "math" || ns == "engine" {
+                if matches!(ns.as_str(), "math" | "engine" | "hash" | "calendar") {
                     return compile_math_call(ns, name, &args[1..], depth);
                 }
             }
@@ -1762,13 +1762,18 @@ fn compile_plain_call(
             "has() is a predicate; an absent input already propagates to an \
                  absent result",
         )),
+        "stable_key" => Err(refuse(
+            "stable_key() is the document's opaque routing key, readable only as \
+             hash.fnv64(stable_key()) in a derived column (docs/derived-columns.md)",
+        )),
         "matches" | "contains" | "startsWith" | "endsWith" | "size" => Err(refuse(format!(
             "{name}() does not compile to a value; string functions are not in \
                  the engine's vocabulary"
         ))),
         other => Err(refuse(format!(
             "unknown function {other}() in a value expression; the vocabulary is \
-                 arithmetic, the conditional layer, double(), math.*, and engine.*"
+                 arithmetic, the conditional layer, double(), math.*, engine.*, \
+                 calendar.*, and hash.fnv64()"
         ))),
     }
 }
@@ -1789,6 +1794,72 @@ fn compile_math_call(
         )));
     };
     let display = format!("{ns}.{name}()");
+    match crate::values::fn_signature(f) {
+        crate::values::FnSignature::StringToUint => {
+            let [arg] = args else {
+                return Err(refuse(format!("{display} takes exactly one argument")));
+            };
+            // `hash.fnv64(stable_key())` is its own leaf: the key is not
+            // a column, and this is the only place stable_key() reads.
+            if let Ast::Call(inner, inner_args) = arg {
+                if inner == "stable_key" {
+                    if !inner_args.is_empty() {
+                        return Err(refuse("stable_key() takes no arguments"));
+                    }
+                    return Ok((
+                        value_of(V::StableKeyHash(pb::StableKeyHash {})),
+                        Some(VType::Uint),
+                    ));
+                }
+            }
+            let (e, vt) = compile_value_ast(arg, depth + 1)?;
+            match vt {
+                Some(VType::Str) => {
+                    return Err(refuse(format!(
+                        "{display} over a string literal is a constant; hash a facet column"
+                    )));
+                }
+                Some(t) => {
+                    return Err(refuse(format!(
+                        "{display} takes a facet string, not a {}",
+                        t.name()
+                    )));
+                }
+                None => {}
+            }
+            return Ok((
+                value_of(V::Func(pb::ValueFunc {
+                    function: f as i32,
+                    args: vec![e],
+                })),
+                Some(VType::Uint),
+            ));
+        }
+        crate::values::FnSignature::IntToInt => {
+            let [arg] = args else {
+                return Err(refuse(format!("{display} takes exactly one argument")));
+            };
+            let (e, vt) = compile_value_ast(arg, depth + 1)?;
+            match vt {
+                Some(VType::Int) | None => {}
+                Some(t) => {
+                    return Err(refuse(format!(
+                        "{display} takes an int of epoch microseconds (a timestamp column), \
+                         not a {}",
+                        t.name()
+                    )));
+                }
+            }
+            return Ok((
+                value_of(V::Func(pb::ValueFunc {
+                    function: f as i32,
+                    args: vec![e],
+                })),
+                Some(VType::Int),
+            ));
+        }
+        crate::values::FnSignature::Numeric { .. } => {}
+    }
     let arity_ok = match f {
         pb::ValueFn::Greatest | pb::ValueFn::Least => !args.is_empty(),
         pb::ValueFn::Pow => args.len() == 2,
@@ -1871,6 +1942,10 @@ fn math_fn_of(ns: &str, name: &str) -> Option<pb::ValueFn> {
         ("engine", "exp") => Some(pb::ValueFn::Exp),
         ("engine", "log10") => Some(pb::ValueFn::Log10),
         ("engine", "pow") => Some(pb::ValueFn::Pow),
+        ("hash", "fnv64") => Some(pb::ValueFn::Fnv64),
+        ("calendar", "year") => Some(pb::ValueFn::CalendarYear),
+        ("calendar", "month") => Some(pb::ValueFn::CalendarMonth),
+        ("calendar", "day") => Some(pb::ValueFn::CalendarDay),
         _ => None,
     }
 }

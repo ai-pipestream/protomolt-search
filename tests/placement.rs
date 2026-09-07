@@ -534,6 +534,105 @@ async fn routed_ingest_places_each_document_in_its_leaf() {
     }
 }
 
+/// A tree on a DERIVED column (docs/derived-columns.md): the decade
+/// the year falls in, computed at ingest.
+fn decade_tree() -> PlacementTreeConfig {
+    PlacementTreeConfig {
+        column: COLUMN.into(),
+        level_bits: 0,
+        nodes: vec![node("old", Some("decade < 200")), node("other", None)],
+    }
+}
+
+fn decade_declaration() -> std::sync::Arc<pipestream_search::derived::Declaration> {
+    std::sync::Arc::new(
+        pipestream_search::derived::Declaration::compile(&pipestream_search::pb::DerivedColumns {
+            columns: vec![pipestream_search::pb::DerivedColumn {
+                name: "decade".into(),
+                expression: "year / 10".into(),
+                kind: pipestream_search::pb::MaterializeKind::I64 as i32,
+                disclosure: pipestream_search::pb::DerivedDisclosure::Inputs as i32,
+            }],
+        })
+        .unwrap(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn routed_ingest_places_documents_by_a_derived_column() {
+    let tree = decade_tree();
+    let placement = Placement::validate(&tree).unwrap();
+    let codes: Vec<i64> = ["old", "other"]
+        .iter()
+        .map(|name| placement.leaf_by_name(name).unwrap().code)
+        .collect();
+    let mut nodes = Vec::new();
+    for (i, code) in codes.iter().enumerate() {
+        let served = start_empty_node(NodeConfig {
+            derived: Some(decade_declaration()),
+            placement_tree: Some(std::sync::Arc::new(
+                pipestream_search::placement::PinnedLeaf::pin(&tree, COLUMN, *code).unwrap(),
+            )),
+            ..config(Some(*code), 1_000 * i as u64)
+        })
+        .await;
+        calibrate(&served.0).await;
+        nodes.push(served);
+    }
+    let addrs: Vec<String> = nodes.iter().map(|n| n.0.clone()).collect();
+    let c = CoordinatorServiceImpl::new(addrs.clone())
+        .with_bm25(
+            Some(NATIVE_ANALYSIS_BACKEND.to_string()),
+            Default::default(),
+        )
+        .with_topology_generation(1)
+        .with_derived(Some(decade_declaration()))
+        .with_hot_topology_placed(
+            vec![Some((0, u64::MAX)); 2],
+            Some((tree, codes.iter().copied().map(Some).collect())),
+        )
+        .unwrap();
+    let all: Vec<usize> = (0..corpus().len()).collect();
+    let response = routed(&c, &all).await.unwrap();
+    assert_eq!(response.added as usize, corpus().len());
+    // The coordinator routed on the computed decade, the shards
+    // computed and stored the same value, and the pinned shards
+    // accepted every row the tree sent them.
+    let old: u64 = corpus()
+        .iter()
+        .filter(|(year, _, _)| year.is_some_and(|y| y < 2000))
+        .count() as u64;
+    assert_eq!(health_docs(&addrs[0]).await, old);
+    assert_eq!(health_docs(&addrs[1]).await, corpus().len() as u64 - old);
+    let response = query(&c, cel("f", "decade == 199")).await;
+    assert_eq!(response.hits.len() as u64, old);
+    assert!(response.hits.iter().all(|h| h.doc_id < 1_000));
+    // The pinned shard refuses a row it would have to derive into
+    // another leaf, naming the predicate.
+    let mut client = NodeServiceClient::connect(addrs[0].clone()).await.unwrap();
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    tx.send(AddDocumentsRequest {
+        text: "a direct opinion from this century".into(),
+        analysis: Some(body_spec()),
+        integers: vec![IntegerValue {
+            field: "year".into(),
+            value: 2015,
+        }],
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    drop(tx);
+    let err = client
+        .add_documents(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .await
+        .unwrap_err();
+    assert!(err.message().contains("decade < 200"), "{}", err.message());
+    for (_, handle) in nodes {
+        handle.abort();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_direct_ingest_takes_the_pinned_leaf_or_is_refused_by_name() {
     let dir = tempdir("direct");

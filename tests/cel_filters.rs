@@ -154,6 +154,7 @@ fn timestamp_of(rfc3339: &str) -> prost_types::Timestamp {
 fn ingest_request(doc: &Doc) -> AddDocumentsRequest {
     AddDocumentsRequest {
         unsigned_integers: Vec::new(),
+        derived_fingerprint: String::new(),
         original_source: None,
         source_chunk_ordinal: None,
         identity: None,

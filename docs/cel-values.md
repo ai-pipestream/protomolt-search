@@ -1,7 +1,9 @@
 # First-class CEL values: projections and materialized columns
 
 Status: implemented; uint values added on the unsigned feature branch
-(2026-09-05). CEL selects (`docs/cel-filters.md`)
+(2026-09-05); the index-level declaration, the calendar and hash
+functions, timestamp and facet inputs, and the stable key are in
+`docs/derived-columns.md` (2026-09-07). CEL selects (`docs/cel-filters.md`)
 and function chains score (`docs/score-functions.md`); this document
 covers the third and fourth uses of the same compiler: expressions that
 PRODUCE values. Query-time **projections** compute named values per
@@ -175,6 +177,12 @@ and remaining public-query integration. Unpinned fetch calls do not establish a
 selection snapshot.
 
 ## 5. Ingest-time materialized columns
+
+The INDEX's own derived columns, declared once for every shard, the
+coordinator and the reshard tool, fingerprinted and pinned to the
+store and the log, are `docs/derived-columns.md`; what follows is the
+per-request spec, a property of one ingest stream, which keeps its
+contract for columns the index does not declare.
 
 `AddDocumentsRequest.materialize` declares derived columns:
 `(name, expression, kind)`, kind one of `MATERIALIZE_KIND_F64` /

@@ -31,6 +31,7 @@ async fn add_documents_with_lineage(addr: &str, opinions: &[u64]) {
         for (i, &opinion) in opinions.iter().enumerate() {
             tx.send(AddDocumentsRequest {
                 unsigned_integers: Vec::new(),
+                derived_fingerprint: String::new(),
                 original_source: None,
                 source_chunk_ordinal: None,
                 identity: None,

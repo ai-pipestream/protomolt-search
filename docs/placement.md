@@ -131,6 +131,12 @@ the layout diagnostics report the pinned code and whether the shard's
 segments carry more than one (`placement_mixed`), and the fixed knob
 `placement_tree` names the pinned leaf when a tree is given.
 
+A predicate may name a derived column (`docs/derived-columns.md`): the
+coordinator computes the declaration per source document before it
+evaluates the tree, a pinned shard computes it before it checks a
+direct row, and a predicate naming a column the shard declares in no
+table, source or derived, is refused at startup.
+
 The code alone does not make the leaf's predicates true of the rows: a
 direct row with any values takes the code. `--placement-tree=<file>`
 gives the node the tree, from the coordinator's shard map (its

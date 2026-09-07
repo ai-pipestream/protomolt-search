@@ -156,6 +156,12 @@ pub struct ShardMap {
     /// serves and the predicates that route a document there.
     #[serde(default)]
     pub placement: Option<crate::placement::PlacementTreeConfig>,
+    /// The index's derived columns (`docs/derived-columns.md`), the
+    /// same declaration every shard runs with; the coordinator
+    /// evaluates them to route under the tree and to scope field
+    /// permissions.
+    #[serde(default)]
+    pub derived: Vec<crate::derived::DerivedColumnConfig>,
 }
 
 /// Read one complete shard-map candidate. Callers validate its routing
@@ -264,6 +270,12 @@ pub struct Config {
     /// `[placement]` table). The shard then refuses a direct row the
     /// tree routes to another leaf. Needs `--placement-leaf`.
     pub placement_tree: Option<std::sync::Arc<crate::placement::PinnedLeaf>>,
+    /// Node: the index's derived-column declaration
+    /// (`--derived-columns=<file>` or an inline `[[derived]]` table,
+    /// docs/derived-columns.md), compiled; the node checks it against
+    /// its column tables and pins it to the store, the log and every
+    /// segment.
+    pub derived: Option<std::sync::Arc<crate::derived::Declaration>>,
     /// Serve a shard whose BM25 bulk build was interrupted: a
     /// `.bm25.build` spill directory with no `.bm25` beside it.
     ///
@@ -567,6 +579,11 @@ struct FileConfig {
     placement_column: Option<String>,
     placement_leaf: Option<i64>,
     placement_tree: Option<String>,
+    /// `--derived-columns=<file>`: a shard map or a file with a
+    /// `[[derived]]` table.
+    derived_columns: Option<String>,
+    /// The declaration inline (`[[derived]]` in this file).
+    derived: Vec<crate::derived::DerivedColumnConfig>,
     allow_missing_bm25: Option<bool>,
     coalesce: Option<bool>,
     scan_parallel: Option<usize>,
@@ -1223,6 +1240,40 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             Some(std::sync::Arc::new(pinned))
         }
         None => None,
+    };
+    // The derived-column declaration (docs/derived-columns.md): a file
+    // (the coordinator's shard map or a bare [[derived]] table) or the
+    // config file's own [[derived]] table, never both.
+    let derived = {
+        let path = opt(
+            args,
+            "derived-columns",
+            "TURBOVEC_DERIVED_COLUMNS",
+            file.derived_columns.as_deref(),
+        )
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+        let spec = match (path, file.derived.is_empty()) {
+            (Some(_), false) => {
+                return Err(
+                    "--derived-columns names a file and the config file has its own [[derived]] \
+                     table; declare the columns in one place"
+                        .to_string(),
+                );
+            }
+            (Some(path), true) => Some(
+                crate::derived::load_declaration(std::path::Path::new(&path))
+                    .map_err(|e| format!("derived columns {path}: {e}"))?,
+            ),
+            (None, false) => Some(crate::derived::spec_from_config(&file.derived)?),
+            (None, true) => None,
+        };
+        spec.map(|spec| {
+            crate::derived::Declaration::compile(&spec)
+                .map(std::sync::Arc::new)
+                .map_err(|e| format!("derived columns: {e}"))
+        })
+        .transpose()?
     };
     let allow_missing_bm25 = flag_present(args, "allow-missing-bm25")
         || match opt(
@@ -2418,6 +2469,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         placement_column,
         placement_leaf,
         placement_tree,
+        derived,
         allow_missing_bm25,
         coalesce,
         scan_parallel,

@@ -64,6 +64,7 @@ async fn add_documents_integer(
     for (text, integers) in docs {
         tx.send(AddDocumentsRequest {
             unsigned_integers: Vec::new(),
+            derived_fingerprint: String::new(),
             original_source: None,
             source_chunk_ordinal: None,
             identity: None,
@@ -877,6 +878,7 @@ async fn timestamps_land_as_epoch_micros_in_the_integer_column() {
     };
     let stamped = |text: &str, seconds: i64, nanos: i32| AddDocumentsRequest {
         unsigned_integers: Vec::new(),
+        derived_fingerprint: String::new(),
         original_source: None,
         source_chunk_ordinal: None,
         identity: None,

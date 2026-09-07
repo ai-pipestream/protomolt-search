@@ -549,6 +549,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         cluster_columns(&cluster_meta, chunk.cluster_id);
                     tx.send(AddDocumentsRequest {
                         unsigned_integers: Vec::new(),
+                        derived_fingerprint: String::new(),
                         original_source: None,
                         source_chunk_ordinal: None,
                         identity: None,
@@ -1038,6 +1039,7 @@ async fn run_remote(
                         cluster_columns(&cluster_meta2, chunk.cluster_id);
                     docs.push(AddDocumentsRequest {
                         unsigned_integers: Vec::new(),
+                        derived_fingerprint: String::new(),
                         original_source: None,
                         source_chunk_ordinal: None,
                         identity: None,

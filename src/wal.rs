@@ -250,6 +250,118 @@ pub struct WalManifest {
     pub preexisting_documents: u64,
     /// On-disk format version; [`FORMAT_VERSION`].
     pub format_version: u32,
+    /// The derived-column declaration the log's records were derived
+    /// under (`docs/derived-columns.md`), by fingerprint; empty for a
+    /// log written without derived columns, or before them.
+    #[serde(default)]
+    pub derived_fingerprint: String,
+    /// The declaration itself, as a `[[derived]]` table, so a replay
+    /// tool can rebuild the columns the records carry and refuse a
+    /// declaration that differs.
+    #[serde(default)]
+    pub derived: Vec<crate::derived::DerivedColumnConfig>,
+    /// The complete column table of the shard the log describes, empty
+    /// columns included, in table order: what a rebuilt child declares
+    /// so its tables match the parent's record for record. `None` in a
+    /// manifest from before the table was recorded.
+    #[serde(default)]
+    pub columns: Option<ColumnTable>,
+}
+
+/// The complete column table of one shard, in table order
+/// (`WalManifest::columns`): the names a store declares whether or not
+/// any row carries a value under them.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ColumnTable {
+    #[serde(default)]
+    pub fields: Vec<String>,
+    #[serde(default)]
+    pub facets: Vec<String>,
+    #[serde(default)]
+    pub numerics: Vec<String>,
+    #[serde(default)]
+    pub map_facets: Vec<String>,
+    #[serde(default)]
+    pub map_numerics: Vec<String>,
+    #[serde(default)]
+    pub integers: Vec<String>,
+    #[serde(default)]
+    pub unsigned_integers: Vec<String>,
+    #[serde(default)]
+    pub geo: Vec<String>,
+}
+
+impl ColumnTable {
+    /// The table a node's configuration declares (derived names
+    /// included, after their source columns).
+    pub fn of_config(config: &crate::node::NodeConfig) -> Self {
+        ColumnTable {
+            fields: config.bm25_fields.clone(),
+            facets: config.facet_fields.clone(),
+            numerics: config.numeric_fields.clone(),
+            map_facets: config.map_facet_fields.clone(),
+            map_numerics: config.map_numeric_fields.clone(),
+            integers: config.integer_fields.clone(),
+            unsigned_integers: config.unsigned_integer_fields.clone(),
+            geo: config.geo_fields.clone(),
+        }
+    }
+
+    /// The first table that differs from `other`, by name.
+    pub fn first_difference(&self, other: &ColumnTable) -> Option<String> {
+        for (name, mine, theirs) in [
+            ("field", &self.fields, &other.fields),
+            ("facet", &self.facets, &other.facets),
+            ("numeric", &self.numerics, &other.numerics),
+            ("map-facet", &self.map_facets, &other.map_facets),
+            ("map-numeric", &self.map_numerics, &other.map_numerics),
+            ("integer", &self.integers, &other.integers),
+            (
+                "unsigned-integer",
+                &self.unsigned_integers,
+                &other.unsigned_integers,
+            ),
+            ("geo", &self.geo, &other.geo),
+        ] {
+            if mine != theirs {
+                return Some(format!("{name} table {mine:?} vs {theirs:?}"));
+            }
+        }
+        None
+    }
+}
+
+/// A resumed log's declaration and column table must be the node's
+/// (`docs/derived-columns.md`): the same derived fingerprint, and the
+/// same tables in the same order. A manifest that recorded neither is
+/// adopted by the caller; one that recorded either and disagrees is
+/// refused naming the difference.
+pub fn check_manifest_tables(held: &WalManifest, fresh: &WalManifest) -> Result<(), String> {
+    if !held.derived_fingerprint.is_empty() || !held.derived.is_empty() {
+        if held.derived_fingerprint != fresh.derived_fingerprint {
+            return Err(format!(
+                "the log was written under derived-column declaration {:?}, this node declares \
+                 {:?}; a changed declaration is a rebuild through the reshard tool",
+                held.derived_fingerprint, fresh.derived_fingerprint
+            ));
+        }
+        if held.derived != fresh.derived {
+            return Err(
+                "the log's [[derived]] table differs from this node's although the \
+                 fingerprints agree; the manifest was edited by hand"
+                    .to_string(),
+            );
+        }
+    }
+    if let (Some(held), Some(fresh)) = (held.columns.as_ref(), fresh.columns.as_ref()) {
+        if let Some(difference) = held.first_difference(fresh) {
+            return Err(format!(
+                "the log records a column table this node does not declare: {difference}; the \
+                 tables of a shard and its log agree name for name and in order"
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl WalManifest {
@@ -1396,6 +1508,9 @@ mod tests {
             preexisting_vectors: 0,
             preexisting_documents: 0,
             format_version: FORMAT_VERSION,
+            derived_fingerprint: String::new(),
+            derived: Vec::new(),
+            columns: None,
         }
     }
 
@@ -1450,6 +1565,7 @@ mod tests {
                 fields: Vec::new(),
                 integers: Vec::new(),
                 unsigned_integers: Vec::new(),
+                derived_fingerprint: String::new(),
                 timestamps: Vec::new(),
                 geo_points: Vec::new(),
                 quality: None,

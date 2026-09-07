@@ -2469,6 +2469,16 @@ message AddDocumentsRequest {
   // Exact unsigned values, one entry per declared u64 column. The WAL retains
   // these typed values for replay; they never pass through i64 or double.
   repeated UnsignedIntegerValue unsigned_integers = 26;
+  // Fingerprint of the derived-column declaration (DerivedColumns,
+  // docs/derived-columns.md) whose values this document carries under
+  // the declared names. Fresh client ingest leaves it empty and carries
+  // no value under a derived name: the node computes the columns from
+  // the document's own values and fills this in before the WAL append,
+  // so a logged record replays with its recorded values and a request
+  // that supplies a derived value, or this fingerprint, is refused as
+  // forged. A replayed record whose fingerprint differs from the node's
+  // declaration is refused naming both.
+  string derived_fingerprint = 27;
 }
 
 // One canonical concept posting derived from a glossary match. Aliases share
@@ -6880,8 +6890,17 @@ message ValueExpr {
 
     // Unsigned integer literal (CEL uint, full u64 domain).
     uint64 uint_literal = 15;
+
+    // `hash.fnv64(stable_key())`: FNV-1a 64 over the document's opaque
+    // stable routing key bytes, the coordinator's routing hash
+    // (docs/derived-columns.md). A uint. Ingest-only: the key is not a
+    // stored column, so a query-time expression is refused by name.
+    StableKeyHash stable_key_hash = 16;
   }
 }
+
+// The `hash.fnv64(stable_key())` leaf; carries nothing.
+message StableKeyHash {}
 
 // The function vocabulary. Typing per function: ABS, SIGN, GREATEST,
 // and LEAST are type-preserving over one numeric type (int with int,
@@ -6929,6 +6948,17 @@ enum ValueFn {
   VALUE_FN_LOG10 = 15;
   // engine.pow(x, y): x to the y, IEEE powf.
   VALUE_FN_POW = 16;
+  // `hash.fnv64(s)`: FNV-1a 64 over the UTF-8 bytes of a facet string,
+  // a uint. Ingest-only (docs/derived-columns.md); at query time the
+  // derived column that stores it is the read.
+  VALUE_FN_FNV64 = 17;
+  // `calendar.year(t)`, `calendar.month(t)`, `calendar.day(t)`: the
+  // proleptic Gregorian UTC civil date of an int of epoch microseconds
+  // (a timestamp column, or a timestamp value at ingest). Int results;
+  // month 1..12, day 1..31.
+  VALUE_FN_CALENDAR_YEAR = 18;
+  VALUE_FN_CALENDAR_MONTH = 19;
+  VALUE_FN_CALENDAR_DAY = 20;
 }
 
 // One function call node.
@@ -7689,6 +7719,63 @@ message ProjectedValue {
     // A uint-typed result. Presence distinguishes zero from absence.
     uint64 uint_value = 5;
   }
+}
+
+// Derived columns declared on the INDEX (docs/derived-columns.md): CEL
+// value columns computed once at index time from each document's own
+// values (its numerics, integers, unsigned integers, map numerics,
+// timestamps as epoch micros, facet strings, and the stable routing
+// key through hash.fnv64(stable_key())), stored as ordinary typed
+// columns, and usable as the physical shard key: a placement predicate
+// and the reshard tool's cut column may name one. Unlike a request's
+// MaterializeSpec, which is a property of one ingest stream, the
+// declaration is the index's: every shard, the coordinator's shard map
+// and the reshard tool carry the same one, identified by a fingerprint
+// over the canonical encoding; a store, log, or segment written under
+// another declaration is refused by name, and a changed expression is
+// a rebuild through the reshard tool, never a mutation in place. The
+// TOML form (`[[derived]]` in a node config or shard map) configures
+// this message field for field.
+message DerivedColumns {
+  // Evaluated in list order. Outputs do not become inputs for later
+  // entries. Names join the column table of their kind after the
+  // declared source columns, in this order, and must not collide with
+  // a source column or with each other.
+  repeated DerivedColumn columns = 1;
+}
+
+// One derived column.
+message DerivedColumn {
+  // Column name the value stores under. Non-empty, declaration-unique,
+  // not a source column of the index.
+  string name = 1;
+  // CEL value expression (docs/cel-values.md) over the document's own
+  // values. Absence propagates: a document lacking an input stores no
+  // value. String and bool results are refused at declaration time.
+  string expression = 2;
+  // Stored family. Explicit, never inferred; the expression's static
+  // type must match.
+  MaterializeKind kind = 3;
+  // Who may use and disclose the column at query time. Explicit; the
+  // zero value is refused.
+  DerivedDisclosure disclosure = 4;
+}
+
+// The disclosure rule of one derived column. Hashing or bucketing a
+// field does not make it public: the default contract ties the derived
+// column to the grants of everything it reads.
+enum DerivedDisclosure {
+  // Zero value. Refused.
+  DERIVED_DISCLOSURE_UNSPECIFIED = 0;
+  // A scope may use or disclose the column only when it holds the same
+  // action on the column itself AND on every input column it reads; a
+  // column reading the stable key also needs the document-identity
+  // disclosure grant.
+  DERIVED_DISCLOSURE_INPUTS = 1;
+  // The column's own grant suffices: the declaration states that the
+  // value discloses nothing about its inputs an operator minds (a
+  // coarse bucket, for example). A deliberate choice, never a default.
+  DERIVED_DISCLOSURE_OWN = 2;
 }
 
 // Ingest-time materialization spec: a session property of the ingest

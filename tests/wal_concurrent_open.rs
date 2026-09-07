@@ -59,6 +59,9 @@ fn manifest() -> WalManifest {
         preexisting_vectors: 10_829_824,
         preexisting_documents: 10_829_824,
         format_version: wal::FORMAT_VERSION,
+        derived_fingerprint: String::new(),
+        derived: Vec::new(),
+        columns: None,
     }
 }
 

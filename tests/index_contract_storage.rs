@@ -261,6 +261,9 @@ async fn empty_binding_recovers_from_synced_wal_without_an_index_image() {
                 preexisting_vectors: 0,
                 preexisting_documents: 0,
                 format_version: 5,
+                derived_fingerprint: String::new(),
+                derived: Vec::new(),
+                columns: None,
             },
         )
         .unwrap();

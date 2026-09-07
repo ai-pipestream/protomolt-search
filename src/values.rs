@@ -58,6 +58,15 @@ pub trait ColumnLookup {
     /// Value ordinal of `value` in map-facet column `ci`'s value
     /// dictionary.
     fn map_facet_value_ord_of(&self, ci: usize, value: &str) -> Option<u32>;
+    /// Whether this lookup types an INGEST evaluation (a document's own
+    /// values, or a declaration checked against the tables before any
+    /// document arrives). The ingest-only vocabulary — `hash.fnv64()`
+    /// and `stable_key()` (docs/derived-columns.md) — resolves here and
+    /// is refused by name at query time, where the derived column that
+    /// stores the value is the read.
+    fn at_ingest(&self) -> bool {
+        false
+    }
 }
 
 /// Declared numeric families used to type-check materialization before a
@@ -71,9 +80,15 @@ pub struct NumericTypes<'a> {
     pub unsigned_integers: &'a [String],
     /// Map-numeric column names.
     pub map_numerics: &'a [String],
+    /// Facet column names: inputs of `hash.fnv64()` and of string
+    /// comparisons in a derived column (docs/derived-columns.md).
+    pub facets: &'a [String],
 }
 
 impl ColumnLookup for NumericTypes<'_> {
+    fn at_ingest(&self) -> bool {
+        true
+    }
     fn numeric_index(&self, name: &str) -> Option<usize> {
         self.numerics.iter().position(|n| n == name)
     }
@@ -90,8 +105,8 @@ impl ColumnLookup for NumericTypes<'_> {
     fn map_numeric_key_ord(&self, _: usize, _: &str) -> Option<u32> {
         Some(0)
     }
-    fn facet_index(&self, _: &str) -> Option<usize> {
-        None
+    fn facet_index(&self, name: &str) -> Option<usize> {
+        self.facets.iter().position(|n| n == name)
     }
     fn map_facet_index(&self, _: &str) -> Option<usize> {
         None
@@ -208,7 +223,7 @@ pub fn validate_projection_row(
 }
 
 impl ValueType {
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             ValueType::Int => "int",
             ValueType::Uint => "uint",
@@ -279,6 +294,8 @@ pub enum ResolvedValue {
     },
     /// A reference this shard cannot resolve: absent everywhere.
     Absent,
+    /// `hash.fnv64(stable_key())`: resolves at ingest only.
+    StableKeyHash,
     /// Int literal.
     ConstInt(i64),
     /// Unsigned integer literal.
@@ -457,6 +474,16 @@ pub fn resolve(
         V::IntLiteral(v) => Ok((ResolvedValue::ConstInt(*v), ValueType::Int)),
         V::UintLiteral(v) => Ok((ResolvedValue::ConstUint(*v), ValueType::Uint)),
         V::FloatLiteral(v) => Ok((ResolvedValue::ConstDouble(*v), ValueType::Double)),
+        V::StableKeyHash(_) => {
+            if !cols.at_ingest() {
+                return Err(refuse(
+                    "hash.fnv64(stable_key()) computes at ingest, where the document's \
+                     stable routing key is known; at query time read the derived column \
+                     that stores it (docs/derived-columns.md)",
+                ));
+            }
+            Ok((ResolvedValue::StableKeyHash, ValueType::Uint))
+        }
         V::ToDouble(inner) => {
             let (rv, vt) = resolve(inner, cols)?;
             match vt {
@@ -657,6 +684,42 @@ pub fn resolve(
             };
             let display = fn_display(f);
             check_fn_arity(f, func.args.len())?;
+            match fn_signature(f) {
+                FnSignature::StringToUint => {
+                    if !cols.at_ingest() {
+                        return Err(refuse(format!(
+                            "{display} computes at ingest; at query time read the derived \
+                             column that stores it (docs/derived-columns.md)"
+                        )));
+                    }
+                    let (rv, vt) = resolve(&func.args[0], cols)?;
+                    return match vt {
+                        ValueType::Str => {
+                            Ok((ResolvedValue::Func { f, args: vec![rv] }, ValueType::Uint))
+                        }
+                        ValueType::Unknown => Ok((ResolvedValue::Absent, ValueType::Unknown)),
+                        other => Err(refuse(format!(
+                            "{display} takes a facet string, not a {}",
+                            other.name()
+                        ))),
+                    };
+                }
+                FnSignature::IntToInt => {
+                    let (rv, vt) = resolve(&func.args[0], cols)?;
+                    return match vt {
+                        ValueType::Int => {
+                            Ok((ResolvedValue::Func { f, args: vec![rv] }, ValueType::Int))
+                        }
+                        ValueType::Unknown => Ok((ResolvedValue::Absent, ValueType::Unknown)),
+                        other => Err(refuse(format!(
+                            "{display} takes an int of epoch microseconds (a timestamp \
+                             column), not a {}",
+                            other.name()
+                        ))),
+                    };
+                }
+                FnSignature::Numeric { .. } => {}
+            }
             let type_preserving = matches!(
                 f,
                 pb::ValueFn::Abs | pb::ValueFn::Sign | pb::ValueFn::Greatest | pb::ValueFn::Least
@@ -875,6 +938,9 @@ pub fn eval(rv: &ResolvedValue, doc_id: u32, cols: &dyn NumericRead) -> Option<V
                 ord,
             }),
         ResolvedValue::Absent => None,
+        ResolvedValue::StableKeyHash => {
+            unreachable!("resolution refused the stable-key hash at query time")
+        }
         ResolvedValue::ConstInt(v) => Some(Val::Int(*v)),
         ResolvedValue::ConstUint(v) => Some(Val::Uint(*v)),
         ResolvedValue::ConstDouble(v) => Some(Val::Double(*v)),
@@ -1032,8 +1098,63 @@ fn fn_display(f: pb::ValueFn) -> &'static str {
         pb::ValueFn::Exp => "engine.exp()",
         pb::ValueFn::Log10 => "engine.log10()",
         pb::ValueFn::Pow => "engine.pow()",
+        pb::ValueFn::Fnv64 => "hash.fnv64()",
+        pb::ValueFn::CalendarYear => "calendar.year()",
+        pb::ValueFn::CalendarMonth => "calendar.month()",
+        pb::ValueFn::CalendarDay => "calendar.day()",
         pb::ValueFn::Unspecified => "unspecified()",
     }
+}
+
+/// The argument and result shape of one function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FnSignature {
+    /// The math and engine vocabulary: numeric arguments of one type;
+    /// `type_preserving` results keep it, the rest take and yield
+    /// doubles (or bools for the classifiers).
+    Numeric { type_preserving: bool },
+    /// `hash.fnv64(s)`: one facet string in, a uint out. Ingest-only.
+    StringToUint,
+    /// `calendar.*(t)`: one int of epoch microseconds in, an int out.
+    IntToInt,
+}
+
+/// The signature of one function, shared by the compiler, resolution
+/// and both evaluators so they cannot disagree.
+pub fn fn_signature(f: pb::ValueFn) -> FnSignature {
+    match f {
+        pb::ValueFn::Fnv64 => FnSignature::StringToUint,
+        pb::ValueFn::CalendarYear | pb::ValueFn::CalendarMonth | pb::ValueFn::CalendarDay => {
+            FnSignature::IntToInt
+        }
+        pb::ValueFn::Abs | pb::ValueFn::Sign | pb::ValueFn::Greatest | pb::ValueFn::Least => {
+            FnSignature::Numeric {
+                type_preserving: true,
+            }
+        }
+        _ => FnSignature::Numeric {
+            type_preserving: false,
+        },
+    }
+}
+
+/// FNV-1a 64 over bytes: the coordinator's stable routing hash
+/// (`coordinator::stable_routing_hash`) and `hash.fnv64()`'s function.
+/// Distinct from the WAL bucket hash, which hashes little-endian row
+/// ids and selects high bits.
+pub fn fnv1a64_bytes(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// The proleptic Gregorian UTC civil date of an instant in epoch
+/// microseconds, exact over the i64 range.
+pub fn civil_of_micros(micros: i64) -> (i64, u32, u32) {
+    crate::calendar::civil_from_days(crate::calendar::floor_div(micros, 86_400_000_000))
 }
 
 /// Arity check, shared by both evaluation paths.
@@ -1100,6 +1221,18 @@ fn eval_fn(f: pb::ValueFn, vals: &[Val]) -> Option<Val> {
         F::IsInf => Some(Val::Bool(d(&vals[0]).is_infinite())),
         F::IsFinite => Some(Val::Bool(d(&vals[0]).is_finite())),
         F::Pow => Some(Val::Double(d(&vals[0]).powf(d(&vals[1])))),
+        F::Fnv64 => unreachable!("hash.fnv64() evaluates at ingest over the document's string"),
+        F::CalendarYear | F::CalendarMonth | F::CalendarDay => {
+            let Val::Int(micros) = vals[0] else {
+                unreachable!("resolution typed the argument int")
+            };
+            let (y, m, day) = civil_of_micros(micros);
+            Some(Val::Int(match f {
+                F::CalendarYear => y,
+                F::CalendarMonth => i64::from(m),
+                _ => i64::from(day),
+            }))
+        }
         F::Greatest | F::Least => {
             let greatest = f == F::Greatest;
             match vals[0] {
@@ -1230,7 +1363,46 @@ pub fn column_leaves(expr: &pb::ValueExpr, out: &mut Vec<ValueLeaf>) {
         | Some(V::FloatLiteral(_))
         | Some(V::BoolLiteral(_))
         | Some(V::StringLiteral(_))
+        | Some(V::StableKeyHash(_))
         | None => {}
+    }
+}
+
+/// Whether the expression reads the document's stable routing key
+/// (`hash.fnv64(stable_key())`), the one input that is not a column.
+pub fn reads_stable_key(expr: &pb::ValueExpr) -> bool {
+    use pb::value_expr::Expr as V;
+    match expr.expr.as_ref() {
+        Some(V::StableKeyHash(_)) => true,
+        Some(V::Arith(arith)) => {
+            arith.left.as_deref().is_some_and(reads_stable_key)
+                || arith.right.as_deref().is_some_and(reads_stable_key)
+        }
+        Some(V::ToDouble(inner)) | Some(V::Negate(inner)) | Some(V::Not(inner)) => {
+            reads_stable_key(inner)
+        }
+        Some(V::Compare(cmp)) => {
+            cmp.left.as_deref().is_some_and(reads_stable_key)
+                || cmp.right.as_deref().is_some_and(reads_stable_key)
+        }
+        Some(V::Logic(logic)) => logic.children.iter().any(reads_stable_key),
+        Some(V::Func(func)) => func.args.iter().any(reads_stable_key),
+        Some(V::Ternary(t)) => [
+            t.cond.as_deref(),
+            t.then_value.as_deref(),
+            t.else_value.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(reads_stable_key),
+        Some(V::Column(_))
+        | Some(V::Map(_))
+        | Some(V::UintLiteral(_))
+        | Some(V::IntLiteral(_))
+        | Some(V::FloatLiteral(_))
+        | Some(V::BoolLiteral(_))
+        | Some(V::StringLiteral(_))
+        | None => false,
     }
 }
 
@@ -1264,9 +1436,10 @@ pub fn leaf_known(leaf: &ValueLeaf, cols: &dyn ColumnLookup) -> bool {
 // ---------------------------------------------------------------------
 
 /// The value environment one AddDocumentsRequest provides: its own
-/// numeric families, by name. Facet strings are deliberately not here —
-/// materialization computes NUMBERS, and a string expression stores
-/// nothing a copy would not.
+/// numeric families by name (timestamps as epoch-micro integers), its
+/// facet strings, and its stable routing key. A string is never a
+/// RESULT — materialization computes numbers — but a facet feeds
+/// `hash.fnv64()` and `==`/`!=` comparisons (docs/derived-columns.md).
 #[derive(Debug, Default)]
 pub struct IngestEnv {
     /// f64 values by column name.
@@ -1277,6 +1450,10 @@ pub struct IngestEnv {
     pub unsigned_integers: HashMap<String, u64>,
     /// Map-numeric values by (column, key).
     pub map_numerics: HashMap<(String, String), f64>,
+    /// Facet strings by column name.
+    pub facets: HashMap<String, String>,
+    /// The document's opaque stable routing key, when it has one.
+    pub stable_key: Option<Vec<u8>>,
 }
 
 // Resolution-only lookup: the returned indexes identify types, not row storage.
@@ -1300,8 +1477,8 @@ impl ColumnLookup for IngestEnv {
     fn map_numeric_key_ord(&self, _: usize, _: &str) -> Option<u32> {
         Some(0)
     }
-    fn facet_index(&self, _: &str) -> Option<usize> {
-        None
+    fn facet_index(&self, name: &str) -> Option<usize> {
+        self.facets.contains_key(name).then_some(0)
     }
     fn map_facet_index(&self, _: &str) -> Option<usize> {
         None
@@ -1314,6 +1491,9 @@ impl ColumnLookup for IngestEnv {
     }
     fn map_facet_value_ord_of(&self, _: usize, _: &str) -> Option<u32> {
         None
+    }
+    fn at_ingest(&self) -> bool {
+        true
     }
 }
 
@@ -1354,11 +1534,24 @@ fn eval_ingest_inner(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Ing
             let num = env.numerics.get(name);
             let int = env.integers.get(name);
             let uint = env.unsigned_integers.get(name);
-            if usize::from(num.is_some()) + usize::from(int.is_some()) + usize::from(uint.is_some())
+            let facet = env.facets.contains_key(name);
+            if usize::from(num.is_some())
+                + usize::from(int.is_some())
+                + usize::from(uint.is_some())
+                + usize::from(facet)
                 > 1
             {
                 return Err(refuse(format!(
-                    "materialization input {name:?} arrives in more than one numeric family on this document"
+                    "materialization input {name:?} arrives in more than one family on this document"
+                )));
+            }
+            if facet {
+                // Resolution admits a facet read only under hash.fnv64()
+                // or against a string literal, both handled by their
+                // parent nodes below.
+                return Err(refuse(format!(
+                    "facet {name:?} is a string; it feeds hash.fnv64() or a `==`/`!=` \
+                     comparison, and is not itself a stored number"
                 )));
             }
             Ok(num
@@ -1366,6 +1559,10 @@ fn eval_ingest_inner(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Ing
                 .or(int.map(|v| IngestVal::Int(*v)))
                 .or(uint.map(|v| IngestVal::Uint(*v))))
         }
+        V::StableKeyHash(_) => Ok(env
+            .stable_key
+            .as_deref()
+            .map(|key| IngestVal::Uint(fnv1a64_bytes(key)))),
         V::Map(read) => Ok(env
             .map_numerics
             .get(&(read.column.clone(), read.key.clone()))
@@ -1471,16 +1668,24 @@ fn eval_ingest_inner(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Ing
                         eq
                     })));
                 }
-                let other = if is_lit(left) { right } else { left };
-                return match eval_ingest_inner(other, env)? {
-                    // Materialization reads no facets, so the read
-                    // side is absent on every document — Kleene.
-                    None => Ok(None),
-                    Some(_) => Err(refuse(
-                        "a string literal compares only against a facet read, and \
-                         materialization reads no facets",
-                    )),
+                let (other, lit) = if is_lit(left) {
+                    (right, left)
+                } else {
+                    (left, right)
                 };
+                let Some(V::StringLiteral(lit)) = lit.expr.as_ref() else {
+                    unreachable!("is_lit matched a string literal")
+                };
+                // The read side is a facet of this document (resolution
+                // admits only a direct facet or map-facet read here); a
+                // map facet is not an ingest input, so it is absent.
+                return Ok(match other.expr.as_ref() {
+                    Some(V::Column(name)) => env.facets.get(name).map(|value| {
+                        let eq = value == lit;
+                        IngestVal::Bool(if op == CmpOp::Ne { !eq } else { eq })
+                    }),
+                    _ => None,
+                });
             }
             let (l, r) = (
                 eval_ingest_inner(left, env)?,
@@ -1519,6 +1724,38 @@ fn eval_ingest_inner(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Ing
             };
             let display = fn_display(f);
             check_fn_arity(f, func.args.len())?;
+            match fn_signature(f) {
+                FnSignature::StringToUint => {
+                    // Resolution typed the argument as a facet read.
+                    return Ok(match func.args[0].expr.as_ref() {
+                        Some(V::Column(name)) => env
+                            .facets
+                            .get(name)
+                            .map(|value| IngestVal::Uint(fnv1a64_bytes(value.as_bytes()))),
+                        _ => None,
+                    });
+                }
+                FnSignature::IntToInt => {
+                    return Ok(match eval_ingest_inner(&func.args[0], env)? {
+                        None => None,
+                        Some(IngestVal::Int(micros)) => {
+                            let (y, m, d) = civil_of_micros(micros);
+                            Some(IngestVal::Int(match f {
+                                pb::ValueFn::CalendarYear => y,
+                                pb::ValueFn::CalendarMonth => i64::from(m),
+                                _ => i64::from(d),
+                            }))
+                        }
+                        Some(_) => {
+                            return Err(refuse(format!(
+                                "{display} takes an int of epoch microseconds (a timestamp \
+                                 column) on this document"
+                            )));
+                        }
+                    });
+                }
+                FnSignature::Numeric { .. } => {}
+            }
             let type_preserving = matches!(
                 f,
                 pb::ValueFn::Abs | pb::ValueFn::Sign | pb::ValueFn::Greatest | pb::ValueFn::Least

@@ -840,6 +840,7 @@ pub async fn atomic_live_cutover(
                 })
                 .collect(),
             placement: None,
+            derived: Vec::new(),
         };
         write_toml_atomic(shard_map_path, &map, "shard map")?;
         durable_map_published = true;

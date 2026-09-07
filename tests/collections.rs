@@ -314,6 +314,9 @@ fn manifest(collection: &str) -> WalManifest {
         preexisting_vectors: 0,
         preexisting_documents: 0,
         format_version: wal::FORMAT_VERSION,
+        derived_fingerprint: String::new(),
+        derived: Vec::new(),
+        columns: None,
     }
 }
 

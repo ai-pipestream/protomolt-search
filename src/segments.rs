@@ -1141,6 +1141,12 @@ impl SegmentCatalog {
                     ));
                 };
                 let mut sink = |_row: crate::reshard::CompactedRow<'_>| Ok(());
+                // The outputs keep the declaration the log's manifest
+                // records (docs/derived-columns.md).
+                let derived = crate::reshard::manifest_derived(
+                    &crate::wal::read_manifest(gen)
+                        .map_err(|e| format!("read manifest of {}: {e}", gen.display()))?,
+                )?;
                 let build = crate::reshard::compact_log_partitioned(
                     gen,
                     u64::MAX,
@@ -1149,6 +1155,7 @@ impl SegmentCatalog {
                     bm25_fields,
                     None,
                     None,
+                    derived.as_ref(),
                     analyze,
                     &mut sink,
                 )?;

@@ -156,6 +156,17 @@ rows per cut, about four segments per year in a band of eleven million
 documents, keeps the build in memory, and segment pruning by year is
 as sharp as with one segment per year.
 
+## Deriving columns on the way through
+
+The rows a transplant reconstructs carry the declaration fingerprint
+of the segment they come from, and the split rederives them under
+`--derived-columns` with `--derive` (`docs/derived-columns.md`): the
+inputs are the segments' own column tables, so a declaration reading a
+column the sources lack refuses before any row moves, and a column
+reading the stable key refuses under `--from-segments`, which carries
+none. The children's tables are the sources' with the derived names
+appended, and every child segment carries the declaration entry.
+
 ## Partitioned compaction of a catalog without a log
 
 The children of a segmented split have no WAL: the spill logs build the

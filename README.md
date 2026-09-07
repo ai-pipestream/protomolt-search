@@ -1828,6 +1828,20 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   device node by declaration, and moves nothing.
   [Bandwidth as the budget](docs/bandwidth-budget.md).
 
+- **Landed 2026-09-07: derived columns, the index-time computed column.**
+  `DerivedColumns` in the proto and `[[derived]]` in TOML declare CEL value
+  columns computed once at ingest from each document's own values (numbers,
+  timestamps, facet strings, the stable key through `hash.fnv64()`,
+  `calendar.year()`), stored as ordinary typed columns, and usable as the
+  physical shard key: a placement predicate and the reshard tool's cut
+  column may name one. The declaration's fingerprint pins the store (kind
+  15), every segment and the log's manifest (with the complete column
+  table); forged values are refused; a changed declaration is a rebuild
+  through `reshard --derived-columns --derive`, which stores what direct
+  ingest stores; a derived column discloses no more than its inputs.
+  `--derived-columns=<file>`. Tests: `tests/derived_columns.rs`.
+  [Derived columns](docs/derived-columns.md).
+
 - **Landed 2026-09-06: the tree on the shard, and a re-placement split.**
   `--placement-tree=<map or table>` gives a pinned node its leaf's
   predicates: the pinned code must be a leaf of the tree, and a direct row

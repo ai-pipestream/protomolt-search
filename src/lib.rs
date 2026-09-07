@@ -42,6 +42,7 @@ pub mod control_plane;
 pub mod coordinator;
 pub mod demo;
 pub mod dense_policy;
+pub mod derived;
 pub mod diagnostics;
 pub mod document_catalog;
 pub mod embedded;

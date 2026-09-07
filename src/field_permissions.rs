@@ -9,8 +9,32 @@ mod query;
 pub(crate) struct FieldScope {
     grants: BTreeMap<String, u8>,
     disclose_identity: bool,
+    /// The index's derived columns (`docs/derived-columns.md`): a
+    /// column declared `inputs` is usable or disclosable only when the
+    /// same action is granted on every column it reads, and on the
+    /// document identity when it reads the stable key. Hashing a field
+    /// does not make it public.
+    derived: Option<std::sync::Arc<crate::derived::Declaration>>,
 }
 impl FieldScope {
+    /// Attach the declaration the grants are judged under.
+    pub(crate) fn with_derived(
+        mut self,
+        derived: Option<std::sync::Arc<crate::derived::Declaration>>,
+    ) -> Self {
+        self.derived = derived;
+        self
+    }
+    /// The inputs a derived column's grant depends on: `None` for a
+    /// source column or a column declared `own`; otherwise its input
+    /// columns and whether it reads the stable key.
+    fn derived_inputs(&self, field: &str) -> Option<(&[String], bool)> {
+        let column = self.derived.as_ref()?.column(field)?;
+        match column.disclosure {
+            crate::pb::DerivedDisclosure::Inputs => Some((&column.inputs, column.reads_stable_key)),
+            _ => None,
+        }
+    }
     pub(crate) fn new(input: &FieldPermissions) -> Result<Self, String> {
         let mut grants = BTreeMap::new();
         for grant in &input.grants {
@@ -36,16 +60,31 @@ impl FieldScope {
         Ok(Self {
             grants,
             disclose_identity: input.disclose_document_identity,
+            derived: None,
         })
     }
     pub(crate) fn can_disclose_identity(&self) -> bool {
         self.disclose_identity
     }
+    fn granted(&self, field: &str, bit: u8) -> bool {
+        if !self.grants.get(field).is_some_and(|bits| bits & bit != 0) {
+            return false;
+        }
+        match self.derived_inputs(field) {
+            None => true,
+            Some((inputs, reads_stable_key)) => {
+                inputs
+                    .iter()
+                    .all(|input| self.grants.get(input).is_some_and(|bits| bits & bit != 0))
+                    && (!reads_stable_key || self.disclose_identity)
+            }
+        }
+    }
     pub(crate) fn can_use(&self, field: &str) -> bool {
-        self.grants.get(field).is_some_and(|bits| bits & 1 != 0)
+        self.granted(field, 1)
     }
     pub(crate) fn can_disclose(&self, field: &str) -> bool {
-        self.grants.get(field).is_some_and(|bits| bits & 2 != 0)
+        self.granted(field, 2)
     }
     fn denied() -> Status {
         Status::permission_denied("field access is not granted")
@@ -361,5 +400,90 @@ impl FieldScope {
         });
         response.field_details_redacted = redacted;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod derived_tests {
+    use super::*;
+
+    fn scope(grants: &[(&str, &[FieldAction])], identity: bool) -> FieldScope {
+        let permissions = FieldPermissions {
+            grants: grants
+                .iter()
+                .map(|(field, actions)| FieldGrant {
+                    field: field.to_string(),
+                    actions: actions.iter().map(|a| *a as i32).collect(),
+                })
+                .collect(),
+            disclose_document_identity: identity,
+        };
+        let declaration = crate::derived::Declaration::compile(&DerivedColumns {
+            columns: vec![
+                DerivedColumn {
+                    name: "court_hash".into(),
+                    expression: "hash.fnv64(court)".into(),
+                    kind: MaterializeKind::U64 as i32,
+                    disclosure: DerivedDisclosure::Inputs as i32,
+                },
+                DerivedColumn {
+                    name: "key_bucket".into(),
+                    expression: "hash.fnv64(stable_key()) % 64u".into(),
+                    kind: MaterializeKind::U64 as i32,
+                    disclosure: DerivedDisclosure::Inputs as i32,
+                },
+                DerivedColumn {
+                    name: "decade".into(),
+                    expression: "year / 10".into(),
+                    kind: MaterializeKind::I64 as i32,
+                    disclosure: DerivedDisclosure::Own as i32,
+                },
+            ],
+        })
+        .unwrap();
+        FieldScope::new(&permissions)
+            .unwrap()
+            .with_derived(Some(std::sync::Arc::new(declaration)))
+    }
+
+    #[test]
+    fn a_derived_column_needs_the_grants_of_its_inputs() {
+        use FieldAction::{Disclose, Use};
+        // The column's own grant is not enough: hashing court does not
+        // make court public.
+        let s = scope(&[("court_hash", &[Use, Disclose])], false);
+        assert!(!s.can_use("court_hash"));
+        assert!(!s.can_disclose("court_hash"));
+        let s = scope(
+            &[("court_hash", &[Use, Disclose]), ("court", &[Use])],
+            false,
+        );
+        assert!(s.can_use("court_hash"));
+        assert!(
+            !s.can_disclose("court_hash"),
+            "disclosing needs disclose on the input"
+        );
+        let s = scope(
+            &[
+                ("court_hash", &[Use, Disclose]),
+                ("court", &[Use, Disclose]),
+            ],
+            false,
+        );
+        assert!(s.can_disclose("court_hash"));
+        // An input grant without the column's own grant is not enough either.
+        let s = scope(&[("court", &[Use, Disclose])], false);
+        assert!(!s.can_use("court_hash"));
+        // The stable key is the document identity.
+        let s = scope(&[("key_bucket", &[Use, Disclose])], false);
+        assert!(!s.can_use("key_bucket"));
+        let s = scope(&[("key_bucket", &[Use, Disclose])], true);
+        assert!(s.can_use("key_bucket") && s.can_disclose("key_bucket"));
+        // A column declared `own` is judged on its own grant.
+        let s = scope(&[("decade", &[Use])], false);
+        assert!(s.can_use("decade") && !s.can_disclose("decade"));
+        // Source columns are unchanged.
+        let s = scope(&[("year", &[Use, Disclose])], false);
+        assert!(s.can_use("year") && s.can_disclose("year") && !s.can_use("decade"));
     }
 }

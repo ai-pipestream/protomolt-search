@@ -95,6 +95,7 @@ async fn start_fixture() -> Fixture {
             for text in shard_texts {
                 tx.send(AddDocumentsRequest {
                     unsigned_integers: Vec::new(),
+                    derived_fingerprint: String::new(),
                     original_source: None,
                     source_chunk_ordinal: None,
                     identity: None,

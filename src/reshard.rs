@@ -595,6 +595,7 @@ fn build_child(
     bm25_fields: Option<&[String]>,
     pinned_fingerprints: Option<&[u64]>,
     binding: Option<&crate::postings::StoredBinding>,
+    derived: Option<&crate::postings::StoredDerived>,
     columns: Option<&ColumnTables>,
     mut transplanted: Option<BTreeMap<u64, Vec<AnalyzedField>>>,
     analyze: &mut Analyzer,
@@ -1304,6 +1305,9 @@ fn build_child(
         // The children stay bound to the plan the parents were written
         // under; replay must not launder a binding away.
         builder.set_binding(binding.cloned());
+        // Likewise the derived-column declaration (docs/derived-columns.md):
+        // the kind-15 entry names what the rows' derived values mean.
+        builder.set_derived(derived.cloned());
         builder
             .finish(&path)
             .map_err(|e| format!("write {}: {e}", path.display()))?;
@@ -1339,6 +1343,9 @@ fn finish_child(
     binding: Option<&crate::postings::StoredBinding>,
     analyze: &mut Analyzer,
 ) -> Result<ChildImage, String> {
+    // A hash split keeps the parents' declaration, which the log's
+    // manifest records (docs/derived-columns.md).
+    let derived = manifest_derived(manifest)?;
     finish_child_pinned(
         manifest,
         replay,
@@ -1350,9 +1357,38 @@ fn finish_child(
         bm25_fields,
         None,
         binding,
+        derived.as_ref(),
         None,
         analyze,
     )
+}
+
+/// The derived-column declaration a log's manifest records, in the
+/// store's form; `None` for a log without one. A manifest whose
+/// fingerprint does not cover its own `[[derived]]` table was edited by
+/// hand and is refused.
+pub fn manifest_derived(
+    manifest: &WalManifest,
+) -> Result<Option<crate::postings::StoredDerived>, String> {
+    if manifest.derived.is_empty() {
+        if !manifest.derived_fingerprint.is_empty() {
+            return Err(format!(
+                "the manifest records derived fingerprint {:?} and no [[derived]] table",
+                manifest.derived_fingerprint
+            ));
+        }
+        return Ok(None);
+    }
+    let spec = crate::derived::spec_from_config(&manifest.derived)?;
+    let declaration = crate::derived::Declaration::compile(&spec)?;
+    if declaration.fingerprint() != manifest.derived_fingerprint {
+        return Err(format!(
+            "the manifest's [[derived]] table hashes to {:?}, its recorded fingerprint is {:?}",
+            declaration.fingerprint(),
+            manifest.derived_fingerprint
+        ));
+    }
+    Ok(Some(crate::postings::StoredDerived::of(&declaration)))
 }
 
 /// [`finish_child`] with the analyzer fingerprints a compaction pins.
@@ -1368,6 +1404,7 @@ fn finish_child_pinned(
     bm25_fields: Option<&[String]>,
     pinned_fingerprints: Option<&[u64]>,
     binding: Option<&crate::postings::StoredBinding>,
+    derived: Option<&crate::postings::StoredDerived>,
     columns: Option<&ColumnTables>,
     analyze: &mut Analyzer,
 ) -> Result<ChildImage, String> {
@@ -1385,6 +1422,7 @@ fn finish_child_pinned(
         bm25_fields,
         pinned_fingerprints,
         binding,
+        derived,
         columns,
         analyze,
     )
@@ -1408,6 +1446,7 @@ fn finish_child_ordered(
     bm25_fields: Option<&[String]>,
     pinned_fingerprints: Option<&[u64]>,
     binding: Option<&crate::postings::StoredBinding>,
+    derived: Option<&crate::postings::StoredDerived>,
     columns: Option<&ColumnTables>,
     analyze: &mut Analyzer,
 ) -> Result<ChildImage, String> {
@@ -1445,6 +1484,7 @@ fn finish_child_ordered(
         bm25_fields,
         pinned_fingerprints,
         binding,
+        derived,
         columns,
         transplanted,
         analyze,
@@ -2375,6 +2415,10 @@ pub struct TreeReshardOutput {
     /// The largest transpose held at once, in bytes (0 under the log
     /// replay): one field of one source segment at a time is the bound.
     pub peak_transpose_bytes: u64,
+    /// The derived-column declaration the children were written under
+    /// (`docs/derived-columns.md`), as the shard map's `[[derived]]`
+    /// table; empty without one.
+    pub derived: Vec<crate::derived::DerivedColumnConfig>,
     /// Documents whose fields were transplanted (0 under the log replay).
     pub transplanted_rows: u64,
 }
@@ -2420,6 +2464,16 @@ pub struct TreeSplitOptions {
     /// reads the process's own soft limit. A test sets a small number
     /// to see the refusal.
     pub open_files_limit: Option<u64>,
+    /// The derived-column declaration the children are written under
+    /// (`--derived-columns`, docs/derived-columns.md); `None` keeps the
+    /// sources' own, from the log's manifest. With a declaration the
+    /// sources' column tables must declare every input.
+    pub derived: Option<std::sync::Arc<crate::derived::Declaration>>,
+    /// Derived columns to compute on every row (`--derive=<name>`): a
+    /// column added to the declaration, or one whose expression changed.
+    /// Rows already derived under `derived` refuse; rows never derived
+    /// need every declared column named (`Declaration::rederive`).
+    pub derive: Vec<String>,
 }
 
 impl Default for TreeSplitOptions {
@@ -2431,6 +2485,8 @@ impl Default for TreeSplitOptions {
             cut: SpillCut::Hash,
             only_child: None,
             open_files_limit: None,
+            derived: None,
+            derive: Vec::new(),
         }
     }
 }
@@ -2568,6 +2624,111 @@ pub fn split_placement_tree_logs(
             ));
         }
     }
+    // The declaration the children are written under
+    // (docs/derived-columns.md): the one given, or the sources' own.
+    // Its inputs must be columns the sources declare; the sources'
+    // tables come from the segments, or from a log manifest that
+    // recorded them.
+    let source_columns: Option<ColumnTables> = match &sources {
+        Some((_, tables)) => Some(tables.columns.clone()),
+        None => manifest.columns.as_ref().map(|table| ColumnTables {
+            facets: table.facets.clone(),
+            numerics: table.numerics.clone(),
+            map_facets: table.map_facets.clone(),
+            map_numerics: table.map_numerics.clone(),
+            integers: table.integers.clone(),
+            unsigned_integers: table.unsigned_integers.clone(),
+            geo: table.geo.clone(),
+        }),
+    };
+    let declaration: Option<std::sync::Arc<crate::derived::Declaration>> = match &options.derived {
+        Some(declaration) => Some(std::sync::Arc::clone(declaration)),
+        None => manifest_derived(&manifest)?
+            .map(|stored| stored.declaration().map(std::sync::Arc::new))
+            .transpose()?,
+    };
+    if let Some(declaration) = declaration.as_deref() {
+        let Some(columns) = source_columns.as_ref() else {
+            return Err(
+                "a split under a derived-column declaration needs the sources' column tables, \
+                 which sealed segments carry and a log manifest written by a node that records \
+                 them does; this log's manifest has none, so split from the segments"
+                    .to_string(),
+            );
+        };
+        // The sources' own derived names are outputs, not inputs.
+        let without = |names: &[String]| -> Vec<String> {
+            names
+                .iter()
+                .filter(|name| !declaration.is_derived(name))
+                .cloned()
+                .collect()
+        };
+        let sources_tables = crate::values::NumericTypes {
+            numerics: &without(&columns.numerics),
+            integers: &without(&columns.integers),
+            unsigned_integers: &without(&columns.unsigned_integers),
+            map_numerics: &columns.map_numerics,
+            facets: &columns.facets,
+        };
+        declaration
+            .check_tables(&sources_tables)
+            .map_err(|e| format!("derived columns: {e}"))?;
+        for name in &options.derive {
+            if !declaration.is_derived(name) {
+                return Err(format!(
+                    "--derive={name} names no column of the declaration ({:?})",
+                    declaration
+                        .columns()
+                        .iter()
+                        .map(|column| column.name.as_str())
+                        .collect::<Vec<_>>()
+                ));
+            }
+            if options.source == TreeRowSource::Segments
+                && declaration
+                    .column(name)
+                    .is_some_and(|column| column.reads_stable_key)
+            {
+                return Err(format!(
+                    "--derive={name} reads the stable routing key, and sealed segments carry \
+                     none; split from the logs"
+                ));
+            }
+        }
+        if let SpillCut::Column { column, .. } = &options.cut {
+            if options.derive.contains(column) {
+                return Err(format!(
+                    "the cut column {column:?} is being derived in this run; derive it first \
+                     and cut on it in a second split"
+                ));
+            }
+        }
+    } else if !options.derive.is_empty() {
+        return Err(format!(
+            "--derive={:?} needs a declaration (--derived-columns)",
+            options.derive
+        ));
+    }
+    // One row through the declaration: recompute what --derive names
+    // and restamp, or refuse a row derived under another declaration
+    // when there is none to write the children under.
+    let rederive = |id: u64,
+                    document: AddDocumentsRequest,
+                    stable_key: Option<&[u8]>|
+     -> Result<AddDocumentsRequest, String> {
+        match declaration.as_deref() {
+            Some(declaration) => declaration
+                .rederive(document, &options.derive, stable_key)
+                .map_err(|e| format!("live source id {id}: {}", e.message())),
+            None if !document.derived_fingerprint.is_empty() => Err(format!(
+                "live source id {id} was derived under declaration {:?}, and the children \
+                 would be written under none; pass --derived-columns",
+                document.derived_fingerprint
+            )),
+            None => Ok(document),
+        }
+    };
     // Where a live row goes: the child index, the leaf, and whether its
     // code changed.
     let route = |id: u64,
@@ -2644,6 +2805,7 @@ pub fn split_placement_tree_logs(
                                 }
                                 let id = shard.slot_offset + label;
                                 let document = reconstruct_document(bm25, row, tables, false)?;
+                                let document = rederive(id, document, None)?;
                                 let (index, _, _) = route(id, &document, None)?;
                                 match partition_key_of(&document, cut_column)? {
                                     Some(key) => *histograms[index].entry(key).or_insert(0) += 1,
@@ -2669,9 +2831,11 @@ pub fn split_placement_tree_logs(
                             )?;
                             replay.compact();
                             for (id, document) in &replay.documents {
-                                let (index, _, _) =
-                                    route(*id, document, replay.stable_keys.get(id))?;
-                                match partition_key_of(document, cut_column)? {
+                                let key = replay.stable_keys.get(id);
+                                let document =
+                                    rederive(*id, document.clone(), key.map(Vec::as_slice))?;
+                                let (index, _, _) = route(*id, &document, key)?;
+                                match partition_key_of(&document, cut_column)? {
                                     Some(key) => *histograms[index].entry(key).or_insert(0) += 1,
                                     None => unkeyed[index] += 1,
                                 }
@@ -2719,6 +2883,17 @@ pub fn split_placement_tree_logs(
     let mut spill_manifest = manifest.clone();
     spill_manifest.bucket_bits = spill_bucket_bits;
     spill_manifest.bucket_count = 1u32 << spill_bucket_bits;
+    // The spill logs record what their rows are derived under.
+    match declaration.as_deref() {
+        Some(declaration) => {
+            spill_manifest.derived_fingerprint = declaration.fingerprint().to_string();
+            spill_manifest.derived = declaration.config();
+        }
+        None => {
+            spill_manifest.derived_fingerprint.clear();
+            spill_manifest.derived.clear();
+        }
+    }
     let spill_bucket_count = spill_manifest.bucket_count;
     // The spill pass holds a log file and an analysis sidecar open per
     // bucket per child, and the sources' segments beside them; a plan
@@ -2870,12 +3045,13 @@ pub fn split_placement_tree_logs(
                                  --placement-ranges, routes such a row to its default child)"
                             ));
                         };
-                        let (index, code, changed) =
-                            route(id, document, replay.stable_keys.get(&id))?;
+                        let key = replay.stable_keys.get(&id);
+                        let document = rederive(id, document.clone(), key.map(Vec::as_slice))?;
+                        let (index, code, changed) = route(id, &document, key)?;
                         if changed {
                             moved += 1;
                         }
-                        let mut rewritten = document.clone();
+                        let mut rewritten = document;
                         rewritten.integers.retain(|value| value.field != column);
                         rewritten.integers.push(crate::pb::IntegerValue {
                             field: column.clone(),
@@ -2935,6 +3111,7 @@ pub fn split_placement_tree_logs(
                             reconstruct_document(bm25, row, tables, true).map_err(|e| {
                                 format!("{} segment {}: {e}", shard.root.display(), meta.segment_id)
                             })?;
+                        let document = rederive(id, document, None)?;
                         let (index, code, changed) = route(id, &document, None)?;
                         if changed {
                             moved += 1;
@@ -2991,7 +3168,7 @@ pub fn split_placement_tree_logs(
         })
         .collect::<Result<_, _>>()?;
     drop(spills);
-    let (pinned_fingerprints, pinned_columns, pinned_fields): (
+    let (pinned_fingerprints, mut pinned_columns, pinned_fields): (
         Option<Vec<u64>>,
         Option<ColumnTables>,
         Option<Vec<String>>,
@@ -3001,8 +3178,30 @@ pub fn split_placement_tree_logs(
             Some(tables.columns.clone()),
             Some(tables.fields.clone()),
         ),
-        None => (None, None, None),
+        None => (None, source_columns.clone(), None),
     };
+    // The children's tables: the sources' (or the manifest's, in table
+    // order), with the derived names of each kind appended after the
+    // source columns, present or not, the way a node declares them.
+    if let (Some(declaration), Some(columns)) = (declaration.as_deref(), pinned_columns.as_mut()) {
+        for (kind, table) in [
+            (crate::pb::MaterializeKind::F64, &mut columns.numerics),
+            (crate::pb::MaterializeKind::I64, &mut columns.integers),
+            (
+                crate::pb::MaterializeKind::U64,
+                &mut columns.unsigned_integers,
+            ),
+        ] {
+            for name in declaration.names_of(kind) {
+                if !table.contains(&name) {
+                    table.push(name);
+                }
+            }
+        }
+    }
+    let derived = declaration
+        .as_deref()
+        .map(crate::postings::StoredDerived::of);
     let bm25_fields: Option<&[String]> = match &pinned_fields {
         Some(fields) => Some(fields.as_slice()),
         None => bm25_fields,
@@ -3080,6 +3279,7 @@ pub fn split_placement_tree_logs(
                     bm25_fields,
                     pinned_fingerprints.as_deref(),
                     binding.as_ref(),
+                    derived.as_ref(),
                     pinned_columns.as_ref(),
                     analyze,
                 )?;
@@ -3169,6 +3369,7 @@ pub fn split_placement_tree_logs(
                         bm25_fields,
                         pinned_fingerprints.as_deref(),
                         binding.as_ref(),
+                        derived.as_ref(),
                         pinned_columns.as_ref(),
                         analyze,
                     )?;
@@ -3294,6 +3495,10 @@ pub fn split_placement_tree_logs(
     std::fs::remove_dir_all(&spill_root)
         .map_err(|error| format!("remove spill {}: {error}", spill_root.display()))?;
     Ok(TreeReshardOutput {
+        derived: declaration
+            .as_deref()
+            .map(|declaration| declaration.config())
+            .unwrap_or_default(),
         images: ReshardOutput {
             generation,
             children: images,
@@ -3373,6 +3578,7 @@ pub fn tree_shard_map_toml(
             })
             .collect(),
         placement: Some(tree.clone()),
+        derived: out.derived.clone(),
     };
     toml::to_string(&map).map_err(|error| format!("render shard map: {error}"))
 }
@@ -3517,6 +3723,7 @@ pub fn compact_log(
     bm25_fields: Option<&[String]>,
     pinned_fingerprints: Option<&[u64]>,
     columns: Option<&ColumnTables>,
+    derived: Option<&crate::postings::StoredDerived>,
     analyze: &mut Analyzer,
     sink: &mut RowSink,
 ) -> Result<CompactionBuild, String> {
@@ -3563,6 +3770,7 @@ pub fn compact_log(
             bm25_fields,
             pinned_fingerprints,
             binding.as_ref(),
+            derived,
             columns,
             analyze,
         )?);
@@ -3599,6 +3807,7 @@ pub fn compact_log(
                 bm25_fields,
                 pinned_fingerprints,
                 binding.as_ref(),
+                derived,
                 columns,
                 analyze,
             )?);
@@ -4165,6 +4374,12 @@ fn reconstruct_document(
         doc.position_fields = tables.position_fields.clone();
         doc.sentence_fields = tables.sentence_fields.clone();
     }
+    // The store's declaration entry says what the row's derived values
+    // mean (docs/derived-columns.md); a logged form of the row carries it.
+    doc.derived_fingerprint = bm25
+        .derived()
+        .map(|derived| derived.fingerprint.clone())
+        .unwrap_or_default();
     for (fi, name) in tables.columns.facets.iter().enumerate() {
         if let Some(ord) = bm25.facet_ord(fi, row) {
             doc.facets.push(crate::pb::FacetValue {
@@ -4450,6 +4665,7 @@ pub fn compact_log_partitioned(
     bm25_fields: Option<&[String]>,
     pinned_fingerprints: Option<&[u64]>,
     columns: Option<&ColumnTables>,
+    derived: Option<&crate::postings::StoredDerived>,
     analyze: &mut Analyzer,
     sink: &mut RowSink,
 ) -> Result<CompactionBuild, String> {
@@ -4627,6 +4843,7 @@ pub fn compact_log_partitioned(
             bm25_fields,
             pinned_fingerprints,
             binding.as_ref(),
+            derived,
             columns,
             analyze,
         )?);

@@ -1083,6 +1083,33 @@ async fn bind_refusals_name_the_gap() {
         "\"price\" (--numeric-fields)",
     );
 
+    // A plan that lands a source field in a DERIVED column
+    // (docs/derived-columns.md) is refused at bind, by name: the index
+    // computes that column itself.
+    let derived =
+        pipestream_search::derived::Declaration::compile(&pipestream_search::pb::DerivedColumns {
+            columns: vec![pipestream_search::pb::DerivedColumn {
+                name: "year".into(),
+                expression: "meta_page_count + 1900".into(),
+                kind: pipestream_search::pb::MaterializeKind::I64 as i32,
+                disclosure: pipestream_search::pb::DerivedDisclosure::Inputs as i32,
+            }],
+        })
+        .unwrap();
+    let (derived_addr, _derived) = start_empty_node(NodeConfig {
+        analysis_addr: Some(analysis.clone()),
+        facet_fields: vec!["id".into(), "status".into(), "published".into()],
+        integer_fields: vec!["created_at".into(), "meta_page_count".into()],
+        numeric_fields: vec!["price".into()],
+        derived: Some(std::sync::Arc::new(derived)),
+        ..Default::default()
+    })
+    .await;
+    expect_refusal(
+        ingest(&derived_addr, bind(), vec![]).await,
+        "lands as \"year\", a derived column",
+    );
+
     // Protocol: the bind comes first, exactly once.
     let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
     let (tx, rx) = mpsc::channel(4);
