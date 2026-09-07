@@ -55,6 +55,7 @@ pub mod geo;
 #[cfg(feature = "net")]
 pub mod harness;
 pub mod highlight;
+pub mod index_contract;
 pub mod interleave;
 mod lineage;
 pub mod link;

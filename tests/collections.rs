@@ -277,6 +277,7 @@ async fn a_node_serves_one_collection_and_says_so() {
             analysis_sha: String::new(),
             analysis_contract: Vec::new(),
             vector_binding: Vec::new(),
+            index_contract: Vec::new(),
             collection: "b".into(),
         })
         .await

@@ -32,6 +32,7 @@ fn explicit_binding_roundtrips_in_both_writers_and_refuses_corruption() {
                 },
                 analysis_contract: if explicit { contract } else { Vec::new() },
                 vector_binding: Vec::new(),
+                index_contract: Vec::new(),
             };
             let mut heap = Bm25Store::new();
             let mut spill =

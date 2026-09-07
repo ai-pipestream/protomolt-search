@@ -140,6 +140,13 @@ and re-sends its completion, which the plane acknowledges):
    worker retries on a later tick, after the source has reported. A
    stale copy is never completed.
 
+Catch-up advances its cursor only after a persistent `Flush` acknowledgment
+for the replayed mutations. It flushes even when rows or the binding were
+already accepted by an earlier attempt: an in-memory tip is not a durability
+receipt. `Flush.written=false` refuses durable catch-up. Binding replication
+also requires exact acknowledgments of analysis, vector and explicit index
+policy contracts; an older receiver that omits one refuses by name.
+
 After completion the worker keeps a placed replica following its
 primary every reconcile interval (the coordinator's `--replica-sync-ms`
 loop can do the same for mapped replicas; run one of the two for a

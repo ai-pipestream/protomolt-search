@@ -10421,6 +10421,7 @@ impl NodeServiceImpl {
         // rebind.
         let incoming = crate::postings::StoredBinding {
             plan_fingerprint: plan.fingerprint.clone(),
+            index_contract: crate::index_contract::from_plan(plan)?,
             body_path: extractor.body_path().to_string(),
             materialize_sha: materialize_sha(bind.materialize.as_ref()),
             analysis_sha: analysis.digest.clone(),
@@ -10459,6 +10460,9 @@ impl NodeServiceImpl {
                 if bound.vector_binding != incoming.vector_binding {
                     differs.push("the vector field binding".to_string());
                 }
+                if bound.index_contract != incoming.index_contract {
+                    differs.push("the explicit index policy".to_string());
+                }
                 if bound.materialize_sha != incoming.materialize_sha {
                     differs.push("the materialize spec".to_string());
                 }
@@ -10486,6 +10490,7 @@ impl NodeServiceImpl {
                         analysis_sha: incoming.analysis_sha.clone(),
                         analysis_contract: incoming.analysis_contract.clone(),
                         vector_binding: incoming.vector_binding.clone(),
+                        index_contract: incoming.index_contract.clone(),
                     }),
                 );
                 guard.mapped_binding = Some(incoming);
@@ -12130,11 +12135,13 @@ impl NodeService for NodeServiceImpl {
             analysis_sha: req.analysis_sha,
             analysis_contract: req.analysis_contract,
             vector_binding: req.vector_binding,
+            index_contract: req.index_contract,
         };
         let _mutation = self.mutation_gate.read().await;
         let mut guard = write_shard(&self.state);
         let analysis_sha = incoming.analysis_sha.clone();
         let vector_binding = incoming.vector_binding.clone();
+        let index_contract = incoming.index_contract.clone();
         if let Some(vector) =
             crate::mapped_vector::decode(&vector_binding, &incoming.plan_fingerprint)?
         {
@@ -12145,6 +12152,7 @@ impl NodeService for NodeServiceImpl {
             already_bound,
             analysis_sha,
             vector_binding,
+            index_contract,
         }))
     }
 
@@ -14338,6 +14346,11 @@ impl NodeServiceImpl {
         )
         .map_err(Status::invalid_argument)?;
         crate::mapped_vector::decode(&incoming.vector_binding, &incoming.plan_fingerprint)?;
+        crate::index_contract::validate_binding(
+            &incoming.index_contract,
+            &incoming.plan_fingerprint,
+            &incoming.vector_binding,
+        )?;
         match guard.mapped_binding.as_ref() {
             Some(bound) if *bound != incoming => Err(Status::failed_precondition(format!(
                 "replica is bound to plan {} body {:?}, source WAL requires plan {} body {:?}",
@@ -14362,6 +14375,7 @@ impl NodeServiceImpl {
                         analysis_sha: incoming.analysis_sha.clone(),
                         analysis_contract: incoming.analysis_contract.clone(),
                         vector_binding: incoming.vector_binding.clone(),
+                        index_contract: incoming.index_contract.clone(),
                     }),
                 );
                 guard.mapped_binding = Some(incoming);

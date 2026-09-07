@@ -51,9 +51,8 @@ requires building and publishing a compatible index generation.
 
 ## Status
 
-This checkpoint is on `feat/explicit-index-definition-2026-09`, based on main
-`af51a1d`. It is not ready for main until the durable policy work below is
-implemented. No fleet changes are part of this work.
+The planner and durable storage integration implement the contract described
+here. This increment builds on main `af51a1d`; it includes no fleet rollout.
 
 The planner, extractor, coordinator, node bind and embedded/mobile protobuf
 entry points use the same definition. Tests cover occurrence-specific types,
@@ -101,53 +100,70 @@ This example assumes the declared types are `uint64`, `string` and
 its name does not turn it into the catalog's opaque document key. A nested path
 such as `field_numbers: [5, 1]` selects field 1 inside root field 5.
 
-## Required durable integration before merge
+## Durable policy and compatibility
 
-The current durable binding retains the plan fingerprint, body path, analysis
-contract and vector binding. It does **not** retain the explicit policy. Restart
-and compaction preserve materialized columns and reject a changed fingerprint,
-but that is insufficient to recover the policy for a later rebuild. Do not merge
-this checkpoint to main on the strength of those tests alone.
+`MappedIndexContract` format 1 retains the canonical explicit definition, root
+message type and bound plan fingerprint. `StoredBinding.index_contract` carries
+its encoded bytes independently of analysis and vector declarations. Original
+source descriptors remain in the source/catalog contract; an empty bind does
+not accept a source document or invent catalog identity.
 
-The next implementation must retain a canonical, versioned protobuf contract
-containing the explicit definition, root message type and bound plan fingerprint.
-Source descriptors remain in the source/catalog contract; policy retention must
-not rewrite them or assert source acceptance for an empty bind.
+The contract survives image flush and reopen, WAL recovery, segment-catalog
+publication, snapshot transfer, replication, compaction and reshard replay.
+`ApplyWalBinding` echoes the installed bytes; the sender rejects a missing or
+different acknowledgment before advancing its replication cursor. Acceptance
+of a bind alone is not a durable receipt: node `Flush` remains the persistence
+boundary. Catch-up flushes every replayed mutation prefix, including a retry
+whose binding or rows were already accepted in memory. It rejects
+`Flush.written=false` instead of advancing a durable cursor on a volatile node. A WAL-only recovery test explicitly syncs the writer before reopening
+without an image.
 
-Carry that contract as its own `StoredBinding` member, not inside the vector or
-analysis declaration. Propagate it through `LoggedBinding`, segment catalog
-bindings, `ApplyWalBinding`, node recovery, compaction and resharding. Receivers
-must echo the installed contract and senders must reject a missing or different
-acknowledgment. Validate version, canonical encoding, structural definition and
-the containing fingerprint before binding, writing, replaying or opening it.
+Image column-table kind **14** extends the kind-13 payload with a little-endian
+u32 byte length followed by the canonical policy. Heap readers, mapped readers,
+spill writers and integrity scanners all recognize it. Older readers reject the
+unknown kind. Segment catalogs retain their existing binding-required format 2
+gate and the extended canonical `LoggedBinding`;
+an older decoder drops its unknown policy field and fails the existing exact
+re-encoding check, including when the catalog has no segments.
 
-Use a distinct binding table kind (14 is currently unused) so older image
-readers refuse rather than discard policy. The current WAL maximum is format 5;
-explicit policy needs a new format, advanced durably before its first record.
-Existing inferred bindings must continue using their existing encodings and
-remain readable. Update every heap, mapped-reader, spill and integrity-scanner
-path; changing only the primary writer is insufficient.
+The first explicit-policy WAL binding durably upgrades the manifest to **format
+6 before appending**. Inferred named-vector bindings still require only format
+5, explicit analysis requires 4, and older binding encodings remain unchanged.
+Readers whose maximum format is 5 refuse a policy-bearing WAL generation.
 
-Required evidence includes an empty bind followed by restart, canonical-policy
-recovery, a correctly fingerprinted incompatible rebind, actual WAL replay,
-heap/spill/mapped image parity, segmented catalogs, compaction/resharding that
-preserve the contract, and replication to a peer that drops its acknowledgment.
-Malformed/unknown/noncanonical contracts must fail without appending a record or
-changing the existing binding. Re-run the combined suite and mobile checks after
-the storage integration, and refresh main before the eventual merge.
+Loading or applying a nonempty contract checks its version, canonical encoding,
+field-number paths, kinds, roles, scope constraints, containing plan fingerprint,
+and agreement with the vector declaration. Malformed, unknown-version and
+noncanonical contracts refuse. Planning additionally checks the source
+descriptor and type compatibility; structural validation of stored metadata does
+not independently establish that relationship.
 
-## Checkpoint validation
+Tests cover empty recovery, incompatible rebinds with correctly derived
+fingerprints, synced WAL-only recovery, image writer parity, truncated payloads,
+segment catalogs, compaction followed by reshard replay, and real network
+replication to a receiver that omits its acknowledgment. Snapshot receivers with
+no WAL recover the policy in both layouts. Invalid WAL appends leave both clock
+and format unchanged. A lost/missing acknowledgment followed by an already-bound
+retry must leave the binding on disk before returning an advanced cursor; a
+receiver without persistence must refuse that durable acknowledgment.
 
-Against main `af51a1d`, 507 library tests, 710 integration tests across 121
-targets, 12 embedded tests and two IVF evaluation tests passed (1,231 total).
+## Validation
+
+Against main `af51a1d`, 507 library tests, 716 integration tests across 122
+targets, 12 embedded tests and two IVF evaluation tests passed (1,237 total).
 The existing live OpenNLP conformance test remains ignored. All five iOS/Android
 Rust target checks passed, retaining three existing relay dead-code warnings.
-Locked tests/examples compilation, formatting, vendored-proto checks and
-whitespace checks also passed. A descriptor comparison confirms exactly three
-additive fields and two new messages, with all prior wire declarations unchanged.
-The documentation's textproto example encodes successfully with protoc.
+Locked tests/examples compilation, formatting, vendored-proto and whitespace
+checks passed. A descriptor comparison confirms exactly six additive fields and
+three new messages, with all prior wire declarations unchanged.
 
-These are local results for the planning/binding checkpoint, not hosted CI,
-device execution, deployment, or evidence of durable policy retention. Source
-files were unchanged throughout final validation. Build concurrency was two and
-test concurrency four.
+The new regressions first reproduced lost policy in image storage, cursor
+advancement after an accepted-but-unflushed retry, and cursor advancement on a
+volatile receiver. They pass with the durable contract and catch-up checks.
+Lifecycle tests cover actual network replication, no-WAL snapshot receivers,
+WAL-only recovery, compaction and reshard replay, not only message round trips.
+
+These are local results, not hosted CI, device execution or deployment. Build
+concurrency was two and test concurrency four. The supported projection kinds
+remain bounded as described above; these results do not establish completion of
+all protobuf shapes, remote authorization or transactional source publication.

@@ -219,7 +219,7 @@ pub async fn sync_once(cursor: &ReplicaCursor) -> Result<ReplicaCursor, String> 
     let mut high_watermark = cursor.clock;
     let mut completed = false;
     let mut prefix_health = None;
-    let mut changed = false;
+    let mut requires_flush = false;
     while let Some(frame) = stream
         .message()
         .await
@@ -249,6 +249,19 @@ pub async fn sync_once(cursor: &ReplicaCursor) -> Result<ReplicaCursor, String> 
         }
         let record = WalRecord::decode(frame.record.as_slice())
             .map_err(|error| format!("decode WAL record: {error}"))?;
+        // An earlier attempt may have applied this record but failed before
+        // flushing or acknowledging it. In-memory tips and already_bound do
+        // not prove durability, so retries must cross the flush boundary too.
+        requires_flush |= matches!(
+            record.op.as_ref(),
+            Some(
+                wal_record::Op::AddVectors(_)
+                    | wal_record::Op::AddDocuments(_)
+                    | wal_record::Op::DeleteDocument(_)
+                    | wal_record::Op::Replacement(_)
+                    | wal_record::Op::Bind(_)
+            )
+        );
         match record.op {
             Some(wal_record::Op::AddVectors(add)) => {
                 let batch = add
@@ -311,7 +324,6 @@ pub async fn sync_once(cursor: &ReplicaCursor) -> Result<ReplicaCursor, String> 
                         }
                     }
                     target.num_vectors += rows;
-                    changed = true;
                 } else {
                     return Err(format!(
                         "replica vector gap: next id is {tip}, WAL starts at {}",
@@ -369,7 +381,6 @@ pub async fn sync_once(cursor: &ReplicaCursor) -> Result<ReplicaCursor, String> 
                         }
                     }
                     target.document_slots += rows;
-                    changed = true;
                 } else {
                     return Err(format!(
                         "replica document gap: next id is {tip}, WAL starts at {}",
@@ -385,7 +396,6 @@ pub async fn sync_once(cursor: &ReplicaCursor) -> Result<ReplicaCursor, String> 
                     })
                     .await
                     .map_err(|error| format!("replicate delete: {error}"))?;
-                changed = true;
             }
             Some(wal_record::Op::Replacement(replacement)) => {
                 replica
@@ -398,7 +408,6 @@ pub async fn sync_once(cursor: &ReplicaCursor) -> Result<ReplicaCursor, String> 
                     })
                     .await
                     .map_err(|error| format!("replicate replacement: {error}"))?;
-                changed = true;
             }
             Some(wal_record::Op::Snapshot(snapshot)) => {
                 return Err(format!(
@@ -409,6 +418,7 @@ pub async fn sync_once(cursor: &ReplicaCursor) -> Result<ReplicaCursor, String> 
             Some(wal_record::Op::Bind(binding)) => {
                 let analysis_sha = binding.analysis_sha.clone();
                 let vector_binding = binding.vector_binding.clone();
+                let index_contract = binding.index_contract.clone();
                 let response = replica
                     .apply_wal_binding(ApplyWalBindingRequest {
                         collection: String::new(),
@@ -418,6 +428,7 @@ pub async fn sync_once(cursor: &ReplicaCursor) -> Result<ReplicaCursor, String> 
                         analysis_sha: binding.analysis_sha,
                         analysis_contract: binding.analysis_contract,
                         vector_binding: binding.vector_binding,
+                        index_contract: binding.index_contract,
                     })
                     .await
                     .map_err(|error| format!("replicate mapped binding: {error}"))?
@@ -428,7 +439,9 @@ pub async fn sync_once(cursor: &ReplicaCursor) -> Result<ReplicaCursor, String> 
                 if response.vector_binding != vector_binding {
                     return Err("replica did not acknowledge the mapped vector binding; upgrade the receiver".into());
                 }
-                changed |= !response.already_bound;
+                if response.index_contract != index_contract {
+                    return Err("replica did not acknowledge the explicit index contract; upgrade the receiver".into());
+                }
             }
             Some(wal_record::Op::Flush(_)) | None => {}
         }
@@ -447,11 +460,15 @@ pub async fn sync_once(cursor: &ReplicaCursor) -> Result<ReplicaCursor, String> 
     if expected_offset != source.slot_offset {
         return Err("WAL prefix slot offset differs from primary health".to_string());
     }
-    if changed {
-        replica
+    if requires_flush {
+        let flushed = replica
             .flush(FlushRequest {})
             .await
-            .map_err(|error| format!("flush replica: {error}"))?;
+            .map_err(|error| format!("flush replica: {error}"))?
+            .into_inner();
+        if !flushed.written {
+            return Err("replica did not persist the WAL prefix (Flush.written=false)".into());
+        }
     }
     let verified = replica
         .health(HealthRequest {})

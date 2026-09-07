@@ -126,7 +126,7 @@ impl SegmentMetadata {
 }
 
 /// Canonical protobuf binding and its checksum, published with the segment set.
-/// The payload uses the same six-field declaration as WAL and replica binding.
+/// The payload uses the complete LoggedBinding declaration shared with the WAL.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SegmentBinding {
     pub protobuf: Vec<u8>,
@@ -142,6 +142,7 @@ impl SegmentBinding {
             analysis_sha: binding.analysis_sha.clone(),
             analysis_contract: binding.analysis_contract.clone(),
             vector_binding: binding.vector_binding.clone(),
+            index_contract: binding.index_contract.clone(),
         }
         .encode_to_vec();
         let value = Self {
@@ -171,6 +172,12 @@ impl SegmentBinding {
         )?;
         crate::mapped_vector::decode(&value.vector_binding, &value.plan_fingerprint)
             .map_err(|e| e.to_string())?;
+        crate::index_contract::validate_binding(
+            &value.index_contract,
+            &value.plan_fingerprint,
+            &value.vector_binding,
+        )
+        .map_err(|e| e.to_string())?;
         Ok(StoredBinding {
             plan_fingerprint: value.plan_fingerprint,
             body_path: value.body_path,
@@ -178,6 +185,7 @@ impl SegmentBinding {
             analysis_sha: value.analysis_sha,
             analysis_contract: value.analysis_contract,
             vector_binding: value.vector_binding,
+            index_contract: value.index_contract,
         })
     }
 }

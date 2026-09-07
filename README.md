@@ -1225,7 +1225,11 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 - **2026-09-06 — Explicit protobuf index definitions.** Plan and bind an
   occurrence-specific policy using field-number paths, concrete column kinds,
   names, roles and dimensions. Unlisted fields stay source-only; descriptor hints
-  do not add projections. See [index definitions](docs/index-definition.md).
+  do not add projections. Canonical policy survives storage, WAL, snapshots,
+  replication and rebuild; new format gates prevent older readers from silently
+  dropping it. Replica retries flush already-applied mutations before advancing
+  their durable cursor and refuse volatile-only acknowledgment.
+  See [index definitions](docs/index-definition.md).
 - **2026-09-06 — Identity on streamed revisions.** Provisional and final
   revisions carry imported identities under the admitted version and authority
   view, with explicit resolved/withheld states and a versioned, wire-reproducible

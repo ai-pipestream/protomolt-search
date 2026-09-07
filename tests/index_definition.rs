@@ -484,7 +484,62 @@ async fn explicit_policy_crosses_rpc_bind_and_persistent_source_boundaries() {
         Some(8)
     );
     assert_eq!(stored.binding().unwrap().plan_fingerprint, plan.fingerprint);
+    let contract = pipestream_search::index_contract::decode(
+        &stored.binding().unwrap().index_contract,
+        &plan.fingerprint,
+    )
+    .unwrap()
+    .expect("compaction must retain the explicit policy");
+    assert_eq!(contract.index_definition, plan.index_definition);
+    assert_eq!(contract.message_type, "explicit.Record");
+    let generation =
+        pipestream_search::reshard::resolve_gen(&pipestream_search::wal::wal_dir(&path)).unwrap();
+    assert_eq!(
+        pipestream_search::reshard::read_generation_binding(&generation)
+            .unwrap()
+            .as_ref(),
+        stored.binding(),
+    );
     assert!(stored.field_index("private_notes").is_none());
+    let output_dir = root.join("replayed");
+    let handle = tokio::runtime::Handle::current();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut analyze = |docs: &[(
+            &str,
+            Option<&pb::AnalysisSpec>,
+            pipestream_search::analyzer::SessionLayers,
+        )]| {
+            handle
+                .block_on(pipestream_search::analyzer::analyze_batch(
+                    pipestream_search::analyzer::NATIVE_ANALYSIS_BACKEND,
+                    docs,
+                ))
+                .map_err(|error| error.to_string())
+        };
+        pipestream_search::reshard::merge(
+            &[generation],
+            &output_dir,
+            None,
+            false,
+            Some(&["body".into()]),
+            &mut analyze,
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(output.children.len(), 1);
+    let child = pipestream_search::postings::Bm25Store::load(
+        output.children[0].bm25_path.as_ref().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(child.binding(), stored.binding());
+    assert_eq!(
+        child.protobuf_source(0).unwrap(),
+        stored.protobuf_source(0).unwrap()
+    );
+    assert_eq!(child.doc_count(), 1);
+    drop(child);
     planning_server.abort();
     let _ = planning_server.await;
     drop(stored);

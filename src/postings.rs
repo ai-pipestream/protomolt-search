@@ -116,6 +116,8 @@ const COLUMN_KIND_BINDING: u8 = 6;
 const COLUMN_KIND_ANALYSIS_BINDING: u8 = 12;
 // Extends the explicit analysis payload with a canonical vector declaration.
 const COLUMN_KIND_VECTOR_BINDING: u8 = 13;
+/// Explicit index policy, appended to the kind-13 binding payload.
+const COLUMN_KIND_INDEX_BINDING: u8 = 14;
 const COLUMN_KIND_SOURCES: u8 = 9;
 const SOURCES_ENTRY_NAME: &str = "protobuf-sources";
 const SOURCE_ENTRY_BYTES: u64 = 2 + SOURCES_ENTRY_NAME.len() as u64 + 1 + 16;
@@ -457,7 +459,10 @@ fn v6v7_section_starts(map: &[u8], v7: bool) -> io::Result<Vec<(String, u64)>> {
                     starts.push((format!("column:{name}:sources"), u64_at(base)));
                     cursor = base + 16;
                 }
-                COLUMN_KIND_BINDING | COLUMN_KIND_ANALYSIS_BINDING | COLUMN_KIND_VECTOR_BINDING => {
+                COLUMN_KIND_BINDING
+                | COLUMN_KIND_ANALYSIS_BINDING
+                | COLUMN_KIND_VECTOR_BINDING
+                | COLUMN_KIND_INDEX_BINDING => {
                     // Inline payload only: three or four length-prefixed
                     // strings, no sections to name.
                     let mut skip = base;
@@ -471,7 +476,12 @@ fn v6v7_section_starts(map: &[u8], v7: bool) -> io::Result<Vec<(String, u64)>> {
                             u32::from_le_bytes(map[skip..skip + 4].try_into().unwrap()) as usize;
                         skip += 4 + len;
                     }
-                    if kind == COLUMN_KIND_VECTOR_BINDING {
+                    if matches!(kind, COLUMN_KIND_VECTOR_BINDING | COLUMN_KIND_INDEX_BINDING) {
+                        let len =
+                            u32::from_le_bytes(map[skip..skip + 4].try_into().unwrap()) as usize;
+                        skip += 4 + len;
+                    }
+                    if kind == COLUMN_KIND_INDEX_BINDING {
                         let len =
                             u32::from_le_bytes(map[skip..skip + 4].try_into().unwrap()) as usize;
                         skip += 4 + len;
@@ -1683,7 +1693,7 @@ fn intern(dict: &mut Vec<String>, index: &mut HashMap<String, u32>, value: &str,
 
 /// The shard-level mapped-plan binding: the identity of the plan this
 /// store's mapped columns were written under (`docs/descriptor-mappings.md`
-/// section 4a). Persisted as a kind-6, kind-12, or kind-13 entry of the column
+/// section 4a). Persisted as a kind-6, kind-12, kind-13, or kind-14 entry of the column
 /// table; an index only ever pairs with the plan it was written under,
 /// and a contradiction at bind time is an index compatibility event.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1703,6 +1713,8 @@ pub struct StoredBinding {
     pub analysis_contract: Vec<u8>,
     /// Canonical MappedVectorBinding; empty means the legacy field is unnamed.
     pub vector_binding: Vec<u8>,
+    /// Canonical MappedIndexContract; empty for inferred-policy bindings.
+    pub index_contract: Vec<u8>,
 }
 
 /// Header bytes of the binding's column-table entry, 0 when unbound.
@@ -1726,6 +1738,11 @@ fn binding_entry_size(binding: Option<&StoredBinding>) -> u64 {
             } else {
                 4 + b.vector_binding.len() as u64
             }
+            + if b.index_contract.is_empty() {
+                0
+            } else {
+                4 + b.index_contract.len() as u64
+            }
     })
 }
 
@@ -1738,7 +1755,15 @@ fn write_binding_entry<W: Write>(w: &mut W, binding: Option<&StoredBinding>) -> 
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     crate::mapped_vector::decode(&b.vector_binding, &b.plan_fingerprint)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    w.write_all(&[if !b.vector_binding.is_empty() {
+    crate::index_contract::validate_binding(
+        &b.index_contract,
+        &b.plan_fingerprint,
+        &b.vector_binding,
+    )
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    w.write_all(&[if !b.index_contract.is_empty() {
+        COLUMN_KIND_INDEX_BINDING
+    } else if !b.vector_binding.is_empty() {
         COLUMN_KIND_VECTOR_BINDING
     } else if b.analysis_sha.is_empty() {
         COLUMN_KIND_BINDING
@@ -1776,6 +1801,15 @@ fn write_binding_entry<W: Write>(w: &mut W, binding: Option<&StoredBinding>) -> 
             })?,
         )?;
         w.write_all(&b.vector_binding)?;
+    }
+    if !b.index_contract.is_empty() {
+        write_u32(
+            w,
+            u32::try_from(b.index_contract.len()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "index contract exceeds u32")
+            })?,
+        )?;
+        w.write_all(&b.index_contract)?;
     }
     Ok(())
 }
@@ -4455,7 +4489,8 @@ impl Bm25Store {
                     }
                     COLUMN_KIND_BINDING
                     | COLUMN_KIND_ANALYSIS_BINDING
-                    | COLUMN_KIND_VECTOR_BINDING => {
+                    | COLUMN_KIND_VECTOR_BINDING
+                    | COLUMN_KIND_INDEX_BINDING => {
                         let mut vals: Vec<String> = Vec::with_capacity(3);
                         let mut cur = base;
                         for _ in 0..if kind != COLUMN_KIND_BINDING { 4 } else { 3 } {
@@ -4480,7 +4515,10 @@ impl Bm25Store {
                         } else {
                             Vec::new()
                         };
-                        let vector_binding = if kind == COLUMN_KIND_VECTOR_BINDING {
+                        let vector_binding = if matches!(
+                            kind,
+                            COLUMN_KIND_VECTOR_BINDING | COLUMN_KIND_INDEX_BINDING
+                        ) {
                             let len = u32::from_le_bytes(at(cur, 4)?.try_into().unwrap()) as u64;
                             let bytes = at(cur + 4, len)?.to_vec();
                             cur += 4 + len;
@@ -4488,7 +4526,25 @@ impl Bm25Store {
                                 .map_err(|e| invalid(&e.to_string()))?
                                 .is_none()
                             {
-                                return Err(invalid("empty vector binding in kind-13 entry"));
+                                return Err(invalid("empty vector binding in vector/index entry"));
+                            }
+                            bytes
+                        } else {
+                            Vec::new()
+                        };
+                        let index_contract = if kind == COLUMN_KIND_INDEX_BINDING {
+                            let len = u32::from_le_bytes(at(cur, 4)?.try_into().unwrap()) as u64;
+                            let bytes = at(cur + 4, len)?.to_vec();
+                            cur += 4 + len;
+                            if crate::index_contract::validate_binding(
+                                &bytes,
+                                &vals[0],
+                                &vector_binding,
+                            )
+                            .map_err(|e| invalid(&e.to_string()))?
+                            .is_none()
+                            {
+                                return Err(invalid("empty index contract in kind-14 entry"));
                             }
                             bytes
                         } else {
@@ -4502,6 +4558,7 @@ impl Bm25Store {
                             analysis_sha: it.next().unwrap_or_default(),
                             analysis_contract,
                             vector_binding,
+                            index_contract,
                         });
                         let bound = binding_meta.as_ref().unwrap();
                         crate::mapped_analysis::decode_contract(
@@ -7110,7 +7167,10 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
                     source_section = Some((u64_at(base)?, u64_at(base + 8)?));
                     cursor = base + 16;
                 }
-                COLUMN_KIND_BINDING | COLUMN_KIND_ANALYSIS_BINDING | COLUMN_KIND_VECTOR_BINDING => {
+                COLUMN_KIND_BINDING
+                | COLUMN_KIND_ANALYSIS_BINDING
+                | COLUMN_KIND_VECTOR_BINDING
+                | COLUMN_KIND_INDEX_BINDING => {
                     // The reserved binding record: pinned name, inline
                     // payload, no sections. Duplicates fall to the
                     // table's name-uniqueness rule above.
@@ -7146,13 +7206,31 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
                         .map_err(invalid)?;
                         cur += 4 + len;
                     }
-                    if kind == COLUMN_KIND_VECTOR_BINDING {
+                    let mut vector_bytes = &[][..];
+                    if matches!(kind, COLUMN_KIND_VECTOR_BINDING | COLUMN_KIND_INDEX_BINDING) {
                         let len = u32::from_le_bytes(bytes_at(cur, 4)?.try_into().unwrap()) as u64;
-                        if crate::mapped_vector::decode(bytes_at(cur + 4, len)?, values[0])
+                        vector_bytes = bytes_at(cur + 4, len)?;
+                        if crate::mapped_vector::decode(vector_bytes, values[0])
                             .map_err(|e| invalid(e.to_string()))?
                             .is_none()
                         {
-                            return Err(invalid("empty vector binding in kind-13 entry".into()));
+                            return Err(invalid(
+                                "empty vector binding in vector/index entry".into(),
+                            ));
+                        }
+                        cur += 4 + len;
+                    }
+                    if kind == COLUMN_KIND_INDEX_BINDING {
+                        let len = u32::from_le_bytes(bytes_at(cur, 4)?.try_into().unwrap()) as u64;
+                        if crate::index_contract::validate_binding(
+                            bytes_at(cur + 4, len)?,
+                            values[0],
+                            vector_bytes,
+                        )
+                        .map_err(|e| invalid(e.to_string()))?
+                        .is_none()
+                        {
+                            return Err(invalid("empty index contract in kind-14 entry".into()));
                         }
                         cur += 4 + len;
                     }
@@ -8858,7 +8936,8 @@ impl Bm25Reader {
                     }
                     COLUMN_KIND_BINDING
                     | COLUMN_KIND_ANALYSIS_BINDING
-                    | COLUMN_KIND_VECTOR_BINDING => {
+                    | COLUMN_KIND_VECTOR_BINDING
+                    | COLUMN_KIND_INDEX_BINDING => {
                         let mut vals: Vec<String> = Vec::with_capacity(3);
                         let mut cur = base;
                         for _ in 0..if kind != COLUMN_KIND_BINDING { 4 } else { 3 } {
@@ -8878,7 +8957,19 @@ impl Bm25Reader {
                         } else {
                             Vec::new()
                         };
-                        let vector_binding = if kind == COLUMN_KIND_VECTOR_BINDING {
+                        let vector_binding = if matches!(
+                            kind,
+                            COLUMN_KIND_VECTOR_BINDING | COLUMN_KIND_INDEX_BINDING
+                        ) {
+                            let len =
+                                u32::from_le_bytes(map[cur..cur + 4].try_into().unwrap()) as usize;
+                            let bytes = map[cur + 4..cur + 4 + len].to_vec();
+                            cur += 4 + len;
+                            bytes
+                        } else {
+                            Vec::new()
+                        };
+                        let index_contract = if kind == COLUMN_KIND_INDEX_BINDING {
                             let len =
                                 u32::from_le_bytes(map[cur..cur + 4].try_into().unwrap()) as usize;
                             let bytes = map[cur + 4..cur + 4 + len].to_vec();
@@ -8895,6 +8986,7 @@ impl Bm25Reader {
                             analysis_sha: it.next().unwrap_or_default(),
                             analysis_contract,
                             vector_binding,
+                            index_contract,
                         });
                         cursor = cur;
                     }

@@ -126,10 +126,9 @@ pub(super) fn derive(
             "index definition requires exactly one explicit VECTOR",
         ));
     }
-    Ok((
-        fields,
-        pb::IndexDefinition {
-            projections: projections.into_values().cloned().collect(),
-        },
-    ))
+    let canonical = pb::IndexDefinition {
+        projections: projections.into_values().cloned().collect(),
+    };
+    crate::index_contract::validate_definition(&canonical)?;
+    Ok((fields, canonical))
 }

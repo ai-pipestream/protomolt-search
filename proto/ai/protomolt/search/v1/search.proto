@@ -1210,6 +1210,8 @@ message ApplyWalBindingRequest {
   bytes analysis_contract = 6;
   // Canonical MappedVectorBinding; empty only for legacy bindings.
   bytes vector_binding = 7;
+  // Canonical MappedIndexContract, empty for inferred-policy bindings.
+  bytes index_contract = 8;
 }
 
 message ApplyWalBindingResponse {
@@ -1219,6 +1221,8 @@ message ApplyWalBindingResponse {
   string analysis_sha = 2;
   // Exact installed vector binding. A sender requires this acknowledgement.
   bytes vector_binding = 3;
+  // Exact installed policy. Explicit-policy senders require this acknowledgment.
+  bytes index_contract = 4;
 }
 
 message CompactShardRequest {
@@ -6020,6 +6024,15 @@ message PlanIndexRequest {
 // body. Repeated-message traversal requires an explicit CHUNKS projection.
 message IndexDefinition {
   repeated IndexProjection projections = 1;
+}
+
+// Durable policy metadata. Source descriptors and payloads remain in the
+// source/catalog contract; this record neither accepts nor publishes a source.
+message MappedIndexContract {
+  uint32 format_version = 1;
+  string message_type = 2;
+  string plan_fingerprint = 3;
+  IndexDefinition index_definition = 4;
 }
 
 message IndexProjection {

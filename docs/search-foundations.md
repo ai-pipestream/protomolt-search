@@ -4,9 +4,11 @@ Foundation work began on `feat/search-foundations` from `PRE_ASTRA`.
 The latest increment adds explicit protobuf index definitions, following
 streamed result identity on main `af51a1d` and the incorporated selected-child
 transplant and benchmark notes.
-It is a feature-branch checkpoint: durable policy retention through image/WAL,
-replication and rebuild is required before merging it. The concrete next work
-and verification gates are in [index definitions](index-definition.md#required-durable-integration-before-merge).
+The increment retains canonical policy through image/WAL, snapshots,
+replication and rebuild. Replica retries cross the persistence boundary before
+advancing their cursor. [The contract](index-definition.md#durable-policy-and-compatibility)
+describes the storage gates and recovery evidence; combined validation passed
+1,237 tests and all five mobile target checks.
 The original main reconciliation checkpoint was `1565d07` on
 `feat/protobuf-unsigned-numerics-2026-09`, accepted for main on 2026-09-06.
 This tracks the full requested foundation. Individual passing increments do not
@@ -17,7 +19,7 @@ establish completion of the three workstreams.
 | Requirement | Required evidence | Current state |
 |---|---|---|
 | Faithful protobuf decoding and compatible index binding | Generated-runtime differential fixtures for presence, oneofs, merges, scalar encodings, unknown values and schema evolution | Oneof, presence, merged messages, int32, enum openness, required fields and groups corrected; v3 includes reachable extensions; coverage expanding |
-| Every protobuf shape has an explicit preservation, indexing and query disposition | Typed index definition and exhaustive descriptor/field support report; no silent omission | Explicit policy planning/binding is implemented on a feature branch; durable policy retention is next. Plans and DescribeSchema report the full graph. Value implementations for source-only shapes remain |
+| Every protobuf shape has an explicit preservation, indexing and query disposition | Typed index definition and exhaustive descriptor/field support report; no silent omission | Explicit policy planning/binding and durable retention are implemented and validated. Plans and DescribeSchema report the full graph. Value implementations for source-only shapes remain |
 | Original payload and descriptor identity survive storage and replay | Byte equality after restart, snapshots, replication, compaction and resharding, including unknown fields | Row-bearing sources survive image/WAL lifecycle byte-for-byte; the catalog retains zero-row sources across restart; catalog backup and publication remain |
 | Complete scalar, repeated, map, nested and well-known-type semantics | Projection and query conformance across supported syntax/edition and shape combinations | Incomplete; existing column-family restrictions remain |
 | Workspace and collection grants separate read, ingest and administration | Denial tests on every public and node entry point, default collection resolution and direct access | Public search and coordinator diagnostics enforce revisioned protobuf capabilities; direct node/cluster-control policy enforcement remains |

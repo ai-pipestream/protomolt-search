@@ -1325,6 +1325,7 @@ fn case_set_without_tags() -> Vec<u8> {
 
 fn expected_binding() -> pipestream_search::postings::StoredBinding {
     pipestream_search::postings::StoredBinding {
+        index_contract: Vec::new(),
         plan_fingerprint: derive_plan(&case_set(), "law.v1.Case").unwrap().fingerprint,
         body_path: "title".into(),
         materialize_sha: String::new(),

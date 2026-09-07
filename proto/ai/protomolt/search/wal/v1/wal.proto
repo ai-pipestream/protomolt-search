@@ -136,4 +136,6 @@ message LoggedBinding {
   bytes analysis_contract = 5;
   // Canonical ai.protomolt.search.v1.MappedVectorBinding; empty for legacy binds.
   bytes vector_binding = 6;
+  // Canonical ai.protomolt.search.v1.MappedIndexContract; requires WAL format 6.
+  bytes index_contract = 7;
 }
