@@ -474,3 +474,41 @@ root cost what they cost before (0.24 to 0.88 s, a 23 MB root).
   split's children): the transplant fed into the shadow build,
   designed in `docs/replay-from-segments.md`.
 - Control-plane leases for the scan rate.
+
+## The backfill proof (2026-09-07)
+
+`docs/derived-columns.md` on the court data: one generation-10 archive
+shard (shard 5, 22 sealed segments, 11,068,537 live documents) was
+re-placed under the generation-11 tree from its segments with the
+declaration `year_d = calendar.year(decided)` computed on each document
+(`reshard.cea2c63 --from-segments --only-child=6 --derived-columns
+--derive=year_d`), building only the archive child (decided before
+1940).
+
+| Measure | Value |
+|---|---|
+| documents transplanted and derived | 11,068,537 |
+| child built (the archive child) | 1,954,825 documents, 64 segments |
+| elapsed | 12 min 24 s |
+| peak resident set | 41.5 GB |
+| documents with `decided` | 1,954,816 |
+| documents with `decided` and no `year_d` | 0 |
+| documents with `year_d` and no `decided` | 0 |
+| years checked (exact filtered counts, one per year) | 234 |
+| documents with `year_d` unequal to the stored `year` | 0 |
+
+The check ran through a one-shard root over the served child (node
+`--derived-columns`, root over a map with the `[[derived]]` table):
+per year, the count of `year == y && year_d == y` equals the count of
+`year == y`. The few documents without `decided` have no `year_d`, the
+documented absence. Projections read the column like any other
+(`year`, `year_d`, `decided` under a 1930 filter agree on each hit),
+and `hash.fnv64(court)` at query time is turned away by name. The
+child's log manifest records the fingerprint, the `[[derived]]` table
+and the complete column table; the shard map the tool wrote has the
+table too.
+
+The peak resident set is the routing pass's largest transpose (2.2 GB)
+plus the spill replay of the child; the box had just lost the serving
+nodes to a kernel out-of-memory event (03:42, the machine's other
+tenant), so the run had the memory to itself.

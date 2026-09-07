@@ -56,7 +56,7 @@ The descriptor comparison preserves every field from feature checkpoint
 `84c527d`, and every main `cea2c63` field except the two explicitly reconciled
 numbers above. Old disk-format tests cover both readers, integrity envelopes,
 rewrite, mixed-version WAL append/reopen and failure before mutation. Three
-older assertions were updated to account for the new receiver/WAL versions
+tests had version assertions updated to account for the new receiver/WAL versions
 and rerun; no production source changed during those assertion reruns.
 These are local checks, not a claim of fleet deployment or hosted CI.
 
