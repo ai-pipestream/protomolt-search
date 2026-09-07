@@ -1296,10 +1296,26 @@ async fn threaded_buckets_write_the_same_catalog_byte_for_byte() {
         rows_per_cut: 30,
     };
     for (tag, cut) in [("hash", reshard::SpillCut::Hash), ("year", year())] {
-        let one = build(&format!("{tag}-one"), segments, segmented(), 1, None, None, cut.clone())
-            .unwrap();
-        let many = build(&format!("{tag}-many"), segments, segmented(), 3, None, None, cut.clone())
-            .unwrap();
+        let one = build(
+            &format!("{tag}-one"),
+            segments,
+            segmented(),
+            1,
+            None,
+            None,
+            cut.clone(),
+        )
+        .unwrap();
+        let many = build(
+            &format!("{tag}-many"),
+            segments,
+            segmented(),
+            3,
+            None,
+            None,
+            cut.clone(),
+        )
+        .unwrap();
         // The bounded build: a backlog of one finished bucket and a
         // budget above three times the largest bucket's estimate.
         let bounded = build(
@@ -1437,5 +1453,20 @@ async fn the_build_memory_budget_refuses_by_name() {
     // A queue of zero passes nothing.
     let err = build("queue", segmented(), 3, Some(0), None).unwrap_err();
     assert!(err.contains("--build-queue=0"), "{err}");
+    #[cfg(target_pointer_width = "64")]
+    {
+        let err = build(
+            "memory-arithmetic-overflow",
+            segmented(),
+            usize::MAX,
+            Some(1),
+            Some(u64::MAX),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("--build-memory") && err.contains("arithmetic overflow"),
+            "{err}"
+        );
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

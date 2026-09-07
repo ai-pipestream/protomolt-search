@@ -2563,13 +2563,14 @@ pub struct TreeSplitOptions {
     /// images' id maps (plus one per thread when all finish at once).
     /// `None` takes the thread count; zero is refused.
     pub build_queue: Option<usize>,
-    /// The build pass's anonymous-memory budget in bytes
+    /// A fixed 70 KiB/row planning admission estimate in bytes
     /// (`--build-memory`, segmented layout only): after the routing
     /// pass, each child's spill counts at [`BUILD_BYTES_PER_ROW`] a row
     /// must fit it — the largest bucket alone, and the thread count
     /// times it. A plan that cannot fit is refused by name; neither
     /// the thread count nor the queue depth is lowered to make it fit.
-    /// `None` enforces nothing.
+    /// This is not an actual process-memory limit: wide values, queued id maps,
+    /// and page cache are outside the estimate. `None` enforces no admission check.
     pub build_memory: Option<u64>,
 }
 
@@ -3385,7 +3386,9 @@ pub fn split_placement_tree_logs(
             else {
                 continue;
             };
-            let estimate = rows.saturating_mul(BUILD_BYTES_PER_ROW);
+            let estimate = rows.checked_mul(BUILD_BYTES_PER_ROW).ok_or_else(|| {
+                "--build-memory arithmetic overflow estimating a bucket".to_string()
+            })?;
             if estimate > budget {
                 return Err(format!(
                     "child {index} ({}) bucket {bucket}: {rows} documents at {} KiB a row (the \
@@ -3398,7 +3401,9 @@ pub fn split_placement_tree_logs(
                     budget / (1 << 20)
                 ));
             }
-            let need = estimate.saturating_mul(threads);
+            let need = estimate.checked_mul(threads).ok_or_else(|| {
+                "--build-memory arithmetic overflow multiplying the bucket estimate by build threads".to_string()
+            })?;
             if need > budget {
                 return Err(format!(
                     "child {index} ({}) bucket {bucket}: {rows} documents at {} KiB a row is \

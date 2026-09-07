@@ -200,7 +200,8 @@ order. A finished bucket waits as its id maps (16 bytes a row), so the
 backlog is cheap beside an in-flight replay, but unbounded it could
 hold a whole child.
 
-`--build-memory=<MiB>` makes the budget rule a refusal instead of an
+`--build-memory=<MiB>` is a fixed 70 KiB/row planning admission estimate, not
+an actual process-memory limit. It makes the budget rule a refusal instead of an
 operator's arithmetic. After the routing pass, each child's spill
 counts are on hand, and the build refuses by name — the budget, the
 estimate, and the cause — when the largest bucket of a child to be
@@ -209,8 +210,8 @@ over the budget, or when the thread count times it is. One thread
 still replays one bucket, so the single-bucket rule applies at
 `--build-threads=1` too. Nothing is lowered to fit: the operator
 raises the budget, lowers the thread count, or cuts finer. The budget
-covers the bucket replays (the anonymous memory), not the mapped
-sources and page cache the cgroup row of the table above shows; a
+does not account for wide protobuf/text/vector values, queued id maps, mapped
+sources, or page cache; a
 single image has no buckets and refuses the flag by name. Without the
 flag nothing is enforced.
 
