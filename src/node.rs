@@ -15,7 +15,9 @@
 //! duration of their chunked scan, so a search never observes a
 //! half-applied batch.
 
+mod projection;
 mod publication;
+pub use projection::StagedDocumentCandidate;
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -8944,9 +8946,9 @@ struct IngestDoc {
 /// Where the ingest pipeline's documents come from: the ordinary
 /// AddDocuments stream verbatim, or the mapped stream decoding each
 /// serialized protobuf document against the bound plan. One pipeline,
-/// two front doors — the mapped path reuses the analysis session, the
-/// apply wavefront, the column validation, and the WAL records
-/// unchanged.
+/// with private accepted-source staging as another input. Each reuses the
+/// analysis session, apply wavefront and column validation. Only live ingest
+/// writes the target's WAL.
 enum IngestSource<'a> {
     Plain {
         stream: &'a mut Streaming<AddDocumentsRequest>,
@@ -8955,6 +8957,8 @@ enum IngestSource<'a> {
     },
     /// Boxed: the extractor's trie dwarfs the plain variant.
     Mapped(Box<MappedSource<'a>>),
+    // Only the accepted-source staging path constructs this private iterator.
+    Prepared(Box<projection::PreparedSource>),
 }
 
 struct MappedSource<'a> {
@@ -9000,6 +9004,7 @@ impl IngestSource<'_> {
                 }))
             }
             IngestSource::Mapped(source) => source.next().await,
+            IngestSource::Prepared(source) => source.next(),
         }
     }
 }
@@ -11078,7 +11083,14 @@ impl NodeServiceImpl {
             bind.index_definition.as_ref(),
         )?;
         let analysis = crate::mapped_analysis::MappedAnalysis::resolve(bind, &extractor)?;
-        if self.config.analysis_addr.as_deref() == Some(crate::analyzer::NATIVE_ANALYSIS_BACKEND) {
+        if self
+            .config
+            .analysis_addr
+            .as_deref()
+            .map(crate::analyzer::AnalysisBackend::parse)
+            .transpose()?
+            == Some(crate::analyzer::AnalysisBackend::Native)
+        {
             analysis.validate_native()?;
         }
         let plan = extractor.plan();
@@ -13943,7 +13955,9 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
             crate::metrics::add_ingested(added, added);
             let parents = match &source {
                 IngestSource::Mapped(mapped) => mapped.parents,
-                IngestSource::Plain { .. } => unreachable!("this handler built a mapped source"),
+                IngestSource::Plain { .. } | IngestSource::Prepared(_) => {
+                    unreachable!("this handler built a mapped source")
+                }
             };
             Ok(Response::new(IngestMappedResponse {
                 added,

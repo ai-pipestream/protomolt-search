@@ -219,6 +219,57 @@ version, then atomically replace its visible chunk set under the index's binding
 and authorization rules. It must not trust a caller-constructed batch as evidence
 that the source authority accepted that version.
 
+## Private analyzed candidates
+
+`StageDocumentProjectionRequest` adds the next preparation step. The trusted
+Rust owner calls `EmbeddedSearch::stage_document_projection(shard, request)` or
+`NodeServiceImpl::stage_document_projection(catalog, request)`. It names an exact
+accepted projection, a complete explicit `field_analysis` contract, optional
+materialization and a positive final-file byte budget. Source bytes, document
+keys, versions and chunk identities come from the catalog; callers cannot submit
+replacement rows. The catalog's immutable collection must match the target node.
+
+The candidate uses a private node with the target's column and derived-column
+declarations, phrase configuration, provider calibration and configured analyzer.
+Its input joins the same analysis stream, field analysis, validation and
+materialization pipeline as ordinary ingest. The existing target's mapping,
+analysis and materialization binding must match. Empty sources also require a
+configured analyzer; native aliases validate every explicit field specification
+before staging. A populated unbound target is refused. Source values, full-width unsigned values and presence, exact source
+bytes and catalog-owned row identities reach the ordinary segment artifacts.
+`hash.fnv64(stable_key())` receives the exact catalog key. Private work does not
+update the target's vocabulary observations, live rows, WAL or read version.
+
+The returned `StagedDocumentCandidate` owns its private files and exposes a
+protobuf `DocumentProjectionStage` description and read-only segment access to
+the trusted owner. It also retains the exact original source, including for zero
+rows. An empty source has an empty segment set with its reviewed binding; a
+deletion has neither a source nor a segment set. The target statistics
+incarnation/epoch in the description identifies the state used for preparation;
+it must be rechecked before publication. The description is not a credential or
+a commit certificate. Neither it nor staging changes the original acceptance
+receipt, and no searchable receipt is issued.
+
+The target needs a persistent index path with an existing parent. Preparation
+creates a unique private sibling directory (mode 0700 on Unix); it does not
+rewrite the target's catalog. Source preparation keeps its existing row and byte
+limits. `max_staged_bytes` accepts 1 byte to 1 GiB and limits the final private
+files before a candidate is returned. It is not a disk quota or a bound on all
+analysis/decoder allocations. Automatic tail seals are disabled for the single
+bounded source; the closing flush seals its complete candidate. Blocking file
+work retains directory ownership through completion. Normal drop and failed
+preparation remove private files; abrupt process exit can leave orphan stage
+directories, which are never committed publication evidence.
+
+There is no new network RPC or mobile ABI command. The embedded Rust entry uses
+its existing native analyzer and opens no socket. Server-side staging uses only
+the node's configured analysis backend. Source-certified publication, recovery
+of publication decisions, visibility across shards and later searchable receipts
+remain the next lifecycle work. A successful private build cannot advance a
+source-history publication cursor by itself. `tests/document_staging.rs` covers
+the accepted-source-to-segment path, late row failures, output budgets, collection
+and analysis refusals, empty sources and deletions, and the embedded entry.
+
 ## Remaining lifecycle work
 
 Imported row identities now accompany `Bm25Hit` from flat and fused lexical

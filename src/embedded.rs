@@ -175,7 +175,7 @@ pub struct EmbeddedSearch {
     /// The shards, reached in-process through [`NodeLink::Local`]: the
     /// same handlers the network serves, with no HTTP/2 between.
     nodes: Vec<Arc<NodeServiceImpl>>,
-    document_catalog: Option<DocumentCatalog>,
+    document_catalog: Option<Arc<DocumentCatalog>>,
 }
 
 impl EmbeddedSearch {
@@ -223,7 +223,8 @@ impl EmbeddedSearch {
                 Some(path) => DocumentCatalog::open(path, &catalog.collection),
                 None => DocumentCatalog::in_memory(&catalog.collection),
             })
-            .transpose()?;
+            .transpose()?
+            .map(Arc::new);
 
         let mut nodes = Vec::with_capacity(config.shards.len());
         for (shard, shard_config) in config.shards.iter().enumerate() {
@@ -294,8 +295,26 @@ impl EmbeddedSearch {
         self.document_catalog()?.prepare_projection(request)
     }
 
+    /// Build private analyzed segments from this collection's accepted history.
+    /// Staging does not mutate the serving shard or publish a write receipt.
+    pub async fn stage_document_projection(
+        &self,
+        shard: usize,
+        request: StageDocumentProjectionRequest,
+    ) -> Result<crate::node::StagedDocumentCandidate, Status> {
+        let node = self
+            .nodes
+            .get(shard)
+            .ok_or_else(|| Status::invalid_argument("unknown embedded shard"))?;
+        let catalog = self.document_catalog.as_ref().ok_or_else(|| {
+            Status::failed_precondition("configure a document catalog before staging")
+        })?;
+        node.stage_document_projection(Arc::clone(catalog), request)
+            .await
+    }
+
     fn document_catalog(&self) -> Result<&DocumentCatalog, Status> {
-        self.document_catalog.as_ref().ok_or_else(|| {
+        self.document_catalog.as_deref().ok_or_else(|| {
             Status::failed_precondition(
                 "configure a collection-wide document catalog before accepting documents",
             )

@@ -1237,6 +1237,12 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: accepted-source candidate staging.** A protobuf request
+  builds private analyzed segments from an exact catalog version using the
+  target's ingest pipeline, derived columns and provider calibration. Complete
+  candidates retain source bytes and document/chunk identity; failures leave
+  the target unchanged. This introduces no searchable receipt or network RPC.
+  See [private candidates](docs/document-writes.md#private-analyzed-candidates).
 - **Foundation branch: coherent segment activation.** A trusted local node
   transaction prepares both search indexes, exact vectors and tombstones before
   publishing its manifest, then activates them under one read-version fence.

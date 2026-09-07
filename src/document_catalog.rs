@@ -76,6 +76,20 @@ pub struct DocumentCatalog {
 }
 
 impl DocumentCatalog {
+    /// Immutable collection binding of this local source authority.
+    pub fn collection(&self) -> Result<String, Status> {
+        let transaction = self.database.begin_read().map_err(storage)?;
+        let meta = transaction.open_table(META).map_err(storage)?;
+        let header: DocumentCatalogHeader = decode(
+            meta.get("header")
+                .map_err(storage)?
+                .ok_or_else(|| Status::data_loss("catalog header missing"))?
+                .value(),
+        )?;
+        validate_current_header(&header)?;
+        Ok(header.collection)
+    }
+
     /// Reopen an existing authority. A missing file must never initialize new
     /// version or retry history; callers explicitly create a new catalog.
     pub fn open(path: &Path, collection: &str) -> Result<Self, Status> {
