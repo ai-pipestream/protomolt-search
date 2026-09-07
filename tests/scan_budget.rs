@@ -191,8 +191,15 @@ fn capacity_of<'a>(plan: &'a ClusterPlan, node_id: &str) -> &'a NodeCapacity {
         .expect("capacity")
 }
 
+/// The scan window is one per process, and both tests below read it
+/// after scanning: run at once, one's searches move the rate between
+/// the other's read and its renewal (a 0.3 % difference seen
+/// 2026-09-07), so the readers take turns.
+static SCAN_RATE_READERS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_observed_rate_reaches_the_authority_on_renewal() {
+    let _turn = SCAN_RATE_READERS.lock().await;
     let dir = tempdir("renewal");
     let (node, addr, corpus) = seeded_node(&dir).await;
     let (coordinator, control_addr) = cluster_over(&addr, &dir).await;
@@ -248,6 +255,7 @@ async fn the_observed_rate_reaches_the_authority_on_renewal() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_balance_dry_run_plans_in_row_bytes_and_excludes_the_device() {
+    let _turn = SCAN_RATE_READERS.lock().await;
     let dir = tempdir("balance");
     let (node, addr, corpus) = seeded_node(&dir).await;
     let (coordinator, control_addr) = cluster_over(&addr, &dir).await;
