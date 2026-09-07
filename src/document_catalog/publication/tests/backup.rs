@@ -43,6 +43,7 @@ async fn compact(f: &Fixture) {
     .unwrap();
 }
 fn check_files(path: &std::path::Path, manifest: &SourceBackupManifest) {
+    assert!(!path.join(".source-audit.redb").exists());
     assert_eq!(
         SourceBackupManifest::decode(
             std::fs::read(path.join("source-backup.pb"))
@@ -430,5 +431,33 @@ async fn backup_rejects_destinations_inside_a_live_catalog() {
         captured.write_to(&output).unwrap_err().code(),
         Code::FailedPrecondition
     );
+    assert!(!output.exists());
+}
+
+#[tokio::test]
+async fn backup_rejects_a_hole_in_older_accepted_history() {
+    let f = Fixture::new();
+    let _ = f.stage(KEY, 1, Some(0)).await;
+    let _ = f.stage(KEY, 2, Some(0)).await;
+    let key = DocumentVersionKey {
+        document_key: KEY.to_vec(),
+        version: 1,
+    }
+    .encode_to_vec();
+    let tx = f.source.database.begin_write().unwrap();
+    tx.open_table(VERSIONS)
+        .unwrap()
+        .remove(key.as_slice())
+        .unwrap();
+    tx.commit().unwrap();
+    // The latest head still exists and there are no index tips to expose the hole.
+    assert!(f.source.get(KEY, None).unwrap().is_some());
+    let output = f.root.join("incomplete-history");
+    let result = f
+        .source
+        .capture_backup(&[], &limits())
+        .unwrap()
+        .write_to(&output);
+    assert_eq!(result.unwrap_err().code(), Code::DataLoss);
     assert!(!output.exists());
 }

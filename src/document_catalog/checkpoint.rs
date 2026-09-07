@@ -6,6 +6,8 @@ use crate::pb::storage::{DocumentCatalogCheckpoint, DocumentCatalogCheckpointLim
 use redb::{ReadTransaction, TableHandle};
 use std::io::{Read, Seek, SeekFrom};
 
+mod audit;
+
 pub(super) type BinaryTable = TableDefinition<'static, &'static [u8], &'static [u8]>;
 
 /// A point-in-time source view. Acceptance and publication can continue while

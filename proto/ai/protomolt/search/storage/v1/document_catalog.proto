@@ -169,8 +169,11 @@ message SourceBackupLimits {
   uint32 max_files = 2;
   // Positive completed bundle byte bound, including the completion manifest.
   // Checked as files are completed; not a filesystem quota.
+  // Separately caps the temporary source-audit database, checked after each
+  // batch of at most 1024 receipts. Scratch is removed before the source copy.
   uint64 max_bytes = 3;
   // 1..64 MiB of source records per output database transaction.
+  // Also bounds each decoded record during the pinned source-history audit.
   uint64 source_batch_bytes = 4;
 }
 

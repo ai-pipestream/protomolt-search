@@ -78,6 +78,26 @@ is written and synced. That additive storage protobuf binds source metadata,
 index keys and epochs, relative artifact paths, sizes and checksums. Its own
 SHA-256 covers the canonical message with its digest field cleared.
 
+Before copying source records, bundle creation audits the pinned accepted
+history. Versions and ordered changes must form a complete sequence with valid
+per-document predecessors and latest heads. Every source and descriptor blob
+must match its content address, including blobs used only by older versions.
+Each accepted write needs exactly one immutable retry receipt with the correct
+history, version, sequence and acceptance flags. Legacy receipts may omit the
+history ID only through the persisted migration boundary; their bytes are
+preserved. Original descriptor and payload bytes are hashed without parsing or
+rewriting the application message.
+
+Receipt uniqueness uses a temporary redb index with an 8 MiB cache and at most
+1024 entries per transaction. Individual decoded records must fit
+`source_batch_bytes`; `max_bytes` also caps the scratch file independently,
+checked after every transaction. The audit deletes scratch before source copy
+starts. It performs read-only checks against the captured source transaction,
+so later acceptance cannot alter the audited history. This adds a full source
+history scan to backup creation. It supplies the source-table check for future
+restore work; historical publication/maintenance chain validation and restore
+activation are still separate work.
+
 A failed write removes only its own output directory. A process crash can leave
 a partial directory. Presence of the completion file alone is insufficient:
 restore must verify its digest and its entire inventory. These local owner

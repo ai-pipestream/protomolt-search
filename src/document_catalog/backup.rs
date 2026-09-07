@@ -350,6 +350,11 @@ impl CapturedBackup<'_> {
             path: destination.to_path_buf(),
             keep: false,
         };
+        self.source.verify_source_history(
+            &destination.join(".source-audit.redb"),
+            self.limits.source_batch_bytes as usize,
+            self.limits.max_bytes,
+        )?;
         let remaining = self
             .limits
             .max_bytes
