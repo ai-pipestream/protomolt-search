@@ -49,7 +49,11 @@ pub(super) fn check_source_live_view(
     Ok(())
 }
 
-fn activation(intent: &ProjectionIntent, claim: StatsClaim) -> DocumentProjectionActivation {
+fn activation(
+    intent: &ProjectionIntent,
+    claim: StatsClaim,
+    catalog_epoch: u64,
+) -> DocumentProjectionActivation {
     let source = intent
         .source
         .as_ref()
@@ -63,7 +67,7 @@ fn activation(intent: &ProjectionIntent, claim: StatsClaim) -> DocumentProjectio
         deleted: source.deleted,
         rows: intent.rows,
         intent_id: intent.intent_id.clone(),
-        catalog_epoch: intent.after_epoch,
+        catalog_epoch,
         stats_epoch: claim.epoch,
         stats_incarnation: claim.incarnation().to_vec(),
     }
@@ -112,7 +116,7 @@ impl NodeServiceImpl {
         }
         source
             .current_index_publication_decision(index_key, shard.catalog())
-            .map(|intent| intent.map(|intent| activation(&intent, claim)))
+            .map(|intent| intent.map(|intent| activation(&intent, claim, shard.snapshot().epoch())))
     }
 
     /// Activate one complete private candidate and record its artifact decision.
@@ -217,10 +221,8 @@ impl NodeServiceImpl {
                 candidate,
             }),
         )?;
-        Ok(activation(
-            &intent.expect("source publication produced an intent"),
-            claim,
-        ))
+        let intent = intent.expect("source publication produced an intent");
+        Ok(activation(&intent, claim, intent.after_epoch))
     }
 
     /// Publish immutable segment rows and activate both search legs under one

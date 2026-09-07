@@ -22,7 +22,7 @@ use crate::sha256;
 
 mod projection;
 mod publication;
-pub use publication::ProjectionRecovery;
+pub use publication::{MaintenanceRecovery, ProjectionRecovery};
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("metadata");
 const HEADS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("heads");

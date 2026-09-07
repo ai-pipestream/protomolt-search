@@ -8,6 +8,23 @@ use crate::pb::storage::{
 use crate::segments::{OpenedSegmentSet, SegmentCatalog, SegmentSetManifest};
 use redb::TableHandle;
 
+macro_rules! maintenance_table {
+    ($tx:expr) => {{
+        let exists = $tx
+            .list_tables()
+            .map_err(storage)?
+            .any(|table| table.name() == MAINTENANCE.name());
+        if exists {
+            Some($tx.open_table(MAINTENANCE).map_err(storage)?)
+        } else {
+            None
+        }
+    }};
+}
+mod maintenance;
+pub use maintenance::MaintenanceRecovery;
+use maintenance::*;
+
 const JOURNAL: &str = "projection_journal";
 const STATES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("projection_states");
 const DECISIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("projection_decisions");
@@ -47,8 +64,9 @@ fn index_key(key: &[u8]) -> Result<(), Status> {
 fn journal_header(bytes: Option<&[u8]>, names: &[String], history: &[u8]) -> Result<bool, Status> {
     let states = names.iter().any(|name| name == STATES.name());
     let decisions = names.iter().any(|name| name == DECISIONS.name());
+    let maintenance = names.iter().any(|name| name == MAINTENANCE.name());
     let Some(bytes) = bytes else {
-        if states || decisions {
+        if states || decisions || maintenance {
             return Err(Status::data_loss(
                 "projection tables exist without their journal header",
             ));
@@ -56,7 +74,12 @@ fn journal_header(bytes: Option<&[u8]>, names: &[String], history: &[u8]) -> Res
         return Ok(false);
     };
     let header: ProjectionJournalHeader = decode(bytes)?;
-    if header.format_version != 1 || header.history_id != history || !states || !decisions {
+    if !matches!(header.format_version, 1 | 2)
+        || (header.format_version == 2) != maintenance
+        || header.history_id != history
+        || !states
+        || !decisions
+    {
         return Err(Status::data_loss(
             "projection journal format, history or tables differ",
         ));
@@ -97,6 +120,7 @@ fn validate_state(
     if state.index_key != key
         || state.history_id != history
         || state.committed_manifest_sha256.len() != 32
+        || (state.pending.is_some() && state.pending_maintenance.is_some())
     {
         return Err(Status::data_loss("invalid projection journal state"));
     }
@@ -120,28 +144,6 @@ fn decision_key(key: &[u8], sequence: u64) -> Vec<u8> {
         accepted_sequence: sequence,
     }
     .encode_to_vec()
-}
-
-fn validate_tip(state: &ProjectionJournalState, bytes: Option<&[u8]>) -> Result<(), Status> {
-    if state.committed_sequence == 0 {
-        if bytes.is_some() {
-            return Err(Status::data_loss(
-                "projection journal lost its committed cursor",
-            ));
-        }
-        return Ok(());
-    }
-    let tip: ProjectionIntent =
-        decode(bytes.ok_or_else(|| Status::data_loss("projection committed decision missing"))?)?;
-    validate_intent(&tip, &state.index_key, &state.history_id)?;
-    if tip.source.as_ref().map(|s| s.accepted_sequence) != Some(state.committed_sequence)
-        || tip.after_manifest_sha256 != state.committed_manifest_sha256
-    {
-        return Err(Status::data_loss(
-            "projection cursor differs from its committed decision",
-        ));
-    }
-    Ok(())
 }
 
 /// Certify exactly the staged append and all live previous rows of this key.
@@ -279,7 +281,7 @@ impl DocumentCatalog {
             };
             let state: ProjectionJournalState = decode(bytes.value())?;
             validate_state(&state, key, &header.history_id)?;
-            if state.pending.is_some() {
+            if state.pending.is_some() || state.pending_maintenance.is_some() {
                 return Err(Status::failed_precondition(
                     "resolve pending projection before observing activation",
                 ));
@@ -290,13 +292,8 @@ impl DocumentCatalog {
                 ));
             }
             let decisions = tx.open_table(DECISIONS).map_err(storage)?;
-            let key = decision_key(key, state.committed_sequence.max(1));
-            let bytes = decisions.get(key.as_slice()).map_err(storage)?;
-            validate_tip(&state, bytes.as_ref().map(|v| v.value()))?;
-            if state.committed_sequence == 0 {
-                return Ok(None);
-            }
-            bytes.map(|v| decode(v.value())).transpose()
+            let maintenance = maintenance_table!(tx);
+            validate_tip(&state, &decisions, maintenance.as_ref(), &header.collection)
         })
     }
 
@@ -458,6 +455,8 @@ impl DocumentCatalog {
                     committed_sequence: 0,
                     committed_manifest_sha256: intent.before_manifest_sha256.clone(),
                     pending: None,
+                    pending_maintenance: None,
+                    maintenance_tip: None,
                 },
                 None => {
                     return Err(Status::failed_precondition(
@@ -466,15 +465,14 @@ impl DocumentCatalog {
                 }
             };
             validate_state(&state, key, &info.history_id)?;
-            let tip_key = decision_key(key, state.committed_sequence.max(1));
-            validate_tip(
-                &state,
-                decisions
-                    .get(tip_key.as_slice())
-                    .map_err(storage)?
-                    .as_ref()
-                    .map(|v| v.value()),
-            )?;
+            let maintenance = maintenance_table!(tx);
+            let collection = self.collection()?;
+            validate_tip(&state, &decisions, maintenance.as_ref(), &collection)?;
+            if state.pending_maintenance.is_some() {
+                return Err(Status::failed_precondition(
+                    "resolve pending maintenance before source publication",
+                ));
+            }
             if let Some(pending) = &state.pending {
                 if pending == &intent {
                     return Ok(intent);
@@ -539,8 +537,11 @@ impl DocumentCatalog {
                 let mut state: ProjectionJournalState = decode(states.get(key).map_err(storage)?.ok_or_else(|| Status::not_found("projection index is not registered"))?.value())?;
                 validate_state(&state, key, &header.history_id)?;
                 let mut decisions = tx.open_table(DECISIONS).map_err(storage)?;
-                let tip_key = decision_key(key, state.committed_sequence.max(1));
-                validate_tip(&state, decisions.get(tip_key.as_slice()).map_err(storage)?.as_ref().map(|v| v.value()))?;
+                let maintenance = maintenance_table!(tx);
+                validate_tip(&state, &decisions, maintenance.as_ref(), &header.collection)?;
+                if state.pending_maintenance.is_some() {
+                    return Err(Status::failed_precondition("resolve pending maintenance before source recovery"));
+                }
                 let Some(intent) = state.pending.take() else {
                     if hash != state.committed_manifest_sha256 {
                         return Err(Status::failed_precondition("durable catalog differs from the committed projection manifest"));
@@ -615,15 +616,8 @@ impl DocumentCatalog {
                     .value(),
             )?;
             validate_state(&state, key, &header.history_id)?;
-            let tip_key = decision_key(key, state.committed_sequence.max(1));
-            validate_tip(
-                &state,
-                table
-                    .get(tip_key.as_slice())
-                    .map_err(storage)?
-                    .as_ref()
-                    .map(|v| v.value()),
-            )?;
+            let maintenance = maintenance_table!(tx);
+            validate_tip(&state, &table, maintenance.as_ref(), &header.collection)?;
             if sequence > state.committed_sequence {
                 return Err(Status::data_loss(
                     "projection decision exceeds committed history",

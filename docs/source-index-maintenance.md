@@ -1,7 +1,8 @@
 # Source-index maintenance
 
-Status: preservation comparison implemented on the foundation branch; journal
-and runtime cutover integration remain proposed. Legacy compaction and index-only
+Status: preservation comparison and the durable maintenance journal are
+implemented on the foundation branch; runtime cutover integration remains
+proposed. Legacy compaction and index-only
 snapshots still refuse source-owned catalogs. This note does not enable them.
 
 ## Two sequences with different meanings
@@ -12,26 +13,42 @@ result. Catalog epoch orders physical manifest publications. It advances for
 source replacement and for maintenance. Source history, logical index key,
 collection, source version and optional chunk identity survive physical rewrites.
 
-The current projection journal checks that its committed manifest equals the
-latest `ProjectionIntent.after_manifest_sha256`. That is correct for source-only
-publication, but a compaction would break it. Do not weaken that comparison or
-rewrite the historical source decision to make compaction appear to succeed.
+The projection journal retains immutable source decisions. Its active manifest
+is checked against the latest source decision or the maintenance decision that
+follows it; compaction never rewrites the source decision to appear successful.
 
-The maintenance extension should retain a separately keyed immutable maintenance
-decision, using its after-catalog epoch as the index-local revision. Its intent
-binds the owner, accepted sequence and last source intent, before/after manifest
-hashes and epochs, previous maintenance decision (if any), and the preservation
-comparison below. At most one source or maintenance intent may be pending for an
-index. A later source publication starts from the maintenance manifest and then
-becomes the new source tip. Acceptance and retry records remain unchanged.
+The format-2 extension stores immutable `MaintenanceIntent` records keyed by
+logical index and after-catalog epoch. Each binds its source owner, accepted
+sequence, last source intent, before/after manifest hashes and epochs, previous
+maintenance cursor, and locally computed preservation certificate. The state
+retains the latest maintenance cursor even after another source write. A later
+source publication starts from the maintenance manifest and becomes the new
+physical tip while retaining that history link.
 
-Adding those records requires a new journal-header version. Older readers must
-refuse it before writing; otherwise a reader unaware of the maintenance pointer
-could erase it when serializing the existing state. Migration must preserve old
-source decisions and resolve pending source publication before changing the
-extension. New readers must validate both the immutable maintenance record and
-its connection to the last source decision, not trust an epoch supplied by a
-caller.
+At most one source or maintenance intent may be pending for an index. Preparation
+retries with the same before/after views return the existing pending intent;
+a different transition refuses. Recovery records a decision only after checking
+the synced actual manifest under its publication lock. The before manifest
+aborts maintenance, the after manifest commits it, and any third manifest keeps
+the intent unresolved. None of these operations changes source acceptance or
+retry receipts.
+
+`enable_index_maintenance` atomically creates the decision table and upgrades
+the journal header from format 1 to 2. Every pending source publication must be
+resolved before migration. Source decisions are preserved. Older readers refuse
+the new header; downgrading the header while retaining its table also refuses.
+Existing format-1 journals remain readable and do not migrate implicitly.
+
+`prepare_index_maintenance` takes held before/after catalogs and computes the
+preservation proof itself. It also recomputes supplied pruning summaries from
+the stored columns, so an incorrect range cannot hide rows after publication.
+The owner must fence publication across preparation and commit; it should run
+the expensive comparison while old queries remain readable, before acquiring
+the shard's final write guard. This method records artifact intent only.
+`recover_index_maintenance` reconciles the durable decision, and
+`index_maintenance_decision` reads immutable history without claiming visibility.
+The node's source activation observation now reports the current catalog epoch
+while preserving the original source intent and accepted sequence.
 
 ## Implemented preservation comparison
 
@@ -98,9 +115,9 @@ segment metadata; reclaiming the final tombstoned segment preserves its proof.
 
 Reindexing or changing a derived expression remains a separate operation from
 compaction. This metadata work does not enable source-owned maintenance cutover;
-the journal and activation sequence below are still required.
+the runtime activation sequence below is still required.
 
-## Publication and recovery integration still required
+## Runtime publication and recovery integration still required
 
 Build outputs under private staging while the old sealed view remains readable.
 At publication, hold the owning node's ingest/mutation/seal fences, verify the
@@ -126,11 +143,16 @@ through lexical, dense, hybrid, Boolean, browse and streaming results. Coherent
 backup/restore must capture source history, journal and the referenced manifest
 as one recoverable authority; copying only index artifacts is insufficient.
 
-## Checkpoint validation
+## Validation scope
 
-The combined local run passed 592 library tests, 831 integration tests across
-142 targets, 13 embedded tests and two IVF adapter tests. One existing live
-OpenNLP comparison remains ignored. All five Android/iOS compile checks,
-examples, formatting, vendored contracts and the full search-protobuf descriptor
-comparison against `3a32b7f` passed. Validation used an enforced 8 GiB scope with
-swap disabled. No fleet operations or production compaction runs were performed.
+Storage-level tests cover consecutive maintenance between source writes,
+source updates/deletes after maintenance, final-segment reclamation, exact retry
+receipt preservation, pending-source migration refusal, exclusive pending
+transactions, both durable manifest outcomes after source-catalog reopen,
+unexpected-manifest retention, and corrupted history links (including recomputed
+checksums). Node reopen reports the current catalog epoch and retains document
+identity. The fixture models manifest cutover explicitly; it does not enable the
+legacy compactor or prove the complete live query/permission matrix above.
+
+Validation remains local under an enforced 8 GiB scope with swap disabled.
+No fleet operations or production compaction runs are part of this checkpoint.
