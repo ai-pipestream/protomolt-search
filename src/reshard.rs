@@ -760,6 +760,34 @@ fn build_child(
                 t
             }
         };
+        let map_integer_table: Vec<String> = match columns {
+            Some(columns) => columns.map_integers.clone(),
+            None => {
+                let mut t: Vec<String> = Vec::new();
+                for (_, doc) in &mapped {
+                    for e in &doc.map_integers {
+                        if !t.iter().any(|n| n == &e.field) {
+                            t.push(e.field.clone());
+                        }
+                    }
+                }
+                t
+            }
+        };
+        let map_unsigned_integer_table: Vec<String> = match columns {
+            Some(columns) => columns.map_unsigned_integers.clone(),
+            None => {
+                let mut t: Vec<String> = Vec::new();
+                for (_, doc) in &mapped {
+                    for e in &doc.map_unsigned_integers {
+                        if !t.iter().any(|n| n == &e.field) {
+                            t.push(e.field.clone());
+                        }
+                    }
+                }
+                t
+            }
+        };
         // Integers and timestamps name the SAME i64 columns
         // (docs/range-facets.md), so both lists feed one table — a
         // child whose records only ever carried timestamps still gets
@@ -825,6 +853,11 @@ fn build_child(
         let numeric_names: Vec<&str> = numeric_table.iter().map(String::as_str).collect();
         let map_facet_names: Vec<&str> = map_facet_table.iter().map(String::as_str).collect();
         let map_numeric_names: Vec<&str> = map_numeric_table.iter().map(String::as_str).collect();
+        let map_integer_names: Vec<&str> = map_integer_table.iter().map(String::as_str).collect();
+        let map_unsigned_integer_names: Vec<&str> = map_unsigned_integer_table
+            .iter()
+            .map(String::as_str)
+            .collect();
         let integer_names: Vec<&str> = integer_table.iter().map(String::as_str).collect();
         let unsigned_integer_names: Vec<&str> =
             unsigned_integer_table.iter().map(String::as_str).collect();
@@ -873,6 +906,8 @@ fn build_child(
             .with_numeric_fields(&numeric_names)
             .with_map_facet_fields(&map_facet_names)
             .with_map_numeric_fields(&map_numeric_names)
+            .with_map_integer_fields(&map_integer_names)
+            .with_map_unsigned_integer_fields(&map_unsigned_integer_names)
             .with_integer_fields(&integer_names)
             .with_unsigned_integer_fields(&unsigned_integer_names)
             .with_geo_fields(&geo_names)
@@ -1245,6 +1280,34 @@ fn build_child(
                         .position(|n| n == &e.field)
                         .expect("map-numeric table was derived from these records");
                     builder.set_map_numeric(ci, *local, &e.key, e.value);
+                }
+                for e in &doc.map_integers {
+                    let ci = map_integer_table
+                        .iter()
+                        .position(|n| n == &e.field)
+                        .ok_or_else(|| {
+                            format!(
+                                "integer map column {:?} is absent from the replay table",
+                                e.field
+                            )
+                        })?;
+                    builder
+                        .set_map_integer(ci, *local, &e.key, e.value)
+                        .map_err(|e| format!("integer map replay: {e}"))?;
+                }
+                for e in &doc.map_unsigned_integers {
+                    let ci = map_unsigned_integer_table
+                        .iter()
+                        .position(|n| n == &e.field)
+                        .ok_or_else(|| {
+                            format!(
+                                "integer map column {:?} is absent from the replay table",
+                                e.field
+                            )
+                        })?;
+                    builder
+                        .set_map_unsigned_integer(ci, *local, &e.key, e.value)
+                        .map_err(|e| format!("integer map replay: {e}"))?;
                 }
                 for e in &doc.integers {
                     let ii = integer_table
@@ -3639,6 +3702,8 @@ pub struct ColumnTables {
     pub numerics: Vec<String>,
     pub map_facets: Vec<String>,
     pub map_numerics: Vec<String>,
+    pub map_integers: Vec<String>,
+    pub map_unsigned_integers: Vec<String>,
     pub integers: Vec<String>,
     pub unsigned_integers: Vec<String>,
     pub geo: Vec<String>,
@@ -4039,6 +4104,12 @@ fn open_segment_sources(
                 map_numerics: (0..bm25.map_numeric_count())
                     .map(|c| bm25.map_numeric_name(c).to_string())
                     .collect(),
+                map_integers: (0..bm25.map_integer_count())
+                    .map(|c| bm25.map_integer_name(c).to_string())
+                    .collect(),
+                map_unsigned_integers: (0..bm25.map_unsigned_integer_count())
+                    .map(|c| bm25.map_unsigned_integer_name(c).to_string())
+                    .collect(),
                 integers: (0..bm25.integer_count())
                     .map(|c| bm25.integer_name(c).to_string())
                     .collect(),
@@ -4225,6 +4296,29 @@ fn reconstruct_document(
                     key: key.clone(),
                     value,
                 });
+            }
+        }
+    }
+    for (ci, name) in tables.columns.map_integers.iter().enumerate() {
+        for (key_ord, key) in bm25.map_integer_keys(ci).iter().enumerate() {
+            if let Some(value) = bm25.map_integer_value(ci, key_ord as u32, row) {
+                doc.map_integers.push(crate::pb::MapIntegerEntry {
+                    field: name.clone(),
+                    key: key.clone(),
+                    value,
+                });
+            }
+        }
+    }
+    for (ci, name) in tables.columns.map_unsigned_integers.iter().enumerate() {
+        for (key_ord, key) in bm25.map_unsigned_integer_keys(ci).iter().enumerate() {
+            if let Some(value) = bm25.map_unsigned_integer_value(ci, key_ord as u32, row) {
+                doc.map_unsigned_integers
+                    .push(crate::pb::MapUnsignedIntegerEntry {
+                        field: name.clone(),
+                        key: key.clone(),
+                        value,
+                    });
             }
         }
     }

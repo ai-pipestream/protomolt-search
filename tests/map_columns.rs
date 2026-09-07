@@ -63,6 +63,8 @@ async fn add_documents_mapped(
     for (text, strs, nums) in docs {
         tx.send(AddDocumentsRequest {
             unsigned_integers: Vec::new(),
+            map_integers: Vec::new(),
+            map_unsigned_integers: Vec::new(),
             original_source: None,
             source_chunk_ordinal: None,
             identity: None,
@@ -601,6 +603,8 @@ async fn distributed_map_stages_and_ingest_refusals() {
     // column, non-finite numeric value. Empty string values are present.
     let bad_facet = |field: &str, key: &str, value: &str| AddDocumentsRequest {
         unsigned_integers: Vec::new(),
+        map_integers: Vec::new(),
+        map_unsigned_integers: Vec::new(),
         original_source: None,
         source_chunk_ordinal: None,
         identity: None,

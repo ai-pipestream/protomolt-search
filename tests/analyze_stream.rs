@@ -203,6 +203,8 @@ async fn ingest_refuses_a_sidecar_without_analyze_stream() {
     for text in TEXTS {
         tx.send(AddDocumentsRequest {
             unsigned_integers: Vec::new(),
+            map_integers: Vec::new(),
+            map_unsigned_integers: Vec::new(),
             original_source: None,
             source_chunk_ordinal: None,
             identity: None,

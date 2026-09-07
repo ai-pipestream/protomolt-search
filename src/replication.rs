@@ -332,6 +332,16 @@ pub async fn sync_once(cursor: &ReplicaCursor) -> Result<ReplicaCursor, String> 
                 }
             }
             Some(wal_record::Op::AddDocuments(add)) => {
+                let required = add
+                    .documents
+                    .iter()
+                    .map(crate::document_contract::required_version)
+                    .max()
+                    .unwrap_or(0);
+                crate::document_contract::require_supported(
+                    target.document_contract_version,
+                    required,
+                )?;
                 let rows = add.documents.len() as u64;
                 if rows == 0 {
                     return Err("WAL document record is empty".to_string());
@@ -353,6 +363,10 @@ pub async fn sync_once(cursor: &ReplicaCursor) -> Result<ReplicaCursor, String> 
                             .await
                             .map_err(|error| format!("replicate documents: {error}"))?
                             .into_inner();
+                        crate::document_contract::require_supported(
+                            response.document_contract_version,
+                            required,
+                        )?;
                         if response.first_id != add.first_id || response.added != rows {
                             return Err("replica assigned different document ids".to_string());
                         }
@@ -373,6 +387,10 @@ pub async fn sync_once(cursor: &ReplicaCursor) -> Result<ReplicaCursor, String> 
                                 .await
                                 .map_err(|error| format!("replicate documents: {error}"))?
                                 .into_inner();
+                            crate::document_contract::require_supported(
+                                response.document_contract_version,
+                                required,
+                            )?;
                             if response.first_id != add.first_id + offset as u64
                                 || response.added != 1
                             {

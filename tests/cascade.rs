@@ -119,6 +119,8 @@ async fn start_cluster(
                 for text in texts {
                     tx.send(pipestream_search::pb::AddDocumentsRequest {
                         unsigned_integers: Vec::new(),
+                        map_integers: Vec::new(),
+                        map_unsigned_integers: Vec::new(),
                         original_source: None,
                         source_chunk_ordinal: None,
                         identity: None,

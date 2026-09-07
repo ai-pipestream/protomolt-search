@@ -18,8 +18,9 @@ use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     selection_query, AddDocumentsRequest, AddVectorsRequest, AggregateOp, AggregateRequest,
     Aggregation, DeleteDocumentsRequest, DenseQuery, DenseScoreMode, DocumentField, FacetValue,
-    FilterQuery, FlushRequest, IntegerValue, LexicalQuery, NumericValue, PhraseMatch, QueryRequest,
-    QueryResponse, SearchQuery, SelectionQuery, SetCalibrationRequest,
+    FilterQuery, FlushRequest, IntegerValue, LexicalQuery, MapIntegerEntry,
+    MapUnsignedIntegerEntry, NumericValue, PhraseMatch, QueryRequest, QueryResponse, SearchQuery,
+    SelectionQuery, SetCalibrationRequest,
 };
 use pipestream_search::placement::{
     PinnedLeaf, Placement, PlacementNodeConfig, PlacementTreeConfig,
@@ -110,6 +111,8 @@ fn config(index_path: PathBuf) -> NodeConfig {
         facet_fields: vec!["court".into()],
         integer_fields: vec!["year".into(), "decided".into(), "placement".into()],
         numeric_fields: vec!["pages".into()],
+        map_integer_fields: vec!["signed_map".into()],
+        map_unsigned_integer_fields: vec!["unsigned_map".into()],
         position_fields: vec!["body".into()],
         sentence_fields: vec!["body".into()],
         ..Default::default()
@@ -155,6 +158,22 @@ fn document(i: usize, archive: i64, with_code: bool) -> AddDocumentsRequest {
             analysis: Some(body_spec()),
         }],
         integers,
+        map_integers: (!i.is_multiple_of(7))
+            .then(|| MapIntegerEntry {
+                field: "signed_map".into(),
+                key: "".into(),
+                value: i64::MIN + i as i64,
+            })
+            .into_iter()
+            .collect(),
+        map_unsigned_integers: (!i.is_multiple_of(7))
+            .then(|| MapUnsignedIntegerEntry {
+                field: "unsigned_map".into(),
+                key: "".into(),
+                value: u64::MAX - i as u64,
+            })
+            .into_iter()
+            .collect(),
         facets: vec![FacetValue {
             field: "court".into(),
             value: court(i).into(),
@@ -682,6 +701,44 @@ async fn a_transplanted_split_serves_the_re_analyzed_splits_answers_bit_for_bit(
                 .partition
                 .is_none());
         }
+    }
+
+    // Rebuilding from logs, copying segments and changing cut order must all
+    // retain full-width map values, empty keys and missing entries.
+    for result in [&by_logs, &by_segments, &by_year] {
+        let mut seen = std::collections::BTreeSet::new();
+        for image in &result.images.children {
+            let set = pipestream_search::segments::OpenedSegmentSet::open(
+                pipestream_search::node::segments_root(&image.vector_path),
+            )
+            .unwrap();
+            for segment in 0..set.len() {
+                let reader = set.bm25(segment);
+                let identity = reader.integer_index("decided").unwrap();
+                let signed = reader.map_integer_index("signed_map").unwrap();
+                let unsigned = reader.map_unsigned_integer_index("unsigned_map").unwrap();
+                for row in 0..reader.next_doc_id() {
+                    let original = reader.integer_value(identity, row).unwrap() as usize;
+                    assert!(seen.insert(original));
+                    assert_eq!(
+                        reader
+                            .map_integer_key_ord(signed, "")
+                            .and_then(|key| reader.map_integer_value(signed, key, row)),
+                        (!original.is_multiple_of(7)).then_some(i64::MIN + original as i64),
+                    );
+                    assert_eq!(
+                        reader
+                            .map_unsigned_integer_key_ord(unsigned, "")
+                            .and_then(|key| reader.map_unsigned_integer_value(unsigned, key, row)),
+                        (!original.is_multiple_of(7)).then_some(u64::MAX - original as u64),
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            seen,
+            (0..N).filter(|i| ![3, 77, 200, 359].contains(i)).collect()
+        );
     }
 
     // Served, the three answer the battery the same, bit for bit.

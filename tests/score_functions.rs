@@ -53,6 +53,8 @@ async fn add_documents_numeric(
     for (text, numerics) in docs {
         tx.send(AddDocumentsRequest {
             unsigned_integers: Vec::new(),
+            map_integers: Vec::new(),
+            map_unsigned_integers: Vec::new(),
             original_source: None,
             source_chunk_ordinal: None,
             identity: None,

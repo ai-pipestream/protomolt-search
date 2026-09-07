@@ -116,6 +116,8 @@ fn validate_column_tables(config: &NodeConfig) -> Result<(), String> {
         .chain(&config.numeric_fields)
         .chain(&config.map_facet_fields)
         .chain(&config.map_numeric_fields)
+        .chain(&config.map_integer_fields)
+        .chain(&config.map_unsigned_integer_fields)
         .chain(&config.integer_fields)
         .chain(&config.unsigned_integer_fields)
         .chain(&config.geo_fields)
@@ -379,6 +381,8 @@ pub struct NodeConfig {
     pub map_facet_fields: Vec<String>,
     /// The map<string, f64> column table for NEW builders. Same rules.
     pub map_numeric_fields: Vec<String>,
+    pub map_integer_fields: Vec<String>,
+    pub map_unsigned_integer_fields: Vec<String>,
     /// The i64 column table for NEW builders (`docs/range-facets.md`).
     /// Same rules as `facet_fields`. Timestamp ingest lands in THESE
     /// columns as epoch micros — it is sugar, not a kind.
@@ -504,6 +508,8 @@ impl Default for NodeConfig {
             numeric_fields: Vec::new(),
             map_facet_fields: Vec::new(),
             map_numeric_fields: Vec::new(),
+            map_integer_fields: Vec::new(),
+            map_unsigned_integer_fields: Vec::new(),
             integer_fields: Vec::new(),
             unsigned_integer_fields: Vec::new(),
             placement_column: None,
@@ -1410,6 +1416,24 @@ impl Bm25Shard {
             Bm25Shard::Spilling(s) => s.map_numeric_index(name),
             Bm25Shard::Resident(r) => r.map_numeric_index(name),
             Bm25Shard::Segmented(g) => g.map_numeric_index(name),
+        }
+    }
+
+    fn map_integer_index(&self, name: &str) -> Option<usize> {
+        match self {
+            Bm25Shard::Building(s) => s.map_integer_index(name),
+            Bm25Shard::Spilling(s) => s.map_integer_index(name),
+            Bm25Shard::Resident(r) => r.map_integer_index(name),
+            Bm25Shard::Segmented(g) => g.map_integer_index(name),
+        }
+    }
+
+    fn map_unsigned_integer_index(&self, name: &str) -> Option<usize> {
+        match self {
+            Bm25Shard::Building(s) => s.map_unsigned_integer_index(name),
+            Bm25Shard::Spilling(s) => s.map_unsigned_integer_index(name),
+            Bm25Shard::Resident(r) => r.map_unsigned_integer_index(name),
+            Bm25Shard::Segmented(g) => g.map_unsigned_integer_index(name),
         }
     }
 
@@ -3583,6 +3607,16 @@ pub(crate) fn heap_store(config: &NodeConfig) -> Result<Bm25Store, String> {
         .iter()
         .map(String::as_str)
         .collect();
+    let map_integers: Vec<&str> = config
+        .map_integer_fields
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let map_unsigned_integers: Vec<&str> = config
+        .map_unsigned_integer_fields
+        .iter()
+        .map(String::as_str)
+        .collect();
     let integers: Vec<&str> = config.integer_fields.iter().map(String::as_str).collect();
     let unsigned_integers: Vec<&str> = config
         .unsigned_integer_fields
@@ -3597,6 +3631,8 @@ pub(crate) fn heap_store(config: &NodeConfig) -> Result<Bm25Store, String> {
         .with_numerics(&numerics)
         .with_map_facets(&map_facets)
         .with_map_numerics(&map_numerics)
+        .with_map_integers(&map_integers)
+        .with_map_unsigned_integers(&map_unsigned_integers)
         .with_integers(&integers)
         .with_unsigned_integers(&unsigned_integers)
         .with_geos(&geos)
@@ -5140,6 +5176,18 @@ impl NodeServiceImpl {
             .iter()
             .map(String::as_str)
             .collect();
+        let map_integers: Vec<&str> = self
+            .config
+            .map_integer_fields
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let map_unsigned_integers: Vec<&str> = self
+            .config
+            .map_unsigned_integer_fields
+            .iter()
+            .map(String::as_str)
+            .collect();
         let integers: Vec<&str> = self
             .config
             .integer_fields
@@ -5201,6 +5249,8 @@ impl NodeServiceImpl {
                                 .with_numeric_fields(&numerics)
                                 .with_map_facet_fields(&map_facets)
                                 .with_map_numeric_fields(&map_numerics)
+                                .with_map_integer_fields(&map_integers)
+                                .with_map_unsigned_integer_fields(&map_unsigned_integers)
                                 .with_integer_fields(&integers)
                                 .with_unsigned_integer_fields(&unsigned_integers)
                                 .with_geo_fields(&geos)
@@ -5216,6 +5266,8 @@ impl NodeServiceImpl {
                     .with_numerics(&numerics)
                     .with_map_facets(&map_facets)
                     .with_map_numerics(&map_numerics)
+                    .with_map_integers(&map_integers)
+                    .with_map_unsigned_integers(&map_unsigned_integers)
                     .with_integers(&integers)
                     .with_unsigned_integers(&unsigned_integers)
                     .with_geos(&geos)
@@ -10019,6 +10071,54 @@ impl NodeServiceImpl {
             }
             slots
         };
+        let map_integer_slots: Vec<(usize, &str, i64)> = {
+            let shard = guard.bm25.as_ref().expect("builder just ensured");
+            let mut seen: Vec<(&str, &str)> = Vec::new();
+            let mut slots = Vec::with_capacity(doc.map_integers.len());
+            for e in &doc.map_integers {
+                if seen.contains(&(e.field.as_str(), e.key.as_str())) {
+                    return Err(Status::invalid_argument(format!(
+                        "map column {:?} key {:?} repeats in one document (a map holds one \
+                         value per key)",
+                        e.field, e.key
+                    )));
+                }
+                seen.push((&e.field, &e.key));
+                let Some(ci) = shard.map_integer_index(&e.field) else {
+                    return Err(Status::invalid_argument(format!(
+                        "unknown map column {:?}; this shard's map-integer table \
+                         (--map-integer-fields) does not have it",
+                        e.field
+                    )));
+                };
+                slots.push((ci, e.key.as_str(), e.value));
+            }
+            slots
+        };
+        let map_unsigned_integer_slots: Vec<(usize, &str, u64)> = {
+            let shard = guard.bm25.as_ref().expect("builder just ensured");
+            let mut seen: Vec<(&str, &str)> = Vec::new();
+            let mut slots = Vec::with_capacity(doc.map_unsigned_integers.len());
+            for e in &doc.map_unsigned_integers {
+                if seen.contains(&(e.field.as_str(), e.key.as_str())) {
+                    return Err(Status::invalid_argument(format!(
+                        "map column {:?} key {:?} repeats in one document (a map holds one \
+                         value per key)",
+                        e.field, e.key
+                    )));
+                }
+                seen.push((&e.field, &e.key));
+                let Some(ci) = shard.map_unsigned_integer_index(&e.field) else {
+                    return Err(Status::invalid_argument(format!(
+                        "unknown map column {:?}; this shard's map-unsigned-integer table \
+                         (--map-unsigned-integer-fields) does not have it",
+                        e.field
+                    )));
+                };
+                slots.push((ci, e.key.as_str(), e.value));
+            }
+            slots
+        };
         // Integer values, and timestamps as sugar over them: both land
         // in the SAME i64 table, so "repeats in one document" spans the
         // two lists. Every i64 value is valid; omission represents absence.
@@ -10149,6 +10249,16 @@ impl NodeServiceImpl {
                 for &(ci, key, value) in &map_numeric_slots {
                     store.set_map_numeric(ci, local, key, value);
                 }
+                for &(ci, key, value) in &map_integer_slots {
+                    store
+                        .set_map_integer(ci, local, key, value)
+                        .map_err(|e| Status::internal(format!("integer map apply: {e}")))?;
+                }
+                for &(ci, key, value) in &map_unsigned_integer_slots {
+                    store
+                        .set_map_unsigned_integer(ci, local, key, value)
+                        .map_err(|e| Status::internal(format!("integer map apply: {e}")))?;
+                }
                 for &(ii, value) in &integer_slots {
                     store.set_integer(ii, local, value);
                 }
@@ -10184,6 +10294,16 @@ impl NodeServiceImpl {
                 }
                 for &(ci, key, value) in &map_numeric_slots {
                     store.set_map_numeric(ci, doc_id, key, value);
+                }
+                for &(ci, key, value) in &map_integer_slots {
+                    store
+                        .set_map_integer(ci, doc_id, key, value)
+                        .map_err(|e| Status::internal(format!("integer map apply: {e}")))?;
+                }
+                for &(ci, key, value) in &map_unsigned_integer_slots {
+                    store
+                        .set_map_unsigned_integer(ci, doc_id, key, value)
+                        .map_err(|e| Status::internal(format!("integer map apply: {e}")))?;
                 }
                 for &(ii, value) in &integer_slots {
                     store.set_integer(ii, doc_id, value);
@@ -10221,6 +10341,16 @@ impl NodeServiceImpl {
                 }
                 for &(ci, key, value) in &map_numeric_slots {
                     builder.set_map_numeric(ci, doc_id, key, value);
+                }
+                for &(ci, key, value) in &map_integer_slots {
+                    builder
+                        .set_map_integer(ci, doc_id, key, value)
+                        .map_err(|e| Status::internal(format!("integer map apply: {e}")))?;
+                }
+                for &(ci, key, value) in &map_unsigned_integer_slots {
+                    builder
+                        .set_map_unsigned_integer(ci, doc_id, key, value)
+                        .map_err(|e| Status::internal(format!("integer map apply: {e}")))?;
                 }
                 for &(ii, value) in &integer_slots {
                     builder.set_integer(ii, doc_id, value);
@@ -10321,6 +10451,8 @@ impl NodeServiceImpl {
             .chain(&self.config.unsigned_integer_fields)
             .chain(&self.config.map_facet_fields)
             .chain(&self.config.map_numeric_fields)
+            .chain(&self.config.map_integer_fields)
+            .chain(&self.config.map_unsigned_integer_fields)
             .chain(&self.config.geo_fields)
             .any(|column| column == name);
         let persisted = store.is_some_and(|store| {
@@ -10330,6 +10462,8 @@ impl NodeServiceImpl {
                 || store.unsigned_integer_index(name).is_some()
                 || store.facet_index(name).is_some()
                 || store.map_numeric_index(name).is_some()
+                || store.map_integer_index(name).is_some()
+                || store.map_unsigned_integer_index(name).is_some()
                 || store.map_facet_index(name).is_some()
                 || store.geo_index(name).is_some()
         });
@@ -12249,6 +12383,7 @@ impl NodeService for NodeServiceImpl {
                 )
             });
         Ok(Response::new(HealthResponse {
+            document_contract_version: crate::document_contract::VERSION,
             collection: self.config.collection.clone(),
             num_vectors,
             dim,
@@ -13023,6 +13158,7 @@ impl NodeService for NodeServiceImpl {
             crate::metrics::add_ingested(added, 0);
             self.seal_if_due().await?;
             Ok(Response::new(AddDocumentsResponse {
+                document_contract_version: crate::document_contract::VERSION,
                 added,
                 total,
                 first_id,

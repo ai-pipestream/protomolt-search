@@ -55,6 +55,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for text in DOCS {
         tx.send(AddDocumentsRequest {
             unsigned_integers: Vec::new(),
+            map_integers: Vec::new(),
+            map_unsigned_integers: Vec::new(),
             original_source: None,
             source_chunk_ordinal: None,
             identity: None,

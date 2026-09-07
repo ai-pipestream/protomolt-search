@@ -614,6 +614,12 @@ impl NodeServiceImpl {
                     map_numerics: (0..s.map_numeric_count())
                         .map(|i| s.map_numeric_name(i).to_string())
                         .collect(),
+                    map_integers: (0..s.map_integer_count())
+                        .map(|i| s.map_integer_name(i).to_string())
+                        .collect(),
+                    map_unsigned_integers: (0..s.map_unsigned_integer_count())
+                        .map(|i| s.map_unsigned_integer_name(i).to_string())
+                        .collect(),
                     integers: (0..s.integer_count())
                         .map(|i| s.integer_name(i).to_string())
                         .collect(),

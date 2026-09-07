@@ -97,8 +97,9 @@ continues to name the physical field; defining a projection grants no access.
 
 ## Remaining work and compatibility
 
-Exact numeric int64/uint64 map storage and message-valued map projections are
-not implemented. Integer maps can be explicitly projected as KEYWORD when string
+Exact numeric int64/uint64 map projections and message-valued map projections
+are not implemented. The integer-map feature branch now provides low-level
+storage and document transport; see [its status](integer-map-storage.md). Integer maps can be explicitly projected as KEYWORD when string
 semantics are intended; numeric projections refuse instead of rounding through
 f64. Bytes, message values and arbitrary repeated/nested values retain their
 source-only disposition until their storage and query contracts are implemented.

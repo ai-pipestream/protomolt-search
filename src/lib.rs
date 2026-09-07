@@ -44,6 +44,7 @@ pub mod demo;
 pub mod dense_policy;
 pub mod diagnostics;
 pub mod document_catalog;
+pub mod document_contract;
 pub mod embedded;
 pub mod error_disclosure;
 pub mod exact_vectors;

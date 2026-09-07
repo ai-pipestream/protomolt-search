@@ -57,6 +57,8 @@ async fn add_documents(addr: &str, texts: &[String]) {
         for text in texts {
             tx.send(AddDocumentsRequest {
                 unsigned_integers: Vec::new(),
+                map_integers: Vec::new(),
+                map_unsigned_integers: Vec::new(),
                 original_source: None,
                 source_chunk_ordinal: None,
                 identity: None,

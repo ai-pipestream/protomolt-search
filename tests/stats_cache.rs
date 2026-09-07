@@ -34,6 +34,8 @@ async fn add_documents(addr: &str, texts: &[&str]) {
     for text in texts {
         tx.send(AddDocumentsRequest {
             unsigned_integers: Vec::new(),
+            map_integers: Vec::new(),
+            map_unsigned_integers: Vec::new(),
             original_source: None,
             source_chunk_ordinal: None,
             identity: None,
@@ -349,6 +351,8 @@ async fn fused_repeated_query_reuses_cached_stats() {
         for (body, name) in *docs {
             tx.send(AddDocumentsRequest {
                 unsigned_integers: Vec::new(),
+                map_integers: Vec::new(),
+                map_unsigned_integers: Vec::new(),
                 original_source: None,
                 source_chunk_ordinal: None,
                 identity: None,

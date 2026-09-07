@@ -40,6 +40,13 @@ The proposed [device-shard contract](docs/device-shards.md) describes shared
 searches with indexes retained on iOS and Android phones and the remaining
 transport, embedding, and availability work.
 
+Exact signed and unsigned map storage and document transport are being built
+on `feat/integer-map-storage-2026-09`. The branch supports typed document
+entries, WAL replay and segment transplant; descriptor-driven integer map
+projection and query operators remain incomplete. See
+[integer map storage](docs/integer-map-storage.md) for the compatibility gates
+and current validation scope.
+
 The current embedded adapter pins the fork branch recorded in `Cargo.toml` and
 uses TurboVec's current `.tv` persistence format. Provider images are opaque to
 the product and are selected by manifest/config identity, never by extension.

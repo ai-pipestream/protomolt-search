@@ -1,8 +1,8 @@
 # Exact integer map storage
 
-Status: storage and segmented-read integration in progress on
-`feat/integer-map-storage-2026-09`. Public protobuf ingestion, WAL replay,
-transplant/compaction, mapping, and typed query integration are not complete.
+Status: storage, document ingestion, WAL replay and segment transplant are
+implemented on `feat/integer-map-storage-2026-09`. Descriptor-driven mapping
+and typed query integration are not complete.
 Do not treat the low-level storage API as an end-to-end supported map shape.
 `docs/map-projection.md` remains the public mapping contract.
 
@@ -52,22 +52,54 @@ long UTF-8 keys, empty files/columns, rejected duplicate writes, legacy writer
 rejection, and segment lifecycle transitions. The section tests in
 `src/integer_map.rs` cover truncation and forged geometry, keys, and bounds.
 
+## Document transport and rebuild
+
+`AddDocumentsRequest.map_integers` (tag 27) and `map_unsigned_integers`
+(tag 28) carry named column, string key and exact signed/unsigned value.
+Configure new builders with `--map-integer-fields` and
+`--map-unsigned-integer-fields`, their `PROTOMOLT_MAP_INTEGER_FIELDS` and
+`PROTOMOLT_MAP_UNSIGNED_INTEGER_FIELDS` environment equivalents, or the
+matching configuration arrays. MobileShardConfig exposes the same arrays at
+29 and 30. These names share the existing column namespace. Unknown columns,
+wrong column families and duplicate document/key entries fail before row
+allocation. Low-level ingestion does not apply protobuf last-entry-wins rules.
+
+WAL format 7 gates these entries. A writer resuming an older generation
+publishes the new manifest version before appending a typed-map record or its
+source blob. A failed manifest update leaves the record clock unchanged.
+Existing index bindings still require format 6, independently of typed maps.
+Older decoders reject the newer generation instead of dropping map fields.
+
+Receiver document contract version 1 is exposed by HealthResponse tag 22 and
+AddDocumentsResponse tag 5. Replication requires it before sending records
+containing integer maps, unsigned scalar values, original source or identity,
+and checks the write response as well. A legacy peer's successful row count
+is insufficient. The acknowledgement describes accepted field semantics;
+replication still requires Flush before advancing its durable cursor. As with
+the existing positional replica protocol, retrying an accepted prefix assumes
+that the receiver retains the same history. This version field is not a
+content digest or a persistent per-write receipt.
+
+Both image layouts retain typed values and source/identity through Flush,
+reopen and compaction. Explicit WAL rebuild and segment transplant copy them
+without a floating-point conversion. Compaction supplies the complete column
+tables, retaining configured columns with no entries. WAL-only split paths
+that infer tables from observed entries cannot recover an entirely absent
+column declaration. Node open does not automatically replay the document WAL.
+
 ## Remaining integration
 
-1. Add typed document entries to the search protobuf and a WAL version gate
-   persisted before any record containing them. Older readers must reject a
-   generation they cannot replay exactly. Replication must establish typed-map
-   support before accepting such writes.
-2. Preserve column tables and entries through rebuild, transplant, compaction,
-   snapshot/recovery, and mutable tail construction, including empty columns.
-3. Bind descriptor-driven signed/unsigned map projections and report their
+1. Persist complete column definitions for standalone WAL-only recovery,
+   including columns with no entries, and define automatic recovery separately.
+2. Bind descriptor-driven signed/unsigned map projections and report their
    preservation, indexing, and query capabilities separately. Keep the default
    and duplicate-key rules already established for protobuf map extraction.
-4. Add exact typed map selectors to filters, values, sorting and aggregations.
+3. Add exact typed map selectors to filters, values, sorting and aggregations.
    Scoring conversions need an explicit numeric contract; do not use a rounded
    floating-point filter as an exact integer predicate.
-5. Exercise the public routes across both layouts and relays with permissions,
-   original source bytes, stable identity, retries and durability receipts.
+4. Exercise public typed-map query routes across both layouts and relays with
+   permissions, original source bytes, stable identity, retries and durable
+   receipts. These query routes are not yet implemented.
 
 ## Validation, 2026-09-07
 
@@ -83,4 +115,22 @@ while a prior tail is frozen and verifies both before and after publication.
 That strengthened test and duplicate-write assertions were rerun after the full
 suite. Production sources remained unchanged during validation. These results
 cover the storage APIs and existing behavior; they do not establish typed-map
-support for the unfinished public and replay routes listed above.
+support for the document transport additions or unfinished query routes described above.
+
+### Document transport validation
+
+The transport, WAL and transplant additions passed 508 library tests, 750
+integration tests across 130 targets, 12 embedded tests and two IVF-provider
+tests: 1,272 passed, zero failed, with the existing live OpenNLP test ignored.
+Android/iOS compilation passed on all supported targets, along with
+compilation of tests/examples, formatting, vendored-proto and whitespace checks.
+A descriptor comparison with `969a204` confirms that existing declarations
+are unchanged: two map-entry messages and six fields were added.
+
+The complete validation ran in one systemd scope with `MemoryMax=8G` and
+`MemorySwapMax=0`. The cgroup peak, including build-file cache, was 8 GiB;
+source inputs remained unchanged during the run. Targeted tests also cover
+failed WAL-version publication, missing receiver capability before dispatch,
+missing write acknowledgement followed by a retry, invalid map entries before
+row allocation, original bytes and stable identity through compaction, and
+exact map values across log rebuild, segment transplant and reordered year cuts.

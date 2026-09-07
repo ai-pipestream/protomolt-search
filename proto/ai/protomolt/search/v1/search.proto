@@ -1335,6 +1335,10 @@ message HealthResponse {
   // The collection this node serves (docs/collections.md); empty for
   // a node configured without one.
   string collection = 21;
+  // Version 1 retains typed integer maps, unsigned scalars, source bytes and
+  // logical identity through document ingestion. Zero does not prove support.
+  // Relays that do not accept document writes report zero.
+  uint32 document_contract_version = 22;
 }
 
 message ClusterHealthRequest {
@@ -2317,6 +2321,21 @@ message MapNumericEntry {
   double value = 3;
 }
 
+// Exact signed value under a literal map key, including the empty key.
+// Omission represents absence; all int64 values, including zero, are present.
+message MapIntegerEntry {
+  string field = 1;
+  string key = 2;
+  int64 value = 3;
+}
+
+// Exact unsigned value; no conversion through signed integers or double.
+message MapUnsignedIntegerEntry {
+  string field = 1;
+  string key = 2;
+  uint64 value = 3;
+}
+
 // One document on the `AddDocuments` stream.
 message AddDocumentsRequest {
   // Raw document text. Non-empty, at most 1 MiB (the sidecar's cap).
@@ -2469,6 +2488,10 @@ message AddDocumentsRequest {
   // Exact unsigned values, one entry per declared u64 column. The WAL retains
   // these typed values for replay; they never pass through i64 or double.
   repeated UnsignedIntegerValue unsigned_integers = 26;
+  // Requires document contract version 1 on the receiver. Check Health before
+  // sending and the AddDocuments response before accepting the acknowledgement.
+  repeated MapIntegerEntry map_integers = 27;
+  repeated MapUnsignedIntegerEntry map_unsigned_integers = 28;
 }
 
 // One canonical concept posting derived from a glossary match. Aliases share
@@ -2543,6 +2566,9 @@ message AddDocumentsResponse {
   // The WAL generation the documents were logged in; see
   // AddVectorsResponse.wal_generation.
   uint64 wal_generation = 4;
+  // Receiver's document contract used to admit this stream. Acknowledges
+  // semantics, not fsync; durability still requires a successful Flush.
+  uint32 document_contract_version = 5;
 }
 
 message DeleteDocumentsRequest {

@@ -24,7 +24,41 @@ fn verify_disk(index: &Path, layout: Layout, expected: &BTreeMap<String, Option<
         let geo_missing = reader.geo_index("geo_missing").unwrap();
         assert!(reader.map_facet_index("map_facet_missing").is_some());
         assert!(reader.map_numeric_index("map_numeric_missing").is_some());
+        let signed_map = reader.map_integer_index("signed_map").unwrap();
+        let unsigned_map = reader.map_unsigned_integer_index("unsigned_map").unwrap();
+        assert!(reader
+            .map_integer_keys(reader.map_integer_index("signed_map_missing").unwrap())
+            .is_empty());
+        assert!(reader
+            .map_unsigned_integer_keys(
+                reader
+                    .map_unsigned_integer_index("unsigned_map_missing")
+                    .unwrap()
+            )
+            .is_empty());
         for row in 0..reader.next_doc_id() {
+            let text = reader.text(row).unwrap();
+            let value = expected[&text];
+            assert_eq!(
+                reader
+                    .map_integer_key_ord(signed_map, "")
+                    .and_then(|key| reader.map_integer_value(signed_map, key, row)),
+                value.map(|v| v as i64)
+            );
+            assert_eq!(
+                reader
+                    .map_unsigned_integer_key_ord(unsigned_map, "")
+                    .and_then(|key| reader.map_unsigned_integer_value(unsigned_map, key, row)),
+                value
+            );
+            assert_eq!(
+                reader.document_identity(row).unwrap().document_key,
+                text.as_bytes()
+            );
+            assert_eq!(
+                reader.protobuf_source(row).unwrap(),
+                Some((common::protobuf_source(&text, "original"), None))
+            );
             assert_eq!(reader.integer_value(signed_missing, row), None);
             assert_eq!(reader.facet_ord(facet_missing, row), None);
             assert_eq!(reader.numeric_value(numeric_missing, row), None);
@@ -63,12 +97,13 @@ fn verify_disk(index: &Path, layout: Layout, expected: &BTreeMap<String, Option<
 }
 
 #[tokio::test]
-async fn unsigned_grpc_values_survive_flush_reopen_and_compaction() {
+async fn exact_integer_grpc_values_survive_flush_reopen_and_compaction() {
     let values = [
         Some(0),
         None,
         Some(1),
         Some((1u64 << 53) + 1),
+        Some(i64::MAX as u64),
         Some(1u64 << 63),
         Some(u64::MAX),
         Some(u64::MAX - 1),
@@ -90,6 +125,8 @@ async fn unsigned_grpc_values_survive_flush_reopen_and_compaction() {
             wal_buckets: 2,
             analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
             unsigned_integer_fields: vec!["value".into(), "missing".into()],
+            map_integer_fields: vec!["signed_map".into(), "signed_map_missing".into()],
+            map_unsigned_integer_fields: vec!["unsigned_map".into(), "unsigned_map_missing".into()],
             integer_fields: vec!["signed".into(), "signed_missing".into()],
             facet_fields: vec!["facet_missing".into()],
             numeric_fields: vec!["numeric_missing".into()],
@@ -109,6 +146,15 @@ async fn unsigned_grpc_values_survive_flush_reopen_and_compaction() {
             })
             .await
             .unwrap();
+        assert_eq!(
+            client
+                .health(pb::HealthRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+                .document_contract_version,
+            1
+        );
         let mut expected = BTreeMap::new();
         for range in [0..4, 4..values.len()] {
             for fields in [vec!["undeclared"], vec!["value", "value"], vec!["signed"]] {
@@ -148,12 +194,91 @@ async fn unsigned_grpc_values_survive_flush_reopen_and_compaction() {
                     before
                 );
             }
+            for unsigned in [false, true] {
+                let own = if unsigned {
+                    "unsigned_map"
+                } else {
+                    "signed_map"
+                };
+                let other = if unsigned {
+                    "signed_map"
+                } else {
+                    "unsigned_map"
+                };
+                for fields in [vec!["undeclared"], vec![own, own], vec![other]] {
+                    let before = client
+                        .health(pb::HealthRequest {})
+                        .await
+                        .unwrap()
+                        .into_inner()
+                        .document_slots;
+                    let mut bad = pb::AddDocumentsRequest {
+                        text: "rejected typed map".into(),
+                        analysis: Some(body_spec()),
+                        ..Default::default()
+                    };
+                    for field in fields {
+                        if unsigned {
+                            bad.map_unsigned_integers.push(pb::MapUnsignedIntegerEntry {
+                                field: field.into(),
+                                key: "".into(),
+                                value: u64::MAX,
+                            });
+                        } else {
+                            bad.map_integers.push(pb::MapIntegerEntry {
+                                field: field.into(),
+                                key: "".into(),
+                                value: i64::MIN,
+                            });
+                        }
+                    }
+                    assert_eq!(
+                        client
+                            .add_documents(tokio_stream::iter([bad]))
+                            .await
+                            .unwrap_err()
+                            .code(),
+                        tonic::Code::InvalidArgument
+                    );
+                    assert_eq!(
+                        client
+                            .health(pb::HealthRequest {})
+                            .await
+                            .unwrap()
+                            .into_inner()
+                            .document_slots,
+                        before
+                    );
+                }
+            }
             let docs: Vec<_> = range
                 .clone()
                 .map(|row| {
                     let text = format!("word row{row}");
                     expected.insert(text.clone(), values[row]);
                     pb::AddDocumentsRequest {
+                        original_source: Some(common::protobuf_source(&text, "original")),
+                        identity: Some(pb::DocumentIdentity {
+                            document_key: text.as_bytes().to_vec(),
+                            version: 1,
+                            chunk_ordinal: None,
+                        }),
+                        map_integers: values[row]
+                            .map(|value| pb::MapIntegerEntry {
+                                field: "signed_map".into(),
+                                key: String::new(),
+                                value: value as i64,
+                            })
+                            .into_iter()
+                            .collect(),
+                        map_unsigned_integers: values[row]
+                            .map(|value| pb::MapUnsignedIntegerEntry {
+                                field: "unsigned_map".into(),
+                                key: String::new(),
+                                value,
+                            })
+                            .into_iter()
+                            .collect(),
                         text,
                         analysis: Some(body_spec()),
                         integers: vec![pb::IntegerValue {
@@ -171,10 +296,12 @@ async fn unsigned_grpc_values_survive_flush_reopen_and_compaction() {
                     }
                 })
                 .collect();
-            client
+            let response = client
                 .add_documents(tokio_stream::iter(docs))
                 .await
-                .unwrap();
+                .unwrap()
+                .into_inner();
+            assert_eq!(response.document_contract_version, 1);
             client
                 .add_vectors(tokio_stream::iter([pb::AddVectorsRequest {
                     vectors: vectors[range.start * 8..range.end * 8].to_vec(),
@@ -246,6 +373,30 @@ async fn unsigned_grpc_values_survive_flush_reopen_and_compaction() {
                 let reader = Bm25Reader::open(&path).unwrap();
                 let column = reader.unsigned_integer_index("value");
                 for row in 0..reader.next_doc_id() {
+                    let text = reader.text(row).unwrap();
+                    let value = expected[&text];
+                    assert_eq!(
+                        reader.map_integer_index("signed_map").and_then(|ci| reader
+                            .map_integer_key_ord(ci, "")
+                            .and_then(|key| reader.map_integer_value(ci, key, row))),
+                        value.map(|v| v as i64)
+                    );
+                    assert_eq!(
+                        reader
+                            .map_unsigned_integer_index("unsigned_map")
+                            .and_then(|ci| reader
+                                .map_unsigned_integer_key_ord(ci, "")
+                                .and_then(|key| reader.map_unsigned_integer_value(ci, key, row))),
+                        value
+                    );
+                    assert_eq!(
+                        reader.document_identity(row).unwrap().document_key,
+                        text.as_bytes()
+                    );
+                    assert_eq!(
+                        reader.protobuf_source(row).unwrap(),
+                        Some((common::protobuf_source(&text, "original"), None))
+                    );
                     assert!(replayed
                         .insert(
                             reader.text(row).unwrap(),
@@ -276,6 +427,14 @@ async fn direct_node_configuration_refuses_column_type_aliases() {
         },
         NodeConfig {
             numeric_fields: vec!["value".into()],
+            ..Default::default()
+        },
+        NodeConfig {
+            map_integer_fields: vec!["value".into()],
+            ..Default::default()
+        },
+        NodeConfig {
+            map_unsigned_integer_fields: vec!["value".into()],
             ..Default::default()
         },
         NodeConfig {

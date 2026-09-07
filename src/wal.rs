@@ -122,7 +122,11 @@ pub fn crc32(data: &[u8]) -> u32 {
 // ---------------------------------------------------------------------------
 
 /// Current on-disk format version (manifest `format_version`).
-pub const FORMAT_VERSION: u32 = 6;
+pub const FORMAT_VERSION: u32 = 7;
+/// Exact integer map entries cannot be replayed by earlier decoders.
+pub const INTEGER_MAP_FORMAT_VERSION: u32 = 7;
+/// Explicit index policies first require format 6.
+pub const INDEX_FORMAT_VERSION: u32 = 6;
 /// Named vector planes first require format 5, independently of index policy.
 pub const VECTOR_FORMAT_VERSION: u32 = 5;
 /// Explicit mapped analysis first requires format 4.
@@ -1234,7 +1238,7 @@ impl WalWriter {
             )
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
             let required_version = if policy.is_some() {
-                FORMAT_VERSION
+                INDEX_FORMAT_VERSION
             } else if vector.is_some() {
                 VECTOR_FORMAT_VERSION
             } else if !binding.analysis_sha.is_empty() {
@@ -1266,6 +1270,9 @@ impl WalWriter {
             }
             let mut required_version = BASE_FORMAT_VERSION;
             for document in &batch.documents {
+                if !document.map_integers.is_empty() || !document.map_unsigned_integers.is_empty() {
+                    required_version = INTEGER_MAP_FORMAT_VERSION;
+                }
                 if let Some(identity) = &document.identity {
                     if document.original_source.is_none() {
                         return Err(io::Error::new(
@@ -1278,20 +1285,21 @@ impl WalWriter {
                         document.source_chunk_ordinal,
                     )
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-                    required_version = IDENTITY_FORMAT_VERSION;
+                    required_version = required_version.max(IDENTITY_FORMAT_VERSION);
                 }
+            }
+            // Publish the compatibility gate before records or source blobs.
+            if self.manifest.format_version < required_version {
+                let mut upgraded = self.manifest.clone();
+                upgraded.format_version = required_version;
+                write_manifest(&self.dir, &upgraded)?;
+                self.manifest = upgraded;
             }
             if batch
                 .documents
                 .iter()
                 .any(|d| d.original_source.is_some() || d.source_chunk_ordinal.is_some())
             {
-                if self.manifest.format_version < required_version {
-                    let mut upgraded = self.manifest.clone();
-                    upgraded.format_version = required_version;
-                    write_manifest(&self.dir, &upgraded)?;
-                    self.manifest = upgraded;
-                }
                 if self.sources.is_none() {
                     self.sources = Some(sources::Writer::open(&self.dir)?);
                 }
@@ -1450,6 +1458,8 @@ mod tests {
                 fields: Vec::new(),
                 integers: Vec::new(),
                 unsigned_integers: Vec::new(),
+                map_integers: Vec::new(),
+                map_unsigned_integers: Vec::new(),
                 timestamps: Vec::new(),
                 geo_points: Vec::new(),
                 quality: None,

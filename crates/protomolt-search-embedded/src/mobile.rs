@@ -217,6 +217,8 @@ fn node_config(config: MobileShardConfig) -> Result<EmbeddedShardConfig, BridgeE
     node.numeric_fields = config.numeric_fields;
     node.map_facet_fields = config.map_facet_fields;
     node.map_numeric_fields = config.map_numeric_fields;
+    node.map_integer_fields = config.map_integer_fields;
+    node.map_unsigned_integer_fields = config.map_unsigned_integer_fields;
     node.integer_fields = config.integer_fields;
     node.unsigned_integer_fields = config.unsigned_integer_fields;
     node.geo_fields = config.geo_fields;
