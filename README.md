@@ -1237,11 +1237,17 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: coherent source/index backup capture.** The local owner
+  pins all journal-matching index artifacts with one source read transaction,
+  then writes a bounded, checksummed bundle with its protobuf completion
+  manifest last. Captures survive compaction retiring the original paths and
+  retain unpublished source backlog. Restore verification and activation remain
+  separate work. See [source/index backup](docs/source-index-backup.md).
 - **Foundation branch: pinned source-catalog checkpoints.** A bounded copy
   preserves accepted history, exact retry records and all index journal anchors
   from one read transaction while acceptance continues. Pending decisions,
   detached source anchors and unknown tables refuse capture. This supplies the
-  source half of a coherent backup; index artifact capture and restore activation
+  source half used by coherent bundle capture; restore verification and activation
   remain separate work. See [source/index backup](docs/source-index-backup.md).
 - **Foundation branch: public identity through source-owned compaction.**
   A 19-shape query matrix covers unary and streamed results before and after

@@ -20,9 +20,11 @@ use crate::pb::{
 };
 use crate::sha256;
 
+mod backup;
 mod checkpoint;
 mod projection;
 mod publication;
+pub use backup::CapturedBackup;
 pub use checkpoint::CatalogCheckpoint;
 pub use publication::{MaintenanceRecovery, ProjectionRecovery};
 

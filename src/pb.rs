@@ -75,6 +75,6 @@ pub mod v1 {
     pub use super::{
         AcceptDocumentRequest, AddDocumentsRequest, AddVectorsRequest, DerivedColumns,
         DocumentWriteReceipt, FlushResponse, IngestMappedRequest, QueryStreamResponse,
-        ReplayStreamBinding, VectorBackendConfig,
+        ReplayStreamBinding, SnapshotArtifact, VectorBackendConfig,
     };
 }

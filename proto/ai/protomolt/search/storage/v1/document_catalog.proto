@@ -159,3 +159,37 @@ message DocumentCatalogCheckpointLimits {
   // It is not a filesystem quota or a whole-process memory bound.
   uint64 max_file_bytes = 2;
 }
+
+// Trusted local backup construction budgets, not transport or serving grants.
+message SourceBackupLimits {
+  // 1..64 MiB of serialized source/index metadata and inventory accounting.
+  uint64 metadata_bytes = 1;
+  // 1..65536 inventory files; the final completion manifest is one extra file.
+  // Artifact pinning may also refuse when the OS file-descriptor limit is lower.
+  uint32 max_files = 2;
+  // Positive completed bundle byte bound, including the completion manifest.
+  // Checked as files are completed; not a filesystem quota.
+  uint64 max_bytes = 3;
+  // 1..64 MiB of source records per output database transaction.
+  uint64 source_batch_bytes = 4;
+}
+
+message SourceBackupIndex {
+  bytes index_key = 1;
+  // Canonical relative directory inside this bundle, never a source path.
+  string directory = 2;
+  uint64 catalog_epoch = 3;
+}
+
+// Written last as source-backup.pb after the entire local bundle is durable.
+// It binds one accepted source snapshot to all of its journaled indexes. It
+// does not authorize activation, replace current grants or advance receipts.
+message SourceBackupManifest {
+  uint32 format_version = 1;
+  DocumentCatalogCheckpoint source = 2;
+  repeated SourceBackupIndex indexes = 3;
+  repeated ai.protomolt.search.v1.SnapshotArtifact artifacts = 4;
+  // SHA-256 of this format-1 message with manifest_sha256 cleared.
+  // Integrity binding only; this is not an authentication signature.
+  bytes manifest_sha256 = 5;
+}

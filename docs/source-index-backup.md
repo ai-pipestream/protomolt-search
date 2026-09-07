@@ -50,34 +50,48 @@ file's disk footprint under ongoing writes. The bundle owner must drop the
 capture promptly on cancellation or failure. Copying an old read transaction
 must never fall back to newer records from the live source.
 
-## Completing the bundle
+## Implemented coherent bundle capture
 
-The source capture is implemented; the following bundle and restore work is
-still required.
+`DocumentCatalog::capture_backup(indexes, limits)` captures the source read
+transaction first, then pins every journaled index under its live catalog's
+publication fence. The caller supplies the actual live catalogs, which share
+those fences with publication and compaction. Missing, duplicate, extra,
+foreign-owner or journal-mismatched indexes refuse the capture. A concurrent
+publication may cause a refusal; capture never substitutes a newer source view.
+`NodeServiceImpl::backup_documents_blocking` supplies this operation for a
+source authority with exactly one journaled local index.
 
-1. Capture the source transaction first. For every journal index, obtain the
-   exact committed manifest under that catalog's publication fence. The index
-   key, owner history/collection, typed manifest hash and physical generation
-   must agree with the captured state. Missing, extra or mismatched indexes
-   refuse the entire backup. Accepted backlog remains source backlog.
-2. Pin each referenced immutable artifact while its catalog fence is held, then
-   release the fence before bulk I/O. An ordinary query's mapped reader is not
-   sufficient protection for a later reopen by pathname: compaction can retire
-   that pathname. The pinning mechanism needs explicit file-descriptor and
-   metadata budgets. A changed manifest refuses capture rather than mixing
-   generations.
-3. Copy artifact bytes from the held files, verify lengths and checksums, retain
-   complete generation declarations even for empty indexes, and write the
-   captured source database. Record only validated relative bundle paths.
-   Create the final protobuf bundle manifest last, after syncing its contents
-   and directories. Partial outputs are private and are not restorable bundles.
-4. Restore into a new private destination. Verify the bundle and artifact
+The capture holds open files for immutable artifacts and retains the captured
+manifest bytes. Compaction may retire the original paths after capture; the
+copy reads the held files instead of reopening those paths. Catalog fences are
+released before bulk copying. Metadata, file count, completed bundle bytes and
+source transaction bytes have explicit protobuf budgets. OS descriptor limits
+may refuse a capture below its requested file count.
+
+`CapturedBackup::write_to(destination)` creates a private directory exclusively
+(mode 0700 on Unix), outside every captured live catalog. Existing destinations
+are untouched. It writes the captured source database, releases the source read
+transaction, then streams artifacts with a 64 KiB buffer and checks every length
+and SHA-256. Complete generation declarations survive even for an empty index.
+Files and directories are synced before the final `source-backup.pb` manifest
+is written and synced. That additive storage protobuf binds source metadata,
+index keys and epochs, relative artifact paths, sizes and checksums. Its own
+SHA-256 covers the canonical message with its digest field cleared.
+
+A failed write removes only its own output directory. A process crash can leave
+a partial directory. Presence of the completion file alone is insufficient:
+restore must verify its digest and its entire inventory. These local owner
+operations grant no remote export, permissions change or serving activation.
+
+## Restore work remaining
+
+1. Restore into a new private destination. Verify the bundle and artifact
    inventory, open the copied source database, validate every journal anchor
    against the copied manifests, and validate each segment with the configured
    provider before producing an activatable result. Do not re-evaluate CEL,
    analyze text, regenerate embeddings, or replay writes to approximate the
    captured state.
-5. Activation belongs to the collection authority. A restore must not create
+2. Activation belongs to the collection authority. A restore must not create
    two active writers for one source history or turn a recovered artifact into
    a current serving receipt. Existing write fencing, ownership and generation
    checks remain mandatory. Define recovery from an older checkpoint explicitly
@@ -91,6 +105,14 @@ use the same owner operation; they must not assemble independent source and
 index snapshots in application code.
 
 ## Validation
+
+The bundle implementation has eight focused passing regressions: capture across
+compaction and path retirement with unpublished source backlog, multiple owned
+indexes, empty declarations and source tombstones, source-only histories,
+index/owner and budget refusals, changed artifact bytes, exclusive output
+ownership, and refusal of destinations nested in live catalogs. Combined
+validation with the derived-column snapshot fix is pending.
+
 
 The checkpoint implementation passed 615 library tests, 837 integration tests
 across 142 targets, 13 embedded tests and two isolated IVF-provider tests:
