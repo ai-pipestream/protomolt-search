@@ -56,7 +56,13 @@ macro_rules! same_tables {
                 .all(|i| other.map_facet_name(i) == tail.map_facet_name(i))
             && other.map_numeric_count() == tail.map_numeric_count()
             && (0..tail.map_numeric_count())
-                .all(|i| other.map_numeric_name(i) == tail.map_numeric_name(i));
+                .all(|i| other.map_numeric_name(i) == tail.map_numeric_name(i))
+            && other.map_integer_count() == tail.map_integer_count()
+            && (0..tail.map_integer_count())
+                .all(|i| other.map_integer_name(i) == tail.map_integer_name(i))
+            && other.map_unsigned_integer_count() == tail.map_unsigned_integer_count()
+            && (0..tail.map_unsigned_integer_count())
+                .all(|i| other.map_unsigned_integer_name(i) == tail.map_unsigned_integer_name(i));
         same_fields && same_columns
     }};
 }
@@ -220,7 +226,11 @@ pub struct SegmentedShard {
     map_values: Vec<UnionDict>,
     map_key_reverse: Vec<KeyReverse>,
     map_numeric_keys: Vec<UnionDict>,
+    map_integer_keys: Vec<UnionDict>,
+    map_unsigned_integer_keys: Vec<UnionDict>,
     map_numeric_key_reverse: Vec<KeyReverse>,
+    map_integer_key_reverse: Vec<KeyReverse>,
+    map_unsigned_integer_key_reverse: Vec<KeyReverse>,
 }
 
 impl std::fmt::Debug for SegmentedShard {
@@ -321,7 +331,11 @@ impl SegmentedShard {
             map_values: Vec::new(),
             map_key_reverse: Vec::new(),
             map_numeric_keys: Vec::new(),
+            map_integer_keys: Vec::new(),
+            map_unsigned_integer_keys: Vec::new(),
             map_numeric_key_reverse: Vec::new(),
+            map_integer_key_reverse: Vec::new(),
+            map_unsigned_integer_key_reverse: Vec::new(),
         };
         shard.rebuild()?;
         Ok(shard)
@@ -402,6 +416,26 @@ impl SegmentedShard {
                 )
             })
             .collect();
+        self.map_integer_keys = (0..self.tail.map_integer_count())
+            .map(|ci| {
+                UnionDict::build(
+                    &readers
+                        .iter()
+                        .map(|r| r.map_integer_keys(ci))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        self.map_unsigned_integer_keys = (0..self.tail.map_unsigned_integer_count())
+            .map(|ci| {
+                UnionDict::build(
+                    &readers
+                        .iter()
+                        .map(|r| r.map_unsigned_integer_keys(ci))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
         // The frozen part's values enter as the tail's did when it froze,
         // then move to the frozen remap; the real tail syncs after them.
         if let Some(frozen) = self.frozen.as_ref().map(|f| Arc::clone(&f.store)) {
@@ -419,6 +453,14 @@ impl SegmentedShard {
             }
             for (ci, dict) in self.map_numeric_keys.iter_mut().enumerate() {
                 dict.sync_tail(frozen.map_numeric_keys(ci));
+                dict.freeze_tail();
+            }
+            for (ci, dict) in self.map_integer_keys.iter_mut().enumerate() {
+                dict.sync_tail(frozen.map_integer_keys(ci));
+                dict.freeze_tail();
+            }
+            for (ci, dict) in self.map_unsigned_integer_keys.iter_mut().enumerate() {
+                dict.sync_tail(frozen.map_unsigned_integer_keys(ci));
                 dict.freeze_tail();
             }
         }
@@ -452,6 +494,30 @@ impl SegmentedShard {
                 )
             })
             .collect();
+        self.map_integer_key_reverse = self
+            .map_integer_keys
+            .iter()
+            .enumerate()
+            .map(|(ci, dict)| {
+                KeyReverse::build(
+                    dict,
+                    frozen.map_or(0, |f| f.map_integer_keys(ci).len()),
+                    self.tail.map_integer_keys(ci).len(),
+                )
+            })
+            .collect();
+        self.map_unsigned_integer_key_reverse = self
+            .map_unsigned_integer_keys
+            .iter()
+            .enumerate()
+            .map(|(ci, dict)| {
+                KeyReverse::build(
+                    dict,
+                    frozen.map_or(0, |f| f.map_unsigned_integer_keys(ci).len()),
+                    self.tail.map_unsigned_integer_keys(ci).len(),
+                )
+            })
+            .collect();
     }
 
     /// Refuse a sealed segment whose tables differ from the tail's.
@@ -479,6 +545,12 @@ impl SegmentedShard {
         }
         for (ci, dict) in self.map_numeric_keys.iter_mut().enumerate() {
             dict.sync_tail(self.tail.map_numeric_keys(ci));
+        }
+        for (ci, dict) in self.map_integer_keys.iter_mut().enumerate() {
+            dict.sync_tail(self.tail.map_integer_keys(ci));
+        }
+        for (ci, dict) in self.map_unsigned_integer_keys.iter_mut().enumerate() {
+            dict.sync_tail(self.tail.map_unsigned_integer_keys(ci));
         }
         self.rebuild_key_reverse();
     }
@@ -520,6 +592,8 @@ impl SegmentedShard {
             .chain(self.map_keys.iter_mut())
             .chain(self.map_values.iter_mut())
             .chain(self.map_numeric_keys.iter_mut())
+            .chain(self.map_integer_keys.iter_mut())
+            .chain(self.map_unsigned_integer_keys.iter_mut())
         {
             dict.freeze_tail();
         }
@@ -1119,6 +1193,132 @@ impl SegmentedShard {
                 .frozen_store()
                 .map_numeric_value(ci, local_key, local_doc),
             Source::Tail => self.tail.map_numeric_value(ci, local_key, local_doc),
+        }
+    }
+
+    pub fn map_integer_count(&self) -> usize {
+        self.tail.map_integer_count()
+    }
+
+    pub fn map_integer_name(&self, ci: usize) -> &str {
+        self.tail.map_integer_name(ci)
+    }
+
+    pub fn map_integer_index(&self, name: &str) -> Option<usize> {
+        self.tail.map_integer_index(name)
+    }
+
+    pub fn map_integer_key_ord(&self, ci: usize, key: &str) -> Option<u32> {
+        self.map_integer_keys[ci].ord_of(key)
+    }
+
+    pub fn map_integer_keys(&self, ci: usize) -> &[String] {
+        &self.map_integer_keys[ci].values
+    }
+
+    /// Exact union bounds; a missing key has no bounds.
+    pub fn map_integer_key_min_max(&self, ci: usize, key_ord: u32) -> Option<(i64, i64)> {
+        let key = self.map_integer_keys[ci].values.get(key_ord as usize)?;
+        let mut bounds: Option<(i64, i64)> = None;
+        let mut include = |next: Option<(i64, i64)>| {
+            if let Some((lo, hi)) = next {
+                bounds = Some(bounds.map_or((lo, hi), |(min, max)| (min.min(lo), max.max(hi))));
+            }
+        };
+        for i in 0..self.parts.len() {
+            let reader = self.reader(i);
+            if let Some(local) = reader.map_integer_key_ord(ci, key) {
+                include(reader.map_integer_key_min_max(ci, local));
+            }
+        }
+        for (_, heap) in self.heaps() {
+            if let Some(local) = heap.map_integer_key_ord(ci, key) {
+                include(heap.map_integer_key_min_max(ci, local));
+            }
+        }
+        bounds
+    }
+
+    pub fn map_integer_value(&self, ci: usize, key_ord: u32, doc: u32) -> Option<i64> {
+        let (source, reverse_index, local_doc) = self.locate(doc);
+        let local_key =
+            *self.map_integer_key_reverse[ci].per_part[reverse_index].get(key_ord as usize)?;
+        if local_key == u32::MAX {
+            return None;
+        }
+        match source {
+            Source::Sealed(part) => self
+                .reader(part)
+                .map_integer_value(ci, local_key, local_doc),
+            Source::Frozen => self
+                .frozen_store()
+                .map_integer_value(ci, local_key, local_doc),
+            Source::Tail => self.tail.map_integer_value(ci, local_key, local_doc),
+        }
+    }
+
+    pub fn map_unsigned_integer_count(&self) -> usize {
+        self.tail.map_unsigned_integer_count()
+    }
+
+    pub fn map_unsigned_integer_name(&self, ci: usize) -> &str {
+        self.tail.map_unsigned_integer_name(ci)
+    }
+
+    pub fn map_unsigned_integer_index(&self, name: &str) -> Option<usize> {
+        self.tail.map_unsigned_integer_index(name)
+    }
+
+    pub fn map_unsigned_integer_key_ord(&self, ci: usize, key: &str) -> Option<u32> {
+        self.map_unsigned_integer_keys[ci].ord_of(key)
+    }
+
+    pub fn map_unsigned_integer_keys(&self, ci: usize) -> &[String] {
+        &self.map_unsigned_integer_keys[ci].values
+    }
+
+    /// Exact union bounds; a missing key has no bounds.
+    pub fn map_unsigned_integer_key_min_max(&self, ci: usize, key_ord: u32) -> Option<(u64, u64)> {
+        let key = self.map_unsigned_integer_keys[ci]
+            .values
+            .get(key_ord as usize)?;
+        let mut bounds: Option<(u64, u64)> = None;
+        let mut include = |next: Option<(u64, u64)>| {
+            if let Some((lo, hi)) = next {
+                bounds = Some(bounds.map_or((lo, hi), |(min, max)| (min.min(lo), max.max(hi))));
+            }
+        };
+        for i in 0..self.parts.len() {
+            let reader = self.reader(i);
+            if let Some(local) = reader.map_unsigned_integer_key_ord(ci, key) {
+                include(reader.map_unsigned_integer_key_min_max(ci, local));
+            }
+        }
+        for (_, heap) in self.heaps() {
+            if let Some(local) = heap.map_unsigned_integer_key_ord(ci, key) {
+                include(heap.map_unsigned_integer_key_min_max(ci, local));
+            }
+        }
+        bounds
+    }
+
+    pub fn map_unsigned_integer_value(&self, ci: usize, key_ord: u32, doc: u32) -> Option<u64> {
+        let (source, reverse_index, local_doc) = self.locate(doc);
+        let local_key = *self.map_unsigned_integer_key_reverse[ci].per_part[reverse_index]
+            .get(key_ord as usize)?;
+        if local_key == u32::MAX {
+            return None;
+        }
+        match source {
+            Source::Sealed(part) => self
+                .reader(part)
+                .map_unsigned_integer_value(ci, local_key, local_doc),
+            Source::Frozen => self
+                .frozen_store()
+                .map_unsigned_integer_value(ci, local_key, local_doc),
+            Source::Tail => self
+                .tail
+                .map_unsigned_integer_value(ci, local_key, local_doc),
         }
     }
 

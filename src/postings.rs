@@ -118,6 +118,8 @@ const COLUMN_KIND_ANALYSIS_BINDING: u8 = 12;
 const COLUMN_KIND_VECTOR_BINDING: u8 = 13;
 /// Explicit index policy, appended to the kind-13 binding payload.
 const COLUMN_KIND_INDEX_BINDING: u8 = 14;
+const COLUMN_KIND_MAP_I64: u8 = 15;
+const COLUMN_KIND_MAP_U64: u8 = 16;
 const COLUMN_KIND_SOURCES: u8 = 9;
 const SOURCES_ENTRY_NAME: &str = "protobuf-sources";
 const SOURCE_ENTRY_BYTES: u64 = 2 + SOURCES_ENTRY_NAME.len() as u64 + 1 + 16;
@@ -436,6 +438,10 @@ fn v6v7_section_starts(map: &[u8], v7: bool) -> io::Result<Vec<(String, u64)>> {
                     starts.push((format!("column:{name}:offsets"), u64_at(base + 12)));
                     starts.push((format!("column:{name}:pairs"), u64_at(base + 20)));
                     cursor = base + 28;
+                }
+                COLUMN_KIND_MAP_I64 | COLUMN_KIND_MAP_U64 => {
+                    starts.push((format!("column:{name}:integer_map"), u64_at(base)));
+                    cursor = base + 16;
                 }
                 COLUMN_KIND_I64 | COLUMN_KIND_I64_PRESENT | COLUMN_KIND_U64 => {
                     starts.push((format!("column:{name}:vals"), u64_at(base + 16)));
@@ -1673,6 +1679,39 @@ fn write_map_numeric_column<W: Write>(
     })
 }
 
+fn integer_map_sections<T: crate::integer_map::Integer>(
+    columns: &[crate::integer_map::Store<T>],
+    rows: u32,
+    cursor: &mut u64,
+) -> io::Result<Vec<(u64, u64)>> {
+    columns
+        .iter()
+        .map(|column| {
+            let len = column.encoded_len(rows)?;
+            let section = (*cursor, len);
+            *cursor = cursor.checked_add(len).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "integer map section overflow")
+            })?;
+            Ok(section)
+        })
+        .collect()
+}
+fn write_integer_map_entries<T: crate::integer_map::Integer>(
+    w: &mut impl Write,
+    columns: &[crate::integer_map::Store<T>],
+    sections: &[(u64, u64)],
+    kind: u8,
+) -> io::Result<()> {
+    for (column, &(off, len)) in columns.iter().zip(sections) {
+        write_u16(w, column.name.len() as u16)?;
+        w.write_all(column.name.as_bytes())?;
+        w.write_all(&[kind])?;
+        write_u64(w, off)?;
+        write_u64(w, len)?;
+    }
+    Ok(())
+}
+
 /// Intern `value` into a dictionary, returning its ordinal.
 fn intern(dict: &mut Vec<String>, index: &mut HashMap<String, u32>, value: &str, col: &str) -> u32 {
     match index.get(value) {
@@ -1834,6 +1873,8 @@ pub struct Bm25Store {
     map_facets: Vec<MapFacetStore>,
     /// map<string, f64> columns in map-numeric-id order.
     map_numerics: Vec<MapNumericStore>,
+    map_integers: Vec<crate::integer_map::Store<i64>>,
+    map_unsigned_integers: Vec<crate::integer_map::Store<u64>>,
     /// i64 columns in integer-id order.
     integers: Vec<IntStore>,
     unsigned_integers: Vec<UintStore>,
@@ -1856,6 +1897,8 @@ impl Default for Bm25Store {
             numerics: Vec::new(),
             map_facets: Vec::new(),
             map_numerics: Vec::new(),
+            map_integers: Vec::new(),
+            map_unsigned_integers: Vec::new(),
             integers: Vec::new(),
             unsigned_integers: Vec::new(),
             geos: Vec::new(),
@@ -1924,6 +1967,8 @@ impl Bm25Store {
             numerics: Vec::new(),
             map_facets: Vec::new(),
             map_numerics: Vec::new(),
+            map_integers: Vec::new(),
+            map_unsigned_integers: Vec::new(),
             integers: Vec::new(),
             unsigned_integers: Vec::new(),
             geos: Vec::new(),
@@ -2314,6 +2359,140 @@ impl Bm25Store {
     /// The name of map-facet column `ci`. Panics when out of range.
     pub fn map_facet_name(&self, ci: usize) -> &str {
         &self.map_facets[ci].name
+    }
+
+    /// Configure exact i64 map columns before adding documents.
+    pub fn with_map_integers(mut self, names: &[&str]) -> Self {
+        assert!(
+            self.fields[0].doc_lengths.is_empty(),
+            "map columns must be configured before documents"
+        );
+        validate_facet_names(names);
+        self.map_integers = names
+            .iter()
+            .map(|name| crate::integer_map::Store::new(name))
+            .collect();
+        self
+    }
+    /// Set an exact value in an existing document slot. Duplicate keys return an error.
+    pub fn set_map_integer(
+        &mut self,
+        ci: usize,
+        doc_id: u32,
+        key: &str,
+        value: i64,
+    ) -> io::Result<()> {
+        if doc_id as usize >= self.fields[0].doc_lengths.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "integer map document slot does not exist",
+            ));
+        }
+        self.map_integers
+            .get_mut(ci)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "integer map column does not exist",
+                )
+            })?
+            .set(doc_id, key, value)
+    }
+    /// Number of exact i64 map columns.
+    pub fn map_integer_count(&self) -> usize {
+        self.map_integers.len()
+    }
+    /// Column name at `ci`; panics for an invalid column index.
+    pub fn map_integer_name(&self, ci: usize) -> &str {
+        &self.map_integers[ci].name
+    }
+    /// Look up an exact i64 map column by name.
+    pub fn map_integer_index(&self, name: &str) -> Option<usize> {
+        self.map_integers.iter().position(|c| c.name == name)
+    }
+    /// Map keys in this reader's ordinal order.
+    pub fn map_integer_keys(&self, ci: usize) -> &[String] {
+        &self.map_integers[ci].keys
+    }
+    /// Find a key, including the empty string.
+    pub fn map_integer_key_ord(&self, ci: usize, key: &str) -> Option<u32> {
+        self.map_integers[ci].key_ord(key)
+    }
+    /// Exact bounds, or `None` when the key has no entries.
+    pub fn map_integer_key_min_max(&self, ci: usize, key: u32) -> Option<(i64, i64)> {
+        self.map_integers[ci].bounds(key)
+    }
+    /// Exact value; an absent entry or out-of-range key or row returns `None`.
+    pub fn map_integer_value(&self, ci: usize, key: u32, row: u32) -> Option<i64> {
+        self.map_integers[ci].value(key, row)
+    }
+
+    /// Configure exact u64 map columns before adding documents.
+    pub fn with_map_unsigned_integers(mut self, names: &[&str]) -> Self {
+        assert!(
+            self.fields[0].doc_lengths.is_empty(),
+            "map columns must be configured before documents"
+        );
+        validate_facet_names(names);
+        self.map_unsigned_integers = names
+            .iter()
+            .map(|name| crate::integer_map::Store::new(name))
+            .collect();
+        self
+    }
+    /// Set an exact value in an existing document slot. Duplicate keys return an error.
+    pub fn set_map_unsigned_integer(
+        &mut self,
+        ci: usize,
+        doc_id: u32,
+        key: &str,
+        value: u64,
+    ) -> io::Result<()> {
+        if doc_id as usize >= self.fields[0].doc_lengths.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "integer map document slot does not exist",
+            ));
+        }
+        self.map_unsigned_integers
+            .get_mut(ci)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "integer map column does not exist",
+                )
+            })?
+            .set(doc_id, key, value)
+    }
+    /// Number of exact u64 map columns.
+    pub fn map_unsigned_integer_count(&self) -> usize {
+        self.map_unsigned_integers.len()
+    }
+    /// Column name at `ci`; panics for an invalid column index.
+    pub fn map_unsigned_integer_name(&self, ci: usize) -> &str {
+        &self.map_unsigned_integers[ci].name
+    }
+    /// Look up an exact u64 map column by name.
+    pub fn map_unsigned_integer_index(&self, name: &str) -> Option<usize> {
+        self.map_unsigned_integers
+            .iter()
+            .position(|c| c.name == name)
+    }
+    /// Map keys in this reader's ordinal order.
+    pub fn map_unsigned_integer_keys(&self, ci: usize) -> &[String] {
+        &self.map_unsigned_integers[ci].keys
+    }
+    /// Find a key, including the empty string.
+    pub fn map_unsigned_integer_key_ord(&self, ci: usize, key: &str) -> Option<u32> {
+        self.map_unsigned_integers[ci].key_ord(key)
+    }
+    /// Exact bounds, or `None` when the key has no entries.
+    pub fn map_unsigned_integer_key_min_max(&self, ci: usize, key: u32) -> Option<(u64, u64)> {
+        self.map_unsigned_integers[ci].bounds(key)
+    }
+    /// Exact value; an absent entry or out-of-range key or row returns `None`.
+    pub fn map_unsigned_integer_value(&self, ci: usize, key: u32, row: u32) -> Option<u64> {
+        self.map_unsigned_integers[ci].value(key, row)
     }
 
     /// The index of the map-facet column named `name`.
@@ -2853,6 +3032,13 @@ impl Bm25Store {
     ///   u32 blob_off, u16 term_len), then the term blob)
     /// ```
     fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        if !self.map_integers.is_empty() || !self.map_unsigned_integers.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "legacy format cannot preserve integer map columns",
+            ));
+        }
+
         if !self.unsigned_integers.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -2967,6 +3153,8 @@ impl Bm25Store {
             || !self.numerics.is_empty()
             || !self.map_facets.is_empty()
             || !self.map_numerics.is_empty()
+            || !self.map_integers.is_empty()
+            || !self.map_unsigned_integers.is_empty()
             || !self.integers.is_empty()
             || !self.unsigned_integers.is_empty()
             || !self.geos.is_empty()
@@ -2995,6 +3183,16 @@ impl Bm25Store {
                     .map_numerics
                     .iter()
                     .map(|c| 2 + c.name.len() as u64 + 1 + 4 + 8 * 3)
+                    .sum::<u64>()
+                + self
+                    .map_integers
+                    .iter()
+                    .map(|c| 2 + c.name.len() as u64 + 1 + 16)
+                    .sum::<u64>()
+                + self
+                    .map_unsigned_integers
+                    .iter()
+                    .map(|c| 2 + c.name.len() as u64 + 1 + 16)
                     .sum::<u64>()
                 + self
                     .integers
@@ -3156,6 +3354,10 @@ impl Bm25Store {
             unsigned_offs.push(cursor);
             cursor += 8 * n_slots + n_slots.div_ceil(8);
         }
+        let map_integer_sections =
+            integer_map_sections(&self.map_integers, n_slots as u32, &mut cursor)?;
+        let map_unsigned_sections =
+            integer_map_sections(&self.map_unsigned_integers, n_slots as u32, &mut cursor)?;
         let source_section = if self.sources.is_empty() {
             None
         } else {
@@ -3184,6 +3386,8 @@ impl Bm25Store {
                     + self.numerics.len()
                     + self.map_facets.len()
                     + self.map_numerics.len()
+                    + self.map_integers.len()
+                    + self.map_unsigned_integers.len()
                     + self.integers.len()
                     + self.unsigned_integers.len()
                     + self.geos.len()
@@ -3278,6 +3482,18 @@ impl Bm25Store {
                 write_u64(w, max)?;
                 write_u64(w, off)?;
             }
+            write_integer_map_entries(
+                w,
+                &self.map_integers,
+                &map_integer_sections,
+                COLUMN_KIND_MAP_I64,
+            )?;
+            write_integer_map_entries(
+                w,
+                &self.map_unsigned_integers,
+                &map_unsigned_sections,
+                COLUMN_KIND_MAP_U64,
+            )?;
             write_binding_entry(w, self.binding.as_ref())?;
             write_source_entry(w, source_section)?;
         }
@@ -3367,6 +3583,12 @@ impl Bm25Store {
         for column in &self.unsigned_integers {
             column.write(w, n_slots as usize)?;
         }
+        for column in &self.map_integers {
+            column.write(w, n_slots as u32)?;
+        }
+        for column in &self.map_unsigned_integers {
+            column.write(w, n_slots as u32)?;
+        }
         if source_section.is_some() {
             self.sources.write(w, n_slots as u32)?;
         }
@@ -3395,6 +3617,13 @@ impl Bm25Store {
     ///   term blob) — binary-searchable by term
     /// ```
     fn write_v4_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        if !self.map_integers.is_empty() || !self.map_unsigned_integers.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "legacy format cannot preserve integer map columns",
+            ));
+        }
+
         if !self.unsigned_integers.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -3524,6 +3753,8 @@ impl Bm25Store {
             numerics: Vec::new(),
             map_facets: Vec::new(),
             map_numerics: Vec::new(),
+            map_integers: Vec::new(),
+            map_unsigned_integers: Vec::new(),
             integers: Vec::new(),
             unsigned_integers: Vec::new(),
             geos: Vec::new(),
@@ -4394,6 +4625,7 @@ impl Bm25Store {
         let mut map_facet_metas: Vec<(String, u32, u32, u64, u64, u64, u64)> = Vec::new();
         // (name, n_keys, keys, offsets, pairs)
         let mut map_numeric_metas: Vec<(String, u32, u64, u64, u64)> = Vec::new();
+        let mut integer_map_metas = Vec::new();
         let mut integer_metas: Vec<(String, u64, bool)> = Vec::new();
         let mut unsigned_metas: Vec<(String, u64)> = Vec::new();
         let mut geo_metas: Vec<(String, u64)> = Vec::new();
@@ -4446,6 +4678,10 @@ impl Bm25Store {
                             u64_at(base + 20)?, // pairs_off
                         ));
                         cursor = base + 28;
+                    }
+                    COLUMN_KIND_MAP_I64 | COLUMN_KIND_MAP_U64 => {
+                        integer_map_metas.push((kind, name, u64_at(base)?, u64_at(base + 8)?));
+                        cursor = base + 16;
                     }
                     COLUMN_KIND_I64 | COLUMN_KIND_I64_PRESENT => {
                         integer_metas.push((
@@ -4776,6 +5012,23 @@ impl Bm25Store {
                 pairs,
             });
         }
+        let mut map_integers = Vec::new();
+        let mut map_unsigned_integers = Vec::new();
+        for (kind, name, off, len) in integer_map_metas {
+            if kind == COLUMN_KIND_MAP_I64 {
+                map_integers.push(crate::integer_map::Store::load(
+                    &name,
+                    at(off, len)?,
+                    n_slots as u32,
+                )?);
+            } else {
+                map_unsigned_integers.push(crate::integer_map::Store::load(
+                    &name,
+                    at(off, len)?,
+                    n_slots as u32,
+                )?);
+            }
+        }
         // Translate legacy sentinel columns into explicit in-memory presence.
         let mut integers = Vec::with_capacity(integer_metas.len());
         for (name, vals_off, has_presence) in integer_metas {
@@ -4829,6 +5082,8 @@ impl Bm25Store {
             numerics,
             map_facets,
             map_numerics,
+            map_integers,
+            map_unsigned_integers,
             integers,
             unsigned_integers,
             geos,
@@ -4949,6 +5204,8 @@ pub struct SpillBuilder {
     map_facets: Vec<MapFacetStore>,
     /// map<string, f64> columns. Non-empty makes `finish` write v7.
     map_numerics: Vec<MapNumericStore>,
+    map_integers: Vec<crate::integer_map::Store<i64>>,
+    map_unsigned_integers: Vec<crate::integer_map::Store<u64>>,
     /// i64 columns (8 B per slot in heap, same argument as `numerics`).
     /// Non-empty makes `finish` write v7.
     integers: Vec<IntStore>,
@@ -5034,6 +5291,8 @@ impl SpillBuilder {
             numerics: Vec::new(),
             map_facets: Vec::new(),
             map_numerics: Vec::new(),
+            map_integers: Vec::new(),
+            map_unsigned_integers: Vec::new(),
             integers: Vec::new(),
             unsigned_integers: Vec::new(),
             geos: Vec::new(),
@@ -5292,6 +5551,142 @@ impl SpillBuilder {
         validate_facet_names(names);
         self.map_numerics = names.iter().map(|n| MapNumericStore::new(n)).collect();
         self
+    }
+
+    /// Configure exact i64 map columns before adding documents.
+    pub fn with_map_integer_fields(mut self, names: &[&str]) -> Self {
+        assert!(
+            self.fields[0].doc_lengths.is_empty(),
+            "map columns must be configured before documents"
+        );
+        assert!(!self.v4_only, "the v4 format carries no columns");
+        validate_facet_names(names);
+        self.map_integers = names
+            .iter()
+            .map(|name| crate::integer_map::Store::new(name))
+            .collect();
+        self
+    }
+    /// Set an exact value in an existing document slot. Duplicate keys return an error.
+    pub fn set_map_integer(
+        &mut self,
+        ci: usize,
+        doc_id: u32,
+        key: &str,
+        value: i64,
+    ) -> io::Result<()> {
+        if doc_id as usize >= self.fields[0].doc_lengths.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "integer map document slot does not exist",
+            ));
+        }
+        self.map_integers
+            .get_mut(ci)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "integer map column does not exist",
+                )
+            })?
+            .set(doc_id, key, value)
+    }
+    /// Number of exact i64 map columns.
+    pub fn map_integer_count(&self) -> usize {
+        self.map_integers.len()
+    }
+    /// Column name at `ci`; panics for an invalid column index.
+    pub fn map_integer_name(&self, ci: usize) -> &str {
+        &self.map_integers[ci].name
+    }
+    /// Look up an exact i64 map column by name.
+    pub fn map_integer_index(&self, name: &str) -> Option<usize> {
+        self.map_integers.iter().position(|c| c.name == name)
+    }
+    /// Map keys in this reader's ordinal order.
+    pub fn map_integer_keys(&self, ci: usize) -> &[String] {
+        &self.map_integers[ci].keys
+    }
+    /// Find a key, including the empty string.
+    pub fn map_integer_key_ord(&self, ci: usize, key: &str) -> Option<u32> {
+        self.map_integers[ci].key_ord(key)
+    }
+    /// Exact bounds, or `None` when the key has no entries.
+    pub fn map_integer_key_min_max(&self, ci: usize, key: u32) -> Option<(i64, i64)> {
+        self.map_integers[ci].bounds(key)
+    }
+    /// Exact value; an absent entry or out-of-range key or row returns `None`.
+    pub fn map_integer_value(&self, ci: usize, key: u32, row: u32) -> Option<i64> {
+        self.map_integers[ci].value(key, row)
+    }
+
+    /// Configure exact u64 map columns before adding documents.
+    pub fn with_map_unsigned_integer_fields(mut self, names: &[&str]) -> Self {
+        assert!(
+            self.fields[0].doc_lengths.is_empty(),
+            "map columns must be configured before documents"
+        );
+        assert!(!self.v4_only, "the v4 format carries no columns");
+        validate_facet_names(names);
+        self.map_unsigned_integers = names
+            .iter()
+            .map(|name| crate::integer_map::Store::new(name))
+            .collect();
+        self
+    }
+    /// Set an exact value in an existing document slot. Duplicate keys return an error.
+    pub fn set_map_unsigned_integer(
+        &mut self,
+        ci: usize,
+        doc_id: u32,
+        key: &str,
+        value: u64,
+    ) -> io::Result<()> {
+        if doc_id as usize >= self.fields[0].doc_lengths.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "integer map document slot does not exist",
+            ));
+        }
+        self.map_unsigned_integers
+            .get_mut(ci)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "integer map column does not exist",
+                )
+            })?
+            .set(doc_id, key, value)
+    }
+    /// Number of exact u64 map columns.
+    pub fn map_unsigned_integer_count(&self) -> usize {
+        self.map_unsigned_integers.len()
+    }
+    /// Column name at `ci`; panics for an invalid column index.
+    pub fn map_unsigned_integer_name(&self, ci: usize) -> &str {
+        &self.map_unsigned_integers[ci].name
+    }
+    /// Look up an exact u64 map column by name.
+    pub fn map_unsigned_integer_index(&self, name: &str) -> Option<usize> {
+        self.map_unsigned_integers
+            .iter()
+            .position(|c| c.name == name)
+    }
+    /// Map keys in this reader's ordinal order.
+    pub fn map_unsigned_integer_keys(&self, ci: usize) -> &[String] {
+        &self.map_unsigned_integers[ci].keys
+    }
+    /// Find a key, including the empty string.
+    pub fn map_unsigned_integer_key_ord(&self, ci: usize, key: &str) -> Option<u32> {
+        self.map_unsigned_integers[ci].key_ord(key)
+    }
+    /// Exact bounds, or `None` when the key has no entries.
+    pub fn map_unsigned_integer_key_min_max(&self, ci: usize, key: u32) -> Option<(u64, u64)> {
+        self.map_unsigned_integers[ci].bounds(key)
+    }
+    /// Exact value; an absent entry or out-of-range key or row returns `None`.
+    pub fn map_unsigned_integer_value(&self, ci: usize, key: u32, row: u32) -> Option<u64> {
+        self.map_unsigned_integers[ci].value(key, row)
     }
 
     /// The index of the map-facet column named `name`.
@@ -5736,6 +6131,8 @@ impl SpillBuilder {
             || !self.numerics.is_empty()
             || !self.map_facets.is_empty()
             || !self.map_numerics.is_empty()
+            || !self.map_integers.is_empty()
+            || !self.map_unsigned_integers.is_empty()
             || !self.integers.is_empty()
             || !self.unsigned_integers.is_empty()
             || !self.geos.is_empty()
@@ -5764,6 +6161,16 @@ impl SpillBuilder {
                     .map_numerics
                     .iter()
                     .map(|c| 2 + c.name.len() as u64 + 1 + 4 + 8 * 3)
+                    .sum::<u64>()
+                + self
+                    .map_integers
+                    .iter()
+                    .map(|c| 2 + c.name.len() as u64 + 1 + 16)
+                    .sum::<u64>()
+                + self
+                    .map_unsigned_integers
+                    .iter()
+                    .map(|c| 2 + c.name.len() as u64 + 1 + 16)
                     .sum::<u64>()
                 + self
                     .integers
@@ -5913,6 +6320,10 @@ impl SpillBuilder {
             unsigned_offs.push(cursor);
             cursor += 8 * n_slots + n_slots.div_ceil(8);
         }
+        let map_integer_sections =
+            integer_map_sections(&self.map_integers, n_slots as u32, &mut cursor)?;
+        let map_unsigned_sections =
+            integer_map_sections(&self.map_unsigned_integers, n_slots as u32, &mut cursor)?;
         let source_section = if self.sources.is_empty() {
             None
         } else {
@@ -5943,6 +6354,8 @@ impl SpillBuilder {
                         + self.numerics.len()
                         + self.map_facets.len()
                         + self.map_numerics.len()
+                        + self.map_integers.len()
+                        + self.map_unsigned_integers.len()
                         + self.integers.len()
                         + self.unsigned_integers.len()
                         + self.geos.len()
@@ -6037,6 +6450,18 @@ impl SpillBuilder {
                     write_u64(&mut w, max)?;
                     write_u64(&mut w, off)?;
                 }
+                write_integer_map_entries(
+                    &mut w,
+                    &self.map_integers,
+                    &map_integer_sections,
+                    COLUMN_KIND_MAP_I64,
+                )?;
+                write_integer_map_entries(
+                    &mut w,
+                    &self.map_unsigned_integers,
+                    &map_unsigned_sections,
+                    COLUMN_KIND_MAP_U64,
+                )?;
                 write_binding_entry(&mut w, self.binding.as_ref())?;
                 write_source_entry(&mut w, source_section)?;
             }
@@ -6164,6 +6589,12 @@ impl SpillBuilder {
             }
             for column in &self.unsigned_integers {
                 column.write(&mut w, n_slots as usize)?;
+            }
+            for column in &self.map_integers {
+                column.write(&mut w, n_slots as u32)?;
+            }
+            for column in &self.map_unsigned_integers {
+                column.write(&mut w, n_slots as u32)?;
             }
             if source_section.is_some() {
                 self.sources.write(&mut w, n_slots as u32)?;
@@ -7029,6 +7460,7 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
     let mut positions: Vec<(Vec<u8>, u64, u64)> = Vec::new();
     let mut sentences: Vec<(Vec<u8>, u64, u64)> = Vec::new();
     let mut source_section = None;
+    let mut integer_maps = Vec::new();
     if v7 {
         let n_columns = u64::from(u32_at(cursor)?);
         if n_columns == 0 {
@@ -7080,6 +7512,10 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
                         u64_at(base + 20)?, // pairs_off
                     ));
                     cursor = base + 28;
+                }
+                COLUMN_KIND_MAP_I64 | COLUMN_KIND_MAP_U64 => {
+                    integer_maps.push((kind, u64_at(base)?, u64_at(base + 8)?));
+                    cursor = base + 16;
                 }
                 COLUMN_KIND_I64 | COLUMN_KIND_I64_PRESENT => {
                     integers.push((
@@ -7244,7 +7680,10 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             }
         }
     }
-    let unsigned_end = source_section.map_or(file_len, |(off, _)| off);
+    let integer_maps_end = source_section.map_or(file_len, |(off, _)| off);
+    let unsigned_end = integer_maps
+        .first()
+        .map_or(integer_maps_end, |entry| entry.1);
     let columns_end = unsigned_integers
         .first()
         .map_or(unsigned_end, |entry| entry.2);
@@ -7853,6 +8292,25 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
         }
         expected_start = end;
     }
+    for &(kind, off, len) in &integer_maps {
+        let end = off
+            .checked_add(len)
+            .ok_or_else(|| invalid("integer map section overflow".into()))?;
+        if off != expected_start || end > integer_maps_end {
+            return Err(invalid("integer map sections do not tile the file".into()));
+        }
+        if kind == COLUMN_KIND_MAP_I64 {
+            crate::integer_map::Reader::<i64>::open(bytes_at(off, len)?, n_slots as u32)?;
+        } else {
+            crate::integer_map::Reader::<u64>::open(bytes_at(off, len)?, n_slots as u32)?;
+        }
+        expected_start = end;
+    }
+    if expected_start != integer_maps_end {
+        return Err(invalid(
+            "column sections leave a gap before sources or EOF".into(),
+        ));
+    }
     if let Some((off, len)) = source_section {
         if off != expected_start || off.checked_add(len) != Some(file_len) {
             return Err(invalid("source section does not tile the file".into()));
@@ -7949,6 +8407,13 @@ struct MapFacetSlice {
 
 /// Per-map-numeric-column read state: the key dictionary with its
 /// per-key min/max bound metadata; offsets and pairs stay in the map.
+struct IntegerMapSlice<T: crate::integer_map::Integer> {
+    name: String,
+    off: usize,
+    len: usize,
+    reader: crate::integer_map::Reader<T>,
+}
+
 struct MapNumericSlice {
     name: String,
     /// Keys in ordinal order.
@@ -8012,6 +8477,8 @@ pub struct Bm25Reader {
     map_facets: Vec<MapFacetSlice>,
     /// Per-map-numeric-column state (v7 files; empty otherwise).
     map_numerics: Vec<MapNumericSlice>,
+    map_integers: Vec<IntegerMapSlice<i64>>,
+    map_unsigned_integers: Vec<IntegerMapSlice<u64>>,
     /// Per-integer-column state, integer-id order (v7 files; empty
     /// otherwise).
     integers: Vec<IntegerSlice>,
@@ -8470,6 +8937,72 @@ impl Bm25Reader {
         &self.map_facets[ci].name
     }
 
+    /// Number of exact i64 map columns.
+    pub fn map_integer_count(&self) -> usize {
+        self.map_integers.len()
+    }
+    /// Column name at `ci`; panics for an invalid column index.
+    pub fn map_integer_name(&self, ci: usize) -> &str {
+        &self.map_integers[ci].name
+    }
+    /// Look up an exact i64 map column by name.
+    pub fn map_integer_index(&self, name: &str) -> Option<usize> {
+        self.map_integers.iter().position(|c| c.name == name)
+    }
+    /// Map keys in this reader's ordinal order.
+    pub fn map_integer_keys(&self, ci: usize) -> &[String] {
+        &self.map_integers[ci].reader.keys
+    }
+    /// Find a key, including the empty string.
+    pub fn map_integer_key_ord(&self, ci: usize, key: &str) -> Option<u32> {
+        self.map_integers[ci].reader.key_ord(key)
+    }
+    /// Exact bounds, or `None` when the key has no entries.
+    pub fn map_integer_key_min_max(&self, ci: usize, key: u32) -> Option<(i64, i64)> {
+        self.map_integers[ci].reader.bounds(key)
+    }
+    /// Exact value; an absent entry or out-of-range key or row returns `None`.
+    pub fn map_integer_value(&self, ci: usize, key: u32, row: u32) -> Option<i64> {
+        let column = &self.map_integers[ci];
+        column
+            .reader
+            .value(&self.map[column.off..column.off + column.len], key, row)
+    }
+
+    /// Number of exact u64 map columns.
+    pub fn map_unsigned_integer_count(&self) -> usize {
+        self.map_unsigned_integers.len()
+    }
+    /// Column name at `ci`; panics for an invalid column index.
+    pub fn map_unsigned_integer_name(&self, ci: usize) -> &str {
+        &self.map_unsigned_integers[ci].name
+    }
+    /// Look up an exact u64 map column by name.
+    pub fn map_unsigned_integer_index(&self, name: &str) -> Option<usize> {
+        self.map_unsigned_integers
+            .iter()
+            .position(|c| c.name == name)
+    }
+    /// Map keys in this reader's ordinal order.
+    pub fn map_unsigned_integer_keys(&self, ci: usize) -> &[String] {
+        &self.map_unsigned_integers[ci].reader.keys
+    }
+    /// Find a key, including the empty string.
+    pub fn map_unsigned_integer_key_ord(&self, ci: usize, key: &str) -> Option<u32> {
+        self.map_unsigned_integers[ci].reader.key_ord(key)
+    }
+    /// Exact bounds, or `None` when the key has no entries.
+    pub fn map_unsigned_integer_key_min_max(&self, ci: usize, key: u32) -> Option<(u64, u64)> {
+        self.map_unsigned_integers[ci].reader.bounds(key)
+    }
+    /// Exact value; an absent entry or out-of-range key or row returns `None`.
+    pub fn map_unsigned_integer_value(&self, ci: usize, key: u32, row: u32) -> Option<u64> {
+        let column = &self.map_unsigned_integers[ci];
+        column
+            .reader
+            .value(&self.map[column.off..column.off + column.len], key, row)
+    }
+
     /// Number of map-numeric columns.
     pub fn map_numeric_count(&self) -> usize {
         self.map_numerics.len()
@@ -8684,6 +9217,8 @@ impl Bm25Reader {
             source_section: None,
             map_facets: Vec::new(),
             map_numerics: Vec::new(),
+            map_integers: Vec::new(),
+            map_unsigned_integers: Vec::new(),
             integers: Vec::new(),
             unsigned_integers: Vec::new(),
             geos: Vec::new(),
@@ -8762,6 +9297,8 @@ impl Bm25Reader {
         let mut numerics = Vec::new();
         let mut map_facets = Vec::new();
         let mut map_numerics = Vec::new();
+        let mut map_integers = Vec::new();
+        let mut map_unsigned_integers = Vec::new();
         let mut integers = Vec::new();
         let mut unsigned_integers = Vec::new();
         let mut geos = Vec::new();
@@ -8866,6 +9403,32 @@ impl Bm25Reader {
                             pairs_off,
                         });
                         cursor = base + 28;
+                    }
+                    COLUMN_KIND_MAP_I64 | COLUMN_KIND_MAP_U64 => {
+                        let off = u64_at(base) as usize;
+                        let len = u64_at(base + 8) as usize;
+                        if kind == COLUMN_KIND_MAP_I64 {
+                            map_integers.push(IntegerMapSlice {
+                                name,
+                                off,
+                                len,
+                                reader: crate::integer_map::Reader::open(
+                                    &map[off..off + len],
+                                    n_slots as u32,
+                                )?,
+                            });
+                        } else {
+                            map_unsigned_integers.push(IntegerMapSlice {
+                                name,
+                                off,
+                                len,
+                                reader: crate::integer_map::Reader::open(
+                                    &map[off..off + len],
+                                    n_slots as u32,
+                                )?,
+                            });
+                        }
+                        cursor = base + 16;
                     }
                     COLUMN_KIND_I64 | COLUMN_KIND_I64_PRESENT => {
                         integers.push(IntegerSlice {
@@ -9004,6 +9567,8 @@ impl Bm25Reader {
             numerics,
             map_facets,
             map_numerics,
+            map_integers,
+            map_unsigned_integers,
             integers,
             unsigned_integers,
             geos,

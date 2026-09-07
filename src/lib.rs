@@ -56,6 +56,7 @@ pub mod geo;
 pub mod harness;
 pub mod highlight;
 pub mod index_contract;
+mod integer_map;
 pub mod interleave;
 mod lineage;
 pub mod link;
