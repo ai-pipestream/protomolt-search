@@ -895,7 +895,9 @@ async fn boost_shapes_refuse_by_name() {
 
 fn add_linear(column: &str, weight: f64) -> ScoreStage {
     ScoreStage {
-        op: ScoreOp::AddLinear as i32,
+        operation: Some(pipestream_search::pb::score_stage::Operation::Op(
+            ScoreOp::AddLinear as i32,
+        )),
         column: column.to_string(),
         weight,
         ..Default::default()

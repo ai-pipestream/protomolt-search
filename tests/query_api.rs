@@ -1436,7 +1436,9 @@ async fn boolean_candidate_rescore_preserves_the_ordinary_score_stage_bits() {
             query: Some(search_query::Query::Lexical(LexicalQuery {
                 text: "document".into(),
                 score_stages: vec![ScoreStage {
-                    op: ScoreOp::AddLinear as i32,
+                    operation: Some(pipestream_search::pb::score_stage::Operation::Op(
+                        ScoreOp::AddLinear as i32,
+                    )),
                     column: "year".into(),
                     weight: 0.125,
                     ..Default::default()

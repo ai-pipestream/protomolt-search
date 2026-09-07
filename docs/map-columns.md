@@ -197,6 +197,16 @@ Descriptor comparison confirms exactly the two additive filter variants, with
 all preceding wire declarations unchanged. This is local validation with two
 build jobs and four test threads; no fleet rollout was performed.
 
+### Explicit map score input (2026-09-06)
+
+Score stages now use a protobuf operation oneof with an explicit map operation
+that preserves a literal empty key. Scoring, bounds, column knowledge, fetched
+signals and explanations carry that distinction through current relays.
+[Score input](score-functions.md#explicit-map-input-2026-09-06) describes the
+contract, generated-client migration and old-peer refusal. Existing operation
+wire encodings remain byte-identical. Range-facet and statistics selectors still
+need explicit map context before public empty-key ingestion can be enabled.
+
 ### Remaining map work
 
 Map projection must preserve protobuf map semantics, including default keys and
@@ -208,8 +218,8 @@ wire occurrences to merge.
 
 An empty key must be distinguishable from no key in every selector shared by
 scalar and map columns. String range/prefix predicates and their placement evaluation now have explicit
-map variants. Score stages, range-facet requests, statistics and their response
-contracts still require that distinction. Use an
+map variants. Score stages now carry explicit map operations too. Range-facet requests,
+statistics and their response contracts still require that distinction. Use an
 explicit typed target or presence-bearing selector, with mixed-version refusal
 where a peer could otherwise ignore that distinction. Existing dedicated map
 predicates and `MapRead` already carry map context; they must preserve the same

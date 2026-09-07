@@ -612,7 +612,9 @@ mod tests {
     fn stored_dimensions_read_their_fetched_values() {
         use std::collections::HashMap;
         let stage = crate::pb::ScoreStage {
-            op: crate::pb::ScoreOp::AddLinear as i32,
+            operation: Some(crate::pb::score_stage::Operation::Op(
+                crate::pb::ScoreOp::AddLinear as i32,
+            )),
             column: "year".into(),
             weight: 1.0,
             ..Default::default()

@@ -437,11 +437,27 @@ async fn every_field_read_is_checked_before_statistics_and_user_aliases_cannot_b
     let mut q = query();
     q.score_stages = vec![ScoreStage {
         column: "boost".into(),
-        op: ScoreOp::AddLinear as i32,
+        operation: Some(pipestream_search::pb::score_stage::Operation::Op(
+            ScoreOp::AddLinear as i32,
+        )),
         weight: 1.,
         ..Default::default()
     }];
     requests.push(q);
+    let mut q = query();
+    q.score_stages = vec![ScoreStage {
+        column: "metrics".into(),
+        operation: Some(pipestream_search::pb::score_stage::Operation::MapOp(
+            MapScoreOperation {
+                op: ScoreOp::AddLinear as i32,
+                key: String::new(),
+            },
+        )),
+        weight: 1.0,
+        ..Default::default()
+    }];
+    requests.push(q);
+
     let mut q = query();
     q.geo_filters = vec![GeoFilter {
         column: "location".into(),
@@ -788,7 +804,9 @@ async fn numeric_use_does_not_grant_explanation_or_projection_and_network_bypass
     let mut q = query();
     q.score_stages = vec![ScoreStage {
         column: "boost".into(),
-        op: ScoreOp::AddLinear as i32,
+        operation: Some(pipestream_search::pb::score_stage::Operation::Op(
+            ScoreOp::AddLinear as i32,
+        )),
         weight: 1.,
         ..Default::default()
     }];
@@ -1061,7 +1079,9 @@ fn stored_query() -> QueryRequest {
                 source: Some(ScoreSignal {
                     source: Some(score_signal::Source::BoundedValue(ScoreStage {
                         column: "boost".into(),
-                        op: ScoreOp::AddLinear as i32,
+                        operation: Some(pipestream_search::pb::score_stage::Operation::Op(
+                            ScoreOp::AddLinear as i32,
+                        )),
                         weight: 1.,
                         ..Default::default()
                     })),

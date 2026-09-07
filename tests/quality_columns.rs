@@ -188,7 +188,9 @@ async fn exp_decay_over_noise_is_the_quality_decay() {
             text: "rust".into(),
             k: 10,
             score_stages: vec![ScoreStage {
-                op: ScoreOp::MultExpDecay as i32,
+                operation: Some(pipestream_search::pb::score_stage::Operation::Op(
+                    ScoreOp::MultExpDecay as i32,
+                )),
                 column: "noise".into(),
                 origin: 0.0,
                 scale: 1.0,

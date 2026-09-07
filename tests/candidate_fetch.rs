@@ -460,7 +460,9 @@ async fn coordinator_refuses_old_or_inconsistent_fetch_peers_before_publishing_v
     *response.lock().unwrap() = malformed_stage;
     let stages = vec![ScoreStage {
         column: "boost".into(),
-        op: ScoreOp::AddLinear as i32,
+        operation: Some(pipestream_search::pb::score_stage::Operation::Op(
+            ScoreOp::AddLinear as i32,
+        )),
         weight: 1.0,
         ..Default::default()
     }];

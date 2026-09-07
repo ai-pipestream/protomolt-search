@@ -1222,6 +1222,11 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **2026-09-06 — Explicit map score input.** Score-stage operations now have
+  a protobuf oneof with an explicit map-key input, including the empty key.
+  Scoring, bounds, fetched signals and explanations retain that key through
+  relays. Legacy wire bytes stay identical; Rust callers use the generated
+  operation oneof. See [score input](docs/score-functions.md#explicit-map-input-2026-09-06).
 - **2026-09-06 — Map string filters keep their key context.** Empty-key
   ordering and prefixes no longer read a same-named plain column. Explicit
   protobuf filter variants preserve map context through node and relay queries,

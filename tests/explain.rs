@@ -319,7 +319,9 @@ async fn score_stages_and_prefix_expansions_get_their_own_nodes() {
                     text: "document".into(),
                     analysis: Some(body_spec()),
                     score_stages: vec![ScoreStage {
-                        op: ScoreOp::AddLinear as i32,
+                        operation: Some(pipestream_search::pb::score_stage::Operation::Op(
+                            ScoreOp::AddLinear as i32,
+                        )),
                         column: "year".into(),
                         weight: 0.125,
                         ..Default::default()

@@ -3246,8 +3246,14 @@ enum ScoreOp {
 // for scoring only. Adjacent integers above 2^53 can have identical scores.
 // Use typed projections, filters or sorting when integer distinctions matter.
 message ScoreStage {
-  // The transform. SCORE_OP_UNSPECIFIED is refused.
-  ScoreOp op = 1;
+  // Exactly one operation is required. Unspecified/unknown transforms refuse.
+  oneof operation {
+    // Legacy selector: an empty key selects a plain column.
+    ScoreOp op = 1;
+    // Explicit map input, including the empty key. Older servers discard this
+    // unknown operation and reject their resulting unspecified op.
+    MapScoreOperation map_op = 9;
+  }
   // The f64, i64 or u64 column the stage reads — or, when
   // `key` is set, the map-numeric column (--map-numeric-fields) whose
   // entry under that key it reads. A document without a value passes
@@ -3266,7 +3272,8 @@ message ScoreStage {
   double scale = 5;
   // When set, `column` names a map-numeric column and the stage reads
   // its entry under this key (docs/map-columns.md); bounds lift from
-  // that key's min/max metadata. Empty = plain numeric column.
+  // that key's min/max metadata. Empty = plain numeric column for `op`.
+  // Leave this legacy selector empty when using `map_op`.
   string key = 6;
   // Decay origin latitude in degrees (MULT_GEO_DECAY_*): finite,
   // within [-90, 90]. `column` then names a geo-point column
@@ -3275,6 +3282,15 @@ message ScoreStage {
   // Decay origin longitude in degrees (MULT_GEO_DECAY_*): finite,
   // within [-180, 180].
   double origin_lon = 8;
+}
+
+// Numeric scoring of a literal map entry. The containing ScoreStage supplies
+// column, weight, origin and scale. Geo transforms are not map operations.
+message MapScoreOperation {
+  // MULT_EXP_DECAY, MULT_LOG or ADD_LINEAR; unspecified/unknown refuses.
+  ScoreOp op = 1;
+  // Literal key, including the protobuf default empty string.
+  string key = 2;
 }
 
 // One field's leg of a fused multi-field BM25 query.
@@ -3502,6 +3518,9 @@ message ScoreStageExplain {
   double contribution = 6;
   // The score after this stage.
   double output = 7;
+  // Present for explicit map operations, even when the key is empty. The
+  // legacy key above is also echoed. Absence retains the legacy key rule.
+  optional string map_key = 8;
 }
 
 // A shard's BM25 top-k.

@@ -133,10 +133,13 @@ pub fn lexical(
     };
     let mut current = node(breakdown.bm25, sum_description, term_nodes);
     for stage in &breakdown.stages {
-        let name = if stage.key.is_empty() {
-            stage.column.clone()
-        } else {
-            format!("{}[{}]", stage.column, stage.key)
+        let key = stage
+            .map_key
+            .as_deref()
+            .or_else(|| (!stage.key.is_empty()).then_some(stage.key.as_str()));
+        let name = match key {
+            None => stage.column.clone(),
+            Some(key) => format!("{}[{key:?}]", stage.column),
         };
         let description = if stage.present {
             format!(

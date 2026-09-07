@@ -784,7 +784,9 @@ async fn distributed_integer_chain_matches_monolith() {
         .with_bm25(Some(analysis.clone()), Default::default());
 
     let stages = vec![ScoreStage {
-        op: ScoreOp::MultLog as i32,
+        operation: Some(pipestream_search::pb::score_stage::Operation::Op(
+            ScoreOp::MultLog as i32,
+        )),
         column: "citations".to_string(),
         key: String::new(),
         weight: 1.0,

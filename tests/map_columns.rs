@@ -544,7 +544,9 @@ async fn distributed_map_stages_and_ingest_refusals() {
         .with_bm25(Some(analysis.clone()), Default::default());
 
     let stages = vec![ScoreStage {
-        op: ScoreOp::MultLog as i32,
+        operation: Some(pipestream_search::pb::score_stage::Operation::Op(
+            ScoreOp::MultLog as i32,
+        )),
         column: "attrs".to_string(),
         key: "boost".to_string(),
         weight: 1.0,

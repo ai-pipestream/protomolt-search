@@ -1,22 +1,25 @@
 # Search foundations
 
 Foundation work began on `feat/search-foundations` from `PRE_ASTRA`.
-The latest increment gives string range and prefix filters explicit map context.
-Empty-key CEL expressions no longer read a same-named plain column. Node/relay
-execution, placement evaluation and pruning, and field-use checks preserve the
-literal key. The two additive protobuf filter variants let preceding decoders
-refuse an unknown expression instead of acquiring scalar semantics.
-Combined validation against main `66094fc` passed 1,244 tests (one existing
-live OpenNLP test ignored), all five mobile Rust target checks, test/example
-compilation and the two-field additive wire compatibility check.
-[Map selectors](map-columns.md#explicit-map-string-selectors-2026-09-06) records
-the contract and the remaining scoring, counting and statistics selectors.
+The latest increment makes a score operation a protobuf oneof, retaining the
+legacy `op` wire tag and adding an explicit map operation with a literal key.
+Map input survives score bounds, column knowledge, candidate-scoped signals,
+relay queries and explanations. Empty keys are distinct from no map selector,
+and zero values remain distinct from missing entries. Older peers refuse the
+new operation; existing valid score-stage bytes remain identical. Regenerated
+Rust callers use the operation oneof. [Score input](score-functions.md#explicit-map-input-2026-09-06)
+records the contract and compatibility limits. Combined validation against
+main `41ca93c` passed 1,249 tests (one existing live OpenNLP test ignored),
+all five mobile Rust target checks, test/example compilation and the scoped
+protobuf compatibility check. The subsequent benchmark document update on main
+`b65be06` is incorporated with the validated source unchanged.
 
-The preceding increment on main `66094fc` preserves present empty string map
-values through ordinary protobuf ingestion, public query projections and counts,
-restart and compaction. It passed 1,240 tests and all five mobile target checks.
-These fixes do not yet enable descriptor-driven map projection or public
-empty-key ingestion.
+The preceding map string-selector increment on main `41ca93c` carries map
+context through filters, placement and field-use checks. It passed 1,244 tests
+and five mobile checks. Main `66094fc` preserved present empty map strings
+through ordinary ingestion and storage rewrites. These increments do not yet
+enable descriptor-driven map projection or public empty-key ingestion;
+range-facet and statistics selectors remain unfinished.
 
 The preceding explicit index-definition increment retains canonical policy
 through image/WAL, snapshots, replication and rebuild. Replica retries cross

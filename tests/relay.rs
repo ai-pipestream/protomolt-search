@@ -2238,7 +2238,9 @@ async fn fetches_by_id_through_relays_equal_the_children() {
             .fetch_values(FetchValuesRequest {
                 candidate_ids: vec![1],
                 stages: vec![pipestream_search::pb::ScoreStage {
-                    op: pipestream_search::pb::ScoreOp::MultLog as i32,
+                    operation: Some(pipestream_search::pb::score_stage::Operation::Op(
+                        pipestream_search::pb::ScoreOp::MultLog as i32,
+                    )),
                     column: "nowhere".into(),
                     weight: 1.0,
                     ..Default::default()

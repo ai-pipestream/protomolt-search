@@ -5,6 +5,65 @@ Recency decay, level boosts, citation weights — as a chain of named
 score transforms that keeps every exactness property the engine already
 has.
 
+## Explicit map input (2026-09-06)
+
+`ScoreStage.operation` is a protobuf oneof. Its `op` member retains tag 1 and
+the existing semantics: an empty legacy `key` selects a plain column, and a
+nonempty key selects a numeric map entry. The `map_op` member at tag 9 contains
+`MapScoreOperation { op, key }`, where the key is literal, including empty.
+Column, weight, origin and scale remain on the containing stage.
+
+```textproto
+score_stages {
+  column: "metrics"
+  map_op { op: SCORE_OP_ADD_LINEAR key: "" }
+  weight: 2
+}
+```
+
+Map operations admit the same numeric transforms and parameter checks as plain
+numeric inputs. Geo transforms, unspecified or unknown operations, non-finite
+parameters and a nonempty legacy key alongside `map_op` refuse before reading.
+A missing entry remains absent; a present zero contributes zero to ADD_LINEAR
+and a present value to the other transforms. The map key's extrema drive bounds.
+Column knowledge uses the same resolution as scoring, including requests for
+zero hits. A spilling bulk builder refuses score queries before reading bounds
+that are only available after Flush.
+
+`ScoreStageExplain.map_key` at tag 8 has explicit presence for the new map
+operation. It is present even for the empty key; the legacy key is also echoed.
+Rendered explanations quote map keys so an empty key cannot appear to be a
+plain column. Field-use checks still require access to the containing column,
+and candidate-scoped FetchValues signals use the same input resolution.
+
+Valid legacy stage encodings remain byte-identical, including field order used
+by the floor-sharing scoring fingerprint. An older decoder discards `map_op`
+and sees an unspecified operation, which its existing parser rejects. New map
+operations therefore require an updated server; they cannot silently fall back
+to a plain column. Rust callers must regenerate their protobuf bindings and set
+`operation: Some(score_stage::Operation::Op(...))` for a legacy operation or
+`Operation::MapOp(...)` for an explicit map operation. Textproto/JSON retain
+`op` for the legacy case.
+
+`tests/map_score_input.rs` covers legacy byte identity, old-decoder refusal,
+ambiguous selectors, invalid map transforms, absence versus zero, heap and
+mapped reads, and direct and two-level relay scoring. Positive and negative
+linear boosts, log boosts, decay and a chain agree bit for bit with a full-row
+calculation; explanations and candidate-scoped signals retain the map input.
+Public empty-key ingestion remains gated while range-facet and statistics
+selectors are unfinished. This change does not alter storage formats.
+
+Validation against main `41ca93c` passed 507 library tests, 728 integration
+tests across 125 targets, 12 embedded tests and two IVF tests (1,249 total;
+one existing live OpenNLP test ignored). All five mobile Rust target checks,
+test/example compilation, formatting and vendored-proto checks passed. The
+wire comparison allows only the operation oneof with its new map member,
+`MapScoreOperation`, and the optional explanation key; all other declarations
+remain unchanged. This is local validation with two build jobs and four test
+threads, not device execution or a fleet rollout. Main `b65be06` was then
+incorporated with a benchmark document update. All tested source files retain
+the same hashes.
+
 ## The two-language split
 
 Column features divide into selection and scoring, and the two demand

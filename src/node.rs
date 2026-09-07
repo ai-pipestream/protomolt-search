@@ -1755,7 +1755,7 @@ impl Bm25Shard {
     /// searchable shapes.
     fn resolve_chain(
         &self,
-        specs: &[(crate::scorefn::StageOp, String, String)],
+        specs: &[(crate::scorefn::StageOp, String, Option<String>)],
     ) -> crate::scorefn::ScoreChain {
         use crate::scorefn::ColumnRef;
         crate::scorefn::ScoreChain {
@@ -1772,7 +1772,7 @@ impl Bm25Shard {
                             min_max: (f64::NAN, f64::NAN),
                         };
                     }
-                    let (column, min_max) = if key.is_empty() {
+                    let (column, min_max) = if key.is_none() {
                         // Column names are unique across numeric families.
                         if let Some(ni) = self.numeric_index(column) {
                             (Some(ColumnRef::Numeric(ni)), Some(self.numeric_min_max(ni)))
@@ -1791,6 +1791,7 @@ impl Bm25Shard {
                     } else {
                         // Map stage: both the column and the key must
                         // resolve; bounds lift from the KEY's min/max.
+                        let key = key.as_deref().expect("map selector is present");
                         let hit = self
                             .map_numeric_index(column)
                             .and_then(|ci| self.map_numeric_key_ord(ci, key).map(|k| (ci, k)));
@@ -2792,7 +2793,12 @@ fn explain_stages(
         let mut row = crate::pb::ScoreStageExplain {
             stage: i as u32,
             column: spec.column.clone(),
-            key: spec.key.clone(),
+            key: spec.map_key().unwrap_or_default().to_owned(),
+            map_key: matches!(
+                spec.operation,
+                Some(crate::pb::score_stage::Operation::MapOp(_))
+            )
+            .then(|| spec.map_key().expect("explicit map selector").to_owned()),
             present: false,
             input: 0.0,
             contribution: 0.0,
@@ -3157,7 +3163,7 @@ fn uint_min_max_as_f64((min, max): (u64, u64)) -> (f64, f64) {
 /// refusal here is a stage whose monotonicity or bound would not hold.
 pub(crate) fn parse_score_stages(
     stages: &[crate::pb::ScoreStage],
-) -> Result<Vec<(crate::scorefn::StageOp, String, String)>, Status> {
+) -> Result<Vec<(crate::scorefn::StageOp, String, Option<String>)>, Status> {
     use crate::scorefn::StageOp;
     stages
         .iter()
@@ -3168,7 +3174,16 @@ pub(crate) fn parse_score_stages(
                     "score stage {i}: a stage names the numeric column it reads"
                 )));
             }
-            let op = match crate::pb::ScoreOp::try_from(stage.op) {
+            if matches!(
+                stage.operation,
+                Some(crate::pb::score_stage::Operation::MapOp(_))
+            ) && !stage.key.is_empty()
+            {
+                return Err(Status::invalid_argument(format!(
+                    "score stage {i}: map_op carries its own key; leave the legacy key empty"
+                )));
+            }
+            let op = match crate::pb::ScoreOp::try_from(stage.operation_code()) {
                 Ok(crate::pb::ScoreOp::MultExpDecay) => {
                     if !(stage.scale.is_finite() && stage.scale > 0.0) || !stage.origin.is_finite()
                     {
@@ -3216,10 +3231,10 @@ pub(crate) fn parse_score_stages(
                         stage.origin_lat,
                         stage.origin_lon,
                     )?;
-                    if !stage.key.is_empty() {
+                    if stage.map_key().is_some() {
                         return Err(Status::invalid_argument(format!(
                             "score stage {i}: MULT_GEO_DECAY reads a geo-point column, which \
-                             has no keys; leave `key` empty"
+                             has no keys; use the plain `op` selector with `key` empty"
                         )));
                     }
                     StageOp::MultGeoDecay {
@@ -3236,11 +3251,11 @@ pub(crate) fn parse_score_stages(
                 Ok(crate::pb::ScoreOp::Unspecified) | Err(_) => {
                     return Err(Status::invalid_argument(format!(
                         "score stage {i}: unknown op {}",
-                        stage.op
+                        stage.operation_code()
                     )));
                 }
             };
-            Ok((op, stage.column.clone(), stage.key.clone()))
+            Ok((op, stage.column.clone(), stage.map_key().map(str::to_owned)))
         })
         .collect()
 }
@@ -14646,27 +14661,16 @@ impl NodeServiceImpl {
         // shard lacking a column answers identity (exact), and the
         // coordinator refuses a column NO shard knows.
         let stage_columns_known: Vec<bool> = match guard.bm25.as_ref() {
-            Some(store) => stage_specs
+            Some(Bm25Shard::Spilling(_)) if !stage_specs.is_empty() => {
+                return Err(Status::failed_precondition(
+                    "bm25 bulk build in progress; Flush first",
+                ));
+            }
+            Some(store) => store
+                .resolve_chain(&stage_specs)
+                .stages
                 .iter()
-                .map(|(op, column, key)| {
-                    // A geo stage resolves against the GEO table and
-                    // nowhere else; asking the numeric tables about it
-                    // would report a real column unknown and turn the
-                    // coordinator's typo rule into a false refusal.
-                    if matches!(op, crate::scorefn::StageOp::MultGeoDecay { .. }) {
-                        return store.geo_index(column).is_some();
-                    }
-                    if key.is_empty() {
-                        store.numeric_index(column).is_some()
-                            || store.integer_index(column).is_some()
-                            || store.unsigned_integer_index(column).is_some()
-                    } else {
-                        store
-                            .map_numeric_index(column)
-                            .and_then(|ci| store.map_numeric_key_ord(ci, key))
-                            .is_some()
-                    }
-                })
+                .map(|stage| stage.column.is_some())
                 .collect(),
             None => vec![false; stage_specs.len()],
         };

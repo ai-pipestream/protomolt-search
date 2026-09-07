@@ -4682,12 +4682,9 @@ impl CoordinatorServiceImpl {
             .iter()
             .zip(&stage_known)
             .filter(|(_, known)| !**known)
-            .map(|(s, _)| {
-                if s.key.is_empty() {
-                    format!("{:?}", s.column)
-                } else {
-                    format!("{:?}[{:?}]", s.column, s.key)
-                }
+            .map(|(s, _)| match s.map_key() {
+                None => format!("{:?}", s.column),
+                Some(key) => format!("{:?}[{:?}]", s.column, key),
             })
             .collect();
         if !unknown.is_empty() {
@@ -4697,7 +4694,7 @@ impl CoordinatorServiceImpl {
             let any_geo = score_stages.iter().zip(&stage_known).any(|(s, known)| {
                 !known
                     && matches!(
-                        crate::pb::ScoreOp::try_from(s.op),
+                        crate::pb::ScoreOp::try_from(s.operation_code()),
                         Ok(crate::pb::ScoreOp::MultGeoDecayHaversine
                             | crate::pb::ScoreOp::MultGeoDecayManhattan)
                     )
@@ -15379,7 +15376,9 @@ mod candidate_fetch_tests {
         };
         let stages = vec![ScoreStage {
             column: "boost".into(),
-            op: ScoreOp::AddLinear as i32,
+            operation: Some(crate::pb::score_stage::Operation::Op(
+                ScoreOp::AddLinear as i32,
+            )),
             weight: 1.0,
             ..Default::default()
         }];
@@ -16739,7 +16738,9 @@ measured_recall_ppm = 980000
                     &HashMap::new(),
                     &[ScoreStage {
                         column: "audience".into(),
-                        op: ScoreOp::AddLinear as i32,
+                        operation: Some(crate::pb::score_stage::Operation::Op(
+                            ScoreOp::AddLinear as i32
+                        )),
                         ..Default::default()
                     },]
                 )

@@ -59,19 +59,25 @@ fn stages() -> Vec<pb::ScoreStage> {
     vec![
         pb::ScoreStage {
             column: "counter".into(),
-            op: pb::ScoreOp::AddLinear as i32,
+            operation: Some(pipestream_search::pb::score_stage::Operation::Op(
+                pb::ScoreOp::AddLinear as i32,
+            )),
             weight: -2e-19,
             ..Default::default()
         },
         pb::ScoreStage {
             column: "counter".into(),
-            op: pb::ScoreOp::MultLog as i32,
+            operation: Some(pipestream_search::pb::score_stage::Operation::Op(
+                pb::ScoreOp::MultLog as i32,
+            )),
             weight: 0.4,
             ..Default::default()
         },
         pb::ScoreStage {
             column: "counter".into(),
-            op: pb::ScoreOp::MultExpDecay as i32,
+            operation: Some(pipestream_search::pb::score_stage::Operation::Op(
+                pb::ScoreOp::MultExpDecay as i32,
+            )),
             origin: 9_223_372_036_854_775_808.0,
             scale: 9_223_372_036_854_775_808.0,
             ..Default::default()
@@ -84,7 +90,10 @@ fn input(value: u64) -> f64 {
 }
 fn contribution(stage: &pb::ScoreStage, value: u64) -> f64 {
     let x = input(value);
-    match pb::ScoreOp::try_from(stage.op).unwrap() {
+    let Some(pb::score_stage::Operation::Op(op)) = stage.operation else {
+        panic!("expected scalar operation")
+    };
+    match pb::ScoreOp::try_from(op).unwrap() {
         pb::ScoreOp::AddLinear => stage.weight * x,
         pb::ScoreOp::MultLog => 1.0 + stage.weight * (1.0 + x.max(0.0)).ln(),
         pb::ScoreOp::MultExpDecay => (-((x - stage.origin).abs()) / stage.scale).exp(),
@@ -251,7 +260,10 @@ fn check(hits: &[pb::Bm25Hit], stages: &[pb::ScoreStage]) -> Vec<(i64, u32)> {
                 } else {
                     assert_eq!(actual.contribution.to_bits(), effect.to_bits());
                 }
-                score = if stage.op == pb::ScoreOp::AddLinear as i32 {
+                score = if stage.operation
+                    == Some(pb::score_stage::Operation::Op(
+                        pb::ScoreOp::AddLinear as i32,
+                    )) {
                     score + effect
                 } else {
                     score * effect
