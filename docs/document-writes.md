@@ -263,12 +263,64 @@ directories, which are never committed publication evidence.
 
 There is no new network RPC or mobile ABI command. The embedded Rust entry uses
 its existing native analyzer and opens no socket. Server-side staging uses only
-the node's configured analysis backend. Source-certified publication, recovery
-of publication decisions, visibility across shards and later searchable receipts
-remain the next lifecycle work. A successful private build cannot advance a
+the node's configured analysis backend. Serving-state integration of the
+source-certified artifact decisions below, visibility across shards and later
+searchable receipts remain lifecycle work. A successful private build cannot advance a
 source-history publication cursor by itself. `tests/document_staging.rs` covers
 the accepted-source-to-segment path, late row failures, output budgets, collection
 and analysis refusals, empty sources and deletions, and the embedded entry.
+
+## Durable projection decisions
+
+The trusted Rust owner can call `DocumentCatalog::prepare_index_publication`
+with a private candidate and validated before/after segment snapshots while
+holding the target publication fence. The catalog derives the version and source
+hash from its immutable accepted history. It verifies the candidate's exact source
+bytes and history identity, the appended artifacts, and retirement of every live
+previous row of that document key. Unrelated rows, index bindings and partition
+settings cannot change in the same certified transition.
+
+The optional journal extension stores protobuf records in two redb tables:
+per-index state and immutable decisions keyed by index identity plus accepted
+sequence. Its format-1 header and tables are created together with the first
+intent under immediate durability. Reopen rejects an unsupported extension,
+foreign history or missing tables. Source catalog format 3 and existing receipts
+are unchanged; older source acceptance writers preserve these additional tables.
+An in-memory source catalog cannot prepare a durable publication intent.
+
+Each logical index processes accepted sequences consecutively starting at 1
+from an empty segment set. The index key is an exact binary logical identity,
+1 to 1024 bytes, not a filesystem path or node address. An intent records the
+source version, row count, adjacent manifest epochs and SHA-256 digests of both
+typed manifests. Format 1 hashes their `serde_json` encoding, including artifact
+hashes and the binding, independent of the manifest file's whitespace. The
+intent ID hashes its protobuf encoding with that ID field empty. There is at
+most one pending intent per index. An exact retry returns the original intent;
+a different transition must first resolve the pending one.
+
+`recover_index_publication` holds the segment catalog's update fence, checks that
+the on-disk manifest matches its opened snapshot, and syncs the manifest and its
+directory before committing a source-journal decision. Matching the intended
+after-manifest commits the decision and cursor atomically. Matching the
+before-manifest aborts only the projection intent, leaving source acceptance
+unchanged. A third manifest refuses recovery and retains the intent. Uncertain
+manifest publication requires reopen first. Even with no pending intent, the
+durable manifest must match the committed cursor, which must match its immutable
+decision. Empty sources and deletions both need explicit sequence transitions,
+including a new manifest epoch when there are no physical rows to change.
+
+This is artifact transaction evidence, not proof of active serving state.
+`index_publication_decision` returns historical decisions without claiming that
+their source versions are still searchable. The original acceptance/retry receipt
+is never rewritten. There is no new network RPC, mobile ABI command or positive
+searchable receipt. The owner still must join this journal to node activation,
+fence legacy writers, handle compaction and coherent backups, and coordinate
+documents spanning shards. In particular, an out-of-band compaction currently
+changes the certified manifest and requires reconciliation; it cannot silently
+advance the source cursor. Regression tests in
+`document_catalog::publication::tests` exercise actual staged source rows,
+replacement and retirement checks, exact retries, empty/deleted sources, cursor
+ordering, foreign histories, missing tables and interrupted manifest commits.
 
 ## Remaining lifecycle work
 

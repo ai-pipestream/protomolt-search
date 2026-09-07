@@ -910,6 +910,49 @@ impl SegmentCatalog {
         Arc::clone(&self.current.read().expect("segment catalog lock poisoned"))
     }
 
+    /// Storage evidence only: the owner still has to activate a matching serving
+    /// view. Keep publication fenced while the caller records its durable
+    /// decision. A failed manifest sync requires reopening before recovery.
+    pub(crate) fn with_durable_snapshot<T>(
+        &self,
+        record: impl FnOnce(&OpenedSegmentSet) -> Result<T, tonic::Status>,
+    ) -> Result<T, tonic::Status> {
+        let failure = |e: String| tonic::Status::failed_precondition(e);
+        let _update = self
+            .update
+            .lock()
+            .map_err(|_| failure("segment update lock poisoned".into()))?;
+        let pending = self
+            .pending_publication
+            .lock()
+            .map_err(|_| failure("segment publication lock poisoned".into()))?;
+        if pending.is_some() {
+            return Err(failure(
+                "segment publication is uncertain; reopen before recording a durable decision"
+                    .into(),
+            ));
+        }
+        let current = self
+            .current
+            .read()
+            .map_err(|_| failure("segment catalog lock poisoned".into()))?;
+        let disk = Self::read_manifest(&self.root).map_err(failure)?;
+        if disk.as_ref().unwrap_or(&SegmentSetManifest::default()) != current.manifest() {
+            return Err(failure(
+                "durable manifest differs from the held catalog; reopen for recovery".into(),
+            ));
+        }
+        if disk.is_some() {
+            std::fs::File::open(Self::manifest_path(&self.root))
+                .and_then(|file| file.sync_all())
+                .map_err(|e| tonic::Status::internal(format!("sync projection manifest: {e}")))?;
+        }
+        std::fs::File::open(&self.root)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| tonic::Status::internal(format!("sync projection directory: {e}")))?;
+        record(&current)
+    }
+
     /// A catalog over `root` whose current set is `manifest` — segments
     /// already staged under `root/segments/` by [`stage_segments`] — with
     /// NOTHING written to `segments.json`: the shadow of an online

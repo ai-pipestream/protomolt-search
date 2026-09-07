@@ -1237,6 +1237,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: durable source projection decisions.** An ordered
+  protobuf journal binds private candidates to exact accepted versions and
+  validated before/after segment manifests. Recovery distinguishes a committed
+  artifact transaction from an aborted preparation and refuses unrelated or
+  uncertain manifests. Original retry receipts remain unchanged. Serving-state
+  activation and searchable receipts still require lifecycle integration.
+  See [projection decisions](docs/document-writes.md#durable-projection-decisions).
 - **Foundation branch: accepted-source candidate staging.** A protobuf request
   builds private analyzed segments from an exact catalog version using the
   target's ingest pipeline, derived columns and provider calibration. Complete

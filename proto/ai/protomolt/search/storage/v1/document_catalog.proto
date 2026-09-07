@@ -26,3 +26,33 @@ message DocumentOperation {
   bytes request_sha256 = 1;
   ai.protomolt.search.v1.DocumentWriteReceipt receipt = 2;
 }
+
+// Optional source-catalog extension. Decisions describe durable index artifacts,
+// never a serving-state activation or a searchable write receipt.
+message ProjectionJournalHeader {
+  uint32 format_version = 1;
+  bytes history_id = 2;
+}
+message ProjectionDecisionKey {
+  bytes index_key = 1;
+  uint64 accepted_sequence = 2;
+}
+message ProjectionIntent {
+  bytes index_key = 1;
+  bytes history_id = 2;
+  DocumentVersion source = 3;
+  bytes before_manifest_sha256 = 4;
+  bytes after_manifest_sha256 = 5;
+  uint64 before_epoch = 6;
+  uint64 after_epoch = 7;
+  uint64 rows = 8;
+  // SHA-256 of this message with intent_id empty, using format-1 encoding.
+  bytes intent_id = 9;
+}
+message ProjectionJournalState {
+  bytes index_key = 1;
+  bytes history_id = 2;
+  uint64 committed_sequence = 3;
+  bytes committed_manifest_sha256 = 4;
+  ProjectionIntent pending = 5;
+}

@@ -21,6 +21,8 @@ use crate::pb::{
 use crate::sha256;
 
 mod projection;
+mod publication;
+pub use publication::ProjectionRecovery;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("metadata");
 const HEADS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("heads");
@@ -141,6 +143,7 @@ impl DocumentCatalog {
             _file_lock: Some(file),
         };
         catalog.initialize(collection, new)?;
+        catalog.validate_projection_journal()?;
         directory.sync_all().map_err(storage)?;
         Ok(catalog)
     }
