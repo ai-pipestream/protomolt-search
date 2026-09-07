@@ -1088,5 +1088,7 @@ async fn empty_declared_generation_reopens_with_schema_analysis_and_vector_state
 
 #[path = "document_staging/maintenance.rs"]
 mod maintenance;
+#[path = "document_staging/query_identity.rs"]
+mod query_identity;
 #[path = "document_staging/rewrite.rs"]
 mod rewrite;

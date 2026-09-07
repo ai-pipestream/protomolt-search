@@ -51,9 +51,12 @@ and direct-node authorization remain separate requirements.
 [Provisional `QueryStreamHit` revisions](query-stream-identity.md) now resolve
 imported identity with explicit disclosure state under the same admitted read
 context. Their row IDs remain generation-local locators. Legacy rows without imported keys
-remain explicitly unkeyed. Server-side catalog publication, stable identity for
-all legacy public route shapes, conditional projection transactions and
-searchable receipts remain unfinished. No identity claim is inferred from
+remain explicitly unkeyed. The trusted local source catalog and embedded owner
+now publish conditional source projections and source-owned maintenance through
+the durable journal. Authenticated remote publication, coherent source/index
+backup and stable identity for all legacy public route shapes remain unfinished.
+See [document writes](document-writes.md) and
+[source-owned maintenance](source-index-maintenance.md). No identity claim is inferred from
 unchanged text or from a passing ranking test.
 
 The wire additions stay in `ai.protomolt.search.v1`. They change no index, WAL or
@@ -75,6 +78,25 @@ Boolean result identities against independent logical source expectations in
 its observation pass, including compacted images, segmented catalogs, reopened
 nodes and WAL replay. Existing field-grant regressions contain private imported
 keys and verify disclosure denial, including document-restricted groups.
+
+`tests/document_staging/query_identity.rs` exercises real accepted source
+versions through the bounded source-owned compactor. Its 19 request shapes cover
+browse, lexical/dense Boolean, lexical, native and FP32-reranked dense, RRF,
+score blending, decomposed fusion, cascade, supported collapse and sorted pages.
+The same private coordinators query before and after live physical rows 3–8
+become 0–5. Under three policies, unary results, terminal streams and nonempty
+provisional revisions retain the expected source version/chunk identity; hidden
+chunks stay excluded and identity disclosure denial stays effective. Logical
+identity/score pairs are bit-identical across the rewrite. Sorting on an
+ungranted stored column remains denied.
+
+This maintenance coverage passed all 108 tests in `document_staging`,
+`query_api`, `field_grants`, `candidate_fetch`, `relay` and `stats_incarnation`
+under an 8 GiB scope with swap disabled. Formatting, vendored-proto and
+whitespace checks passed. Compiled search descriptors, including imports, are
+byte-identical to checkpoint `937a228`; only the stale identity field comment
+changed. This is local validation of tests and documentation, with no new
+runtime implementation, fleet rollout or hosted CI claim.
 
 `tests/stats_incarnation.rs` replaces the node at the same address immediately
 before the identity fetch. Unary and streamed queries refuse without a terminal

@@ -1,7 +1,7 @@
 use super::*;
 use pipestream_search::segments::OpenedSegmentSet;
 
-fn request(rows: u32) -> CompactDocumentIndexRequest {
+pub(super) fn request(rows: u32) -> CompactDocumentIndexRequest {
     CompactDocumentIndexRequest {
         index_key: b"books-index".to_vec(),
         batch_rows: rows,
@@ -10,7 +10,7 @@ fn request(rows: u32) -> CompactDocumentIndexRequest {
         proof_batch_rows: 2,
     }
 }
-async fn publish_key(
+pub(super) async fn publish_key(
     f: &Fixture,
     node: Arc<NodeServiceImpl>,
     key: &[u8],
@@ -51,7 +51,7 @@ async fn publish_key(
         .await
         .unwrap()
 }
-async fn compact(
+pub(super) async fn compact(
     f: &Fixture,
     node: Arc<NodeServiceImpl>,
     request: CompactDocumentIndexRequest,
@@ -61,7 +61,7 @@ async fn compact(
         .await
         .unwrap()
 }
-fn opened(f: &Fixture) -> OpenedSegmentSet {
+pub(super) fn opened(f: &Fixture) -> OpenedSegmentSet {
     OpenedSegmentSet::open(segments_root(f.config.index_path.as_ref().unwrap())).unwrap()
 }
 fn scratch_count(f: &Fixture) -> usize {

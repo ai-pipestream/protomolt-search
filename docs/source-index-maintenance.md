@@ -202,11 +202,14 @@ bridge remains separate packaging work.
 
 ## Remaining integration
 
-The complete public query/permission matrix still needs stable document/chunk
-identity across lexical, dense, hybrid, Boolean, browse and streaming surfaces.
-Complex public query shapes that do not yet expose source identity need that
-separate plumbing; stored-identity preservation alone is not complete coverage
-of the public API. Coherent backup/restore must join source history, journal and
+Public `Query` and `QueryStream` already resolve stable document/chunk identity
+across lexical, dense, hybrid, Boolean and browse results, including collapse
+inner hits and provisional revisions. Resolution uses the admitted read version
+and enforces document visibility and identity disclosure; physical row IDs remain
+generation-local. See [query result identity](query-result-identity.md) for the
+public contract and its maintenance coverage.
+
+Coherent backup/restore must join source history, journal and
 the referenced manifest. Recovery-aware orphan reclamation and corpus-scale
 rewrite measurements remain outstanding. Index-only snapshots and WAL compaction
 must continue to refuse owned catalogs until their contracts are joined.

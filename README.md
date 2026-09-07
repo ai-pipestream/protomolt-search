@@ -1237,6 +1237,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: public identity through source-owned compaction.**
+  A 19-shape query matrix covers unary and streamed results before and after
+  real physical row renumbering, including hybrid strategies, collapse and
+  sorting. Document visibility, identity disclosure and field-use restrictions
+  survive the rewrite with unchanged logical identity/score pairs. The public
+  identity resolver was already implemented; stale contract comments are now
+  corrected. See [query result identity](docs/query-result-identity.md).
 - **Foundation branch: bounded source-owned compaction.** The owner rebuilds
   live rows in bounded batches, preserves stored analysis and typed/source
   semantics, merges compatible segments, and publishes through the maintenance

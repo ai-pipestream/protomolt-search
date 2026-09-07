@@ -6061,9 +6061,11 @@ message QueryHit {
   // The score explanation tree; present only when the request set
   // `explain` (docs/explain.md).
   Explanation explain = 11;
-  // Logical source version and chunk carried by simple lexical selection.
-  // Dense, hybrid, Boolean and browse selection do not expose identity yet;
-  // absence makes no stable-identity claim about doc_id.
+  // Stored logical document key, source version and optional chunk ordinal.
+  // Public Query and terminal QueryStream resolve this for every returned hit,
+  // including collapse inner hits, under the selection's admitted read version
+  // when identity disclosure is authorized. Absent for unkeyed rows or when
+  // disclosure is denied; doc_id remains a generation-local locator.
   DocumentIdentity identity = 12;
 }
 
