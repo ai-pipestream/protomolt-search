@@ -466,8 +466,11 @@ root cost what they cost before (0.24 to 0.88 s, a 23 MB root).
   generation 11, and a partitioned compaction by `year` inside each
   band gives segment pruning something to skip within a leaf
   (`docs/segment-pruning.md`).
-- The boolean lexical clause's candidate walk (600 ms where the
-  allowlist shape's block-max search takes 70-100 ms).
+- The boolean lexical clause's cost is the filter leaf's column scan
+  over every row of every shard, two thirds of it on the Pi shards;
+  the candidate walk is at most 18 ms and now picks the cheaper walk
+  per term ("The boolean lexical clause", below). Next: resolve a
+  MUST filter leaf over its narrower sibling's members.
 - The log replay's children declare their column tables in record
   order; they should pin the sources' order as the transplant does.
 - The partitioned compaction of a served catalog that has no log (the
@@ -508,7 +511,174 @@ child's log manifest records the fingerprint, the `[[derived]]` table
 and the complete column table; the shard map the tool wrote has the
 table too.
 
-The peak resident set is the routing pass's largest transpose (2.2 GB)
-plus the spill replay of the child; the box had just lost the serving
-nodes to a kernel out-of-memory event (03:42, the machine's other
-tenant), so the run had the memory to itself.
+The peak resident set is file-backed, not allocated: the source
+segments mapped and read once, the spill written and read back. The
+anonymous memory of the run peaks at 2.8 GB (measured below, "The
+transplant's memory"); the box had just lost the serving nodes to a
+kernel out-of-memory event (03:27), so the run had the memory to
+itself.
+
+### Reconciling the proof child (2026-09-07)
+
+The per-year counts above check one column. `examples/reconcile.rs`
+(`docs/derived-columns.md`, "Reconciling a child") reads the child
+back against the source's 22 sealed segments document for document:
+each live source row goes through the split's own transformation
+(rederived under the declaration, the placement code rewritten) and
+is digested with its text, lineage, identity, original source, every
+column and its FP32 vector; each child row is digested the same way;
+the two multisets must be equal. Two checks stay outside the
+declaration's evaluator: `year_d == year` (the corpus's own year) and
+`year_d` equal to the civil year of `decided` counted day by day from
+1970.
+
+| Measure | Value |
+|---|---|
+| live source rows read | 11,068,537 |
+| routed to the archive leaf by the tree | 1,954,825 |
+| child rows (64 segments, 0 deleted) | 1,954,825 |
+| matched by digest | 1,954,825 (0 unmatched either way) |
+| rows with `decided`: `year_d` equals the civil year, and the stored `year` | 1,954,816 of 1,954,816 |
+| rows without `decided` | 9, none with `year_d` |
+| child tables | the source's, `year_d` appended; the declaration on all 64 segments |
+| wall, 8 threads | 209 s |
+
+The limits of the check: it covers what the store reconstructs (the
+columns, the stored text, lineage, identity, original source, the
+FP32 row) and not the postings themselves, which the transplant copies
+as transposed spans and the served answers cover (`tests/replay_from_
+segments.rs`, bit for bit against the re-analyzed split); the civil
+year is the only derived expression with an independent form here, a
+declaration with another expression gets the digest check and
+`--equal` against a stored column; and sealed segments carry no stable
+routing keys, so a leaf tiled by them (more than one shard) is not
+reconciled from segments.
+
+### The transplant's memory (2026-09-07)
+
+The 41.5 GB "peak resident set" of the proof run was measured with
+`/usr/bin/time`; it counts the mapped pages of the source segments and
+the page cache of the spill, not allocations. The same run inside a
+transient systemd scope (`systemd-run --user --scope -p
+MemoryAccounting=yes`, the cgroup's `memory.stat` sampled every 5 s):
+
+| Run (`reshard --from-segments --only-child=6 --derive=year_d`) | Wall | Anonymous peak | Resident peak | Scope peak |
+|---|---|---|---|---|
+| cea2c63, no limit | 11 min 45 s | 2.8 GB | 34.9 GB | 55.3 GB |
+| cea2c63, `MemoryMax=8G` `MemorySwapMax=0` | 12 min 2 s | 2.8 GB | 7.9 GB | 8.0 GB, swap 0 |
+| page release, no limit | 11 min 51 s | 2.8 GB | 14.9 GB | 26.7 GB |
+| page release, `MemoryMax=8G` `MemorySwapMax=0` | 11 min 50 s | 2.8 GB | 9.7 GB (pages the serving nodes had charged elsewhere) | 8.0 GB, swap 0 |
+| page release, `--build-threads=4`, `MemoryMax=8G` `MemorySwapMax=0` | 8 min 5 s | 3.8 GB | 8.8 GB | 8.0 GB, swap 0 |
+
+Every run's catalog is byte for byte the proof's (sha256 over the 321
+files of `shard-6.tv.segments`). Throughput is the source read plus
+the child build: 11.07 million rows read and 1.95 million sealed in
+about 12 minutes, 15,700 source rows per second single-threaded; four
+build threads seal the child in 8 min 5 s inside the same 8 GiB budget
+(the routing pass is unchanged, the child build goes from about 6.5
+minutes to under 3; anonymous peak 3.8 GB, one bucket's replay per
+thread).
+
+### The boolean lexical clause: where the 600 ms is (2026-09-07)
+
+"What remains" above named the boolean lexical clause's candidate walk
+(600 ms against the allowlist shape's 70-100 ms). Measured offline on
+the proof child (1,954,825 rows, 64 segments, krick-1, third warm
+round, `examples/boolean_walk.rs`), the shard-side phases in
+milliseconds:
+
+| shape | members | lexical membership walk | filter column scan | scorer, candidate walk | scorer, postings walk | top-k |
+|---|---|---|---|---|---|---|
+| `grandfath` (df 591) | 591 | 0.0 | | 0.0 | 0.0 | 0.0 |
+| `court` (df 815,750) | 815,750 | 1.4 | | 17.9 | 11.2 | 3.9 |
+| `court`, `year >= 1900` | 545,077 | 1.5 | 14.9 | 11.6 | 8.5 | 2.9 |
+| `qualifi immun` | 26,001 | 0.1 | | 1.0 | 0.6 | 0.3 |
+| `qualifi immun`, `year >= 1900` | 17,068 | 0.1 | 14.7 | 1.0 | 0.9 | 0.2 |
+
+The candidate walk costs at most 18 ms on this hardware even over
+815,000 candidates; the filter leaf's column scan (about 15 ms per 2
+million rows, every row of the shard) is the largest shard-side phase
+in a filtered shape. The change that landed (`bm25::score_candidates_
+plain` picks per term between positioning the impact cursor on each
+candidate and merge-joining the term's doc run against the candidates,
+by df against the candidate count, each candidate taking at most one
+contribution per term in term order so the scores are bitwise the
+same; the shard route's accumulators sized to the members instead of
+the shard's rows) is sound and measurable offline (`court` 17.9 to
+11.2 ms) and flat end to end on one krick-1 shard (eight shapes through
+the proof root, before 3.0-83.3 ms, after 2.8-94.3 ms, ids and scores
+identical over 1,070 hits; `tests/blockmax.rs` holds the bitwise
+equality over random corpora and a three-part catalog with a heap
+tail).
+
+Where the fleet's 600 ms is, measured on the recovered fleet with the
+same binary (a9bf470) through three roots, warm:
+
+| shape | all 7 shards (`:19391`) | the 6 krick-1 shards only | plain shape, krick-1 only |
+|---|---|---|---|
+| lexical "qualified immunity", `court == "scotus"` | 568 ms | 168 ms | 56 ms |
+| lexical "qualified immunity", `year >= 2018` | 651 ms | 47 ms (no rows) | 37 ms |
+| lexical "qualified immunity" AND dense row 7 | 425 ms | 210 ms | |
+| dense row 7, `court == "scotus"` | 600 ms | 174 ms | 182 ms |
+
+Two thirds of the boolean lexical shape is the two Pi shards (20
+million rows of the recent group behind the relay), where the filter
+leaf's column scan over every row costs what the walk never did; the
+krick-1 third is the scan too (the plain shape reads the column only
+for the postings' candidates and prunes segments by their summaries,
+the boolean shape resolves the filter leaf over the whole shard before
+the group rule). The next step on this route is therefore not the
+walk: a filter leaf that only ever meets the group rule under MUST
+beside a narrower leaf can be resolved over that leaf's members
+instead of the shard, the same set by construction.
+
+## 2026-09-07: the out-of-memory event and the recovery
+
+At 03:27 krick-1 (61.4 GiB, 64 GiB swap) ran out of memory. The
+kernel's reports (`journalctl -k`, eight dumps between 03:27 and
+03:42) show the memory in one cgroup: `system.slice:docker:x6zmx...`,
+a BuildKit build inside a privileged `docker buildx` builder
+(root, no memory limit), about 2,000 concurrent `cc1plus` processes
+of 100-180 MB each, `memory.peak` 59.5 GiB; the machine's other
+tenant (the `protomolt-glimmer-vllm` container) has a recorded peak
+of 45.2 GiB. `systemd-oomd` did not act (its swap threshold is 90 %,
+swap use peaked near 33 GB). The kernel chose its victims by badness,
+which counts swapped pages: the search nodes (65 GB of virtual memory
+each, most of it mapped segments, the idle heap swapped) went first,
+then `llama-server`, the vLLM engine and `uvicorn`, then the build's
+own compilers. Every search process in the user slice was gone by
+03:42; the Pi nodes and the relay were untouched.
+
+The budget the fleet came back under: a node's anonymous memory is
+2-35 MB (the rest is mapped segments), a root's under 100 MB, the
+analysis sidecar's JVM 8 GB at most. Each group runs in a transient
+user scope with `MemoryAccounting=yes`, `MemoryLow=8G`,
+`MemoryHigh=20G` and `MemoryMax=28G` for the six generation-10
+archive nodes (`search-v10.scope`) and the six generation-11 bands
+(`search-v11.scope`), `MemoryMax=6G` per root, so the fleet's own
+footprint (cache included) is bounded and reclaimed inside its scopes
+before it presses on anything else. The limit of the budget: it
+bounds the fleet, not the tenant; a root build with no limit peaks at
+the machine's size again and the kernel's choice of victim does not
+change. `docker update --memory` on the builder container is the
+tenant's call.
+
+The recovery, in order, each step verified before the next: the
+sidecar (already back, `:19202`); the six band nodes
+(`serve-v11-fs.sh up` in its scope; `readlink /proc/<pid>/exe` and the
+md5 of the running text against `bin-v11/pipestream-search.a9bf470`,
+`cf03f4bd…`, on every process); the generation-11 root `:19393`; the
+generation-10 nodes (`rebuild.sh down serve`, 1,192 s to open); the
+roots `:19391` and `:19392`. Counts and partitions through
+`DiagnosticsService/GetShardDiagnostics`: generation 11 reports the
+six bands at 10,636,780 / 11,088,325 / 10,973,089 / 10,737,302 /
+10,782,660 / 12,203,725 live rows with their year ranges (2008-2014,
+2000-2007, 1990-1999, 1976-1989, 1940-1975, 202-1939; 39 to 112
+keyed segments each) and the relay at 20,211,518, 86,633,399 in all;
+generation 10 reports the same total over its six hash shards. The
+cross-generation identity pairing (`v11-identity-check.py`, 79
+documents, 237 fields) has 0 problems; the band-filter shapes on
+`:19393` and the boolean shapes on `:19391` answer with the ids of the
+tables above (boolean lexical with `court == "scotus"` 568 ms against
+the plain shape's 95 ms, the lexical `year >= 2018` pair 651 against
+47 ms, the same top ids on each pair).
