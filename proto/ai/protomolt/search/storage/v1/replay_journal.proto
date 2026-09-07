@@ -9,4 +9,7 @@ message ReplayJournalHeader {
   uint64 accepted_sequence = 4;
   uint64 source_clock = 5;
   bytes head_sha256 = 6;
+  // Irreversible for this journal after history/epoch changes or device residency.
+  // A higher policy revision cannot reactivate the old stream assignment.
+  bool admission_fenced = 7;
 }

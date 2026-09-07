@@ -1,5 +1,6 @@
 syntax = "proto3";
 package ai.protomolt.search.v1;
+import "ai/protomolt/search/v1/search.proto";
 
 // Immutable identity of one assigned replay stream. This is a local journal
 // contract; it does not authorize a network caller or expose a replay RPC.
@@ -69,4 +70,26 @@ message ReadReplayJournalResponse {
   uint64 through_sequence = 2;
   uint64 next_sequence = 3;
   bool complete = 4;
+}
+
+// Trusted receiver control state, never accepted from a replay sender. The
+// control publisher must verify the baseline, assignment and current fencing
+// state before enabling admission. This is not a credential or a control RPC.
+message ReplayAdmissionPolicy {
+  uint32 contract_version = 1; // Required: 1.
+  bytes authority_id = 2; // 16-byte durable authority incarnation.
+  uint64 revision = 3; // Strictly increasing; exact retries are idempotent.
+  bytes binding_sha256 = 4; // Exact immutable journal assignment, 32 bytes.
+  // SHA-256 of the verified TLS leaf certificate's DER bytes. Exact allowlist;
+  // cluster-CA membership or request metadata alone grants no permission.
+  repeated bytes source_certificate_sha256 = 5;
+  // Current control-authority observations. A mismatch with the journal's
+  // assigned histories/epochs fences admission, even when enabled is true.
+  bytes source_history_id = 6;
+  bytes target_history_id = 7;
+  uint64 source_write_epoch = 8;
+  uint64 target_write_epoch = 9;
+  NodeResidency source_residency = 10;
+  NodeResidency target_residency = 11;
+  bool enabled = 12;
 }

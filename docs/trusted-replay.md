@@ -85,12 +85,52 @@ retry returns the original sequence, source clock and content digest even
 when the journal has advanced. Only `replayed` changes. The kernel checks the
 binding's shape and consistency, not a caller's network authority.
 
+## Persisted admission gate
+
+`ReplayAdmissionPolicy` is a typed decision installed through the trusted local
+`publish_authorization` API. It binds one authority incarnation and monotonic
+revision to the immutable stream digest, an exact certificate allowlist,
+current source/target histories and writer epochs, explicit residency and
+an enable decision. This API is not a credential endpoint for senders.
+
+First publication is allowed only before any locally accepted frames. It
+atomically upgrades the journal to format 2 and persists the policy. An old
+format-1 reader refuses that journal; missing policy or a mismatched format
+also refuses. Exact policy retries are idempotent, conflicting reuse of a
+revision refuses, and an authority change or older revision cannot overwrite
+the decision. Unrelated higher revisions leave an unchanged assignment usable.
+
+`accept_authenticated` takes its peer identity only from tonic's verified TLS
+leaf certificate, hashing the DER bytes with SHA-256. The receiver checks the
+persisted decision inside the same write transaction that appends the frame.
+Revocation and acceptance therefore have one durable order; after revocation
+commits, even an exact frame retry on an existing TLS connection refuses. The
+plain local `accept` API cannot bypass an installed policy. The local `head`
+and `read` methods remain trusted application APIs, not network routes.
+
+A source/target history change, writer-epoch mismatch or device residency
+permanently fences this journal. Reopening or publishing a higher policy
+revision cannot reactivate that old assignment. Ordinary enable/allowlist
+revocation can be reversed only while the original histories, epochs and
+server residency still hold. Both ends must explicitly be servers: unspecified
+residency refuses and phone-resident shards are ineligible for this replay path.
+
+The gate validates the installed decision; it does not manufacture control
+authority or prove that a publisher observed current state. Assignment issuance,
+baseline/selector verification, authority delivery and the index application
+commit boundary must be connected before exposing a replay RPC. No production
+listener, placement worker, fresh-ingest route or fleet process changes here.
+
 ## Work remaining before network replay
 
 - Assign and persist durable source/target history identities and baseline
   proofs; do not reuse ephemeral statistics tokens or addresses.
-- Add a peer-scoped assignment authorizer integrated with the published map
-  and its current fencing state, with revocation tests.
+- Feed the receiver admission policy from the trusted published control state.
+  The map today has neither durable shard histories nor these assignments;
+  lease membership, addresses and statistics epochs cannot substitute for them.
+  Publish revocation before activating a replacement writer and fence the
+  applier against the same authority. The persisted receiver gate below is
+  implemented; that publisher and application integration remain outstanding.
 - Persist application identities and frame digests inside target mutation
   history and checkpoints, including the crash window after application but
   before a receiver progress update.
@@ -106,7 +146,7 @@ The local journal is a component of this path. Its tests are not evidence
 that the network, application or cutover steps are finished. The existing
 explicit refusal of derived network WAL forwarding remains in force.
 
-## Local validation
+## Receiver journal checkpoint 402a64b validation
 
 The broad run passed 524 unit tests, 790 integration tests across 139 targets,
 12 embedded tests and two IVF adapter tests (1,328 total). One existing
@@ -118,10 +158,30 @@ tests, including the two added byte-preservation and independent digest cases.
 That brings the tested cases to 1,330; this is a broad run plus the focused
 rerun, not a second full-suite run of the final tree.
 
-The final tree also passed the five Android/iOS target checks, embedded and
+That checkpoint also passed the five Android/iOS target checks, embedded and
 IVF tests, test/example compilation, formatting, vendored-proto checks and
 the existing-field descriptor comparisons. All builds and tests used an
 8 GiB memory limit with swap disabled and two Cargo build jobs. Source hashes
 confirmed that existing production paths did not change during the final
 journal correction. These are local results; no fleet rollout or hosted CI
 result is implied.
+
+## Admission gate validation
+
+This increment passed 563 local tests: the full unit suite (533, including
+nine admission tests), nine journal integration tests, seven security tests,
+12 embedded tests and two IVF adapter tests. It also passed all five Android/
+iOS target checks, test/example compilation, formatting, vendored-proto checks
+and the existing-field descriptor comparisons. The complete integration suite
+from the receiver checkpoint was not rerun for this isolated journal change.
+Source hashes stayed unchanged during final validation. Every build and test
+ran with an 8 GiB memory cap, no swap and two Cargo build jobs.
+
+The admission tests cover exact policy retries, stale/conflicting revisions,
+authority replacement, persistent revocation, permanent history/epoch/device
+fencing, empty or rotated peer allowlists, concurrent delivery after revocation,
+refusal to adopt previously accepted local history, and missing-policy/format
+corruption. A real loopback mTLS fixture verifies certificate-based admission:
+CA membership is insufficient, metadata cannot supply identity, and revoking
+the peer denies further retries over the same established TLS channel. No
+production replay RPC or live-fleet claim is implied by that fixture.

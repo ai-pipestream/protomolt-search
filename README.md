@@ -1843,6 +1843,12 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   device node by declaration, and moves nothing.
   [Bandwidth as the budget](docs/bandwidth-budget.md).
 
+- **Branch checkpoint 2026-09-07: persisted replay admission.**
+  The receiver checks a typed authority decision and the verified TLS peer in
+  the frame's durable transaction. Revocation survives reopen, history/epoch
+  changes permanently fence an assignment, and device residency forbids replay.
+  Control-state publication and index application remain to be connected; no
+  replay RPC is exposed. [Trusted replay](docs/trusted-replay.md).
 - **Branch checkpoint 2026-09-07: durable receiver replay journal.**
   A protobuf stream binding and hash-linked frames give the receiver persistent
   retry decisions tied to source/target histories, writer epochs and a baseline.
