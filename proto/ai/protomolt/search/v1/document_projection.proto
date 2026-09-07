@@ -104,3 +104,22 @@ message DocumentMaintenanceActivation {
   bytes stats_incarnation = 8;
   uint64 live_rows = 9;
 }
+
+// Trusted local compaction of an owned index from its immutable stored rows.
+// No source re-analysis, derived re-evaluation, or source acceptance occurs.
+// This is also the embedded owner operation; it introduces no network RPC.
+message CompactDocumentIndexRequest {
+  bytes index_key = 1;
+  // 1..65536 input rows per scan and live rows per output segment. A byte
+  // limit may shorten a scan or cut. Vector presence also starts a new cut.
+  uint32 batch_rows = 2;
+  // 1..64 MiB of accounted row content and analysis per input/output batch.
+  // Not a process heap quota: readers, one decoded row/posting, allocator and
+  // provider build buffers also consume memory. An oversized single row refuses.
+  uint64 batch_bytes = 3;
+  // Positive budget for completed private output files, checked per cut.
+  // Not a filesystem quota; publication also copies outputs into the catalog.
+  uint64 max_staged_bytes = 4;
+  // 1..1048576 rows per preservation-proof batch.
+  uint32 proof_batch_rows = 5;
+}

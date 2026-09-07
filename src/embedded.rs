@@ -357,6 +357,49 @@ impl EmbeddedSearch {
         .map_err(|error| Status::internal(format!("projection recovery worker: {error}")))?
     }
 
+    /// Compact stored source rows locally, without analysis or network access.
+    /// The blocking operation owns its node, source catalog and private files.
+    /// Dropping the awaiter does not cancel an already running publication;
+    /// recover_document_maintenance observes its durable outcome after reopen.
+    pub async fn compact_document_index(
+        &self,
+        shard: usize,
+        request: CompactDocumentIndexRequest,
+    ) -> Result<DocumentMaintenanceActivation, Status> {
+        let node = Arc::clone(
+            self.nodes
+                .get(shard)
+                .ok_or_else(|| Status::invalid_argument("unknown embedded shard"))?,
+        );
+        let catalog = Arc::clone(self.document_catalog.as_ref().ok_or_else(|| {
+            Status::failed_precondition("configure a document catalog before compaction")
+        })?);
+        tokio::task::spawn_blocking(move || node.compact_document_index_blocking(&catalog, request))
+            .await
+            .map_err(|error| Status::internal(format!("source compaction worker: {error}")))?
+    }
+
+    /// Reconcile and observe the reopened shard's current maintenance decision.
+    pub async fn recover_document_maintenance(
+        &self,
+        shard: usize,
+        index_key: Vec<u8>,
+    ) -> Result<Option<DocumentMaintenanceActivation>, Status> {
+        let node = Arc::clone(
+            self.nodes
+                .get(shard)
+                .ok_or_else(|| Status::invalid_argument("unknown embedded shard"))?,
+        );
+        let catalog = Arc::clone(self.document_catalog.as_ref().ok_or_else(|| {
+            Status::failed_precondition("configure a document catalog before maintenance recovery")
+        })?);
+        tokio::task::spawn_blocking(move || {
+            node.recover_document_maintenance_blocking(&catalog, &index_key)
+        })
+        .await
+        .map_err(|error| Status::internal(format!("maintenance recovery worker: {error}")))?
+    }
+
     fn document_catalog(&self) -> Result<&DocumentCatalog, Status> {
         self.document_catalog.as_deref().ok_or_else(|| {
             Status::failed_precondition(

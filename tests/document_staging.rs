@@ -760,6 +760,25 @@ async fn embedded_owner_publishes_and_recovers_through_the_real_search_path() {
     };
     let response = runtime.search(query.clone()).await.unwrap();
     assert_eq!(response.hits.len(), 2);
+    let compacted = runtime
+        .compact_document_index(
+            0,
+            CompactDocumentIndexRequest {
+                index_key: b"books-index".to_vec(),
+                batch_rows: 1,
+                batch_bytes: 1024 * 1024,
+                max_staged_bytes: 16 * 1024 * 1024,
+                proof_batch_rows: 1,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(compacted.source_intent_id, activated.intent_id);
+    assert_eq!(compacted.live_rows, 2);
+    assert_eq!(
+        runtime.search(query.clone()).await.unwrap().hits,
+        response.hits
+    );
     let retry = runtime.accept_document(&request).unwrap();
     assert!(retry.replayed);
     assert!(!retry.searchable);
@@ -772,6 +791,16 @@ async fn embedded_owner_publishes_and_recovers_through_the_real_search_path() {
         .unwrap();
     assert_eq!(recovered.intent_id, activated.intent_id);
     assert_ne!(recovered.stats_incarnation, activated.stats_incarnation);
+    let maintained = reopened
+        .recover_document_maintenance(0, b"books-index".to_vec())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        maintained.maintenance_intent_id,
+        compacted.maintenance_intent_id
+    );
+    assert_eq!(maintained.catalog_epoch, recovered.catalog_epoch);
     let after = reopened.search(query).await.unwrap();
     assert_eq!(after.hits, response.hits);
     assert!(reopened
@@ -1059,3 +1088,5 @@ async fn empty_declared_generation_reopens_with_schema_analysis_and_vector_state
 
 #[path = "document_staging/maintenance.rs"]
 mod maintenance;
+#[path = "document_staging/rewrite.rs"]
+mod rewrite;

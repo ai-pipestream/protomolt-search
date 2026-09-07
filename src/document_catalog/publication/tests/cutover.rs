@@ -197,3 +197,115 @@ async fn a_source_write_can_finish_during_verification_and_invalidates_the_rewri
         .unwrap()
         .is_none());
 }
+
+#[tokio::test]
+async fn cancelling_embedded_awaiter_keeps_rewrite_files_and_finishes_the_owned_operation() {
+    use crate::embedded::{
+        EmbeddedDocumentCatalogConfig, EmbeddedSearch, EmbeddedSearchConfig, EmbeddedShardConfig,
+    };
+    let mut fixture = Fixture::new();
+    publish(&fixture, 1, 3).await;
+    publish(&fixture, 2, 2).await;
+    let mut config = EmbeddedSearchConfig::single(EmbeddedShardConfig {
+        node: fixture.node.config.clone(),
+        allow_missing_bm25: false,
+    });
+    config.document_catalog = Some(EmbeddedDocumentCatalogConfig {
+        collection: "books".into(),
+        path: Some(fixture.root.join("source.redb")),
+    });
+    let source = std::mem::replace(
+        &mut fixture.source,
+        Arc::new(DocumentCatalog::in_memory("books").unwrap()),
+    );
+    drop(source);
+    let runtime = Arc::new(EmbeddedSearch::open(config).await.unwrap());
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+    crate::node::set_rewrite_test_hooks(
+        crate::node::segments_root(fixture.node.config.index_path.as_ref().unwrap()),
+        Box::new(move || {
+            let _ = entered_tx.send(());
+            release_rx.recv().unwrap();
+        }),
+        Box::new(move || {
+            let _ = finished_tx.send(());
+        }),
+    );
+    let worker = runtime.clone();
+    let task = tokio::spawn(async move {
+        worker
+            .compact_document_index(
+                0,
+                CompactDocumentIndexRequest {
+                    index_key: INDEX.to_vec(),
+                    batch_rows: 1,
+                    batch_bytes: 1024 * 1024,
+                    max_staged_bytes: 32 * 1024 * 1024,
+                    proof_batch_rows: 1,
+                },
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), entered_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let private_count = || {
+        std::fs::read_dir(&fixture.root)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".document-rewrite-")
+            })
+            .count()
+    };
+    assert_eq!(private_count(), 1);
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(private_count(), 1);
+    // The builder held no serving fence while assembling its private output.
+    assert_eq!(
+        runtime
+            .search(SearchRequest {
+                k: 2,
+                vector: vec![0.25; 8],
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .hits
+            .len(),
+        2
+    );
+    release_tx.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), finished_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(private_count(), 0);
+    let maintained = runtime
+        .recover_document_maintenance(0, INDEX.to_vec())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(maintained.accepted_sequence, 2);
+    assert_eq!(maintained.live_rows, 2);
+    assert_eq!(
+        runtime
+            .search(SearchRequest {
+                k: 2,
+                vector: vec![0.25; 8],
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .hits
+            .len(),
+        2
+    );
+}

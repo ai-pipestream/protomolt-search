@@ -2,9 +2,9 @@
 
 Status: preservation comparison, durable maintenance journal, and the trusted
 local node's journaled cutover/recovery are implemented on the foundation branch.
-The bounded source-owned rewrite builder and its product integration remain
-unfinished. The WAL compactor and index-only snapshots still refuse source-owned
-catalogs; this does not enable those legacy routes.
+Bounded stored-row rebuilding and the embedded owner operation are implemented
+on this branch. The WAL compactor and index-only snapshots still refuse
+source-owned catalogs; those legacy routes are not maintenance entry points.
 
 ## Two sequences with different meanings
 
@@ -159,22 +159,57 @@ images. Ambiguous outcomes retain files for recovery; automatic orphan cleanup
 after recovery is not implemented and must not guess which private files to
 remove.
 
+## Bounded stored-row rebuilding
+
+`NodeServiceImpl::compact_document_index_blocking` captures an owned immutable
+view and read claim, builds private outputs, and invokes the journaled cutover.
+`CompactDocumentIndexRequest` carries the logical index key and required row,
+byte, staging-file and preservation-proof budgets. It contains no filesystem
+paths and introduces no network RPC.
+
+The builder walks posting skip runs over a bounded input row interval, retaining
+only live rows. It copies original protobuf sources, identities, lineage, all
+nine stored column families and presence, field lengths, terms, frequencies,
+spans, positions and sentence tables. It does not invoke an analyzer, CEL or an
+embedding service. Complete generation declarations restore empty columns and
+analysis metadata. Vector-bearing cuts rebuild provider images from the exact
+FP32 rows and the persisted backend configuration; a change in vector presence
+starts a separate cut so vector-less documents remain vector-less.
+
+Compatible rows combine across source segments. Row and byte limits cut outputs;
+a read interval that exceeds the byte budget is halved and retried. One row that
+cannot fit refuses the entire operation. Accounting includes row protobufs,
+analysis structures, terms, occurrences and vectors. An input batch and an
+output batch can coexist. These are content budgets, not a total-process heap
+quota: immutable readers, one decoded row/posting, allocation overhead and
+provider build buffers also consume memory. Output metadata grows with the
+number of cuts, as does the eventual catalog. Mapped serving remains the default.
+The staging-file budget is checked after each completed cut; publication also
+copies those files into the active catalog's fresh output directories.
+
+Private files live in one exclusively created directory owned by the blocking
+operation. Budget failures discard private work without changing source or
+serving state. A concurrent source publication makes the captured read version
+stale; cutover refuses it rather than losing that write. This operation does not
+tail concurrent writes or promise convergence under continuous ingestion.
+
+`EmbeddedSearch::compact_document_index` uses this same operation with owned
+node/catalog references on a blocking worker. Cancelling its awaiter does not
+cancel an operation already running or remove files from under it. The owner
+can use `recover_document_maintenance` to observe its durable result. The Rust
+embedded API is available; adding this operation to the mobile C/Kotlin/Swift
+bridge remains separate packaging work.
+
 ## Remaining integration
 
-Build source-owned rewrites in bounded batches from the retained segment rows,
-including mixed vector/no-vector segments, every typed value family and analyzed
-postings. Feed those outputs through the node cutover above. The WAL compactor
-cannot supply source-owned rows: these indexes deliberately have no WAL. Expose
-an owned candidate/operation through the embedded runtime without borrowing
-caller paths across cancellation, and cover the full query/permission matrix.
-
-Required additional evidence includes repeated real row rebuilding across
-source versions, all-deleted and zero-row sources, stable document/chunk identity
-across lexical, dense, hybrid, Boolean, browse and streaming surfaces, and
-coherent backup/restore of source history, journal and the referenced manifest.
-Complex public query shapes that do not yet expose source identity still need
-that separate identity plumbing; stored-identity preservation alone is not
-complete coverage of the public API.
+The complete public query/permission matrix still needs stable document/chunk
+identity across lexical, dense, hybrid, Boolean, browse and streaming surfaces.
+Complex public query shapes that do not yet expose source identity need that
+separate plumbing; stored-identity preservation alone is not complete coverage
+of the public API. Coherent backup/restore must join source history, journal and
+the referenced manifest. Recovery-aware orphan reclamation and corpus-scale
+rewrite measurements remain outstanding. Index-only snapshots and WAL compaction
+must continue to refuse owned catalogs until their contracts are joined.
 
 ## Validation scope
 
@@ -190,8 +225,14 @@ Integration tests physically renumber surviving rows, retain lexical scores and
 source identity, enforce document visibility and identity-disclosure grants,
 reject stale read claims/public cursors, preserve empty vector configuration,
 and accept later source writes. Held old readers remain usable after normal
-file retirement. These tests use rebuilt layouts assembled from immutable live
-segments; the bounded row-rebuilding component remains on the list above.
+file retirement. The row-builder tests also merge source segments, replace a
+source inside the merged segment, reclaim its partial tombstones, retain a zero-row source,
+reclaim all deleted rows and accept subsequent versions. Independent fixtures
+compare mixed vector/no-vector cuts, all typed column families, negative zero,
+missing versus zero values and analyzed postings through the preservation proof.
+Budget failures preserve the old view; smaller input intervals complete under
+a tighter byte budget. Embedded tests cover query equality, reopen/recovery and
+an awaiter cancelled while the private build is held before publication.
 
 Validation is local under an enforced 8 GiB scope with swap disabled. No fleet
 operations or production compaction runs are part of this checkpoint.

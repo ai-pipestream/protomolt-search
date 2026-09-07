@@ -157,7 +157,15 @@ The optional [logical document catalog](document-writes.md) adds source/version
 acceptance and persistent retry decisions to the local runtime and both mobile
 bridges. Configure its collection-wide path independently of shard images.
 Its receipts distinguish local source durability from search visibility;
-projection publication is still pending.
+the trusted Rust owner can stage and publish accepted projections. Its
+`compact_document_index` operation uses bounded stored-row rebuilding and the
+source maintenance journal, with `recover_document_maintenance` for recovery.
+These owner operations require a source-owned, sealed index without a WAL;
+`EmbeddedShardConfig::persistent` enables a WAL by default, so configure the
+source-owned shard explicitly. Cancelling an awaiter leaves an already running
+blocking operation owning its private files through completion. These methods
+are not yet exposed by the C/Kotlin/Swift bridge. See
+[source-index maintenance](source-index-maintenance.md).
 The Android package includes all public `search/v1` contracts, including source,
 schema-report and document-write imports, alongside `mobile.proto`.
 

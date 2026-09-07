@@ -1,12 +1,15 @@
 //! A trusted local segment transaction and its coherent serving-state switch.
 use super::*;
 mod maintenance;
+mod rewrite;
 use crate::document_catalog::{DocumentCatalog, ProjectionRecovery};
 use crate::pb::{storage::ProjectionIntent, DocumentProjectionActivation};
 use crate::segments::{OpenedSegmentSet, SegmentRowRetirement, SegmentSource};
 use crate::stats_identity::StatsClaim;
 #[cfg(test)]
 pub(crate) use maintenance::{AFTER_MAINTENANCE_VERIFIED, INTERRUPT_MAINTENANCE};
+#[cfg(test)]
+pub(crate) use rewrite::set_rewrite_test_hooks;
 
 #[cfg(test)]
 thread_local! { pub(crate) static FAIL_PROJECTION_DECISION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
