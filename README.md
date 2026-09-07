@@ -1237,12 +1237,20 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: persistent generation declarations.** Source publication
+  writes a format-4 catalog retaining all column tables, field capabilities,
+  analyzer fingerprints, derived declarations and vector construction state.
+  Reopen preserves those semantics with no segments; the rewrite proof now
+  verifies final-segment reclamation. Source-owned compaction still requires
+  its maintenance journal and runtime cutover. See
+  [source-index maintenance](docs/source-index-maintenance.md).
 - **Foundation branch: source rewrite preservation check.** A bounded row-digest
   comparison detects changed identities, source bytes, typed columns, vectors
   and analyzed postings across segment reorderings and tombstone reclamation.
   It uses a disk-backed identity table and no whole-field transpose. This is
   comparison groundwork; [source-aware maintenance](docs/source-index-maintenance.md)
-  still needs its journal, empty-generation declaration and runtime cutover.
+  still needs its journal and runtime cutover; the empty-generation declaration
+  is covered by the newer entry above.
 - **Foundation branch: persistent source ownership.** Source activation now
   records its history, logical index and collection in a format-3 segment
   manifest, including empty/deleted sources. Reopen and mutation boundaries

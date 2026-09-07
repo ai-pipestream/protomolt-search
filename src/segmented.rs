@@ -411,6 +411,9 @@ impl SegmentedShard {
         if tail.next_doc_id() != 0 {
             return Err("a segmented shard's tail must start empty".to_string());
         }
+        if let Some(declaration) = set.generation_declaration() {
+            crate::segments::generation::restore_tail(declaration, &mut tail)?;
+        }
         if let Some(binding) = set.binding() {
             if tail.binding().is_some_and(|held| held != binding) {
                 return Err("segment tail and generation mapped bindings disagree".into());

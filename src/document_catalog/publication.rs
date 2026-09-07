@@ -170,6 +170,11 @@ fn validate_transition(
     {
         return Err(fail());
     }
+    if let Some(previous) = before.generation_declaration() {
+        let declaration = after.generation_declaration().ok_or_else(fail)?;
+        crate::segments::generation::check_upgrade(previous, declaration)
+            .map_err(Status::failed_precondition)?;
+    }
     let retired = before
         .document_retirements(&info.document_key, 65536)
         .map_err(|e| Status::failed_precondition(e))?;

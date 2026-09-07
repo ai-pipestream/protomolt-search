@@ -1,6 +1,7 @@
 syntax = "proto3";
 package ai.protomolt.search.storage.v1;
 import "ai/protomolt/search/v1/document_write.proto";
+import "ai/protomolt/search/v1/search.proto";
 
 message DocumentCatalogHeader {
   uint32 format_version = 1;
@@ -75,4 +76,36 @@ message SourceRewriteCertificate {
   uint64 live_rows = 3;
   bytes schema_sha256 = 4;
   bytes identity_content_sha256 = 5;
+}
+
+// Physical index semantics retained independently of the remaining row files.
+message IndexGenerationDeclaration {
+  uint32 format_version = 1;
+  repeated GenerationTextField text_fields = 2;
+  GenerationColumns columns = 3;
+  ai.protomolt.search.v1.DerivedColumns derived = 4;
+  // Absent until a source publication first establishes a vector backend.
+  GenerationVectorState vector = 5;
+}
+message GenerationTextField {
+  string name = 1;
+  // Absent until analysis has established this field's fingerprint.
+  optional fixed64 analysis_fingerprint = 2;
+  bool positions = 3;
+  bool sentences = 4;
+}
+message GenerationColumns {
+  repeated string facets = 1;
+  repeated string numerics = 2;
+  repeated string integers = 3;
+  repeated string unsigned_integers = 4;
+  repeated string geo = 5;
+  repeated string map_facets = 6;
+  repeated string map_numerics = 7;
+  repeated string map_integers = 8;
+  repeated string map_unsigned_integers = 9;
+}
+message GenerationVectorState {
+  uint32 dimension = 1;
+  ai.protomolt.search.v1.VectorBackendConfig config = 2;
 }

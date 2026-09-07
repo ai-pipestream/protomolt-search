@@ -22,13 +22,16 @@ use crate::postings::{Bm25Index, Bm25Reader, StoredBinding};
 use crate::vector::{QualityContract, ScoreDirection, VectorIndex, VectorSearchOptions};
 use prost::Message;
 
+pub(crate) mod generation;
 mod rewrite_proof;
+pub use generation::SegmentGenerationDeclaration;
 mod row_update;
 pub use row_update::SegmentRowRetirement;
 
 const BASE_SET_FORMAT: u32 = 1;
 const SET_FORMAT: u32 = 2;
 const SOURCE_SET_FORMAT: u32 = 3;
+const DECLARED_SET_FORMAT: u32 = 4;
 const SET_FILE: &str = "segments.json";
 const SEGMENT_META_FILE: &str = "segment.json";
 
@@ -238,6 +241,8 @@ pub struct SegmentSetManifest {
     pub binding: Option<SegmentBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_owner: Option<SegmentSourceOwner>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_declaration: Option<SegmentGenerationDeclaration>,
     pub epoch: u64,
     pub segments: Vec<SegmentMetadata>,
     /// The integer column a partitioned compaction ordered this set by
@@ -255,6 +260,7 @@ impl Default for SegmentSetManifest {
             format: BASE_SET_FORMAT,
             binding: None,
             source_owner: None,
+            generation_declaration: None,
             epoch: 0,
             segments: Vec::new(),
             partition_key: None,
@@ -265,7 +271,9 @@ impl Default for SegmentSetManifest {
 impl SegmentSetManifest {
     pub fn with_binding(mut self, binding: Option<&StoredBinding>) -> Result<Self, String> {
         self.binding = binding.map(SegmentBinding::encode).transpose()?;
-        self.format = if self.source_owner.is_some() {
+        self.format = if self.generation_declaration.is_some() {
+            DECLARED_SET_FORMAT
+        } else if self.source_owner.is_some() {
             SOURCE_SET_FORMAT
         } else if self.binding.is_some() {
             SET_FORMAT
@@ -328,6 +336,7 @@ struct OpenedSegment {
 pub struct OpenedSegmentSet {
     root: PathBuf,
     binding: Option<StoredBinding>,
+    declaration: Option<crate::pb::storage::IndexGenerationDeclaration>,
     manifest: SegmentSetManifest,
     /// Shared with the set this one was published from: a segment that
     /// is already open and verified stays open across a publish.
@@ -625,9 +634,20 @@ impl OpenedSegmentSet {
                 _ => {}
             }
         }
+        let declaration = manifest
+            .generation_declaration
+            .as_ref()
+            .map(SegmentGenerationDeclaration::decode)
+            .transpose()?;
+        if let Some(declaration) = &declaration {
+            for segment in &segments {
+                generation::check_reader(declaration, &segment.bm25, segment.vector.as_deref())?;
+            }
+        }
         Ok(Self {
             root,
             binding: declared.or_else(|| held.flatten()),
+            declaration,
             manifest,
             segments,
         })
@@ -635,6 +655,12 @@ impl OpenedSegmentSet {
 
     pub fn binding(&self) -> Option<&StoredBinding> {
         self.binding.as_ref()
+    }
+
+    pub fn generation_declaration(
+        &self,
+    ) -> Option<&crate::pb::storage::IndexGenerationDeclaration> {
+        self.declaration.as_ref()
     }
 
     /// Whether segment `i` is the same opened segment as `other`'s
@@ -1642,14 +1668,16 @@ fn verify_retry_source(
 }
 
 fn validate_manifest(manifest: &SegmentSetManifest) -> Result<(), String> {
-    if !(BASE_SET_FORMAT..=SOURCE_SET_FORMAT).contains(&manifest.format)
+    if !(BASE_SET_FORMAT..=DECLARED_SET_FORMAT).contains(&manifest.format)
         || (manifest.format == BASE_SET_FORMAT && manifest.binding.is_some())
         || (manifest.format == SET_FORMAT && manifest.binding.is_none())
-        || ((manifest.format == SOURCE_SET_FORMAT) != manifest.source_owner.is_some())
+        || (manifest.format < SOURCE_SET_FORMAT && manifest.source_owner.is_some())
+        || (manifest.format == SOURCE_SET_FORMAT && manifest.source_owner.is_none())
+        || ((manifest.format == DECLARED_SET_FORMAT) != manifest.generation_declaration.is_some())
     {
         return Err(format!(
             "segment set format {} or binding declaration is unsupported; expected format \
-             {BASE_SET_FORMAT} without a binding, {SET_FORMAT} with a binding, or {SOURCE_SET_FORMAT} with a source owner",
+             {BASE_SET_FORMAT} without a binding, {SET_FORMAT} with a binding, or {SOURCE_SET_FORMAT} with a source owner, or {DECLARED_SET_FORMAT} with a generation declaration",
             manifest.format
         ));
     }
@@ -1658,6 +1686,9 @@ fn validate_manifest(manifest: &SegmentSetManifest) -> Result<(), String> {
     }
     if let Some(owner) = &manifest.source_owner {
         owner.decode()?;
+    }
+    if let Some(declaration) = &manifest.generation_declaration {
+        declaration.decode()?;
     }
     let mut ids = BTreeSet::new();
     let mut previous_end = None;

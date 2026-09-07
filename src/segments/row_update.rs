@@ -37,7 +37,15 @@ impl SegmentCatalog {
         sources: Vec<SegmentSource<'_>>,
         prepare: impl FnOnce(&Arc<OpenedSegmentSet>) -> Result<T, String>,
     ) -> Result<(Arc<OpenedSegmentSet>, T), String> {
-        self.commit_row_transaction(expected_epoch, retirements, sources, None, None, prepare)
+        self.commit_row_transaction(
+            expected_epoch,
+            retirements,
+            sources,
+            None,
+            None,
+            None,
+            prepare,
+        )
     }
 
     /// Source versions may produce zero rows. Still commit their epoch and
@@ -49,6 +57,7 @@ impl SegmentCatalog {
         sources: Vec<SegmentSource<'_>>,
         binding: Option<&StoredBinding>,
         owner: &crate::pb::storage::SourceIndexOwner,
+        declaration: &crate::pb::storage::IndexGenerationDeclaration,
         prepare: impl FnOnce(&Arc<OpenedSegmentSet>) -> Result<T, String>,
     ) -> Result<(Arc<OpenedSegmentSet>, T), String> {
         self.commit_row_transaction(
@@ -57,6 +66,7 @@ impl SegmentCatalog {
             sources,
             binding,
             Some(owner),
+            Some(declaration),
             prepare,
         )
     }
@@ -68,6 +78,7 @@ impl SegmentCatalog {
         sources: Vec<SegmentSource<'_>>,
         binding: Option<&StoredBinding>,
         owner: Option<&crate::pb::storage::SourceIndexOwner>,
+        declaration: Option<&crate::pb::storage::IndexGenerationDeclaration>,
         prepare: impl FnOnce(&Arc<OpenedSegmentSet>) -> Result<T, String>,
     ) -> Result<(Arc<OpenedSegmentSet>, T), String> {
         let _guard = self
@@ -157,6 +168,13 @@ impl SegmentCatalog {
         }
         let mut manifest = current.published_manifest();
         manifest.source_owner = owner.map(SegmentSourceOwner::encode).transpose()?;
+        if let Some(declaration) = declaration {
+            if let Some(previous) = current.generation_declaration() {
+                generation::check_upgrade(previous, declaration)?;
+            }
+            manifest.generation_declaration =
+                Some(SegmentGenerationDeclaration::encode(declaration)?);
+        }
         manifest = manifest.with_binding(binding.or(current.binding()))?;
         manifest.epoch = epoch;
         let mut outputs = Vec::new();

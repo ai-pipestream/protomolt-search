@@ -76,18 +76,29 @@ soundness of caller-supplied pruning metadata.
 
 ## Empty generations must keep declarations
 
-Current segment catalogs keep mapped binding and owner metadata even with no
-rows, but the complete column/derived declaration and surviving empty vector
-backend state can still live only in segment files. Dropping the last segment
-must not erase those declarations. The comparison currently refuses that loss.
+Source publication now writes a format-4 segment catalog with a checksummed,
+canonical protobuf `IndexGenerationDeclaration`. It retains the complete ordered
+column tables (including empty columns), field names, analyzer fingerprints,
+position and sentence capabilities, derived declaration, and vector dimension
+and backend construction state. Each segment must agree with the declaration.
 
-Before enabling full compaction, persist a protobuf generation declaration in the
-catalog, including empty columns, field capabilities, derived declaration and
-vector construction state. Validate each segment against that declaration and
-retain it when every physical row is reclaimed. Treat the new manifest format as
-an explicit reader compatibility boundary. Reindexing or changing a derived
-expression is a different operation from compaction, never an exception to this
-preservation rule.
+The first source write may establish an analyzer fingerprint or vector backend
+that was previously unset. Once established, later source writes cannot change
+or remove it. Rewrites use strict equality, including when every physical row is
+reclaimed. Reopen restores analyzer metadata into the empty configured tail,
+validates the column and derived declarations, and constructs the empty vector
+provider with the persisted scoring configuration. A stale legacy vector file
+cannot override a declared generation.
+
+Formats 1, 2 and 3 remain readable. Format 4 requires the declaration; older
+readers refuse it. The optional JSON field is omitted from older manifests so
+the source journal's existing typed-manifest hashes remain unchanged. The
+format-1 rewrite transcript represents declared metadata identically to matching
+segment metadata; reclaiming the final tombstoned segment preserves its proof.
+
+Reindexing or changing a derived expression remains a separate operation from
+compaction. This metadata work does not enable source-owned maintenance cutover;
+the journal and activation sequence below are still required.
 
 ## Publication and recovery integration still required
 

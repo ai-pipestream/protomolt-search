@@ -300,6 +300,40 @@ impl NodeServiceImpl {
         let source_owner = projection
             .map(|source| source.catalog.index_owner(source.index_key))
             .transpose()?;
+        let declaration = projection
+            .map(|source| {
+                use crate::segments::generation;
+                // The reviewed configuration supplies even columns with no rows.
+                let mut declared =
+                    generation::from_store(&heap_store(&self.config)?, backend.clone())?;
+                if let Some(previous) = old_set.generation_declaration() {
+                    generation::check_upgrade(&declared, previous)?;
+                    declared = previous.clone();
+                } else if !old_set.is_empty() {
+                    let previous = generation::from_reader(old_set.bm25(0), backend.clone())?;
+                    generation::check_upgrade(&declared, &previous)?;
+                    declared = previous;
+                }
+                if let Some(staged) = source.candidate.segments().filter(|set| !set.is_empty()) {
+                    let mut selected_backend = generation::backend(&declared);
+                    if selected_backend.is_none() {
+                        if let Some(vector) = (0..staged.len()).find_map(|i| staged.vector(i)) {
+                            selected_backend = Some((
+                                vector
+                                    .dim_opt()
+                                    .ok_or("candidate vector dimension is absent")?,
+                                vector.backend_config().map_err(|error| error.to_string())?,
+                            ));
+                        }
+                    }
+                    let candidate = generation::from_reader(staged.bm25(0), selected_backend)?;
+                    generation::check_upgrade(&declared, &candidate)?;
+                    declared = candidate;
+                }
+                Ok::<_, String>(declared)
+            })
+            .transpose()
+            .map_err(Status::failed_precondition)?;
         let mut prepared_commit = false;
         let prepare = |set: &Arc<OpenedSegmentSet>| {
             let prepared = self.prepare_serving_state(&catalog, set, old_live, backend)?;
@@ -341,6 +375,9 @@ impl NodeServiceImpl {
                 source_owner
                     .as_ref()
                     .expect("source publication has an owner"),
+                declaration
+                    .as_ref()
+                    .expect("source publication has a declaration"),
                 prepare,
             ),
             None => catalog.commit_rows_prepared(catalog_epoch, retirements, sources, prepare),
@@ -469,6 +506,16 @@ impl NodeServiceImpl {
             shard.doc_count(),
             "the publication catalog",
         )?;
+        if let Some(declaration) = set.generation_declaration() {
+            let declared = crate::segments::generation::backend(declaration);
+            if backend
+                .as_ref()
+                .is_some_and(|held| declared.as_ref() != Some(held))
+            {
+                return Err("publication changes the established vector backend".into());
+            }
+            backend = declared;
+        }
         if backend.is_none() {
             if let Some(first) = (0..set.len()).find_map(|i| set.vector(i)) {
                 if first.descriptor().backend_kind != self.config.vector_backend {
@@ -483,6 +530,9 @@ impl NodeServiceImpl {
             }
         }
         let (index, exact) = if let Some((dim, config)) = backend {
+            if config.backend_kind != self.config.vector_backend {
+                return Err("publication vector backend differs from node configuration".into());
+            }
             let tail = VectorIndex::from_backend_config(dim, &config)
                 .map_err(|error| error.to_string())?;
             let provider =

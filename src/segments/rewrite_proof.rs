@@ -35,7 +35,60 @@ struct Schema {
     derived: Option<crate::postings::StoredDerived>,
 }
 fn schema(set: &OpenedSegmentSet) -> Result<Option<Schema>, String> {
-    let mut schema = None;
+    let mut schema = set
+        .generation_declaration()
+        .map(|declaration| {
+            let columns = declaration
+                .columns
+                .as_ref()
+                .expect("validated generation columns");
+            Ok::<_, String>(Schema {
+                tables: SourceTables {
+                    fields: declaration
+                        .text_fields
+                        .iter()
+                        .map(|f| f.name.clone())
+                        .collect(),
+                    fingerprints: declaration
+                        .text_fields
+                        .iter()
+                        .map(|f| f.analysis_fingerprint.unwrap_or(0))
+                        .collect(),
+                    position_fields: declaration
+                        .text_fields
+                        .iter()
+                        .filter(|f| f.positions)
+                        .map(|f| f.name.clone())
+                        .collect(),
+                    sentence_fields: declaration
+                        .text_fields
+                        .iter()
+                        .filter(|f| f.sentences)
+                        .map(|f| f.name.clone())
+                        .collect(),
+                    columns: crate::reshard::ColumnTables {
+                        facets: columns.facets.clone(),
+                        numerics: columns.numerics.clone(),
+                        integers: columns.integers.clone(),
+                        unsigned_integers: columns.unsigned_integers.clone(),
+                        geo: columns.geo.clone(),
+                        map_facets: columns.map_facets.clone(),
+                        map_numerics: columns.map_numerics.clone(),
+                        map_integers: columns.map_integers.clone(),
+                        map_unsigned_integers: columns.map_unsigned_integers.clone(),
+                    },
+                },
+                derived: declaration
+                    .derived
+                    .as_ref()
+                    .map(|d| {
+                        crate::derived::Declaration::compile(d)
+                            .map(|d| crate::postings::StoredDerived::of(&d))
+                    })
+                    .transpose()?,
+            })
+        })
+        .transpose()?;
     for i in 0..set.len() {
         let reader = set.bm25(i);
         let this = Schema {
@@ -93,7 +146,7 @@ fn schema_hash(set: &OpenedSegmentSet, schema: Option<&Schema>) -> [u8; 32] {
 fn backend(
     set: &OpenedSegmentSet,
 ) -> Result<Option<(usize, crate::vector::VectorBackendConfig)>, String> {
-    let mut expected = None;
+    let mut expected = set.generation_declaration().and_then(generation::backend);
     for i in 0..set.len() {
         if let Some(vector) = set.vector(i) {
             let this = (
@@ -605,6 +658,68 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn final_segment_can_be_reclaimed_only_with_identical_generation_metadata() {
+        let fixture = Fixture::new();
+        let before = fixture.set("all-deleted", &[0, 1], &[0, 1], "", 2);
+        let declaration =
+            generation::from_reader(before.bm25(0), backend(&before).unwrap()).unwrap();
+        let expected = before
+            .verify_source_rewrite(&before, &fixture.0.join("self-proof"), 1)
+            .unwrap();
+        let mut manifest = before.published_manifest();
+        manifest.format = 4;
+        manifest.generation_declaration =
+            Some(SegmentGenerationDeclaration::encode(&declaration).unwrap());
+        manifest.segments.clear();
+        manifest.epoch += 1;
+        let empty = OpenedSegmentSet::open_manifest(
+            before.root().to_path_buf(),
+            manifest.clone(),
+            Default::default(),
+        )
+        .unwrap();
+        let proof = before
+            .verify_source_rewrite(&empty, &fixture.0.join("empty-proof"), 1)
+            .unwrap();
+        assert_eq!(proof, expected);
+        assert_eq!(proof.live_rows, 0);
+        for change in 0..3 {
+            let mut altered = declaration.clone();
+            match change {
+                0 => altered.columns.as_mut().unwrap().facets.pop(),
+                1 => {
+                    altered.text_fields[0].analysis_fingerprint = Some(12);
+                    None
+                }
+                2 => {
+                    altered.vector = None;
+                    None
+                }
+                _ => unreachable!(),
+            };
+            manifest.generation_declaration =
+                Some(SegmentGenerationDeclaration::encode(&altered).unwrap());
+            let mut populated = manifest.clone();
+            populated.segments = before.manifest().segments.clone();
+            assert!(OpenedSegmentSet::open_manifest(
+                before.root().to_path_buf(),
+                populated,
+                Default::default()
+            )
+            .is_err());
+            let changed = OpenedSegmentSet::open_manifest(
+                before.root().to_path_buf(),
+                manifest.clone(),
+                Default::default(),
+            )
+            .unwrap();
+            assert!(before
+                .verify_source_rewrite(&changed, &fixture.0.join("bad-proof"), 1)
+                .is_err());
         }
     }
 

@@ -5389,11 +5389,13 @@ impl NodeServiceImpl {
         declare_derived_columns(&mut config)?;
         check_placement_columns(&config)?;
         validate_column_tables(&config)?;
+        let mut declared_generation = false;
         if let Some(path) = config.index_path.as_ref() {
             recover_segments_swap(path);
             if let Some(manifest) =
                 crate::segments::SegmentCatalog::read_manifest(&segments_root(path))?
             {
+                declared_generation = manifest.generation_declaration.is_some();
                 if let Some(owner) = &manifest.source_owner {
                     let owner = owner.decode()?;
                     if owner.collection != config.collection
@@ -5412,7 +5414,7 @@ impl NodeServiceImpl {
             .as_ref()
             .and_then(|path| recover_generation(path));
 
-        let mut index = match config.index_path.as_ref() {
+        let mut index = match config.index_path.as_ref().filter(|_| !declared_generation) {
             Some(index_path) => {
                 let path = generation
                     .as_ref()
@@ -5481,13 +5483,26 @@ impl NodeServiceImpl {
                         return Err("source-managed index requires its original collection, segmented layout and WAL disabled".into());
                     }
                 }
-                if let Some(first) = (0..set.len()).find_map(|i| set.vector(i)) {
-                    let backend = first
-                        .backend_config()
-                        .map_err(|error| format!("segment vector backend: {error}"))?;
-                    let dim = first
-                        .dim_opt()
-                        .ok_or_else(|| "segment vector image has no dimension".to_string())?;
+                let declared_backend = set
+                    .generation_declaration()
+                    .and_then(crate::segments::generation::backend);
+                let stored_backend = match (0..set.len()).find_map(|i| set.vector(i)) {
+                    Some(first) => Some((
+                        first
+                            .dim_opt()
+                            .ok_or("segment vector image has no dimension")?,
+                        first
+                            .backend_config()
+                            .map_err(|error| format!("segment vector backend: {error}"))?,
+                    )),
+                    None => None,
+                };
+                if let Some((dim, backend)) = declared_backend.or(stored_backend) {
+                    if declared_generation && backend.backend_kind != config.vector_backend {
+                        return Err(
+                            "generation vector backend differs from node configuration".into()
+                        );
+                    }
                     exact_vectors = Some(
                         ExactVectorStore::from_segments(&set, dim)
                             .map_err(|error| format!("segment exact-vector view: {error}"))?,
@@ -5497,6 +5512,9 @@ impl NodeServiceImpl {
                     let provider = SegmentedProvider::open(set, tail_image)
                         .map_err(|error| format!("segment vectors: {error}"))?;
                     index = Some(VectorIndex::from_provider(provider));
+                } else if declared_generation {
+                    index = None;
+                    exact_vectors = None;
                 } else if index.as_ref().is_some_and(VectorIndex::is_empty) {
                     // An empty calibrated image is the surviving provider state
                     // after complete compaction. It cannot adopt retired rows.

@@ -871,7 +871,8 @@ async fn source_owner_survives_reopen_and_fences_legacy_storage_and_snapshots() 
         assert_eq!(owner.history_id, receipt.history_id);
         assert_eq!(owner.index_key, b"books-index");
         assert_eq!(owner.collection, "books");
-        assert_eq!(set.manifest().format, 3);
+        assert_eq!(set.manifest().format, 4);
+        assert!(set.generation_declaration().is_some());
         let before = fixture.manifest();
         let catalog = SegmentCatalog::open(&root).unwrap();
         for result in [
@@ -974,4 +975,84 @@ async fn source_owner_refuses_local_view_substitution_without_losing_valid_reads
     .unwrap()
     .unwrap();
     assert_eq!(activation.intent_id, recovered.intent_id);
+}
+
+#[tokio::test]
+async fn empty_declared_generation_reopens_with_schema_analysis_and_vector_state() {
+    use pipestream_search::segments::OpenedSegmentSet;
+    let fixture = Fixture::new();
+    let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None, false).unwrap());
+    let receipt = fixture.accept(1, Some(source(2, false)));
+    let candidate = node
+        .stage_document_projection(fixture.catalog.clone(), fixture.request(&receipt))
+        .await
+        .unwrap();
+    publish_candidate(node.clone(), fixture.catalog.clone(), candidate)
+        .await
+        .unwrap();
+    let original_health = node
+        .health(Request::new(HealthRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+    let original =
+        OpenedSegmentSet::open(segments_root(fixture.config.index_path.as_ref().unwrap())).unwrap();
+    let declaration = original.generation_declaration().unwrap().clone();
+    assert!(declaration.derived.is_some());
+    assert!(declaration
+        .text_fields
+        .iter()
+        .any(|f| f.analysis_fingerprint.is_some()));
+    assert_eq!(declaration.vector.as_ref().unwrap().dimension, 8);
+
+    // A private rewrite fixture exercises reopen only. It is never published to
+    // the source journal, and does not claim an accepted/searchable receipt.
+    let mut config = fixture.config.clone();
+    config.index_path = Some(fixture.root.join("empty-index"));
+    let root = segments_root(config.index_path.as_ref().unwrap());
+    std::fs::create_dir_all(&root).unwrap();
+    let mut manifest = original.published_manifest();
+    manifest.segments.clear();
+    manifest.epoch += 1;
+    std::fs::write(
+        root.join("segments.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    // A stale legacy vector image must not override the declaration.
+    std::fs::write(config.index_path.as_ref().unwrap(), b"retired legacy image").unwrap();
+    let empty = NodeServiceImpl::open(config.clone(), None, false).unwrap();
+    let health = empty
+        .health(Request::new(HealthRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        (health.num_vectors, health.bm25_docs, health.dim),
+        (0, 0, 8)
+    );
+    assert_eq!(
+        health.scoring_fingerprint,
+        original_health.scoring_fingerprint
+    );
+    assert_eq!(health.vector_backend, original_health.vector_backend);
+    let reopened = OpenedSegmentSet::open(&root).unwrap();
+    assert_eq!(reopened.generation_declaration(), Some(&declaration));
+    drop(empty);
+    for change in 0..3 {
+        let mut wrong = config.clone();
+        match change {
+            0 => wrong.unsigned_integer_fields.push("extra-column".into()),
+            1 => wrong.derived = None,
+            2 => wrong.vector_backend = "different-provider".into(),
+            _ => unreachable!(),
+        }
+        let error = NodeServiceImpl::open(wrong, None, false)
+            .err()
+            .expect("changed configuration must refuse even with no segments");
+        assert!(
+            error.contains("generation") || error.contains("declaration"),
+            "{error}"
+        );
+    }
 }
