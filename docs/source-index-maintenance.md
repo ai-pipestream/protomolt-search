@@ -210,7 +210,10 @@ generation-local. See [query result identity](query-result-identity.md) for the
 public contract and its maintenance coverage.
 
 Coherent backup/restore must join source history, journal and
-the referenced manifest. Recovery-aware orphan reclamation and corpus-scale
+the referenced manifest. The [pinned source checkpoint](source-index-backup.md)
+now preserves the complete source transaction and index anchors; coherent
+artifact capture, bundle completion and restore activation remain outstanding.
+Recovery-aware orphan reclamation and corpus-scale
 rewrite measurements remain outstanding. Index-only snapshots and WAL compaction
 must continue to refuse owned catalogs until their contracts are joined.
 

@@ -20,8 +20,10 @@ use crate::pb::{
 };
 use crate::sha256;
 
+mod checkpoint;
 mod projection;
 mod publication;
+pub use checkpoint::CatalogCheckpoint;
 pub use publication::{MaintenanceRecovery, ProjectionRecovery};
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("metadata");

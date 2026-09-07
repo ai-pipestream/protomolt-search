@@ -136,3 +136,26 @@ message MaintenanceIntent {
   // SHA-256 of this message with intent_id empty, using format-1 encoding.
   bytes intent_id = 11;
 }
+
+// Source half of a coherent backup. The database contains exact accepted
+// source history, retry receipts and projection/maintenance journal records
+// from one read transaction. This is not an index backup or a serving receipt:
+// a complete backup must also include each index's committed manifest and all
+// of its artifacts, matching the states below, before publishing a bundle.
+message DocumentCatalogCheckpoint {
+  uint32 format_version = 1;
+  DocumentCatalogHeader header = 2;
+  repeated ProjectionJournalState indexes = 3;
+  uint64 bytes = 4;
+  bytes sha256 = 5;
+  uint64 records = 6;
+}
+
+message DocumentCatalogCheckpointLimits {
+  // 1..64 MiB of accounted record content per output transaction. A record
+  // larger than this is refused rather than split or truncated.
+  uint64 batch_bytes = 1;
+  // Positive completed output database size bound, checked after each commit.
+  // It is not a filesystem quota or a whole-process memory bound.
+  uint64 max_file_bytes = 2;
+}
