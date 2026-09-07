@@ -2295,11 +2295,10 @@ message MapFacetEntry {
   // Map column name; must exist in the shard's map-facet table
   // (--map-facet-fields). Unknown names are INVALID_ARGUMENT.
   string field = 1;
-  // The entry's key. Non-empty (an empty key is almost always a
-  // producer bug; a document without an entry simply omits it). At
-  // most one value per (document, field, key) — map semantics.
+  // The entry's key. Empty keys are currently unsupported. At most one
+  // value per (document, field, key); omit the entry to represent absence.
   string key = 2;
-  // The value. Non-empty, exact identity.
+  // The exact value. Empty is present; omit the entry to represent absence.
   string value = 3;
 }
 

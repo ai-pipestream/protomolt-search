@@ -596,7 +596,7 @@ async fn distributed_map_stages_and_ingest_refusals() {
     );
 
     // Ingest refusals: empty key, repeated (column, key), unknown
-    // column, empty string value, non-finite numeric value.
+    // column, non-finite numeric value. Empty string values are present.
     let bad_facet = |field: &str, key: &str, value: &str| AddDocumentsRequest {
         unsigned_integers: Vec::new(),
         original_source: None,
@@ -642,7 +642,6 @@ async fn distributed_map_stages_and_ingest_refusals() {
     for (req, needle) in [
         (bad_facet("meta", "", "x"), "empty keys"),
         (bad_facet("nope", "k", "x"), "unknown map column"),
-        (bad_facet("meta", "k", ""), "empty value"),
     ] {
         let err = send(addrs[0].clone(), req).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument, "{needle}");

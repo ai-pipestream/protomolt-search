@@ -9931,8 +9931,9 @@ impl NodeServiceImpl {
             slots
         };
         // Map entries (docs/map-columns.md): unknown columns, empty
-        // keys, repeated (column, key) pairs, empty string values, and
-        // non-finite numeric values all refuse before anything mutates.
+        // keys, repeated (column, key) pairs, and non-finite numeric values
+        // all refuse before anything mutates. An empty string is a present
+        // map value; absence is represented only by an omitted entry.
         let map_facet_slots: Vec<(usize, &str, &str)> = {
             let shard = guard.bm25.as_ref().expect("builder just ensured");
             let mut seen: Vec<(&str, &str)> = Vec::new();
@@ -9940,7 +9941,7 @@ impl NodeServiceImpl {
             for e in &doc.map_facets {
                 if e.key.is_empty() {
                     return Err(Status::invalid_argument(format!(
-                        "map column {:?}: empty keys are refused (almost always a producer bug)",
+                        "map column {:?}: empty keys are not supported by the current map selector contract",
                         e.field
                     )));
                 }
@@ -9959,12 +9960,6 @@ impl NodeServiceImpl {
                         e.field
                     )));
                 };
-                if e.value.is_empty() {
-                    return Err(Status::invalid_argument(format!(
-                        "map column {:?} key {:?} has an empty value; omit absent entries",
-                        e.field, e.key
-                    )));
-                }
                 slots.push((ci, e.key.as_str(), e.value.as_str()));
             }
             slots
@@ -9976,7 +9971,7 @@ impl NodeServiceImpl {
             for e in &doc.map_numerics {
                 if e.key.is_empty() {
                     return Err(Status::invalid_argument(format!(
-                        "map column {:?}: empty keys are refused (almost always a producer bug)",
+                        "map column {:?}: empty keys are not supported by the current map selector contract",
                         e.field
                     )));
                 }

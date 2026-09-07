@@ -1222,6 +1222,11 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **2026-09-06 — Empty map values preserve presence.** A present empty string
+  now survives ordinary protobuf ingestion, query projections, facet counts
+  and storage rewrites. Missing keys remain absent. This uses the existing
+  storage format; descriptor-driven map projection and empty-key selectors
+  remain unfinished. See [map semantics](docs/map-columns.md#empty-string-values-2026-09-06).
 - **2026-09-06 — Explicit protobuf index definitions.** Plan and bind an
   occurrence-specific policy using field-number paths, concrete column kinds,
   names, roles and dimensions. Unlisted fields stay source-only; descriptor hints

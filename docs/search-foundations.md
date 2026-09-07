@@ -1,14 +1,19 @@
 # Search foundations
 
 Foundation work began on `feat/search-foundations` from `PRE_ASTRA`.
-The latest increment adds explicit protobuf index definitions, following
-streamed result identity on main `af51a1d` and the incorporated selected-child
-transplant and benchmark notes.
-The increment retains canonical policy through image/WAL, snapshots,
-replication and rebuild. Replica retries cross the persistence boundary before
-advancing their cursor. [The contract](index-definition.md#durable-policy-and-compatibility)
-describes the storage gates and recovery evidence; combined validation passed
-1,237 tests and all five mobile target checks.
+The latest increment preserves present empty string map values through ordinary
+protobuf ingestion, public query projections and counts, restart and compaction.
+It incorporates main `483be73`, including the split open-files preflight, and
+passed 1,240 tests with one existing live OpenNLP test ignored, plus all five
+mobile target checks. Protobuf wire declarations are byte-identical to that
+main baseline. [Map semantics](map-columns.md#empty-string-values-2026-09-06)
+records the evidence and the remaining empty-key and descriptor-projection work.
+
+The preceding explicit index-definition increment retains canonical policy
+through image/WAL, snapshots, replication and rebuild. Replica retries cross
+the persistence boundary before advancing their cursor.
+[The contract](index-definition.md#durable-policy-and-compatibility) describes
+the storage gates and recovery evidence.
 The original main reconciliation checkpoint was `1565d07` on
 `feat/protobuf-unsigned-numerics-2026-09`, accepted for main on 2026-09-06.
 This tracks the full requested foundation. Individual passing increments do not

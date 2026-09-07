@@ -96,9 +96,14 @@ number, which is the whole point of the kinded table.
   positions inside map values are possible later — tantivy's
   per-path-id position offsets are the design to copy — but blurring
   term identity now would compromise everything built on it.)
-- Absence = the key simply missing from the document's pair list. No
-  NaN sentinel in map pairs; non-finite numeric values are refused at
-  ingest. Empty keys are refused (almost always a producer bug).
+- Absence = the key missing from the document's pair list. A present empty
+  string is a value, including when protobuf omits the default `value` field
+  inside a present `MapFacetEntry`. Equality, ordering, projected values and
+  counts retain it. No NaN sentinel exists in map pairs; non-finite numeric
+  values are refused at ingest.
+- Empty keys remain unsupported by ingestion. Several shared selector
+  contracts still use an empty key to select a plain column; accepting such
+  entries before replacing that ambiguity would permit incorrect queries.
 - **Counting**: `MapFacetField { column, key }` entries ride the same
   count-then-rank pass as plain facets — resolve (column, key) to a
   shard-local key ordinal once, then one binary search per matched
@@ -114,26 +119,65 @@ number, which is the whole point of the kinded table.
   typo'd drill-down or a typo'd chain must never read as "zero results"
   or a silent no-op.
 
-## The protobuf story
+## Protobuf preservation and projection
 
-With maps, the column plane covers most of the proto data model:
+The column API and descriptor-driven extraction are separate. The ordinary
+`AddDocuments` API accepts explicit `MapFacetEntry` and `MapNumericEntry`
+records. It does not infer their contents from an attached original source.
+`MappedPlan` currently reports protobuf maps as source-only; the explicit
+index-definition compiler also refuses map value projections. The original
+protobuf bytes preserve every map entry, including empty keys and values.
+Describing or retaining a source is not proof of a queryable map projection.
 
-| proto type | lands as |
-|---|---|
-| string / enum | facet column (kind 0) |
-| double/float/ints (< 2^53) | f64 column (kind 1) |
-| int64/uint64 exact, Timestamp | i64 column (kind 4, `range-facets.md`) |
-| map<string, string> | kind 2 |
-| map<string, numeric> | kind 3 |
-| nested message paths | dotted column names (declared) |
-| repeated scalars | list column (queued; same pair-list encoding) |
-| bytes, Any, repeated-inside-repeated | out of scope, refused loudly |
+Current scalar storage has full-domain signed and unsigned integer columns
+with independent presence. Map-numeric storage is f64, so it is not an exact
+replacement for protobuf int64/uint64 maps. Map-facet values are strings with
+entry presence; a missing key and a present empty string are distinct. The
+current [schema report](schema-report.md) and [index contract](index-definition.md)
+are the entry points for what descriptor-based planning actually supports.
 
-A descriptor-driven extractor ("FileDescriptorSet + message name →
-column schema") is the consumer-side one-liner that makes "index any
-protobuf" real; the engine's wire stays explicit typed values.
+### Empty string values (2026-09-06)
 
-## Queued behind this
+Ingestion previously rejected a present empty map value and told the caller to
+omit it, which changed its meaning to absence. Both existing storage encodings
+already distinguish those cases. The rejection is removed without changing the
+file format or any protobuf wire declaration. Older ingestion services can
+still refuse these values; existing image readers can retain them.
+
+`tests/map_value_presence.rs` checks heap/spill byte equality, heap and mapped
+readers, and both sides of the public gRPC boundary. It distinguishes present
+empty, present nonempty and absent entries under equality, membership, ordering,
+prefixes, projections and facet counts. One- and two-shard runs cover both
+storage layouts, restart and compaction that moves rows. Existing duplicate-key,
+unknown-column and non-finite numeric refusals remain in force.
+
+Combined validation on main `483be73` plus this change passed 507 library tests,
+719 integration tests across 123 targets, 12 embedded tests and two IVF tests
+(1,240 total; one existing live OpenNLP test ignored). All five mobile Rust
+checks, test/example compilation, formatting and vendored-proto checks passed.
+Descriptor comparison confirms byte-identical protobuf wire declarations to
+`483be73`. This is local validation; no fleet rollout was performed.
+
+### Remaining map work
+
+Map projection must preserve protobuf map semantics, including default keys and
+values and decoder-defined duplicate-key resolution, before emitting unique
+column entries. It must keep integer domains exact and retain original bytes
+independently of the chosen projections. Current direct `AddDocuments` entries
+require unique keys; they are already materialized values, not raw protobuf map
+wire occurrences to merge.
+
+An empty key must be distinguishable from no key in every selector shared by
+scalar and map columns. This includes string ranges/prefixes, score stages,
+statistics, placement evaluation and their relay/response contracts. Use an
+explicit typed target or presence-bearing selector, with mixed-version refusal
+where a peer could otherwise ignore that distinction. Existing dedicated map
+predicates and `MapRead` already carry map context; they must preserve the same
+key semantics through planning, caches and authorization. Until that is wired
+end to end, empty keys remain a named ingestion refusal, not an alias for a
+plain field. These gaps remain part of the search foundation goal.
+
+## Original sequencing notes (2026-08-03)
 
 - **Increment 2** — LANDED 2026-08-03 (`docs/range-facets.md`): i64
   columns as kind 4 (exact past 2^53, `i64::MIN` the refused absence
