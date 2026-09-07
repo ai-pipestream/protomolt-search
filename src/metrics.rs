@@ -1425,6 +1425,28 @@ mod tests {
     /// opens records both phases at once.
     #[tokio::test]
     async fn streaming_phases_record_first_response_and_completion() {
+        // Other library tests stream real queries through this global registry.
+        // Keep exact phase/gauge assertions in an isolated process, as the
+        // route-counter test above does, without resetting production metrics.
+        const ISOLATED: &str = "PSEARCH_TEST_ISOLATED_STREAM_PHASES";
+        if std::env::var_os(ISOLATED).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "metrics::tests::streaming_phases_record_first_response_and_completion",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated streaming metrics test failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let route = Route::QueryStream;
         let (req0, _, done0, first0, err0) = snapshot(route);
 
