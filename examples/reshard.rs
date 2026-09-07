@@ -76,6 +76,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let out_dir = PathBuf::from(out_dir);
+    match reshard::raise_open_files_limit() {
+        Some(limit) => eprintln!("reshard: open-files limit {limit}"),
+        None => eprintln!("reshard: open-files limit left as is"),
+    }
     let analysis_addr = arg("analysis-addr", "http://127.0.0.1:50051");
     // Vector-only replay skips document analysis and the BM25 sidecars
     // entirely: shard-count and routing experiments only search the
@@ -202,6 +206,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 source,
                 cut,
                 only_child,
+                open_files_limit: None,
             },
             &mut analyze,
         )?;

@@ -2416,6 +2416,10 @@ pub struct TreeSplitOptions {
     /// 2026-09-06) is redone without the five that finished. Segmented
     /// layout only; a single-image split is refused by name.
     pub only_child: Option<usize>,
+    /// The open-files limit the spill pass is checked against; `None`
+    /// reads the process's own soft limit. A test sets a small number
+    /// to see the refusal.
+    pub open_files_limit: Option<u64>,
 }
 
 impl Default for TreeSplitOptions {
@@ -2426,6 +2430,7 @@ impl Default for TreeSplitOptions {
             source: TreeRowSource::Logs,
             cut: SpillCut::Hash,
             only_child: None,
+            open_files_limit: None,
         }
     }
 }
@@ -2715,6 +2720,44 @@ pub fn split_placement_tree_logs(
     spill_manifest.bucket_bits = spill_bucket_bits;
     spill_manifest.bucket_count = 1u32 << spill_bucket_bits;
     let spill_bucket_count = spill_manifest.bucket_count;
+    // The spill pass holds a log file and an analysis sidecar open per
+    // bucket per child, and the sources' segments beside them; a plan
+    // past the process's open-files limit dies deep into the pass (the
+    // archive at 150,000 rows per cut: "Too many open files" after 34
+    // minutes), so it is refused here by name.
+    {
+        let spill_files = (0..children.len())
+            .map(|index| match &cut_plans {
+                Some(plans) => u64::from(plans[index].buckets),
+                None => u64::from(spill_bucket_count),
+            })
+            .sum::<u64>()
+            .saturating_mul(2);
+        let source_files = sources.as_ref().map_or(0, |(shards, _)| {
+            shards
+                .iter()
+                .map(|shard| shard.set.len() as u64)
+                .sum::<u64>()
+                .saturating_mul(2)
+        });
+        let needed = spill_files.saturating_add(source_files).saturating_add(64);
+        let limit = match options.open_files_limit {
+            Some(limit) => Some(limit),
+            None => open_files_soft_limit(),
+        };
+        if let Some(limit) = limit {
+            if needed > limit {
+                return Err(format!(
+                    "the split would hold about {needed} files open ({spill_files} spill logs and \
+                     analysis sidecars over {} children, {source_files} for the sources' segments) \
+                     above this process's open-files limit of {limit}; raise it (ulimit -n, or \
+                     the reshard raises its own to the hard limit at start) or use fewer, larger \
+                     cuts (--cut-rows)",
+                    children.len()
+                ));
+            }
+        }
+    }
     let mut spills = Vec::with_capacity(children.len());
     for index in 0..children.len() {
         let dir = spill_root.join(format!("c{index:05}"));
@@ -4718,6 +4761,54 @@ pub fn shards_toml(out: &ReshardOutput) -> String {
         ));
     }
     s
+}
+
+/// The process's soft open-files limit, from `/proc/self/limits` on
+/// Linux; `None` where that file is absent or unreadable.
+pub fn open_files_soft_limit() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/self/limits").ok()?;
+    let line = text
+        .lines()
+        .find(|line| line.starts_with("Max open files"))?;
+    let mut fields = line["Max open files".len()..].split_whitespace();
+    let soft = fields.next()?;
+    if soft == "unlimited" {
+        return Some(u64::MAX);
+    }
+    soft.parse().ok()
+}
+
+/// Raise the soft open-files limit to the hard limit, so a spill plan
+/// sized for the machine is not stopped by the shell's default of
+/// 1024. Returns the limit in force afterwards; `None` when the build
+/// cannot set limits (no `net` feature) or the call failed.
+#[cfg(feature = "net")]
+pub fn raise_open_files_limit() -> Option<u64> {
+    // SAFETY: getrlimit/setrlimit read and write a plain struct the
+    // caller owns; no memory is shared past the calls.
+    unsafe {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+            return None;
+        }
+        if limit.rlim_cur < limit.rlim_max {
+            limit.rlim_cur = limit.rlim_max;
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                return None;
+            }
+        }
+        // rlim_t is u64 on the fleet's targets and wider elsewhere.
+        #[allow(clippy::unnecessary_cast)]
+        Some(limit.rlim_cur as u64)
+    }
+}
+
+#[cfg(not(feature = "net"))]
+pub fn raise_open_files_limit() -> Option<u64> {
+    None
 }
 
 #[cfg(test)]

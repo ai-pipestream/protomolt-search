@@ -1072,6 +1072,44 @@ async fn one_child_is_built_alone_and_equals_the_full_splits() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A spill plan past the open-files limit is refused before the pass,
+/// naming the files it would hold and the limit; the process's own
+/// limit is readable and the raise leaves it at or above where it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_spill_plan_past_the_open_files_limit_is_refused_by_name() {
+    let dir = tempdir("fdlimit");
+    let (index_path, _addr) = source_shard(&dir, true).await;
+    let gen = reshard::resolve_gen(&pipestream_search::wal::wal_dir(&index_path)).unwrap();
+    let error = reshard::split_placement_tree_logs(
+        std::slice::from_ref(&gen),
+        &band_tree(),
+        &dir.join("small"),
+        &[0, 1_000, 2_000],
+        None,
+        reshard::TreeSplitOptions {
+            source: reshard::TreeRowSource::Segments,
+            cut: reshard::SpillCut::Column {
+                column: "year".into(),
+                rows_per_cut: 30,
+            },
+            open_files_limit: Some(16),
+            ..Default::default()
+        },
+        &mut analyzer(),
+    )
+    .unwrap_err();
+    assert!(error.contains("open-files limit of 16"), "{error}");
+    assert!(
+        error.contains("spill logs and analysis sidecars"),
+        "{error}"
+    );
+    let before = reshard::open_files_soft_limit().expect("Linux exposes the limit");
+    let raised = reshard::raise_open_files_limit().expect("the net build can raise it");
+    assert!(raised >= before, "{raised} >= {before}");
+    assert_eq!(reshard::open_files_soft_limit(), Some(raised));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sources_with_different_analyzers_are_refused() {
     let dir = tempdir("mixed");
