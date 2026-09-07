@@ -84,6 +84,7 @@ mod query_disclosure;
 mod query_identity;
 mod rangefacet;
 pub mod rankdiff;
+pub mod reconcile;
 pub mod relay;
 #[cfg(feature = "net")]
 pub mod replication;

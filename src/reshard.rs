@@ -4039,24 +4039,24 @@ fn analysis_sidecar_path(spill_dir: &Path, bucket: u32) -> PathBuf {
 
 /// One source shard's catalog beside its log, with the rows its shard
 /// overlay and its log have deleted since the segments sealed.
-struct SegmentSourceShard {
-    gen: PathBuf,
-    root: PathBuf,
-    set: std::sync::Arc<crate::segments::OpenedSegmentSet>,
+pub(crate) struct SegmentSourceShard {
+    pub(crate) gen: PathBuf,
+    pub(crate) root: PathBuf,
+    pub(crate) set: std::sync::Arc<crate::segments::OpenedSegmentSet>,
     /// The shard-wide live-document overlay (`<index>.tv.live`), when
     /// written: a delete after a seal lands there, not in the segment's
     /// own sidecar.
-    overlay: Option<crate::live_docs::LiveDocs>,
+    pub(crate) overlay: Option<crate::live_docs::LiveDocs>,
     /// Rows the log deletes or replaces, as local labels.
-    deleted: BTreeSet<u64>,
+    pub(crate) deleted: BTreeSet<u64>,
     /// The shard's slot offset: a global id is the offset plus the label.
-    slot_offset: u64,
+    pub(crate) slot_offset: u64,
 }
 
 impl SegmentSourceShard {
     /// Whether shard-local row `label` (segment `i`, row `row` in it) is
     /// live: the segment's sidecar, the shard overlay, and the log agree.
-    fn is_live(&self, i: usize, row: u32, label: u64) -> bool {
+    pub(crate) fn is_live(&self, i: usize, row: u32, label: u64) -> bool {
         if self.set.live_docs(i).is_deleted(row as usize) {
             return false;
         }
@@ -4070,12 +4070,61 @@ impl SegmentSourceShard {
 }
 
 /// The tables every source shares, pinned on the children.
-struct SourceTables {
-    fields: Vec<String>,
-    fingerprints: Vec<u64>,
-    position_fields: Vec<String>,
-    sentence_fields: Vec<String>,
-    columns: ColumnTables,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SourceTables {
+    pub(crate) fields: Vec<String>,
+    pub(crate) fingerprints: Vec<u64>,
+    pub(crate) position_fields: Vec<String>,
+    pub(crate) sentence_fields: Vec<String>,
+    pub(crate) columns: ColumnTables,
+}
+
+/// The field and column tables a sealed store declares, in index order.
+pub(crate) fn segment_tables(bm25: &crate::postings::Bm25Reader) -> SourceTables {
+    let fields: Vec<String> = (0..bm25.field_count())
+        .map(|f| bm25.field_name(f).to_string())
+        .collect();
+    let fingerprints: Vec<u64> = (0..bm25.field_count())
+        .map(|f| bm25.analysis_fingerprint(f))
+        .collect();
+    let position_fields: Vec<String> = (0..bm25.field_count())
+        .filter(|&f| bm25.field_has_positions(f))
+        .map(|f| bm25.field_name(f).to_string())
+        .collect();
+    let sentence_fields: Vec<String> = (0..bm25.field_count())
+        .filter(|&f| bm25.field_has_sentences(f))
+        .map(|f| bm25.field_name(f).to_string())
+        .collect();
+    let columns = ColumnTables {
+        facets: (0..bm25.facet_count())
+            .map(|c| bm25.facet_name(c).to_string())
+            .collect(),
+        numerics: (0..bm25.numeric_count())
+            .map(|c| bm25.numeric_name(c).to_string())
+            .collect(),
+        map_facets: (0..bm25.map_facet_count())
+            .map(|c| bm25.map_facet_name(c).to_string())
+            .collect(),
+        map_numerics: (0..bm25.map_numeric_count())
+            .map(|c| bm25.map_numeric_name(c).to_string())
+            .collect(),
+        integers: (0..bm25.integer_count())
+            .map(|c| bm25.integer_name(c).to_string())
+            .collect(),
+        unsigned_integers: (0..bm25.unsigned_integer_count())
+            .map(|c| bm25.unsigned_integer_name(c).to_string())
+            .collect(),
+        geo: (0..bm25.geo_count())
+            .map(|c| bm25.geo_name(c).to_string())
+            .collect(),
+    };
+    SourceTables {
+        fields,
+        fingerprints,
+        position_fields,
+        sentence_fields,
+        columns,
+    }
 }
 
 /// The catalog root of the shard whose log generation is `gen`:
@@ -4162,7 +4211,7 @@ fn wal_row_watermark(gen: &Path, bucket_count: u32) -> Result<(u64, BTreeSet<u64
 
 /// Open the catalogs beside the logs and check what a child pins
 /// (`docs/replay-from-segments.md`, "The replay").
-fn open_segment_sources(
+pub(crate) fn open_segment_sources(
     gens: &[PathBuf],
 ) -> Result<(Vec<SegmentSourceShard>, SourceTables), String> {
     let mut shards = Vec::with_capacity(gens.len());
@@ -4221,50 +4270,7 @@ fn open_segment_sources(
         }
         for i in 0..set.len() {
             let bm25 = set.bm25(i);
-            let fields: Vec<String> = (0..bm25.field_count())
-                .map(|f| bm25.field_name(f).to_string())
-                .collect();
-            let fingerprints: Vec<u64> = (0..bm25.field_count())
-                .map(|f| bm25.analysis_fingerprint(f))
-                .collect();
-            let position_fields: Vec<String> = (0..bm25.field_count())
-                .filter(|&f| bm25.field_has_positions(f))
-                .map(|f| bm25.field_name(f).to_string())
-                .collect();
-            let sentence_fields: Vec<String> = (0..bm25.field_count())
-                .filter(|&f| bm25.field_has_sentences(f))
-                .map(|f| bm25.field_name(f).to_string())
-                .collect();
-            let columns = ColumnTables {
-                facets: (0..bm25.facet_count())
-                    .map(|c| bm25.facet_name(c).to_string())
-                    .collect(),
-                numerics: (0..bm25.numeric_count())
-                    .map(|c| bm25.numeric_name(c).to_string())
-                    .collect(),
-                map_facets: (0..bm25.map_facet_count())
-                    .map(|c| bm25.map_facet_name(c).to_string())
-                    .collect(),
-                map_numerics: (0..bm25.map_numeric_count())
-                    .map(|c| bm25.map_numeric_name(c).to_string())
-                    .collect(),
-                integers: (0..bm25.integer_count())
-                    .map(|c| bm25.integer_name(c).to_string())
-                    .collect(),
-                unsigned_integers: (0..bm25.unsigned_integer_count())
-                    .map(|c| bm25.unsigned_integer_name(c).to_string())
-                    .collect(),
-                geo: (0..bm25.geo_count())
-                    .map(|c| bm25.geo_name(c).to_string())
-                    .collect(),
-            };
-            let this = SourceTables {
-                fields,
-                fingerprints,
-                position_fields,
-                sentence_fields,
-                columns,
-            };
+            let this = segment_tables(bm25);
             match &tables {
                 None => tables = Some(this),
                 Some(first) => {
@@ -4345,7 +4351,7 @@ fn open_segment_sources(
 
 /// The logged document row `row` of `bm25` stands for: its columns,
 /// and with `with_text` its text, lineage, source and identity too.
-fn reconstruct_document(
+pub(crate) fn reconstruct_document(
     bm25: &crate::postings::Bm25Reader,
     row: u32,
     tables: &SourceTables,
@@ -4447,7 +4453,7 @@ fn reconstruct_document(
 }
 
 /// The exact-vector sidecar of segment `i`, when the segment has vectors.
-fn open_segment_exact(
+pub(crate) fn open_segment_exact(
     shard: &SegmentSourceShard,
     i: usize,
 ) -> Result<Option<crate::exact_vectors::ExactVectorStore>, String> {
