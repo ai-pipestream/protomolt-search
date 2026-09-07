@@ -398,8 +398,41 @@ segment summaries need, and that is the transplant run below.
 with each document's analyzed fields copied from the source segments
 through a per-field transpose, the analyzer never called, and cuts
 each band's spill by year so the segments come out partitioned with
-summaries, no compaction step. Its run on the archive started at
-15:41 into `shards-v11/archive-fs`; its numbers go here.
+summaries, no compaction step. Three attempts on the archive: the
+first refused shard 1 on a global-versus-local id mistake in the tail
+check (fixed with a test, a6e21f4); the second, with million-row cuts,
+put 42 GB into swap and was stopped (the doc now sizes the cut); the
+third, at 300,000 rows per cut, spilled in 34 minutes with no analysis
+and built a 300,000-row cut every 37 seconds on one thread, five bands
+in 2 h 51 min, and was killed by the kernel on the sixth when the
+machine ran out of memory under its other tenants (a 30B model server,
+a CI container, twelve nodes). That kill also took the six
+generation-10 archive nodes and the analysis sidecar; both were
+restarted on the pinned binary. `--only-child` (dcc1529) rebuilds the
+sixth band alone.
+
+The five year-cut bands serve beside the hash-cut sixth under the same
+map. Every segment covers one year at 300,000 rows or fewer, the
+catalogs name `year` as their partition key, and the identity check
+across generations (79 documents paired by text through both roots,
+lineage, document key, version and chunk ordinal compared) finds no
+difference. Through the generation-11 root, k = 10, warm:
+
+| Filter | Generation 10 root | Generation 11, five bands year-cut |
+|---|---|---|
+| lexical, `year >= 2012 && year < 2013` | 7 shards, no segment skipped | 61 ms, 273 of 278 segments skipped |
+| lexical, `year >= 1985 && year < 1986` | 7 shards | 41 ms, 154 of 157 segments skipped |
+| dense, `year >= 2012 && year < 2013` | 250 ms class | 86 ms |
+| dense, `year >= 1985 && year < 1986` | 250 ms class | 92 ms |
+| dense, `year >= 1995 && year < 1998` | 250 ms class | 152 ms |
+| dense, `year >= 2008 && year < 2015` (one whole band) | 249 ms | 233 ms |
+
+A filter narrower than a band is where the year cut pays: the dense
+scan reads only the segments whose year range the filter admits, and a
+one-year filter costs a third of the band-aligned shape. A filter that
+is a whole band gains nothing inside it, as expected. The boolean
+shapes through this root cost what they cost before (0.2 to 0.9 s, a
+23 MB root).
 
 ## What remains
 
