@@ -469,6 +469,22 @@ impl<'a> DocColumns<'a> {
             .map(|e| e.value)
     }
 
+    fn map_number(&self, column: &str, key: &str) -> Option<NumberValue> {
+        self.doc
+            .map_integers
+            .iter()
+            .find(|e| e.field == column && e.key == key)
+            .map(|e| NumberValue::Int(e.value))
+            .or_else(|| {
+                self.doc
+                    .map_unsigned_integers
+                    .iter()
+                    .find(|e| e.field == column && e.key == key)
+                    .map(|e| NumberValue::Uint(e.value))
+            })
+            .or_else(|| self.map_numeric(column, key).map(NumberValue::Float))
+    }
+
     fn geo(&self, column: &str) -> Option<(f64, f64)> {
         self.doc
             .geo_points
@@ -573,9 +589,21 @@ pub fn eval_document(expr: &pb::FilterExpr, doc: &DocColumns<'_>) -> Tri {
                 p.max.as_ref().and_then(edge_of),
             )),
         },
+        Some(Expr::TypedMapNumber(p)) => match doc.map_number(&p.column, &p.key) {
+            None => Tri::Unknown,
+            Some(v) => Tri::from(in_number_range(
+                v,
+                p.min.as_ref().and_then(edge_of),
+                p.max.as_ref().and_then(edge_of),
+            )),
+        },
         Some(Expr::MapHasKey(p)) => Tri::from(
             doc.map_facet(&p.column, &p.key).is_some()
                 || doc.map_numeric(&p.column, &p.key).is_some(),
+        ),
+        Some(Expr::TypedMapHasKey(p)) => Tri::from(
+            doc.map_facet(&p.column, &p.key).is_some()
+                || doc.map_number(&p.column, &p.key).is_some(),
         ),
         Some(Expr::Has(p)) => Tri::from(doc.has(&p.column)),
         Some(Expr::Geo(g)) => match doc.geo(&g.column) {
@@ -857,7 +885,9 @@ fn impossible_walk(
         | Some(Expr::MapStringPrefix(_))
         | Some(Expr::MapFacet(_))
         | Some(Expr::MapNumber(_))
+        | Some(Expr::TypedMapNumber(_))
         | Some(Expr::MapHasKey(_))
+        | Some(Expr::TypedMapHasKey(_))
         | Some(Expr::Has(_))
         | Some(Expr::Geo(_)) => {
             *next += 1;
@@ -934,7 +964,9 @@ fn implied_walk(
         | Some(Expr::MapStringPrefix(_))
         | Some(Expr::MapFacet(_))
         | Some(Expr::MapNumber(_))
+        | Some(Expr::TypedMapNumber(_))
         | Some(Expr::MapHasKey(_))
+        | Some(Expr::TypedMapHasKey(_))
         | Some(Expr::Geo(_)) => {
             *next += 1;
         }

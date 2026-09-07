@@ -26,6 +26,12 @@ impl NumericRead for Pair {
     fn map_value(&self, _: usize, _: u32, _: u32) -> Option<f64> {
         None
     }
+    fn map_int_value(&self, _: usize, _: u32, _: u32) -> Option<i64> {
+        None
+    }
+    fn map_uint_value(&self, _: usize, _: u32, _: u32) -> Option<u64> {
+        None
+    }
     fn geo_value(&self, _: usize, _: u32) -> Option<(f64, f64)> {
         None
     }
@@ -45,6 +51,8 @@ fn unsigned_arithmetic_matches_wide_integer_and_cel_oracles() {
         integers: &[],
         unsigned_integers: &names,
         map_numerics: &[],
+        map_integers: &[],
+        map_unsigned_integers: &[],
     };
     let edges = [
         0,

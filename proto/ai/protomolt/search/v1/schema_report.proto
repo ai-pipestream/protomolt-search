@@ -105,6 +105,10 @@ enum MappedQueryRepresentation {
   MAPPED_QUERY_REPRESENTATION_MAP_STRING_FACET = 7;
   // Finite f64 values addressed by a canonical map key, with entry presence.
   MAPPED_QUERY_REPRESENTATION_MAP_FLOATING_POINT = 8;
+  // Exact signed map values, comparisons, presence and checked expressions.
+  MAPPED_QUERY_REPRESENTATION_MAP_SIGNED_INTEGER = 9;
+  // Full-domain unsigned map values, comparisons, presence and expressions.
+  MAPPED_QUERY_REPRESENTATION_MAP_UNSIGNED_INTEGER = 10;
 }
 
 message FieldProjection {

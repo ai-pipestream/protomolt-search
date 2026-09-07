@@ -157,6 +157,8 @@ fn leaf_impossible(leaf: &ResolvedLeaf, summary: &SegmentSummary, names: &dyn Co
         | ResolvedLeaf::NumberUnknown
         | ResolvedLeaf::MapFacet { .. }
         | ResolvedLeaf::MapNumber { .. }
+        | ResolvedLeaf::MapIntRange { .. }
+        | ResolvedLeaf::MapUintRange { .. }
         | ResolvedLeaf::MapHasKey(_)
         | ResolvedLeaf::Geo { .. }
         | ResolvedLeaf::FacetOrdRange { .. }

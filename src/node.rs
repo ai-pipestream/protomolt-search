@@ -1028,17 +1028,33 @@ impl Bm25Shard {
                     };
                     ResolvedFilter::Leaf(ResolvedLeaf::MapFacet { target, ords })
                 }
-                Expr::MapNumber(p) => {
-                    let target = self
-                        .map_numeric_index(&p.column)
-                        .and_then(|ci| self.map_numeric_key_ord(ci, &p.key).map(|k| (ci, k)));
-                    ResolvedFilter::Leaf(ResolvedLeaf::MapNumber {
-                        target,
-                        lo: p.min.as_ref().and_then(crate::filter::edge_of),
-                        hi: p.max.as_ref().and_then(crate::filter::edge_of),
-                    })
+                Expr::MapNumber(p) | Expr::TypedMapNumber(p) => {
+                    let typed = matches!(expr.expr, Some(Expr::TypedMapNumber(_)));
+                    let lo = p.min.as_ref().and_then(crate::filter::edge_of);
+                    let hi = p.max.as_ref().and_then(crate::filter::edge_of);
+                    let leaf = if let Some(ci) = self.map_integer_index(&p.column).filter(|_| typed)
+                    {
+                        let target = self.map_integer_key_ord(ci, &p.key).map(|key| (ci, key));
+                        let (lo, hi) = crate::filter::int_range(&lo, &hi);
+                        ResolvedLeaf::MapIntRange { target, lo, hi }
+                    } else if let Some(ci) =
+                        self.map_unsigned_integer_index(&p.column).filter(|_| typed)
+                    {
+                        let target = self
+                            .map_unsigned_integer_key_ord(ci, &p.key)
+                            .map(|key| (ci, key));
+                        let (lo, hi) = crate::filter::uint_range(&lo, &hi);
+                        ResolvedLeaf::MapUintRange { target, lo, hi }
+                    } else {
+                        let target = self.map_numeric_index(&p.column).and_then(|ci| {
+                            self.map_numeric_key_ord(ci, &p.key).map(|key| (ci, key))
+                        });
+                        ResolvedLeaf::MapNumber { target, lo, hi }
+                    };
+                    ResolvedFilter::Leaf(leaf)
                 }
-                Expr::MapHasKey(p) => {
+                Expr::MapHasKey(p) | Expr::TypedMapHasKey(p) => {
+                    let typed = matches!(expr.expr, Some(Expr::TypedMapHasKey(_)));
                     // Map-facet first, then map-numeric: the one order,
                     // shared with `filter_columns_known` below.
                     let target = if let Some(ci) = self.map_facet_index(&p.column) {
@@ -1050,6 +1066,18 @@ impl Bm25Shard {
                         MapKeyRef::Numeric {
                             column: ci,
                             key_ord: self.map_numeric_key_ord(ci, &p.key),
+                        }
+                    } else if let Some(ci) = self.map_integer_index(&p.column).filter(|_| typed) {
+                        MapKeyRef::Integer {
+                            column: ci,
+                            key_ord: self.map_integer_key_ord(ci, &p.key),
+                        }
+                    } else if let Some(ci) =
+                        self.map_unsigned_integer_index(&p.column).filter(|_| typed)
+                    {
+                        MapKeyRef::UnsignedInteger {
+                            column: ci,
+                            key_ord: self.map_unsigned_integer_key_ord(ci, &p.key),
                         }
                     } else {
                         MapKeyRef::Unknown
@@ -1306,13 +1334,34 @@ impl Bm25Shard {
                     .map_facet_index(&p.column)
                     .and_then(|ci| self.map_facet_key_ord(ci, &p.key))
                     .is_some(),
-                LeafRef::MapNumber(p) => self
-                    .map_numeric_index(&p.column)
-                    .and_then(|ci| self.map_numeric_key_ord(ci, &p.key))
-                    .is_some(),
-                LeafRef::MapHasKey(p) => {
+                LeafRef::MapNumber(p) | LeafRef::TypedMapNumber(p) => {
+                    let typed = matches!(leaf, LeafRef::TypedMapNumber(_));
+                    self.map_integer_index(&p.column)
+                        .filter(|_| typed)
+                        .and_then(|ci| self.map_integer_key_ord(ci, &p.key))
+                        .is_some()
+                        || self
+                            .map_unsigned_integer_index(&p.column)
+                            .filter(|_| typed)
+                            .and_then(|ci| self.map_unsigned_integer_key_ord(ci, &p.key))
+                            .is_some()
+                        || self
+                            .map_numeric_index(&p.column)
+                            .and_then(|ci| self.map_numeric_key_ord(ci, &p.key))
+                            .is_some()
+                }
+                LeafRef::MapHasKey(p) | LeafRef::TypedMapHasKey(p) => {
+                    let typed = matches!(leaf, LeafRef::TypedMapHasKey(_));
                     self.map_facet_index(&p.column).is_some()
                         || self.map_numeric_index(&p.column).is_some()
+                        || self
+                            .map_integer_index(&p.column)
+                            .filter(|_| typed)
+                            .is_some()
+                        || self
+                            .map_unsigned_integer_index(&p.column)
+                            .filter(|_| typed)
+                            .is_some()
                 }
                 LeafRef::Has(p) => {
                     self.facet_index(&p.column).is_some()
@@ -1437,6 +1486,38 @@ impl Bm25Shard {
         }
     }
 
+    fn map_integer_key_ord(&self, ci: usize, key: &str) -> Option<u32> {
+        match self {
+            Bm25Shard::Building(s) => s.map_integer_key_ord(ci, key),
+            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
+            Bm25Shard::Resident(s) => s.map_integer_key_ord(ci, key),
+            Bm25Shard::Segmented(s) => s.map_integer_key_ord(ci, key),
+        }
+    }
+    fn map_integer_value(&self, ci: usize, key_ord: u32, row: u32) -> Option<i64> {
+        match self {
+            Bm25Shard::Building(s) => s.map_integer_value(ci, key_ord, row),
+            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
+            Bm25Shard::Resident(s) => s.map_integer_value(ci, key_ord, row),
+            Bm25Shard::Segmented(s) => s.map_integer_value(ci, key_ord, row),
+        }
+    }
+    fn map_unsigned_integer_key_ord(&self, ci: usize, key: &str) -> Option<u32> {
+        match self {
+            Bm25Shard::Building(s) => s.map_unsigned_integer_key_ord(ci, key),
+            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
+            Bm25Shard::Resident(s) => s.map_unsigned_integer_key_ord(ci, key),
+            Bm25Shard::Segmented(s) => s.map_unsigned_integer_key_ord(ci, key),
+        }
+    }
+    fn map_unsigned_integer_value(&self, ci: usize, key_ord: u32, row: u32) -> Option<u64> {
+        match self {
+            Bm25Shard::Building(s) => s.map_unsigned_integer_value(ci, key_ord, row),
+            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
+            Bm25Shard::Resident(s) => s.map_unsigned_integer_value(ci, key_ord, row),
+            Bm25Shard::Segmented(s) => s.map_unsigned_integer_value(ci, key_ord, row),
+        }
+    }
     /// The key ordinal of `key` in map-numeric column `ci`.
     fn map_numeric_key_ord(&self, ci: usize, key: &str) -> Option<u32> {
         match self {
@@ -2066,6 +2147,18 @@ struct ShardNumericRead<'a>(&'a Bm25Shard);
 /// the same name-to-index lookups filters use, packaged as the trait
 /// `values::resolve` consumes.
 impl crate::values::ColumnLookup for Bm25Shard {
+    fn map_integer_index(&self, name: &str) -> Option<usize> {
+        Bm25Shard::map_integer_index(self, name)
+    }
+    fn map_integer_key_ord(&self, ci: usize, key: &str) -> Option<u32> {
+        Bm25Shard::map_integer_key_ord(self, ci, key)
+    }
+    fn map_unsigned_integer_index(&self, name: &str) -> Option<usize> {
+        Bm25Shard::map_unsigned_integer_index(self, name)
+    }
+    fn map_unsigned_integer_key_ord(&self, ci: usize, key: &str) -> Option<u32> {
+        Bm25Shard::map_unsigned_integer_key_ord(self, ci, key)
+    }
     fn numeric_index(&self, name: &str) -> Option<usize> {
         Bm25Shard::numeric_index(self, name)
     }
@@ -2104,6 +2197,12 @@ impl crate::scorefn::NumericRead for ShardNumericRead<'_> {
     }
     fn map_value(&self, column: usize, key_ord: u32, doc_id: u32) -> Option<f64> {
         self.0.map_numeric_value(column, key_ord, doc_id)
+    }
+    fn map_int_value(&self, column: usize, key_ord: u32, doc_id: u32) -> Option<i64> {
+        self.0.map_integer_value(column, key_ord, doc_id)
+    }
+    fn map_uint_value(&self, column: usize, key_ord: u32, doc_id: u32) -> Option<u64> {
+        self.0.map_unsigned_integer_value(column, key_ord, doc_id)
     }
     fn int_value(&self, ii: usize, doc_id: u32) -> Option<i64> {
         self.0.integer_value(ii, doc_id)
@@ -8959,6 +9058,8 @@ impl NodeServiceImpl {
             integers: &self.config.integer_fields,
             unsigned_integers: &self.config.unsigned_integer_fields,
             map_numerics: &self.config.map_numeric_fields,
+            map_integers: &self.config.map_integer_fields,
+            map_unsigned_integers: &self.config.map_unsigned_integer_fields,
         };
         for ((name, expr, kind), source) in columns.iter().zip(&spec.columns) {
             let (_, vt) = crate::values::resolve(expr, &types).map_err(|e| {
@@ -9151,6 +9252,14 @@ pub(crate) fn apply_materialize(
         }
         for entry in &doc.map_numerics {
             env.map_numerics
+                .insert((entry.field.clone(), entry.key.clone()), entry.value);
+        }
+        for entry in &doc.map_integers {
+            env.map_integers
+                .insert((entry.field.clone(), entry.key.clone()), entry.value);
+        }
+        for entry in &doc.map_unsigned_integers {
+            env.map_unsigned_integers
                 .insert((entry.field.clone(), entry.key.clone()), entry.value);
         }
         for (name, expr, kind) in compiled {
@@ -14856,6 +14965,8 @@ impl NodeServiceImpl {
             integers: &[],
             unsigned_integers: &[],
             map_numerics: &[],
+            map_integers: &[],
+            map_unsigned_integers: &[],
         };
         let columns: &dyn crate::values::ColumnLookup = match guard.bm25.as_ref() {
             Some(store) => store,

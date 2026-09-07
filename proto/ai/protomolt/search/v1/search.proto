@@ -2979,9 +2979,9 @@ message FilterExpr {
     NumberPredicate number = 5;
     // String equality/membership on one key of a map-facet column.
     MapFacetPredicate map_facet = 6;
-    // Range or equality on one key of a map-numeric column.
+    // Legacy range or equality on one key of an f64 map column.
     MapNumberPredicate map_number = 7;
-    // Key presence in a map column (CEL `"k" in m`).
+    // Legacy presence in string/f64 maps only.
     MapKeyPredicate map_has_key = 8;
     // Value presence under this name in ANY column family (CEL
     // `has(col)`).
@@ -3005,6 +3005,11 @@ message FilterExpr {
     StringRangePredicate map_string_range = 13;
     // Explicit map context, with the same key rule as map_string_range.
     StringPrefixPredicate map_string_prefix = 14;
+    // Numeric map comparison across i64, u64 and f64 planes. Older decoders
+    // see an unset expression and reject instead of skipping integer columns.
+    MapNumberPredicate typed_map_number = 15;
+    // Presence across all string and numeric map planes, including integer maps.
+    MapKeyPredicate typed_map_has_key = 16;
   }
 }
 
@@ -3080,12 +3085,12 @@ message MapFacetPredicate {
   repeated string values = 3;
 }
 
-// Range or equality on one key of a map-numeric column
-// (--map-numeric-fields). Known = column AND key, like
-// MapFacetPredicate; bounds as in NumberPredicate (map-numeric values
-// are f64).
+// Range or equality on one key of a numeric map column. Signed, unsigned and
+// floating maps use the same exact bound-domain rules as NumberPredicate.
+// Known = column AND key, like MapFacetPredicate.
 message MapNumberPredicate {
-  // Map-numeric column name.
+  // Numeric map column name (--map-integer-fields,
+  // --map-unsigned-integer-fields or --map-numeric-fields).
   string column = 1;
   // The key whose value is tested.
   string key = 2;
@@ -3096,7 +3101,8 @@ message MapNumberPredicate {
 }
 
 // Key presence in a map column (CEL `"k" in m`), resolved against the
-// map-facet table first, then map-numeric. TOTAL: TRUE when the
+// map-facet, map-numeric, map-integer and map-unsigned-integer tables.
+// TOTAL: TRUE when the
 // document has an entry under the key, FALSE otherwise — `"k" in {}`
 // is false, not unknown, exactly as in CEL. Known = the COLUMN exists;
 // the key is deliberately not part of the known handshake, because the
@@ -6851,7 +6857,7 @@ message ValueExpr {
     // column's. Absent value = absent result.
     string column = 1;
 
-    // Read one map-column entry under a string key.
+    // Legacy string/f64 map entry read. Integer maps require typed_map.
     MapRead map = 2;
 
     // Integer literal (CEL int, i64).
@@ -6910,6 +6916,10 @@ message ValueExpr {
 
     // Unsigned integer literal (CEL uint, full u64 domain).
     uint64 uint_literal = 15;
+
+    // String, f64, i64 or u64 map entry. The column determines its exact type.
+    // Older decoders reject the unset expression rather than reading absence.
+    MapRead typed_map = 16;
   }
 }
 
@@ -7657,7 +7667,8 @@ message ValueTernary {
   ValueExpr else_value = 3;
 }
 
-// One map-column read.
+// One map-column read. Integer maps retain int/uint type and full-width values;
+// numeric conversion is explicit through the value-expression operations.
 message MapRead {
   // Map column name.
   string column = 1;

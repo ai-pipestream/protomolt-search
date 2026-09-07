@@ -1138,14 +1138,14 @@ fn compile_number_relation(
             min,
             max,
         })),
-        Side::MapAccess(name, key) => {
-            wrap(pb::filter_expr::Expr::MapNumber(pb::MapNumberPredicate {
+        Side::MapAccess(name, key) => wrap(pb::filter_expr::Expr::TypedMapNumber(
+            pb::MapNumberPredicate {
                 column: name.clone(),
                 key: key.clone(),
                 min,
                 max,
-            }))
-        }
+            },
+        )),
         _ => unreachable!("callers pass a column side"),
     };
     Ok(if op == RelOp::Ne { not_of(leaf) } else { leaf })
@@ -1155,7 +1155,7 @@ fn compile_number_relation(
 /// and `column in [v, ...]` (membership).
 fn compile_in(lhs: Side, rhs: Side) -> Result<pb::FilterExpr, Status> {
     match (lhs, rhs) {
-        (Side::Str(key), Side::Column(column)) => Ok(wrap(pb::filter_expr::Expr::MapHasKey(
+        (Side::Str(key), Side::Column(column)) => Ok(wrap(pb::filter_expr::Expr::TypedMapHasKey(
             pb::MapKeyPredicate { column, key },
         ))),
         (Side::Column(_) | Side::MapAccess(..), Side::Column(name)) => Err(refuse(format!(
@@ -1626,7 +1626,7 @@ fn compile_value_ast(ast: &Ast, depth: usize) -> Result<(pb::ValueExpr, Option<V
             _ => Ok((value_of(V::Column(name.clone())), None)),
         },
         Ast::MapAccess(col, key) => Ok((
-            value_of(V::Map(pb::MapRead {
+            value_of(V::TypedMap(pb::MapRead {
                 column: col.clone(),
                 key: key.clone(),
             })),
@@ -2312,21 +2312,23 @@ mod tests {
         assert_eq!(
             compiled("cites[\"410 U.S. 113\"] >= 3"),
             pb::FilterExpr {
-                expr: Some(pb::filter_expr::Expr::MapNumber(pb::MapNumberPredicate {
-                    column: "cites".into(),
-                    key: "410 U.S. 113".into(),
-                    min: Some(pb::FilterBound {
-                        value: Some(pb::filter_bound::Value::Int(3)),
-                        exclusive: false,
-                    }),
-                    max: None,
-                })),
+                expr: Some(pb::filter_expr::Expr::TypedMapNumber(
+                    pb::MapNumberPredicate {
+                        column: "cites".into(),
+                        key: "410 U.S. 113".into(),
+                        min: Some(pb::FilterBound {
+                            value: Some(pb::filter_bound::Value::Int(3)),
+                            exclusive: false,
+                        }),
+                        max: None,
+                    }
+                )),
             }
         );
         assert_eq!(
             compiled("\"color\" in tags"),
             pb::FilterExpr {
-                expr: Some(pb::filter_expr::Expr::MapHasKey(pb::MapKeyPredicate {
+                expr: Some(pb::filter_expr::Expr::TypedMapHasKey(pb::MapKeyPredicate {
                     column: "tags".into(),
                     key: "color".into(),
                 })),

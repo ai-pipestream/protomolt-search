@@ -340,6 +340,10 @@ pub fn uint_range(min: &Option<Edge>, max: &Option<Edge>) -> (u64, u64) {
 /// key, which makes the (total) test false for every document.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MapKeyRef {
+    /// Key presence in an exact signed map column.
+    Integer { column: usize, key_ord: Option<u32> },
+    /// Key presence in an exact unsigned map column.
+    UnsignedInteger { column: usize, key_ord: Option<u32> },
     /// The name is a map-facet column here.
     Facet {
         /// Index into the shard's map-facet table.
@@ -423,6 +427,18 @@ pub enum ResolvedLeaf {
         lo: Option<Edge>,
         /// Upper edge.
         hi: Option<Edge>,
+    },
+    /// Exact signed map range, normalized to inclusive integer bounds.
+    MapIntRange {
+        target: Option<(usize, u32)>,
+        lo: i64,
+        hi: i64,
+    },
+    /// Exact unsigned map range, normalized to inclusive integer bounds.
+    MapUintRange {
+        target: Option<(usize, u32)>,
+        lo: u64,
+        hi: u64,
     },
     /// Key presence in a map column (total).
     MapHasKey(MapKeyRef),
@@ -514,7 +530,27 @@ impl ResolvedLeaf {
                     ),
                 },
             },
+            ResolvedLeaf::MapIntRange { target, lo, hi } => {
+                match target.and_then(|(ci, key)| cols.map_int_value(ci, key, doc_id)) {
+                    None => Tri::Unknown,
+                    Some(value) => Tri::from(value >= *lo && value <= *hi),
+                }
+            }
+            ResolvedLeaf::MapUintRange { target, lo, hi } => {
+                match target.and_then(|(ci, key)| cols.map_uint_value(ci, key, doc_id)) {
+                    None => Tri::Unknown,
+                    Some(value) => Tri::from(value >= *lo && value <= *hi),
+                }
+            }
             ResolvedLeaf::MapHasKey(target) => match target {
+                MapKeyRef::Integer {
+                    column,
+                    key_ord: Some(key),
+                } => Tri::from(cols.map_int_value(*column, *key, doc_id).is_some()),
+                MapKeyRef::UnsignedInteger {
+                    column,
+                    key_ord: Some(key),
+                } => Tri::from(cols.map_uint_value(*column, *key, doc_id).is_some()),
                 MapKeyRef::Facet {
                     column,
                     key_ord: Some(k),
@@ -701,8 +737,12 @@ pub enum LeafRef<'a> {
     MapFacet(&'a crate::pb::MapFacetPredicate),
     /// A map-number predicate.
     MapNumber(&'a crate::pb::MapNumberPredicate),
+    /// Numeric map comparison including exact integer columns.
+    TypedMapNumber(&'a crate::pb::MapNumberPredicate),
     /// A map-key presence test.
     MapHasKey(&'a crate::pb::MapKeyPredicate),
+    /// Presence including exact integer columns.
+    TypedMapHasKey(&'a crate::pb::MapKeyPredicate),
     /// A column presence test.
     Has(&'a crate::pb::HasPredicate),
     /// A geo leaf.
@@ -725,10 +765,12 @@ impl LeafRef<'_> {
             LeafRef::Facet(p) => format!("facet column {:?}", p.column),
             LeafRef::Number(p) => format!("numeric column {:?}", p.column),
             LeafRef::MapFacet(p) => format!("map-facet column {:?} key {:?}", p.column, p.key),
-            LeafRef::MapNumber(p) => {
-                format!("map-numeric column {:?} key {:?}", p.column, p.key)
+            LeafRef::MapNumber(p) | LeafRef::TypedMapNumber(p) => {
+                format!("numeric map column {:?} key {:?}", p.column, p.key)
             }
-            LeafRef::MapHasKey(p) => format!("map column {:?}", p.column),
+            LeafRef::MapHasKey(p) | LeafRef::TypedMapHasKey(p) => {
+                format!("map column {:?}", p.column)
+            }
             LeafRef::Has(p) => format!("column {:?}", p.column),
             LeafRef::Geo(g) => format!("geo column {:?}", g.column),
             LeafRef::StringRange(p) => describe_string_target(&p.column, &p.key),
@@ -767,7 +809,9 @@ pub fn walk_leaves<'a>(expr: &'a crate::pb::FilterExpr, visit: &mut dyn FnMut(Le
         Some(Expr::Number(p)) => visit(LeafRef::Number(p)),
         Some(Expr::MapFacet(p)) => visit(LeafRef::MapFacet(p)),
         Some(Expr::MapNumber(p)) => visit(LeafRef::MapNumber(p)),
+        Some(Expr::TypedMapNumber(p)) => visit(LeafRef::TypedMapNumber(p)),
         Some(Expr::MapHasKey(p)) => visit(LeafRef::MapHasKey(p)),
+        Some(Expr::TypedMapHasKey(p)) => visit(LeafRef::TypedMapHasKey(p)),
         Some(Expr::Has(p)) => visit(LeafRef::Has(p)),
         Some(Expr::Geo(g)) => visit(LeafRef::Geo(g)),
         Some(Expr::StringRange(p)) => visit(LeafRef::StringRange(p)),
@@ -897,7 +941,7 @@ fn validate_node(
             }
             Ok(())
         }
-        Some(Expr::MapNumber(p)) => {
+        Some(Expr::MapNumber(p)) | Some(Expr::TypedMapNumber(p)) => {
             *leaves += 1;
             if p.column.is_empty() {
                 return Err(Status::invalid_argument(
@@ -915,7 +959,7 @@ fn validate_node(
             }
             Ok(())
         }
-        Some(Expr::MapHasKey(p)) => {
+        Some(Expr::MapHasKey(p)) | Some(Expr::TypedMapHasKey(p)) => {
             *leaves += 1;
             if p.column.is_empty() {
                 return Err(Status::invalid_argument(
@@ -1105,6 +1149,12 @@ mod tests {
         }
         fn map_value(&self, _ci: usize, key_ord: u32, doc_id: u32) -> Option<f64> {
             (doc_id == 0 && key_ord == 7).then_some(9.0)
+        }
+        fn map_int_value(&self, _: usize, _: u32, _: u32) -> Option<i64> {
+            None
+        }
+        fn map_uint_value(&self, _: usize, _: u32, _: u32) -> Option<u64> {
+            None
         }
         fn int_value(&self, _ii: usize, doc_id: u32) -> Option<i64> {
             (doc_id == 0).then_some(1990)

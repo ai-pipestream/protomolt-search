@@ -29,8 +29,10 @@ family, as described below.
   descriptor defines wire decoding, as it does for scalar projections.
 
 The integer map families are implemented on `feat/integer-map-storage-2026-09`.
-They currently report VALUE with query representation NONE and an explicit
-constraint explaining that typed map query operators remain unimplemented.
+They report VALUE with MAP_SIGNED_INTEGER or MAP_UNSIGNED_INTEGER query
+representation. Exact filters, key presence, typed expressions, materialization
+and expression-based aggregates are supported; remaining limits are explicit
+in the report. See [integer map queries](integer-map-queries.md).
 
 For example, for `map<string, string> labels = 4`, this policy creates the
 query column `attrs`:
@@ -99,15 +101,17 @@ A singular parent occurrence and a chunk occurrence retain their own path and
 column assignment. Traversal into a map's synthetic entry fields is refused;
 that would discard the relationship between each key and its value.
 
-Schema reports mark the map field as a VALUE. String and floating maps name
-their query representation; integer maps currently report NONE.
+Schema reports mark the map field as a VALUE and name its query representation
+for string, floating, signed integer or unsigned integer values.
 The synthetic `key` and `value` fields are INPUTs with `value_path` pointing to
 that map projection. They are not independent dotted query fields. Constraints
 record key conversion, default/duplicate handling and value conversion.
 
 Existing map filters, presence tests, value projections, scoring, facet counts,
 range facets and expression-based aggregates address the string and floating
-map columns. Integer map operators remain unimplemented. The explicit
+map columns. Integer maps support the filter, presence, value-expression and
+expression-aggregate paths; direct sorting, bounded score stages, exact range
+facets and column statistics remain pending. The explicit
 empty-key selector rules in [map columns](map-columns.md) apply. Authorization
 continues to name the physical field; defining a projection grants no access.
 
@@ -115,7 +119,8 @@ continues to name the physical field; defining a projection grants no access.
 
 Integer map projection, storage and document transport are implemented on the
 feature branch; see [storage and recovery status](integer-map-storage.md).
-Exact typed map queries remain unfinished. Integer maps can also be explicitly
+Exact typed map filters and expressions are implemented; direct map sorting,
+score stages, exact range facets and column statistics remain unfinished. Integer maps can also be explicitly
 projected as KEYWORD when string comparison semantics are intended. Projecting
 integer descriptors as floating maps fails instead of rounding through f64.
 Bytes, message-valued maps and arbitrary repeated/nested values retain their
@@ -126,7 +131,10 @@ search foundations.
 
 The original map increment added two ColumnFamily values and two
 MappedQueryRepresentation values. The integer projection increment adds
-ColumnFamily MAP_I64 (9) and MAP_U64 (10), without adding query representations. Existing fields and enum numbers remain unchanged. Clients must
+ColumnFamily MAP_I64 (9) and MAP_U64 (10). The later query increment adds
+MAP_SIGNED_INTEGER (9) and MAP_UNSIGNED_INTEGER (10), plus three typed map
+operators that older decoders reject. Existing fields and enum numbers remain
+unchanged. See [query compatibility](integer-map-queries.md#protobuf-operators-and-older-nodes). Clients must
 recognize the returned map families/representations and inspect the acknowledged
 index definition. Older planners cannot derive these value projections; binding
 to an older node refuses rather than dropping a requested map column. Existing

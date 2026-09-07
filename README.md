@@ -43,7 +43,9 @@ transport, embedding, and availability work.
 Exact signed and unsigned map storage and document transport are being built
 on `feat/integer-map-storage-2026-09`. The branch supports typed document
 entries, descriptor-driven integer map projection, WAL replay and segment
-transplant. Typed map query operators remain incomplete. See
+transplant. Exact map filters, typed expressions and expression-based aggregates
+are supported; map sorting, bounded scoring, range facets and statistics remain
+incomplete. See [integer map queries](docs/integer-map-queries.md) and
 [integer map storage](docs/integer-map-storage.md) for the compatibility gates
 and current validation scope.
 

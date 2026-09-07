@@ -25,6 +25,12 @@ impl NumericRead for Columns<'_> {
     fn map_value(&self, c: usize, k: u32, d: u32) -> Option<f64> {
         self.0.map_numeric_value(c, k, d)
     }
+    fn map_int_value(&self, c: usize, k: u32, d: u32) -> Option<i64> {
+        self.0.map_integer_value(c, k, d)
+    }
+    fn map_uint_value(&self, c: usize, k: u32, d: u32) -> Option<u64> {
+        self.0.map_unsigned_integer_value(c, k, d)
+    }
     fn geo_value(&self, c: usize, d: u32) -> Option<(f64, f64)> {
         self.0.geo_value(c, d)
     }

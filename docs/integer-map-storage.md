@@ -2,7 +2,9 @@
 
 Status: storage, document ingestion, WAL replay and segment transplant are
 implemented on `feat/integer-map-storage-2026-09`, including descriptor-driven
-integer map projection. Typed query integration is not complete.
+integer map projection. Exact map filters, key presence, typed expressions and
+expression-based aggregates are implemented; other query surfaces remain
+incomplete. See [integer map queries](integer-map-queries.md).
 Do not treat the low-level storage API as an end-to-end supported map shape.
 `docs/map-projection.md` remains the public mapping contract.
 
@@ -91,12 +93,11 @@ column declaration. Node open does not automatically replay the document WAL.
 
 1. Persist complete column definitions for standalone WAL-only recovery,
    including columns with no entries, and define automatic recovery separately.
-2. Add exact typed map selectors to filters, values, sorting and aggregations.
-   Scoring conversions need an explicit numeric contract; do not use a rounded
-   floating-point filter as an exact integer predicate.
-3. Exercise public typed-map query routes across both layouts and relays with
-   permissions, original source bytes, stable identity, retries and durable
-   receipts. These query routes are not yet implemented.
+2. Add direct map sorting/collapse, bounded score stages, exact range facets
+   and column statistics. Keep scoring conversions explicit.
+3. Complete persistent identity/retry/durability integration for these mapped
+   fields. Filter, value, aggregate and permission tests now exercise both
+   layouts and relays, but the overall storage-authority goal remains open.
 
 ## Validation, 2026-09-07
 
@@ -135,4 +136,6 @@ exact map values across log rebuild, segment transplant and reordered year cuts.
 Descriptor-driven integer map projection is now tested through planning, binding,
 ingest and compaction. Its validation is recorded in
 [map projection](map-projection.md#integer-projection-validation-2026-09-07).
-Typed map query operators and complete WAL-only column metadata remain pending.
+The newer [query increment](integer-map-queries.md) adds exact filter, value
+and aggregate operations. Other query surfaces and complete WAL-only column
+metadata remain pending.

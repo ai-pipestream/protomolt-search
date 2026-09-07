@@ -49,6 +49,12 @@ pub trait ColumnLookup {
     fn map_numeric_index(&self, name: &str) -> Option<usize>;
     /// Key ordinal in map-numeric column `ci`'s key dictionary.
     fn map_numeric_key_ord(&self, ci: usize, key: &str) -> Option<u32>;
+    /// Signed map column and key lookup.
+    fn map_integer_index(&self, name: &str) -> Option<usize>;
+    fn map_integer_key_ord(&self, ci: usize, key: &str) -> Option<u32>;
+    /// Unsigned map column and key lookup.
+    fn map_unsigned_integer_index(&self, name: &str) -> Option<usize>;
+    fn map_unsigned_integer_key_ord(&self, ci: usize, key: &str) -> Option<u32>;
     /// Map-facet column index for `name`.
     fn map_facet_index(&self, name: &str) -> Option<usize>;
     /// Key ordinal in map-facet column `ci`'s key dictionary.
@@ -71,6 +77,9 @@ pub struct NumericTypes<'a> {
     pub unsigned_integers: &'a [String],
     /// Map-numeric column names.
     pub map_numerics: &'a [String],
+    /// Exact signed and unsigned map column names.
+    pub map_integers: &'a [String],
+    pub map_unsigned_integers: &'a [String],
 }
 
 impl ColumnLookup for NumericTypes<'_> {
@@ -85,6 +94,18 @@ impl ColumnLookup for NumericTypes<'_> {
     }
     fn map_numeric_index(&self, name: &str) -> Option<usize> {
         self.map_numerics.iter().position(|n| n == name)
+    }
+    fn map_integer_index(&self, name: &str) -> Option<usize> {
+        self.map_integers.iter().position(|n| n == name)
+    }
+    fn map_unsigned_integer_index(&self, name: &str) -> Option<usize> {
+        self.map_unsigned_integers.iter().position(|n| n == name)
+    }
+    fn map_integer_key_ord(&self, _: usize, _: &str) -> Option<u32> {
+        Some(0)
+    }
+    fn map_unsigned_integer_key_ord(&self, _: usize, _: &str) -> Option<u32> {
+        Some(0)
     }
     // Keys can be absent per document; the declared family still fixes their type.
     fn map_numeric_key_ord(&self, _: usize, _: &str) -> Option<u32> {
@@ -270,6 +291,10 @@ pub enum ResolvedValue {
         /// Key ordinal in that column's key dictionary.
         key_ord: u32,
     },
+    /// Exact signed map entry. Missing keys retain the column's static type.
+    MapInt { column: usize, key_ord: Option<u32> },
+    /// Exact unsigned map entry. Missing keys retain the column's static type.
+    MapUint { column: usize, key_ord: Option<u32> },
     /// Map-facet entry read (whole-expression string).
     MapFacet {
         /// Map-facet column index.
@@ -418,17 +443,43 @@ pub fn resolve(
                 Ok((ResolvedValue::Absent, ValueType::Unknown))
             }
         }
-        V::Map(read) => {
+        V::Map(read) | V::TypedMap(read) => {
+            let typed = matches!(expr.expr, Some(V::TypedMap(_)));
             let num = cols.map_numeric_index(&read.column);
             let facet = cols.map_facet_index(&read.column);
-            if num.is_some() && facet.is_some() {
+            let int = cols.map_integer_index(&read.column).filter(|_| typed);
+            let uint = cols
+                .map_unsigned_integer_index(&read.column)
+                .filter(|_| typed);
+            if [num, facet, int, uint]
+                .iter()
+                .filter(|c| c.is_some())
+                .count()
+                > 1
+            {
                 return Err(refuse(format!(
-                    "map column {:?} exists in both map families on this shard; \
+                    "map column {:?} exists in multiple map families on this shard; \
                      a value read cannot pick one",
                     read.column
                 )));
             }
-            if let Some(ci) = num {
+            if let Some(ci) = int {
+                Ok((
+                    ResolvedValue::MapInt {
+                        column: ci,
+                        key_ord: cols.map_integer_key_ord(ci, &read.key),
+                    },
+                    ValueType::Int,
+                ))
+            } else if let Some(ci) = uint {
+                Ok((
+                    ResolvedValue::MapUint {
+                        column: ci,
+                        key_ord: cols.map_unsigned_integer_key_ord(ci, &read.key),
+                    },
+                    ValueType::Uint,
+                ))
+            } else if let Some(ci) = num {
                 match cols.map_numeric_key_ord(ci, &read.key) {
                     Some(key_ord) => Ok((
                         ResolvedValue::MapNum {
@@ -868,6 +919,12 @@ pub fn eval(rv: &ResolvedValue, doc_id: u32, cols: &dyn NumericRead) -> Option<V
         ResolvedValue::MapNum { column, key_ord } => {
             cols.map_value(*column, *key_ord, doc_id).map(Val::Double)
         }
+        ResolvedValue::MapInt { column, key_ord } => key_ord
+            .and_then(|key| cols.map_int_value(*column, key, doc_id))
+            .map(Val::Int),
+        ResolvedValue::MapUint { column, key_ord } => key_ord
+            .and_then(|key| cols.map_uint_value(*column, key, doc_id))
+            .map(Val::Uint),
         ResolvedValue::MapFacet { column, key_ord } => cols
             .map_facet_value_ord(*column, *key_ord, doc_id)
             .map(|ord| Val::MapFacetOrd {
@@ -1153,6 +1210,8 @@ fn eval_fn(f: pb::ValueFn, vals: &[Val]) -> Option<Val> {
 /// One column-read leaf of a value expression.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValueLeaf {
+    /// A map read that includes the exact integer planes.
+    TypedMap { column: String, key: String },
     /// A plain column read.
     Column(String),
     /// A map entry read.
@@ -1169,7 +1228,9 @@ impl ValueLeaf {
     pub fn describe(&self) -> String {
         match self {
             ValueLeaf::Column(name) => name.clone(),
-            ValueLeaf::Map { column, key } => format!("{column}[{key:?}]"),
+            ValueLeaf::Map { column, key } | ValueLeaf::TypedMap { column, key } => {
+                format!("{column}[{key:?}]")
+            }
         }
     }
 }
@@ -1180,6 +1241,10 @@ pub fn column_leaves(expr: &pb::ValueExpr, out: &mut Vec<ValueLeaf>) {
     use pb::value_expr::Expr as V;
     match expr.expr.as_ref() {
         Some(V::Column(name)) => out.push(ValueLeaf::Column(name.clone())),
+        Some(V::TypedMap(read)) => out.push(ValueLeaf::TypedMap {
+            column: read.column.clone(),
+            key: read.key.clone(),
+        }),
         Some(V::Map(read)) => out.push(ValueLeaf::Map {
             column: read.column.clone(),
             key: read.key.clone(),
@@ -1245,7 +1310,8 @@ pub fn leaf_known(leaf: &ValueLeaf, cols: &dyn ColumnLookup) -> bool {
                 || cols.unsigned_integer_index(name).is_some()
                 || cols.facet_index(name).is_some()
         }
-        ValueLeaf::Map { column, key } => {
+        ValueLeaf::Map { column, key } | ValueLeaf::TypedMap { column, key } => {
+            let typed = matches!(leaf, ValueLeaf::TypedMap { .. });
             let num = cols
                 .map_numeric_index(column)
                 .and_then(|ci| cols.map_numeric_key_ord(ci, key))
@@ -1255,6 +1321,16 @@ pub fn leaf_known(leaf: &ValueLeaf, cols: &dyn ColumnLookup) -> bool {
                 .and_then(|ci| cols.map_facet_key_ord(ci, key))
                 .is_some();
             num || facet
+                || cols
+                    .map_integer_index(column)
+                    .filter(|_| typed)
+                    .and_then(|ci| cols.map_integer_key_ord(ci, key))
+                    .is_some()
+                || cols
+                    .map_unsigned_integer_index(column)
+                    .filter(|_| typed)
+                    .and_then(|ci| cols.map_unsigned_integer_key_ord(ci, key))
+                    .is_some()
         }
     }
 }
@@ -1277,6 +1353,9 @@ pub struct IngestEnv {
     pub unsigned_integers: HashMap<String, u64>,
     /// Map-numeric values by (column, key).
     pub map_numerics: HashMap<(String, String), f64>,
+    /// Exact signed and unsigned map inputs.
+    pub map_integers: HashMap<(String, String), i64>,
+    pub map_unsigned_integers: HashMap<(String, String), u64>,
 }
 
 // Resolution-only lookup: the returned indexes identify types, not row storage.
@@ -1296,6 +1375,24 @@ impl ColumnLookup for IngestEnv {
             .keys()
             .any(|(n, _)| n == name)
             .then_some(0)
+    }
+    fn map_integer_index(&self, name: &str) -> Option<usize> {
+        self.map_integers
+            .keys()
+            .any(|(n, _)| n == name)
+            .then_some(0)
+    }
+    fn map_unsigned_integer_index(&self, name: &str) -> Option<usize> {
+        self.map_unsigned_integers
+            .keys()
+            .any(|(n, _)| n == name)
+            .then_some(0)
+    }
+    fn map_integer_key_ord(&self, _: usize, _: &str) -> Option<u32> {
+        Some(0)
+    }
+    fn map_unsigned_integer_key_ord(&self, _: usize, _: &str) -> Option<u32> {
+        Some(0)
     }
     fn map_numeric_key_ord(&self, _: usize, _: &str) -> Option<u32> {
         Some(0)
@@ -1370,6 +1467,19 @@ fn eval_ingest_inner(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Ing
             .map_numerics
             .get(&(read.column.clone(), read.key.clone()))
             .map(|v| IngestVal::Double(*v))),
+        V::TypedMap(read) => {
+            let key = (read.column.clone(), read.key.clone());
+            Ok(env
+                .map_integers
+                .get(&key)
+                .map(|v| IngestVal::Int(*v))
+                .or_else(|| {
+                    env.map_unsigned_integers
+                        .get(&key)
+                        .map(|v| IngestVal::Uint(*v))
+                })
+                .or_else(|| env.map_numerics.get(&key).map(|v| IngestVal::Double(*v))))
+        }
         V::IntLiteral(v) => Ok(Some(IngestVal::Int(*v))),
         V::UintLiteral(v) => Ok(Some(IngestVal::Uint(*v))),
         V::FloatLiteral(v) => Ok(Some(IngestVal::Double(*v))),

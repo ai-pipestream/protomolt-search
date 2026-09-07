@@ -1142,6 +1142,12 @@ impl NumericRead for ReaderNumerics<'_> {
     fn map_value(&self, column: usize, key_ord: u32, doc_id: u32) -> Option<f64> {
         self.0.map_numeric_value(column, key_ord, doc_id)
     }
+    fn map_int_value(&self, column: usize, key_ord: u32, doc_id: u32) -> Option<i64> {
+        self.0.map_integer_value(column, key_ord, doc_id)
+    }
+    fn map_uint_value(&self, column: usize, key_ord: u32, doc_id: u32) -> Option<u64> {
+        self.0.map_unsigned_integer_value(column, key_ord, doc_id)
+    }
     fn int_value(&self, ii: usize, doc_id: u32) -> Option<i64> {
         self.0.integer_value(ii, doc_id)
     }

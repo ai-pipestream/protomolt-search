@@ -497,7 +497,7 @@ fn integer_map_projections_preserve_descriptor_domains_and_entry_presence() {
 }
 
 #[test]
-fn integer_map_reports_separate_indexed_values_from_unimplemented_queries() {
+fn integer_map_reports_exact_queries_and_remaining_limits() {
     for (wire, kind, family) in [
         (Type::Int64, pb::MappedKind::Int64, pb::ColumnFamily::MapI64),
         (
@@ -532,7 +532,11 @@ fn integer_map_reports_separate_indexed_values_from_unimplemented_queries() {
         assert_eq!(projection.r#use, pb::ProjectionUse::Value as i32);
         assert_eq!(
             projection.query_representation,
-            pb::MappedQueryRepresentation::None as i32
+            if family == pb::ColumnFamily::MapI64 {
+                pb::MappedQueryRepresentation::MapSignedInteger as i32
+            } else {
+                pb::MappedQueryRepresentation::MapUnsignedInteger as i32
+            }
         );
         assert!(projection
             .constraints

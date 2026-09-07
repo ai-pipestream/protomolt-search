@@ -217,7 +217,9 @@ impl FieldScope {
             crate::values::column_leaves(expr, &mut leaves);
             for leaf in leaves {
                 let column = match leaf {
-                    ValueLeaf::Column(column) | ValueLeaf::Map { column, .. } => column,
+                    ValueLeaf::Column(column)
+                    | ValueLeaf::Map { column, .. }
+                    | ValueLeaf::TypedMap { column, .. } => column,
                 };
                 self.dictionary(&column)?;
             }
@@ -270,8 +272,8 @@ impl FieldScope {
                     LeafRef::Facet(p) => &p.column,
                     LeafRef::Number(p) => &p.column,
                     LeafRef::MapFacet(p) => &p.column,
-                    LeafRef::MapNumber(p) => &p.column,
-                    LeafRef::MapHasKey(p) => &p.column,
+                    LeafRef::MapNumber(p) | LeafRef::TypedMapNumber(p) => &p.column,
+                    LeafRef::MapHasKey(p) | LeafRef::TypedMapHasKey(p) => &p.column,
                     LeafRef::Has(p) => &p.column,
                     LeafRef::Geo(p) => &p.column,
                     LeafRef::StringRange(p) | LeafRef::MapStringRange(p) => &p.column,
@@ -303,7 +305,9 @@ impl FieldScope {
             }
             for leaf in leaves {
                 let column = match leaf {
-                    ValueLeaf::Column(column) | ValueLeaf::Map { column, .. } => column,
+                    ValueLeaf::Column(column)
+                    | ValueLeaf::Map { column, .. }
+                    | ValueLeaf::TypedMap { column, .. } => column,
                 };
                 self.dictionary(&column)?;
             }

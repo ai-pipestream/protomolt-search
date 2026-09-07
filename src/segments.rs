@@ -316,6 +316,12 @@ impl crate::scorefn::NumericRead for NoColumns {
     fn map_value(&self, _column: usize, _key_ord: u32, _doc_id: u32) -> Option<f64> {
         None
     }
+    fn map_int_value(&self, _: usize, _: u32, _: u32) -> Option<i64> {
+        None
+    }
+    fn map_uint_value(&self, _: usize, _: u32, _: u32) -> Option<u64> {
+        None
+    }
     fn int_value(&self, _ii: usize, _doc_id: u32) -> Option<i64> {
         None
     }

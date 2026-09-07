@@ -38,6 +38,10 @@ pub trait NumericRead {
     /// `doc_id`'s value under `key_ord` in map-numeric column
     /// `column` (`docs/map-columns.md`), `None` when absent.
     fn map_value(&self, column: usize, key_ord: u32, doc_id: u32) -> Option<f64>;
+    /// Exact signed map value, with absence separate from zero.
+    fn map_int_value(&self, column: usize, key_ord: u32, doc_id: u32) -> Option<i64>;
+    /// Exact unsigned map value, with absence separate from zero.
+    fn map_uint_value(&self, column: usize, key_ord: u32, doc_id: u32) -> Option<u64>;
     /// `doc_id`'s value in i64 column `ii` (`docs/range-facets.md`),
     /// `None` when absent. Kept i64 here and cast at the eval site so
     /// the storage stays exact and only the arithmetic is float.
@@ -371,6 +375,12 @@ mod tests {
         fn map_value(&self, column: usize, key_ord: u32, doc_id: u32) -> Option<f64> {
             // The unit tests model a map key as one more plain column.
             self.0[column + key_ord as usize][doc_id as usize]
+        }
+        fn map_int_value(&self, _: usize, _: u32, _: u32) -> Option<i64> {
+            None
+        }
+        fn map_uint_value(&self, _: usize, _: u32, _: u32) -> Option<u64> {
+            None
         }
         fn int_value(&self, ii: usize, doc_id: u32) -> Option<i64> {
             self.0[ii][doc_id as usize].map(|v| v as i64)
