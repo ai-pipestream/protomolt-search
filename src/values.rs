@@ -973,6 +973,19 @@ impl CmpOp {
     }
 }
 
+impl Op {
+    /// The operator's spelling, for refusals.
+    fn name(self) -> &'static str {
+        match self {
+            Op::Add => "+",
+            Op::Sub => "-",
+            Op::Mul => "*",
+            Op::Div => "/",
+            Op::Mod => "%",
+        }
+    }
+}
+
 /// The string-ordering refusal, shared by both evaluation paths.
 fn string_ordering(op: CmpOp) -> Status {
     refuse(format!(
@@ -1657,10 +1670,49 @@ pub fn eval_ingest(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Inges
     // Check all branches without evaluating them. A type error in an untaken
     // branch is still an error; arithmetic absence there must not propagate.
     resolve(expr, env)?;
-    eval_ingest_inner(expr, env)
+    eval_ingest_inner(expr, env, false)
 }
 
-fn eval_ingest_inner(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<IngestVal>, Status> {
+/// [`eval_ingest`] for one of the index's DECLARED derived columns
+/// (docs/derived-columns.md): the integer operations stock CEL calls
+/// errors — overflow, a zero divisor, the `i64::MIN` edges — refuse
+/// loudly naming the operation, because a declared column must not
+/// turn an impossible value into the same absence a missing input
+/// stores. A genuinely missing input still evaluates `Ok(None)`:
+/// absence and impossibility are different outcomes.
+pub fn eval_ingest_derived(
+    expr: &pb::ValueExpr,
+    env: &IngestEnv,
+) -> Result<Option<IngestVal>, Status> {
+    resolve(expr, env)?;
+    eval_ingest_inner(expr, env, true)
+}
+
+/// The strict derived-column refusal for an impossible integer
+/// operation: the operands, the operation, and the cause.
+fn arith_overflow(
+    op: Op,
+    a: impl std::fmt::Display,
+    b: impl std::fmt::Display,
+    zero_divisor: bool,
+) -> Status {
+    let cause = if zero_divisor {
+        "division by zero"
+    } else {
+        "overflow"
+    };
+    refuse(format!(
+        "integer arithmetic {cause}: {a} {} {b} has no exact answer; a declared derived \
+         column refuses the document rather than storing a wrapped value or a fake absence",
+        op.name()
+    ))
+}
+
+fn eval_ingest_inner(
+    expr: &pb::ValueExpr,
+    env: &IngestEnv,
+    strict: bool,
+) -> Result<Option<IngestVal>, Status> {
     use pb::value_expr::Expr as V;
     match expr
         .expr
@@ -1720,7 +1772,7 @@ fn eval_ingest_inner(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Ing
         V::IntLiteral(v) => Ok(Some(IngestVal::Int(*v))),
         V::UintLiteral(v) => Ok(Some(IngestVal::Uint(*v))),
         V::FloatLiteral(v) => Ok(Some(IngestVal::Double(*v))),
-        V::ToDouble(inner) => Ok(match eval_ingest_inner(inner, env)? {
+        V::ToDouble(inner) => Ok(match eval_ingest_inner(inner, env, strict)? {
             None => None,
             Some(IngestVal::Int(i)) => Some(IngestVal::Double(i as f64)),
             Some(IngestVal::Uint(i)) => Some(IngestVal::Double(i as f64)),
@@ -1729,9 +1781,19 @@ fn eval_ingest_inner(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Ing
                 return Err(refuse("double() over a bool; only numbers convert"));
             }
         }),
-        V::Negate(inner) => Ok(match eval_ingest_inner(inner, env)? {
+        V::Negate(inner) => Ok(match eval_ingest_inner(inner, env, strict)? {
             None => None,
-            Some(IngestVal::Int(v)) => v.checked_neg().map(IngestVal::Int),
+            Some(IngestVal::Int(v)) => match v.checked_neg() {
+                Some(v) => Some(IngestVal::Int(v)),
+                None if strict => {
+                    return Err(refuse(format!(
+                        "integer overflow: -({v}) has no exact answer; a declared derived \
+                         column refuses the document rather than storing a wrapped value \
+                         or a fake absence"
+                    )));
+                }
+                None => None,
+            },
             Some(IngestVal::Uint(_)) => return Err(refuse("unary minus over a uint")),
             Some(IngestVal::Double(v)) => Some(IngestVal::Double(-v)),
             Some(IngestVal::Bool(_)) => {
@@ -1750,8 +1812,8 @@ fn eval_ingest_inner(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Ing
                 .as_ref()
                 .ok_or_else(|| refuse("arithmetic node without a right operand"))?;
             let (l, r) = (
-                eval_ingest_inner(left, env)?,
-                eval_ingest_inner(right, env)?,
+                eval_ingest_inner(left, env, strict)?,
+                eval_ingest_inner(right, env, strict)?,
             );
             let op = match pb::ArithOp::try_from(arith.op) {
                 Ok(pb::ArithOp::Add) => Op::Add,
@@ -1767,11 +1829,17 @@ fn eval_ingest_inner(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Ing
                     "a boolean joins no arithmetic; wrap it in a ternary that \
                      yields a number",
                 )),
-                (Some(IngestVal::Int(a)), Some(IngestVal::Int(b))) => {
-                    Ok(int_arith(op, a, b).map(IngestVal::Int))
-                }
+                (Some(IngestVal::Int(a)), Some(IngestVal::Int(b))) => match int_arith(op, a, b) {
+                    Some(v) => Ok(Some(IngestVal::Int(v))),
+                    None if strict => Err(arith_overflow(op, a, b, b == 0)),
+                    None => Ok(None),
+                },
                 (Some(IngestVal::Uint(a)), Some(IngestVal::Uint(b))) => {
-                    Ok(uint_arith(op, a, b).map(IngestVal::Uint))
+                    match uint_arith(op, a, b) {
+                        Some(v) => Ok(Some(IngestVal::Uint(v))),
+                        None if strict => Err(arith_overflow(op, a, b, b == 0)),
+                        None => Ok(None),
+                    }
                 }
                 (Some(IngestVal::Double(a)), Some(IngestVal::Double(b))) => {
                     if op == Op::Mod {
@@ -1838,8 +1906,8 @@ fn eval_ingest_inner(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Ing
                 });
             }
             let (l, r) = (
-                eval_ingest_inner(left, env)?,
-                eval_ingest_inner(right, env)?,
+                eval_ingest_inner(left, env, strict)?,
+                eval_ingest_inner(right, env, strict)?,
             );
             match (l, r) {
                 (None, _) | (_, None) => Ok(None),
@@ -1886,7 +1954,7 @@ fn eval_ingest_inner(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Ing
                     });
                 }
                 FnSignature::IntToInt => {
-                    return Ok(match eval_ingest_inner(&func.args[0], env)? {
+                    return Ok(match eval_ingest_inner(&func.args[0], env, strict)? {
                         None => None,
                         Some(IngestVal::Int(micros)) => {
                             let (y, m, d) = civil_of_micros(micros);
@@ -1913,7 +1981,7 @@ fn eval_ingest_inner(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Ing
             let mut vals: Vec<Option<Val>> = Vec::with_capacity(func.args.len());
             let mut known: Option<ValueType> = None;
             for a in &func.args {
-                let v = match eval_ingest_inner(a, env)? {
+                let v = match eval_ingest_inner(a, env, strict)? {
                     None => None,
                     Some(IngestVal::Bool(_)) => {
                         return Err(refuse(format!("{display} over a bool; it takes numbers")));
@@ -1987,7 +2055,7 @@ fn eval_ingest_inner(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Ing
             let mut absent = false;
             let mut determined = false;
             for child in &logic.children {
-                match eval_ingest_inner(child, env)? {
+                match eval_ingest_inner(child, env, strict)? {
                     None => absent = true,
                     Some(IngestVal::Bool(b)) => {
                         if b != and {
@@ -2011,7 +2079,7 @@ fn eval_ingest_inner(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Ing
                 Some(IngestVal::Bool(and))
             })
         }
-        V::Not(inner) => Ok(match eval_ingest_inner(inner, env)? {
+        V::Not(inner) => Ok(match eval_ingest_inner(inner, env, strict)? {
             None => None,
             Some(IngestVal::Bool(b)) => Some(IngestVal::Bool(!b)),
             Some(_) => {
@@ -2031,10 +2099,10 @@ fn eval_ingest_inner(expr: &pb::ValueExpr, env: &IngestEnv) -> Result<Option<Ing
                 .else_value
                 .as_ref()
                 .ok_or_else(|| refuse("ternary node without an else-branch"))?;
-            match eval_ingest_inner(cond, env)? {
+            match eval_ingest_inner(cond, env, strict)? {
                 None => Ok(None),
-                Some(IngestVal::Bool(true)) => eval_ingest_inner(then, env),
-                Some(IngestVal::Bool(false)) => eval_ingest_inner(otherwise, env),
+                Some(IngestVal::Bool(true)) => eval_ingest_inner(then, env, strict),
+                Some(IngestVal::Bool(false)) => eval_ingest_inner(otherwise, env, strict),
                 Some(_) => Err(refuse(
                     "the ternary's condition is a number; a condition is a boolean",
                 )),

@@ -362,7 +362,7 @@ impl Declaration {
             )));
         }
         let env = ingest_env(&doc, stable_key)?;
-        let mut doc = materialize_into(doc, &self.triples(), &env)?;
+        let mut doc = materialize_into(doc, &self.triples(), &env, true)?;
         doc.derived_fingerprint = self.fingerprint.clone();
         Ok(doc)
     }
@@ -439,7 +439,7 @@ impl Declaration {
             }
         }
         let env = ingest_env(&source, stable_key)?;
-        let mut doc = materialize_into(doc, &triples, &env)?;
+        let mut doc = materialize_into(doc, &triples, &env, true)?;
         doc.derived_fingerprint = self.fingerprint.clone();
         Ok(doc)
     }
@@ -551,14 +551,24 @@ pub fn ingest_env(
 /// Evaluate compiled `(name, expression, kind)` columns over `env` and
 /// push the results into the document's ordinary value lists, refusing
 /// a result whose type is not the declared kind. Shared by the index
-/// declaration and a request's own `MaterializeSpec`.
+/// declaration and a request's own `MaterializeSpec`. With `strict`
+/// (the declaration's paths), the integer operations stock CEL calls
+/// errors refuse the document instead of evaluating absent
+/// (`values::eval_ingest_derived`); the per-request spec keeps the
+/// Kleene rule (`values::eval_ingest`).
 pub fn materialize_into(
     mut doc: AddDocumentsRequest,
     columns: &[(String, pb::ValueExpr, pb::MaterializeKind)],
     env: &IngestEnv,
+    strict: bool,
 ) -> Result<AddDocumentsRequest, Status> {
     for (name, expr, kind) in columns {
-        let value = values::eval_ingest(expr, env).map_err(|e| {
+        let value = if strict {
+            values::eval_ingest_derived(expr, env)
+        } else {
+            values::eval_ingest(expr, env)
+        }
+        .map_err(|e| {
             Status::invalid_argument(format!("materialize: column {name:?}: {}", e.message()))
         })?;
         match value {
@@ -1159,14 +1169,97 @@ mod tests {
     }
 
     #[test]
-    fn integer_boundaries_evaluate_absent_never_wrapped() {
+    fn integer_overflow_refuses_the_document_and_boundaries_stay_exact() {
+        let int_decl = |expression: &str| {
+            Declaration::compile(&pb::DerivedColumns {
+                columns: vec![column("edge", pb::MaterializeKind::I64, expression)],
+            })
+            .unwrap()
+        };
+        let uint_decl = |expression: &str| {
+            Declaration::compile(&pb::DerivedColumns {
+                columns: vec![column("edge", pb::MaterializeKind::U64, expression)],
+            })
+            .unwrap()
+        };
+        let with_int = |n: i64| AddDocumentsRequest {
+            integers: vec![pb::IntegerValue {
+                field: "n".into(),
+                value: n,
+            }],
+            ..Default::default()
+        };
+        let with_uint = |u: u64| AddDocumentsRequest {
+            unsigned_integers: vec![pb::UnsignedIntegerValue {
+                field: "u".into(),
+                value: u,
+            }],
+            ..Default::default()
+        };
+        // Correct values at the edges still compute. The input column
+        // sits in the same list, so read the derived one by name.
+        let edge_int = |out: &AddDocumentsRequest| {
+            out.integers
+                .iter()
+                .find(|v| v.field == "edge")
+                .map(|v| v.value)
+        };
+        let edge_uint = |out: &AddDocumentsRequest| {
+            out.unsigned_integers
+                .iter()
+                .find(|v| v.field == "edge")
+                .map(|v| v.value)
+        };
+        let out = int_decl("n + 1")
+            .apply(with_int(i64::MAX - 1), None)
+            .unwrap();
+        assert_eq!(edge_int(&out), Some(i64::MAX));
+        let out = int_decl("n + 1").apply(with_int(i64::MIN), None).unwrap();
+        assert_eq!(edge_int(&out), Some(i64::MIN + 1));
+        let out = int_decl("n - 1")
+            .apply(with_int(i64::MIN + 1), None)
+            .unwrap();
+        assert_eq!(edge_int(&out), Some(i64::MIN));
+        let out = int_decl("-n").apply(with_int(i64::MIN + 1), None).unwrap();
+        assert_eq!(edge_int(&out), Some(i64::MAX));
+        let out = uint_decl("u % 64u")
+            .apply(with_uint(u64::MAX), None)
+            .unwrap();
+        assert_eq!(edge_uint(&out), Some(63));
+        let out = uint_decl("u % 64u").apply(with_uint(0), None).unwrap();
+        assert_eq!(edge_uint(&out), Some(0));
+        // The impossible states refuse the document, naming the column
+        // and the cause; they are not the absence a missing input
+        // stores.
+        for (expression, n, needle) in [
+            ("n + 1", i64::MAX, "overflow"),
+            ("n - 1", i64::MIN, "overflow"),
+            ("-n", i64::MIN, "overflow"),
+            ("n / -1", i64::MIN, "overflow"),
+            ("n / 0", 42, "division by zero"),
+            ("n % 0", 42, "division by zero"),
+        ] {
+            let err = int_decl(expression).apply(with_int(n), None).unwrap_err();
+            assert!(
+                err.message().contains("\"edge\"") && err.message().contains(needle),
+                "{expression} at {n}: {}",
+                err.message()
+            );
+        }
+        let err = uint_decl("u + 1u")
+            .apply(with_uint(u64::MAX), None)
+            .unwrap_err();
+        assert!(
+            err.message().contains("\"edge\"") && err.message().contains("overflow"),
+            "{}",
+            err.message()
+        );
+        // A genuinely missing input still stores absence, and the
+        // reshard path's rederive refuses an impossible row the same
+        // way (the tool's own error adds the row's source id).
         let decl = Declaration::compile(&pb::DerivedColumns {
             columns: vec![
                 column("plus_one", pb::MaterializeKind::I64, "n + 1"),
-                column("minus_one", pb::MaterializeKind::I64, "n - 1"),
-                column("neg", pb::MaterializeKind::I64, "-n"),
-                column("u_mod", pb::MaterializeKind::U64, "u % 64u"),
-                column("u_plus_one", pb::MaterializeKind::U64, "u + 1u"),
                 column(
                     "bucket",
                     pb::MaterializeKind::U64,
@@ -1175,61 +1268,20 @@ mod tests {
             ],
         })
         .unwrap();
-        let run = |n: Option<i64>, u: Option<u64>, court: Option<&str>| {
-            let mut doc = AddDocumentsRequest::default();
-            if let Some(n) = n {
-                doc.integers.push(pb::IntegerValue {
-                    field: "n".into(),
-                    value: n,
-                });
-            }
-            if let Some(u) = u {
-                doc.unsigned_integers.push(pb::UnsignedIntegerValue {
-                    field: "u".into(),
-                    value: u,
-                });
-            }
-            if let Some(court) = court {
-                doc.facets.push(pb::FacetValue {
-                    field: "court".into(),
-                    value: court.into(),
-                });
-            }
-            decl.apply(doc, None).unwrap()
-        };
-        let int_of = |doc: &AddDocumentsRequest, name: &str| {
-            doc.integers
-                .iter()
-                .find(|v| v.field == name)
-                .map(|v| v.value)
-        };
-        let uint_of = |doc: &AddDocumentsRequest, name: &str| {
-            doc.unsigned_integers
-                .iter()
-                .find(|v| v.field == name)
-                .map(|v| v.value)
-        };
-        // i64::MAX: + 1 overflows to absence; - 1 and negation hold.
-        // u64::MAX: % 64 is 63; + 1u overflows to absence.
-        let out = run(Some(i64::MAX), Some(u64::MAX), Some("scotus"));
-        assert_eq!(int_of(&out, "plus_one"), None);
-        assert_eq!(int_of(&out, "minus_one"), Some(i64::MAX - 1));
-        assert_eq!(int_of(&out, "neg"), Some(-i64::MAX));
-        assert_eq!(uint_of(&out, "u_mod"), Some(u64::MAX % 64));
-        assert_eq!(uint_of(&out, "u_plus_one"), None);
-        assert_eq!(
-            uint_of(&out, "bucket"),
-            Some(values::fnv1a64_bytes(b"scotus") % 64)
+        let out = decl.apply(AddDocumentsRequest::default(), None).unwrap();
+        assert!(out.integers.is_empty() && out.unsigned_integers.is_empty());
+        let err = decl
+            .rederive(
+                with_int(i64::MAX),
+                &["plus_one".to_string(), "bucket".to_string()],
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            err.message().contains("\"plus_one\"") && err.message().contains("overflow"),
+            "{}",
+            err.message()
         );
-        // i64::MIN: - 1 and the negation overflow to absence; + 1 holds.
-        let out = run(Some(i64::MIN), Some(0), None);
-        assert_eq!(int_of(&out, "plus_one"), Some(i64::MIN + 1));
-        assert_eq!(int_of(&out, "minus_one"), None);
-        assert_eq!(int_of(&out, "neg"), None);
-        assert_eq!(uint_of(&out, "u_mod"), Some(0));
-        assert_eq!(uint_of(&out, "u_plus_one"), Some(1));
-        // An absent facet stores no bucket.
-        assert_eq!(uint_of(&out, "bucket"), None);
     }
 
     #[test]

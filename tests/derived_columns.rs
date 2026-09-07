@@ -1007,26 +1007,26 @@ fn an_empty_store_keeps_its_declaration_through_save_and_attach() {
 fn a_log_written_under_another_declaration_refuses_to_resume() {
     let dir = tempdir("wal-declaration");
     let index_path = dir.join("shard.tv");
-    let node = NodeServiceImpl::new(None, config(Some(index_path.clone()), Some(declaration())));
+    let node = NodeServiceImpl::open(
+        config(Some(index_path.clone()), Some(declaration())),
+        None,
+        false,
+    )
+    .expect("the first open creates the log");
     drop(node);
     let other = changed_declaration();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        NodeServiceImpl::new(None, config(Some(index_path.clone()), Some(other.clone())))
-    }));
-    let payload = match result {
-        Ok(_) => panic!("the mismatched log must refuse the node"),
-        Err(payload) => payload,
-    };
-    let message = payload
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| payload.downcast_ref::<&str>().copied())
-        .unwrap_or("");
+    let err = NodeServiceImpl::open(
+        config(Some(index_path.clone()), Some(other.clone())),
+        None,
+        false,
+    )
+    .err()
+    .unwrap();
     assert!(
-        message.contains("the log was written under derived-column declaration")
-            && message.contains(declaration().fingerprint())
-            && message.contains(other.fingerprint()),
-        "{message}"
+        err.contains("the log was written under derived-column declaration")
+            && err.contains(declaration().fingerprint())
+            && err.contains(other.fingerprint()),
+        "{err}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1119,7 +1119,9 @@ async fn an_installed_snapshot_keeps_the_declaration_and_tables() {
     thandle.abort();
 
     // A shard under another declaration refuses the same install,
-    // naming both fingerprints, and stays empty.
+    // naming both fingerprints; the refusal precedes the swap, so the
+    // shard keeps its prior contents (the seeded calibration, no
+    // documents) and none of the source's rows land.
     let other_path = dir.join("other.tv");
     let other = changed_declaration();
     let (oaddr, ohandle) = start_empty_node(NodeConfig {
@@ -1153,7 +1155,7 @@ async fn an_installed_snapshot_keeps_the_declaration_and_tables() {
         .into_inner();
     assert!(
         empty.hits.is_empty(),
-        "a refused install leaves the shard untouched"
+        "the refused install's documents did not land"
     );
     ohandle.abort();
     let _ = std::fs::remove_dir_all(&dir);
