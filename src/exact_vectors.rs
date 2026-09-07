@@ -79,6 +79,20 @@ pub struct ScoredSlots {
 }
 
 impl ExactVectorStore {
+    /// Drop a mapped store's resident pages from the process; the
+    /// mapping stays valid and a later read faults them back in. A
+    /// building or spilling store has no mapping and is unchanged.
+    pub fn release_pages(&self) -> io::Result<()> {
+        match &self.storage {
+            // A read-only file mapping: DONTNEED drops the pages, the
+            // next access reads the file again.
+            Storage::Mapped { map, .. } => unsafe {
+                map.unchecked_advise(memmap2::UncheckedAdvice::DontNeed)
+            },
+            _ => Ok(()),
+        }
+    }
+
     /// An appendable empty store. `dim` may remain unknown until the first
     /// vector batch arrives.
     pub fn empty(dim: Option<usize>) -> Self {

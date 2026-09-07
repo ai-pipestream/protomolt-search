@@ -147,7 +147,7 @@ it costs a scan of the column tables under `--from-segments`, and a WAL
 replay of the columns under the log replay.
 
 `--cut-rows` sets the child build's memory, not only the segment size:
-the build replays one cut into memory at about 70 KB per row (the
+the build replays one cut into memory at about 40-70 KB per row (the
 document text, the transplanted spans and ordinals, the vector and the
 FP32 row), so a cut of 300,000 rows is about 21 GB and a cut of a
 million rows about 70 GB. On the archive (2026-09-06) a million-row
@@ -155,6 +155,46 @@ cut put 42 GB into swap on a 61 GB machine and was stopped; 300,000
 rows per cut, about four segments per year in a band of eleven million
 documents, keeps the build in memory, and segment pruning by year is
 as sharp as with one segment per year.
+
+## Memory: what is allocated and what is mapped
+
+A transplant's resident set is not its allocations. Measured on the
+backfill proof (2026-09-07: one 11-million-row source, the 1.95
+million-row archive child built alone, 64 hash buckets of about 30,000
+rows) inside a transient systemd scope with memory accounting:
+
+| Run | Wall | Anonymous peak | Resident peak | Scope peak (cache included) |
+|---|---|---|---|---|
+| no limit, before the page release | 11 min 45 s | 2.8 GB | 34.9 GB | 55.3 GB |
+| `MemoryMax=8G`, `MemorySwapMax=0`, before | 12 min 2 s | 2.8 GB | 7.9 GB | 8.0 GB (the cap), no swap |
+| no limit, with the page release | 11 min 51 s | 2.8 GB | 14.9 GB | 26.7 GB |
+
+The anonymous memory is the routing pass's transposes (about 2.2 GB
+for the largest source segment) and one bucket's replay in the child
+build (about 1 GB at 30,000 rows); everything above that is
+file-backed: the source segments mapped and read once, the spill logs
+written and read back, the sealed segments written. Under a cgroup
+limit the kernel reclaims those pages and the run is the same job at
+the same speed, so an 8 GiB budget with swap off holds the proof with
+room, and the output is byte for byte the output of the unlimited run.
+
+The page release keeps the footprint honest without a cgroup: after
+each source segment is read the run drops its mapped pages
+(`Bm25Reader::release_pages`, `ExactVectorStore::release_pages`,
+`madvise(DONTNEED)` on a read-only file mapping) and asks the kernel
+to drop the segment's page cache (`posix_fadvise(DONTNEED)`); after
+each bucket is sealed it does the same for the bucket's spill files
+and the sealed segment's files. The remaining scope peak is the spill
+being written (dirty pages the kernel writes back at its own pace).
+
+`--build-threads=<n>` seals that many buckets at once under
+`--from-segments`: each bucket's slot range comes from the spill's own
+row counts, so buckets build in any order and append in bucket order,
+and the catalog is byte for byte the one-thread build's
+(`tests/replay_from_segments.rs`). The build's memory is `n` buckets'
+replays, so the budget rule is `n × rows per bucket × 40-70 KB` under
+the limit; the log replay analyzes through one sidecar session and
+refuses more than one thread by name.
 
 ## Deriving columns on the way through
 
