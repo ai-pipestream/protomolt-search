@@ -120,6 +120,42 @@ const COLUMN_KIND_VECTOR_BINDING: u8 = 13;
 const COLUMN_KIND_INDEX_BINDING: u8 = 14;
 const COLUMN_KIND_MAP_I64: u8 = 15;
 const COLUMN_KIND_MAP_U64: u8 = 16;
+/// Kind 17 (`docs/derived-columns.md`): the index's derived-column
+/// declaration, one inline entry named `derived-columns`: a u16-length
+/// fingerprint (lowercase hex), then a u32-length canonical
+/// `DerivedColumns` protobuf. A file written under another declaration
+/// is refused by name where it is attached. Kinds 15 and 16 contain exact integer maps.
+const COLUMN_KIND_DERIVED: u8 = 17;
+
+/// Main cea2c63 wrote derived declarations as kind 15, already allocated to
+/// signed maps on the parallel branch. Recognize only its pinned name and
+/// SHA-256 prefix when those bytes cannot describe an in-file map section.
+/// The normal derived parser still validates the declaration and its digest.
+fn compatible_column_kind(kind: u8, name: &[u8], payload: &[u8], file_len: u64) -> u8 {
+    if kind != COLUMN_KIND_MAP_I64 || name != DERIVED_ENTRY_NAME.as_bytes() {
+        return kind;
+    }
+    let Some(prefix) = payload.get(..66) else {
+        return kind;
+    };
+    if prefix[..2] != 64u16.to_le_bytes()
+        || !prefix[2..]
+            .iter()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return kind;
+    }
+    let offset = u64::from_le_bytes(prefix[..8].try_into().unwrap());
+    let length = u64::from_le_bytes(prefix[8..16].try_into().unwrap());
+    if offset
+        .checked_add(length)
+        .is_some_and(|end| end <= file_len)
+    {
+        return kind;
+    }
+    COLUMN_KIND_DERIVED
+}
+
 const COLUMN_KIND_SOURCES: u8 = 9;
 const SOURCES_ENTRY_NAME: &str = "protobuf-sources";
 const SOURCE_ENTRY_BYTES: u64 = 2 + SOURCES_ENTRY_NAME.len() as u64 + 1 + 16;
@@ -136,6 +172,8 @@ fn write_source_entry(w: &mut impl Write, section: Option<(u64, u64)>) -> io::Re
 }
 /// The binding record's reserved entry name.
 const BINDING_ENTRY_NAME: &str = "plan-binding";
+/// The derived-column declaration's reserved entry name (kind 17).
+const DERIVED_ENTRY_NAME: &str = "derived-columns";
 /// Kind 7 (`docs/phrase-proximity.md`): one BM25 field's token
 /// positions, the opt-in payload behind exact phrase and proximity
 /// queries. The entry is named `positions:<field>` (the prefix keeps it
@@ -416,6 +454,8 @@ fn v6v7_section_starts(map: &[u8], v7: bool) -> io::Result<Vec<(String, u64)>> {
                 String::from_utf8_lossy(&map[cursor + 2..cursor + 2 + name_len]).into_owned();
             let kind = map[cursor + 2 + name_len];
             let base = cursor + 2 + name_len + 1;
+            let kind =
+                compatible_column_kind(kind, name.as_bytes(), &map[base..], map.len() as u64);
             match kind {
                 COLUMN_KIND_FACET => {
                     starts.push((format!("column:{name}:dict"), u64_at(base + 4)));
@@ -492,6 +532,15 @@ fn v6v7_section_starts(map: &[u8], v7: bool) -> io::Result<Vec<(String, u64)>> {
                             u32::from_le_bytes(map[skip..skip + 4].try_into().unwrap()) as usize;
                         skip += 4 + len;
                     }
+                    cursor = skip;
+                }
+                COLUMN_KIND_DERIVED => {
+                    // Inline payload only: the fingerprint and the
+                    // canonical declaration, no sections to name.
+                    let len = u16::from_le_bytes(map[base..base + 2].try_into().unwrap()) as usize;
+                    let mut skip = base + 2 + len;
+                    let len = u32::from_le_bytes(map[skip..skip + 4].try_into().unwrap()) as usize;
+                    skip += 4 + len;
                     cursor = skip;
                 }
                 other => {
@@ -1756,6 +1805,95 @@ pub struct StoredBinding {
     pub index_contract: Vec<u8>,
 }
 
+/// The index's derived-column declaration as a store persists it
+/// (`docs/derived-columns.md`): the kind-15 column-table entry. A store
+/// pairs with one declaration; where it is attached, a differing
+/// fingerprint is an index compatibility event, refused by name.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StoredDerived {
+    /// The declaration fingerprint (`derived::fingerprint_of`, lowercase hex).
+    pub fingerprint: String,
+    /// The canonical `DerivedColumns` protobuf.
+    pub declaration: Vec<u8>,
+}
+
+impl StoredDerived {
+    /// The stored form of a validated declaration.
+    pub fn of(declaration: &crate::derived::Declaration) -> Self {
+        StoredDerived {
+            fingerprint: declaration.fingerprint().to_string(),
+            declaration: declaration.canonical(),
+        }
+    }
+
+    /// Decode the declaration and check the fingerprint covers it.
+    pub fn validate(&self) -> Result<crate::pb::DerivedColumns, String> {
+        if self.fingerprint.len() != 64
+            || !self
+                .fingerprint
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(format!(
+                "derived-columns entry: fingerprint {:?} is not lowercase SHA-256 hex",
+                self.fingerprint
+            ));
+        }
+        let spec = crate::derived::decode_canonical(&self.declaration)?;
+        if spec.columns.is_empty() {
+            return Err("derived-columns entry declares no columns".to_string());
+        }
+        let expected = crate::derived::fingerprint_of(&spec);
+        if expected != self.fingerprint {
+            return Err(format!(
+                "derived-columns entry: fingerprint {:?} does not cover its declaration \
+                 (which hashes to {expected:?})",
+                self.fingerprint
+            ));
+        }
+        Ok(spec)
+    }
+
+    /// The compiled declaration.
+    pub fn declaration(&self) -> Result<crate::derived::Declaration, String> {
+        crate::derived::Declaration::compile(&self.validate()?)
+    }
+}
+
+/// Header bytes of the derived-columns entry, 0 without a declaration.
+fn derived_entry_size(derived: Option<&StoredDerived>) -> u64 {
+    derived.map_or(0, |d| {
+        2 + DERIVED_ENTRY_NAME.len() as u64
+            + 1
+            + 2
+            + d.fingerprint.len() as u64
+            + 4
+            + d.declaration.len() as u64
+    })
+}
+
+/// Emit the derived-columns entry (a no-op without a declaration).
+fn write_derived_entry<W: Write>(w: &mut W, derived: Option<&StoredDerived>) -> io::Result<()> {
+    let Some(d) = derived else { return Ok(()) };
+    d.validate()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    write_u16(w, DERIVED_ENTRY_NAME.len() as u16)?;
+    w.write_all(DERIVED_ENTRY_NAME.as_bytes())?;
+    w.write_all(&[COLUMN_KIND_DERIVED])?;
+    write_u16(w, d.fingerprint.len() as u16)?;
+    w.write_all(d.fingerprint.as_bytes())?;
+    write_u32(
+        w,
+        u32::try_from(d.declaration.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "derived declaration exceeds u32",
+            )
+        })?,
+    )?;
+    w.write_all(&d.declaration)
+}
+
 /// Header bytes of the binding's column-table entry, 0 when unbound.
 fn binding_entry_size(binding: Option<&StoredBinding>) -> u64 {
     binding.map_or(0, |b| {
@@ -1884,6 +2022,9 @@ pub struct Bm25Store {
     /// The mapped-plan binding, persisted as the kind-6 table entry.
     /// `Some` forces v7 even with no columns.
     binding: Option<StoredBinding>,
+    /// The derived-column declaration, persisted as the kind-15 entry.
+    /// `Some` forces v7 like the binding.
+    derived: Option<StoredDerived>,
     sources: crate::source_archive::SourceArchive,
 }
 
@@ -1903,6 +2044,7 @@ impl Default for Bm25Store {
             unsigned_integers: Vec::new(),
             geos: Vec::new(),
             binding: None,
+            derived: None,
             sources: Default::default(),
         }
     }
@@ -1940,6 +2082,17 @@ impl Bm25Store {
         self.binding = binding;
     }
 
+    /// The derived-column declaration this store was written under.
+    pub fn derived(&self) -> Option<&StoredDerived> {
+        self.derived.as_ref()
+    }
+
+    /// Set the declaration persisted by the next save. Plain storage,
+    /// like [`Self::set_binding`].
+    pub fn set_derived(&mut self, derived: Option<StoredDerived>) {
+        self.derived = derived;
+    }
+
     /// An empty store.
     pub fn new() -> Self {
         Self::default()
@@ -1973,6 +2126,7 @@ impl Bm25Store {
             unsigned_integers: Vec::new(),
             geos: Vec::new(),
             binding: None,
+            derived: None,
             sources: Default::default(),
         }
     }
@@ -3159,6 +3313,7 @@ impl Bm25Store {
             || !self.unsigned_integers.is_empty()
             || !self.geos.is_empty()
             || self.binding.is_some()
+            || self.derived.is_some()
             || !self.sources.is_empty()
             || self.fields.iter().any(|f| f.positions || f.sentences);
         let column_table_size: u64 = if !has_columns {
@@ -3222,6 +3377,7 @@ impl Bm25Store {
                     .map(|f| 2 + (SENTENCES_ENTRY_PREFIX.len() + f.name.len()) as u64 + 1 + 8 * 2)
                     .sum::<u64>()
                 + binding_entry_size(self.binding.as_ref())
+                + derived_entry_size(self.derived.as_ref())
                 + if self.sources.is_empty() {
                     0
                 } else {
@@ -3394,6 +3550,7 @@ impl Bm25Store {
                     + positions_offs.len()
                     + sentences_offs.len()
                     + usize::from(self.binding.is_some())
+                    + usize::from(self.derived.is_some())
                     + usize::from(!self.sources.is_empty())) as u32,
             )?;
             for (facet, &(dict_off, ords_off)) in self.facets.iter().zip(&facet_offs) {
@@ -3495,6 +3652,7 @@ impl Bm25Store {
                 COLUMN_KIND_MAP_U64,
             )?;
             write_binding_entry(w, self.binding.as_ref())?;
+            write_derived_entry(w, self.derived.as_ref())?;
             write_source_entry(w, source_section)?;
         }
         self.write_shared_sections(w, 0)?;
@@ -3759,6 +3917,7 @@ impl Bm25Store {
             unsigned_integers: Vec::new(),
             geos: Vec::new(),
             binding: None,
+            derived: None,
             sources: Default::default(),
         }
     }
@@ -4633,6 +4792,7 @@ impl Bm25Store {
         let mut positions_metas: Vec<(String, u64)> = Vec::new();
         let mut sentences_metas: Vec<(String, u64)> = Vec::new();
         let mut binding_meta: Option<StoredBinding> = None;
+        let mut derived_meta: Option<StoredDerived> = None;
         let mut sources_meta = None;
         if v7 {
             let n_columns = u32_at(cursor)? as usize;
@@ -4643,6 +4803,12 @@ impl Bm25Store {
                     .map_err(|_| invalid("invalid utf-8 in column name"))?;
                 let kind = at(cursor + 2 + name_len, 1)?[0];
                 let base = cursor + 2 + name_len + 1;
+                let kind = compatible_column_kind(
+                    kind,
+                    name.as_bytes(),
+                    &all[base as usize - 8..],
+                    (all.len() + 8) as u64,
+                );
                 match kind {
                     COLUMN_KIND_FACET => {
                         facet_metas.push((
@@ -4803,6 +4969,23 @@ impl Bm25Store {
                             &bound.body_path,
                         )
                         .map_err(|e| invalid(&e))?;
+                        cursor = cur;
+                    }
+                    COLUMN_KIND_DERIVED => {
+                        let mut cur = base;
+                        let len = u64::from(u16_at(at(cur, 2)?));
+                        let fingerprint = String::from_utf8(at(cur + 2, len)?.to_vec())
+                            .map_err(|_| invalid("invalid utf-8 in derived-columns record"))?;
+                        cur += 2 + len;
+                        let len = u32::from_le_bytes(at(cur, 4)?.try_into().unwrap()) as u64;
+                        let declaration = at(cur + 4, len)?.to_vec();
+                        cur += 4 + len;
+                        let stored = StoredDerived {
+                            fingerprint,
+                            declaration,
+                        };
+                        stored.validate().map_err(|e| invalid(&e))?;
+                        derived_meta = Some(stored);
                         cursor = cur;
                     }
                     k => {
@@ -5088,6 +5271,7 @@ impl Bm25Store {
             unsigned_integers,
             geos,
             binding: binding_meta,
+            derived: derived_meta,
             sources: match sources_meta {
                 Some((offset, length)) => {
                     crate::source_archive::SourceArchive::read(at(offset, length)?, n_slots as u32)?
@@ -5217,6 +5401,9 @@ pub struct SpillBuilder {
     /// when `finish` writes v7 (`Some` forces v7). The v4 oracle
     /// format cannot carry it and refuses.
     binding: Option<StoredBinding>,
+    /// The derived-column declaration `finish` persists as the kind-15
+    /// entry (`Some` forces v7).
+    derived: Option<StoredDerived>,
     sources: crate::source_archive::SourceArchive,
     /// Write the v4 format instead of v6 (benchmarking/migration only).
     v4_only: bool,
@@ -5297,6 +5484,7 @@ impl SpillBuilder {
             unsigned_integers: Vec::new(),
             geos: Vec::new(),
             binding: None,
+            derived: None,
             sources: crate::source_archive::SourceArchive::spilling(&dir.join("sources.spill"))?,
             v4_only,
         })
@@ -5956,10 +6144,10 @@ impl SpillBuilder {
     /// corpus, unless built with [`Self::create_v4_for_bench`].
     pub fn finish(&mut self, path: &Path) -> io::Result<()> {
         if self.v4_only {
-            if self.binding.is_some() {
+            if self.binding.is_some() || self.derived.is_some() {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "the v4 oracle format cannot carry a mapped-plan binding",
+                    "the v4 oracle format cannot carry a mapped-plan binding or a derived-column declaration",
                 ));
             }
             self.finish_v4(path)
@@ -5976,6 +6164,16 @@ impl SpillBuilder {
     /// Set the binding `finish` persists (see [`Bm25Store::set_binding`]).
     pub fn set_binding(&mut self, binding: Option<StoredBinding>) {
         self.binding = binding;
+    }
+
+    /// The derived-column declaration the finish will persist, if any.
+    pub fn derived(&self) -> Option<&StoredDerived> {
+        self.derived.as_ref()
+    }
+
+    /// Set the declaration `finish` persists (see [`Bm25Store::set_derived`]).
+    pub fn set_derived(&mut self, derived: Option<StoredDerived>) {
+        self.derived = derived;
     }
 
     /// Merge one field's runs into a postings-section body file at
@@ -6137,6 +6335,7 @@ impl SpillBuilder {
             || !self.unsigned_integers.is_empty()
             || !self.geos.is_empty()
             || self.binding.is_some()
+            || self.derived.is_some()
             || !self.sources.is_empty()
             || self.fields.iter().any(|f| f.positions || f.sentences);
         let column_table_size: u64 = if !has_columns {
@@ -6200,6 +6399,7 @@ impl SpillBuilder {
                     .map(|f| 2 + (SENTENCES_ENTRY_PREFIX.len() + f.name.len()) as u64 + 1 + 8 * 2)
                     .sum::<u64>()
                 + binding_entry_size(self.binding.as_ref())
+                + derived_entry_size(self.derived.as_ref())
                 + if self.sources.is_empty() {
                     0
                 } else {
@@ -6362,6 +6562,7 @@ impl SpillBuilder {
                         + positions_offs.len()
                         + sentences_offs.len()
                         + usize::from(self.binding.is_some())
+                        + usize::from(self.derived.is_some())
                         + usize::from(!self.sources.is_empty())) as u32,
                 )?;
                 for (facet, &(dict_off, ords_off)) in self.facets.iter().zip(&facet_offs) {
@@ -6463,6 +6664,7 @@ impl SpillBuilder {
                     COLUMN_KIND_MAP_U64,
                 )?;
                 write_binding_entry(&mut w, self.binding.as_ref())?;
+                write_derived_entry(&mut w, self.derived.as_ref())?;
                 write_source_entry(&mut w, source_section)?;
             }
             // texts: byte-copy of the spill (already section-encoded).
@@ -7480,6 +7682,12 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             column_names.push(name);
             let kind = bytes_at(cursor + 2 + name_len, 1)?[0];
             let base = cursor + 2 + name_len + 1;
+            let kind = compatible_column_kind(
+                kind,
+                column_names.last().unwrap(),
+                &map[base as usize..],
+                map.len() as u64,
+            );
             match kind {
                 COLUMN_KIND_FACET => {
                     facets.push((
@@ -7670,6 +7878,30 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
                         }
                         cur += 4 + len;
                     }
+                    cursor = cur;
+                }
+                COLUMN_KIND_DERIVED => {
+                    if column_names.last().map(Vec::as_slice) != Some(DERIVED_ENTRY_NAME.as_bytes())
+                    {
+                        return Err(invalid(format!(
+                            "column {i}: kind {COLUMN_KIND_DERIVED} must be named \
+                             {DERIVED_ENTRY_NAME:?}"
+                        )));
+                    }
+                    let mut cur = base;
+                    let len = u64::from(u16_at(bytes_at(cur, 2)?));
+                    let fingerprint = std::str::from_utf8(bytes_at(cur + 2, len)?)
+                        .map_err(|_| invalid("invalid utf-8 in derived-columns record".into()))?
+                        .to_string();
+                    cur += 2 + len;
+                    let len = u32::from_le_bytes(bytes_at(cur, 4)?.try_into().unwrap()) as u64;
+                    StoredDerived {
+                        fingerprint,
+                        declaration: bytes_at(cur + 4, len)?.to_vec(),
+                    }
+                    .validate()
+                    .map_err(invalid)?;
+                    cur += 4 + len;
                     cursor = cur;
                 }
                 k => {
@@ -8512,6 +8744,8 @@ pub struct Bm25Reader {
     /// nothing to verify). Open has already checked the table itself
     /// The mapped-plan binding read from the kind-6 table entry.
     binding: Option<StoredBinding>,
+    /// The derived-column declaration read from the kind-15 entry.
+    derived: Option<StoredDerived>,
     source_section: Option<(u64, u64, crate::source_archive::SourceArchiveReader)>,
     /// and the eagerly-read sections; [`Self::verify_integrity`]
     /// checks everything.
@@ -8547,6 +8781,11 @@ impl Bm25Reader {
     /// The mapped-plan binding this file was written under, if any.
     pub fn binding(&self) -> Option<&StoredBinding> {
         self.binding.as_ref()
+    }
+
+    /// The derived-column declaration this file was written under, if any.
+    pub fn derived(&self) -> Option<&StoredDerived> {
+        self.derived.as_ref()
     }
 
     /// The next local doc id (number of document slots).
@@ -9214,6 +9453,7 @@ impl Bm25Reader {
             facets: Vec::new(),
             numerics: Vec::new(),
             binding: None,
+            derived: None,
             source_section: None,
             map_facets: Vec::new(),
             map_numerics: Vec::new(),
@@ -9303,6 +9543,7 @@ impl Bm25Reader {
         let mut unsigned_integers = Vec::new();
         let mut geos = Vec::new();
         let mut binding = None;
+        let mut derived = None;
         let mut source_section = None;
         if v7 {
             // Decode a length-prefixed dictionary of `n` entries
@@ -9327,6 +9568,8 @@ impl Bm25Reader {
                     String::from_utf8_lossy(&map[cursor + 2..cursor + 2 + name_len]).into_owned();
                 let kind = map[cursor + 2 + name_len];
                 let base = cursor + 2 + name_len + 1;
+                let kind =
+                    compatible_column_kind(kind, name.as_bytes(), &map[base..], map.len() as u64);
                 match kind {
                     COLUMN_KIND_FACET => {
                         let n_values = u32_at(base) as usize;
@@ -9553,6 +9796,23 @@ impl Bm25Reader {
                         });
                         cursor = cur;
                     }
+                    COLUMN_KIND_DERIVED => {
+                        let mut cur = base;
+                        let len =
+                            u16::from_le_bytes(map[cur..cur + 2].try_into().unwrap()) as usize;
+                        let fingerprint =
+                            String::from_utf8_lossy(&map[cur + 2..cur + 2 + len]).into_owned();
+                        cur += 2 + len;
+                        let len =
+                            u32::from_le_bytes(map[cur..cur + 4].try_into().unwrap()) as usize;
+                        let declaration = map[cur + 4..cur + 4 + len].to_vec();
+                        cur += 4 + len;
+                        derived = Some(StoredDerived {
+                            fingerprint,
+                            declaration,
+                        });
+                        cursor = cur;
+                    }
                     k => unreachable!("validation refused unknown column kind {k}"),
                 }
             }
@@ -9579,6 +9839,7 @@ impl Bm25Reader {
             v5_runs: true,
             blob_relative: true,
             binding,
+            derived,
             source_section,
             lineage_index: std::sync::OnceLock::new(),
             integrity: None,
@@ -12908,3 +13169,7 @@ mod malformed_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+#[path = "postings_derived_compat_tests.rs"]
+mod derived_compat_tests;

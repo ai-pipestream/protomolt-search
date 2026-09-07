@@ -252,6 +252,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 placement_column: cfg.placement_column.clone(),
                 placement_leaf: cfg.placement_leaf,
                 placement_tree: cfg.placement_tree.clone(),
+                derived: cfg.derived.clone(),
                 geo_fields: cfg.geo_fields.clone(),
                 wal: shard.wal,
                 wal_buckets: shard.wal_buckets,
@@ -353,6 +354,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             placement_column: cfg.placement_column.clone(),
             placement_leaf: cfg.placement_leaf,
             placement_tree: cfg.placement_tree.clone(),
+            derived: cfg.derived.clone(),
             geo_fields: cfg.geo_fields.clone(),
             position_fields: cfg.position_fields.clone(),
             bigram_fields: cfg.bigram_fields.clone(),
@@ -809,6 +811,16 @@ async fn build_corpus(
             .clone()
             .map(|tree| (tree, routes.iter().map(|route| route.placement).collect()));
         coordinator = coordinator.with_hot_topology_placed(ranges, placement)?;
+        // The map's [[derived]] table is the index's declaration
+        // (docs/derived-columns.md); the coordinator routes and scopes
+        // with it for the life of the process.
+        if !map.derived.is_empty() {
+            let declaration = pipestream_search::derived::spec_from_config(&map.derived)
+                .and_then(|spec| pipestream_search::derived::Declaration::compile(&spec))
+                .map_err(|e| format!("shard map [[derived]]: {e}"))?;
+            eprintln!("derived columns: declaration {}", declaration.fingerprint());
+            coordinator = coordinator.with_derived(Some(std::sync::Arc::new(declaration)));
+        }
         eprintln!(
             "shard map generation {} ({} shards)",
             map.generation,
@@ -843,6 +855,21 @@ async fn build_corpus(
                                 }
                             };
                             if candidate.generation <= reload.current_topology_generation() {
+                                continue;
+                            }
+                            // A map that changes the derived-column declaration
+                            // describes another index: a rebuild, not a reload.
+                            let running: Vec<pipestream_search::derived::DerivedColumnConfig> = reload
+                                .derived()
+                                .map(|declaration| declaration.config())
+                                .unwrap_or_default();
+                            if candidate.derived != running {
+                                eprintln!(
+                                    "shard-map reload refused: generation {} changes the [[derived]] \
+                                     declaration; a changed declaration is a rebuild through the \
+                                     reshard tool and a restart (docs/derived-columns.md)",
+                                    candidate.generation
+                                );
                                 continue;
                             }
                             let generation = candidate.generation;

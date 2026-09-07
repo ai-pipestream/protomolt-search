@@ -20,18 +20,45 @@ branch:
 | ValueExpr tag 16 | typed_map | stable_key_hash |
 | Column-table kind 15 | exact signed integer map | derived-column declaration |
 
-Main must be reconciled before publishing a combined build. Preserve integer
-map tags 27/28 and value-expression tag 16, allocate unused identifiers for
-the new derived fields, and allocate a distinct derived table kind after the
-map kinds 15/16. Define explicit handling for files and records written by
-cea2c63: changing enum constants alone does not make those bytes compatible.
-Readers must distinguish a supported legacy format or refuse it by name;
-interpreting a derived declaration as a map is not a migration.
+The feature branch now reconciles these allocations: map document tags 27/28,
+typed-map expression tag 16 and map kinds 15/16 remain intact. Derived fields
+move to tags 29 and 17, and the declaration uses kind 17. Main's old images
+and WAL records have explicit disk compatibility readers; see
+[the combined compatibility contract](derived-columns.md#compatibility-with-the-parallel-integer-map-branch).
+External clients need the combined schema; there is no claim that changing
+main's two conflicting tags is wire-compatible for old clients.
 
-The current range checkpoint is validated independently of cea2c63. It is not
-a combined build and has not been merged to main. Reconciliation also needs
-both sets of evaluator inputs, column definitions, WAL records, replication
-metadata, field permissions and compaction behavior, followed by combined tests.
+The shared evaluator retains map types, calendar/facet inputs, source bytes
+and derived input dependencies. Complete WAL source tables now include both
+map families, including entirely absent columns, and declaration mismatch
+checks precede record truncation or append. Combined tests exercise direct
+ingest, segment attach/reopen, backfill, field permissions and both old disk
+formats. Full validation is recorded with the source checkpoint.
+
+One pre-existing gap is explicit: network WAL replication forwards through
+fresh `AddDocuments`, which refuses carried derived values. The sender now
+refuses these records before transmission or cursor advancement; accepting
+them requires a separately authorized replay route. Do not strip the
+fingerprint, recompute logged expressions, or add a client-controlled bypass.
+This remains work for the identity/durability track and does not hold the
+other task's source development or authorize fleet operations.
+
+## Checkpoint validation
+
+The combined source passed 1,321 local tests: 524 unit tests, 783 integration
+tests across 138 targets, 12 embedded tests and two IVF adapter tests. One
+existing live-service integration test remains ignored. The five Android/iOS
+cross-target checks, test/example compilation, formatting, vendored-proto
+checks and descriptor comparisons passed. Every build and test ran inside an
+8 GiB memory limit with swap disabled and two Cargo build jobs.
+
+The descriptor comparison preserves every field from feature checkpoint
+`84c527d`, and every main `cea2c63` field except the two explicitly reconciled
+numbers above. Old disk-format tests cover both readers, integrity envelopes,
+rewrite, mixed-version WAL append/reopen and failure before mutation. Three
+older assertions were updated to account for the new receiver/WAL versions
+and rerun; no production source changed during those assertion reruns.
+These are local checks, not a claim of fleet deployment or hosted CI.
 
 ## Declaration and recovery
 

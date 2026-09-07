@@ -355,12 +355,7 @@ fn build_topology(
 /// Stable FNV-1a over opaque product identity bytes. Unlike the historical
 /// WAL bucket hash, this never depends on generation-local numeric slots.
 pub fn stable_routing_hash(key: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in key {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
+    crate::values::fnv1a64_bytes(key)
 }
 
 #[cfg(feature = "net")]
@@ -491,6 +486,14 @@ pub struct CoordinatorServiceImpl {
     /// and the validated tree they name. Empty and `None` without one.
     placement_codes: Vec<Option<i64>>,
     placement: Option<Arc<crate::placement::Placement>>,
+    /// The index's derived-column declaration (`docs/derived-columns.md`),
+    /// from the shard map's `[[derived]]` table: evaluated over each
+    /// routed document so a placement predicate on a derived column
+    /// routes the way the shards store it, and consulted by field
+    /// permissions so a derived column discloses no more than its
+    /// inputs. Static for the process, like a node's; a reloaded map
+    /// that declares otherwise is refused.
+    derived: Option<Arc<crate::derived::Declaration>>,
     /// Hot topology authority. Public RPC entry points snapshot this once and
     /// recurse into a frozen clone with this field cleared, so no request can
     /// observe half of two generations.
@@ -2036,6 +2039,7 @@ impl CoordinatorServiceImpl {
             hash_ranges: Vec::new(),
             placement_codes: Vec::new(),
             placement: None,
+            derived: None,
             live_topology: None,
             topology_watch: Arc::new(watch::channel(0).0),
             write_gate: Arc::new(tokio::sync::RwLock::new(())),
@@ -2082,7 +2086,10 @@ impl CoordinatorServiceImpl {
         }
         crate::visibility::VisibilityScope::new(view)?;
         scoped.field_permissions = fields
-            .map(crate::field_permissions::FieldScope::new)
+            .map(|fields| {
+                crate::field_permissions::FieldScope::new(fields)
+                    .map(|scope| scope.with_derived(self.derived.clone()))
+            })
             .transpose()
             .map_err(|_| Status::permission_denied("invalid field permission decision"))?;
         if access.is_none_or(|a| a.action != crate::pb::AccessAction::Search as i32) {
@@ -3128,6 +3135,18 @@ impl CoordinatorServiceImpl {
         &self,
     ) -> Result<Option<crate::clustered_turbovec::ClusteredQualityIdentity>, Status> {
         Ok(None)
+    }
+
+    /// The index's derived-column declaration (`docs/derived-columns.md`),
+    /// the shard map's `[[derived]]` table compiled.
+    pub fn with_derived(mut self, derived: Option<Arc<crate::derived::Declaration>>) -> Self {
+        self.derived = derived;
+        self
+    }
+
+    /// The declaration this coordinator routes and scopes with.
+    pub fn derived(&self) -> Option<&Arc<crate::derived::Declaration>> {
+        self.derived.as_ref()
     }
 
     pub fn with_topology_generation(mut self, generation: u64) -> Self {
@@ -12483,7 +12502,11 @@ impl CoordinatorServiceImpl {
         // picks (docs/placement.md); the leaf's shards fill the
         // placement column from their pinned code.
         let placer = match self.placement.as_ref() {
-            Some(placement) => Some(PlacementRouter::new(Arc::clone(placement), &mapped_bind)?),
+            Some(placement) => Some(PlacementRouter::new(
+                Arc::clone(placement),
+                &mapped_bind,
+                self.derived.clone(),
+            )?),
             None => None,
         };
         let mut batches: Vec<Vec<crate::pb::IngestMappedRequest>> =
@@ -12509,7 +12532,9 @@ impl CoordinatorServiceImpl {
                 }
             };
             let leaf = match placer.as_ref() {
-                Some(placer) => Some(placer.leaf_of(&document.document, position)?),
+                Some(placer) => {
+                    Some(placer.leaf_of(&document.document, position, &document.stable_key)?)
+                }
                 None => None,
             };
             position += 1;
@@ -12580,12 +12605,16 @@ struct PlacementRouter {
     placement: Arc<crate::placement::Placement>,
     extractor: crate::mapping::Extractor,
     materialize: Vec<(String, crate::pb::ValueExpr, crate::pb::MaterializeKind)>,
+    /// The index's declaration (`docs/derived-columns.md`), evaluated
+    /// here for routing only: the shard computes and stores its own.
+    derived: Option<Arc<crate::derived::Declaration>>,
 }
 
 impl PlacementRouter {
     fn new(
         placement: Arc<crate::placement::Placement>,
         bind: &crate::pb::MappedBind,
+        derived: Option<Arc<crate::derived::Declaration>>,
     ) -> Result<Self, Status> {
         let extractor = crate::mapping::Extractor::new(
             &bind.descriptor_set,
@@ -12600,6 +12629,7 @@ impl PlacementRouter {
             placement,
             extractor,
             materialize,
+            derived,
         })
     }
 
@@ -12607,7 +12637,7 @@ impl PlacementRouter {
     /// stream. Quality and geography columns are derived on the node
     /// after analysis and are absent here, so a predicate on one is
     /// UNKNOWN at routing time and falls through to the default.
-    fn leaf_of(&self, bytes: &[u8], position: u64) -> Result<i64, Status> {
+    fn leaf_of(&self, bytes: &[u8], position: u64, stable_key: &[u8]) -> Result<i64, Status> {
         let rows = self.extractor.extract(bytes).map_err(|status| {
             Status::new(
                 status.code(),
@@ -12631,6 +12661,17 @@ impl PlacementRouter {
                         format!("document {position}: {}", status.message()),
                     )
                 })?;
+            let doc = match self.derived.as_deref() {
+                Some(declaration) => {
+                    declaration.apply(doc, Some(stable_key)).map_err(|status| {
+                        Status::new(
+                            status.code(),
+                            format!("document {position}: {}", status.message()),
+                        )
+                    })?
+                }
+                None => doc,
+            };
             let leaf = self
                 .placement
                 .evaluate(&doc)

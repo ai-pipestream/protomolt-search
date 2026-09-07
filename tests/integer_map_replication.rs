@@ -226,3 +226,75 @@ async fn replication_requires_advertisement_and_acknowledgement_before_advancing
     }
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test]
+async fn derived_wal_replication_refuses_before_transmitting_or_advancing() {
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("derived-map-replication-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let declaration = Arc::new(
+        pipestream_search::derived::Declaration::compile(&pb::DerivedColumns {
+            columns: vec![pb::DerivedColumn {
+                name: "copied".into(),
+                expression: "signed['']".into(),
+                kind: pb::MaterializeKind::I64 as i32,
+                disclosure: pb::DerivedDisclosure::Inputs as i32,
+            }],
+        })
+        .unwrap(),
+    );
+    for layout in [Layout::SingleImage, Layout::Segments] {
+        let config = |name: &str| NodeConfig {
+            index_path: Some(root.join(format!("{name}-{layout:?}.tv"))),
+            layout,
+            wal: true,
+            analysis_addr: Some(pipestream_search::analyzer::NATIVE_ANALYSIS_BACKEND.into()),
+            map_integer_fields: vec!["signed".into()],
+            derived: Some(declaration.clone()),
+            ..Default::default()
+        };
+        let (primary, primary_server) = common::start_empty_node(config("source")).await;
+        let mut source = NodeServiceClient::connect(primary.clone()).await.unwrap();
+        source
+            .add_documents(tokio_stream::iter([pb::AddDocumentsRequest {
+                text: "map".into(),
+                analysis: Some(pipestream_search::analyzer::body_spec()),
+                map_integers: vec![pb::MapIntegerEntry {
+                    field: "signed".into(),
+                    key: "".into(),
+                    value: i64::MIN,
+                }],
+                ..Default::default()
+            }]))
+            .await
+            .unwrap();
+        source.flush(pb::FlushRequest {}).await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let replica = format!("http://{}", listener.local_addr().unwrap());
+        let ingests = Arc::new(AtomicUsize::new(0));
+        let receiver = VersionedReceiver {
+            node: NodeServiceImpl::new(None, config("receiver")),
+            mode: Arc::new(AtomicU8::new(2)),
+            ingests: ingests.clone(),
+        };
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(receiver)
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let cursor = ReplicaCursor {
+            primary,
+            replica,
+            ..Default::default()
+        };
+        let error = sync_once(&cursor).await.unwrap_err();
+        assert!(error.contains("trusted replay RPC"), "{error}");
+        assert_eq!(ingests.load(Ordering::SeqCst), 0);
+        assert_eq!(cursor.clock, 0);
+        server.abort();
+        primary_server.abort();
+        let _ = server.await;
+        let _ = primary_server.await;
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}

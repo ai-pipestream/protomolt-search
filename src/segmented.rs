@@ -67,6 +67,96 @@ macro_rules! same_tables {
     }};
 }
 
+/// The first table on which a sealed segment and the tail disagree,
+/// named with both sides, for a refusal that says what to fix.
+fn first_table_difference(other: &crate::postings::Bm25Reader, tail: &Bm25Store) -> Option<String> {
+    let fields = |names: Vec<String>| format!("{names:?}");
+    let pairs: [(&str, Vec<String>, Vec<String>); 8] = [
+        (
+            "field",
+            (0..other.field_count())
+                .map(|f| other.field_name(f).to_string())
+                .collect(),
+            (0..tail.field_count())
+                .map(|f| tail.field_name(f).to_string())
+                .collect(),
+        ),
+        (
+            "facet",
+            (0..other.facet_count())
+                .map(|i| other.facet_name(i).to_string())
+                .collect(),
+            (0..tail.facet_count())
+                .map(|i| tail.facet_name(i).to_string())
+                .collect(),
+        ),
+        (
+            "numeric",
+            (0..other.numeric_count())
+                .map(|i| other.numeric_name(i).to_string())
+                .collect(),
+            (0..tail.numeric_count())
+                .map(|i| tail.numeric_name(i).to_string())
+                .collect(),
+        ),
+        (
+            "integer",
+            (0..other.integer_count())
+                .map(|i| other.integer_name(i).to_string())
+                .collect(),
+            (0..tail.integer_count())
+                .map(|i| tail.integer_name(i).to_string())
+                .collect(),
+        ),
+        (
+            "unsigned-integer",
+            (0..other.unsigned_integer_count())
+                .map(|i| other.unsigned_integer_name(i).to_string())
+                .collect(),
+            (0..tail.unsigned_integer_count())
+                .map(|i| tail.unsigned_integer_name(i).to_string())
+                .collect(),
+        ),
+        (
+            "geo",
+            (0..other.geo_count())
+                .map(|i| other.geo_name(i).to_string())
+                .collect(),
+            (0..tail.geo_count())
+                .map(|i| tail.geo_name(i).to_string())
+                .collect(),
+        ),
+        (
+            "map-facet",
+            (0..other.map_facet_count())
+                .map(|i| other.map_facet_name(i).to_string())
+                .collect(),
+            (0..tail.map_facet_count())
+                .map(|i| tail.map_facet_name(i).to_string())
+                .collect(),
+        ),
+        (
+            "map-numeric",
+            (0..other.map_numeric_count())
+                .map(|i| other.map_numeric_name(i).to_string())
+                .collect(),
+            (0..tail.map_numeric_count())
+                .map(|i| tail.map_numeric_name(i).to_string())
+                .collect(),
+        ),
+    ];
+    for (what, segment, shard) in pairs {
+        if segment != shard {
+            return Some(format!(
+                "{what} table: the segment has {}, this shard {}",
+                fields(segment),
+                fields(shard)
+            ));
+        }
+    }
+    None
+}
+
 /// One column's global dictionary over the sealed parts and the tail.
 #[derive(Debug, Default)]
 struct UnionDict {
@@ -520,12 +610,44 @@ impl SegmentedShard {
             .collect();
     }
 
-    /// Refuse a sealed segment whose tables differ from the tail's.
+    /// Refuse a sealed segment whose tables differ from the tail's, or
+    /// whose derived-column declaration (`docs/derived-columns.md`) is
+    /// not the tail's: one shard, one declaration.
     fn check_tables(&self, reader: &crate::postings::Bm25Reader, id: &str) -> Result<(), String> {
+        // The declaration first: a differing one explains a differing
+        // table, and names the fix.
+        match (reader.derived(), self.tail.derived()) {
+            (None, None) => {}
+            (Some(held), Some(wanted)) if held.fingerprint == wanted.fingerprint => {}
+            (Some(held), Some(wanted)) => {
+                return Err(format!(
+                    "segment {id:?} was written under derived-column declaration {:?}, this \
+                     shard declares {:?}; a changed declaration is a rebuild through the \
+                     reshard tool",
+                    held.fingerprint, wanted.fingerprint
+                ));
+            }
+            (Some(held), None) => {
+                return Err(format!(
+                    "segment {id:?} was written under derived-column declaration {:?}, which \
+                     this shard does not declare (--derived-columns)",
+                    held.fingerprint
+                ));
+            }
+            (None, Some(wanted)) => {
+                return Err(format!(
+                    "segment {id:?} was written without derived columns, this shard declares \
+                     {:?}; backfill the rows through the reshard tool (--derive)",
+                    wanted.fingerprint
+                ));
+            }
+        }
         if !same_tables!(reader, &self.tail) {
+            let difference = first_table_difference(reader, &self.tail)
+                .unwrap_or_else(|| "a field flag".to_string());
             return Err(format!(
-                "segment {id:?} declares a field or column table this shard does not; the \
-                 catalog and the node configuration must agree"
+                "segment {id:?} declares a field or column table this shard does not \
+                 ({difference}); the catalog and the node configuration must agree"
             ));
         }
         Ok(())
@@ -776,6 +898,16 @@ impl SegmentedShard {
                     .then(|| self.reader(0).binding())
                     .flatten()
             })
+    }
+
+    /// The derived-column declaration this shard is written under: the
+    /// tail's, which every attached segment was checked against.
+    pub fn derived(&self) -> Option<&crate::postings::StoredDerived> {
+        self.tail.derived().or_else(|| {
+            (!self.parts.is_empty())
+                .then(|| self.reader(0).derived())
+                .flatten()
+        })
     }
 
     pub fn next_doc_id(&self) -> u32 {

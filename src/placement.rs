@@ -334,6 +334,38 @@ impl Placement {
         &self.config
     }
 
+    /// Every column the tree's predicates read, for a shard or a
+    /// coordinator to check against the tables it declares
+    /// (`docs/derived-columns.md`): a predicate naming a column no row
+    /// will ever carry is refused at startup, not on the first row.
+    pub fn predicate_columns(&self) -> std::collections::BTreeSet<String> {
+        fn collect(nodes: &[CompiledNode], out: &mut std::collections::BTreeSet<String>) {
+            for node in nodes {
+                if let Some(expr) = node.predicate.as_ref() {
+                    crate::filter::walk_leaves(expr, &mut |leaf| {
+                        use crate::filter::LeafRef;
+                        let column = match leaf {
+                            LeafRef::Facet(p) => &p.column,
+                            LeafRef::Number(p) => &p.column,
+                            LeafRef::MapFacet(p) => &p.column,
+                            LeafRef::MapNumber(p) | LeafRef::TypedMapNumber(p) => &p.column,
+                            LeafRef::MapHasKey(p) | LeafRef::TypedMapHasKey(p) => &p.column,
+                            LeafRef::Has(p) => &p.column,
+                            LeafRef::Geo(p) => &p.column,
+                            LeafRef::StringRange(p) | LeafRef::MapStringRange(p) => &p.column,
+                            LeafRef::StringPrefix(p) | LeafRef::MapStringPrefix(p) => &p.column,
+                        };
+                        out.insert(column.clone());
+                    });
+                }
+                collect(&node.children, out);
+            }
+        }
+        let mut out = std::collections::BTreeSet::new();
+        collect(&self.compiled, &mut out);
+        out
+    }
+
     pub fn leaf_by_code(&self, code: i64) -> Option<&Leaf> {
         self.leaves.iter().find(|leaf| leaf.code == code)
     }

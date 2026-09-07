@@ -1418,11 +1418,11 @@ async fn mapped_integer_maps_bind_persist_and_compact_without_rounding() {
         let generation =
             pipestream_search::reshard::resolve_gen(&pipestream_search::wal::wal_dir(&path))
                 .unwrap();
-        assert_eq!(
-            pipestream_search::wal::read_manifest(&generation)
-                .unwrap()
-                .format_version,
-            7
+        let manifest = pipestream_search::wal::read_manifest(&generation).unwrap();
+        assert_eq!(manifest.format_version, 8);
+        assert!(
+            manifest.columns.is_some(),
+            "complete column tables require the new format"
         );
         drop(client);
         server.abort();

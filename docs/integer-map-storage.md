@@ -71,6 +71,9 @@ publishes the new manifest version before appending a typed-map record or its
 source blob. A failed manifest update leaves the record clock unchanged.
 Existing index bindings still require format 6, independently of typed maps.
 Older decoders reject the newer generation instead of dropping map fields.
+Complete column-table metadata independently requires WAL format 8, even if
+no row contains a map value. This protects entirely absent declared columns
+from being lost by an older replay tool.
 
 Receiver document contract version 1 is exposed by HealthResponse tag 22 and
 AddDocumentsResponse tag 5. Replication requires it before sending records

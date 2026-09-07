@@ -45,6 +45,7 @@ fn old_decoders_reject_typed_map_operators_instead_of_reporting_missing_columns(
     let forwarded = pb::ValueExpr::decode(legacy.encode_to_vec().as_slice()).unwrap();
     let names = ["unsigned".into()];
     let columns = values::NumericTypes {
+        facets: &[],
         numerics: &[],
         integers: &[],
         unsigned_integers: &[],
@@ -78,6 +79,7 @@ fn legacy_map_reads_keep_their_string_and_float_scope() {
     ));
     let names = ["value".into()];
     let mut columns = values::NumericTypes {
+        facets: &[],
         numerics: &[],
         integers: &[],
         unsigned_integers: &[],

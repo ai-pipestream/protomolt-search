@@ -53,6 +53,7 @@ fn unsigned_arithmetic_matches_wide_integer_and_cel_oracles() {
         map_numerics: &[],
         map_integers: &[],
         map_unsigned_integers: &[],
+        facets: &[],
     };
     let edges = [
         0,

@@ -48,6 +48,9 @@ use crate::reshard::bucket_of;
 #[path = "wal_sources.rs"]
 mod sources;
 
+#[path = "wal_derived.rs"]
+mod derived_wire;
+
 // ---------------------------------------------------------------------------
 // CRC32 (IEEE, table-based; hand-rolled to avoid a crate dependency)
 // ---------------------------------------------------------------------------
@@ -122,7 +125,10 @@ pub fn crc32(data: &[u8]) -> u32 {
 // ---------------------------------------------------------------------------
 
 /// Current on-disk format version (manifest `format_version`).
-pub const FORMAT_VERSION: u32 = 7;
+pub const FORMAT_VERSION: u32 = 8;
+/// Complete column tables and derived fingerprints require version 8.
+/// Derived fingerprints use document tag 29; prior main used tag 27.
+pub const DERIVED_FORMAT_VERSION: u32 = 8;
 /// Exact integer map entries cannot be replayed by earlier decoders.
 pub const INTEGER_MAP_FORMAT_VERSION: u32 = 7;
 /// Explicit index policies first require format 6.
@@ -254,6 +260,134 @@ pub struct WalManifest {
     pub preexisting_documents: u64,
     /// On-disk format version; [`FORMAT_VERSION`].
     pub format_version: u32,
+    /// The derived-column declaration the log's records were derived
+    /// under (`docs/derived-columns.md`), by fingerprint; empty for a
+    /// log written without derived columns, or before them.
+    #[serde(default)]
+    pub derived_fingerprint: String,
+    /// This generation contains pre-reconciliation derived fingerprints at tag 27.
+    /// Retained across format upgrades so mixed old/new records reopen safely.
+    #[serde(default)]
+    pub legacy_derived_tag27: bool,
+    /// The declaration itself, as a `[[derived]]` table, so a replay
+    /// tool can rebuild the columns the records carry and refuse a
+    /// declaration that differs.
+    #[serde(default)]
+    pub derived: Vec<crate::derived::DerivedColumnConfig>,
+    /// The complete column table of the shard the log describes, empty
+    /// columns included, in table order: what a rebuilt child declares
+    /// so its tables match the parent's record for record. `None` in a
+    /// manifest from before the table was recorded.
+    #[serde(default)]
+    pub columns: Option<ColumnTable>,
+}
+
+/// The complete column table of one shard, in table order
+/// (`WalManifest::columns`): the names a store declares whether or not
+/// any row carries a value under them.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ColumnTable {
+    #[serde(default)]
+    pub fields: Vec<String>,
+    #[serde(default)]
+    pub facets: Vec<String>,
+    #[serde(default)]
+    pub numerics: Vec<String>,
+    #[serde(default)]
+    pub map_facets: Vec<String>,
+    #[serde(default)]
+    pub map_numerics: Vec<String>,
+    #[serde(default)]
+    pub map_integers: Vec<String>,
+    #[serde(default)]
+    pub map_unsigned_integers: Vec<String>,
+    #[serde(default)]
+    pub integers: Vec<String>,
+    #[serde(default)]
+    pub unsigned_integers: Vec<String>,
+    #[serde(default)]
+    pub geo: Vec<String>,
+}
+
+impl ColumnTable {
+    /// The table a node's configuration declares (derived names
+    /// included, after their source columns).
+    pub fn of_config(config: &crate::node::NodeConfig) -> Self {
+        ColumnTable {
+            fields: config.bm25_fields.clone(),
+            facets: config.facet_fields.clone(),
+            numerics: config.numeric_fields.clone(),
+            map_facets: config.map_facet_fields.clone(),
+            map_numerics: config.map_numeric_fields.clone(),
+            map_integers: config.map_integer_fields.clone(),
+            map_unsigned_integers: config.map_unsigned_integer_fields.clone(),
+            integers: config.integer_fields.clone(),
+            unsigned_integers: config.unsigned_integer_fields.clone(),
+            geo: config.geo_fields.clone(),
+        }
+    }
+
+    /// The first table that differs from `other`, by name.
+    pub fn first_difference(&self, other: &ColumnTable) -> Option<String> {
+        for (name, mine, theirs) in [
+            ("field", &self.fields, &other.fields),
+            ("facet", &self.facets, &other.facets),
+            ("numeric", &self.numerics, &other.numerics),
+            ("map-facet", &self.map_facets, &other.map_facets),
+            ("map-numeric", &self.map_numerics, &other.map_numerics),
+            ("map-integer", &self.map_integers, &other.map_integers),
+            (
+                "map-unsigned-integer",
+                &self.map_unsigned_integers,
+                &other.map_unsigned_integers,
+            ),
+            ("integer", &self.integers, &other.integers),
+            (
+                "unsigned-integer",
+                &self.unsigned_integers,
+                &other.unsigned_integers,
+            ),
+            ("geo", &self.geo, &other.geo),
+        ] {
+            if mine != theirs {
+                return Some(format!("{name} table {mine:?} vs {theirs:?}"));
+            }
+        }
+        None
+    }
+}
+
+/// A resumed log's declaration and column table must be the node's
+/// (`docs/derived-columns.md`): the same derived fingerprint, and the
+/// same tables in the same order. A manifest that recorded neither is
+/// adopted by the caller; one that recorded either and disagrees is
+/// refused naming the difference.
+pub fn check_manifest_tables(held: &WalManifest, fresh: &WalManifest) -> Result<(), String> {
+    if !held.derived_fingerprint.is_empty() || !held.derived.is_empty() {
+        if held.derived_fingerprint != fresh.derived_fingerprint {
+            return Err(format!(
+                "the log was written under derived-column declaration {:?}, this node declares \
+                 {:?}; a changed declaration is a rebuild through the reshard tool",
+                held.derived_fingerprint, fresh.derived_fingerprint
+            ));
+        }
+        if held.derived != fresh.derived {
+            return Err(
+                "the log's [[derived]] table differs from this node's although the \
+                 fingerprints agree; the manifest was edited by hand"
+                    .to_string(),
+            );
+        }
+    }
+    if let (Some(held), Some(fresh)) = (held.columns.as_ref(), fresh.columns.as_ref()) {
+        if let Some(difference) = held.first_difference(fresh) {
+            return Err(format!(
+                "the log records a column table this node does not declare: {difference}; the \
+                 tables of a shard and its log agree name for name and in order"
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl WalManifest {
@@ -330,7 +464,7 @@ pub fn write_manifest(gen_dir: &Path, manifest: &WalManifest) -> io::Result<()> 
 /// Read and validate a generation's manifest.
 pub fn read_manifest(gen_dir: &Path) -> io::Result<WalManifest> {
     let text = std::fs::read_to_string(manifest_path(gen_dir))?;
-    let manifest: WalManifest = toml::from_str(&text)
+    let mut manifest: WalManifest = toml::from_str(&text)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad manifest: {e}")))?;
     if !(1..=FORMAT_VERSION).contains(&manifest.format_version) {
         return Err(io::Error::new(
@@ -353,7 +487,34 @@ pub fn read_manifest(gen_dir: &Path) -> io::Result<WalManifest> {
             ),
         ));
     }
+    validate_derived_profile(&mut manifest, true)?;
     Ok(manifest)
+}
+
+// Validate before any record mutation; old main used formats at most 6.
+fn validate_derived_profile(manifest: &mut WalManifest, infer_legacy: bool) -> io::Result<()> {
+    let derived = crate::reshard::manifest_derived(manifest)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if manifest.legacy_derived_tag27 && derived.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "legacy derived WAL profile requires its declaration",
+        ));
+    }
+    if infer_legacy && manifest.format_version <= INDEX_FORMAT_VERSION && derived.is_some() {
+        manifest.legacy_derived_tag27 = true;
+    }
+    Ok(())
+}
+
+fn legacy_derived_for_file(path: &Path) -> io::Result<Option<String>> {
+    match read_manifest(path.parent().unwrap_or_else(|| Path::new("."))) {
+        Ok(manifest) => Ok(manifest
+            .legacy_derived_tag27
+            .then_some(manifest.derived_fingerprint)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -446,6 +607,7 @@ pub struct RecordReader {
     next_seq: u64,
     done: bool,
     sources: Option<sources::Reader>,
+    legacy_derived_fingerprint: Option<String>,
 }
 
 impl RecordReader {
@@ -457,6 +619,7 @@ impl RecordReader {
             next_seq: 1,
             done: false,
             sources: None,
+            legacy_derived_fingerprint: legacy_derived_for_file(path)?,
         })
     }
 
@@ -474,6 +637,7 @@ impl RecordReader {
             next_seq,
             done: false,
             sources: None,
+            legacy_derived_fingerprint: legacy_derived_for_file(path)?,
         })
     }
 
@@ -505,6 +669,10 @@ impl RecordReader {
                 self.done = true;
                 return Ok(None);
             }
+        };
+        let frame = match &self.legacy_derived_fingerprint {
+            Some(fingerprint) => derived_wire::upgrade_record(&frame, fingerprint)?,
+            None => frame,
         };
         let mut record = WalRecord::decode(frame.as_slice()).map_err(|e| {
             io::Error::new(
@@ -878,6 +1046,8 @@ pub fn open_or_create(wal_dir: &Path, cutoff: u64, fresh: WalManifest) -> io::Re
         let attempt = match latest_gen(wal_dir)? {
             Some((_, gen)) => match read_manifest(&gen) {
                 Ok(m) => {
+                    check_manifest_tables(&m, &fresh)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                     let dropped = truncate_records_at_or_above(&gen, cutoff)?;
                     if dropped > 0 {
                         eprintln!(
@@ -970,8 +1140,12 @@ impl WalWriter {
     /// the same shard would both create and clobber each other. Startup
     /// goes through [`open_or_create`], which converges concurrent
     /// first-openers on one generation.
-    pub fn create(wal_dir: &Path, manifest: WalManifest) -> io::Result<Self> {
+    pub fn create(wal_dir: &Path, mut manifest: WalManifest) -> io::Result<Self> {
         check_geometry(&manifest)?;
+        validate_derived_profile(&mut manifest, false)?;
+        if !manifest.derived.is_empty() || manifest.columns.is_some() {
+            manifest.format_version = manifest.format_version.max(DERIVED_FORMAT_VERSION);
+        }
         let dir = gen_dir(wal_dir, manifest.generation);
         std::fs::create_dir_all(&dir)?;
         write_manifest(&dir, &manifest)?;
@@ -1002,8 +1176,12 @@ impl WalWriter {
     /// resumable generation (an abandoned one still errors, just
     /// slower). Rotation keeps [`Self::create`]: there a pre-existing
     /// directory is stale state to truncate, not a peer to join.
-    pub fn create_or_resume(wal_dir: &Path, manifest: WalManifest) -> io::Result<Self> {
+    pub fn create_or_resume(wal_dir: &Path, mut manifest: WalManifest) -> io::Result<Self> {
         check_geometry(&manifest)?;
+        validate_derived_profile(&mut manifest, false)?;
+        if !manifest.derived.is_empty() || manifest.columns.is_some() {
+            manifest.format_version = manifest.format_version.max(DERIVED_FORMAT_VERSION);
+        }
         std::fs::create_dir_all(wal_dir)?;
         let dir = gen_dir(wal_dir, manifest.generation);
         let deadline = Instant::now() + PEER_CREATE_TIMEOUT;
@@ -1048,7 +1226,14 @@ impl WalWriter {
     /// Resume the generation in `gen_dir` after a restart: adopt its
     /// manifest, and for every existing bucket file and the markers file
     /// truncate any torn tail and continue its sequence.
-    pub fn resume(gen_dir: &Path, manifest: WalManifest) -> io::Result<Self> {
+    pub fn resume(gen_dir: &Path, mut manifest: WalManifest) -> io::Result<Self> {
+        validate_derived_profile(&mut manifest, true)?;
+        if (!manifest.derived.is_empty() || manifest.columns.is_some())
+            && manifest.format_version < DERIVED_FORMAT_VERSION
+        {
+            manifest.format_version = DERIVED_FORMAT_VERSION;
+            write_manifest(gen_dir, &manifest)?;
+        }
         let mut buckets = HashMap::new();
         let mut max_clock = 0u64;
         let mut legacy_clock_records = false;
@@ -1099,6 +1284,18 @@ impl WalWriter {
         }
         let mut updated = self.manifest.clone();
         update(&mut updated);
+        updated.legacy_derived_tag27 |= self.manifest.legacy_derived_tag27;
+        updated.format_version = updated.format_version.max(self.manifest.format_version);
+        if let Err(error) = validate_derived_profile(&mut updated, false) {
+            eprintln!(
+                "wal: refusing manifest update in {}: {error}",
+                self.dir.display()
+            );
+            return false;
+        }
+        if !updated.derived.is_empty() || updated.columns.is_some() {
+            updated.format_version = updated.format_version.max(DERIVED_FORMAT_VERSION);
+        }
         if updated == self.manifest {
             return true;
         }
@@ -1270,8 +1467,17 @@ impl WalWriter {
             }
             let mut required_version = BASE_FORMAT_VERSION;
             for document in &batch.documents {
+                if document.derived_fingerprint != self.manifest.derived_fingerprint {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "WAL document derived fingerprint differs from its manifest declaration",
+                    ));
+                }
+                if !document.derived_fingerprint.is_empty() {
+                    required_version = required_version.max(DERIVED_FORMAT_VERSION);
+                }
                 if !document.map_integers.is_empty() || !document.map_unsigned_integers.is_empty() {
-                    required_version = INTEGER_MAP_FORMAT_VERSION;
+                    required_version = required_version.max(INTEGER_MAP_FORMAT_VERSION);
                 }
                 if let Some(identity) = &document.identity {
                     if document.original_source.is_none() {
@@ -1404,6 +1610,10 @@ mod tests {
             preexisting_vectors: 0,
             preexisting_documents: 0,
             format_version: FORMAT_VERSION,
+            derived_fingerprint: String::new(),
+            legacy_derived_tag27: false,
+            derived: Vec::new(),
+            columns: None,
         }
     }
 
@@ -1460,6 +1670,7 @@ mod tests {
                 unsigned_integers: Vec::new(),
                 map_integers: Vec::new(),
                 map_unsigned_integers: Vec::new(),
+                derived_fingerprint: String::new(),
                 timestamps: Vec::new(),
                 geo_points: Vec::new(),
                 quality: None,

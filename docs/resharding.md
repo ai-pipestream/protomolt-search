@@ -116,6 +116,13 @@ from `TermStats` at query time as usual.
   code, and without one such a row refuses the split by id. Children keep
   the parent's full hash coverage, because routing under a tree is by
   code first and by hash inside the group.
+- **Derived columns** (`docs/derived-columns.md`): every child keeps the
+  declaration the log's manifest records; the re-placement split's
+  `--derived-columns=<file>` writes the children under a declaration and
+  `--derive=a,b` computes those columns on every row (a backfill of new
+  columns, or a recompute of changed expressions), refusing by name a
+  row already derived under the declaration or a column the sources'
+  tables cannot feed.
 
 ### Snapshot installation
 

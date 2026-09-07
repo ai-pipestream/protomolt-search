@@ -802,6 +802,7 @@ impl NodeServiceImpl {
                 }
                 Ok(())
             };
+            let derived = crate::node::stored_derived(&self.config);
             match pre.partition.as_deref() {
                 Some(column) => crate::reshard::compact_log_partitioned(
                     &pre.gen_dir,
@@ -814,6 +815,7 @@ impl NodeServiceImpl {
                     names.as_deref(),
                     pins.as_deref(),
                     pre.columns.as_ref(),
+                    derived.as_ref(),
                     analyze,
                     &mut sink,
                 ),
@@ -825,6 +827,7 @@ impl NodeServiceImpl {
                     names.as_deref(),
                     pins.as_deref(),
                     pre.columns.as_ref(),
+                    derived.as_ref(),
                     analyze,
                     &mut sink,
                 ),
@@ -1361,7 +1364,9 @@ impl NodeServiceImpl {
                     let analyzed = analyzed.next().ok_or_else(|| {
                         Status::internal("the tail applied more documents than it analyzed")
                     })?;
-                    let (doc, analyzed) = self.materialize_document(doc, analyzed)?;
+                    let key = keys.next();
+                    let (doc, analyzed) =
+                        self.materialize_document(doc, analyzed, key.as_deref())?;
                     let mut added = 0u64;
                     let mut first = 0u64;
                     self.apply_document_locked(
@@ -1369,7 +1374,7 @@ impl NodeServiceImpl {
                         doc,
                         analyzed,
                         None,
-                        keys.next(),
+                        key,
                         &mut added,
                         &mut first,
                     )?;

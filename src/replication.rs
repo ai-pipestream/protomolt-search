@@ -342,6 +342,9 @@ pub async fn sync_once(cursor: &ReplicaCursor) -> Result<ReplicaCursor, String> 
                     target.document_contract_version,
                     required,
                 )?;
+                for document in &add.documents {
+                    require_fresh_ingest_replay(document)?;
+                }
                 let rows = add.documents.len() as u64;
                 if rows == 0 {
                     return Err("WAL document record is empty".to_string());
@@ -377,6 +380,7 @@ pub async fn sync_once(cursor: &ReplicaCursor) -> Result<ReplicaCursor, String> 
                             .zip(add.stable_routing_keys)
                             .enumerate()
                         {
+                            let required = crate::document_contract::required_version(&document);
                             let mut request = tonic::Request::new(tokio_stream::iter([document]));
                             request.metadata_mut().insert_bin(
                                 "x-protomolt-stable-key-bin",
@@ -617,20 +621,34 @@ async fn add_vector_with_key(
     Ok(())
 }
 
+// AddDocuments is a fresh-ingest contract. A fingerprint is not authority
+// to bypass derivation; forwarding a logged derived row needs a distinct,
+// authenticated replay contract that retains its already-computed values.
+fn require_fresh_ingest_replay(document: &crate::pb::AddDocumentsRequest) -> Result<(), String> {
+    if !document.derived_fingerprint.is_empty() {
+        return Err("derived-column WAL replication requires a trusted replay RPC; AddDocuments accepts fresh ingest, not carried derived values".to_string());
+    }
+    Ok(())
+}
+
 async fn add_document_with_key(
     client: &mut NodeServiceClient<Channel>,
     document: crate::pb::AddDocumentsRequest,
     key: &[u8],
 ) -> Result<(), String> {
+    require_fresh_ingest_replay(&document)?;
+    let required = crate::document_contract::required_version(&document);
     let mut request = tonic::Request::new(tokio_stream::iter([document]));
     request.metadata_mut().insert_bin(
         "x-protomolt-stable-key-bin",
         tonic::metadata::MetadataValue::from_bytes(key),
     );
-    client
+    let response = client
         .add_documents(request)
         .await
-        .map_err(|error| format!("append child document: {error}"))?;
+        .map_err(|error| format!("append child document: {error}"))?
+        .into_inner();
+    crate::document_contract::require_supported(response.document_contract_version, required)?;
     Ok(())
 }
 
@@ -661,6 +679,7 @@ pub async fn catch_up_children_once(state: &LiveReshardState) -> Result<LiveResh
     let mut clients = Vec::with_capacity(state.children.len());
     let mut skip_vectors = Vec::with_capacity(state.children.len());
     let mut skip_documents = Vec::with_capacity(state.children.len());
+    let mut document_versions = Vec::with_capacity(state.children.len());
     for child in &state.children {
         let mut child_client = client(&child.addr)?;
         let health = child_client
@@ -678,6 +697,7 @@ pub async fn catch_up_children_once(state: &LiveReshardState) -> Result<LiveResh
         }
         skip_vectors.push(health.num_vectors - expected_vectors);
         skip_documents.push(health.document_slots - expected_documents);
+        document_versions.push(health.document_contract_version);
         clients.push(child_client);
     }
     let mut stream = source
@@ -750,6 +770,11 @@ pub async fn catch_up_children_once(state: &LiveReshardState) -> Result<LiveResh
                 }
                 for (document, key) in add.documents.into_iter().zip(add.stable_routing_keys) {
                     let child = updated.route(&key)?;
+                    crate::document_contract::require_supported(
+                        document_versions[child],
+                        crate::document_contract::required_version(&document),
+                    )?;
+                    require_fresh_ingest_replay(&document)?;
                     if skip_documents[child] > 0 {
                         skip_documents[child] -= 1;
                     } else {
@@ -858,6 +883,7 @@ pub async fn atomic_live_cutover(
                 })
                 .collect(),
             placement: None,
+            derived: Vec::new(),
         };
         write_toml_atomic(shard_map_path, &map, "shard map")?;
         durable_map_published = true;

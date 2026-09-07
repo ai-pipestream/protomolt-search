@@ -154,6 +154,7 @@ async fn ingest(
                 unsigned_integers: Vec::new(),
                 map_integers: Vec::new(),
                 map_unsigned_integers: Vec::new(),
+                derived_fingerprint: String::new(),
                 original_source: None,
                 source_chunk_ordinal: None,
                 identity: None,
@@ -492,6 +493,10 @@ async fn merge_reproduces_monolithic() {
             preexisting_vectors: 0,
             preexisting_documents: 0,
             format_version: pipestream_search::wal::FORMAT_VERSION,
+            derived_fingerprint: String::new(),
+            legacy_derived_tag27: false,
+            derived: Vec::new(),
+            columns: None,
         };
         let mut writer = pipestream_search::wal::WalWriter::create(&wal_root, manifest).unwrap();
         writer
@@ -719,6 +724,10 @@ fn reshard_refuses_a_log_with_preexisting_state() {
         preexisting_vectors: 123,
         preexisting_documents: 0,
         format_version: pipestream_search::wal::FORMAT_VERSION,
+        derived_fingerprint: String::new(),
+        legacy_derived_tag27: false,
+        derived: Vec::new(),
+        columns: None,
     };
     let writer = pipestream_search::wal::WalWriter::create(&dir, manifest).unwrap();
     let gen = writer.dir().to_path_buf();
@@ -771,6 +780,10 @@ fn segmented_replay_refuses_a_foreign_batch_that_straddles_buckets() {
         preexisting_vectors: 0,
         preexisting_documents: 0,
         format_version: pipestream_search::wal::FORMAT_VERSION,
+        derived_fingerprint: String::new(),
+        legacy_derived_tag27: false,
+        derived: Vec::new(),
+        columns: None,
     };
     manifest.set_backend_config(config);
     let mut writer = pipestream_search::wal::WalWriter::create(&dir, manifest).unwrap();
@@ -1150,6 +1163,7 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
                 unsigned_integers: Vec::new(),
                 map_integers: Vec::new(),
                 map_unsigned_integers: Vec::new(),
+                derived_fingerprint: String::new(),
                 original_source: None,
                 source_chunk_ordinal: None,
                 identity: None,

@@ -106,6 +106,178 @@ fn declare_placement_column(config: &mut NodeConfig) {
     }
 }
 
+/// The index's SOURCE column tables: the configured lists without the
+/// derived names, which is what a derived expression or a request's
+/// own materialize spec may read (outputs are not inputs).
+fn source_tables(config: &NodeConfig) -> SourceTables {
+    let without = |names: &[String]| -> Vec<String> {
+        names
+            .iter()
+            .filter(|name| {
+                config
+                    .derived
+                    .as_ref()
+                    .is_none_or(|declaration| !declaration.is_derived(name))
+            })
+            .cloned()
+            .collect()
+    };
+    SourceTables {
+        numerics: without(&config.numeric_fields),
+        integers: without(&config.integer_fields),
+        unsigned_integers: without(&config.unsigned_integer_fields),
+        map_numerics: config.map_numeric_fields.clone(),
+        map_integers: config.map_integer_fields.clone(),
+        map_unsigned_integers: config.map_unsigned_integer_fields.clone(),
+        facets: config.facet_fields.clone(),
+    }
+}
+
+/// Owned form of [`crate::values::NumericTypes`].
+struct SourceTables {
+    numerics: Vec<String>,
+    integers: Vec<String>,
+    unsigned_integers: Vec<String>,
+    map_numerics: Vec<String>,
+    map_integers: Vec<String>,
+    map_unsigned_integers: Vec<String>,
+    facets: Vec<String>,
+}
+
+impl SourceTables {
+    fn types(&self) -> crate::values::NumericTypes<'_> {
+        crate::values::NumericTypes {
+            numerics: &self.numerics,
+            integers: &self.integers,
+            unsigned_integers: &self.unsigned_integers,
+            map_numerics: &self.map_numerics,
+            map_integers: &self.map_integers,
+            map_unsigned_integers: &self.map_unsigned_integers,
+            facets: &self.facets,
+        }
+    }
+}
+
+/// The derived columns (`docs/derived-columns.md`) join the column
+/// tables of their kinds after the declared source columns, in
+/// declaration order, once the declaration is checked against those
+/// source tables: every input names a source column, the static type
+/// matches the kind, and no derived name collides. Every constructor
+/// runs this after the placement column so the tables, the catalog and
+/// the log agree. Idempotent.
+fn declare_derived_columns(config: &mut NodeConfig) -> Result<(), String> {
+    let Some(declaration) = config.derived.clone() else {
+        return Ok(());
+    };
+    // A derived name already in a table is either this function's own
+    // earlier append (the derived names of the kind, in order, at the
+    // table's end) or a collision with a source column.
+    for (kind, table) in [
+        (crate::pb::MaterializeKind::F64, &config.numeric_fields),
+        (crate::pb::MaterializeKind::I64, &config.integer_fields),
+        (
+            crate::pb::MaterializeKind::U64,
+            &config.unsigned_integer_fields,
+        ),
+    ] {
+        let names = declaration.names_of(kind);
+        let appended = table.ends_with(&names);
+        if !appended {
+            if let Some(name) = names.iter().find(|name| table.contains(name)) {
+                return Err(format!(
+                    "derived columns: derived column {name:?} collides with a source column \
+                     of the same name"
+                ));
+            }
+        }
+    }
+    let sources = source_tables(config);
+    declaration
+        .check_tables(&sources.types())
+        .map_err(|e| format!("derived columns: {e}"))?;
+    for (kind, table) in [
+        (crate::pb::MaterializeKind::F64, &mut config.numeric_fields),
+        (crate::pb::MaterializeKind::I64, &mut config.integer_fields),
+        (
+            crate::pb::MaterializeKind::U64,
+            &mut config.unsigned_integer_fields,
+        ),
+    ] {
+        for name in declaration.names_of(kind) {
+            if !table.contains(&name) {
+                table.push(name);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A placement tree's predicates read columns this shard declares,
+/// source or derived; a predicate naming any other column would send
+/// rows by a value no row carries, so it is refused at startup.
+fn check_placement_columns(config: &NodeConfig) -> Result<(), String> {
+    let Some(pinned) = config.placement_tree.as_ref() else {
+        return Ok(());
+    };
+    for column in pinned.placement().predicate_columns() {
+        let declared = config.facet_fields.contains(&column)
+            || config.numeric_fields.contains(&column)
+            || config.map_facet_fields.contains(&column)
+            || config.map_numeric_fields.contains(&column)
+            || config.integer_fields.contains(&column)
+            || config.unsigned_integer_fields.contains(&column)
+            || config.geo_fields.contains(&column);
+        if !declared {
+            return Err(format!(
+                "placement tree: a predicate reads column {column:?}, which this shard \
+                 declares in no table, source or derived (docs/derived-columns.md)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The store form of the configured declaration.
+pub(crate) fn stored_derived(config: &NodeConfig) -> Option<crate::postings::StoredDerived> {
+    config
+        .derived
+        .as_deref()
+        .map(crate::postings::StoredDerived::of)
+}
+
+/// A store or catalog attached to this shard was written under this
+/// shard's declaration, or under none while still empty; anything else
+/// is an index compatibility event, refused by name.
+fn check_attached_derived(
+    config: &NodeConfig,
+    held: Option<&crate::postings::StoredDerived>,
+    rows: u64,
+    what: &str,
+) -> Result<(), String> {
+    match (held, config.derived.as_deref()) {
+        (None, None) => Ok(()),
+        (Some(held), Some(wanted)) if held.fingerprint == wanted.fingerprint() => Ok(()),
+        (Some(held), Some(wanted)) => Err(format!(
+            "{what} was written under derived-column declaration {:?}, this node declares \
+             {:?}; a changed declaration is a rebuild through the reshard tool \
+             (docs/derived-columns.md)",
+            held.fingerprint,
+            wanted.fingerprint()
+        )),
+        (Some(held), None) => Err(format!(
+            "{what} was written under derived-column declaration {:?}, which this node does \
+             not declare (--derived-columns)",
+            held.fingerprint
+        )),
+        (None, Some(_)) if rows == 0 => Ok(()),
+        (None, Some(wanted)) => Err(format!(
+            "{what} holds {rows} rows written without derived columns, this node declares \
+             {:?}; backfill the rows through the reshard tool (--derive)",
+            wanted.fingerprint()
+        )),
+    }
+}
+
 // Rust and embedded callers bypass the CLI parser. Enforce the same column
 // namespace before they create or open storage, and before a fresh ingest.
 fn validate_column_tables(config: &NodeConfig) -> Result<(), String> {
@@ -239,6 +411,30 @@ fn node_knobs(config: &NodeConfig) -> crate::diagnostics::Knobs {
                 .unwrap_or_default(),
             description: "The pinned leaf's name under the tree this shard checks direct \
                           rows against (--placement-tree); empty without a tree.",
+        },
+        FixedKnob {
+            name: "derived_columns",
+            kind: KnobKind::String,
+            value: config
+                .derived
+                .as_ref()
+                .map(|declaration| {
+                    crate::derived::declaration_toml(declaration.spec()).unwrap_or_default()
+                })
+                .unwrap_or_default(),
+            description: "The index's derived-column declaration as a [[derived]] table \
+                          (--derived-columns, docs/derived-columns.md); empty without one.",
+        },
+        FixedKnob {
+            name: "derived_fingerprint",
+            kind: KnobKind::String,
+            value: config
+                .derived
+                .as_ref()
+                .map(|declaration| declaration.fingerprint().to_string())
+                .unwrap_or_default(),
+            description: "The declaration's fingerprint, which the store, the log and every \
+                          segment of this shard carry.",
         },
     ];
     Knobs::node(
@@ -404,6 +600,14 @@ pub struct NodeConfig {
     /// path and refuses a row the tree routes elsewhere. Needs
     /// `placement_leaf`.
     pub placement_tree: Option<Arc<crate::placement::PinnedLeaf>>,
+    /// The index's derived columns (`--derived-columns=<file>`,
+    /// docs/derived-columns.md): CEL value columns computed here at
+    /// ingest from each document's own values and stored as ordinary
+    /// typed columns. Their names join the tables of their kinds after
+    /// the declared source columns; the declaration's fingerprint is
+    /// persisted with the store, the log and every segment, and a
+    /// mismatch refuses by name.
+    pub derived: Option<Arc<crate::derived::Declaration>>,
     /// The geo-point column table for NEW builders
     /// (`docs/geo-columns.md`). Same rules as `facet_fields`; the
     /// columns geo FILTERS and distance-decay stages read.
@@ -515,6 +719,7 @@ impl Default for NodeConfig {
             placement_column: None,
             placement_leaf: None,
             placement_tree: None,
+            derived: None,
             geo_fields: Vec::new(),
             position_fields: Vec::new(),
             sentence_fields: Vec::new(),
@@ -636,6 +841,16 @@ impl Bm25Shard {
             Bm25Shard::Spilling(s) => s.binding(),
             Bm25Shard::Resident(r) => r.binding(),
             Bm25Shard::Segmented(g) => g.binding(),
+        }
+    }
+
+    /// The derived-column declaration the store was written under.
+    pub(crate) fn derived(&self) -> Option<&crate::postings::StoredDerived> {
+        match self {
+            Bm25Shard::Building(s) => s.derived(),
+            Bm25Shard::Spilling(s) => s.derived(),
+            Bm25Shard::Resident(r) => r.derived(),
+            Bm25Shard::Segmented(g) => g.derived(),
         }
     }
 
@@ -3877,7 +4092,7 @@ pub(crate) fn heap_store(config: &NodeConfig) -> Result<Bm25Store, String> {
     let geos: Vec<&str> = config.geo_fields.iter().map(String::as_str).collect();
     let positions: Vec<&str> = config.position_fields.iter().map(String::as_str).collect();
     let sentences: Vec<&str> = config.sentence_fields.iter().map(String::as_str).collect();
-    Ok(Bm25Store::with_fields(&names)
+    let mut store = Bm25Store::with_fields(&names)
         .with_facets(&facets)
         .with_numerics(&numerics)
         .with_map_facets(&map_facets)
@@ -3888,7 +4103,9 @@ pub(crate) fn heap_store(config: &NodeConfig) -> Result<Bm25Store, String> {
         .with_unsigned_integers(&unsigned_integers)
         .with_geos(&geos)
         .with_positions(&positions)
-        .with_sentences(&sentences))
+        .with_sentences(&sentences);
+    store.set_derived(stored_derived(config));
+    Ok(store)
 }
 
 pub fn bm25_sidecar_path(index_path: &std::path::Path) -> PathBuf {
@@ -4199,6 +4416,18 @@ pub(crate) fn wal_manifest(
         preexisting_vectors: preexisting.0,
         preexisting_documents: preexisting.1,
         format_version: wal::BASE_FORMAT_VERSION,
+        legacy_derived_tag27: false,
+        derived_fingerprint: config
+            .derived
+            .as_ref()
+            .map(|declaration| declaration.fingerprint().to_string())
+            .unwrap_or_default(),
+        derived: config
+            .derived
+            .as_ref()
+            .map(|declaration| declaration.config())
+            .unwrap_or_default(),
+        columns: Some(wal::ColumnTable::of_config(config)),
     }
 }
 
@@ -4262,7 +4491,7 @@ fn open_wal(index: Option<&VectorIndex>, config: &NodeConfig) -> Option<WalWrite
     let dir = wal::wal_dir(index_path);
     let cutoff = config.slot_offset + vector_tip.max(doc_tip);
     let fresh = wal_manifest(index, config, 0, (vector_tip, doc_tip));
-    let mut writer = wal::open_or_create(&dir, cutoff, fresh)
+    let mut writer = wal::open_or_create(&dir, cutoff, fresh.clone())
         .unwrap_or_else(|e| panic!("open WAL at {}: {e}", dir.display()));
     // The log belongs to one collection (docs/collections.md). A manifest
     // from before collections is adopted by the node that opens it, and
@@ -4279,6 +4508,23 @@ fn open_wal(index: Option<&VectorIndex>, config: &NodeConfig) -> Option<WalWrite
             config.collection
         );
     }
+    // The log records the declaration it was written under and the
+    // complete column table, empty columns included
+    // (docs/derived-columns.md). A manifest from before either is
+    // adopted by the node that opens it; one that disagrees is refused,
+    // because replaying it here would mix two meanings of one column.
+    if let Err(error) = wal::check_manifest_tables(writer.manifest(), &fresh) {
+        panic!("WAL at {}: {error}", dir.display());
+    }
+    writer.update_manifest(|m| {
+        if m.derived_fingerprint.is_empty() && m.derived.is_empty() {
+            m.derived_fingerprint = fresh.derived_fingerprint.clone();
+            m.derived = fresh.derived.clone();
+        }
+        if m.columns.is_none() {
+            m.columns = fresh.columns.clone();
+        }
+    });
     if writer.manifest().bucket_count != config.wal_buckets {
         eprintln!(
             "wal: --wal-buckets={} ignored; the existing log at {} has bucket_count={}",
@@ -5110,6 +5356,8 @@ impl NodeServiceImpl {
         allow_missing_bm25: bool,
     ) -> Result<Self, String> {
         declare_placement_column(&mut config);
+        declare_derived_columns(&mut config)?;
+        check_placement_columns(&config)?;
         validate_column_tables(&config)?;
         let generation = config.index_path.as_ref().and_then(|path| {
             recover_segments_swap(path);
@@ -5245,6 +5493,12 @@ impl NodeServiceImpl {
             }
         }
 
+        // The store's declaration entry must be this node's
+        // (docs/derived-columns.md), refused here by name rather than
+        // in the attach below, which panics for the direct constructor.
+        if let Some(store) = bm25.as_ref() {
+            check_attached_derived(&config, store.derived(), store.doc_count(), "the store")?;
+        }
         let service = Self::new(index, config)
             .with_bm25(bm25)
             .with_exact_vectors(exact_vectors)?
@@ -5257,6 +5511,11 @@ impl NodeServiceImpl {
     /// Wrap an optional preloaded index in a node service.
     pub fn new(index: Option<VectorIndex>, mut config: NodeConfig) -> Self {
         declare_placement_column(&mut config);
+        if let Err(error) =
+            declare_derived_columns(&mut config).and_then(|()| check_placement_columns(&config))
+        {
+            panic!("{error}");
+        }
         let wal = open_wal(index.as_ref(), &config);
         let mapped_binding = wal.as_ref().and_then(|wal| {
             crate::reshard::read_generation_binding(wal.dir())
@@ -5495,24 +5754,25 @@ impl NodeServiceImpl {
                 let dir = bm25_build_dir(&storage_paths(p, generation).2);
                 SpillBuilder::create_with_fields(&dir, &names)
                     .map(|b| {
-                        Bm25Shard::Spilling(
-                            b.with_facet_fields(&facets)
-                                .with_numeric_fields(&numerics)
-                                .with_map_facet_fields(&map_facets)
-                                .with_map_numeric_fields(&map_numerics)
-                                .with_map_integer_fields(&map_integers)
-                                .with_map_unsigned_integer_fields(&map_unsigned_integers)
-                                .with_integer_fields(&integers)
-                                .with_unsigned_integer_fields(&unsigned_integers)
-                                .with_geo_fields(&geos)
-                                .with_position_fields(&positions)
-                                .with_sentence_fields(&sentences),
-                        )
+                        let mut b = b
+                            .with_facet_fields(&facets)
+                            .with_numeric_fields(&numerics)
+                            .with_map_facet_fields(&map_facets)
+                            .with_map_numeric_fields(&map_numerics)
+                            .with_map_integer_fields(&map_integers)
+                            .with_map_unsigned_integer_fields(&map_unsigned_integers)
+                            .with_integer_fields(&integers)
+                            .with_unsigned_integer_fields(&unsigned_integers)
+                            .with_geo_fields(&geos)
+                            .with_position_fields(&positions)
+                            .with_sentence_fields(&sentences);
+                        b.set_derived(stored_derived(&self.config));
+                        Bm25Shard::Spilling(b)
                     })
                     .map_err(|e| Status::internal(format!("spill dir {}: {e}", dir.display())))
             }
-            None => Ok(Bm25Shard::Building(
-                Bm25Store::with_fields(&names)
+            None => {
+                let mut store = Bm25Store::with_fields(&names)
                     .with_facets(&facets)
                     .with_numerics(&numerics)
                     .with_map_facets(&map_facets)
@@ -5523,8 +5783,10 @@ impl NodeServiceImpl {
                     .with_unsigned_integers(&unsigned_integers)
                     .with_geos(&geos)
                     .with_positions(&positions)
-                    .with_sentences(&sentences),
-            )),
+                    .with_sentences(&sentences);
+                store.set_derived(stored_derived(&self.config));
+                Ok(Bm25Shard::Building(store))
+            }
         }
     }
 
@@ -5573,6 +5835,16 @@ impl NodeServiceImpl {
                     recovered, persisted,
                     "WAL and BM25 mapped bindings disagree"
                 );
+            }
+            if let Some(store) = store.as_ref() {
+                if let Err(error) = check_attached_derived(
+                    &self.config,
+                    store.derived(),
+                    store.doc_count(),
+                    "the BM25 store",
+                ) {
+                    panic!("{error}");
+                }
             }
             guard.mapped_binding = persisted.or_else(|| guard.mapped_binding.clone());
             guard.bm25 = store;
@@ -6294,9 +6566,11 @@ impl NodeServiceImpl {
         // entry), so the flushed file carries exactly what the shard is
         // bound to.
         let binding = guard.mapped_binding.clone();
+        let derived = stored_derived(&self.config);
         let built = match guard.bm25.as_mut() {
             Some(Bm25Shard::Building(store)) => {
                 store.set_binding(binding);
+                store.set_derived(derived);
                 store
                     .save(&bm25_path)
                     .map_err(|e| Status::internal(format!("write {}: {e}", bm25_path.display())))?;
@@ -6304,6 +6578,7 @@ impl NodeServiceImpl {
             }
             Some(Bm25Shard::Spilling(builder)) => {
                 builder.set_binding(binding);
+                builder.set_derived(derived);
                 builder
                     .finish(&bm25_path)
                     .map_err(|e| Status::internal(format!("write {}: {e}", bm25_path.display())))?;
@@ -7366,6 +7641,13 @@ impl NodeServiceImpl {
         };
         let num_documents = shard.doc_count();
         let num_vectors = index.as_ref().map_or(0, |i| i.len() as u64);
+        check_attached_derived(
+            &self.config,
+            shard.derived(),
+            num_documents,
+            "the installed catalog",
+        )
+        .map_err(Status::failed_precondition)?;
         guard.mapped_binding = shard.binding().cloned();
         guard.bm25 = Some(Bm25Shard::Segmented(shard));
         guard.index = index;
@@ -9205,14 +9487,19 @@ impl NodeServiceImpl {
             }
         }
         let columns = compile_materialize_spec(spec)?;
-        let types = crate::values::NumericTypes {
-            numerics: &self.config.numeric_fields,
-            integers: &self.config.integer_fields,
-            unsigned_integers: &self.config.unsigned_integer_fields,
-            map_numerics: &self.config.map_numeric_fields,
-            map_integers: &self.config.map_integer_fields,
-            map_unsigned_integers: &self.config.map_unsigned_integer_fields,
-        };
+        if let Some(declaration) = self.config.derived.as_deref() {
+            for (name, _, _) in &columns {
+                if declaration.is_derived(name) {
+                    return Err(Status::invalid_argument(format!(
+                        "materialize: column {name:?} is a derived column of this index's \
+                         declaration, which the index computes itself; a request's spec \
+                         cannot redefine it"
+                    )));
+                }
+            }
+        }
+        let sources = source_tables(&self.config);
+        let types = sources.types();
         for ((name, expr, kind), source) in columns.iter().zip(&spec.columns) {
             let (_, vt) = crate::values::resolve(expr, &types).map_err(|e| {
                 Status::invalid_argument(format!("materialize: column {name:?}: {}", e.message()))
@@ -9247,20 +9534,30 @@ impl NodeServiceImpl {
     /// included, and none of the quality or geography columns analysis
     /// adds later. Runs on live ingest only; a logged record already
     /// passed, so replay and the compaction shadow skip it.
-    fn check_placement(&self, doc: &AddDocumentsRequest) -> Result<(), Status> {
+    fn check_placement(
+        &self,
+        doc: &AddDocumentsRequest,
+        stable_key: Option<&[u8]>,
+    ) -> Result<(), Status> {
         let Some(pinned) = self.config.placement_tree.as_ref() else {
             return Ok(());
         };
-        let outcome = match doc.materialize.as_ref() {
-            Some(spec) if !spec.columns.is_empty() => {
-                let compiled = self.compiled_materialize(spec)?;
-                let mut routed = doc.clone();
-                routed.materialize = None;
-                let routed = apply_materialize(routed, &compiled)?;
-                pinned.check(&routed)
+        let mut routed = doc.clone();
+        if let Some(spec) = doc
+            .materialize
+            .as_ref()
+            .filter(|spec| !spec.columns.is_empty())
+        {
+            let compiled = self.compiled_materialize(spec)?;
+            routed.materialize = None;
+            routed = apply_materialize(routed, &compiled)?;
+        }
+        if let Some(declaration) = self.config.derived.as_deref() {
+            if routed.derived_fingerprint.is_empty() {
+                routed = declaration.apply(routed, stable_key)?;
             }
-            _ => pinned.check(doc),
-        };
+        }
+        let outcome = pinned.check(&routed);
         outcome.map_err(|reason| {
             Status::invalid_argument(format!(
                 "{reason}; this shard pins leaf {} (--placement-leaf) under the tree in \
@@ -9325,15 +9622,32 @@ impl NodeServiceImpl {
     fn materialize_columns(
         &self,
         mut doc: AddDocumentsRequest,
+        stable_key: Option<&[u8]>,
     ) -> Result<AddDocumentsRequest, Status> {
-        let Some(spec) = doc.materialize.take() else {
-            return Ok(doc);
-        };
-        if spec.columns.is_empty() {
-            return Ok(doc);
+        if let Some(spec) = doc
+            .materialize
+            .take()
+            .filter(|spec| !spec.columns.is_empty())
+        {
+            let compiled = self.compiled_materialize(&spec)?;
+            doc = apply_materialize(doc, &compiled)?;
         }
-        let compiled = self.compiled_materialize(&spec)?;
-        apply_materialize(doc, &compiled)
+        // The index's own declaration (docs/derived-columns.md): a fresh
+        // document is computed and stamped here; a logged record
+        // carries its values and must have been derived under this
+        // declaration.
+        if let Some(declaration) = self.config.derived.as_deref() {
+            if doc.derived_fingerprint.is_empty() {
+                doc = declaration.apply(doc, stable_key)?;
+            } else {
+                declaration.check_logged(&doc)?;
+            }
+        } else if !doc.derived_fingerprint.is_empty() {
+            return Err(Status::failed_precondition(
+                "the document carries a derived fingerprint, but this index declares no derived columns",
+            ));
+        }
+        Ok(doc)
     }
 }
 
@@ -9388,86 +9702,11 @@ pub(crate) fn compile_materialize_spec(
 /// evaluation, so a placement predicate on a derived column sees the
 /// value the shard will store.
 pub(crate) fn apply_materialize(
-    mut doc: AddDocumentsRequest,
+    doc: AddDocumentsRequest,
     compiled: &[(String, crate::pb::ValueExpr, crate::pb::MaterializeKind)],
 ) -> Result<AddDocumentsRequest, Status> {
-    {
-        let mut env = crate::values::IngestEnv::default();
-        for nv in &doc.numerics {
-            env.numerics.insert(nv.field.clone(), nv.value);
-        }
-        for iv in &doc.integers {
-            env.integers.insert(iv.field.clone(), iv.value);
-        }
-        for iv in &doc.unsigned_integers {
-            env.unsigned_integers.insert(iv.field.clone(), iv.value);
-        }
-        for entry in &doc.map_numerics {
-            env.map_numerics
-                .insert((entry.field.clone(), entry.key.clone()), entry.value);
-        }
-        for entry in &doc.map_integers {
-            env.map_integers
-                .insert((entry.field.clone(), entry.key.clone()), entry.value);
-        }
-        for entry in &doc.map_unsigned_integers {
-            env.map_unsigned_integers
-                .insert((entry.field.clone(), entry.key.clone()), entry.value);
-        }
-        for (name, expr, kind) in compiled {
-            let value = crate::values::eval_ingest(expr, &env).map_err(|e| {
-                Status::invalid_argument(format!("materialize: column {name:?}: {}", e.message()))
-            })?;
-            match value {
-                None => {}
-                Some(crate::values::IngestVal::Bool(_)) => {
-                    return Err(Status::invalid_argument(format!(
-                        "materialize: column {name:?} evaluated a boolean; a stored \
-                         column holds numbers — wrap the expression in a ternary \
-                         (`cond ? 1 : 0`)"
-                    )));
-                }
-                Some(crate::values::IngestVal::Double(v)) => {
-                    if *kind != crate::pb::MaterializeKind::F64 {
-                        return Err(Status::invalid_argument(format!(
-                            "materialize: column {name:?} declares {kind:?} but its \
-                             expression evaluated double on this document; stock CEL \
-                             does not coerce — align the kind or the expression"
-                        )));
-                    }
-                    doc.numerics.push(crate::pb::NumericValue {
-                        field: name.clone(),
-                        value: v,
-                    });
-                }
-                Some(crate::values::IngestVal::Int(v)) => {
-                    if *kind != crate::pb::MaterializeKind::I64 {
-                        return Err(Status::invalid_argument(format!(
-                            "materialize: column {name:?} declares {kind:?} but its \
-                             expression evaluated int on this document; write \
-                             double(...) to land it in the f64 family"
-                        )));
-                    }
-                    doc.integers.push(crate::pb::IntegerValue {
-                        field: name.clone(),
-                        value: v,
-                    });
-                }
-                Some(crate::values::IngestVal::Uint(v)) => {
-                    if *kind != crate::pb::MaterializeKind::U64 {
-                        return Err(Status::invalid_argument(format!(
-                            "materialize: column {name:?} declares {kind:?} but evaluated uint; align the kind or convert explicitly with double()"
-                        )));
-                    }
-                    doc.unsigned_integers.push(crate::pb::UnsignedIntegerValue {
-                        field: name.clone(),
-                        value: v,
-                    });
-                }
-            }
-        }
-    }
-    Ok(doc)
+    let env = crate::derived::ingest_env(&doc, None)?;
+    crate::derived::materialize_into(doc, compiled, &env)
 }
 
 impl NodeServiceImpl {
@@ -9824,12 +10063,13 @@ impl NodeServiceImpl {
         &self,
         doc: AddDocumentsRequest,
         analyzed: crate::postings::AnalyzedDoc,
+        stable_key: Option<&[u8]>,
     ) -> Result<(AddDocumentsRequest, crate::postings::AnalyzedDoc), Status> {
         let (doc, analyzed) = self.materialize_proximity(doc, analyzed)?;
         let (doc, analyzed) = self.materialize_phrases(doc, analyzed)?;
         let doc = materialize_quality(doc, &analyzed)?;
         let doc = materialize_geography(doc, &analyzed)?;
-        let doc = self.materialize_columns(doc)?;
+        let doc = self.materialize_columns(doc, stable_key)?;
         let doc = self.place_document(doc)?;
         Ok((doc, analyzed))
     }
@@ -9853,8 +10093,16 @@ impl NodeServiceImpl {
         // take the one path they already took. Clearing the spec is what
         // makes replay exact — the logged request carries the values, so
         // replay never calls the sidecar and never derives twice.
-        self.check_placement(&doc)?;
-        let (doc, analyzed) = self.materialize_document(doc, analyzed)?;
+        // Live ingest: the node is the only writer of derived values
+        // (docs/derived-columns.md), so a request that carries one, or
+        // a fingerprint, is refused as forged before anything else
+        // looks at it. Logged records never come through here.
+        if let Some(declaration) = self.config.derived.as_deref() {
+            declaration.refuse_carried(&doc)?;
+        }
+        self.check_placement(&doc, stable_routing_key.as_deref())?;
+        let (doc, analyzed) =
+            self.materialize_document(doc, analyzed, stable_routing_key.as_deref())?;
         let _mutation = self.mutation_gate.read().await;
         let mut guard = write_shard(&self.state);
         self.apply_document_locked(
@@ -10819,6 +11067,21 @@ impl NodeServiceImpl {
                 // VECTOR is the dense leg; NONE lands nowhere, visibly.
                 continue;
             };
+            // A derived column is the index's to compute
+            // (docs/derived-columns.md): a plan projecting a source
+            // field into it is refused here, by name, not per document.
+            if self
+                .config
+                .derived
+                .as_deref()
+                .is_some_and(|declaration| declaration.is_derived(name))
+            {
+                return Err(Status::invalid_argument(format!(
+                    "mapped field {} lands as {name:?}, a derived column this index computes \
+                     from its declaration; rename the mapping with a hint",
+                    field.path
+                )));
+            }
             if !table.iter().any(|declared| declared == name) {
                 missing.push(format!("{name:?} ({flag})"));
             }
@@ -15190,6 +15453,7 @@ impl NodeServiceImpl {
             map_numerics: &[],
             map_integers: &[],
             map_unsigned_integers: &[],
+            facets: &[],
         };
         let columns: &dyn crate::values::ColumnLookup = match guard.bm25.as_ref() {
             Some(store) => store,

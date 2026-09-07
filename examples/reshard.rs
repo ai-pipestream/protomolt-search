@@ -71,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              --out-dir=<dir> [--slot-base=B] [--slot-stride=S] [--analysis-addr=ADDR] \
              [--stable-routing] [--placement-tree=<file> [--single-image=<max child rows>] \
              [--spill-bucket-bits=<bits>] [--from-segments] [--only-child=<index>] [--cut-column=<col> \
-             [--cut-rows=<n>]]]"
+             [--cut-rows=<n>]] [--derived-columns=<file> [--derive=a,b]]]"
                 .into(),
         );
     }
@@ -194,6 +194,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
             })
             .transpose()?;
+        // `--derived-columns=<file>` writes the children under that
+        // declaration (a shard map or a bare [[derived]] table,
+        // docs/derived-columns.md); `--derive=a,b` computes those
+        // columns on every row (a column added to the declaration, or
+        // one whose expression changed). Without the file the children
+        // keep the sources' own declaration.
+        let derived = opt("derived-columns")
+            .map(|path| {
+                pipestream_search::derived::load_declaration(Path::new(&path))
+                    .and_then(|spec| pipestream_search::derived::Declaration::compile(&spec))
+                    .map(std::sync::Arc::new)
+                    .map_err(|error| format!("--derived-columns={path}: {error}"))
+            })
+            .transpose()?;
+        let derive: Vec<String> = opt("derive")
+            .map(|names| {
+                names
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
         let placed = reshard::split_placement_tree_logs(
             &generations,
             &tree,
@@ -207,6 +231,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cut,
                 only_child,
                 open_files_limit: None,
+                derived,
+                derive,
             },
             &mut analyze,
         )?;

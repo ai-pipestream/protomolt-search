@@ -51,7 +51,7 @@ preserve exact values and typed edges; column statistics remain incomplete. See
 [integer map queries](docs/integer-map-queries.md) and
 [integer map storage](docs/integer-map-storage.md) for the compatibility gates
 and current validation scope.
-The parallel derived-column design has a
+The derived-column implementation is reconciled on this branch; its
 [reconciliation note](docs/derived-column-reconciliation.md) covering durable
 metadata, evaluator semantics and reserved wire/storage allocations.
 
@@ -1842,6 +1842,27 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   moves within a placement leaf's node set from those rates, excludes a
   device node by declaration, and moves nothing.
   [Bandwidth as the budget](docs/bandwidth-budget.md).
+
+- **Branch checkpoint 2026-09-07: derived columns with exact integer maps.**
+  Preserves the published map wire/storage identifiers and assigns separate
+  derived identifiers. Reads old main derived images and WAL generations,
+  retains both map families in source tables and expressions, and refuses
+  declaration mismatches before row or log mutation. Derived network WAL
+  replay remains unavailable through fresh ingest and is refused before
+  transmission. [Compatibility and remaining replay work](docs/derived-columns.md#compatibility-with-the-parallel-integer-map-branch).
+- **Landed 2026-09-07: derived columns, the index-time computed column.**
+  `DerivedColumns` in the proto and `[[derived]]` in TOML declare CEL value
+  columns computed once at ingest from each document's own values (numbers,
+  timestamps, facet strings, the stable key through `hash.fnv64()`,
+  `calendar.year()`), stored as ordinary typed columns, and usable as the
+  physical shard key: a placement predicate and the reshard tool's cut
+  column may name one. The declaration's fingerprint pins the store (kind
+  17), every segment and the log's manifest (with the complete column
+  table); forged values are refused; a changed declaration is a rebuild
+  through `reshard --derived-columns --derive`, which stores what direct
+  ingest stores; a derived column discloses no more than its inputs.
+  `--derived-columns=<file>`. Tests: `tests/derived_columns.rs`.
+  [Derived columns](docs/derived-columns.md).
 
 - **Landed 2026-09-06: the tree on the shard, and a re-placement split.**
   `--placement-tree=<map or table>` gives a pinned node its leaf's
