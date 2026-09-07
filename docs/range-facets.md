@@ -168,7 +168,7 @@ The bucket rules are stated once and enforced everywhere:
   BEFORE its zero-term/k=0 early return and the nodes run it again: a
   malformed list refuses even when there is no match set to count.
 
-With an empty `key`, the named column may be f64, i64 or u64; a nonempty
+In the legacy form (no `map`), an empty `key` selects f64, i64 or u64; a nonempty
 `key` selects a map-numeric entry. A column has one declared family per shard.
 Different shards may use different numeric families: an interval has the same
 numeric meaning for each, and all values compare exactly across domains.
@@ -206,6 +206,30 @@ double boundaries and omit typed response fields. Use matching client and
 server builds: old nodes cannot execute typed requests, and relays or roots
 refuse responses that lack the requested exact bounds. No index format or
 materialization fingerprint changes are needed for this query feature.
+
+### Explicit map input (2026-09-06)
+
+`RangeFacetField.map` (tag 5) selects a numeric map entry with a literal key,
+including empty. Its `MapRangeFacet` holds the key and either `edges` or
+`typed_edges`. The containing request supplies the column; leave its legacy
+`key`, `edges` and `typed_edges` empty. Mixed selectors refuse. Edge validation,
+exact comparison and half-open membership are shared with the legacy form.
+
+```protobuf
+column: "metrics"
+map { key: "" edges: [-1, 0, 3, 6] }
+```
+
+`RangeFacetCounts.map_key` (optional string, tag 5) is present on every map
+response, even for an empty key or `known=false`. Plain-column responses omit
+it. Explicit map requests require this response context; a root or relay
+refuses a missing or different key before merging counts. Legacy nonempty-key
+requests still accept an older response's matching `key` without `map_key`.
+An older decoder drops the new map input, leaving no edges; existing range
+validation refuses that request rather than counting a plain column. Regenerate
+clients and use updated servers for the new request shape. Ordinary ingestion
+now accepts empty keys; [map semantics](map-columns.md) documents recovery and
+rewrite coverage, and the remaining descriptor-projection limitations.
 
 ## Distribution
 

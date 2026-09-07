@@ -1494,79 +1494,77 @@ fn merge_cardinality(
 /// ascending. A facet field NO shard knows is refused — the same rule
 /// as an unknown scoring field: zeros everywhere would make a typo read
 /// as "no results per anything".
-fn merge_facet_counts(
+pub(crate) fn merge_facet_counts(
     requested: &[String],
     map_requested: &[crate::pb::MapFacetField],
     shard_facets: &[Vec<crate::pb::FacetFieldCounts>],
+    require_known: bool,
 ) -> Result<Vec<crate::pb::FacetFieldCounts>, Status> {
-    // Response order is the request order: plain entries, then map
-    // entries — merged positionally.
-    let want: Vec<(String, String)> = requested
+    let targets: Vec<(&str, Option<&str>)> = requested
         .iter()
-        .map(|name| (name.clone(), String::new()))
+        .map(|name| (name.as_str(), None))
         .chain(
             map_requested
                 .iter()
-                .map(|m| (m.column.clone(), m.key.clone())),
+                .map(|entry| (entry.column.as_str(), Some(entry.key.as_str()))),
         )
         .collect();
-    if want.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut known = vec![false; want.len()];
-    let mut sums: Vec<HashMap<String, u64>> = want.iter().map(|_| HashMap::new()).collect();
-    for per_shard in shard_facets {
-        if per_shard.len() != want.len() {
-            return Err(Status::internal(format!(
-                "shard returned {} facet fields for {} requested",
-                per_shard.len(),
-                want.len()
-            )));
+    let mut known = vec![false; targets.len()];
+    let mut sums: Vec<HashMap<String, u64>> = targets.iter().map(|_| HashMap::new()).collect();
+    for share in shard_facets {
+        if share.len() != targets.len() {
+            return Err(Status::failed_precondition(
+                "facet response has wrong field count",
+            ));
         }
-        for (fi, ff) in per_shard.iter().enumerate() {
-            known[fi] |= ff.known;
-            for c in &ff.counts {
-                *sums[fi].entry(c.value.clone()).or_default() += c.count;
+        for (i, (response, &(field, key))) in share.iter().zip(&targets).enumerate() {
+            let legacy_map = key.is_some_and(|key| !key.is_empty()) && response.map_key.is_none();
+            if response.field != field
+                || response.key != key.unwrap_or_default()
+                || (response.map_key.as_deref() != key && !legacy_map)
+                || (!response.known && !response.counts.is_empty())
+            {
+                return Err(Status::failed_precondition(format!(
+                    "facet response does not match requested column {field:?} and map key {key:?}"
+                )));
+            }
+            known[i] |= response.known;
+            for count in &response.counts {
+                let total = sums[i].entry(count.value.clone()).or_default();
+                *total = total
+                    .checked_add(count.count)
+                    .ok_or_else(|| Status::out_of_range("facet count overflows u64"))?;
             }
         }
     }
-    let unknown: Vec<String> = want
-        .iter()
-        .zip(&known)
-        .filter(|(_, k)| !**k)
-        .map(|((field, key), _)| {
-            if key.is_empty() {
-                format!("{field:?}")
-            } else {
-                format!("{field:?}[{key:?}]")
-            }
-        })
-        .collect();
-    if !unknown.is_empty() {
-        return Err(Status::invalid_argument(format!(
-            "no shard has facet field {}: counting an unknown field would silently answer \
-             zero everywhere. Check the spelling, or the nodes' --facet-fields / \
-             --map-facet-fields.",
-            unknown.join(", ")
-        )));
-    }
-    Ok(want
+    targets
         .into_iter()
+        .zip(known)
         .zip(sums)
-        .map(|((field, key), sum)| {
-            let mut counts: Vec<crate::pb::FacetCount> = sum
+        .map(|(((field, key), known), sum)| {
+            if require_known && !known {
+                let target = match key {
+                    Some(key) => format!("{field:?}[{key:?}]"),
+                    None => format!("{field:?}"),
+                };
+                return Err(Status::invalid_argument(format!(
+                    "no shard has facet field {target}; check --facet-fields / --map-facet-fields"
+                )));
+            }
+            let mut counts: Vec<_> = sum
                 .into_iter()
                 .map(|(value, count)| crate::pb::FacetCount { value, count })
                 .collect();
             counts.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.value.cmp(&b.value)));
-            crate::pb::FacetFieldCounts {
-                field,
-                known: true,
+            Ok(crate::pb::FacetFieldCounts {
+                field: field.to_owned(),
+                key: key.unwrap_or_default().to_owned(),
+                map_key: key.map(str::to_owned),
+                known,
                 counts,
-                key,
-            }
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// Merge per-shard range-facet counts into global counts
@@ -4733,7 +4731,7 @@ impl CoordinatorServiceImpl {
                 unknown_projection.join(", ")
             )));
         }
-        let facets = merge_facet_counts(facet_fields, map_facet_fields, &shard_facets)?;
+        let facets = merge_facet_counts(facet_fields, map_facet_fields, &shard_facets, true)?;
         let ranges = merge_range_counts(range_facet_fields, &shard_ranges)?;
         let stats = merge_column_stats(stats_fields, &shard_stats)?;
         let cardinality = merge_cardinality(cardinality_fields, &shard_distinct)?;
@@ -5888,7 +5886,7 @@ impl CoordinatorServiceImpl {
             mark_known(&mut filter_known, &mask.known);
         }
         refuse_unknown_filter_leaves(filter, &filter_known)?;
-        let facets = merge_facet_counts(facet_fields, map_facet_fields, &shard_facets)?;
+        let facets = merge_facet_counts(facet_fields, map_facet_fields, &shard_facets, true)?;
         let ranges = merge_range_counts(range_facet_fields, &shard_ranges)?;
         if let (Some(heap), Some(fingerprint)) = (&stream_heap, scoring_fingerprint.as_ref()) {
             let snapshot = heap

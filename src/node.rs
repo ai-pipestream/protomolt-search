@@ -1568,6 +1568,7 @@ impl Bm25Shard {
                         known: false,
                         counts: Vec::new(),
                         key: String::new(),
+                        map_key: None,
                     };
                 };
                 let counts = count_by(&|doc| self.facet_ord(fi, doc), self.facet_value_count(fi));
@@ -1576,6 +1577,7 @@ impl Bm25Shard {
                     known: true,
                     counts: to_wire(counts, &|ord| self.facet_value(fi, ord).to_string()),
                     key: String::new(),
+                    map_key: None,
                 }
             })
             .collect();
@@ -1592,6 +1594,7 @@ impl Bm25Shard {
                     known: false,
                     counts: Vec::new(),
                     key: req.key.clone(),
+                    map_key: Some(req.key.clone()),
                 });
                 continue;
             };
@@ -1604,6 +1607,7 @@ impl Bm25Shard {
                 known: true,
                 counts: to_wire(counts, &|ord| self.map_facet_value(ci, ord).to_string()),
                 key: req.key.clone(),
+                map_key: Some(req.key.clone()),
             });
         }
         // Range facets: one value read per matched document, then a
@@ -1618,7 +1622,7 @@ impl Bm25Shard {
             .map(|req| {
                 let intervals = crate::rangefacet::Intervals::new(req)
                     .expect("range facets validated before counting");
-                let source = self.resolve_range_column(&req.column, &req.key);
+                let source = self.resolve_range_column(&req.column, req.map_key());
                 let mut counts = vec![0u64; intervals.len()];
                 if let Some(source) = source {
                     for (wi, &word) in bits.iter().enumerate() {
@@ -1646,7 +1650,7 @@ impl Bm25Shard {
             .iter()
             .map(|name| {
                 use crate::pb::ScalarValueType as Type;
-                let source = self.resolve_range_column(name, "");
+                let source = self.resolve_range_column(name, None);
                 let ty = match source {
                     Some(RangeSource::Numeric(_)) => Type::Number,
                     Some(RangeSource::Integer(_)) => Type::Integer,
@@ -1714,8 +1718,8 @@ impl Bm25Shard {
     /// across kinds, so at most one answers), with a key the
     /// map-numeric column and its key ordinal. `None` = this shard
     /// cannot resolve it, which answers `known: false`.
-    fn resolve_range_column(&self, column: &str, key: &str) -> Option<RangeSource> {
-        if key.is_empty() {
+    fn resolve_range_column(&self, column: &str, key: Option<&str>) -> Option<RangeSource> {
+        if key.is_none() {
             if let Some(ni) = self.numeric_index(column) {
                 return Some(RangeSource::Numeric(ni));
             }
@@ -1727,6 +1731,7 @@ impl Bm25Shard {
                         .map(RangeSource::Unsigned)
                 });
         }
+        let key = key?;
         let ci = self.map_numeric_index(column)?;
         let key_ord = self.map_numeric_key_ord(ci, key)?;
         Some(RangeSource::MapKey {
@@ -2021,11 +2026,10 @@ pub(crate) fn timestamp_to_epoch_micros(
 fn unknown_range_counts(fields: &[crate::pb::RangeFacetField]) -> Vec<crate::pb::RangeFacetCounts> {
     fields
         .iter()
-        .map(|req| crate::pb::RangeFacetCounts {
-            column: req.column.clone(),
-            key: req.key.clone(),
-            known: false,
-            buckets: Vec::new(),
+        .map(|req| {
+            let intervals = crate::rangefacet::Intervals::new(req)
+                .expect("range facets validated before unknown response");
+            intervals.response(vec![0; intervals.len()], false)
         })
         .collect()
 }
@@ -7773,17 +7777,18 @@ impl NodeServiceImpl {
                 facets = req
                     .facet_fields
                     .iter()
-                    .map(|name| (name.clone(), String::new()))
+                    .map(|name| (name.clone(), None))
                     .chain(
                         req.map_facet_fields
                             .iter()
-                            .map(|m| (m.column.clone(), m.key.clone())),
+                            .map(|m| (m.column.clone(), Some(m.key.clone()))),
                     )
                     .map(|(field, key)| crate::pb::FacetFieldCounts {
                         field,
                         known: false,
                         counts: Vec::new(),
-                        key,
+                        key: key.clone().unwrap_or_default(),
+                        map_key: key,
                     })
                     .collect();
                 range_facets = unknown_range_counts(&req.range_facet_fields);
@@ -9956,21 +9961,15 @@ impl NodeServiceImpl {
             }
             slots
         };
-        // Map entries (docs/map-columns.md): unknown columns, empty
-        // keys, repeated (column, key) pairs, and non-finite numeric values
-        // all refuse before anything mutates. An empty string is a present
+        // Map entries (docs/map-columns.md): unknown columns, repeated
+        // (column, key) pairs, and non-finite numeric values refuse before
+        // anything mutates. Empty keys are literal keys. An empty string is a present
         // map value; absence is represented only by an omitted entry.
         let map_facet_slots: Vec<(usize, &str, &str)> = {
             let shard = guard.bm25.as_ref().expect("builder just ensured");
             let mut seen: Vec<(&str, &str)> = Vec::new();
             let mut slots = Vec::with_capacity(doc.map_facets.len());
             for e in &doc.map_facets {
-                if e.key.is_empty() {
-                    return Err(Status::invalid_argument(format!(
-                        "map column {:?}: empty keys are not supported by the current map selector contract",
-                        e.field
-                    )));
-                }
                 if seen.contains(&(e.field.as_str(), e.key.as_str())) {
                     return Err(Status::invalid_argument(format!(
                         "map column {:?} key {:?} repeats in one document (a map holds one \
@@ -9995,12 +9994,6 @@ impl NodeServiceImpl {
             let mut seen: Vec<(&str, &str)> = Vec::new();
             let mut slots = Vec::with_capacity(doc.map_numerics.len());
             for e in &doc.map_numerics {
-                if e.key.is_empty() {
-                    return Err(Status::invalid_argument(format!(
-                        "map column {:?}: empty keys are not supported by the current map selector contract",
-                        e.field
-                    )));
-                }
                 if seen.contains(&(e.field.as_str(), e.key.as_str())) {
                     return Err(Status::invalid_argument(format!(
                         "map column {:?} key {:?} repeats in one document (a map holds one \
@@ -14624,17 +14617,18 @@ impl NodeServiceImpl {
             _ => (
                 req.facet_fields
                     .iter()
-                    .map(|name| (name.clone(), String::new()))
+                    .map(|name| (name.clone(), None))
                     .chain(
                         req.map_facet_fields
                             .iter()
-                            .map(|m| (m.column.clone(), m.key.clone())),
+                            .map(|m| (m.column.clone(), Some(m.key.clone()))),
                     )
                     .map(|(field, key)| crate::pb::FacetFieldCounts {
                         field,
                         known: false,
                         counts: Vec::new(),
-                        key,
+                        key: key.clone().unwrap_or_default(),
+                        map_key: key,
                     })
                     .collect(),
                 unknown_range_counts(&req.range_facet_fields),

@@ -1,25 +1,24 @@
 # Search foundations
 
 Foundation work began on `feat/search-foundations` from `PRE_ASTRA`.
-The latest increment makes a score operation a protobuf oneof, retaining the
-legacy `op` wire tag and adding an explicit map operation with a literal key.
-Map input survives score bounds, column knowledge, candidate-scoped signals,
-relay queries and explanations. Empty keys are distinct from no map selector,
-and zero values remain distinct from missing entries. Older peers refuse the
-new operation; existing valid score-stage bytes remain identical. Regenerated
-Rust callers use the operation oneof. [Score input](score-functions.md#explicit-map-input-2026-09-06)
-records the contract and compatibility limits. Combined validation against
-main `41ca93c` passed 1,249 tests (one existing live OpenNLP test ignored),
-all five mobile Rust target checks, test/example compilation and the scoped
-protobuf compatibility check. The subsequent benchmark document update on main
-`b65be06` is incorporated with the validated source unchanged.
+The latest increment enables literal empty keys in ordinary map ingestion.
+Explicit map range inputs and presence-bearing count responses preserve map
+context through roots and relays. Tests cover explicit WAL rebuild, image reopen,
+compaction, projections, counts and map aggregates. [Map counts](map-columns.md#explicit-map-counts-and-ingestion-2026-09-06)
+records the contract and compatibility limits. Descriptor-driven map projection
+and exact integer map storage still require implementation.
 
-The preceding map string-selector increment on main `41ca93c` carries map
-context through filters, placement and field-use checks. It passed 1,244 tests
-and five mobile checks. Main `66094fc` preserved present empty map strings
-through ordinary ingestion and storage rewrites. These increments do not yet
-enable descriptor-driven map projection or public empty-key ingestion;
-range-facet and statistics selectors remain unfinished.
+Combined validation against main `46099c7` passed 1,253 tests (one existing
+live OpenNLP test ignored), all five mobile Rust checks, test/example
+compilation and the scoped protobuf compatibility check. Automatic replay on
+node open remains a recovery integration gap; the WAL test exercises explicit
+rebuild after the flush barrier. Remote authorization, remaining protobuf
+shapes and transactional identity/publication remain required.
+
+The preceding score-input checkpoint on main `46099c7` passed 1,249 tests and
+all five mobile Rust checks. Main `41ca93c` carries map context through string
+filters, placement and field-use checks; main `66094fc` preserved present empty
+map strings through ordinary ingestion and storage rewrites.
 
 The preceding explicit index-definition increment retains canonical policy
 through image/WAL, snapshots, replication and rebuild. Replica retries cross

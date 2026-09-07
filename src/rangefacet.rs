@@ -31,34 +31,60 @@ fn display(value: NumBound) -> f64 {
     }
 }
 
+impl RangeFacetField {
+    /// Literal map key; presence distinguishes an empty key from a plain column.
+    pub(crate) fn map_key(&self) -> Option<&str> {
+        self.map
+            .as_ref()
+            .map(|map| map.key.as_str())
+            .or_else(|| (!self.key.is_empty()).then_some(self.key.as_str()))
+    }
+}
+
 pub(crate) struct Intervals<'a> {
     request: &'a RangeFacetField,
     edges: Vec<NumBound>,
+    key: Option<&'a str>,
+    typed_edges: &'a [crate::pb::FilterBound],
 }
 impl<'a> Intervals<'a> {
     pub(crate) fn new(request: &'a RangeFacetField) -> Result<Self, Status> {
         let invalid = |why| {
             Status::invalid_argument(format!(
                 "range facet {:?}[{:?}]: {why}",
-                request.column, request.key
+                request.column,
+                request.map_key().unwrap_or_default()
             ))
         };
         if request.column.is_empty() {
             return Err(invalid("a request names the column it buckets"));
         }
-        if !request.edges.is_empty() && !request.typed_edges.is_empty() {
+        let key = request.map_key();
+        let (raw_edges, typed_edges) = match &request.map {
+            Some(map) => {
+                if !request.key.is_empty()
+                    || !request.edges.is_empty()
+                    || !request.typed_edges.is_empty()
+                {
+                    return Err(invalid(
+                        "map input carries its own key and edges; leave legacy fields empty",
+                    ));
+                }
+                (&map.edges, &map.typed_edges)
+            }
+            None => (&request.edges, &request.typed_edges),
+        };
+        if !raw_edges.is_empty() && !typed_edges.is_empty() {
             return Err(invalid("supply either edges or typed_edges, never both"));
         }
-        let edges = if request.typed_edges.is_empty() {
-            request
-                .edges
+        let edges = if typed_edges.is_empty() {
+            raw_edges
                 .iter()
                 .copied()
                 .map(NumBound::F)
                 .collect::<Vec<_>>()
         } else {
-            request
-                .typed_edges
+            typed_edges
                 .iter()
                 .map(|edge| {
                     if edge.exclusive {
@@ -90,7 +116,12 @@ impl<'a> Intervals<'a> {
         {
             return Err(invalid("edges must be strictly ascending"));
         }
-        Ok(Self { request, edges })
+        Ok(Self {
+            request,
+            edges,
+            key,
+            typed_edges,
+        })
     }
     pub(crate) fn len(&self) -> usize {
         self.edges.len() - 1
@@ -105,7 +136,8 @@ impl<'a> Intervals<'a> {
         debug_assert_eq!(counts.len(), self.len());
         RangeFacetCounts {
             column: self.request.column.clone(),
-            key: self.request.key.clone(),
+            key: self.key.unwrap_or_default().to_owned(),
+            map_key: self.key.map(str::to_owned),
             known,
             buckets: if known {
                 counts
@@ -115,8 +147,8 @@ impl<'a> Intervals<'a> {
                         from: display(self.edges[i]),
                         to: display(self.edges[i + 1]),
                         count,
-                        typed_from: self.request.typed_edges.get(i).cloned(),
-                        typed_to: self.request.typed_edges.get(i + 1).cloned(),
+                        typed_from: self.typed_edges.get(i).cloned(),
+                        typed_to: self.typed_edges.get(i + 1).cloned(),
                     })
                     .collect()
             } else {
@@ -128,10 +160,18 @@ impl<'a> Intervals<'a> {
         let malformed = || {
             Status::failed_precondition(format!(
                 "range facet {:?}[{:?}]: child response does not match requested intervals",
-                self.request.column, self.request.key
+                self.request.column,
+                self.key.unwrap_or_default()
             ))
         };
-        if response.column != self.request.column || response.key != self.request.key {
+        if response.column != self.request.column || response.key != self.key.unwrap_or_default() {
+            return Err(malformed());
+        }
+        let legacy_nonempty_map =
+            self.request.map.is_none() && self.key.is_some_and(|key| !key.is_empty());
+        if response.map_key.as_deref() != self.key
+            && !(legacy_nonempty_map && response.map_key.is_none())
+        {
             return Err(malformed());
         }
         if !response.known {
@@ -198,7 +238,7 @@ pub(crate) fn merge(
             if require_known && !known {
                 return Err(Status::invalid_argument(format!(
                 "no shard has range-facet column {:?}[{:?}]; check --numeric-fields / --integer-fields / --unsigned-integer-fields / --map-numeric-fields",
-                plan.request.column, plan.request.key
+                plan.request.column, plan.key.unwrap_or_default()
             )));
             }
             Ok(plan.response(counts, known))

@@ -145,8 +145,8 @@ async fn empty_key_ranges_and_prefixes_survive_node_and_relay_wire() {
         let mut addresses = Vec::new();
         let mut handles = Vec::new();
         for leaf in 0..2 {
-            // Low-level storage already supports empty keys. Public ingestion
-            // remains gated until score/count selectors can represent them.
+            // Exercise prepared heap and mapped dictionaries here; the
+            // ingestion and rewrite lifecycle is covered in map_value_presence.
             let mut store = Bm25Store::new().with_map_facets(&["meta"]);
             for (row, value) in [Some("map"), Some("a"), Some(""), None].iter().enumerate() {
                 store.add_document(

@@ -2295,8 +2295,8 @@ message MapFacetEntry {
   // Map column name; must exist in the shard's map-facet table
   // (--map-facet-fields). Unknown names are INVALID_ARGUMENT.
   string field = 1;
-  // The entry's key. Empty keys are currently unsupported. At most one
-  // value per (document, field, key); omit the entry to represent absence.
+  // The literal key, including empty. At most one value per (document,
+  // field, key); omit the entry to represent absence.
   string key = 2;
   // The exact value. Empty is present; omit the entry to represent absence.
   string value = 3;
@@ -2311,7 +2311,7 @@ message MapNumericEntry {
   // Map column name; must exist in the shard's map-numeric table
   // (--map-numeric-fields).
   string field = 1;
-  // The entry's key. Non-empty; at most one per (document, field, key).
+  // The literal key, including empty; at most one per (document, field, key).
   string key = 2;
   // The value. Finite.
   double value = 3;
@@ -3165,6 +3165,21 @@ message RangeFacetField {
   // may mix. For the full u64 domain use uint(0) through num(2^64), which
   // is exactly representable. Requires matching server and client builds.
   repeated FilterBound typed_edges = 4;
+  // Explicit map input, including an empty key. All legacy key/edge fields
+  // must be empty. An older server drops this field and refuses its resulting
+  // empty edge list rather than counting a plain column.
+  MapRangeFacet map = 5;
+}
+
+// Numeric map entry and requested intervals. The containing RangeFacetField
+// supplies the column. Edge validation and exact comparison rules are shared
+// with the legacy range-facet form.
+message MapRangeFacet {
+  // Literal key, including empty.
+  string key = 1;
+  // Supply either edges or typed_edges, never both.
+  repeated double edges = 2;
+  repeated FilterBound typed_edges = 3;
 }
 
 // One bucket's count within one range facet.
@@ -3197,6 +3212,9 @@ message RangeFacetCounts {
   // Counts are additive, so the coordinator's merge is the positional
   // sum. Empty when `known` is false.
   repeated RangeBucket buckets = 4;
+  // Map context with explicit key presence, including empty. Nodes echo this
+  // on map responses even when known=false; plain columns leave it absent.
+  optional string map_key = 5;
 }
 
 // One map-facet count request: a (column, key) pair. Structured rather
@@ -3688,6 +3706,9 @@ message FacetFieldCounts {
   // dictionary" — the same partial-knowledge rule, applied per key so
   // a typo'd key cannot read as zero results everywhere.
   string key = 4;
+  // Map context with explicit key presence, including empty. Nodes echo this
+  // on map responses even when known=false; plain columns leave it absent.
+  optional string map_key = 5;
 }
 
 // Reads raw texts from the doc store.

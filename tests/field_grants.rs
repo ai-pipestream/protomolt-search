@@ -435,6 +435,24 @@ async fn every_field_read_is_checked_before_statistics_and_user_aliases_cannot_b
     }];
     requests.push(q);
     let mut q = query();
+    q.range_facet_fields = vec![RangeFacetField {
+        column: "metrics".into(),
+        map: Some(MapRangeFacet {
+            key: String::new(),
+            edges: vec![0.0, 1.0],
+            ..Default::default()
+        }),
+        ..Default::default()
+    }];
+    requests.push(q);
+    let mut q = query();
+    q.map_facet_fields = vec![MapFacetField {
+        column: "tags".into(),
+        key: String::new(),
+    }];
+    requests.push(q);
+
+    let mut q = query();
     q.score_stages = vec![ScoreStage {
         column: "boost".into(),
         operation: Some(pipestream_search::pb::score_stage::Operation::Op(

@@ -1222,6 +1222,12 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **2026-09-06 — Empty map keys and count context.** Ordinary map ingestion
+  accepts literal empty keys. Explicit map range inputs and presence-bearing
+  count responses prevent scalar/map confusion through nested relays. Explicit
+  WAL rebuild, image reopen, compaction, projections and map aggregates retain
+  empty values and numeric zero. Descriptor-driven map projection and exact
+  integer maps remain unfinished. See [map counts](docs/map-columns.md#explicit-map-counts-and-ingestion-2026-09-06).
 - **2026-09-06 — Explicit map score input.** Score-stage operations now have
   a protobuf oneof with an explicit map-key input, including the empty key.
   Scoring, bounds, fetched signals and explanations retain that key through
@@ -1230,13 +1236,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 - **2026-09-06 — Map string filters keep their key context.** Empty-key
   ordering and prefixes no longer read a same-named plain column. Explicit
   protobuf filter variants preserve map context through node and relay queries,
-  placement and field-use checks. Other empty-key selectors and public ingestion
-  remain unfinished. See [map selectors](docs/map-columns.md#explicit-map-string-selectors-2026-09-06).
+  placement and field-use checks. The subsequent count contract enables empty-key
+  ingestion. See [map selectors](docs/map-columns.md#explicit-map-string-selectors-2026-09-06).
 - **2026-09-06 — Empty map values preserve presence.** A present empty string
   now survives ordinary protobuf ingestion, query projections, facet counts
   and storage rewrites. Missing keys remain absent. This uses the existing
-  storage format; descriptor-driven map projection and empty-key selectors
-  remain unfinished. See [map semantics](docs/map-columns.md#empty-string-values-2026-09-06).
+  storage format; descriptor-driven map projection remains unfinished. The later
+  selector/count increments enable empty keys. See [map semantics](docs/map-columns.md#empty-string-values-2026-09-06).
 - **2026-09-06 — Explicit protobuf index definitions.** Plan and bind an
   occurrence-specific policy using field-number paths, concrete column kinds,
   names, roles and dimensions. Unlisted fields stay source-only; descriptor hints

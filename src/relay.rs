@@ -1747,14 +1747,10 @@ pub fn merge_bm25_responses(
     req: &Bm25QueryRequest,
     shares: Vec<Bm25QueryResponse>,
 ) -> Result<Bm25QueryResponse, Status> {
-    let facet_slots = req.facet_fields.len() + req.map_facet_fields.len();
     crate::node::validate_range_facet_fields(&req.range_facet_fields)?;
     let mut range_shares = Vec::new();
     let mut hits = Vec::new();
-    let mut facet_known = vec![false; facet_slots];
-    let mut facet_names: Vec<(String, String)> = Vec::new();
-    let mut facet_sums: Vec<HashMap<String, u64>> =
-        (0..facet_slots).map(|_| HashMap::new()).collect();
+    let mut facet_shares = Vec::new();
     let mut stage_known = None;
     let mut geo_known = None;
     let mut filter_known = None;
@@ -1763,27 +1759,7 @@ pub fn merge_bm25_responses(
     let mut segments_total: u32 = 0;
     let mut segments_skipped: u32 = 0;
     for (shard, share) in shares.into_iter().enumerate() {
-        if share.facets.len() != facet_slots {
-            return Err(Status::internal(format!(
-                "relay: child {shard} answered {} facet fields for {facet_slots} requested",
-                share.facets.len()
-            )));
-        }
-        for (fi, ff) in share.facets.iter().enumerate() {
-            if facet_names.len() <= fi {
-                facet_names.push((ff.field.clone(), ff.key.clone()));
-            }
-            facet_known[fi] |= ff.known;
-            for c in &ff.counts {
-                let acc = facet_sums[fi].entry(c.value.clone()).or_default();
-                *acc = acc.checked_add(c.count).ok_or_else(|| {
-                    Status::internal(format!(
-                        "relay: facet {:?} value {:?} count overflows u64 across children",
-                        ff.field, c.value
-                    ))
-                })?;
-            }
-        }
+        facet_shares.push(share.facets);
         range_shares.push(share.range_facets);
         merge_known(
             "stage-column",
@@ -1838,24 +1814,12 @@ pub fn merge_bm25_responses(
     } else {
         0.0
     };
-    let facets = facet_names
-        .into_iter()
-        .zip(facet_known)
-        .zip(facet_sums)
-        .map(|(((field, key), known), sum)| {
-            let mut counts: Vec<crate::pb::FacetCount> = sum
-                .into_iter()
-                .map(|(value, count)| crate::pb::FacetCount { value, count })
-                .collect();
-            counts.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.value.cmp(&b.value)));
-            crate::pb::FacetFieldCounts {
-                field,
-                known,
-                counts: if known { counts } else { Vec::new() },
-                key,
-            }
-        })
-        .collect();
+    let facets = crate::coordinator::merge_facet_counts(
+        &req.facet_fields,
+        &req.map_facet_fields,
+        &facet_shares,
+        false,
+    )?;
     let range_facets = crate::rangefacet::merge(&req.range_facet_fields, &range_shares, false)?;
     Ok(Bm25QueryResponse {
         hits,

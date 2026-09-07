@@ -101,17 +101,20 @@ number, which is the whole point of the kinded table.
   inside a present `MapFacetEntry`. Equality, ordering, projected values and
   counts retain it. No NaN sentinel exists in map pairs; non-finite numeric
   values are refused at ingest.
-- Empty keys remain unsupported by ingestion. Several shared selector
-  contracts still use an empty key to select a plain column; accepting such
-  entries before replacing that ambiguity would permit incorrect queries.
+- Empty keys are literal keys in ordinary `AddDocuments` map entries.
+  Dedicated map predicates, explicit map score/range inputs and `MapRead`
+  distinguish them from plain columns. Legacy selectors retain their meaning;
+  use the explicit map forms to select an empty key.
 - **Counting**: `MapFacetField { column, key }` entries ride the same
   count-then-rank pass as plain facets — resolve (column, key) to a
   shard-local key ordinal once, then one binary search per matched
-  document. Counts are additive; the coordinator merges positionally
-  and sorts count-desc, value-asc. Answered in `facets` after the plain
-  entries with `FacetFieldCounts.key` set.
-- **Scoring**: `ScoreStage.key` selects a map-numeric entry; bounds
-  lift from THAT KEY's min/max. All score-function contracts unchanged.
+  document. Counts are additive; roots and relays validate each response's
+  column and key before merging, then sort count-desc, value-asc. Map entries
+  follow plain entries in `facets`, with `FacetFieldCounts.map_key` present
+  even for an empty key. The legacy `key` also echoes the key.
+- **Scoring**: `ScoreStage.map_op` selects a map-numeric entry, including an
+  empty key; bounds use that key's min/max. Legacy operations with a nonempty
+  `ScoreStage.key` still select a map entry. See [score input](score-functions.md).
 - **The typo rule goes down to the key.** A shard lacking the column or
   the key answers known=false and contributes nothing (its documents
   genuinely hold no entries — exact, not degraded). A (column, key)
@@ -186,8 +189,8 @@ Tests cover heap and mapped dictionaries, absent keys and empty values, Kleene
 negation, direct and two-level relay queries over gRPC, placement evaluation and
 pruning, field-use denial before statistics, and decoding against the preceding
 12-variant filter descriptor. The descriptor comparison permits only these two
-additive fields. Public empty-key ingestion still refuses until the remaining
-shared selectors below preserve this context end to end.
+additive fields. Empty-key ingestion was gated at that checkpoint; the count
+contract below completes the ordinary ingestion path.
 
 Combined validation against main `66094fc` passed 507 library tests, 723
 integration tests across 124 targets, 12 embedded tests and two IVF tests
@@ -204,8 +207,53 @@ that preserves a literal empty key. Scoring, bounds, column knowledge, fetched
 signals and explanations carry that distinction through current relays.
 [Score input](score-functions.md#explicit-map-input-2026-09-06) describes the
 contract, generated-client migration and old-peer refusal. Existing operation
-wire encodings remain byte-identical. Range-facet and statistics selectors still
-need explicit map context before public empty-key ingestion can be enabled.
+wire encodings remain identical. The subsequent count contract below enables
+empty-key ingestion through the ordinary column API.
+
+### Explicit map counts and ingestion (2026-09-06)
+
+Ordinary `AddDocuments` now accepts empty map keys for strings and finite
+numbers. A present empty string or numeric zero remains distinct from an
+omitted entry. Duplicate keys, unknown columns and non-finite values still
+refuse before mutation. Descriptor-driven map extraction remains source-only.
+
+`RangeFacetField.map` carries `MapRangeFacet { key, edges, typed_edges }` with
+a literal key, including empty. Keep the outer legacy key and edge lists
+empty; mixed forms refuse. The same half-open, exact typed-edge rules apply
+inside the map input. An older decoder drops this new field and leaves an
+invalid empty edge list, so it cannot reinterpret the request as a plain range.
+See [range facets](range-facets.md#explicit-map-input-2026-09-06).
+
+`FacetFieldCounts.map_key` and `RangeFacetCounts.map_key` retain map context
+with protobuf presence. Nodes echo them on known and unknown map responses;
+plain responses omit them. Roots and relays reject a different column/key,
+missing context for empty-key counts, unknown responses carrying counts, and
+count overflow. Explicit map ranges require this context for every key;
+legacy nonempty-key requests can still accept an older response's key echo.
+Range merges also validate every interval edge before adding counts.
+
+`tests/map_count_presence.rs` covers typed intervals and boundaries, old-decoder
+refusal, ambiguous inputs, forged response identity and overflow.
+`tests/map_value_presence.rs` covers named and empty keys, missing entries,
+string and numeric projections, facet and range counts, and Aggregate count,
+sum and mean through direct and two-level relay gRPC queries. It exercises
+both storage layouts, explicit WAL rebuild, image reopen, and compaction that
+renumbers rows. Field-grant tests deny map count requests before statistics.
+The WAL check uses the explicit reshard replay path after the flush persistence
+barrier; the rebuild reads log records independently of the source images.
+Automatic WAL replay on node open is not implemented: an interrupted bulk
+build refuses to open. This remains a durability/recovery integration gap.
+Storage encodings are unchanged. Deploy matching servers for empty-key queries;
+older ingestion servers may still refuse empty keys.
+
+Validation against main `46099c7` passed 507 library tests, 732 integration
+tests across 126 targets, 12 embedded tests and two IVF tests (1,253 total;
+one existing live OpenNLP test ignored). All five Android/iOS Rust target
+checks, test/example compilation, formatting and vendored-proto checks passed.
+Descriptor comparison permits only `RangeFacetField.map`, `MapRangeFacet`,
+and the optional `map_key` fields on the two count responses; preceding wire
+declarations are unchanged. This is local validation with two build jobs and
+four test threads. No fleet deployment was performed.
 
 ### Remaining map work
 
@@ -216,16 +264,11 @@ independently of the chosen projections. Current direct `AddDocuments` entries
 require unique keys; they are already materialized values, not raw protobuf map
 wire occurrences to merge.
 
-An empty key must be distinguishable from no key in every selector shared by
-scalar and map columns. String range/prefix predicates and their placement evaluation now have explicit
-map variants. Score stages now carry explicit map operations too. Range-facet requests,
-statistics and their response contracts still require that distinction. Use an
-explicit typed target or presence-bearing selector, with mixed-version refusal
-where a peer could otherwise ignore that distinction. Existing dedicated map
-predicates and `MapRead` already carry map context; they must preserve the same
-key semantics through planning, caches and authorization. Until that is wired
-end to end, empty keys remain a named ingestion refusal, not an alias for a
-plain field. These gaps remain part of the search foundation goal.
+The legacy `stats_fields` and `cardinality_fields` request lists name plain
+columns. They are not CEL expressions or map selectors. Map statistics use
+`Aggregate` with an explicit `MapRead` expression, such as `metrics['']`.
+Descriptor-driven map projection and exact integer map storage remain part of
+the search foundation goal.
 
 ## Original sequencing notes (2026-08-03)
 

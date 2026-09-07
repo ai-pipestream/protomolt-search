@@ -50,8 +50,8 @@ ambiguous selectors, invalid map transforms, absence versus zero, heap and
 mapped reads, and direct and two-level relay scoring. Positive and negative
 linear boosts, log boosts, decay and a chain agree bit for bit with a full-row
 calculation; explanations and candidate-scoped signals retain the map input.
-Public empty-key ingestion remains gated while range-facet and statistics
-selectors are unfinished. This change does not alter storage formats.
+The subsequent [map count contract](map-columns.md#explicit-map-counts-and-ingestion-2026-09-06)
+enables ordinary empty-key ingestion. Storage formats are unchanged.
 
 Validation against main `41ca93c` passed 507 library tests, 728 integration
 tests across 125 targets, 12 embedded tests and two IVF tests (1,249 total;
