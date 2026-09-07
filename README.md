@@ -1843,6 +1843,11 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   device node by declaration, and moves nothing.
   [Bandwidth as the budget](docs/bandwidth-budget.md).
 
+- **Branch checkpoint 2026-09-07: replay authority freshness.**
+  Reopening a journal no longer restores permission from a persisted allow
+  decision. Admission needs a bounded live authority refresh; disconnects,
+  expired proofs and late replies fence it. Format 3 prevents older receivers
+  from bypassing the freshness requirement. [Trusted replay](docs/trusted-replay.md).
 - **Branch checkpoint 2026-09-07: persisted replay admission.**
   The receiver checks a typed authority decision and the verified TLS peer in
   the frame's durable transaction. Revocation survives reopen, history/epoch

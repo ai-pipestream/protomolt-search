@@ -17,7 +17,11 @@ use crate::pb::{
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("metadata");
 const FRAMES: TableDefinition<u64, &[u8]> = TableDefinition::new("frames");
 const FORMAT: u32 = 1;
-const AUTHORIZED_FORMAT: u32 = 2;
+const LEGACY_AUTHORIZED_FORMAT: u32 = 2;
+const AUTHORIZED_FORMAT: u32 = 3;
+
+mod authority;
+pub use authority::{ReplayAuthorityRefresh, ReplayAuthoritySession, MAX_AUTHORITY_VALIDITY};
 pub const MAX_FRAME_BYTES: usize = 64 << 20;
 
 fn storage(error: impl std::fmt::Display) -> Status {
@@ -144,6 +148,9 @@ pub struct ReplayJournal {
     database: Database,
     binding: ReplayStreamBinding,
     digest: Vec<u8>,
+    authority: std::sync::Mutex<authority::Freshness>,
+    #[cfg(test)]
+    authority_clock: std::sync::Arc<dyn Fn() -> std::time::Instant + Send + Sync>,
     // Drop the database before releasing the portable exclusive file lock.
     _file_lock: File,
 }
@@ -188,6 +195,9 @@ impl ReplayJournal {
             database,
             binding,
             digest,
+            authority: Default::default(),
+            #[cfg(test)]
+            authority_clock: std::sync::Arc::new(std::time::Instant::now),
             _file_lock: file,
         };
         if new {
@@ -222,8 +232,10 @@ impl ReplayJournal {
         frames: &impl ReadableTable<u64, &'static [u8]>,
     ) -> Result<ReplayJournalHeader, Status> {
         let header: ReplayJournalHeader = decode(bytes)?;
-        if !matches!(header.format_version, FORMAT | AUTHORIZED_FORMAT)
-            || header.binding.as_ref() != Some(&self.binding)
+        if !matches!(
+            header.format_version,
+            FORMAT | LEGACY_AUTHORIZED_FORMAT | AUTHORIZED_FORMAT
+        ) || header.binding.as_ref() != Some(&self.binding)
             || header.binding_sha256 != self.digest
         {
             return Err(Status::failed_precondition(
@@ -334,6 +346,9 @@ impl ReplayJournal {
     ) -> Result<ReplayJournalReceipt, Status> {
         validate_frame(&self.digest, frame)?;
         let encoded = frame.encode_to_vec();
+        // Global lock order: authority then database. Keep the guard through
+        // commit so session closure and admission have one ordered boundary.
+        let authority = self.lock_authority()?;
         let mut tx = self.database.begin_write().map_err(storage)?;
         tx.set_durability(Durability::Immediate).map_err(storage)?;
         {
@@ -348,12 +363,18 @@ impl ReplayJournal {
             )?;
             let policy = self.read_policy(&header, &meta)?;
             self.authorize_peer(policy.as_ref(), peer, header.admission_fenced)?;
+            if peer.is_some() {
+                authority.check(self.authority_now(), header.format_version)?;
+            }
             if frame.sequence <= header.accepted_sequence {
                 let held = self.read_frame(&frames, frame.sequence)?;
                 if held != *frame {
                     return Err(Status::already_exists(
                         "replay sequence already names different content",
                     ));
+                }
+                if peer.is_some() {
+                    authority.check(self.authority_now(), header.format_version)?;
                 }
                 return Ok(self.receipt(frame, true));
             }
@@ -372,14 +393,16 @@ impl ReplayJournal {
             let header = header.encode_to_vec();
             meta.insert("header", header.as_slice()).map_err(storage)?;
         }
+        if peer.is_some() {
+            authority.check(self.authority_now(), AUTHORIZED_FORMAT)?;
+        }
         tx.commit().map_err(storage)?;
         Ok(self.receipt(frame, false))
     }
 
-    /// Install a decision from the trusted control publisher. There is no
-    /// sender-facing route to this method. Revocation and frame acceptance
-    /// serialize through the same durable write transaction.
-    pub fn publish_authorization(&self, policy: &ReplayAdmissionPolicy) -> Result<(), Status> {
+    // Called only while holding the authority mutex; persistence cannot open
+    // admission unless the live-session wrapper also confirms freshness.
+    fn persist_authorization(&self, policy: &ReplayAdmissionPolicy) -> Result<(), Status> {
         Self::validate_policy(policy)?;
         if policy.binding_sha256 != self.digest {
             return Err(Status::failed_precondition(
@@ -405,13 +428,16 @@ impl ReplayJournal {
                     ));
                 }
                 if held.revision == policy.revision {
-                    return if held == *policy {
-                        Ok(())
-                    } else {
-                        Err(Status::already_exists(
+                    if held != *policy {
+                        return Err(Status::already_exists(
                             "replay policy revision already names another decision",
-                        ))
-                    };
+                        ));
+                    }
+                    if header.format_version == AUTHORIZED_FORMAT {
+                        return Ok(());
+                    }
+                    // Identical legacy decisions still need the durable format
+                    // upgrade so older receivers cannot bypass live freshness.
                 }
             } else if header.accepted_sequence != 0 {
                 return Err(Status::failed_precondition("cannot authorize a journal with unassigned accepted history; start a new assignment"));
@@ -480,7 +506,7 @@ impl ReplayJournal {
         let stored = meta.get("admission").map_err(storage)?;
         match (header.format_version, stored) {
             (FORMAT, None) if !header.admission_fenced => Ok(None),
-            (AUTHORIZED_FORMAT, Some(stored)) => {
+            (LEGACY_AUTHORIZED_FORMAT | AUTHORIZED_FORMAT, Some(stored)) => {
                 // Bound allocation before protobuf decode, including tampered files.
                 if stored.value().len() > 8192 {
                     return Err(Status::data_loss(

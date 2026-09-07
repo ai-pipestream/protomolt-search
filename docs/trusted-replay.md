@@ -94,11 +94,12 @@ current source/target histories and writer epochs, explicit residency and
 an enable decision. This API is not a credential endpoint for senders.
 
 First publication is allowed only before any locally accepted frames. It
-atomically upgrades the journal to format 2 and persists the policy. An old
-format-1 reader refuses that journal; missing policy or a mismatched format
+atomically upgrades the journal to format 3 and persists the policy. Older
+receivers refuse that format; missing policy or a mismatched format
 also refuses. Exact policy retries are idempotent, conflicting reuse of a
 revision refuses, and an authority change or older revision cannot overwrite
-the decision. Unrelated higher revisions leave an unchanged assignment usable.
+the decision. Unrelated higher revisions do not retire an unchanged assignment; live
+permission renewal is described below.
 
 `accept_authenticated` takes its peer identity only from tonic's verified TLS
 leaf certificate, hashing the DER bytes with SHA-256. The receiver checks the
@@ -120,6 +121,46 @@ authority or prove that a publisher observed current state. Assignment issuance,
 baseline/selector verification, authority delivery and the index application
 commit boundary must be connected before exposing a replay RPC. No production
 listener, placement worker, fresh-ingest route or fleet process changes here.
+
+## Live authority freshness
+
+A persisted allow decision is a rollback floor, not evidence of current
+permission. Opening a journal begins with admission closed. Plain
+`publish_authorization` also closes admission and invalidates outstanding
+sessions; it is the durable offline-installation/revocation path.
+
+The trusted publisher owns a `ReplayAuthoritySession`. It begins a refresh
+**before** asking the authority for a verified current decision, using the
+remaining validity supported by that authority proof (at most 30 seconds).
+The response can publish only within that original monotonic deadline and
+only if it belongs to the newest refresh of the current session. Queueing,
+network latency and persistence consume the window; receipt time never starts
+a new window. Failed publication leaves admission closed. An unchanged policy
+may renew a valid proof without changing the stream binding or its digest.
+
+Dropping the session, replacing the subscription or calling
+`suspend_authorization` fences acceptance and invalidates late replies. The
+publisher must do this on disconnect, loss of authority proof or shutdown;
+if it stops running without cleanup, deadline checks still stop admission.
+Session creation alone grants nothing. The authority mutex is always taken
+before a journal write transaction and held through commit, ordering session
+closure with acceptance. Freshness is checked after waiting for the lock and
+again before commit or retry acknowledgment. An admitted storage commit may
+finish after its admission decision; this is not an index writer lease or a
+promise that I/O can be interrupted at the deadline.
+
+Format-2 policies remain readable for recovery, but accepting a peer frame
+requires format 3 and a live refresh. Republishing the exact legacy decision
+under a verified refresh upgrades the format durably. Older receivers therefore
+cannot reopen the upgraded journal and restore the former permissive behavior.
+Freshness itself is process-local and never restored from disk.
+
+The session/refresh handles are local capabilities for a trusted publisher,
+not remote credentials. They do not establish that an authority response is
+valid. The publisher still needs an authenticated, current authority protocol
+and must derive the allowed validity from it; it cannot substitute a cached
+map, a client-supplied TTL or periodic replay of an old policy. The data-plane
+application proof and writer fences remain separate required work.
 
 ## Work remaining before network replay
 
@@ -166,7 +207,7 @@ confirmed that existing production paths did not change during the final
 journal correction. These are local results; no fleet rollout or hosted CI
 result is implied.
 
-## Admission gate validation
+## Admission gate checkpoint 24a476d validation
 
 This increment passed 563 local tests: the full unit suite (533, including
 nine admission tests), nine journal integration tests, seven security tests,
@@ -185,3 +226,24 @@ corruption. A real loopback mTLS fixture verifies certificate-based admission:
 CA membership is insufficient, metadata cannot supply identity, and revoking
 the peer denies further retries over the same established TLS channel. No
 production replay RPC or live-fleet claim is implied by that fixture.
+
+## Freshness validation
+
+The restart regression first failed against checkpoint `24a476d`: reopening a
+journal accepted a frame using only the persisted allow decision. After the
+fix, final validation passed 570 tests: the full unit suite (540, including
+16 admission/freshness tests), nine journal integration tests, seven security
+tests, 12 embedded tests and two IVF adapter tests. The five Android/iOS target
+checks, test/example compilation, formatting, vendored-proto checks and
+existing-field descriptor comparisons passed. The complete integration suite
+was not rerun for this isolated receiver change. Source hashes remained stable
+through final validation; all builds/tests used an 8 GiB cap, no swap and two
+Cargo build jobs.
+
+A controllable monotonic test clock verifies delayed-response expiry and time
+spent waiting for admission without sleeps. Tests also cover restart, session
+drop, disconnect, late or superseded replies, failed publication, bounded
+validity, unchanged-policy renewal, and format-2 recovery/upgrade. The mTLS
+fixture now proves that suspending authority rejects retries on the existing
+connection until a new verified local refresh is installed. It still does not
+expose a production replay RPC or establish a live-fleet result.
