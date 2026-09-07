@@ -66,3 +66,13 @@ message SourceIndexOwner {
   bytes index_key = 3;
   string collection = 4;
 }
+
+// Local artifact comparison, not an authorization grant or a write receipt.
+// The maintenance publisher must compute this from its held before/after views.
+message SourceRewriteCertificate {
+  uint32 format_version = 1;
+  SourceIndexOwner owner = 2;
+  uint64 live_rows = 3;
+  bytes schema_sha256 = 4;
+  bytes identity_content_sha256 = 5;
+}

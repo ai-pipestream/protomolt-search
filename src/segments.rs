@@ -22,6 +22,7 @@ use crate::postings::{Bm25Index, Bm25Reader, StoredBinding};
 use crate::vector::{QualityContract, ScoreDirection, VectorIndex, VectorSearchOptions};
 use prost::Message;
 
+mod rewrite_proof;
 mod row_update;
 pub use row_update::SegmentRowRetirement;
 
