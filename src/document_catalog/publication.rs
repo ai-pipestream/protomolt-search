@@ -220,6 +220,54 @@ fn validate_transition(
 }
 
 impl DocumentCatalog {
+    /// Current artifact decision, checked against the durable catalog while its
+    /// publication fence is held. Pending transactions must be resolved first.
+    pub fn current_index_publication_decision(
+        &self,
+        key: &[u8],
+        catalog: &SegmentCatalog,
+    ) -> Result<Option<ProjectionIntent>, Status> {
+        index_key(key)?;
+        if !self.validate_projection_journal()? {
+            return Ok(None);
+        }
+        catalog.with_durable_snapshot(|snapshot| {
+            let tx = self.database.begin_read().map_err(storage)?;
+            let meta = tx.open_table(META).map_err(storage)?;
+            let header: DocumentCatalogHeader = decode(
+                meta.get("header")
+                    .map_err(storage)?
+                    .ok_or_else(|| Status::data_loss("catalog header missing"))?
+                    .value(),
+            )?;
+            validate_current_header(&header)?;
+            let states = tx.open_table(STATES).map_err(storage)?;
+            let Some(bytes) = states.get(key).map_err(storage)? else {
+                return Ok(None);
+            };
+            let state: ProjectionJournalState = decode(bytes.value())?;
+            validate_state(&state, key, &header.history_id)?;
+            if state.pending.is_some() {
+                return Err(Status::failed_precondition(
+                    "resolve pending projection before observing activation",
+                ));
+            }
+            if manifest_hash(snapshot.manifest())? != state.committed_manifest_sha256 {
+                return Err(Status::failed_precondition(
+                    "durable catalog differs from the committed projection manifest",
+                ));
+            }
+            let decisions = tx.open_table(DECISIONS).map_err(storage)?;
+            let key = decision_key(key, state.committed_sequence.max(1));
+            let bytes = decisions.get(key.as_slice()).map_err(storage)?;
+            validate_tip(&state, bytes.as_ref().map(|v| v.value()))?;
+            if state.committed_sequence == 0 {
+                return Ok(None);
+            }
+            bytes.map(|v| decode(v.value())).transpose()
+        })
+    }
+
     pub(super) fn validate_projection_journal(&self) -> Result<bool, Status> {
         let tx = self.database.begin_read().map_err(storage)?;
         let meta = tx.open_table(META).map_err(storage)?;

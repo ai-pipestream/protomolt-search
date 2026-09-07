@@ -37,6 +37,31 @@ impl SegmentCatalog {
         sources: Vec<SegmentSource<'_>>,
         prepare: impl FnOnce(&Arc<OpenedSegmentSet>) -> Result<T, String>,
     ) -> Result<(Arc<OpenedSegmentSet>, T), String> {
+        self.commit_row_transaction(expected_epoch, retirements, sources, None, false, prepare)
+    }
+
+    /// Source versions may produce zero rows. Still commit their epoch and
+    /// reviewed binding, with the source journal prepared under this fence.
+    pub(crate) fn commit_projection_prepared<T>(
+        &self,
+        expected_epoch: u64,
+        retirements: &[SegmentRowRetirement],
+        sources: Vec<SegmentSource<'_>>,
+        binding: Option<&StoredBinding>,
+        prepare: impl FnOnce(&Arc<OpenedSegmentSet>) -> Result<T, String>,
+    ) -> Result<(Arc<OpenedSegmentSet>, T), String> {
+        self.commit_row_transaction(expected_epoch, retirements, sources, binding, true, prepare)
+    }
+
+    fn commit_row_transaction<T>(
+        &self,
+        expected_epoch: u64,
+        retirements: &[SegmentRowRetirement],
+        sources: Vec<SegmentSource<'_>>,
+        binding: Option<&StoredBinding>,
+        allow_empty: bool,
+        prepare: impl FnOnce(&Arc<OpenedSegmentSet>) -> Result<T, String>,
+    ) -> Result<(Arc<OpenedSegmentSet>, T), String> {
         let _guard = self
             .update
             .lock()
@@ -62,8 +87,13 @@ impl SegmentCatalog {
         let epoch = expected_epoch
             .checked_add(1)
             .ok_or("segment catalog epoch overflow")?;
-        if retirements.is_empty() && sources.is_empty() {
+        if !allow_empty && retirements.is_empty() && sources.is_empty() {
             return Err("row update requires retirements or new segments".into());
+        }
+        if binding.is_some_and(|binding| current.binding().is_some_and(|held| held != binding))
+            || (binding.is_some() && current.binding().is_none() && !current.is_empty())
+        {
+            return Err("projection cannot change or adopt a populated mapped binding".into());
         }
         let mut seen = BTreeSet::new();
         let mut updates = Vec::new();
@@ -118,7 +148,7 @@ impl SegmentCatalog {
         }
         let mut manifest = current
             .published_manifest()
-            .with_binding(current.binding())?;
+            .with_binding(binding.or(current.binding()))?;
         manifest.epoch = epoch;
         let mut outputs = Vec::new();
         let mut overlays = Vec::new();

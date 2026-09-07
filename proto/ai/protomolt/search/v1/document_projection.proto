@@ -72,3 +72,20 @@ message DocumentProjectionStage {
   uint64 target_stats_epoch = 9;
   bytes target_stats_incarnation = 10;
 }
+
+// A trusted local owner's observation after both artifact decision and serving
+// activation. Bound to this read version, not a perpetual visibility promise.
+// This does not rewrite the original accepted/searchable/durable retry receipt.
+message DocumentProjectionActivation {
+  bytes history_id = 1;
+  bytes index_key = 2;
+  bytes document_key = 3;
+  uint64 version = 4;
+  uint64 accepted_sequence = 5;
+  bool deleted = 6;
+  uint64 rows = 7;
+  bytes intent_id = 8;
+  uint64 catalog_epoch = 9;
+  uint64 stats_epoch = 10;
+  bytes stats_incarnation = 11;
+}

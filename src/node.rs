@@ -18,6 +18,8 @@
 mod projection;
 mod publication;
 pub use projection::StagedDocumentCandidate;
+#[cfg(test)]
+pub(crate) use publication::FAIL_PROJECTION_DECISION;
 
 use std::collections::HashMap;
 use std::io::Read;

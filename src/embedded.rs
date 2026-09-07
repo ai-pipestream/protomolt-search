@@ -313,6 +313,50 @@ impl EmbeddedSearch {
             .await
     }
 
+    /// Activate a complete accepted candidate on one local shard. This returns
+    /// a shard read-version observation, not a collection publication receipt.
+    pub async fn publish_document_projection(
+        &self,
+        shard: usize,
+        index_key: Vec<u8>,
+        candidate: crate::node::StagedDocumentCandidate,
+    ) -> Result<DocumentProjectionActivation, Status> {
+        let node = Arc::clone(
+            self.nodes
+                .get(shard)
+                .ok_or_else(|| Status::invalid_argument("unknown embedded shard"))?,
+        );
+        let catalog = Arc::clone(self.document_catalog.as_ref().ok_or_else(|| {
+            Status::failed_precondition("configure a document catalog before publication")
+        })?);
+        tokio::task::spawn_blocking(move || {
+            node.publish_document_projection_blocking(&catalog, &index_key, &candidate)
+        })
+        .await
+        .map_err(|error| Status::internal(format!("projection publication worker: {error}")))?
+    }
+
+    /// Observe the reopened shard only after its artifact journal is reconciled.
+    pub async fn recover_document_projection(
+        &self,
+        shard: usize,
+        index_key: Vec<u8>,
+    ) -> Result<Option<DocumentProjectionActivation>, Status> {
+        let node = Arc::clone(
+            self.nodes
+                .get(shard)
+                .ok_or_else(|| Status::invalid_argument("unknown embedded shard"))?,
+        );
+        let catalog = Arc::clone(self.document_catalog.as_ref().ok_or_else(|| {
+            Status::failed_precondition("configure a document catalog before projection recovery")
+        })?);
+        tokio::task::spawn_blocking(move || {
+            node.recover_document_projection_blocking(&catalog, &index_key)
+        })
+        .await
+        .map_err(|error| Status::internal(format!("projection recovery worker: {error}")))?
+    }
+
     fn document_catalog(&self) -> Result<&DocumentCatalog, Status> {
         self.document_catalog.as_deref().ok_or_else(|| {
             Status::failed_precondition(

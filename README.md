@@ -1237,6 +1237,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: accepted-source activation.** The trusted Rust owner can
+  publish a complete candidate through the node's serving-state fence, including
+  zero-row sources and deletions. Reopen joins source-journal recovery to the
+  active read version; embedded search uses the same path. Configured WAL targets
+  refuse even after their writer has failed. Collection-wide searchable receipts
+  and exclusive source-managed mutation rules remain pending.
+  See [local source activation](docs/document-writes.md#local-source-activation).
 - **Foundation branch: durable source projection decisions.** An ordered
   protobuf journal binds private candidates to exact accepted versions and
   validated before/after segment manifests. Recovery distinguishes a committed

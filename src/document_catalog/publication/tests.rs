@@ -578,3 +578,86 @@ async fn reopening_refuses_missing_journal_tables() {
         .expect("missing journal table must refuse reopening");
     assert_eq!(error.code(), tonic::Code::DataLoss);
 }
+
+#[tokio::test]
+async fn node_recovery_joins_both_crash_windows_after_reopening_source_and_index() {
+    use crate::pb::node_service_server::NodeService;
+    for after_activation in [false, true] {
+        let mut fixture = Fixture::new();
+        let (receipt, candidate) = fixture.stage(KEY, 1, Some(1)).await;
+        let before_incarnation = candidate.info().target_stats_incarnation.clone();
+        let node = fixture.node.clone();
+        let source = fixture.source.clone();
+        let error = tokio::task::spawn_blocking(move || {
+            if after_activation {
+                crate::node::FAIL_PROJECTION_DECISION.with(|fail| fail.set(true));
+            } else {
+                crate::segments::FAIL_SET_SYNC.with(|fail| fail.set(true));
+            }
+            node.publish_document_projection_blocking(&source, INDEX, &candidate)
+        })
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(
+            error.message().contains(if after_activation {
+                "before source decision"
+            } else {
+                "after manifest rename"
+            }),
+            "{error}"
+        );
+        assert!(fixture.node.ingest_fence().is_some());
+        assert!(fixture
+            .source
+            .index_publication_decision(INDEX, 1)
+            .unwrap()
+            .is_none());
+        let health = fixture
+            .node
+            .health(tonic::Request::new(HealthRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(health.num_vectors, u64::from(after_activation));
+        let old = std::mem::replace(
+            &mut fixture.source,
+            Arc::new(DocumentCatalog::in_memory("books").unwrap()),
+        );
+        drop(old);
+        fixture.source =
+            Arc::new(DocumentCatalog::open(&fixture.root.join("source.redb"), "books").unwrap());
+        fixture.node = NodeServiceImpl::open(fixture.node.config.clone(), None, false).unwrap();
+        let source = fixture.source.clone();
+        let node = fixture.node.clone();
+        let recovered = tokio::task::spawn_blocking(move || {
+            node.recover_document_projection_blocking(&source, INDEX)
+        })
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(recovered.history_id, receipt.history_id);
+        assert_eq!(recovered.accepted_sequence, receipt.accepted_sequence);
+        assert_ne!(recovered.stats_incarnation, before_incarnation);
+        assert_eq!(
+            fixture
+                .node
+                .health(tonic::Request::new(HealthRequest {}))
+                .await
+                .unwrap()
+                .into_inner()
+                .num_vectors,
+            1
+        );
+        assert_eq!(
+            fixture
+                .source
+                .index_publication_decision(INDEX, 1)
+                .unwrap()
+                .unwrap()
+                .intent_id,
+            recovered.intent_id
+        );
+    }
+}

@@ -1,7 +1,19 @@
 //! A trusted local segment transaction and its coherent serving-state switch.
 use super::*;
+use crate::document_catalog::{DocumentCatalog, ProjectionRecovery};
+use crate::pb::{storage::ProjectionIntent, DocumentProjectionActivation};
 use crate::segments::{OpenedSegmentSet, SegmentRowRetirement, SegmentSource};
 use crate::stats_identity::StatsClaim;
+
+#[cfg(test)]
+thread_local! { pub(crate) static FAIL_PROJECTION_DECISION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+#[derive(Clone, Copy)]
+struct SourcePublication<'a> {
+    catalog: &'a DocumentCatalog,
+    index_key: &'a [u8],
+    candidate: &'a StagedDocumentCandidate,
+}
 
 struct PreparedServingState {
     index: Option<VectorIndex>,
@@ -10,7 +22,197 @@ struct PreparedServingState {
     live: LiveDocs,
 }
 
+fn check_source_live_view(set: &OpenedSegmentSet, live: &LiveDocs) -> Result<(), Status> {
+    let mut durable = LiveDocs::default();
+    set.merge_tombstones(&mut durable)
+        .map_err(Status::failed_precondition)?;
+    let actual = live.words();
+    if live.deleted_count() != durable.deleted_count()
+        || durable.words().is_some_and(|words| {
+            words.iter().enumerate().any(|(i, word)| {
+                *word
+                    != actual
+                        .as_ref()
+                        .and_then(|words| words.get(i))
+                        .copied()
+                        .unwrap_or(0)
+            })
+        })
+    {
+        return Err(Status::failed_precondition(
+            "source publication cannot certify uncommitted runtime tombstones",
+        ));
+    }
+    Ok(())
+}
+
+fn activation(intent: &ProjectionIntent, claim: StatsClaim) -> DocumentProjectionActivation {
+    let source = intent
+        .source
+        .as_ref()
+        .expect("validated publication source");
+    DocumentProjectionActivation {
+        history_id: intent.history_id.clone(),
+        index_key: intent.index_key.clone(),
+        document_key: source.document_key.clone(),
+        version: source.version,
+        accepted_sequence: source.accepted_sequence,
+        deleted: source.deleted,
+        rows: intent.rows,
+        intent_id: intent.intent_id.clone(),
+        catalog_epoch: intent.after_epoch,
+        stats_epoch: claim.epoch,
+        stats_incarnation: claim.incarnation().to_vec(),
+    }
+}
+
 impl NodeServiceImpl {
+    /// Join the reopened serving view with source-journal recovery. The result
+    /// identifies this node's current read version, including a new incarnation
+    /// after restart. A pending/dirty tail or uncommitted deletion cannot qualify.
+    pub fn recover_document_projection_blocking(
+        &self,
+        source: &DocumentCatalog,
+        index_key: &[u8],
+    ) -> Result<Option<DocumentProjectionActivation>, Status> {
+        if source.collection()? != self.config.collection {
+            return Err(Status::failed_precondition(
+                "publication source and target collections differ",
+            ));
+        }
+        let _ingest = self.claim_ingest()?;
+        let _mutation = self.mutation_gate.blocking_write();
+        let _seal = self
+            .seal_lock
+            .lock()
+            .map_err(|_| Status::internal("seal lock poisoned"))?;
+        let guard = write_shard(&self.state);
+        let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
+            return Err(Status::failed_precondition(
+                "source recovery requires a segmented target",
+            ));
+        };
+        let claim = StatsClaim::required(guard.stats_epoch, &guard.stats_incarnation.bytes()?)?;
+        self.check_segment_publication(&guard, claim, shard.snapshot().epoch())?;
+        check_source_live_view(shard.snapshot(), &guard.live_docs)?;
+        match source.recover_index_publication(index_key, shard.catalog()) {
+            Ok(_) => {}
+            Err(status) if status.code() == tonic::Code::NotFound => {}
+            Err(status) => return Err(status),
+        }
+        source
+            .current_index_publication_decision(index_key, shard.catalog())
+            .map(|intent| intent.map(|intent| activation(&intent, claim)))
+    }
+
+    /// Activate one complete private candidate and record its artifact decision.
+    /// Call on a blocking worker. The target read version captured at staging
+    /// must still hold. This is a trusted local owner operation, not a public
+    /// ingest route or a collection-wide searchable write receipt.
+    pub fn publish_document_projection_blocking(
+        &self,
+        source: &DocumentCatalog,
+        index_key: &[u8],
+        candidate: &StagedDocumentCandidate,
+    ) -> Result<DocumentProjectionActivation, Status> {
+        if index_key.is_empty() || index_key.len() > 1024 {
+            return Err(Status::invalid_argument(
+                "projection index_key must contain 1 to 1024 bytes",
+            ));
+        }
+        if source.collection()? != self.config.collection {
+            return Err(Status::failed_precondition(
+                "publication source and target collections differ",
+            ));
+        }
+        let info = candidate.info();
+        let expected =
+            StatsClaim::required(info.target_stats_epoch, &info.target_stats_incarnation)?;
+        let before = {
+            let guard = read_shard(&self.state);
+            guard.check_stats_epoch(expected.epoch, &expected.incarnation())?;
+            let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
+                return Err(Status::failed_precondition(
+                    "source publication requires a segmented target",
+                ));
+            };
+            shard.snapshot().clone()
+        };
+        let retired = before
+            .document_retirements(&info.document_key, 65536)
+            .map_err(Status::failed_precondition)?;
+        let staged = candidate.segments();
+        let ids: Vec<_> = (0..staged.map_or(0, OpenedSegmentSet::len))
+            .map(|i| {
+                format!(
+                    "source-{}-{}-{i}",
+                    crate::sha256::hex_digest(index_key),
+                    info.accepted_sequence
+                )
+            })
+            .collect();
+        let paths: Vec<_> = staged
+            .into_iter()
+            .flat_map(|set| {
+                (0..set.len()).map(move |i| {
+                    let meta = set.metadata(i);
+                    let dir =
+                        crate::segments::SegmentCatalog::segment_dir(set.root(), &meta.segment_id);
+                    [
+                        dir.join(&meta.vector.file),
+                        dir.join(&meta.exact_vectors.file),
+                        dir.join(&meta.bm25.file),
+                        dir.join(&meta.live_docs.file),
+                    ]
+                })
+            })
+            .collect();
+        let mut base = before
+            .manifest()
+            .segments
+            .last()
+            .map(|m| m.end_label_exclusive())
+            .transpose()
+            .map_err(Status::failed_precondition)?
+            .unwrap_or(0);
+        let mut sources = Vec::with_capacity(paths.len());
+        for (i, paths) in paths.iter().enumerate() {
+            let meta = staged
+                .expect("candidate paths require segments")
+                .metadata(i);
+            sources.push(SegmentSource {
+                segment_id: &ids[i],
+                generation: info.accepted_sequence,
+                base_label: base,
+                backend_kind: &meta.backend_kind,
+                vector_path: (!meta.vector.file.is_empty()).then_some(paths[0].as_path()),
+                exact_vector_path: (!meta.exact_vectors.file.is_empty())
+                    .then_some(paths[1].as_path()),
+                bm25_path: &paths[2],
+                live_docs_path: &paths[3],
+                partition_column: None,
+            });
+            base = base
+                .checked_add(meta.rows)
+                .ok_or_else(|| Status::resource_exhausted("publication row range overflows"))?;
+        }
+        let (claim, intent) = self.publish_rows_inner(
+            expected,
+            before.epoch(),
+            &retired,
+            sources,
+            Some(SourcePublication {
+                catalog: source,
+                index_key,
+                candidate,
+            }),
+        )?;
+        Ok(activation(
+            &intent.expect("source publication produced an intent"),
+            claim,
+        ))
+    }
+
     /// Publish immutable segment rows and activate both search legs under one
     /// shard write fence. Call on a blocking worker, not a Tokio worker thread.
     /// This privileged local operation is not a document API: the source
@@ -27,6 +229,18 @@ impl NodeServiceImpl {
         retirements: &[SegmentRowRetirement],
         sources: Vec<SegmentSource<'_>>,
     ) -> Result<StatsClaim, Status> {
+        self.publish_rows_inner(expected, catalog_epoch, retirements, sources, None)
+            .map(|(claim, _)| claim)
+    }
+
+    fn publish_rows_inner(
+        &self,
+        expected: StatsClaim,
+        catalog_epoch: u64,
+        retirements: &[SegmentRowRetirement],
+        sources: Vec<SegmentSource<'_>>,
+        projection: Option<SourcePublication<'_>>,
+    ) -> Result<(StatsClaim, Option<ProjectionIntent>), Status> {
         StatsClaim::required(expected.epoch, &expected.incarnation())?;
         let _ingest = self.claim_ingest()?;
         let _mutation = self.mutation_gate.blocking_write();
@@ -67,8 +281,11 @@ impl NodeServiceImpl {
                 next_claim,
             )
         };
+        if projection.is_some() {
+            check_source_live_view(&old_set, &old_live)?;
+        }
         let mut prepared_commit = false;
-        let result = catalog.commit_rows_prepared(catalog_epoch, retirements, sources, |set| {
+        let prepare = |set: &Arc<OpenedSegmentSet>| {
             let prepared = self.prepare_serving_state(&catalog, set, old_live, backend)?;
             if (!old_set.is_empty() || old_binding.is_some())
                 && prepared.bm25.binding() != old_binding.as_ref()
@@ -81,9 +298,35 @@ impl NodeServiceImpl {
             self.check_segment_publication(&guard, expected, catalog_epoch)
                 .map_err(|status| status.to_string())?;
             prepared_commit = true;
-            Ok((guard, prepared))
-        });
-        let (_, (mut guard, prepared)) = match result {
+            let intent = projection
+                .map(|source| {
+                    source
+                        .catalog
+                        .prepare_index_publication(
+                            source.index_key,
+                            source.candidate,
+                            &old_set,
+                            set,
+                        )
+                        .map_err(|status| status.to_string())
+                })
+                .transpose()?;
+            Ok((guard, prepared, intent))
+        };
+        let result = match projection {
+            Some(source) => catalog.commit_projection_prepared(
+                catalog_epoch,
+                retirements,
+                sources,
+                source
+                    .candidate
+                    .segments()
+                    .and_then(OpenedSegmentSet::binding),
+                prepare,
+            ),
+            None => catalog.commit_rows_prepared(catalog_epoch, retirements, sources, prepare),
+        };
+        let (_, (mut guard, prepared, intent)) = match result {
             Ok(result) => result,
             Err(error) => {
                 if prepared_commit {
@@ -95,7 +338,8 @@ impl NodeServiceImpl {
                 return Err(Status::failed_precondition(error));
             }
         };
-        // No fallible work remains after the durable manifest commit.
+        // Install the already-prepared fields without fallible work. For source
+        // publication, the journal decision is checked next under this guard.
         guard.index = prepared.index;
         guard.exact_vectors = prepared.exact;
         guard.mapped_binding = prepared.bm25.binding().cloned();
@@ -104,7 +348,34 @@ impl NodeServiceImpl {
         guard.parents = None;
         guard.stats_epoch = next_claim.epoch;
         guard.files_current = false;
-        Ok(next_claim)
+        if let Some(source) = projection {
+            #[cfg(test)]
+            if FAIL_PROJECTION_DECISION.with(|fail| fail.replace(false)) {
+                self.fence_ingest(
+                    "injected interruption after activation; reopen for recovery".into(),
+                );
+                return Err(Status::unavailable(
+                    "injected interruption before source decision",
+                ));
+            }
+            let resolved = source
+                .catalog
+                .recover_index_publication(source.index_key, &catalog);
+            match resolved {
+                Ok(ProjectionRecovery::Committed(ref decided))
+                    if Some(decided) == intent.as_ref() => {}
+                result => {
+                    self.fence_ingest("source publication activation lacks a matching durable decision; reopen for recovery".into());
+                    return Err(match result {
+                        Err(status) => status,
+                        Ok(_) => Status::data_loss(
+                            "source publication resolved a different artifact decision",
+                        ),
+                    });
+                }
+            }
+        }
+        Ok((next_claim, intent))
     }
 
     fn check_segment_publication(
@@ -115,6 +386,7 @@ impl NodeServiceImpl {
     ) -> Result<(), Status> {
         guard.check_stats_epoch(expected.epoch, &expected.incarnation())?;
         if self.config.index_path.is_none()
+            || self.config.wal
             || guard.generation.is_some()
             || guard.wal.is_some()
             || guard.pending_compaction.is_some()
@@ -407,6 +679,22 @@ mod tests {
         assert!(error.message().contains("without WAL"), "{error}");
         assert_eq!(std::fs::read(&manifest_path).unwrap(), before);
         assert!(node.ingest_fence().is_none());
+        // Retiring a failed writer does not change the configured recovery
+        // contract. It must not turn this into an unlogged publication target.
+        write_shard(&node.state).wal = None;
+        let error = node
+            .publish_segment_rows_blocking(
+                claim(&node),
+                old.epoch(),
+                &[SegmentRowRetirement {
+                    segment_id: "old".into(),
+                    rows: vec![0],
+                }],
+                vec![],
+            )
+            .unwrap_err();
+        assert!(error.message().contains("without WAL"), "{error}");
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), before);
         drop(node);
         std::fs::remove_dir_all(root).unwrap();
     }

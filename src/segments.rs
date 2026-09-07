@@ -950,6 +950,16 @@ impl SegmentCatalog {
         std::fs::File::open(&self.root)
             .and_then(|dir| dir.sync_all())
             .map_err(|e| tonic::Status::internal(format!("sync projection directory: {e}")))?;
+        // A fresh catalog creates this directory beneath the application's
+        // existing container. Persist that link as well as the entries inside.
+        let parent = self
+            .root
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        std::fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| tonic::Status::internal(format!("sync projection container: {e}")))?;
         record(&current)
     }
 

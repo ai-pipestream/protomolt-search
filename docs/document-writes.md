@@ -263,9 +263,9 @@ directories, which are never committed publication evidence.
 
 There is no new network RPC or mobile ABI command. The embedded Rust entry uses
 its existing native analyzer and opens no socket. Server-side staging uses only
-the node's configured analysis backend. Serving-state integration of the
-source-certified artifact decisions below, visibility across shards and later
-searchable receipts remain lifecycle work. A successful private build cannot advance a
+the node's configured analysis backend. Local activation is described below;
+visibility across shards and later searchable receipts remain lifecycle work.
+A successful private build cannot advance a
 source-history publication cursor by itself. `tests/document_staging.rs` covers
 the accepted-source-to-segment path, late row failures, output budgets, collection
 and analysis refusals, empty sources and deletions, and the embedded entry.
@@ -300,7 +300,8 @@ a different transition must first resolve the pending one.
 
 `recover_index_publication` holds the segment catalog's update fence, checks that
 the on-disk manifest matches its opened snapshot, and syncs the manifest and its
-directory before committing a source-journal decision. Matching the intended
+directory and the link from its existing application container before committing
+a source-journal decision. Matching the intended
 after-manifest commits the decision and cursor atomically. Matching the
 before-manifest aborts only the projection intent, leaving source acceptance
 unchanged. A third manifest refuses recovery and retains the intent. Uncertain
@@ -313,14 +314,65 @@ This is artifact transaction evidence, not proof of active serving state.
 `index_publication_decision` returns historical decisions without claiming that
 their source versions are still searchable. The original acceptance/retry receipt
 is never rewritten. There is no new network RPC, mobile ABI command or positive
-searchable receipt. The owner still must join this journal to node activation,
-fence legacy writers, handle compaction and coherent backups, and coordinate
+searchable receipt. The local activation path below joins the journal to the
+serving view. Exclusive source ownership still must fence legacy writers, handle
+compaction and coherent backups, and coordinate
 documents spanning shards. In particular, an out-of-band compaction currently
 changes the certified manifest and requires reconciliation; it cannot silently
 advance the source cursor. Regression tests in
 `document_catalog::publication::tests` exercise actual staged source rows,
 replacement and retirement checks, exact retries, empty/deleted sources, cursor
 ordering, foreign histories, missing tables and interrupted manifest commits.
+
+## Local source activation
+
+`NodeServiceImpl::publish_document_projection_blocking` takes the source catalog,
+an exact logical index key, and the private candidate. It derives artifact paths
+and complete retirements itself; callers do not submit arbitrary rows or source
+identities. The collection must match and the read version captured at staging
+must still hold. The target must have a persistent, sealed segment catalog with
+WAL disabled and no active compaction. A configured WAL remains a refusal even
+if a failed writer was removed. Runtime deletions absent from the catalog also
+refuse certification. The application supplies existing durable container
+directories for the source authority and index, as for source-catalog creation.
+
+The node holds its ingest, mutation and seal gates through the transaction.
+It prepares both search legs and exact-vector views before taking the final
+serving-state write lock. Under that lock it rechecks the read version and
+records the source intent, publishes the manifest, activates the prepared view,
+advances the statistics epoch, and resolves the journal decision. A zero-row
+source still publishes its reviewed binding and a new epoch. Deletions retire
+all prior live chunks; repeated deletions also advance the source sequence
+without creating dummy rows.
+
+Success returns a protobuf `DocumentProjectionActivation` identifying the source
+history/key/version, accepted sequence, logical index, artifact decision, row
+count, catalog epoch, and active shard read version. This is a local observation
+at that read version, not a collection-wide or perpetual visibility promise.
+Original acceptance/retry receipts remain unchanged. If manifest publication is
+uncertain, the old runtime remains active and ingest is fenced. If the runtime
+has activated but the journal decision cannot be acknowledged, the method returns
+an error and fences ingest; it does not fabricate a successful observation.
+
+After reopen, `recover_document_projection_blocking` resolves pending artifact
+transactions and verifies that the current journal decision matches the durable
+catalog and the active, sealed serving state. It returns that decision with the
+new lifetime's read version, or no activation when none has committed. Stale
+candidates must be discarded; recovery observes an already committed transition
+without appending another copy. The embedded Rust owner exposes asynchronous
+`publish_document_projection` and `recover_document_projection` methods; its
+blocking worker retains ownership of candidate files even if the caller stops
+awaiting it. The same socket-free search path observes the published rows.
+
+This does not yet introduce a public document-write RPC, mobile ABI publication
+command, or source-managed index mode. Existing legacy mutation APIs remain
+available, so exclusive source ownership and collection publication still need
+their durable configuration and write gates. Out-of-band mutations may cause
+subsequent source publication/recovery to refuse. Compaction must be joined to
+the journal before it can maintain a source-managed index. Tests cover actual
+lexical/vector reads and identities, stale candidates, empty sources, deletions,
+embedded restart, unjournaled runtime deletes, and both interruption windows
+with the source catalog and serving node reopened.
 
 ## Remaining lifecycle work
 
@@ -347,15 +399,16 @@ guarantees before this becomes the complete document-facing search contract.
 This API does not feed legacy `IngestMapped` automatically. Its accepted deletes
 do not remove existing legacy search rows. Legacy ingest still lacks these
 transactional receipts and still loses mapped parents that produce no rows.
-Next, projection publication must consume accepted versions, replace all chunks
-atomically, and return stable document/chunk identity through every result path.
-The searchable state must reflect that publication, including recovery.
+The local publisher now consumes accepted versions and replaces their chunks
+atomically. Next, exclusive source ownership and collection-wide publication
+must make those guarantees part of the authenticated document-write contract,
+with stable document/chunk identity through every result path.
 
 ### Runtime publication constraints
 
 The foundation branch can prepare a complete accepted projection, resolve an
 exact key to sealed rows, and commit new segments with old-row retirements in
-one segment manifest. Those components are not yet a document publisher.
+one segment manifest. The local publisher joins those components for one shard.
 A document spanning shards still needs a collection publication decision;
 independent shard acknowledgments cannot establish an atomic visible version.
 
@@ -392,11 +445,11 @@ unacknowledged publication must never be interpreted as a successful document
 receipt. Tests in `node::publication::tests` inject failure after manifest rename;
 `tests/exact_segment_view.rs` verifies row replacement and read-version activation.
 
-Recovery must join the catalog's immutable accepted history to the actual
-committed index manifests before reporting publication. Empty projections and
-deletions need explicit outcomes even when they add no rows. A cursor advanced
+Local recovery joins immutable accepted history to the actual committed index
+manifest and active read version, including empty projections and deletions.
+Collection-wide publication still needs its own decision. A cursor advanced
 after an ingest or flush is not that evidence, and the original persistent
-acceptance/retry decision must remain distinct from later publication status.
+acceptance/retry decision remains distinct from later publication status.
 
 The catalog is outside current index snapshots, replica bootstrap and row
 resharding. Those operations do not constitute a backup or migration of this

@@ -459,3 +459,368 @@ async fn empty_sources_validate_the_configured_analyzer_before_building_artifact
         "empty sources accepted unsupported analyzers: {accepted:?}"
     );
 }
+
+async fn publish_candidate(
+    node: Arc<NodeServiceImpl>,
+    catalog: Arc<DocumentCatalog>,
+    candidate: pipestream_search::node::StagedDocumentCandidate,
+) -> Result<DocumentProjectionActivation, tonic::Status> {
+    tokio::task::spawn_blocking(move || {
+        node.publish_document_projection_blocking(&catalog, b"books-index", &candidate)
+    })
+    .await
+    .unwrap()
+}
+
+async fn recover_activation(
+    node: Arc<NodeServiceImpl>,
+    catalog: Arc<DocumentCatalog>,
+) -> Option<DocumentProjectionActivation> {
+    tokio::task::spawn_blocking(move || {
+        node.recover_document_projection_blocking(&catalog, b"books-index")
+    })
+    .await
+    .unwrap()
+    .unwrap()
+}
+
+async fn assert_active_rows(
+    node: &NodeServiceImpl,
+    activation: &DocumentProjectionActivation,
+    ids: &[u64],
+) {
+    let fetched = node
+        .fetch_values(Request::new(FetchValuesRequest {
+            candidate_ids: (0..8).collect(),
+            visibility: Some(DocumentVisibility {
+                filter: pipestream_search::cel::compile_filter("has(key_bucket)").unwrap(),
+            }),
+            include_identities: true,
+            expected_stats_epoch: activation.stats_epoch,
+            expected_stats_incarnation: activation.stats_incarnation.clone(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        fetched
+            .identities
+            .iter()
+            .map(|row| row.doc_id)
+            .collect::<Vec<_>>(),
+        ids
+    );
+    for row in &fetched.identities {
+        let identity = row.identity.as_ref().unwrap();
+        assert_eq!(identity.document_key, KEY);
+        assert_eq!(identity.version, activation.version);
+    }
+    let lexical = node
+        .browse_shard(Request::new(BrowseShardRequest {
+            k: 20,
+            first_page: true,
+            lexical_terms: pipestream_search::analyzer::analyze_document_native(
+                "accepted",
+                Some(&body_spec()),
+            )
+            .unwrap()
+            .fields[0]
+                .terms
+                .iter()
+                .map(|(term, _, _)| term.clone())
+                .collect(),
+            analysis_fingerprint: pipestream_search::analyzer::analysis_fingerprint(Some(
+                &body_spec(),
+            )),
+            expected_stats_epoch: activation.stats_epoch,
+            expected_stats_incarnation: activation.stats_incarnation.clone(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(lexical.doc_ids, ids);
+    let dense = node
+        .exact_vector_rescore(Request::new(ExactVectorRescoreRequest {
+            vector: vec![0.25; 8],
+            candidate_ids: (0..8).collect(),
+            expected_stats_epoch: activation.stats_epoch,
+            expected_stats_incarnation: activation.stats_incarnation.clone(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        dense.hits.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(),
+        ids
+    );
+}
+
+#[tokio::test]
+async fn accepted_versions_activate_both_search_legs_and_recover_with_identity() {
+    let fixture = Fixture::new();
+    let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None, false).unwrap());
+    let receipt = fixture.accept(1, Some(source(3, false)));
+    let first = node
+        .stage_document_projection(fixture.catalog.clone(), fixture.request(&receipt))
+        .await
+        .unwrap();
+    let next_receipt = fixture.accept(2, Some(source(1, false)));
+    let stale = node
+        .stage_document_projection(fixture.catalog.clone(), fixture.request(&next_receipt))
+        .await
+        .unwrap();
+    let activated = publish_candidate(node.clone(), fixture.catalog.clone(), first)
+        .await
+        .unwrap();
+    assert_eq!(activated.accepted_sequence, receipt.accepted_sequence);
+    assert_eq!(activated.history_id, receipt.history_id);
+    assert_eq!(fixture.stages(), 1); // Only the not-yet-consumed stale candidate.
+    assert_active_rows(&node, &activated, &[0, 1, 2]).await;
+    assert_eq!(
+        publish_candidate(node.clone(), fixture.catalog.clone(), stale)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    let replacement = node
+        .stage_document_projection(fixture.catalog.clone(), fixture.request(&next_receipt))
+        .await
+        .unwrap();
+    let replaced = publish_candidate(node.clone(), fixture.catalog.clone(), replacement)
+        .await
+        .unwrap();
+    assert!(replaced.stats_epoch > activated.stats_epoch);
+    assert_eq!(replaced.stats_incarnation, activated.stats_incarnation);
+    assert_active_rows(&node, &replaced, &[3]).await;
+    assert_eq!(
+        recover_activation(node.clone(), fixture.catalog.clone())
+            .await
+            .unwrap(),
+        replaced
+    );
+    assert!(!fixture.accept(1, Some(source(3, false))).searchable);
+    drop(node);
+    let reopened = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None, false).unwrap());
+    let recovered = recover_activation(reopened.clone(), fixture.catalog.clone())
+        .await
+        .unwrap();
+    assert_eq!(recovered.intent_id, replaced.intent_id);
+    assert_eq!(recovered.document_key, replaced.document_key);
+    assert_ne!(recovered.stats_incarnation, replaced.stats_incarnation);
+    assert_active_rows(&reopened, &recovered, &[3]).await;
+}
+
+#[tokio::test]
+async fn zero_rows_and_deletion_publish_without_dummy_documents() {
+    let fixture = Fixture::new();
+    let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None, false).unwrap());
+    let empty_receipt = fixture.accept(1, Some(source(0, false)));
+    let empty = node
+        .stage_document_projection(fixture.catalog.clone(), fixture.request(&empty_receipt))
+        .await
+        .unwrap();
+    let empty = publish_candidate(node.clone(), fixture.catalog.clone(), empty)
+        .await
+        .unwrap();
+    assert_eq!(empty.rows, 0);
+    assert!(!empty.deleted);
+    let set = pipestream_search::segments::OpenedSegmentSet::open(segments_root(
+        fixture.config.index_path.as_ref().unwrap(),
+    ))
+    .unwrap();
+    assert!(set.is_empty());
+    assert!(set.binding().is_some());
+    let receipt = fixture.accept(2, Some(source(2, false)));
+    let candidate = node
+        .stage_document_projection(fixture.catalog.clone(), fixture.request(&receipt))
+        .await
+        .unwrap();
+    let populated = publish_candidate(node.clone(), fixture.catalog.clone(), candidate)
+        .await
+        .unwrap();
+    assert_active_rows(&node, &populated, &[0, 1]).await;
+    let deletion_receipt = fixture.accept(3, None);
+    let mut request = fixture.request(&deletion_receipt);
+    request
+        .projection
+        .as_mut()
+        .unwrap()
+        .expected_plan_fingerprint
+        .clear();
+    request.field_analysis.clear();
+    let deletion = node
+        .stage_document_projection(fixture.catalog.clone(), request)
+        .await
+        .unwrap();
+    let deleted = publish_candidate(node.clone(), fixture.catalog.clone(), deletion)
+        .await
+        .unwrap();
+    assert!(deleted.deleted);
+    assert_eq!(deleted.rows, 0);
+    assert_active_rows(&node, &deleted, &[]).await;
+    let receipt = fixture.accept(4, None);
+    let mut request = fixture.request(&receipt);
+    request
+        .projection
+        .as_mut()
+        .unwrap()
+        .expected_plan_fingerprint
+        .clear();
+    request.field_analysis.clear();
+    let candidate = node
+        .stage_document_projection(fixture.catalog.clone(), request)
+        .await
+        .unwrap();
+    let no_rows = publish_candidate(node.clone(), fixture.catalog.clone(), candidate)
+        .await
+        .unwrap();
+    assert_eq!(no_rows.catalog_epoch, deleted.catalog_epoch + 1);
+    assert_eq!(
+        recover_activation(node, fixture.catalog.clone())
+            .await
+            .unwrap(),
+        no_rows
+    );
+}
+
+#[tokio::test]
+async fn volatile_acceptance_cannot_activate_a_durable_target() {
+    let fixture = Fixture::new();
+    let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None, false).unwrap());
+    let catalog = Arc::new(DocumentCatalog::in_memory("books").unwrap());
+    let receipt = catalog
+        .accept(&AcceptDocumentRequest {
+            contract_version: 1,
+            document_key: KEY.to_vec(),
+            operation_id: b"volatile".to_vec(),
+            mutation: Some(accept_document_request::Mutation::Source(source(1, false))),
+            ..Default::default()
+        })
+        .unwrap();
+    let candidate = node
+        .stage_document_projection(catalog.clone(), fixture.request(&receipt))
+        .await
+        .unwrap();
+    let before = fixture.manifest();
+    let error = publish_candidate(node.clone(), catalog, candidate)
+        .await
+        .unwrap_err();
+    assert!(error.message().contains("durable source catalog"));
+    assert_eq!(fixture.manifest(), before);
+    assert_eq!(
+        node.health(Request::new(HealthRequest {}))
+            .await
+            .unwrap()
+            .into_inner()
+            .num_vectors,
+        0
+    );
+}
+
+#[tokio::test]
+async fn embedded_owner_publishes_and_recovers_through_the_real_search_path() {
+    use pipestream_search::embedded::{
+        EmbeddedDocumentCatalogConfig, EmbeddedSearch, EmbeddedSearchConfig, EmbeddedShardConfig,
+    };
+    let fixture = Fixture::new();
+    let mut config = EmbeddedSearchConfig::single(EmbeddedShardConfig {
+        node: fixture.config.clone(),
+        allow_missing_bm25: false,
+    });
+    config.document_catalog = Some(EmbeddedDocumentCatalogConfig {
+        collection: "books".into(),
+        path: Some(fixture.root.join("embedded-sources.redb")),
+    });
+    let runtime = EmbeddedSearch::create(config.clone()).await.unwrap();
+    let request = AcceptDocumentRequest {
+        contract_version: 1,
+        document_key: KEY.to_vec(),
+        operation_id: b"embedded-publication".to_vec(),
+        expected_version: Some(0),
+        mutation: Some(accept_document_request::Mutation::Source(source(2, false))),
+        ..Default::default()
+    };
+    let receipt = runtime.accept_document(&request).unwrap();
+    let candidate = runtime
+        .stage_document_projection(0, fixture.request(&receipt))
+        .await
+        .unwrap();
+    let activated = runtime
+        .publish_document_projection(0, b"books-index".to_vec(), candidate)
+        .await
+        .unwrap();
+    let query = SearchRequest {
+        k: 2,
+        vector: vec![0.25; 8],
+        ..Default::default()
+    };
+    let response = runtime.search(query.clone()).await.unwrap();
+    assert_eq!(response.hits.len(), 2);
+    let retry = runtime.accept_document(&request).unwrap();
+    assert!(retry.replayed);
+    assert!(!retry.searchable);
+    drop(runtime);
+    let reopened = EmbeddedSearch::open(config).await.unwrap();
+    let recovered = reopened
+        .recover_document_projection(0, b"books-index".to_vec())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.intent_id, activated.intent_id);
+    assert_ne!(recovered.stats_incarnation, activated.stats_incarnation);
+    let after = reopened.search(query).await.unwrap();
+    assert_eq!(after.hits, response.hits);
+    assert!(reopened
+        .recover_document_projection(1, b"books-index".to_vec())
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn unjournaled_runtime_deletions_cannot_be_reported_as_source_activation() {
+    let fixture = Fixture::new();
+    let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None, false).unwrap());
+    let receipt = fixture.accept(1, Some(source(2, false)));
+    let candidate = node
+        .stage_document_projection(fixture.catalog.clone(), fixture.request(&receipt))
+        .await
+        .unwrap();
+    publish_candidate(node.clone(), fixture.catalog.clone(), candidate)
+        .await
+        .unwrap();
+    node.delete_documents(Request::new(DeleteDocumentsRequest {
+        doc_ids: vec![0],
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let source_catalog = fixture.catalog.clone();
+    let worker_node = node.clone();
+    let error = tokio::task::spawn_blocking(move || {
+        worker_node.recover_document_projection_blocking(&source_catalog, b"books-index")
+    })
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(error.message().contains("uncommitted runtime tombstones"));
+    let next = fixture.accept(2, Some(source(1, false)));
+    let candidate = node
+        .stage_document_projection(fixture.catalog.clone(), fixture.request(&next))
+        .await
+        .unwrap();
+    let before = fixture.manifest();
+    let error = publish_candidate(node, fixture.catalog.clone(), candidate)
+        .await
+        .unwrap_err();
+    assert!(error.message().contains("uncommitted runtime tombstones"));
+    assert_eq!(fixture.manifest(), before);
+    assert!(fixture
+        .catalog
+        .index_publication_decision(b"books-index", next.accepted_sequence)
+        .unwrap()
+        .is_none());
+}
