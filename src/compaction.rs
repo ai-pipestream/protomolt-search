@@ -1720,10 +1720,33 @@ impl NodeServiceImpl {
                     Some(Bm25Shard::Segmented(live)) => live.snapshot().epoch(),
                     _ => shadow.epoch_at_open,
                 };
-                shard
+                let epoch = live_epoch
+                    .max(shadow.epoch_at_open)
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        Status::out_of_range("compaction publication epoch exhausted")
+                    })?;
+                let published = shard
                     .catalog()
-                    .commit_current(live_epoch.max(shadow.epoch_at_open) + 1)
+                    .commit_current(epoch)
                     .map_err(|e| Status::internal(format!("publish the compacted set: {e}")))?;
+                // Publication returns a new immutable view. Adopt it in both
+                // legs; previously an in-place epoch mutation hid this step.
+                if let Some(Bm25Shard::Segmented(shard)) = shadow.state.bm25.as_mut() {
+                    shard
+                        .republish(published.clone())
+                        .map_err(|e| Status::internal(format!("adopt compacted documents: {e}")))?;
+                }
+                if let Some(provider) = shadow
+                    .state
+                    .index
+                    .as_mut()
+                    .and_then(VectorIndex::as_segmented_mut)
+                {
+                    provider
+                        .republish(published)
+                        .map_err(|e| Status::internal(format!("adopt compacted vectors: {e}")))?;
+                }
             } else {
                 let staged = shadow
                     .state

@@ -1237,6 +1237,11 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: immutable publication recovery.** Held segment views
+  keep their epochs through compaction. A manifest sync failure retains files
+  needed for recovery and blocks a different publication until resolution.
+  Exact-content append retries reaffirm durability without duplicating rows.
+  See [publication recovery](docs/immutable-segments.md#publication-recovery-foundation-branch).
 - **2026-09-06 — Descriptor-driven scalar map projections.** Explicit protobuf
   map projections now use map-facet or map-numeric columns. All protobuf key
   types, default entries, duplicate-key resolution and enum openness retain

@@ -283,11 +283,6 @@ pub struct OpenedSegmentSet {
     root: PathBuf,
     binding: Option<StoredBinding>,
     manifest: SegmentSetManifest,
-    /// The set's epoch as published. Opens at `manifest.epoch`; a
-    /// compaction cutover raises it past the live set's before it
-    /// commits the shadow set it built earlier (`docs/mutations.md`),
-    /// so publication order stays monotone on disk.
-    epoch: std::sync::atomic::AtomicU64,
     /// Shared with the set this one was published from: a segment that
     /// is already open and verified stays open across a publish.
     segments: Vec<Arc<OpenedSegment>>,
@@ -555,7 +550,6 @@ impl OpenedSegmentSet {
         Ok(Self {
             root,
             binding: declared.or_else(|| held.flatten()),
-            epoch: std::sync::atomic::AtomicU64::new(manifest.epoch),
             manifest,
             segments,
         })
@@ -579,15 +573,13 @@ impl OpenedSegmentSet {
 
     /// The set's published epoch.
     pub fn epoch(&self) -> u64 {
-        self.epoch.load(std::sync::atomic::Ordering::Acquire)
+        self.manifest.epoch
     }
 
     /// The manifest as it is published: `manifest()` with the current
     /// epoch.
     pub fn published_manifest(&self) -> SegmentSetManifest {
-        let mut manifest = self.manifest.clone();
-        manifest.epoch = self.epoch();
-        manifest
+        self.manifest.clone()
     }
 
     /// The catalog root this set was opened from.
@@ -815,6 +807,7 @@ pub struct SegmentCatalog {
     root: PathBuf,
     current: Arc<RwLock<Arc<OpenedSegmentSet>>>,
     update: Arc<Mutex<()>>,
+    pending_publication: Arc<Mutex<Option<SegmentSetManifest>>>,
     /// How every snapshot this catalog publishes serves vector images.
     load: VectorLoad,
 }
@@ -833,6 +826,7 @@ impl SegmentCatalog {
             root,
             current: Arc::new(RwLock::new(Arc::new(current))),
             update: Arc::new(Mutex::new(())),
+            pending_publication: Arc::new(Mutex::new(None)),
             load,
         })
     }
@@ -858,6 +852,7 @@ impl SegmentCatalog {
             root,
             current: Arc::new(RwLock::new(Arc::new(current))),
             update: Arc::new(Mutex::new(())),
+            pending_publication: Arc::new(Mutex::new(None)),
             load,
         })
     }
@@ -878,11 +873,9 @@ impl SegmentCatalog {
                 current.epoch()
             ));
         }
-        current
-            .epoch
-            .store(epoch, std::sync::atomic::Ordering::Release);
-        write_json_atomic(&self.root.join(SET_FILE), &current.published_manifest())?;
-        Ok(current)
+        let mut manifest = current.published_manifest();
+        manifest.epoch = epoch;
+        self.publish(manifest)
     }
 
     /// The catalog root's set manifest as written on disk, `None` when the
@@ -916,6 +909,10 @@ impl SegmentCatalog {
     /// compaction would have left. `None` returns the catalog to the
     /// bucket layout's declaration.
     pub fn publish_partition_key(&self, key: Option<String>) -> Result<(), String> {
+        let _guard = self
+            .update
+            .lock()
+            .map_err(|_| "segment update lock poisoned".to_string())?;
         let current = self.snapshot();
         let mut manifest = current
             .published_manifest()
@@ -964,19 +961,35 @@ impl SegmentCatalog {
             .update
             .lock()
             .map_err(|_| "segment update lock poisoned".to_string())?;
+        validate_segment_id(source.segment_id)?;
+        if Self::segment_dir(&self.root, source.segment_id).exists() {
+            let manifest = Self::read_manifest(&self.root)?.ok_or_else(|| {
+                "existing staged segment is not published; recovery is required".to_string()
+            })?;
+            let held = manifest
+                .segments
+                .iter()
+                .find(|segment| segment.segment_id == source.segment_id)
+                .ok_or_else(|| {
+                    "existing staged segment is not published; recovery is required".to_string()
+                })?;
+            verify_retry_source(&self.root, &source, held)?;
+            // Reaffirm durability even if the first attempt failed after rename.
+            // Opening reuses unchanged segments and validates any newly adopted ones.
+            return self.publish(manifest);
+        }
         let metadata = stage_segment(&self.root, source)?;
-        let staged_id = metadata.segment_id.clone();
         let current = self.snapshot();
         let mut manifest = current.published_manifest();
         manifest.epoch = manifest
             .epoch
             .checked_add(1)
             .ok_or("segment catalog epoch overflow")?;
-        manifest.segments.push(metadata);
+        manifest.segments.push(metadata.clone());
         manifest.segments.sort_by_key(|segment| segment.base_label);
         let published = self.publish(manifest);
         if published.is_err() {
-            let _ = std::fs::remove_dir_all(self.root.join("segments").join(staged_id));
+            cleanup_staged(&self.root, std::slice::from_ref(&metadata));
         }
         published
     }
@@ -1239,6 +1252,16 @@ impl SegmentCatalog {
     }
 
     fn publish(&self, manifest: SegmentSetManifest) -> Result<Arc<OpenedSegmentSet>, String> {
+        let mut pending = self
+            .pending_publication
+            .lock()
+            .map_err(|_| "segment publication lock poisoned".to_string())?;
+        if pending.as_ref().is_some_and(|held| held != &manifest) {
+            return Err(
+                "segment publication is uncertain; retry the same manifest or reopen for recovery"
+                    .into(),
+            );
+        }
         let current = self.snapshot();
         let opened = Arc::new(OpenedSegmentSet::open_manifest_reusing(
             self.root.clone(),
@@ -1246,11 +1269,15 @@ impl SegmentCatalog {
             self.load,
             Some(&current),
         )?);
-        write_json_atomic(&self.root.join(SET_FILE), &manifest)?;
+        if let Err(error) = write_json_atomic(&self.root.join(SET_FILE), &manifest) {
+            *pending = Some(manifest);
+            return Err(error);
+        }
         *self
             .current
             .write()
             .map_err(|_| "segment catalog lock poisoned".to_string())? = Arc::clone(&opened);
+        *pending = None;
         Ok(opened)
     }
 }
@@ -1294,9 +1321,77 @@ pub fn remove_segment_dirs(root: &Path, segments: &[SegmentMetadata]) {
 }
 
 fn cleanup_staged(root: &Path, segments: &[SegmentMetadata]) {
+    // A rename can succeed before directory fsync fails. Never delete files
+    // named by that manifest, and retain them if the manifest cannot be read.
+    let manifest = match SegmentCatalog::read_manifest(root) {
+        Ok(value) => value,
+        Err(_) => return,
+    };
     for segment in segments {
+        if manifest.as_ref().is_some_and(|m| {
+            m.segments
+                .iter()
+                .any(|s| s.segment_id == segment.segment_id)
+        }) {
+            continue;
+        }
         let _ = std::fs::remove_dir_all(root.join("segments").join(&segment.segment_id));
     }
+}
+
+fn verify_retry_source(
+    root: &Path,
+    source: &SegmentSource<'_>,
+    held: &SegmentMetadata,
+) -> Result<(), String> {
+    let backend = if source.vector_path.is_some() {
+        source.backend_kind
+    } else {
+        ""
+    };
+    if source.generation != held.generation
+        || source.base_label != held.base_label
+        || backend != held.backend_kind
+    {
+        return Err("segment retry differs from the published generation, range or backend".into());
+    }
+    let expected_partition = source.partition_column.and_then(|column| {
+        held.summary
+            .as_ref()?
+            .int_columns
+            .iter()
+            .find(|summary| summary.name == column && summary.present > 0)
+            .map(|summary| PartitionRange {
+                column: column.into(),
+                lo: summary.min,
+                hi: summary.max,
+            })
+    });
+    if held.summary.as_ref().and_then(|s| s.partition.clone()) != expected_partition {
+        return Err("segment retry differs from the published partition contract".into());
+    }
+    let directory = SegmentCatalog::segment_dir(root, &held.segment_id);
+    for (source, artifact) in [
+        (source.vector_path, &held.vector),
+        (source.exact_vector_path, &held.exact_vectors),
+        (Some(source.bm25_path), &held.bm25),
+        (Some(source.live_docs_path), &held.live_docs),
+    ] {
+        match source {
+            Some(path) if !artifact.file.is_empty() => {
+                let (bytes, sha256) = digest_file(path)?;
+                if bytes != artifact.bytes || sha256 != artifact.sha256 {
+                    return Err("segment retry content differs from its published artifact".into());
+                }
+                verify_artifact(&directory, artifact)?;
+            }
+            None if artifact.file.is_empty()
+                && artifact.bytes == 0
+                && artifact.sha256.is_empty() => {}
+            _ => return Err("segment retry differs from the published artifact shape".into()),
+        }
+    }
+    Ok(())
 }
 
 fn validate_manifest(manifest: &SegmentSetManifest) -> Result<(), String> {
@@ -1427,15 +1522,19 @@ fn copy_artifact(source: &Path, directory: &Path, name: &str) -> Result<SegmentA
     })
 }
 
-fn stage_segment(root: &Path, source: SegmentSource<'_>) -> Result<SegmentMetadata, String> {
-    if source.segment_id.is_empty()
-        || !source
-            .segment_id
+fn validate_segment_id(segment_id: &str) -> Result<(), String> {
+    if segment_id.is_empty()
+        || !segment_id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
     {
-        return Err(format!("invalid segment id {:?}", source.segment_id));
+        return Err(format!("invalid segment id {segment_id:?}"));
     }
+    Ok(())
+}
+
+fn stage_segment(root: &Path, source: SegmentSource<'_>) -> Result<SegmentMetadata, String> {
+    validate_segment_id(source.segment_id)?;
     let final_dir = root.join("segments").join(source.segment_id);
     if final_dir.exists() {
         return Err(format!("segment {:?} already exists", source.segment_id));
@@ -1602,6 +1701,9 @@ fn verify_artifact(directory: &Path, artifact: &SegmentArtifact) -> Result<(), S
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! { static FAIL_SET_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), String> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)
@@ -1619,6 +1721,12 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), String> 
             .map_err(|error| format!("write {}: {error}", temp.display()))?;
     }
     std::fs::rename(&temp, path).map_err(|error| format!("replace {}: {error}", path.display()))?;
+    #[cfg(test)]
+    if path.file_name().is_some_and(|name| name == SET_FILE)
+        && FAIL_SET_SYNC.with(|fail| fail.replace(false))
+    {
+        return Err("injected directory sync failure after manifest rename".into());
+    }
     std::fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| format!("sync {}: {error}", parent.display()))
@@ -1791,6 +1899,180 @@ mod tests {
             live_docs_path: &fixture.live_docs,
             partition_column: None,
         }
+    }
+
+    #[test]
+    fn compaction_publication_preserves_previously_pinned_epochs() {
+        let fixture = fixture(
+            "pinned-epoch",
+            &[
+                1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.8, 0.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ],
+            &["one", "two"],
+        );
+        let catalog = SegmentCatalog::open(fixture.root.join("catalog")).unwrap();
+        let before = catalog.snapshot();
+        let after = catalog.commit_current(7).unwrap();
+        assert_eq!(before.epoch(), 0, "a held snapshot is immutable");
+        assert_eq!(after.epoch(), 7);
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert_eq!(catalog.snapshot().epoch(), 7);
+        assert_eq!(
+            SegmentCatalog::open(fixture.root.join("catalog"))
+                .unwrap()
+                .snapshot()
+                .epoch(),
+            7
+        );
+    }
+
+    #[test]
+    fn failed_compaction_publication_does_not_consume_the_requested_epoch() {
+        let fixture = fixture(
+            "failed-epoch",
+            &[
+                1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.8, 0.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ],
+            &["one", "two"],
+        );
+        let root = fixture.root.join("catalog");
+        let catalog = SegmentCatalog::open(&root).unwrap();
+        catalog.commit_current(1).unwrap();
+        let before = catalog.snapshot();
+        let path = SegmentCatalog::manifest_path(&root);
+        let backup = root.join("saved.json");
+        std::fs::rename(&path, &backup).unwrap();
+        std::fs::create_dir(&path).unwrap(); // Force manifest rename to fail.
+        assert!(catalog.commit_current(2).is_err());
+        assert_eq!(before.epoch(), 1);
+        assert_eq!(catalog.snapshot().epoch(), 1);
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&backup, &path).unwrap();
+        assert_eq!(catalog.commit_current(2).unwrap().epoch(), 2);
+    }
+
+    fn publication_fixture(name: &str, terms: &[&str]) -> Fixture {
+        fixture(
+            name,
+            &[
+                1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.8, 0.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ],
+            terms,
+        )
+    }
+
+    #[test]
+    fn uncertain_append_keeps_published_artifacts_and_retries_without_duplicate_rows() {
+        let data = publication_fixture("uncertain-append", &["one", "two"]);
+        let root = data.root.join("catalog");
+        let catalog = SegmentCatalog::open(&root).unwrap();
+        let before = catalog.snapshot();
+        FAIL_SET_SYNC.with(|fail| fail.set(true));
+        assert!(catalog
+            .append(source(&data, "s0", 0))
+            .unwrap_err()
+            .contains("after manifest rename"));
+        assert_eq!(before.epoch(), 0);
+        assert_eq!(catalog.snapshot().epoch(), 0);
+        // The disk manifest already names s0: cleanup must retain it.
+        assert!(SegmentCatalog::segment_dir(&root, "s0").exists());
+        assert_eq!(
+            SegmentCatalog::open(&root)
+                .unwrap()
+                .snapshot()
+                .manifest()
+                .segments
+                .len(),
+            1
+        );
+        // A different write cannot overwrite the disk manifest from a stale view.
+        assert!(catalog
+            .append(source(&data, "s1", 2))
+            .unwrap_err()
+            .contains("uncertain"));
+        assert!(catalog
+            .publish_partition_key(Some("year".into()))
+            .unwrap_err()
+            .contains("uncertain"));
+        assert_eq!(
+            SegmentCatalog::read_manifest(&root)
+                .unwrap()
+                .unwrap()
+                .segments
+                .len(),
+            1
+        );
+        assert!(!SegmentCatalog::segment_dir(&root, "s1").exists());
+        let recovered = catalog.append(source(&data, "s0", 0)).unwrap();
+        assert_eq!(recovered.epoch(), 1);
+        assert_eq!(recovered.manifest().segments.len(), 1);
+        assert_eq!(recovered.manifest().segments[0].rows, 2);
+        assert_eq!(catalog.append(source(&data, "s0", 0)).unwrap().epoch(), 1);
+        assert_eq!(before.epoch(), 0);
+    }
+
+    #[test]
+    fn segment_retry_refuses_changed_content_generation_range_and_damaged_artifacts() {
+        let data = publication_fixture("retry-source", &["one", "two"]);
+        let changed = publication_fixture("retry-changed", &["other", "two"]);
+        let root = data.root.join("catalog");
+        let catalog = SegmentCatalog::open(&root).unwrap();
+        catalog.append(source(&data, "s0", 0)).unwrap();
+        assert!(catalog.append(source(&changed, "s0", 0)).is_err());
+        assert!(catalog
+            .append(source_generation(&data, "s0", 0, 2))
+            .is_err());
+        assert!(catalog.append(source(&data, "s0", 2)).is_err());
+        assert_eq!(catalog.snapshot().epoch(), 1);
+        let vector = SegmentCatalog::segment_dir(&root, "s0").join("vector.index");
+        let original = std::fs::read(&vector).unwrap();
+        let mut damaged = original.clone();
+        let last = damaged.len() - 1;
+        damaged[last] ^= 1;
+        std::fs::write(&vector, &damaged).unwrap();
+        assert!(catalog.append(source(&data, "s0", 0)).is_err());
+        std::fs::write(&vector, original).unwrap();
+        assert_eq!(catalog.append(source(&data, "s0", 0)).unwrap().epoch(), 1);
+    }
+
+    #[test]
+    fn uncertain_compaction_keeps_outputs_needed_to_reopen_the_published_set() {
+        let data = publication_fixture("uncertain-compact", &["one", "two"]);
+        let root = data.root.join("catalog");
+        let catalog = SegmentCatalog::open(&root).unwrap();
+        let before = catalog.append(source(&data, "input", 0)).unwrap();
+        FAIL_SET_SYNC.with(|fail| fail.set(true));
+        assert!(catalog
+            .replace_for_compaction(&["input".into()], source_generation(&data, "output", 0, 2))
+            .is_err());
+        assert_eq!(before.epoch(), 1);
+        assert_eq!(
+            catalog.snapshot().manifest().segments[0].segment_id,
+            "input"
+        );
+        let reopened = SegmentCatalog::open(&root).unwrap();
+        assert_eq!(reopened.snapshot().epoch(), 2);
+        assert_eq!(
+            reopened.snapshot().manifest().segments[0].segment_id,
+            "output"
+        );
+        assert!(SegmentCatalog::segment_dir(&root, "input").exists());
+        assert!(SegmentCatalog::segment_dir(&root, "output").exists());
+    }
+
+    #[test]
+    fn cleanup_retains_artifacts_when_it_cannot_establish_the_committed_manifest() {
+        let data = publication_fixture("uncertain-cleanup", &["one", "two"]);
+        let root = data.root.join("catalog");
+        let catalog = SegmentCatalog::open(&root).unwrap();
+        let metadata = stage_segment(&root, source(&data, "orphan", 0)).unwrap();
+        std::fs::write(SegmentCatalog::manifest_path(&root), b"broken JSON").unwrap();
+        cleanup_staged(&root, std::slice::from_ref(&metadata));
+        assert!(SegmentCatalog::segment_dir(&root, "orphan").exists());
+        assert!(catalog.append(source(&data, "orphan", 0)).is_err());
+        std::fs::remove_file(SegmentCatalog::manifest_path(&root)).unwrap();
+        cleanup_staged(&root, &[metadata]);
+        assert!(!SegmentCatalog::segment_dir(&root, "orphan").exists());
     }
 
     #[test]

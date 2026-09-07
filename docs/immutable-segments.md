@@ -10,6 +10,30 @@ every existing single-image shard keeps it: a shard has the layout its files
 have, and nothing converts on open — a path with both a single image and a
 catalog refuses by name.
 
+## Publication recovery (foundation branch)
+
+Published snapshots keep their epoch for their entire lifetime. Compaction
+publishes a new snapshot and adopts it in both the document and vector legs;
+a failed manifest write does not change the epoch of an existing view.
+
+A manifest rename can succeed before the parent-directory sync fails. That
+result is uncertain: the caller receives an error, but recovery may find the
+new manifest. Cleanup retains every segment it references and retains staged
+files when the manifest cannot be read. The catalog refuses a different
+publication while that acknowledgment is unresolved, preventing a later write
+from replacing the disk manifest using the older in-memory snapshot.
+
+An append retry with the same segment id verifies its generation, positional
+range, backend, partition metadata, and hashes of both its source and published
+artifacts. It then republishes the same manifest to reaffirm durability,
+without adding duplicate rows or advancing the epoch. Changed content refuses.
+An existing staged directory absent from the manifest requires recovery; it
+is never adopted on its name alone. Compaction recovery continues to use its
+commit marker and rollback protocol.
+
+These guarantees concern segment publication. They do not yet publish a
+logical document version and all its projected rows as one transaction.
+
 ## The node's segmented shard
 
 Local document ids are one positional space: segment `i` covers
