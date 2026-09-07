@@ -230,8 +230,9 @@ remains ignored. All 5 Android/iOS targets, tests/examples compilation,
 formatting, vendored-proto identity and diff checks passed. The descriptor
 comparison against `bd75556` found no changes to existing wire declarations.
 All 630 captured tracked and untracked files matched between both phase
-snapshots and remained unchanged through validation. The scope had an 8 GiB hard limit, peaked at
-8 GiB, used no swap and recorded 0 OOM, OOM-kill or OOM-group-kill events.
+snapshots and remained unchanged through validation. The scope had an 8 GiB
+hard limit, peaked at 8 GiB, used no swap and recorded 0 OOM, OOM-kill or
+OOM-group-kill events.
 
 The library phase of an earlier driver attempt exited successfully, after which
 the driver stopped because its suite-script path was missing; this was not a
