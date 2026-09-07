@@ -781,7 +781,7 @@ async fn embedded_owner_publishes_and_recovers_through_the_real_search_path() {
 }
 
 #[tokio::test]
-async fn unjournaled_runtime_deletions_cannot_be_reported_as_source_activation() {
+async fn source_owner_refuses_runtime_deletion_and_preserves_next_publication() {
     let fixture = Fixture::new();
     let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None, false).unwrap());
     let receipt = fixture.accept(1, Some(source(2, false)));
@@ -789,38 +789,189 @@ async fn unjournaled_runtime_deletions_cannot_be_reported_as_source_activation()
         .stage_document_projection(fixture.catalog.clone(), fixture.request(&receipt))
         .await
         .unwrap();
-    publish_candidate(node.clone(), fixture.catalog.clone(), candidate)
+    let activated = publish_candidate(node.clone(), fixture.catalog.clone(), candidate)
         .await
         .unwrap();
-    node.delete_documents(Request::new(DeleteDocumentsRequest {
-        doc_ids: vec![0],
-        ..Default::default()
-    }))
-    .await
-    .unwrap();
+    let before = fixture.manifest();
+    let error = node
+        .delete_documents(Request::new(DeleteDocumentsRequest {
+            doc_ids: vec![0],
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert!(error.message().contains("source-managed index"));
     let source_catalog = fixture.catalog.clone();
     let worker_node = node.clone();
-    let error = tokio::task::spawn_blocking(move || {
+    let recovered = tokio::task::spawn_blocking(move || {
         worker_node.recover_document_projection_blocking(&source_catalog, b"books-index")
     })
     .await
     .unwrap()
-    .unwrap_err();
-    assert!(error.message().contains("uncommitted runtime tombstones"));
+    .unwrap()
+    .unwrap();
+    assert_eq!(recovered.intent_id, activated.intent_id);
+    assert_eq!(fixture.manifest(), before);
     let next = fixture.accept(2, Some(source(1, false)));
     let candidate = node
         .stage_document_projection(fixture.catalog.clone(), fixture.request(&next))
         .await
         .unwrap();
-    let before = fixture.manifest();
-    let error = publish_candidate(node, fixture.catalog.clone(), candidate)
+    let activated = publish_candidate(node, fixture.catalog.clone(), candidate)
         .await
-        .unwrap_err();
-    assert!(error.message().contains("uncommitted runtime tombstones"));
-    assert_eq!(fixture.manifest(), before);
-    assert!(fixture
-        .catalog
-        .index_publication_decision(b"books-index", next.accepted_sequence)
+        .unwrap();
+    assert_eq!(activated.version, 2);
+    assert_eq!(activated.rows, 1);
+}
+
+#[tokio::test]
+async fn source_owner_survives_reopen_and_fences_legacy_storage_and_snapshots() {
+    use pipestream_search::segments::{
+        write_manifest_file, OpenedSegmentSet, SegmentCatalog, SegmentSetManifest,
+    };
+    for rows in [0, 2] {
+        let fixture = Fixture::new();
+        let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None, false).unwrap());
+        let receipt = fixture.accept(
+            1,
+            if rows == 0 {
+                None
+            } else {
+                Some(source(rows, false))
+            },
+        );
+        let mut request = fixture.request(&receipt);
+        if rows == 0 {
+            request
+                .projection
+                .as_mut()
+                .unwrap()
+                .expected_plan_fingerprint
+                .clear();
+            request.field_analysis.clear();
+        }
+        let candidate = node
+            .stage_document_projection(fixture.catalog.clone(), request)
+            .await
+            .unwrap();
+        publish_candidate(node, fixture.catalog.clone(), candidate)
+            .await
+            .unwrap();
+        let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None, false).unwrap());
+        let root = segments_root(fixture.config.index_path.as_ref().unwrap());
+        let set = OpenedSegmentSet::open(&root).unwrap();
+        let owner = set
+            .manifest()
+            .source_owner
+            .as_ref()
+            .unwrap()
+            .decode()
+            .unwrap();
+        assert_eq!(owner.history_id, receipt.history_id);
+        assert_eq!(owner.index_key, b"books-index");
+        assert_eq!(owner.collection, "books");
+        assert_eq!(set.manifest().format, 3);
+        let before = fixture.manifest();
+        let catalog = SegmentCatalog::open(&root).unwrap();
+        for result in [
+            catalog.commit_rows(set.epoch(), &[], vec![]).map(|_| ()),
+            catalog.publish_partition_key(Some("key_bucket".into())),
+            catalog.commit_current(set.epoch() + 1).map(|_| ()),
+            write_manifest_file(&root.join("segments.json"), &SegmentSetManifest::default()),
+        ] {
+            assert!(result.unwrap_err().contains("source"));
+        }
+        let shadow =
+            SegmentCatalog::open_staged(&root, SegmentSetManifest::default(), Default::default())
+                .unwrap();
+        assert!(shadow
+            .commit_current(set.epoch() + 1)
+            .unwrap_err()
+            .contains("source"));
+        let worker = node.clone();
+        let destination = fixture.root.join("index-only-backup");
+        let error =
+            tokio::task::spawn_blocking(move || worker.export_snapshot_blocking(&destination))
+                .await
+                .unwrap()
+                .unwrap_err();
+        assert!(error.message().contains("source-managed index"));
+        assert!(!fixture.root.join("index-only-backup").exists());
+        assert_eq!(fixture.manifest(), before);
+        for kind in 0..3 {
+            let mut config = fixture.config.clone();
+            match kind {
+                0 => config.collection = "another-collection".into(),
+                1 => config.wal = true,
+                _ => config.layout = pipestream_search::node::Layout::SingleImage,
+            }
+            let error = NodeServiceImpl::open(config, None, false)
+                .err()
+                .expect("owner configuration must be preserved");
+            assert!(error.contains("source-managed index"), "{error}");
+        }
+        let worker = node.clone();
+        let source_catalog = fixture.catalog.clone();
+        let error = tokio::task::spawn_blocking(move || {
+            worker.recover_document_projection_blocking(&source_catalog, b"another-index")
+        })
+        .await
         .unwrap()
-        .is_none());
+        .unwrap_err();
+        assert!(error.message().contains("another index owner"));
+    }
+}
+
+#[tokio::test]
+async fn source_owner_refuses_local_view_substitution_without_losing_valid_reads() {
+    use pipestream_search::{exact_vectors::ExactVectorStore, live_docs::LiveDocs};
+    let fixture = Fixture::new();
+    let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None, false).unwrap());
+    let receipt = fixture.accept(1, Some(source(2, false)));
+    let candidate = node
+        .stage_document_projection(fixture.catalog.clone(), fixture.request(&receipt))
+        .await
+        .unwrap();
+    let activation = publish_candidate(node.clone(), fixture.catalog.clone(), candidate)
+        .await
+        .unwrap();
+    let unrelated = ExactVectorStore::from_values(8, vec![0.9; 16]).unwrap();
+    for exact in [Some(unrelated), None] {
+        let error = node
+            .as_ref()
+            .clone()
+            .with_exact_vectors(exact)
+            .err()
+            .expect("owned vectors must not be replaceable");
+        assert!(error.contains("source-managed index"));
+    }
+    let mut overlay = LiveDocs::default();
+    overlay.delete(0);
+    let error = node
+        .as_ref()
+        .clone()
+        .with_live_docs(overlay)
+        .err()
+        .expect("uncommitted overlay must be refused");
+    assert!(error.contains("uncommitted runtime tombstones"));
+    let clone = node.as_ref().clone();
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| clone.with_bm25(None))).is_err()
+    );
+    let clone = node.as_ref().clone();
+    let dir = fixture.root.join("other-generation");
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+        || clone.with_generation(Some(dir))
+    ))
+    .is_err());
+    let catalog = fixture.catalog.clone();
+    let recovered = tokio::task::spawn_blocking(move || {
+        node.recover_document_projection_blocking(&catalog, b"books-index")
+    })
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    assert_eq!(activation.intent_id, recovered.intent_id);
 }

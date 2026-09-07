@@ -315,11 +315,10 @@ This is artifact transaction evidence, not proof of active serving state.
 their source versions are still searchable. The original acceptance/retry receipt
 is never rewritten. There is no new network RPC, mobile ABI command or positive
 searchable receipt. The local activation path below joins the journal to the
-serving view. Exclusive source ownership still must fence legacy writers, handle
-compaction and coherent backups, and coordinate
-documents spanning shards. In particular, an out-of-band compaction currently
-changes the certified manifest and requires reconciliation; it cannot silently
-advance the source cursor. Regression tests in
+serving view. Source activation now installs persistent ownership in the segment
+manifest and fences legacy writers as described below. Source-aware compaction,
+coherent backups and coordination of documents spanning shards remain unfinished;
+legacy maintenance cannot silently advance the source cursor. Regression tests in
 `document_catalog::publication::tests` exercise actual staged source rows,
 replacement and retirement checks, exact retries, empty/deleted sources, cursor
 ordering, foreign histories, missing tables and interrupted manifest commits.
@@ -364,15 +363,41 @@ without appending another copy. The embedded Rust owner exposes asynchronous
 blocking worker retains ownership of candidate files even if the caller stops
 awaiting it. The same socket-free search path observes the published rows.
 
-This does not yet introduce a public document-write RPC, mobile ABI publication
-command, or source-managed index mode. Existing legacy mutation APIs remain
-available, so exclusive source ownership and collection publication still need
-their durable configuration and write gates. Out-of-band mutations may cause
-subsequent source publication/recovery to refuse. Compaction must be joined to
-the journal before it can maintain a source-managed index. Tests cover actual
-lexical/vector reads and identities, stale candidates, empty sources, deletions,
-embedded restart, unjournaled runtime deletes, and both interruption windows
-with the source catalog and serving node reopened.
+The first source activation atomically installs `SourceIndexOwner`, including
+on an empty source or deletion-only index. It identifies the source history,
+logical index and collection; it contains no path, node address or credential.
+The segment manifest stores canonical protobuf bytes and their SHA-256 under
+format 3. Formats 1 and 2 remain readable for unowned indexes; older readers
+refuse format 3. A later source transition must preserve the same owner, and
+recovery verifies that it belongs to the supplied source catalog and index key.
+There is no separate mutation that adopts an arbitrary populated legacy index.
+
+Owned indexes refuse legacy row, vector, delete, replacement, binding and backend
+mutations at their commit boundaries. Generic catalog publication and staged
+compaction cannot remove or replace the owner. Startup requires the original
+collection, segmented layout, WAL disabled and no competing snapshot generation.
+The local attachment methods reject replacement exact-vector data and extra
+runtime tombstones. As with other local persistence, this is not protection from
+an actor who can rewrite the files directly; independent writers must not share
+a root without the owning application's serialization.
+
+Index-only snapshot export and import are unavailable for source-managed indexes:
+copying index files without the authoritative source catalog is not a coherent
+backup. Legacy compaction is also refused. Both need journal-aware lifecycle
+transactions before support can be enabled. No public document-write RPC, mobile
+ABI publication command or collection-wide searchable receipt is added here.
+Tests cover actual lexical/vector reads and identities, stale candidates, empty
+sources, deletions, embedded restart, rejected unjournaled mutations, persisted
+ownership and both interruption windows with the source catalog and serving node
+reopened.
+
+Ownership checkpoint validation: 588 library tests, 831 integration tests across
+142 targets, 13 embedded tests and two IVF adapter tests passed. The existing
+live OpenNLP comparison remains ignored. All five Android/iOS compile targets,
+examples, formatting, vendored contracts and the search-protobuf descriptor
+comparison against `3c5c7ed` passed. The combined run used an enforced 8 GiB
+cgroup limit with swap disabled and no OOM kills. This is local validation;
+no fleet deployment or source-aware backup/compaction proof is claimed.
 
 ## Remaining lifecycle work
 

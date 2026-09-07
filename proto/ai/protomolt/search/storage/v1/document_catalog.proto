@@ -56,3 +56,13 @@ message ProjectionJournalState {
   bytes committed_manifest_sha256 = 4;
   ProjectionIntent pending = 5;
 }
+
+// Persistent authority of a source-managed index. It is not a credential and
+// contains no storage path or network address. Mutations must join this source
+// history's publication journal; ordinary row/WAL mutation routes refuse.
+message SourceIndexOwner {
+  uint32 format_version = 1;
+  bytes history_id = 2;
+  bytes index_key = 3;
+  string collection = 4;
+}

@@ -22,7 +22,10 @@ struct PreparedServingState {
     live: LiveDocs,
 }
 
-fn check_source_live_view(set: &OpenedSegmentSet, live: &LiveDocs) -> Result<(), Status> {
+pub(super) fn check_source_live_view(
+    set: &OpenedSegmentSet,
+    live: &LiveDocs,
+) -> Result<(), Status> {
     let mut durable = LiveDocs::default();
     set.merge_tombstones(&mut durable)
         .map_err(Status::failed_precondition)?;
@@ -93,6 +96,13 @@ impl NodeServiceImpl {
             ));
         };
         let claim = StatsClaim::required(guard.stats_epoch, &guard.stats_incarnation.bytes()?)?;
+        if let Some(owner) = &shard.snapshot().manifest().source_owner {
+            if owner.decode().map_err(Status::data_loss)? != source.index_owner(index_key)? {
+                return Err(Status::failed_precondition(
+                    "source recovery belongs to another index owner",
+                ));
+            }
+        }
         self.check_segment_publication(&guard, claim, shard.snapshot().epoch())?;
         check_source_live_view(shard.snapshot(), &guard.live_docs)?;
         match source.recover_index_publication(index_key, shard.catalog()) {
@@ -250,6 +260,9 @@ impl NodeServiceImpl {
             .map_err(|_| Status::internal("seal lock poisoned"))?;
         let (catalog, old_set, old_live, backend, old_binding, next_claim) = {
             let guard = read_shard(&self.state);
+            if projection.is_none() {
+                guard.check_legacy_mutation()?;
+            }
             self.check_segment_publication(&guard, expected, catalog_epoch)?;
             let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
                 unreachable!()
@@ -284,6 +297,9 @@ impl NodeServiceImpl {
         if projection.is_some() {
             check_source_live_view(&old_set, &old_live)?;
         }
+        let source_owner = projection
+            .map(|source| source.catalog.index_owner(source.index_key))
+            .transpose()?;
         let mut prepared_commit = false;
         let prepare = |set: &Arc<OpenedSegmentSet>| {
             let prepared = self.prepare_serving_state(&catalog, set, old_live, backend)?;
@@ -322,6 +338,9 @@ impl NodeServiceImpl {
                     .candidate
                     .segments()
                     .and_then(OpenedSegmentSet::binding),
+                source_owner
+                    .as_ref()
+                    .expect("source publication has an owner"),
                 prepare,
             ),
             None => catalog.commit_rows_prepared(catalog_epoch, retirements, sources, prepare),

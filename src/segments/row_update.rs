@@ -37,7 +37,7 @@ impl SegmentCatalog {
         sources: Vec<SegmentSource<'_>>,
         prepare: impl FnOnce(&Arc<OpenedSegmentSet>) -> Result<T, String>,
     ) -> Result<(Arc<OpenedSegmentSet>, T), String> {
-        self.commit_row_transaction(expected_epoch, retirements, sources, None, false, prepare)
+        self.commit_row_transaction(expected_epoch, retirements, sources, None, None, prepare)
     }
 
     /// Source versions may produce zero rows. Still commit their epoch and
@@ -48,9 +48,17 @@ impl SegmentCatalog {
         retirements: &[SegmentRowRetirement],
         sources: Vec<SegmentSource<'_>>,
         binding: Option<&StoredBinding>,
+        owner: &crate::pb::storage::SourceIndexOwner,
         prepare: impl FnOnce(&Arc<OpenedSegmentSet>) -> Result<T, String>,
     ) -> Result<(Arc<OpenedSegmentSet>, T), String> {
-        self.commit_row_transaction(expected_epoch, retirements, sources, binding, true, prepare)
+        self.commit_row_transaction(
+            expected_epoch,
+            retirements,
+            sources,
+            binding,
+            Some(owner),
+            prepare,
+        )
     }
 
     fn commit_row_transaction<T>(
@@ -59,7 +67,7 @@ impl SegmentCatalog {
         retirements: &[SegmentRowRetirement],
         sources: Vec<SegmentSource<'_>>,
         binding: Option<&StoredBinding>,
-        allow_empty: bool,
+        owner: Option<&crate::pb::storage::SourceIndexOwner>,
         prepare: impl FnOnce(&Arc<OpenedSegmentSet>) -> Result<T, String>,
     ) -> Result<(Arc<OpenedSegmentSet>, T), String> {
         let _guard = self
@@ -78,6 +86,7 @@ impl SegmentCatalog {
             );
         }
         let current = self.snapshot();
+        self.check_source_owner(owner)?;
         if current.epoch() != expected_epoch {
             return Err(format!(
                 "row update expected epoch {expected_epoch}, current epoch is {}",
@@ -87,7 +96,7 @@ impl SegmentCatalog {
         let epoch = expected_epoch
             .checked_add(1)
             .ok_or("segment catalog epoch overflow")?;
-        if !allow_empty && retirements.is_empty() && sources.is_empty() {
+        if owner.is_none() && retirements.is_empty() && sources.is_empty() {
             return Err("row update requires retirements or new segments".into());
         }
         if binding.is_some_and(|binding| current.binding().is_some_and(|held| held != binding))
@@ -146,9 +155,9 @@ impl SegmentCatalog {
                 );
             }
         }
-        let mut manifest = current
-            .published_manifest()
-            .with_binding(binding.or(current.binding()))?;
+        let mut manifest = current.published_manifest();
+        manifest.source_owner = owner.map(SegmentSourceOwner::encode).transpose()?;
+        manifest = manifest.with_binding(binding.or(current.binding()))?;
         manifest.epoch = epoch;
         let mut outputs = Vec::new();
         let mut overlays = Vec::new();
@@ -181,7 +190,7 @@ impl SegmentCatalog {
                 Some(&current),
             )?);
             let context = prepare(&opened)?;
-            let published = self.publish_opened(opened)?;
+            let published = self.publish_owned(opened, owner)?;
             Ok((published, context))
         })();
         if result.is_err() {

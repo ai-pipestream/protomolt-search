@@ -1237,19 +1237,25 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: persistent source ownership.** Source activation now
+  records its history, logical index and collection in a format-3 segment
+  manifest, including empty/deleted sources. Reopen and mutation boundaries
+  enforce that owner; legacy compaction, index-only snapshots and arbitrary
+  local view replacement refuse. Source-aware maintenance and coherent backups
+  remain unfinished. See [local source activation](docs/document-writes.md#local-source-activation).
 - **Foundation branch: accepted-source activation.** The trusted Rust owner can
   publish a complete candidate through the node's serving-state fence, including
   zero-row sources and deletions. Reopen joins source-journal recovery to the
   active read version; embedded search uses the same path. Configured WAL targets
   refuse even after their writer has failed. Collection-wide searchable receipts
-  and exclusive source-managed mutation rules remain pending.
+  remain pending; persistent source ownership is described in the newer entry above.
   See [local source activation](docs/document-writes.md#local-source-activation).
 - **Foundation branch: durable source projection decisions.** An ordered
   protobuf journal binds private candidates to exact accepted versions and
   validated before/after segment manifests. Recovery distinguishes a committed
   artifact transaction from an aborted preparation and refuses unrelated or
   uncertain manifests. Original retry receipts remain unchanged. Serving-state
-  activation and searchable receipts still require lifecycle integration.
+  activation is described above; collection-wide searchable receipts still require lifecycle integration.
   See [projection decisions](docs/document-writes.md#durable-projection-decisions).
 - **Foundation branch: accepted-source candidate staging.** A protobuf request
   builds private analyzed segments from an exact catalog version using the

@@ -496,6 +496,7 @@ impl NodeServiceImpl {
             )
         })?;
         let guard = crate::node::read_shard(&self.state);
+        guard.check_legacy_mutation()?;
         if guard.pending_compaction.is_some() {
             return Err(Status::failed_precondition(
                 "a compaction cutover is pending its closing flush on this shard; call Flush",

@@ -20,6 +20,25 @@ pub(super) struct SegmentedExact {
 }
 
 impl ExactVectorStore {
+    /// An owned projection can only attach the exact images of its held catalog.
+    /// Equal dimensions and row counts alone do not prove the same vector data.
+    pub(crate) fn matches_segments(&self, set: &OpenedSegmentSet) -> bool {
+        let Storage::Segmented(view) = &self.storage else {
+            return false;
+        };
+        view.parts.len() == set.len()
+            && view.parts.iter().enumerate().all(|(i, part)| {
+                let metadata = set.metadata(i);
+                part.base as u64 == metadata.base_label
+                    && (part.end - part.base) as u64 == metadata.rows
+                    && match (&part.store, set.exact_vectors(i)) {
+                        (Some(held), Some(expected)) => Arc::ptr_eq(held, expected),
+                        (None, None) => true,
+                        _ => false,
+                    }
+            })
+    }
+
     /// Share the FP32 images already validated and held by this catalog view.
     /// `len` counts physical rows, including document-only gaps. Scoring skips
     /// gaps; range reads and single-file exports refuse to invent their values.

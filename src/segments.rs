@@ -27,6 +27,7 @@ pub use row_update::SegmentRowRetirement;
 
 const BASE_SET_FORMAT: u32 = 1;
 const SET_FORMAT: u32 = 2;
+const SOURCE_SET_FORMAT: u32 = 3;
 const SET_FILE: &str = "segments.json";
 const SEGMENT_META_FILE: &str = "segment.json";
 
@@ -193,12 +194,49 @@ impl SegmentBinding {
     }
 }
 
+/// Canonical protobuf authority, including for a generation with no rows.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SegmentSourceOwner {
+    pub protobuf: Vec<u8>,
+    pub sha256: String,
+}
+
+impl SegmentSourceOwner {
+    pub fn encode(owner: &crate::pb::storage::SourceIndexOwner) -> Result<Self, String> {
+        let protobuf = owner.encode_to_vec();
+        let value = Self {
+            sha256: crate::sha256::hex_digest(&protobuf),
+            protobuf,
+        };
+        value.decode()?;
+        Ok(value)
+    }
+
+    pub fn decode(&self) -> Result<crate::pb::storage::SourceIndexOwner, String> {
+        let owner = crate::pb::storage::SourceIndexOwner::decode(self.protobuf.as_slice())
+            .map_err(|e| format!("source index owner: {e}"))?;
+        if self.sha256 != crate::sha256::hex_digest(&self.protobuf)
+            || owner.encode_to_vec() != self.protobuf
+            || owner.format_version != 1
+            || owner.history_id.len() != 16
+            || owner.history_id.iter().all(|b| *b == 0)
+            || owner.index_key.is_empty()
+            || owner.index_key.len() > 1024
+        {
+            return Err("invalid source index owner format, identity or checksum".into());
+        }
+        Ok(owner)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SegmentSetManifest {
     pub format: u32,
     /// Generation-level metadata remains present even when no segment has rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding: Option<SegmentBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_owner: Option<SegmentSourceOwner>,
     pub epoch: u64,
     pub segments: Vec<SegmentMetadata>,
     /// The integer column a partitioned compaction ordered this set by
@@ -215,6 +253,7 @@ impl Default for SegmentSetManifest {
         Self {
             format: BASE_SET_FORMAT,
             binding: None,
+            source_owner: None,
             epoch: 0,
             segments: Vec::new(),
             partition_key: None,
@@ -225,7 +264,9 @@ impl Default for SegmentSetManifest {
 impl SegmentSetManifest {
     pub fn with_binding(mut self, binding: Option<&StoredBinding>) -> Result<Self, String> {
         self.binding = binding.map(SegmentBinding::encode).transpose()?;
-        self.format = if self.binding.is_some() {
+        self.format = if self.source_owner.is_some() {
+            SOURCE_SET_FORMAT
+        } else if self.binding.is_some() {
             SET_FORMAT
         } else {
             BASE_SET_FORMAT
@@ -881,6 +922,29 @@ pub struct SegmentCatalog {
 }
 
 impl SegmentCatalog {
+    fn check_source_owner(
+        &self,
+        owner: Option<&crate::pb::storage::SourceIndexOwner>,
+    ) -> Result<(), String> {
+        let proposed = owner.map(SegmentSourceOwner::encode).transpose()?;
+        let current = self.snapshot();
+        let disk = Self::read_manifest(&self.root)?;
+        for held in [
+            current.manifest().source_owner.as_ref(),
+            disk.as_ref().and_then(|m| m.source_owner.as_ref()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if Some(held) != proposed.as_ref() {
+                return Err(
+                    "source-managed index requires its owning source publication journal".into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, String> {
         Self::open_with(root, VectorLoad::default())
     }
@@ -1380,6 +1444,7 @@ impl SegmentCatalog {
     }
 
     fn publish(&self, manifest: SegmentSetManifest) -> Result<Arc<OpenedSegmentSet>, String> {
+        self.check_source_owner(None)?;
         if self
             .pending_publication
             .lock()
@@ -1408,6 +1473,18 @@ impl SegmentCatalog {
         &self,
         opened: Arc<OpenedSegmentSet>,
     ) -> Result<Arc<OpenedSegmentSet>, String> {
+        self.publish_owned(opened, None)
+    }
+
+    fn publish_owned(
+        &self,
+        opened: Arc<OpenedSegmentSet>,
+        owner: Option<&crate::pb::storage::SourceIndexOwner>,
+    ) -> Result<Arc<OpenedSegmentSet>, String> {
+        self.check_source_owner(owner)?;
+        if opened.manifest().source_owner != owner.map(SegmentSourceOwner::encode).transpose()? {
+            return Err("source-managed index owner cannot be added, changed or removed by a legacy publication".into());
+        }
         let manifest = opened.manifest();
         let mut pending = self
             .pending_publication
@@ -1462,6 +1539,14 @@ pub fn stage_segments(
 /// Write a set manifest to `path` atomically: the copy a compaction
 /// cutover keeps for rollback beside the live one (`docs/mutations.md`).
 pub fn write_manifest_file(path: &Path, manifest: &SegmentSetManifest) -> Result<(), String> {
+    if path.file_name().is_some_and(|name| name == SET_FILE) {
+        let held = SegmentCatalog::read_manifest(path.parent().unwrap_or(Path::new(".")))?;
+        if manifest.source_owner.is_some()
+            || held.as_ref().is_some_and(|m| m.source_owner.is_some())
+        {
+            return Err("source-managed index manifests require source publication".into());
+        }
+    }
     write_json_atomic(path, manifest)
 }
 
@@ -1556,18 +1641,22 @@ fn verify_retry_source(
 }
 
 fn validate_manifest(manifest: &SegmentSetManifest) -> Result<(), String> {
-    if !(BASE_SET_FORMAT..=SET_FORMAT).contains(&manifest.format)
+    if !(BASE_SET_FORMAT..=SOURCE_SET_FORMAT).contains(&manifest.format)
         || (manifest.format == BASE_SET_FORMAT && manifest.binding.is_some())
         || (manifest.format == SET_FORMAT && manifest.binding.is_none())
+        || ((manifest.format == SOURCE_SET_FORMAT) != manifest.source_owner.is_some())
     {
         return Err(format!(
             "segment set format {} or binding declaration is unsupported; expected format \
-             {BASE_SET_FORMAT} without a binding or {SET_FORMAT} with a binding",
+             {BASE_SET_FORMAT} without a binding, {SET_FORMAT} with a binding, or {SOURCE_SET_FORMAT} with a source owner",
             manifest.format
         ));
     }
     if let Some(binding) = &manifest.binding {
         binding.decode()?;
+    }
+    if let Some(owner) = &manifest.source_owner {
+        owner.decode()?;
     }
     let mut ids = BTreeSet::new();
     let mut previous_end = None;
@@ -1978,6 +2067,62 @@ pub(crate) fn summarize_columns(bm25: &Bm25Reader, rows: u32) -> SegmentSummary 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_owner_metadata_rejects_downgrade_corruption_and_noncanonical_protobuf() {
+        let owner = crate::pb::storage::SourceIndexOwner {
+            format_version: 1,
+            history_id: vec![2; 16],
+            index_key: b"index\0key".to_vec(),
+            collection: String::new(),
+        };
+        let valid = SegmentSourceOwner::encode(&owner).unwrap();
+        assert_eq!(valid.decode().unwrap(), owner);
+        for case in 0..6 {
+            let mut invalid = owner.clone();
+            match case {
+                0 => invalid.format_version = 2,
+                1 => invalid.history_id = vec![0; 16],
+                2 => invalid.history_id.pop().map(|_| ()).unwrap(),
+                3 => invalid.index_key.clear(),
+                4 => invalid.index_key = vec![1; 1025],
+                _ => invalid.history_id.push(3),
+            }
+            assert!(SegmentSourceOwner::encode(&invalid).is_err());
+        }
+        let mut corrupted = valid.clone();
+        corrupted.sha256 = "00".repeat(32);
+        assert!(corrupted.decode().is_err());
+        let mut noncanonical = valid.clone();
+        noncanonical.protobuf.extend_from_slice(&[0x08, 0x01]);
+        noncanonical.sha256 = crate::sha256::hex_digest(&noncanonical.protobuf);
+        assert!(noncanonical.decode().is_err());
+        let mut unknown = valid.clone();
+        unknown.protobuf.extend_from_slice(&[0x78, 0x01]);
+        unknown.sha256 = crate::sha256::hex_digest(&unknown.protobuf);
+        assert!(unknown.decode().is_err());
+        let root = std::env::temp_dir().join(format!("source-owner-format-{}", std::process::id()));
+        let valid_manifest = SegmentSetManifest {
+            format: 3,
+            source_owner: Some(valid),
+            ..Default::default()
+        };
+        OpenedSegmentSet::open_manifest(root.clone(), valid_manifest.clone(), Default::default())
+            .unwrap();
+        for case in 0..4 {
+            let mut invalid = valid_manifest.clone();
+            match case {
+                0 => invalid.format = 1,
+                1 => invalid.format = 2,
+                2 => invalid.source_owner = None,
+                _ => invalid.source_owner = Some(corrupted.clone()),
+            }
+            assert!(
+                OpenedSegmentSet::open_manifest(root.clone(), invalid, Default::default()).is_err()
+            );
+        }
+    }
+
     use crate::postings::{AnalyzedDoc, Bm25Store};
     use crate::vector::{VectorIndex, EMBEDDED_TURBOVEC};
 

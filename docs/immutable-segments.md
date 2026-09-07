@@ -308,3 +308,18 @@ tiling before it replaces the old replica records or publishes a topology.
 The worker may run in the server process with `spawn_blocking` or in the same
 private embedded/mobile process. Neither form requires another network hop for
 the search data path.
+
+## Source-owned catalogs
+
+A catalog activated from a durable source projection uses manifest format 3 and
+retains a canonical protobuf `SourceIndexOwner` (source history, logical index
+key and collection). The owner is present even if the first accepted transition
+is a deletion and no binding or segment exists. Format-1 and format-2 catalogs
+remain unowned and readable; readers that do not know format 3 refuse it.
+
+Only the owning source publication journal can advance this manifest. Generic
+row commits, partition-key publication, staged compaction cutover and manifest
+writers cannot remove or replace ownership. Index-only snapshot import/export
+and legacy compaction refuse until coherent source-aware maintenance exists.
+See [local source activation](document-writes.md#local-source-activation) for
+recovery, local attachment checks and the remaining lifecycle work.

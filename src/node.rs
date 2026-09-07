@@ -17,6 +17,8 @@
 
 mod projection;
 mod publication;
+#[cfg(test)]
+mod source_owner_tests;
 pub use projection::StagedDocumentCandidate;
 #[cfg(test)]
 pub(crate) use publication::FAIL_PROJECTION_DECISION;
@@ -3821,6 +3823,17 @@ pub(crate) struct ParentMap {
 }
 
 impl ShardState {
+    pub(crate) fn check_legacy_mutation(&self) -> Result<(), Status> {
+        self.check_catalog_publication()?;
+        if matches!(self.bm25.as_ref(), Some(Bm25Shard::Segmented(shard))
+            if shard.snapshot().manifest().source_owner.is_some()
+                || shard.catalog().snapshot().manifest().source_owner.is_some())
+        {
+            return Err(Status::failed_precondition("source-managed index requires its owning source publication journal; legacy mutation and index-only snapshots are unavailable"));
+        }
+        Ok(())
+    }
+
     fn check_catalog_publication(&self) -> Result<(), Status> {
         if matches!(self.bm25.as_ref(), Some(Bm25Shard::Segmented(shard))
             if shard.catalog().publication_is_uncertain())
@@ -5376,10 +5389,28 @@ impl NodeServiceImpl {
         declare_derived_columns(&mut config)?;
         check_placement_columns(&config)?;
         validate_column_tables(&config)?;
-        let generation = config.index_path.as_ref().and_then(|path| {
+        if let Some(path) = config.index_path.as_ref() {
             recover_segments_swap(path);
-            recover_generation(path)
-        });
+            if let Some(manifest) =
+                crate::segments::SegmentCatalog::read_manifest(&segments_root(path))?
+            {
+                if let Some(owner) = &manifest.source_owner {
+                    let owner = owner.decode()?;
+                    if owner.collection != config.collection
+                        || config.wal
+                        || config.layout != Layout::Segments
+                        || generation_dir(path).exists()
+                        || generation_old_dir(path).exists()
+                    {
+                        return Err("source-managed index requires its original collection, segmented layout, WAL disabled and no competing snapshot generation".into());
+                    }
+                }
+            }
+        }
+        let generation = config
+            .index_path
+            .as_ref()
+            .and_then(|path| recover_generation(path));
 
         let mut index = match config.index_path.as_ref() {
             Some(index_path) => {
@@ -5441,6 +5472,15 @@ impl NodeServiceImpl {
                 let shard = SegmentedShard::open_with(&root, tail, config.vector_load())
                     .map_err(|error| format!("segment catalog {}: {error}", root.display()))?;
                 let set = shard.snapshot().clone();
+                if let Some(owner) = &set.manifest().source_owner {
+                    let owner = owner.decode()?;
+                    if owner.collection != config.collection
+                        || config.wal
+                        || config.layout != Layout::Segments
+                    {
+                        return Err("source-managed index requires its original collection, segmented layout and WAL disabled".into());
+                    }
+                }
                 if let Some(first) = (0..set.len()).find_map(|i| set.vector(i)) {
                     let backend = first
                         .backend_config()
@@ -5831,6 +5871,36 @@ impl NodeServiceImpl {
     pub fn with_bm25(self, store: Option<Bm25Shard>) -> Self {
         {
             let mut guard = write_shard(&self.state);
+            if let Err(error) = guard.check_legacy_mutation() {
+                drop(guard);
+                panic!("{error}");
+            }
+            if let Some(Bm25Shard::Segmented(shard)) = store.as_ref() {
+                if let Some(owner) = &shard.snapshot().manifest().source_owner {
+                    let owner = owner.decode().expect("validated source owner");
+                    assert!(
+                        owner.collection == self.config.collection
+                            && !self.config.wal
+                            && self.config.layout == Layout::Segments,
+                        "source-managed index requires its original collection, segmented layout and WAL disabled"
+                    );
+                    let set = shard.snapshot();
+                    let has_vectors = (0..set.len()).any(|i| set.vector(i).is_some());
+                    let matches = guard.index.as_ref().map_or(!has_vectors, |index| {
+                        index
+                            .as_segmented()
+                            .map_or(!has_vectors && index.is_empty(), |provider| {
+                                Arc::ptr_eq(provider.snapshot(), set)
+                                    && provider.tail().is_empty()
+                                    && provider.frozen().is_none()
+                            })
+                    });
+                    if !matches {
+                        drop(guard);
+                        panic!("source-managed index vectors must come from its serving catalog");
+                    }
+                }
+            }
             let persisted = store.as_ref().and_then(|s| s.binding().cloned());
             if let (Some(recovered), Some(persisted)) = (&guard.mapped_binding, &persisted) {
                 assert_eq!(
@@ -5853,6 +5923,14 @@ impl NodeServiceImpl {
                     .snapshot()
                     .merge_tombstones(&mut guard.live_docs)
                     .unwrap_or_else(|error| panic!("attach segment tombstones: {error}"));
+                if shard.snapshot().manifest().source_owner.is_some() {
+                    if let Err(error) =
+                        publication::check_source_live_view(shard.snapshot(), &guard.live_docs)
+                    {
+                        drop(guard);
+                        panic!("{error}");
+                    }
+                }
             }
             guard.mapped_binding = persisted.or_else(|| guard.mapped_binding.clone());
             guard.bm25 = store;
@@ -5866,6 +5944,21 @@ impl NodeServiceImpl {
     pub fn with_exact_vectors(self, store: Option<ExactVectorStore>) -> Result<Self, String> {
         {
             let mut guard = write_shard(&self.state);
+            if let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() {
+                let set = shard.snapshot();
+                if set.manifest().source_owner.is_some() {
+                    let matches = store.as_ref().map_or_else(
+                        || (0..set.len()).all(|i| set.exact_vectors(i).is_none()),
+                        |exact| exact.matches_segments(set),
+                    );
+                    if !matches {
+                        return Err(
+                            "source-managed index exact vectors must come from its serving catalog"
+                                .into(),
+                        );
+                    }
+                }
+            }
             if let Some(exact) = store.as_ref() {
                 if let Some(index) = guard.index.as_ref() {
                     if exact.len() != index.len() || exact.dim() != index.dim_opt() {
@@ -5906,6 +5999,10 @@ impl NodeServiceImpl {
             }
             if let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() {
                 shard.snapshot().merge_tombstones(&mut live_docs)?;
+                if shard.snapshot().manifest().source_owner.is_some() {
+                    publication::check_source_live_view(shard.snapshot(), &live_docs)
+                        .map_err(|error| error.message().to_string())?;
+                }
             }
             guard.live_docs = live_docs;
         }
@@ -5916,10 +6013,16 @@ impl NodeServiceImpl {
     /// (startup found one via [`recover_generation`]): Flush and the
     /// AddDocuments reload path then read/write inside it.
     pub fn with_generation(self, dir: Option<PathBuf>) -> Self {
-        self.state
-            .write()
-            .expect("shard state lock poisoned")
-            .generation = dir;
+        {
+            let mut guard = write_shard(&self.state);
+            if dir.is_some() {
+                if let Err(error) = guard.check_legacy_mutation() {
+                    drop(guard);
+                    panic!("{error}");
+                }
+            }
+            guard.generation = dir;
+        }
         self
     }
 
@@ -6852,6 +6955,7 @@ impl NodeServiceImpl {
         with_bm25: bool,
         with_live_docs: bool,
     ) -> Result<InstallSnapshotResponse, Status> {
+        read_shard(&self.state).check_legacy_mutation()?;
         let path = self
             .config
             .index_path
@@ -6964,6 +7068,7 @@ impl NodeServiceImpl {
         }
 
         let mut guard = write_shard(&self.state);
+        guard.check_legacy_mutation()?;
         // Scoring comparability: a shard with a locked backend configuration
         // only accepts an image with the identical scoring fingerprint.
         if let (Some(index), Some(loaded)) = (guard.index.as_ref(), loaded.as_ref()) {
@@ -7128,6 +7233,7 @@ impl NodeServiceImpl {
         &self,
         directory: &Path,
     ) -> Result<ExportSnapshotResponse, Status> {
+        read_shard(&self.state).check_legacy_mutation()?;
         let index_path = self.config.index_path.clone().ok_or_else(|| {
             Status::failed_precondition(
                 "shard has no persistence path (index_path); a snapshot export needs one",
@@ -7187,6 +7293,7 @@ impl NodeServiceImpl {
     ) -> Result<Option<(RepositoryManifest, u64)>, Status> {
         let _sealing = self.seal_lock.lock().expect("seal lock poisoned");
         let guard = read_shard(&self.state);
+        guard.check_legacy_mutation()?;
         guard.check_catalog_publication()?;
         if !guard.files_current || guard.wal.as_ref().is_some_and(|wal| wal.is_dirty()) {
             return Ok(None);
@@ -7201,6 +7308,7 @@ impl NodeServiceImpl {
         index_path: &Path,
         directory: &Path,
     ) -> Result<(RepositoryManifest, u64), Status> {
+        guard.check_legacy_mutation()?;
         let layout = Self::served_layout(guard);
         let mut sources: Vec<(String, PathBuf)> = Vec::new();
         if layout == LAYOUT_SEGMENTS {
@@ -7380,6 +7488,7 @@ impl NodeServiceImpl {
         tmp_dir: &Path,
         manifest: &RepositoryManifest,
     ) -> Result<InstallSnapshotResponse, Status> {
+        read_shard(&self.state).check_legacy_mutation()?;
         repo::verify_artifacts(tmp_dir, manifest).map_err(Status::invalid_argument)?;
         if manifest.slot_offset != self.config.slot_offset {
             return Err(Status::failed_precondition(format!(
@@ -7456,6 +7565,7 @@ impl NodeServiceImpl {
         tmp_dir: &Path,
         manifest: &RepositoryManifest,
     ) -> Result<InstallSnapshotResponse, Status> {
+        read_shard(&self.state).check_legacy_mutation()?;
         let path = self
             .config
             .index_path
@@ -7488,6 +7598,11 @@ impl NodeServiceImpl {
             self.config.vector_load(),
         )
         .map_err(|e| Status::invalid_argument(format!("snapshot catalog is invalid: {e}")))?;
+        if staged.manifest().source_owner.is_some() {
+            return Err(Status::failed_precondition(
+                "source-managed index snapshots require a coherent source-catalog restore",
+            ));
+        }
         let incoming = (0..staged.len())
             .find_map(|i| staged.vector(i))
             .map(|vector| vector.descriptor());
@@ -7608,6 +7723,7 @@ impl NodeServiceImpl {
         drop(plain_image);
 
         let mut guard = write_shard(&self.state);
+        guard.check_legacy_mutation()?;
         if let (Some(index), Some(incoming)) = (guard.index.as_ref(), incoming.as_ref()) {
             let current = index.descriptor();
             if current.backend_kind != incoming.backend_kind
@@ -7797,6 +7913,7 @@ impl NodeServiceImpl {
                 .map_err(|e| Status::invalid_argument(format!("invalid backend config: {e}")))
         };
         let mut guard = write_shard(&self.state);
+        guard.check_legacy_mutation()?;
         let result = match guard.index.as_ref() {
             Some(index) if !index.is_empty() => Err(Status::failed_precondition(format!(
                 "shard holds {} vectors; vector backend configuration is locked for the generation",
@@ -7879,6 +7996,7 @@ impl NodeServiceImpl {
         batch: AddVectorsRequest,
         stable_routing_key: Option<Vec<u8>>,
     ) -> Result<(u64, u64), Status> {
+        guard.check_legacy_mutation()?;
         if batch.vectors.is_empty() {
             return Ok((0, 0));
         }
@@ -10205,6 +10323,7 @@ impl NodeServiceImpl {
         added: &mut u64,
         first_id: &mut u64,
     ) -> Result<(), Status> {
+        guard.check_legacy_mutation()?;
         match &doc.original_source {
             Some(source) if source.descriptor_set.is_empty() || source.message_type.is_empty() => {
                 return Err(Status::invalid_argument(
@@ -11197,6 +11316,7 @@ impl NodeServiceImpl {
             ),
         };
         let mut guard = write_shard(&self.state);
+        guard.check_legacy_mutation()?;
         let vector = plan
             .vector_binding
             .as_ref()
@@ -15053,6 +15173,7 @@ impl NodeServiceImpl {
         doc_ids: &[u64],
         expected_wal_generation: Option<u64>,
     ) -> Result<DeleteDocumentsResponse, Status> {
+        guard.check_legacy_mutation()?;
         let wal_generation = Self::check_wal_generation(guard, expected_wal_generation)?;
         let offset = self.config.slot_offset;
         let rows = physical_rows(guard);
@@ -15099,6 +15220,7 @@ impl NodeServiceImpl {
         replacements: &[Replacement],
         expected_wal_generation: Option<u64>,
     ) -> Result<CommitReplacementsResponse, Status> {
+        guard.check_legacy_mutation()?;
         let wal_generation = Self::check_wal_generation(guard, expected_wal_generation)?;
         let offset = self.config.slot_offset;
         let artifact_rows = active_artifact_rows(guard);
@@ -15179,6 +15301,7 @@ impl NodeServiceImpl {
         guard: &mut ShardState,
         incoming: crate::postings::StoredBinding,
     ) -> Result<bool, Status> {
+        guard.check_legacy_mutation()?;
         crate::mapped_analysis::decode_contract(
             &incoming.analysis_sha,
             &incoming.analysis_contract,

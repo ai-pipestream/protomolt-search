@@ -220,6 +220,33 @@ fn validate_transition(
 }
 
 impl DocumentCatalog {
+    pub(crate) fn index_owner(
+        &self,
+        key: &[u8],
+    ) -> Result<crate::pb::storage::SourceIndexOwner, Status> {
+        index_key(key)?;
+        if !self.durable {
+            return Err(Status::failed_precondition(
+                "source-managed publication requires a durable source catalog",
+            ));
+        }
+        let tx = self.database.begin_read().map_err(storage)?;
+        let meta = tx.open_table(META).map_err(storage)?;
+        let header: DocumentCatalogHeader = decode(
+            meta.get("header")
+                .map_err(storage)?
+                .ok_or_else(|| Status::data_loss("catalog header missing"))?
+                .value(),
+        )?;
+        validate_current_header(&header)?;
+        Ok(crate::pb::storage::SourceIndexOwner {
+            format_version: 1,
+            history_id: header.history_id,
+            index_key: key.to_vec(),
+            collection: header.collection,
+        })
+    }
+
     /// Current artifact decision, checked against the durable catalog while its
     /// publication fence is held. Pending transactions must be resolved first.
     pub fn current_index_publication_decision(
@@ -312,6 +339,20 @@ impl DocumentCatalog {
             ));
         }
         validate_transition(candidate, before, after)?;
+        if before.manifest().source_owner.is_some()
+            && before.manifest().source_owner != after.manifest().source_owner
+        {
+            return Err(Status::failed_precondition(
+                "source publication cannot change or remove the index owner",
+            ));
+        }
+        if let Some(owner) = &after.manifest().source_owner {
+            if owner.decode().map_err(Status::data_loss)? != self.index_owner(key)? {
+                return Err(Status::failed_precondition(
+                    "source publication belongs to another index owner",
+                ));
+            }
+        }
         let info = candidate.info();
         let read = self.database.begin_read().map_err(storage)?;
         let (source, bytes) = Self::get_from(&read, &info.document_key, Some(info.version))?
