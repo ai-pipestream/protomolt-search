@@ -82,7 +82,11 @@ is absent on every document by accident), the static type must match
 the kind, and a derived name may not collide with a source column. A
 string or bool result refuses naming the fix (hash it, compare it,
 wrap it in a ternary). Absence propagates: a document lacking an input
-stores no value.
+stores no value. Absence is not an error state: integer arithmetic
+with no exact answer (overflow, a zero divisor, the `i64::MIN` edges)
+refuses the document at ingest and refuses the run at backfill,
+naming the column and the operation — a declared column stores a
+computed value or nothing, never a wrapped value.
 
 The names join the column tables of their kinds after the declared
 source columns, in declaration order, whether or not any row carries
@@ -156,8 +160,9 @@ log manifest records.
 
 `tests/derived_columns.rs` shows the backfill storing, row for row,
 what direct ingest under the same declaration stores; the court-data
-proof (11 million documents, the computed year equal to the stored
-year on each document of the rebuilt child) is in
+proof (11 million source documents; the computed year equal to the
+stored year on each of the 1,954,816 rebuilt rows carrying `decided`,
+and absent on the 9 that do not) is in
 `docs/benchmarks/fleet-placement-2026-09.md`.
 
 ### Reconciling a child

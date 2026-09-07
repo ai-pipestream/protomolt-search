@@ -4160,6 +4160,36 @@ fn persisted_doc_tip(index_path: &Path) -> u64 {
     }
 }
 
+/// The WAL-resume table check as a returned error: a log whose
+/// manifest records another derived-column declaration or another
+/// column table refuses the open naming the difference, instead of
+/// reaching `open_wal`'s panic. `NodeServiceImpl::open` runs this
+/// before `Self::new`; the panic stays the backstop for the direct
+/// constructor, the same split as `declare_derived_columns`.
+fn check_wal_tables(index: Option<&VectorIndex>, config: &NodeConfig) -> Result<(), String> {
+    if !config.wal {
+        return Ok(());
+    }
+    let Some(index_path) = config.index_path.as_ref() else {
+        return Ok(());
+    };
+    let dir = wal::wal_dir(index_path);
+    if !dir.exists() {
+        return Ok(());
+    }
+    let Some((_, gen_dir)) =
+        wal::latest_gen(&dir).map_err(|e| format!("scan WAL at {}: {e}", dir.display()))?
+    else {
+        return Ok(());
+    };
+    let held = wal::read_manifest(&gen_dir)
+        .map_err(|e| format!("read WAL manifest at {}: {e}", gen_dir.display()))?;
+    let vector_tip = index.map_or(0, |i| i.len() as u64);
+    let doc_tip = persisted_doc_tip(index_path);
+    let fresh = wal_manifest(index, config, 0, (vector_tip, doc_tip));
+    wal::check_manifest_tables(&held, &fresh).map_err(|e| format!("WAL at {}: {e}", dir.display()))
+}
+
 /// Open the shard's WAL at `<index path>.wal/`: resume the newest
 /// generation after a restart (truncating any torn tails, continuing the
 /// per-file sequences) or start generation 0. A resumed log keeps its own
@@ -5205,6 +5235,10 @@ impl NodeServiceImpl {
         if let Some(store) = bm25.as_ref() {
             check_attached_derived(&config, store.derived(), store.doc_count(), "the store")?;
         }
+        // The resumed log's manifest likewise: a disagreement is a
+        // returned error here; `open_wal`'s panic stays the backstop
+        // for the direct constructor.
+        check_wal_tables(index.as_ref(), &config)?;
         let service = Self::new(index, config)
             .with_bm25(bm25)
             .with_exact_vectors(exact_vectors)?
@@ -6590,6 +6624,15 @@ impl NodeServiceImpl {
             let store = Bm25Shard::open(&bm25_tmp).map_err(|e| {
                 Status::invalid_argument(format!("snapshot sidecar is not a valid BM25 store: {e}"))
             })?;
+            // The store's derived-column declaration must be this
+            // shard's before anything swaps (docs/derived-columns.md).
+            check_attached_derived(
+                &self.config,
+                store.derived(),
+                store.doc_count(),
+                "the installed snapshot's store",
+            )
+            .map_err(Status::failed_precondition)?;
             u64::from(store.next_doc_id())
         } else {
             0
@@ -9392,7 +9435,7 @@ pub(crate) fn apply_materialize(
     compiled: &[(String, crate::pb::ValueExpr, crate::pb::MaterializeKind)],
 ) -> Result<AddDocumentsRequest, Status> {
     let env = crate::derived::ingest_env(&doc, None)?;
-    crate::derived::materialize_into(doc, compiled, &env)
+    crate::derived::materialize_into(doc, compiled, &env, false)
 }
 
 impl NodeServiceImpl {
