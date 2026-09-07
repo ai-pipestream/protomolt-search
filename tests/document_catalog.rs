@@ -478,3 +478,59 @@ fn legacy_history_upgrades_atomically_and_keeps_retry_receipts() {
         .open_table(redb::TableDefinition::<u64, &[u8]>::new("changes"))
         .is_err());
 }
+
+#[test]
+fn missing_catalog_on_reopen_cannot_reset_versions_or_retry_history() {
+    let dir = Directory::new("missing-authority");
+    let saved = dir.0.join("saved.redb");
+    let request = write(b"accepted-before-move", Some(0));
+    let receipt;
+    {
+        let catalog = DocumentCatalog::create(&dir.catalog(), "books").unwrap();
+        receipt = catalog.accept(&request).unwrap();
+    }
+    std::fs::rename(dir.catalog(), &saved).unwrap();
+    assert_eq!(
+        DocumentCatalog::open(&dir.catalog(), "books")
+            .err()
+            .expect("reopen must not create a new authority")
+            .code(),
+        Code::NotFound
+    );
+    assert!(!dir.catalog().exists());
+    std::fs::rename(&saved, dir.catalog()).unwrap();
+    let catalog = DocumentCatalog::open(&dir.catalog(), "books").unwrap();
+    assert_eq!(
+        catalog.accept(&request).unwrap(),
+        pipestream_search::pb::DocumentWriteReceipt {
+            replayed: true,
+            ..receipt
+        }
+    );
+}
+
+#[tokio::test]
+async fn embedded_reopen_refuses_missing_authority_before_opening_shards() {
+    let dir = Directory::new("missing-embedded-authority");
+    let mut config = embedded_config(dir.catalog(), 1);
+    config.shards[0] = EmbeddedShardConfig::persistent(dir.0.join("index"), 0);
+    config.shards[0].node.collection = "books".into();
+    let error = EmbeddedSearch::open(config.clone())
+        .await
+        .err()
+        .expect("reopen must require its configured durable catalog");
+    assert!(error.to_string().contains("document catalog"));
+    assert!(!dir.catalog().exists());
+    assert_eq!(
+        std::fs::read_dir(&dir.0).unwrap().count(),
+        0,
+        "failed recovery must not initialize shard storage"
+    );
+    let search = EmbeddedSearch::create(config).await.unwrap();
+    assert!(
+        search
+            .accept_document(&write(b"explicit-create", Some(0)))
+            .unwrap()
+            .durable
+    );
+}

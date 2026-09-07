@@ -47,6 +47,8 @@ pub struct DocumentCatalog {
 }
 
 impl DocumentCatalog {
+    /// Reopen an existing authority. A missing file must never initialize new
+    /// version or retry history; callers explicitly create a new catalog.
     pub fn open(path: &Path, collection: &str) -> Result<Self, Status> {
         Self::open_file(path, collection, false)
     }
@@ -62,31 +64,23 @@ impl DocumentCatalog {
             .unwrap_or(Path::new("."));
         // The application supplies an existing durable container directory.
         // Creating ancestors here would require syncing each ancestor as well.
-        let directory = File::open(parent).map_err(storage)?;
-        let create_file = || {
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(path)
-        };
-        let opened = if create {
-            create_file().map(|file| (file, true))
-        } else {
-            match OpenOptions::new().read(true).write(true).open(path) {
-                Ok(file) => Ok((file, false)),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    create_file().map(|file| (file, true))
-                }
-                Err(error) => Err(error),
-            }
-        };
-        let (file, new) = opened.map_err(|error| match error.kind() {
+        let opening_error = |error: std::io::Error| match error.kind() {
             std::io::ErrorKind::AlreadyExists => {
                 Status::already_exists("document catalog already exists")
             }
+            std::io::ErrorKind::NotFound if !create => {
+                Status::not_found("document catalog is missing; open never creates a new authority")
+            }
             _ => storage(error),
-        })?;
+        };
+        let directory = File::open(parent).map_err(opening_error)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(create)
+            .open(path)
+            .map_err(opening_error)?;
+        let new = create;
         file.try_lock().map_err(|e| {
             Status::failed_precondition(format!("exclusive document catalog lock unavailable: {e}"))
         })?;

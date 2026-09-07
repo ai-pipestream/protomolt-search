@@ -202,7 +202,9 @@ impl EmbeddedSearch {
     }
 
     /// Open existing private shards, or start empty shards when their paths do
-    /// not exist. All analysis and shard transport is forced in-process.
+    /// not exist. A configured persistent document catalog must already exist:
+    /// missing authority is refused before shard storage is opened. All analysis
+    /// and shard transport is forced in-process.
     pub async fn open(config: EmbeddedSearchConfig) -> Result<Self, EmbeddedError> {
         Self::open_inner(config, false).await
     }

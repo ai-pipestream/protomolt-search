@@ -1001,6 +1001,85 @@ mod tests {
         assert!(closed.closed);
     }
 
+    #[test]
+    fn mobile_reopen_never_recreates_missing_durable_document_history() {
+        use pipestream_search::pb::mobile::MobileDocumentCatalogConfig;
+        use pipestream_search::pb::{
+            accept_document_request::Mutation, DocumentWriteReceipt, ProtobufSource,
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "mobile-catalog-reopen-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("documents.redb");
+        let saved = dir.join("saved.redb");
+        let request = MobileOpenRequest {
+            shards: vec![MobileShardConfig {
+                in_memory: true,
+                ..Default::default()
+            }],
+            document_catalog: Some(MobileDocumentCatalogConfig {
+                collection: "private".into(),
+                path: path.to_str().unwrap().into(),
+                in_memory: false,
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        // Exercise the ABI entry point, including its typed error envelope.
+        let buffer = protomolt_search_open(request.as_ptr(), request.len(), 0);
+        let response = outcome(unsafe { std::slice::from_raw_parts(buffer.data, buffer.len) });
+        unsafe {
+            protomolt_search_buffer_free(buffer);
+        }
+        let mobile_response::Outcome::Error(error) = response else {
+            panic!("missing catalog must fail");
+        };
+        assert_eq!(error.code(), MobileErrorCode::NotFound);
+        assert!(!path.exists());
+        let opened: MobileOpenResponse = payload(&open_bytes(&request, true));
+        let write = AcceptDocumentRequest {
+            contract_version: 1,
+            document_key: b"original-key".to_vec(),
+            operation_id: b"original-operation".to_vec(),
+            expected_version: Some(0),
+            mutation: Some(Mutation::Source(ProtobufSource {
+                descriptor_set: record_descriptor(),
+                message_type: "private.v1.Record".into(),
+                payload: vec![],
+            })),
+        }
+        .encode_to_vec();
+        let receipt: DocumentWriteReceipt = payload(&accept_document_bytes(opened.handle, &write));
+        assert!(receipt.durable);
+        let closed: MobileCloseResponse = payload(&close_bytes(opened.handle));
+        assert!(closed.closed);
+        std::fs::rename(&path, &saved).unwrap();
+        let mobile_response::Outcome::Error(error) = outcome(&open_bytes(&request, false)) else {
+            panic!("missing accepted history must fail");
+        };
+        assert_eq!(error.code(), MobileErrorCode::NotFound);
+        assert!(!path.exists());
+        std::fs::rename(&saved, &path).unwrap();
+        let reopened: MobileOpenResponse = payload(&open_bytes(&request, false));
+        let retry: DocumentWriteReceipt = payload(&accept_document_bytes(reopened.handle, &write));
+        assert_eq!(
+            retry,
+            DocumentWriteReceipt {
+                replayed: true,
+                ..receipt
+            }
+        );
+        let closed: MobileCloseResponse = payload(&close_bytes(reopened.handle));
+        assert!(closed.closed);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn payload<M: Message + Default>(bytes: &[u8]) -> M {
         let payload = match outcome(bytes) {
             mobile_response::Outcome::Payload(payload) => payload,

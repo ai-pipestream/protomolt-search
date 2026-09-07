@@ -75,7 +75,11 @@ catalog's parent directory before opening succeeds. The parent must already
 exist. The cache is explicitly 8 MiB; redb's
 [builder default is 1 GiB](https://docs.rs/redb/4.1.0/redb/struct.Builder.html#method.new).
 A separate exclusive file lock covers backends where redb does not acquire one.
-Failure to acquire that lock fails opening. Existing empty files, missing tables,
+Failure to acquire that lock fails opening. `open` requires an existing file:
+missing files or parent directories return `NOT_FOUND` without creating storage.
+Only an explicit `create` can initialize a new authority. This prevents a missing
+mount or moved catalog from resetting versions and idempotency history.
+Existing empty files, missing tables,
 unknown catalog formats and collection mismatches fail instead of creating fresh
 retry history. Content hashes are checked during source reads.
 
@@ -84,7 +88,9 @@ retry history. Content hashes are checked during source reads.
 Configure `EmbeddedSearchConfig.document_catalog` with the collection and a
 stable private path. Use `path=None` only for explicitly volatile storage.
 Omitting the configuration disables `accept_document`; legacy search and ingest
-still work. `create` refuses an existing catalog; `open` loads it.
+still work. `create` refuses an existing catalog; `open` requires and loads it.
+The catalog is opened before any shard storage, so missing authority fails
+without initializing replacement shard artifacts.
 
 The mobile equivalent is `MobileOpenRequest.document_catalog`. Its `path` must
 be nonempty for persistent storage and empty exactly when `in_memory=true`.
@@ -92,7 +98,10 @@ The bridge binds the runtime's shards to the configured collection. Invoke
 `nativeAcceptDocument` on Android or `acceptDocument` in the Swift facade with
 encoded `AcceptDocumentRequest` bytes. The `MobileResponse` payload is an encoded
 `DocumentWriteReceipt`. Version conflicts retain the distinct mobile `ABORTED`
-error code. Calls block through commit and should run off the UI thread.
+error code. A persistent mobile reopen with missing history returns mobile
+`NOT_FOUND`; applications must restore or locate that history rather than
+silently retrying as a create. Calls block through commit and should run off
+the UI thread.
 
 The source store adds no networking. The Rust `accepted_document` lookup is for
 the trusted local application. No network source-fetch service is exposed.
@@ -185,3 +194,27 @@ and the no-network dependency gate remain separate required checks.
 History tests cover fixed-fence pagination during new writes, exact byte budgets,
 replaced/deleted sources, successful format-1 upgrades and rollback of an
 incomplete-history migration.
+
+## Missing-authority recovery regression
+
+Checkpoint `e658840` still recreated a catalog when its file was missing on
+`open`. Two regression tests reproduced that behavior: direct catalog reopen
+silently initialized fresh history, and embedded reopen continued into shard
+startup. The corrected path opens an existing file without a create fallback.
+Tests move an accepted catalog away, verify refusal without replacement files,
+restore it, and verify that the original operation returns its original receipt
+as a retry. The mobile ABI carries the missing-history error as `NOT_FOUND`
+and also verifies the restore/retry sequence. Explicit create and explicitly
+volatile catalogs retain their existing behavior.
+
+This fixes source-authority recovery. It does not implement the index projection
+publication and target WAL application proofs described above.
+
+Validation for the missing-authority fix passed 566 local tests: 540 unit tests,
+13 catalog integration tests and 13 embedded/mobile/dependency tests. All five
+Android/iOS target checks, test/example compilation, formatting, vendored-proto
+checks and existing-field descriptor comparisons passed. The two new catalog
+regressions failed before the fix and passed afterwards. These were the shared
+unit suite and affected integration targets, not a rerun of every integration
+target. All builds/tests ran under an 8 GiB memory cap with swap disabled and
+two Cargo build jobs. No fleet rollout or hosted-CI result is claimed.

@@ -1843,6 +1843,11 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   device node by declaration, and moves nothing.
   [Bandwidth as the budget](docs/bandwidth-budget.md).
 
+- **Branch checkpoint 2026-09-07: missing catalog recovery refuses.**
+  Persistent document-catalog reopen no longer creates fresh version/retry
+  history when the file is missing. Embedded startup fails before shard storage
+  is opened; the mobile ABI reports `NOT_FOUND`. Explicit creation remains a
+  separate operation. [Document writes](docs/document-writes.md).
 - **Branch checkpoint 2026-09-07: replay authority freshness.**
   Reopening a journal no longer restores permission from a persisted allow
   decision. Admission needs a bounded live authority refresh; disconnects,

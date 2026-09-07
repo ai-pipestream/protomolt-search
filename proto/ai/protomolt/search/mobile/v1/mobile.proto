@@ -65,6 +65,8 @@ message MobileOpenRequest {
 message MobileDocumentCatalogConfig {
   string collection = 1;
   // Parent directory must exist. Empty exactly when in_memory is true.
+  // Persistent open requires this file to exist; only explicit create initializes
+  // a new document/version/retry authority. Missing history returns NOT_FOUND.
   string path = 2;
   bool in_memory = 3;
 }
