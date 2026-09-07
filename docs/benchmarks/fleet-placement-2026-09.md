@@ -411,28 +411,46 @@ generation-10 archive nodes and the analysis sidecar; both were
 restarted on the pinned binary. `--only-child` (dcc1529) rebuilds the
 sixth band alone.
 
-The five year-cut bands serve beside the hash-cut sixth under the same
-map. Every segment covers one year at 300,000 rows or fewer, the
-catalogs name `year` as their partition key, and the identity check
-across generations (79 documents paired by text through both roots,
-lineage, document key, version and chunk ordinal compared) finds no
-difference. Through the generation-11 root, k = 10, warm:
+The sixth band was rebuilt alone (`--only-child=6`, 150,000 rows per
+cut: 12,203,725 documents in 112 segments in an hour, one 33-row
+unkeyed segment for the documents without a year), after two more
+stopped attempts whose causes were not memory at all: the split needed
+about 700 open files under the shell's 1024 (the split now sizes its
+plan against the limit and the reshard raises its own, 483be73), and
+every fleet process on krick-1 was being SIGKILLed whenever the last
+ssh session closed, because the host had no lingering for the fleet
+user and systemd tears the user manager down with everything in it.
+`loginctl enable-linger` on krick-1 ended that; the Pis already had it,
+which is why their nodes survived the same nights.
 
-| Filter | Generation 10 root | Generation 11, five bands year-cut |
+All six bands serve year-cut under the same map: every segment covers
+one year (the early centuries grouped where years are sparse) at
+150,000 to 300,000 rows, the catalogs name `year` as their partition
+key, the children carry the sources' column order, and the identity
+check across generations (documents paired by text through both roots,
+lineage, document key, version and chunk ordinal compared) finds no
+difference. Through the generation-11 root, k = 10, warm, against the
+generation-10 root on the same binary:
+
+| Filter | Generation 10 | Generation 11, six bands year-cut |
 |---|---|---|
-| lexical, `year >= 2012 && year < 2013` | 7 shards, no segment skipped | 61 ms, 273 of 278 segments skipped |
-| lexical, `year >= 1985 && year < 1986` | 7 shards | 41 ms, 154 of 157 segments skipped |
-| dense, `year >= 2012 && year < 2013` | 250 ms class | 86 ms |
-| dense, `year >= 1985 && year < 1986` | 250 ms class | 92 ms |
-| dense, `year >= 1995 && year < 1998` | 250 ms class | 152 ms |
-| dense, `year >= 2008 && year < 2015` (one whole band) | 249 ms | 233 ms |
+| lexical, `year >= 2012 && year < 2013` | 291 ms, 236 of 322 segments skipped | 35 ms, 321 of 326 skipped |
+| lexical, `year >= 1985 && year < 1986` | 241 ms | 37 ms, 202 of 205 skipped, 4 shards skipped |
+| lexical, `year < 1940` | 410 ms | 41 ms, 6 of 7 shards skipped |
+| dense, `year >= 2012 && year < 2013` | 2.9 s | 79 ms |
+| dense, `year >= 1985 && year < 1986` | 2.2 s | 65 ms |
+| dense, `year >= 1995 && year < 1998` | 714 ms | 137 ms |
+| dense, `year < 1990` | 854 ms | 257 ms, 4 of 7 shards skipped |
+| dense, `year >= 2008 && year < 2015` (one whole band) | 249 ms | 239 ms |
 
 A filter narrower than a band is where the year cut pays: the dense
-scan reads only the segments whose year range the filter admits, and a
-one-year filter costs a third of the band-aligned shape. A filter that
-is a whole band gains nothing inside it, as expected. The boolean
-shapes through this root cost what they cost before (0.2 to 0.9 s, a
-23 MB root).
+scan reads only the segments whose year range the filter admits, so a
+one-year filter costs a fortieth of what it did and a three-year range
+a fifth; a filter that is a whole band gains nothing inside it, as
+expected, and shard pruning is what it gains. The boolean shapes
+through this root cost what they cost before (0.24 to 0.88 s, a 23 MB
+root). The generation-10 column was taken right after its nodes
+reopened, so its dense times are on the cold side.
 
 ## What remains
 
