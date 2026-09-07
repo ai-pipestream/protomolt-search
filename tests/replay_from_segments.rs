@@ -1230,3 +1230,111 @@ async fn sources_with_different_analyzers_are_refused() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Every file of a catalog with its digest, by relative path.
+fn catalog_digests(root: &Path) -> Vec<(String, String)> {
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, root, out);
+                continue;
+            }
+            let mut hasher = pipestream_search::sha256::Sha256::new();
+            hasher.update(&std::fs::read(&path).unwrap());
+            let relative = path.strip_prefix(root).unwrap().display().to_string();
+            out.push((
+                relative,
+                pipestream_search::sha256::to_hex(&hasher.finalize()),
+            ));
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+/// Buckets sealed by several threads write the catalog the one-thread
+/// build writes, byte for byte, under the hash cut and the year cut;
+/// the log replay and a single image refuse the threads by name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn threaded_buckets_write_the_same_catalog_byte_for_byte() {
+    let dir = tempdir("threads");
+    let (index_path, _addr) = source_shard(&dir, true).await;
+    let gen = reshard::resolve_gen(&pipestream_search::wal::wal_dir(&index_path)).unwrap();
+    let build = |out: &str,
+                 source: reshard::TreeRowSource,
+                 layout: reshard::TreeChildLayout,
+                 threads: usize,
+                 cut: reshard::SpillCut| {
+        reshard::split_placement_tree_logs(
+            std::slice::from_ref(&gen),
+            &band_tree(),
+            &dir.join(out),
+            &[0, 1_000, 2_000],
+            None,
+            reshard::TreeSplitOptions {
+                source,
+                layout,
+                cut,
+                build_threads: threads,
+                ..Default::default()
+            },
+            &mut analyzer(),
+        )
+    };
+    let segments = reshard::TreeRowSource::Segments;
+    let segmented = || reshard::TreeChildLayout::Segmented;
+    let year = || reshard::SpillCut::Column {
+        column: "year".into(),
+        rows_per_cut: 30,
+    };
+    for (tag, cut) in [("hash", reshard::SpillCut::Hash), ("year", year())] {
+        let one = build(&format!("{tag}-one"), segments, segmented(), 1, cut.clone()).unwrap();
+        let many = build(&format!("{tag}-many"), segments, segmented(), 3, cut).unwrap();
+        assert_eq!(one.placed, many.placed, "{tag}");
+        assert_eq!(one.segments, many.segments, "{tag}");
+        assert!(
+            one.segments.iter().any(|&n| n >= 3),
+            "{tag}: a child with several segments ({:?})",
+            one.segments
+        );
+        for (index, (a, b)) in one
+            .images
+            .children
+            .iter()
+            .zip(&many.images.children)
+            .enumerate()
+        {
+            let digests = catalog_digests(&pipestream_search::node::segments_root(&a.vector_path));
+            assert!(!digests.is_empty(), "{tag}: child {index} has files");
+            assert_eq!(
+                digests,
+                catalog_digests(&pipestream_search::node::segments_root(&b.vector_path)),
+                "{tag}: child {index}'s catalog differs between one and three threads"
+            );
+        }
+    }
+    let err = build(
+        "logs",
+        reshard::TreeRowSource::Logs,
+        segmented(),
+        2,
+        reshard::SpillCut::Hash,
+    )
+    .unwrap_err();
+    assert!(err.contains("one sidecar session"), "{err}");
+    let err = build(
+        "single",
+        segments,
+        reshard::TreeChildLayout::SingleImage {
+            max_child_rows: 1_000,
+        },
+        2,
+        reshard::SpillCut::Hash,
+    )
+    .unwrap_err();
+    assert!(err.contains("single-image child is one image"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

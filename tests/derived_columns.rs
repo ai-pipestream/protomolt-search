@@ -690,7 +690,7 @@ async fn the_backfill_stores_what_direct_ingest_stores() {
         reshard::TreeSplitOptions {
             source: reshard::TreeRowSource::Segments,
             derived: Some(declaration.clone()),
-            derive: every,
+            derive: every.clone(),
             ..Default::default()
         },
     )
@@ -702,6 +702,61 @@ async fn the_backfill_stores_what_direct_ingest_stores() {
         "{map}"
     );
     let image = &out.images.children[0];
+    // The reconciliation: every source row in the child once, carried
+    // whole, the derived values agreeing with an independent count of
+    // the civil year; a child written under another declaration is
+    // named row for row.
+    let reconcile = |declaration: Arc<Declaration>| {
+        pipestream_search::reconcile::reconcile(&pipestream_search::reconcile::ReconcileOptions {
+            sources: vec![gen_dir.clone()],
+            child: image.vector_path.clone(),
+            tree: one_leaf(),
+            child_index: 0,
+            declaration: Some(declaration),
+            derive: every.clone(),
+            checks: vec![pipestream_search::reconcile::ColumnCheck::CivilYear {
+                column: "year_d".into(),
+                timestamp: "decided".into(),
+            }],
+            threads: 2,
+        })
+        .unwrap()
+    };
+    let report = reconcile(declaration.clone());
+    assert!(report.is_clean(), "{}", report.render());
+    assert_eq!(
+        (
+            report.source_rows_to_child,
+            report.child_rows_live,
+            report.matched
+        ),
+        (N as u64, N as u64, N as u64),
+        "{}",
+        report.render()
+    );
+    assert_eq!(report.checks[0].1.both, N as u64, "{}", report.render());
+    let mut other = spec();
+    other.columns[0].expression = "calendar.year(decided) - 1".into();
+    let report = reconcile(Arc::new(Declaration::compile(&other).unwrap()));
+    assert!(!report.is_clean());
+    assert_eq!(
+        (
+            report.matched,
+            report.unmatched_source,
+            report.unmatched_child
+        ),
+        (0, N as u64, N as u64),
+        "{}",
+        report.render()
+    );
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.contains("carries declaration") && p.contains(declaration.fingerprint())),
+        "{}",
+        report.render()
+    );
     for path in segment_stores(&image.vector_path) {
         let reader = pipestream_search::postings::Bm25Reader::open(&path).unwrap();
         assert_eq!(

@@ -70,7 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "usage: reshard (--log=<wal dir|generation dir> --split=N | --logs=a,b,c) \
              --out-dir=<dir> [--slot-base=B] [--slot-stride=S] [--analysis-addr=ADDR] \
              [--stable-routing] [--placement-tree=<file> [--single-image=<max child rows>] \
-             [--spill-bucket-bits=<bits>] [--from-segments] [--only-child=<index>] [--cut-column=<col> \
+             [--spill-bucket-bits=<bits>] [--from-segments] [--build-threads=<n>] [--only-child=<index>] [--cut-column=<col> \
              [--cut-rows=<n>]] [--derived-columns=<file> [--derive=a,b]]]"
                 .into(),
         );
@@ -194,6 +194,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
             })
             .transpose()?;
+        // `--build-threads=<n>` seals that many spill buckets at once
+        // under --from-segments; the build's memory is that many
+        // buckets' replays (docs/replay-from-segments.md).
+        let build_threads = arg("build-threads", "1")
+            .parse::<usize>()
+            .map_err(|error| format!("--build-threads takes a thread count: {error}"))?;
+        if build_threads == 0 {
+            return Err("--build-threads takes at least one thread".into());
+        }
         // `--derived-columns=<file>` writes the children under that
         // declaration (a shard map or a bare [[derived]] table,
         // docs/derived-columns.md); `--derive=a,b` computes those
@@ -233,6 +242,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 open_files_limit: None,
                 derived,
                 derive,
+                build_threads,
             },
             &mut analyze,
         )?;

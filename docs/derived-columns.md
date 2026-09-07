@@ -200,6 +200,41 @@ proof (11 million documents, the computed year equal to the stored
 year on each document of the rebuilt child) is in
 `docs/benchmarks/fleet-placement-2026-09.md`.
 
+### Reconciling a child
+
+`examples/reconcile.rs` (`src/reconcile.rs`) reads a child back
+against its sources' sealed segments, document for document: every
+live source row the tree sends to the child's leaf must appear in the
+child once with the same text, lineage, identity, original source,
+columns and FP32 vector, the placement code rewritten and the declared
+columns computed; no other row may appear; the child's tables must be
+the sources' with the derived names appended; every child segment must
+record the declaration. Rows are matched by a content digest with the
+value lists sorted, so the order a store lists its columns in does not
+count. Two checks stay outside the declaration's evaluator:
+`--equal=<a>:<b>` (two integer columns agree on every row holding
+both) and `--civil-year=<column>:<timestamp>` (the column is the UTC
+year of the epoch-micro timestamp, counted year by year from 1970, and
+present exactly when the timestamp is). The report names the first
+twenty rows of each kind of disagreement and the tool exits 1 unless
+it is clean.
+
+The foundation branch includes both exact integer-map families in the shared
+source/child column tables and the reconciliation digest. Signed and unsigned
+values use distinct tags and their full 64-bit representation, including empty
+keys and present zero values. A regression reproduced equal digests after a
+signed map value changed; the combined implementation compares these columns
+without passing through floating point. This extends the verification contract
+to the foundation branch's columns; the earlier court proof did not contain
+these map columns.
+
+```
+reconcile --logs=<source>.tv.wal --child=<out>/shard-6.tv \
+  --placement-tree=<map> --child-index=6 \
+  --derived-columns=<file> --derive=year_d \
+  --civil-year=year_d:decided --equal=year_d:year --threads=8
+```
+
 ## Disclosure
 
 Hashing a field does not make it public. A column declared

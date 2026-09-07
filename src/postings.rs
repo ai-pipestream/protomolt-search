@@ -8817,6 +8817,23 @@ impl Bm25Reader {
         self.derived.as_ref()
     }
 
+    /// Drop this file's resident pages from the process. The mapping
+    /// stays valid: a later read faults the page back in from the page
+    /// cache or the file, so a reader is not changed by it. For a pass
+    /// that reads a store once and moves on (the transplant over a
+    /// catalog of many segments), so the resident set is the segment
+    /// in hand and not every segment read so far.
+    pub fn release_pages(&self) -> io::Result<()> {
+        // A read-only file mapping: DONTNEED drops the pages and the
+        // next access reads the file again; the advice is unchecked
+        // in memmap2 because on an anonymous or writable private
+        // mapping it would discard data, which this mapping has none of.
+        unsafe {
+            self.map
+                .unchecked_advise(memmap2::UncheckedAdvice::DontNeed)
+        }
+    }
+
     /// The next local doc id (number of document slots).
     pub fn next_doc_id(&self) -> u32 {
         self.n_slots() as u32

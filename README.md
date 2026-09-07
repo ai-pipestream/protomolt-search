@@ -1895,6 +1895,27 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   declaration mismatches before row or log mutation. Derived network WAL
   replay remains unavailable through fresh ingest and is refused before
   transmission. [Compatibility and remaining replay work](docs/derived-columns.md#compatibility-with-the-parallel-integer-map-branch).
+- **Landed 2026-09-07: the reconciled child, and the transplant under 8 GiB.**
+  `examples/reconcile.rs` reads a re-placement child back against its
+  sources' sealed segments document for document (text, lineage, identity,
+  original source, every column, the FP32 vector, the placement code, the
+  derived values) by content digest, with checks outside the declaration's
+  evaluator (`--equal`, `--civil-year`); the court proof child reconciles
+  clean, 1,954,825 rows in 209 s. The transplant's 41.5 GB resident peak
+  was mapped and cached file pages, not allocations (2.8 GB anonymous): it
+  now releases each source segment's pages and each sealed bucket's cache
+  as it goes, runs under `MemoryMax=8G` with swap off in the same time with
+  the same catalog byte for byte, and `--build-threads=<n>` seals that many
+  buckets at once inside the same budget. The shard-side Boolean scorer
+  picks the cheaper walk per term (impact cursor per candidate, or a
+  merge-join over the term's doc run) with bitwise-identical scores, and
+  sizes its accumulators to the members; measured, the route's remaining
+  cost is the filter leaf's whole-shard column scan, not the walk. Tests:
+  `tests/derived_columns.rs`, `tests/replay_from_segments.rs`,
+  `tests/blockmax.rs`. [Reconciling a child](docs/derived-columns.md),
+  [Memory](docs/replay-from-segments.md), [Where the boolean cost
+  is](docs/benchmarks/fleet-placement-2026-09.md).
+
 - **Landed 2026-09-07: derived columns, the index-time computed column.**
   `DerivedColumns` in the proto and `[[derived]]` in TOML declare CEL value
   columns computed once at ingest from each document's own values (numbers,

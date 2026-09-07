@@ -15770,9 +15770,6 @@ pub(crate) struct EvaluatedBoolean {
     /// Sealed segments consulted and ruled out, summed over the leaves,
     /// plus the live-document seed where the group rule consulted it.
     prune: crate::segment_prune::PruneStats,
-    /// The slot universe: this shard's rows, documents with or without
-    /// a vector and vectors whose document has not arrived.
-    n: usize,
 }
 
 fn boolean_leaf(
@@ -16086,7 +16083,6 @@ pub(crate) fn evaluate_boolean_membership(
         members,
         leaves,
         prune,
-        n,
     })
 }
 
@@ -16744,7 +16740,6 @@ impl NodeServiceImpl {
         &self,
         req: crate::pb::BooleanShardRequest,
     ) -> Result<crate::pb::BooleanShardResponse, Status> {
-        use crate::boolean_bits::Bits;
         use crate::pb::boolean_plan_leaf::Leaf as L;
         if req.depth == 0 {
             return Err(Status::invalid_argument(
@@ -16761,7 +16756,6 @@ impl NodeServiceImpl {
             expected_stats_incarnation: req.expected_stats_incarnation.clone(),
         }))?;
         let evaluated = evaluate_boolean_membership(&guard, &req, self.knobs.segment_pruning())?;
-        let n = evaluated.n;
         let members = &evaluated.members;
         // The positive scoring leaves in leaf order, which is the
         // coordinator's traversal order and the order the signals sum in.
@@ -16819,26 +16813,33 @@ impl NodeServiceImpl {
                 }
             }
             _ => {
-                let mut acc = vec![0.0f32; n];
-                let mut scored = Bits::empty(n);
+                // One accumulator per member, in member order (slot
+                // ascending), not one per row of the shard: a narrow
+                // group over a wide shard costs the members, not the
+                // universe.
                 let member_slots: Vec<u32> = members.iter().map(|slot| slot as u32).collect();
-                // The slots of `slots` a leaf's membership holds.
-                let in_leaf = |slots: &[u32], leaf_index: usize| -> Vec<u32> {
+                let mut acc = vec![0.0f32; member_slots.len()];
+                let mut scored = vec![false; member_slots.len()];
+                // The members a leaf's membership holds: their slots
+                // (a subsequence of the member list) and their indexes
+                // into it.
+                let in_leaf = |leaf_index: usize| -> (Vec<u32>, Vec<usize>) {
                     let bits = &evaluated.leaves[leaf_index].membership;
-                    slots
+                    member_slots
                         .iter()
-                        .copied()
-                        .filter(|&slot| bits.test(slot as usize))
-                        .collect()
+                        .enumerate()
+                        .filter(|(_, &slot)| bits.test(slot as usize))
+                        .map(|(at, &slot)| (slot, at))
+                        .unzip()
                 };
                 for &leaf_index in &scoring {
                     match req.leaves[leaf_index].leaf.as_ref() {
                         Some(L::Lexical(lexical)) => {
-                            let candidates = in_leaf(&member_slots, leaf_index);
+                            let (candidates, at) = in_leaf(leaf_index);
                             let (scores, known) =
                                 Self::boolean_lexical_scores(&guard, lexical, &candidates)?;
                             stages_known[leaf_index].stage_columns_known = known;
-                            for (slot, score) in candidates.iter().zip(scores) {
+                            for ((slot, member), score) in candidates.iter().zip(&at).zip(scores) {
                                 let Some(score) = score else {
                                     return Err(Status::failed_precondition(format!(
                                         "boolean membership selected doc {} for scoring clause \
@@ -16846,8 +16847,8 @@ impl NodeServiceImpl {
                                         offset + u64::from(*slot)
                                     )));
                                 };
-                                acc[*slot as usize] += score;
-                                scored.set(*slot as usize);
+                                acc[*member] += score;
+                                scored[*member] = true;
                             }
                         }
                         Some(L::Dense(dense)) => {
@@ -16855,17 +16856,28 @@ impl NodeServiceImpl {
                             // (the leaf's membership says so); a member
                             // outside it, admitted by another clause,
                             // takes no score from this one.
-                            let candidates = in_leaf(&member_slots, leaf_index);
+                            let (candidates, at) = in_leaf(leaf_index);
+                            let mut stray = None;
                             let products = self.boolean_dense_each(
                                 &guard,
                                 dense,
                                 &candidates,
                                 &req,
-                                |slot, score| {
-                                    acc[slot as usize] += score;
-                                    scored.set(slot as usize);
+                                |slot, score| match candidates.binary_search(&slot) {
+                                    Ok(position) => {
+                                        acc[at[position]] += score;
+                                        scored[at[position]] = true;
+                                    }
+                                    Err(_) => stray = Some(slot),
                                 },
                             )?;
+                            if let Some(slot) = stray {
+                                return Err(Status::internal(format!(
+                                    "dense leaf {leaf_index} scored slot {slot}, which is not \
+                                     one of its {} members holding a vector",
+                                    candidates.len()
+                                )));
+                            }
                             if products != candidates.len() {
                                 return Err(Status::internal(format!(
                                     "dense leaf {leaf_index} returned {products} products for \
@@ -16878,12 +16890,9 @@ impl NodeServiceImpl {
                     }
                 }
                 let mut top = TopSlots::new(depth);
-                for slot in members.iter() {
-                    let score = if scored.test(slot) { acc[slot] } else { 0.0 };
-                    top.offer(RankedSlot {
-                        score,
-                        slot: slot as u32,
-                    });
+                for (member, &slot) in member_slots.iter().enumerate() {
+                    let score = if scored[member] { acc[member] } else { 0.0 };
+                    top.offer(RankedSlot { score, slot });
                 }
                 top.into_sorted()
             }

@@ -729,3 +729,181 @@ fn a_term_absent_from_this_shard_does_not_disable_pruning() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// One `score_candidates` answer as the plain scorer's shape: the summed
+/// score of every candidate a term occurs in, `None` for the rest.
+fn plain_of(hits: &[ScoredDoc], candidates: &[u32]) -> Vec<Option<u64>> {
+    candidates
+        .iter()
+        .map(|c| {
+            hits.iter()
+                .find(|h| h.doc_id == *c)
+                .map(|h| h.score.to_bits())
+        })
+        .collect()
+}
+
+fn bits_of(scores: &[Option<f64>]) -> Vec<Option<u64>> {
+    scores.iter().map(|s| s.map(f64::to_bits)).collect()
+}
+
+/// The plain candidate scorer answers bitwise the same whichever walk
+/// visits a term's postings: the candidate walk (`advance_shallow` per
+/// candidate), the postings walk (the doc run merge-joined against the
+/// candidates), and the automatic choice between them; and the same as
+/// the heap store's merge-join and as `score_candidates` with offsets.
+/// Over random corpora with candidates outside every posting and past
+/// the store, an empty candidate list, terms with df 0, and a segment
+/// catalog whose parts each lack some term (the chained cursor skips
+/// parts) with a heap tail holding one term (no cursor: the fallback).
+#[test]
+fn score_candidates_plain_walks_are_bitwise_equal() {
+    use pipestream_search::bm25::CandidateWalk;
+    use pipestream_search::live_docs::LiveDocs;
+    use pipestream_search::segmented::SegmentedShard;
+    use pipestream_search::segments::{SegmentCatalog, SegmentSource};
+    let dir = test_dir("walks");
+    let mut rng = Lcg::new(0x5C0BE);
+    let params = Bm25Params::default();
+    let all_walks = [
+        CandidateWalk::Auto,
+        CandidateWalk::Candidates,
+        CandidateWalk::Postings,
+    ];
+    for round in 0..12 {
+        let n_vocab = 3 + rng.below(8);
+        let vocab: Vec<String> = (0..n_vocab).map(|i| format!("t{i}")).collect();
+        let n_docs = 40 + rng.below(300);
+        let corpus = random_corpus(&mut rng, n_docs, &vocab, false, round % 3 == 0);
+        let store = build_store(&corpus);
+        let path = dir.join(format!("w{round}.bm25"));
+        store.save(&path).unwrap();
+        let reader = Bm25Reader::open(&path).unwrap();
+        let n_take = 1 + rng.below(3) as usize;
+        let mut terms: Vec<String> = vocab
+            .iter()
+            .filter(|_| rng.below(2) == 0)
+            .take(n_take)
+            .cloned()
+            .collect();
+        terms.push("absent".to_string());
+        if terms.len() == 1 {
+            terms.insert(0, vocab[0].clone());
+        }
+        let stats = CorpusStats {
+            doc_count: store.doc_count(),
+            total_doc_length: store.total_doc_length(),
+            dfs: terms.iter().map(|t| Bm25Index::df(&store, t)).collect(),
+        };
+        // Sorted distinct candidates: gap slots, ids past the store, and
+        // in one round of three every slot of the store.
+        let mut candidates: Vec<u32> = if round % 3 == 1 {
+            (0..store.next_doc_id() + 5).collect()
+        } else {
+            (0..rng.below(120))
+                .map(|_| rng.below(u64::from(store.next_doc_id()) + 20) as u32)
+                .collect()
+        };
+        candidates.sort_unstable();
+        candidates.dedup();
+        if round == 5 {
+            candidates.clear();
+        }
+        let oracle = plain_of(
+            &bm25::score_candidates(&reader, &terms, &stats, params, &candidates),
+            &candidates,
+        );
+        let heap = bm25::score_candidates_plain(&store, &terms, &stats, params, &candidates);
+        assert_eq!(bits_of(&heap), oracle, "round {round}: heap merge-join");
+        for walk in all_walks {
+            let got = bm25::score_candidates_plain_walk(
+                &reader,
+                &terms,
+                &stats,
+                params,
+                &candidates,
+                walk,
+            );
+            assert_eq!(bits_of(&got), oracle, "round {round}: v5 reader, {walk:?}");
+        }
+    }
+    // A catalog of three sealed parts: part p holds only the terms whose
+    // index is not p (mod 3), so every term's chained cursor skips one
+    // part; the tail holds one document with t0, so t0 has no cursor at
+    // all and merge-joins whatever the walk.
+    let vocab: Vec<String> = (0..6).map(|i| format!("t{i}")).collect();
+    let root = dir.join("catalog");
+    let catalog = SegmentCatalog::open(&root).unwrap();
+    let mut base = 0u64;
+    let mut whole = Bm25Store::new();
+    for part in 0..3usize {
+        let part_vocab: Vec<String> = vocab
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 3 != part)
+            .map(|(_, t)| t.clone())
+            .collect();
+        let part_docs = 60 + rng.below(100);
+        let corpus = random_corpus(&mut rng, part_docs, &part_vocab, false, true);
+        let store = build_store(&corpus);
+        for (id, text, doc) in &corpus {
+            whole.add_document(base as u32 + *id, text.clone(), doc.clone());
+        }
+        let stage = dir.join(format!("part-{part}"));
+        std::fs::create_dir_all(&stage).unwrap();
+        let bm25_path = stage.join("documents.bm25");
+        let live = stage.join("live.bin");
+        store.save(&bm25_path).unwrap();
+        let rows = u64::from(store.next_doc_id());
+        LiveDocs::default().write(&live, rows).unwrap();
+        catalog
+            .append(SegmentSource {
+                segment_id: &format!("part-{part}"),
+                generation: part as u64 + 1,
+                base_label: base,
+                backend_kind: "",
+                vector_path: None,
+                exact_vector_path: None,
+                bm25_path: &bm25_path,
+                live_docs_path: &live,
+                partition_column: None,
+            })
+            .unwrap();
+        base += rows;
+    }
+    let mut shard = SegmentedShard::open(&root, Bm25Store::new()).unwrap();
+    let tail_doc = AnalyzedDoc::body(vec![("t0".into(), 2, vec![])], 2);
+    shard
+        .add_document(base as u32, "tail".into(), tail_doc.clone(), None)
+        .unwrap();
+    whole.add_document(base as u32, "tail".into(), tail_doc);
+    let terms = vocab.clone();
+    let stats = CorpusStats {
+        doc_count: Bm25Index::doc_count(&shard),
+        total_doc_length: Bm25Index::total_doc_length(&shard),
+        dfs: terms.iter().map(|t| Bm25Index::df(&shard, t)).collect(),
+    };
+    assert!(
+        Bm25Index::impacts(&shard, "t0").is_none() && Bm25Index::impacts(&shard, "t1").is_some(),
+        "the tail holds t0 (no cursor) and no other term"
+    );
+    for bound in [0u32, 7, 64, base as u32 + 3] {
+        let candidates: Vec<u32> = (0..=bound).filter(|c| c % 2 == 0 || c % 5 == 0).collect();
+        let oracle = plain_of(
+            &bm25::score_candidates(&whole, &terms, &stats, params, &candidates),
+            &candidates,
+        );
+        for walk in all_walks {
+            let got = bm25::score_candidates_plain_walk(
+                &shard,
+                &terms,
+                &stats,
+                params,
+                &candidates,
+                walk,
+            );
+            assert_eq!(bits_of(&got), oracle, "catalog, bound {bound}, {walk:?}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

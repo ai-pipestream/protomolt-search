@@ -2445,6 +2445,10 @@ pub struct TreeChild {
     pub hash_hi: u64,
 }
 
+/// Built bucket images by plan position, handed from the sealing
+/// threads to the appending one.
+type BuiltBuckets = BTreeMap<usize, Result<(ChildImage, u64), String>>;
+
 /// The result of a re-placement split: the images, the child list
 /// (parallel to `images.children`), and what moved.
 #[derive(Debug)]
@@ -2537,6 +2541,14 @@ pub struct TreeSplitOptions {
     /// Rows already derived under `derived` refuse; rows never derived
     /// need every declared column named (`Declaration::rederive`).
     pub derive: Vec<String>,
+    /// Spill buckets built at once in a segmented child under
+    /// `--from-segments` (`--build-threads`): each thread replays one
+    /// bucket into memory and seals it, so the build's memory is this
+    /// many buckets' replays; the segments append in bucket order and
+    /// the catalog is the same as the one-thread build's, byte for
+    /// byte. The log replay analyzes through one sidecar session and
+    /// refuses more than one.
+    pub build_threads: usize,
 }
 
 impl Default for TreeSplitOptions {
@@ -2550,6 +2562,7 @@ impl Default for TreeSplitOptions {
             open_files_limit: None,
             derived: None,
             derive: Vec::new(),
+            build_threads: 1,
         }
     }
 }
@@ -2626,6 +2639,23 @@ pub fn split_placement_tree_logs(
                 "--only-child={only} names no child; the tree has {} leaf shards (0..{})",
                 children.len(),
                 children.len().saturating_sub(1)
+            ));
+        }
+    }
+    if options.build_threads > 1 {
+        if options.source != TreeRowSource::Segments {
+            return Err(format!(
+                "--build-threads={} builds buckets at once from transplanted fields; the log \
+                 replay analyzes through one sidecar session, split with --from-segments or \
+                 one thread",
+                options.build_threads
+            ));
+        }
+        if matches!(options.layout, TreeChildLayout::SingleImage { .. }) {
+            return Err(format!(
+                "--build-threads={} builds a segmented child's buckets at once; a single-image \
+                 child is one image",
+                options.build_threads
             ));
         }
     }
@@ -3012,6 +3042,11 @@ pub fn split_placement_tree_logs(
         .collect();
     let mut moved = 0u64;
     let mut placed = vec![0u64; children.len()];
+    // Documents filed per (child, bucket): the threaded build takes each
+    // bucket's slot range from these before any bucket is replayed.
+    let mut bucket_docs: Vec<Vec<u64>> = (0..children.len())
+        .map(|_| vec![0u64; spill_bucket_count as usize])
+        .collect();
     let mut transplanted_rows = 0u64;
     let mut peak_transpose_bytes = 0u64;
     let mut seen: BTreeSet<u64> = BTreeSet::new();
@@ -3051,6 +3086,8 @@ pub fn split_placement_tree_logs(
             None => spills[index].append(document),
         }
         .map_err(|error| format!("spill document {id}: {error}"))?;
+        let filed = bucket.unwrap_or(bucket_of(id, spill_bucket_count as usize) as u32);
+        bucket_docs[index][filed as usize] += 1;
         if let Some((vector, dim)) = vector {
             let record = wal_record::Op::AddVectors(crate::pb::wal::LoggedAddVectors {
                 first_id: id,
@@ -3211,6 +3248,20 @@ pub fn split_placement_tree_logs(
                         transplanted_rows += 1;
                         placed[index] += 1;
                     }
+                    // This segment is read; its pages leave the resident
+                    // set and the page cache, so the run's footprint is
+                    // one segment's, not the catalog's.
+                    drop(transposes);
+                    if let Some(store) = exact.as_ref() {
+                        store.release_pages().map_err(|e| {
+                            format!("{} segment {}: {e}", shard.root.display(), meta.segment_id)
+                        })?;
+                    }
+                    drop(exact);
+                    bm25.release_pages().map_err(|e| {
+                        format!("{} segment {}: {e}", shard.root.display(), meta.segment_id)
+                    })?;
+                    drop_segment_cache(&shard.root, &meta.segment_id);
                 }
             }
         }
@@ -3399,10 +3450,15 @@ pub fn split_placement_tree_logs(
                 std::fs::create_dir_all(&work)
                     .map_err(|error| format!("mkdir {}: {error}", work.display()))?;
                 let bound = slot_bound(index);
-                let mut next_slot = slot_offsets[index];
                 let mut documents = 0u64;
                 let mut vectors = 0u64;
-                for bucket in 0..spill_bucket_count {
+                // One spill bucket replayed and sealed into a staged
+                // image at `slot`; `None` for an empty bucket.
+                let build = |bucket: u32,
+                             ordinal: usize,
+                             slot: u64,
+                             analyze: &mut Analyzer|
+                 -> Result<Option<(ChildImage, u64)>, String> {
                     let mut replay = Replay::default();
                     replay_buckets_routed(
                         spill_dir,
@@ -3420,17 +3476,15 @@ pub fn split_placement_tree_logs(
                     }
                     replay.compact();
                     let rows = live_rows(&replay);
-                    peak_replay_rows = peak_replay_rows.max(rows);
                     if rows == 0 {
-                        continue;
+                        return Ok(None);
                     }
-                    let ordinal = segments[index];
                     let image = finish_child_pinned(
                         &manifest,
                         replay,
                         ordinal,
                         &work,
-                        next_slot,
+                        slot,
                         child.hash_lo,
                         child.hash_hi,
                         bm25_fields,
@@ -3440,8 +3494,18 @@ pub fn split_placement_tree_logs(
                         pinned_columns.as_ref(),
                         analyze,
                     )?;
+                    Ok(Some((image, rows)))
+                };
+                // A staged image into the catalog: the checks, the live
+                // sidecar, the append, the staged files removed, the
+                // caches dropped. Returns the segment's rows.
+                let mut place = |bucket: u32,
+                                 ordinal: usize,
+                                 slot: u64,
+                                 image: ChildImage|
+                 -> Result<u64, String> {
                     let image_rows = image_rows(&image);
-                    check_slot_bound(index, &child.leaf, next_slot, image_rows, bound)?;
+                    check_slot_bound(index, &child.leaf, slot, image_rows, bound)?;
                     if image.num_vectors != 0 && image.num_vectors != image.num_documents {
                         return Err(format!(
                             "child {index} ({}) bucket {bucket}: {} vectors but {} documents; a \
@@ -3478,7 +3542,7 @@ pub fn split_placement_tree_logs(
                             generation,
                             // Labels are shard-local: the node adds its
                             // slot offset when it serves the catalog.
-                            base_label: next_slot - slot_offsets[index],
+                            base_label: slot - slot_offsets[index],
                             backend_kind: &backend_kind,
                             vector_path,
                             exact_vector_path: exact_path,
@@ -3507,13 +3571,144 @@ pub fn split_placement_tree_logs(
                             })?;
                         }
                     }
-                    next_slot = next_slot
-                        .checked_add(image_rows)
-                        .ok_or_else(|| "re-placement split slot overflow".to_string())?;
+                    // The bucket's spill and the sealed segment are done
+                    // with: out of the page cache.
+                    drop_page_cache(&wal::bucket_path(spill_dir, bucket));
+                    drop_page_cache(&analysis_sidecar_path(spill_dir, bucket));
+                    drop_segment_cache(&root, &segment_id);
                     documents += image.num_documents;
                     vectors += image.num_vectors;
-                    segments[index] += 1;
+                    Ok(image_rows)
+                };
+                let mut built = 0usize;
+                if options.build_threads <= 1 {
+                    let mut next_slot = slot_offsets[index];
+                    for bucket in 0..spill_bucket_count {
+                        let Some((image, rows)) = build(bucket, built, next_slot, analyze)? else {
+                            continue;
+                        };
+                        peak_replay_rows = peak_replay_rows.max(rows);
+                        let image_rows = place(bucket, built, next_slot, image)?;
+                        next_slot = next_slot
+                            .checked_add(image_rows)
+                            .ok_or_else(|| "re-placement split slot overflow".to_string())?;
+                        built += 1;
+                    }
+                } else {
+                    // Threaded: every bucket's slot range comes from the
+                    // spill's own counts, so buckets build in any order
+                    // and the segments append in bucket order, the same
+                    // catalog the one-thread build writes.
+                    let counts = &bucket_docs[index];
+                    let mut plan: Vec<(u32, usize, u64)> = Vec::new();
+                    let mut slot = slot_offsets[index];
+                    for bucket in 0..spill_bucket_count {
+                        let n = counts[bucket as usize];
+                        if n == 0 {
+                            continue;
+                        }
+                        plan.push((bucket, plan.len(), slot));
+                        slot = slot
+                            .checked_add(n)
+                            .ok_or_else(|| "re-placement split slot overflow".to_string())?;
+                    }
+                    let next = std::sync::atomic::AtomicUsize::new(0);
+                    let stop = std::sync::atomic::AtomicBool::new(false);
+                    let done: std::sync::Mutex<BuiltBuckets> =
+                        std::sync::Mutex::new(BTreeMap::new());
+                    let ready = std::sync::Condvar::new();
+                    let threads = options.build_threads.min(plan.len().max(1));
+                    let outcome: Result<(), String> = std::thread::scope(|scope| {
+                        for _ in 0..threads {
+                            scope.spawn(|| {
+                                // The fields come from the spill; a row
+                                // without them is a defect, not a job for
+                                // the sidecar.
+                                let mut refuse = |_: &[(&str, Option<&AnalysisSpec>, SessionLayers)]|
+                                 -> Result<Vec<AnalyzedDoc>, String> {
+                                    Err("a transplant from segments analyzes nothing; every \
+                                         row's fields come from the spill"
+                                        .to_string())
+                                };
+                                loop {
+                                    if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                                        break;
+                                    }
+                                    let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    if i >= plan.len() {
+                                        break;
+                                    }
+                                    let (bucket, ordinal, slot) = plan[i];
+                                    let result =
+                                        build(bucket, ordinal, slot, &mut refuse).and_then(|built| {
+                                            built.ok_or_else(|| {
+                                                format!(
+                                                    "child {index} ({}) bucket {bucket}: the \
+                                                     spill counted {} documents and the replay \
+                                                     found none",
+                                                    child.leaf, counts[bucket as usize]
+                                                )
+                                            })
+                                        });
+                                    let failed = result.is_err();
+                                    done.lock().expect("bucket results").insert(i, result);
+                                    ready.notify_all();
+                                    if failed {
+                                        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                                        break;
+                                    }
+                                }
+                            });
+                        }
+                        for (i, &(bucket, ordinal, slot)) in plan.iter().enumerate() {
+                            let result = {
+                                let mut guard = done.lock().expect("bucket results");
+                                loop {
+                                    if let Some(result) = guard.remove(&i) {
+                                        break result;
+                                    }
+                                    if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                                        let first = guard
+                                            .values()
+                                            .find_map(|r| r.as_ref().err().cloned())
+                                            .unwrap_or_else(|| {
+                                                "a bucket build stopped without a result"
+                                                    .to_string()
+                                            });
+                                        break Err(first);
+                                    }
+                                    guard = ready
+                                        .wait_timeout(guard, std::time::Duration::from_millis(200))
+                                        .expect("bucket results")
+                                        .0;
+                                }
+                            };
+                            let placed_rows = result.and_then(|(image, rows)| {
+                                peak_replay_rows = peak_replay_rows.max(rows);
+                                place(bucket, ordinal, slot, image)
+                            });
+                            let image_rows = match placed_rows {
+                                Ok(rows) => rows,
+                                Err(e) => {
+                                    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    return Err(e);
+                                }
+                            };
+                            if image_rows != counts[bucket as usize] {
+                                stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                                return Err(format!(
+                                    "child {index} ({}) bucket {bucket}: the spill counted {} \
+                                     documents, the sealed segment holds {image_rows} rows",
+                                    child.leaf, counts[bucket as usize]
+                                ));
+                            }
+                        }
+                        Ok(())
+                    });
+                    outcome?;
+                    built = plan.len();
                 }
+                segments[index] += built;
                 if documents != placed[index] {
                     return Err(format!(
                         "child {index} ({}): the sealed segments hold {documents} documents, \
@@ -4106,26 +4301,57 @@ fn analysis_sidecar_path(spill_dir: &Path, bucket: u32) -> PathBuf {
     spill_dir.join(format!("analysis-{bucket:05}.bin"))
 }
 
+/// Ask the kernel to drop the page cache of a file this pass is done
+/// with (`posix_fadvise` DONTNEED). A split reads hundreds of gigabytes
+/// of segments once and writes as much spill and output; without this
+/// the run's cache footprint is that whole volume, taken from the nodes
+/// serving beside it, and its resident set with it. Advice only: dirty
+/// pages stay until written back, and the run's result does not depend
+/// on it. Off the network build (no libc) it does nothing.
+#[cfg(all(feature = "net", target_os = "linux"))]
+fn drop_page_cache(path: &Path) {
+    use std::os::unix::io::AsRawFd;
+    if let Ok(file) = std::fs::File::open(path) {
+        // SAFETY: a plain advisory call on an open descriptor.
+        unsafe {
+            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+        }
+    }
+}
+
+#[cfg(not(all(feature = "net", target_os = "linux")))]
+fn drop_page_cache(_path: &Path) {}
+
+/// [`drop_page_cache`] over every file of a sealed segment's directory.
+fn drop_segment_cache(root: &Path, segment_id: &str) {
+    let dir = crate::segments::SegmentCatalog::segment_dir(root, segment_id);
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            drop_page_cache(&entry.path());
+        }
+    }
+}
+
 /// One source shard's catalog beside its log, with the rows its shard
 /// overlay and its log have deleted since the segments sealed.
-struct SegmentSourceShard {
-    gen: PathBuf,
-    root: PathBuf,
-    set: std::sync::Arc<crate::segments::OpenedSegmentSet>,
+pub(crate) struct SegmentSourceShard {
+    pub(crate) gen: PathBuf,
+    pub(crate) root: PathBuf,
+    pub(crate) set: std::sync::Arc<crate::segments::OpenedSegmentSet>,
     /// The shard-wide live-document overlay (`<index>.tv.live`), when
     /// written: a delete after a seal lands there, not in the segment's
     /// own sidecar.
-    overlay: Option<crate::live_docs::LiveDocs>,
+    pub(crate) overlay: Option<crate::live_docs::LiveDocs>,
     /// Rows the log deletes or replaces, as local labels.
-    deleted: BTreeSet<u64>,
+    pub(crate) deleted: BTreeSet<u64>,
     /// The shard's slot offset: a global id is the offset plus the label.
-    slot_offset: u64,
+    pub(crate) slot_offset: u64,
 }
 
 impl SegmentSourceShard {
     /// Whether shard-local row `label` (segment `i`, row `row` in it) is
     /// live: the segment's sidecar, the shard overlay, and the log agree.
-    fn is_live(&self, i: usize, row: u32, label: u64) -> bool {
+    pub(crate) fn is_live(&self, i: usize, row: u32, label: u64) -> bool {
         if self.set.live_docs(i).is_deleted(row as usize) {
             return false;
         }
@@ -4139,12 +4365,67 @@ impl SegmentSourceShard {
 }
 
 /// The tables every source shares, pinned on the children.
-struct SourceTables {
-    fields: Vec<String>,
-    fingerprints: Vec<u64>,
-    position_fields: Vec<String>,
-    sentence_fields: Vec<String>,
-    columns: ColumnTables,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SourceTables {
+    pub(crate) fields: Vec<String>,
+    pub(crate) fingerprints: Vec<u64>,
+    pub(crate) position_fields: Vec<String>,
+    pub(crate) sentence_fields: Vec<String>,
+    pub(crate) columns: ColumnTables,
+}
+
+/// The field and column tables a sealed store declares, in index order.
+pub(crate) fn segment_tables(bm25: &crate::postings::Bm25Reader) -> SourceTables {
+    let fields: Vec<String> = (0..bm25.field_count())
+        .map(|f| bm25.field_name(f).to_string())
+        .collect();
+    let fingerprints: Vec<u64> = (0..bm25.field_count())
+        .map(|f| bm25.analysis_fingerprint(f))
+        .collect();
+    let position_fields: Vec<String> = (0..bm25.field_count())
+        .filter(|&f| bm25.field_has_positions(f))
+        .map(|f| bm25.field_name(f).to_string())
+        .collect();
+    let sentence_fields: Vec<String> = (0..bm25.field_count())
+        .filter(|&f| bm25.field_has_sentences(f))
+        .map(|f| bm25.field_name(f).to_string())
+        .collect();
+    let columns = ColumnTables {
+        facets: (0..bm25.facet_count())
+            .map(|c| bm25.facet_name(c).to_string())
+            .collect(),
+        numerics: (0..bm25.numeric_count())
+            .map(|c| bm25.numeric_name(c).to_string())
+            .collect(),
+        map_facets: (0..bm25.map_facet_count())
+            .map(|c| bm25.map_facet_name(c).to_string())
+            .collect(),
+        map_numerics: (0..bm25.map_numeric_count())
+            .map(|c| bm25.map_numeric_name(c).to_string())
+            .collect(),
+        map_integers: (0..bm25.map_integer_count())
+            .map(|c| bm25.map_integer_name(c).to_string())
+            .collect(),
+        map_unsigned_integers: (0..bm25.map_unsigned_integer_count())
+            .map(|c| bm25.map_unsigned_integer_name(c).to_string())
+            .collect(),
+        integers: (0..bm25.integer_count())
+            .map(|c| bm25.integer_name(c).to_string())
+            .collect(),
+        unsigned_integers: (0..bm25.unsigned_integer_count())
+            .map(|c| bm25.unsigned_integer_name(c).to_string())
+            .collect(),
+        geo: (0..bm25.geo_count())
+            .map(|c| bm25.geo_name(c).to_string())
+            .collect(),
+    };
+    SourceTables {
+        fields,
+        fingerprints,
+        position_fields,
+        sentence_fields,
+        columns,
+    }
 }
 
 /// The catalog root of the shard whose log generation is `gen`:
@@ -4231,7 +4512,7 @@ fn wal_row_watermark(gen: &Path, bucket_count: u32) -> Result<(u64, BTreeSet<u64
 
 /// Open the catalogs beside the logs and check what a child pins
 /// (`docs/replay-from-segments.md`, "The replay").
-fn open_segment_sources(
+pub(crate) fn open_segment_sources(
     gens: &[PathBuf],
 ) -> Result<(Vec<SegmentSourceShard>, SourceTables), String> {
     let mut shards = Vec::with_capacity(gens.len());
@@ -4290,56 +4571,7 @@ fn open_segment_sources(
         }
         for i in 0..set.len() {
             let bm25 = set.bm25(i);
-            let fields: Vec<String> = (0..bm25.field_count())
-                .map(|f| bm25.field_name(f).to_string())
-                .collect();
-            let fingerprints: Vec<u64> = (0..bm25.field_count())
-                .map(|f| bm25.analysis_fingerprint(f))
-                .collect();
-            let position_fields: Vec<String> = (0..bm25.field_count())
-                .filter(|&f| bm25.field_has_positions(f))
-                .map(|f| bm25.field_name(f).to_string())
-                .collect();
-            let sentence_fields: Vec<String> = (0..bm25.field_count())
-                .filter(|&f| bm25.field_has_sentences(f))
-                .map(|f| bm25.field_name(f).to_string())
-                .collect();
-            let columns = ColumnTables {
-                facets: (0..bm25.facet_count())
-                    .map(|c| bm25.facet_name(c).to_string())
-                    .collect(),
-                numerics: (0..bm25.numeric_count())
-                    .map(|c| bm25.numeric_name(c).to_string())
-                    .collect(),
-                map_facets: (0..bm25.map_facet_count())
-                    .map(|c| bm25.map_facet_name(c).to_string())
-                    .collect(),
-                map_numerics: (0..bm25.map_numeric_count())
-                    .map(|c| bm25.map_numeric_name(c).to_string())
-                    .collect(),
-                map_integers: (0..bm25.map_integer_count())
-                    .map(|c| bm25.map_integer_name(c).to_string())
-                    .collect(),
-                map_unsigned_integers: (0..bm25.map_unsigned_integer_count())
-                    .map(|c| bm25.map_unsigned_integer_name(c).to_string())
-                    .collect(),
-                integers: (0..bm25.integer_count())
-                    .map(|c| bm25.integer_name(c).to_string())
-                    .collect(),
-                unsigned_integers: (0..bm25.unsigned_integer_count())
-                    .map(|c| bm25.unsigned_integer_name(c).to_string())
-                    .collect(),
-                geo: (0..bm25.geo_count())
-                    .map(|c| bm25.geo_name(c).to_string())
-                    .collect(),
-            };
-            let this = SourceTables {
-                fields,
-                fingerprints,
-                position_fields,
-                sentence_fields,
-                columns,
-            };
+            let this = segment_tables(bm25);
             match &tables {
                 None => tables = Some(this),
                 Some(first) => {
@@ -4420,7 +4652,7 @@ fn open_segment_sources(
 
 /// The logged document row `row` of `bm25` stands for: its columns,
 /// and with `with_text` its text, lineage, source and identity too.
-fn reconstruct_document(
+pub(crate) fn reconstruct_document(
     bm25: &crate::postings::Bm25Reader,
     row: u32,
     tables: &SourceTables,
@@ -4545,7 +4777,7 @@ fn reconstruct_document(
 }
 
 /// The exact-vector sidecar of segment `i`, when the segment has vectors.
-fn open_segment_exact(
+pub(crate) fn open_segment_exact(
     shard: &SegmentSourceShard,
     i: usize,
 ) -> Result<Option<crate::exact_vectors::ExactVectorStore>, String> {
