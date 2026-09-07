@@ -3406,7 +3406,8 @@ fn fill_allowlist(n: u32, prune: &SegmentPrune, mut passes: impl FnMut(u32) -> b
 /// domain is `false` without a predicate evaluation. The Boolean
 /// planner uses this for a filter leaf whose group admits a row only
 /// where an exact MUST sibling holds it: off that intersection the
-/// verdict can never be consulted, so evaluating it there is waste.
+/// verdict cannot affect group membership. Returned candidates can still need
+/// a separate predicate check for complete filter provenance.
 fn fill_allowlist_domain(
     n: u32,
     prune: &SegmentPrune,
@@ -3449,7 +3450,7 @@ fn fill_allowlist_domain(
 /// (`docs/segment-pruning.md`): their slots are `false` without a
 /// per-row evaluation, and the counts come back alongside. With
 /// `domain` set, only its slots are evaluated at all — the caller
-/// guarantees the verdict is never consulted off the domain.
+/// guarantees membership evaluation never consults the verdict off the domain.
 /// What [`resolve_shard_filters`] hands back: the predicate for the
 /// scorers' heap gate, the slot allowlist for the vector kernel, and
 /// the segment counts.
@@ -16049,9 +16050,13 @@ struct EvaluatedLeaf {
     /// hold a vector.
     membership: crate::boolean_bits::Bits,
     /// Whether a MUST/SHOULD chain reaches the leaf; MUST_NOT leaves
-    /// score nothing and name no provenance.
+    /// score nothing. The wire matched list still describes all matching leaves.
     positive: bool,
     filter_known: Option<crate::pb::BooleanFilterKnown>,
+    /// A narrowed filter still needs its complete verdict on returned rows
+    /// admitted through other branches. Reuse the compiled predicate on those
+    /// candidates instead of expanding its whole-shard membership bitmap.
+    filter_recheck: Option<crate::filter::DocFilter<'static>>,
 }
 
 /// The tree resolved on one shard.
@@ -16269,8 +16274,29 @@ fn filter_leaf_domains(
         }
     }
     for node in group.should.iter().chain(&group.must_not) {
-        if let Some(Node::Group(child)) = node.node.as_ref() {
-            filter_leaf_domains(req, child, bound, leaves, bounded, unbounded, depth + 1)?;
+        match node.node.as_ref() {
+            Some(Node::Group(child)) => {
+                filter_leaf_domains(req, child, bound, leaves, bounded, unbounded, depth + 1)?;
+            }
+            Some(Node::Leaf(index)) => {
+                if matches!(
+                    boolean_leaf(req, *index)?,
+                    crate::pb::boolean_plan_leaf::Leaf::Filter(_)
+                ) {
+                    // A shared leaf must cover this direct occurrence too.
+                    // Sibling MUST clauses cannot narrow SHOULD/MUST_NOT here.
+                    match (bound, &mut bounded[*index as usize]) {
+                        (None, _) => unbounded[*index as usize] = true,
+                        (Some(domain), slot @ None) => *slot = Some(domain.clone()),
+                        (Some(domain), Some(bits)) => bits.or_with(domain),
+                    }
+                }
+            }
+            None => {
+                return Err(Status::invalid_argument(
+                    "Boolean plan node is neither a group nor a leaf",
+                ));
+            }
         }
     }
     Ok(())
@@ -16434,6 +16460,7 @@ pub(crate) fn evaluate_boolean_membership(
             membership,
             positive: positive[index],
             filter_known: None,
+            filter_recheck: None,
         }));
     }
     let mut domains: Vec<Option<Bits>> = vec![None; req.leaves.len()];
@@ -16455,7 +16482,7 @@ pub(crate) fn evaluate_boolean_membership(
         let (geo_columns_known, filter_columns_known) =
             filter_known_flags(bm25, &filter.geo_filters, filter.filter.as_ref());
         let domain = domains[index].as_ref();
-        let (_, allow, stats) = resolve_shard_filters(
+        let (predicate, allow, stats) = resolve_shard_filters(
             bm25,
             deleted.clone(),
             n,
@@ -16494,6 +16521,8 @@ pub(crate) fn evaluate_boolean_membership(
                 geo_columns_known,
                 filter_columns_known,
             }),
+            filter_recheck: (domain.is_some() && bm25.is_some())
+                .then(|| predicate.unwrap_or_default()),
         });
     }
     let leaves: Vec<EvaluatedLeaf> = leaves
@@ -17405,7 +17434,15 @@ impl NodeServiceImpl {
                 .leaves
                 .iter()
                 .enumerate()
-                .filter(|(_, leaf)| leaf.membership.test(entry.slot as usize))
+                .filter(|(_, leaf)| {
+                    leaf.membership.test(entry.slot as usize)
+                        || leaf.filter_recheck.as_ref().is_some_and(|filter| {
+                            guard.bm25.as_ref().is_some_and(|store| {
+                                entry.slot < store.next_doc_id()
+                                    && filter.passes(entry.slot, &ShardNumericRead(store))
+                            })
+                        })
+                })
                 .map(|(index, _)| index as u32)
                 .collect();
             candidates.push(crate::pb::BooleanCandidate {
@@ -18151,6 +18188,7 @@ mod filter_domain_tests {
             membership,
             positive: true,
             filter_known: None,
+            filter_recheck: None,
         })
     }
 

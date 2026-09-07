@@ -159,6 +159,13 @@ membership came back as a bitmap and the coordinator held the match set as an
 id set, which at 66 million members took 50 GB and minutes
 (`docs/benchmarks/fleet-placement-2026-09.md`).
 
+A shared filter accounts for all reference positions, including direct SHOULD
+and MUST_NOT. A use without a restricted domain forces a full scan. Candidate
+provenance is evaluated separately using the retained expression, so candidates
+selected by another branch still report all matching filters. See
+`tests/boolean_shared_filter.rs` for membership, visibility and provenance
+regressions.
+
 `depth` is the page's absolute end (the cursor's rank plus `k`), or, when a
 scorer or a boost reorders, the pool they reorder: `selection_k`, the
 coordinator's `max_k` when zero, with `k <= selection_k <= max_k` and a
