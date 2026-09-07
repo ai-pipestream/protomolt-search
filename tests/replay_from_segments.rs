@@ -1199,8 +1199,9 @@ fn catalog_digests(root: &Path) -> Vec<(String, String)> {
 }
 
 /// Buckets sealed by several threads write the catalog the one-thread
-/// build writes, byte for byte, under the hash cut and the year cut;
-/// the log replay and a single image refuse the threads by name.
+/// build writes, byte for byte, under the hash cut and the year cut,
+/// with or without the bounded backlog and the memory budget; the log
+/// replay and a single image refuse the threads by name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn threaded_buckets_write_the_same_catalog_byte_for_byte() {
     let dir = tempdir("threads");
@@ -1210,6 +1211,8 @@ async fn threaded_buckets_write_the_same_catalog_byte_for_byte() {
                  source: reshard::TreeRowSource,
                  layout: reshard::TreeChildLayout,
                  threads: usize,
+                 queue: Option<usize>,
+                 memory: Option<u64>,
                  cut: reshard::SpillCut| {
         reshard::split_placement_tree_logs(
             std::slice::from_ref(&gen),
@@ -1222,6 +1225,8 @@ async fn threaded_buckets_write_the_same_catalog_byte_for_byte() {
                 layout,
                 cut,
                 build_threads: threads,
+                build_queue: queue,
+                build_memory: memory,
                 ..Default::default()
             },
             &mut analyzer(),
@@ -1234,20 +1239,37 @@ async fn threaded_buckets_write_the_same_catalog_byte_for_byte() {
         rows_per_cut: 30,
     };
     for (tag, cut) in [("hash", reshard::SpillCut::Hash), ("year", year())] {
-        let one = build(&format!("{tag}-one"), segments, segmented(), 1, cut.clone()).unwrap();
-        let many = build(&format!("{tag}-many"), segments, segmented(), 3, cut).unwrap();
+        let one = build(&format!("{tag}-one"), segments, segmented(), 1, None, None, cut.clone())
+            .unwrap();
+        let many = build(&format!("{tag}-many"), segments, segmented(), 3, None, None, cut.clone())
+            .unwrap();
+        // The bounded build: a backlog of one finished bucket and a
+        // budget above three times the largest bucket's estimate.
+        let bounded = build(
+            &format!("{tag}-bounded"),
+            segments,
+            segmented(),
+            3,
+            Some(1),
+            Some(32 << 20),
+            cut,
+        )
+        .unwrap();
         assert_eq!(one.placed, many.placed, "{tag}");
+        assert_eq!(one.placed, bounded.placed, "{tag}");
         assert_eq!(one.segments, many.segments, "{tag}");
+        assert_eq!(one.segments, bounded.segments, "{tag}");
         assert!(
             one.segments.iter().any(|&n| n >= 3),
             "{tag}: a child with several segments ({:?})",
             one.segments
         );
-        for (index, (a, b)) in one
+        for (index, ((a, b), c)) in one
             .images
             .children
             .iter()
             .zip(&many.images.children)
+            .zip(&bounded.images.children)
             .enumerate()
         {
             let digests = catalog_digests(&pipestream_search::node::segments_root(&a.vector_path));
@@ -1257,6 +1279,11 @@ async fn threaded_buckets_write_the_same_catalog_byte_for_byte() {
                 catalog_digests(&pipestream_search::node::segments_root(&b.vector_path)),
                 "{tag}: child {index}'s catalog differs between one and three threads"
             );
+            assert_eq!(
+                digests,
+                catalog_digests(&pipestream_search::node::segments_root(&c.vector_path)),
+                "{tag}: child {index}'s catalog differs with the bounded queue and budget"
+            );
         }
     }
     let err = build(
@@ -1264,6 +1291,8 @@ async fn threaded_buckets_write_the_same_catalog_byte_for_byte() {
         reshard::TreeRowSource::Logs,
         segmented(),
         2,
+        None,
+        None,
         reshard::SpillCut::Hash,
     )
     .unwrap_err();
@@ -1275,9 +1304,81 @@ async fn threaded_buckets_write_the_same_catalog_byte_for_byte() {
             max_child_rows: 1_000,
         },
         2,
+        None,
+        None,
         reshard::SpillCut::Hash,
     )
     .unwrap_err();
     assert!(err.contains("single-image child is one image"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The build-memory budget refuses by name -- the budget, the estimate,
+/// and the cause -- when one bucket cannot fit it and when the threads
+/// times it cannot; nothing is lowered to fit. Under the year cut at 30
+/// rows a bucket every cut here is 27 documents, about 2 MiB at the
+/// conservative 70 KiB a row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_build_memory_budget_refuses_by_name() {
+    let dir = tempdir("budget");
+    let (index_path, _addr) = source_shard(&dir, true).await;
+    let gen = reshard::resolve_gen(&pipestream_search::wal::wal_dir(&index_path)).unwrap();
+    let year = || reshard::SpillCut::Column {
+        column: "year".into(),
+        rows_per_cut: 30,
+    };
+    let build = |out: &str,
+                 layout: reshard::TreeChildLayout,
+                 threads: usize,
+                 queue: Option<usize>,
+                 memory: Option<u64>| {
+        reshard::split_placement_tree_logs(
+            std::slice::from_ref(&gen),
+            &band_tree(),
+            &dir.join(out),
+            &[0, 1_000, 2_000],
+            None,
+            reshard::TreeSplitOptions {
+                source: reshard::TreeRowSource::Segments,
+                layout,
+                cut: year(),
+                build_threads: threads,
+                build_queue: queue,
+                build_memory: memory,
+                ..Default::default()
+            },
+            &mut analyzer(),
+        )
+    };
+    let segmented = || reshard::TreeChildLayout::Segmented;
+    // Three threads at about 2 MiB a bucket need about 6 MiB, over 2.
+    let err = build("threads", segmented(), 3, None, Some(2 << 20)).unwrap_err();
+    assert!(
+        err.contains("--build-memory=2 MiB") && err.contains("not lowered"),
+        "{err}"
+    );
+    // One thread still replays one bucket, and one bucket is over 1 MiB.
+    let err = build("one", segmented(), 1, None, Some(1 << 20)).unwrap_err();
+    assert!(
+        err.contains("--build-memory=1 MiB") && err.contains("single bucket"),
+        "{err}"
+    );
+    // The budget fits: the split runs.
+    build("fits", segmented(), 3, None, Some(8 << 20)).unwrap();
+    // The budget sizes bucket replays; a single image is not one.
+    let err = build(
+        "image",
+        reshard::TreeChildLayout::SingleImage {
+            max_child_rows: 1_000,
+        },
+        1,
+        None,
+        Some(64 << 20),
+    )
+    .unwrap_err();
+    assert!(err.contains("single-image child"), "{err}");
+    // A queue of zero passes nothing.
+    let err = build("queue", segmented(), 3, Some(0), None).unwrap_err();
+    assert!(err.contains("--build-queue=0"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
