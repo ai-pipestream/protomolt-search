@@ -466,11 +466,12 @@ root cost what they cost before (0.24 to 0.88 s, a 23 MB root).
   generation 11, and a partitioned compaction by `year` inside each
   band gives segment pruning something to skip within a leaf
   (`docs/segment-pruning.md`).
-- The boolean lexical clause's cost is the filter leaf's column scan
-  over every row of every shard, two thirds of it on the Pi shards;
-  the candidate walk is at most 18 ms and now picks the cheaper walk
-  per term ("The boolean lexical clause", below). Next: resolve a
-  MUST filter leaf over its narrower sibling's members.
+- The boolean lexical clause's MUST filter leaf now resolves over its
+  narrower exact siblings' members instead of every row of the shard
+  ("The boolean lexical clause", below): on the proof child the filter
+  phase fell from 14.6 ms to 0.0-6.7 ms depending on the sibling's
+  width, with identical answers. The fleet's 600 ms on the shape is
+  not re-measured since; the Pi two-thirds should fall the same way.
 - The log replay's children declare their column tables in record
   order; they should pin the sources' order as the transplant does.
 - The partitioned compaction of a served catalog that has no log (the
@@ -609,6 +610,38 @@ milliseconds:
 | `qualifi immun` | 26,001 | 0.1 | | 1.0 | 0.6 | 0.3 |
 | `qualifi immun`, `year >= 1900` | 17,068 | 0.1 | 14.7 | 1.0 | 0.9 | 0.2 |
 
+With the filter-leaf narrowing landed (the filter phase reads the
+column over the narrower MUST sibling's members only;
+`examples/boolean_walk.rs` runs it by default, `--filter-scan=full`
+is the A/B baseline, and the old binary `boolean_walk.wt1f2b706`
+re-ran for the identical conditions), third warm round on the same
+proof child, milliseconds:
+
+| shape | members | filter scan before | filter scan after | total before | total after |
+|---|---|---|---|---|---|
+| `grandfath`, `year >= 1900` | 405 | 14.5 | 0.0 | 15.3 | 0.8 |
+| `court`, `year >= 1900` | 545,077 | 14.6 | 6.7 | 31.1 | 23.3 |
+| `qualifi immun`, `year >= 1900` | 17,068 | 14.6 | 0.4 | 15.8 | 1.5 |
+
+The gain tracks the sibling's width: `grandfath`'s 591 postings leave
+405 rows to test, `court`'s 815,750 leave over half a million, so the
+common-term shape keeps most of its scan while the selective shapes
+drop to nothing. The members, the ranked page, and the scores are
+identical in every round (the old binary's `top:` lines diff clean
+against the narrowed ones; peak resident memory is unchanged at 6.9
+GB, the shard's own pages). The node side applies the same rule in
+`evaluate_boolean_membership`: a filter leaf the tree reaches only
+under MUST, beside exact (lexical or dense) siblings, resolves over
+the intersection of those siblings' memberships narrowed by every
+ancestor MUST bound; a SHOULD or MUST_NOT filter, a filter without an
+exact MUST sibling, and a leaf shared between a bounded and an
+unbounded position keep the whole-shard scan. Membership stays
+exhaustive — no row outside the bound can satisfy the group, so the
+verdict there is never consulted. `tests/boolean_filter_domain.rs`
+pins the two modes identical over fixed and randomized trees,
+tombstones, vector gaps, and root aggregates;
+`PIPESTREAM_SEARCH_BOOLEAN_FILTER_FULL_SCAN` forces the old scan.
+
 The candidate walk costs at most 18 ms on this hardware even over
 815,000 candidates; the filter leaf's column scan (about 15 ms per 2
 million rows, every row of the shard) is the largest shard-side phase
@@ -641,10 +674,8 @@ leaf's column scan over every row costs what the walk never did; the
 krick-1 third is the scan too (the plain shape reads the column only
 for the postings' candidates and prunes segments by their summaries,
 the boolean shape resolves the filter leaf over the whole shard before
-the group rule). The next step on this route is therefore not the
-walk: a filter leaf that only ever meets the group rule under MUST
-beside a narrower leaf can be resolved over that leaf's members
-instead of the shard, the same set by construction.
+the group rule). The narrowing above attacks exactly that scan; the
+fleet table has not been re-run against it.
 
 ## 2026-09-07: the out-of-memory event and the recovery
 
