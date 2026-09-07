@@ -6,6 +6,10 @@ message DocumentCatalogHeader {
   uint32 format_version = 1;
   string collection = 2;
   uint64 accepted_sequence = 3;
+  // Format 3: created once and persisted; reopen never invents a replacement.
+  bytes history_id = 4;
+  // Receipts through this migration boundary may predate the identity field.
+  uint64 legacy_receipts_through_sequence = 5;
 }
 message DocumentVersionKey {
   bytes document_key = 1;

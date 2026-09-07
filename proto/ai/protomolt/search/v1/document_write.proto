@@ -6,6 +6,7 @@ import "ai/protomolt/search/v1/source.proto";
 // Version 1 persists source and retry history. It does not publish a search
 // projection; successful receipts explicitly report searchable=false.
 message AcceptDocumentRequest {
+  // Version 1 is legacy unpinned local acceptance. Version 2 requires history_id.
   uint32 contract_version = 1;
   // Exact collection-local identity, never a hash or physical row number.
   bytes document_key = 2;
@@ -19,6 +20,9 @@ message AcceptDocumentRequest {
     // Must be true. Deletion creates a new version and preserves retry history.
     bool delete = 6;
   }
+  // Version 2: exact 16-byte catalog history identity from a receipt or history page.
+  // Version 1 requires this to be empty. Older receivers reject version 2.
+  bytes history_id = 7;
 }
 
 message DocumentWriteReceipt {
@@ -31,6 +35,8 @@ message DocumentWriteReceipt {
   // promise an index-image checkpoint or a replica on another device.
   bool durable = 6;
   bool replayed = 7;
+  // Persistent catalog lineage, independent of its path and shard geometry.
+  bytes history_id = 8;
 }
 
 // Trusted local consumption of accepted versions in commit order. This is
@@ -45,6 +51,11 @@ message ReadAcceptedDocumentsRequest {
   // 1 byte to 64 MiB, summed encoded AcceptedDocumentVersion sizes. A first
   // version larger than this budget returns RESOURCE_EXHAUSTED without advancing.
   uint64 max_bytes = 4;
+  // Required for nonzero after_sequence or a positive through_sequence fence.
+  // Omit only to discover a history at sequence zero. An explicit zero fence
+  // returns its identity without reading any source. Always verify the returned
+  // identity; older readers can ignore this field and return an empty identity.
+  bytes history_id = 5;
 }
 
 message AcceptedDocumentVersion {
@@ -63,4 +74,6 @@ message ReadAcceptedDocumentsResponse {
   // Last returned sequence, or after_sequence when no versions were returned.
   uint64 next_sequence = 3;
   bool complete = 4;
+  // Must accompany subsequent cursors, including when tailing without a fence.
+  bytes history_id = 5;
 }

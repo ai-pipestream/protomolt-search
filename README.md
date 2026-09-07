@@ -1237,6 +1237,11 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: catalog history identity.** Source-history pages and
+  acceptance receipts carry a persistent catalog identity. Resumed reads and
+  version-2 writes reject another history before advancing or mutating state.
+  Catalog migration preserves source and retry records; mobile calls retain
+  the distinct refusal codes. See [document writes](docs/document-writes.md).
 - **Foundation branch: immutable publication recovery.** Held segment views
   keep their epochs through compaction. A manifest sync failure retains files
   needed for recovery and blocks a different publication until resolution.

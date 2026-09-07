@@ -959,6 +959,7 @@ mod tests {
                 message_type: "private.v1.Record".into(),
                 payload: vec![],
             })),
+            ..Default::default()
         };
         let bytes = request.encode_to_vec();
         let buffer = protomolt_search_accept_document(opened.handle, bytes.as_ptr(), bytes.len());
@@ -970,6 +971,8 @@ mod tests {
         let retry: DocumentWriteReceipt = payload(&accept_document_bytes(opened.handle, &bytes));
         assert!(retry.replayed);
         assert_eq!(retry.version, receipt.version);
+        assert_eq!(receipt.history_id.len(), 16);
+        assert_eq!(retry.history_id, receipt.history_id);
         let mut history_request = ReadAcceptedDocumentsRequest {
             limit: 10,
             max_bytes: 1024 * 1024,
@@ -989,6 +992,36 @@ mod tests {
             panic!("oversized source must fail");
         };
         assert_eq!(error.code(), MobileErrorCode::ResourceExhausted);
+        assert_eq!(history.history_id, receipt.history_id);
+        history_request.after_sequence = 1;
+        history_request.max_bytes = 1024 * 1024;
+        history_request.history_id = receipt.history_id.clone();
+        history_request.history_id[0] ^= 1;
+        let mobile_response::Outcome::Error(error) = outcome(&read_accepted_documents_bytes(
+            opened.handle,
+            &history_request.encode_to_vec(),
+        )) else {
+            panic!("foreign history cursor must fail");
+        };
+        assert_eq!(error.code(), MobileErrorCode::FailedPrecondition);
+        request.contract_version = 2;
+        request.history_id = receipt.history_id;
+        request.expected_version = Some(1);
+        request.operation_id = b"pinned".to_vec();
+        let pinned: DocumentWriteReceipt = payload(&accept_document_bytes(
+            opened.handle,
+            &request.encode_to_vec(),
+        ));
+        assert_eq!(pinned.version, 2);
+        request.history_id[0] ^= 1;
+        let mobile_response::Outcome::Error(error) = outcome(&accept_document_bytes(
+            opened.handle,
+            &request.encode_to_vec(),
+        )) else {
+            panic!("foreign history write must fail before retry lookup");
+        };
+        assert_eq!(error.code(), MobileErrorCode::FailedPrecondition);
+        request.history_id = pinned.history_id;
         request.operation_id = b"stale".to_vec();
         let mobile_response::Outcome::Error(error) = outcome(&accept_document_bytes(
             opened.handle,
@@ -1053,6 +1086,7 @@ mod tests {
                 message_type: "private.v1.Record".into(),
                 payload: vec![],
             })),
+            ..Default::default()
         }
         .encode_to_vec();
         let receipt: DocumentWriteReceipt = payload(&accept_document_bytes(opened.handle, &write));

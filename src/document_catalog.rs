@@ -27,7 +27,7 @@ const OPERATIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("operatio
 const DESCRIPTORS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("descriptors");
 const SOURCES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("sources");
 const CHANGES: TableDefinition<u64, &[u8]> = TableDefinition::new("changes");
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 const CACHE_BYTES: usize = 8 << 20;
 
 fn storage(error: impl std::fmt::Display) -> Status {
@@ -35,6 +35,33 @@ fn storage(error: impl std::fmt::Display) -> Status {
 }
 fn decode<T: Message + Default>(bytes: &[u8]) -> Result<T, Status> {
     T::decode(bytes).map_err(|e| Status::data_loss(format!("document catalog record: {e}")))
+}
+
+fn valid_history_id(id: &[u8]) -> bool {
+    id.len() == 16 && id.iter().any(|byte| *byte != 0)
+}
+
+fn new_history_id() -> Result<Vec<u8>, Status> {
+    let mut id = vec![0; 16];
+    getrandom::getrandom(&mut id).map_err(storage)?;
+    if !valid_history_id(&id) {
+        return Err(Status::internal(
+            "catalog history entropy returned an invalid identity",
+        ));
+    }
+    Ok(id)
+}
+
+fn validate_current_header(header: &DocumentCatalogHeader) -> Result<(), Status> {
+    if header.format_version != FORMAT_VERSION
+        || !valid_history_id(&header.history_id)
+        || header.legacy_receipts_through_sequence > header.accepted_sequence
+    {
+        return Err(Status::data_loss(
+            "invalid document catalog history identity or migration boundary",
+        ));
+    }
+    Ok(())
 }
 
 pub struct DocumentCatalog {
@@ -136,11 +163,21 @@ impl DocumentCatalog {
             for definition in [HEADS, VERSIONS, OPERATIONS, DESCRIPTORS, SOURCES] {
                 transaction.open_table(definition).map_err(storage)?;
             }
-            if header.format_version == 1 {
+            if header.format_version == FORMAT_VERSION {
+                validate_current_header(&header)?;
+            } else {
+                if !header.history_id.is_empty() || header.legacy_receipts_through_sequence != 0 {
+                    return Err(Status::data_loss(
+                        "legacy catalog contains unexpected history identity metadata",
+                    ));
+                }
+                if header.format_version == 2 {
+                    transaction.open_table(CHANGES).map_err(storage)?;
+                }
                 drop(bytes);
                 drop(table);
                 drop(transaction);
-                return self.upgrade_ordered_history();
+                return self.upgrade_history();
             }
             transaction.open_table(CHANGES).map_err(storage)?;
             return Ok(());
@@ -155,6 +192,8 @@ impl DocumentCatalog {
                 format_version: FORMAT_VERSION,
                 collection: collection.into(),
                 accepted_sequence: 0,
+                history_id: new_history_id()?,
+                legacy_receipts_through_sequence: 0,
             }
             .encode_to_vec();
             table.insert("header", header.as_slice()).map_err(storage)?;
@@ -166,7 +205,7 @@ impl DocumentCatalog {
         transaction.commit().map_err(storage)
     }
 
-    fn upgrade_ordered_history(&self) -> Result<(), Status> {
+    fn upgrade_history(&self) -> Result<(), Status> {
         let mut transaction = self.database.begin_write().map_err(storage)?;
         transaction
             .set_durability(Durability::Immediate)
@@ -179,44 +218,48 @@ impl DocumentCatalog {
                     .ok_or_else(|| Status::data_loss("catalog header missing"))?
                     .value(),
             )?;
-            let versions = transaction.open_table(VERSIONS).map_err(storage)?;
-            let mut changes = transaction.open_table(CHANGES).map_err(storage)?;
-            if !changes.is_empty().map_err(storage)? {
-                return Err(Status::data_loss(
-                    "version-1 catalog already contains a change index",
-                ));
-            }
-            for entry in versions.iter().map_err(storage)? {
-                let (key, value) = entry.map_err(storage)?;
-                let version: DocumentVersion = decode(value.value())?;
-                let valid_key =
-                    !version.document_key.is_empty() && version.document_key.len() <= 16 * 1024;
-                let expected = DocumentVersionKey {
-                    document_key: version.document_key,
-                    version: version.version,
+            if header.format_version == 1 {
+                let versions = transaction.open_table(VERSIONS).map_err(storage)?;
+                let mut changes = transaction.open_table(CHANGES).map_err(storage)?;
+                if !changes.is_empty().map_err(storage)? {
+                    return Err(Status::data_loss(
+                        "version-1 catalog already contains a change index",
+                    ));
                 }
-                .encode_to_vec();
-                if version.version == 0
-                    || !valid_key
-                    || key.value() != expected
-                    || version.accepted_sequence == 0
-                    || version.accepted_sequence > header.accepted_sequence
-                {
-                    return Err(Status::data_loss("invalid version in catalog history"));
+                for entry in versions.iter().map_err(storage)? {
+                    let (key, value) = entry.map_err(storage)?;
+                    let version: DocumentVersion = decode(value.value())?;
+                    let valid_key =
+                        !version.document_key.is_empty() && version.document_key.len() <= 16 * 1024;
+                    let expected = DocumentVersionKey {
+                        document_key: version.document_key,
+                        version: version.version,
+                    }
+                    .encode_to_vec();
+                    if version.version == 0
+                        || !valid_key
+                        || key.value() != expected
+                        || version.accepted_sequence == 0
+                        || version.accepted_sequence > header.accepted_sequence
+                    {
+                        return Err(Status::data_loss("invalid version in catalog history"));
+                    }
+                    if changes
+                        .insert(version.accepted_sequence, key.value())
+                        .map_err(storage)?
+                        .is_some()
+                    {
+                        return Err(Status::data_loss("duplicate sequence in catalog history"));
+                    }
                 }
-                if changes
-                    .insert(version.accepted_sequence, key.value())
-                    .map_err(storage)?
-                    .is_some()
-                {
-                    return Err(Status::data_loss("duplicate sequence in catalog history"));
+                if changes.len().map_err(storage)? != header.accepted_sequence {
+                    return Err(Status::data_loss(
+                        "catalog history has missing accepted versions",
+                    ));
                 }
             }
-            if changes.len().map_err(storage)? != header.accepted_sequence {
-                return Err(Status::data_loss(
-                    "catalog history has missing accepted versions",
-                ));
-            }
+            header.history_id = new_history_id()?;
+            header.legacy_receipts_through_sequence = header.accepted_sequence;
             header.format_version = FORMAT_VERSION;
             meta.insert("header", header.encode_to_vec().as_slice())
                 .map_err(storage)?;
@@ -227,10 +270,12 @@ impl DocumentCatalog {
     /// Atomically accept a version and its retry decision. A retry is resolved
     /// before the version precondition, including after later writes or delete.
     pub fn accept(&self, request: &AcceptDocumentRequest) -> Result<DocumentWriteReceipt, Status> {
-        if request.contract_version != 1 {
-            return Err(Status::invalid_argument(
-                "document write contract_version must be 1",
-            ));
+        match request.contract_version {
+            1 if request.history_id.is_empty() => {}
+            2 if valid_history_id(&request.history_id) => {}
+            _ => return Err(Status::invalid_argument(
+                "document write requires version 1 with no history_id or version 2 with a nonzero 16-byte history_id",
+            )),
         }
         if request.document_key.is_empty() || request.document_key.len() > 16 * 1024 {
             return Err(Status::invalid_argument(
@@ -257,6 +302,22 @@ impl DocumentCatalog {
         transaction
             .set_durability(Durability::Immediate)
             .map_err(storage)?;
+        let mut header: DocumentCatalogHeader = {
+            let meta = transaction.open_table(META).map_err(storage)?;
+            let header = decode(
+                meta.get("header")
+                    .map_err(storage)?
+                    .ok_or_else(|| Status::data_loss("catalog header missing"))?
+                    .value(),
+            )?;
+            header
+        };
+        validate_current_header(&header)?;
+        if request.contract_version == 2 && request.history_id != header.history_id {
+            return Err(Status::failed_precondition(
+                "document write belongs to another catalog history",
+            ));
+        }
         {
             let operations = transaction.open_table(OPERATIONS).map_err(storage)?;
             if let Some(previous) = operations
@@ -272,6 +333,17 @@ impl DocumentCatalog {
                 let mut receipt = previous
                     .receipt
                     .ok_or_else(|| Status::data_loss("operation receipt missing"))?;
+                if receipt.history_id.is_empty()
+                    && receipt.accepted_sequence > 0
+                    && receipt.accepted_sequence <= header.legacy_receipts_through_sequence
+                {
+                    // Enrich only pre-migration receipts; the stored retry decision stays intact.
+                    receipt.history_id = header.history_id.clone();
+                } else if receipt.history_id != header.history_id {
+                    return Err(Status::data_loss(
+                        "operation receipt belongs to another catalog history",
+                    ));
+                }
                 receipt.replayed = true;
                 return Ok(receipt);
             };
@@ -295,16 +367,6 @@ impl DocumentCatalog {
         let version = current_version
             .checked_add(1)
             .ok_or_else(|| Status::out_of_range("document version exhausted"))?;
-        let mut header: DocumentCatalogHeader = {
-            let meta = transaction.open_table(META).map_err(storage)?;
-            let header = decode(
-                meta.get("header")
-                    .map_err(storage)?
-                    .ok_or_else(|| Status::data_loss("catalog header missing"))?
-                    .value(),
-            )?;
-            header
-        };
         header.accepted_sequence = header
             .accepted_sequence
             .checked_add(1)
@@ -359,6 +421,7 @@ impl DocumentCatalog {
             searchable: false,
             durable: self.durable,
             replayed: false,
+            history_id: header.history_id.clone(),
         };
         let document_bytes = document.encode_to_vec();
         let version_key = DocumentVersionKey {
@@ -501,6 +564,24 @@ impl DocumentCatalog {
                 .ok_or_else(|| Status::data_loss("catalog header missing"))?
                 .value(),
         )?;
+        validate_current_header(&header)?;
+        if request.history_id.is_empty() {
+            if request.after_sequence != 0
+                || request.through_sequence.is_some_and(|fence| fence != 0)
+            {
+                return Err(Status::invalid_argument(
+                    "resuming accepted history requires history_id",
+                ));
+            }
+        } else if !valid_history_id(&request.history_id) {
+            return Err(Status::invalid_argument(
+                "history_id must be a nonzero 16-byte value",
+            ));
+        } else if request.history_id != header.history_id {
+            return Err(Status::failed_precondition(
+                "accepted cursor belongs to another catalog history",
+            ));
+        }
         let fence = request.through_sequence.unwrap_or(header.accepted_sequence);
         if fence > header.accepted_sequence || request.after_sequence > fence {
             return Err(Status::invalid_argument(
@@ -512,6 +593,7 @@ impl DocumentCatalog {
             next_sequence: request.after_sequence,
             complete: request.after_sequence == fence,
             documents: Vec::new(),
+            history_id: header.history_id.clone(),
         };
         if response.complete {
             return Ok(response);

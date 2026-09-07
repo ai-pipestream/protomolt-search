@@ -18,6 +18,23 @@ placing the catalog within known index artifacts, snapshot/segment trees, BM25
 spill directories, WAL trees or default compaction paths. Custom compaction work
 directories must be empty under the existing compaction preflight.
 
+Each catalog has a persistent, randomly generated 16-byte `history_id`. Moving
+or reopening the file preserves it; creating another catalog, even for the same
+collection, creates another identity. It identifies source lineage and must be
+stored with projection checkpoints. It is not an authorization credential or a
+lease fence, and does not distinguish divergent copies of the same catalog file.
+Workspace binding and replicated authority remain separate unfinished work.
+
+New clients discover the identity with a history request at `after_sequence=0`
+and `through_sequence=0` (with valid positive limits). This returns an empty page
+and the identity even when the first source is larger than the page budget.
+They then write with `contract_version=2` and that `history_id`. The catalog
+checks it before retry lookup or mutation; a foreign history returns
+`FAILED_PRECONDITION` and consumes no sequence or operation ID. Version 1 remains
+legacy unpinned local acceptance and requires an empty identity field. It must
+not be used to claim protection against authority replacement. Older receivers
+reject write version 2 rather than silently ignoring its identity precondition.
+
 Every successful mutation increments the document version and the catalog's
 accepted sequence. Version zero means no prior version. A deletion creates a
 tombstone version; it never resets the version counter or removes history.
@@ -31,18 +48,22 @@ tombstone version; it never resets the version counter or removes history.
 
 An operation ID is also exact bytes, scoped to the entire catalog. A transaction
 first checks whether that ID was already accepted, before checking the version.
-An identical retry returns the original receipt with `replayed=true`, even if a
+An identical retry returns the original acceptance decision with `replayed=true`, even if a
 later replacement or deletion changed the head. Reusing an accepted ID for a
 different request returns `ALREADY_EXISTS`. A failed version precondition returns
 `ABORTED` and consumes neither a version nor an operation ID. Thus an unaccepted
 operation can be corrected and submitted again.
 
-Contract version 1 compares the SHA-256 of the generated request encoding. It
+Both write versions compare the SHA-256 of the generated request encoding. It
 includes the exact source and descriptor bytes, identity, mutation and presence
-of the precondition. Alternate outer protobuf wire encodings of the same request
+of the precondition; version 2 also includes the pinned history identity. Alternate outer protobuf wire encodings of the same request
 have the same meaning. Changes that give additional request fields meaning must
 use a new contract version; unknown outer fields do not acquire semantics here.
-Keys are limited to 16 KiB and operation IDs to 1 KiB; both must be nonempty.
+Retry a pending operation with its original contract version and request.
+Changing an existing operation from version 1 to version 2 changes its retry
+hash and returns `ALREADY_EXISTS`; the identity precondition does not rewrite
+an older operation. Keys are limited to 16 KiB and operation IDs to 1 KiB;
+both must be nonempty.
 
 ## Preservation and receipts
 
@@ -116,10 +137,14 @@ It includes replaced versions and tombstones, independently of the current head.
 
 Start with `after_sequence=0`, omit `through_sequence`, and supply `limit` and
 `max_bytes`. The response pins the current upper sequence. For subsequent pages,
-reuse that fence and the returned `next_sequence`; later concurrent writes are
+reuse that fence, the returned `next_sequence`, and `history_id`; later concurrent writes are
 excluded. `complete=true` means the fence was reached. To tail subsequent writes,
-omit the fence again while retaining the last sequence. These cursors belong to
-the same catalog and are not portable to a newly created authority.
+omit the fence again while retaining the last sequence and identity. A nonzero
+cursor or positive fence without an identity returns `INVALID_ARGUMENT`; a
+foreign identity returns `FAILED_PRECONDITION`, including for an empty or complete
+page. Clients must check the returned identity: an older reader can ignore the
+request field and return no identity. Such a response cannot advance a bound
+checkpoint. A zero-sequence discovery starts a history, never resumes one.
 
 Each page reads one database snapshot. Limits are 1 to 1000 versions and 1 byte
 to 64 MiB of summed encoded `AcceptedDocumentVersion` values. Metadata framing
@@ -136,13 +161,20 @@ using protobuf bytes through the local bridge. These operations return original
 sources to the owning application; they introduce no transport. The bridge
 preserves `RESOURCE_EXHAUSTED` and `DATA_LOSS` as distinct mobile error codes.
 
-Catalog format 2 adds the ordered index. Opening a format-1 catalog rebuilds it
-from immutable versions in one immediate transaction, validates sequence
-uniqueness/completeness, and advances the header only with the complete index.
-A failed migration leaves format 1 intact. Original source bytes, keys, versions
-and retry receipts are unchanged. Older binaries refuse format 2. This is a
-source-authority migration; it neither changes physical index formats nor asks
-the application to discard and rebuild its source catalog.
+Catalog format 3 adds the history identity and a boundary for older retry
+receipts. Opening format 2 commits those header fields once without rewriting
+sources, versions, change entries or retry records. Opening format 1 also rebuilds
+the ordered index from immutable versions, validating sequence uniqueness and
+completeness in that same immediate transaction. A failed migration leaves the
+original format intact. Old receipts are returned with the newly assigned
+identity, while their stored bytes and acceptance decisions stay unchanged.
+Only receipts through the recorded migration boundary may omit a stored identity;
+new receipts with missing or foreign identities fail as data loss. Reopening
+format 3 with a missing or malformed identity fails without generating one.
+Older binaries refuse format 3. This is a source-authority migration; it does
+not change physical index formats or require source reindexing. Preserve the
+migrated authority in backups: restoring a pre-migration copy assigns a new
+identity and requires reconciling any previously bound projection checkpoints.
 
 The feed is publisher input, not a complete catalog backup: it does not expose
 operation IDs and cannot reconstruct the persistent idempotency authority.

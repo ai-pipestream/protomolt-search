@@ -19,6 +19,7 @@ fn page(after_sequence: u64) -> ReadAcceptedDocumentsRequest {
         limit: 1000,
         through_sequence: None,
         max_bytes: 1024 * 1024,
+        ..Default::default()
     }
 }
 
@@ -61,6 +62,7 @@ fn write(operation: &[u8], expected: Option<u64>) -> AcceptDocumentRequest {
         operation_id: operation.to_vec(),
         expected_version: expected,
         mutation: Some(Mutation::Source(source())),
+        ..Default::default()
     }
 }
 
@@ -361,6 +363,7 @@ fn accepted_pages_pin_history_and_retain_replaced_sources() {
         Some(accepted_document_version::Mutation::Source(source()))
     );
     catalog.accept(&write(b"third", Some(2))).unwrap();
+    request.history_id = first.history_id.clone();
     request.after_sequence = first.next_sequence;
     request.through_sequence = Some(first.through_sequence);
     let last = catalog.read_accepted(&request).unwrap();
@@ -370,7 +373,12 @@ fn accepted_pages_pin_history_and_retain_replaced_sources() {
         last.documents[0].mutation,
         Some(accepted_document_version::Mutation::Deleted(true))
     );
-    let latest = catalog.read_accepted(&page(2)).unwrap();
+    let latest = catalog
+        .read_accepted(&ReadAcceptedDocumentsRequest {
+            history_id: first.history_id,
+            ..page(2)
+        })
+        .unwrap();
     assert_eq!(latest.documents[0].version, 3);
     request.after_sequence = 0;
     request.through_sequence = Some(0);
@@ -407,25 +415,48 @@ fn history_byte_budget_never_advances_over_an_unreturned_source() {
     assert_eq!(catalog.read_accepted(&page(0)).unwrap(), whole);
 }
 
-fn downgrade_history_for_migration(path: &std::path::Path, break_sequence: bool) {
+fn downgrade_history_for_migration(path: &std::path::Path, format: u32, break_sequence: bool) {
     use pipestream_search::pb::storage::DocumentCatalogHeader;
     let database = redb::Database::open(path).unwrap();
     let transaction = database.begin_write().unwrap();
-    transaction
-        .delete_table(redb::TableDefinition::<u64, &[u8]>::new("changes"))
-        .unwrap();
+    if format == 1 {
+        transaction
+            .delete_table(redb::TableDefinition::<u64, &[u8]>::new("changes"))
+            .unwrap();
+    }
     {
         let mut meta = transaction
             .open_table(redb::TableDefinition::<&str, &[u8]>::new("metadata"))
             .unwrap();
         let mut header =
             DocumentCatalogHeader::decode(meta.get("header").unwrap().unwrap().value()).unwrap();
-        header.format_version = 1;
+        header.format_version = format;
+        header.history_id.clear();
+        header.legacy_receipts_through_sequence = 0;
         if break_sequence {
             header.accepted_sequence += 1;
         }
         meta.insert("header", header.encode_to_vec().as_slice())
             .unwrap();
+    }
+    {
+        use pipestream_search::pb::storage::DocumentOperation;
+        let mut operations = transaction
+            .open_table(redb::TableDefinition::<&[u8], &[u8]>::new("operations"))
+            .unwrap();
+        let rows: Vec<_> = operations
+            .iter()
+            .unwrap()
+            .map(|row| {
+                let (key, value) = row.unwrap();
+                let mut operation = DocumentOperation::decode(value.value()).unwrap();
+                operation.receipt.as_mut().unwrap().history_id.clear();
+                (key.value().to_vec(), operation.encode_to_vec())
+            })
+            .collect();
+        for (key, value) in rows {
+            operations.insert(key.as_slice(), value.as_slice()).unwrap();
+        }
     }
     transaction.commit().unwrap();
 }
@@ -441,10 +472,14 @@ fn legacy_history_upgrades_atomically_and_keeps_retry_receipts() {
         catalog.accept(&write(b"second", Some(1))).unwrap();
         before = catalog.read_accepted(&page(0)).unwrap();
     }
-    downgrade_history_for_migration(&dir.catalog(), false);
+    downgrade_history_for_migration(&dir.catalog(), 1, false);
     {
         let catalog = DocumentCatalog::open(&dir.catalog(), "books").unwrap();
-        assert_eq!(catalog.read_accepted(&page(0)).unwrap(), before);
+        let after = catalog.read_accepted(&page(0)).unwrap();
+        assert_eq!(after.documents, before.documents);
+        assert_eq!(after.through_sequence, before.through_sequence);
+        assert_eq!(after.history_id.len(), 16);
+        assert_eq!(catalog.accept(&first).unwrap().history_id, after.history_id);
         assert!(catalog.accept(&first).unwrap().replayed);
         assert_eq!(
             catalog
@@ -454,7 +489,7 @@ fn legacy_history_upgrades_atomically_and_keeps_retry_receipts() {
             3
         );
     }
-    downgrade_history_for_migration(&dir.catalog(), true);
+    downgrade_history_for_migration(&dir.catalog(), 1, true);
     assert_eq!(
         DocumentCatalog::open(&dir.catalog(), "books")
             .err()
@@ -533,4 +568,228 @@ async fn embedded_reopen_refuses_missing_authority_before_opening_shards() {
             .unwrap()
             .durable
     );
+}
+
+#[test]
+fn history_identity_survives_reopen_and_rejects_another_catalog() {
+    let dir = Directory::new("history-identity");
+    let request;
+    let id;
+    {
+        let catalog = DocumentCatalog::create(&dir.catalog(), "books").unwrap();
+        let mut probe = page(0);
+        probe.through_sequence = Some(0);
+        let first = catalog.read_accepted(&probe).unwrap();
+        assert_eq!(first.history_id.len(), 16);
+        assert!(first.history_id.iter().any(|b| *b != 0));
+        assert!(first.documents.is_empty());
+        id = first.history_id;
+        let mut pinned = write(b"pinned", Some(0));
+        pinned.contract_version = 2;
+        pinned.history_id = id.clone();
+        assert_eq!(catalog.accept(&pinned).unwrap().history_id, id);
+        request = pinned;
+    }
+    let catalog = DocumentCatalog::open(&dir.catalog(), "books").unwrap();
+    let retry = catalog.accept(&request).unwrap();
+    assert!(retry.replayed);
+    assert_eq!(retry.history_id, id);
+    let other = DocumentCatalog::in_memory("books").unwrap();
+    other.accept(&write(b"other", Some(0))).unwrap();
+    assert_ne!(other.read_accepted(&page(0)).unwrap().history_id, id);
+    assert_eq!(
+        other.accept(&request).unwrap_err().code(),
+        Code::FailedPrecondition
+    );
+    let mut cursor = page(1);
+    cursor.history_id = id;
+    assert!(catalog.read_accepted(&cursor).unwrap().complete);
+    assert_eq!(
+        other.read_accepted(&cursor).unwrap_err().code(),
+        Code::FailedPrecondition
+    );
+}
+
+#[test]
+fn history_identity_is_required_before_resuming_an_existing_cursor() {
+    let catalog = DocumentCatalog::in_memory("books").unwrap();
+    catalog.accept(&write(b"first", Some(0))).unwrap();
+    catalog.accept(&write(b"second", Some(1))).unwrap();
+    assert_eq!(
+        catalog.read_accepted(&page(1)).unwrap_err().code(),
+        Code::InvalidArgument
+    );
+    let mut request = page(0);
+    request.through_sequence = Some(2);
+    assert_eq!(
+        catalog.read_accepted(&request).unwrap_err().code(),
+        Code::InvalidArgument
+    );
+}
+
+fn change_catalog_header(
+    path: &std::path::Path,
+    change: impl FnOnce(&mut pipestream_search::pb::storage::DocumentCatalogHeader),
+) {
+    let database = redb::Database::open(path).unwrap();
+    let transaction = database.begin_write().unwrap();
+    {
+        let mut meta = transaction
+            .open_table(redb::TableDefinition::<&str, &[u8]>::new("metadata"))
+            .unwrap();
+        let mut header = pipestream_search::pb::storage::DocumentCatalogHeader::decode(
+            meta.get("header").unwrap().unwrap().value(),
+        )
+        .unwrap();
+        change(&mut header);
+        meta.insert("header", header.encode_to_vec().as_slice())
+            .unwrap();
+    }
+    transaction.commit().unwrap();
+}
+
+fn stored_operation(path: &std::path::Path, key: &[u8]) -> Vec<u8> {
+    use redb::ReadableDatabase;
+    let database = redb::Database::open(path).unwrap();
+    let transaction = database.begin_read().unwrap();
+    let operations = transaction
+        .open_table(redb::TableDefinition::<&[u8], &[u8]>::new("operations"))
+        .unwrap();
+    operations.get(key).unwrap().unwrap().value().to_vec()
+}
+
+#[test]
+fn format_two_migration_pins_identity_without_rewriting_retry_history() {
+    let dir = Directory::new("format-two-identity");
+    let request = write(b"legacy", Some(0));
+    {
+        let catalog = DocumentCatalog::create(&dir.catalog(), "books").unwrap();
+        catalog.accept(&request).unwrap();
+    }
+    downgrade_history_for_migration(&dir.catalog(), 2, false);
+    let stored = stored_operation(&dir.catalog(), &request.operation_id);
+    let id;
+    {
+        let catalog = DocumentCatalog::open(&dir.catalog(), "books").unwrap();
+        let receipt = catalog.accept(&request).unwrap();
+        assert!(receipt.replayed && receipt.durable && !receipt.searchable);
+        assert_eq!((receipt.version, receipt.accepted_sequence), (1, 1));
+        id = receipt.history_id;
+        assert_eq!(id.len(), 16);
+        assert_eq!(catalog.read_accepted(&page(0)).unwrap().history_id, id);
+        assert_eq!(
+            catalog.accept(&write(b"new", Some(1))).unwrap().history_id,
+            id
+        );
+    }
+    assert_eq!(
+        stored_operation(&dir.catalog(), &request.operation_id),
+        stored
+    );
+    let catalog = DocumentCatalog::open(&dir.catalog(), "books").unwrap();
+    assert_eq!(catalog.accept(&request).unwrap().history_id, id);
+}
+
+#[test]
+fn malformed_history_identity_is_never_recreated_on_open() {
+    for id in [vec![], vec![1; 15], vec![0; 16]] {
+        let dir = Directory::new("damaged-history-id");
+        drop(DocumentCatalog::create(&dir.catalog(), "books").unwrap());
+        change_catalog_header(&dir.catalog(), |header| header.history_id = id.clone());
+        for _ in 0..2 {
+            assert_eq!(
+                DocumentCatalog::open(&dir.catalog(), "books")
+                    .err()
+                    .unwrap()
+                    .code(),
+                Code::DataLoss
+            );
+        }
+        change_catalog_header(&dir.catalog(), |header| assert_eq!(header.history_id, id));
+    }
+    let dir = Directory::new("damaged-migration-boundary");
+    drop(DocumentCatalog::create(&dir.catalog(), "books").unwrap());
+    change_catalog_header(&dir.catalog(), |header| {
+        header.legacy_receipts_through_sequence = 1
+    });
+    assert_eq!(
+        DocumentCatalog::open(&dir.catalog(), "books")
+            .err()
+            .unwrap()
+            .code(),
+        Code::DataLoss
+    );
+}
+
+#[test]
+fn pinned_write_refusals_consume_neither_sequence_nor_operation_id() {
+    let catalog = DocumentCatalog::in_memory("books").unwrap();
+    let id = catalog.read_accepted(&page(0)).unwrap().history_id;
+    let mut request = write(b"pin", Some(0));
+    request.contract_version = 2;
+    for bad in [vec![], vec![1; 15], vec![0; 16]] {
+        request.history_id = bad;
+        assert_eq!(
+            catalog.accept(&request).unwrap_err().code(),
+            Code::InvalidArgument
+        );
+    }
+    request.history_id = id.clone();
+    request.history_id[0] ^= 1;
+    assert_eq!(
+        catalog.accept(&request).unwrap_err().code(),
+        Code::FailedPrecondition
+    );
+    request.history_id = id;
+    request.contract_version = 1;
+    assert_eq!(
+        catalog.accept(&request).unwrap_err().code(),
+        Code::InvalidArgument
+    );
+    request.contract_version = 2;
+    assert_eq!(catalog.accept(&request).unwrap().accepted_sequence, 1);
+    assert!(catalog.accept(&request).unwrap().replayed);
+    let mut bad_cursor = page(1);
+    bad_cursor.history_id = vec![0; 16];
+    assert_eq!(
+        catalog.read_accepted(&bad_cursor).unwrap_err().code(),
+        Code::InvalidArgument
+    );
+}
+
+#[test]
+fn new_receipts_cannot_use_the_legacy_missing_identity_exception() {
+    let dir = Directory::new("receipt-id-corruption");
+    let request = write(b"new", Some(0));
+    {
+        let catalog = DocumentCatalog::create(&dir.catalog(), "books").unwrap();
+        catalog.accept(&request).unwrap();
+    }
+    {
+        let database = redb::Database::open(dir.catalog()).unwrap();
+        let transaction = database.begin_write().unwrap();
+        {
+            let mut operations = transaction
+                .open_table(redb::TableDefinition::<&[u8], &[u8]>::new("operations"))
+                .unwrap();
+            let mut operation = pipestream_search::pb::storage::DocumentOperation::decode(
+                operations
+                    .get(request.operation_id.as_slice())
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+            )
+            .unwrap();
+            operation.receipt.as_mut().unwrap().history_id.clear();
+            operations
+                .insert(
+                    request.operation_id.as_slice(),
+                    operation.encode_to_vec().as_slice(),
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+    }
+    let catalog = DocumentCatalog::open(&dir.catalog(), "books").unwrap();
+    assert_eq!(catalog.accept(&request).unwrap_err().code(), Code::DataLoss);
 }
