@@ -782,3 +782,4 @@ async fn checkpoint_refuses_a_journal_tip_detached_from_accepted_history() {
 }
 
 mod backup;
+mod restore;

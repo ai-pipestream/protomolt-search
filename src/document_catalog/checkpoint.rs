@@ -19,7 +19,7 @@ pub struct CatalogCheckpoint<'a> {
     metadata: DocumentCatalogCheckpoint,
     binary_tables: Vec<BinaryTable>,
     // Retain the owner's explicit file lock as well as redb's read snapshot.
-    _source: &'a DocumentCatalog,
+    _source: Option<&'a DocumentCatalog>,
 }
 
 impl DocumentCatalog {
@@ -35,12 +35,26 @@ impl DocumentCatalog {
                 "catalog checkpoint requires durable source history",
             ));
         }
+        CatalogCheckpoint::from_read(
+            self.database.begin_read().map_err(storage)?,
+            max_metadata_bytes,
+            Some(self),
+        )
+    }
+}
+
+impl<'a> CatalogCheckpoint<'a> {
+    // A restore uses a held read-only database in its private staging directory.
+    pub(super) fn from_read(
+        read: ReadTransaction,
+        max_metadata_bytes: usize,
+        source: Option<&'a DocumentCatalog>,
+    ) -> Result<Self, Status> {
         if max_metadata_bytes == 0 || max_metadata_bytes > 64 << 20 {
             return Err(Status::invalid_argument(
                 "checkpoint metadata budget must be 1..64 MiB",
             ));
         }
-        let read = self.database.begin_read().map_err(storage)?;
         let header: DocumentCatalogHeader = {
             let meta = read.open_table(META).map_err(storage)?;
             let record = meta
@@ -94,12 +108,42 @@ impl DocumentCatalog {
             read,
             metadata,
             binary_tables,
-            _source: self,
+            _source: source,
         })
     }
 }
 
 impl CatalogCheckpoint<'_> {
+    pub(super) fn record_count(&self) -> Result<u64, Status> {
+        let mut count = self
+            .read
+            .open_table(META)
+            .map_err(storage)?
+            .len()
+            .map_err(storage)?;
+        let mut add = |n: u64| -> Result<(), Status> {
+            count = count
+                .checked_add(n)
+                .ok_or_else(|| Status::data_loss("checkpoint record count overflow"))?;
+            Ok(())
+        };
+        add(self
+            .read
+            .open_table(CHANGES)
+            .map_err(storage)?
+            .len()
+            .map_err(storage)?)?;
+        for table in &self.binary_tables {
+            add(self
+                .read
+                .open_table(*table)
+                .map_err(storage)?
+                .len()
+                .map_err(storage)?)?;
+        }
+        Ok(count)
+    }
+
     /// The exact source/index anchors that a complete backup must satisfy.
     /// The file checksum, byte count and record count are populated by `write_to`.
     pub fn metadata(&self) -> &DocumentCatalogCheckpoint {

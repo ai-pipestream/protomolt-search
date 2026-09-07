@@ -102,27 +102,65 @@ decision and previous maintenance cursor. Exact table counts reject extra
 records outside those chains. Reads hold one decision at a time under the
 record budget; historical artifact files are not required. These checks also
 apply to histories containing empty publications and unpublished source backlog.
-Incoming bundle staging and restore activation remain separate work.
+Incoming bundle staging is described below; restore activation remains separate
+work.
 
 A failed write removes only its own output directory. A process crash can leave
 a partial directory. Presence of the completion file alone is insufficient:
 restore must verify its digest and its entire inventory. These local owner
 operations grant no remote export, permissions change or serving activation.
 
+## Implemented incoming bundle staging
+
+`DocumentCatalog::stage_backup_restore(bundle, destination, request)` verifies
+one incoming local bundle against the digest, history ID and exact collection
+supplied independently in `SourceRestoreRequest`; the empty collection is
+valid. The trusted owner chooses both the input root and private destination
+parent. The request requires explicit metadata, file, total-byte and
+source-record budgets. Before protobuf decoding allocates repeated entries, the
+verifier bounds the outer artifact and index envelopes, including nested
+checkpoint index counts. It then requires the canonical completion manifest,
+its expected digest, and one sorted, unique, checksummed inventory containing
+exactly the source and physical index artifacts referenced by the journal.
+Unlisted files present on disk are ignored and never copied; listed artifacts
+that are missing, changed, duplicated, noncanonical or unreferenced refuse.
+
+On Unix, every input component is opened relative to a held directory
+descriptor with symlink following disabled and must be a regular file below
+real directories. Linux, Android and iOS use this path; other platforms refuse
+explicitly until they provide equivalent descriptor-relative reads. This makes
+`libc` an embedded as well as network dependency. The owner-selected destination
+must be outside the incoming bundle and must not exist.
+Staging creates it with mode 0700 and copies only named files into new mode-0600
+files, checking each length and SHA-256 while streaming. The original bundle is
+left byte-for-byte unchanged.
+
+The copied redb source is opened read-only under an explicit shared source-file
+lock. Its checkpoint metadata and record count must match the completion
+manifest, and the full accepted-source, retry, publication and maintenance
+journal audit runs against that private copy. Each physical segment is reopened;
+BM25 and exact-vector payload integrity are checked in addition to the manifest
+and artifact hashes. After files and directories are durable, the original
+canonical `source-backup.pb` is written last into staging. This completion
+marker identifies a verified bundle, not an activated authority. Staging does
+not re-evaluate CEL, reanalyze text, regenerate embeddings or replay accepted
+writes to reconstruct the captured state.
+
+The returned `VerifiedSourceRestore` retains the private directory, read-only
+database handle and shared lock. Dropping it releases those handles and attempts
+to remove only its owned staging directory; filesystem cleanup is best-effort.
+It creates no writer or serving state, restores no grants and permits no
+off-phone or other remote export.
+
 ## Restore work remaining
 
-1. Restore into a new private destination. Verify the bundle and artifact
-   inventory, open the copied source database, validate every journal anchor
-   against the copied manifests, and validate each segment with the configured
-   provider before producing an activatable result. Do not re-evaluate CEL,
-   analyze text, regenerate embeddings, or replay writes to approximate the
-   captured state.
-2. Activation belongs to the collection authority. A restore must not create
-   two active writers for one source history or turn a recovered artifact into
-   a current serving receipt. Existing write fencing, ownership and generation
-   checks remain mandatory. Define recovery from an older checkpoint explicitly
-   before allowing it to replace a newer accepted history. A local restore
-   verifier does not supply this distributed activation contract.
+Activation belongs to the collection authority. A restore must not create two
+active writers for one source history or turn a verified completion marker into
+a current serving receipt. Activation and rollback must enforce current
+permissions, write fencing, ownership, generation checks and a single active
+authority, including an explicit rule for replacing newer accepted history
+with an older checkpoint. Mobile activation must retain local-device residency.
+The staging verifier does not supply this distributed activation contract.
 
 The bundle must be usable without the original source paths or a running
 analysis service. It must retain accepted-but-unpublished writes and expose

@@ -24,9 +24,11 @@ mod backup;
 mod checkpoint;
 mod projection;
 mod publication;
+mod restore;
 pub use backup::CapturedBackup;
 pub use checkpoint::CatalogCheckpoint;
 pub use publication::{MaintenanceRecovery, ProjectionRecovery};
+pub use restore::VerifiedSourceRestore;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("metadata");
 const HEADS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("heads");

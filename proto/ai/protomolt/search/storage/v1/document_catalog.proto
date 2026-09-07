@@ -196,3 +196,14 @@ message SourceBackupManifest {
   // Integrity binding only; this is not an authentication signature.
   bytes manifest_sha256 = 5;
 }
+
+// Trusted local restore expectation. The owner supplies the expected digest
+// and identity independently of the incoming bundle. No field grants serving,
+// writer activation, remote export or permission rollback.
+message SourceRestoreRequest {
+  bytes expected_manifest_sha256 = 1;
+  // Exact collection binding; the empty/default collection is a valid value.
+  string collection = 2;
+  bytes history_id = 3;
+  SourceBackupLimits limits = 4;
+}

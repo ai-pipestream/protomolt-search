@@ -1237,6 +1237,15 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: verified private restore staging.** A trusted local owner
+  supplies an incoming bundle root, a new private destination, explicit budgets
+  and the expected digest, collection and source history. Staging copies only
+  the manifest's named files through descriptor-relative no-follow reads,
+  verifies the complete source/journal history and physical segment payloads,
+  and retains a read-only source handle and lock. Its completion marker records
+  verification, not serving activation; authority cutover, rollback, current
+  permissions, single-writer fencing and mobile locality remain unfinished. See
+  [source/index backup](docs/source-index-backup.md).
 - **Foundation branch: source-history audit before backup.** Bundle creation
   checks older accepted versions, content-addressed blobs, document heads and
   immutable retry receipts. A temporary disk index proves receipt uniqueness
@@ -1248,14 +1257,16 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   pins all journal-matching index artifacts with one source read transaction,
   then writes a bounded, checksummed bundle with its protobuf completion
   manifest last. Captures survive compaction retiring the original paths and
-  retain unpublished source backlog. Restore verification and activation remain
-  separate work. See [source/index backup](docs/source-index-backup.md).
+  retain unpublished source backlog. Verified private restore staging is
+  implemented; authority activation remains separate work. See
+  [source/index backup](docs/source-index-backup.md).
 - **Foundation branch: pinned source-catalog checkpoints.** A bounded copy
   preserves accepted history, exact retry records and all index journal anchors
   from one read transaction while acceptance continues. Pending decisions,
   detached source anchors and unknown tables refuse capture. This supplies the
-  source half used by coherent bundle capture; restore verification and activation
-  remain separate work. See [source/index backup](docs/source-index-backup.md).
+  source half used by coherent bundle capture; restore verification and
+  activation are covered by the newer entries above. See
+  [source/index backup](docs/source-index-backup.md).
 - **Foundation branch: public identity through source-owned compaction.**
   A 19-shape query matrix covers unary and streamed results before and after
   real physical row renumbering, including hybrid strategies, collapse and

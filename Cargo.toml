@@ -37,10 +37,9 @@ protomolt-analyzer = { path = "crates/protomolt-analyzer" }
 http-body = "1"
 bytes = "1"
 tower = { version = "0.5", features = ["util"], optional = true }
-# The node agent's capacity report (docs/cluster-control.md) reads the
-# data directory's filesystem size through statvfs; libc is already in
-# the tree under tokio. `net` only.
-libc = { version = "0.2", optional = true }
+# Descriptor-relative local restore reads also use libc on Android and iOS.
+# Network capacity reporting uses statvfs from the same dependency.
+libc = "0.2"
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 # The snapshot repository's HTTP(S) source (docs/snapshots.md): a node
 # GETs a repository from a NAS or object store itself. hyper's HTTP/1.1
@@ -81,7 +80,6 @@ net = [
     "hyper-util/http1",
     "dep:hyper",
     "dep:http-body-util",
-    "dep:libc",
     "dep:turbovec-grpc",
     "prost-reflect/serde",
 ]

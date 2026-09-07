@@ -11,8 +11,8 @@ use std::{
     path::{Component, PathBuf},
 };
 
-const SOURCE: &str = "sources.redb";
-const COMPLETION: &str = "source-backup.pb";
+pub(super) const SOURCE: &str = "sources.redb";
+pub(super) const COMPLETION: &str = "source-backup.pb";
 
 /// A coherent capture of source history and every journaled index. Open file
 /// descriptions survive path retirement; no catalog mutation fence is retained
@@ -39,10 +39,10 @@ enum Data {
 fn fail(message: impl Into<String>) -> Status {
     Status::failed_precondition(message.into())
 }
-fn exhausted() -> Status {
+pub(super) fn exhausted() -> Status {
     Status::resource_exhausted("source backup budget exceeded")
 }
-fn charge(total: &mut u64, amount: u64, maximum: u64) -> Result<(), Status> {
+pub(super) fn charge(total: &mut u64, amount: u64, maximum: u64) -> Result<(), Status> {
     *total = total.checked_add(amount).ok_or_else(exhausted)?;
     if *total > maximum {
         return Err(exhausted());
@@ -65,7 +65,7 @@ fn parent_directory(path: &Path) -> &Path {
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."))
 }
-fn new_file(path: &Path) -> Result<File, Status> {
+pub(super) fn new_file(path: &Path) -> Result<File, Status> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -74,6 +74,20 @@ fn new_file(path: &Path) -> Result<File, Status> {
         options.mode(0o600);
     }
     options.open(path).map_err(storage)
+}
+
+pub(super) fn validate_limits(limits: &SourceBackupLimits) -> Result<(), Status> {
+    if limits.metadata_bytes == 0
+        || limits.metadata_bytes > 64 << 20
+        || limits.max_files == 0
+        || limits.max_files > 65_536
+        || limits.max_bytes == 0
+        || limits.source_batch_bytes == 0
+        || limits.source_batch_bytes > 64 << 20
+    {
+        return Err(Status::invalid_argument("backup needs metadata_bytes and source_batch_bytes 1..64 MiB, max_files 1..65536 and positive max_bytes"));
+    }
+    Ok(())
 }
 
 impl DocumentCatalog {
@@ -86,16 +100,7 @@ impl DocumentCatalog {
         indexes: &[(&[u8], &SegmentCatalog)],
         limits: &SourceBackupLimits,
     ) -> Result<CapturedBackup<'a>, Status> {
-        if limits.metadata_bytes == 0
-            || limits.metadata_bytes > 64 << 20
-            || limits.max_files == 0
-            || limits.max_files > 65_536
-            || limits.max_bytes == 0
-            || limits.source_batch_bytes == 0
-            || limits.source_batch_bytes > 64 << 20
-        {
-            return Err(Status::invalid_argument("backup needs metadata_bytes and source_batch_bytes 1..64 MiB, max_files 1..65536 and positive max_bytes"));
-        }
+        validate_limits(limits)?;
         let source = self.capture_checkpoint(limits.metadata_bytes as usize)?;
         let states = &source.metadata().indexes;
         let mut supplied = indexes.to_vec();
@@ -441,9 +446,9 @@ impl CapturedBackup<'_> {
         Ok(manifest)
     }
 }
-struct OwnedDirectory {
-    path: PathBuf,
-    keep: bool,
+pub(super) struct OwnedDirectory {
+    pub(super) path: PathBuf,
+    pub(super) keep: bool,
 }
 impl Drop for OwnedDirectory {
     fn drop(&mut self) {
