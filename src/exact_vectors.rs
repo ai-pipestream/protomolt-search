@@ -4,9 +4,9 @@
 //! original row-major vectors in the product generation so a public dense
 //! query can select candidates with that provider and rescore the fixed pool
 //! with an ordinary FP32 dot product. Persisted stores are memory-mapped. A
-//! persisted shard builds its store on disk ([`ExactVectorStore::spilling`]):
-//! every appended row goes to the file [`ExactVectorStore::write`] later
-//! finalizes in place, so an ingest never holds its FP32 rows in heap. An
+//! persisted shard builds new rows on disk ([`ExactVectorStore::spilling`]).
+//! Appends to a mapped store retain the immutable base and spill only the new
+//! rows. A full `write` streams both into one compatible snapshot file. An
 //! in-memory shard keeps a heap builder until `write` persists it.
 
 use std::fs::{File, OpenOptions};
@@ -34,6 +34,11 @@ const HEADER_CRC_START: usize = 72;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_FINALIZE_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[derive(Debug)]
 enum Storage {
     Building {
@@ -52,6 +57,12 @@ enum Storage {
         rows: usize,
         digest: crate::sha256::Sha256,
         finalized: AtomicBool,
+    },
+    /// The immutable mapped prefix plus only the new rows in a private spill.
+    /// A full write remains an explicit snapshot/export operation.
+    Appended {
+        base: Box<ExactVectorStore>,
+        delta: Box<ExactVectorStore>,
     },
     Mapped {
         path: PathBuf,
@@ -89,6 +100,10 @@ impl ExactVectorStore {
             Storage::Mapped { map, .. } => unsafe {
                 map.unchecked_advise(memmap2::UncheckedAdvice::DontNeed)
             },
+            Storage::Appended { base, delta } => {
+                base.release_pages()?;
+                delta.release_pages()
+            }
             _ => Ok(()),
         }
     }
@@ -242,6 +257,7 @@ impl ExactVectorStore {
             Storage::Building { dim, .. } => *dim,
             Storage::Spilled { dim, .. } => *dim,
             Storage::Mapped { dim, .. } => Some(*dim),
+            Storage::Appended { base, .. } => base.dim(),
         }
     }
 
@@ -250,12 +266,16 @@ impl ExactVectorStore {
             Storage::Building { dim, values } => dim.map_or(0, |d| values.len() / d),
             Storage::Spilled { rows, .. } => *rows,
             Storage::Mapped { rows, .. } => *rows,
+            Storage::Appended { base, delta } => base.len() + delta.len(),
         }
     }
 
-    /// Whether the store builds on disk ([`Self::spilling`]).
+    /// Whether new rows build on disk, including a mapped-base/delta view.
     pub fn is_spilled(&self) -> bool {
-        matches!(self.storage, Storage::Spilled { .. })
+        matches!(
+            self.storage,
+            Storage::Spilled { .. } | Storage::Appended { .. }
+        )
     }
 
     pub fn is_empty(&self) -> bool {
@@ -269,13 +289,13 @@ impl ExactVectorStore {
     pub fn path(&self) -> Option<&Path> {
         match &self.storage {
             Storage::Mapped { path, .. } => Some(path),
-            Storage::Building { .. } | Storage::Spilled { .. } => None,
+            Storage::Building { .. } | Storage::Spilled { .. } | Storage::Appended { .. } => None,
         }
     }
 
-    /// Append complete rows. A mapped store becomes a disk builder beside
-    /// its own file (its payload copied, never decoded into heap) only
-    /// when a real append arrives; read-only serving stays mmap-backed.
+    /// Append complete rows. A mapped store retains its immutable payload and
+    /// writes only the new rows to a private spill. A finalized builder refuses
+    /// writes; callers continue through the mapped instance returned by write.
     pub fn append(&mut self, vectors: &[f32], dim: usize) -> io::Result<()> {
         if vectors.is_empty() {
             return Ok(());
@@ -297,34 +317,30 @@ impl ExactVectorStore {
                 self.dim().expect("checked Some")
             )));
         }
+        self.len()
+            .checked_add(vectors.len() / dim)
+            .and_then(|rows| rows.checked_mul(dim))
+            .and_then(|values| values.checked_mul(4))
+            .ok_or_else(|| invalid("exact-vector append size overflow"))?;
         if let Storage::Mapped { path, .. } = &self.storage {
-            let target = path.clone();
-            let mut spilled = Self::spilling(&target, Some(dim))?;
-            let Storage::Mapped { map, rows, .. } = &self.storage else {
-                unreachable!("matched above")
+            let target = unique_temp_path(path);
+            let mut delta = Self::spilling(&target, Some(dim))?;
+            // Do not change the readable view unless the entire append succeeds.
+            delta.append(vectors, dim)?;
+            let base = Self {
+                storage: std::mem::replace(
+                    &mut self.storage,
+                    Storage::Building {
+                        dim: None,
+                        values: Vec::new(),
+                    },
+                ),
             };
-            let Storage::Spilled {
-                file,
-                rows: spilled_rows,
-                digest,
-                ..
-            } = &mut spilled.storage
-            else {
-                unreachable!("spilling() builds a Spilled store")
+            self.storage = Storage::Appended {
+                base: Box::new(base),
+                delta: Box::new(delta),
             };
-            let payload = &map[HEADER_BYTES..];
-            for (i, chunk) in payload.chunks(1 << 20).enumerate() {
-                digest.update(chunk);
-                file.write_all_at(chunk, (HEADER_BYTES + (i << 20)) as u64)?;
-            }
-            *spilled_rows = *rows;
-            self.storage = std::mem::replace(
-                &mut spilled.storage,
-                Storage::Building {
-                    dim: None,
-                    values: Vec::new(),
-                },
-            );
+            return Ok(());
         }
         match &mut self.storage {
             Storage::Building { dim: known, values } => {
@@ -336,18 +352,26 @@ impl ExactVectorStore {
                 dim: known,
                 rows,
                 digest,
+                finalized,
                 ..
             } => {
+                if finalized.load(Ordering::Acquire) {
+                    return Err(invalid("exact-vector builder is finalized; append through the returned mapped store"));
+                }
                 let mut bytes = Vec::with_capacity(vectors.len() * 4);
                 for value in vectors {
                     bytes.extend_from_slice(&value.to_le_bytes());
                 }
                 let offset = HEADER_BYTES as u64 + (*rows as u64) * (dim as u64) * 4;
                 file.write_all_at(&bytes, offset)?;
+                // A previous failed larger write may have left an uncommitted
+                // suffix. The successful append defines the complete extent.
+                file.set_len(offset + bytes.len() as u64)?;
                 digest.update(&bytes);
                 *known = Some(dim);
                 *rows += vectors.len() / dim;
             }
+            Storage::Appended { delta, .. } => delta.append(vectors, dim)?,
             Storage::Mapped { .. } => unreachable!("mapped store converted above"),
         }
         Ok(())
@@ -357,7 +381,30 @@ impl ExactVectorStore {
     /// always mmap-backed.
     pub fn write(&self, path: &Path) -> io::Result<Self> {
         if self.path() == Some(path) {
-            return Self::open(path);
+            let opened = Self::open(path)?;
+            let same = match (&self.storage, &opened.storage) {
+                (
+                    Storage::Mapped {
+                        dim,
+                        rows,
+                        payload_sha256,
+                        ..
+                    },
+                    Storage::Mapped {
+                        dim: current_dim,
+                        rows: current_rows,
+                        payload_sha256: current_hash,
+                        ..
+                    },
+                ) => dim == current_dim && rows == current_rows && payload_sha256 == current_hash,
+                _ => false,
+            };
+            if !same {
+                return Err(invalid(
+                    "exact-vector path now refers to another snapshot; write to a new path",
+                ));
+            }
+            return Ok(opened);
         }
         let dim = self
             .dim()
@@ -373,6 +420,11 @@ impl ExactVectorStore {
         } = &self.storage
         {
             if target == path {
+                if finalized.load(Ordering::Acquire) {
+                    return Err(invalid(
+                        "exact-vector builder is finalized; reopen the published image",
+                    ));
+                }
                 let payload_bytes = rows
                     .checked_mul(dim)
                     .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
@@ -381,8 +433,16 @@ impl ExactVectorStore {
                 file.write_all_at(&header, 0)?;
                 file.sync_all()?;
                 std::fs::rename(spill, path)?;
-                crate::postings::fsync_parent(path)?;
+                // The file is now published, even if its directory sync or
+                // acknowledgment fails. Never append through this file handle.
                 finalized.store(true, Ordering::Release);
+                #[cfg(test)]
+                if FAIL_FINALIZE_SYNC.with(|fail| fail.replace(false)) {
+                    return Err(io::Error::other(
+                        "injected exact-vector sync failure after rename",
+                    ));
+                }
+                crate::postings::fsync_parent(path)?;
                 return Self::open(path);
             }
         }
@@ -399,36 +459,7 @@ impl ExactVectorStore {
             let mut out = BufWriter::new(file);
             out.write_all(&[0u8; HEADER_BYTES])?;
             let mut digest = crate::sha256::Sha256::new();
-            match &self.storage {
-                Storage::Building { values, .. } => {
-                    let mut bytes = Vec::with_capacity(64 * 1024);
-                    for chunk in values.chunks(16 * 1024) {
-                        bytes.clear();
-                        for value in chunk {
-                            bytes.extend_from_slice(&value.to_le_bytes());
-                        }
-                        digest.update(&bytes);
-                        out.write_all(&bytes)?;
-                    }
-                }
-                Storage::Spilled { file, rows, .. } => {
-                    let payload_bytes = rows * dim * 4;
-                    let mut buf = vec![0u8; 1 << 20];
-                    let mut done = 0usize;
-                    while done < payload_bytes {
-                        let take = buf.len().min(payload_bytes - done);
-                        file.read_exact_at(&mut buf[..take], (HEADER_BYTES + done) as u64)?;
-                        digest.update(&buf[..take]);
-                        out.write_all(&buf[..take])?;
-                        done += take;
-                    }
-                }
-                Storage::Mapped { map, .. } => {
-                    let payload = &map[HEADER_BYTES..];
-                    digest.update(payload);
-                    out.write_all(payload)?;
-                }
-            }
+            self.write_payload(&mut out, &mut digest)?;
             out.flush()?;
             let mut file = out
                 .into_inner()
@@ -446,6 +477,48 @@ impl ExactVectorStore {
         }
         result?;
         Self::open(path)
+    }
+
+    fn write_payload(
+        &self,
+        out: &mut impl Write,
+        digest: &mut crate::sha256::Sha256,
+    ) -> io::Result<()> {
+        match &self.storage {
+            Storage::Building { values, .. } => {
+                let mut bytes = Vec::with_capacity(64 * 1024);
+                for chunk in values.chunks(16 * 1024) {
+                    bytes.clear();
+                    for value in chunk {
+                        bytes.extend_from_slice(&value.to_le_bytes());
+                    }
+                    digest.update(&bytes);
+                    out.write_all(&bytes)?;
+                }
+            }
+            Storage::Spilled { file, rows, .. } => {
+                let payload_bytes = rows * self.dim().unwrap_or(0) * 4;
+                let mut buf = vec![0u8; 1 << 20];
+                let mut done = 0usize;
+                while done < payload_bytes {
+                    let take = buf.len().min(payload_bytes - done);
+                    file.read_exact_at(&mut buf[..take], (HEADER_BYTES + done) as u64)?;
+                    digest.update(&buf[..take]);
+                    out.write_all(&buf[..take])?;
+                    done += take;
+                }
+            }
+            Storage::Appended { base, delta } => {
+                base.write_payload(out, digest)?;
+                delta.write_payload(out, digest)?;
+            }
+            Storage::Mapped { map, .. } => {
+                let payload = &map[HEADER_BYTES..];
+                digest.update(payload);
+                out.write_all(payload)?;
+            }
+        }
+        Ok(())
     }
 
     /// Write one store whose rows are `parts` back to back, streaming each
@@ -516,6 +589,22 @@ impl ExactVectorStore {
     /// This intentionally scans the complete file and is therefore an
     /// explicit integrity operation rather than part of ordinary mmap open.
     pub fn verify_payload(&self) -> io::Result<()> {
+        match &self.storage {
+            Storage::Appended { base, delta } => {
+                base.verify_payload()?;
+                return delta.verify_payload();
+            }
+            Storage::Spilled { digest, .. } => {
+                let mut actual = crate::sha256::Sha256::new();
+                self.write_payload(&mut io::sink(), &mut actual)?;
+                return if actual.finalize() == digest.clone().finalize() {
+                    Ok(())
+                } else {
+                    Err(invalid("spilled exact-vector payload SHA-256 mismatch"))
+                };
+            }
+            _ => {}
+        }
         let Storage::Mapped {
             map,
             payload_sha256,
@@ -588,28 +677,37 @@ impl ExactVectorStore {
         let scored_page_order: Vec<(usize, usize, f32)> = if tasks <= 1 {
             scheduled
                 .iter()
-                .map(|&(ordinal, slot)| (ordinal, slot, self.score_one(query, slot, dim)))
-                .collect()
+                .map(|&(ordinal, slot)| {
+                    self.score_one(query, slot, dim)
+                        .map(|score| (ordinal, slot, score))
+                })
+                .collect::<io::Result<_>>()?
         } else {
             let chunk = scheduled.len().div_ceil(tasks);
-            std::thread::scope(|scope| {
+            std::thread::scope(|scope| -> io::Result<Vec<_>> {
                 let handles: Vec<_> = scheduled
                     .chunks(chunk)
                     .map(|part| {
                         scope.spawn(move || {
                             part.iter()
                                 .map(|&(ordinal, slot)| {
-                                    (ordinal, slot, self.score_one(query, slot, dim))
+                                    self.score_one(query, slot, dim)
+                                        .map(|score| (ordinal, slot, score))
                                 })
-                                .collect::<Vec<_>>()
+                                .collect::<io::Result<Vec<_>>>()
                         })
                     })
                     .collect();
-                handles
-                    .into_iter()
-                    .flat_map(|handle| handle.join().expect("exact rerank worker panicked"))
-                    .collect()
-            })
+                let mut all = Vec::with_capacity(scheduled.len());
+                for handle in handles {
+                    all.extend(
+                        handle
+                            .join()
+                            .map_err(|_| io::Error::other("exact rerank worker panicked"))??,
+                    );
+                }
+                Ok(all)
+            })?
         };
         let mut restored = scored_page_order;
         restored.sort_unstable_by_key(|&(ordinal, _, _)| ordinal);
@@ -617,19 +715,11 @@ impl ExactVectorStore {
             .into_iter()
             .map(|(_, slot, score)| (slot, score))
             .collect::<Vec<_>>();
-        let pages_touched = if self.is_mapped() {
-            let mut pages = std::collections::BTreeSet::new();
-            for &(_, slot) in &scheduled {
-                let start = HEADER_BYTES + slot * row_bytes;
-                let end = start + row_bytes - 1;
-                for page in start / PAGE_BYTES..=end / PAGE_BYTES {
-                    pages.insert(page);
-                }
-            }
-            pages.len() as u64
-        } else {
-            0
-        };
+        let mut pages = std::collections::BTreeSet::new();
+        for &(_, slot) in &scheduled {
+            self.mapped_pages(slot, row_bytes, &mut pages);
+        }
+        let pages_touched = pages.len() as u64;
         let logical_bytes = u64::try_from(rows.len())
             .ok()
             .and_then(|count| count.checked_mul(row_bytes as u64))
@@ -642,43 +732,66 @@ impl ExactVectorStore {
         })
     }
 
-    fn score_one(&self, query: &[f32], slot: usize, dim: usize) -> f32 {
+    // A delta view has exactly one mapped prefix and a disk-builder suffix.
+    fn mapped_pages(
+        &self,
+        slot: usize,
+        row_bytes: usize,
+        pages: &mut std::collections::BTreeSet<usize>,
+    ) {
         match &self.storage {
-            Storage::Building { values, .. } => {
-                let row = &values[slot * dim..(slot + 1) * dim];
-                dot(row, query)
+            Storage::Mapped { .. } => {
+                let start = HEADER_BYTES + slot * row_bytes;
+                let end = start + row_bytes - 1;
+                pages.extend(start / PAGE_BYTES..=end / PAGE_BYTES);
             }
+            Storage::Appended { base, .. } if slot < base.len() => {
+                base.mapped_pages(slot, row_bytes, pages)
+            }
+            _ => {}
+        }
+    }
+
+    fn score_one(&self, query: &[f32], slot: usize, dim: usize) -> io::Result<f32> {
+        Ok(match &self.storage {
+            Storage::Building { values, .. } => dot(&values[slot * dim..(slot + 1) * dim], query),
             Storage::Spilled { file, .. } => {
                 let mut row = vec![0u8; dim * 4];
-                // A short read here is the file vanishing under the
-                // store (an operator removing the spill); zeros score
-                // zero rather than tearing the query down.
-                let _ = file.read_exact_at(&mut row, (HEADER_BYTES + slot * dim * 4) as u64);
+                file.read_exact_at(&mut row, (HEADER_BYTES + slot * dim * 4) as u64)?;
                 dot_bytes(&row, query)
             }
             Storage::Mapped { map, .. } => dot_mapped(
                 &map[HEADER_BYTES + slot * dim * 4..HEADER_BYTES + (slot + 1) * dim * 4],
                 query,
             ),
-        }
+            Storage::Appended { base, delta } => {
+                if slot < base.len() {
+                    base.score_one(query, slot, dim)?
+                } else {
+                    delta.score_one(query, slot - base.len(), dim)?
+                }
+            }
+        })
     }
 
-    /// The FP32 rows `[from, to)`, flat, for sealing a segment
-    /// (`docs/immutable-segments.md`); empty when the store has no
-    /// dimension yet.
-    pub fn row_values(&self, from: usize, to: usize) -> Vec<f32> {
-        let Some(dim) = self.dim() else {
-            return Vec::new();
-        };
-        let (from, to) = (from.min(self.len()), to.min(self.len()));
-        if from >= to {
-            return Vec::new();
+    /// Read all FP32 rows in [from, to) for sealing or reconstruction. Invalid
+    /// ranges and short reads refuse the entire result instead of returning a
+    /// partial range or synthesizing vector coordinates.
+    pub fn row_values(&self, from: usize, to: usize) -> io::Result<Vec<f32>> {
+        if from > to || to > self.len() {
+            return Err(invalid("exact-vector row range is out of bounds"));
         }
-        match &self.storage {
+        if from == to {
+            return Ok(Vec::new());
+        }
+        let dim = self
+            .dim()
+            .ok_or_else(|| invalid("exact-vector store has no dimension"))?;
+        Ok(match &self.storage {
             Storage::Building { values, .. } => values[from * dim..to * dim].to_vec(),
             Storage::Spilled { file, .. } => {
                 let mut bytes = vec![0u8; (to - from) * dim * 4];
-                let _ = file.read_exact_at(&mut bytes, (HEADER_BYTES + from * dim * 4) as u64);
+                file.read_exact_at(&mut bytes, (HEADER_BYTES + from * dim * 4) as u64)?;
                 bytes
                     .as_chunks::<4>()
                     .0
@@ -693,7 +806,19 @@ impl ExactVectorStore {
                 .iter()
                 .map(|bytes| f32::from_le_bytes(*bytes))
                 .collect(),
-        }
+            Storage::Appended { base, delta } => {
+                let boundary = base.len();
+                if to <= boundary {
+                    base.row_values(from, to)?
+                } else if from >= boundary {
+                    delta.row_values(from - boundary, to - boundary)?
+                } else {
+                    let mut result = base.row_values(from, boundary)?;
+                    result.extend(delta.row_values(0, to - boundary)?);
+                    result
+                }
+            }
+        })
     }
 }
 
@@ -846,8 +971,11 @@ mod tests {
         }
         assert_eq!(spilled.len(), 37);
         assert_eq!(spilled.dim(), Some(dim));
-        assert_eq!(spilled.row_values(3, 11), heap.row_values(3, 11));
-        assert_eq!(spilled.row_values(0, 37), rows);
+        assert_eq!(
+            spilled.row_values(3, 11).unwrap(),
+            heap.row_values(3, 11).unwrap()
+        );
+        assert_eq!(spilled.row_values(0, 37).unwrap(), rows);
         let query: Vec<f32> = (0..dim).map(|i| 0.5 - i as f32 * 0.1).collect();
         let slots = [36usize, 0, 17, 5];
         assert_eq!(
@@ -863,7 +991,7 @@ mod tests {
         assert!(target.exists(), "finalized in place");
         assert!(!spill_file.exists(), "renamed onto the target");
         mapped.verify_payload().unwrap();
-        assert_eq!(mapped.row_values(0, 37), rows);
+        assert_eq!(mapped.row_values(0, 37).unwrap(), rows);
         let expected = heap.write(&dir.join("heap.f32")).unwrap();
         assert_eq!(
             std::fs::read(&target).unwrap(),
@@ -882,8 +1010,8 @@ mod tests {
         reopened.append(&rows[..dim], dim).unwrap();
         assert!(reopened.is_spilled());
         assert_eq!(reopened.len(), 38);
-        assert_eq!(reopened.row_values(37, 38), &rows[..dim]);
-        assert_eq!(reopened.row_values(0, 37), rows);
+        assert_eq!(reopened.row_values(37, 38).unwrap(), &rows[..dim]);
+        assert_eq!(reopened.row_values(0, 37).unwrap(), rows);
         let grown = reopened.write(&target).unwrap();
         assert_eq!(grown.len(), 38);
         grown.verify_payload().unwrap();
@@ -894,7 +1022,7 @@ mod tests {
         other.append(&rows, dim).unwrap();
         let elsewhere = other.write(&dir.join("copy.f32")).unwrap();
         elsewhere.verify_payload().unwrap();
-        assert_eq!(elsewhere.row_values(0, 37), rows);
+        assert_eq!(elsewhere.row_values(0, 37).unwrap(), rows);
         assert!(spill_path(&dir.join("other.f32")).exists());
         drop(other);
         assert!(
@@ -902,6 +1030,232 @@ mod tests {
             "an unfinalized builder removes its file"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn test_directory(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "exact-{name}-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    #[test]
+    fn mapped_append_writes_only_new_rows() {
+        let directory = test_directory("append-delta");
+        let path = directory.join("vectors.f32");
+        let mut store = ExactVectorStore::from_values(4, vec![0.5; 8192])
+            .unwrap()
+            .write(&path)
+            .unwrap();
+        let original = std::fs::read(&path).unwrap();
+        store.append(&[1.0, 2.0, 3.0, 4.0], 4).unwrap();
+        let scratch_bytes: u64 = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "building")
+            })
+            .map(|entry| entry.metadata().unwrap().len())
+            .sum();
+        assert_eq!(
+            scratch_bytes,
+            (HEADER_BYTES + 16) as u64,
+            "append must not copy existing FP32 rows"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn short_spill_reads_refuse_scoring_instead_of_inventing_zeroes() {
+        let directory = test_directory("short-read");
+        let path = directory.join("vectors.f32");
+        let mut store = ExactVectorStore::spilling(&path, Some(2)).unwrap();
+        store.append(&vec![1.0; 2048], 2).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(spill_path(&path))
+            .unwrap()
+            .set_len(HEADER_BYTES as u64 + 4)
+            .unwrap();
+        assert!(store.score_slots(&[1.0, 2.0], &[0]).is_err());
+        assert!(store.row_values(0, 1).is_err());
+        assert!(store
+            .score_slots_profiled(&[1.0, 2.0], &(0..1024).collect::<Vec<_>>(), 4)
+            .is_err());
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn finalized_builder_cannot_mutate_the_published_image() {
+        let directory = test_directory("finalized");
+        let path = directory.join("vectors.f32");
+        let mut store = ExactVectorStore::spilling(&path, Some(2)).unwrap();
+        store.append(&[1.0, 2.0], 2).unwrap();
+        let image = store.write(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(store.append(&[3.0, 4.0], 2).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        image.verify_payload().unwrap();
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn uncertain_finalization_fences_the_builder_after_rename() {
+        let directory = test_directory("uncertain-finalization");
+        let path = directory.join("vectors.f32");
+        let mut store = ExactVectorStore::spilling(&path, Some(2)).unwrap();
+        store.append(&[1.0, 2.0], 2).unwrap();
+        FAIL_FINALIZE_SYNC.with(|fail| fail.set(true));
+        assert!(store
+            .write(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("after rename"));
+        let committed = std::fs::read(&path).unwrap();
+        assert!(store.append(&[3.0, 4.0], 2).is_err());
+        assert!(store.write(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), committed);
+        let recovered = ExactVectorStore::open(&path).unwrap();
+        recovered.verify_payload().unwrap();
+        assert_eq!(recovered.row_values(0, 1).unwrap(), [1.0, 2.0]);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_replaced_path_cannot_acknowledge_a_different_snapshot() {
+        let directory = test_directory("replaced-path");
+        let path = directory.join("vectors.f32");
+        let old = ExactVectorStore::from_values(2, vec![1.0, 2.0])
+            .unwrap()
+            .write(&path)
+            .unwrap();
+        let new = ExactVectorStore::from_values(2, vec![3.0, 4.0])
+            .unwrap()
+            .write(&path)
+            .unwrap();
+        assert!(old.write(&path).is_err());
+        assert_eq!(
+            ExactVectorStore::open(&path)
+                .unwrap()
+                .row_values(0, 1)
+                .unwrap(),
+            [3.0, 4.0]
+        );
+        assert_eq!(
+            new.write(&path).unwrap().row_values(0, 1).unwrap(),
+            [3.0, 4.0]
+        );
+        assert_eq!(
+            old.write(&directory.join("old.f32"))
+                .unwrap()
+                .row_values(0, 1)
+                .unwrap(),
+            [1.0, 2.0]
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn delta_reads_scores_and_snapshots_preserve_one_row_space() {
+        let directory = test_directory("delta-snapshots");
+        let path = directory.join("vectors.f32");
+        let dim = 8;
+        let values: Vec<f32> = (0..dim * 1100).map(|i| (i as f32 * 0.013).sin()).collect();
+        let mut view = ExactVectorStore::from_values(dim, values[..dim * 700].to_vec())
+            .unwrap()
+            .write(&path)
+            .unwrap();
+        let old = ExactVectorStore::open(&path).unwrap();
+        assert!(view.append(&[f32::NAN; 8], dim).is_err());
+        assert!(view.is_mapped());
+        view.append(&values[dim * 700..dim * 1000], dim).unwrap();
+        let first = view.write(&path).unwrap();
+        // Continue through the same append view after a snapshot. The snapshot
+        // and original mapping must stay immutable while the private delta grows.
+        view.append(&values[dim * 1000..], dim).unwrap();
+        assert_eq!(old.len(), 700);
+        assert_eq!(first.len(), 1000);
+        assert_eq!(view.len(), 1100);
+        assert_eq!(old.row_values(0, 700).unwrap(), values[..dim * 700]);
+        assert_eq!(first.row_values(0, 1000).unwrap(), values[..dim * 1000]);
+        for (from, to) in [(0, 3), (699, 702), (700, 706), (1097, 1100)] {
+            assert_eq!(
+                view.row_values(from, to).unwrap(),
+                values[from * dim..to * dim]
+            );
+        }
+        assert!(view.row_values(0, 1101).is_err());
+        assert!(view.row_values(5, 4).is_err());
+        let query: Vec<f32> = (0..dim).map(|i| i as f32 * 0.11).collect();
+        let slots: Vec<usize> = (0..1100).rev().chain([699, 700, 1099]).collect();
+        let expected = ExactVectorStore::from_values(dim, values.clone())
+            .unwrap()
+            .score_slots(&query, &slots)
+            .unwrap();
+        let scored = view.score_slots_profiled(&query, &slots, 4).unwrap();
+        assert_eq!(scored.rows, expected);
+        assert!(scored.pages_touched > 0);
+        assert!(scored.tasks > 1);
+        view.verify_payload().unwrap();
+        let latest = view.write(&path).unwrap();
+        let canonical = directory.join("canonical.f32");
+        ExactVectorStore::from_values(dim, values)
+            .unwrap()
+            .write(&canonical)
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            std::fs::read(&canonical).unwrap()
+        );
+        latest.verify_payload().unwrap();
+        old.verify_payload().unwrap();
+        first.verify_payload().unwrap();
+        drop(view);
+        assert!(std::fs::read_dir(&directory).unwrap().all(|entry| entry
+            .unwrap()
+            .path()
+            .extension()
+            .is_none_or(|ext| ext != "building")));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn broken_delta_refuses_complete_reads_and_keeps_the_published_base() {
+        let directory = test_directory("delta-failure");
+        let path = directory.join("vectors.f32");
+        let mut view = ExactVectorStore::from_values(2, vec![1.0, 2.0])
+            .unwrap()
+            .write(&path)
+            .unwrap();
+        let old = std::fs::read(&path).unwrap();
+        view.append(&[3.0, 4.0], 2).unwrap();
+        let Storage::Appended { delta, .. } = &view.storage else {
+            unreachable!()
+        };
+        let Storage::Spilled { file, .. } = &delta.storage else {
+            unreachable!()
+        };
+        file.set_len(HEADER_BYTES as u64).unwrap();
+        assert_eq!(view.row_values(0, 1).unwrap(), [1.0, 2.0]);
+        assert!(view.row_values(0, 2).is_err());
+        assert!(view.score_slots(&[1.0, 1.0], &[0, 1]).is_err());
+        assert!(view.verify_payload().is_err());
+        assert!(view.write(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), old);
+        drop(view);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

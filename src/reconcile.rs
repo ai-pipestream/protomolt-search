@@ -564,7 +564,9 @@ where
                                 })?;
                             let vector = exact
                                 .as_ref()
-                                .map(|store| store.row_values(row as usize, row as usize + 1));
+                                .map(|store| store.row_values(row as usize, row as usize + 1))
+                                .transpose()
+                                .map_err(|e| format!("read exact row {row}: {e}"))?;
                             if let Some(digest) = each(id, doc, vector.as_deref())? {
                                 mine.push((digest, id));
                             }

@@ -1237,6 +1237,10 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: exact-vector append views.** Persisted FP32 rows stay
+  mapped while new rows spill separately. Short reads refuse scoring and
+  reconstruction; finalized builders cannot mutate published images.
+  See [exact-vector storage](docs/exact-vector-storage.md).
 - **Foundation branch: exact document-key lookup.** Identified source archives
   now persist a validated reverse index, and held segment snapshots resolve
   complete live row sets under an explicit budget. Compaction rebuilds the

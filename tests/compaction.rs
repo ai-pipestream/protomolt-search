@@ -1569,8 +1569,8 @@ async fn a_node_reopened_without_a_flush_rebuilds_its_exact_sidecar_from_segment
         .expect("the open rebuilt the sidecar from the segments");
     assert_eq!(exact.len(), 256);
     exact.verify_payload().unwrap();
-    assert_eq!(exact.row_values(5, 6), rows[5].vector);
-    assert_eq!(exact.row_values(200, 201), rows[200].vector);
+    assert_eq!(exact.row_values(5, 6).unwrap(), rows[5].vector);
+    assert_eq!(exact.row_values(200, 201).unwrap(), rows[200].vector);
 
     let mut second = client(&addr).await;
     let more: Vec<Row> = (256..320).map(|i| row(i, false)).collect();

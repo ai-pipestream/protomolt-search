@@ -6392,7 +6392,12 @@ impl NodeServiceImpl {
                     let dim = exact.dim().ok_or_else(|| {
                         Status::failed_precondition("exact-vector sidecar has no dim")
                     })?;
-                    (dim, exact.row_values(plan.base, plan.base + plan.rows))
+                    (
+                        dim,
+                        exact
+                            .row_values(plan.base, plan.base + plan.rows)
+                            .map_err(|e| io("exact rows", e))?,
+                    )
                 };
                 let exact_path = plan.stage.join("vectors.f32");
                 ExactVectorStore::from_values(dim, values)

@@ -3226,12 +3226,15 @@ pub fn split_placement_tree_logs(
                             field: column.clone(),
                             value: code,
                         });
-                        let vector = exact.as_ref().map(|store| {
-                            (
-                                store.row_values(row as usize, row as usize + 1),
-                                current.dim,
-                            )
-                        });
+                        let vector = exact
+                            .as_ref()
+                            .map(|store| {
+                                store
+                                    .row_values(row as usize, row as usize + 1)
+                                    .map(|values| (values, current.dim))
+                            })
+                            .transpose()
+                            .map_err(|e| format!("read exact row {row}: {e}"))?;
                         let fields: Vec<AnalyzedField> = transposes
                             .iter()
                             .map(|transpose| {

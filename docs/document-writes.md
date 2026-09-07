@@ -260,12 +260,13 @@ and every serving route must observe or validate that view before returning a
 final result. A document spanning shards needs a collection publication decision;
 independent shard acknowledgments cannot establish an atomic visible version.
 
-Exact vectors are another integration constraint. `ExactVectorStore::append`
-currently copies a mapped payload into a new spilling file, and startup can
-concatenate sealed FP32 files into a whole-shard sidecar. A publisher must reuse
-the existing segment files instead of doing either operation for every logical
-write. The reader must retain physical row positions, including segments without
-vectors, rather than treating only vector-bearing segments as one dense row set.
+Exact vectors are another integration constraint. Appending now retains the
+mapped base and spills only new rows; see [exact-vector storage](exact-vector-storage.md).
+Explicit snapshots and startup reconstruction can still copy a whole-shard
+sidecar. A publisher must reuse existing segment files instead of invoking those
+operations for every logical write. The reader must retain physical row
+positions, including segments without vectors, rather than treating only
+vector-bearing segments as one dense row set.
 
 Recovery must join the catalog's immutable accepted history to the actual
 committed index manifests before reporting publication. Empty projections and
