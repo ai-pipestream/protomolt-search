@@ -83,7 +83,8 @@ the kind, and a derived name may not collide with a source column. A
 string or bool result refuses naming the fix (hash it, compare it,
 wrap it in a ternary). Absence propagates: a document lacking an input
 stores no value. Absence is not an error state: integer arithmetic
-with no exact answer (overflow, a zero divisor, the `i64::MIN` edges)
+with no exact answer (overflow, a zero divisor, the `i64::MIN` edges including
+`math.abs(i64::MIN)`)
 refuses the document at ingest and refuses the run at backfill,
 naming the column and the operation — a declared column stores a
 computed value or nothing, never a wrapped value.

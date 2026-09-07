@@ -1235,6 +1235,7 @@ mod tests {
             ("n + 1", i64::MAX, "overflow"),
             ("n - 1", i64::MIN, "overflow"),
             ("-n", i64::MIN, "overflow"),
+            ("math.abs(n)", i64::MIN, "overflow"),
             ("n / -1", i64::MIN, "overflow"),
             ("n / 0", 42, "division by zero"),
             ("n % 0", 42, "division by zero"),
@@ -1282,6 +1283,39 @@ mod tests {
             "{}",
             err.message()
         );
+    }
+
+    #[test]
+    fn strict_function_overflow_preserves_request_absence_and_untaken_branches() {
+        let declaration = |expression: &str| {
+            Declaration::compile(&pb::DerivedColumns {
+                columns: vec![column("magnitude", pb::MaterializeKind::I64, expression)],
+            })
+            .unwrap()
+        };
+        let doc = AddDocumentsRequest {
+            integers: vec![pb::IntegerValue {
+                field: "n".into(),
+                value: i64::MIN,
+            }],
+            ..Default::default()
+        };
+        let decl = declaration("math.abs(n)");
+        let env = ingest_env(&doc, None).unwrap();
+        let request = materialize_into(doc.clone(), &decl.triples(), &env, false).unwrap();
+        assert_eq!(request.integers, doc.integers);
+        let error = decl
+            .rederive(doc.clone(), &["magnitude".into()], None)
+            .unwrap_err();
+        assert!(error.message().contains("magnitude"), "{error}");
+        assert!(error.message().contains("math.abs"), "{error}");
+        assert!(error.message().contains("overflow"), "{error}");
+        let absent = decl.apply(AddDocumentsRequest::default(), None).unwrap();
+        assert!(absent.integers.is_empty());
+        let guarded = declaration("n < 0 ? 0 : math.abs(n)")
+            .apply(doc, None)
+            .unwrap();
+        assert_eq!(guarded.integers.last().unwrap().value, 0);
     }
 
     #[test]

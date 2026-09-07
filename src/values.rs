@@ -2030,6 +2030,11 @@ fn eval_ingest_inner(
             let Some(vals) = vals.into_iter().collect::<Option<Vec<Val>>>() else {
                 return Ok(None);
             };
+            if strict && f == pb::ValueFn::Abs && matches!(vals[0], Val::Int(i64::MIN)) {
+                return Err(refuse(
+                    "integer overflow: math.abs(i64::MIN) has no exact i64 result",
+                ));
+            }
             Ok(eval_fn(f, &vals).map(|v| match v {
                 Val::Int(i) => IngestVal::Int(i),
                 Val::Uint(i) => IngestVal::Uint(i),
