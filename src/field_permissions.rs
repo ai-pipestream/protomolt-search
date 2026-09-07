@@ -274,8 +274,8 @@ impl FieldScope {
                     LeafRef::MapHasKey(p) => &p.column,
                     LeafRef::Has(p) => &p.column,
                     LeafRef::Geo(p) => &p.column,
-                    LeafRef::StringRange(p) => &p.column,
-                    LeafRef::StringPrefix(p) => &p.column,
+                    LeafRef::StringRange(p) | LeafRef::MapStringRange(p) => &p.column,
+                    LeafRef::StringPrefix(p) | LeafRef::MapStringPrefix(p) => &p.column,
                 };
                 allowed &= self.can_use(column);
             });

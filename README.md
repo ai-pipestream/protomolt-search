@@ -1222,6 +1222,11 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **2026-09-06 — Map string filters keep their key context.** Empty-key
+  ordering and prefixes no longer read a same-named plain column. Explicit
+  protobuf filter variants preserve map context through node and relay queries,
+  placement and field-use checks. Other empty-key selectors and public ingestion
+  remain unfinished. See [map selectors](docs/map-columns.md#explicit-map-string-selectors-2026-09-06).
 - **2026-09-06 — Empty map values preserve presence.** A present empty string
   now survives ordinary protobuf ingestion, query projections, facet counts
   and storage rewrites. Missing keys remain absent. This uses the existing

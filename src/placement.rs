@@ -585,8 +585,8 @@ pub fn eval_document(expr: &pb::FilterExpr, doc: &DocColumns<'_>) -> Tri {
                 Err(_) => Tri::Unknown,
             },
         },
-        Some(Expr::StringRange(p)) => {
-            let value = if p.key.is_empty() {
+        Some(Expr::StringRange(p)) | Some(Expr::MapStringRange(p)) => {
+            let value = if !matches!(expr.expr, Some(Expr::MapStringRange(_))) && p.key.is_empty() {
                 doc.facet(&p.column)
             } else {
                 doc.map_facet(&p.column, &p.key)
@@ -596,8 +596,9 @@ pub fn eval_document(expr: &pb::FilterExpr, doc: &DocColumns<'_>) -> Tri {
                 Some(v) => Tri::from(string_in_range(v, p.min.as_ref(), p.max.as_ref())),
             }
         }
-        Some(Expr::StringPrefix(p)) => {
-            let value = if p.key.is_empty() {
+        Some(Expr::StringPrefix(p)) | Some(Expr::MapStringPrefix(p)) => {
+            let value = if !matches!(expr.expr, Some(Expr::MapStringPrefix(_))) && p.key.is_empty()
+            {
                 doc.facet(&p.column)
             } else {
                 doc.map_facet(&p.column, &p.key)
@@ -852,7 +853,9 @@ fn impossible_walk(
                 .any(|v| v.as_bytes().starts_with(p.prefix.as_bytes())))
             .then_some(vec![index])
         }
-        Some(Expr::MapFacet(_))
+        Some(Expr::MapStringRange(_))
+        | Some(Expr::MapStringPrefix(_))
+        | Some(Expr::MapFacet(_))
         | Some(Expr::MapNumber(_))
         | Some(Expr::MapHasKey(_))
         | Some(Expr::Has(_))
@@ -927,6 +930,8 @@ fn implied_walk(
         }
         Some(Expr::StringRange(_))
         | Some(Expr::StringPrefix(_))
+        | Some(Expr::MapStringRange(_))
+        | Some(Expr::MapStringPrefix(_))
         | Some(Expr::MapFacet(_))
         | Some(Expr::MapNumber(_))
         | Some(Expr::MapHasKey(_))

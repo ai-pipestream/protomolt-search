@@ -158,6 +158,45 @@ checks, test/example compilation, formatting and vendored-proto checks passed.
 Descriptor comparison confirms byte-identical protobuf wire declarations to
 `483be73`. This is local validation; no fleet rollout was performed.
 
+### Explicit map string selectors (2026-09-06)
+
+`FilterExpr.map_string_range` (tag 13) and `map_string_prefix` (tag 14)
+carry explicit map context. Their key is literal, including the empty string.
+The node resolves an optional key: no key selects a plain column; a present
+empty key selects the map dictionary's empty key. CEL emits these variants
+for empty-key ordering and prefixes. Existing scalar and nonempty map CEL
+predicates retain their previous wire encoding; callers may also use the new
+variants for nonempty map keys.
+
+Before this change, `meta[''] >= 'm'` and `meta[''].startsWith('m')` lost
+map context in CEL compilation. Node and placement evaluation then read a plain
+column named `meta`. A regression with opposite scalar and map values reproduced
+the incorrect placement decision. Evaluation now reads the map, and placement
+cannot exclude or remove these leaves using same-named scalar bounds. Leaf order
+for knowledge checks and field-use authorization includes both new variants.
+
+An older protobuf filter schema sees an unknown oneof variant. Its required
+expression validation must reject the unset node, including inside a connective,
+so the compiled filter cannot silently acquire scalar semantics. The public CEL
+text endpoint needs an updated server to compile this meaning correctly; the new
+wire contract does not change an older server's compiler. These variants also
+work through current relays without a special translation.
+
+Tests cover heap and mapped dictionaries, absent keys and empty values, Kleene
+negation, direct and two-level relay queries over gRPC, placement evaluation and
+pruning, field-use denial before statistics, and decoding against the preceding
+12-variant filter descriptor. The descriptor comparison permits only these two
+additive fields. Public empty-key ingestion still refuses until the remaining
+shared selectors below preserve this context end to end.
+
+Combined validation against main `66094fc` passed 507 library tests, 723
+integration tests across 124 targets, 12 embedded tests and two IVF tests
+(1,244 total; one existing live OpenNLP test ignored). All five mobile Rust
+checks, test/example compilation, formatting and vendored-proto checks passed.
+Descriptor comparison confirms exactly the two additive filter variants, with
+all preceding wire declarations unchanged. This is local validation with two
+build jobs and four test threads; no fleet rollout was performed.
+
 ### Remaining map work
 
 Map projection must preserve protobuf map semantics, including default keys and
@@ -168,8 +207,9 @@ require unique keys; they are already materialized values, not raw protobuf map
 wire occurrences to merge.
 
 An empty key must be distinguishable from no key in every selector shared by
-scalar and map columns. This includes string ranges/prefixes, score stages,
-statistics, placement evaluation and their relay/response contracts. Use an
+scalar and map columns. String range/prefix predicates and their placement evaluation now have explicit
+map variants. Score stages, range-facet requests, statistics and their response
+contracts still require that distinction. Use an
 explicit typed target or presence-bearing selector, with mixed-version refusal
 where a peer could otherwise ignore that distinction. Existing dedicated map
 predicates and `MapRead` already carry map context; they must preserve the same

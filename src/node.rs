@@ -955,20 +955,26 @@ impl Bm25Shard {
                         .collect::<Result<_, _>>()?,
                 ),
                 Expr::Not(child) => ResolvedFilter::Not(Box::new(self.resolve_filter(child)?)),
-                Expr::StringRange(p) => ResolvedFilter::Leaf(self.resolve_string_predicate(
-                    &p.column,
-                    &p.key,
-                    p.min.as_ref().map(|b| (b.value.as_str(), b.exclusive)),
-                    p.max.as_ref().map(|b| (b.value.as_str(), b.exclusive)),
-                    None,
-                )?),
-                Expr::StringPrefix(p) => ResolvedFilter::Leaf(self.resolve_string_predicate(
-                    &p.column,
-                    &p.key,
-                    None,
-                    None,
-                    Some(p.prefix.as_str()),
-                )?),
+                Expr::StringRange(p) | Expr::MapStringRange(p) => ResolvedFilter::Leaf(
+                    self.resolve_string_predicate(
+                        &p.column,
+                        (matches!(expr.expr, Some(Expr::MapStringRange(_))) || !p.key.is_empty())
+                            .then_some(p.key.as_str()),
+                        p.min.as_ref().map(|b| (b.value.as_str(), b.exclusive)),
+                        p.max.as_ref().map(|b| (b.value.as_str(), b.exclusive)),
+                        None,
+                    )?,
+                ),
+                Expr::StringPrefix(p) | Expr::MapStringPrefix(p) => ResolvedFilter::Leaf(
+                    self.resolve_string_predicate(
+                        &p.column,
+                        (matches!(expr.expr, Some(Expr::MapStringPrefix(_))) || !p.key.is_empty())
+                            .then_some(p.key.as_str()),
+                        None,
+                        None,
+                        Some(p.prefix.as_str()),
+                    )?,
+                ),
                 Expr::Facet(p) => {
                     let column = self.facet_index(&p.column);
                     let ords = match column {
@@ -1060,7 +1066,7 @@ impl Bm25Shard {
     }
 
     /// Resolve a string range (`min`/`max`, each `(value, exclusive)`)
-    /// or a `prefix` over a facet column (`key` empty) or a map-facet
+    /// or a `prefix` over a facet column (`key` absent) or a map-facet
     /// value (`docs/prefix-terms.md`), to an ORDINAL RANGE when the
     /// column's dictionary is in byte order — every file this writer
     /// produces, checked at open — and to plain ordinal membership on
@@ -1072,7 +1078,7 @@ impl Bm25Shard {
     fn resolve_string_predicate(
         &self,
         column: &str,
-        key: &str,
+        key: Option<&str>,
         min: Option<(&str, bool)>,
         max: Option<(&str, bool)>,
         prefix: Option<&str>,
@@ -1131,7 +1137,7 @@ impl Bm25Shard {
                  flush — rebuild or reshard the generation"
             ))
         };
-        if key.is_empty() {
+        if key.is_none() {
             let Some(fi) = self.facet_index(column) else {
                 return Ok(ResolvedLeaf::FacetOrdRange {
                     column: None,
@@ -1200,6 +1206,7 @@ impl Bm25Shard {
                 )),
             };
         }
+        let key = key.expect("plain column returned above");
         let Some((ci, key_ord)) = self
             .map_facet_index(column)
             .and_then(|ci| self.map_facet_key_ord(ci, key).map(|k| (ci, k)))
@@ -1309,8 +1316,12 @@ impl Bm25Shard {
                         || self.geo_index(&p.column).is_some()
                 }
                 LeafRef::Geo(g) => self.geo_index(&g.column).is_some(),
-                LeafRef::StringRange(p) => self.string_target_known(&p.column, &p.key),
-                LeafRef::StringPrefix(p) => self.string_target_known(&p.column, &p.key),
+                LeafRef::StringRange(p) => self
+                    .string_target_known(&p.column, (!p.key.is_empty()).then_some(p.key.as_str())),
+                LeafRef::MapStringRange(p) => self.string_target_known(&p.column, Some(&p.key)),
+                LeafRef::StringPrefix(p) => self
+                    .string_target_known(&p.column, (!p.key.is_empty()).then_some(p.key.as_str())),
+                LeafRef::MapStringPrefix(p) => self.string_target_known(&p.column, Some(&p.key)),
             });
         });
         known
@@ -1320,13 +1331,13 @@ impl Bm25Shard {
     /// the map-facet column and its key (the FacetPredicate /
     /// MapFacetPredicate rules, since the predicate reads the same
     /// dictionaries).
-    fn string_target_known(&self, column: &str, key: &str) -> bool {
-        if key.is_empty() {
-            self.facet_index(column).is_some()
-        } else {
-            self.map_facet_index(column)
+    fn string_target_known(&self, column: &str, key: Option<&str>) -> bool {
+        match key {
+            None => self.facet_index(column).is_some(),
+            Some(key) => self
+                .map_facet_index(column)
                 .and_then(|ci| self.map_facet_key_ord(ci, key))
-                .is_some()
+                .is_some(),
         }
     }
 

@@ -711,6 +711,10 @@ pub enum LeafRef<'a> {
     StringRange(&'a crate::pb::StringRangePredicate),
     /// A string prefix on a facet column or map-facet value.
     StringPrefix(&'a crate::pb::StringPrefixPredicate),
+    /// A string range with explicit map context, including the empty key.
+    MapStringRange(&'a crate::pb::StringRangePredicate),
+    /// A string prefix with explicit map context, including the empty key.
+    MapStringPrefix(&'a crate::pb::StringPrefixPredicate),
 }
 
 impl LeafRef<'_> {
@@ -729,6 +733,12 @@ impl LeafRef<'_> {
             LeafRef::Geo(g) => format!("geo column {:?}", g.column),
             LeafRef::StringRange(p) => describe_string_target(&p.column, &p.key),
             LeafRef::StringPrefix(p) => describe_string_target(&p.column, &p.key),
+            LeafRef::MapStringRange(p) => {
+                format!("map-facet column {:?} key {:?}", p.column, p.key)
+            }
+            LeafRef::MapStringPrefix(p) => {
+                format!("map-facet column {:?} key {:?}", p.column, p.key)
+            }
         }
     }
 }
@@ -762,6 +772,8 @@ pub fn walk_leaves<'a>(expr: &'a crate::pb::FilterExpr, visit: &mut dyn FnMut(Le
         Some(Expr::Geo(g)) => visit(LeafRef::Geo(g)),
         Some(Expr::StringRange(p)) => visit(LeafRef::StringRange(p)),
         Some(Expr::StringPrefix(p)) => visit(LeafRef::StringPrefix(p)),
+        Some(Expr::MapStringRange(p)) => visit(LeafRef::MapStringRange(p)),
+        Some(Expr::MapStringPrefix(p)) => visit(LeafRef::MapStringPrefix(p)),
         None => {}
     }
 }
@@ -925,7 +937,7 @@ fn validate_node(
             *leaves += 1;
             crate::node::validate_geo_filter(g).map(|_| ())
         }
-        Some(Expr::StringRange(p)) => {
+        Some(Expr::StringRange(p)) | Some(Expr::MapStringRange(p)) => {
             *leaves += 1;
             if p.column.is_empty() {
                 return Err(Status::invalid_argument(
@@ -941,7 +953,7 @@ fn validate_node(
             }
             Ok(())
         }
-        Some(Expr::StringPrefix(p)) => {
+        Some(Expr::StringPrefix(p)) | Some(Expr::MapStringPrefix(p)) => {
             *leaves += 1;
             if p.column.is_empty() {
                 return Err(Status::invalid_argument(

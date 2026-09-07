@@ -389,6 +389,8 @@ async fn every_field_read_is_checked_before_statistics_and_user_aliases_cannot_b
         "secret < 'x'",
         "boost > 0",
         "tags['k'] == 'x'",
+        "tags[''] >= 'x'",
+        "tags[''].startsWith('x')",
         "'k' in tags",
         "metrics['k'] > 0",
         "color == 'red' && secret == 'x'",

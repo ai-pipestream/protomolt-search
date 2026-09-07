@@ -1092,14 +1092,21 @@ fn compile_string_relation(col: &Side, op: RelOp, value: &str) -> Result<pb::Fil
         })
     };
     let range = |min: Option<pb::StringBound>, max: Option<pb::StringBound>| {
-        wrap(pb::filter_expr::Expr::StringRange(
-            pb::StringRangePredicate {
-                column: column.clone(),
-                key: key.clone(),
-                min,
-                max,
+        let predicate = pb::StringRangePredicate {
+            column: column.clone(),
+            key: key.clone(),
+            min,
+            max,
+        };
+        // Preserve the legacy encoding where it is unambiguous. An empty
+        // map key needs its own oneof variant so older readers refuse it.
+        wrap(
+            if matches!(col, Side::MapAccess(_, key) if key.is_empty()) {
+                pb::filter_expr::Expr::MapStringRange(predicate)
+            } else {
+                pb::filter_expr::Expr::StringRange(predicate)
             },
-        ))
+        )
     };
     match op {
         RelOp::Eq => Ok(eq),
@@ -1294,9 +1301,9 @@ fn compile_call(name: &str, args: &[Ast]) -> Result<pb::FilterExpr, Status> {
                     "startsWith() takes a column receiver and one string",
                 ));
             }
-            let (column, key) = match side_of(&args[0])? {
-                Side::Column(name) => (name, String::new()),
-                Side::MapAccess(name, key) => (name, key),
+            let (column, key, is_map) = match side_of(&args[0])? {
+                Side::Column(name) => (name, String::new(), false),
+                Side::MapAccess(name, key) => (name, key, true),
                 _ => {
                     return Err(refuse(
                         "startsWith() reads a facet column or a map entry; the receiver \
@@ -1313,13 +1320,17 @@ fn compile_call(name: &str, args: &[Ast]) -> Result<pb::FilterExpr, Status> {
                     "startsWith(\"\") matches every value; presence is has(column)",
                 ));
             }
-            Ok(wrap(pb::filter_expr::Expr::StringPrefix(
-                pb::StringPrefixPredicate {
-                    column,
-                    key,
-                    prefix,
-                },
-            )))
+            let explicit_map = is_map && key.is_empty();
+            let predicate = pb::StringPrefixPredicate {
+                column,
+                key,
+                prefix,
+            };
+            Ok(wrap(if explicit_map {
+                pb::filter_expr::Expr::MapStringPrefix(predicate)
+            } else {
+                pb::filter_expr::Expr::StringPrefix(predicate)
+            }))
         }
         "endsWith" | "contains" => Err(refuse(format!(
             "{name}() does not compile: a byte-sorted dictionary resolves prefixes \

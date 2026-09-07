@@ -2973,6 +2973,12 @@ message FilterExpr {
     // `court.startsWith("ca")`): the ordinal range of the dictionary
     // entries sharing the prefix, same resolution and refusal rules.
     StringPrefixPredicate string_prefix = 12;
+    // Explicit map context: key is a literal map key, including empty.
+    // Unlike string_range, an empty key never selects a plain column.
+    // Older servers see an unset expression and must reject the filter.
+    StringRangePredicate map_string_range = 13;
+    // Explicit map context, with the same key rule as map_string_range.
+    StringPrefixPredicate map_string_prefix = 14;
   }
 }
 
@@ -3098,7 +3104,8 @@ message StringRangePredicate {
   // Column name.
   string column = 1;
   // For a map-facet column, the key whose value is tested; empty for
-  // a plain facet column.
+  // a plain facet column. In FilterExpr.map_string_range or
+  // map_string_prefix this always selects a map entry, including empty.
   string key = 2;
   // Lower bound, absent = unbounded below.
   StringBound min = 3;
@@ -3114,7 +3121,8 @@ message StringPrefixPredicate {
   // Column name.
   string column = 1;
   // For a map-facet column, the key whose value is tested; empty for
-  // a plain facet column.
+  // a plain facet column. In FilterExpr.map_string_range or
+  // map_string_prefix this always selects a map entry, including empty.
   string key = 2;
   // The prefix, compared in bytes.
   string prefix = 3;

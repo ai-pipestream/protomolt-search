@@ -1,13 +1,22 @@
 # Search foundations
 
 Foundation work began on `feat/search-foundations` from `PRE_ASTRA`.
-The latest increment preserves present empty string map values through ordinary
-protobuf ingestion, public query projections and counts, restart and compaction.
-It incorporates main `483be73`, including the split open-files preflight, and
-passed 1,240 tests with one existing live OpenNLP test ignored, plus all five
-mobile target checks. Protobuf wire declarations are byte-identical to that
-main baseline. [Map semantics](map-columns.md#empty-string-values-2026-09-06)
-records the evidence and the remaining empty-key and descriptor-projection work.
+The latest increment gives string range and prefix filters explicit map context.
+Empty-key CEL expressions no longer read a same-named plain column. Node/relay
+execution, placement evaluation and pruning, and field-use checks preserve the
+literal key. The two additive protobuf filter variants let preceding decoders
+refuse an unknown expression instead of acquiring scalar semantics.
+Combined validation against main `66094fc` passed 1,244 tests (one existing
+live OpenNLP test ignored), all five mobile Rust target checks, test/example
+compilation and the two-field additive wire compatibility check.
+[Map selectors](map-columns.md#explicit-map-string-selectors-2026-09-06) records
+the contract and the remaining scoring, counting and statistics selectors.
+
+The preceding increment on main `66094fc` preserves present empty string map
+values through ordinary protobuf ingestion, public query projections and counts,
+restart and compaction. It passed 1,240 tests and all five mobile target checks.
+These fixes do not yet enable descriptor-driven map projection or public
+empty-key ingestion.
 
 The preceding explicit index-definition increment retains canonical policy
 through image/WAL, snapshots, replication and rebuild. Replica retries cross
