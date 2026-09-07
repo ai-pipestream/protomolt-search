@@ -52,18 +52,20 @@ impl FieldScope {
             )?;
         }
         for QuerySort {
+            map,
             column,
             descending: _,
         } in sort
         {
-            self.dictionary(column)?;
+            self.dictionary(crate::sortkeys::target_field(column, map.as_ref())?)?;
         }
         if let Some(CollapseSpec {
+            map,
             column,
             inner_hits: _,
         }) = collapse
         {
-            self.dictionary(column)?;
+            self.dictionary(crate::sortkeys::target_field(column, map.as_ref())?)?;
         }
         self.fetch_values(&crate::coordinator::compile_projections(projections)?, &[])?;
         if let Some(spec) = highlight {

@@ -382,6 +382,7 @@ async fn public_query_value_fetch_keeps_the_preselection_lifetime() {
     let coordinator = coordinator(address);
     let mut query = public_query();
     query.sort = vec![QuerySort {
+        map: None,
         column: "boost".into(),
         descending: false,
     }];
@@ -514,6 +515,7 @@ async fn query_pins_a_reachable_replica_for_selection_values_and_cursor_continua
         });
     let mut query = public_query();
     query.sort = vec![QuerySort {
+        map: None,
         column: "boost".into(),
         descending: false,
     }];
@@ -675,6 +677,7 @@ async fn public_query_collapse_refuses_lineage_from_a_replacement_lifetime() {
         let (address, service, handle) = start(node(&["rust", "rust"]).await).await;
         let mut query = public_query();
         query.collapse = Some(CollapseSpec {
+            map: None,
             column: column.into(),
             inner_hits: 2,
         });

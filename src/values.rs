@@ -32,6 +32,31 @@ fn refuse(msg: impl Into<String>) -> Status {
     Status::invalid_argument(format!("projection: {}", msg.into()))
 }
 
+/// Typed-map fetches include empty-node validation and declared value types.
+pub const TYPED_MAP_FETCH_VERSION: u32 = 1;
+
+/// Older empty nodes could skip expression validation and type declarations.
+/// Check the response from every node or relay before combining any rows.
+pub fn validate_map_fetch_contract(
+    projections: &[pb::CompiledProjection],
+    version: u32,
+) -> Result<(), Status> {
+    let mut leaves = Vec::new();
+    for projection in projections {
+        if let Some(expr) = &projection.expr {
+            column_leaves(expr, &mut leaves);
+        }
+    }
+    if version < TYPED_MAP_FETCH_VERSION
+        && leaves
+            .iter()
+            .any(|leaf| matches!(leaf, ValueLeaf::TypedMap { .. }))
+    {
+        return Err(Status::failed_precondition("shard omitted the typed map fetch contract acknowledgement; update every node and relay"));
+    }
+    Ok(())
+}
+
 /// Column lookup surface a shard provides to resolution — name to
 /// table index per family, plus map key dictionaries. Implemented by
 /// the node's shard wrapper over both the heap store and the mmap
@@ -488,7 +513,14 @@ pub fn resolve(
                         },
                         ValueType::Double,
                     )),
-                    None => Ok((ResolvedValue::Absent, ValueType::Unknown)),
+                    None => Ok((
+                        ResolvedValue::Absent,
+                        if typed {
+                            ValueType::Double
+                        } else {
+                            ValueType::Unknown
+                        },
+                    )),
                 }
             } else if let Some(ci) = facet {
                 match cols.map_facet_key_ord(ci, &read.key) {
@@ -499,7 +531,14 @@ pub fn resolve(
                         },
                         ValueType::Str,
                     )),
-                    None => Ok((ResolvedValue::Absent, ValueType::Unknown)),
+                    None => Ok((
+                        ResolvedValue::Absent,
+                        if typed {
+                            ValueType::Str
+                        } else {
+                            ValueType::Unknown
+                        },
+                    )),
                 }
             } else {
                 Ok((ResolvedValue::Absent, ValueType::Unknown))

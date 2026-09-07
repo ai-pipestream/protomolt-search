@@ -986,6 +986,9 @@ message SortValue {
 message BrowseSort {
   string column = 1;
   bool descending = 2;
+  // Exactly one of column or map must be set. Includes the empty string key.
+  // Requires sort_contract_version >= 1 on every child response.
+  MapRead map = 3;
 }
 
 // Resolved scalar type for sorting and projected-value merging. UNSPECIFIED
@@ -1018,10 +1021,10 @@ message BrowseShardResponse {
   // u64 and lineage keys use unsigned_bits without a sign transform.
   // Facet keys travel as their term text.
   repeated SortKeyRow sort_rows = 7;
-  // Per sort key, whether this shard resolves the column (typo rule:
-  // refused at the coordinator only when NO shard does; a shard
-  // without the column contributes nothing, exactly as its documents
-  // hold no value). Parallel to the request's `sort`.
+  // Per sort key, whether this shard resolves the column and (for map
+  // selectors) the key. Refused only when NO shard resolves a selector.
+  // A shard without the column or key contributes no rows.
+  // Parallel to the request's `sort`.
   repeated bool sort_columns_known = 8;
   // Sealed segments in this shard's snapshot, and how many of them the
   // request ruled out from their summaries without opening them
@@ -1029,6 +1032,7 @@ message BrowseShardResponse {
   uint32 segments_total = 9;
   uint32 segments_skipped = 10;
   // Parallel to sort_columns_known. UNSPECIFIED means the column is absent.
+  // A map column retains its declared type even when its key is unknown.
   // Required for sorted responses, even when sort_rows is empty.
   repeated ScalarValueType sort_column_types = 11;
 
@@ -1037,6 +1041,9 @@ message BrowseShardResponse {
   bytes stats_incarnation = 13;
   bytes visibility_fingerprint = 14;
   repeated bool visibility_columns_known = 15;
+  // Version 1 acknowledges map selectors and static map types, including empty
+  // columns. Required for any map sort; omission from any child refuses.
+  uint32 sort_contract_version = 16;
 }
 
 message FilterBitmapRequest {
@@ -4939,6 +4946,9 @@ message FetchValuesResponse {
   // One per owned live visible requested row, including rows without column
   // tables. Bound to the response view/version; independent of projected rows.
   repeated CandidateIdentity identities = 10;
+  // Version 1 validates typed map expressions and reports declared types even
+  // without a document store. Every child must acknowledge typed map fetches.
+  uint32 typed_map_contract_version = 11;
 }
 
 // Candidate-scoped vector scoring (see NodeService.VectorRescore).
@@ -5341,14 +5351,17 @@ message Explanation {
 
 // One sort key (docs/query-api.md "Sorting").
 message QuerySort {
-  // An i64, f64, or facet column, or `parent_id` / `group_id`.
+  // An i64, u64, f64, or facet column, or `parent_id` / `group_id`.
   string column = 1;
   bool descending = 2;
+  // A string or numeric map entry. Exactly one of column or map must be set.
+  // Empty keys are valid. Absent entries are excluded from the sorted set.
+  MapRead map = 3;
 }
 
 // A collapse (docs/query-api.md "Collapse").
 message CollapseSpec {
-  // The key: an i64 or facet column, or the lineage keys `parent_id` /
+  // The key: an i64, u64 or facet column, or the lineage keys `parent_id` /
   // `group_id`. A document without a value forms no group and is
   // dropped from a collapsed result, as the sort rule drops it.
   string column = 1;
@@ -5357,6 +5370,9 @@ message CollapseSpec {
   // complete (no hit outside the served candidate pool can belong in
   // it).
   uint32 inner_hits = 2;
+  // A string, i64 or u64 map entry. Exactly one of column or map must be set.
+  // Absent entries form no group; floating map values are not group identities.
+  MapRead map = 3;
 }
 
 // One node of the selection tree.

@@ -412,6 +412,7 @@ async fn a_collapse_aggregates_the_pool_before_grouping() {
             selection_k: 4,
             selection: Some(lexical_leaf("z", "zebra")),
             collapse: Some(CollapseSpec {
+                map: None,
                 column: "court".into(),
                 inner_hits: 2,
             }),
@@ -452,6 +453,7 @@ async fn a_browse_aggregates_the_exact_filter_match_set() {
             k: 2,
             selection: Some(cel_filter("late", "year >= 3")),
             sort: vec![QuerySort {
+                map: None,
                 column: "year".into(),
                 descending: true,
             }],
@@ -502,6 +504,7 @@ async fn pool_aggregation_refuses_by_name() {
                 k: 2,
                 selection: Some(lexical_leaf("z", "zebra")),
                 sort: vec![QuerySort {
+                    map: None,
                     column: "year".into(),
                     descending: false,
                 }],

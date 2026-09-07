@@ -110,8 +110,9 @@ record key conversion, default/duplicate handling and value conversion.
 Existing map filters, presence tests, value projections, scoring, facet counts,
 range facets and expression-based aggregates address the string and floating
 map columns. Integer maps support the filter, presence, value-expression and
-expression-aggregate paths; direct sorting, bounded score stages, exact range
-facets and column statistics remain pending. The explicit
+expression-aggregate paths, plus [direct sorting and collapse](integer-map-order.md).
+Bounded score stages, exact range facets and column statistics remain pending.
+The explicit
 empty-key selector rules in [map columns](map-columns.md) apply. Authorization
 continues to name the physical field; defining a projection grants no access.
 
@@ -119,8 +120,9 @@ continues to name the physical field; defining a projection grants no access.
 
 Integer map projection, storage and document transport are implemented on the
 feature branch; see [storage and recovery status](integer-map-storage.md).
-Exact typed map filters and expressions are implemented; direct map sorting,
-score stages, exact range facets and column statistics remain unfinished. Integer maps can also be explicitly
+Exact typed map filters, expressions, sorting and collapse are implemented;
+score stages, exact range facets and column statistics remain unfinished.
+Integer maps can also be explicitly
 projected as KEYWORD when string comparison semantics are intended. Projecting
 integer descriptors as floating maps fails instead of rounding through f64.
 Bytes, message-valued maps and arbitrary repeated/nested values retain their

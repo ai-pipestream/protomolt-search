@@ -270,6 +270,7 @@ async fn synonym_rules_add_terms_that_score_as_ordinary_terms_and_are_reported()
             k: 10,
             selection: Some(leaf(vec![rule(&["car", "automobile"], &[])])),
             sort: vec![QuerySort {
+                map: None,
                 column: "parent_id".into(),
                 descending: false,
             }],

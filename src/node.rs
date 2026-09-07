@@ -2141,6 +2141,60 @@ fn unknown_range_counts(fields: &[crate::pb::RangeFacetField]) -> Vec<crate::pb:
 
 /// [`crate::scorefn::NumericRead`] over a searchable shard shape, for
 /// score-chain evaluation during scoring.
+/// Declared families on a node with no lexical store yet. No map keys or
+/// dictionary values exist, but an absent row must not erase a declared type.
+struct EmptyColumns<'a>(&'a NodeConfig);
+impl crate::values::ColumnLookup for EmptyColumns<'_> {
+    fn numeric_index(&self, name: &str) -> Option<usize> {
+        self.0.numeric_fields.iter().position(|n| n == name)
+    }
+    fn integer_index(&self, name: &str) -> Option<usize> {
+        self.0.integer_fields.iter().position(|n| n == name)
+    }
+    fn unsigned_integer_index(&self, name: &str) -> Option<usize> {
+        self.0
+            .unsigned_integer_fields
+            .iter()
+            .position(|n| n == name)
+    }
+    fn facet_index(&self, name: &str) -> Option<usize> {
+        self.0.facet_fields.iter().position(|n| n == name)
+    }
+    fn map_numeric_index(&self, name: &str) -> Option<usize> {
+        self.0.map_numeric_fields.iter().position(|n| n == name)
+    }
+    fn map_integer_index(&self, name: &str) -> Option<usize> {
+        self.0.map_integer_fields.iter().position(|n| n == name)
+    }
+    fn map_unsigned_integer_index(&self, name: &str) -> Option<usize> {
+        self.0
+            .map_unsigned_integer_fields
+            .iter()
+            .position(|n| n == name)
+    }
+    fn map_facet_index(&self, name: &str) -> Option<usize> {
+        self.0.map_facet_fields.iter().position(|n| n == name)
+    }
+    fn map_numeric_key_ord(&self, _: usize, _: &str) -> Option<u32> {
+        None
+    }
+    fn map_integer_key_ord(&self, _: usize, _: &str) -> Option<u32> {
+        None
+    }
+    fn map_unsigned_integer_key_ord(&self, _: usize, _: &str) -> Option<u32> {
+        None
+    }
+    fn map_facet_key_ord(&self, _: usize, _: &str) -> Option<u32> {
+        None
+    }
+    fn facet_value_ord_of(&self, _: usize, _: &str) -> Option<u32> {
+        None
+    }
+    fn map_facet_value_ord_of(&self, _: usize, _: &str) -> Option<u32> {
+        None
+    }
+}
+
 struct ShardNumericRead<'a>(&'a Bm25Shard);
 
 /// The value-expression resolution surface (`docs/cel-values.md`):
@@ -11515,6 +11569,9 @@ impl NodeService for NodeServiceImpl {
     ) -> Result<Response<crate::pb::BrowseShardResponse>, Status> {
         crate::metrics::timed(Route::BrowseShard, request, |request| async move {
             let req = request.into_inner();
+            for sort in &req.sort {
+                crate::sortkeys::target_field(&sort.column, sort.map.as_ref())?;
+            }
             let scope = crate::visibility::VisibilityScope::new(req.visibility.as_ref())?;
             let filter =
                 crate::visibility::intersect_filter(req.visibility.as_ref(), req.filter.clone())?;
@@ -11537,6 +11594,7 @@ impl NodeService for NodeServiceImpl {
                 // A document-less shard admits nothing; its all-false known
                 // flags feed the coordinator's typo rule like everywhere.
                 return Ok(Response::new(crate::pb::BrowseShardResponse {
+sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                     stats_epoch: guard.stats_epoch,
                     stats_incarnation: guard.stats_incarnation.bytes()?,
                     visibility_fingerprint: scope.fingerprint().to_vec(),
@@ -11548,7 +11606,16 @@ impl NodeService for NodeServiceImpl {
                     filter_columns_known,
                     sort_rows: Vec::new(),
                     sort_columns_known: vec![false; req.sort.len()],
-                    sort_column_types: vec![0; req.sort.len()],
+                    sort_column_types: req.sort.iter().map(|sort| {
+                        use crate::pb::ScalarValueType as Type;
+                        let Some(map) = &sort.map else { return Type::Unspecified as i32; };
+                        let name = &map.column;
+                        (if self.config.map_integer_fields.contains(name) { Type::Integer }
+                        else if self.config.map_unsigned_integer_fields.contains(name) { Type::UnsignedInteger }
+                        else if self.config.map_numeric_fields.contains(name) { Type::Number }
+                        else if self.config.map_facet_fields.contains(name) { Type::Text }
+                        else { Type::Unspecified }) as i32
+                    }).collect(),
                 }));
             };
             if store.as_index().is_none() {
@@ -11622,6 +11689,10 @@ impl NodeService for NodeServiceImpl {
                     Integer(usize),
                     UnsignedInteger(usize),
                     Facet(usize),
+                    MapNumeric(usize, Option<u32>),
+                    MapInteger(usize, Option<u32>),
+                    MapUnsignedInteger(usize, Option<u32>),
+                    MapFacet(usize, Option<u32>),
                     Parent,
                     Group,
                 }
@@ -11633,7 +11704,16 @@ impl NodeService for NodeServiceImpl {
                     if families.iter().filter(|c| c.is_some()).count() > 1 {
                         return Err(Status::invalid_argument(format!("sort column {:?} exists in more than one family on this shard", sort.column)));
                     }
-                    let column = if let Some(ni) = store.numeric_index(&sort.column) {
+                    let column = if let Some(map) = &sort.map {
+                        let families = [store.map_numeric_index(&map.column), store.map_integer_index(&map.column), store.map_unsigned_integer_index(&map.column), store.map_facet_index(&map.column)];
+                        if families.iter().filter(|c| c.is_some()).count() > 1 {
+                            return Err(Status::invalid_argument(format!("sort map column {:?} exists in more than one family on this shard", map.column)));
+                        }
+                        if let Some(ci) = families[0] { Some(Column::MapNumeric(ci, store.map_numeric_key_ord(ci, &map.key))) }
+                        else if let Some(ci) = families[1] { Some(Column::MapInteger(ci, store.map_integer_key_ord(ci, &map.key))) }
+                        else if let Some(ci) = families[2] { Some(Column::MapUnsignedInteger(ci, store.map_unsigned_integer_key_ord(ci, &map.key))) }
+                        else { families[3].map(|ci| Column::MapFacet(ci, store.map_facet_key_ord(ci, &map.key))) }
+                    } else if let Some(ni) = store.numeric_index(&sort.column) {
                         Some(Column::Numeric(ni))
                     } else if let Some(ii) = store.integer_index(&sort.column) {
                         Some(Column::Integer(ii))
@@ -11649,13 +11729,16 @@ impl NodeService for NodeServiceImpl {
                         None
                     };
                     column_types.push(match column {
-                        Some(Column::Integer(_)) => crate::pb::ScalarValueType::Integer,
-                        Some(Column::Numeric(_)) => crate::pb::ScalarValueType::Number,
-                        Some(Column::UnsignedInteger(_) | Column::Parent | Column::Group) => crate::pb::ScalarValueType::UnsignedInteger,
-                        Some(Column::Facet(_)) => crate::pb::ScalarValueType::Text,
+                        Some(Column::Integer(_) | Column::MapInteger(..)) => crate::pb::ScalarValueType::Integer,
+                        Some(Column::Numeric(_) | Column::MapNumeric(..)) => crate::pb::ScalarValueType::Number,
+                        Some(Column::UnsignedInteger(_) | Column::MapUnsignedInteger(..) | Column::Parent | Column::Group) => crate::pb::ScalarValueType::UnsignedInteger,
+                        Some(Column::Facet(_) | Column::MapFacet(..)) => crate::pb::ScalarValueType::Text,
                         None => crate::pb::ScalarValueType::Unspecified,
                     } as i32);
-                    known.push(column.is_some());
+                    known.push(match column {
+                        Some(Column::MapNumeric(_, key) | Column::MapInteger(_, key) | Column::MapUnsignedInteger(_, key) | Column::MapFacet(_, key)) => key.is_some(),
+                        _ => column.is_some(),
+                    });
                     columns.push(column);
                 }
                 if columns.iter().any(Option::is_none) {
@@ -11664,6 +11747,7 @@ impl NodeService for NodeServiceImpl {
                     // key holds no value for it on any document, so it
                     // contributes no rows.
                     return Ok(Response::new(crate::pb::BrowseShardResponse {
+sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                         stats_epoch: guard.stats_epoch,
                         stats_incarnation: guard.stats_incarnation.bytes()?,
                         visibility_fingerprint: scope.fingerprint().to_vec(),
@@ -11707,6 +11791,27 @@ impl NodeService for NodeServiceImpl {
                             Column::Facet(fi) => {
                                 let ord = store.facet_ord(*fi, doc)?;
                                 let text = store.facet_value(*fi, ord);
+                                keys.push(KeyRef::Text(text));
+                                values.push(Value::Text(text.to_string()));
+                            }
+                            Column::MapNumeric(ci, key) => {
+                                let v = store.map_numeric_value(*ci, (*key)?, doc)?;
+                                keys.push(KeyRef::Bits(adjust(f64_order_bits(v))));
+                                values.push(Value::Number(v));
+                            }
+                            Column::MapInteger(ci, key) => {
+                                let v = store.map_integer_value(*ci, (*key)?, doc)?;
+                                keys.push(KeyRef::Bits(adjust(i64_order_bits(v))));
+                                values.push(Value::Integer(v));
+                            }
+                            Column::MapUnsignedInteger(ci, key) => {
+                                let v = store.map_unsigned_integer_value(*ci, (*key)?, doc)?;
+                                keys.push(KeyRef::UnsignedBits(adjust(v)));
+                                values.push(Value::UnsignedInteger(v));
+                            }
+                            Column::MapFacet(ci, key) => {
+                                let ord = store.map_facet_value_ord(*ci, (*key)?, doc)?;
+                                let text = store.map_facet_value(*ci, ord);
                                 keys.push(KeyRef::Text(text));
                                 values.push(Value::Text(text.to_string()));
                             }
@@ -11805,6 +11910,7 @@ impl NodeService for NodeServiceImpl {
                     });
                 }
                 return Ok(Response::new(crate::pb::BrowseShardResponse {
+sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                     stats_epoch: guard.stats_epoch,
                     stats_incarnation: guard.stats_incarnation.bytes()?,
                     visibility_fingerprint: scope.fingerprint().to_vec(),
@@ -11829,6 +11935,7 @@ impl NodeService for NodeServiceImpl {
                 }
             }
             Ok(Response::new(crate::pb::BrowseShardResponse {
+sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                 stats_epoch: guard.stats_epoch,
                 stats_incarnation: guard.stats_incarnation.bytes()?,
                 visibility_fingerprint: scope.fingerprint().to_vec(),
@@ -13857,6 +13964,7 @@ impl NodeService for NodeServiceImpl {
             let req = request.into_inner();
             let offset = self.config.slot_offset;
             let state = self.state.clone();
+            let config = self.config.clone();
             let resp = tokio::task::spawn_blocking(
                 move || -> Result<crate::pb::FetchValuesResponse, Status> {
                     // Stage parameters validate everywhere they arrive; a
@@ -13875,6 +13983,7 @@ impl NodeService for NodeServiceImpl {
                     let (_, visibility_columns_known) =
                         filter_known_flags(guard.bm25.as_ref(), &[], visibility);
                     let mut response = crate::pb::FetchValuesResponse {
+                        typed_map_contract_version: crate::values::TYPED_MAP_FETCH_VERSION,
                         stats_epoch: guard.stats_epoch,
                         stats_incarnation: guard.stats_incarnation.bytes()?,
                         visibility_fingerprint: scope.fingerprint().to_vec(),
@@ -13929,8 +14038,24 @@ impl NodeService for NodeServiceImpl {
                     // candidates' values and resolves no column.
                     let Some(store) = guard.bm25.as_ref() else {
                         response.stage_columns_known = vec![false; req.stages.len()];
-                        response.projection_leaves_known = vec![false; projection_leaves.len()];
-                        response.projection_types = vec![0; req.projections.len()];
+                        let columns = EmptyColumns(&config);
+                        response.projection_leaves_known = projection_leaves
+                            .iter()
+                            .map(|leaf| crate::values::leaf_known(leaf, &columns))
+                            .collect();
+                        response.projection_types = req
+                            .projections
+                            .iter()
+                            .map(|projection| {
+                                let expr = projection.expr.as_ref().ok_or_else(|| {
+                                    Status::invalid_argument(
+                                        "projection: empty compiled expression",
+                                    )
+                                })?;
+                                crate::values::resolve(expr, &columns)
+                                    .map(|(_, ty)| crate::pb::ScalarValueType::from(ty) as i32)
+                            })
+                            .collect::<Result<_, Status>>()?;
                         return Ok(response);
                     };
                     if store.as_index().is_none() {

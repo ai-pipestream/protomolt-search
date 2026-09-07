@@ -13,6 +13,76 @@ use std::cmp::Ordering;
 
 use crate::pb;
 
+/// Map-selector ordering and static type acknowledgement.
+pub const MAP_SORT_CONTRACT_VERSION: u32 = 1;
+
+/// Resolve the physical field named by an explicit column or map selector.
+/// Requiring exactly one keeps old public decoders from executing a fallback.
+pub fn target_field<'a>(
+    column: &'a str,
+    map: Option<&'a pb::MapRead>,
+) -> Result<&'a str, tonic::Status> {
+    match (column.is_empty(), map) {
+        (false, None) => Ok(column),
+        (true, Some(map)) if !map.column.is_empty() => Ok(&map.column),
+        _ => Err(tonic::Status::invalid_argument(
+            "sort/collapse requires exactly one nonempty column or map column selector",
+        )),
+    }
+}
+
+/// Human-readable selector, without treating a map key as CEL source.
+pub fn target_name(column: &str, map: Option<&pb::MapRead>) -> String {
+    map.map_or_else(
+        || column.to_string(),
+        |m| format!("{}[{:?}]", m.column, m.key),
+    )
+}
+
+/// Validate every child's acknowledgement and static type before composition.
+/// A map column can be typed while its key is absent from this child.
+pub fn validate_browse_metadata(
+    sort: &[pb::BrowseSort],
+    response: &pb::BrowseShardResponse,
+) -> Result<(), tonic::Status> {
+    use pb::ScalarValueType as Type;
+    let refuse = tonic::Status::failed_precondition;
+    if sort.iter().any(|s| s.map.is_some())
+        && response.sort_contract_version < MAP_SORT_CONTRACT_VERSION
+    {
+        return Err(refuse(
+            "shard omitted the map sort contract acknowledgement; update every node and relay",
+        ));
+    }
+    if response.sort_columns_known.len() != sort.len()
+        || response.sort_column_types.len() != sort.len()
+    {
+        return Err(refuse("shard omitted sorted column type metadata; all nodes must use the matching sort contract"));
+    }
+    if !response.doc_ids.is_empty() && response.sort_columns_known.iter().any(|known| !known) {
+        return Err(refuse(
+            "shard returned sorted rows for an unresolved sort key",
+        ));
+    }
+    for ((sort, &known), &raw) in sort
+        .iter()
+        .zip(&response.sort_columns_known)
+        .zip(&response.sort_column_types)
+    {
+        let kind = Type::try_from(raw)
+            .map_err(|_| refuse("shard returned an unknown sort column type"))?;
+        if kind == Type::Boolean
+            || (known && kind == Type::Unspecified)
+            || (sort.map.is_none() && known != (kind != Type::Unspecified))
+        {
+            return Err(refuse(
+                "shard sort column type disagrees with its known flag",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// One key of one row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Key {

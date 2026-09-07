@@ -3291,6 +3291,9 @@ pub fn merge_browse_pages(
         id: u64,
         row: Option<crate::pb::SortKeyRow>,
     }
+    for sort in &req.sort {
+        crate::sortkeys::target_field(&sort.column, sort.map.as_ref())?;
+    }
     let sorted = !req.sort.is_empty();
     let mut geo_known: Option<Vec<bool>> = None;
     let mut filter_known: Option<Vec<bool>> = None;
@@ -3300,6 +3303,7 @@ pub fn merge_browse_pages(
     let mut segments_skipped = 0u32;
     let mut rows: Vec<Row> = Vec::new();
     for (child, share) in shares.iter().enumerate() {
+        crate::sortkeys::validate_browse_metadata(&req.sort, share)?;
         merge_known("geo", child, &mut geo_known, &share.geo_columns_known)?;
         merge_known(
             "filter",
@@ -3355,6 +3359,21 @@ pub fn merge_browse_pages(
                     req.sort.len()
                 )));
             }
+            if row.values.len() != req.sort.len() {
+                return Err(Status::failed_precondition(
+                    "relay: sorted row has the wrong value width",
+                ));
+            }
+            for ((key, value), &raw) in keys.iter().zip(&row.values).zip(&share.sort_column_types) {
+                let kind = crate::pb::ScalarValueType::try_from(raw).expect("validated metadata");
+                if !crate::sortkeys::key_matches_type(key, kind)
+                    || crate::sortkeys::value_from_pb(value).is_none_or(|v| v.column_type() != kind)
+                {
+                    return Err(Status::failed_precondition(
+                        "relay: sort row disagrees with its declared column type",
+                    ));
+                }
+            }
             rows.push(Row {
                 keys,
                 id,
@@ -3366,6 +3385,7 @@ pub fn merge_browse_pages(
     rows.sort_by(|a, b| cmp_rows(&a.keys, a.id, &b.keys, b.id, &descending));
     rows.truncate(req.k as usize);
     Ok(crate::pb::BrowseShardResponse {
+        sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
         doc_ids: rows.iter().map(|r| r.id).collect(),
         geo_columns_known: geo_known.unwrap_or_default(),
         filter_columns_known: filter_known.unwrap_or_default(),
@@ -4402,6 +4422,10 @@ impl NodeService for RelayService {
                 req.candidate_ids.iter().copied().collect();
             let mut identity_ids = std::collections::HashSet::new();
             for (shard, share) in shares {
+                crate::values::validate_map_fetch_contract(
+                    &req.projections,
+                    share.typed_map_contract_version,
+                )?;
                 if share.identities_included != req.include_identities
                     || (!req.include_identities && !share.identities.is_empty())
                 {
@@ -4450,6 +4474,7 @@ impl NodeService for RelayService {
                 &receipts,
             )?;
             Ok(Response::new(crate::pb::FetchValuesResponse {
+                typed_map_contract_version: crate::values::TYPED_MAP_FETCH_VERSION,
                 rows,
                 identities,
                 identities_included: req.include_identities,
@@ -4945,6 +4970,9 @@ impl NodeService for RelayService {
             let req = request.into_inner();
             if req.k == 0 {
                 return Err(Status::invalid_argument("browse requires k > 0"));
+            }
+            for sort in &req.sort {
+                crate::sortkeys::target_field(&sort.column, sort.map.as_ref())?;
             }
             let (pinned, frozen, children, claims) = self.open_children(
                 "BrowseShard",

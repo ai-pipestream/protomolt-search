@@ -2,8 +2,9 @@
 
 Status: implemented on `feat/integer-map-storage-2026-09` for filters, key
 presence, typed value expressions, materialization and expression-based
-aggregates. Direct map sorting/collapse, bounded score stages, exact range
-facets and column statistics remain unfinished. See
+aggregates. [Direct map sorting/collapse](integer-map-order.md) is also
+implemented. Bounded score stages, exact range facets and column statistics
+remain unfinished. See
 [map projection](map-projection.md) and [storage](integer-map-storage.md).
 
 ## Protobuf operators and older nodes
@@ -27,7 +28,10 @@ This prevents a mixed cluster from treating an integer-map column on an older
 node as unknown and silently omitting its rows while another node answers.
 Map queries emitted by the new compiler therefore require updated node and
 relay decoders; legacy protobuf operators remain usable for their original
-families. This check is part of the request encoding, not a racy health probe.
+families. Candidate fetches also require the typed-map response acknowledgement
+described in [map order](integer-map-order.md#exact-ordering-and-composition),
+including from empty nodes that previously skipped expression validation.
+These checks use request/response contracts, not health probes.
 
 ## Exact values and missing entries
 
@@ -85,7 +89,7 @@ same exact numeric map comparisons. A denied streaming projection emits no hits.
 
 Schema reports now expose MAP_SIGNED_INTEGER (9) and MAP_UNSIGNED_INTEGER (10).
 Their constraints distinguish the implemented query operations from the
-remaining sort, score, facet and statistics work. This does not complete the
+remaining score, facet and statistics work. This does not complete the
 broader network authorization, catalog identity or durability goals.
 
 ## Validation, 2026-09-07

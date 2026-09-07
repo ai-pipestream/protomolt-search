@@ -663,6 +663,7 @@ async fn observe(addrs: &[String], analysis: &str, queries: &[Vec<f32>]) -> Read
             k: 100_000,
             first_page: true,
             sort: vec![BrowseSort {
+                map: None,
                 column: "num".into(),
                 descending: false,
             }],

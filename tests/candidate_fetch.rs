@@ -552,3 +552,77 @@ async fn coordinator_refuses_old_or_inconsistent_fetch_peers_before_publishing_v
     server.abort();
     let _ = server.await;
 }
+
+#[tokio::test]
+async fn typed_map_fetch_requires_empty_peers_to_acknowledge_declared_types() {
+    let projections = vec![projection("values['']")];
+    let current = FetchValuesResponse {
+        typed_map_contract_version: 1,
+        rows: vec![FetchedRow {
+            doc_id: 0,
+            values: vec![ProjectedValue {
+                value: Some(projected_value::Value::UintValue(u64::MAX)),
+            }],
+            stage_values: vec![],
+        }],
+        projection_types: vec![ScalarValueType::UnsignedInteger as i32],
+        projection_leaves_known: vec![true],
+        stats_epoch: 1,
+        stats_incarnation: vec![2; 32],
+        ..Default::default()
+    };
+    let empty = FetchValuesResponse {
+        projection_types: vec![ScalarValueType::Unspecified as i32],
+        projection_leaves_known: vec![false],
+        stats_epoch: 1,
+        stats_incarnation: vec![3; 32],
+        ..Default::default()
+    };
+    let mut addresses = Vec::new();
+    let mut servers = Vec::new();
+    let mut responses = Vec::new();
+    for response in [current, empty] {
+        let response = Arc::new(std::sync::Mutex::new(response));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        addresses.push(format!("http://{}", listener.local_addr().unwrap()));
+        servers.push(tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(FetchPeer(response.clone()))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        ));
+        responses.push(response);
+    }
+    let coordinator = CoordinatorServiceImpl::new(addresses);
+    let error = coordinator
+        .fetch_values(&[0], &projections, &[])
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(error
+        .message()
+        .contains("typed map fetch contract acknowledgement"));
+    responses[1].lock().unwrap().typed_map_contract_version = 1;
+    let result = coordinator
+        .fetch_values(&[0], &projections, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        result.rows[&0][0].value,
+        Some(projected_value::Value::UintValue(u64::MAX))
+    );
+    responses[1].lock().unwrap().projection_types = vec![ScalarValueType::Integer as i32];
+    assert_eq!(
+        coordinator
+            .fetch_values(&[0], &projections, &[])
+            .await
+            .err()
+            .unwrap()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    for server in servers {
+        server.abort();
+        let _ = server.await;
+    }
+}

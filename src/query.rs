@@ -1038,9 +1038,7 @@ pub(crate) async fn execute(
     };
     if !req.sort.is_empty() {
         for sort in &req.sort {
-            if sort.column.is_empty() {
-                return Err(refuse("sort names no column"));
-            }
+            crate::sortkeys::target_field(&sort.column, sort.map.as_ref())?;
         }
         match &plan.shape {
             Shape::Browse => {}
@@ -1090,9 +1088,7 @@ pub(crate) async fn execute(
         }
     }
     if let Some(collapse) = &req.collapse {
-        if collapse.column.is_empty() {
-            return Err(refuse("collapse names no column"));
-        }
+        crate::sortkeys::target_field(&collapse.column, collapse.map.as_ref())?;
         if matches!(plan.shape, Shape::Browse) {
             return Err(refuse(
                 "collapse needs a SCORED selection: a browse has no order to pick a \
@@ -1966,6 +1962,7 @@ async fn execute_browse(
             .sort
             .iter()
             .map(|s| crate::pb::BrowseSort {
+                map: s.map.clone(),
                 column: s.column.clone(),
                 descending: s.descending,
             })
@@ -2120,21 +2117,37 @@ impl GroupKey {
 /// without a value is absent.
 async fn collapse_keys(
     coordinator: &CoordinatorServiceImpl,
-    column: &str,
+    selector: &crate::pb::CollapseSpec,
     ids: &[u64],
 ) -> Result<std::collections::HashMap<u64, GroupKey>, Status> {
+    let column = crate::sortkeys::target_name(&selector.column, selector.map.as_ref());
     let mut keys = std::collections::HashMap::with_capacity(ids.len());
-    if column == "parent_id" || column == "group_id" {
-        for (id, v) in coordinator.lineage_key(ids, column).await? {
+    if selector.map.is_none() && (column == "parent_id" || column == "group_id") {
+        for (id, v) in coordinator.lineage_key(ids, &column).await? {
             keys.insert(id, GroupKey::UnsignedInteger(v));
         }
         return Ok(keys);
     }
-    let compiled = crate::coordinator::compile_projections(&[crate::pb::NamedProjection {
-        name: column.to_string(),
-        expression: column.to_string(),
-    }])?;
+    let compiled = vec![crate::pb::CompiledProjection {
+        name: column.clone(),
+        expr: Some(crate::pb::ValueExpr {
+            expr: Some(match &selector.map {
+                Some(map) => crate::pb::value_expr::Expr::TypedMap(map.clone()),
+                None => crate::pb::value_expr::Expr::Column(column.clone()),
+            }),
+        }),
+    }];
     let fetched = coordinator.fetch_values(ids, &compiled, &[]).await?;
+    if fetched.projection_types.iter().any(|ty| {
+        matches!(
+            ty,
+            crate::pb::ScalarValueType::Number | crate::pb::ScalarValueType::Boolean
+        )
+    }) {
+        return Err(refuse(format!(
+            "collapse by {column:?}: a double or bool column is not a group identity"
+        )));
+    }
     for (id, values) in fetched.rows {
         let Some(value) = values.first().and_then(|v| v.value.as_ref()) else {
             continue;
@@ -2184,7 +2197,7 @@ async fn page_or_collapse(
     let t0 = std::time::Instant::now();
     let pool_full = hits.len() as u64 >= u64::from(pool_depth);
     let ids: Vec<u64> = hits.iter().map(|h| h.doc_id).collect();
-    let keys = collapse_keys(coordinator, &collapse.column, &ids).await?;
+    let keys = collapse_keys(coordinator, collapse, &ids).await?;
     // Groups in first-appearance order; the pool's order is the
     // selection's order, so the first hit of a group is its best.
     let mut index: std::collections::HashMap<GroupKey, usize> = std::collections::HashMap::new();
@@ -2214,7 +2227,7 @@ async fn page_or_collapse(
                  ranking under the cursor; re-run from the first page with a larger \
                  selection_k",
                 groups.len(),
-                collapse.column
+                crate::sortkeys::target_name(&collapse.column, collapse.map.as_ref())
             )));
         }
         // At max_k with too few groups: what the pool holds is served,

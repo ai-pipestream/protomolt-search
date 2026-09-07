@@ -75,10 +75,12 @@ async fn verify(coordinator: &CoordinatorServiceImpl) {
                 let mut req = request(selection);
                 req.sort = vec![
                     pb::QuerySort {
+                        map: None,
                         column: column.into(),
                         descending: desc,
                     },
                     pb::QuerySort {
+                        map: None,
                         column: "key".into(),
                         descending: !desc,
                     },
@@ -182,6 +184,7 @@ async fn verify(coordinator: &CoordinatorServiceImpl) {
         let mut req = request(lexical());
         req.selection_k = 100;
         req.collapse = Some(pb::CollapseSpec {
+            map: None,
             column: column.into(),
             inner_hits: 100,
         });
@@ -432,6 +435,7 @@ async fn incompatible_shard_types_refuse_even_when_no_rows_match() {
             })),
         });
         req.sort = vec![pb::QuerySort {
+            map: None,
             column: "value".into(),
             descending: false,
         }];
@@ -496,6 +500,7 @@ async fn incompatible_shard_types_refuse_even_when_no_rows_match() {
     }
     let mut req = request(lexical());
     req.collapse = Some(pb::CollapseSpec {
+        map: None,
         column: "value".into(),
         inner_hits: 2,
     });
@@ -519,6 +524,7 @@ async fn incompatible_shard_types_refuse_even_when_no_rows_match() {
             first_page: false,
             after: 10,
             sort: vec![pb::BrowseSort {
+                map: None,
                 column: "value".into(),
                 descending: false,
             }],

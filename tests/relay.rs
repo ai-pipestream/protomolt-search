@@ -1981,6 +1981,7 @@ async fn browse_pages_and_projections_through_relays_equal_the_flat_root() {
         ..Default::default()
     };
     let by_year = vec![pipestream_search::pb::QuerySort {
+        map: None,
         column: "year".into(),
         descending: true,
     }];

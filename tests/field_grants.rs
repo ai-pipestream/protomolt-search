@@ -1129,6 +1129,7 @@ async fn public_query_redacts_stored_dimensions_and_inner_hit_identity_without_c
     let owner = cluster_subset(true, false, true).await;
     let request_body = QueryRequest {
         collapse: Some(CollapseSpec {
+            map: None,
             column: "color".into(),
             inner_hits: 2,
         }),
@@ -1262,6 +1263,7 @@ async fn public_query_admits_every_field_before_statistics_or_selection() {
         },
         QueryRequest {
             sort: vec![QuerySort {
+                map: None,
                 column: "secret".into(),
                 descending: false,
             }],
@@ -1269,6 +1271,7 @@ async fn public_query_admits_every_field_before_statistics_or_selection() {
         },
         QueryRequest {
             collapse: Some(CollapseSpec {
+                map: None,
                 column: "secret".into(),
                 inner_hits: 2,
             }),
@@ -1434,6 +1437,7 @@ async fn field_granted_boolean_browse_and_boost_queries_match_unrestricted_execu
         QueryRequest {
             selection: Some(filter),
             sort: vec![QuerySort {
+                map: None,
                 column: "boost".into(),
                 descending: true,
             }],
@@ -1624,6 +1628,7 @@ async fn document_queries_and_every_stream_revision_match_the_visible_corpus() {
         QueryRequest {
             selection: Some(filter("boost > 0")),
             sort: vec![QuerySort {
+                map: None,
                 column: "boost".into(),
                 descending: true,
             }],
@@ -1636,6 +1641,7 @@ async fn document_queries_and_every_stream_revision_match_the_visible_corpus() {
         },
         QueryRequest {
             collapse: Some(CollapseSpec {
+                map: None,
                 column: "color".into(),
                 inner_hits: 4,
             }),
@@ -1848,6 +1854,7 @@ async fn document_views_compose_with_field_redaction_and_pagination() {
     );
     let query = QueryRequest {
         collapse: Some(CollapseSpec {
+            map: None,
             column: "color".into(),
             inner_hits: 4,
         }),
@@ -2078,6 +2085,77 @@ async fn exact_integer_maps_require_separate_use_and_disclosure_grants() {
             false,
         ),
     );
+    for collapse in [false, true] {
+        let mut ordered = public_query();
+        let map = MapRead {
+            column: "unsigned".into(),
+            key: "".into(),
+        };
+        if collapse {
+            ordered.collapse = Some(CollapseSpec {
+                map: Some(map),
+                ..Default::default()
+            });
+        } else {
+            ordered.sort = vec![QuerySort {
+                map: Some(map),
+                ..Default::default()
+            }];
+        }
+        let before = owner.stats_cache().fetch_count();
+        for denied in [&reader, &use_only] {
+            assert_eq!(
+                denied
+                    .query(request(ordered.clone()))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Code::PermissionDenied
+            );
+        }
+        assert_eq!(
+            owner.stats_cache().fetch_count(),
+            before,
+            "map order admission must precede reads"
+        );
+        let result = allowed
+            .query(request(ordered.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        let value = if collapse {
+            result.groups[0].key.as_ref().unwrap()
+        } else {
+            &result.hits[0].sort_values[0]
+        };
+        assert_eq!(
+            value.value,
+            Some(sort_value::Value::UnsignedInteger(u64::MAX))
+        );
+        let mut stream = use_only
+            .query_stream(request(QueryStreamRequest {
+                query: Some(ordered),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut completed = false;
+        while let Some(event) = stream.next().await {
+            match event.unwrap().payload.unwrap() {
+                query_stream_response::Payload::Revision(revision) => {
+                    assert!(revision.hits.is_empty())
+                }
+                query_stream_response::Payload::Completion(end) => {
+                    assert!(!end.completed);
+                    assert_eq!(end.error_code, Code::PermissionDenied as u32);
+                    assert!(end.response.is_none());
+                    completed = true;
+                }
+            }
+        }
+        assert!(completed);
+    }
     let expected = allowed
         .query(request(projected.clone()))
         .await

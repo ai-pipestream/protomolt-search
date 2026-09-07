@@ -43,11 +43,15 @@ transport, embedding, and availability work.
 Exact signed and unsigned map storage and document transport are being built
 on `feat/integer-map-storage-2026-09`. The branch supports typed document
 entries, descriptor-driven integer map projection, WAL replay and segment
-transplant. Exact map filters, typed expressions and expression-based aggregates
-are supported; map sorting, bounded scoring, range facets and statistics remain
-incomplete. See [integer map queries](docs/integer-map-queries.md) and
+transplant. Exact map filters, typed expressions, expression-based aggregates
+and [map sorting/collapse](docs/integer-map-order.md) are supported. Bounded
+scoring, range facets and statistics remain incomplete. See
+[integer map queries](docs/integer-map-queries.md) and
 [integer map storage](docs/integer-map-storage.md) for the compatibility gates
 and current validation scope.
+The parallel derived-column design has a
+[reconciliation note](docs/derived-column-reconciliation.md) covering durable
+metadata, evaluator semantics and reserved wire/storage allocations.
 
 The current embedded adapter pins the fork branch recorded in `Cargo.toml` and
 uses TurboVec's current `.tv` persistence format. Provider images are opaque to

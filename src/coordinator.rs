@@ -775,6 +775,8 @@ type AggregatedHits = (
 /// shard knows is refused by name, the usual typo rule.
 /// The evaluated values for one candidate set (`fetch_values`).
 pub struct FetchedValues {
+    /// Agreed declaration types, including empty nodes and absent candidate values.
+    pub projection_types: Vec<crate::pb::ScalarValueType>,
     /// Explicit identity/absence records when requested, under the same receipt.
     pub identities: HashMap<u64, Option<crate::pb::DocumentIdentity>>,
     /// doc -> projected values, aligned with the request projections.
@@ -9275,6 +9277,7 @@ impl CoordinatorServiceImpl {
         }
         let mut identity_bytes = 0usize;
         let mut out = FetchedValues {
+            projection_types: vec![crate::pb::ScalarValueType::Unspecified; projections.len()],
             identities: HashMap::new(),
             rows: HashMap::new(),
             stage_rows: vec![HashMap::new(); stages.len()],
@@ -9331,6 +9334,10 @@ impl CoordinatorServiceImpl {
             responses.insert(shard, response?);
         }
         for (shard, resp) in responses {
+            crate::values::validate_map_fetch_contract(
+                projections,
+                resp.typed_map_contract_version,
+            )?;
             scope.validate_echo(&resp.visibility_fingerprint, &resp.visibility_columns_known)?;
             let claim = StatsClaim::required(resp.stats_epoch, &resp.stats_incarnation)?;
             if epochs.is_some_and(|epochs| epochs[shard] != claim) {
@@ -9434,6 +9441,7 @@ impl CoordinatorServiceImpl {
                 unknown_projection.join(", ")
             )));
         }
+        out.projection_types = projection_types;
         Ok(out)
     }
 
@@ -9595,6 +9603,9 @@ impl CoordinatorServiceImpl {
     ) -> Result<BrowseRows, Status> {
         use crate::sortkeys::{cmp_rows, Key, Value};
         let k = self.resolve_k(k)?;
+        for key in sort {
+            crate::sortkeys::target_field(&key.column, key.map.as_ref())?;
+        }
         if let Some(fields) = &self.field_permissions {
             fields.browse(filters, sort, lexical_terms)?;
         }
@@ -9674,37 +9685,29 @@ impl CoordinatorServiceImpl {
                 segments_total: response.segments_total,
                 segments_skipped: response.segments_skipped,
             });
-            if response.sort_columns_known.len() != sort.len()
-                || response.sort_column_types.len() != sort.len()
-            {
-                return Err(Status::failed_precondition("shard omitted sorted column type metadata; all nodes must use the matching sort contract"));
-            }
+            crate::sortkeys::validate_browse_metadata(sort, &response)?;
             for (i, (&known, &raw_type)) in response
                 .sort_columns_known
                 .iter()
                 .zip(&response.sort_column_types)
                 .enumerate()
             {
-                let kind = crate::pb::ScalarValueType::try_from(raw_type).map_err(|_| {
-                    Status::failed_precondition("shard returned an unknown sort column type")
-                })?;
-                if kind == crate::pb::ScalarValueType::Boolean
-                    || known != (kind != crate::pb::ScalarValueType::Unspecified)
-                {
-                    return Err(Status::failed_precondition(
-                        "shard sort column type disagrees with its known flag",
-                    ));
-                }
-                if known {
-                    if sort_known[i] && sort_types[i] != kind {
+                let kind =
+                    crate::pb::ScalarValueType::try_from(raw_type).expect("validated metadata");
+                if kind != crate::pb::ScalarValueType::Unspecified {
+                    if sort_types[i] != crate::pb::ScalarValueType::Unspecified
+                        && sort_types[i] != kind
+                    {
                         return Err(Status::failed_precondition(format!(
                             "sort column {:?} has incompatible types across shards: {:?} and {:?}",
-                            sort[i].column, sort_types[i], kind
+                            crate::sortkeys::target_name(&sort[i].column, sort[i].map.as_ref()),
+                            sort_types[i],
+                            kind
                         )));
                     }
-                    sort_known[i] = true;
                     sort_types[i] = kind;
                 }
+                sort_known[i] |= known;
             }
             if sort.is_empty() {
                 rows.extend(response.doc_ids.iter().map(|&id| Row {
@@ -9756,10 +9759,8 @@ impl CoordinatorServiceImpl {
         for (sort, known) in sort.iter().zip(&sort_known) {
             if !known {
                 return Err(Status::invalid_argument(format!(
-                    "sort column {:?} is not declared on any shard's numeric, integer, unsigned integer, or \
-                     facet table (--numeric-fields / --integer-fields / --unsigned-integer-fields / --facet-fields), \
-                     and is not a lineage key (parent_id, group_id)",
-                    sort.column
+                    "sort column or map entry {:?} is not declared on any shard; check the column and key",
+                    crate::sortkeys::target_name(&sort.column, sort.map.as_ref())
                 )));
             }
         }
@@ -15621,6 +15622,7 @@ mod scoped_fold_tests {
         };
         let reader = owner.for_access(Some(&access), "aggregate").unwrap();
         let sort = [BrowseSort {
+            map: None,
             column: "color".into(),
             descending: false,
         }];
@@ -15669,6 +15671,7 @@ mod scoped_fold_tests {
         for (sort, terms, filter) in [
             (
                 vec![BrowseSort {
+                    map: None,
                     column: "body".into(),
                     descending: false,
                 }],
@@ -15678,6 +15681,7 @@ mod scoped_fold_tests {
             (vec![], vec![], "audience == 'public'"),
             (
                 vec![BrowseSort {
+                    map: None,
                     column: "parent_id".into(),
                     descending: false,
                 }],

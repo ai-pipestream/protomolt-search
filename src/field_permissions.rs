@@ -185,7 +185,10 @@ impl FieldScope {
             self.require_use("body")?;
         }
         for key in sort {
-            self.dictionary(&key.column)?;
+            self.dictionary(crate::sortkeys::target_field(
+                &key.column,
+                key.map.as_ref(),
+            )?)?;
         }
         Ok(())
     }

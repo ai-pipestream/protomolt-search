@@ -724,6 +724,7 @@ async fn shapes_without_a_score_refuse_explain_by_name() {
             explain: true,
             selection: Some(lexical_leaf("lex", lexical_query("document"))),
             sort: vec![QuerySort {
+                map: None,
                 column: "year".into(),
                 descending: true,
             }],

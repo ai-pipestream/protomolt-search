@@ -547,6 +547,7 @@ async fn scorer_interplays_refuse_by_name() {
                 k: 5,
                 selection: Some(lexical_leaf("lex", "zebra")),
                 sort: vec![QuerySort {
+                    map: None,
                     column: "year".into(),
                     descending: true,
                 }],

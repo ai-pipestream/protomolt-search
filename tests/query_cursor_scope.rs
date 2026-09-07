@@ -301,6 +301,7 @@ async fn altered_paging_and_sort_requests_are_refused_before_fanout() {
             0 => changed.k = 2,
             1 => changed.selection_k = 2,
             2 => changed.sort.push(QuerySort {
+                map: None,
                 column: "unknown_column".into(),
                 descending: true,
             }),

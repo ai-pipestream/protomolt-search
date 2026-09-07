@@ -338,6 +338,7 @@ fn cases(queries: Vec<Vec<f32>>) -> Vec<Case> {
         label: "browse year >= 2018, sorted by year",
         build: Box::new(|_| QueryRequest {
             sort: vec![QuerySort {
+                map: None,
                 column: "year".into(),
                 descending: false,
             }],

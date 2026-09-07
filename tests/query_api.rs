@@ -321,6 +321,7 @@ async fn every_query_shape_and_collapse_carries_imported_identity() {
         for collapse in [
             None,
             Some(CollapseSpec {
+                map: None,
                 column: "court".into(),
                 inner_hits: 4,
             }),
@@ -1799,6 +1800,7 @@ async fn sorted_browse_orders_by_column_and_pages() {
     let (coordinator, _qvec, _handles) = start_cluster().await;
     let selection = || cel_filter("f", "year >= 1");
     let by = |column: &str, descending: bool| QuerySort {
+        map: None,
         column: column.into(),
         descending,
     };
@@ -1895,6 +1897,7 @@ async fn sorted_browse_orders_by_column_and_pages() {
 async fn multi_key_sort_orders_text_then_number_and_pages() {
     let (coordinator, _qvec, _handles) = start_cluster().await;
     let by = |column: &str, descending: bool| QuerySort {
+        map: None,
         column: column.into(),
         descending,
     };
@@ -2011,6 +2014,7 @@ async fn a_lexical_leaf_sorts_its_exact_membership_without_scores() {
             k: 10,
             selection: Some(lexical_leaf("lex", "zebra")),
             sort: vec![QuerySort {
+                map: None,
                 column: "year".into(),
                 descending: true,
             }],
@@ -2039,6 +2043,7 @@ async fn a_lexical_leaf_sorts_its_exact_membership_without_scores() {
                 None,
             )),
             sort: vec![QuerySort {
+                map: None,
                 column: "year".into(),
                 descending: false,
             }],
@@ -2064,6 +2069,7 @@ async fn a_lexical_leaf_sorts_its_exact_membership_without_scores() {
                 k: 1,
                 selection: Some(lexical_leaf("lex", "zebra")),
                 sort: vec![QuerySort {
+                    map: None,
                     column: "year".into(),
                     descending: true,
                 }],
@@ -2096,6 +2102,7 @@ async fn a_lexical_leaf_sorts_its_exact_membership_without_scores() {
             k: 5,
             selection: Some(phrase),
             sort: vec![QuerySort {
+                map: None,
                 column: "year".into(),
                 descending: true,
             }],
@@ -2112,6 +2119,7 @@ async fn collapse_groups_the_pool_by_key_with_inner_hits_and_pages() {
     let (coordinator, qvec, _handles) = start_cluster().await;
     let collapse = |column: &str, inner_hits: u32| {
         Some(CollapseSpec {
+            map: None,
             column: column.into(),
             inner_hits,
         })
@@ -2359,6 +2367,7 @@ async fn collapse_groups_the_pool_by_key_with_inner_hits_and_pages() {
             selection: Some(lexical_leaf("lex", "document")),
             collapse: collapse("court", 1),
             sort: vec![QuerySort {
+                map: None,
                 column: "year".into(),
                 descending: true,
             }],

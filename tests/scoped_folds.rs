@@ -99,6 +99,7 @@ async fn browse_aggregate_and_quantile_rounds_share_the_view_and_physical_versio
                 expected_stats_epoch: phase.stats_epoch,
                 expected_stats_incarnation: phase.stats_incarnation.clone(),
                 sort: vec![BrowseSort {
+                    map: None,
                     column: "n".into(),
                     descending: false,
                 }],

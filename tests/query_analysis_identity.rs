@@ -388,6 +388,7 @@ async fn public_queries_carry_identity_through_scoring_sorting_boosts_and_member
                         selection: Some(selection(lexical(spec.clone()))),
                         sort: if sorted {
                             vec![QuerySort {
+                                map: None,
                                 column: "ordinal".into(),
                                 descending: true,
                             }]
