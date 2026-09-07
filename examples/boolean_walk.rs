@@ -1,15 +1,19 @@
 //! Time the phases of a shard-side Boolean evaluation offline, over a
 //! sealed segment catalog, the way `EvaluateBoolean` runs them on a
 //! node: the lexical leaf's membership walk, the filter leaf's column
-//! scan, the group AND, the member materialization, the whole-shard
+//! reads, the group AND, the member materialization, the whole-shard
 //! accumulator, the candidate scorer, the top-k pass, and the second
 //! scorer pass over the ranked candidates.
 //!
 //! Usage: `boolean_walk <catalog root> --terms=a,b [--year-ge=N]
-//!         [--depth=N] [--walk=auto|candidates|postings] [--repeat=N]`
+//!         [--depth=N] [--walk=auto|candidates|postings] [--repeat=N]
+//!         [--filter-scan=domain|full]`
 //!
 //! Terms are the stems the analyzer stores (`bm25_tables` prints the
-//! tables; a df of 0 means the term is spelled differently).
+//! tables; a df of 0 means the term is spelled differently). The filter
+//! phase defaults to the node's narrowing: the MUST filter leaf reads
+//! its column over the lexical sibling's members only; `full` is the
+//! A/B baseline, the whole-shard column scan.
 use pipestream_search::bm25::{self, Bm25Params, CandidateWalk, CorpusStats};
 use pipestream_search::boolean_bits::Bits;
 use pipestream_search::postings::{Bm25Index, Bm25Reader, Bm25Store};
@@ -108,7 +112,7 @@ fn run() -> Result<(), String> {
     let root = args
         .iter()
         .find(|a| !a.starts_with("--"))
-        .ok_or("usage: boolean_walk <catalog root> --terms=a,b [--year-ge=N] [--depth=N] [--walk=auto|candidates|postings] [--repeat=N]")?;
+        .ok_or("usage: boolean_walk <catalog root> --terms=a,b [--year-ge=N] [--depth=N] [--walk=auto|candidates|postings] [--repeat=N] [--filter-scan=domain|full]")?;
     let opt = |key: &str| {
         args.iter()
             .find_map(|a| a.strip_prefix(&format!("--{key}=")).map(str::to_string))
@@ -131,6 +135,11 @@ fn run() -> Result<(), String> {
         Some("candidates") => CandidateWalk::Candidates,
         Some("postings") => CandidateWalk::Postings,
         Some(other) => return Err(format!("--walk={other}: auto, candidates, or postings")),
+    };
+    let filter_domain = match opt("filter-scan").as_deref() {
+        None | Some("domain") => true,
+        Some("full") => false,
+        Some(other) => return Err(format!("--filter-scan={other}: domain or full")),
     };
     let root = Path::new(root);
     let t = Instant::now();
@@ -181,14 +190,27 @@ fn run() -> Result<(), String> {
             });
         }
         let t_lex = ms(t);
-        // Filter leaf membership: a column scan.
+        // Filter leaf membership: the column reads, over the lexical
+        // sibling's members (the node's narrowing) or over every row
+        // (the A/B baseline).
         let t = Instant::now();
         let filter = match (year_ge, year_ii) {
             (Some(bound), Some(ii)) => {
                 let mut bits = Bits::empty(n);
-                for doc in 0..n as u32 {
-                    if shard.integer_value(ii, doc).is_some_and(|y| y >= bound) {
-                        bits.set(doc as usize);
+                if filter_domain {
+                    for doc in lexical.iter() {
+                        if shard
+                            .integer_value(ii, doc as u32)
+                            .is_some_and(|y| y >= bound)
+                        {
+                            bits.set(doc);
+                        }
+                    }
+                } else {
+                    for doc in 0..n as u32 {
+                        if shard.integer_value(ii, doc).is_some_and(|y| y >= bound) {
+                            bits.set(doc as usize);
+                        }
                     }
                 }
                 Some(bits)
@@ -255,10 +277,11 @@ fn run() -> Result<(), String> {
         let t_again = ms(t);
         let total = t_lex + t_filter + t_and + t_materialize + t_alloc + t_score + t_topk + t_again;
         println!(
-            "terms={terms:?} year_ge={year_ge:?} walk={walk:?} n={n} lexical={} filter={} members={} \
+            "terms={terms:?} year_ge={year_ge:?} walk={walk:?} scan={} n={n} lexical={} filter={} members={} \
              candidates={} unscored={missing} | lexical {t_lex:.1} filter {t_filter:.1} and {t_and:.1} \
              materialize {t_materialize:.1} alloc {t_alloc:.1} score {t_score:.1} topk {t_topk:.1} \
              again {t_again:.1} | total {total:.1} ms",
+            if filter_domain { "domain" } else { "full" },
             lexical.count(),
             filter.as_ref().map_or(n as u64, Bits::count),
             members.count(),
