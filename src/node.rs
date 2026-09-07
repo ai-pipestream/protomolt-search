@@ -6590,6 +6590,15 @@ impl NodeServiceImpl {
             let store = Bm25Shard::open(&bm25_tmp).map_err(|e| {
                 Status::invalid_argument(format!("snapshot sidecar is not a valid BM25 store: {e}"))
             })?;
+            // The store's derived-column declaration must be this
+            // shard's before anything swaps (docs/derived-columns.md).
+            check_attached_derived(
+                &self.config,
+                store.derived(),
+                store.doc_count(),
+                "the installed snapshot's store",
+            )
+            .map_err(Status::failed_precondition)?;
             u64::from(store.next_doc_id())
         } else {
             0

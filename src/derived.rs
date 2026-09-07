@@ -997,4 +997,187 @@ mod tests {
             .unwrap_err();
         assert!(err.message().contains("not a column"), "{}", err.message());
     }
+
+    /// The civil date the declaration computes for one epoch-micro
+    /// input, through the full evaluator.
+    fn civil_at(decl: &Declaration, micros: i64) -> (i64, i64, i64) {
+        let doc = AddDocumentsRequest {
+            integers: vec![pb::IntegerValue {
+                field: "decided".into(),
+                value: micros,
+            }],
+            ..Default::default()
+        };
+        let out = decl.apply(doc, None).unwrap();
+        let get = |name: &str| {
+            out.integers
+                .iter()
+                .find(|v| v.field == name)
+                .unwrap_or_else(|| panic!("no {name} computed for {micros}"))
+                .value
+        };
+        (get("y"), get("m"), get("d"))
+    }
+
+    #[test]
+    fn calendar_functions_are_exact_at_the_boundaries() {
+        let decl = Declaration::compile(&pb::DerivedColumns {
+            columns: vec![
+                column("y", pb::MaterializeKind::I64, "calendar.year(decided)"),
+                column("m", pb::MaterializeKind::I64, "calendar.month(decided)"),
+                column("d", pb::MaterializeKind::I64, "calendar.day(decided)"),
+            ],
+        })
+        .unwrap();
+        const DAY: i64 = 86_400_000_000;
+        let at = |y: i64, m: u32, d: u32| crate::calendar::days_from_civil(y, m, d) * DAY;
+        // The proleptic Gregorian edge: the first day of year 1.
+        assert_eq!(civil_at(&decl, at(1, 1, 1)), (1, 1, 1));
+        assert_eq!(civil_at(&decl, at(1, 6, 15) + DAY / 2), (1, 6, 15));
+        // The epoch exactly, and the microsecond before it.
+        assert_eq!(civil_at(&decl, 0), (1970, 1, 1));
+        assert_eq!(civil_at(&decl, -1), (1969, 12, 31));
+        assert_eq!(civil_at(&decl, at(1969, 12, 31) + DAY - 1), (1969, 12, 31));
+        // 2000 is a leap year by the 400-rule; 1900 is not by the
+        // 100-rule, so the microsecond after 1900-02-28 is 1900-03-01.
+        assert_eq!(civil_at(&decl, at(2000, 2, 29)), (2000, 2, 29));
+        assert_eq!(civil_at(&decl, at(2000, 2, 29) + DAY - 1), (2000, 2, 29));
+        assert_eq!(civil_at(&decl, at(1900, 2, 28) + DAY - 1), (1900, 2, 28));
+        assert_eq!(civil_at(&decl, at(1900, 2, 28) + DAY), (1900, 3, 1));
+        // The last microsecond of a UTC day keeps the day.
+        assert_eq!(civil_at(&decl, at(2024, 12, 31) + DAY - 1), (2024, 12, 31));
+        // The ends of the i64 range are exact proleptic dates, not a
+        // wrap into a wrong sign and not a panic: i64::MIN micros is
+        // 290309 BCE (year -290308), i64::MAX is 294247 CE.
+        assert_eq!(civil_at(&decl, i64::MIN), (-290308, 12, 21));
+        assert_eq!(civil_at(&decl, i64::MAX), (294247, 1, 10));
+    }
+
+    #[test]
+    fn integer_boundaries_evaluate_absent_never_wrapped() {
+        let decl = Declaration::compile(&pb::DerivedColumns {
+            columns: vec![
+                column("plus_one", pb::MaterializeKind::I64, "n + 1"),
+                column("minus_one", pb::MaterializeKind::I64, "n - 1"),
+                column("neg", pb::MaterializeKind::I64, "-n"),
+                column("u_mod", pb::MaterializeKind::U64, "u % 64u"),
+                column("u_plus_one", pb::MaterializeKind::U64, "u + 1u"),
+                column(
+                    "bucket",
+                    pb::MaterializeKind::U64,
+                    "hash.fnv64(court) % 64u",
+                ),
+            ],
+        })
+        .unwrap();
+        let run = |n: Option<i64>, u: Option<u64>, court: Option<&str>| {
+            let mut doc = AddDocumentsRequest::default();
+            if let Some(n) = n {
+                doc.integers.push(pb::IntegerValue {
+                    field: "n".into(),
+                    value: n,
+                });
+            }
+            if let Some(u) = u {
+                doc.unsigned_integers.push(pb::UnsignedIntegerValue {
+                    field: "u".into(),
+                    value: u,
+                });
+            }
+            if let Some(court) = court {
+                doc.facets.push(pb::FacetValue {
+                    field: "court".into(),
+                    value: court.into(),
+                });
+            }
+            decl.apply(doc, None).unwrap()
+        };
+        let int_of = |doc: &AddDocumentsRequest, name: &str| {
+            doc.integers
+                .iter()
+                .find(|v| v.field == name)
+                .map(|v| v.value)
+        };
+        let uint_of = |doc: &AddDocumentsRequest, name: &str| {
+            doc.unsigned_integers
+                .iter()
+                .find(|v| v.field == name)
+                .map(|v| v.value)
+        };
+        // i64::MAX: + 1 overflows to absence; - 1 and negation hold.
+        // u64::MAX: % 64 is 63; + 1u overflows to absence.
+        let out = run(Some(i64::MAX), Some(u64::MAX), Some("scotus"));
+        assert_eq!(int_of(&out, "plus_one"), None);
+        assert_eq!(int_of(&out, "minus_one"), Some(i64::MAX - 1));
+        assert_eq!(int_of(&out, "neg"), Some(-i64::MAX));
+        assert_eq!(uint_of(&out, "u_mod"), Some(u64::MAX % 64));
+        assert_eq!(uint_of(&out, "u_plus_one"), None);
+        assert_eq!(
+            uint_of(&out, "bucket"),
+            Some(values::fnv1a64_bytes(b"scotus") % 64)
+        );
+        // i64::MIN: - 1 and the negation overflow to absence; + 1 holds.
+        let out = run(Some(i64::MIN), Some(0), None);
+        assert_eq!(int_of(&out, "plus_one"), Some(i64::MIN + 1));
+        assert_eq!(int_of(&out, "minus_one"), None);
+        assert_eq!(int_of(&out, "neg"), None);
+        assert_eq!(uint_of(&out, "u_mod"), Some(0));
+        assert_eq!(uint_of(&out, "u_plus_one"), Some(1));
+        // An absent facet stores no bucket.
+        assert_eq!(uint_of(&out, "bucket"), None);
+    }
+
+    #[test]
+    fn fnv64_is_one_function_for_ingest_and_routing() {
+        // The published FNV-1a 64 vectors pin the function itself.
+        assert_eq!(values::fnv1a64_bytes(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(values::fnv1a64_bytes(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(values::fnv1a64_bytes(b"foobar"), 0x8594_4171_f739_67e8);
+        // The coordinator's routing hash and the derived-column hash
+        // are the same function over the same bytes, binary input
+        // included: an ingest-time key bucket and the coordinator's
+        // routing cannot drift apart.
+        let long = [0xabu8; 1024];
+        let inputs: [&[u8]; 4] = [b"", b"case-1", &[0x00, 0xff, 0x7f, 0x80], &long];
+        for input in inputs {
+            assert_eq!(
+                crate::coordinator::stable_routing_hash(input),
+                values::fnv1a64_bytes(input),
+                "{input:?}"
+            );
+        }
+        // The declaration path stores exactly that function's output.
+        let decl = Declaration::compile(&pb::DerivedColumns {
+            columns: vec![
+                column("court_hash", pb::MaterializeKind::U64, "hash.fnv64(court)"),
+                column(
+                    "key_bucket",
+                    pb::MaterializeKind::U64,
+                    "hash.fnv64(stable_key()) % 64u",
+                ),
+            ],
+        })
+        .unwrap();
+        let doc = AddDocumentsRequest {
+            facets: vec![pb::FacetValue {
+                field: "court".into(),
+                value: "scotus".into(),
+            }],
+            ..Default::default()
+        };
+        let out = decl.apply(doc, Some(b"case-1")).unwrap();
+        assert_eq!(
+            out.unsigned_integers,
+            vec![
+                pb::UnsignedIntegerValue {
+                    field: "court_hash".into(),
+                    value: crate::coordinator::stable_routing_hash(b"scotus"),
+                },
+                pb::UnsignedIntegerValue {
+                    field: "key_bucket".into(),
+                    value: crate::coordinator::stable_routing_hash(b"case-1") % 64,
+                },
+            ]
+        );
+    }
 }

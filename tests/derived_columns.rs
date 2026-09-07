@@ -387,6 +387,47 @@ async fn forged_values_stamped_fingerprints_and_redefinitions_are_refused() {
         "{}",
         err.message()
     );
+    // Every value family refuses the same way, not only integers.
+    let mut forged = document(0);
+    forged
+        .unsigned_integers
+        .push(pipestream_search::pb::UnsignedIntegerValue {
+            field: "court_hash".into(),
+            value: 42,
+        });
+    let err = ingest(&addr, vec![forged]).await.unwrap_err();
+    assert!(
+        err.message().contains("refused as forged"),
+        "{}",
+        err.message()
+    );
+    let mut forged = document(0);
+    forged.numerics.push(pipestream_search::pb::NumericValue {
+        field: "court_hash".into(),
+        value: 1.0,
+    });
+    let err = ingest(&addr, vec![forged]).await.unwrap_err();
+    assert!(
+        err.message().contains("refused as forged"),
+        "{}",
+        err.message()
+    );
+    let mut forged = document(0);
+    forged
+        .timestamps
+        .push(pipestream_search::pb::TimestampValue {
+            field: "year_d".into(),
+            value: Some(prost_types::Timestamp {
+                seconds: 1_420_070_400,
+                nanos: 0,
+            }),
+        });
+    let err = ingest(&addr, vec![forged]).await.unwrap_err();
+    assert!(
+        err.message().contains("refused as forged"),
+        "{}",
+        err.message()
+    );
     let mut stamped = document(0);
     stamped.derived_fingerprint = declaration().fingerprint().to_string();
     let err = ingest(&addr, vec![stamped]).await.unwrap_err();
@@ -782,4 +823,602 @@ async fn the_backfill_stores_what_direct_ingest_stores() {
     handle.abort();
     assert_eq!(backfilled, direct);
     assert_eq!(direct, expected_rows(0..N));
+}
+
+/// A changed declaration: `calendar.year(decided) - 1900` reads the
+/// same input and stores the same kind, so only the fingerprints tell
+/// it apart from `spec()`.
+fn changed_declaration() -> Arc<Declaration> {
+    let mut changed = spec();
+    changed.columns[0].expression = "calendar.year(decided) - 1900".into();
+    Arc::new(Declaration::compile(&changed).unwrap())
+}
+
+#[test]
+fn an_empty_store_keeps_its_declaration_through_save_and_attach() {
+    let dir = tempdir("empty-store");
+    let index_path = dir.join("shard.tv");
+    let declaration = declaration();
+    // A zero-row store written under the declaration: the kind-15
+    // entry and the complete tables, no rows.
+    let mut store = pipestream_search::postings::Bm25Store::with_fields(&["body"])
+        .with_facets(&["court"])
+        .with_integers(&["decided", "placement", "year_d", "scotus"])
+        .with_unsigned_integers(&["court_hash"]);
+    store.set_derived(Some(pipestream_search::postings::StoredDerived::of(
+        &declaration,
+    )));
+    let path = pipestream_search::node::bm25_sidecar_path(&index_path);
+    store.save(&path).unwrap();
+    let reader = pipestream_search::postings::Bm25Reader::open(&path).unwrap();
+    let stored = reader
+        .derived()
+        .expect("the empty store keeps the declaration");
+    assert_eq!(stored.fingerprint, declaration.fingerprint());
+    assert_eq!(stored.validate().unwrap(), spec());
+    let integers: Vec<&str> = (0..reader.integer_count())
+        .map(|i| reader.integer_name(i))
+        .collect();
+    assert_eq!(integers, vec!["decided", "placement", "year_d", "scotus"]);
+    let unsigned: Vec<&str> = (0..reader.unsigned_integer_count())
+        .map(|i| reader.unsigned_integer_name(i))
+        .collect();
+    assert_eq!(unsigned, vec!["court_hash"]);
+    drop(reader);
+
+    // It attaches under its own declaration; every other pairing
+    // refuses by name, both fingerprints in the message.
+    let single = |derived: Option<Arc<Declaration>>| NodeConfig {
+        layout: Layout::SingleImage,
+        ..config(Some(index_path.clone()), derived)
+    };
+    NodeServiceImpl::open(single(Some(declaration.clone())), None, false).unwrap();
+    let other = changed_declaration();
+    let err = NodeServiceImpl::open(single(Some(other.clone())), None, false)
+        .err()
+        .unwrap();
+    assert!(
+        err.contains("written under derived-column declaration")
+            && err.contains(declaration.fingerprint())
+            && err.contains(other.fingerprint()),
+        "{err}"
+    );
+    let err = NodeServiceImpl::open(single(None), None, false)
+        .err()
+        .unwrap();
+    assert!(err.contains("does not declare"), "{err}");
+
+    // A zero-row SEGMENT, though, never enters a catalog: the row
+    // alignment check refuses it by name rather than publishing an
+    // empty part.
+    let live_path = dir.join("live-docs.bin");
+    pipestream_search::live_docs::LiveDocs::default()
+        .write(&live_path, 0)
+        .unwrap();
+    let catalog =
+        pipestream_search::segments::SegmentCatalog::open(dir.join("catalog.segments")).unwrap();
+    let err = catalog
+        .append(pipestream_search::segments::SegmentSource {
+            segment_id: "seg-empty",
+            generation: 1,
+            base_label: 0,
+            backend_kind: "",
+            vector_path: None,
+            exact_vector_path: None,
+            bm25_path: &path,
+            live_docs_path: &live_path,
+            partition_column: None,
+        })
+        .unwrap_err();
+    assert!(err.contains("not aligned"), "{err}");
+
+    // A zero-row store written under NO declaration may still attach:
+    // "written under none" is refused only once the store holds rows.
+    // Each open gets its own store: the first open's log records the
+    // declaration, so a later open of the same path under none would
+    // refuse the log, not the store.
+    let plain = |name: &str| {
+        let index_path = dir.join(name);
+        pipestream_search::postings::Bm25Store::with_fields(&["body"])
+            .with_facets(&["court"])
+            .with_integers(&["decided", "placement"])
+            .save(&pipestream_search::node::bm25_sidecar_path(&index_path))
+            .unwrap();
+        index_path
+    };
+    NodeServiceImpl::open(
+        NodeConfig {
+            layout: Layout::SingleImage,
+            ..config(Some(plain("plain-declared.tv")), Some(declaration.clone()))
+        },
+        None,
+        false,
+    )
+    .expect("an empty store written under none attaches");
+    NodeServiceImpl::open(
+        NodeConfig {
+            layout: Layout::SingleImage,
+            ..config(Some(plain("plain-undeclared.tv")), None)
+        },
+        None,
+        false,
+    )
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_log_written_under_another_declaration_refuses_to_resume() {
+    let dir = tempdir("wal-declaration");
+    let index_path = dir.join("shard.tv");
+    let node = NodeServiceImpl::new(None, config(Some(index_path.clone()), Some(declaration())));
+    drop(node);
+    let other = changed_declaration();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        NodeServiceImpl::new(None, config(Some(index_path.clone()), Some(other.clone())))
+    }));
+    let payload = match result {
+        Ok(_) => panic!("the mismatched log must refuse the node"),
+        Err(payload) => payload,
+    };
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        message.contains("the log was written under derived-column declaration")
+            && message.contains(declaration().fingerprint())
+            && message.contains(other.fingerprint()),
+        "{message}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_installed_snapshot_keeps_the_declaration_and_tables() {
+    let dir = tempdir("snapshot");
+    // The source: documents ingested under the declaration and flushed
+    // to a single image.
+    let source_path = dir.join("source.tv");
+    let source_config = NodeConfig {
+        layout: Layout::SingleImage,
+        ..config(Some(source_path.clone()), Some(declaration()))
+    };
+    let (addr, handle) = start_empty_node(source_config).await;
+    let (shift, scale) = common::fit_calibration(DIM, 4, &common::unit_vectors(8, DIM, 7));
+    async fn seed(addr: &str, shift: Vec<f32>, scale: Vec<f32>) {
+        NodeServiceClient::connect(addr.to_string())
+            .await
+            .unwrap()
+            .set_calibration(pipestream_search::pb::SetCalibrationRequest {
+                dim: DIM as u32,
+                bit_width: 4,
+                shift,
+                scale,
+            })
+            .await
+            .unwrap();
+    }
+    seed(&addr, shift.clone(), scale.clone()).await;
+    ingest_aligned(&addr, (0..N).map(document).collect()).await;
+    NodeServiceClient::connect(addr.clone())
+        .await
+        .unwrap()
+        .flush(FlushRequest {})
+        .await
+        .unwrap();
+    handle.abort();
+    let source_bm25 = pipestream_search::node::bm25_sidecar_path(&source_path);
+    assert!(source_path.exists() && source_bm25.exists());
+
+    // The target installs it under the same declaration; the installed
+    // generation's store keeps the fingerprint and the complete tables,
+    // and the shard serves the derived values, before and after a
+    // restart.
+    let target_path = dir.join("target.tv");
+    let target_config = |derived: Option<Arc<Declaration>>| NodeConfig {
+        layout: Layout::SingleImage,
+        ..config(Some(target_path.clone()), derived)
+    };
+    let declaration = declaration();
+    let (taddr, thandle) = start_empty_node(target_config(Some(declaration.clone()))).await;
+    seed(&taddr, shift.clone(), scale.clone()).await;
+    let report =
+        pipestream_search::snapshot::install_snapshot(&taddr, &source_path, Some(&source_bm25))
+            .await
+            .unwrap();
+    assert_eq!(report.num_documents, N as u64);
+    let installed = pipestream_search::node::generation_bm25(
+        &pipestream_search::node::generation_dir(&target_path),
+    );
+    let reader = pipestream_search::postings::Bm25Reader::open(&installed).unwrap();
+    let stored = reader
+        .derived()
+        .expect("the installed store keeps the declaration");
+    assert_eq!(stored.fingerprint, declaration.fingerprint());
+    assert_eq!(stored.validate().unwrap(), spec());
+    let integers: Vec<&str> = (0..reader.integer_count())
+        .map(|i| reader.integer_name(i))
+        .collect();
+    assert_eq!(integers, vec!["decided", "placement", "year_d", "scotus"]);
+    let unsigned: Vec<&str> = (0..reader.unsigned_integer_count())
+        .map(|i| reader.unsigned_integer_name(i))
+        .collect();
+    assert_eq!(unsigned, vec!["court_hash"]);
+    drop(reader);
+    assert_eq!(
+        projected(&root(&taddr), "").await.unwrap(),
+        expected_rows(0..N)
+    );
+    thandle.abort();
+    let (taddr, thandle) =
+        pipestream_search::harness::start_opened_node(target_config(Some(declaration.clone())))
+            .await;
+    assert_eq!(
+        projected(&root(&taddr), "").await.unwrap(),
+        expected_rows(0..N),
+        "the installed generation survives a restart"
+    );
+    thandle.abort();
+
+    // A shard under another declaration refuses the same install,
+    // naming both fingerprints, and stays empty.
+    let other_path = dir.join("other.tv");
+    let other = changed_declaration();
+    let (oaddr, ohandle) = start_empty_node(NodeConfig {
+        layout: Layout::SingleImage,
+        ..config(Some(other_path.clone()), Some(other.clone()))
+    })
+    .await;
+    seed(&oaddr, shift, scale).await;
+    let err =
+        pipestream_search::snapshot::install_snapshot(&oaddr, &source_path, Some(&source_bm25))
+            .await
+            .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        err.message()
+            .contains("written under derived-column declaration")
+            && err.message().contains(declaration.fingerprint())
+            && err.message().contains(other.fingerprint()),
+        "{}",
+        err.message()
+    );
+    let empty = root(&oaddr)
+        .bm25_search(Request::new(Bm25SearchRequest {
+            text: "opinion".into(),
+            analysis: Some(body_spec()),
+            k: 1,
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        empty.hits.is_empty(),
+        "a refused install leaves the shard untouched"
+    );
+    ohandle.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_seal_interrupted_mid_publish_never_serves_a_partial_segment() {
+    let dir = tempdir("crash-seal");
+    let index_path = dir.join("shard.tv");
+    let declaration = declaration();
+    let (addr, handle) =
+        start_empty_node(config(Some(index_path.clone()), Some(declaration.clone()))).await;
+    ingest(&addr, (0..N).map(document).collect()).await.unwrap();
+    NodeServiceClient::connect(addr.clone())
+        .await
+        .unwrap()
+        .flush(FlushRequest {})
+        .await
+        .unwrap();
+    // The crash: the server task dies with no further writes.
+    handle.abort();
+    let root_path = pipestream_search::node::segments_root(&index_path);
+    let segments_dir = root_path.join("segments");
+    let set = pipestream_search::segments::OpenedSegmentSet::open(&root_path).unwrap();
+    assert!(set.len() >= 2, "the flush sealed more than one segment");
+    let sealed = set.len();
+    let first_id = set.metadata(0).segment_id.clone();
+    let first_dir = segments_dir.join(&first_id);
+    drop(set);
+
+    // The leftovers a seal that died mid-publish leaves: the catalog's
+    // staging dir with a torn store, the segment's final directory
+    // never listed by the manifest, and the node's own stage dir.
+    let torn = segments_dir.join(".tmp-seg-dead-4242-5");
+    std::fs::create_dir_all(&torn).unwrap();
+    let whole = std::fs::read(first_dir.join("documents.bm25")).unwrap();
+    std::fs::write(torn.join("documents.bm25"), &whole[..whole.len() / 2]).unwrap();
+    let copy_dir = |from: &Path, to: &Path| {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        }
+    };
+    copy_dir(&first_dir, &segments_dir.join("seg-orphan"));
+    let stage = root_path.join(".seal-dead-4242");
+    std::fs::create_dir_all(&stage).unwrap();
+    std::fs::write(stage.join("documents.bm25"), &whole[..whole.len() / 4]).unwrap();
+
+    // Reopen: the catalog serves exactly the flushed rows under the
+    // declaration; the leftovers contribute nothing.
+    let (addr, handle) = pipestream_search::harness::start_opened_node(config(
+        Some(index_path.clone()),
+        Some(declaration.clone()),
+    ))
+    .await;
+    assert_eq!(
+        projected(&root(&addr), "").await.unwrap(),
+        expected_rows(0..N)
+    );
+    handle.abort();
+    let set = pipestream_search::segments::OpenedSegmentSet::open(&root_path).unwrap();
+    assert_eq!(set.len(), sealed, "the orphan segment is not adopted");
+    drop(set);
+
+    // A manifest-listed segment with torn bytes is named, never
+    // served: the integrity check fires before any row is read.
+    let mut torn_bytes = whole.clone();
+    let middle = torn_bytes.len() / 2;
+    torn_bytes[middle] ^= 0x5a;
+    std::fs::write(first_dir.join("documents.bm25"), &torn_bytes).unwrap();
+    let err = NodeServiceImpl::open(
+        config(Some(index_path.clone()), Some(declaration.clone())),
+        None,
+        false,
+    )
+    .err()
+    .unwrap();
+    assert!(
+        err.contains("integrity mismatch") && err.contains(&first_id),
+        "{err}"
+    );
+    std::fs::write(first_dir.join("documents.bm25"), &whole).unwrap();
+
+    // A torn manifest the atomic publish never completed: named at
+    // parse, not served.
+    let manifest_path = root_path.join("segments.json");
+    let manifest = std::fs::read(&manifest_path).unwrap();
+    std::fs::write(&manifest_path, &manifest[..manifest.len() / 2]).unwrap();
+    let err = NodeServiceImpl::open(
+        config(Some(index_path.clone()), Some(declaration)),
+        None,
+        false,
+    )
+    .err()
+    .unwrap();
+    assert!(err.contains("segment set"), "{err}");
+    std::fs::write(&manifest_path, &manifest).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_serving_routes_enforce_the_inputs_rule() {
+    use pipestream_search::pb::{
+        search_query, selection_query, AccessAction, AccessPolicy, CollectionGrant,
+        CollectionResource, FieldAction, FieldGrant, FieldPermissions, LexicalQuery, QueryRequest,
+        QuerySort, SearchQuery, SelectionQuery,
+    };
+    use FieldAction::{Disclose, Use};
+    let declaration = declaration();
+    let node = Arc::new(NodeServiceImpl::new(
+        None,
+        config(None, Some(declaration.clone())),
+    ));
+    pipestream_search::link::NodeLink::local(node.clone())
+        .add_documents(tokio_stream::iter((0..6).map(document)))
+        .await
+        .unwrap();
+    let coordinator = CoordinatorServiceImpl::with_local_nodes(vec![node])
+        .with_bm25(
+            Some(NATIVE_ANALYSIS_BACKEND.to_string()),
+            Default::default(),
+        )
+        .with_derived(Some(declaration));
+
+    let reader = |fields: &[(&str, &[FieldAction])]| {
+        let permissions = FieldPermissions {
+            grants: fields
+                .iter()
+                .map(|(field, actions)| FieldGrant {
+                    field: (*field).into(),
+                    actions: actions.iter().map(|a| *a as i32).collect(),
+                })
+                .collect(),
+            disclose_document_identity: false,
+        };
+        pipestream_search::collections::CollectionSet::single(coordinator.clone()).with_principals(
+            Arc::new(
+                pipestream_search::security::Principals::from_configs(&[
+                    pipestream_search::security::PrincipalConfig {
+                        name: "reader".into(),
+                        token: "reader-token-0123456789012345".into(),
+                        ..Default::default()
+                    },
+                ])
+                .unwrap()
+                .with_authorizer(Arc::new(
+                    pipestream_search::authorization::PolicyAuthority::new(AccessPolicy {
+                        format_version: 3,
+                        revision: 1,
+                        resources: vec![CollectionResource {
+                            workspace: "work".into(),
+                            collection: "".into(),
+                        }],
+                        grants: vec![CollectionGrant {
+                            principal: "reader".into(),
+                            workspace: "work".into(),
+                            collection: "".into(),
+                            actions: vec![AccessAction::Search as i32],
+                            field_permissions: Some(permissions),
+                            document_visibility: None,
+                        }],
+                    })
+                    .unwrap(),
+                )),
+            ),
+        )
+    };
+    let bearer = |mut request: tonic::Request<Bm25SearchRequest>| {
+        request.metadata_mut().insert(
+            "authorization",
+            "Bearer reader-token-0123456789012345".parse().unwrap(),
+        );
+        request
+    };
+    let body: (&str, &[FieldAction]) = ("body", &[Use, Disclose]);
+    let full = reader(&[
+        body,
+        ("court_hash", &[Use, Disclose]),
+        ("court", &[Use, Disclose]),
+    ]);
+    let no_input = reader(&[body, ("court_hash", &[Use, Disclose])]);
+    let no_own = reader(&[body, ("court", &[Use, Disclose])]);
+    let use_only_input = reader(&[body, ("court_hash", &[Use, Disclose]), ("court", &[Use])]);
+
+    let scotus_hash = fnv1a64_bytes(b"scotus");
+    let filtered = || Bm25SearchRequest {
+        text: "opinion".into(),
+        analysis: Some(body_spec()),
+        k: 6,
+        filter: format!("court_hash == {scotus_hash}u"),
+        projections: vec![projection("court_hash", "court_hash")],
+        ..Default::default()
+    };
+    // The scope holding the grant on the column and on every input may
+    // filter and project it.
+    let response = SearchService::bm25_search(&full, bearer(Request::new(filtered())))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.hits.len(), 2, "documents 0 and 3 are scotus");
+    for hit in &response.hits {
+        assert_eq!(
+            hit.projected[0].value,
+            Some(projected_value::Value::UintValue(scotus_hash))
+        );
+    }
+    // Missing the input grant, or the column's own grant, refuses.
+    for (who, reader) in [("no input grant", &no_input), ("no own grant", &no_own)] {
+        let err = SearchService::bm25_search(reader, bearer(Request::new(filtered())))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied, "{who}");
+    }
+
+    // Column statistics disclose: the input's Use grant alone does not
+    // admit them.
+    let faceted = || Bm25SearchRequest {
+        text: "opinion".into(),
+        analysis: Some(body_spec()),
+        k: 6,
+        stats_fields: vec!["court_hash".into()],
+        ..Default::default()
+    };
+    let response = SearchService::bm25_search(&full, bearer(Request::new(faceted())))
+        .await
+        .unwrap()
+        .into_inner();
+    let court_stats = response
+        .stats
+        .iter()
+        .find(|f| f.field == "court_hash")
+        .expect("the column stats");
+    assert_eq!(court_stats.count, 6);
+    let err = SearchService::bm25_search(&use_only_input, bearer(Request::new(faceted())))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+    // Explanations disclose the fields they name: an explained score
+    // stage over the derived column needs Disclose on its input.
+    let stage = || pipestream_search::pb::ScoreStage {
+        column: "court_hash".into(),
+        operation: Some(pipestream_search::pb::score_stage::Operation::Op(
+            pipestream_search::pb::ScoreOp::AddLinear as i32,
+        )),
+        weight: 1.0,
+        ..Default::default()
+    };
+    let explained = || Bm25SearchRequest {
+        text: "opinion".into(),
+        analysis: Some(body_spec()),
+        k: 6,
+        filter: format!("court_hash == {scotus_hash}u"),
+        score_stages: vec![stage()],
+        explain: true,
+        ..Default::default()
+    };
+    let response = SearchService::bm25_search(&full, bearer(Request::new(explained())))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.hits.iter().all(|h| h.explain.is_some()));
+    assert!(
+        response
+            .hits
+            .iter()
+            .all(|h| h.explain.as_ref().unwrap().stages[0].column == "court_hash"),
+        "the explanation names the derived column"
+    );
+    let err = SearchService::bm25_search(&use_only_input, bearer(Request::new(explained())))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+    // The Query route's sort on the derived column follows the same rule.
+    let sorted = || QueryRequest {
+        k: 6,
+        selection: Some(SelectionQuery {
+            node: Some(selection_query::Node::Search(SearchQuery {
+                id: "lex".into(),
+                query: Some(search_query::Query::Lexical(LexicalQuery {
+                    text: "opinion".into(),
+                    analysis: Some(body_spec()),
+                    ..Default::default()
+                })),
+            })),
+        }),
+        sort: vec![QuerySort {
+            column: "court_hash".into(),
+            descending: false,
+        }],
+        ..Default::default()
+    };
+    let mut bearer_q = Request::new(sorted());
+    bearer_q.metadata_mut().insert(
+        "authorization",
+        "Bearer reader-token-0123456789012345".parse().unwrap(),
+    );
+    let response = SearchService::query(&full, bearer_q)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.hits.len(), 6);
+    let hashes: Vec<u64> = (0..6).map(|i| fnv1a64_bytes(court(i).as_bytes())).collect();
+    let mut sorted_hashes = hashes.clone();
+    sorted_hashes.sort_unstable();
+    assert_eq!(
+        response
+            .hits
+            .iter()
+            .map(|h| hashes[h.doc_id as usize])
+            .collect::<Vec<_>>(),
+        sorted_hashes,
+        "the sort orders by the derived column"
+    );
+    let mut bearer_q = Request::new(sorted());
+    bearer_q.metadata_mut().insert(
+        "authorization",
+        "Bearer reader-token-0123456789012345".parse().unwrap(),
+    );
+    let err = SearchService::query(&no_input, bearer_q).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
 }
