@@ -126,6 +126,24 @@ index snapshots in application code.
 
 ## Validation
 
+At `92bfe79`, the source-history audit and Boolean reconciliation passed
+636 library tests, 848 integration tests across 144 targets, 13 embedded
+tests and 2 IVF-provider tests: 1,499 passed, 0 failed. The live OpenNLP
+test remains ignored. Android/iOS compilation passed on all 5 targets;
+tests/examples, formatting, vendored protos and whitespace checks passed.
+Search/storage descriptors from `d3c4534` are unchanged. Input hashes matched
+before and after validation. The 8 GiB scope used no swap and had 0 OOM or
+OOM-kill events. These results apply to this local checkpoint, ahead of the
+pending derived-evaluation fixes.
+
+The source audit regressions cover older history gaps, blob corruption, stale
+heads, invalid retry flags, migration boundaries, disk and record budgets,
+exclusive scratch ownership and duplicate receipts across 1024-entry batches.
+The Boolean fix in `92bfe79` checks shared filter references under direct
+SHOULD/MUST_NOT and complete candidate provenance, with document visibility.
+
+### Bundle capture validation
+
 The bundle implementation has eight focused passing regressions: capture across
 compaction and path retirement with unpublished source backlog, multiple owned
 indexes, empty declarations and source tombstones, source-only histories,
