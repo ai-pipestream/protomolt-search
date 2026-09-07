@@ -70,7 +70,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "usage: reshard (--log=<wal dir|generation dir> --split=N | --logs=a,b,c) \
              --out-dir=<dir> [--slot-base=B] [--slot-stride=S] [--analysis-addr=ADDR] \
              [--stable-routing] [--placement-tree=<file> [--single-image=<max child rows>] \
-             [--spill-bucket-bits=<bits>] [--from-segments] [--build-threads=<n>] [--only-child=<index>] [--cut-column=<col> \
+             [--spill-bucket-bits=<bits>] [--from-segments] [--build-threads=<n>] [--build-queue=<n>] \
+             [--build-memory=<MiB>] [--only-child=<index>] [--cut-column=<col> \
              [--cut-rows=<n>]] [--derived-columns=<file> [--derive=a,b]]]"
                 .into(),
         );
@@ -203,6 +204,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if build_threads == 0 {
             return Err("--build-threads takes at least one thread".into());
         }
+        // `--build-queue=<n>` bounds the sealed-but-unappended bucket
+        // images a threaded build holds; absent, the thread count.
+        let build_queue = opt("build-queue")
+            .map(|n| {
+                n.parse::<usize>()
+                    .map_err(|error| format!("--build-queue takes a depth: {error}"))
+            })
+            .transpose()?;
+        // `--build-memory=<MiB>` budgets the build pass: the spill's
+        // per-bucket row counts at 70 KiB a row must fit it, alone and
+        // times the threads, or the split refuses by name after the
+        // routing pass.
+        let build_memory = opt("build-memory")
+            .map(|mb| {
+                mb.parse::<u64>()
+                    .ok()
+                    .and_then(|mb| mb.checked_mul(1 << 20))
+                    .ok_or_else(|| "--build-memory takes a MiB count".to_string())
+            })
+            .transpose()?;
         // `--derived-columns=<file>` writes the children under that
         // declaration (a shard map or a bare [[derived]] table,
         // docs/derived-columns.md); `--derive=a,b` computes those
@@ -243,6 +264,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 derived,
                 derive,
                 build_threads,
+                build_queue,
+                build_memory,
             },
             &mut analyze,
         )?;
