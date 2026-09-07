@@ -94,9 +94,15 @@ Receipt uniqueness uses a temporary redb index with an 8 MiB cache and at most
 checked after every transaction. The audit deletes scratch before source copy
 starts. It performs read-only checks against the captured source transaction,
 so later acceptance cannot alter the audited history. This adds a full source
-history scan to backup creation. It supplies the source-table check for future
-restore work; historical publication/maintenance chain validation and restore
-activation are still separate work.
+history scan to backup creation. The same pinned read also validates the full
+publication and maintenance journal. Per index, accepted source decisions and
+physical maintenance steps must form one uninterrupted epoch/hash chain ending
+at the captured tip. Each step binds the correct accepted version, source
+decision and previous maintenance cursor. Exact table counts reject extra
+records outside those chains. Reads hold one decision at a time under the
+record budget; historical artifact files are not required. These checks also
+apply to histories containing empty publications and unpublished source backlog.
+Incoming bundle staging and restore activation remain separate work.
 
 A failed write removes only its own output directory. A process crash can leave
 a partial directory. Presence of the completion file alone is insufficient:

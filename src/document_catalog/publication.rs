@@ -21,7 +21,9 @@ macro_rules! maintenance_table {
         }
     }};
 }
+mod audit;
 mod maintenance;
+pub(super) use audit::verify_checkpoint_chain;
 pub use maintenance::MaintenanceRecovery;
 use maintenance::*;
 

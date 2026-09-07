@@ -1240,8 +1240,10 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 - **Foundation branch: source-history audit before backup.** Bundle creation
   checks older accepted versions, content-addressed blobs, document heads and
   immutable retry receipts. A temporary disk index proves receipt uniqueness
-  in bounded batches. A missing older version now fails before a completion
-  manifest can be written. See [source/index backup](docs/source-index-backup.md).
+  in bounded batches. Full publication and compaction chains are checked in
+  epoch order against accepted history. Missing older versions or decisions
+  fail before a completion manifest can be written. See
+  [source/index backup](docs/source-index-backup.md).
 - **Foundation branch: coherent source/index backup capture.** The local owner
   pins all journal-matching index artifacts with one source read transaction,
   then writes a bounded, checksummed bundle with its protobuf completion

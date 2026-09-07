@@ -50,6 +50,12 @@ impl CatalogCheckpoint<'_> {
         scratch_bytes: u64,
     ) -> Result<(), Status> {
         let header = self.metadata.header.as_ref().expect("captured header");
+        publication::verify_checkpoint_chain(
+            &self.read,
+            header,
+            &self.metadata.indexes,
+            record_bytes,
+        )?;
         let versions = self.read.open_table(VERSIONS).map_err(storage)?;
         let changes = self.read.open_table(CHANGES).map_err(storage)?;
         let heads = self.read.open_table(HEADS).map_err(storage)?;

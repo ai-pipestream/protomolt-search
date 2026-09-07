@@ -12,7 +12,7 @@ pub enum MaintenanceRecovery {
     Idle,
 }
 
-fn maintenance_key(key: &[u8], epoch: u64) -> Vec<u8> {
+pub(super) fn maintenance_key(key: &[u8], epoch: u64) -> Vec<u8> {
     MaintenanceDecisionKey {
         index_key: key.to_vec(),
         after_epoch: epoch,
@@ -24,13 +24,13 @@ fn maintenance_hash(intent: &MaintenanceIntent) -> Vec<u8> {
     value.intent_id.clear();
     sha256::digest(&value.encode_to_vec()).to_vec()
 }
-fn cursor(intent: &MaintenanceIntent) -> MaintenanceCursor {
+pub(super) fn cursor(intent: &MaintenanceIntent) -> MaintenanceCursor {
     MaintenanceCursor {
         after_epoch: intent.after_epoch,
         intent_id: intent.intent_id.clone(),
     }
 }
-fn validate_maintenance(
+pub(super) fn validate_maintenance(
     intent: &MaintenanceIntent,
     key: &[u8],
     history: &[u8],
