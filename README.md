@@ -1237,26 +1237,33 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: journaled source-owned cutover.** The local owner can
+  publish rebuilt immutable layouts, activate every serving component together,
+  and recover interrupted manifest/activation windows. Copying and preservation
+  verification run before mutation fences; stale builds refuse. Tests cover
+  physical renumbering, grants, read claims/cursors and later source writes.
+  The bounded rewrite builder and embedded operation remain unfinished; the
+  WAL compactor stays gated. See [source-index maintenance](docs/source-index-maintenance.md).
 - **Foundation branch: durable maintenance decisions.** A format-2 source
   journal records physical maintenance separately from accepted versions,
   preserving source decisions and retry receipts. Explicit migration refuses
   pending source publications; manifest recovery distinguishes commit, abort
   and unresolved divergence. The owner computes row-preservation proofs and
-  checks pruning summaries. Live compaction cutover remains gated. See
+  checks pruning summaries. The local cutover is covered by the newer entry above. See
   [source-index maintenance](docs/source-index-maintenance.md).
 - **Foundation branch: persistent generation declarations.** Source publication
   writes a format-4 catalog retaining all column tables, field capabilities,
   analyzer fingerprints, derived declarations and vector construction state.
   Reopen preserves those semantics with no segments; the rewrite proof now
   verifies final-segment reclamation. Source-owned compaction still requires
-  its runtime cutover; the journal is covered by the newer entry above. See
+  its rewrite builder; journal and cutover are covered by newer entries above. See
   [source-index maintenance](docs/source-index-maintenance.md).
 - **Foundation branch: source rewrite preservation check.** A bounded row-digest
   comparison detects changed identities, source bytes, typed columns, vectors
   and analyzed postings across segment reorderings and tombstone reclamation.
   It uses a disk-backed identity table and no whole-field transpose. This is
   comparison groundwork; [source-aware maintenance](docs/source-index-maintenance.md)
-  still needs runtime cutover; the journal and empty-generation declaration
+  still needs its rewrite builder; journal, cutover and generation declarations
   are covered by the newer entries above.
 - **Foundation branch: persistent source ownership.** Source activation now
   records its history, logical index and collection in a format-3 segment

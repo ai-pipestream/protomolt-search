@@ -229,6 +229,15 @@ pub(super) fn validate_tip(
     Ok(Some(source))
 }
 
+/// Constructed only by the local row/metadata comparison. It is deliberately
+/// not a protobuf credential that another caller can manufacture or deserialize.
+pub(crate) struct VerifiedMaintenance<'a> {
+    owner: crate::pb::storage::SourceIndexOwner,
+    before: &'a OpenedSegmentSet,
+    after: &'a OpenedSegmentSet,
+    preservation: crate::pb::storage::SourceRewriteCertificate,
+}
+
 impl DocumentCatalog {
     /// Explicit, atomic journal-format migration. Old readers refuse format 2.
     /// Resolve every pending source transaction before enabling maintenance.
@@ -308,8 +317,6 @@ impl DocumentCatalog {
         scratch: &Path,
         batch_rows: usize,
     ) -> Result<MaintenanceIntent, Status> {
-        index_key(key)?;
-        let owner = self.index_owner(key)?;
         {
             let read = self.database.begin_read().map_err(storage)?;
             let meta = read.open_table(META).map_err(storage)?;
@@ -324,6 +331,25 @@ impl DocumentCatalog {
             }
         }
 
+        let verified = self.verify_index_maintenance(key, before, after, scratch, batch_rows)?;
+        self.prepare_verified_index_maintenance(&verified)
+    }
+
+    pub(crate) fn verify_index_maintenance<'a>(
+        &self,
+        key: &[u8],
+        before: &'a OpenedSegmentSet,
+        after: &'a OpenedSegmentSet,
+        scratch: &Path,
+        batch_rows: usize,
+    ) -> Result<VerifiedMaintenance<'a>, Status> {
+        if !(1..=1_048_576).contains(&batch_rows) {
+            return Err(Status::invalid_argument(
+                "maintenance proof batch_rows must be 1..=1048576",
+            ));
+        }
+        index_key(key)?;
+        let owner = self.index_owner(key)?;
         if before.root() != after.root()
             || before.epoch().checked_add(1) != Some(after.epoch())
             || before.manifest().partition_key != after.manifest().partition_key
@@ -373,6 +399,27 @@ impl DocumentCatalog {
         let preservation = before
             .verify_source_rewrite(after, scratch, batch_rows)
             .map_err(Status::failed_precondition)?;
+        Ok(VerifiedMaintenance {
+            owner,
+            before,
+            after,
+            preservation,
+        })
+    }
+
+    pub(crate) fn prepare_verified_index_maintenance(
+        &self,
+        verified: &VerifiedMaintenance<'_>,
+    ) -> Result<MaintenanceIntent, Status> {
+        let owner = &verified.owner;
+        let key = owner.index_key.as_slice();
+        if self.index_owner(key)? != *owner {
+            return Err(Status::failed_precondition(
+                "verified maintenance belongs to another source owner",
+            ));
+        }
+        let before = verified.before;
+        let after = verified.after;
         let mut tx = self.database.begin_write().map_err(storage)?;
         tx.set_durability(Durability::Immediate).map_err(storage)?;
         let intent;
@@ -425,7 +472,7 @@ impl DocumentCatalog {
                 before_epoch: before.epoch(),
                 after_epoch: after.epoch(),
                 previous: state.maintenance_tip.clone(),
-                preservation: Some(preservation),
+                preservation: Some(verified.preservation.clone()),
                 intent_id: vec![],
             };
             prepared.intent_id = maintenance_hash(&prepared);
@@ -462,6 +509,63 @@ impl DocumentCatalog {
         }
         tx.commit().map_err(storage)?;
         Ok(intent)
+    }
+
+    /// Current maintenance decision, only while its after-manifest is the
+    /// durable physical tip. A later source write supersedes this observation.
+    pub fn current_index_maintenance_decision(
+        &self,
+        key: &[u8],
+        catalog: &SegmentCatalog,
+    ) -> Result<Option<MaintenanceIntent>, Status> {
+        index_key(key)?;
+        if !self.validate_projection_journal()? {
+            return Ok(None);
+        }
+        catalog.with_durable_snapshot(|snapshot| {
+            let tx = self.database.begin_read().map_err(storage)?;
+            let meta = tx.open_table(META).map_err(storage)?;
+            let header: DocumentCatalogHeader = decode(
+                meta.get("header")
+                    .map_err(storage)?
+                    .ok_or_else(|| Status::data_loss("catalog header missing"))?
+                    .value(),
+            )?;
+            validate_current_header(&header)?;
+            let states = tx.open_table(STATES).map_err(storage)?;
+            let Some(bytes) = states.get(key).map_err(storage)? else {
+                return Ok(None);
+            };
+            let state: ProjectionJournalState = decode(bytes.value())?;
+            validate_state(&state, key, &header.history_id)?;
+            if state.pending.is_some() || state.pending_maintenance.is_some() {
+                return Err(Status::failed_precondition(
+                    "resolve pending publication before observing maintenance activation",
+                ));
+            }
+            let decisions = tx.open_table(DECISIONS).map_err(storage)?;
+            let maintenance = maintenance_table!(tx);
+            validate_tip(&state, &decisions, maintenance.as_ref(), &header.collection)?;
+            if manifest_hash(snapshot.manifest())? != state.committed_manifest_sha256 {
+                return Err(Status::failed_precondition(
+                    "durable catalog differs from the committed physical manifest",
+                ));
+            }
+            let Some(reference) = &state.maintenance_tip else {
+                return Ok(None);
+            };
+            let table = maintenance
+                .as_ref()
+                .ok_or_else(|| Status::data_loss("maintenance decision table missing"))?;
+            let intent = maintenance_record(table, &state, reference, &header.collection)?;
+            if intent.accepted_sequence == state.committed_sequence
+                && intent.after_epoch == snapshot.epoch()
+            {
+                Ok(Some(intent))
+            } else {
+                Ok(None)
+            }
+        })
     }
 
     /// An immutable artifact decision, not a claim of current visibility.

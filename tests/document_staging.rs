@@ -1056,3 +1056,6 @@ async fn empty_declared_generation_reopens_with_schema_analysis_and_vector_state
         );
     }
 }
+
+#[path = "document_staging/maintenance.rs"]
+mod maintenance;

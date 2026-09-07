@@ -21,7 +21,9 @@ mod publication;
 mod source_owner_tests;
 pub use projection::StagedDocumentCandidate;
 #[cfg(test)]
-pub(crate) use publication::FAIL_PROJECTION_DECISION;
+pub(crate) use publication::{
+    AFTER_MAINTENANCE_VERIFIED, FAIL_PROJECTION_DECISION, INTERRUPT_MAINTENANCE,
+};
 
 use std::collections::HashMap;
 use std::io::Read;

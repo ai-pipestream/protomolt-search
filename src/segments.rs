@@ -1827,12 +1827,14 @@ fn stage_segment(root: &Path, source: SegmentSource<'_>) -> Result<SegmentMetada
         std::process::id(),
         source.generation
     ));
-    if temp_dir.exists() {
-        std::fs::remove_dir_all(&temp_dir)
-            .map_err(|error| format!("remove stale stage {}: {error}", temp_dir.display()))?;
-    }
-    std::fs::create_dir_all(&temp_dir)
-        .map_err(|error| format!("mkdir stage {}: {error}", temp_dir.display()))?;
+    // Maintenance stages outside the publication fence. Another build may
+    // already own this directory; only exclusive creation permits cleanup.
+    std::fs::create_dir(&temp_dir).map_err(|error| {
+        format!(
+            "create private stage {}: {error}; existing stages must be retained for their owner",
+            temp_dir.display()
+        )
+    })?;
     let result = (|| {
         // A documents-only segment (docs/immutable-segments.md) has no
         // vector rows; the exact rows go with the vector rows.
@@ -2402,6 +2404,35 @@ mod tests {
         );
         assert!(SegmentCatalog::segment_dir(&root, "input").exists());
         assert!(SegmentCatalog::segment_dir(&root, "output").exists());
+    }
+
+    #[test]
+    fn staging_refuses_an_existing_private_directory_without_touching_its_files() {
+        let data = publication_fixture("stage-collision", &["one", "two"]);
+        let root = data.root.join("catalog");
+        let catalog = SegmentCatalog::open(&root).unwrap();
+        let private = root
+            .join("segments")
+            .join(format!(".tmp-output-{}-1", std::process::id()));
+        std::fs::create_dir(&private).unwrap();
+        let marker = private.join("in-progress");
+        std::fs::write(&marker, b"another builder's work").unwrap();
+
+        let result = stage_segment(&root, source(&data, "output", 0));
+        assert!(
+            result.is_err(),
+            "another builder's directory must be refused"
+        );
+        assert_eq!(std::fs::read(&marker).unwrap(), b"another builder's work");
+        assert!(!SegmentCatalog::segment_dir(&root, "output").exists());
+        assert_eq!(catalog.snapshot().epoch(), 0);
+
+        // Only its owner may remove the private directory. A later retry can
+        // then stage normally, without publishing a manifest on its own.
+        std::fs::remove_dir_all(&private).unwrap();
+        let staged = stage_segment(&root, source(&data, "output", 0)).unwrap();
+        assert_eq!(staged.rows, 2);
+        assert_eq!(catalog.snapshot().epoch(), 0);
     }
 
     #[test]

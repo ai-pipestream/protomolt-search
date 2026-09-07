@@ -1,9 +1,10 @@
 # Source-index maintenance
 
-Status: preservation comparison and the durable maintenance journal are
-implemented on the foundation branch; runtime cutover integration remains
-proposed. Legacy compaction and index-only
-snapshots still refuse source-owned catalogs. This note does not enable them.
+Status: preservation comparison, durable maintenance journal, and the trusted
+local node's journaled cutover/recovery are implemented on the foundation branch.
+The bounded source-owned rewrite builder and its product integration remain
+unfinished. The WAL compactor and index-only snapshots still refuse source-owned
+catalogs; this does not enable those legacy routes.
 
 ## Two sequences with different meanings
 
@@ -42,9 +43,11 @@ Existing format-1 journals remain readable and do not migrate implicitly.
 `prepare_index_maintenance` takes held before/after catalogs and computes the
 preservation proof itself. It also recomputes supplied pruning summaries from
 the stored columns, so an incorrect range cannot hide rows after publication.
-The owner must fence publication across preparation and commit; it should run
-the expensive comparison while old queries remain readable, before acquiring
-the shard's final write guard. This method records artifact intent only.
+The standalone storage method records artifact intent only. The node path
+separates verification from preparation using a private, non-serializable
+verified object bound to the held before/after views. It copies and verifies
+outputs before acquiring mutation fences; source writes and old queries can
+continue, and a changed read version rejects the stale output before intent.
 `recover_index_maintenance` reconciles the durable decision, and
 `index_maintenance_decision` reads immutable history without claiming visibility.
 The node's source activation observation now reports the current catalog epoch
@@ -114,45 +117,81 @@ format-1 rewrite transcript represents declared metadata identically to matching
 segment metadata; reclaiming the final tombstoned segment preserves its proof.
 
 Reindexing or changing a derived expression remains a separate operation from
-compaction. This metadata work does not enable source-owned maintenance cutover;
-the runtime activation sequence below is still required.
+compaction. The production rewrite builder still has to use the activation
+sequence below; writing generation metadata alone cannot publish a rewrite.
 
-## Runtime publication and recovery integration still required
+## Implemented node cutover
 
-Build outputs under private staging while the old sealed view remains readable.
-At publication, hold the owning node's ingest/mutation/seal fences, verify the
-captured read version and owner, and prepare the complete new provider, exact,
-lexical and live-document state. Record the maintenance intent before the
-manifest, publish the manifest, activate the complete state and advance the read
-version, then acknowledge the durable maintenance decision. Keep source sequence
-and acceptance receipts unchanged.
+`NodeServiceImpl::publish_document_maintenance_blocking` accepts a trusted
+owner's rebuilt segment files and captured node read claim. It copies them into
+fresh immutable directories and verifies row preservation and pruning metadata
+without holding mutation fences. A private staged object owns the copied files,
+and a private verified object binds their complete manifests and preservation
+result. A caller cannot manufacture either object from a protobuf certificate.
+Staging exclusively creates its temporary directory. A competing build or a
+leftover directory is refused without removing its files; cleanup only owns a
+directory this attempt successfully created.
 
-A reopened before-manifest aborts only maintenance; an after-manifest commits its
-decision; any third manifest retains the intent and refuses reconciliation.
-Uncertain publication retains artifacts. Runtime activation and journal recovery
-must have fault-injection coverage on both sides of the manifest commit. Held
-old views remain usable, while old public read claims are rejected after cutover.
-The activation observation must report the current catalog epoch, not the older
-source intent's epoch.
+At cutover the node takes its ingest/mutation/seal fences, checks the captured
+read claim and catalog again, and explicitly enables the maintenance journal.
+It prepares the complete vector, exact-vector, lexical, binding and live-row
+view before acquiring the final shard write guard. The verified intent precedes
+the manifest swap. The node then installs all serving components together,
+invalidates its parent cache, advances the read epoch, and acknowledges the
+maintenance decision while the serving guard is still held. Physical row
+renumbering starts with the new layout's tombstones, not the old row bitmap.
 
-Required integration evidence includes repeated compactions between source
-versions, updates and deletes after compaction, an all-deleted generation,
-zero-row sources, per-field permission filtering before and after, both crash
-windows, source-catalog and index reopen, and stable document/chunk identities
-through lexical, dense, hybrid, Boolean, browse and streaming results. Coherent
-backup/restore must capture source history, journal and the referenced manifest
-as one recoverable authority; copying only index artifacts is insufficient.
+`DocumentMaintenanceActivation` identifies the maintained source sequence,
+source and maintenance intents, current catalog/read versions and live row
+count. It is an observation of this node, not a source acceptance or a
+collection-wide write receipt. A later source publication supersedes it.
+`recover_document_maintenance_blocking` joins a reopened exact serving view to
+journal recovery and returns the observation only if maintenance is still the
+current physical tip. Source recovery continues to return the immutable source
+decision paired with the current catalog epoch.
+
+An unresolved durable intent fences node ingestion. A manifest-sync failure
+retains staged files even if the rename succeeded. Reopen distinguishes before,
+after and third manifests through the journal; any third manifest remains
+unresolved. Normal successful cutover retires the known old segment directories
+only after the journal decision. Existing query snapshots retain their opened
+images. Ambiguous outcomes retain files for recovery; automatic orphan cleanup
+after recovery is not implemented and must not guess which private files to
+remove.
+
+## Remaining integration
+
+Build source-owned rewrites in bounded batches from the retained segment rows,
+including mixed vector/no-vector segments, every typed value family and analyzed
+postings. Feed those outputs through the node cutover above. The WAL compactor
+cannot supply source-owned rows: these indexes deliberately have no WAL. Expose
+an owned candidate/operation through the embedded runtime without borrowing
+caller paths across cancellation, and cover the full query/permission matrix.
+
+Required additional evidence includes repeated real row rebuilding across
+source versions, all-deleted and zero-row sources, stable document/chunk identity
+across lexical, dense, hybrid, Boolean, browse and streaming surfaces, and
+coherent backup/restore of source history, journal and the referenced manifest.
+Complex public query shapes that do not yet expose source identity still need
+that separate identity plumbing; stored-identity preservation alone is not
+complete coverage of the public API.
 
 ## Validation scope
 
-Storage-level tests cover consecutive maintenance between source writes,
-source updates/deletes after maintenance, final-segment reclamation, exact retry
-receipt preservation, pending-source migration refusal, exclusive pending
-transactions, both durable manifest outcomes after source-catalog reopen,
-unexpected-manifest retention, and corrupted history links (including recomputed
-checksums). Node reopen reports the current catalog epoch and retains document
-identity. The fixture models manifest cutover explicitly; it does not enable the
-legacy compactor or prove the complete live query/permission matrix above.
+Storage tests cover consecutive maintenance, source writes after maintenance,
+final-segment reclamation, exact retry-receipt preservation, migration refusal,
+exclusive pending transactions, unexpected manifests and corrupted history
+links. Actual node tests interrupt after intent, after activation and after an
+uncertain manifest rename, reopen source and node, and reconcile the serving
+view. A deterministic concurrent source write proves verification holds no
+mutation fence and stale verified output cannot commit.
 
-Validation remains local under an enforced 8 GiB scope with swap disabled.
-No fleet operations or production compaction runs are part of this checkpoint.
+Integration tests physically renumber surviving rows, retain lexical scores and
+source identity, enforce document visibility and identity-disclosure grants,
+reject stale read claims/public cursors, preserve empty vector configuration,
+and accept later source writes. Held old readers remain usable after normal
+file retirement. These tests use rebuilt layouts assembled from immutable live
+segments; the bounded row-rebuilding component remains on the list above.
+
+Validation is local under an enforced 8 GiB scope with swap disabled. No fleet
+operations or production compaction runs are part of this checkpoint.
