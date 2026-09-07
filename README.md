@@ -1237,6 +1237,10 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: segment-owned exact-vector reads.** Startup, compaction
+  and snapshot install share sealed FP32 mappings, preserve document-only gaps,
+  and incorporate catalog tombstones. Segmented flushes no longer rewrite a
+  whole-shard FP32 sidecar. See [exact-vector storage](docs/exact-vector-storage.md).
 - **Foundation branch: exact-vector append views.** Persisted FP32 rows stay
   mapped while new rows spill separately. Short reads refuse scoring and
   reconstruction; finalized builders cannot mutate published images.

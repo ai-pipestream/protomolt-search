@@ -260,13 +260,13 @@ and every serving route must observe or validate that view before returning a
 final result. A document spanning shards needs a collection publication decision;
 independent shard acknowledgments cannot establish an atomic visible version.
 
-Exact vectors are another integration constraint. Appending now retains the
-mapped base and spills only new rows; see [exact-vector storage](exact-vector-storage.md).
-Explicit snapshots and startup reconstruction can still copy a whole-shard
-sidecar. A publisher must reuse existing segment files instead of invoking those
-operations for every logical write. The reader must retain physical row
-positions, including segments without vectors, rather than treating only
-vector-bearing segments as one dense row set.
+Exact-vector views now share the sealed FP32 files and spill only new rows;
+see [exact-vector storage](exact-vector-storage.md). Startup, compaction and
+snapshot install preserve physical positions, including segments without vectors,
+and catalog attachment incorporates committed tombstones into the serving mask.
+Those operations remove full-sidecar copying from segmented startup and flush.
+The publisher must still prepare and activate the complete runtime view alongside
+its source publication decision, without dropping concurrently accepted tail rows.
 
 Recovery must join the catalog's immutable accepted history to the actual
 committed index manifests before reporting publication. Empty projections and

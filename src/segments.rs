@@ -278,6 +278,7 @@ struct OpenedSegment {
     metadata: SegmentMetadata,
     /// `None` for a documents-only segment (an empty `vector` artifact).
     vector: Option<Arc<VectorIndex>>,
+    exact: Option<Arc<ExactVectorStore>>,
     bm25: Arc<Bm25Reader>,
     live_docs: LiveDocs,
 }
@@ -428,6 +429,7 @@ impl OpenedSegmentSet {
                     segments.push(Arc::new(OpenedSegment {
                         metadata: metadata.clone(),
                         vector: held.vector.clone(),
+                        exact: held.exact.clone(),
                         bm25: Arc::clone(&held.bm25),
                         live_docs,
                     }));
@@ -463,15 +465,22 @@ impl OpenedSegmentSet {
             } else {
                 None
             };
-            let exact_rows = if has_vectors {
-                ExactVectorStore::open(&directory.join(&metadata.exact_vectors.file))
+            let exact = if has_vectors {
+                let exact = ExactVectorStore::open(&directory.join(&metadata.exact_vectors.file))
                     .map_err(|error| {
-                        format!("open exact segment {:?}: {error}", metadata.segment_id)
-                    })?
-                    .len()
+                    format!("open exact segment {:?}: {error}", metadata.segment_id)
+                })?;
+                if exact.dim() != vector.as_ref().and_then(VectorIndex::dim_opt) {
+                    return Err(format!(
+                        "segment {:?} exact-vector dimension differs from its provider",
+                        metadata.segment_id
+                    ));
+                }
+                Some(Arc::new(exact))
             } else {
-                0
+                None
             };
+            let exact_rows = exact.as_ref().map_or(0, |store| store.len());
             let bm25 = Bm25Reader::open(&directory.join(&metadata.bm25.file))
                 .map_err(|error| format!("open BM25 segment {:?}: {error}", metadata.segment_id))?;
             let live_docs =
@@ -488,6 +497,7 @@ impl OpenedSegmentSet {
             let aligned = |n: usize| n == 0 || n == rows;
             if rows == 0
                 || !aligned(vector_rows)
+                || (has_vectors && vector_rows != rows)
                 || !aligned(exact_rows)
                 || exact_rows != vector_rows
                 || !aligned(bm25_rows)
@@ -551,6 +561,7 @@ impl OpenedSegmentSet {
             segments.push(Arc::new(OpenedSegment {
                 metadata: metadata.clone(),
                 vector: vector.map(Arc::new),
+                exact,
                 bm25: Arc::new(bm25),
                 live_docs,
             }));
@@ -632,6 +643,38 @@ impl OpenedSegmentSet {
     /// Segment `i`'s vector image, `None` for a documents-only segment.
     pub fn vector(&self, i: usize) -> Option<&VectorIndex> {
         self.segments[i].vector.as_deref()
+    }
+
+    /// The immutable FP32 image opened and verified with this segment snapshot.
+    /// Documents-only segments have no exact rows. Bitmap-only publications
+    /// share this image while retaining their own tombstone overlays.
+    pub fn exact_vectors(&self, i: usize) -> Option<&Arc<ExactVectorStore>> {
+        self.segments[i].exact.as_ref()
+    }
+
+    /// Add this snapshot's committed tombstones to a generation-wide serving
+    /// overlay. Preserve newer overlay deletes and every previously held view.
+    /// Work visits bitmap words and set bits, not each physical document.
+    pub fn merge_tombstones(&self, live: &mut LiveDocs) -> Result<(), String> {
+        for segment in &self.segments {
+            usize::try_from(segment.metadata.end_label_exclusive()?)
+                .map_err(|_| "segment tombstone row range does not fit usize")?;
+        }
+        for segment in &self.segments {
+            let Some(words) = segment.live_docs.words() else {
+                continue;
+            };
+            let base = segment.metadata.base_label as usize;
+            for (ordinal, &word) in words.iter().enumerate() {
+                let mut remaining = word;
+                while remaining != 0 {
+                    let bit = remaining.trailing_zeros() as usize;
+                    live.delete(base + ordinal * 64 + bit);
+                    remaining &= remaining - 1;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn live_docs(&self, i: usize) -> &LiveDocs {
@@ -1620,6 +1663,11 @@ fn stage_segment(root: &Path, source: SegmentSource<'_>) -> Result<SegmentMetada
             exact
                 .verify_payload()
                 .map_err(|error| format!("verify staged exact vectors: {error}"))?;
+            if exact.dim() != vector.as_ref().and_then(VectorIndex::dim_opt) {
+                return Err(
+                    "staged segment exact-vector dimension differs from its provider".into(),
+                );
+            }
             exact.len()
         } else {
             0
@@ -1636,6 +1684,7 @@ fn stage_segment(root: &Path, source: SegmentSource<'_>) -> Result<SegmentMetada
         let aligned = |n: usize| n == 0 || n == rows;
         if rows == 0
             || !aligned(vector_rows)
+            || (vector.is_some() && vector_rows != rows)
             || exact_rows != vector_rows
             || !aligned(bm25_rows)
             || live_docs.persisted_rows() != rows as u64

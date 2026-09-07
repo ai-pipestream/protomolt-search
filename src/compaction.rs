@@ -1196,20 +1196,10 @@ impl NodeServiceImpl {
                     crate::segmented_vectors::SegmentedProvider::open(set.clone(), tail_image)
                         .map_err(|e| Status::internal(format!("segment vectors: {e}")))?;
                 index = Some(VectorIndex::from_provider(provider));
-                let parts: Vec<PathBuf> = (0..set.len())
-                    .filter(|i| set.vector(*i).is_some())
-                    .map(|i| {
-                        SegmentCatalog::segment_dir(&root, &set.metadata(i).segment_id)
-                            .join(&set.metadata(i).exact_vectors.file)
-                    })
-                    .collect();
-                let part_refs: Vec<&Path> = parts.iter().map(PathBuf::as_path).collect();
-                let exact_path = pre.work_dir.join("vectors.exact");
-                exact_vectors = Some(
-                    ExactVectorStore::write_concatenated(dim, &part_refs, &exact_path).map_err(
-                        |e| Status::internal(format!("assemble {}: {e}", exact_path.display())),
-                    )?,
-                );
+                exact_vectors =
+                    Some(ExactVectorStore::from_segments(&set, dim).map_err(|error| {
+                        Status::internal(format!("compacted exact-vector view: {error}"))
+                    })?);
             }
             let mapped_binding = bm25.binding().cloned();
             Ok(Shadow {

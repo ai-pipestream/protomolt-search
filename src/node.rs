@@ -5388,14 +5388,16 @@ impl NodeServiceImpl {
         let mut live_docs = LiveDocs::default();
         if let Some(index_path) = config.index_path.as_ref() {
             let (_, exact_path, bm25_path) = storage_paths(index_path, generation.as_ref());
-            if exact_path.exists() {
+            let root = segments_root(index_path);
+            let catalog_exists = root.join("segments.json").exists();
+            // A segment catalog owns its sealed FP32 files. Legacy sidecars
+            // cannot override that view, even when their row counts agree.
+            if exact_path.exists() && (!catalog_exists || generation.is_some()) {
                 exact_vectors = Some(
                     ExactVectorStore::open(&exact_path)
                         .map_err(|error| format!("load {}: {error}", exact_path.display()))?,
                 );
             }
-            let root = segments_root(index_path);
-            let catalog_exists = root.join("segments.json").exists();
             if bm25_path.exists() {
                 if catalog_exists && generation.is_none() {
                     return Err(format!(
@@ -5429,44 +5431,27 @@ impl NodeServiceImpl {
                     let dim = first
                         .dim_opt()
                         .ok_or_else(|| "segment vector image has no dimension".to_string())?;
-                    // The whole-shard FP32 sidecar is written at a flush;
-                    // a node that stopped without one (a refused shutdown
-                    // flush, a crash) has its sealed rows' FP32 files in
-                    // the segments, so the sidecar is rebuilt from them
-                    // here rather than refusing the next append by name.
-                    let sealed_rows: usize = (0..set.len())
-                        .filter(|i| set.vector(*i).is_some())
-                        .map(|i| set.metadata(i).rows as usize)
-                        .sum();
-                    let held = exact_vectors.as_ref().map_or(0, ExactVectorStore::len);
-                    if held != sealed_rows {
-                        let parts: Vec<PathBuf> = (0..set.len())
-                            .filter(|i| set.vector(*i).is_some())
-                            .map(|i| {
-                                root.join("segments")
-                                    .join(&set.metadata(i).segment_id)
-                                    .join(&set.metadata(i).exact_vectors.file)
-                            })
-                            .collect();
-                        let part_refs: Vec<&Path> = parts.iter().map(PathBuf::as_path).collect();
-                        eprintln!(
-                            "exact-vector sidecar {} holds {held} rows against {sealed_rows} \
-                             sealed; rebuilding it from {} segment files",
-                            exact_path.display(),
-                            parts.len()
-                        );
-                        exact_vectors = Some(
-                            ExactVectorStore::write_concatenated(dim, &part_refs, &exact_path)
-                                .map_err(|error| {
-                                    format!("rebuild {}: {error}", exact_path.display())
-                                })?,
-                        );
-                    }
+                    exact_vectors = Some(
+                        ExactVectorStore::from_segments(&set, dim)
+                            .map_err(|error| format!("segment exact-vector view: {error}"))?,
+                    );
                     let tail_image = VectorIndex::from_backend_config(dim, &backend)
                         .map_err(|error| format!("segment tail image: {error}"))?;
                     let provider = SegmentedProvider::open(set, tail_image)
                         .map_err(|error| format!("segment vectors: {error}"))?;
                     index = Some(VectorIndex::from_provider(provider));
+                } else if index.as_ref().is_some_and(VectorIndex::is_empty) {
+                    // An empty calibrated image is the surviving provider state
+                    // after complete compaction. It cannot adopt retired rows.
+                    exact_vectors = Some(ExactVectorStore::empty(
+                        index.as_ref().and_then(VectorIndex::dim_opt),
+                    ));
+                } else if exact_path.exists() {
+                    // Product-owned exact rows can accompany a remote provider.
+                    exact_vectors = Some(
+                        ExactVectorStore::open(&exact_path)
+                            .map_err(|error| format!("load {}: {error}", exact_path.display()))?,
+                    );
                 }
                 bm25 = Some(Bm25Shard::Segmented(shard));
             } else {
@@ -5846,6 +5831,12 @@ impl NodeServiceImpl {
                     panic!("{error}");
                 }
             }
+            if let Some(Bm25Shard::Segmented(shard)) = store.as_ref() {
+                shard
+                    .snapshot()
+                    .merge_tombstones(&mut guard.live_docs)
+                    .unwrap_or_else(|error| panic!("attach segment tombstones: {error}"));
+            }
             guard.mapped_binding = persisted.or_else(|| guard.mapped_binding.clone());
             guard.bm25 = store;
             guard.advance_stats_epoch();
@@ -5886,7 +5877,7 @@ impl NodeServiceImpl {
     }
 
     /// Attach the persisted generation overlay loaded at startup.
-    pub fn with_live_docs(self, live_docs: LiveDocs) -> Result<Self, String> {
+    pub fn with_live_docs(self, mut live_docs: LiveDocs) -> Result<Self, String> {
         {
             let mut guard = write_shard(&self.state);
             let rows = physical_rows(&guard);
@@ -5895,6 +5886,9 @@ impl NodeServiceImpl {
                     "live-doc overlay describes {} rows but the shard has only {rows}",
                     live_docs.persisted_rows()
                 ));
+            }
+            if let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() {
+                shard.snapshot().merge_tombstones(&mut live_docs)?;
             }
             guard.live_docs = live_docs;
         }
@@ -6553,7 +6547,32 @@ impl NodeServiceImpl {
                 })?;
             }
         }
-        if let Some(exact) = guard.exact_vectors.as_ref() {
+        let sealed_exact = guard
+            .index
+            .as_ref()
+            .and_then(VectorIndex::as_segmented)
+            .filter(|provider| provider.tail().is_empty() && provider.frozen().is_none())
+            .map(|provider| {
+                let dim = provider
+                    .tail()
+                    .dim_opt()
+                    .ok_or_else(|| Status::internal("segmented provider has no dimension"))?;
+                ExactVectorStore::from_segments(provider.snapshot(), dim)
+                    .map_err(|error| Status::internal(format!("sealed exact-vector view: {error}")))
+            })
+            .transpose()?;
+        if let Some(exact) = sealed_exact {
+            guard.exact_vectors = Some(exact);
+        } else if guard
+            .index
+            .as_ref()
+            .and_then(VectorIndex::as_segmented)
+            .is_some()
+        {
+            // Writes accepted during the seal remain in the private tail. The
+            // catalog already durably owns the sealed prefix; no full copy is
+            // needed. files_current below prevents exporting this newer tail.
+        } else if let Some(exact) = guard.exact_vectors.as_ref() {
             let mapped = exact
                 .write(&exact_path)
                 .map_err(|e| Status::internal(format!("write {}: {e}", exact_path.display())))?;
@@ -7198,9 +7217,13 @@ impl NodeServiceImpl {
                 ("vectors.f32", exact_vector_sidecar_path(index_path)),
                 ("live-docs.bin", live_docs_sidecar_path(index_path)),
             ] {
+                if name == "vectors.f32" && guard.index.as_ref().is_some_and(VectorIndex::is_empty)
+                {
+                    continue;
+                }
                 // A standalone image from before the first seal is obsolete
                 // once sealed vector images define the serving generation.
-                if name == "vector.index"
+                if (name == "vector.index" || name == "vectors.f32")
                     && matches!(guard.bm25.as_ref(), Some(Bm25Shard::Segmented(shard))
                         if (0..shard.snapshot().len()).any(|i| shard.snapshot().vector(i).is_some()))
                 {
@@ -7504,10 +7527,17 @@ impl NodeServiceImpl {
                 }
             }
         }
-        let sealed_vector_rows = (0..staged.len())
-            .filter_map(|i| staged.vector(i))
-            .map(|image| image.len())
-            .sum::<usize>();
+        let sealed_vector_rows = staged
+            .manifest()
+            .segments
+            .last()
+            .map(|segment| segment.end_label_exclusive())
+            .transpose()
+            .map_err(Status::invalid_argument)?
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| Status::invalid_argument("snapshot physical rows exceed usize"))?
+            .unwrap_or(0);
         let sealed_dim =
             (0..staged.len()).find_map(|i| staged.vector(i).and_then(|image| image.dim_opt()));
         let (vector_rows, vector_dim) = match sealed_dim {
@@ -7615,7 +7645,7 @@ impl NodeServiceImpl {
                 .ok_or_else(|| Status::internal("segment vector image has no dimension"))?;
             let tail_image = VectorIndex::from_backend_config(dim, &backend)
                 .map_err(|e| Status::internal(format!("segment tail image: {e}")))?;
-            let provider = SegmentedProvider::open(set, tail_image)
+            let provider = SegmentedProvider::open(set.clone(), tail_image)
                 .map_err(|e| Status::internal(format!("segment vectors: {e}")))?;
             Some(VectorIndex::from_provider(provider))
         } else if path.exists() {
@@ -7629,21 +7659,36 @@ impl NodeServiceImpl {
             None
         };
         let exact_path = exact_vector_sidecar_path(&path);
-        let exact_vectors = if exact_path.exists() {
-            Some(ExactVectorStore::open(&exact_path).map_err(|e| {
-                Status::internal(format!("open installed {}: {e}", exact_path.display()))
-            })?)
-        } else {
-            None
-        };
+        let exact_vectors =
+            if let Some(provider) = index.as_ref().and_then(VectorIndex::as_segmented) {
+                Some(
+                    ExactVectorStore::from_segments(
+                        &set,
+                        provider.tail().dim_opt().ok_or_else(|| {
+                            Status::internal("installed provider has no dimension")
+                        })?,
+                    )
+                    .map_err(|error| {
+                        Status::internal(format!("installed exact-vector view: {error}"))
+                    })?,
+                )
+            } else if exact_path.exists() {
+                Some(ExactVectorStore::open(&exact_path).map_err(|e| {
+                    Status::internal(format!("open installed {}: {e}", exact_path.display()))
+                })?)
+            } else {
+                None
+            };
         let live_path = live_docs_sidecar_path(&path);
-        let live_docs = if live_path.exists() {
+        let mut live_docs = if live_path.exists() {
             LiveDocs::open(&live_path).map_err(|e| {
                 Status::internal(format!("open installed {}: {e}", live_path.display()))
             })?
         } else {
             LiveDocs::default()
         };
+        set.merge_tombstones(&mut live_docs)
+            .map_err(|error| Status::internal(format!("installed segment tombstones: {error}")))?;
         let num_documents = shard.doc_count();
         let num_vectors = index.as_ref().map_or(0, |i| i.len() as u64);
         check_attached_derived(
@@ -14681,6 +14726,7 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
             let dim = exact.dim().ok_or_else(|| {
                 Status::failed_precondition("exact-vector sidecar has no dimension")
             })?;
+            let slots: Vec<usize> = slots.into_iter().filter(|&slot| exact.contains_row(slot)).collect();
             let predicted = (slots.len() as u64)
                 .checked_mul(dim as u64)
                 .and_then(|bytes| bytes.checked_mul(4))

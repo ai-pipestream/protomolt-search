@@ -1534,10 +1534,10 @@ async fn blocks_seal_with_their_vectors_and_documents_first_is_refused_by_name()
 
 /// A node that stopped without a flush (a refused shutdown flush, a
 /// crash) never finalized its whole-shard FP32 sidecar, but the sealed
-/// rows' FP32 files live in the segments: the next open rebuilds the
-/// sidecar from them, bit for bit, and appends continue.
+/// rows' FP32 files live in the segments: the next open shares them without
+/// writing a whole-shard sidecar, and appends continue.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_node_reopened_without_a_flush_rebuilds_its_exact_sidecar_from_segments() {
+async fn a_node_reopened_without_a_flush_shares_its_exact_segment_images() {
     let (analysis, _mock) = start_mock_analysis().await;
     let dir = tempdir("reopen");
     let sample = unit_vectors(64, DIM, SEED);
@@ -1565,8 +1565,16 @@ async fn a_node_reopened_without_a_flush_rebuilds_its_exact_sidecar_from_segment
         &analysis,
     ))
     .await;
-    let exact = pipestream_search::exact_vectors::ExactVectorStore::open(&exact_path)
-        .expect("the open rebuilt the sidecar from the segments");
+    assert!(
+        !exact_path.exists(),
+        "reopening must not copy the full FP32 corpus"
+    );
+    let set = pipestream_search::segments::OpenedSegmentSet::open(
+        pipestream_search::node::segments_root(&index_path),
+    )
+    .unwrap();
+    let exact =
+        pipestream_search::exact_vectors::ExactVectorStore::from_segments(&set, DIM).unwrap();
     assert_eq!(exact.len(), 256);
     exact.verify_payload().unwrap();
     assert_eq!(exact.row_values(5, 6).unwrap(), rows[5].vector);
@@ -1580,7 +1588,16 @@ async fn a_node_reopened_without_a_flush_rebuilds_its_exact_sidecar_from_segment
     assert_eq!(health.bm25_docs, 320);
     let flushed = second.flush(FlushRequest {}).await.unwrap().into_inner();
     assert_eq!(flushed.num_vectors, 320);
-    let exact = pipestream_search::exact_vectors::ExactVectorStore::open(&exact_path).unwrap();
+    assert!(
+        !exact_path.exists(),
+        "segment flush persists no redundant sidecar"
+    );
+    let set = pipestream_search::segments::OpenedSegmentSet::open(
+        pipestream_search::node::segments_root(&index_path),
+    )
+    .unwrap();
+    let exact =
+        pipestream_search::exact_vectors::ExactVectorStore::from_segments(&set, DIM).unwrap();
     assert_eq!(exact.len(), 320);
     exact.verify_payload().unwrap();
     handle.abort();

@@ -1051,6 +1051,15 @@ async fn segment_snapshot_refuses_rehashed_misaligned_exact_rows_before_replacin
             .write(&path)
             .unwrap();
         let (bytes, sha256) = repo::hash_file(&path).unwrap();
+        // New segment exports omit the redundant sidecar. Older producers may
+        // still send one; its shape must be checked before any installation.
+        if manifest.artifact("vectors.f32").is_none() {
+            manifest.artifacts.push(repo::Artifact {
+                file: "vectors.f32".into(),
+                bytes,
+                sha256: sha256.clone(),
+            });
+        }
         let artifact = manifest
             .artifacts
             .iter_mut()

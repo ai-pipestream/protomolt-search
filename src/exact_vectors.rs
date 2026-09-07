@@ -15,6 +15,8 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+mod segmented;
+
 const PAGE_BYTES: usize = 4096;
 const MIN_ROWS_PER_TASK: usize = 256;
 
@@ -64,6 +66,7 @@ enum Storage {
         base: Box<ExactVectorStore>,
         delta: Box<ExactVectorStore>,
     },
+    Segmented(segmented::SegmentedExact),
     Mapped {
         path: PathBuf,
         map: memmap2::Mmap,
@@ -104,6 +107,7 @@ impl ExactVectorStore {
                 base.release_pages()?;
                 delta.release_pages()
             }
+            Storage::Segmented(view) => view.release_pages(),
             _ => Ok(()),
         }
     }
@@ -258,6 +262,7 @@ impl ExactVectorStore {
             Storage::Spilled { dim, .. } => *dim,
             Storage::Mapped { dim, .. } => Some(*dim),
             Storage::Appended { base, .. } => base.dim(),
+            Storage::Segmented(view) => Some(view.dim),
         }
     }
 
@@ -267,6 +272,7 @@ impl ExactVectorStore {
             Storage::Spilled { rows, .. } => *rows,
             Storage::Mapped { rows, .. } => *rows,
             Storage::Appended { base, delta } => base.len() + delta.len(),
+            Storage::Segmented(view) => view.rows,
         }
     }
 
@@ -283,13 +289,16 @@ impl ExactVectorStore {
     }
 
     pub fn is_mapped(&self) -> bool {
-        matches!(self.storage, Storage::Mapped { .. })
+        matches!(self.storage, Storage::Mapped { .. } | Storage::Segmented(_))
     }
 
     pub fn path(&self) -> Option<&Path> {
         match &self.storage {
             Storage::Mapped { path, .. } => Some(path),
-            Storage::Building { .. } | Storage::Spilled { .. } | Storage::Appended { .. } => None,
+            Storage::Building { .. }
+            | Storage::Spilled { .. }
+            | Storage::Appended { .. }
+            | Storage::Segmented(_) => None,
         }
     }
 
@@ -322,7 +331,12 @@ impl ExactVectorStore {
             .and_then(|rows| rows.checked_mul(dim))
             .and_then(|values| values.checked_mul(4))
             .ok_or_else(|| invalid("exact-vector append size overflow"))?;
-        if let Storage::Mapped { path, .. } = &self.storage {
+        let append_origin = match &self.storage {
+            Storage::Mapped { path, .. } => Some(path.as_path()),
+            Storage::Segmented(view) => Some(view.append_target.as_path()),
+            _ => None,
+        };
+        if let Some(path) = append_origin {
             let target = unique_temp_path(path);
             let mut delta = Self::spilling(&target, Some(dim))?;
             // Do not change the readable view unless the entire append succeeds.
@@ -372,7 +386,9 @@ impl ExactVectorStore {
                 *rows += vectors.len() / dim;
             }
             Storage::Appended { delta, .. } => delta.append(vectors, dim)?,
-            Storage::Mapped { .. } => unreachable!("mapped store converted above"),
+            Storage::Mapped { .. } | Storage::Segmented(_) => {
+                unreachable!("immutable store converted above")
+            }
         }
         Ok(())
     }
@@ -512,6 +528,7 @@ impl ExactVectorStore {
                 base.write_payload(out, digest)?;
                 delta.write_payload(out, digest)?;
             }
+            Storage::Segmented(view) => view.write_payload(out, digest)?,
             Storage::Mapped { map, .. } => {
                 let payload = &map[HEADER_BYTES..];
                 digest.update(payload);
@@ -590,6 +607,7 @@ impl ExactVectorStore {
     /// explicit integrity operation rather than part of ordinary mmap open.
     pub fn verify_payload(&self) -> io::Result<()> {
         match &self.storage {
+            Storage::Segmented(view) => return view.verify_payload(),
             Storage::Appended { base, delta } => {
                 base.verify_payload()?;
                 return delta.verify_payload();
@@ -667,7 +685,7 @@ impl ExactVectorStore {
             .iter()
             .copied()
             .enumerate()
-            .filter_map(|(ordinal, slot)| (slot < self.len()).then_some((ordinal, slot)))
+            .filter_map(|(ordinal, slot)| self.contains_row(slot).then_some((ordinal, slot)))
             .collect();
         scheduled.sort_unstable_by_key(|&(ordinal, slot)| {
             let byte = HEADER_BYTES.saturating_add(slot.saturating_mul(row_bytes));
@@ -732,19 +750,39 @@ impl ExactVectorStore {
         })
     }
 
-    // A delta view has exactly one mapped prefix and a disk-builder suffix.
+    /// Whether a physical row has an FP32 vector. This is storage presence,
+    /// not a live-document or authorization decision.
+    pub fn contains_row(&self, slot: usize) -> bool {
+        match &self.storage {
+            Storage::Segmented(view) => view.contains_row(slot),
+            Storage::Appended { base, delta } => {
+                if slot < base.len() {
+                    base.contains_row(slot)
+                } else {
+                    delta.contains_row(slot - base.len())
+                }
+            }
+            _ => slot < self.len(),
+        }
+    }
+
+    // Mapped page identities include the held mapping, not just its file offset.
     fn mapped_pages(
         &self,
         slot: usize,
         row_bytes: usize,
-        pages: &mut std::collections::BTreeSet<usize>,
+        pages: &mut std::collections::BTreeSet<(usize, usize)>,
     ) {
         match &self.storage {
-            Storage::Mapped { .. } => {
+            Storage::Mapped { map, .. } => {
                 let start = HEADER_BYTES + slot * row_bytes;
                 let end = start + row_bytes - 1;
-                pages.extend(start / PAGE_BYTES..=end / PAGE_BYTES);
+                pages.extend(
+                    (start / PAGE_BYTES..=end / PAGE_BYTES)
+                        .map(|page| (map.as_ptr() as usize, page)),
+                );
             }
+            Storage::Segmented(view) => view.mapped_pages(slot, row_bytes, pages),
             Storage::Appended { base, .. } if slot < base.len() => {
                 base.mapped_pages(slot, row_bytes, pages)
             }
@@ -755,6 +793,7 @@ impl ExactVectorStore {
     fn score_one(&self, query: &[f32], slot: usize, dim: usize) -> io::Result<f32> {
         Ok(match &self.storage {
             Storage::Building { values, .. } => dot(&values[slot * dim..(slot + 1) * dim], query),
+            Storage::Segmented(view) => view.score_one(query, slot, dim)?,
             Storage::Spilled { file, .. } => {
                 let mut row = vec![0u8; dim * 4];
                 file.read_exact_at(&mut row, (HEADER_BYTES + slot * dim * 4) as u64)?;
@@ -788,6 +827,7 @@ impl ExactVectorStore {
             .dim()
             .ok_or_else(|| invalid("exact-vector store has no dimension"))?;
         Ok(match &self.storage {
+            Storage::Segmented(view) => view.row_values(from, to)?,
             Storage::Building { values, .. } => values[from * dim..to * dim].to_vec(),
             Storage::Spilled { file, .. } => {
                 let mut bytes = vec![0u8; (to - from) * dim * 4];
