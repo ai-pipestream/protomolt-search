@@ -1445,6 +1445,7 @@ async fn the_serving_routes_enforce_the_inputs_rule() {
         sort: vec![QuerySort {
             column: "court_hash".into(),
             descending: false,
+            map: None,
         }],
         ..Default::default()
     };

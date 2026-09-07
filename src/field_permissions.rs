@@ -513,6 +513,7 @@ mod derived_tests {
             sort: vec![QuerySort {
                 column: column.into(),
                 descending: false,
+                map: None,
             }],
             projections: vec![NamedProjection {
                 name: "p".into(),
@@ -628,6 +629,7 @@ mod derived_tests {
         let sort = vec![BrowseSort {
             column: "court_hash".into(),
             descending: false,
+            map: None,
         }];
         assert!(both().browse(&filters, &sort, &[]).is_ok());
         denied(no_input().browse(&filters, &sort, &[]));

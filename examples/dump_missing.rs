@@ -118,8 +118,9 @@ fn run() -> Result<u64, String> {
             }
             let facets: Vec<String> = (0..bm25.facet_count())
                 .filter_map(|fi| {
-                    bm25.facet_ord(fi, row)
-                        .map(|ord| format!("{}={:?}", bm25.facet_name(fi), bm25.facet_value(fi, ord)))
+                    bm25.facet_ord(fi, row).map(|ord| {
+                        format!("{}={:?}", bm25.facet_name(fi), bm25.facet_value(fi, ord))
+                    })
                 })
                 .collect();
             println!("facets: {}", facets.join(", "));
