@@ -110,9 +110,22 @@ The bundle implementation has eight focused passing regressions: capture across
 compaction and path retirement with unpublished source backlog, multiple owned
 indexes, empty declarations and source tombstones, source-only histories,
 index/owner and budget refusals, changed artifact bytes, exclusive output
-ownership, and refusal of destinations nested in live catalogs. Combined
-validation with the derived-column snapshot fix is pending.
+ownership, and refusal of destinations nested in live catalogs.
 
+Local validation at `afcc03c`, including the merge of `ba71981`, passed:
+628 library tests, 842 integration tests across 142 targets, 13 embedded tests
+and 2 isolated IVF-provider tests. Total: 1,485 passed, 0 failed. The existing
+live OpenNLP test remains ignored. All 5 Android/iOS compile targets,
+tests/examples compilation, formatting, vendored-proto identity and whitespace
+checks passed. Existing search/storage descriptors from `bdb54c4` are preserved;
+the backup messages are additive. Source hashes matched before and after the
+run. The scope used `MemoryMax=8G` and `MemorySwapMax=0`, peaked at 8 GiB,
+with 0 OOM and OOM-kill events.
+
+This checkpoint is local and unpushed pending the derived-evaluation fixes.
+Those future edits need their own validation.
+
+### Source-only checkpoint validation
 
 The checkpoint implementation passed 615 library tests, 837 integration tests
 across 142 targets, 13 embedded tests and two isolated IVF-provider tests:
