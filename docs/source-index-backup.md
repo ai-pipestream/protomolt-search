@@ -211,6 +211,9 @@ The staging verifier and local terminal seal do not supply this distributed
 activation contract. The seal implements the old-store retirement primitive;
 committed prepare/activate decisions, replacement catch-up proof, rollback
 policy and recovery of that authority transaction remain to be implemented.
+The proposed [source authority activation contract](source-authority-activation.md)
+sets the ownership, admission, rollback and crash-recovery requirements for that
+implementation; it does not enable a replacement writer.
 
 The bundle must be usable without the original source paths or a running
 analysis service. It must retain accepted-but-unpublished writes and expose
@@ -219,6 +222,25 @@ use the same owner operation; they must not assemble independent source and
 index snapshots in application code.
 
 ## Validation
+
+At `21c21a1`, the reconciled source-authority and checked-budget run passed 658
+library tests, 850 integration tests across 144 targets, 13 embedded tests and
+2 IVF-provider tests: 1,523 passed, 0 failed. The existing live OpenNLP test
+remains ignored. All 5 Android/iOS targets, tests/examples compilation,
+formatting, vendored-proto identity and diff checks passed. The descriptor
+comparison against `bd75556` found no changes to existing wire declarations.
+All 630 captured tracked and untracked files matched between both phase
+snapshots and remained unchanged through validation. The scope had an 8 GiB hard limit, peaked at
+8 GiB, used no swap and recorded 0 OOM, OOM-kill or OOM-group-kill events.
+
+The library phase of an earlier driver attempt exited successfully, after which
+the driver stopped because its suite-script path was missing; this was not a
+test failure. The complete final attempt exited successfully. These are local
+results; hosted CI, merge to `main` and fleet rollout were not performed. The
+[source authority activation contract](source-authority-activation.md) remains
+proposed; no replacement authority was activated.
+
+### Historical validation at `2546712`
 
 At `2546712`, the complete local source-authority run passed 658 library tests,
 848 integration tests across 144 targets, 13 embedded tests and 2 IVF-provider

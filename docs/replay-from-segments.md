@@ -199,6 +199,9 @@ claiming its next bucket, and the appender takes the results in plan
 order. A finished bucket waits as its id maps (16 bytes a row), so the
 backlog is cheap beside an in-flight replay, but unbounded it could
 hold a whole child.
+Workers already in flight can finish together after the queue reaches its
+threshold. The maximum backlog is bounded by the queue threshold plus the
+worker count, not the queue threshold alone.
 
 `--build-memory=<MiB>` is a fixed 70 KiB/row planning admission estimate, not
 an actual process-memory limit. It makes the budget rule a refusal instead of an
@@ -211,9 +214,10 @@ still replays one bucket, so the single-bucket rule applies at
 `--build-threads=1` too. Nothing is lowered to fit: the operator
 raises the budget, lowers the thread count, or cuts finer. The budget
 does not account for wide protobuf/text/vector values, queued id maps, mapped
-sources, or page cache; a
-single image has no buckets and refuses the flag by name. Without the
-flag nothing is enforced.
+sources, or page cache. A single image has no buckets and refuses the flag by
+name. Without the flag, there is no memory-estimate admission check. Use the
+operational cgroup limit (`MemoryMax=8G`, `MemorySwapMax=0`) to enforce actual
+memory usage independently of this estimate.
 
 The two passes do not overlap: a spill bucket takes rows from the
 first source segment to the last (every row files to its child and

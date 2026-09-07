@@ -1237,6 +1237,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: reconciled source authority and checked transplant build budgets.**
+  Checkpoint `21c21a1` reconciles main `16305a3` through `537efd1`. Transplant
+  build-memory arithmetic refuses overflow; planning estimates describe the
+  requested work, while the hard process/cgroup limit remains the operational
+  memory boundary. Local retirement and verified staging do not activate a
+  replacement writer. The [source authority activation
+  contract](docs/source-authority-activation.md) remains proposed only.
 - **Foundation branch: durable source retirement.** A trusted local owner can
   seal a source history at an exact accepted sequence after resolving every
   pending publication and maintenance decision. The terminal seal survives
