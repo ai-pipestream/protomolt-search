@@ -5,6 +5,12 @@ The decoder and fingerprint were revised after `PRE_ASTRA`; see
 remaining preservation, indexing and query contracts. In particular, the older
 reference description below is historical evidence, not complete shape support.
 
+`PlanIndexRequest.index_definition` and `MappedBind.index_definition` now select
+an [explicit protobuf projection policy](index-definition.md). A present
+definition replaces hint inference and naming heuristics; omission retains the
+legacy behavior described below. Explicit and inferred plans have distinct
+binding fingerprint domains.
+
 Status: **increments 1 and 2 implemented** (2026-08-25) — dry-run
 derivation, and bind + protobuf-native ingest (section 4a).
 `SearchService.PlanIndex` derives the deterministic, fingerprinted plan

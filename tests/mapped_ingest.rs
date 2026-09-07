@@ -320,6 +320,7 @@ fn bind() -> MappedBind {
         analysis: None,
         materialize: None,
         field_analysis: Vec::new(),
+        index_definition: None,
     }
 }
 
@@ -1732,6 +1733,7 @@ fn opinion_bind() -> MappedBind {
         analysis: None,
         materialize: None,
         field_analysis: Vec::new(),
+        index_definition: None,
     }
 }
 

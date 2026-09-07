@@ -13607,7 +13607,11 @@ impl SearchService for CoordinatorServiceImpl {
             // nothing fans out, nothing binds, and the same request returns the
             // same fingerprint on every coordinator.
             let req = request.into_inner();
-            let plan = crate::mapping::derive_plan(&req.descriptor_set, &req.message_type)?;
+            let plan = crate::mapping::derive_plan_with_definition(
+                &req.descriptor_set,
+                &req.message_type,
+                req.index_definition.as_ref(),
+            )?;
             Ok(Response::new(crate::pb::PlanIndexResponse {
                 plan: Some(plan),
             }))

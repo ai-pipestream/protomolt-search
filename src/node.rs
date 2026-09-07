@@ -10347,10 +10347,11 @@ impl NodeServiceImpl {
                  review it, and bind the fingerprint you saw",
             ));
         }
-        let extractor = crate::mapping::Extractor::new(
+        let extractor = crate::mapping::Extractor::with_definition(
             &bind.descriptor_set,
             &bind.message_type,
             &bind.body_path,
+            bind.index_definition.as_ref(),
         )?;
         let analysis = crate::mapped_analysis::MappedAnalysis::resolve(bind, &extractor)?;
         if self.config.analysis_addr.as_deref() == Some(crate::analyzer::NATIVE_ANALYSIS_BACKEND) {

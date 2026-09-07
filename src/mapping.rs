@@ -50,6 +50,9 @@ use crate::sha256;
 #[path = "schema_report.rs"]
 mod schema_report;
 
+#[path = "index_definition.rs"]
+mod index_definition;
+
 /// Full name of the field-option extension carrying indexing hints,
 /// owned by ProtoMolt and vendored under `proto/ai/protomolt/`.
 const HINT_EXTENSION_NAME: &str = "ai.protomolt.proto.index.hints.v1.index";
@@ -81,6 +84,15 @@ fn refuse_at(path: &str, msg: impl AsRef<str>) -> Status {
 /// ambiguity and every unsupported hint is an error here, before any
 /// index exists.
 pub fn derive_plan(descriptor_set: &[u8], message_type: &str) -> Result<pb::MappedPlan, Status> {
+    derive_plan_with_definition(descriptor_set, message_type, None)
+}
+
+/// Derive a plan using an explicit policy, or legacy descriptor inference.
+pub fn derive_plan_with_definition(
+    descriptor_set: &[u8],
+    message_type: &str,
+    definition: Option<&pb::IndexDefinition>,
+) -> Result<pb::MappedPlan, Status> {
     if message_type.is_empty() {
         return Err(refuse("message_type is required"));
     }
@@ -98,10 +110,16 @@ pub fn derive_plan(descriptor_set: &[u8], message_type: &str) -> Result<pb::Mapp
     })?;
     validate_descriptor_syntax(&set).map_err(refuse)?;
     let index = TypeIndex::build(&set);
-    check_extension_declarations(&set)?;
+    if definition.is_none() {
+        check_extension_declarations(&set)?;
+    }
     let pool = DescriptorPool::decode(descriptor_set)
         .map_err(|e| refuse(format!("invalid descriptor set: {e}")))?;
-    let hint_map = extract_hints(descriptor_set)?;
+    let hint_map = if definition.is_none() {
+        extract_hints(descriptor_set)?
+    } else {
+        HashMap::new()
+    };
     let root = index.messages.get(message_type).ok_or_else(|| {
         refuse(format!(
             "message type {message_type:?} is not in the descriptor set; \
@@ -125,16 +143,23 @@ pub fn derive_plan(descriptor_set: &[u8], message_type: &str) -> Result<pb::Mapp
 
     let mut fields = Vec::new();
     let mut visiting = Vec::new();
-    walk(
-        root,
-        "",
-        "",
-        0,
-        &index,
-        &hint_map,
-        &mut fields,
-        &mut visiting,
-    )?;
+    let canonical_definition = if let Some(definition) = definition {
+        let (projected, canonical) = index_definition::derive(definition, root, &index)?;
+        fields = projected;
+        Some(canonical)
+    } else {
+        walk(
+            root,
+            "",
+            "",
+            0,
+            &index,
+            &hint_map,
+            &mut fields,
+            &mut visiting,
+        )?;
+        None
+    };
     if fields.is_empty() {
         return Err(refuse(format!(
             "message type {message_type} has no indexable fields"
@@ -209,6 +234,7 @@ pub fn derive_plan(descriptor_set: &[u8], message_type: &str) -> Result<pb::Mapp
         descriptor_sha256: sha256::hex_digest(descriptor_set),
         schema_report: None,
         vector_binding: None,
+        index_definition: canonical_definition,
     };
     plan.fingerprint = fingerprint(&plan, &set, &pool);
     plan.vector_binding = Some(crate::mapped_vector::from_plan(&plan)?);
@@ -1450,6 +1476,9 @@ fn vector_shaped_name(name: &str) -> bool {
 /// may derive the same plan. The reachable wire schema is covered separately.
 fn fingerprint(plan: &pb::MappedPlan, set: &FileDescriptorSet, pool: &DescriptorPool) -> String {
     let mut hasher = sha256::Sha256::new();
+    if plan.index_definition.is_some() {
+        write_str(&mut hasher, "protomolt.search.index-definition.v1");
+    }
     write_str(&mut hasher, FINGERPRINT_VERSION);
     write_str(&mut hasher, &plan.message_type);
     hash_wire_schema(&mut hasher, set, pool, &plan.message_type);
@@ -1715,7 +1744,17 @@ impl Extractor {
         message_type: &str,
         body_path: &str,
     ) -> Result<Extractor, Status> {
-        let plan = derive_plan(descriptor_set, message_type)?;
+        Self::with_definition(descriptor_set, message_type, body_path, None)
+    }
+
+    /// Compile the exact explicit projection reviewed by a client.
+    pub fn with_definition(
+        descriptor_set: &[u8],
+        message_type: &str,
+        body_path: &str,
+        definition: Option<&pb::IndexDefinition>,
+    ) -> Result<Extractor, Status> {
+        let plan = derive_plan_with_definition(descriptor_set, message_type, definition)?;
         let pool = DescriptorPool::decode(descriptor_set)
             .map_err(|e| refuse(format!("invalid descriptor set: {e}")))?;
         let descriptor = pool

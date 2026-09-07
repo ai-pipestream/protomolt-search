@@ -1267,9 +1267,34 @@ mod tests {
         assert!(opened.no_egress);
 
         let descriptor_set = record_descriptor();
+        let definition = pipestream_search::pb::IndexDefinition {
+            projections: vec![
+                pipestream_search::pb::IndexProjection {
+                    field_numbers: vec![1],
+                    kind: pipestream_search::pb::MappedKind::Keyword as i32,
+                    column_name: "id".into(),
+                    role: pipestream_search::pb::MappedRole::DocId as i32,
+                    ..Default::default()
+                },
+                pipestream_search::pb::IndexProjection {
+                    field_numbers: vec![2],
+                    kind: pipestream_search::pb::MappedKind::Text as i32,
+                    column_name: "body".into(),
+                    ..Default::default()
+                },
+                pipestream_search::pb::IndexProjection {
+                    field_numbers: vec![3],
+                    kind: pipestream_search::pb::MappedKind::Vector as i32,
+                    column_name: "semantic".into(),
+                    vector_dims: 32,
+                    ..Default::default()
+                },
+            ],
+        };
         let planning = PlanIndexRequest {
             descriptor_set: descriptor_set.clone(),
             message_type: "private.v1.Record".into(),
+            index_definition: Some(definition.clone()),
             ..Default::default()
         }
         .encode_to_vec();
@@ -1278,6 +1303,7 @@ mod tests {
             payload(unsafe { std::slice::from_raw_parts(buffer.data, buffer.len) });
         unsafe { protomolt_search_buffer_free(buffer) };
         let plan = planned.plan.expect("mobile fixture plan");
+        assert_eq!(plan.index_definition, Some(definition.clone()));
         let ingest = MobileIngestMappedBatch {
             shard: 0,
             requests: vec![
@@ -1291,6 +1317,7 @@ mod tests {
                         analysis: Some(body_spec()),
                         materialize: None,
                         field_analysis: Vec::new(),
+                        index_definition: Some(definition),
                     })),
                 },
                 IngestMappedRequest {

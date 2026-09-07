@@ -413,6 +413,7 @@ async fn descriptor_plan_and_mapped_ingest_use_the_embedded_schema() {
     let descriptor_set = record_descriptor();
     let planned = runtime
         .plan_index(PlanIndexRequest {
+            index_definition: None,
             collection: String::new(),
             descriptor_set: descriptor_set.clone(),
             message_type: "private.v1.Record".into(),
@@ -451,6 +452,7 @@ async fn descriptor_plan_and_mapped_ingest_use_the_embedded_schema() {
                         analysis: Some(body_spec()),
                         materialize: None,
                         field_analysis: Vec::new(),
+                        index_definition: None,
                     })),
                 },
                 IngestMappedRequest {

@@ -1222,6 +1222,10 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **2026-09-06 — Explicit protobuf index definitions.** Plan and bind an
+  occurrence-specific policy using field-number paths, concrete column kinds,
+  names, roles and dimensions. Unlisted fields stay source-only; descriptor hints
+  do not add projections. See [index definitions](docs/index-definition.md).
 - **2026-09-06 — Identity on streamed revisions.** Provisional and final
   revisions carry imported identities under the admitted version and authority
   view, with explicit resolved/withheld states and a versioned, wire-reproducible

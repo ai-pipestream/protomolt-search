@@ -191,6 +191,7 @@ fn bind() -> MappedBind {
         analysis: Some(body_spec()),
         materialize: None,
         field_analysis: Vec::new(),
+        index_definition: None,
     }
 }
 

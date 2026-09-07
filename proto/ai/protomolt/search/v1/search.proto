@@ -6007,6 +6007,31 @@ message PlanIndexRequest {
   // default; an unknown name, or no name where named collections exist
   // and no default is configured, refuses by name.
   string collection = 3;
+  // Present: use exactly these projections, with no descriptor hints or name
+  // inference. Omitted fields remain in the original source. Inspect the
+  // returned definition acknowledgment before binding on mixed-version fleets.
+  IndexDefinition index_definition = 4;
+}
+
+// Explicit occurrence-specific indexing policy. Paths use protobuf field
+// numbers from the root. Unlisted fields are source-only, including unknown
+// fields. The source descriptor and payload are never rewritten by this policy.
+// A definition currently requires one DOC_ID, one VECTOR and (at bind) a TEXT
+// body. Repeated-message traversal requires an explicit CHUNKS projection.
+message IndexDefinition {
+  repeated IndexProjection projections = 1;
+}
+
+message IndexProjection {
+  repeated uint32 field_numbers = 1;
+  // Required concrete kind. Unsupported value shapes refuse at planning;
+  // omit a projection to retain a field only in the source.
+  MappedKind kind = 2;
+  // Required physical column name for a value. Empty for a CHUNKS container.
+  string column_name = 3;
+  MappedRole role = 4;
+  // Required positive dimension for VECTOR; must be zero for other kinds.
+  uint32 vector_dims = 5;
 }
 
 // PlanIndexResponse returns the plan a future bind would bind.
@@ -6185,6 +6210,10 @@ message MappedPlan {
   // than assuming a body field or a source-path alias. It is an explanation of
   // the fingerprinted plan, not a credential or a runtime read-version claim.
   MappedVectorBinding vector_binding = 11;
+  // Canonical acknowledgment of explicit policy, sorted by field-number path.
+  // Absent for legacy inferred plans. Explicit plans use a distinct fingerprint
+  // domain so a peer that ignores the policy cannot accept its bind.
+  IndexDefinition index_definition = 12;
 }
 
 // Canonical vector identity derived from MappedPlan. The current plan supports
@@ -6267,6 +6296,9 @@ message MappedBind {
   // stream; Flush makes it durable. Changing it requires rebuilding from sources.
   // Empty retains the legacy body-only analysis behavior.
   repeated MappedFieldAnalysis field_analysis = 8;
+  // The same explicit policy reviewed through PlanIndex. The node re-derives
+  // it and verifies expected_fingerprint before accepting any source rows.
+  IndexDefinition index_definition = 9;
 }
 
 message MappedFieldAnalysis {

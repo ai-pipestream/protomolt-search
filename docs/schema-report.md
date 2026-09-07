@@ -2,8 +2,9 @@
 
 `PlanIndex` returns `MappedPlan.schema_report` for a successfully derived plan.
 The report distinguishes original-byte preservation, mapped projection and the
-query representation. It is an explanation of the current plan, not a new
-indexing policy or a promise that every protobuf field type is queryable.
+query representation. It explains the current plan, including a supplied
+[explicit index definition](index-definition.md); it does not promise that
+every protobuf field type is queryable.
 
 `DescribeSchema` accepts a complete descriptor set and a root type without
 requiring a viable index plan. Its report inventories proto2/proto3 schemas,
@@ -90,8 +91,11 @@ other projection/wire semantics does. See the wrapper migration in
 extractor for each proposed value path, so a column family that cannot decode
 its declared protobuf type refuses during planning rather than failing only at
 bind. Rejected plans still return a status; clients can independently call
-`DescribeSchema` to inspect their source graph. Configurable projections and
-query implementations for currently source-only shapes remain unfinished.
+`DescribeSchema` to inspect their source graph. Query implementations for
+currently source-only shapes remain unfinished.
+An explicit definition now selects supported projections independently of
+descriptor hints. Unlisted occurrences have no projection, and
+`excluded_by_hint` is false because hint policy is not applied in that mode.
 
 `tests/schema_report.rs` uses protoc-generated schemas and the existing Google
 protobuf semantics fixture. It checks fields hidden by projection boundaries,
