@@ -132,6 +132,25 @@ index snapshots in application code.
 
 ## Validation
 
+At `9cee9a3`, the reconciled branch passed 640 library tests, 848 integration
+tests across 144 targets, 13 embedded tests and 2 IVF-provider tests: 1,503
+passed, 0 failed. The existing live OpenNLP test remains ignored. All 5
+Android/iOS targets, tests/examples compilation, formatting, vendored-proto
+identity and diff checks passed. Existing search/storage descriptors from
+`daec858` are unchanged, and all 625 tracked source hashes matched before and
+after validation. The 8 GiB scope used no swap and recorded 0 OOM, OOM-kill or
+OOM-group-kill events. This is local validation; hosted CI, fleet rollout and
+merge to `main` were not performed.
+
+This checkpoint reconciles the local `main` correction in `1a74f97`, the
+Boolean fixes in `92bfe79`, and the complete journal audit in `a749925`.
+`9cee9a3` additionally rejects `math.abs(i64::MIN)` when evaluating a declared
+column, while missing input, per-request materialization absence and untaken
+ternary branches retain their existing behavior. Incoming-bundle verification
+and collection-authority activation remain unfinished.
+
+### Historical validation at `92bfe79`
+
 At `92bfe79`, the source-history audit and Boolean reconciliation passed
 636 library tests, 848 integration tests across 144 targets, 13 embedded
 tests and 2 IVF-provider tests: 1,499 passed, 0 failed. The live OpenNLP
@@ -139,8 +158,7 @@ test remains ignored. Android/iOS compilation passed on all 5 targets;
 tests/examples, formatting, vendored protos and whitespace checks passed.
 Search/storage descriptors from `d3c4534` are unchanged. Input hashes matched
 before and after validation. The 8 GiB scope used no swap and had 0 OOM or
-OOM-kill events. These results apply to this local checkpoint, ahead of the
-pending derived-evaluation fixes.
+OOM-kill events. These results apply to that historical local checkpoint.
 
 The source audit regressions cover older history gaps, blob corruption, stale
 heads, invalid retry flags, migration boundaries, disk and record budgets,
@@ -148,7 +166,7 @@ exclusive scratch ownership and duplicate receipts across 1024-entry batches.
 The Boolean fix in `92bfe79` checks shared filter references under direct
 SHOULD/MUST_NOT and complete candidate provenance, with document visibility.
 
-### Bundle capture validation
+### Historical bundle capture validation
 
 The bundle implementation has eight focused passing regressions: capture across
 compaction and path retirement with unpublished source backlog, multiple owned
@@ -166,10 +184,7 @@ the backup messages are additive. Source hashes matched before and after the
 run. The scope used `MemoryMax=8G` and `MemorySwapMax=0`, peaked at 8 GiB,
 with 0 OOM and OOM-kill events.
 
-This checkpoint is local and unpushed pending the derived-evaluation fixes.
-Those future edits need their own validation.
-
-### Source-only checkpoint validation
+### Historical source-only checkpoint validation
 
 The checkpoint implementation passed 615 library tests, 837 integration tests
 across 142 targets, 13 embedded tests and two isolated IVF-provider tests:

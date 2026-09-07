@@ -1995,6 +1995,10 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   declaration mismatches before row or log mutation. Derived network WAL
   replay remains unavailable through fresh ingest and is refused before
   transmission. [Compatibility and remaining replay work](docs/derived-columns.md#compatibility-with-the-parallel-integer-map-branch).
+- **Branch checkpoint 2026-09-07: exact derived absolute value.**
+  Declared columns reject `math.abs(i64::MIN)`, which has no exact signed
+  64-bit result. Missing input, per-request materialization absence and untaken
+  ternary branches keep their prior behavior. [Derived columns](docs/derived-columns.md).
 - **Landed 2026-09-07: the reconciled child, and the transplant under 8 GiB.**
   `examples/reconcile.rs` reads a re-placement child back against its
   sources' sealed segments document for document (text, lineage, identity,
