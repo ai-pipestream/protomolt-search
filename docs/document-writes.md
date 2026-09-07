@@ -176,6 +176,14 @@ not change physical index formats or require source reindexing. Preserve the
 migrated authority in backups: restoring a pre-migration copy assigns a new
 identity and requires reconciling any previously bound projection checkpoints.
 
+An explicit `DocumentCatalog::seal_history` retirement commits format 4 with a
+terminal seal at an exact accepted watermark. It preserves the history identity
+and all retry/source records. All subsequent source and index journal writes
+refuse, including after reopen or copying a sealed backup. Active catalogs stay
+format 3; there is no automatic retirement on lease expiry and no unseal API.
+Historical reads remain available. See [source writer retirement](source-index-backup.md#terminal-retirement-of-the-source-writer)
+for the pending-work rule and the separate replacement-activation boundary.
+
 The feed is publisher input, not a complete catalog backup: it does not expose
 operation IDs and cannot reconstruct the persistent idempotency authority.
 

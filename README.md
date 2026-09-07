@@ -1237,6 +1237,14 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: durable source retirement.** A trusted local owner can
+  seal a source history at an exact accepted sequence after resolving every
+  pending publication and maintenance decision. The terminal seal survives
+  restart, backup and restore staging; every source/index write transaction
+  checks it after acquiring the database writer. Format 4 prevents older source
+  writers from reopening a sealed catalog. Historical reads and backups remain
+  available. This retires one local store; replacement authority activation is
+  still separate. See [source/index backup](docs/source-index-backup.md).
 - **Foundation branch: verified private restore staging.** A trusted local owner
   supplies an incoming bundle root, a new private destination, explicit budgets
   and the expected digest, collection and source history. Staging copies only

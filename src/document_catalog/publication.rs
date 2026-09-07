@@ -399,8 +399,7 @@ impl DocumentCatalog {
         };
         intent.intent_id = intent_hash(&intent);
         validate_intent(&intent, key, &info.history_id)?;
-        let mut tx = self.database.begin_write().map_err(storage)?;
-        tx.set_durability(Durability::Immediate).map_err(storage)?;
+        let tx = self.writable_transaction()?;
         let names = tx
             .list_tables()
             .map_err(storage)?
@@ -528,8 +527,7 @@ impl DocumentCatalog {
         }
         catalog.with_durable_snapshot(|snapshot| {
             let hash = manifest_hash(snapshot.manifest())?;
-            let mut tx = self.database.begin_write().map_err(storage)?;
-            tx.set_durability(Durability::Immediate).map_err(storage)?;
+            let tx = self.writable_transaction()?;
             let result;
             {
                 let meta = tx.open_table(META).map_err(storage)?;

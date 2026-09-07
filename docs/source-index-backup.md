@@ -152,6 +152,53 @@ to remove only its owned staging directory; filesystem cleanup is best-effort.
 It creates no writer or serving state, restores no grants and permits no
 off-phone or other remote export.
 
+## Terminal retirement of the source writer
+
+`DocumentCatalog::seal_history(SourceSealRequest)` is the trusted local owner's
+durable retirement operation. The request names the source history, its exact
+expected accepted sequence and an operation ID of 1..1024 bytes. It requires
+a durable catalog. It does not accept a lease-expiry observation or an index
+epoch as a substitute for the accepted watermark.
+
+The seal takes the same redb writer used by acceptance and by all projection
+and maintenance journal mutations. Before changing anything it captures the
+last committed source checkpoint, with a 64 MiB metadata bound. Pending source
+or maintenance intents refuse sealing; the owner must resolve them against
+their actual durable segment manifests first. A new preparation either commits
+first, leaving an intent that blocks sealing, or waits and observes the seal.
+A concurrent accepted write either advances the expected sequence and makes
+sealing refuse, or observes the committed seal and refuses itself.
+
+This operation never takes node or segment locks while holding the database
+writer. Publishers acquire those locks before the source transaction, so the
+reverse order would deadlock. The pending journal intent covers the interval
+between preparation and the final artifact decision, including filesystem work
+outside a database transaction. A private staged candidate has no reservation:
+if sealing wins first, its later publication must refuse at preparation.
+
+The header and `SourceHistorySeal` are committed together with immediate
+durability. Active catalogs remain format 3. A sealed catalog becomes format 4,
+which older writers refuse; a format-3 header carrying a seal or a format-4
+header missing its seal is corrupt. The seal binds the unchanged history ID,
+final accepted sequence and operation ID. Retrying the exact request returns
+the stored seal after restart. Another operation ID refuses. No unseal API or
+automatic expiry exists.
+
+After sealing, acceptance (including retries), publication preparation and
+recovery, maintenance enablement, preparation and recovery all refuse at the
+database write boundary. Historical reads and backup capture remain available.
+Source bytes, versions, idempotency records and index journal state are retained;
+sealing does not claim that an accepted backlog was indexed. Backup and incoming
+staging preserve the seal, and reopening that copied source keeps it sealed.
+
+This is evidence about the retired **local store**, not authorization for a
+replacement writer and not a fence on an earlier independent copy. Raw file
+copies, a stale backup, a shared history ID or a matching completion digest do
+not prove exclusive ownership. The collection authority must bind its current
+workspace/collection grants, action, owner, incarnation and generation to any
+future activation. Phones may retire and recover locally; this operation
+introduces no transfer or off-device replica path.
+
 ## Restore work remaining
 
 Activation belongs to the collection authority. A restore must not create two
@@ -160,7 +207,10 @@ a current serving receipt. Activation and rollback must enforce current
 permissions, write fencing, ownership, generation checks and a single active
 authority, including an explicit rule for replacing newer accepted history
 with an older checkpoint. Mobile activation must retain local-device residency.
-The staging verifier does not supply this distributed activation contract.
+The staging verifier and local terminal seal do not supply this distributed
+activation contract. The seal implements the old-store retirement primitive;
+committed prepare/activate decisions, replacement catch-up proof, rollback
+policy and recovery of that authority transaction remain to be implemented.
 
 The bundle must be usable without the original source paths or a running
 analysis service. It must retain accepted-but-unpublished writes and expose

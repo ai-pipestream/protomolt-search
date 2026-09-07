@@ -25,6 +25,7 @@ mod checkpoint;
 mod projection;
 mod publication;
 mod restore;
+mod seal;
 pub use backup::CapturedBackup;
 pub use checkpoint::CatalogCheckpoint;
 pub use publication::{MaintenanceRecovery, ProjectionRecovery};
@@ -38,6 +39,7 @@ const DESCRIPTORS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("descrip
 const SOURCES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("sources");
 const CHANGES: TableDefinition<u64, &[u8]> = TableDefinition::new("changes");
 const FORMAT_VERSION: u32 = 3;
+const SEALED_FORMAT_VERSION: u32 = 4;
 const CACHE_BYTES: usize = 8 << 20;
 
 fn storage(error: impl std::fmt::Display) -> Status {
@@ -63,14 +65,17 @@ fn new_history_id() -> Result<Vec<u8>, Status> {
 }
 
 fn validate_current_header(header: &DocumentCatalogHeader) -> Result<(), Status> {
-    if header.format_version != FORMAT_VERSION
-        || !valid_history_id(&header.history_id)
+    if !matches!(
+        header.format_version,
+        FORMAT_VERSION | SEALED_FORMAT_VERSION
+    ) || !valid_history_id(&header.history_id)
         || header.legacy_receipts_through_sequence > header.accepted_sequence
     {
         return Err(Status::data_loss(
             "invalid document catalog history identity or migration boundary",
         ));
     }
+    seal::validate_header_seal(header)?;
     Ok(())
 }
 
@@ -178,7 +183,7 @@ impl DocumentCatalog {
                 .map_err(storage)?
                 .ok_or_else(|| Status::data_loss("existing document catalog header missing"))?;
             let header: DocumentCatalogHeader = decode(bytes.value())?;
-            if !(1..=FORMAT_VERSION).contains(&header.format_version)
+            if !(1..=SEALED_FORMAT_VERSION).contains(&header.format_version)
                 || header.collection != collection
             {
                 return Err(Status::failed_precondition(
@@ -188,10 +193,13 @@ impl DocumentCatalog {
             for definition in [HEADS, VERSIONS, OPERATIONS, DESCRIPTORS, SOURCES] {
                 transaction.open_table(definition).map_err(storage)?;
             }
-            if header.format_version == FORMAT_VERSION {
+            if header.format_version >= FORMAT_VERSION {
                 validate_current_header(&header)?;
             } else {
-                if !header.history_id.is_empty() || header.legacy_receipts_through_sequence != 0 {
+                if !header.history_id.is_empty()
+                    || header.legacy_receipts_through_sequence != 0
+                    || header.history_seal.is_some()
+                {
                     return Err(Status::data_loss(
                         "legacy catalog contains unexpected history identity metadata",
                     ));
@@ -219,6 +227,7 @@ impl DocumentCatalog {
                 accepted_sequence: 0,
                 history_id: new_history_id()?,
                 legacy_receipts_through_sequence: 0,
+                history_seal: None,
             }
             .encode_to_vec();
             table.insert("header", header.as_slice()).map_err(storage)?;
@@ -323,10 +332,7 @@ impl DocumentCatalog {
             }
         }
         let request_sha = sha256::digest(&request.encode_to_vec());
-        let mut transaction = self.database.begin_write().map_err(storage)?;
-        transaction
-            .set_durability(Durability::Immediate)
-            .map_err(storage)?;
+        let transaction = self.writable_transaction()?;
         let mut header: DocumentCatalogHeader = {
             let meta = transaction.open_table(META).map_err(storage)?;
             let header = decode(

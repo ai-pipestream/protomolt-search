@@ -247,8 +247,7 @@ impl DocumentCatalog {
                 "maintenance requires a durable source catalog",
             ));
         }
-        let mut tx = self.database.begin_write().map_err(storage)?;
-        tx.set_durability(Durability::Immediate).map_err(storage)?;
+        let tx = self.writable_transaction()?;
         {
             let names = tx
                 .list_tables()
@@ -420,8 +419,7 @@ impl DocumentCatalog {
         }
         let before = verified.before;
         let after = verified.after;
-        let mut tx = self.database.begin_write().map_err(storage)?;
-        tx.set_durability(Durability::Immediate).map_err(storage)?;
+        let tx = self.writable_transaction()?;
         let intent;
         {
             let names = tx
@@ -647,8 +645,7 @@ impl DocumentCatalog {
         }
         catalog.with_durable_snapshot(|snapshot| {
             let hash = manifest_hash(snapshot.manifest())?;
-            let mut tx = self.database.begin_write().map_err(storage)?;
-            tx.set_durability(Durability::Immediate).map_err(storage)?;
+            let tx = self.writable_transaction()?;
             let result;
             {
                 let meta = tx.open_table(META).map_err(storage)?;
