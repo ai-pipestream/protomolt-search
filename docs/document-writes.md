@@ -253,20 +253,41 @@ The searchable state must reflect that publication, including recovery.
 The foundation branch can prepare a complete accepted projection, resolve an
 exact key to sealed rows, and commit new segments with old-row retirements in
 one segment manifest. Those components are not yet a document publisher.
-`ShardState` also owns mutable/frozen tails, the generation-wide live-row mask,
-the exact-vector store and read-version metadata. A segment epoch alone does
-not fence those states. Activation must prepare and switch their coherent view,
-and every serving route must observe or validate that view before returning a
-final result. A document spanning shards needs a collection publication decision;
+A document spanning shards still needs a collection publication decision;
 independent shard acknowledgments cannot establish an atomic visible version.
 
-Exact-vector views now share the sealed FP32 files and spill only new rows;
-see [exact-vector storage](exact-vector-storage.md). Startup, compaction and
-snapshot install preserve physical positions, including segments without vectors,
-and catalog attachment incorporates committed tombstones into the serving mask.
-Those operations remove full-sidecar copying from segmented startup and flush.
-The publisher must still prepare and activate the complete runtime view alongside
-its source publication decision, without dropping concurrently accepted tail rows.
+`NodeServiceImpl::publish_segment_rows_blocking` activates a prepared segment
+transaction as one coherent runtime view. It requires both the current shard
+statistics epoch/incarnation and the segment catalog epoch. It claims the ingest,
+mutation and sealing gates, then constructs the complete BM25, vector-provider,
+exact-vector and tombstone state before publishing any manifest. It checks the
+node's column/derived declaration and preserves its mapped binding. Queries can
+read the old state during preparation; a final shard write guard covers manifest
+sync, runtime activation, parent-cache invalidation and the read-version advance.
+Old version claims are rejected after activation, and held immutable segment
+snapshots retain their previous rows and tombstones.
+
+This trusted local, blocking operation requires a persistent segmented layout
+with no mutable/frozen tail, WAL, installed single-image generation or active
+compaction. It refuses incompatible states instead of losing pending rows or
+bypassing replay. Call it off Tokio workers. It introduces no public RPC,
+authentication boundary or document receipt: its returned statistics claim only
+identifies the activated runtime. An owner must fence independent catalog writers.
+
+Exact-vector views share sealed FP32 files, including catalogs with document-only
+segments, without copying the corpus into a sidecar; see
+[exact-vector storage](exact-vector-storage.md). Existing global deletions remain
+in the runtime mask. The operation does not certify those earlier deletions as
+durable, or certify source identities supplied in segment artifacts.
+
+If consumer preparation fails, the manifest and serving state stay unchanged.
+If manifest publication fails after preparation, the node retains the old runtime
+and fences ingest until recovery. An uncertain catalog publication also blocks
+flush, seal and snapshot copying, including an export whose initial flush happened
+before the failure. Reopening validates the manifest actually on disk; an
+unacknowledged publication must never be interpreted as a successful document
+receipt. Tests in `node::publication::tests` inject failure after manifest rename;
+`tests/exact_segment_view.rs` verifies row replacement and read-version activation.
 
 Recovery must join the catalog's immutable accepted history to the actual
 committed index manifests before reporting publication. Empty projections and

@@ -899,6 +899,13 @@ impl SegmentCatalog {
         })
     }
 
+    pub(crate) fn publication_is_uncertain(&self) -> bool {
+        self.pending_publication
+            .lock()
+            .map(|pending| pending.is_some())
+            .unwrap_or(true)
+    }
+
     pub fn snapshot(&self) -> Arc<OpenedSegmentSet> {
         Arc::clone(&self.current.read().expect("segment catalog lock poisoned"))
     }
@@ -1320,11 +1327,13 @@ impl SegmentCatalog {
     }
 
     fn publish(&self, manifest: SegmentSetManifest) -> Result<Arc<OpenedSegmentSet>, String> {
-        let mut pending = self
+        if self
             .pending_publication
             .lock()
-            .map_err(|_| "segment publication lock poisoned".to_string())?;
-        if pending.as_ref().is_some_and(|held| held != &manifest) {
+            .map_err(|_| "segment publication lock poisoned".to_string())?
+            .as_ref()
+            .is_some_and(|held| held != &manifest)
+        {
             return Err(
                 "segment publication is uncertain; retry the same manifest or reopen for recovery"
                     .into(),
@@ -1333,18 +1342,39 @@ impl SegmentCatalog {
         let current = self.snapshot();
         let opened = Arc::new(OpenedSegmentSet::open_manifest_reusing(
             self.root.clone(),
-            manifest.clone(),
+            manifest,
             self.load,
             Some(&current),
         )?);
-        if let Err(error) = write_json_atomic(&self.root.join(SET_FILE), &manifest) {
-            *pending = Some(manifest);
-            return Err(error);
+        self.publish_opened(opened)
+    }
+
+    /// The candidate is fully validated before acquiring the final pointer
+    /// lock. After its manifest sync succeeds, publishing this Arc cannot fail.
+    fn publish_opened(
+        &self,
+        opened: Arc<OpenedSegmentSet>,
+    ) -> Result<Arc<OpenedSegmentSet>, String> {
+        let manifest = opened.manifest();
+        let mut pending = self
+            .pending_publication
+            .lock()
+            .map_err(|_| "segment publication lock poisoned".to_string())?;
+        if pending.as_ref().is_some_and(|held| held != manifest) {
+            return Err(
+                "segment publication is uncertain; retry the same manifest or reopen for recovery"
+                    .into(),
+            );
         }
-        *self
+        let mut current = self
             .current
             .write()
-            .map_err(|_| "segment catalog lock poisoned".to_string())? = Arc::clone(&opened);
+            .map_err(|_| "segment catalog lock poisoned".to_string())?;
+        if let Err(error) = write_json_atomic(&self.root.join(SET_FILE), manifest) {
+            *pending = Some(manifest.clone());
+            return Err(error);
+        }
+        *current = Arc::clone(&opened);
         *pending = None;
         Ok(opened)
     }
@@ -1786,7 +1816,7 @@ fn verify_artifact(directory: &Path, artifact: &SegmentArtifact) -> Result<(), S
 }
 
 #[cfg(test)]
-thread_local! { static FAIL_SET_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+thread_local! { pub(crate) static FAIL_SET_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), String> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -2224,6 +2254,44 @@ mod tests {
             ids(&SegmentCatalog::open(&root).unwrap().snapshot()),
             ids(&after)
         );
+    }
+
+    #[test]
+    fn consumer_preparation_precedes_publication_and_can_refuse_it() {
+        let input = publication_fixture("prepare-consumer", &["old", "kept"]);
+        let output = publication_fixture("prepare-output", &["new", "newer"]);
+        let root = input.root.join("catalog");
+        let catalog = SegmentCatalog::open(&root).unwrap();
+        let before = catalog.append(source(&input, "old", 0)).unwrap();
+        let bytes = std::fs::read(root.join(SET_FILE)).unwrap();
+        let refused = catalog.commit_rows_prepared(
+            before.epoch(),
+            &[retire("old", &[0])],
+            vec![source(&output, "new", 2)],
+            |candidate| {
+                assert_eq!(ids(candidate), [1, 2, 3]);
+                assert_eq!(ids(&catalog.snapshot()), [0, 1]);
+                assert_eq!(std::fs::read(root.join(SET_FILE)).unwrap(), bytes);
+                Err::<(), _>("consumer cannot activate this view".into())
+            },
+        );
+        assert!(refused.unwrap_err().contains("cannot activate"));
+        assert_eq!(std::fs::read(root.join(SET_FILE)).unwrap(), bytes);
+        assert!(!SegmentCatalog::segment_dir(&root, "new").exists());
+        let (published, prepared) = catalog
+            .commit_rows_prepared(
+                before.epoch(),
+                &[retire("old", &[0])],
+                vec![source(&output, "new", 2)],
+                |candidate| {
+                    assert_eq!(std::fs::read(root.join(SET_FILE)).unwrap(), bytes);
+                    Ok(Arc::clone(candidate))
+                },
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(&published, &prepared));
+        assert_eq!(ids(&published), [1, 2, 3]);
+        assert_eq!(ids(&before), [0, 1]);
     }
 
     #[test]

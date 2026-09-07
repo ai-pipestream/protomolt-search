@@ -15,6 +15,8 @@
 //! duration of their chunked scan, so a search never observes a
 //! half-applied batch.
 
+mod publication;
+
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -3815,6 +3817,17 @@ pub(crate) struct ParentMap {
 }
 
 impl ShardState {
+    fn check_catalog_publication(&self) -> Result<(), Status> {
+        if matches!(self.bm25.as_ref(), Some(Bm25Shard::Segmented(shard))
+            if shard.catalog().publication_is_uncertain())
+        {
+            return Err(Status::failed_precondition(
+                "segment publication is uncertain; reopen for recovery before flushing or sealing",
+            ));
+        }
+        Ok(())
+    }
+
     /// Never wrap a mutation version into one a coordinator may still hold.
     pub(crate) fn advance_stats_epoch(&mut self) {
         self.files_current = false;
@@ -6249,6 +6262,7 @@ impl NodeServiceImpl {
     /// writer needs. `None` when there is nothing to seal.
     fn freeze_tail(&self) -> Result<Option<SealPlan>, Status> {
         let mut guard = write_shard(&self.state);
+        guard.check_catalog_publication()?;
         if let Some(binding) = guard.mapped_binding.clone() {
             if let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_mut() {
                 shard
@@ -6492,6 +6506,7 @@ impl NodeServiceImpl {
         // from every future replay (reshard, recovery).
         {
             let mut guard = write_shard(&self.state);
+            guard.check_catalog_publication()?;
             if guard.mapped_binding.is_some() && guard.bm25.is_none() {
                 guard.bm25 = Some(self.new_builder(guard.generation.as_ref())?);
             }
@@ -6505,6 +6520,7 @@ impl NodeServiceImpl {
         // `seal_tail`); the single-image writes below hold it.
         let sealed = self.seal_tail()?;
         let mut guard = write_shard(&self.state);
+        guard.check_catalog_publication()?;
         let num_vectors = guard.index.as_ref().map_or(0, |i| i.len() as u64);
         let num_documents = guard.bm25.as_ref().map_or(0, |b| b.doc_count());
         let (vector_path, exact_path, bm25_path) =
@@ -7167,6 +7183,7 @@ impl NodeServiceImpl {
     ) -> Result<Option<(RepositoryManifest, u64)>, Status> {
         let _sealing = self.seal_lock.lock().expect("seal lock poisoned");
         let guard = read_shard(&self.state);
+        guard.check_catalog_publication()?;
         if !guard.files_current || guard.wal.as_ref().is_some_and(|wal| wal.is_dirty()) {
             return Ok(None);
         }

@@ -396,11 +396,21 @@ impl SegmentedShard {
         Self::from_catalog(catalog, tail)
     }
 
-    fn from_catalog(catalog: SegmentCatalog, mut tail: Bm25Store) -> Result<Self, String> {
+    fn from_catalog(catalog: SegmentCatalog, tail: Bm25Store) -> Result<Self, String> {
+        let set = catalog.snapshot();
+        Self::from_snapshot(catalog, set, tail)
+    }
+
+    /// Construct a complete serving view before its catalog commits the set.
+    /// Only the owning publisher may activate this prepared snapshot.
+    pub(crate) fn from_snapshot(
+        catalog: SegmentCatalog,
+        set: Arc<OpenedSegmentSet>,
+        mut tail: Bm25Store,
+    ) -> Result<Self, String> {
         if tail.next_doc_id() != 0 {
             return Err("a segmented shard's tail must start empty".to_string());
         }
-        let set = catalog.snapshot();
         if let Some(binding) = set.binding() {
             if tail.binding().is_some_and(|held| held != binding) {
                 return Err("segment tail and generation mapped bindings disagree".into());

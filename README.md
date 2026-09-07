@@ -1237,6 +1237,12 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: coherent segment activation.** A trusted local node
+  transaction prepares both search indexes, exact vectors and tombstones before
+  publishing its manifest, then activates them under one read-version fence.
+  Uncertain publication blocks flush, seal and snapshot copying until recovery.
+  Accepted-source certification and document publication receipts remain pending.
+  See [runtime publication](docs/document-writes.md#runtime-publication-constraints).
 - **Foundation branch: segment-owned exact-vector reads.** Startup, compaction
   and snapshot install share sealed FP32 mappings, preserve document-only gaps,
   and incorporate catalog tombstones. Segmented flushes no longer rewrite a

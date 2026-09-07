@@ -419,3 +419,103 @@ async fn an_empty_configured_catalog_does_not_reuse_retired_sidecar_rows() {
     node.export_snapshot_blocking(&path).unwrap();
     assert!(!path.join("vectors.f32").exists());
 }
+
+#[test]
+fn publication_switches_sealed_rows_and_read_version_together() {
+    use pipestream_search::segments::{OpenedSegmentSet, SegmentRowRetirement};
+    use pipestream_search::stats_identity::StatsClaim;
+    let fixture = Fixture::new(true);
+    let node = NodeServiceImpl::open(fixture.config(), None, false).unwrap();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let before = runtime.block_on(fixture.scores(&node));
+    let claim = StatsClaim::required(before.stats_epoch, &before.stats_incarnation).unwrap();
+    let root = segments_root(&fixture.index);
+    let held = OpenedSegmentSet::open(&root).unwrap();
+    let stage = fixture.directory.join("stage-0");
+    let next = node
+        .publish_segment_rows_blocking(
+            claim,
+            held.epoch(),
+            &[SegmentRowRetirement {
+                segment_id: "part-0".into(),
+                rows: vec![0],
+            }],
+            vec![SegmentSource {
+                segment_id: "replacement",
+                generation: held.epoch() + 1,
+                base_label: 6,
+                backend_kind: EMBEDDED_TURBOVEC,
+                vector_path: Some(&stage.join("vector.index")),
+                exact_vector_path: Some(&stage.join("vectors.f32")),
+                bm25_path: &stage.join("documents.bm25"),
+                live_docs_path: &stage.join("live.bin"),
+                partition_column: None,
+            }],
+        )
+        .unwrap();
+    assert_eq!(next.epoch, claim.epoch + 1);
+    assert_eq!(next.incarnation(), claim.incarnation());
+    let scores = runtime
+        .block_on(
+            node.exact_vector_rescore(Request::new(ExactVectorRescoreRequest {
+                vector: fixture.vectors[..DIM].to_vec(),
+                candidate_ids: (0..8).collect(),
+                expected_stats_epoch: next.epoch,
+                expected_stats_incarnation: next.incarnation(),
+                ..Default::default()
+            })),
+        )
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        scores.hits.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(),
+        [1, 4, 5, 6, 7]
+    );
+    assert_eq!(scores.hits[3].score, before.hits[0].score);
+    assert_eq!(scores.hits[4].score, before.hits[1].score);
+    let lexical = runtime
+        .block_on(node.browse_shard(Request::new(BrowseShardRequest {
+            k: 20,
+            first_page: true,
+            lexical_terms: vec!["word".into()],
+            expected_stats_epoch: next.epoch,
+            expected_stats_incarnation: next.incarnation(),
+            ..Default::default()
+        })))
+        .unwrap()
+        .into_inner();
+    assert_eq!(lexical.doc_ids, [1, 2, 3, 4, 5, 6, 7]);
+    assert!(!held.live_docs(0).is_deleted(0));
+    let stale = runtime
+        .block_on(
+            node.exact_vector_rescore(Request::new(ExactVectorRescoreRequest {
+                vector: fixture.vectors[..DIM].to_vec(),
+                candidate_ids: vec![0, 6],
+                expected_stats_epoch: claim.epoch,
+                expected_stats_incarnation: claim.incarnation(),
+                ..Default::default()
+            })),
+        )
+        .unwrap_err();
+    assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+    assert!(node
+        .publish_segment_rows_blocking(claim, held.epoch(), &[], vec![])
+        .is_err());
+    drop(node);
+    let reopened = NodeServiceImpl::open(fixture.config(), None, false).unwrap();
+    let restored = runtime
+        .block_on(
+            reopened.exact_vector_rescore(Request::new(ExactVectorRescoreRequest {
+                vector: fixture.vectors[..DIM].to_vec(),
+                candidate_ids: (0..8).collect(),
+                ..Default::default()
+            })),
+        )
+        .unwrap()
+        .into_inner();
+    assert_eq!(restored.hits, scores.hits);
+}

@@ -21,6 +21,22 @@ impl SegmentCatalog {
         retirements: &[SegmentRowRetirement],
         sources: Vec<SegmentSource<'_>>,
     ) -> Result<Arc<OpenedSegmentSet>, String> {
+        self.commit_rows_prepared(expected_epoch, retirements, sources, |_| Ok(()))
+            .map(|(snapshot, ())| snapshot)
+    }
+
+    /// Prepare the complete consumer view before publishing the manifest. The
+    /// callback runs after artifact validation while the catalog update lock is
+    /// held, and must not mutate this catalog recursively. Its returned context
+    /// stays alive across the manifest commit, so a consumer can hold its final
+    /// visibility fence until it installs the already-prepared view.
+    pub(crate) fn commit_rows_prepared<T>(
+        &self,
+        expected_epoch: u64,
+        retirements: &[SegmentRowRetirement],
+        sources: Vec<SegmentSource<'_>>,
+        prepare: impl FnOnce(&Arc<OpenedSegmentSet>) -> Result<T, String>,
+    ) -> Result<(Arc<OpenedSegmentSet>, T), String> {
         let _guard = self
             .update
             .lock()
@@ -128,7 +144,15 @@ impl SegmentCatalog {
             }
             manifest.segments.extend(outputs.iter().cloned());
             manifest.segments.sort_by_key(|segment| segment.base_label);
-            self.publish(manifest)
+            let opened = Arc::new(OpenedSegmentSet::open_manifest_reusing(
+                self.root.clone(),
+                manifest,
+                self.load,
+                Some(&current),
+            )?);
+            let context = prepare(&opened)?;
+            let published = self.publish_opened(opened)?;
+            Ok((published, context))
         })();
         if result.is_err() {
             cleanup_staged(&self.root, &outputs);
