@@ -34,6 +34,45 @@ commit marker and rollback protocol.
 These guarantees concern segment publication. They do not yet publish a
 logical document version and all its projected rows as one transaction.
 
+## Atomic row updates (foundation branch)
+
+`SegmentCatalog::commit_rows` publishes new segments and retirements from sealed
+segments in one manifest swap. It checks the caller's held epoch before staging,
+resolves all retirement locations against that view, and refuses stale epochs,
+unknown segments, out-of-range or duplicate rows, and reused output ranges.
+New rows use fresh segment ids and positions after the existing set. Replacement
+row counts may differ, including a retirement-only update with no new rows.
+
+Retirement bitmaps get content-addressed filenames; existing bitmaps are never
+modified. Staging copies one affected bitmap at a time. A newly published view
+shares the unchanged open text/vector images and verifies its new bitmap, while
+older snapshots retain their own masks and epoch. Both lexical and vector reads
+of the new snapshot exclude retired rows; live corpus statistics use that same
+mask. Reopen verifies the manifest and all referenced artifacts.
+
+Before publication, a failed stage leaves the current manifest unchanged. After
+an uncertain manifest acknowledgment, cleanup retains every referenced segment
+and bitmap. The in-memory catalog refuses another row update until recovery
+reopens the committed manifest; callers must inspect that result rather than
+assuming the failed attempt had no effect. Unreferenced files may remain when
+disk state is unreadable or an artifact's directory sync fails.
+
+This is a storage primitive over sealed segments. Its epoch check serializes
+clones sharing the catalog's update lock, not independently opened processes;
+the owner must fence those writers. It does not coordinate mutable node tails,
+accept source versions, authorize retirements, retain logical retry decisions,
+or return searchable receipts. The document publisher must still connect those
+contracts and activate the verified snapshot in every serving search path.
+
+Validation passed 551 unit tests, 807 tests across 140 integration targets,
+13 embedded tests and two IVF adapter tests. All five iOS/Android compile
+targets, the protobuf contract comparison, vendored-contract check, examples
+and formatting passed under an 8 GiB aggregate cgroup limit with swap disabled.
+The new regressions exercise both search legs, pinned snapshots, retirement-only
+updates, invalid metadata, concurrent epoch checks and recovery after an injected
+failure following the manifest rename. These are local storage tests, not a
+source-to-search transaction or fleet deployment proof.
+
 ## The node's segmented shard
 
 Local document ids are one positional space: segment `i` covers

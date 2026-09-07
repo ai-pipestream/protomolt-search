@@ -22,6 +22,9 @@ use crate::postings::{Bm25Index, Bm25Reader, StoredBinding};
 use crate::vector::{QualityContract, ScoreDirection, VectorIndex, VectorSearchOptions};
 use prost::Message;
 
+mod row_update;
+pub use row_update::SegmentRowRetirement;
+
 const BASE_SET_FORMAT: u32 = 1;
 const SET_FORMAT: u32 = 2;
 const SET_FILE: &str = "segments.json";
@@ -274,8 +277,8 @@ pub struct WalCompactionResult {
 struct OpenedSegment {
     metadata: SegmentMetadata,
     /// `None` for a documents-only segment (an empty `vector` artifact).
-    vector: Option<VectorIndex>,
-    bm25: Bm25Reader,
+    vector: Option<Arc<VectorIndex>>,
+    bm25: Arc<Bm25Reader>,
     live_docs: LiveDocs,
 }
 
@@ -368,8 +371,9 @@ impl OpenedSegmentSet {
     }
 
     /// Open `manifest`, taking every segment whose metadata is unchanged
-    /// from `reuse` as it is (open, verified, its images prepared) and
-    /// opening and verifying only the rest. A publish adds one segment
+    /// from `reuse` as it is (open, verified, its images prepared). A bitmap-only
+    /// change shares those images and verifies the new bitmap. Other changes
+    /// open and verify the new images. A publish adds one segment
     /// to a set of hundreds; hashing every artifact of every segment on
     /// each publish made a long ingest quadratic in its seal count
     /// (measured 2026-09-04: a Pi's rate fell from 1.2k to 340 rows/s
@@ -388,7 +392,7 @@ impl OpenedSegmentSet {
             if let Some(held) = reuse.and_then(|set| {
                 set.segments
                     .iter()
-                    .find(|segment| segment.metadata == *metadata)
+                    .find(|segment| same_segment_images(&segment.metadata, metadata))
             }) {
                 if held.vector.is_some() {
                     match scoring_fingerprint {
@@ -406,7 +410,28 @@ impl OpenedSegmentSet {
                     None => analysis_fingerprints = Some(&metadata.analysis_fingerprints),
                     _ => {}
                 }
-                segments.push(Arc::clone(held));
+                if held.metadata == *metadata {
+                    segments.push(Arc::clone(held));
+                } else {
+                    let directory = root.join("segments").join(&metadata.segment_id);
+                    verify_artifact(&directory, &metadata.live_docs)?;
+                    let live_docs = LiveDocs::open(&directory.join(&metadata.live_docs.file))
+                        .map_err(|error| format!("open retired segment bitmap: {error}"))?;
+                    if live_docs.persisted_rows() != metadata.rows
+                        || metadata.rows.checked_sub(live_docs.deleted_count())
+                            != Some(metadata.live_rows)
+                    {
+                        return Err(
+                            "retired segment bitmap differs from manifest row counts".into()
+                        );
+                    }
+                    segments.push(Arc::new(OpenedSegment {
+                        metadata: metadata.clone(),
+                        vector: held.vector.clone(),
+                        bm25: Arc::clone(&held.bm25),
+                        live_docs,
+                    }));
+                }
                 continue;
             }
             let directory = root.join("segments").join(&metadata.segment_id);
@@ -525,8 +550,8 @@ impl OpenedSegmentSet {
             }
             segments.push(Arc::new(OpenedSegment {
                 metadata: metadata.clone(),
-                vector,
-                bm25,
+                vector: vector.map(Arc::new),
+                bm25: Arc::new(bm25),
                 live_docs,
             }));
         }
@@ -606,7 +631,7 @@ impl OpenedSegmentSet {
 
     /// Segment `i`'s vector image, `None` for a documents-only segment.
     pub fn vector(&self, i: usize) -> Option<&VectorIndex> {
-        self.segments[i].vector.as_ref()
+        self.segments[i].vector.as_deref()
     }
 
     pub fn live_docs(&self, i: usize) -> &LiveDocs {
@@ -621,7 +646,7 @@ impl OpenedSegmentSet {
         };
         for segment in &self.segments {
             let (document_count, total_document_length, dfs) =
-                live_stats_share(&segment.bm25, &segment.live_docs, terms)?;
+                live_stats_share(segment.bm25.as_ref(), &segment.live_docs, terms)?;
             stats.doc_count = stats
                 .doc_count
                 .checked_add(document_count)
@@ -658,7 +683,7 @@ impl OpenedSegmentSet {
             };
             let mut pruning = bm25::PruneStats::default();
             let hits = bm25::top_k_pruned_chained_filtered_stats(
-                &segment.bm25,
+                segment.bm25.as_ref(),
                 terms,
                 &stats,
                 params,
@@ -1318,6 +1343,16 @@ pub fn write_manifest_file(path: &Path, manifest: &SegmentSetManifest) -> Result
 /// of a compaction that did not commit, or the inputs one replaced.
 pub fn remove_segment_dirs(root: &Path, segments: &[SegmentMetadata]) {
     cleanup_staged(root, segments)
+}
+
+fn same_segment_images(left: &SegmentMetadata, right: &SegmentMetadata) -> bool {
+    if left.segment_id != right.segment_id {
+        return false;
+    }
+    let mut normalized = left.clone();
+    normalized.live_docs = right.live_docs.clone();
+    normalized.live_rows = right.live_rows;
+    normalized == *right
 }
 
 fn cleanup_staged(root: &Path, segments: &[SegmentMetadata]) {
@@ -2073,6 +2108,189 @@ mod tests {
         std::fs::remove_file(SegmentCatalog::manifest_path(&root)).unwrap();
         cleanup_staged(&root, &[metadata]);
         assert!(!SegmentCatalog::segment_dir(&root, "orphan").exists());
+    }
+
+    fn retire(id: &str, rows: &[u64]) -> SegmentRowRetirement {
+        SegmentRowRetirement {
+            segment_id: id.into(),
+            rows: rows.to_vec(),
+        }
+    }
+
+    fn ids(snapshot: &OpenedSegmentSet) -> Vec<u64> {
+        let mut ids: Vec<_> = snapshot
+            .search_bm25(&["document".into()], Bm25Params::default(), 20)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.doc_id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[test]
+    fn row_replacement_publishes_both_legs_and_reuses_immutable_images() {
+        let input = publication_fixture("replace-old", &["old", "kept"]);
+        let output = publication_fixture("replace-new", &["new", "newer"]);
+        let root = input.root.join("catalog");
+        let catalog = SegmentCatalog::open(&root).unwrap();
+        let before = catalog.append(source(&input, "old", 0)).unwrap();
+        let after = catalog
+            .commit_rows(
+                before.epoch(),
+                &[retire("old", &[0])],
+                vec![source(&output, "new", 2)],
+            )
+            .unwrap();
+        assert_eq!(ids(&before), vec![0, 1]);
+        assert_eq!(ids(&after), vec![1, 2, 3]);
+        assert_eq!(after.epoch(), before.epoch() + 1);
+        assert!(std::ptr::eq(before.bm25(0), after.bm25(0)));
+        assert!(std::ptr::eq(
+            before.vector(0).unwrap(),
+            after.vector(0).unwrap()
+        ));
+        assert!(!before.live_docs(0).is_deleted(0));
+        assert!(after.live_docs(0).is_deleted(0));
+        assert_ne!(
+            before.metadata(0).live_docs.file,
+            after.metadata(0).live_docs.file
+        );
+        let mut vector_ids: Vec<_> = after
+            .search_vector(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 20)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.doc_id)
+            .collect();
+        vector_ids.sort_unstable();
+        assert_eq!(vector_ids, ids(&after));
+        assert_eq!(
+            after
+                .global_bm25_stats(&["document".into()])
+                .unwrap()
+                .doc_count,
+            3
+        );
+        assert_eq!(
+            ids(&SegmentCatalog::open(&root).unwrap().snapshot()),
+            ids(&after)
+        );
+    }
+
+    #[test]
+    fn zero_row_replacement_retires_the_complete_old_set() {
+        let input = publication_fixture("retire-all", &["one", "two"]);
+        let root = input.root.join("catalog");
+        let catalog = SegmentCatalog::open(&root).unwrap();
+        let before = catalog.append(source(&input, "old", 0)).unwrap();
+        let after = catalog
+            .commit_rows(before.epoch(), &[retire("old", &[0, 1])], vec![])
+            .unwrap();
+        assert!(ids(&after).is_empty());
+        assert!(after
+            .search_vector(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 20)
+            .unwrap()
+            .is_empty());
+        assert_eq!(after.metadata(0).live_rows, 0);
+        assert_eq!(ids(&before), vec![0, 1]);
+        assert!(ids(&SegmentCatalog::open(&root).unwrap().snapshot()).is_empty());
+    }
+
+    #[test]
+    fn row_update_refusals_leave_manifest_and_old_bitmaps_unchanged() {
+        let input = publication_fixture("retire-refuse", &["one", "two"]);
+        let root = input.root.join("catalog");
+        let catalog = SegmentCatalog::open(&root).unwrap();
+        let before = catalog.append(source(&input, "old", 0)).unwrap();
+        let directory = SegmentCatalog::segment_dir(&root, "old");
+        let count = std::fs::read_dir(&directory).unwrap().count();
+        let manifest = std::fs::read(root.join(SET_FILE)).unwrap();
+        for (epoch, retirements) in [
+            (0, vec![retire("old", &[0])]),
+            (1, vec![retire("missing", &[0])]),
+            (1, vec![retire("old", &[2])]),
+            (1, vec![retire("old", &[0, 0])]),
+            (1, vec![retire("old", &[])]),
+        ] {
+            assert!(catalog.commit_rows(epoch, &retirements, vec![]).is_err());
+        }
+        let mut invalid_counts = before.published_manifest();
+        invalid_counts.epoch += 1;
+        invalid_counts.segments[0].live_rows = 0;
+        assert!(catalog
+            .publish(invalid_counts)
+            .unwrap_err()
+            .contains("row counts"));
+        let missing = input.root.join("missing.bm25");
+        let mut invalid = source(&input, "new", 2);
+        invalid.bm25_path = &missing;
+        assert!(catalog
+            .commit_rows(1, &[retire("old", &[0])], vec![invalid])
+            .is_err());
+        assert_eq!(std::fs::read(root.join(SET_FILE)).unwrap(), manifest);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), count);
+        assert_eq!(catalog.snapshot().epoch(), 1);
+        assert_eq!(ids(&before), ids(&catalog.snapshot()));
+    }
+
+    #[test]
+    fn uncertain_row_update_retains_every_artifact_for_recovery() {
+        let input = publication_fixture("retire-uncertain", &["one", "two"]);
+        let root = input.root.join("catalog");
+        let catalog = SegmentCatalog::open(&root).unwrap();
+        let before = catalog.append(source(&input, "old", 0)).unwrap();
+        FAIL_SET_SYNC.with(|fail| fail.set(true));
+        assert!(catalog
+            .commit_rows(1, &[retire("old", &[0, 1])], vec![source(&input, "new", 2)])
+            .unwrap_err()
+            .contains("after manifest rename"));
+        assert_eq!(ids(&catalog.snapshot()), vec![0, 1]);
+        assert_eq!(ids(&before), vec![0, 1]);
+        assert!(catalog
+            .commit_rows(1, &[retire("old", &[0])], vec![])
+            .unwrap_err()
+            .contains("uncertain"));
+        let reopened = SegmentCatalog::open(&root).unwrap();
+        assert_eq!(reopened.snapshot().epoch(), 2);
+        assert_eq!(ids(&reopened.snapshot()), vec![2, 3]);
+        assert!(directory_bitmap_exists(
+            &root,
+            &reopened.snapshot().metadata(0).live_docs.file
+        ));
+    }
+
+    fn directory_bitmap_exists(root: &Path, name: &str) -> bool {
+        SegmentCatalog::segment_dir(root, "old").join(name).exists()
+    }
+
+    #[test]
+    fn concurrent_row_updates_have_one_epoch_winner() {
+        let input = publication_fixture("retire-race", &["one", "two"]);
+        let catalog = SegmentCatalog::open(input.root.join("catalog")).unwrap();
+        catalog.append(source(&input, "old", 0)).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = [0, 1]
+            .into_iter()
+            .map(|row| {
+                let catalog = catalog.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    catalog
+                        .commit_rows(1, &[retire("old", &[row])], vec![])
+                        .is_ok()
+                })
+            })
+            .collect();
+        assert_eq!(
+            handles
+                .into_iter()
+                .map(|handle| usize::from(handle.join().unwrap()))
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(catalog.snapshot().epoch(), 2);
+        assert_eq!(ids(&catalog.snapshot()).len(), 1);
     }
 
     #[test]

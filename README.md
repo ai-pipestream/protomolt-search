@@ -1237,6 +1237,10 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: atomic row updates.** The segment catalog can append
+  replacement segments and retire old rows with one epoch-checked manifest swap,
+  including retirement-only updates. Bitmap changes preserve pinned views and
+  reuse open text/vector images. See [atomic row updates](docs/immutable-segments.md#atomic-row-updates-foundation-branch).
 - **Foundation branch: complete projection preparation.** A trusted local
   reader prepares one exact accepted version as a bounded protobuf batch with
   catalog-owned row identities. Empty projections and tombstones remain explicit;
