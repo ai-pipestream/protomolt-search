@@ -245,13 +245,30 @@ pub fn score_candidates(
     slots.into_iter().flatten().collect()
 }
 
+/// How [`score_candidates_plain_walk`] visits one term's postings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateWalk {
+    /// Per term, whichever of the two walks reads fewer entries: the
+    /// candidates when the term has more postings than there are
+    /// candidates, the postings otherwise.
+    Auto,
+    /// Position the term's impact cursor on each candidate in turn
+    /// (`advance_shallow`): the cost grows with the candidates.
+    Candidates,
+    /// Read every posting of the term and merge-join the sorted
+    /// candidates against it: the cost grows with the term's df.
+    Postings,
+}
+
 /// [`score_candidates`] without the offsets: the summed BM25 score of
 /// each of `candidates` (local ids, sorted ascending, distinct), parallel
-/// to the input, `None` for a candidate no query term occurs in. The
-/// walk and the accumulation order are the same, so a score here is
-/// bitwise the score `score_candidates` computes for the same document;
-/// what this form saves is the per-document offset lists, which the
-/// shard-side Boolean planner scores millions of members without.
+/// to the input, `None` for a candidate no query term occurs in. Term
+/// by term each candidate takes at most one contribution, added in
+/// term order, so a score here is bitwise the score `score_candidates`
+/// computes for the same document whichever walk visits the postings
+/// ([`CandidateWalk::Auto`]); what this form saves is the per-document
+/// offset lists, which the shard-side Boolean planner scores millions
+/// of members without.
 pub fn score_candidates_plain(
     store: &dyn Bm25Index,
     terms: &[String],
@@ -259,27 +276,39 @@ pub fn score_candidates_plain(
     params: Bm25Params,
     candidates: &[u32],
 ) -> Vec<Option<f64>> {
+    score_candidates_plain_walk(store, terms, stats, params, candidates, CandidateWalk::Auto)
+}
+
+/// [`score_candidates_plain`] with the walk chosen by the caller. A
+/// term the store holds no impact cursor for (a heap store, a v3/v4
+/// file, a term some heap part holds) is merge-joined over its postings
+/// whatever `walk` says, the way [`score_candidates`] falls back.
+pub fn score_candidates_plain_walk(
+    store: &dyn Bm25Index,
+    terms: &[String],
+    stats: &CorpusStats,
+    params: Bm25Params,
+    candidates: &[u32],
+    walk: CandidateWalk,
+) -> Vec<Option<f64>> {
     debug_assert_eq!(terms.len(), stats.dfs.len());
     debug_assert!(candidates.windows(2).all(|w| w[0] < w[1]));
     let avgdl = stats.avgdl();
     let mut scores: Vec<Option<f64>> = vec![None; candidates.len()];
-    let mut cursors = Vec::new();
-    let mut all_have_impacts = true;
     for (ti, term) in terms.iter().enumerate() {
-        if stats.dfs[ti] == 0 {
+        if stats.dfs[ti] == 0 || candidates.is_empty() {
             continue;
         }
-        match store.impacts(term) {
-            Some(cursor) => cursors.push((ti, cursor)),
-            None => {
-                all_have_impacts = false;
-                break;
-            }
-        }
-    }
-    if all_have_impacts {
-        for (ti, mut cursor) in cursors {
-            let idf = idf(stats.doc_count, stats.dfs[ti]);
+        let idf = idf(stats.doc_count, stats.dfs[ti]);
+        let cursor = store.impacts(term);
+        let by_candidates = match (walk, &cursor) {
+            (_, None) => false,
+            (CandidateWalk::Candidates, Some(_)) => true,
+            (CandidateWalk::Postings, Some(_)) => false,
+            (CandidateWalk::Auto, Some(cursor)) => u64::from(cursor.df()) > candidates.len() as u64,
+        };
+        if by_candidates {
+            let mut cursor = cursor.expect("chosen only with a cursor");
             for (ci, &cand) in candidates.iter().enumerate() {
                 if cursor.exhausted() {
                     break;
@@ -292,16 +321,12 @@ pub fn score_candidates_plain(
                     *entry += contribution;
                 }
             }
-        }
-        return scores;
-    }
-    for (ti, term) in terms.iter().enumerate() {
-        if stats.dfs[ti] == 0 {
             continue;
         }
-        let idf = idf(stats.doc_count, stats.dfs[ti]);
+        // Merge-join: the postings stream ascending by doc id; a cursor
+        // walks the sorted candidates.
         let mut ci = 0usize;
-        store.for_each_posting(term, &mut |doc_id, tf, _offsets| {
+        store.for_each_doc_tf(term, &mut |doc_id, tf| {
             while ci < candidates.len() && candidates[ci] < doc_id {
                 ci += 1;
             }
