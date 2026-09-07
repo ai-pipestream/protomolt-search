@@ -1,0 +1,45 @@
+syntax = "proto3";
+package ai.protomolt.search.v1;
+
+import "ai/protomolt/search/v1/source.proto";
+import "ai/protomolt/search/v1/search.proto";
+
+// Trusted local preparation of one immutable accepted source version. This is
+// neither an ingest RPC nor evidence that any row is durable or searchable.
+message PrepareDocumentProjectionRequest {
+  bytes history_id = 1;
+  bytes document_key = 2;
+  // Exact positive accepted version; never an implicit current head.
+  uint64 version = 3;
+  // Required for source versions, derived again from the stored descriptor.
+  // Deletions require this, body_path and index_definition to be absent/empty.
+  string expected_plan_fingerprint = 4;
+  string body_path = 5;
+  IndexDefinition index_definition = 6;
+  // 1 to 65536. Exceeding either budget refuses the entire preparation.
+  uint32 max_rows = 7;
+  // 1 byte to 64 MiB of the complete encoded PreparedDocumentProjection.
+  // Bounds returned data, not all decoder/database heap allocations.
+  uint64 max_bytes = 8;
+}
+
+message DocumentProjectionRow {
+  // Unanalyzed mapped values with the catalog key/version and chunk ordinal.
+  // original_source is omitted here: it is carried once in the batch below.
+  AddDocumentsRequest document = 1;
+  repeated float vector = 2;
+}
+
+message PreparedDocumentProjection {
+  bytes history_id = 1;
+  bytes document_key = 2;
+  uint64 version = 3;
+  uint64 accepted_sequence = 4;
+  // Exact original bytes, including for sources producing zero rows.
+  ProtobufSource source = 5;
+  // A tombstone has no source, mapping or rows. A zero-row source is not deleted.
+  bool deleted = 6;
+  string plan_fingerprint = 7;
+  string body_path = 8;
+  repeated DocumentProjectionRow rows = 9;
+}

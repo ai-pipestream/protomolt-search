@@ -1967,24 +1967,91 @@ impl Extractor {
     /// — body, id, vector, declared chunk id — each naming the field,
     /// chunk refusals naming the chunk ordinal.
     pub fn extract(&self, bytes: &[u8]) -> Result<Vec<ExtractedDoc>, Status> {
-        let mut slots: Vec<Option<Slot>> = (0..self.leaves.len()).map(|_| None).collect();
-        let mut chunks: Vec<Vec<Option<Slot>>> = Vec::new();
-        let message = crate::protobuf::decode(self.descriptor.clone(), bytes)?;
-        self.project_message(&message, &self.root, &mut slots, &mut chunks)?;
-        if self.chunked.is_none() {
-            return Ok(vec![self.assemble(&slots, None)?]);
-        }
-        let mut rows = Vec::with_capacity(chunks.len());
-        for (ordinal, chunk_slots) in chunks.iter().enumerate() {
-            let row = self.assemble(&slots, Some(chunk_slots)).map_err(|status| {
-                Status::new(
-                    status.code(),
-                    format!("chunk {ordinal}: {}", status.message()),
-                )
-            })?;
+        let mut rows = Vec::new();
+        self.visit_rows(bytes, usize::MAX, |_, row| {
             rows.push(row);
-        }
+            Ok(())
+        })?;
         Ok(rows)
+    }
+
+    /// Visit assembled rows with a caller-owned output budget. Check the chunk
+    /// count before allocating per-chunk slots; callbacks may stop extraction.
+    /// A callback's work must remain private until the entire visit succeeds.
+    pub(crate) fn visit_rows(
+        &self,
+        bytes: &[u8],
+        max_rows: usize,
+        mut emit: impl FnMut(Option<u32>, ExtractedDoc) -> Result<(), Status>,
+    ) -> Result<(), Status> {
+        if max_rows == 0 {
+            return Err(Status::invalid_argument(
+                "projection max_rows must be positive",
+            ));
+        }
+        let mut slots: Vec<Option<Slot>> = (0..self.leaves.len()).map(|_| None).collect();
+        let message = crate::protobuf::decode(self.descriptor.clone(), bytes)?;
+        self.project_message(&message, &self.root, &mut slots)?;
+        if self.chunked.is_none() {
+            return emit(None, self.assemble(&slots, None)?);
+        }
+        self.visit_chunk_messages(&message, &self.root, max_rows, &mut |ordinal, sub, node| {
+            let mut chunk_slots = vec![None; self.leaves.len()];
+            let row = self
+                .project_message(sub, node, &mut chunk_slots)
+                .and_then(|()| self.assemble(&slots, Some(&chunk_slots)))
+                .map_err(|status| {
+                    Status::new(
+                        status.code(),
+                        format!("chunk {ordinal}: {}", status.message()),
+                    )
+                })?;
+            let ordinal = u32::try_from(ordinal)
+                .map_err(|_| Status::resource_exhausted("chunk ordinal exceeds u32"))?;
+            emit(Some(ordinal), row)
+        })
+    }
+
+    fn visit_chunk_messages(
+        &self,
+        message: &DynamicMessage,
+        node: &TrieNode,
+        max_rows: usize,
+        emit: &mut impl FnMut(usize, &DynamicMessage, &TrieNode) -> Result<(), Status>,
+    ) -> Result<(), Status> {
+        let descriptor = message.descriptor();
+        for (number, child) in &node.children {
+            if matches!(child, Child::Leaf(_)) {
+                continue;
+            }
+            let field = descriptor
+                .get_field(*number as u32)
+                .expect("compiled path belongs to the validated descriptor");
+            if !message.has_field(&field) {
+                continue;
+            }
+            let value = message.get_field(&field);
+            match (child, value.as_ref()) {
+                (Child::Descend(inner), Value::Message(sub)) => {
+                    self.visit_chunk_messages(sub, inner, max_rows, emit)?;
+                }
+                (Child::Chunks(inner), Value::List(values)) => {
+                    if values.len() > max_rows {
+                        return Err(Status::resource_exhausted(
+                            "document projection exceeds max_rows",
+                        ));
+                    }
+                    for (ordinal, value) in values.iter().enumerate() {
+                        let Value::Message(sub) = value else {
+                            unreachable!("validated chunk type")
+                        };
+                        emit(ordinal, sub, inner)?;
+                    }
+                }
+                _ => unreachable!("validated projection type"),
+            }
+        }
+        Ok(())
     }
 
     /// Build one engine row from the parent slots plus, for chunked
@@ -2149,7 +2216,6 @@ impl Extractor {
         message: &DynamicMessage,
         node: &TrieNode,
         slots: &mut [Option<Slot>],
-        chunks: &mut Vec<Vec<Option<Slot>>>,
     ) -> Result<(), Status> {
         let descriptor = message.descriptor();
         for (number, child) in &node.children {
@@ -2164,18 +2230,11 @@ impl Extractor {
             let value = message.get_field(&field);
             match (child, value.as_ref()) {
                 (Child::Descend(inner), Value::Message(sub)) => {
-                    self.project_message(sub, inner, slots, chunks)?;
+                    self.project_message(sub, inner, slots)?;
                 }
-                (Child::Chunks(inner), Value::List(values)) => {
-                    for value in values {
-                        let Value::Message(sub) = value else {
-                            unreachable!("validated chunk type")
-                        };
-                        let mut chunk_slots = vec![None; self.leaves.len()];
-                        self.project_message(sub, inner, &mut chunk_slots, &mut Vec::new())?;
-                        chunks.push(chunk_slots);
-                    }
-                }
+                // The separate chunk visitor projects one row at a time after
+                // all parent fields have landed, irrespective of field order.
+                (Child::Chunks(_), Value::List(_)) => {}
                 (Child::Leaf(slot), value) => {
                     let leaf = &self.leaves[*slot];
                     slots[*slot] = Some(project_leaf(&leaf.land, &leaf.path, value)?);

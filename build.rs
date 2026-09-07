@@ -26,6 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "proto/ai/protomolt/search/v1/query_cursor.proto",
                 "proto/ai/protomolt/search/v1/source.proto",
                 "proto/ai/protomolt/search/v1/document_write.proto",
+                "proto/ai/protomolt/search/v1/document_projection.proto",
                 "proto/ai/protomolt/search/v1/replay.proto",
                 "proto/ai/protomolt/search/storage/v1/replay_journal.proto",
                 "proto/ai/protomolt/search/v1/document_identity.proto",

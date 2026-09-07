@@ -1237,6 +1237,10 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: complete projection preparation.** A trusted local
+  reader prepares one exact accepted version as a bounded protobuf batch with
+  catalog-owned row identities. Empty projections and tombstones remain explicit;
+  preparation publishes no rows. See [document preparation](docs/document-writes.md#complete-projection-preparation).
 - **Foundation branch: catalog history identity.** Source-history pages and
   acceptance receipts carry a persistent catalog identity. Resumed reads and
   version-2 writes reject another history before advancing or mutating state.

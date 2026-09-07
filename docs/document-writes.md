@@ -179,6 +179,46 @@ identity and requires reconciling any previously bound projection checkpoints.
 The feed is publisher input, not a complete catalog backup: it does not expose
 operation IDs and cannot reconstruct the persistent idempotency authority.
 
+## Complete projection preparation
+
+`DocumentCatalog::prepare_projection` and
+`EmbeddedSearch::prepare_document_projection` read one exact accepted version
+through `PrepareDocumentProjectionRequest`. This is trusted local source access,
+with no network RPC or mobile entry point. The request pins the catalog history,
+exact key and positive version; a later replacement cannot retarget it. The
+catalog checks the version's accepted-history entry and source hashes in one
+read snapshot, then derives the reviewed plan from its stored descriptor and
+optional `IndexDefinition`. A missing or different fingerprint refuses.
+
+The protobuf `PreparedDocumentProjection` carries the original source once and
+a complete list of mapped, unanalyzed rows and vectors. Every row carries the
+catalog's exact key and version. Flat identities have no chunk ordinal; chunked
+identities use their zero-based source ordinal, independently of a payload's
+legacy id or chunk-id hint. Source-only and unknown bytes remain in the original.
+The resolved body path accompanies the plan fingerprint. Legacy mapped lineage
+remains mapped payload data; it is not proof of catalog-authorized parent grouping.
+
+A source with zero chunks returns a nondeleted batch with its original bytes,
+reviewed mapping and no rows. An accepted deletion returns a tombstone batch
+without a source, mapping or rows; requesting mapping options for a deletion
+refuses. Neither case disappears from the version lifecycle.
+
+`max_rows` is 1 to 65536 and is checked before per-chunk slot allocation.
+`max_bytes` is 1 byte to 64 MiB of the entire encoded result, including metadata,
+source, row identities, vectors and protobuf framing. Source sizes are checked
+before copying large blobs. Rows are assembled one chunk at a time into a
+private batch; per-chunk projection slots are released before assembling the
+next chunk. An over-budget result or invalid later chunk returns an error, never a partial
+batch. These are data budgets, not a hard bound on decoder/database heap usage.
+
+Preparation is read-only. It does not analyze text, compute derived columns,
+validate the complete runtime index binding, ingest rows, advance a publication
+cursor or change any searchable receipt. The returned protobuf is data, not an
+authorization or commit proof. Publication must still stage and verify the full
+version, then atomically replace its visible chunk set under the index's binding
+and authorization rules. It must not trust a caller-constructed batch as evidence
+that the source authority accepted that version.
+
 ## Remaining lifecycle work
 
 Imported row identities now accompany `Bm25Hit` from flat and fused lexical

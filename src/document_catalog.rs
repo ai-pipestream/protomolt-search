@@ -20,6 +20,8 @@ use crate::pb::{
 };
 use crate::sha256;
 
+mod projection;
+
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("metadata");
 const HEADS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("heads");
 const VERSIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("versions");

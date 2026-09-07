@@ -285,6 +285,15 @@ impl EmbeddedSearch {
         self.document_catalog()?.read_accepted(request)
     }
 
+    /// Prepare a complete, bounded batch from one accepted version. This is
+    /// trusted local source access and publishes no search rows or receipts.
+    pub fn prepare_document_projection(
+        &self,
+        request: &PrepareDocumentProjectionRequest,
+    ) -> Result<PreparedDocumentProjection, Status> {
+        self.document_catalog()?.prepare_projection(request)
+    }
+
     fn document_catalog(&self) -> Result<&DocumentCatalog, Status> {
         self.document_catalog.as_ref().ok_or_else(|| {
             Status::failed_precondition(
