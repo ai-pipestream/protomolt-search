@@ -485,8 +485,9 @@ shard (shard 5, 22 sealed segments, 11,068,537 live documents) was
 re-placed under the generation-11 tree from its segments with the
 declaration `year_d = calendar.year(decided)` computed on each document
 (`reshard.cea2c63 --from-segments --only-child=6 --derived-columns
---derive=year_d`), building only the archive child (decided before
-1940).
+--derive=year_d`), building only the archive child (the tree's default
+leaf: `year` before 1940, plus the undated rows the band predicates
+cannot place).
 
 | Measure | Value |
 |---|---|
@@ -542,6 +543,19 @@ declaration's evaluator: `year_d == year` (the corpus's own year) and
 | rows without `decided` | 9, none with `year_d` |
 | child tables | the source's, `year_d` appended; the declaration on all 64 segments |
 | wall, 8 threads | 209 s |
+
+The 9 rows without `decided`, identified read-only against the child
+(`examples/dump_missing.rs`, which walks the catalog and prints every
+live row lacking the column), are the complete chunk sets of two
+source opinions whose cluster ids are absent from the source cluster
+metadata, so the rows carry no `court` facet, no stored `year`, and no
+`decided`: CourtListener opinion 10297883 (cluster 9831271), five
+chunks of one District of Nevada order, and opinion 10658737 (cluster
+10192143), four chunks of another. They sit in the archive leaf
+because the tree's bands all predicate on `year`, which is absent for
+them, so the default leaf takes them; `calendar.year(decided)`
+computes absence, so they store no `year_d` — the documented absence
+rule, not a derivation error.
 
 The limits of the check: it covers what the store reconstructs (the
 columns, the stored text, lineage, identity, original source, the
