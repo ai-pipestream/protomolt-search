@@ -4,12 +4,25 @@ package ai.protomolt.search.storage.v1;
 // The archive's index precedes its blob area. Offsets are relative to that
 // area. Descriptors precede source records; all blobs tile it without gaps.
 message SourceArchiveIndex {
-  // 1 for source-only archives; 2 permits interned logical identities.
+  // 1 for source-only archives; 2 permits interned logical identities;
+  // 3 requires a complete identity-to-row lookup.
   uint32 format_version = 1;
   repeated SourceBlob descriptors = 2;
   repeated SourceBlob sources = 3;
   repeated SourceRow rows = 4;
   repeated SourceIdentity identities = 5;
+  SourceIdentityLookup identity_lookup = 6;
+}
+
+// Compact reverse index. Identity ordinals are one-based, sorted by exact
+// document_key bytes and then unsigned version. Each identity appears once.
+// offsets has identities.size + 1 entries, begins at zero, and ends at rows.size.
+// The slice rows[offsets[i]:offsets[i+1]] lists every row bound to identities[i],
+// in strictly increasing zero-based row order. Unbound rows are omitted.
+message SourceIdentityLookup {
+  repeated uint32 identities = 1;
+  repeated uint32 offsets = 2;
+  repeated uint32 rows = 3;
 }
 
 // Interned once per logical source version, independent of chunk row count.

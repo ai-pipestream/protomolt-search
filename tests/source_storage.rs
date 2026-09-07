@@ -120,6 +120,20 @@ fn identity_views_outlive_builders_images_and_row_reuse() {
             .unwrap();
     }
     let mut after = vec![heap.identity_snapshot(), spill.identity_snapshot()];
+    for key in [&first.document_key, &second.document_key] {
+        let mut heap_rows = Vec::new();
+        let mut spill_rows = Vec::new();
+        heap.visit_document_rows(key, &mut |row, version, ordinal| {
+            heap_rows.push((row, version, ordinal));
+            true
+        });
+        spill.visit_document_rows(key, &mut |row, version, ordinal| {
+            spill_rows.push((row, version, ordinal));
+            true
+        });
+        assert_eq!(heap_rows, spill_rows);
+        assert_eq!(heap_rows.len(), 1);
+    }
     let heap_path = directory.join("heap.bm25");
     let spill_path = directory.join("spill.bm25");
     heap.save(&heap_path).unwrap();
@@ -130,6 +144,20 @@ fn identity_views_outlive_builders_images_and_row_reuse() {
         after.push(reader.identity_snapshot());
         let mut loaded = Bm25Store::load(path).unwrap();
         after.push(loaded.identity_snapshot());
+        for key in [&first.document_key, &second.document_key] {
+            let mut mapped_rows = Vec::new();
+            let mut heap_rows = Vec::new();
+            reader.visit_document_rows(key, &mut |row, version, ordinal| {
+                mapped_rows.push((row, version, ordinal));
+                true
+            });
+            loaded.visit_document_rows(key, &mut |row, version, ordinal| {
+                heap_rows.push((row, version, ordinal));
+                true
+            });
+            assert_eq!(mapped_rows, heap_rows);
+            assert_eq!(mapped_rows.len(), 1);
+        }
         // A new generation may bind row zero to another source. Older
         // snapshots must retain the key from the generation that was scored.
         *loaded.source_archive_mut() = Default::default();

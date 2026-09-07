@@ -1237,6 +1237,10 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: exact document-key lookup.** Identified source archives
+  now persist a validated reverse index, and held segment snapshots resolve
+  complete live row sets under an explicit budget. Compaction rebuilds the
+  lookup at the new row positions. See [exact key lookup](docs/protobuf-source-storage.md#exact-key-lookup).
 - **Foundation branch: atomic row updates.** The segment catalog can append
   replacement segments and retire old rows with one epoch-checked manifest swap,
   including retirement-only updates. Bitmap changes preserve pinned views and

@@ -33,8 +33,34 @@ Rows reference that entry and retain their own chunk ordinal. A key/version pair
 cannot refer to different source bytes within one archive. The metadata resides
 in the archive index, so identity lookup does not load the original payload.
 This keeps long keys from being repeated on every chunk row. Archive format 2
-marks this extension; source-only archives continue to write format 1, and this
-reader accepts both. Older format-1 readers refuse identified archives.
+introduced identities. Format 3 adds a complete reverse lookup; source-only
+archives continue to write format 1. This reader accepts all three formats.
+Older readers refuse archive versions they do not support.
+
+### Exact key lookup
+
+New identified archives persist `SourceIdentityLookup`: identity ordinals sorted
+by exact key bytes and unsigned version, offsets into one packed row array, and
+every bound row listed once. Lookup compares full keys, with no text conversion
+or hash-based equality. The reader checks ordering, bounds, row bindings and
+complete coverage on open, even when the metadata checksum is valid. A missing
+or malformed format-3 lookup is refused rather than repaired silently. Legacy
+format-2 archives build the lookup once on open; rewriting emits format 3.
+
+`visit_document_rows` on source archives, heap/spill builders and image readers
+visits all versions of an exact key without reading source payloads or scanning
+unrelated rows. Sealed lookup costs a binary search plus the matching rows.
+Builders maintain an ordered key/version table and compact append-only row
+links. The visitor can stop without allocating the complete result, and row
+order within a version is unspecified. Compaction reconstructs the lookup from
+the retained identities at their new positions; public keys remain unchanged.
+
+`OpenedSegmentSet::document_retirements` uses this lookup across its held sealed
+segments, removes tombstoned rows and enforces a caller-supplied row budget.
+An exceeded budget refuses the complete resolution. Its output is local storage
+positions for `commit_rows` at that snapshot's epoch, not a public identity or
+authorization grant. Neither lookup establishes the catalog's current version,
+searchable receipts, mutable-tail coordination or workspace/collection policy.
 
 The current TVBM2508 writer adds a kind-9 column-table entry named
 `protobuf-sources`. Its offset and length address the final payload section.

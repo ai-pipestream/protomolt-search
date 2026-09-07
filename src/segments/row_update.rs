@@ -190,3 +190,47 @@ fn cleanup_overlays(root: &Path, overlays: &[(String, SegmentArtifact)]) {
         let _ = std::fs::remove_file(SegmentCatalog::segment_dir(root, id).join(&artifact.file));
     }
 }
+
+impl OpenedSegmentSet {
+    /// Resolve every live sealed row for an exact document key, across versions,
+    /// against this immutable snapshot. The caller must use this snapshot's
+    /// epoch for commit_rows and supply its authorization and version policy.
+    /// Exceeding max_rows refuses the whole resolution, never a partial update.
+    pub fn document_retirements(
+        &self,
+        key: &[u8],
+        max_rows: usize,
+    ) -> Result<Vec<SegmentRowRetirement>, String> {
+        if key.is_empty() || key.len() > 16 * 1024 || max_rows == 0 {
+            return Err(
+                "document retirement requires a valid key and a positive row budget".into(),
+            );
+        }
+        let mut remaining = max_rows;
+        let mut retirements = Vec::new();
+        for segment in &self.segments {
+            let mut rows = Vec::new();
+            let complete = segment.bm25.visit_document_rows(key, &mut |row, _, _| {
+                if segment.live_docs.is_deleted(row as usize) {
+                    return true;
+                }
+                if remaining == 0 {
+                    return false;
+                }
+                remaining -= 1;
+                rows.push(u64::from(row));
+                true
+            });
+            if !complete {
+                return Err("document retirement exceeds the row budget".into());
+            }
+            if !rows.is_empty() {
+                retirements.push(SegmentRowRetirement {
+                    segment_id: segment.metadata.segment_id.clone(),
+                    rows,
+                });
+            }
+        }
+        Ok(retirements)
+    }
+}

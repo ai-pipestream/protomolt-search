@@ -2264,6 +2264,73 @@ mod tests {
     }
 
     #[test]
+    fn exact_key_retirement_spans_segments_and_honors_snapshot_and_budget() {
+        let first = publication_fixture("key-retire-first", &["one", "two"]);
+        let second = publication_fixture("key-retire-second", &["three", "four"]);
+        let original = crate::pb::ProtobufSource {
+            descriptor_set: include_bytes!("../tests/fixtures/protobuf-semantics/descriptor.bin")
+                .to_vec(),
+            message_type: "semantics.Doc".into(),
+            payload: vec![8, 1],
+        };
+        let key = vec![0, 255, 0];
+        for (fixture, version) in [(&first, 1), (&second, 2)] {
+            let mut store = Bm25Store::load(&fixture.bm25).unwrap();
+            for row in 0..2 {
+                let identity = crate::pb::DocumentIdentity {
+                    document_key: key.clone(),
+                    version,
+                    chunk_ordinal: Some(row),
+                };
+                store
+                    .source_archive_mut()
+                    .attach_source_with_identity(row, &original, Some(row), Some(&identity))
+                    .unwrap();
+            }
+            store.save(&fixture.bm25).unwrap();
+        }
+        let root = first.root.join("catalog");
+        let catalog = SegmentCatalog::open(&root).unwrap();
+        catalog.append(source(&first, "first", 0)).unwrap();
+        let before = catalog.append(source(&second, "second", 2)).unwrap();
+        assert!(before
+            .document_retirements(&key, 3)
+            .unwrap_err()
+            .contains("row budget"));
+        assert!(before.document_retirements(&key, 0).is_err());
+        assert!(before
+            .document_retirements(&[0, 255], 4)
+            .unwrap()
+            .is_empty());
+        let all = before.document_retirements(&key, 4).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].rows, [0, 1]);
+        assert_eq!(all[1].rows, [0, 1]);
+        let partial = catalog
+            .commit_rows(before.epoch(), &[retire("first", &[0])], vec![])
+            .unwrap();
+        let remaining = partial.document_retirements(&key, 3).unwrap();
+        assert_eq!(remaining[0].rows, [1]);
+        assert_eq!(remaining[1].rows, [0, 1]);
+        assert_eq!(
+            before.document_retirements(&key, 4).unwrap()[0].rows,
+            [0, 1]
+        );
+        let gone = catalog
+            .commit_rows(partial.epoch(), &remaining, vec![])
+            .unwrap();
+        assert!(gone.document_retirements(&key, 1).unwrap().is_empty());
+        assert!(ids(&gone).is_empty());
+        assert!(SegmentCatalog::open(&root)
+            .unwrap()
+            .snapshot()
+            .document_retirements(&key, 1)
+            .unwrap()
+            .is_empty());
+        assert_eq!(gone.bm25(0).document_identity(1).unwrap().document_key, key);
+    }
+
+    #[test]
     fn concurrent_row_updates_have_one_epoch_winner() {
         let input = publication_fixture("retire-race", &["one", "two"]);
         let catalog = SegmentCatalog::open(input.root.join("catalog")).unwrap();

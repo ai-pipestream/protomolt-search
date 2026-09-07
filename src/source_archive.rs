@@ -16,7 +16,10 @@ use crate::sha256;
 
 const MAGIC: &[u8; 8] = b"PMSOURCE";
 const HEADER_BYTES: usize = 48;
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
+
+mod lookup;
+use lookup::{build_lookup, validate_lookup, IdentityLink};
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
@@ -226,6 +229,8 @@ pub struct SourceArchive {
     rows: SharedPages<SourceRow>,
     identities: SharedPages<SharedIdentity>,
     identity_ids: BTreeMap<(Vec<u8>, u64), u32>,
+    identity_heads: Vec<u32>,
+    identity_links: Vec<IdentityLink>,
     spill: Option<Mutex<File>>,
 }
 
@@ -387,6 +392,10 @@ impl SourceArchive {
         }
         if let Some(identity) = identity {
             validate_identity(identity, chunk_ordinal)?;
+            u32::try_from(self.identity_links.len())
+                .ok()
+                .and_then(|length| length.checked_add(1))
+                .ok_or_else(|| invalid("identity row count exceeds u32"))?;
         }
         let existing_identity = identity.and_then(|identity| {
             self.identity_ids
@@ -416,6 +425,7 @@ impl SourceArchive {
                         version: identity.version,
                         source: id,
                     });
+                    self.identity_heads.push(0);
                     self.identity_ids.insert(key, ordinal);
                     ordinal
                 }
@@ -425,6 +435,14 @@ impl SourceArchive {
         };
         self.attach(row, id, chunk_ordinal)?;
         self.rows[row as usize].identity = identity;
+        if identity != 0 {
+            let head = &mut self.identity_heads[identity as usize - 1];
+            self.identity_links.push(IdentityLink {
+                row,
+                previous: *head,
+            });
+            *head = self.identity_links.len() as u32;
+        }
         Ok(())
     }
 
@@ -475,7 +493,7 @@ impl SourceArchive {
             .collect::<io::Result<Vec<_>>>()?;
         let mut rows = self.rows.iter().cloned().collect::<Vec<_>>();
         rows.resize_with(row_count as usize, SourceRow::default);
-        Ok(SourceArchiveIndex {
+        let mut index = SourceArchiveIndex {
             format_version: if self.identities.is_empty() {
                 1
             } else {
@@ -493,7 +511,12 @@ impl SourceArchive {
                     source: identity.source,
                 })
                 .collect(),
-        })
+            identity_lookup: None,
+        };
+        if !index.identities.is_empty() {
+            index.identity_lookup = Some(build_lookup(&index));
+        }
+        Ok(index)
     }
 
     pub fn encoded_len(&self, row_count: u32) -> io::Result<u64> {
@@ -556,6 +579,7 @@ impl SourceArchive {
             .map(SharedIdentity::from)
             .collect();
         archive.rows = index.rows.into_iter().collect();
+        archive.restore_identity_links();
         Ok(archive)
     }
 
@@ -612,10 +636,11 @@ impl SourceArchiveReader {
         if sha256::digest(encoded_index).as_slice() != &bytes[16..48] {
             return Err(invalid("source index checksum mismatch"));
         }
-        let index = SourceArchiveIndex::decode(encoded_index)
+        let mut index = SourceArchiveIndex::decode(encoded_index)
             .map_err(|e| invalid(format!("source index: {e}")))?;
         if !(1..=FORMAT_VERSION).contains(&index.format_version)
             || (index.format_version == 1 && !index.identities.is_empty())
+            || (index.format_version < 3 && index.identity_lookup.is_some())
         {
             return Err(invalid("unsupported source archive version"));
         }
@@ -659,6 +684,11 @@ impl SourceArchiveReader {
             {
                 return Err(invalid("invalid or duplicate logical source identity"));
             }
+        }
+        if index.format_version == 3 {
+            validate_lookup(&index)?;
+        } else if !index.identities.is_empty() {
+            index.identity_lookup = Some(build_lookup(&index));
         }
         let descriptors: BTreeMap<_, _> = index
             .descriptors
@@ -965,6 +995,158 @@ mod tests {
         }
     }
 
+    fn rewrite_archive(bytes: &[u8], mutate: impl FnOnce(&mut SourceArchiveIndex)) -> Vec<u8> {
+        let old_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let mut index = SourceArchiveIndex::decode(&bytes[48..48 + old_len]).unwrap();
+        mutate(&mut index);
+        let index = index.encode_to_vec();
+        let mut output = Vec::new();
+        output.extend_from_slice(MAGIC);
+        output.extend_from_slice(&(index.len() as u64).to_le_bytes());
+        output.extend_from_slice(&sha256::digest(&index));
+        output.extend_from_slice(&index);
+        output.extend_from_slice(&bytes[48 + old_len..]);
+        output
+    }
+
+    fn lookup_fixture() -> SourceArchive {
+        let mut archive = SourceArchive::default();
+        // Deliberately interleave keys, versions and row positions. Exact binary
+        // keys must not alias by UTF-8 conversion, prefixes or source hashes.
+        for (row, key, version, ordinal) in [
+            (7, vec![0, 255], 2, Some(1)),
+            (3, vec![0, 255, 0], 1, None),
+            (1, vec![0, 255], u64::MAX, None),
+            (0, vec![0, 255], 2, Some(0)),
+            (5, vec![0, 254], 2, None),
+        ] {
+            let identity = DocumentIdentity {
+                document_key: key,
+                version,
+                chunk_ordinal: ordinal,
+            };
+            archive
+                .attach_source_with_identity(row, &source(), ordinal, Some(&identity))
+                .unwrap();
+        }
+        archive
+    }
+
+    #[test]
+    fn exact_key_lookup_survives_sealing_legacy_upgrade_and_builder_reload() {
+        let archive = lookup_fixture();
+        let mut bytes = Vec::new();
+        archive.write(&mut bytes, 9).unwrap();
+        let legacy = rewrite_archive(&bytes, |index| {
+            index.format_version = 2;
+            index.identity_lookup = None;
+        });
+        let reader = SourceArchiveReader::open(&bytes, 9).unwrap();
+        let legacy_reader = SourceArchiveReader::open(&legacy, 9).unwrap();
+        let mut loaded = SourceArchive::read(&legacy, 9).unwrap();
+        for key in [vec![0, 255], vec![0, 255, 0], vec![0], vec![255], vec![]] {
+            let mut expected = Vec::new();
+            for row in 0..9 {
+                if let Some(identity) = archive
+                    .identity(row)
+                    .filter(|identity| identity.document_key == key)
+                {
+                    expected.push((row, identity.version, identity.chunk_ordinal));
+                }
+            }
+            for variant in 0..4 {
+                let mut actual = Vec::new();
+                let mut visit = |row, version, ordinal| {
+                    actual.push((row, version, ordinal));
+                    true
+                };
+                assert!(match variant {
+                    0 => archive.visit_document_rows(&key, &mut visit),
+                    1 => reader.visit_document_rows(&key, &mut visit),
+                    2 => legacy_reader.visit_document_rows(&key, &mut visit),
+                    _ => loaded.visit_document_rows(&key, &mut visit),
+                });
+                actual.sort_unstable();
+                assert_eq!(actual, expected);
+            }
+        }
+        let mut seen = 0;
+        assert!(!reader.visit_document_rows(&[0, 255], &mut |_, _, _| {
+            seen += 1;
+            false
+        }));
+        assert_eq!(seen, 1);
+        seen = 0;
+        assert!(!archive.visit_document_rows(&[0, 255], &mut |_, _, _| {
+            seen += 1;
+            false
+        }));
+        assert_eq!(seen, 1);
+        let identity = DocumentIdentity {
+            document_key: vec![0, 255],
+            version: 2,
+            chunk_ordinal: Some(2),
+        };
+        loaded
+            .attach_source_with_identity(9, &source(), Some(2), Some(&identity))
+            .unwrap();
+        let mut found = Vec::new();
+        loaded.visit_document_rows(&[0, 255], &mut |row, _, _| {
+            found.push(row);
+            true
+        });
+        found.sort_unstable();
+        assert_eq!(found, [0, 1, 7, 9]);
+        let mut upgraded = Vec::new();
+        loaded.write(&mut upgraded, 10).unwrap();
+        assert_eq!(
+            SourceArchiveReader::open(&upgraded, 10)
+                .unwrap()
+                .index
+                .format_version,
+            3
+        );
+    }
+
+    #[test]
+    fn malformed_reverse_lookup_is_refused_even_with_valid_checksum() {
+        let mut bytes = Vec::new();
+        lookup_fixture().write(&mut bytes, 9).unwrap();
+        for corruption in 0..10 {
+            let corrupt = rewrite_archive(&bytes, |index| {
+                match corruption {
+                    0 => index.identity_lookup = None,
+                    1 => index
+                        .identity_lookup
+                        .as_mut()
+                        .unwrap()
+                        .identities
+                        .swap(0, 1),
+                    2 => index.identity_lookup.as_mut().unwrap().identities[0] = 0,
+                    3 => index.identity_lookup.as_mut().unwrap().offsets[0] = 1,
+                    4 => index.identity_lookup.as_mut().unwrap().offsets[1] = u32::MAX,
+                    5 => index.identity_lookup.as_mut().unwrap().rows[0] = 8, // unbound
+                    6 => index.identity_lookup.as_mut().unwrap().rows[0] = 99,
+                    7 => {
+                        let lookup = index.identity_lookup.as_mut().unwrap();
+                        lookup.rows[2] = lookup.rows[1];
+                    }
+                    8 => {
+                        let lookup = index.identity_lookup.as_mut().unwrap();
+                        lookup.rows.pop();
+                        *lookup.offsets.last_mut().unwrap() -= 1;
+                    }
+                    9 => index.format_version = 2, // never accept a disguised new contract
+                    _ => unreachable!(),
+                }
+            });
+            assert!(
+                SourceArchiveReader::open(&corrupt, 9).is_err(),
+                "corruption {corruption}"
+            );
+        }
+    }
+
     #[test]
     fn logical_identity_is_interned_and_survives_archive_reload() {
         let mut archive = SourceArchive::default();
@@ -983,7 +1165,7 @@ mod tests {
         let mut bytes = Vec::new();
         archive.write(&mut bytes, 3).unwrap();
         let reader = SourceArchiveReader::open(&bytes, 3).unwrap();
-        assert_eq!(reader.index.format_version, 2);
+        assert_eq!(reader.index.format_version, 3);
         assert_eq!(reader.index.identities.len(), 1);
         assert_eq!(reader.index.sources.len(), 1);
         assert_eq!(

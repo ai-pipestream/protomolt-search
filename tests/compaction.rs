@@ -942,6 +942,7 @@ async fn run_online_compaction(layout: Layout) {
     let final_rows: Vec<Row> = tracked.lock().unwrap().live.values().cloned().collect();
     let verify_sources = |reader: &pipestream_search::postings::Bm25Reader| {
         use pipestream_search::postings::Bm25Index;
+        let mut keyed: BTreeMap<Vec<u8>, Vec<(u32, u64, Option<u32>)>> = BTreeMap::new();
         for local in 0..reader.next_doc_id() {
             let text = reader.text(local).unwrap();
             let row = final_rows.iter().find(|r| r.text == text).unwrap();
@@ -949,7 +950,26 @@ async fn run_online_compaction(layout: Layout) {
                 reader.protobuf_source(local).unwrap(),
                 Some(original_source(row))
             );
-            assert_eq!(reader.document_identity(local), Some(logical_identity(row)));
+            let identity = logical_identity(row);
+            assert_eq!(reader.document_identity(local), Some(identity.clone()));
+            keyed.entry(identity.document_key).or_default().push((
+                local,
+                identity.version,
+                identity.chunk_ordinal,
+            ));
+        }
+        // Reverse lookup must refer to the new positions after compaction,
+        // including keys whose chunks span several output segments.
+        for (key, expected) in keyed {
+            let mut actual = Vec::new();
+            assert!(
+                reader.visit_document_rows(&key, &mut |row, version, ordinal| {
+                    actual.push((row, version, ordinal));
+                    true
+                })
+            );
+            actual.sort_unstable();
+            assert_eq!(actual, expected);
         }
     };
     match layout {

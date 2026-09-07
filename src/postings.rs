@@ -2051,6 +2051,15 @@ impl Default for Bm25Store {
 }
 
 impl Bm25Store {
+    /// Visit stored rows for an exact key; does not apply visibility or grants.
+    pub fn visit_document_rows(
+        &self,
+        key: &[u8],
+        visitor: &mut dyn FnMut(u32, u64, Option<u32>) -> bool,
+    ) -> bool {
+        self.sources.visit_document_rows(key, visitor)
+    }
+
     pub fn document_identity(&self, row: u32) -> Option<crate::pb::DocumentIdentity> {
         self.sources.identity(row)
     }
@@ -5410,6 +5419,15 @@ pub struct SpillBuilder {
 }
 
 impl SpillBuilder {
+    /// Visit stored rows for an exact key; does not apply visibility or grants.
+    pub fn visit_document_rows(
+        &self,
+        key: &[u8],
+        visitor: &mut dyn FnMut(u32, u64, Option<u32>) -> bool,
+    ) -> bool {
+        self.sources.visit_document_rows(key, visitor)
+    }
+
     pub fn document_identity(&self, row: u32) -> Option<crate::pb::DocumentIdentity> {
         self.sources.identity(row)
     }
@@ -8753,6 +8771,17 @@ pub struct Bm25Reader {
 }
 
 impl Bm25Reader {
+    /// Visit stored rows for an exact key; does not apply visibility or grants.
+    pub fn visit_document_rows(
+        &self,
+        key: &[u8],
+        visitor: &mut dyn FnMut(u32, u64, Option<u32>) -> bool,
+    ) -> bool {
+        self.source_section
+            .as_ref()
+            .is_none_or(|(_, _, reader)| reader.visit_document_rows(key, visitor))
+    }
+
     pub fn identity_snapshot(&self) -> crate::source_archive::IdentitySnapshot {
         self.source_section
             .as_ref()
