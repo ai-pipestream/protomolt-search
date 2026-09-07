@@ -350,7 +350,25 @@ async fn every_query_shape_and_collapse_carries_imported_identity() {
                 );
             }
             let events = streamed_query(&coordinator, Some(request), 0).await;
-            let (_, completion) = stream_parts(&events);
+            let (revisions, completion) = stream_parts(&events);
+            for revision in revisions {
+                assert_eq!(revision.content_fingerprint_version, 2);
+                if revision.hits.is_empty() {
+                    continue;
+                }
+                assert_eq!(
+                    revision.identity_state,
+                    pipestream_search::pb::QueryStreamIdentityState::Resolved as i32
+                );
+                for hit in &revision.hits {
+                    assert_eq!(
+                        hit.identity,
+                        fixture_identity(hit.doc_id),
+                        "revision shape {shape}, phase {}",
+                        revision.phase
+                    );
+                }
+            }
             let terminal = completion.response.as_ref().unwrap();
             for hit in terminal
                 .hits

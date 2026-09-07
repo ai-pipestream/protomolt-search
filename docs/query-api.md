@@ -10,9 +10,10 @@ when the selected row has one. This covers every result adapter, including
 lexical, dense, hybrid, Boolean and browse. The coordinator resolves identity
 under the selection's admitted shard versions and document view and applies
 field disclosure before publishing unary or terminal streamed results.
-`doc_id` is still a generation-local locator; provisional stream revisions do
-not carry stable identity yet. See [query result identity](query-result-identity.md)
-and [document writes](document-writes.md) for the remaining publication contract.
+`doc_id` is still a generation-local locator. [Streamed revisions](query-stream-identity.md)
+also carry imported identities with explicit disclosure state and versioned
+fingerprints. See [query result identity](query-result-identity.md) and
+[document writes](document-writes.md) for the remaining publication contract.
 
 Status: `SearchService.Query` and its certified streaming form
 `SearchService.QueryStream` are IMPLEMENTED. Increment 1 landed on 2026-08-24:

@@ -48,8 +48,9 @@ collapse groups. Public stream authority checks still run before delivery.
 These internal request fields do not authenticate callers. Remote delegation
 and direct-node authorization remain separate requirements.
 
-Provisional `QueryStreamHit` revisions still carry generation-local row IDs;
-this increment covers the terminal response. Legacy rows without imported keys
+[Provisional `QueryStreamHit` revisions](query-stream-identity.md) now resolve
+imported identity with explicit disclosure state under the same admitted read
+context. Their row IDs remain generation-local locators. Legacy rows without imported keys
 remain explicitly unkeyed. Server-side catalog publication, stable identity for
 all legacy public route shapes, conditional projection transactions and
 searchable receipts remain unfinished. No identity claim is inferred from

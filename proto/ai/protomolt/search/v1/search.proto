@@ -5801,12 +5801,24 @@ message QueryStreamHit {
   uint64 doc_id = 1;
   float score = 2;
   uint32 rank = 3;
+  // Imported source identity under the selection's version and authority view.
+  // Consult the revision's identity_state before interpreting absence.
+  DocumentIdentity identity = 4;
+}
+
+enum QueryStreamIdentityState {
+  // An older peer made no identity claim, or no selection has been admitted.
+  QUERY_STREAM_IDENTITY_STATE_UNSPECIFIED = 0;
+  // Every hit's identity was evaluated; absent identity means an unkeyed row.
+  QUERY_STREAM_IDENTITY_STATE_RESOLVED = 1;
+  // Authority withheld identities. Absence says nothing about stored keys.
+  QUERY_STREAM_IDENTITY_STATE_WITHHELD = 2;
 }
 
 // A complete replacement snapshot. Clients apply the greatest revision they
 // have seen and discard older ones; no patch replay or arrival-order merge is
-// required. `content_fingerprint` hashes phase plus ordered (id, score-bits)
-// rows, making duplicate snapshots and deterministic retries observable.
+// required. `content_fingerprint` identifies the disclosed phase and ordered
+// rows; its explicit version defines whether identities participate.
 message QueryStreamRevision {
   uint64 revision = 1;
   QueryStreamPhase phase = 2;
@@ -5815,6 +5827,13 @@ message QueryStreamRevision {
   // Score-space identity when the collector has certified it. Empty on the
   // accepted revision and on a provisional collector awaiting completions.
   string scoring_fingerprint = 5;
+  QueryStreamIdentityState identity_state = 6;
+  // 0 denotes the legacy v1 phase/id/score-bits hash. Version 2 additionally
+  // binds rank, identity_state and each disclosed key/version/chunk presence.
+  // Version 2 hashes either signed zero as +0, matching this float field's
+  // implicit-default protobuf encoding.
+  // Revision number and scoring_fingerprint do not participate in either hash.
+  uint32 content_fingerprint_version = 7;
 }
 
 // The only terminal shape. `response` is present exactly on success.

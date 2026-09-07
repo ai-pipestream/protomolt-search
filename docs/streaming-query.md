@@ -3,7 +3,7 @@
 `SearchService.QueryStream` is the streaming form of `SearchService.Query`.
 It does not define a second search language or a weaker result. It executes the
 same `QueryRequest`, publishes complete replacement snapshots while certified
-collectors are running, then returns the byte-identical unary `QueryResponse`
+collectors are running, then returns the ordinary unary `QueryResponse`
 inside one terminal completion message.
 
 ## State machine
@@ -20,9 +20,12 @@ Every accepted call emits these shapes in order:
 Revision numbers strictly increase. A revision is a full snapshot, not a
 patch, so a slow client can discard every snapshot older than the greatest
 revision it has seen. Ranks are one-based and match list order. The content
-fingerprint hashes the phase and ordered `(document id, score bits)` rows;
-identical final results therefore have a retry-stable fingerprint even when
-timing changes which provisional revisions are observed.
+fingerprint has an explicit version. Version 2 binds phase, identity disclosure
+state and the ordered rows, including imported keys, versions and optional
+ordinals; signed zero follows the protobuf wire representation. See
+[streamed query identity](query-stream-identity.md) for the exact hash and
+identity-read contract. Identical final results have retry-stable fingerprints
+even when timing changes which provisional revisions are observed.
 
 The terminal success contains the ordinary `QueryResponse` and identifies the
 last revision. That response is the source of truth for projections, score
@@ -58,8 +61,9 @@ message with:
 - the canonical gRPC code and message.
 
 The optional `timeout_ms` covers the complete operation from acceptance
-through final response construction. A client that drops the response stream
-cancels the execution future and its in-flight shard work; the server does not
+through identity reads, final response construction and sending the final
+revision. A client that drops the response stream aborts its owned query task,
+candidate fetches and lexical collector tasks; the server does not
 manufacture a terminal event for a client that is no longer listening.
 
 ## Collector guarantees

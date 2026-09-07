@@ -151,7 +151,8 @@ Rows ingested without an identity report absence rather than a fabricated key.
 The product-owned dense paths also retain scored identities through classic and
 streaming scans; see [Dense identity](dense-identity.md). Remote-provider,
 streaming parent-collapse and remaining legacy route identities remain,
-as do provisional candidate revisions. [Final Query results](query-result-identity.md)
+while [provisional revisions](query-stream-identity.md) now carry imported keys
+under the same admitted version and authority view. [Final Query results](query-result-identity.md)
 now resolve identity across hybrid, Boolean and browse adapters, including collapse
 inner hits, under the same selection version and authority view.
 These paths report imported row metadata;

@@ -1222,6 +1222,11 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **2026-09-06 — Identity on streamed revisions.** Provisional and final
+  revisions carry imported identities under the admitted version and authority
+  view, with explicit resolved/withheld states and a versioned, wire-reproducible
+  fingerprint. Identity reads and lexical collectors cancel with the operation.
+  See [streamed query identity](docs/query-stream-identity.md).
 - **2026-09-06 — Identity on final query results.** Public Query and terminal
   QueryStream responses resolve imported identities for all result adapters and
   collapse inner hits under the selection's version and authority view. Relays

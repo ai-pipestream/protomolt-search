@@ -10,6 +10,25 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tonic::codegen::{http, Service};
 
+#[derive(Default)]
+struct RouteGate {
+    route: Option<&'static str>,
+    started: AtomicUsize,
+    active: AtomicUsize,
+    cancelled: AtomicUsize,
+    entered: tokio::sync::Notify,
+    released: tokio::sync::Notify,
+    finished: tokio::sync::Notify,
+}
+struct RouteWait(Arc<RouteGate>);
+impl Drop for RouteWait {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::SeqCst);
+        self.0.cancelled.fetch_add(1, Ordering::SeqCst);
+        self.0.finished.notify_one();
+    }
+}
+
 type NodeServer = NodeServiceServer<NodeServiceImpl>;
 
 /// Keep the TCP listener and pooled connection fixed while replacing the
@@ -19,6 +38,7 @@ struct Replaceable<S> {
     current: Arc<Mutex<S>>,
     before_score: Arc<Mutex<VecDeque<S>>>,
     before_fetch: Arc<Mutex<VecDeque<S>>>,
+    fetch_gate: Arc<Mutex<Option<Arc<RouteGate>>>>,
     scoring_calls: Arc<AtomicUsize>,
     before_reads: Arc<Mutex<std::collections::HashMap<String, VecDeque<Option<S>>>>>,
 }
@@ -30,10 +50,13 @@ impl<S: tonic::server::NamedService> tonic::server::NamedService for Replaceable
 impl<S, B> Service<http::Request<B>> for Replaceable<S>
 where
     S: Service<http::Request<B>> + Clone,
+    S::Future: Send + 'static,
 {
     type Response = S::Response;
     type Error = S::Error;
-    type Future = S::Future;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
     fn poll_ready(
         &mut self,
         _: &mut std::task::Context<'_>,
@@ -72,7 +95,23 @@ where
                 *self.current.lock().unwrap() = next;
             }
         }
-        self.current.lock().unwrap().clone().call(request)
+        let gate = self
+            .fetch_gate
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|gate| route == gate.route.unwrap_or("FetchValues"));
+        let future = self.current.lock().unwrap().clone().call(request);
+        Box::pin(async move {
+            if let Some(gate) = gate {
+                gate.started.fetch_add(1, Ordering::SeqCst);
+                gate.active.fetch_add(1, Ordering::SeqCst);
+                let _waiting = RouteWait(gate.clone());
+                gate.entered.notify_one();
+                gate.released.notified().await;
+            }
+            future.await
+        })
     }
 }
 
@@ -120,6 +159,7 @@ async fn start(
         current: Arc::new(Mutex::new(server)),
         before_score: Arc::new(Mutex::new(VecDeque::new())),
         before_fetch: Arc::new(Mutex::new(VecDeque::new())),
+        fetch_gate: Arc::new(Mutex::new(None)),
         scoring_calls: Arc::new(AtomicUsize::new(0)),
         before_reads: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
@@ -656,5 +696,126 @@ async fn public_query_collapse_refuses_lineage_from_a_replacement_lifetime() {
         assert!(service.before_reads.lock().unwrap()["ResolveParents"].is_empty());
         handle.abort();
         let _ = handle.await;
+    }
+}
+
+#[tokio::test]
+async fn stream_identity_reads_obey_deadlines_and_client_drop_without_stalling_execution() {
+    use pipestream_search::pb::{search_service_server::SearchService, *};
+    use std::time::Duration;
+    use tokio_stream::StreamExt;
+    for deadline in [false, true] {
+        let (address, service, handle) = start(node(&["rust", "rust"]).await).await;
+        let coordinator = coordinator(address);
+        let gate = Arc::new(RouteGate::default());
+        *service.fetch_gate.lock().unwrap() = Some(gate.clone());
+        let mut stream = SearchService::query_stream(
+            &coordinator,
+            tonic::Request::new(QueryStreamRequest {
+                query: Some(public_query()),
+                timeout_ms: if deadline { 500 } else { 0 },
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let accepted = stream.next().await.unwrap().unwrap();
+        assert!(
+            matches!(accepted.payload, Some(query_stream_response::Payload::Revision(QueryStreamRevision { phase, ref hits, .. }))
+            if phase == QueryStreamPhase::Accepted as i32 && hits.is_empty())
+        );
+        // The provisional identity read and terminal identity read must both
+        // start: pausing the collector while its lookup awaits would deadlock.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while gate.started.load(Ordering::SeqCst) < 2 {
+                gate.entered.notified().await;
+            }
+        })
+        .await
+        .expect("execution must keep running during the provisional identity read");
+        if deadline {
+            let event = tokio::time::timeout(Duration::from_secs(3), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let Some(query_stream_response::Payload::Completion(done)) = event.payload else {
+                panic!("identity lookup emitted a hit before it completed")
+            };
+            assert!(!done.completed);
+            assert!(done.response.is_none());
+            assert_eq!(done.error_code, tonic::Code::DeadlineExceeded as u32);
+            assert!(stream.next().await.is_none());
+        }
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while gate.active.load(Ordering::SeqCst) != 0 {
+                gate.finished.notified().await;
+            }
+        })
+        .await
+        .expect("every in-flight identity RPC must be cancelled");
+        assert_eq!(
+            gate.cancelled.load(Ordering::SeqCst),
+            gate.started.load(Ordering::SeqCst)
+        );
+        handle.abort();
+        let _ = handle.await;
+    }
+}
+
+#[tokio::test]
+async fn cancelling_flat_and_fused_lexical_collectors_drops_their_shard_calls() {
+    use pipestream_search::pb::{search_service_server::SearchService, *};
+    use std::time::Duration;
+    for fused in [false, true] {
+        let (address, service, server) = start(node(&["rust", "rust"]).await).await;
+        let coordinator = coordinator(address).with_bm25_stream(true);
+        let gate = Arc::new(RouteGate {
+            route: Some("Bm25QueryStream"),
+            ..Default::default()
+        });
+        *service.fetch_gate.lock().unwrap() = Some(gate.clone());
+        let mut query = tokio::spawn(async move {
+            SearchService::bm25_search(
+                &coordinator,
+                tonic::Request::new(Bm25SearchRequest {
+                    text: "rust".into(),
+                    k: 1,
+                    analysis: if fused { None } else { Some(body_spec()) },
+                    fields: if fused {
+                        vec![QueryField {
+                            field: "body".into(),
+                            analysis: Some(body_spec()),
+                            ..Default::default()
+                        }]
+                    } else {
+                        vec![]
+                    },
+                    ..Default::default()
+                }),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::select! {
+                _ = gate.entered.notified() => {},
+                result = &mut query => panic!("collector exited before its gate, fused={fused}: {result:?}"),
+            }
+        }).await.expect("collector must start");
+        query.abort();
+        assert!(query.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while gate.active.load(Ordering::SeqCst) != 0 {
+                gate.finished.notified().await;
+            }
+        })
+        .await
+        .expect("aborted collector must cancel the outstanding shard RPC");
+        assert_eq!(gate.started.load(Ordering::SeqCst), 1);
+        assert_eq!(gate.cancelled.load(Ordering::SeqCst), 1);
+        server.abort();
+        let _ = server.await;
     }
 }

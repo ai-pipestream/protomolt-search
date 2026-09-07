@@ -43,8 +43,9 @@ Field-use-only grants still omit raw identity and stored scorer dimensions from
 representatives and inner hits. Document restrictions additionally withhold
 physical execution details. `doc_id` remains a generation-local locator.
 [Final query responses](query-result-identity.md) now resolve imported identity
-under the same authority and version. Provisional identity and transactional
-source publication remain unfinished foundations.
+under the same authority and version. [Provisional identities](query-stream-identity.md)
+use that admitted context and current stream permits too. Transactional source
+publication remains an unfinished foundation.
 
 ## Evidence
 

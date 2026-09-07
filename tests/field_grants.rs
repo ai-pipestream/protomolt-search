@@ -1451,6 +1451,31 @@ async fn query_field_revocation_invalidates_cursors_and_pending_streams() {
             .unwrap()
             .into_inner();
         assert!(!first.next_cursor.is_empty());
+        let mut hidden = SearchService::query_stream(
+            &reader,
+            request(QueryStreamRequest {
+                query: Some(query.clone()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let mut observed = false;
+        while let Some(event) = hidden.next().await {
+            if let Some(query_stream_response::Payload::Revision(revision)) = event.unwrap().payload
+            {
+                if !revision.hits.is_empty() {
+                    observed = true;
+                    assert_eq!(
+                        revision.identity_state,
+                        QueryStreamIdentityState::Withheld as i32
+                    );
+                    assert!(revision.hits.iter().all(|hit| hit.identity.is_none()));
+                }
+            }
+        }
+        assert!(observed);
         let mut stream = SearchService::query_stream(
             &reader,
             request(QueryStreamRequest {
@@ -1726,6 +1751,11 @@ async fn document_revocation_after_provisional_hits_discards_buffered_results() 
                     .iter()
                     .all(|hit| matches!(hit.doc_id, 0 | 100)));
                 if !revision.hits.is_empty() {
+                    assert_eq!(
+                        revision.identity_state,
+                        QueryStreamIdentityState::Resolved as i32
+                    );
+                    assert!(revision.hits.iter().all(|hit| hit.identity.is_some()));
                     assert_ne!(revision.phase, QueryStreamPhase::Final as i32);
                     break;
                 }
