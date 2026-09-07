@@ -5,6 +5,7 @@ use pipestream_search::document_catalog::DocumentCatalog;
 use pipestream_search::embedded::{
     EmbeddedDocumentCatalogConfig, EmbeddedSearch, EmbeddedSearchConfig, EmbeddedShardConfig,
 };
+use pipestream_search::pb::storage::SourceSealRequest;
 use pipestream_search::pb::{
     accept_document_request::Mutation, AcceptDocumentRequest, ProtobufSource,
 };
@@ -231,6 +232,7 @@ fn committed_receipt_survives_process_exit_without_dropping_database() {
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "abrupt_exit_worker", "--nocapture"])
         .env("PSEARCH_CATALOG_CRASH_PATH", dir.catalog())
+        .env_remove("PSEARCH_CATALOG_CRASH_SEAL")
         .status()
         .unwrap();
     assert_eq!(status.code(), Some(73));
@@ -245,6 +247,43 @@ fn committed_receipt_survives_process_exit_without_dropping_database() {
 }
 
 #[test]
+fn committed_seal_survives_process_exit_without_dropping_database() {
+    let dir = Directory::new("seal-crash");
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "abrupt_exit_worker", "--nocapture"])
+        .env("PSEARCH_CATALOG_CRASH_PATH", dir.catalog())
+        .env("PSEARCH_CATALOG_CRASH_SEAL", "1")
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(73));
+    let catalog = DocumentCatalog::open(&dir.catalog(), "books").unwrap();
+    let seal = catalog
+        .history_seal()
+        .unwrap()
+        .expect("seal committed before abrupt exit");
+    assert_eq!((seal.format_version, seal.accepted_sequence), (1, 1));
+    assert_eq!(seal.operation_id, b"crash-seal");
+    assert_eq!(
+        catalog
+            .seal_history(&SourceSealRequest {
+                history_id: seal.history_id.clone(),
+                expected_accepted_sequence: 1,
+                operation_id: b"crash-seal".to_vec(),
+            })
+            .unwrap(),
+        seal
+    );
+    for request in [
+        write(b"crash-retry", Some(0)),
+        write(b"new-after-crash-seal", Some(1)),
+    ] {
+        let error = catalog.accept(&request).unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("sealed"), "{error}");
+    }
+}
+
+#[test]
 fn abrupt_exit_worker() {
     let Some(path) = std::env::var_os("PSEARCH_CATALOG_CRASH_PATH") else {
         return;
@@ -256,6 +295,17 @@ fn abrupt_exit_worker() {
             .unwrap()
             .durable
     );
+    if std::env::var_os("PSEARCH_CATALOG_CRASH_SEAL").is_some() {
+        let receipt = catalog.accept(&write(b"crash-retry", Some(0))).unwrap();
+        let seal = catalog
+            .seal_history(&SourceSealRequest {
+                history_id: receipt.history_id,
+                expected_accepted_sequence: receipt.accepted_sequence,
+                operation_id: b"crash-seal".to_vec(),
+            })
+            .unwrap();
+        assert_eq!(seal.accepted_sequence, 1);
+    }
     // Deliberately skip database Drop and the test harness cleanup.
     std::process::exit(73);
 }
