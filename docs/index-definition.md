@@ -27,7 +27,10 @@ The current index requires one explicit DOC_ID and one explicit VECTOR, with a
 positive vector dimension. Bind still selects a TEXT body and validates explicit
 analysis and node column declarations. An explicit CHUNKS container enables
 traversal into that repeated message; arbitrary repeated or map traversal cannot
-silently flatten element relationships. Unsupported value shapes must remain
+silently flatten element relationships. A projection can end at a map field:
+KEYWORD/BOOLEAN values use the map-facet plane and FLOAT/DOUBLE values use the
+map-numeric plane. [Map projection](map-projection.md) defines keys, defaults,
+duplicate entries and supported value types. Other unsupported shapes remain
 source-only until their storage and query semantics are implemented.
 
 Explicit policy uses a separate fingerprint domain, even if its resolved columns

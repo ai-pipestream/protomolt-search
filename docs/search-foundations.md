@@ -1,19 +1,23 @@
 # Search foundations
 
 Foundation work began on `feat/search-foundations` from `PRE_ASTRA`.
-The latest increment enables literal empty keys in ordinary map ingestion.
-Explicit map range inputs and presence-bearing count responses preserve map
-context through roots and relays. Tests cover explicit WAL rebuild, image reopen,
-compaction, projections, counts and map aggregates. [Map counts](map-columns.md#explicit-map-counts-and-ingestion-2026-09-06)
-records the contract and compatibility limits. Descriptor-driven map projection
-and exact integer map storage still require implementation.
+The latest increment connects explicit protobuf map projections to map-facet
+and map-numeric storage. Every protobuf map-key type has a canonical selector;
+default entries, duplicate-key resolution, enum openness and per-chunk scope
+retain their meaning. Schema reports name queryable maps and key/value inputs.
+[Map projection](map-projection.md) records the implemented semantics and limits.
+Exact numeric integer maps and message-valued map projection remain required.
 
-Combined validation against main `46099c7` passed 1,253 tests (one existing
-live OpenNLP test ignored), all five mobile Rust checks, test/example
-compilation and the scoped protobuf compatibility check. Automatic replay on
-node open remains a recovery integration gap; the WAL test exercises explicit
-rebuild after the flush barrier. Remote authorization, remaining protobuf
-shapes and transactional identity/publication remain required.
+Combined validation against main `73a420b` passed 1,264 tests (one existing live
+OpenNLP test ignored), all five mobile Rust checks, test/example compilation,
+formatting, vendored-proto checks and a descriptor comparison allowing only
+four additive map enum values. This does not complete the three workstreams.
+
+The preceding empty-key/count checkpoint on main `73a420b` passed 1,253 tests
+and all five mobile Rust checks. Automatic replay on node open remains a
+recovery integration gap; its WAL test exercises explicit rebuild after flush.
+Remote authorization, remaining protobuf shapes and transactional
+identity/publication remain required.
 
 The preceding score-input checkpoint on main `46099c7` passed 1,249 tests and
 all five mobile Rust checks. Main `41ca93c` carries map context through string

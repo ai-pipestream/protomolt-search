@@ -61,8 +61,9 @@ Boolean wrappers use the existing `true`/`false` string facet representation.
 TEXT wrappers index analyzed terms; scalar presence and value expressions need a
 KEYWORD projection. Original bytes distinguish absent and empty text regardless
 of whether either produces terms. Floating wrappers use finite f64 columns.
-`BytesValue`, repeated wrappers, maps and explicit OBJECT/NESTED/BINARY hints
-remain source-only under the current column contract. SKIP retains the original
+`BytesValue`, repeated wrappers and explicit OBJECT/NESTED/BINARY hints remain
+source-only. Unhinted maps are also source-only; explicit scalar
+[map projections](map-projection.md) use the map column planes. SKIP retains the original
 without a projected value. These are the [standard protobuf wrappers](https://protobuf.dev/reference/protobuf/google.protobuf/).
 
 Absence of the wrapper is missing. A present empty wrapper projects the scalar

@@ -43,9 +43,20 @@ pub(super) fn build(
                         mapped.path == plan.vector_path,
                         field.field_descriptor_proto(),
                         &enum_values,
+                        pool,
                     )?;
                 }
-                let mut value_descriptor = field.field_descriptor_proto().clone();
+                let mut value_descriptor = if field.is_map() {
+                    let Kind::Message(entry) = field.kind() else {
+                        unreachable!("map descriptor")
+                    };
+                    entry
+                        .map_entry_value_field()
+                        .field_descriptor_proto()
+                        .clone()
+                } else {
+                    field.field_descriptor_proto().clone()
+                };
                 value_descriptor.r#type =
                     Some(super::projection_scalar_type(&value_descriptor) as i32);
                 let mut projection = projection(mapped, &value_descriptor, numbers.clone());
@@ -56,6 +67,9 @@ pub(super) fn build(
                         {
                             projection.constraints.push("An absent wrapper is missing; a present empty wrapper projects its scalar default.".into());
                             &["value"]
+                        } else if child.is_map_entry() {
+                            projection.constraints.push("Map keys are exact strings, canonical decimal integers or true/false; use those strings in map selectors. Omitted key/value fields use protobuf defaults. The last decoded entry for a key wins; a missing entry remains absent. Original wire occurrences are preserved separately.".into());
+                            &["key", "value"]
                         } else if mapped.kind == pb::MappedKind::Date as i32 {
                             &["seconds", "nanos"]
                         } else {
@@ -249,6 +263,8 @@ fn projection(
             ColumnFamily::I64 => (Use::Value, Query::SignedInteger),
             ColumnFamily::U64 => (Use::Value, Query::UnsignedInteger),
             ColumnFamily::F64 => (Use::Value, Query::FloatingPoint),
+            ColumnFamily::MapFacet => (Use::Value, Query::MapStringFacet),
+            ColumnFamily::MapF64 => (Use::Value, Query::MapFloatingPoint),
         };
     let mut constraints = Vec::new();
     if usage == Use::Value {
@@ -272,10 +288,13 @@ fn projection(
                     .into(),
             );
         }
-        if representation == Query::FloatingPoint {
+        if matches!(
+            representation,
+            Query::FloatingPoint | Query::MapFloatingPoint
+        ) {
             constraints.push("Stored numeric values must be finite.".into());
         }
-        if representation == Query::StringFacet {
+        if matches!(representation, Query::StringFacet | Query::MapStringFacet) {
             match descriptor.r#type() {
                 Type::Enum => constraints.push("Enums query as their first declared alias; unknown open-enum numbers query as decimal strings. Unknown closed-enum numbers do not project.".into()),
                 Type::Bool => constraints.push("Booleans query as the strings true and false.".into()),

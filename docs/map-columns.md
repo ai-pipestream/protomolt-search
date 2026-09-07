@@ -127,9 +127,10 @@ number, which is the whole point of the kinded table.
 The column API and descriptor-driven extraction are separate. The ordinary
 `AddDocuments` API accepts explicit `MapFacetEntry` and `MapNumericEntry`
 records. It does not infer their contents from an attached original source.
-`MappedPlan` currently reports protobuf maps as source-only; the explicit
-index-definition compiler also refuses map value projections. The original
-protobuf bytes preserve every map entry, including empty keys and values.
+Unhinted maps retain their source-only inference. Explicit map KEYWORD/BOOLEAN
+and FLOAT/DOUBLE projections now bind to the matching map column families; see
+[protobuf map projection](map-projection.md). Original protobuf bytes preserve
+every wire entry, including duplicates and empty keys and values.
 Describing or retaining a source is not proof of a queryable map projection.
 
 Current scalar storage has full-domain signed and unsigned integer columns
@@ -215,7 +216,8 @@ empty-key ingestion through the ordinary column API.
 Ordinary `AddDocuments` now accepts empty map keys for strings and finite
 numbers. A present empty string or numeric zero remains distinct from an
 omitted entry. Duplicate keys, unknown columns and non-finite values still
-refuse before mutation. Descriptor-driven map extraction remains source-only.
+refuse before mutation. The subsequent [descriptor projection](map-projection.md)
+increment connects supported protobuf map values to these columns.
 
 `RangeFacetField.map` carries `MapRangeFacet { key, edges, typed_edges }` with
 a literal key, including empty. Keep the outer legacy key and edge lists
@@ -257,18 +259,17 @@ four test threads. No fleet deployment was performed.
 
 ### Remaining map work
 
-Map projection must preserve protobuf map semantics, including default keys and
-values and decoder-defined duplicate-key resolution, before emitting unique
-column entries. It must keep integer domains exact and retain original bytes
-independently of the chosen projections. Current direct `AddDocuments` entries
-require unique keys; they are already materialized values, not raw protobuf map
-wire occurrences to merge.
+Scalar [map projection](map-projection.md) now applies protobuf defaults and
+decoder-defined duplicate-key handling before emitting unique entries. Exact
+numeric integer map storage and message-valued map projection remain unfinished.
+Original bytes remain independent of selected projections. Direct `AddDocuments`
+entries require unique keys because they are already materialized values.
 
 The legacy `stats_fields` and `cardinality_fields` request lists name plain
 columns. They are not CEL expressions or map selectors. Map statistics use
 `Aggregate` with an explicit `MapRead` expression, such as `metrics['']`.
-Descriptor-driven map projection and exact integer map storage remain part of
-the search foundation goal.
+Message-valued map projection and exact numeric integer map storage remain
+part of the search foundation goal.
 
 ## Original sequencing notes (2026-08-03)
 

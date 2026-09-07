@@ -101,6 +101,10 @@ enum MappedQueryRepresentation {
   // Exact u64 comparisons and presence. Additional query restrictions are
   // recorded on FieldProjection.constraints.
   MAPPED_QUERY_REPRESENTATION_UNSIGNED_INTEGER = 6;
+  // Exact string values addressed by a canonical map key, with entry presence.
+  MAPPED_QUERY_REPRESENTATION_MAP_STRING_FACET = 7;
+  // Finite f64 values addressed by a canonical map key, with entry presence.
+  MAPPED_QUERY_REPRESENTATION_MAP_FLOATING_POINT = 8;
 }
 
 message FieldProjection {

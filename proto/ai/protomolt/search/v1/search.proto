@@ -6084,8 +6084,11 @@ message MappedIndexContract {
 
 message IndexProjection {
   repeated uint32 field_numbers = 1;
-  // Required concrete kind. Unsupported value shapes refuse at planning;
-  // omit a projection to retain a field only in the source.
+  // Required concrete kind. On a map field, KEYWORD/BOOLEAN project scalar
+  // values as string facets; FLOAT/DOUBLE project floating-point values as f64.
+  // Map keys use exact strings or canonical decimal/boolean strings.
+  // Unsupported value shapes refuse at planning; omit a projection to retain
+  // a field only in the source.
   MappedKind kind = 2;
   // Required physical column name for a value. Empty for a CHUNKS container.
   string column_name = 3;
@@ -6178,6 +6181,11 @@ enum ColumnFamily {
   COLUMN_FAMILY_VECTOR = 5;
   // Full-domain u64 plane with separate presence. UINT32 and UINT64 land here.
   COLUMN_FAMILY_U64 = 6;
+  // Map entry values projected as exact strings; keys use their canonical
+  // string representation. Missing entries remain absent.
+  COLUMN_FAMILY_MAP_FACET = 7;
+  // Map entry float/double values, stored as finite f64 with entry presence.
+  COLUMN_FAMILY_MAP_F64 = 8;
 }
 
 // MappedField is one field of the derived plan.

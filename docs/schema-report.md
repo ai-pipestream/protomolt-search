@@ -46,7 +46,8 @@ Each field lists exact root-relative paths and their field-number paths. VALUE
 paths name the mapped column and its query representation. CONTAINER paths
 identify traversal or a chunk scope, with no independently queryable message
 value. Version 2 adds INPUT paths for wrapper `value` and Timestamp `seconds`
-and `nanos` components. An INPUT names its consuming VALUE through `value_path`
+and `nanos` components. Projected maps now also mark their synthetic `key` and
+`value` fields as INPUTs to the containing map VALUE. An INPUT names its consuming VALUE through `value_path`
 and carries that output column name; its query representation is NONE. It does
 not create an independently queryable dotted field. SOURCE_ONLY paths do not
 extract values. All unlisted occurrences of a
@@ -56,7 +57,9 @@ message reused under two parents does not acquire a projection everywhere just
 because one occurrence is indexed.
 
 The query representation distinguishes analyzed text, string facets, signed and unsigned
-integers, floating-point numbers and dense vectors. Constraints describe current
+integers, floating-point numbers, dense vectors, map string facets and map
+floating-point values. [Map projection](map-projection.md) records canonical key
+conversion and entry semantics. Constraints describe current
 conversions and value-domain restrictions: finite numerics, f32 vectors, the
 unsigned-to-i64 limit on signed numeric columns, string-rendered enums and
 epoch-microsecond timestamp storage. Bind-time analyzer configuration,

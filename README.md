@@ -1222,12 +1222,20 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **2026-09-06 — Descriptor-driven scalar map projections.** Explicit protobuf
+  map projections now use map-facet or map-numeric columns. All protobuf key
+  types, default entries, duplicate-key resolution and enum openness retain
+  their semantics through extraction. Schema reports name map queries and
+  key/value inputs; persisted bindings and compaction preserve the policy and
+  original source. Exact numeric integer maps and message-valued maps remain
+  unfinished. See [map projection](docs/map-projection.md).
 - **2026-09-06 — Empty map keys and count context.** Ordinary map ingestion
   accepts literal empty keys. Explicit map range inputs and presence-bearing
   count responses prevent scalar/map confusion through nested relays. Explicit
   WAL rebuild, image reopen, compaction, projections and map aggregates retain
-  empty values and numeric zero. Descriptor-driven map projection and exact
-  integer maps remain unfinished. See [map counts](docs/map-columns.md#explicit-map-counts-and-ingestion-2026-09-06).
+  empty values and numeric zero. The subsequent scalar map projection increment
+  connects this path to protobuf descriptors; exact numeric integer maps remain
+  unfinished. See [map counts](docs/map-columns.md#explicit-map-counts-and-ingestion-2026-09-06).
 - **2026-09-06 — Explicit map score input.** Score-stage operations now have
   a protobuf oneof with an explicit map-key input, including the empty key.
   Scoring, bounds, fetched signals and explanations retain that key through

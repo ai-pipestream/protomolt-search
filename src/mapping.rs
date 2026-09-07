@@ -40,7 +40,9 @@
 use std::collections::HashMap;
 
 use prost::Message as _;
-use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor, ReflectMessage, Value};
+use prost_reflect::{
+    DescriptorPool, DynamicMessage, MapKey, MessageDescriptor, ReflectMessage, Value,
+};
 use prost_types::{DescriptorProto, FieldDescriptorProto, FileDescriptorSet};
 use tonic::Status;
 
@@ -1146,7 +1148,15 @@ fn planned(
         vector_dims: hint.vector_dims,
         analyzer: hint.analyzer.clone(),
         search_analyzer: hint.search_analyzer.clone(),
-        family: family(hint.kind, repeated) as i32,
+        family: if map {
+            match hint.kind {
+                pb::MappedKind::Keyword | pb::MappedKind::Boolean => pb::ColumnFamily::MapFacet,
+                pb::MappedKind::Float | pb::MappedKind::Double => pb::ColumnFamily::MapF64,
+                _ => pb::ColumnFamily::None,
+            }
+        } else {
+            family(hint.kind, repeated)
+        } as i32,
     }
 }
 
@@ -1676,6 +1686,8 @@ struct Leaf {
 
 /// How one decoded leaf lands in the index.
 enum Land {
+    /// One map entry value projection. Key type belongs to the source descriptor.
+    Map(Box<Land>),
     /// A present wrapper projects its scalar default even when value is omitted.
     Wrapper(Box<Land>),
     /// A TEXT field: the body, or a multi-field column.
@@ -1725,6 +1737,8 @@ pub struct ExtractedDoc {
 /// A projected value for one document.
 #[derive(Clone)]
 enum Slot {
+    MapFacet(Vec<(String, String)>),
+    MapNumeric(Vec<(String, f64)>),
     Str(String),
     Int(i64),
     Uint(u64),
@@ -1872,13 +1886,13 @@ impl Extractor {
             let land = match (scoped, &chunk_entry) {
                 (Some(relative), Some(entry)) => {
                     let leaf_desc = index.navigate(entry, relative)?;
-                    let land = land_for(field, is_vector, leaf_desc, &enums)?;
+                    let land = land_for(field, is_vector, leaf_desc, &enums, &pool)?;
                     insert_path(&mut chunk_root, entry, &index, relative, Child::Leaf(slot))?;
                     land
                 }
                 _ => {
                     let leaf_desc = index.navigate(root_entry, &field.path)?;
-                    let land = land_for(field, is_vector, leaf_desc, &enums)?;
+                    let land = land_for(field, is_vector, leaf_desc, &enums, &pool)?;
                     insert_path(
                         &mut root,
                         root_entry,
@@ -2023,6 +2037,24 @@ impl Extractor {
                 reduced_id = Some(reduce_id(&leaf.land, slot, &leaf.path)?);
             }
             match slot.clone() {
+                Slot::MapFacet(entries) => {
+                    request
+                        .map_facets
+                        .extend(entries.into_iter().map(|(key, value)| pb::MapFacetEntry {
+                            field: leaf.name.clone(),
+                            key,
+                            value,
+                        }))
+                }
+                Slot::MapNumeric(entries) => {
+                    request
+                        .map_numerics
+                        .extend(entries.into_iter().map(|(key, value)| pb::MapNumericEntry {
+                            field: leaf.name.clone(),
+                            key,
+                            value,
+                        }))
+                }
                 Slot::Str(value) => {
                     if matches!(leaf.land.value_land(), Land::Text) {
                         if index == self.body {
@@ -2176,8 +2208,42 @@ fn land_for(
     is_vector: bool,
     leaf: &FieldDescriptorProto,
     enums: &HashMap<String, HashMap<i64, String>>,
+    pool: &DescriptorPool,
 ) -> Result<Land, Status> {
     use prost_types::field_descriptor_proto::Type;
+    if matches!(
+        pb::ColumnFamily::try_from(field.family),
+        Ok(pb::ColumnFamily::MapFacet | pb::ColumnFamily::MapF64)
+    ) {
+        let entry = pool
+            .get_message_by_name(leaf.type_name().trim_start_matches('.'))
+            .filter(|entry| entry.is_map_entry())
+            .ok_or_else(|| {
+                refuse_at(&field.path, "map projection requires a protobuf map field")
+            })?;
+        let value = entry.map_entry_value_field();
+        if matches!(value.kind(), prost_reflect::Kind::Message(_)) {
+            return Err(refuse_at(&field.path, "message-valued maps require an element-correlated projection; scalar map projection cannot flatten them"));
+        }
+        if field.kind == pb::MappedKind::Boolean as i32 && value.kind() != prost_reflect::Kind::Bool
+        {
+            return Err(refuse_at(
+                &field.path,
+                "BOOLEAN map projection requires boolean values",
+            ));
+        }
+        let scalar = pb::MappedField {
+            family: if field.family == pb::ColumnFamily::MapFacet as i32 {
+                pb::ColumnFamily::Facet
+            } else {
+                pb::ColumnFamily::F64
+            } as i32,
+            repeated: false,
+            ..field.clone()
+        };
+        return land_for(&scalar, false, value.field_descriptor_proto(), enums, pool)
+            .map(|inner| Land::Map(Box::new(inner)));
+    }
     if leaf.r#type() == Type::Message {
         if let Some(kind) = wrapper_kind(leaf.type_name()) {
             let scalar = FieldDescriptorProto {
@@ -2185,7 +2251,7 @@ fn land_for(
                 type_name: None,
                 ..leaf.clone()
             };
-            return land_for(field, is_vector, &scalar, enums)
+            return land_for(field, is_vector, &scalar, enums, pool)
                 .map(|inner| Land::Wrapper(Box::new(inner)));
         }
     }
@@ -2414,6 +2480,51 @@ fn project_leaf(land: &Land, path: &str, value: &Value) -> Result<Slot, Status> 
         }
     };
     Ok(match (land, value) {
+        (Land::Map(inner), Value::Map(entries)) => {
+            let mut entries = entries
+                .iter()
+                .map(|(key, value)| {
+                    let key = match key {
+                        MapKey::String(value) => value.clone(),
+                        MapKey::Bool(value) => value.to_string(),
+                        MapKey::I32(value) => value.to_string(),
+                        MapKey::I64(value) => value.to_string(),
+                        MapKey::U32(value) => value.to_string(),
+                        MapKey::U64(value) => value.to_string(),
+                    };
+                    Ok((key, project_leaf(inner, path, value)?))
+                })
+                .collect::<Result<Vec<_>, Status>>()?;
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            if matches!(inner.as_ref(), Land::Num) {
+                Slot::MapNumeric(
+                    entries
+                        .into_iter()
+                        .map(|(key, slot)| {
+                            let Slot::Num(value) = slot else {
+                                unreachable!("compiled numeric map")
+                            };
+                            if !value.is_finite() {
+                                return Err(refuse_at(path, "numeric map values must be finite"));
+                            }
+                            Ok((key, value))
+                        })
+                        .collect::<Result<_, Status>>()?,
+                )
+            } else {
+                Slot::MapFacet(
+                    entries
+                        .into_iter()
+                        .map(|(key, slot)| {
+                            let Slot::Str(value) = slot else {
+                                unreachable!("compiled facet map")
+                            };
+                            (key, value)
+                        })
+                        .collect(),
+                )
+            }
+        }
         (Land::Wrapper(inner), Value::Message(message)) => {
             let value = message.get_field_by_name("value").ok_or_else(|| {
                 refuse_at(path, "scalar wrapper value does not match its descriptor")
