@@ -170,6 +170,20 @@ index snapshots in application code.
 
 ## Validation
 
+At `7538f96`, the incoming-staging checkpoint passed 651 library tests, 848
+integration tests across 144 targets, 13 embedded tests and 2 IVF-provider
+tests: 1,514 passed, 0 failed. The existing live OpenNLP test remains ignored.
+All 5 Android/iOS targets, tests/examples compilation, formatting,
+vendored-proto identity and diff checks passed. Existing search/storage wire
+descriptors from `14ef9cf` are unchanged, and all 627 tracked source hashes
+matched before and after validation. The scope had an 8 GiB hard limit, peaked
+at 8 GiB, used no swap and recorded 0 OOM, OOM-kill or OOM-group-kill events.
+This is local validation; hosted CI, fleet rollout and merge to `main` were not
+performed. Incoming private-staging verification is implemented as described
+above; collection-authority activation remains unfinished.
+
+### Historical validation at `9cee9a3`
+
 At `9cee9a3`, the reconciled branch passed 640 library tests, 848 integration
 tests across 144 targets, 13 embedded tests and 2 IVF-provider tests: 1,503
 passed, 0 failed. The existing live OpenNLP test remains ignored. All 5
@@ -184,8 +198,7 @@ This checkpoint reconciles the local `main` correction in `1a74f97`, the
 Boolean fixes in `92bfe79`, and the complete journal audit in `a749925`.
 `9cee9a3` additionally rejects `math.abs(i64::MIN)` when evaluating a declared
 column, while missing input, per-request materialization absence and untaken
-ternary branches retain their existing behavior. Incoming-bundle verification
-and collection-authority activation remain unfinished.
+ternary branches retain their existing behavior.
 
 ### Historical validation at `92bfe79`
 
