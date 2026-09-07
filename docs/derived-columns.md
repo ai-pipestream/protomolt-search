@@ -155,7 +155,10 @@ second split). Compaction and hash splits keep the declaration the
 log manifest records.
 
 `tests/derived_columns.rs` shows the backfill storing, row for row,
-what direct ingest under the same declaration stores.
+what direct ingest under the same declaration stores; the court-data
+proof (11 million documents, the computed year equal to the stored
+year on each document of the rebuilt child) is in
+`docs/benchmarks/fleet-placement-2026-09.md`.
 
 ## Disclosure
 
