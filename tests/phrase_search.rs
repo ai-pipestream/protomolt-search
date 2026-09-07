@@ -126,6 +126,34 @@ async fn phrase_search_boosts_registered_matches_and_exposes_entity_map() {
         .any(|span| span.start == 0 && span.end == 13)));
 
     let concept_key = entity_key("glossary", "nyc");
+    let empty = SearchService::phrase_search(
+        &coordinator,
+        Request::new(PhraseSearchRequest {
+            base: Some(Bm25SearchRequest {
+                text: " ".into(),
+                k: 0,
+                analysis: Some(body_spec()),
+                map_facet_fields: vec![MapFacetField {
+                    column: "entities".into(),
+                    key: concept_key.clone(),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    assert!(empty.hits.is_empty());
+    assert_eq!(empty.facets.len(), 1);
+    assert!(empty.facets[0].known);
+    assert_eq!(
+        empty.facets[0].map_key.as_deref(),
+        Some(concept_key.as_str())
+    );
+    assert!(empty.facets[0].counts.is_empty());
+
     let filtered = SearchService::phrase_search(
         &coordinator,
         Request::new(PhraseSearchRequest {

@@ -93,10 +93,10 @@ column declaration. Node open does not automatically replay the document WAL.
 
 1. Persist complete column definitions for standalone WAL-only recovery,
    including columns with no entries, and define automatic recovery separately.
-2. Add exact range facets and column statistics. Direct map sorting/collapse
-   and bounded scoring are implemented; see [map order](integer-map-order.md)
-   and [score functions](score-functions.md). Scoring converts inputs and
-   extrema to double explicitly.
+2. Add column statistics. Direct map sorting/collapse, exact range facets
+   and bounded scoring are implemented; see [map order](integer-map-order.md),
+   [range facets](range-facets.md) and [score functions](score-functions.md).
+   Scoring converts inputs and extrema to double explicitly.
 3. Complete persistent identity/retry/durability integration for these mapped
    fields. Filter, value, aggregate and permission tests now exercise both
    layouts and relays, but the overall storage-authority goal remains open.

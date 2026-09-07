@@ -1743,7 +1743,8 @@ impl Bm25Shard {
             .map(|req| {
                 let intervals = crate::rangefacet::Intervals::new(req)
                     .expect("range facets validated before counting");
-                let source = self.resolve_range_column(&req.column, req.map_key());
+                let source =
+                    self.resolve_range_column(&req.column, req.map_key(), req.typed_map.is_some());
                 let mut counts = vec![0u64; intervals.len()];
                 if let Some(source) = source {
                     for (wi, &word) in bits.iter().enumerate() {
@@ -1771,7 +1772,7 @@ impl Bm25Shard {
             .iter()
             .map(|name| {
                 use crate::pb::ScalarValueType as Type;
-                let source = self.resolve_range_column(name, None);
+                let source = self.resolve_range_column(name, None, false);
                 let ty = match source {
                     Some(RangeSource::Numeric(_)) => Type::Number,
                     Some(RangeSource::Integer(_)) => Type::Integer,
@@ -1837,9 +1838,15 @@ impl Bm25Shard {
     /// Resolve a range facet's column against THIS shard's tables:
     /// with no key the f64, i64 and u64 tables (one name space
     /// across kinds, so at most one answers), with a key the
-    /// map-numeric column and its key ordinal. `None` = this shard
+    /// map-numeric column and its key ordinal; typed map requests also resolve
+    /// i64/u64 map tables. `None` = this shard
     /// cannot resolve it, which answers `known: false`.
-    fn resolve_range_column(&self, column: &str, key: Option<&str>) -> Option<RangeSource> {
+    fn resolve_range_column(
+        &self,
+        column: &str,
+        key: Option<&str>,
+        typed_map: bool,
+    ) -> Option<RangeSource> {
         if key.is_none() {
             if let Some(ni) = self.numeric_index(column) {
                 return Some(RangeSource::Numeric(ni));
@@ -1853,6 +1860,24 @@ impl Bm25Shard {
                 });
         }
         let key = key?;
+        if typed_map {
+            if let Some(ci) = self.map_integer_index(column) {
+                return self
+                    .map_integer_key_ord(ci, key)
+                    .map(|key_ord| RangeSource::MapInteger {
+                        column: ci,
+                        key_ord,
+                    });
+            }
+            if let Some(ci) = self.map_unsigned_integer_index(column) {
+                return self.map_unsigned_integer_key_ord(ci, key).map(|key_ord| {
+                    RangeSource::MapUnsigned {
+                        column: ci,
+                        key_ord,
+                    }
+                });
+            }
+        }
         let ci = self.map_numeric_index(column)?;
         let key_ord = self.map_numeric_key_ord(ci, key)?;
         Some(RangeSource::MapKey {
@@ -1871,6 +1896,12 @@ impl Bm25Shard {
             RangeSource::MapKey { column, key_ord } => self
                 .map_numeric_value(column, key_ord, doc_id)
                 .map(NumBound::F),
+            RangeSource::MapInteger { column, key_ord } => self
+                .map_integer_value(column, key_ord, doc_id)
+                .map(NumBound::I),
+            RangeSource::MapUnsigned { column, key_ord } => self
+                .map_unsigned_integer_value(column, key_ord, doc_id)
+                .map(NumBound::U),
         }
     }
 
@@ -1992,7 +2023,7 @@ impl Bm25Shard {
     }
 }
 
-/// A range facet's resolved column on THIS shard. The four shapes a
+/// A range facet's resolved column on THIS shard. The numeric shapes a
 /// bucketable value can live in; see [`Bm25Shard::resolve_range_column`].
 #[derive(Debug, Clone, Copy)]
 enum RangeSource {
@@ -2009,6 +2040,10 @@ enum RangeSource {
         /// Key ordinal within that column's key dictionary.
         key_ord: u32,
     },
+    /// Exact signed map entry and its dictionary-local key.
+    MapInteger { column: usize, key_ord: u32 },
+    /// Exact unsigned map entry and its dictionary-local key.
+    MapUnsigned { column: usize, key_ord: u32 },
 }
 
 /// Validate a request's range-facet edge lists (`docs/range-facets.md`).

@@ -3208,6 +3208,11 @@ message RangeFacetField {
   // must be empty. An older server drops this field and refuses its resulting
   // empty edge list rather than counting a plain column.
   MapRangeFacet map = 5;
+  // Explicit f64/i64/u64 map entry with exact numeric comparison. Supply
+  // only this field and column; map and the legacy key/edge fields must
+  // be empty. Older servers drop this field and refuse the empty edge list.
+  // The map field at tag 5 and the legacy key remain f64-only.
+  MapRangeFacet typed_map = 6;
 }
 
 // Numeric map entry and requested intervals. The containing RangeFacetField

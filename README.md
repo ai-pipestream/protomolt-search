@@ -46,8 +46,8 @@ entries, descriptor-driven integer map projection, WAL replay and segment
 transplant. Exact map filters, typed expressions, expression-based aggregates
 and [map sorting/collapse](docs/integer-map-order.md) are supported.
 [Bounded map scoring](docs/score-functions.md#signed-and-unsigned-map-scoring-2026-09-07)
-uses explicit double conversion; exact range facets and statistics remain
-incomplete. See
+uses explicit double conversion. [Integer map range facets](docs/range-facets.md#integer-map-entries-2026-09-07)
+preserve exact values and typed edges; column statistics remain incomplete. See
 [integer map queries](docs/integer-map-queries.md) and
 [integer map storage](docs/integer-map-storage.md) for the compatibility gates
 and current validation scope.

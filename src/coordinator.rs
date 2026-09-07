@@ -4367,7 +4367,16 @@ impl CoordinatorServiceImpl {
         // An empty lexical selection still needs the projection schema
         // agreement. Request metadata without scoring when analysis is empty.
         let k = if terms.is_empty() { 0 } else { k };
-        if k == 0 && projections.is_empty() {
+        // Named summaries still need schema agreement and zero counts when
+        // analysis yields no terms. Only a result-free request can skip fan-out.
+        if k == 0
+            && projections.is_empty()
+            && facet_fields.is_empty()
+            && map_facet_fields.is_empty()
+            && range_facet_fields.is_empty()
+            && stats_fields.is_empty()
+            && cardinality_fields.is_empty()
+        {
             if self.document_visibility.is_some() {
                 self.body_stats(&[], false).await?;
             }
@@ -4997,7 +5006,11 @@ impl CoordinatorServiceImpl {
             phrase_requests.push(phrase);
         }
         let t_analyzed = t0.elapsed();
-        if k == 0 || field_terms.iter().all(|t| t.is_empty()) {
+        if (k == 0 || field_terms.iter().all(|t| t.is_empty()))
+            && facet_fields.is_empty()
+            && map_facet_fields.is_empty()
+            && range_facet_fields.is_empty()
+        {
             if self.document_visibility.is_some() {
                 self.body_stats(&[], false).await?;
             }
@@ -5293,7 +5306,11 @@ impl CoordinatorServiceImpl {
             synonyms_off: false,
         });
         field_terms.push(phrase_terms);
-        if k == 0 || field_terms.iter().all(Vec::is_empty) {
+        if (k == 0 || field_terms.iter().all(Vec::is_empty))
+            && base.facet_fields.is_empty()
+            && base.map_facet_fields.is_empty()
+            && base.range_facet_fields.is_empty()
+        {
             return Ok((Vec::new(), Vec::new(), Vec::new()));
         }
         let t_analyzed = t0.elapsed();

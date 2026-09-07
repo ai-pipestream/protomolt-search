@@ -34,8 +34,9 @@ fn display(value: NumBound) -> f64 {
 impl RangeFacetField {
     /// Literal map key; presence distinguishes an empty key from a plain column.
     pub(crate) fn map_key(&self) -> Option<&str> {
-        self.map
+        self.typed_map
             .as_ref()
+            .or(self.map.as_ref())
             .map(|map| map.key.as_str())
             .or_else(|| (!self.key.is_empty()).then_some(self.key.as_str()))
     }
@@ -60,7 +61,10 @@ impl<'a> Intervals<'a> {
             return Err(invalid("a request names the column it buckets"));
         }
         let key = request.map_key();
-        let (raw_edges, typed_edges) = match &request.map {
+        if request.map.is_some() && request.typed_map.is_some() {
+            return Err(invalid("supply either map or typed_map, never both"));
+        }
+        let (raw_edges, typed_edges) = match request.typed_map.as_ref().or(request.map.as_ref()) {
             Some(map) => {
                 if !request.key.is_empty()
                     || !request.edges.is_empty()
@@ -167,8 +171,9 @@ impl<'a> Intervals<'a> {
         if response.column != self.request.column || response.key != self.key.unwrap_or_default() {
             return Err(malformed());
         }
-        let legacy_nonempty_map =
-            self.request.map.is_none() && self.key.is_some_and(|key| !key.is_empty());
+        let legacy_nonempty_map = self.request.map.is_none()
+            && self.request.typed_map.is_none()
+            && self.key.is_some_and(|key| !key.is_empty());
         if response.map_key.as_deref() != self.key
             && !(legacy_nonempty_map && response.map_key.is_none())
         {
@@ -237,7 +242,7 @@ pub(crate) fn merge(
         .map(|((plan, counts), known)| {
             if require_known && !known {
                 return Err(Status::invalid_argument(format!(
-                "no shard has range-facet column {:?}[{:?}]; check --numeric-fields / --integer-fields / --unsigned-integer-fields / --map-numeric-fields",
+                "no shard has range-facet column {:?}[{:?}]; check --numeric-fields / --integer-fields / --unsigned-integer-fields / --map-numeric-fields / --map-integer-fields / --map-unsigned-integer-fields",
                 plan.request.column, plan.key.unwrap_or_default()
             )));
             }

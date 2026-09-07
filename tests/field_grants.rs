@@ -2126,6 +2126,55 @@ async fn exact_integer_maps_require_separate_use_and_disclosure_grants() {
             false,
         ),
     );
+    let mut bucketed = query();
+    bucketed.range_facet_fields = vec![RangeFacetField {
+        column: "unsigned".into(),
+        typed_map: Some(MapRangeFacet {
+            key: "".into(),
+            typed_edges: vec![
+                FilterBound {
+                    value: Some(filter_bound::Value::Uint(u64::MAX)),
+                    exclusive: false,
+                },
+                FilterBound {
+                    value: Some(filter_bound::Value::Num(18_446_744_073_709_551_616.0)),
+                    exclusive: false,
+                },
+            ],
+            ..Default::default()
+        }),
+        ..Default::default()
+    }];
+    let before = owner.stats_cache().fetch_count();
+    for denied in [&reader, &use_only] {
+        assert_eq!(
+            denied
+                .bm25_search(request(bucketed.clone()))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::PermissionDenied
+        );
+    }
+    assert_eq!(owner.stats_cache().fetch_count(), before);
+    let counts = allowed
+        .bm25_search(request(bucketed.clone()))
+        .await
+        .unwrap()
+        .into_inner()
+        .range_facets
+        .remove(0);
+    assert_eq!(counts.buckets[0].count, 1);
+    assert_eq!(
+        counts.buckets[0].typed_from,
+        bucketed.range_facet_fields[0]
+            .typed_map
+            .as_ref()
+            .unwrap()
+            .typed_edges
+            .first()
+            .cloned()
+    );
     let explanation = allowed
         .bm25_search(request(scored))
         .await

@@ -186,6 +186,43 @@ async fn stats_and_cardinality_aggregate_the_match_set() {
         "scotus (both shards, counted once) and ca5; ca9 is unmatched"
     );
 
+    // Public k=0 retains max_k. Analysis with no terms still returns named
+    // summaries, with known columns and zero values rather than omission.
+    let default_k = search(
+        &coordinator,
+        Bm25SearchRequest {
+            text: "rust".into(),
+            k: 0,
+            stats_fields: vec!["score".into(), "year".into()],
+            cardinality_fields: vec!["court".into()],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(default_k.stats, resp.stats);
+    assert_eq!(default_k.cardinality, resp.cardinality);
+    let empty = search(
+        &coordinator,
+        Bm25SearchRequest {
+            text: " ".into(),
+            k: 0,
+            stats_fields: vec!["score".into(), "year".into()],
+            cardinality_fields: vec!["court".into()],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(empty.hits.is_empty());
+    assert_eq!(empty.stats.len(), 2);
+    assert!(empty
+        .stats
+        .iter()
+        .all(|s| s.known && s.count == 0 && s.sum == 0.0));
+    assert_eq!(empty.cardinality.len(), 1);
+    assert_eq!(empty.cardinality[0].cardinality, 0);
+
     // A filter narrows the aggregation exactly as it narrows facets.
     let resp = search(
         &coordinator,

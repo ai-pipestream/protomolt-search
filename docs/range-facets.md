@@ -4,6 +4,61 @@ Landed 2026-08-03 (track 1, increment 2 of the column plane).
 "How many results per year band, per citation band" — over a column
 kind that can hold an integer without rounding it.
 
+## Integer map entries (2026-09-07)
+
+`RangeFacetField.typed_map` at tag 6 selects an f64/i64/u64 map entry, using
+`MapRangeFacet { key, edges, typed_edges }`. Supply only `column` and
+`typed_map`; the legacy key/edge fields and `map` must be absent. Literal
+empty and quoted keys are supported. `map` at tag 5 and the legacy nonempty
+key continue to select only f64 maps.
+
+Values retain their signed or unsigned integer domain through bucket comparison.
+Typed edges may mix signed, unsigned and finite double bounds, in strictly
+increasing numeric order. Buckets remain half-open. Adjacent large integers
+stay distinct even when their rounded display bounds coincide; `typed_from`
+and `typed_to` are authoritative. The final exclusive edge `num(2^64)` includes
+`u64::MAX` without inventing an unsigned value outside the protobuf domain.
+
+A missing entry contributes nothing, while zero is a present value. Counts
+cover the whole matched document bitmap rather than just returned hits; query
+filters still apply. A shard request with k=0 still computes counts. The public
+request retains its documented k=0 default of the configured maximum. Queries
+that analyze to no terms return the named intervals with zero counts on flat,
+fused and phrase routes, while validating their column and key identities. An unresolved child returns unknown and no buckets,
+with the literal map key echoed. Every relay and the root validate that key,
+the requested interval identities and checked count addition. The root refuses
+a key unknown to every child.
+
+Older decoders discard the new selector and refuse the resulting empty edge
+list. Both explicit selectors together, conflicting legacy fields, invalid
+bounds and missing interval lists refuse before an empty-node shortcut. No
+storage format or RPC route changes. Field USE and DISCLOSE are both required
+for bucket counts, with denial before fetching statistics.
+
+The integer-map range tests compare with an independent i128 oracle, including
+half-integer boundaries and adjacent extremes. They exercise heap and mapped
+reads, mutable tails and changed key ordinals, both storage layouts, compaction
+and reopen, filtered requests, ordinary and live-floor streams, and nested
+relays with an empty child. Fused requests retain the relay's existing requirement
+for homogeneous field capabilities; the fixture verifies its named refusal when
+a never-ingested child cannot advertise the same fields. The field-grant tests
+check admission and disclosure.
+
+Validation on `28983cd` plus the range increment passed 508 library tests,
+775 integration tests across 137 targets, 12 embedded tests and two IVF tests:
+1,297 passed, none failed, with one existing live OpenNLP test ignored. The
+subsequent empty-analysis coordinator fix and expanded flat/fused/phrase cases
+passed all 41 tests across the six affected query and permission targets.
+Embedded tests, all five mobile Rust targets, test/example compilation,
+formatting and vendored-proto checks passed again on the final code. Descriptor
+comparison permits only RangeFacetField.typed_map at tag 6. All validation ran
+under an 8 GiB cgroup limit with swap disabled.
+
+This checkpoint is separate from main cea2c63. That commit's derived-column
+contracts collide with earlier integer-map allocations; see the
+[reconciliation note](derived-column-reconciliation.md#main-cea2c63-collisions-to-reconcile).
+No combined-build or fleet compatibility claim is made here.
+
 ## Why i64 is a kind and not an f64 with a note
 
 An f64 holds every integer up to 2^53 exactly, but not every integer above it:

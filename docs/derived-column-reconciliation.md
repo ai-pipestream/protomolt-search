@@ -8,6 +8,31 @@ partition-binding sequence can proceed with the corrections below. This note
 coordinates contracts; it does not implement derived columns or authorize a
 fleet operation.
 
+## Main cea2c63: collisions to reconcile
+
+Main's derived-column implementation landed while the integer-map range checks
+were running. It reuses three allocations already published on this feature
+branch:
+
+| Allocation | Integer-map branch | Main cea2c63 |
+|---|---|---|
+| AddDocumentsRequest tag 27 | repeated MapIntegerEntry map_integers | string derived_fingerprint |
+| ValueExpr tag 16 | typed_map | stable_key_hash |
+| Column-table kind 15 | exact signed integer map | derived-column declaration |
+
+Main must be reconciled before publishing a combined build. Preserve integer
+map tags 27/28 and value-expression tag 16, allocate unused identifiers for
+the new derived fields, and allocate a distinct derived table kind after the
+map kinds 15/16. Define explicit handling for files and records written by
+cea2c63: changing enum constants alone does not make those bytes compatible.
+Readers must distinguish a supported legacy format or refuse it by name;
+interpreting a derived declaration as a map is not a migration.
+
+The current range checkpoint is validated independently of cea2c63. It is not
+a combined build and has not been merged to main. Reconciliation also needs
+both sets of evaluator inputs, column definitions, WAL records, replication
+metadata, field permissions and compaction behavior, followed by combined tests.
+
 ## Declaration and recovery
 
 Define DerivedColumns in `ai.protomolt.search.v1` as the canonical contract.
@@ -99,3 +124,8 @@ reusing MapScoreOperation for f64/i64/u64 inputs. Preserve its distinction from
 the legacy f64-only selectors and its double conversion at score evaluation.
 This changes no routes, value-expression tags, storage formats or recovery
 metadata.
+
+The integer-map range increment reserves `RangeFacetField.typed_map` at tag 6,
+reusing MapRangeFacet for exact f64/i64/u64 map bucket counts. It is exclusive
+with the legacy f64-only map selector and key/edge fields. Keep this allocation
+when reconciling the proto; no routes or storage metadata change.
