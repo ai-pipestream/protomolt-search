@@ -10547,6 +10547,13 @@ impl NodeServiceImpl {
                 (&self.config.map_facet_fields, "--map-facet-fields")
             } else if field.family == ColumnFamily::MapF64 as i32 {
                 (&self.config.map_numeric_fields, "--map-numeric-fields")
+            } else if field.family == ColumnFamily::MapI64 as i32 {
+                (&self.config.map_integer_fields, "--map-integer-fields")
+            } else if field.family == ColumnFamily::MapU64 as i32 {
+                (
+                    &self.config.map_unsigned_integer_fields,
+                    "--map-unsigned-integer-fields",
+                )
             } else {
                 // VECTOR is the dense leg; NONE lands nowhere, visibly.
                 continue;

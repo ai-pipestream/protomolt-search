@@ -1,8 +1,8 @@
 # Exact integer map storage
 
 Status: storage, document ingestion, WAL replay and segment transplant are
-implemented on `feat/integer-map-storage-2026-09`. Descriptor-driven mapping
-and typed query integration are not complete.
+implemented on `feat/integer-map-storage-2026-09`, including descriptor-driven
+integer map projection. Typed query integration is not complete.
 Do not treat the low-level storage API as an end-to-end supported map shape.
 `docs/map-projection.md` remains the public mapping contract.
 
@@ -91,13 +91,10 @@ column declaration. Node open does not automatically replay the document WAL.
 
 1. Persist complete column definitions for standalone WAL-only recovery,
    including columns with no entries, and define automatic recovery separately.
-2. Bind descriptor-driven signed/unsigned map projections and report their
-   preservation, indexing, and query capabilities separately. Keep the default
-   and duplicate-key rules already established for protobuf map extraction.
-3. Add exact typed map selectors to filters, values, sorting and aggregations.
+2. Add exact typed map selectors to filters, values, sorting and aggregations.
    Scoring conversions need an explicit numeric contract; do not use a rounded
    floating-point filter as an exact integer predicate.
-4. Exercise public typed-map query routes across both layouts and relays with
+3. Exercise public typed-map query routes across both layouts and relays with
    permissions, original source bytes, stable identity, retries and durable
    receipts. These query routes are not yet implemented.
 
@@ -134,3 +131,8 @@ failed WAL-version publication, missing receiver capability before dispatch,
 missing write acknowledgement followed by a retry, invalid map entries before
 row allocation, original bytes and stable identity through compaction, and
 exact map values across log rebuild, segment transplant and reordered year cuts.
+
+Descriptor-driven integer map projection is now tested through planning, binding,
+ingest and compaction. Its validation is recorded in
+[map projection](map-projection.md#integer-projection-validation-2026-09-07).
+Typed map query operators and complete WAL-only column metadata remain pending.

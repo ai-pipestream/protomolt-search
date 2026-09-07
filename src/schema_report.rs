@@ -265,9 +265,26 @@ fn projection(
             ColumnFamily::F64 => (Use::Value, Query::FloatingPoint),
             ColumnFamily::MapFacet => (Use::Value, Query::MapStringFacet),
             ColumnFamily::MapF64 => (Use::Value, Query::MapFloatingPoint),
+            // Storage and extraction are available; typed map query operators
+            // are not yet exposed. Do not advertise scalar query semantics.
+            ColumnFamily::MapI64 | ColumnFamily::MapU64 => (Use::Value, Query::None),
         };
     let mut constraints = Vec::new();
     if usage == Use::Value {
+        if matches!(
+            ColumnFamily::try_from(mapped.family),
+            Ok(ColumnFamily::MapI64 | ColumnFamily::MapU64)
+        ) {
+            constraints.push("Exact typed map entries are indexed with separate presence. Typed map filters, value expressions, sorting and aggregations are not yet implemented; the query representation is NONE.".into());
+            if mapped.family == ColumnFamily::MapI64 as i32
+                && matches!(descriptor.r#type(), Type::Uint64 | Type::Fixed64)
+            {
+                constraints.push(
+                    "Unsigned map values above i64::MAX are refused by the signed projection."
+                        .into(),
+                );
+            }
+        }
         if representation == Query::SignedInteger
             && matches!(descriptor.r#type(), Type::Uint64 | Type::Fixed64)
         {

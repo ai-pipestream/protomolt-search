@@ -4,7 +4,8 @@ An explicit `IndexDefinition` can now project a protobuf map as one physical
 map column. The projection path ends at the map field. Its kind describes the
 entry values; it does not flatten the synthetic entry message into unrelated
 key and value columns. Ordinary `AddDocuments` map entries and descriptor-driven
-`IngestMapped` use the same storage and query path.
+`IngestMapped` use the same storage path. Query support depends on the value
+family, as described below.
 
 ## Supported projections
 
@@ -18,6 +19,18 @@ key and value columns. Ordinary `AddDocuments` map entries and descriptor-driven
   f64; double values retain their numeric value. Non-finite projected values
   refuse during extraction. The plan reports `MAP_F64` and the schema report
   reports `MAP_FLOATING_POINT`.
+- `INT32` or `INT64` accepts integer-valued maps and stores entries in `MAP_I64`.
+  Signed wire types, including zigzag and fixed encodings, retain their full
+  descriptor range. Unsigned values may be explicitly projected to this plane
+  only when they fit i64; larger values fail extraction.
+- `UINT32` or `UINT64` requires an unsigned integer descriptor and stores entries
+  in `MAP_U64`, retaining values through `u64::MAX`. Signed descriptors are
+  rejected at planning time. These kinds select a storage plane; the producer's
+  descriptor defines wire decoding, as it does for scalar projections.
+
+The integer map families are implemented on `feat/integer-map-storage-2026-09`.
+They currently report VALUE with query representation NONE and an explicit
+constraint explaining that typed map query operators remain unimplemented.
 
 For example, for `map<string, string> labels = 4`, this policy creates the
 query column `attrs`:
@@ -32,12 +45,13 @@ projections {
 
 The complete current row-index definition still needs its explicit document ID,
 vector and body projections. At node bind, declare `attrs` in
-`--map-facet-fields`; floating maps use `--map-numeric-fields`. Mobile and Rust
+`--map-facet-fields`; floating maps use `--map-numeric-fields`, signed maps use
+`--map-integer-fields`, and unsigned maps use `--map-unsigned-integer-fields`. Mobile and Rust
 configurations have the corresponding lists. A missing declaration refuses
 before the binding or rows are applied.
 
 Unhinted maps retain their existing source-only inference. Explicit descriptor
-KEYWORD/BOOLEAN/FLOAT/DOUBLE hints use the same map rules as an explicit index
+KEYWORD/BOOLEAN/FLOAT/DOUBLE/INT32/INT64/UINT32/UINT64 hints use the same map rules as an explicit index
 definition. Adding a projection changes the plan fingerprint and requires a
 new compatible index generation; a persisted binding cannot be changed in
 place. Existing plans without these new map projections retain their
@@ -85,30 +99,34 @@ A singular parent occurrence and a chunk occurrence retain their own path and
 column assignment. Traversal into a map's synthetic entry fields is refused;
 that would discard the relationship between each key and its value.
 
-Schema reports mark the map field as a VALUE with its map query representation.
+Schema reports mark the map field as a VALUE. String and floating maps name
+their query representation; integer maps currently report NONE.
 The synthetic `key` and `value` fields are INPUTs with `value_path` pointing to
 that map projection. They are not independent dotted query fields. Constraints
 record key conversion, default/duplicate handling and value conversion.
 
 Existing map filters, presence tests, value projections, scoring, facet counts,
-range facets and expression-based aggregates address these columns. The explicit
+range facets and expression-based aggregates address the string and floating
+map columns. Integer map operators remain unimplemented. The explicit
 empty-key selector rules in [map columns](map-columns.md) apply. Authorization
 continues to name the physical field; defining a projection grants no access.
 
 ## Remaining work and compatibility
 
-Exact numeric int64/uint64 map projections and message-valued map projections
-are not implemented. The integer-map feature branch now provides low-level
-storage and document transport; see [its status](integer-map-storage.md). Integer maps can be explicitly projected as KEYWORD when string
-semantics are intended; numeric projections refuse instead of rounding through
-f64. Bytes, message values and arbitrary repeated/nested values retain their
+Integer map projection, storage and document transport are implemented on the
+feature branch; see [storage and recovery status](integer-map-storage.md).
+Exact typed map queries remain unfinished. Integer maps can also be explicitly
+projected as KEYWORD when string comparison semantics are intended. Projecting
+integer descriptors as floating maps fails instead of rounding through f64.
+Bytes, message-valued maps and arbitrary repeated/nested values retain their
 source-only disposition until their storage and query contracts are implemented.
 This increment does not remove the row index's ID/vector/body requirements,
 publish catalog identity, implement remote authorization, or complete the three
 search foundations.
 
-The wire changes add two ColumnFamily values and two MappedQueryRepresentation
-values. Existing fields and enum numbers remain unchanged. Clients must
+The original map increment added two ColumnFamily values and two
+MappedQueryRepresentation values. The integer projection increment adds
+ColumnFamily MAP_I64 (9) and MAP_U64 (10), without adding query representations. Existing fields and enum numbers remain unchanged. Clients must
 recognize the returned map families/representations and inspect the acknowledged
 index definition. Older planners cannot derive these value projections; binding
 to an older node refuses rather than dropping a requested map column. Existing
@@ -130,3 +148,25 @@ test/example compilation, formatting and vendored-proto checks passed. Descripto
 comparison confirms only the four additive map enum values, with all preceding
 wire declarations unchanged. Validation used two build jobs and four test
 threads. No fleet deployment was performed.
+
+## Integer projection validation, 2026-09-07
+
+On base `f2d7c41`, the integer projection additions passed 508 library tests,
+754 integration tests across 130 targets, 12 embedded tests and two IVF tests:
+1,276 passed, zero failed, with the existing live OpenNLP test ignored. All
+supported Android/iOS compile targets, tests/examples compilation, formatting,
+vendored-proto and whitespace checks passed. Descriptor comparison confirms
+that only ColumnFamily MAP_I64 (9) and MAP_U64 (10) were added.
+
+Regression tests first reproduced rejection of valid integer map projections.
+The completed tests cover all ten integer value wire types, all twelve map-key
+types, default and duplicate entries, full-width extrema, checked conversion
+from unsigned to signed values, chunk scope and fingerprints. Public RPC tests
+cover wrong-family binding, ingestion, reopen, persisted-policy rejection and
+compaction in both layouts, retaining original source bytes and typed values.
+Schema-report assertions distinguish indexing from unfinished query support.
+
+The validation ran in one scope capped at 8 GiB with swap disabled; its peak,
+including build-file cache, was 8 GiB. Source and check inputs remained unchanged
+throughout validation. This is a feature-branch checkpoint, not a fleet rollout
+or completion of typed map query support.

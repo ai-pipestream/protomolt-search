@@ -1152,6 +1152,8 @@ fn planned(
             match hint.kind {
                 pb::MappedKind::Keyword | pb::MappedKind::Boolean => pb::ColumnFamily::MapFacet,
                 pb::MappedKind::Float | pb::MappedKind::Double => pb::ColumnFamily::MapF64,
+                pb::MappedKind::Int32 | pb::MappedKind::Int64 => pb::ColumnFamily::MapI64,
+                pb::MappedKind::Uint32 | pb::MappedKind::Uint64 => pb::ColumnFamily::MapU64,
                 _ => pb::ColumnFamily::None,
             }
         } else {
@@ -1739,6 +1741,8 @@ pub struct ExtractedDoc {
 enum Slot {
     MapFacet(Vec<(String, String)>),
     MapNumeric(Vec<(String, f64)>),
+    MapInteger(Vec<(String, i64)>),
+    MapUnsignedInteger(Vec<(String, u64)>),
     Str(String),
     Int(i64),
     Uint(u64),
@@ -2055,6 +2059,26 @@ impl Extractor {
                             value,
                         }))
                 }
+                Slot::MapInteger(entries) => {
+                    request
+                        .map_integers
+                        .extend(entries.into_iter().map(|(key, value)| pb::MapIntegerEntry {
+                            field: leaf.name.clone(),
+                            key,
+                            value,
+                        }))
+                }
+                Slot::MapUnsignedInteger(entries) => {
+                    request
+                        .map_unsigned_integers
+                        .extend(entries.into_iter().map(|(key, value)| {
+                            pb::MapUnsignedIntegerEntry {
+                                field: leaf.name.clone(),
+                                key,
+                                value,
+                            }
+                        }))
+                }
                 Slot::Str(value) => {
                     if matches!(leaf.land.value_land(), Land::Text) {
                         if index == self.body {
@@ -2213,7 +2237,10 @@ fn land_for(
     use prost_types::field_descriptor_proto::Type;
     if matches!(
         pb::ColumnFamily::try_from(field.family),
-        Ok(pb::ColumnFamily::MapFacet | pb::ColumnFamily::MapF64)
+        Ok(pb::ColumnFamily::MapFacet
+            | pb::ColumnFamily::MapF64
+            | pb::ColumnFamily::MapI64
+            | pb::ColumnFamily::MapU64)
     ) {
         let entry = pool
             .get_message_by_name(leaf.type_name().trim_start_matches('.'))
@@ -2235,6 +2262,10 @@ fn land_for(
         let scalar = pb::MappedField {
             family: if field.family == pb::ColumnFamily::MapFacet as i32 {
                 pb::ColumnFamily::Facet
+            } else if field.family == pb::ColumnFamily::MapI64 as i32 {
+                pb::ColumnFamily::I64
+            } else if field.family == pb::ColumnFamily::MapU64 as i32 {
+                pb::ColumnFamily::U64
             } else {
                 pb::ColumnFamily::F64
             } as i32,
@@ -2496,7 +2527,31 @@ fn project_leaf(land: &Land, path: &str, value: &Value) -> Result<Slot, Status> 
                 })
                 .collect::<Result<Vec<_>, Status>>()?;
             entries.sort_by(|a, b| a.0.cmp(&b.0));
-            if matches!(inner.as_ref(), Land::Num) {
+            if matches!(inner.as_ref(), Land::Int) {
+                Slot::MapInteger(
+                    entries
+                        .into_iter()
+                        .map(|(key, slot)| {
+                            let Slot::Int(value) = slot else {
+                                unreachable!("compiled signed map")
+                            };
+                            (key, value)
+                        })
+                        .collect(),
+                )
+            } else if matches!(inner.as_ref(), Land::Uint) {
+                Slot::MapUnsignedInteger(
+                    entries
+                        .into_iter()
+                        .map(|(key, slot)| {
+                            let Slot::Uint(value) = slot else {
+                                unreachable!("compiled unsigned map")
+                            };
+                            (key, value)
+                        })
+                        .collect(),
+                )
+            } else if matches!(inner.as_ref(), Land::Num) {
                 Slot::MapNumeric(
                     entries
                         .into_iter()

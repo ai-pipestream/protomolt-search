@@ -42,8 +42,8 @@ transport, embedding, and availability work.
 
 Exact signed and unsigned map storage and document transport are being built
 on `feat/integer-map-storage-2026-09`. The branch supports typed document
-entries, WAL replay and segment transplant; descriptor-driven integer map
-projection and query operators remain incomplete. See
+entries, descriptor-driven integer map projection, WAL replay and segment
+transplant. Typed map query operators remain incomplete. See
 [integer map storage](docs/integer-map-storage.md) for the compatibility gates
 and current validation scope.
 

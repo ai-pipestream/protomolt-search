@@ -6212,6 +6212,10 @@ enum ColumnFamily {
   COLUMN_FAMILY_MAP_FACET = 7;
   // Map entry float/double values, stored as finite f64 with entry presence.
   COLUMN_FAMILY_MAP_F64 = 8;
+  // Exact signed map entries with separate presence, including a present zero.
+  COLUMN_FAMILY_MAP_I64 = 9;
+  // Full-domain unsigned map entries; values never pass through double or i64.
+  COLUMN_FAMILY_MAP_U64 = 10;
 }
 
 // MappedField is one field of the derived plan.
