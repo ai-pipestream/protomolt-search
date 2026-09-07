@@ -196,8 +196,9 @@ log manifest records.
 
 `tests/derived_columns.rs` shows the backfill storing, row for row,
 what direct ingest under the same declaration stores; the court-data
-proof (11 million documents, the computed year equal to the stored
-year on each document of the rebuilt child) is in
+proof (11 million source documents; the computed year equal to the
+stored year on each of the 1,954,816 rebuilt rows carrying `decided`,
+and absent on the 9 that do not) is in
 `docs/benchmarks/fleet-placement-2026-09.md`.
 
 ### Reconciling a child
