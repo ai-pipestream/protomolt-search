@@ -87,6 +87,7 @@ mod query_identity;
 mod rangefacet;
 pub mod rankdiff;
 pub mod relay;
+pub mod replay_journal;
 #[cfg(feature = "net")]
 pub mod replication;
 pub mod reshard;

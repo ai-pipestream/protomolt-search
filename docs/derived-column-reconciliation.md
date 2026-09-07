@@ -40,7 +40,8 @@ fresh `AddDocuments`, which refuses carried derived values. The sender now
 refuses these records before transmission or cursor advancement; accepting
 them requires a separately authorized replay route. Do not strip the
 fingerprint, recompute logged expressions, or add a client-controlled bypass.
-This remains work for the identity/durability track and does not hold the
+The [trusted-replay design and receiver journal](trusted-replay.md) begin this
+work for the identity/durability track. This does not hold the
 other task's source development or authorize fleet operations.
 
 ## Checkpoint validation

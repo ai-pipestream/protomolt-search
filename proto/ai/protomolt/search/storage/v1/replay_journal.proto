@@ -1,0 +1,12 @@
+syntax = "proto3";
+package ai.protomolt.search.storage.v1;
+import "ai/protomolt/search/v1/replay.proto";
+
+message ReplayJournalHeader {
+  uint32 format_version = 1;
+  ai.protomolt.search.v1.ReplayStreamBinding binding = 2;
+  bytes binding_sha256 = 3;
+  uint64 accepted_sequence = 4;
+  uint64 source_clock = 5;
+  bytes head_sha256 = 6;
+}

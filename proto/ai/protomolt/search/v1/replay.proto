@@ -1,0 +1,72 @@
+syntax = "proto3";
+package ai.protomolt.search.v1;
+
+// Immutable identity of one assigned replay stream. This is a local journal
+// contract; it does not authorize a network caller or expose a replay RPC.
+// Every field participates in the binding digest. Reassignment starts another
+// journal; addresses, row counts and ephemeral statistics tokens are not identity.
+// Digest v1: SHA256("protomolt-search.replay-binding.v1\0" || canonical binding).
+// Canonical metadata emits known fields in ascending tag order, once each, with
+// shortest varints, UTF-8 strings, and omitted default scalars/empty bytes/strings.
+// This rule applies to this flat metadata, never to the opaque WAL record bytes.
+message ReplayStreamBinding {
+  uint32 contract_version = 1;
+  string workspace = 2;
+  string collection = 3;
+  string source_shard_id = 4;
+  bytes source_history_id = 5; // 16-byte durable history incarnation.
+  uint64 source_wal_generation = 6; // Zero is a valid initial generation.
+  uint64 source_write_epoch = 7;
+  string target_shard_id = 8;
+  bytes target_history_id = 9; // 16-byte durable history incarnation.
+  uint64 target_write_epoch = 10;
+  uint64 topology_revision = 11;
+  bytes assignment_id = 12; // 16-byte authority-issued assignment identity.
+  uint64 baseline_clock = 13;
+  bytes baseline_sha256 = 14; // Verified baseline snapshot identity, 32 bytes.
+  bytes index_contract_sha256 = 15; // Full source/target projection contract.
+}
+
+// Ordered, hash-linked delivery within this assignment. Source clocks increase
+// strictly; stream sequences are contiguous from 1. Filtered child streams may
+// skip source clocks only after the assignment's selector has verified them.
+// Frame digest v1: SHA256("protomolt-search.replay-frame.v1\0" || binding digest
+// || canonical frame with sha256 cleared), using the same metadata encoding.
+// Version 1 has only the fields declared here; additions need a new digest contract.
+message ReplayJournalFrame {
+  uint64 sequence = 1;
+  uint64 source_clock = 2;
+  bytes previous_sha256 = 3; // First frame points at the binding digest.
+  // Original ai.protomolt.search.wal.v1.WalRecord bytes. The source clock must agree.
+  // Field order, nonminimal varints and unknown fields are retained, not normalized.
+  // Acceptance is durable storage only; execution needs separate schema validation.
+  // Original document protobuf bytes remain opaque inside the source archive.
+  bytes record = 4;
+  bytes sha256 = 5; // Binding + this frame with sha256 cleared, domain separated.
+}
+
+// Acceptance in a synced local receiver journal. Search visibility and target
+// index durability require a separate application proof; searchable is false.
+message ReplayJournalReceipt {
+  bytes binding_sha256 = 1;
+  uint64 sequence = 2;
+  uint64 source_clock = 3;
+  bytes sha256 = 4;
+  bool accepted = 5;
+  bool durable = 6;
+  bool searchable = 7;
+  bool replayed = 8;
+}
+
+message ReadReplayJournalRequest {
+  uint64 after_sequence = 1;
+  optional uint64 through_sequence = 2; // Omit to pin the current accepted tip.
+  uint32 limit = 3; // 1..1000 frames.
+  uint64 max_bytes = 4; // 1..64 MiB of encoded frames; no oversized first frame.
+}
+message ReadReplayJournalResponse {
+  repeated ReplayJournalFrame frames = 1;
+  uint64 through_sequence = 2;
+  uint64 next_sequence = 3;
+  bool complete = 4;
+}

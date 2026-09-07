@@ -1843,6 +1843,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   device node by declaration, and moves nothing.
   [Bandwidth as the budget](docs/bandwidth-budget.md).
 
+- **Branch checkpoint 2026-09-07: durable receiver replay journal.**
+  A protobuf stream binding and hash-linked frames give the receiver persistent
+  retry decisions tied to source/target histories, writer epochs and a baseline.
+  Acceptance and the journal frontier commit together; receipts do not claim
+  search visibility. Bounded reads pin a prefix and preserve exact WAL bytes.
+  Network authorization and application proofs remain separate work; no new RPC
+  is exposed. [Trusted replay](docs/trusted-replay.md).
 - **Branch checkpoint 2026-09-07: derived columns with exact integer maps.**
   Preserves the published map wire/storage identifiers and assigns separate
   derived identifiers. Reads old main derived images and WAL generations,

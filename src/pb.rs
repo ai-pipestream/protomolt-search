@@ -74,6 +74,6 @@ pub mod wal {
 pub mod v1 {
     pub use super::{
         AcceptDocumentRequest, AddDocumentsRequest, AddVectorsRequest, DocumentWriteReceipt,
-        FlushResponse, IngestMappedRequest, QueryStreamResponse,
+        FlushResponse, IngestMappedRequest, QueryStreamResponse, ReplayStreamBinding,
     };
 }
