@@ -1,7 +1,26 @@
 # Search foundations
 
-Foundation work began on `feat/search-foundations` from `PRE_ASTRA`.
-The latest increment connects explicit protobuf map projections to map-facet
+Foundation work began on `feat/search-foundations` from `PRE_ASTRA`. At
+`2546712`, the current source-authority increment preserves original source and
+immutable retry history, journals local publication and maintenance, audits
+complete accepted-source and journal histories, writes coherent source/index
+backups, verifies incoming bundles in private read-only staging, and adds
+explicit terminal retirement of a local source writer. See [Document
+writes](document-writes.md) and [Source/index
+backup](source-index-backup.md).
+
+This remains local authority work. Explicit server routing, activation of a
+verified restore under the current collection authority, remaining protobuf
+shape semantics, and the remaining authorization scope are unfinished. The
+foundation goal is not complete.
+
+## Historical map-projection checkpoint
+
+The following introduction records the earlier `73a420b` map-projection
+increment and its validation. It is historical evidence, not the latest
+foundation checkpoint.
+
+That increment connects explicit protobuf map projections to map-facet
 and map-numeric storage. Every protobuf map-key type has a canonical selector;
 default entries, duplicate-key resolution, enum openness and per-chunk scope
 retain their meaning. Schema reports name queryable maps and key/value inputs.
@@ -36,7 +55,10 @@ establish completion of the three workstreams.
 
 ## Completion requirements
 
-| Requirement | Required evidence | Current state |
+These evidence requirements remain binding, but the status column records the
+historical map checkpoint and is not a current completion audit.
+
+| Requirement | Required evidence | Status at the map checkpoint (historical) |
 |---|---|---|
 | Faithful protobuf decoding and compatible index binding | Generated-runtime differential fixtures for presence, oneofs, merges, scalar encodings, unknown values and schema evolution | Oneof, presence, merged messages, int32, enum openness, required fields and groups corrected; v3 includes reachable extensions; coverage expanding |
 | Every protobuf shape has an explicit preservation, indexing and query disposition | Typed index definition and exhaustive descriptor/field support report; no silent omission | Explicit policy planning/binding and durable retention are implemented and validated. Plans and DescribeSchema report the full graph. Value implementations for source-only shapes remain |

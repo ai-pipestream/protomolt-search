@@ -220,6 +220,26 @@ index snapshots in application code.
 
 ## Validation
 
+At `2546712`, the complete local source-authority run passed 658 library tests,
+848 integration tests across 144 targets, 13 embedded tests and 2 IVF-provider
+tests: 1,521 passed, 0 failed. The existing live OpenNLP test remains ignored.
+All 5 Android/iOS targets, tests/examples compilation, formatting,
+vendored-proto identity and diff checks passed. The descriptor comparison with
+`44276d8` preserves existing field numbers/types, enum values and RPCs;
+retirement adds a header field and two messages. All 629 tracked source hashes
+matched before and after validation. The scope had an 8 GiB hard limit, peaked
+at 8 GiB, used no swap and recorded 0 OOM, OOM-kill or OOM-group-kill events.
+This is local validation; hosted CI, fleet rollout and merge to `main` were not
+performed. Explicit server routing and current-authority activation remain
+unfinished.
+
+The test-only follow-up `2214e48` adds an abrupt-exit regression. The complete
+20-test `document_catalog` integration target and formatting passed with runtime
+source hashes unchanged. Together this covers 1,522
+passing tests, but the full gate was not rerun at `2214e48`.
+
+### Historical validation at `7538f96`
+
 At `7538f96`, the incoming-staging checkpoint passed 651 library tests, 848
 integration tests across 144 targets, 13 embedded tests and 2 IVF-provider
 tests: 1,514 passed, 0 failed. The existing live OpenNLP test remains ignored.
