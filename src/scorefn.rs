@@ -89,6 +89,20 @@ pub enum ColumnRef {
         /// Key ordinal within that column's key dictionary.
         key_ord: u32,
     },
+    /// Exact signed map input, converted to double at score evaluation.
+    MapIntegerKey {
+        /// Index into the signed map table.
+        column: usize,
+        /// Key ordinal within that column's dictionary.
+        key_ord: u32,
+    },
+    /// Exact unsigned map input, converted to double at score evaluation.
+    MapUnsignedIntegerKey {
+        /// Index into the unsigned map table.
+        column: usize,
+        /// Key ordinal within that column's dictionary.
+        key_ord: u32,
+    },
     /// Index into the shard's geo table (`docs/geo-columns.md`). Only
     /// the [`StageOp::MultGeoDecay`] ops resolve to this; the scalar
     /// ops never see it, and it never sees them.
@@ -190,6 +204,12 @@ impl Stage {
             Some(ColumnRef::MapKey { column, key_ord }) => {
                 columns.map_value(column, key_ord, doc_id)
             }
+            Some(ColumnRef::MapIntegerKey { column, key_ord }) => columns
+                .map_int_value(column, key_ord, doc_id)
+                .map(|v| v as f64),
+            Some(ColumnRef::MapUnsignedIntegerKey { column, key_ord }) => columns
+                .map_uint_value(column, key_ord, doc_id)
+                .map(|v| v as f64),
             Some(ColumnRef::Geo(_)) | None => None,
         }?;
         Some(match self.op {
@@ -228,6 +248,12 @@ impl Stage {
             Some(ColumnRef::MapKey { column, key_ord }) => {
                 columns.map_value(column, key_ord, doc_id)
             }
+            Some(ColumnRef::MapIntegerKey { column, key_ord }) => columns
+                .map_int_value(column, key_ord, doc_id)
+                .map(|v| v as f64),
+            Some(ColumnRef::MapUnsignedIntegerKey { column, key_ord }) => columns
+                .map_uint_value(column, key_ord, doc_id)
+                .map(|v| v as f64),
             Some(ColumnRef::Geo(_)) | None => None,
         }
     }
@@ -279,6 +305,12 @@ impl ScoreChain {
                 Some(ColumnRef::MapKey { column, key_ord }) => {
                     columns.map_value(column, key_ord, doc_id)
                 }
+                Some(ColumnRef::MapIntegerKey { column, key_ord }) => columns
+                    .map_int_value(column, key_ord, doc_id)
+                    .map(|v| v as f64),
+                Some(ColumnRef::MapUnsignedIntegerKey { column, key_ord }) => columns
+                    .map_uint_value(column, key_ord, doc_id)
+                    .map(|v| v as f64),
                 Some(ColumnRef::Geo(_)) | None => None,
             };
             let Some(x) = x else {
@@ -545,7 +577,7 @@ impl crate::pb::ScoreStage {
         use crate::pb::score_stage::Operation;
         match &self.operation {
             Some(Operation::Op(op)) => *op,
-            Some(Operation::MapOp(map)) => map.op,
+            Some(Operation::MapOp(map) | Operation::TypedMapOp(map)) => map.op,
             None => 0,
         }
     }
@@ -555,7 +587,7 @@ impl crate::pb::ScoreStage {
     pub(crate) fn map_key(&self) -> Option<&str> {
         use crate::pb::score_stage::Operation;
         match &self.operation {
-            Some(Operation::MapOp(map)) => Some(&map.key),
+            Some(Operation::MapOp(map) | Operation::TypedMapOp(map)) => Some(&map.key),
             _ => (!self.key.is_empty()).then_some(self.key.as_str()),
         }
     }

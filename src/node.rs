@@ -1518,6 +1518,22 @@ impl Bm25Shard {
             Bm25Shard::Segmented(s) => s.map_unsigned_integer_value(ci, key_ord, row),
         }
     }
+    fn map_integer_key_min_max(&self, ci: usize, key_ord: u32) -> Option<(i64, i64)> {
+        match self {
+            Bm25Shard::Building(s) => s.map_integer_key_min_max(ci, key_ord),
+            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
+            Bm25Shard::Resident(s) => s.map_integer_key_min_max(ci, key_ord),
+            Bm25Shard::Segmented(s) => s.map_integer_key_min_max(ci, key_ord),
+        }
+    }
+    fn map_unsigned_integer_key_min_max(&self, ci: usize, key_ord: u32) -> Option<(u64, u64)> {
+        match self {
+            Bm25Shard::Building(s) => s.map_unsigned_integer_key_min_max(ci, key_ord),
+            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
+            Bm25Shard::Resident(s) => s.map_unsigned_integer_key_min_max(ci, key_ord),
+            Bm25Shard::Segmented(s) => s.map_unsigned_integer_key_min_max(ci, key_ord),
+        }
+    }
     /// The key ordinal of `key` in map-numeric column `ci`.
     fn map_numeric_key_ord(&self, ci: usize, key: &str) -> Option<u32> {
         match self {
@@ -1863,15 +1879,18 @@ impl Bm25Shard {
     /// has it (`None` = every document absent = identity, which is
     /// exact) and the column's min/max bound metadata. Only called on
     /// searchable shapes.
-    fn resolve_chain(
-        &self,
-        specs: &[(crate::scorefn::StageOp, String, Option<String>)],
-    ) -> crate::scorefn::ScoreChain {
+    fn resolve_chain(&self, specs: &[ScoreStageSpec]) -> crate::scorefn::ScoreChain {
         use crate::scorefn::ColumnRef;
         crate::scorefn::ScoreChain {
             stages: specs
                 .iter()
-                .map(|(op, column, key)| {
+                .map(|spec| {
+                    let ScoreStageSpec {
+                        op,
+                        column,
+                        key,
+                        typed_map,
+                    } = spec;
                     // A geo stage reads a geo-point column and nothing
                     // else: its op carries the origin, and its bound is
                     // identity, so there is no min/max to lift.
@@ -1898,6 +1917,33 @@ impl Bm25Shard {
                                 ui.map(|ui| uint_min_max_as_f64(self.unsigned_integer_min_max(ui))),
                             )
                         }
+                    } else if *typed_map && self.map_integer_index(column).is_some() {
+                        let ci = self.map_integer_index(column).expect("checked signed map");
+                        let key_ord = self.map_integer_key_ord(ci, key.as_deref().unwrap());
+                        (
+                            key_ord.map(|key_ord| ColumnRef::MapIntegerKey {
+                                column: ci,
+                                key_ord,
+                            }),
+                            key_ord
+                                .and_then(|k| self.map_integer_key_min_max(ci, k))
+                                .map(int_min_max_as_f64),
+                        )
+                    } else if *typed_map && self.map_unsigned_integer_index(column).is_some() {
+                        let ci = self
+                            .map_unsigned_integer_index(column)
+                            .expect("checked unsigned map");
+                        let key_ord =
+                            self.map_unsigned_integer_key_ord(ci, key.as_deref().unwrap());
+                        (
+                            key_ord.map(|key_ord| ColumnRef::MapUnsignedIntegerKey {
+                                column: ci,
+                                key_ord,
+                            }),
+                            key_ord
+                                .and_then(|k| self.map_unsigned_integer_key_min_max(ci, k))
+                                .map(uint_min_max_as_f64),
+                        )
                     } else {
                         // Map stage: both the column and the key must
                         // resolve; bounds lift from the KEY's min/max.
@@ -2977,7 +3023,10 @@ fn explain_stages(
             key: spec.map_key().unwrap_or_default().to_owned(),
             map_key: matches!(
                 spec.operation,
-                Some(crate::pb::score_stage::Operation::MapOp(_))
+                Some(
+                    crate::pb::score_stage::Operation::MapOp(_)
+                        | crate::pb::score_stage::Operation::TypedMapOp(_)
+                )
             )
             .then(|| spec.map_key().expect("explicit map selector").to_owned()),
             present: false,
@@ -3337,6 +3386,15 @@ fn uint_min_max_as_f64((min, max): (u64, u64)) -> (f64, f64) {
     }
 }
 
+/// A validated score input. Keep the typed map selector distinct from the
+/// legacy f64-only map operation throughout resolution.
+pub(crate) struct ScoreStageSpec {
+    op: crate::scorefn::StageOp,
+    column: String,
+    key: Option<String>,
+    typed_map: bool,
+}
+
 /// Parse and validate a wire score-stage list into resolved ops plus
 /// their column names — the shard-independent half of chain building
 /// (`docs/score-functions.md`). Refuses unknown ops, empty column
@@ -3344,7 +3402,7 @@ fn uint_min_max_as_f64((min, max): (u64, u64)) -> (f64, f64) {
 /// refusal here is a stage whose monotonicity or bound would not hold.
 pub(crate) fn parse_score_stages(
     stages: &[crate::pb::ScoreStage],
-) -> Result<Vec<(crate::scorefn::StageOp, String, Option<String>)>, Status> {
+) -> Result<Vec<ScoreStageSpec>, Status> {
     use crate::scorefn::StageOp;
     stages
         .iter()
@@ -3357,11 +3415,11 @@ pub(crate) fn parse_score_stages(
             }
             if matches!(
                 stage.operation,
-                Some(crate::pb::score_stage::Operation::MapOp(_))
+                Some(crate::pb::score_stage::Operation::MapOp(_) | crate::pb::score_stage::Operation::TypedMapOp(_))
             ) && !stage.key.is_empty()
             {
                 return Err(Status::invalid_argument(format!(
-                    "score stage {i}: map_op carries its own key; leave the legacy key empty"
+                    "score stage {i}: an explicit map operation carries its own key; leave the legacy key empty"
                 )));
             }
             let op = match crate::pb::ScoreOp::try_from(stage.operation_code()) {
@@ -3436,7 +3494,12 @@ pub(crate) fn parse_score_stages(
                     )));
                 }
             };
-            Ok((op, stage.column.clone(), stage.map_key().map(str::to_owned)))
+            Ok(ScoreStageSpec {
+                op,
+                column: stage.column.clone(),
+                key: stage.map_key().map(str::to_owned),
+                typed_map: matches!(stage.operation, Some(crate::pb::score_stage::Operation::TypedMapOp(_))),
+            })
         })
         .collect()
 }

@@ -2043,7 +2043,7 @@ async fn exact_integer_maps_require_separate_use_and_disclosure_grants() {
         owner.clone(),
         permissions(
             &[
-                ("body", &[FieldAction::Use]),
+                ("body", &[FieldAction::Use, FieldAction::Disclose]),
                 ("signed", &[FieldAction::Use]),
                 ("unsigned", &[FieldAction::Use]),
             ],
@@ -2062,6 +2062,47 @@ async fn exact_integer_maps_require_separate_use_and_disclosure_grants() {
             .len(),
         1
     );
+    let mut scored = query();
+    scored.score_stages = vec![ScoreStage {
+        column: "unsigned".into(),
+        operation: Some(score_stage::Operation::TypedMapOp(MapScoreOperation {
+            op: ScoreOp::AddLinear as i32,
+            key: "".into(),
+        })),
+        weight: 2e-19,
+        ..Default::default()
+    }];
+    let before = owner.stats_cache().fetch_count();
+    assert_eq!(
+        reader
+            .bm25_search(request(scored.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    assert_eq!(owner.stats_cache().fetch_count(), before);
+    assert_eq!(
+        use_only
+            .bm25_search(request(scored.clone()))
+            .await
+            .unwrap()
+            .into_inner()
+            .hits
+            .len(),
+        1
+    );
+    scored.explain = true;
+    let before = owner.stats_cache().fetch_count();
+    assert_eq!(
+        use_only
+            .bm25_search(request(scored.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    assert_eq!(owner.stats_cache().fetch_count(), before);
     let mut projected = public_query();
     projected.projections = vec![NamedProjection {
         name: "alias".into(),
@@ -2079,11 +2120,24 @@ async fn exact_integer_maps_require_separate_use_and_disclosure_grants() {
         owner.clone(),
         permissions(
             &[
-                ("body", &[FieldAction::Use]),
+                ("body", &[FieldAction::Use, FieldAction::Disclose]),
                 ("unsigned", &[FieldAction::Use, FieldAction::Disclose]),
             ],
             false,
         ),
+    );
+    let explanation = allowed
+        .bm25_search(request(scored))
+        .await
+        .unwrap()
+        .into_inner()
+        .hits
+        .remove(0)
+        .explain
+        .unwrap();
+    assert_eq!(
+        explanation.stages[0].input,
+        u64::MAX.to_string().parse::<f64>().unwrap()
     );
     for collapse in [false, true] {
         let mut ordered = public_query();

@@ -3,7 +3,8 @@
 Status: implemented on `feat/integer-map-storage-2026-09` for filters, key
 presence, typed value expressions, materialization and expression-based
 aggregates. [Direct map sorting/collapse](integer-map-order.md) is also
-implemented. Bounded score stages, exact range facets and column statistics
+implemented, as are [bounded score stages](score-functions.md#signed-and-unsigned-map-scoring-2026-09-07)
+with explicit double conversion. Exact range facets and column statistics
 remain unfinished. See
 [map projection](map-projection.md) and [storage](integer-map-storage.md).
 

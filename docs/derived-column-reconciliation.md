@@ -93,3 +93,9 @@ remain under `ai.protomolt.search.v1`.
 Declaration/persistence can start independently. Reconcile against the current
 feature checkpoint before changing the shared evaluator, and keep the fleet
 proof after the source contract, durability checks and backfill verification.
+
+The following scoring increment allocates `ScoreStage.typed_map_op` at tag 10,
+reusing MapScoreOperation for f64/i64/u64 inputs. Preserve its distinction from
+the legacy f64-only selectors and its double conversion at score evaluation.
+This changes no routes, value-expression tags, storage formats or recovery
+metadata.

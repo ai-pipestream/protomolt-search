@@ -5,6 +5,58 @@ Recency decay, level boosts, citation weights — as a chain of named
 score transforms that keeps every exactness property the engine already
 has.
 
+## Signed and unsigned map scoring (2026-09-07)
+
+`ScoreStage.typed_map_op` at tag 10 accepts f64, i64 and u64 map entries.
+It uses the existing `MapScoreOperation { op, key }` message and stage
+parameters. The key is literal and may be empty. `map_op` and the legacy
+nonempty `key` selector retain their f64-only meaning.
+
+```textproto
+score_stages {
+  column: "counts"
+  typed_map_op { op: SCORE_OP_ADD_LINEAR key: "" }
+  weight: 0.25
+}
+```
+
+Stored integers remain exact. Score inputs and each key's minimum and maximum
+convert to double at evaluation; neighboring integers above 2^53 can receive
+the same score. This monotone conversion preserves the bound's ordering.
+Missing entries pass through unchanged, including on a child with no documents
+or no matching key. A key unknown to every consulted child is refused. Neither
+absence nor zero is inferred from a numeric sentinel.
+
+The selector is used by lexical score chains, candidate rescores, Boolean
+lexical leaves, FetchValues and bounded-value scorer dimensions. Explain echoes
+the literal key and the converted input. USE permits scoring; DISCLOSE is also
+required to expose the field's explanatory input or stored dimension details.
+Geo operations, unknown operations, incompatible parameters and conflicting
+legacy keys are refused before an empty-node shortcut.
+
+Older nodes discard the new oneof member and refuse the missing operation.
+The independent old-wire fixture verifies that behavior on empty FetchValues,
+BM25 query and rescore routes. There is no new route or storage format.
+
+`tests/integer_map_scoring.rs` checks integer extrema, zero, absence, empty and
+quoted keys, mutable and persisted reads, key-ordinal changes, compaction and
+reopen in both layouts, relay composition with an empty child, Explain,
+FetchValues and public bounded-value scoring. Its 3,000-row pruning fixture
+compares top-k results with exhaustive scoring, with and without seeded floors,
+and independently checks converted values and each transform's arithmetic.
+`tests/field_grants.rs` checks admission before statistics, USE-only scoring,
+and the extra disclosure permission required for Explain.
+
+Validation on `b6c1017` plus this increment passed 508 library tests, 772
+integration tests across 136 targets, 12 embedded tests and two IVF tests:
+1,294 passed, none failed, with one existing live OpenNLP test ignored. All
+five mobile Rust targets, test/example compilation, formatting and vendored
+protos passed. Descriptor comparison permits only the new stage selector.
+The final schema-description and grant-isolation fixture edits were followed
+by passing reruns of all 21 field-grant and eight schema-report tests.
+Every validation process ran under an 8 GiB cgroup limit with swap disabled.
+This is local validation; the feature branch has not been merged or deployed.
+
 ## Explicit map input (2026-09-06)
 
 `ScoreStage.operation` is a protobuf oneof. Its `op` member retains tag 1 and
