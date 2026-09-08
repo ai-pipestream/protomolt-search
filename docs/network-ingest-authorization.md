@@ -127,15 +127,14 @@ recovery; stale owner/history/incarnation refusals; and explicit partial progres
 across multiple owners. Local receiver tests prove only the local portions of
 these requirements.
 
-The existing JSON control-state writer also needs a stronger recovery boundary
-before it can govern source ownership. On code inspection, `write_state` renames
-the new file before syncing its parent directory, while callers restore the old
-in-memory state on any persistence error. A failure after rename can therefore
-leave disk and memory on different decisions. This failure path has not yet been
-fault-injected. Managed ownership must use the accepted transactional control
-storage/recovery design, or fail closed on ambiguous persistence, rather than
-reuse that clone-and-rollback pattern. Missing managed authority state must also
-refuse recovery instead of creating the current control plane's default state.
+The JSON control-state failure path has now been fault-injected: an error after
+rename left disk on the new decision while memory returned to the old decision
+and remained usable. The branch's [control recovery change](cluster-control.md#persistence-failures-and-recovery)
+closes the shared instance after an ambiguous publication and provides strict
+existing-state reopening; its validation is separate from the receiver gate
+below. This is not transactional managed-owner storage. Managed ownership still
+requires the accepted control storage/recovery design, and missing authority
+state must never bootstrap a replacement history.
 
 ## Local receiver validation
 

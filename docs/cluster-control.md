@@ -36,6 +36,55 @@ authority: a newer durable generation is published before serving, while a
 state file behind the live generation or conflicting at the same generation is
 refused.
 
+### Persistence failures and recovery
+
+The foundation branch distinguishes a failure before publishing a replacement
+state file from an ambiguous publication. A failure before rename leaves the
+prior in-memory and durable state usable. An error from rename or the following
+directory sync closes that `DurableControlPlane` instance and every clone.
+Later authority reads, mutations, admission and topology publication return
+`FAILED_PRECONDITION` naming the uncertain persistence outcome. The configuration
+collection label remains readable; it is not a current-authority decision.
+The state mutex covers both the failure latch and synchronous map publication.
+
+Collection binding and reconciliation compute a private candidate and publish
+it in memory only after persistence succeeds. A late validation error, including
+topology-generation overflow, cannot leave uncommitted candidate changes in the
+shared state.
+
+`DurableControlPlane::open_existing` is the explicit recovery entry point. It
+requires an existing, valid state file and syncs the loaded state before use;
+missing, malformed or unsupported-format state refuses instead of creating a
+new history. A new instance does not reactivate older failed clones. Preserve
+the intended state file and resolve storage errors before reopening it. The
+legacy `open` constructor still permits initial bootstrap; that behavior must
+not be used to recover missing managed authority state.
+
+This is fail-closed handling for the existing single-authority JSON adapter.
+It does not supply replicated control storage, source-owner activation,
+distributed fencing or atomicity across the multiple mutations of a control
+RPC. Those remain in the accepted [Raft design](raft-control-design.md).
+
+Validation (2026-09-08, working tree above `ddfb7b6`): fault injection first
+reproduced usable old memory after a post-rename failure, an uncommitted
+collection binding after a pre-rename failure, and changed reconciliation
+history after topology-generation overflow. The six regression tests now pass,
+including strict reopen refusals and old clones remaining closed after recovery.
+The focused gate passed 18 control tests and 23 collection/placement tests.
+
+The full gate passed 694 library tests and all 150 integration targets (903
+top-level passes plus one nested retry worker); the existing native OpenNLP
+test remains ignored because it requires its external analysis service.
+Embedded tests (13), IVF tests (2), protobuf reference tests (9), all five
+Android/iOS compilation targets, tests/examples compilation, formatting and
+vendored-proto checks passed. All 21 proto files and the original protobuf
+fixtures remained byte-identical to `ddfb7b6`; 651 input hashes matched before
+and after validation. Terra executed the gates and Astra reviewed raw exits,
+logs and hashes. The full scope reached its 8 GiB memory limit (41,469 limit
+events), with no swap or OOM events. These are correctness checks under a cap,
+not performance measurements. Raw evidence uses the local
+`/tmp/psearch-control-persistence-{red,red2,green,full}-*` prefixes.
+
 ## Node lifecycle
 
 1. `RegisterNode` returns a lease token only to that node.

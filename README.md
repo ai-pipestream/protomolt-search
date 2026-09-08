@@ -1237,6 +1237,14 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: control-state failure boundaries.** Ambiguous state-file
+  publication closes the shared control authority until an explicit existing-file
+  reopen. Collection binding and reconciliation keep failed candidate changes
+  out of shared memory. Six fault/recovery regressions, the full 150-target
+  integration gate and five mobile compilation targets pass under the 8 GiB,
+  swap-disabled scope. See [control recovery](docs/cluster-control.md#persistence-failures-and-recovery)
+  for the single-authority scope and remaining managed-owner work.
+
 - **Foundation branch: receiving-side logical source writes.** The programmatic
   `DocumentWriteService` adapter authenticates each caller and pins local Ingest
   permission through the catalog transaction. Version-2 requests bind the exact
