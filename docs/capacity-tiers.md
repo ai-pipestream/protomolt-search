@@ -1,17 +1,47 @@
 # Capacity tiers over declared hash partitions
 
-Status: amended design for operator review, 2026-09-08. The 2026-09-07
-draft was reviewed; this revision applies the review's corrections:
-resource-scoped identity, an observation signal that the reports
-actually carry, a frozen planning snapshot, a canonical policy encoding
-with pinned fixtures, an explicit advisory/execution boundary, and
-worked examples with literal inputs and expected outputs (§10). Nothing
-in this document is built. It is the contract to review before any
-ownership change is implemented: it names partitions, observations, the
-plan, the move shape, and the refusal behavior, and it embeds draft
-protocol blocks as text. No field number below is allocated; every one
-is marked DRAFT and becomes contract only when the number is reserved in
+Status: second amendment for operator review, 2026-09-08. The
+2026-09-07 draft was reviewed; the first amendment applied its
+corrections (resource-scoped identity, carried observation signal,
+frozen planning snapshot, canonical policy encoding, advisory/execution
+boundary, worked examples). The review of that amendment found six
+contradictions in the examples and remaining semantic gaps; this
+revision repairs them: three-domain replica evidence in the fixtures, a
+corrected warm literal, cohort-aligned windows, per-fragment
+attribution, owner/history/storage binding on reports and copies, an
+advisory (never minted) move target, a defined v1 move objective with
+capacity limits, checked aggregation bounds, and an executable fixture
+verifier (`scripts/verify_capacity_tier_fixtures.py`) that recomputes
+every pinned literal in §10. Nothing in this document is built. It is
+the contract to review before any ownership change is implemented: it
+names partitions, observations, the plan, the move shape, and the
+refusal behavior, and it embeds draft protocol blocks as text. No field
+number below is allocated; every one is marked DRAFT and becomes
+contract only when the number is reserved in
 `proto/ai/protomolt/search/v1/search.proto`.
+
+Implementation state, 2026-09-08: the bounded observation store and the
+deterministic dry-run planner are built as a pure library module
+(`src/capacity_tiers.rs`) on branch `feat/capacity-tiers`, with §10's
+literals as its golden tests and `scripts/verify_capacity_tier_fixtures.py`
+as the independent oracle. The module allocates no protocol fields,
+opens no routes, and executes nothing; the typed snapshot it plans
+from is the coordination seam with the control-plane track, which owns
+persistence, revision allocation, and Raft wiring.
+
+The snapshot boundary, agreed for Fable's integration: `TierSnapshot`
+is opaque, and `TierSnapshot::validated` is the only constructor. It
+enforces once, for the store-fed path and any hand-built input alike:
+resource binding of every observation and fragment to the context and
+the committed view; committed-identity equality in both directions;
+incarnation currency; duplicate rejection (nothing silently
+overwrites); Server residency and eligibility for every `complete`
+claim, with one coverage digest per fragment's complete copies;
+canonical ordering of fragments, pools, owners, and copies; and the
+admission caps. Fragment pools, owners, and copies are derived from the
+committed view, never accepted from the caller. Adapters must not
+compensate for invalid inputs; an input that fails validation is a
+refusal by name, not a fix-up.
 
 The documents this one extends: the measurement and the dry run in
 [bandwidth-budget.md](bandwidth-budget.md), the predicate tree and its
@@ -103,7 +133,8 @@ outside it (§8).
 **Copy identity.** Each concrete copy of a fragment is identified by:
 
 ```
-copy = (fragment, node_id, process_incarnation, storage_incarnation)
+copy = (fragment, node_id, process_incarnation, storage_incarnation,
+        ownership_epoch)
 ```
 
 - **process_incarnation** is the 128-bit identifier the node process
@@ -116,12 +147,22 @@ copy = (fragment, node_id, process_incarnation, storage_incarnation)
   re-bootstraps the same fragment mints a new storage incarnation, so a
   stale plan can never address bytes installed after the plan's
   snapshot.
+- **ownership_epoch** is the authority's committed ownership-history
+  counter for the shard the copy serves: it advances on every committed
+  ownership transition (attach, bootstrap, handoff, replacement), and
+  the authority's record of it is the logical owner/history the
+  fragment tuples name. A copy, a report, or a coverage claim whose
+  ownership epoch is not *equal* to the committed one — older or
+  newer — is refused by name; an integer generation comparison that
+  only rejects older values cannot distinguish replacement bytes, so
+  equality is the rule everywhere in this contract.
 
 **Complete replica, defined.** One *complete replica* of fragment F at
 source version V is a copy whose verified coverage evidence — the
 manifest digest and per-section integrity proof over F's full row set
-at V — matches V, held by a distinct eligible owner in a distinct
-failure domain. Consequences:
+at V — matches V, presented under the committed ownership epoch, held
+by a distinct eligible owner in a distinct failure domain.
+Consequences:
 
 - Two nodes holding disjoint rows of one bucket are two **partial
   copies**, together zero complete replicas; a floor counts only
@@ -179,48 +220,60 @@ bounds changes.
 
 ## 3. Capacity observations
 
-Each node reports, per partition-in-shard it holds rows of, one
-observation per window. The carrier is `ReportShard` (per shard, so per
-partition-in-shard), the route whose discipline the scan rate already
-uses on the lease; the authority aggregates to per (partition, node)
-and per partition under the rules below.
+Each node reports, per (partition, shard, leaf) triple it holds rows
+of, one observation per reporting cohort. The carrier is `ReportShard`
+(per shard, so per partition-in-shard, split per leaf when the shard
+spans leaves), the route whose discipline the scan rate already uses
+on the lease; the authority aggregates to per fragment under the rules
+below.
 
 ```proto
 // DRAFT. Not allocated. One node's measured statement about one
-// partition in one shard. Carried as
+// partition in one shard, attributed to one placement leaf. Carried as
 // `repeated PartitionObservation partitions` on ReportShardRequest
 // (DRAFT field, number unassigned).
 message PartitionObservation {
   PartitionIdentity partition = 1;      // DRAFT; includes workspace+collection
   ReporterIdentity reporter = 2;        // DRAFT
-  ShardRef shard = 3;                   // DRAFT
-  // Rows and resident encoded bytes of the partition in this shard.
-  uint64 rows = 4;                      // DRAFT
-  uint64 resident_bytes = 5;            // DRAFT
+  ShardRef shard = 3;                   // DRAFT; generation, storage, owner epoch
+  // The fragment this report's figures describe. The authority checks
+  // the pair against committed topology: a (shard, leaf) pair that is
+  // not committed coverage at this topology generation is refused by
+  // name. A shard whose rows of the partition span several leaves
+  // produces one report per leaf, with disjoint row/byte attribution —
+  // never one report copied wholesale into every leaf.
+  uint64 topology_generation = 4;       // DRAFT
+  string leaf = 5;                      // DRAFT
+  // Rows and resident encoded bytes of the fragment in this shard.
+  uint64 rows = 6;                      // DRAFT
+  uint64 resident_bytes = 7;            // DRAFT
   // The band signal's numerator: scans served by this reporter that
   // were confined to this partition, inside the window below. Zero is
-  // a measured value (measured idle), not unknown; unknown is the
-  // absence of a current report, never a zero.
-  uint64 scans_observed = 6;            // DRAFT
+  // a measured value (measured idle): it means zero *qualifying*
+  // scans — it says nothing about broad queries that touched the
+  // partition without being confined to it. Unknown is the absence of
+  // a current report, never a zero.
+  uint64 scans_observed = 8;            // DRAFT
   // Attributed payload bytes of those scans, same window; diagnostic,
   // never an input to classification.
-  uint64 scan_bytes = 7;                // DRAFT
+  uint64 scan_bytes = 9;                // DRAFT
   // Queueing: the p50 and p99 queue wait this shard's scans of this
   // partition observed inside the window, microseconds. Unknown when
   // samples is zero; percentiles are per-reporter values and are never
   // merged across reporters (see the aggregation rules below).
-  uint64 queue_wait_p50_us = 8;         // DRAFT
-  uint64 queue_wait_p99_us = 9;         // DRAFT
-  uint32 samples = 10;                  // DRAFT; queue-wait sample count
+  uint64 queue_wait_p50_us = 10;        // DRAFT
+  uint64 queue_wait_p99_us = 11;        // DRAFT
+  uint32 samples = 12;                  // DRAFT; queue-wait sample count
   // Warmth: when this reporter last served a scan touching the
   // partition, unix ms. Zero means never observed since this
   // incarnation started; warmth is a last-touch time, not a cache
   // probe.
-  uint64 last_scanned_unix_ms = 11;     // DRAFT
-  // The exact window: [window_start_unix_ms, window_end_unix_ms).
-  // window_end is the observation time; both are the reporter's clock.
-  uint64 window_start_unix_ms = 12;     // DRAFT
-  uint64 window_end_unix_ms = 13;       // DRAFT
+  uint64 last_scanned_unix_ms = 13;     // DRAFT
+  // The cohort window: [window_start_unix_ms, window_end_unix_ms),
+  // aligned to the committed reporting cohort (below). window_end is
+  // the observation time; both are the reporter's clock.
+  uint64 window_start_unix_ms = 14;     // DRAFT
+  uint64 window_end_unix_ms = 15;       // DRAFT
 }
 
 // DRAFT. Identity as §2 defines it: resource-scoped.
@@ -238,81 +291,125 @@ message ReporterIdentity {
   bytes process_incarnation = 2;        // DRAFT; 16 bytes, minted at startup
 }
 
-// DRAFT. A shard at one source generation.
+// DRAFT. A shard's bytes as one committed installation: the source
+// generation, the storage incarnation of this copy, and the committed
+// ownership-history epoch. All three are equality-checked against the
+// authority's committed record; older *or newer* values are refused by
+// name, because a behind-or-ahead value names bytes other than the
+// committed ones (a replacement mints a new storage incarnation).
 message ShardRef {
   string shard = 1;                     // DRAFT
   uint64 source_generation = 2;         // DRAFT
+  bytes storage_incarnation = 3;        // DRAFT; 16 bytes
+  uint64 ownership_epoch = 4;           // DRAFT
 }
 ```
 
 **The signal the band consumes.** The tier band is scans per second
-per resident byte, and the observation now carries its inputs
-directly: `scans_observed` over the explicit window, and
-`resident_bytes`. Classification computes the rate in fixed point
-under §5's rules. The v1 attribution rule is the scan rate's existing
-one: a scan is attributed to a partition only when it was confined to
-that one partition; a scan that touched several partitions is
-attributed to none of them and appears only in the node-level rate.
+per resident byte, and the observation carries its inputs directly:
+`scans_observed` over the cohort window, and `resident_bytes`.
+Classification computes the rate in fixed point under §5's rules. The
+v1 attribution rule is the scan rate's existing one: a scan is
+attributed to a partition only when it was confined to that one
+partition; a scan that touched several partitions is attributed to
+none of them and appears only in the node-level rate. So
+`scans_observed == 0` asserts "no qualifying confined scan in this
+window", never "no query touched these rows".
+
+**The reporting cohort.** Windows are not per-reporter choices. The
+authority commits one **reporting cohort** — a window length `L` and a
+phase — and every reporter emits windows aligned to it:
+`[phase + k·L, phase + (k+1)·L)`. Rules:
+
+- A report whose window is not exactly one cohort window is refused at
+  ingest by name (example E10). There is no per-reporter window
+  normalization to define, because unaligned windows never enter the
+  stored set.
+- Aggregation combines only reports of the *same* cohort window: the
+  plan selects the latest cohort window fully closed at the frozen
+  planning instant (the *current cohort*), and only reports aligned to
+  it participate. Two reports with different windows — 60 scans in 60
+  seconds and 60 scans in 600 seconds — are never summed into one
+  rate.
+- A reporter whose latest report is for an earlier cohort window is
+  judged by the ordinary freshness rule against the frozen instant; a
+  fresh-but-previous-cohort report is stored, marked non-current, and
+  does not satisfy coverage.
 
 **Zero, idle, unknown — three different values.**
 
 - `scans_observed == 0` in a current report is **measured idle**: the
-  reporter was alive, the window is fresh, and nothing scanned the
-  partition. Its rate is exactly 0 and it classifies into a band whose
-  `lo` is 0.
-- **Unknown** is the absence of a current report from the committed
-  owner's current incarnation. Unknown is never rendered as zero, never
-  classifies, and under the coverage rule below refuses the plan.
-  (Example E3 works the pair literally.)
+  reporter was alive, the window is the current cohort, and no
+  qualifying scan was served. Its rate is exactly 0 and it classifies
+  into a band whose `lo` is 0.
+- **Unknown** is the absence of a current-cohort report from the
+  committed owner's current process and storage incarnation. Unknown
+  is never rendered as zero, never classifies, and under the coverage
+  rule below refuses the plan. (Example E3 works the pair literally.)
 - `resident_bytes == 0` with `rows > 0`, or `scans_observed > 0` with
   `resident_bytes == 0`, is an impossible state — a scan of zero
   resident bytes is attribution corruption — and the report is refused
-  by name. A shard holding no rows of a partition sends no report for
-  it at all.
+  by name. A shard holding no rows of a partition in a leaf sends no
+  report for that pair at all.
 
 **Report binding.** The stored observation key is the full tuple
-`(workspace, collection, derived_fingerprint, column, bucket, shard,
-source_generation, node_id, process_incarnation)`. Rules:
+`(workspace, collection, derived_fingerprint, column, bucket,
+topology_generation, leaf, shard, source_generation, ownership_epoch,
+node_id, process_incarnation, storage_incarnation)` — the same rows
+the §2 copy identity names, so an observation and the copy it
+describes can never disagree about which bytes were measured. Rules:
 
 - **Restart supersedes.** When node N's incarnation J lands its first
-  report, every stored observation keyed to `(…, N, J′)` with `J′ ≠ J`
-  is dropped in the same committed transition. An old incarnation's
-  freshness never counts, and a report from a superseded incarnation is
-  refused by name (example E5).
-- **Reshard refuses.** A report keyed to a source generation behind
-  the committed one is refused by name; it is never silently absorbed
-  into the new generation's set.
+  report, every stored observation keyed to `(…, N, J′, …)` with
+  `J′ ≠ J` is dropped in the same committed transition. An old
+  incarnation's freshness never counts, and a report from a superseded
+  incarnation is refused by name (example E5). A restart changes the
+  process incarnation only; the storage incarnation stays with the
+  bytes.
+- **Generation and epoch equality.** A report whose source generation,
+  ownership epoch, or topology generation is not *equal* to the
+  committed value — behind or ahead — is refused by name; it is never
+  silently absorbed into another generation's set. A refusal does not
+  change the stored set.
 - **Retries are idempotent; conflicts refuse.** A report whose key and
   window match a stored report: identical payload is a no-op (the set
   is unchanged, the epoch does not advance); a differing payload under
-  the same key and window is refused by name — the reporter must move
-  to a new window (example E6).
-- **Overlapping windows.** One stored observation per key: the one
-  with the greatest `window_end`. A report whose window overlaps but is
-  not equal to the stored one supersedes it if its `window_end` is
-  greater, and is discarded as superseded otherwise. Windows are
-  half-open, so disjoint windows never overlap.
+  the same key and window is refused by name — the reporter must wait
+  for the next cohort window (example E6).
+- **One stored observation per key.** Because every stored window is a
+  cohort window, the cohort rule replaces any overlap handling: the
+  stored report for a key is the one for the latest cohort window the
+  reporter has landed; an older-cohort report arriving later is
+  discarded as superseded.
 
-**Aggregation from partition-in-shard to partition.** The planner's
-partition figures come from the stored per-shard reports under
-coverage and deduplication rules, not from any merged summary:
+**Aggregation from reports to a fragment.** Classification is per
+fragment (§8), and each report is attributed to exactly one fragment
+by its (partition, topology generation, leaf), so the planner's
+fragment figures come from the stored reports under coverage and
+deduplication rules, not from any merged summary:
 
 - **Rows and resident bytes** sum over the reports of each shard's
   *committed owner* only. Shards partition the rows, so owner reports
   are disjoint and the sum is exact coverage; a replica's report is
   coverage evidence for §2's replica test and is never added again.
   If the committed owner of a covered shard has no current report, the
-  partition's bytes are unknown, not zero.
-- **Scans** sum over every current reporter (owner and serving
-  replicas): each reported scan happened once, at that node.
-- **Warmth** is the maximum `last_scanned_unix_ms` over current
-  reporters; zero participates as never.
+  fragment's bytes are unknown, not zero.
+- **Scans** sum over every current reporter of the fragment (owner and
+  serving replicas): each reported scan happened once, at that node.
+- **Warmth** is the maximum `last_scanned_unix_ms` over the fragment's
+  current reporters; zero participates as never.
 - **Percentiles are never aggregated.** Averaging or adding p50/p99
   values across reporters is not a percentile of anything, so the plan
   keeps them per reporter and never classifies on them; they appear in
   the response's placements as per-reporter diagnostics. A future
   mergeable distribution (a sketch with a stated merge rule) may
   replace them without changing the rest of this contract.
+- **Aggregate bounds are checked, not assumed.** At most 2²⁰ reports
+  may feed one fragment's aggregate (a larger fan-in refuses by name);
+  S and B accumulate in `u128`. With per-report `u64` fields and the
+  §5 window bound, the aggregates satisfy `S < 2⁸⁴` and `B < 2⁸⁴`,
+  which is what makes §5's `u128` rate argument hold for the
+  aggregates rather than only for single reports.
 
 **Freshness and the observation epoch.** The authority judges
 staleness from the frozen planning instant (§4), never from lease
@@ -388,8 +485,10 @@ Same snapshot, same plan, bitwise. The rules:
 - **No hidden inputs.** The context binds the authority that planned
   (identity and incarnation), both revisions, the observation set by
   digest, the full topology and tree by generation and digest, the
-  collection declaration, and the provider geometry. A topology
-  generation alone does not bind those values; per the
+  collection declaration, and the provider geometry — which includes
+  each node's committed capacity report (total and currently resident
+  bytes), the only capacity figure destination selection may use. A
+  topology generation alone does not bind those values; per the
   [authority convergence boundary](raft-control-design.md#single-authority-convergence-boundary-2026-09-08),
   the planner consumes the committed snapshot and performs no live
   coordinator lookups — a live lookup would be an unrecorded input and
@@ -402,20 +501,67 @@ iteration order is never an input:
   bucket ordinal) inside (workspace, collection);
 - observations are ordered by the §3 stored-key tuple;
 - nodes are ordered by node id;
-- within a step, the candidate partition is the one whose move lowers
-  the objective most, ties broken by partition identity, then by
-  destination node id, then by tier name — the same shape as
-  `PlanBalance`'s node-id-then-shard-id rule;
 - all arithmetic is the fixed-point integer arithmetic of §5; nothing
   floating point is computed, compared, or serialized anywhere in the
   plan.
 
-**plan_digest.** The plan's identity is
-`SHA-256("protomolt.capacity-plan-input.v1" ‖ 0x00 ‖ u32le(1) ‖ the context fields in the order above)`,
-each field in §5's canonical encoding. Because the context includes the resolved limits and
-the planning instant, two runs that differ only in a defaulted limit
-or in when they planned have different digests — a plan can always be
-checked against exactly what it planned from.
+**The v1 move algorithm is violation repair, not optimization.** A
+plan emits moves only to eliminate violations of the *classified*
+tier's constraints, and it does so in a fully specified order:
+
+1. **Classify** every covered partition's fragments (§5). A fragment
+   whose current copies already satisfy its classified tier's
+   residency kind and floor produces no moves; reclassification alone
+   never moves bytes, because all v1 tiers share residency kind
+   SERVER — the tier label changes what the floor demands, not where
+   bytes sit.
+2. **Collect violations** in deterministic order: fragments by
+   partition identity, then (topology generation, leaf); within a
+   fragment, floor violations before residency violations. A floor
+   violation needs `min_replicas − current_complete` added copies; a
+   residency violation (a complete copy on a node of the wrong
+   residency kind) needs one replacement copy per offending copy.
+3. **Build the candidate list** for each needed copy: nodes in the
+   fragment's leaf pool, residency SERVER, not already holding a
+   complete copy of the fragment, failure domain distinct from every
+   current complete copy, and with projected free bytes — committed
+   capacity minus committed resident bytes minus bytes already planned
+   onto that node earlier in *this* plan — greater than or equal to the
+   fragment's bytes. Candidates are ordered by projected free bytes
+   descending, ties by node id ascending.
+4. **Emit the move** to the first candidate, or record a capacity
+   refusal naming the fragment, the tier, and every candidate's
+   shortfall (example E13), then continue with the next violation.
+5. **Stop** when no violations remain or `max_moves` moves have been
+   emitted. Violations left unplanned because of the limit are
+   reported by name in the response; the emitted prefix is still a
+   complete plan for what it covers, since every emitted move is
+   independently floor-checked (§7).
+
+The objective this minimizes is bytes copied while eliminating every
+classified-tier violation. Each violation forces a fixed number of
+copies of a fixed fragment, so byte minimization reduces to
+destination choice, which step 3's ordering fixes. The complete
+tie-break key for any move is: (partition identity tuple, topology
+generation, leaf, violation kind, source node id, source storage
+incarnation, destination node id). Two planners given the same
+snapshot emit the same moves because every choice above is a function
+of the snapshot; example E12 is the golden nonempty case.
+
+**plan_digest.** The plan's identity, encoding version 2, is
+`SHA-256("protomolt.capacity-plan-input.v1" ‖ 0x00 ‖ u32le(2) ‖ the context fields in the order above ‖ u64le(cohort_length_ms) ‖ u64le(cohort_phase_unix_ms) ‖ nodes_digest ‖ fragments_digest)`,
+each field in §5's canonical encoding. `nodes_digest` is the SHA-256 of
+`"protomolt.capacity-plan-nodes.v1" ‖ 0x00 ‖ u32le(1) ‖ u32le(count) ‖ per node in id order: s(node_id) ‖ u8(residency: 0=Unspecified, 1=SERVER, 2=DEVICE) ‖ u8(eligible) ‖ s(failure_domain) ‖ u64le(total_bytes) ‖ u64le(resident_bytes)`.
+`fragments_digest` is the SHA-256 of
+`"protomolt.capacity-plan-fragments.v1" ‖ 0x00 ‖ u32le(1) ‖ u32le(count) ‖ per fragment in canonical order: partition ‖ u64le(topology_generation) ‖ s(leaf) ‖ pool in node-id order ‖ shard owners in shard order ‖ copies in (node, storage-incarnation) order, each as s(node) ‖ 16 bytes ‖ s(domain) ‖ u8(complete) ‖ 32-byte coverage digest`.
+Because the context includes the resolved limits, the planning instant,
+the cohort, the node registry, and the fragment records, two runs that
+differ in any effective input — a defaulted limit, a capacity figure, a
+failure domain, a residency, an eligibility, a pool, an owner, or a
+copy — have different digests: a plan can always be checked against
+exactly what it planned from. (Version 1 omitted the cohort, the node
+registry, and the fragment records; the third 2026-09-08 review found
+the gap, and version 2 is the deliberate correction.)
 
 ```proto
 // DRAFT. Not allocated. On ClusterControl, beside PlanBalance:
@@ -467,12 +613,22 @@ message CopyIdentity {                  // DRAFT
   string node_id = 1;                   // DRAFT
   bytes process_incarnation = 2;        // DRAFT
   bytes storage_incarnation = 3;        // DRAFT
+  uint64 ownership_epoch = 4;           // DRAFT; committed owner history
+}
+
+// DRAFT. An advisory destination description — deliberately not a
+// CopyIdentity. A dry run never mints the destination's storage
+// incarnation: no copy exists there, so there is nothing to name.
+// The future execution protocol assigns the reservation its
+// identities when it actually creates them.
+message MoveTarget {
+  string node_id = 1;                   // DRAFT
 }
 
 message TierMove {                      // DRAFT
   FragmentIdentity fragment = 1;        // DRAFT
-  CopyIdentity source = 2;              // DRAFT
-  CopyIdentity destination = 3;         // DRAFT; the reserved identity
+  CopyIdentity source = 2;              // DRAFT; fully bound, §2
+  MoveTarget destination = 3;           // DRAFT; advisory, never reserved
   string from_tier = 4;                 // DRAFT; "" when unclassified
   string to_tier = 5;                   // DRAFT
   uint64 bytes = 6;                     // DRAFT
@@ -523,12 +679,17 @@ nodes, partitions, and observations, and asserts the bytes do not
 change (example E8). A plan that depends on iteration order, wall
 clock beyond the frozen instant, or process identity fails it. The
 golden bytes are produced once, reviewed, and pinned per
-implementation — never regenerated to match a change — and the same
-golden test runs on the ARM and x86 builds; with §5's all-integer
-arithmetic and little-endian canonical encoding, the bytes are
-architecture-independent by construction, and the cross-arch run
-proves it. This is the tier-plan analogue of the placement suite's
-pruning-on/pruning-off answer identity.
+implementation — never regenerated to match a change. Because §5's
+arithmetic is all-integer and the canonical encoding is little-endian,
+the bytes are architecture-independent by construction; the executed
+cross-architecture proof is **pending**: it exists only when the
+planner is implemented and the same golden test has run on the ARM and
+x86 builds, with the exact commands, outputs, and tested
+implementations recorded here. Until then the claim is a design
+property, not a measured result; `scripts/verify_capacity_tier_fixtures.py`
+is today's executable evidence, and it verifies the fixtures against
+the rules, not any planner binary. This is the tier-plan analogue of
+the placement suite's pruning-on/pruning-off answer identity.
 
 ## 5. Canonical encodings, policy identity, and numeric rules
 
@@ -565,22 +726,40 @@ recursive and undefined, so the hashed form is the versioned policy
 literal bytes and digest of one policy and shows that permuting tier
 order changes the fingerprint, because order is precedence.
 
+**Where the policy lives.** The tier policy is declared in the shard
+map beside `[placement]` and `[[derived]]`, and that declaration is a
+*bootstrap or explicit update input*, not a live source: the authority
+reads it at bootstrap or on an explicit policy-update route, validates
+it (band validity, residency kinds, unique names), and commits the
+effective policy with a new `policy_revision`. Every frozen context
+carries the committed policy's revision and fingerprint. Reloading or
+editing the local shard-map file never overrides committed policy
+silently — a restarted authority whose file disagrees with its
+committed policy refuses to serve `PlanTiers` until an explicit update
+or a restored commit resolves the difference by name. This keeps one
+writer (the authority) and one committed value, so the file's role is
+configuration input, not a second live authority.
+
 **Fixed-point bands, exact classification.** The band's unit is the
 *nano*: scans per second per resident byte, times 10⁹, as a `u64`.
 There are no doubles anywhere in the contract — no NaN, no infinity,
 no signed zero, no serialization ambiguity, and no
-architecture-dependent evaluation. Given a partition's aggregate
-`scans_observed` S over a window of W milliseconds and aggregate
-`resident_bytes` B (both §3's rules), the classification rate is
+architecture-dependent evaluation. Given a fragment's aggregate
+`scans_observed` S over the current cohort window of W milliseconds
+and aggregate `resident_bytes` B (both §3's rules), the classification
+rate is
 
 ```
 rate_nanos = floor( S · 10¹² / (W · B) )
 ```
 
 computed in `u128` with checked conversions. A window longer than
-2⁴⁰ ms is refused at report ingest, so `W · B < 2¹⁰⁴` and
-`S · 10¹² < 2¹⁰⁴`: the arithmetic cannot overflow, and any violation
-of the bounds is a named refusal, never a wrap. Because the band edges
+2⁴⁰ ms is refused at report ingest, and §3's aggregation bounds cap a
+fragment's fan-in at 2²⁰ reports, so the *aggregate* S and B satisfy
+`S < 2⁸⁴` and `B < 2⁸⁴`, giving `W · B < 2¹²⁴` and
+`S · 10¹² < 2¹²⁴`: the arithmetic cannot overflow for single reports
+or for the aggregates the planner actually uses, and any violation of
+the bounds is a named refusal, never a wrap. Because the band edges
 are integers, floor division is exact: the true rational rate lies in
 `[lo, hi)` if and only if `rate_nanos` does, so no partition is
 misclassified by rounding, and a true rate exactly equal to `hi`
@@ -780,16 +959,27 @@ plan, because pruning is a per-query decision and capacity is not.
   foundations work; this contract names the dependency rather than
   bypassing it.
 
+
 ## 10. Worked examples, with literal fixtures
 
 These examples are the review fixtures: complete inputs and the
 expected classifications, plans, and refusals, with the digests
-pinned. When the planner is implemented, §4's proof-obligation test
-pins these literals as golden expectations; a behavior change must
-change the fixture by deliberate reviewed edit, never by regenerating
-goldens to match new output.
+pinned. Every pinned literal in this section is recomputed from the
+stated encodings by `scripts/verify_capacity_tier_fixtures.py`, an
+executable, stdlib-only verifier with all inputs and widths specified;
+run it with
 
-**Common fixture.** Unless an example says otherwise:
+```
+python3 scripts/verify_capacity_tier_fixtures.py
+```
+
+and it exits nonzero unless every recomputed value matches the value
+pinned here. When the planner is implemented, §4's proof-obligation
+test pins these same literals as golden expectations; a behavior
+change must change the fixture by deliberate reviewed edit, never by
+regenerating goldens to match new output.
+
+**Common fixture A.** Unless an example says otherwise:
 
 - workspace `ws-court`, collection `cases`.
 - Declaration D: `key_bucket = hash.fnv64(stable_key()) % 64u`. For
@@ -807,41 +997,76 @@ goldens to match new output.
   | warm | SERVER | 2 | [1, 100) | 86 400 s |
   | archive | SERVER | 2 | [0, 1) | none |
 
-- Nodes: `krick-1`, `pi5v1`, `pi5v3` (SERVER; failure domains `krick`,
-  `pi5`, `pi5` respectively — the two Pis share a domain), and `pi5v2`
-  (DEVICE). Tree generation 9; leaf `L4` = {krick-1, pi5v1, pi5v3}.
+- Nodes: `krick-1` (SERVER, failure domain `krick`), `pi5v1` (SERVER,
+  domain `pi5-west`), `pi5v3` (SERVER, domain `pi5-east`) — three
+  distinct domains — and `pi5v2` (DEVICE). Tree generation 9; leaf
+  `L4` = {krick-1, pi5v1, pi5v3}, leaf `L7` = {krick-1, pi5v1}.
+- Committed capacity reports (provider geometry): free bytes
+  krick-1 = 26 843 545 600 (25 GiB), pi5v1 = 16 106 127 360 (15 GiB),
+  pi5v3 = 0.
 - Frozen planning instant `T = 1788868800000` (2026-09-08T12:00:00Z).
-  Default window: `[1788868200000, 1788868800000)` (600 s). Resolved
-  limits unless stated: `max_moves = 16`, `max_observation_age_ms =
-  600000`, `clock_skew_bound_ms = 5000`. Authority `control-0`,
-  incarnation `00…01`; control revision 41, policy revision 7,
-  observation epoch 118.
-- Incarnations: `A = 00…0a`, `B = 00…0b` (16 bytes each).
-- Base observation set O, two reports for partition
-  `(ws-court, cases, 34386b55…26d0, key_bucket, 7)`:
+  The committed reporting cohort is `L = 600000 ms`, phase 0, so
+  cohort windows are the 600-second unix-aligned intervals; the current
+  cohort at T is `[1788868200000, 1788868800000)`. Resolved limits
+  unless stated: `max_moves = 16`, `max_observation_age_ms = 600000`,
+  `clock_skew_bound_ms = 5000`. Authority `control-0`, incarnation
+  `00…01`; control revision 41, policy revision 7.
+- Process incarnations: krick-1 `A = 00…0a`, pi5v1 `B = 00…0b`,
+  pi5v3 `C = 00…0c` (16 bytes each). Storage incarnations: krick-1's
+  s6 install `00…a1`, krick-1's s7 install `00…a2`, pi5v1's s6 install
+  `00…b1`, pi5v1's s7 install `00…b2`, pi5v3's s6 install `00…c1`.
+  Committed ownership epochs: shard s6 → 5, shard s7 → 2.
 
-  | shard (gen) | reporter | rows | resident bytes | scans | last scanned | samples |
-  |---|---|---|---|---|---|---|
-  | s6 (3) | krick-1 / A | 1 000 000 | 268 435 456 | 3 000 000 | T−5000 | 3000 (p50 1200 µs, p99 9400 µs) |
-  | s7 (3) | pi5v1 / B | 500 000 | 134 217 728 | 0 | T−3 600 000 | 0 |
+Bucket 7 spans two leaves, so it is two fragments, each with its own
+observation reports (§3's per-leaf attribution):
 
-  The s6 reporter also attributes `scan_bytes = 786 432 000 000`; the
-  s7 report's percentiles are unknown (`samples = 0`), not fast.
+- **Fragment (bucket 7, gen 9, L4)** lives in shard s6 (source
+  generation 3, ownership epoch 5): 1 000 000 rows, 268 435 456
+  resident bytes. Three complete copies, each verified against the
+  same coverage digest at source generation 3 — the example's
+  coverage-evidence constant is
+  `0dbf795457d54641dc05c4e7d679f8a1988de734d6f45594079ed463e02ca681`:
 
-  Aggregates under §3: rows 1 500 000, resident bytes 402 653 184,
-  scans 3 000 000, warmth T−5000. Rate:
-  `floor(3 000 000 · 10¹² / (600 000 · 402 653 184)) = 12417` nanos
-  (exact rational 12 417.6343…; floor is exact per §5). 12 417 ∈
-  [100, 10¹²) → **hot**.
+  | copy | node | proc inc. | storage inc. | domain |
+  |---|---|---|---|---|
+  | owner | krick-1 | 00…0a | 00…a1 | krick |
+  | replica | pi5v1 | 00…0b | 00…b1 | pi5-west |
+  | replica | pi5v3 | 00…0c | 00…c1 | pi5-east |
 
-  Canonical observation-set digest (`C` over the §3 stored-key order,
-  domain `protomolt.capacity-observations.v1`):
-  `67e90291160053b7bd8602114bc9a9f93345f12d5b4bd337a5df6a234cbb377b`.
+  Reports (window = current cohort): krick-1 — scans 3 000 000,
+  scan_bytes 786 432 000 000, p50 1200 µs, p99 9400 µs, samples 3000,
+  last_scanned T−5000. pi5v1 and pi5v3 — scans 0 (measured idle),
+  last_scanned 0 (never served since this incarnation), samples 0.
 
-  Plan digest for the full frozen context (tree digest
-  `SHA-256("example placement tree: gen 9, leaf L4 = {krick-1, pi5v1, pi5v3}")`,
-  provider-geometry digest `SHA-256("example provider geometry: turbovec 64-shard mapped image")`):
-  `1ffd7ca10bd031449688debc5c493de4ea8928195641cf31e7bc57027380725d`.
+- **Fragment (bucket 7, gen 9, L7)** lives in shard s7 (source
+  generation 3, ownership epoch 2): 500 000 rows, 134 217 728 resident
+  bytes. Two complete copies, coverage digest
+  `c06e53ec1642080f0acda4e03305040364fd96cbbeb37cd3106f2adc99ac18e0`:
+  owner pi5v1 (proc 00…0b, storage 00…b2, domain pi5-west) and replica
+  krick-1 (proc 00…0a, storage 00…a2, domain krick). Reports: pi5v1 —
+  scans 0, last_scanned T−3 600 000, samples 0; krick-1 — scans 0,
+  last_scanned 0, samples 0.
+
+Aggregates under §3 (fixture A observation epoch 118):
+
+- Fragment (7, L4): owner-only bytes B = 268 435 456 (the two replica
+  reports are coverage evidence, never re-added); scans S = 3 000 000
+  over all three reporters; warmth T−5000.
+  Rate: `floor(3 000 000 · 10¹² / (600 000 · 268 435 456)) = 18626`
+  nanos. 18 626 ∈ [100, 10¹²) → **hot**.
+- Fragment (7, L7): B = 134 217 728, S = 0 (measured idle), warmth
+  T−3 600 000. Rate 0 ∈ [0, 1) → **archive**.
+
+Canonical observation-set digest (domain
+`protomolt.capacity-observations.v1`, encoding version 1, entries
+ordered by the §3 stored-key tuple):
+`33d9878d3941dbc85ffddd22d4b739162bae935dd5476521a5f0a1439ab965e3`.
+
+Plan digest (encoding version 2) for the full frozen context (tree digest
+`SHA-256("example placement tree: gen 9, leaf L4 = {krick-1, pi5v1, pi5v3}, leaf L7 = {krick-1, pi5v1}")`,
+provider-geometry digest
+`SHA-256("example provider geometry: turbovec 64-shard mapped image; committed free bytes: krick-1=26843545600, pi5v1=16106127360, pi5v3=0")`):
+`363d0d80d42d9d9e1e3deb256792dab6c088d3aa82eada126e7a038c7460ce27`.
 
 ### E1. Cross-collection identical declarations
 
@@ -885,14 +1110,14 @@ to pi5v1's copy are one copy.
 
 ### E3. Measured idle versus missing data
 
-- Bucket 7's s7 report (fixture O): `scans_observed = 0` in a fresh
-  window from the current incarnation — **measured idle**. Its
-  contribution to the rate is exactly 0, the report classifies
-  normally, and had the aggregate rate fallen in [0, 1) the partition
-  would classify `archive`.
+- Fragment (7, L7) in fixture A: `scans_observed = 0` in current-cohort
+  reports from current incarnations — **measured idle**. Its rate is
+  exactly 0 and it classifies `archive`. The zero asserts "no
+  qualifying confined scan in this window"; a broad query that swept
+  the fragment without being confined to it leaves the zero untouched.
 - Bucket 11 is covered by policy P, but the committed owner of its
-  shard has sent no current report — **unknown**, not zero. The plan
-  refuses:
+  shard has sent no current-cohort report — **unknown**, not zero. The
+  plan refuses:
 
 ```
 plan_tiers: partition key_bucket=11 on node krick-1 has no current observation; unknown is not idle
@@ -922,41 +1147,49 @@ for freshness arithmetic.
 
 ### E5. Restarted reporters
 
-krick-1 (incarnation A) has a fresh stored report for (bucket 7, s6)
-with `window_end = T − 60000`. krick-1 restarts; incarnation B lands
-its first report at `window_end = T − 30000` with `scans_observed = 0`
-(measured idle for the window it can speak for). In the same committed
-transition the authority drops every observation keyed to
-`(…, krick-1, A)`; the epoch advances once. Consequences:
+krick-1 (process incarnation A, storage incarnation 00…a1) has a
+fresh stored report for fragment (7, L4). krick-1 restarts: new
+process incarnation `00…1a`, *same* storage incarnation — the bytes
+survived. Its first report lands for the current cohort with
+`scans_observed = 0`. In the same committed transition the authority
+drops every observation keyed to `(…, krick-1, 00…0a, …)`; the epoch
+advances once. Consequences:
 
-- The A report's freshness never counts, although its window is only
-  60 s old.
-- Classification now uses B: the partition's s6 scans for planning are
-  0, not 3 000 000.
-- A late-arriving A report — a retry that outlived its process — is
-  refused:
+- The old process's freshness never counts, although its window was
+  current.
+- Classification now uses the new incarnation's report: the
+  fragment's scans for planning drop to the serving replicas' 0, and
+  the fragment reclassifies from hot toward its measured rate — the
+  restart changed the *measurement*, which is correct: the process
+  that served 3 000 000 scans is gone.
+- A late-arriving report from process incarnation `00…0a` — a retry
+  that outlived its process — is refused:
 
 ```
-report_shard: node krick-1 incarnation 00…0a is superseded by 00…0b
+report_shard: node krick-1 incarnation 00…0a is superseded by 00…1a
 ```
+
+Had krick-1 instead re-installed the fragment's bytes, the storage
+incarnation would change (`00…a1` → new), the authority's committed
+ownership epoch would advance, and every observation keyed to the old
+storage incarnation would be refused as naming replaced bytes.
 
 ### E6. Duplicate reports and window conflicts
 
-- The s6 report of fixture O is retried byte-identically (same key,
-  same window): idempotent no-op. The stored set is unchanged, the
-  observation-set digest stays `67e90291…377b`, and the epoch stays
-  118.
+- The krick-1 L4 report of fixture A is retried byte-identically (same
+  key, same cohort window): idempotent no-op. The stored set is
+  unchanged, the observation-set digest stays `33d9878d…65e3`, and the
+  epoch stays 118.
 - The same key and window arrives with `scans_observed = 2 999 999`:
-  refused, naming the conflict — the reporter must emit a new window:
+  refused, naming the conflict — the reporter must wait for the next
+  cohort window:
 
 ```
-report_shard: observation for (key_bucket=7, s6, gen 3) window [1788868200000, 1788868800000) from krick-1/00…0a conflicts with the stored report
+report_shard: observation for (key_bucket=7, gen 9, L4, s6, gen 3) window [1788868200000, 1788868800000) from krick-1/00…0a conflicts with the stored report
 ```
 
-- A report with window `[1788868201000, 1788868801000)` (overlapping,
-  greater end) supersedes the stored one; one with window
-  `[1788867600000, 1788868200000)` (earlier, disjoint) is discarded as
-  superseded by the newer stored window.
+- A report for the previous cohort window arriving late is discarded
+  as superseded by the stored current-cohort report for the same key.
 
 ### E7. Policy hashing, pinned
 
@@ -985,18 +1218,21 @@ Pinned consequences:
   both values.
 - A tier with `lo >= hi` (e.g. warm edited to [100, 100)) is refused
   at validation, not hashed.
+- An operator who edits the policy in the shard-map file changes
+  nothing committed: the authority keeps serving the committed policy
+  at revision 7 until an explicit update commits a new revision (§5).
 
 ### E8. Permuted input order, identical plan
 
-The authority applies the two fixture reports in the order (O_s6,
-O_s7) and, on a second instance, (O_s7, O_s6). Canonicalization orders
-the stored set by the §3 key tuple either way, so:
+The authority applies fixture A's five reports in two different
+orders on two planner instances. Canonicalization orders the stored
+set by the §3 key tuple either way, so:
 
-- observation-set digest is `67e90291…377b` in both;
+- observation-set digest is `33d9878d…65e3` in both;
 - the plan bytes are identical in both, with plan digest
-  `1ffd7ca1…725d`.
+  `363d0d80…ce27`.
 
-Expected plan output for the fixture, stated literally:
+Expected plan output for fixture A, stated literally:
 
 ```
 PlanTiersResponse {
@@ -1006,31 +1242,63 @@ PlanTiersResponse {
   control_revision: 41  policy_revision: 7
   policy_fingerprint: "5858b135…08eb"
   observation_epoch: 118
-  observation_set_digest: "67e90291…377b"
+  observation_set_digest: "33d9878d…65e3"
   topology_generation: 9
   workspace: "ws-court"  collection: "cases"
   derived_fingerprint: "34386b55…26d0"
-  plan_digest: "1ffd7ca1…725d"
+  plan_digest: "363d0d80…ce27"
   placements: [
-    { partition: (ws-court, cases, 34386b55…26d0, key_bucket, 7),
+    { fragment: (ws-court, cases, 34386b55…26d0, key_bucket, 7, gen 9, L4),
       classified_tier: "hot",
-      rate_nanos: 12417, rows: 1500000, resident_bytes: 402653184,
+      rate_nanos: 18626, rows: 1000000, resident_bytes: 268435456,
       last_scanned_unix_ms: 1788868795000,
+      complete_replicas: [
+        { copy: (krick-1, 00…0a, 00…a1, epoch 5), domain: "krick",
+          coverage: "0dbf7954…a681" },
+        { copy: (pi5v1, 00…0b, 00…b1, epoch 5), domain: "pi5-west",
+          coverage: "0dbf7954…a681" },
+        { copy: (pi5v3, 00…0c, 00…c1, epoch 5), domain: "pi5-east",
+          coverage: "0dbf7954…a681" } ],
       reporters: [
         { node: "krick-1", shard: "s6", p50_us: 1200, p99_us: 9400, samples: 3000 },
-        { node: "pi5v1",  shard: "s7", samples: 0 } ] }
+        { node: "pi5v1",  shard: "s6", samples: 0 },
+        { node: "pi5v3",  shard: "s6", samples: 0 } ] },
+    { fragment: (…, key_bucket, 7, gen 9, L7),
+      classified_tier: "archive",
+      rate_nanos: 0, rows: 500000, resident_bytes: 134217728,
+      last_scanned_unix_ms: 1788865200000,
+      complete_replicas: [
+        { copy: (pi5v1, 00…0b, 00…b2, epoch 2), domain: "pi5-west",
+          coverage: "c06e53ec…18e0" },
+        { copy: (krick-1, 00…0a, 00…a2, epoch 2), domain: "krick",
+          coverage: "c06e53ec…18e0" } ],
+      reporters: [
+        { node: "pi5v1",  shard: "s7", samples: 0 },
+        { node: "krick-1", shard: "s7", samples: 0 } ] }
   ]
-  moves: []    # bucket 7 already sits on three SERVER nodes in L4; hot's floor of 3 is met
+  moves: []
 }
 ```
 
-The percentiles appear per reporter, unmerged. A partition with
-`scans_observed = 60000` on the same bytes would classify at 248 nanos
-→ `warm`; the fixture's 3 000 000 scans is what puts it in `hot`.
+`moves: []` because both classified tiers' constraints are satisfied
+by *proven* copies: hot's floor of 3 is met by three complete replicas
+in three distinct failure domains, each with coverage evidence at the
+committed source generation and ownership epoch; archive's floor of 2
+is met by two. Node count plays no part — delete the coverage digest
+from any copy and the floor check fails (E2's refusal shape), even
+though the node still holds the rows.
+
+The warm literal: had the L4 reporters served `scans_observed =
+12 000` in the same window on the same bytes, the rate would be
+`floor(12 000 · 10¹² / (600 000 · 268 435 456)) = 74` nanos ∈ [1, 100)
+→ `warm`. (The fixture's 3 000 000 scans at 18 626 nanos is `hot`;
+an earlier draft of this example used 60 000 scans — 248 nanos —
+which is hot under these bands, not warm. 12 000 is the corrected
+literal.)
 
 ### E9. Multi-step plans and revisions
 
-Suppose plan P (digest `1ffd7ca1…725d`, control revision 41, epoch
+Suppose plan P (digest `363d0d80…ce27`, control revision 41, epoch
 118) carries two moves, m1 then m2, for two fragments. Under strict
 per-step revision comparison, if an executor commits m1, the control
 revision advances to 42 — and m2, which carries 41, refuses:
@@ -1050,41 +1318,188 @@ must refuse when an unrelated observation or topology change would
 reinterpret an accepted step. Until that contract is reviewed, m1 and
 m2 are lines in a report an operator reads.
 
+### E10. Unequal windows never aggregate
+
+krick-1 emits a report with window `[1788868140000, 1788868740000)` —
+660 seconds, offset from the cohort grid. It is refused at ingest:
+
+```
+report_shard: window [1788868140000, 1788868740000) is not a cohort window (length 600000 ms, phase 0)
+```
+
+The rule the cohort replaces: without alignment, 60 scans in 60
+seconds from one reporter and 60 scans in 600 seconds from another
+could be summed into "120 scans" over an unspecified duration — a
+rate of nothing. Under the cohort rule both reports either name the
+same 600-second window and aggregate, or name different cohort
+windows, in which case only the current cohort participates in the
+plan and the earlier one is staleness-judged, never blended.
+
+### E11. One partition, two leaves, two tiers
+
+Fixture A is the multi-leaf example. Bucket 7's rows were split by
+the placement tree on `year`: the year≤2020 rows live in shard s6
+under leaf L4, the rest in shard s7 under leaf L7. The s6 node does
+**not** copy its report into L7: it reports (bucket 7, s6, L4) with
+exactly the rows and bytes that leaf holds, and the s7 node reports
+(bucket 7, s7, L7) with its own. Classification runs per fragment
+with per-fragment aggregates, so the same bucket ordinal classifies
+**hot** in L4 (18 626 nanos) and **archive** in L7 (0 nanos,
+measured idle) in one plan — E8's response shows both placements side
+by side. A move the plan might one day emit for one fragment is
+bounded by that fragment's leaf pool and says nothing about the
+other.
+
+### E12. A nonempty move plan, fully specified
+
+Fixture M: same world as fixture A, plus two cold partitions whose
+rows sit in shard s6 under leaf L4, each with exactly one complete
+copy on pi5v3 (proc 00…0c, storage 00…c1, epoch 5):
+
+| bucket | rows | resident bytes | scans (cohort) | last scanned |
+|---|---|---|---|---|
+| 5 | 80 000 | 21 474 836 480 (20 GiB) | 0 | T−7 200 000 |
+| 6 | 72 000 | 19 327 352 832 (18 GiB) | 0 | T−10 800 000 |
+
+Both classify `archive` (rate 0), floor 2, one complete copy each —
+two floor violations. Observation epoch 119; fixture M's
+observation-set digest is
+`236d6740a5d5eaec435bb2b6c4b85644ed437ff87b40fd6b9150579ead21f6e1`
+and its plan digest is
+`69725b5f19f17c5f42e5fbd45074c11ed941ac5ad1962a9de993dac6cb2400c1`
+(fixture M's frozen context is fixture A's with epoch 119 and the M
+observation set; note fixture M *replaces* fixture A's bucket-7
+reports for this example — its observation set is exactly the two
+reports above).
+
+The repair loop (§4):
+
+1. Violations in partition-identity order: bucket 5 before bucket 6.
+2. Bucket 5 needs one copy. Candidates in L4's pool: krick-1
+   (projected free 25 GiB ≥ 20 GiB, domain `krick` ≠ `pi5-east`),
+   pi5v1 (15 GiB < 20 GiB — ineligible). Ordered by projected free
+   descending: krick-1.
+3. Emit:
+
+```
+TierMove {
+  fragment: (ws-court, cases, 34386b55…26d0, key_bucket, 5, gen 9, L4)
+  source:      { node_id: "pi5v3", process_incarnation: 00…0c,
+                 storage_incarnation: 00…c1, ownership_epoch: 5 }
+  destination: { node_id: "krick-1" }    # advisory; no incarnation minted
+  from_tier: "archive"  to_tier: "archive"
+  bytes: 21474836480
+  plan_digest: "69725b5f…00c1"  control_revision: 41
+  observation_epoch: 119  policy_fingerprint: "5858b135…08eb"
+}
+```
+
+`from_tier == to_tier` is correct: the move repairs the floor, the
+classification is unchanged. The destination is an advisory target
+description; the storage incarnation of the copy it proposes does not
+exist and is not named.
+
+### E13. Capacity refusal
+
+Fixture M continues: bucket 6 needs one copy of 18 GiB. After the
+bucket-5 move is planned onto krick-1, projected free bytes are
+krick-1 = 25 − 20 = 5 GiB and pi5v1 = 15 GiB; both are below 18 GiB.
+No candidate remains, so the plan records a refusal instead of a move:
+
+```
+plan_tiers: tier "archive" floor is 2 for partition key_bucket=6, but no eligible destination in leaf L4 has capacity: krick-1 has 5368709120 free after earlier planned moves, pi5v1 has 16106127360 free, the fragment needs 19327352832
+```
+
+The plan still contains the bucket-5 move; the refusal is reported
+per violation, and the emitted prefix is a complete plan for what it
+covers (§4 step 5). Re-running the same snapshot emits the same move
+and the same refusal, byte-identically.
+
 ## 11. Review dispositions
 
-The 2026-09-08 operator review of the 2026-09-07 draft resolved the
-original checklist as follows; the section numbers are this revision's.
+The 2026-09-08 operator review of the 2026-09-07 draft, and its
+second pass over the first amendment, resolved the original checklist
+as follows; the section numbers are this revision's.
 
 1. **Identity** — superseded: the partition identity is the
-   resource-scoped quintuple of §2, and movement names fragments and
-   copies, never bare partitions, leaves, or addresses.
-2. **Carrier** — retained: per-(partition, shard) reporting on
-   `ReportShard`, now bound to reporter incarnation and source
-   generation, with explicit aggregation rules (§3).
-3. **Attribution** — retained for v1 (confined scans only), and the
-   band's signal is now a carried counter (`scans_observed` over an
-   explicit window), not a derivative of byte throughput (§3, §5).
+   resource-scoped quintuple of §2; movement names fragments and
+   copies; copies and reports bind the committed owner/history
+   (`ownership_epoch`) and storage incarnation with equality checks
+   in both directions.
+2. **Carrier** — retained: per-(partition, shard, leaf) reporting on
+   `ReportShard`, bound to process incarnation, storage incarnation,
+   source generation, and ownership epoch, with explicit aggregation
+   rules (§3).
+3. **Attribution** — retained for v1 (confined scans only), with zero
+   defined as zero *qualifying* scans; the band's signal is a carried
+   counter (`scans_observed`) over a cohort-aligned window, not a
+   derivative of byte throughput (§3, §5).
 4. **Refuse-on-stale** — retained, with the measured-idle/unknown
-   distinction made explicit so cold-but-measured partitions still
+   distinction explicit so cold-but-measured partitions still
    classify (§3, E3).
-5. **Band units** — scans per second per resident byte, kept, now in
-   fixed-point nanos with exact integer-edge classification (§5).
+5. **Band units** — scans per second per resident byte, kept, in
+   fixed-point nanos with exact integer-edge classification and
+   checked aggregate bounds (§5).
 6. **Movement scope** — retained: per (partition, leaf) fragments
-   inside the leaf's node set (§2, §8).
-7. **Floors** — per tier, counted in complete replicas, with the
-   old-tier/new-tier transition point defined (§7).
-8. **Golden fixtures** — pinned literals, reviewed expectations,
-   proven on both architectures; never regenerated to match a change
-   (§4, §10).
+   inside the leaf's node set (§2, §8, E11).
+7. **Floors** — per tier, counted in complete replicas with coverage
+   and source-version evidence, with the old-tier/new-tier transition
+   point defined (§7, E8).
+8. **Golden fixtures** — pinned literals in §10, recomputed by the
+   committed executable verifier
+   (`scripts/verify_capacity_tier_fixtures.py`); the fixtures are
+   reviewed expectations, never regenerated to match a change. The
+   cross-architecture ARM/x86 golden run is **pending**: it is a
+   property to demonstrate on the implemented planner, with exact
+   commands and outputs recorded here once they exist, not a claimed
+   result.
 9. **Refusal texts** — the §3, §5, §6, §7 texts are the set the
    executor's log must preserve verbatim.
-10. **Policy location** — still the operator's call: whether the tier
-    policy lives in the shard map beside `[placement]` and
-    `[[derived]]` so one file carries all three identities.
+10. **Policy location** — resolved: the policy is declared in the
+    shard map beside `[placement]` and `[[derived]]` as bootstrap or
+    explicit-update input; the effective policy is committed with its
+    `policy_revision` in the authority and returned in every frozen
+    context; reloading the local file never silently overrides
+    committed policy (§5).
+
+The third 2026-09-08 review (of the first implementation) found five
+defects, all repaired on `feat/capacity-tiers` with counterexample
+regressions:
+
+1. **Resource/identity binding at the planning boundary** — the
+   planner had grouped reports by a shortened key. The planner now
+   keys on full identity, and the validated constructor re-verifies
+   every observation and fragment against the committed view's
+   resource, owner/history, and copy records; duplicates refuse rather
+   than overwrite.
+2. **Digest completeness** — plan-input encoding version 2 (§4) now
+   binds the cohort and canonical subdigests of the node registry and
+   the fragment records; the §10 digests were recomputed deliberately
+   and the Python oracle recomputes them.
+3. **Bounds and arithmetic as hard refusals** — cohort length
+   validated before any division, checked skew addition, epoch
+   increments preflight-checked before mutation, retained accounting
+   charged by allocation capacity for both key and value, a bounded
+   incarnation registry, replica floors capped at policy validation,
+   and admission caps on observations, fragments, and nodes.
+4. **Residency and eligibility** — the snapshot's node registry
+   carries self-declared residency, eligibility, failure domain, and
+   capacity; `complete` claims validate against it (Server, eligible,
+   one coverage digest per fragment), device-local and unspecified
+   sources are never candidates or verified copies, and pools, owners,
+   and copies are derived from the committed view rather than accepted
+   from the caller.
+5. **Permutation coverage** — the constructor canonicalizes every
+   unordered input and refuses duplicates, so reversed fragments,
+   copies, and pools yield byte-identical plans; two fragments
+   competing for one destination resolve in canonical partition order.
+   Policy tier order stays semantic and is never sorted.
 
 **Next bounded task (per the review's handoff).** With these semantics
-fixed: implement bounded observation collection and a pure dry-run
-planner against committed input snapshots, with §10's literals as the
-golden tests. Move execution, ownership changes, transport tag
+fixed, the fixtures verified by the committed script, and the
+implementation's golden tests green: wire the store and the validated
+snapshot into the control plane's persistence and revision allocation
+(Fable's track), then the cohort-aligned reporting path on
+`ReportShard`. Move execution, ownership changes, transport tag
 allocation, and further fleet operations stay out of that task;
 source-authority activation remains on the foundations track.
