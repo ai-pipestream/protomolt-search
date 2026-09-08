@@ -32,6 +32,109 @@ struct Chunk {
     #[prost(uint64, optional, tag = "4")]
     value: Option<u64>,
 }
+#[derive(Clone, PartialEq, Message)]
+struct ParentWithSecondary {
+    #[prost(fixed64, tag = "1")]
+    id: u64,
+    #[prost(message, repeated, tag = "2")]
+    chunks: Vec<ChunkWithSecondary>,
+}
+#[derive(Clone, PartialEq, Message)]
+struct ChunkWithSecondary {
+    #[prost(uint64, tag = "1")]
+    id: u64,
+    #[prost(string, tag = "2")]
+    body: String,
+    #[prost(float, repeated, tag = "3")]
+    embedding: Vec<f32>,
+    #[prost(uint64, optional, tag = "4")]
+    value: Option<u64>,
+    #[prost(string, optional, tag = "5")]
+    secondary: Option<String>,
+}
+
+fn source_with_present_empty_secondary(count: usize) -> ProtobufSource {
+    use prost_reflect::{DescriptorPool, DynamicMessage, Value};
+
+    // Decode through reflection so custom FieldOptions remain unknown fields
+    // on descriptor messages instead of being discarded by prost_types.
+    let pool = DescriptorPool::global();
+    let set_descriptor = pool
+        .get_message_by_name("google.protobuf.FileDescriptorSet")
+        .unwrap();
+    let field_descriptor = pool
+        .get_message_by_name("google.protobuf.FieldDescriptorProto")
+        .unwrap();
+    let oneof_descriptor = pool
+        .get_message_by_name("google.protobuf.OneofDescriptorProto")
+        .unwrap();
+    let mut set = DynamicMessage::decode(set_descriptor, DESCRIPTOR).unwrap();
+    let files = set
+        .get_field_by_name_mut("file")
+        .unwrap()
+        .as_list_mut()
+        .unwrap();
+    let file = files
+        .iter_mut()
+        .filter_map(Value::as_message_mut)
+        .find(|file| {
+            file.get_field_by_name("package").unwrap().as_str() == Some("unsigned_mapping")
+        })
+        .unwrap();
+    let messages = file
+        .get_field_by_name_mut("message_type")
+        .unwrap()
+        .as_list_mut()
+        .unwrap();
+    let chunk = messages
+        .iter_mut()
+        .filter_map(Value::as_message_mut)
+        .find(|message| message.get_field_by_name("name").unwrap().as_str() == Some("Chunk"))
+        .unwrap();
+    let oneofs = chunk
+        .get_field_by_name_mut("oneof_decl")
+        .unwrap()
+        .as_list_mut()
+        .unwrap();
+    let oneof_index = oneofs.len() as i32;
+    let mut oneof = DynamicMessage::new(oneof_descriptor);
+    oneof.set_field_by_name("name", Value::String("_secondary".into()));
+    oneofs.push(Value::Message(oneof));
+    let mut field = DynamicMessage::new(field_descriptor);
+    field.set_field_by_name("name", Value::String("secondary".into()));
+    field.set_field_by_name("number", Value::I32(5));
+    field.set_field_by_name("label", Value::EnumNumber(1)); // LABEL_OPTIONAL
+    field.set_field_by_name("type", Value::EnumNumber(9)); // TYPE_STRING
+    field.set_field_by_name("oneof_index", Value::I32(oneof_index));
+    field.set_field_by_name("proto3_optional", Value::Bool(true));
+    field.set_field_by_name("json_name", Value::String("secondary".into()));
+    chunk
+        .get_field_by_name_mut("field")
+        .unwrap()
+        .as_list_mut()
+        .unwrap()
+        .push(Value::Message(field));
+
+    let mut payload = ParentWithSecondary {
+        id: u64::MAX,
+        chunks: (0..count)
+            .map(|i| ChunkWithSecondary {
+                id: i as u64,
+                body: format!("accepted chunk {i}"),
+                embedding: vec![0.25; 8],
+                value: Some(i as u64),
+                secondary: Some(String::new()),
+            })
+            .collect(),
+    }
+    .encode_to_vec();
+    payload.extend_from_slice(&[0xa0, 6, 0x81, 0]);
+    ProtobufSource {
+        descriptor_set: set.encode_to_vec(),
+        message_type: TYPE.into(),
+        payload,
+    }
+}
 fn source(count: usize, bad_last: bool) -> ProtobufSource {
     let mut payload = Parent {
         id: u64::MAX,
@@ -222,6 +325,70 @@ async fn accepted_rows_are_analyzed_materialized_and_sealed_without_publication(
     assert_eq!(fixture.stages(), 1);
     drop(candidate);
     assert_eq!(fixture.stages(), 0);
+}
+
+#[tokio::test]
+async fn staged_projection_keeps_present_empty_secondary_text_but_ingest_omits_it() {
+    let mut fixture = Fixture::new();
+    let original = source_with_present_empty_secondary(2);
+    let plan = mapping::derive_plan(&original.descriptor_set, TYPE).unwrap();
+    let secondary = plan
+        .fields
+        .iter()
+        .find(|field| field.path == "chunks.secondary")
+        .unwrap()
+        .name
+        .clone();
+    fixture.config.bm25_fields.push(secondary.clone());
+    let receipt = fixture.accept(1, Some(original.clone()));
+    let mut request = fixture.request(&receipt);
+    let projection = request.projection.as_mut().unwrap();
+    projection.expected_plan_fingerprint = plan.fingerprint;
+    projection.body_path = "chunks.body".into();
+    request.field_analysis.push(MappedFieldAnalysis {
+        path: "chunks.secondary".into(),
+        analysis: Some(body_spec()),
+    });
+
+    let prepared = fixture
+        .catalog
+        .prepare_projection(request.projection.as_ref().unwrap())
+        .unwrap();
+    assert_eq!(prepared.source, Some(original.clone()));
+    assert_eq!(prepared.rows.len(), 2);
+    for row in &prepared.rows {
+        let empty = row
+            .document
+            .as_ref()
+            .unwrap()
+            .fields
+            .iter()
+            .find(|field| field.field == secondary)
+            .expect("explicitly present secondary field");
+        assert_eq!(empty.text, "");
+    }
+
+    let node = Arc::new(NodeServiceImpl::open(fixture.config.clone(), None, false).unwrap());
+    let candidate = node
+        .stage_document_projection(fixture.catalog.clone(), request)
+        .await
+        .unwrap();
+    assert_eq!(candidate.source(), Some(&original));
+    for row in 0..2 {
+        assert_eq!(
+            candidate
+                .segments()
+                .unwrap()
+                .bm25(0)
+                .protobuf_source(row)
+                .unwrap(),
+            Some((original.clone(), Some(row)))
+        );
+    }
+    let activation = publish_candidate(node.clone(), fixture.catalog.clone(), candidate)
+        .await
+        .unwrap();
+    assert_active_rows(&node, &activation, &[0, 1]).await;
 }
 
 #[tokio::test]

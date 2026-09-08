@@ -1,0 +1,1168 @@
+{
+  "cases": [
+    {
+      "case": "utf8_ascii_control",
+      "cpp_protoc": {
+        "exit_code": 0,
+        "stderr": "",
+        "success": true,
+        "text_output": "text: \"A\"\n"
+      },
+      "expected_source_preserved": true,
+      "input_hex": "0a0141",
+      "product": {
+        "disposition": "accept",
+        "expected_fields": {
+          "text": {
+            "text": "A",
+            "utf8_hex": "41"
+          }
+        }
+      },
+      "python_upb": {
+        "initialization_errors": {
+          "success": true,
+          "value": []
+        },
+        "initialized": {
+          "success": true,
+          "value": true
+        },
+        "known_fields": {
+          "success": true,
+          "value": {
+            "text": {
+              "text": "A",
+              "utf8_hex": "41"
+            }
+          }
+        },
+        "parse": {
+          "success": true,
+          "value": 3
+        },
+        "serialized_hex": {
+          "success": true,
+          "value": "0a0141"
+        }
+      },
+      "syntax": "proto2"
+    },
+    {
+      "case": "utf8_multibyte_boundary_control",
+      "cpp_protoc": {
+        "exit_code": 0,
+        "stderr": "",
+        "success": true,
+        "text_output": "text: \"\\303\\251\"\n"
+      },
+      "expected_source_preserved": true,
+      "input_hex": "0a02c3a9",
+      "product": {
+        "disposition": "accept",
+        "expected_fields": {
+          "text": {
+            "text": "é",
+            "utf8_hex": "c3a9"
+          }
+        }
+      },
+      "python_upb": {
+        "initialization_errors": {
+          "success": true,
+          "value": []
+        },
+        "initialized": {
+          "success": true,
+          "value": true
+        },
+        "known_fields": {
+          "success": true,
+          "value": {
+            "text": {
+              "text": "é",
+              "utf8_hex": "c3a9"
+            }
+          }
+        },
+        "parse": {
+          "success": true,
+          "value": 4
+        },
+        "serialized_hex": {
+          "success": true,
+          "value": "0a02c3a9"
+        }
+      },
+      "syntax": "proto2"
+    },
+    {
+      "case": "utf8_invalid_lone_ff",
+      "cpp_protoc": {
+        "exit_code": 0,
+        "stderr": "",
+        "success": true,
+        "text_output": "text: \"\\377\"\n"
+      },
+      "expected_source_preserved": true,
+      "input_hex": "0a01ff",
+      "product": {
+        "disposition": "refuse",
+        "error_contains": "invalid string value",
+        "reason": "declared strings require valid UTF-8"
+      },
+      "python_upb": {
+        "initialization_errors": {
+          "success": true,
+          "value": []
+        },
+        "initialized": {
+          "success": true,
+          "value": true
+        },
+        "known_fields": {
+          "success": true,
+          "value": {
+            "text": {
+              "bytes_hex": "ff"
+            }
+          }
+        },
+        "parse": {
+          "success": true,
+          "value": 3
+        },
+        "serialized_hex": {
+          "success": true,
+          "value": "0a01ff"
+        }
+      },
+      "syntax": "proto2"
+    },
+    {
+      "case": "utf8_invalid_continuation",
+      "cpp_protoc": {
+        "exit_code": 0,
+        "stderr": "",
+        "success": true,
+        "text_output": "text: \"\\303(\"\n"
+      },
+      "expected_source_preserved": true,
+      "input_hex": "0a02c328",
+      "product": {
+        "disposition": "refuse",
+        "error_contains": "invalid string value",
+        "reason": "declared strings require valid UTF-8"
+      },
+      "python_upb": {
+        "initialization_errors": {
+          "success": true,
+          "value": []
+        },
+        "initialized": {
+          "success": true,
+          "value": true
+        },
+        "known_fields": {
+          "success": true,
+          "value": {
+            "text": {
+              "bytes_hex": "c328"
+            }
+          }
+        },
+        "parse": {
+          "success": true,
+          "value": 4
+        },
+        "serialized_hex": {
+          "success": true,
+          "value": "0a02c328"
+        }
+      },
+      "syntax": "proto2"
+    },
+    {
+      "case": "uint64_zero_canonical_control",
+      "cpp_protoc": {
+        "exit_code": 0,
+        "stderr": "",
+        "success": true,
+        "text_output": "text: \"\"\nnumber: 0\n"
+      },
+      "expected_source_preserved": true,
+      "input_hex": "0a001000",
+      "product": {
+        "disposition": "accept",
+        "expected_fields": {
+          "number": 0,
+          "text": {
+            "text": "",
+            "utf8_hex": ""
+          }
+        }
+      },
+      "python_upb": {
+        "initialization_errors": {
+          "success": true,
+          "value": []
+        },
+        "initialized": {
+          "success": true,
+          "value": true
+        },
+        "known_fields": {
+          "success": true,
+          "value": {
+            "number": 0,
+            "text": {
+              "text": "",
+              "utf8_hex": ""
+            }
+          }
+        },
+        "parse": {
+          "success": true,
+          "value": 4
+        },
+        "serialized_hex": {
+          "success": true,
+          "value": "0a001000"
+        }
+      },
+      "syntax": "proto2"
+    },
+    {
+      "case": "uint64_zero_ten_byte_noncanonical_boundary",
+      "cpp_protoc": {
+        "exit_code": 0,
+        "stderr": "",
+        "success": true,
+        "text_output": "text: \"\"\nnumber: 0\n"
+      },
+      "expected_source_preserved": true,
+      "input_hex": "0a001080808080808080808000",
+      "product": {
+        "disposition": "accept",
+        "expected_fields": {
+          "number": 0,
+          "text": {
+            "text": "",
+            "utf8_hex": ""
+          }
+        }
+      },
+      "python_upb": {
+        "initialization_errors": {
+          "success": true,
+          "value": []
+        },
+        "initialized": {
+          "success": true,
+          "value": true
+        },
+        "known_fields": {
+          "success": true,
+          "value": {
+            "number": 0,
+            "text": {
+              "text": "",
+              "utf8_hex": ""
+            }
+          }
+        },
+        "parse": {
+          "success": true,
+          "value": 13
+        },
+        "serialized_hex": {
+          "success": true,
+          "value": "0a001000"
+        }
+      },
+      "syntax": "proto2"
+    },
+    {
+      "case": "uint64_max_ten_byte_boundary",
+      "cpp_protoc": {
+        "exit_code": 0,
+        "stderr": "",
+        "success": true,
+        "text_output": "text: \"\"\nnumber: 18446744073709551615\n"
+      },
+      "expected_source_preserved": true,
+      "input_hex": "0a0010ffffffffffffffffff01",
+      "product": {
+        "disposition": "accept",
+        "expected_fields": {
+          "number": 18446744073709551615,
+          "text": {
+            "text": "",
+            "utf8_hex": ""
+          }
+        }
+      },
+      "python_upb": {
+        "initialization_errors": {
+          "success": true,
+          "value": []
+        },
+        "initialized": {
+          "success": true,
+          "value": true
+        },
+        "known_fields": {
+          "success": true,
+          "value": {
+            "number": 18446744073709551615,
+            "text": {
+              "text": "",
+              "utf8_hex": ""
+            }
+          }
+        },
+        "parse": {
+          "success": true,
+          "value": 13
+        },
+        "serialized_hex": {
+          "success": true,
+          "value": "0a0010ffffffffffffffffff01"
+        }
+      },
+      "syntax": "proto2"
+    },
+    {
+      "case": "uint64_ten_byte_final_byte_overflow",
+      "cpp_protoc": {
+        "exit_code": 0,
+        "stderr": "",
+        "success": true,
+        "text_output": "text: \"\"\nnumber: 9223372036854775807\n"
+      },
+      "expected_source_preserved": true,
+      "input_hex": "0a0010ffffffffffffffffff02",
+      "product": {
+        "disposition": "refuse",
+        "error_contains": "invalid varint",
+        "reason": "varint payload exceeds 64 bits"
+      },
+      "python_upb": {
+        "initialization_errors": {
+          "success": true,
+          "value": []
+        },
+        "initialized": {
+          "success": true,
+          "value": true
+        },
+        "known_fields": {
+          "success": true,
+          "value": {
+            "number": 9223372036854775807,
+            "text": {
+              "text": "",
+              "utf8_hex": ""
+            }
+          }
+        },
+        "parse": {
+          "success": true,
+          "value": 13
+        },
+        "serialized_hex": {
+          "success": true,
+          "value": "0a0010ffffffffffffffff7f"
+        }
+      },
+      "syntax": "proto2"
+    },
+    {
+      "case": "uint64_truncated_control",
+      "cpp_protoc": {
+        "exit_code": 1,
+        "stderr": "Failed to parse input.\n",
+        "success": false,
+        "text_output": ""
+      },
+      "expected_source_preserved": true,
+      "input_hex": "0a001080",
+      "product": {
+        "disposition": "refuse",
+        "error_contains": "invalid varint",
+        "reason": "truncated varint"
+      },
+      "python_upb": {
+        "initialization_errors": {
+          "success": true,
+          "value": []
+        },
+        "initialized": {
+          "success": true,
+          "value": true
+        },
+        "known_fields": {
+          "success": true,
+          "value": {
+            "number": 0,
+            "text": {
+              "text": "",
+              "utf8_hex": ""
+            }
+          }
+        },
+        "parse": {
+          "error": "Error parsing message with type 'wireprobe.Proto2Probe'",
+          "error_type": "DecodeError",
+          "success": false
+        },
+        "serialized_hex": {
+          "success": true,
+          "value": "0a001000"
+        }
+      },
+      "syntax": "proto2"
+    },
+    {
+      "case": "int64_negative_one_ten_byte_control",
+      "cpp_protoc": {
+        "exit_code": 0,
+        "stderr": "",
+        "success": true,
+        "text_output": "text: \"\"\nsigned_number: -1\n"
+      },
+      "expected_source_preserved": true,
+      "input_hex": "0a0018ffffffffffffffffff01",
+      "product": {
+        "disposition": "accept",
+        "expected_fields": {
+          "signed_number": -1,
+          "text": {
+            "text": "",
+            "utf8_hex": ""
+          }
+        }
+      },
+      "python_upb": {
+        "initialization_errors": {
+          "success": true,
+          "value": []
+        },
+        "initialized": {
+          "success": true,
+          "value": true
+        },
+        "known_fields": {
+          "success": true,
+          "value": {
+            "signed_number": -1,
+            "text": {
+              "text": "",
+              "utf8_hex": ""
+            }
+          }
+        },
+        "parse": {
+          "success": true,
+          "value": 13
+        },
+        "serialized_hex": {
+          "success": true,
+          "value": "0a0018ffffffffffffffffff01"
+        }
+      },
+      "syntax": "proto2"
+    },
+    {
+      "case": "int64_ten_byte_ff_final_7f",
+      "cpp_protoc": {
+        "exit_code": 0,
+        "stderr": "",
+        "success": true,
+        "text_output": "text: \"\"\nsigned_number: -1\n"
+      },
+      "expected_source_preserved": true,
+      "input_hex": "0a0018ffffffffffffffffff7f",
+      "product": {
+        "disposition": "refuse",
+        "error_contains": "invalid varint",
+        "reason": "varint payload exceeds 64 bits"
+      },
+      "python_upb": {
+        "initialization_errors": {
+          "success": true,
+          "value": []
+        },
+        "initialized": {
+          "success": true,
+          "value": true
+        },
+        "known_fields": {
+          "success": true,
+          "value": {
+            "signed_number": -1,
+            "text": {
+              "text": "",
+              "utf8_hex": ""
+            }
+          }
+        },
+        "parse": {
+          "success": true,
+          "value": 13
+        },
+        "serialized_hex": {
+          "success": true,
+          "value": "0a0018ffffffffffffffffff01"
+        }
+      },
+      "syntax": "proto2"
+    },
+    {
+      "case": "int64_minimum_control",
+      "cpp_protoc": {
+        "exit_code": 0,
+        "stderr": "",
+        "success": true,
+        "text_output": "text: \"\"\nsigned_number: -9223372036854775808\n"
+      },
+      "expected_source_preserved": true,
+      "input_hex": "0a001880808080808080808001",
+      "product": {
+        "disposition": "accept",
+        "expected_fields": {
+          "signed_number": -9223372036854775808,
+          "text": {
+            "text": "",
+            "utf8_hex": ""
+          }
+        }
+      },
+      "python_upb": {
+        "initialization_errors": {
+          "success": true,
+          "value": []
+        },
+        "initialized": {
+          "success": true,
+          "value": true
+        },
+        "known_fields": {
+          "success": true,
+          "value": {
+            "signed_number": -9223372036854775808,
+            "text": {
+              "text": "",
+              "utf8_hex": ""
+            }
+          }
+        },
+        "parse": {
+          "success": true,
+          "value": 13
+        },
+        "serialized_hex": {
+          "success": true,
+          "value": "0a001880808080808080808001"
+        }
+      },
+      "syntax": "proto2"
+    },
+    {
+      "case": "int64_ten_byte_80_final_7f",
+      "cpp_protoc": {
+        "exit_code": 0,
+        "stderr": "",
+        "success": true,
+        "text_output": "text: \"\"\nsigned_number: -9223372036854775808\n"
+      },
+      "expected_source_preserved": true,
+      "input_hex": "0a00188080808080808080807f",
+      "product": {
+        "disposition": "refuse",
+        "error_contains": "invalid varint",
+        "reason": "varint payload exceeds 64 bits"
+      },
+      "python_upb": {
+        "initialization_errors": {
+          "success": true,
+          "value": []
+        },
+        "initialized": {
+          "success": true,
+          "value": true
+        },
+        "known_fields": {
+          "success": true,
+          "value": {
+            "signed_number": -9223372036854775808,
+            "text": {
+              "text": "",
+              "utf8_hex": ""
+            }
+          }
+        },
+        "parse": {
+          "success": true,
+          "value": 13
+        },
+        "serialized_hex": {
+          "success": true,
+          "value": "0a001880808080808080808001"
+        }
+      },
+      "syntax": "proto2"
+    },
+    {
+      "case": "utf8_ascii_control",
+      "cpp_protoc": {
+        "exit_code": 0,
+        "stderr": "",
+        "success": true,
+        "text_output": "text: \"A\"\n"
+      },
+      "expected_source_preserved": true,
+      "input_hex": "0a0141",
+      "product": {
+        "disposition": "accept",
+        "expected_fields": {
+          "text": {
+            "text": "A",
+            "utf8_hex": "41"
+          }
+        }
+      },
+      "python_upb": {
+        "initialization_errors": {
+          "success": true,
+          "value": []
+        },
+        "initialized": {
+          "success": true,
+          "value": true
+        },
+        "known_fields": {
+          "success": true,
+          "value": {
+            "text": {
+              "text": "A",
+              "utf8_hex": "41"
+            }
+          }
+        },
+        "parse": {
+          "success": true,
+          "value": 3
+        },
+        "serialized_hex": {
+          "success": true,
+          "value": "0a0141"
+        }
+      },
+      "syntax": "proto3"
+    },
+    {
+      "case": "utf8_multibyte_boundary_control",
+      "cpp_protoc": {
+        "exit_code": 0,
+        "stderr": "",
+        "success": true,
+        "text_output": "text: \"\\303\\251\"\n"
+      },
+      "expected_source_preserved": true,
+      "input_hex": "0a02c3a9",
+      "product": {
+        "disposition": "accept",
+        "expected_fields": {
+          "text": {
+            "text": "é",
+            "utf8_hex": "c3a9"
+          }
+        }
+      },
+      "python_upb": {
+        "initialization_errors": {
+          "success": true,
+          "value": []
+        },
+        "initialized": {
+          "success": true,
+          "value": true
+        },
+        "known_fields": {
+          "success": true,
+          "value": {
+            "text": {
+              "text": "é",
+              "utf8_hex": "c3a9"
+            }
+          }
+        },
+        "parse": {
+          "success": true,
+          "value": 4
+        },
+        "serialized_hex": {
+          "success": true,
+          "value": "0a02c3a9"
+        }
+      },
+      "syntax": "proto3"
+    },
+    {
+      "case": "utf8_invalid_lone_ff",
+      "cpp_protoc": {
+        "exit_code": 1,
+        "stderr": "E0907 22:38:33.769752 3544010 wire_format_lite.cc:603] String field 'wireprobe.Proto3Probe.text' contains invalid UTF-8 data when parsing a protocol buffer. Use the 'bytes' type if you intend to send raw bytes. \nFailed to parse input.\n",
+        "success": false,
+        "text_output": ""
+      },
+      "expected_source_preserved": true,
+      "input_hex": "0a01ff",
+      "product": {
+        "disposition": "refuse",
+        "error_contains": "invalid string value",
+        "reason": "declared strings require valid UTF-8"
+      },
+      "python_upb": {
+        "initialization_errors": {
+          "success": true,
+          "value": []
+        },
+        "initialized": {
+          "success": true,
+          "value": true
+        },
+        "known_fields": {
+          "success": true,
+          "value": {}
+        },
+        "parse": {
+          "error": "Error parsing message with type 'wireprobe.Proto3Probe'",
+          "error_type": "DecodeError",
+          "success": false
+        },
+        "serialized_hex": {
+          "success": true,
+          "value": ""
+        }
+      },
+      "syntax": "proto3"
+    },
+    {
+      "case": "utf8_invalid_continuation",
+      "cpp_protoc": {
+        "exit_code": 1,
+        "stderr": "E0907 22:38:33.770499 3544011 wire_format_lite.cc:603] String field 'wireprobe.Proto3Probe.text' contains invalid UTF-8 data when parsing a protocol buffer. Use the 'bytes' type if you intend to send raw bytes. \nFailed to parse input.\n",
+        "success": false,
+        "text_output": ""
+      },
+      "expected_source_preserved": true,
+      "input_hex": "0a02c328",
+      "product": {
+        "disposition": "refuse",
+        "error_contains": "invalid string value",
+        "reason": "declared strings require valid UTF-8"
+      },
+      "python_upb": {
+        "initialization_errors": {
+          "success": true,
+          "value": []
+        },
+        "initialized": {
+          "success": true,
+          "value": true
+        },
+        "known_fields": {
+          "success": true,
+          "value": {}
+        },
+        "parse": {
+          "error": "Error parsing message with type 'wireprobe.Proto3Probe'",
+          "error_type": "DecodeError",
+          "success": false
+        },
+        "serialized_hex": {
+          "success": true,
+          "value": ""
+        }
+      },
+      "syntax": "proto3"
+    },
+    {
+      "case": "uint64_zero_canonical_control",
+      "cpp_protoc": {
+        "exit_code": 0,
+        "stderr": "",
+        "success": true,
+        "text_output": ""
+      },
+      "expected_source_preserved": true,
+      "input_hex": "0a001000",
+      "product": {
+        "disposition": "accept",
+        "expected_fields": {}
+      },
+      "python_upb": {
+        "initialization_errors": {
+          "success": true,
+          "value": []
+        },
+        "initialized": {
+          "success": true,
+          "value": true
+        },
+        "known_fields": {
+          "success": true,
+          "value": {}
+        },
+        "parse": {
+          "success": true,
+          "value": 4
+        },
+        "serialized_hex": {
+          "success": true,
+          "value": ""
+        }
+      },
+      "syntax": "proto3"
+    },
+    {
+      "case": "uint64_zero_ten_byte_noncanonical_boundary",
+      "cpp_protoc": {
+        "exit_code": 0,
+        "stderr": "",
+        "success": true,
+        "text_output": ""
+      },
+      "expected_source_preserved": true,
+      "input_hex": "0a001080808080808080808000",
+      "product": {
+        "disposition": "accept",
+        "expected_fields": {}
+      },
+      "python_upb": {
+        "initialization_errors": {
+          "success": true,
+          "value": []
+        },
+        "initialized": {
+          "success": true,
+          "value": true
+        },
+        "known_fields": {
+          "success": true,
+          "value": {}
+        },
+        "parse": {
+          "success": true,
+          "value": 13
+        },
+        "serialized_hex": {
+          "success": true,
+          "value": ""
+        }
+      },
+      "syntax": "proto3"
+    },
+    {
+      "case": "uint64_max_ten_byte_boundary",
+      "cpp_protoc": {
+        "exit_code": 0,
+        "stderr": "",
+        "success": true,
+        "text_output": "number: 18446744073709551615\n"
+      },
+      "expected_source_preserved": true,
+      "input_hex": "0a0010ffffffffffffffffff01",
+      "product": {
+        "disposition": "accept",
+        "expected_fields": {
+          "number": 18446744073709551615
+        }
+      },
+      "python_upb": {
+        "initialization_errors": {
+          "success": true,
+          "value": []
+        },
+        "initialized": {
+          "success": true,
+          "value": true
+        },
+        "known_fields": {
+          "success": true,
+          "value": {
+            "number": 18446744073709551615
+          }
+        },
+        "parse": {
+          "success": true,
+          "value": 13
+        },
+        "serialized_hex": {
+          "success": true,
+          "value": "10ffffffffffffffffff01"
+        }
+      },
+      "syntax": "proto3"
+    },
+    {
+      "case": "uint64_ten_byte_final_byte_overflow",
+      "cpp_protoc": {
+        "exit_code": 0,
+        "stderr": "",
+        "success": true,
+        "text_output": "number: 9223372036854775807\n"
+      },
+      "expected_source_preserved": true,
+      "input_hex": "0a0010ffffffffffffffffff02",
+      "product": {
+        "disposition": "refuse",
+        "error_contains": "invalid varint",
+        "reason": "varint payload exceeds 64 bits"
+      },
+      "python_upb": {
+        "initialization_errors": {
+          "success": true,
+          "value": []
+        },
+        "initialized": {
+          "success": true,
+          "value": true
+        },
+        "known_fields": {
+          "success": true,
+          "value": {
+            "number": 9223372036854775807
+          }
+        },
+        "parse": {
+          "success": true,
+          "value": 13
+        },
+        "serialized_hex": {
+          "success": true,
+          "value": "10ffffffffffffffff7f"
+        }
+      },
+      "syntax": "proto3"
+    },
+    {
+      "case": "uint64_truncated_control",
+      "cpp_protoc": {
+        "exit_code": 1,
+        "stderr": "Failed to parse input.\n",
+        "success": false,
+        "text_output": ""
+      },
+      "expected_source_preserved": true,
+      "input_hex": "0a001080",
+      "product": {
+        "disposition": "refuse",
+        "error_contains": "invalid varint",
+        "reason": "truncated varint"
+      },
+      "python_upb": {
+        "initialization_errors": {
+          "success": true,
+          "value": []
+        },
+        "initialized": {
+          "success": true,
+          "value": true
+        },
+        "known_fields": {
+          "success": true,
+          "value": {}
+        },
+        "parse": {
+          "error": "Error parsing message with type 'wireprobe.Proto3Probe'",
+          "error_type": "DecodeError",
+          "success": false
+        },
+        "serialized_hex": {
+          "success": true,
+          "value": ""
+        }
+      },
+      "syntax": "proto3"
+    },
+    {
+      "case": "int64_negative_one_ten_byte_control",
+      "cpp_protoc": {
+        "exit_code": 0,
+        "stderr": "",
+        "success": true,
+        "text_output": "signed_number: -1\n"
+      },
+      "expected_source_preserved": true,
+      "input_hex": "0a0018ffffffffffffffffff01",
+      "product": {
+        "disposition": "accept",
+        "expected_fields": {
+          "signed_number": -1
+        }
+      },
+      "python_upb": {
+        "initialization_errors": {
+          "success": true,
+          "value": []
+        },
+        "initialized": {
+          "success": true,
+          "value": true
+        },
+        "known_fields": {
+          "success": true,
+          "value": {
+            "signed_number": -1
+          }
+        },
+        "parse": {
+          "success": true,
+          "value": 13
+        },
+        "serialized_hex": {
+          "success": true,
+          "value": "18ffffffffffffffffff01"
+        }
+      },
+      "syntax": "proto3"
+    },
+    {
+      "case": "int64_ten_byte_ff_final_7f",
+      "cpp_protoc": {
+        "exit_code": 0,
+        "stderr": "",
+        "success": true,
+        "text_output": "signed_number: -1\n"
+      },
+      "expected_source_preserved": true,
+      "input_hex": "0a0018ffffffffffffffffff7f",
+      "product": {
+        "disposition": "refuse",
+        "error_contains": "invalid varint",
+        "reason": "varint payload exceeds 64 bits"
+      },
+      "python_upb": {
+        "initialization_errors": {
+          "success": true,
+          "value": []
+        },
+        "initialized": {
+          "success": true,
+          "value": true
+        },
+        "known_fields": {
+          "success": true,
+          "value": {
+            "signed_number": -1
+          }
+        },
+        "parse": {
+          "success": true,
+          "value": 13
+        },
+        "serialized_hex": {
+          "success": true,
+          "value": "18ffffffffffffffffff01"
+        }
+      },
+      "syntax": "proto3"
+    },
+    {
+      "case": "int64_minimum_control",
+      "cpp_protoc": {
+        "exit_code": 0,
+        "stderr": "",
+        "success": true,
+        "text_output": "signed_number: -9223372036854775808\n"
+      },
+      "expected_source_preserved": true,
+      "input_hex": "0a001880808080808080808001",
+      "product": {
+        "disposition": "accept",
+        "expected_fields": {
+          "signed_number": -9223372036854775808
+        }
+      },
+      "python_upb": {
+        "initialization_errors": {
+          "success": true,
+          "value": []
+        },
+        "initialized": {
+          "success": true,
+          "value": true
+        },
+        "known_fields": {
+          "success": true,
+          "value": {
+            "signed_number": -9223372036854775808
+          }
+        },
+        "parse": {
+          "success": true,
+          "value": 13
+        },
+        "serialized_hex": {
+          "success": true,
+          "value": "1880808080808080808001"
+        }
+      },
+      "syntax": "proto3"
+    },
+    {
+      "case": "int64_ten_byte_80_final_7f",
+      "cpp_protoc": {
+        "exit_code": 0,
+        "stderr": "",
+        "success": true,
+        "text_output": "signed_number: -9223372036854775808\n"
+      },
+      "expected_source_preserved": true,
+      "input_hex": "0a00188080808080808080807f",
+      "product": {
+        "disposition": "refuse",
+        "error_contains": "invalid varint",
+        "reason": "varint payload exceeds 64 bits"
+      },
+      "python_upb": {
+        "initialization_errors": {
+          "success": true,
+          "value": []
+        },
+        "initialized": {
+          "success": true,
+          "value": true
+        },
+        "known_fields": {
+          "success": true,
+          "value": {
+            "signed_number": -9223372036854775808
+          }
+        },
+        "parse": {
+          "success": true,
+          "value": 13
+        },
+        "serialized_hex": {
+          "success": true,
+          "value": "1880808080808080808001"
+        }
+      },
+      "syntax": "proto3"
+    }
+  ],
+  "format_version": 1,
+  "reference_runtime": {
+    "protoc": "libprotoc 25.1",
+    "python_backend": "upb",
+    "python_protobuf": "6.33.5"
+  },
+  "schema": {
+    "proto2": "required string text = 1; optional uint64 number = 2; optional int64 signed_number = 3;",
+    "proto3": "string text = 1; uint64 number = 2; int64 signed_number = 3;"
+  }
+}

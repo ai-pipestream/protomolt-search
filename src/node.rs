@@ -9220,7 +9220,8 @@ struct MappedSource<'a> {
 
 impl IngestSource<'_> {
     async fn next(&mut self) -> Result<Option<IngestDoc>, Status> {
-        match self {
+        let projected = matches!(self, Self::Mapped(_) | Self::Prepared(_));
+        let mut document = match self {
             IngestSource::Plain {
                 stream,
                 stable_routing_key,
@@ -9241,7 +9242,16 @@ impl IngestSource<'_> {
             }
             IngestSource::Mapped(source) => source.next().await,
             IngestSource::Prepared(source) => source.next(),
+        }?;
+        if projected {
+            if let Some(doc) = &mut document {
+                // Extraction and accepted-source projections retain explicit
+                // empty-field presence. Only the analyzer input omits empty
+                // secondary text; the original protobuf bytes remain intact.
+                doc.req.fields.retain(|field| !field.text.is_empty());
+            }
         }
+        Ok(document)
     }
 }
 

@@ -1237,6 +1237,15 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: measured proto2/proto3 wire boundaries.** The 26-case
+  fixture records strict UTF-8 and 64-bit varint boundaries against pinned C++
+  and upb observations. Empty mapped secondary text retains extraction presence
+  and source bytes but is omitted from the secondary analyzer input. Focused
+  validation passed 100 tests, including the existing optional-presence case,
+  with 646 stable hashes, zero swap and zero OOM events; full validation remains
+  pending. See [protobuf wire semantics](docs/protobuf-wire-semantics.md) and the
+  [fixture contract](tests/fixtures/protobuf-semantics/README.md).
+
 - **Foundation branch: actor-scoped retry ownership.**
   Controlled source acceptance keys receipts by the pinned authenticated principal
   and operation ID. Format 8 retains legacy decisions until explicit Admin
