@@ -830,3 +830,48 @@ with the old file renamed back; the conditions above keep the shards
 untouched either way. Any digest mismatch stops the roll at the step
 that introduced it, and the discrepancy is investigated before any
 improvement is claimed.
+
+**After, `92b11fb`, measured 2026-09-07 23:25-23:31 under operator
+authorization.** The roll followed the plan above: roots stopped,
+`rebuild.sh down`, binary swapped by rename (the old file stays as
+`pipestream-search.a9bf470.serving`), `serve` (1,179 s), the Pis on an
+aarch64 build of the same commit (pi5v3 then pi5v1 with the relay), the
+three roots last. Every node process verified by `/proc/<pid>/exe` md5
+against the staged file. The v11 bands and their root stayed on
+`a9bf470` and are not part of this measurement. Every shape's digest
+matches the before run on both roots — ids, scores, and ranks bitwise
+identical over all 240 hits.
+
+| shape (warm, round 3) | all 7 shards before | after | krick-1 only before | after |
+|---|---|---|---|---|
+| lexical "grandfathered status" AND dense row 7 | 308 ms | 295 ms | 136 ms | 107 ms |
+| lexical "qualified immunity" AND dense row 7 | 387 ms | 377 ms | 175 ms | 151 ms |
+| lexical "qualified immunity", `court == "scotus"` | 532 ms | **59 ms** | 130 ms | **23 ms** |
+| lexical "qualified immunity", `year >= 2018` | 619 ms | **130 ms** | 8 ms | 10 ms |
+| dense row 7, `court == "scotus"` | 565 ms | 588 ms | 139 ms | 155 ms |
+| dense row 7, `year >= 2018` | 848 ms | 896 ms | 15 ms | 31 ms |
+| allowlist "qualified immunity", `court == "scotus"` | 51 ms | 49 ms | 18 ms | 18 ms |
+| allowlist "qualified immunity", `year >= 2018` | 10 ms | 10 ms | 1 ms | 1 ms |
+
+The lexical+filter boolean shapes — the ones whose cost was the filter
+leaf's whole-shard column scan — drop 5.7 to 9 times on the krick-1
+shards and 4.8 to 9 times across the fleet, landing at the allowlist
+shape's cost (59 ms against 49 ms), because the filter now reads its
+column only over the lexical sibling's members. The AND-dense shapes
+gain a little (the filter leaf is absent there; the residual is the
+dense scan and the coordinator). The two dense+filter shapes gain
+nothing and pay a small, stable surcharge — +23 to +48 ms on the full
+root, +16 ms on the krick-1 set where the filter matches no rows at
+all: the new evaluation order resolves the exact leaves first, so the
+dense membership bitmap (rows with a vector, a per-shard structure the
+segment pruning does not shrink) is paid even when the filter leaf
+would have emptied the group first. An empty-MUST short-circuit is the
+fix; the allowlist controls (unchanged route) hold at 51/49 and 10/10,
+so the conditions are comparable. Cold rows (first round after the
+restart) have no before counterpart on the previously warm fleet; the
+after cold rows run 1.1 to 11 times the warm figures
+(lex-grandfathered+dense 3,295 ms cold against 295 ms warm is the
+dense scan's cold read), recorded here so the next roll measures cold
+against cold. Roots' VmHWM after: 24.7 MB (`:19391`), 24.2 MB
+(`:19394`); the search-v10 scope peaks at 21.5 GB of its 28 GB cap,
+all from the fresh segment read at serve.
