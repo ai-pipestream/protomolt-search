@@ -1250,6 +1250,15 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   destination store remains unchanged. See [retirement and crash recovery](docs/control-retirement.md);
   transactional import, worker fencing and activation remain separate steps.
 
+- **Foundation branch: bounded staged import contract (for review).** The
+  retired record moves through the destination's ordinary 1 MiB command path
+  as committed chunks under one workflow, is re-validated at commit against
+  the retirement's own digest, actor and destination identity, and applies
+  with allocators preserved, node leases as observations, pending actions
+  unreconciled and the placement tree, derived declaration, geometry and
+  policy supplied explicitly. One actor-scoped receipt; no local-file replay.
+  Nothing is implemented yet. See [control import](docs/control-import.md).
+
 - **Foundation branch: typed legacy control checkpoint.** A bounded private
   protobuf preserves full authority history, lease credentials, allocator and
   retained retry IDs, with exact optional presence and explicit legacy provenance.
