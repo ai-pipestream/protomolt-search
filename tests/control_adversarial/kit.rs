@@ -10,20 +10,20 @@
 //! `control_authority_model` targets, each of which uses a subset.
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use pipestream_search::capacity_tiers::{
-    CapacityTier, CommittedCopy, CommittedShard, CommittedView, FragmentRequest, IngestOutcome,
-    LeafCoverage, NodeCapacity, NodeRecord, NodeResidency, ObservationStore, PartitionIdentity,
-    PartitionObservation, ReporterIdentity, ShardRef, TierPolicy, TierSnapshotInput,
+    plan_tiers, FragmentRequest, PartitionIdentity, TierSnapshot,
 };
 use pipestream_search::control_plane::{
-    ControlPolicy, DurableControlPlane, LegacyControlCheckpoint, RetiredLegacyControl,
+    ClusterControlService, ControlPolicy, DurableControlPlane, LegacyControlCheckpoint,
+    RetiredLegacyControl,
 };
 use pipestream_search::coordinator::TopologyRoute;
+use pipestream_search::pb::cluster_control_server::ClusterControl;
+use pipestream_search::pb::storage::capacity_transition::Action as CapacityAction;
 use pipestream_search::pb::storage::control_import_command::Action as ImportAction;
 use pipestream_search::pb::storage::legacy_control_import_supplement::{
     Derived, Placement, Provider,
@@ -31,19 +31,26 @@ use pipestream_search::pb::storage::legacy_control_import_supplement::{
 use pipestream_search::pb::storage::source_authority_command::Action;
 use pipestream_search::pb::storage::{
     AbortControlImport, ActivateSourceOwner, BeginControlImport, CancelPreparedSourceOwner,
-    CommitControlImport, ConfirmSourceOwnerReady, ControlCollectionSnapshot, ControlImportChunk,
+    CapacityConfiguration, CapacityConfigureCommand, CapacityObservation, CapacityPartition,
+    CapacityResidency, CapacityShardRef, CapacityTierPolicy, CapacityTierSpec, CapacityTransition,
+    CommitCapacityExpiry, CommitControlImport, ConfirmSourceOwnerReady, ControlImportChunk,
     ControlImportCommand, ControlImportPayload, ControlImportReceipt, ControlPlannerPolicy,
     ControlProviderGeometry, LegacyControlImportSupplement, LegacyControlRetirementRequest,
-    LogicalSourceOwner, RecoverControlImport, ReplaceSourceCollectionGrants,
-    SourceAuthorityCommand, SourceAuthorityIdentity, SourceAuthorityLimits, SourceOwnerCompletion,
-    SourceResidency, SourceStorageTarget,
+    LogicalSourceOwner, PlacementRouteCode, RecoverControlImport, RegisterCapacityReporter,
+    ReplaceSourceCollectionGrants, SourceAuthorityCommand, SourceAuthorityIdentity,
+    SourceAuthorityLimits, SourceOwnerCompletion, SourceResidency, SourceStorageTarget,
 };
-use pipestream_search::pb::{AccessAction, AccessPolicy, CollectionGrant, CollectionResource};
+use pipestream_search::pb::{
+    AccessAction, AccessPolicy, CollectionGrant, CollectionResource, NodeCapacity, NodeLease,
+    NodeResidency, PlacementNode, PlacementTree, RegisterNodeRequest, ReportShardRequest,
+    ShardReplicaRole, ShardReplicaState,
+};
 use pipestream_search::sha256;
 use pipestream_search::source_authority::{
-    chunk_digest, payload_digest, retirement_digest, SourceAuthorityStore,
+    chunk_digest, payload_digest, retirement_digest, PlanningContext, SourceAuthorityStore,
 };
 use prost::Message;
+use tonic::Request;
 
 pub const WORKER_ENV: &str = "PSEARCH_ADV_WORKER";
 pub const WORKER_DIR_ENV: &str = "PSEARCH_ADV_DIR";
@@ -605,6 +612,62 @@ pub const WORKER_GO_TIMEOUT: Duration = Duration::from_secs(120);
 /// marker `mk` after each durable step, and when armed at `k` waits (up to
 /// [`WORKER_GO_TIMEOUT`]) for a `go` file so the parent controls the exact
 /// kill point. Early-returns unless [`WORKER_ENV`] is set.
+/// Staged import with the slice-1 marker schedule: begin (m1), one marker
+/// after each chunk (m2..m4), commit (m5). Shared by both SIGKILL worker
+/// bodies; the parent arms one marker and controls the kill point with a
+/// `go` file.
+fn import_with_markers(
+    store: &SourceAuthorityStore,
+    authority: &SourceAuthorityIdentity,
+    retired: &RetiredLegacyControl,
+    payload: &[u8],
+    dir: &TestDir,
+    arm: u32,
+) {
+    let (chunk_bytes, chunk_count) = plan_three_chunks(payload.len());
+    let begin = store
+        .begin_control_import(
+            "alice",
+            &import_command(
+                authority,
+                "begin",
+                1,
+                WORKFLOW,
+                begin_action(retired, payload, chunk_bytes, chunk_count),
+            ),
+            retired,
+        )
+        .unwrap();
+    assert_eq!(begin.code, 0, "{}", begin.message);
+    pause_for_go(dir, arm, 1, WORKER_GO_TIMEOUT);
+    let mut revision = 2u64;
+    for ordinal in 0..chunk_count {
+        let decision = store
+            .execute_control_import(
+                "alice",
+                &import_command(
+                    authority,
+                    &format!("chunk-{ordinal}"),
+                    revision,
+                    WORKFLOW,
+                    chunk_action(payload, chunk_bytes, ordinal),
+                ),
+            )
+            .unwrap();
+        assert_eq!(decision.code, 0, "{}", decision.message);
+        revision += 1;
+        pause_for_go(dir, arm, 2 + ordinal, WORKER_GO_TIMEOUT);
+    }
+    let commit = store
+        .execute_control_import(
+            "alice",
+            &import_command(authority, "commit", revision, WORKFLOW, commit_action()),
+        )
+        .unwrap();
+    assert_eq!(commit.code, 0, "{}", commit.message);
+    pause_for_go(dir, arm, 5, WORKER_GO_TIMEOUT);
+}
+
 pub fn sigkill_import_worker_body() {
     if std::env::var_os(WORKER_ENV).is_none() {
         return;
@@ -621,430 +684,547 @@ pub fn sigkill_import_worker_body() {
     pause_for_go(&dir, arm, 0, WORKER_GO_TIMEOUT);
 
     let payload = import_payload(&retired);
-    let (chunk_bytes, chunk_count) = plan_three_chunks(payload.len());
-    let begin = store
-        .begin_control_import(
-            "alice",
-            &import_command(
-                &authority,
-                "begin",
-                1,
-                WORKFLOW,
-                begin_action(&retired, &payload, chunk_bytes, chunk_count),
-            ),
-            &retired,
-        )
-        .unwrap();
-    assert_eq!(begin.code, 0, "{}", begin.message);
-    pause_for_go(&dir, arm, 1, WORKER_GO_TIMEOUT);
-    let mut revision = 2u64;
-    for ordinal in 0..chunk_count {
-        let decision = store
-            .execute_control_import(
-                "alice",
-                &import_command(
-                    &authority,
-                    &format!("chunk-{ordinal}"),
-                    revision,
-                    WORKFLOW,
-                    chunk_action(&payload, chunk_bytes, ordinal),
-                ),
-            )
-            .unwrap();
-        assert_eq!(decision.code, 0, "{}", decision.message);
-        revision += 1;
-        pause_for_go(&dir, arm, 2 + ordinal, WORKER_GO_TIMEOUT);
-    }
-    let commit = store
-        .execute_control_import(
-            "alice",
-            &import_command(&authority, "commit", revision, WORKFLOW, commit_action()),
-        )
-        .unwrap();
-    assert_eq!(commit.code, 0, "{}", commit.message);
-    pause_for_go(&dir, arm, 5, WORKER_GO_TIMEOUT);
+    import_with_markers(&store, &authority, &retired, &payload, &dir, arm);
 }
 
-// ---- capacity-planner leg (slice 2b) ----------------------------------------
+// ---- capacity-planner leg (slice 3b: the persisted adapter) -----------------
 
-/// Planning instant shared by every planner input in this suite: the fixed
-/// fixture instant of the in-crate `capacity_tiers` tests.
-pub const PLANNING_INSTANT_UNIX_MS: u64 = 1_788_868_800_000;
-/// Cohort length shared by every observation store in this suite; the
-/// observation windows are `[PLANNING_INSTANT_UNIX_MS - COHORT_LENGTH_MS,
+/// Cohort length shared by every capacity configuration in this suite; the
+/// observation windows are `[PLANNING_INSTANT_UNIX_MS - CAPACITY_COHORT_MS,
 /// PLANNING_INSTANT_UNIX_MS)`, aligned to phase 0.
-pub const COHORT_LENGTH_MS: u64 = 600_000;
+pub const CAPACITY_COHORT_MS: u64 = 600_000;
+/// Fixed planning instant: twenty cohorts past the epoch at phase 0. Node
+/// eligibility compares the committed lease expiry against this instant; the
+/// imported leases were captured at wall-clock registration time, so they
+/// always win and the instant stays deterministic.
+pub const PLANNING_INSTANT_UNIX_MS: u64 = 20 * CAPACITY_COHORT_MS;
+/// Generation every reported shard replica carries; the adapter names the
+/// primary's generation the shard's source generation.
+pub const SOURCE_GENERATION: u64 = 7;
+pub const NODE_A: &str = "node-a";
+pub const NODE_B: &str = "node-b";
+pub const SHARD_A: &str = "shard-a";
+pub const SHARD_B: &str = "shard-b";
+/// Process incarnations the two fixture reporters register with.
+pub const INC_A: u8 = 0x0a;
+pub const INC_B: u8 = 0x0b;
 
-fn planner_inc(byte: u8) -> [u8; 16] {
-    let mut out = [0u8; 16];
-    out[15] = byte;
-    out
+/// The placement tree of the in-crate capacity fixtures: leaf "old" catches
+/// rows with year < 2020, leaf "rest" everything else.
+pub fn placement_tree() -> PlacementTree {
+    PlacementTree {
+        column: "placement".into(),
+        level_bits: 0,
+        nodes: vec![
+            PlacementNode {
+                name: "old".into(),
+                cel: "year < 2020".into(),
+                ..Default::default()
+            },
+            PlacementNode {
+                name: "rest".into(),
+                ..Default::default()
+            },
+        ],
+    }
 }
 
-fn planner_tier(name: &str, min_replicas: u32, lo: u64, hi: u64, warmth: u64) -> CapacityTier {
-    CapacityTier {
-        name: name.to_string(),
-        residency: NodeResidency::Server,
-        min_replicas,
+fn leaf_code(name: &str) -> u64 {
+    let placement = pipestream_search::placement::Placement::validate(
+        &pipestream_search::placement::PlacementTreeConfig::from_proto(&placement_tree()),
+    )
+    .unwrap();
+    placement.leaf_by_name(name).unwrap().code as u64
+}
+
+/// The kit supplement plus the placement tree and one route code per route:
+/// route 0 names leaf "old", route 1 names leaf "rest". The planner adapter
+/// names a shard's leaf only when the import carried placement for the
+/// route whose hash range exactly matches the shard's primary.
+pub fn placement_supplement(checkpoint: &LegacyControlCheckpoint) -> LegacyControlImportSupplement {
+    let mut supplement = supplement(checkpoint);
+    supplement.placement = Some(Placement::Tree(placement_tree()));
+    supplement.route_codes = ["old", "rest"]
+        .map(|name| PlacementRouteCode {
+            has_placement: true,
+            placement: leaf_code(name),
+        })
+        .to_vec();
+    supplement
+}
+
+/// Payload + placement supplement rebuilt from a (possibly recovered) holder.
+pub fn import_payload_placement(retired: &RetiredLegacyControl) -> Vec<u8> {
+    payload(retired, placement_supplement(&checkpoint_of(retired)))
+}
+
+/// A pristine 2-route legacy plane with two registered server nodes (rack-a,
+/// rack-b) and one reported ready primary per route — shard-a on node-a in
+/// route 0, shard-b on node-b in route 1 — exactly the committed shape the
+/// capacity adapter derives shards, leaves, pools and eligible nodes from.
+///
+/// Registration and shard reports are cluster routes, not source-authority
+/// commands, so they run through the public `ClusterControl` trait over a
+/// short-lived in-process runtime; the plane is then reopened from disk so
+/// the caller owns it for retirement. Lease duration is the plane maximum
+/// (300s) and is plenty: eligibility is judged at the fixed planning
+/// instant of 1970, long before any wall-clock expiry.
+pub fn legacy_plane_with_cluster(dir: &TestDir) -> DurableControlPlane {
+    let plane = legacy_plane(dir, 2);
+    let control = ClusterControlService::new(plane);
+    let runtime = tokio::runtime::Runtime::new().expect("cluster control runtime");
+    let register = |node_id: &str, port: u16, domain: &str| RegisterNodeRequest {
+        collection: COLLECTION.into(),
+        node_id: node_id.into(),
+        addr: format!("127.0.0.1:{port}"),
+        capacity: Some(NodeCapacity {
+            disk_bytes: 26_843_545_600,
+            used_disk_bytes: 0,
+            failure_domain: domain.into(),
+            residency: NodeResidency::Server as i32,
+            ..Default::default()
+        }),
+        lease_ms: 300_000,
+    };
+    let lease_a = runtime
+        .block_on(ClusterControl::register_node(
+            &control,
+            Request::new(register(NODE_A, 9_101, "rack-a")),
+        ))
+        .unwrap()
+        .into_inner();
+    let lease_b = runtime
+        .block_on(ClusterControl::register_node(
+            &control,
+            Request::new(register(NODE_B, 9_102, "rack-b")),
+        ))
+        .unwrap()
+        .into_inner();
+    // One primary per route; the reported ranges exactly tile the two
+    // routes of `legacy_plane`, which is how derive() names each shard's
+    // leaf through its route's committed placement code.
+    let space = u64::MAX as u128 + 1;
+    let report = |lease: &NodeLease, shard: &str, route: usize| ReportShardRequest {
+        collection: COLLECTION.into(),
+        node_id: lease.node_id.clone(),
+        lease_token: lease.lease_token,
+        replica: Some(ShardReplicaState {
+            collection: COLLECTION.into(),
+            shard_id: shard.into(),
+            node_id: lease.node_id.clone(),
+            generation: SOURCE_GENERATION,
+            hash_lo: (route as u128 * space / 2) as u64,
+            hash_hi: ((route as u128 + 1) * space / 2 - 1) as u64,
+            rows: 1_000_000,
+            bytes: 268_435_456,
+            role: ShardReplicaRole::Primary as i32,
+            ready: true,
+            ..Default::default()
+        }),
+    };
+    for (lease, shard, route) in [(lease_a, SHARD_A, 0usize), (lease_b, SHARD_B, 1usize)] {
+        runtime
+            .block_on(ClusterControl::report_shard(
+                &control,
+                Request::new(report(&lease, shard, route)),
+            ))
+            .unwrap();
+    }
+    drop(control);
+    DurableControlPlane::open_existing(dir.legacy(), control_policy()).unwrap()
+}
+
+fn capacity_tier(name: &str, lo: u64, hi: u64, warmth: u64) -> CapacityTierSpec {
+    CapacityTierSpec {
+        name: name.into(),
+        residency: CapacityResidency::Server as i32,
+        min_replicas: 1,
         scans_per_byte_nanos_lo: lo,
         scans_per_byte_nanos_hi: hi,
         max_seconds_since_scan: warmth,
     }
 }
 
-/// The three-tier policy of the in-crate planner fixtures.
-pub fn planner_policy() -> TierPolicy {
-    TierPolicy {
-        tiers: vec![
-            planner_tier("hot", 3, 100, 1_000_000_000_000, 0),
-            planner_tier("warm", 2, 1, 100, 86_400),
-            planner_tier("archive", 2, 0, 1, 0),
-        ],
+/// The three-tier policy of the slice-2b fixture, rebased for single-replica
+/// pools: every shard has exactly one committed copy, so every tier asks for
+/// one replica. `hot_hi` lets the digest-move test change the policy bytes.
+pub fn capacity_configuration(hot_hi: u64) -> CapacityConfiguration {
+    CapacityConfiguration {
+        format_version: 1,
+        cohort_length_ms: CAPACITY_COHORT_MS,
+        cohort_phase_unix_ms: 0,
+        max_total_records: 64,
+        max_total_bytes: 1 << 20,
+        max_registered_nodes: 8,
+        policy: Some(CapacityTierPolicy {
+            format_version: 1,
+            tiers: vec![
+                capacity_tier("hot", 100, hot_hi, 0),
+                capacity_tier("warm", 1, 100, 86_400),
+                capacity_tier("archive", 0, 1, 0),
+            ],
+        }),
     }
 }
 
-/// A committed-copy spec, mirroring the in-crate fixture A copy specs.
-pub struct PlannerCopySpec {
-    pub node: &'static str,
-    pub proc_inc: u8,
-    pub stor_inc: u8,
-    pub domain: &'static str,
-}
-
-pub const K1_S6: PlannerCopySpec = PlannerCopySpec {
-    node: "krick-1",
-    proc_inc: 0x0a,
-    stor_inc: 0xa1,
-    domain: "krick",
-};
-pub const P1_S6: PlannerCopySpec = PlannerCopySpec {
-    node: "pi5v1",
-    proc_inc: 0x0b,
-    stor_inc: 0xb1,
-    domain: "pi5-west",
-};
-pub const P3_S6: PlannerCopySpec = PlannerCopySpec {
-    node: "pi5v3",
-    proc_inc: 0x0c,
-    stor_inc: 0xc1,
-    domain: "pi5-east",
-};
-pub const P1_S7: PlannerCopySpec = PlannerCopySpec {
-    node: "pi5v1",
-    proc_inc: 0x0b,
-    stor_inc: 0xb2,
-    domain: "pi5-west",
-};
-pub const K1_S7: PlannerCopySpec = PlannerCopySpec {
-    node: "krick-1",
-    proc_inc: 0x0a,
-    stor_inc: 0xa2,
-    domain: "krick",
-};
-
-fn planner_committed_copy(spec: &PlannerCopySpec, coverage: [u8; 32]) -> CommittedCopy {
-    CommittedCopy {
-        node_id: spec.node.to_string(),
-        storage_incarnation: planner_inc(spec.stor_inc),
-        failure_domain: spec.domain.to_string(),
-        complete: true,
-        coverage_digest: coverage,
+pub fn configure_command(
+    authority: &SourceAuthorityIdentity,
+    id: &str,
+    control_revision: u64,
+    policy_revision: u64,
+    configuration: CapacityConfiguration,
+) -> CapacityConfigureCommand {
+    CapacityConfigureCommand {
+        format_version: 1,
+        authority: Some(authority.clone()),
+        key: Some(key()),
+        command_id: id.as_bytes().to_vec(),
+        expected_control_revision: control_revision,
+        expected_policy_revision: policy_revision,
+        configuration: Some(configuration),
     }
 }
 
-/// Coverage digests of the in-crate fixtures; only the sharing rule matters
-/// (every complete copy of one fragment carries one digest).
-fn planner_cov_l4() -> [u8; 32] {
-    sha256::digest(b"adversarial harness manifest: fragment (key_bucket=7, L4)")
-}
-
-fn planner_cov_l7() -> [u8; 32] {
-    sha256::digest(b"adversarial harness manifest: fragment (key_bucket=7, L7)")
-}
-
-/// The committed view for the imported resource: the in-crate fixture A
-/// shard/leaf/copies shape bound to the snapshot's resource triple and
-/// topology generation. The imported 2-route plane registers no nodes, so
-/// the coverage topology is harness-built, exactly as the in-crate planner
-/// fixtures hand-build theirs.
-pub fn planner_committed_view(snapshot: &ControlCollectionSnapshot) -> CommittedView {
-    let state = snapshot
-        .state
-        .as_ref()
-        .expect("imported snapshot carries collection state");
-    let supplement = state
-        .configuration
-        .as_ref()
-        .expect("imported snapshot carries the import supplement");
-    let key = snapshot
-        .key
-        .as_ref()
-        .expect("snapshot carries the resource key");
-    let mut shards = BTreeMap::new();
-    shards.insert(
-        "s6".to_string(),
-        CommittedShard {
-            source_generation: 3,
-            ownership_epoch: 5,
-            leaves: BTreeMap::from([(
-                "L4".to_string(),
-                LeafCoverage {
-                    pool: vec![
-                        "krick-1".to_string(),
-                        "pi5v1".to_string(),
-                        "pi5v3".to_string(),
-                    ],
-                    owner_node: "krick-1".to_string(),
-                    copies: vec![
-                        planner_committed_copy(&K1_S6, planner_cov_l4()),
-                        planner_committed_copy(&P1_S6, planner_cov_l4()),
-                        planner_committed_copy(&P3_S6, planner_cov_l4()),
-                    ],
-                },
-            )]),
-        },
-    );
-    shards.insert(
-        "s7".to_string(),
-        CommittedShard {
-            source_generation: 3,
-            ownership_epoch: 2,
-            leaves: BTreeMap::from([(
-                "L7".to_string(),
-                LeafCoverage {
-                    pool: vec!["krick-1".to_string(), "pi5v1".to_string()],
-                    owner_node: "pi5v1".to_string(),
-                    copies: vec![
-                        planner_committed_copy(&P1_S7, planner_cov_l7()),
-                        planner_committed_copy(&K1_S7, planner_cov_l7()),
-                    ],
-                },
-            )]),
-        },
-    );
-    CommittedView {
-        workspace: key.workspace.clone(),
-        collection: key.collection.clone(),
-        derived_fingerprint: sha256::digest(supplement.derived_fingerprint.as_bytes()),
-        topology_generation: state.topology_generation,
-        shards,
+fn capacity_transition(
+    authority: &SourceAuthorityIdentity,
+    action: CapacityAction,
+) -> CapacityTransition {
+    CapacityTransition {
+        format_version: 1,
+        authority: Some(authority.clone()),
+        key: Some(key()),
+        action: Some(action),
     }
 }
 
-/// Build one observation bound to `view`'s resource and topology
-/// generation; `spec` names the reporting node and its process/storage
-/// incarnations (pass a spec with the committed `stor_inc` and a new
-/// `proc_inc` to report from a superseding process).
-pub fn planner_obs(
-    view: &CommittedView,
-    spec: &PlannerCopySpec,
+pub fn register_transition(
+    authority: &SourceAuthorityIdentity,
+    node: &str,
+    incarnation: u8,
+) -> CapacityTransition {
+    capacity_transition(
+        authority,
+        CapacityAction::Register(RegisterCapacityReporter {
+            node_id: node.into(),
+            process_incarnation: vec![incarnation; 16],
+        }),
+    )
+}
+
+pub fn report_transition(
+    authority: &SourceAuthorityIdentity,
+    observation: CapacityObservation,
+) -> CapacityTransition {
+    capacity_transition(authority, CapacityAction::Report(observation))
+}
+
+pub fn expire_transition(
+    authority: &SourceAuthorityIdentity,
+    now_unix_ms: u64,
+    max_age_ms: u64,
+) -> CapacityTransition {
+    capacity_transition(
+        authority,
+        CapacityAction::Expire(CommitCapacityExpiry {
+            now_unix_ms,
+            max_age_ms,
+        }),
+    )
+}
+
+fn observation(
+    node: &str,
+    incarnation: u8,
     leaf: &str,
     shard: &str,
-    sgen: u64,
-    epoch: u64,
     rows: u64,
-    bytes: u64,
+    resident_bytes: u64,
     scans: u64,
-    last: u64,
-) -> PartitionObservation {
-    PartitionObservation {
-        partition: PartitionIdentity {
-            workspace: view.workspace.clone(),
-            collection: view.collection.clone(),
-            derived_fingerprint: view.derived_fingerprint,
-            column: "key_bucket".to_string(),
+    scan_bytes: u64,
+    queue_wait_p50_us: u64,
+    queue_wait_p99_us: u64,
+    samples: u32,
+    last_scanned_unix_ms: u64,
+    topology_generation: u64,
+) -> CapacityObservation {
+    CapacityObservation {
+        format_version: 1,
+        partition: Some(CapacityPartition {
+            workspace: WORKSPACE.into(),
+            collection: COLLECTION.into(),
+            derived_fingerprint: vec![0; 32],
+            column: "year_bucket".into(),
             bucket: 7,
-        },
-        reporter: ReporterIdentity {
-            node_id: spec.node.to_string(),
-            process_incarnation: planner_inc(spec.proc_inc),
-        },
-        shard: ShardRef {
-            shard: shard.to_string(),
-            source_generation: sgen,
-            storage_incarnation: planner_inc(spec.stor_inc),
-            ownership_epoch: epoch,
-        },
-        topology_generation: view.topology_generation,
-        leaf: leaf.to_string(),
+        }),
+        node_id: node.into(),
+        process_incarnation: vec![incarnation; 16],
+        shard: Some(CapacityShardRef {
+            shard: shard.into(),
+            source_generation: SOURCE_GENERATION,
+            storage_incarnation: vec![0; 16],
+            ownership_epoch: 0,
+        }),
+        topology_generation,
+        leaf: leaf.into(),
         rows,
-        resident_bytes: bytes,
+        resident_bytes,
         scans_observed: scans,
-        scan_bytes: if scans > 0 { 786_432_000_000 } else { 0 },
-        queue_wait_p50_us: if scans > 0 { 1200 } else { 0 },
-        queue_wait_p99_us: if scans > 0 { 9400 } else { 0 },
-        samples: if scans > 0 { 3000 } else { 0 },
-        last_scanned_unix_ms: last,
-        window_start_unix_ms: PLANNING_INSTANT_UNIX_MS - COHORT_LENGTH_MS,
+        scan_bytes,
+        queue_wait_p50_us,
+        queue_wait_p99_us,
+        samples,
+        last_scanned_unix_ms,
+        window_start_unix_ms: PLANNING_INSTANT_UNIX_MS - CAPACITY_COHORT_MS,
         window_end_unix_ms: PLANNING_INSTANT_UNIX_MS,
     }
 }
 
-/// The five fixture A reports, bound to `view`'s resource triple and
-/// topology generation: the s6 owner scanned recently, every other copy
-/// silent, and one stale scan on s7's owner so the archive tier has work.
-pub fn planner_reports(view: &CommittedView) -> Vec<PartitionObservation> {
-    vec![
-        planner_obs(
-            view,
-            &K1_S6,
-            "L4",
-            "s6",
-            3,
-            5,
-            1_000_000,
-            268_435_456,
-            3_000_000,
-            PLANNING_INSTANT_UNIX_MS - 5000,
-        ),
-        planner_obs(view, &P1_S6, "L4", "s6", 3, 5, 1_000_000, 268_435_456, 0, 0),
-        planner_obs(view, &P3_S6, "L4", "s6", 3, 5, 1_000_000, 268_435_456, 0, 0),
-        planner_obs(
-            view,
-            &P1_S7,
-            "L7",
-            "s7",
-            3,
-            2,
-            500_000,
-            134_217_728,
-            0,
-            PLANNING_INSTANT_UNIX_MS - 3_600_000,
-        ),
-        planner_obs(view, &K1_S7, "L7", "s7", 3, 2, 500_000, 134_217_728, 0, 0),
-    ]
-}
-
-/// A fresh observation store bound to `view`, with the three fixture node
-/// incarnations registered (the same values as the in-crate `store_a`
-/// fixture).
-pub fn planner_observation_store(view: &CommittedView) -> ObservationStore {
-    let mut store = ObservationStore::new(COHORT_LENGTH_MS, 0, 1000, 1 << 20, 64, view.clone())
-        .expect("valid cohort config");
-    store
-        .register_incarnation("krick-1", planner_inc(0x0a))
-        .unwrap();
-    store
-        .register_incarnation("pi5v1", planner_inc(0x0b))
-        .unwrap();
-    store
-        .register_incarnation("pi5v3", planner_inc(0x0c))
-        .unwrap();
-    store
-}
-
-/// Feed `reports` into a fresh store (already-incarnation-registered) and
-/// return it; `reverse` ingests in reverse key order to prove the stored
-/// set, its digest, and the derived plan are order-insensitive.
-pub fn feed_reports(view: &CommittedView, reverse: bool) -> ObservationStore {
-    let mut store = planner_observation_store(view);
-    let mut reports = planner_reports(view);
-    if reverse {
-        reports.reverse();
-    }
-    for report in reports {
-        assert_eq!(store.ingest(report).expect("ingest"), IngestOutcome::Landed);
-    }
-    store
-}
-
-/// The three-node registry of the in-crate fixture: two eligible servers
-/// with headroom and one with none.
-pub fn planner_nodes() -> BTreeMap<String, NodeRecord> {
-    let server = |domain: &str, total: u64| NodeRecord {
-        residency: NodeResidency::Server,
-        eligible: true,
-        failure_domain: domain.to_string(),
-        capacity: NodeCapacity {
-            total_bytes: total,
-            resident_bytes: 0,
-        },
-    };
-    BTreeMap::from([
-        ("krick-1".to_string(), server("krick", 26_843_545_600)),
-        ("pi5v1".to_string(), server("pi5-west", 16_106_127_360)),
-        ("pi5v3".to_string(), server("pi5-east", 0)),
-    ])
-}
-
-/// Fragment requests for the two fixture leaves of bucket 7, bound to the
-/// view's resource and topology generation.
-pub fn planner_fragment_requests(view: &CommittedView) -> Vec<FragmentRequest> {
-    let partition = |bucket: u64| PartitionIdentity {
-        workspace: view.workspace.clone(),
-        collection: view.collection.clone(),
-        derived_fingerprint: view.derived_fingerprint,
-        column: "key_bucket".to_string(),
-        bucket,
-    };
-    ["L4", "L7"]
-        .into_iter()
-        .map(|leaf| FragmentRequest {
-            partition: partition(7),
-            topology_generation: view.topology_generation,
-            leaf: leaf.to_string(),
-        })
-        .collect()
-}
-
-/// Map a real imported `ControlCollectionSnapshot` to the capacity
-/// planner's public input (`TierSnapshotInput`). Authority-derived fields —
-/// the authority identity, both revisions, the resource triple, the
-/// topology generation, and the supplement's derived/provider digests —
-/// come from the snapshot itself. Nodes, policy, fragment requests, and
-/// observations are harness-built and identical across every test in this
-/// suite, mirroring the in-crate planner fixtures; the import registers no
-/// nodes, so a hand-built registry is expected here.
-pub fn planner_input(
-    snapshot: &ControlCollectionSnapshot,
-    view: &CommittedView,
-    observations: &ObservationStore,
-) -> TierSnapshotInput {
-    let authority = snapshot
-        .authority
-        .as_ref()
-        .expect("snapshot carries the authority identity");
-    let state = snapshot
+/// The topology generation the committed control state carries after the
+/// import: each legacy `report_shard` reconciles and publishes, so the
+/// generation is whatever the plane published, read back from the snapshot
+/// rather than assumed.
+pub fn committed_generation(store: &SourceAuthorityStore) -> u64 {
+    let snapshot = store.control_snapshot("alice", &key()).unwrap();
+    snapshot
         .state
         .as_ref()
-        .expect("imported snapshot carries collection state");
-    let supplement = state
-        .configuration
-        .as_ref()
-        .expect("imported snapshot carries the import supplement");
-    let key = snapshot
-        .key
-        .as_ref()
-        .expect("snapshot carries the resource key");
-    let provider_geometry_digest = match supplement.provider.as_ref() {
-        Some(Provider::Geometry(geometry)) => sha256::digest(&geometry.encode_to_vec()),
-        _ => sha256::digest(b"no-provider-geometry"),
+        .expect("imported snapshot carries collection state")
+        .topology_generation
+}
+
+/// shard-a's owner report: scanned heavily inside the current window, the
+/// "hot" shape of the slice-2b fixture (3,000,000 scans over 786,432,000,000
+/// bytes ≈ 3,800 ns/byte).
+pub fn scanned_observation(
+    node: &str,
+    incarnation: u8,
+    topology_generation: u64,
+) -> CapacityObservation {
+    observation(
+        node,
+        incarnation,
+        "old",
+        SHARD_A,
+        1_000_000,
+        268_435_456,
+        3_000_000,
+        786_432_000_000,
+        1_200,
+        9_400,
+        3_000,
+        PLANNING_INSTANT_UNIX_MS - 5_000,
+        topology_generation,
+    )
+}
+
+/// shard-b's owner report: present but silent, the "archive" shape.
+pub fn silent_observation(
+    node: &str,
+    incarnation: u8,
+    topology_generation: u64,
+) -> CapacityObservation {
+    observation(
+        node,
+        incarnation,
+        "rest",
+        SHARD_B,
+        500_000,
+        134_217_728,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        topology_generation,
+    )
+}
+
+/// The planning context at `instant`: both fixture leaves of bucket 7, bound
+/// to the suite's resource triple and the committed topology generation.
+pub fn planning_context(instant: u64, topology_generation: u64) -> PlanningContext {
+    let partition = PartitionIdentity {
+        workspace: WORKSPACE.into(),
+        collection: COLLECTION.into(),
+        derived_fingerprint: [0; 32],
+        column: "year_bucket".into(),
+        bucket: 7,
     };
-    TierSnapshotInput {
-        planning_instant_unix_ms: PLANNING_INSTANT_UNIX_MS,
+    PlanningContext {
+        planning_instant_unix_ms: instant,
         max_moves: 16,
-        max_observation_age_ms: COHORT_LENGTH_MS,
+        max_observation_age_ms: 10 * CAPACITY_COHORT_MS,
         clock_skew_bound_ms: 5_000,
-        authority_id: sha256::to_hex(&sha256::digest(&authority.group_id)),
-        authority_incarnation: authority.authority_incarnation[..]
-            .try_into()
-            .expect("authority incarnation is 16 bytes"),
-        control_revision: snapshot.control_revision,
-        policy_revision: snapshot.policy_revision,
-        policy: planner_policy(),
-        observation_epoch: observations.epoch(),
-        topology_generation: state.topology_generation,
-        placement_tree_digest: sha256::digest(b"no-placement-tree"),
-        workspace: key.workspace.clone(),
-        collection: key.collection.clone(),
-        derived_fingerprint: view.derived_fingerprint,
-        provider_geometry_digest,
-        cohort_length_ms: COHORT_LENGTH_MS,
-        cohort_phase_unix_ms: 0,
-        nodes: planner_nodes(),
-        observations: observations.observations().into_iter().cloned().collect(),
-        fragment_requests: planner_fragment_requests(view),
-        committed: view.clone(),
-        current_incarnations: observations.current_incarnations().clone(),
+        fragment_requests: ["old", "rest"]
+            .map(|leaf| FragmentRequest {
+                partition: partition.clone(),
+                topology_generation,
+                leaf: leaf.into(),
+            })
+            .to_vec(),
     }
+}
+
+/// The planner's view of the store through the real persisted adapter: the
+/// input's debug form, the validated snapshot's plan digest, and the plan's
+/// canonical bytes. Panics unless the adapter input validates and plans.
+pub fn planner_view(store: &SourceAuthorityStore, instant: u64) -> (String, [u8; 32], Vec<u8>) {
+    let input = store
+        .planner_input(
+            "alice",
+            &key(),
+            &planning_context(instant, committed_generation(store)),
+        )
+        .unwrap();
+    let rendered = format!("{input:?}");
+    let snapshot = TierSnapshot::validated(input).expect("adapter input must validate");
+    let plan = plan_tiers(&snapshot).expect("plan_tiers must accept the adapter input");
+    (rendered, snapshot.plan_digest(), plan.canonical_bytes())
+}
+
+/// A store that went through the full adapter flow: the cluster plane
+/// (registered nodes, reported primaries) retired and imported with the
+/// placement supplement, capacity configured at control revision 6, both
+/// reporters registered, and one report per shard in the current cohort
+/// window. Observation epoch is 2.
+pub struct AdapterFixture {
+    pub dir: TestDir,
+    pub authority: SourceAuthorityIdentity,
+    pub store: SourceAuthorityStore,
+    /// The committed topology generation the reports and context bind to.
+    pub generation: u64,
+}
+
+pub fn adapter_fixture(name: &str) -> AdapterFixture {
+    adapter_fixture_staged(name, false)
+}
+
+/// [`adapter_fixture`], with the chunk staging order reversed when `reverse`
+/// is set (the protocol keys chunks by ordinal and accepts any order).
+pub fn adapter_fixture_staged(name: &str, reverse: bool) -> AdapterFixture {
+    let dir = TestDir::new(name);
+    let (store, authority) = create_store(&dir);
+    let legacy = legacy_plane_with_cluster(&dir);
+    let (retired, _request) = retire(&store, &legacy, 1);
+    let payload = import_payload_placement(&retired);
+    run_import_staged(&store, &authority, &retired, &payload, reverse);
+    let generation = committed_generation(&store);
+    // The import commits at control revision 6 (begin 1, three chunks,
+    // commit); configure is the next retained command.
+    let decision = store
+        .configure_capacity(
+            "alice",
+            &configure_command(
+                &authority,
+                "cfg",
+                6,
+                1,
+                capacity_configuration(1_000_000_000_000),
+            ),
+        )
+        .unwrap();
+    assert_eq!(decision.code, 0, "{}", decision.message);
+    for (node, incarnation) in [(NODE_A, INC_A), (NODE_B, INC_B)] {
+        store
+            .capacity_transition("alice", &register_transition(&authority, node, incarnation))
+            .unwrap();
+    }
+    store
+        .capacity_transition(
+            "alice",
+            &report_transition(&authority, scanned_observation(NODE_A, INC_A, generation)),
+        )
+        .unwrap();
+    store
+        .capacity_transition(
+            "alice",
+            &report_transition(&authority, silent_observation(NODE_B, INC_B, generation)),
+        )
+        .unwrap();
+    AdapterFixture {
+        dir,
+        authority,
+        store,
+        generation,
+    }
+}
+
+/// Begin -> three chunks -> commit; `reverse` stages the chunk ordinals in
+/// reverse order.
+pub fn run_import_staged(
+    store: &SourceAuthorityStore,
+    authority: &SourceAuthorityIdentity,
+    retired: &RetiredLegacyControl,
+    payload: &[u8],
+    reverse: bool,
+) {
+    let (chunk_bytes, chunk_count) = plan_three_chunks(payload.len());
+    let begin = store
+        .begin_control_import(
+            "alice",
+            &import_command(
+                authority,
+                "begin",
+                1,
+                WORKFLOW,
+                begin_action(retired, payload, chunk_bytes, chunk_count),
+            ),
+            retired,
+        )
+        .unwrap();
+    assert_eq!(begin.code, 0, "{}", begin.message);
+    let ordinals: Vec<u32> = if reverse {
+        (0..chunk_count).rev().collect()
+    } else {
+        (0..chunk_count).collect()
+    };
+    let mut revision = 2u64;
+    for ordinal in ordinals {
+        let decision = store
+            .execute_control_import(
+                "alice",
+                &import_command(
+                    authority,
+                    &format!("chunk-{ordinal}"),
+                    revision,
+                    WORKFLOW,
+                    chunk_action(payload, chunk_bytes, ordinal),
+                ),
+            )
+            .unwrap();
+        assert_eq!(decision.code, 0, "chunk {ordinal}: {}", decision.message);
+        revision += 1;
+    }
+    let commit = store
+        .execute_control_import(
+            "alice",
+            &import_command(authority, "commit", revision, WORKFLOW, commit_action()),
+        )
+        .unwrap();
+    assert_eq!(commit.code, 0, "{}", commit.message);
+}
+
+/// Worker body for the adapter SIGKILL-recovery test
+/// (`control_authority_planner::plan_digest_stable_across_sigkill_recovery`).
+/// Identical durable steps to the parent's baseline — cluster plane,
+/// retirement, placement import — on the slice-1 marker schedule. The parent
+/// recovers the import and then runs the capacity steps itself.
+/// Early-returns unless [`WORKER_ENV`] is set.
+pub fn sigkill_capacity_worker_body() {
+    if std::env::var_os(WORKER_ENV).is_none() {
+        return;
+    }
+    let dir = TestDir::from_env();
+    let arm: u32 = std::env::var(WORKER_ARM_ENV)
+        .unwrap()
+        .parse()
+        .expect("PSEARCH_ADV_ARM is a marker index");
+    let (store, authority) = create_store(&dir);
+    let legacy = legacy_plane_with_cluster(&dir);
+    let (retired, request) = retire(&store, &legacy, 1);
+    std::fs::write(dir.request(), request.encode_to_vec()).unwrap();
+    pause_for_go(&dir, arm, 0, WORKER_GO_TIMEOUT);
+
+    let payload = import_payload_placement(&retired);
+    import_with_markers(&store, &authority, &retired, &payload, &dir, arm);
 }

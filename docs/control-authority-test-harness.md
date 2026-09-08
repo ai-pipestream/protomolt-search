@@ -1,12 +1,12 @@
-# Control-authority adversarial test harness (slices 1 and 2)
+# Control-authority adversarial test harness (slices 1, 2 and 3)
 
 Coordination record and design for the adversarial integration-test harness
 around the source-authority control plane. This is test-only work: it adds
 `tests/control_authority_adversarial.rs` (slice 1),
-`tests/control_authority_model.rs` (slice 2a), and
-`tests/control_authority_planner.rs` (slice 2b) plus the shared kit under
-`tests/control_adversarial/` and this document. No production source, proto,
-or Cargo manifest changes.
+`tests/control_authority_model.rs` (slice 2a),
+`tests/control_authority_planner.rs` (slice 2b, replaced by slice 3b) plus
+the shared kit under `tests/control_adversarial/` and this document. No
+production source, proto, or Cargo manifest changes.
 
 ## Checkpoint and branch
 
@@ -84,6 +84,31 @@ All confirmed against commit `43596c9`:
   `LegacyControlImportSupplement`, ...); `pipestream_search::pb::{AccessAction,
   AccessPolicy, CollectionGrant, CollectionResource}`.
 - `pipestream_search::sha256::digest(&[u8]) -> [u8; 32]`, `to_hex`.
+- Capacity adapter and transitions (added for slice 3b, confirmed against
+  `331c18f` + `b1bbe51`): `SourceAuthorityStore::configure_capacity(principal,
+  &CapacityConfigureCommand) -> CapacityConfigureDecision` (a retained
+  control command over applied state: it advances `control_revision` on
+  acceptance and returns refusals as recorded decisions with a nonzero gRPC
+  code, e.g. a cohort shift with observations retained is a recorded
+  `FailedPrecondition`), `capacity_transition(principal, &CapacityTransition)
+  -> CapacityTransitionReceipt` (Register/Report/Expire; idempotent by
+  content — an exact report retry is `UNCHANGED`, a re-registration repeats
+  the same receipt, a repeat expiry drops 0 — refusals are `Status`, never
+  stored, and no transition moves `control_revision`), and
+  `planner_input(principal, key, &PlanningContext) -> TierSnapshotInput`, the
+  real persisted adapter: every input field except the planning context
+  (instant, move/age/skew bounds, fragment requests) is derived from
+  committed authority rows. `capacity_state(principal, key)` exposes the
+  reporter/observation counts and the observation epoch.
+- Cluster fixture path (slice 3b): node registration and shard reports are
+  cluster routes, not source-authority commands. The kit drives them through
+  `pipestream_search::control_plane::ClusterControlService::new(plane)` and
+  the `pipestream_search::pb::cluster_control_server::ClusterControl` trait
+  (`register_node`, `report_shard`) on a short-lived in-process tokio
+  runtime, then reopens the plane with `open_existing` for retirement.
+  `lease_ms` is clamped to 300,000 ms by the plane; each `report_shard`
+  reconciles and publishes, so the committed topology generation after the
+  import is read back from the snapshot, never assumed.
 
 ## Harness design
 
@@ -229,99 +254,6 @@ doc-implementation contradiction found. Runtime headroom is large (24 seeds ≈
 Gate: model target passes under the 8 GiB, swap-disabled scope in ~1.0 s;
 the slice-1 target still passes; rustfmt clean; no production changes.
 
-## Slice 2b: capacity-planner integration leg
-
-`tests/control_authority_planner.rs` closes the loop from the committed
-authority state to the capacity planner's public input
-(`pipestream_search::capacity_tiers::TierSnapshotInput`,
-`TierSnapshot::validated`, `plan_tiers`). The kit maps a real imported
-`ControlCollectionSnapshot` to a planner input (`kit::planner_input`) with an
-explicit split:
-
-- Authority-derived fields come from the snapshot itself: the authority id
-  (hex of the SHA-256 of the identity's `group_id`) and incarnation, both
-  revisions, the workspace/collection key, the topology generation from the
-  imported collection state, the derived fingerprint (SHA-256 of the
-  supplement's `derived_fingerprint` string), and the provider geometry
-  digest (SHA-256 of the supplement's canonical prost encoding).
-- Harness-built fields mirror the in-crate planner fixtures
-  (`src/capacity_tiers.rs` test module): the three-node registry, the
-  three-tier policy, the two fragment requests (bucket 7, leaves L4/L7), the
-  cohort configuration (600 s, phase 0, planning instant
-  2026-09-08T12:00:00Z), and the five fixture observations. The committed
-  view (`kit::planner_committed_view`) carries the fixture-A shard/leaf/copy
-  shape (s6/s7, leaves L4/L7, five copy specs) bound to the snapshot's
-  resource triple and topology generation. Hand-building is expected: the
-  imported 2-route plane registers no nodes, exactly as the in-crate
-  fixtures hand-build theirs.
-
-Tests:
-
-- `plan_digest_stable_across_replay_reopen_and_permutation` — four-way plan
-  digest equality (`plan_tiers(...).plan_digest`): forward vs reverse chunk
-  staging (the protocol keys chunks by ordinal and accepts any staging
-  order), committed store vs reopened store, and forward vs reverse
-  observation ingest order (the observation set and its digest are canonical,
-  so the plan cannot move). Also pins snapshot-digest equality across the
-  reopen and observation-set-digest equality across the permutation.
-- `plan_digest_stable_across_sigkill_recovery` — the shared
-  `kit::sigkill_import_worker_body` worker (refactored out of the slice-1
-  target; both targets now carry a thin env-gated `#[test]` wrapper, and the
-  slice-1 test names and behavior are unchanged) is armed at marker 2
-  (killed right after its first staged chunk), recovered through the public
-  API, and the recovered import's plan digest equals the no-crash baseline.
-- `observation_bound_to_committed_resource` — the observation store's
-  committed view serves one resource: a report of another collection is
-  refused with "is not this resource" and a report one topology generation
-  ahead is refused with the identity error, even though the shard, leaf, and
-  node all exist in the committed view; the committed-matching twin lands.
-
-Gate: all three targets (`control_authority_adversarial` 8 tests,
-`control_authority_model` 1, `control_authority_planner` 4) pass under the
-8 GiB, swap-disabled systemd scope; rustfmt clean; no production changes, no
-new dependencies. The planner leg remains local single-process evidence the
-same way slice 1 is: no Raft leader change, log replication, or
-snapshot installation across processes is claimed.
-
-## Slice 2c: observation expiry and incarnation supersession
-
-Two focused tests in `tests/control_authority_planner.rs` pin the
-observation store's two committed lifecycle transitions, verified against
-`src/capacity_tiers.rs` (`commit_expiry` at line 533, `register_incarnation`
-at line 488, and the in-crate boundary test at line 3141):
-
-- `expiry_is_deterministic_and_excludes_the_expired` — expiry ages
-  observations on `window_end_unix_ms`, never `last_scanned_unix_ms`, and
-  expires one only when `now - window_end` is STRICTLY greater than
-  `max_age` (age == max_age survives; the boundary is inclusive). A repeat
-  `commit_expiry` with the same arguments is a no-op (`Ok(0)`, digest
-  unchanged), and a `now` at or before every window end expires nothing.
-  Two identical stores fed the same reports (three in the current cohort,
-  two advanced into the next one so a strict subset can expire) return the
-  same drop count, end with equal `observation_set_digest()` values that
-  differ from the pre-expiry digest, and no longer carry the expired shard's
-  reports. A plan built at the survivors' cohort instant classifies the
-  surviving fragment field-equal (placements, refusals, policy fingerprint)
-  to a store that only ever held the survivors; the fully expired fragment
-  refuses loudly ("no current observation; unknown is not idle") instead of
-  planning from memory.
-- `supersession_drops_the_old_incarnation_and_is_deterministic` —
-  re-registering a node drops its reports at every other process
-  incarnation (epoch advances once, only when the set changes). A late
-  duplicate report from the superseded process is refused naming the current
-  incarnation ("... is superseded by ..."); the replacement process reports
-  with the committed storage incarnation and lands. Two stores taken through
-  the identical sequence end with equal set digests and equal
-  `TierSnapshot::plan_digest()` values.
-
-Also: the pre-existing dead-code warnings from `model.rs`/`rng.rs` (each
-target uses only part of the shared module) are silenced with the same
-`#![allow(dead_code)]` rationale used in `kit.rs`.
-
-Gate: all three targets pass under the 8 GiB, swap-disabled scope in
-`--release` with zero warnings; rustfmt clean; no production changes, no
-commit.
-
 ## Slice 3a: administrative recovery and activation refusals (post-Raft rebase)
 
 Rebased onto the frozen foundations checkpoint `331c18f` (Raft hosting);
@@ -399,3 +331,111 @@ Gate: `cargo check --tests --features fault-injection,raft` clean; the
 model and adversarial targets pass both with `--features fault-injection,raft`
 and without; the planner target passes unchanged; rustfmt clean; no
 production changes, no commit.
+## Slice 3b: the planner leg on the real persisted adapter
+
+Slice 2b mapped an imported `ControlCollectionSnapshot` to the capacity
+planner's input by hand: the kit built the node registry, the committed
+view, the policy and the observations, and only the revisions, the resource
+triple and the supplement digests came from the snapshot. That leg is
+replaced (the slice-2b and slice-2c sections are removed with it). The
+hand-built `kit::planner_input`, `planner_committed_view`,
+`planner_observation_store`, `feed_reports` and their helpers are deleted
+from the kit. `tests/control_authority_planner.rs` now feeds
+`SourceAuthorityStore::planner_input` — the real persisted adapter at
+`src/source_authority/capacity.rs` — and everything the planner sees is
+authority-derived: the committed control and policy revisions, the authority
+identity, the resource triple, the topology generation, the placement tree
+digest, the provider geometry digest, the node records with eligibility,
+the committed shards/leaves/copies, the retained observations and the
+observation epoch. The kit supplies only the `PlanningContext` (a fixed
+planning instant, move/age/skew bounds, and the fragment requests) and the
+observation values.
+
+The fixture chain, all public API:
+
+1. `kit::legacy_plane_with_cluster(dir)` — a pristine 2-route plane (routes
+   tile the u64 hash space) with two server nodes registered through the
+   `ClusterControl` routes (`node-a`/rack-a, `node-b`/rack-b, the plane's
+   300,000 ms lease maximum, `NodeResidency::Server`) and one ready primary
+   replica reported per route: shard-a on node-a with route 0's exact hash
+   range, shard-b on node-b with route 1's. Registration and reports run on
+   a short-lived in-process tokio runtime; the plane is then reopened with
+   `open_existing` for retirement. Each `report_shard` reconciles and
+   publishes, so the committed topology generation is whatever the plane
+   published — the kit reads it back from the snapshot
+   (`kit::committed_generation`) instead of assuming 1.
+2. Retirement and import with the placement supplement
+   (`kit::placement_supplement`): the in-crate two-leaf tree ("old" with
+   `year < 2020`, "rest") and one route code per route, so derive() names
+   shard-a's leaf "old" and shard-b's leaf "rest" through each route's
+   committed placement code. Copies derive as partial legacy evidence
+   (`complete = false`, zero storage incarnation and coverage).
+3. `configure_capacity` at control revision 6 (the import commits at
+   revision 6: begin 1, three chunks, commit), three server-resident tiers
+   with single-replica minima — every shard has exactly one committed copy —
+   then Register transitions for both reporters and one Report per shard in
+   the current cohort window. The planning instant is fixed at twenty
+   cohorts past the epoch (phase 0), so node eligibility (committed lease
+   expiry must exceed the instant) is deterministic even though the imported
+   leases were captured at wall clock.
+
+Tests (`tests/control_authority_planner.rs`, nine including the env-gated
+worker):
+
+- `adapter_input_and_plan_digest_stable_across_reopen` — the adapter input
+  binds `control_revision: 7`, `policy_revision: 1`,
+  `observation_epoch: 2` and the committed topology generation; reopening
+  the store reproduces the committed snapshot digest and the plan view
+  (input render, `TierSnapshot::plan_digest`, plan canonical bytes) exactly.
+- `adapter_plan_digest_stable_across_chunk_permutation` — forward vs
+  reverse chunk staging on twin stores: byte-identical adapter inputs and
+  plan digests, because nodes, replicas and placement codes all come from
+  the committed import, not the staging order.
+- `adapter_transitions_are_idempotent_and_epoch_scoped` — an exact report
+  retry is `UNCHANGED` with the epoch still; re-registration repeats the
+  same receipt; a repeat expiry drops 0; transitions never move the control
+  revision; a report whose leaf the committed shard does not cover refuses
+  with "covers no rows in leaf" and stores nothing.
+- `adapter_plan_digest_moves_with_policy_and_tier_changes` — a
+  `ReplaceGrants` command advancing the access-policy revision moves the
+  digest; a reconfigure with different tier thresholds (same cohort) moves
+  it again; a cohort shift with observations retained is a recorded
+  `FailedPrecondition` decision that moves nothing; a reopen reproduces the
+  final view exactly.
+- `adapter_expiry_is_deterministic_and_epoch_scoped` — the Expire
+  transition (this replaces the slice-2c `commit_expiry` test, re-expressed
+  through the committed path) drops both reports when `now - window_end`
+  strictly exceeds `max_age`, moves the epoch once, repeats as a no-op, and
+  leaves the adapter serving zero observations; planning the evicted leaves
+  refuses "no current observation" instead of planning from memory. Twin
+  stores produce equal receipts, equal counts and equal digests.
+- `adapter_supersession_drops_old_incarnation_and_is_deterministic` — the
+  Register transition (replacing the slice-2c `register_incarnation` test)
+  supersedes the old process incarnation: its rows drop in the same
+  committed transition (`dropped == 1`), its late report is refused naming
+  the new incarnation, the replacement process reports and lands, and twin
+  stores end with equal receipts and equal plan views.
+- `adapter_refuses_reports_outside_the_committed_resource` — a report of
+  another collection refuses with "is not this resource" and a report a
+  topology generation ahead refuses with the identity error, both through
+  the committed transition path; a corrected report for the next cohort
+  window lands.
+- `plan_digest_stable_across_sigkill_recovery` — kept from slice 2b on a
+  new worker, `kit::sigkill_capacity_worker_body` (same marker schedule as
+  the slice-1 import worker, plus the cluster registration and the
+  placement supplement): killed at marker 2, recovered through the public
+  API, then configure/register/report run deterministically and the adapter
+  plan view equals the no-crash baseline. Baseline and recovery are
+  different directories registered at different wall-clock times; the
+  comparison is the plan view, not the snapshot digest, because node
+  eligibility is judged at the fixed planning instant and the imported
+  lease bytes legitimately differ.
+
+Gate: all three targets (`control_authority_adversarial` 11 tests,
+`control_authority_model` 1, `control_authority_planner` 9) pass under the
+8 GiB, swap-disabled systemd scope, with and without
+`--features fault-injection,raft`; `cargo check --tests --features
+fault-injection,raft` is clean; rustfmt clean; no production changes, no
+new dependencies, no commit. The leg remains local single-process evidence:
+no Raft leader change, log replication, or snapshot installation across
+processes is claimed.
