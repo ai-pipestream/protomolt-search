@@ -3,6 +3,8 @@
 //! committed-replay paths and the in-process host.
 pub mod host;
 pub mod log_store;
+#[cfg(feature = "tls")]
+pub mod operator;
 pub mod state_machine;
 #[cfg(feature = "tls")]
 pub mod transport;

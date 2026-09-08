@@ -26,6 +26,8 @@ mod contract;
 mod import;
 mod map_feed;
 mod recovery;
+#[cfg(feature = "net")]
+mod relay_map;
 mod retirement;
 mod transition;
 
@@ -39,6 +41,8 @@ pub use import::{
     MAX_IMPORT_CHUNKS, MAX_IMPORT_PAYLOAD_BYTES, MAX_SUPPLEMENT_BYTES, MIN_CHUNK_CAPACITY,
 };
 pub use map_feed::MapConsumer;
+#[cfg(feature = "net")]
+pub use relay_map::AuthorityMapSource;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("source_authority_meta");
 /// Meta key of the Raft applied position (docs/raft-hosting.md).
@@ -1482,5 +1486,7 @@ mod capacity_tests;
 mod import_tests;
 #[cfg(test)]
 mod map_feed_tests;
+#[cfg(all(test, feature = "net"))]
+mod relay_map_tests;
 #[cfg(test)]
 mod retirement_tests;

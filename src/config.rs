@@ -221,6 +221,42 @@ pub enum ClusteredTurboVecConfig {
     External { endpoint: String },
 }
 
+/// The resource a relay routes on from a Raft-hosted authority's
+/// committed map (`--raft-map-principal`, `--raft-map-workspace`,
+/// `--raft-map-collection`; docs/raft-hosting.md).
+#[derive(Debug, Clone)]
+pub struct RaftMapConfig {
+    pub principal: String,
+    pub workspace: String,
+    pub collection: String,
+}
+
+/// A Raft member of the source authority group (`--raft-*`,
+/// docs/raft-hosting.md "Operator configuration"). Serving opens existing
+/// state; `raft-prepare` creates it.
+#[derive(Debug, Clone)]
+pub struct RaftMemberConfig {
+    /// The member's directory: store, log and snapshots.
+    pub dir: PathBuf,
+    pub node_id: u64,
+    /// The group identity the store must carry (16 bytes each, given as
+    /// 32 hex digits).
+    pub group_id: Vec<u8>,
+    pub authority_incarnation: Vec<u8>,
+    pub listen: SocketAddr,
+    /// The address peers dial, when it is not the bound one.
+    pub advertise: Option<String>,
+    /// The peers file (`[[peers]]` of `node_id` and `certificate`).
+    pub peers: PathBuf,
+    pub heartbeat_ms: u64,
+    pub election_min_ms: u64,
+    pub election_max_ms: u64,
+    pub lease_ms: u64,
+    pub skew_ms: u64,
+    pub max_snapshot_bytes: u64,
+    pub map: Option<RaftMapConfig>,
+}
+
 /// Full process configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -481,6 +517,9 @@ pub struct Config {
     /// channels (`--tls-ca`, `--tls-client-cert`, `--tls-client-key`,
     /// `--tls-domain`).
     pub client_tls: Option<crate::security::ClientTls>,
+    /// This process as a member of the source authority's Raft group
+    /// (`--raft-dir` and the other `--raft-*` options).
+    pub raft: Option<RaftMemberConfig>,
     /// Serve plaintext gRPC on a non-loopback listener without TLS
     /// (`--allow-plaintext`). Loopback listeners never need it.
     pub allow_plaintext: bool,
@@ -552,6 +591,22 @@ struct FileConfig {
     tls_key: Option<String>,
     tls_client_ca: Option<String>,
     tls_ca: Option<String>,
+    raft_dir: Option<String>,
+    raft_node_id: Option<u64>,
+    raft_group_id: Option<String>,
+    raft_authority_incarnation: Option<String>,
+    raft_listen: Option<String>,
+    raft_advertise: Option<String>,
+    raft_peers: Option<String>,
+    raft_heartbeat_ms: Option<u64>,
+    raft_election_min_ms: Option<u64>,
+    raft_election_max_ms: Option<u64>,
+    raft_lease_ms: Option<u64>,
+    raft_skew_ms: Option<u64>,
+    raft_max_snapshot_bytes: Option<u64>,
+    raft_map_principal: Option<String>,
+    raft_map_workspace: Option<String>,
+    raft_map_collection: Option<String>,
     tls_client_cert: Option<String>,
     tls_client_key: Option<String>,
     tls_domain: Option<String>,
@@ -2470,9 +2525,12 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         }
     }
 
+    let raft = parse_raft(args, &file, relay)?;
+
     Ok(Config {
         role,
         coord_listen,
+        raft,
         metrics_listen,
         node_addrs,
         clustered_turbovec,
@@ -2580,6 +2638,113 @@ mod tests {
 
     fn args_raw(pairs: &[&str]) -> Vec<String> {
         pairs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn raft_member_options_parse_together_and_partial_ones_refuse() {
+        // Extras replace a base option of the same key: the first value of
+        // a key wins in `arg_value`.
+        let member = |extra: &[&str]| {
+            let key = |pair: &str| pair.split('=').next().unwrap_or(pair).to_string();
+            let overridden: Vec<String> = extra.iter().map(|p| key(p)).collect();
+            let mut pairs: Vec<&str> = [
+                "--role=coordinator",
+                "--nodes=127.0.0.1:1",
+                "--raft-dir=/tmp/member-1",
+                "--raft-node-id=1",
+                "--raft-group-id=0102030405060708090a0b0c0d0e0f10",
+                "--raft-authority-incarnation=ffffffffffffffffffffffffffffffff",
+                "--raft-listen=127.0.0.1:19500",
+                "--raft-peers=/tmp/peers.toml",
+            ]
+            .into_iter()
+            .filter(|p| !overridden.contains(&key(p)))
+            .collect();
+            pairs.extend_from_slice(extra);
+            parse(&args(&pairs))
+        };
+        let cfg = member(&["--raft-advertise=krick-1:19500", "--raft-lease-ms=400"]).unwrap();
+        let raft = cfg.raft.unwrap();
+        assert_eq!(raft.node_id, 1);
+        assert_eq!(raft.group_id, (1..=16).collect::<Vec<u8>>());
+        assert_eq!(raft.authority_incarnation, vec![255; 16]);
+        assert_eq!(raft.listen.port(), 19500);
+        assert_eq!(raft.advertise.as_deref(), Some("krick-1:19500"));
+        assert_eq!(raft.peers, PathBuf::from("/tmp/peers.toml"));
+        assert_eq!(raft.lease_ms, 400);
+        assert_eq!(raft.election_min_ms, 1_000);
+        assert!(raft.map.is_none());
+        assert!(parse(&args(&["--role=node", "--index=/tmp/x.tv"]))
+            .unwrap()
+            .raft
+            .is_none());
+        // A member is its directory: node id or peers without it refuse.
+        let error = parse(&args(&[
+            "--role=node",
+            "--index=/tmp/x.tv",
+            "--raft-node-id=1",
+        ]))
+        .unwrap_err();
+        assert!(error.contains("needs --raft-dir"), "{error}");
+        for (missing, expect) in [
+            ("--raft-node-id=", "needs --raft-node-id"),
+            ("--raft-group-id=", "needs --raft-group-id"),
+            ("--raft-peers=", "needs --raft-peers"),
+        ] {
+            let pairs: Vec<&str> = [
+                "--role=coordinator",
+                "--nodes=127.0.0.1:1",
+                "--raft-dir=/tmp/member-1",
+                "--raft-node-id=1",
+                "--raft-group-id=0102030405060708090a0b0c0d0e0f10",
+                "--raft-authority-incarnation=ffffffffffffffffffffffffffffffff",
+                "--raft-listen=127.0.0.1:19500",
+                "--raft-peers=/tmp/peers.toml",
+            ]
+            .into_iter()
+            .filter(|p| !p.starts_with(missing))
+            .collect();
+            let error = parse(&args(&pairs)).unwrap_err();
+            assert!(error.contains(expect), "{missing}: {error}");
+        }
+        // Malformed values are refused by name.
+        let error = member(&["--raft-group-id=0102"]).unwrap_err();
+        assert!(error.contains("32 hex digits"), "{error}");
+        let error = member(&["--raft-group-id=zz02030405060708090a0b0c0d0e0f10"]).unwrap_err();
+        assert!(error.contains("non-hex"), "{error}");
+        let error =
+            member(&["--raft-authority-incarnation=00000000000000000000000000000000"]).unwrap_err();
+        assert!(error.contains("nonzero"), "{error}");
+        let error = member(&["--raft-node-id=0"]).unwrap_err();
+        assert!(error.contains("nonzero"), "{error}");
+        let error = member(&["--raft-lease-ms=soon"]).unwrap_err();
+        assert!(error.contains("--raft-lease-ms"), "{error}");
+        // The map options go together and need a relay.
+        let error = member(&["--raft-map-principal=relay"]).unwrap_err();
+        assert!(error.contains("go together"), "{error}");
+        let error = member(&[
+            "--raft-map-principal=relay",
+            "--raft-map-workspace=workspace-a",
+            "--raft-map-collection=books",
+        ])
+        .unwrap_err();
+        assert!(error.contains("needs --relay"), "{error}");
+        let cfg = member(&[
+            "--relay",
+            "--raft-map-principal=relay",
+            "--raft-map-workspace=workspace-a",
+            "--raft-map-collection=books",
+        ])
+        .unwrap();
+        let map = cfg.raft.unwrap().map.unwrap();
+        assert_eq!(
+            (
+                map.principal.as_str(),
+                map.workspace.as_str(),
+                map.collection.as_str()
+            ),
+            ("relay", "workspace-a", "books")
+        );
     }
 
     #[test]
@@ -3259,4 +3424,206 @@ slot_offset = 25000000
         assert!(cfg.phrase_ignore_case);
         assert!(cfg.phrase_ner);
     }
+}
+
+/// 32 hex digits to 16 bytes, refusing anything else by name.
+fn hex16(what: &str, value: &str) -> Result<Vec<u8>, String> {
+    let digits = value.as_bytes();
+    if digits.len() != 32 {
+        return Err(format!(
+            "{what} must be 32 hex digits, got {} characters",
+            digits.len()
+        ));
+    }
+    let nibble = |d: u8| -> Result<u8, String> {
+        match d {
+            b'0'..=b'9' => Ok(d - b'0'),
+            b'a'..=b'f' => Ok(d - b'a' + 10),
+            b'A'..=b'F' => Ok(d - b'A' + 10),
+            _ => Err(format!("{what} holds a non-hex character {:?}", d as char)),
+        }
+    };
+    let mut bytes = Vec::with_capacity(16);
+    for pair in digits.chunks(2) {
+        bytes.push((nibble(pair[0])? << 4) | nibble(pair[1])?);
+    }
+    if bytes.iter().all(|b| *b == 0) {
+        return Err(format!("{what} must be nonzero"));
+    }
+    Ok(bytes)
+}
+
+/// The `--raft-*` options: none of them makes a member; `--raft-dir`
+/// does, and then node id, group, incarnation, listen and peers are
+/// required. Timing defaults are the host's (`HostConfig::default`) and
+/// are validated when the host starts.
+fn parse_raft(
+    args: &[String],
+    file: &FileConfig,
+    relay: bool,
+) -> Result<Option<RaftMemberConfig>, String> {
+    let text = |key: &str, env: &str, file_value: Option<&str>| {
+        opt(args, key, &format!("PIPESTREAM_SEARCH_{env}"), file_value)
+    };
+    let number =
+        |key: &str, env: &str, file_value: Option<u64>, default: u64| -> Result<u64, String> {
+            match text(key, env, file_value.map(|v| v.to_string()).as_deref()) {
+                Some(value) => value
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|e| format!("--{key}: {e}")),
+                None => Ok(default),
+            }
+        };
+    let Some(dir) = text("raft-dir", "RAFT_DIR", file.raft_dir.as_deref()) else {
+        for (key, present) in [
+            (
+                "raft-node-id",
+                text("raft-node-id", "RAFT_NODE_ID", None).is_some(),
+            ),
+            (
+                "raft-peers",
+                text("raft-peers", "RAFT_PEERS", file.raft_peers.as_deref()).is_some(),
+            ),
+            (
+                "raft-listen",
+                text("raft-listen", "RAFT_LISTEN", file.raft_listen.as_deref()).is_some(),
+            ),
+        ] {
+            if present {
+                return Err(format!(
+                    "--{key} needs --raft-dir; a member is its directory"
+                ));
+            }
+        }
+        return Ok(None);
+    };
+    let required = |key: &str, env: &str, file_value: Option<&str>| {
+        text(key, env, file_value).ok_or_else(|| format!("a raft member needs --{key}"))
+    };
+    let node_id = required(
+        "raft-node-id",
+        "RAFT_NODE_ID",
+        file.raft_node_id.map(|v| v.to_string()).as_deref(),
+    )?
+    .trim()
+    .parse::<u64>()
+    .map_err(|e| format!("--raft-node-id: {e}"))?;
+    if node_id == 0 {
+        return Err("--raft-node-id must be nonzero".to_string());
+    }
+    let group_id = hex16(
+        "--raft-group-id",
+        &required(
+            "raft-group-id",
+            "RAFT_GROUP_ID",
+            file.raft_group_id.as_deref(),
+        )?,
+    )?;
+    let authority_incarnation = hex16(
+        "--raft-authority-incarnation",
+        &required(
+            "raft-authority-incarnation",
+            "RAFT_AUTHORITY_INCARNATION",
+            file.raft_authority_incarnation.as_deref(),
+        )?,
+    )?;
+    let listen = required("raft-listen", "RAFT_LISTEN", file.raft_listen.as_deref())?
+        .parse::<SocketAddr>()
+        .map_err(|e| format!("--raft-listen: {e}"))?;
+    let advertise = text(
+        "raft-advertise",
+        "RAFT_ADVERTISE",
+        file.raft_advertise.as_deref(),
+    );
+    if advertise
+        .as_deref()
+        .is_some_and(|a| a.is_empty() || a.len() > 1024)
+    {
+        return Err("--raft-advertise must be 1..1024 bytes".to_string());
+    }
+    let peers = PathBuf::from(required(
+        "raft-peers",
+        "RAFT_PEERS",
+        file.raft_peers.as_deref(),
+    )?);
+    let heartbeat_ms = number(
+        "raft-heartbeat-ms",
+        "RAFT_HEARTBEAT_MS",
+        file.raft_heartbeat_ms,
+        250,
+    )?;
+    let election_min_ms = number(
+        "raft-election-min-ms",
+        "RAFT_ELECTION_MIN_MS",
+        file.raft_election_min_ms,
+        1_000,
+    )?;
+    let election_max_ms = number(
+        "raft-election-max-ms",
+        "RAFT_ELECTION_MAX_MS",
+        file.raft_election_max_ms,
+        2_000,
+    )?;
+    let lease_ms = number("raft-lease-ms", "RAFT_LEASE_MS", file.raft_lease_ms, 500)?;
+    let skew_ms = number("raft-skew-ms", "RAFT_SKEW_MS", file.raft_skew_ms, 250)?;
+    let max_snapshot_bytes = number(
+        "raft-max-snapshot-bytes",
+        "RAFT_MAX_SNAPSHOT_BYTES",
+        file.raft_max_snapshot_bytes,
+        4 << 30,
+    )?;
+    let map = {
+        let principal = text(
+            "raft-map-principal",
+            "RAFT_MAP_PRINCIPAL",
+            file.raft_map_principal.as_deref(),
+        );
+        let workspace = text(
+            "raft-map-workspace",
+            "RAFT_MAP_WORKSPACE",
+            file.raft_map_workspace.as_deref(),
+        );
+        let collection = text(
+            "raft-map-collection",
+            "RAFT_MAP_COLLECTION",
+            file.raft_map_collection.as_deref(),
+        );
+        match (principal, workspace, collection) {
+            (None, None, None) => None,
+            (Some(principal), Some(workspace), Some(collection)) => {
+                if !relay {
+                    return Err(
+                        "--raft-map-* routes a relay on the committed map and needs --relay"
+                            .to_string(),
+                    );
+                }
+                Some(RaftMapConfig {
+                    principal,
+                    workspace,
+                    collection,
+                })
+            }
+            _ => return Err(
+                "--raft-map-principal, --raft-map-workspace and --raft-map-collection go together"
+                    .to_string(),
+            ),
+        }
+    };
+    Ok(Some(RaftMemberConfig {
+        dir: PathBuf::from(dir),
+        node_id,
+        group_id,
+        authority_incarnation,
+        listen,
+        advertise,
+        peers,
+        heartbeat_ms,
+        election_min_ms,
+        election_max_ms,
+        lease_ms,
+        skew_ms,
+        max_snapshot_bytes,
+        map,
+    }))
 }

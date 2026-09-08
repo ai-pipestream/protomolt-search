@@ -183,6 +183,9 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let mut handles = Vec::new();
+    // A Raft member starts from its existing durable state before any
+    // listener that routes on its committed map (docs/raft-hosting.md).
+    let raft_host = start_raft_member(&cfg).await?;
     let mut node_services = Vec::new();
     // Membership (docs/cluster-control.md): one agent per collection the
     // configured shards name, each reporting its shards under their own
@@ -476,7 +479,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             &mut handles,
         )
         .await?;
-        let relay = pipestream_search::relay::RelayService::new(std::sync::Arc::new(coordinator));
+        let relay = relay_service(&cfg, raft_host.as_ref(), coordinator)?;
         let health = relay
             .check_children()
             .await
@@ -561,6 +564,17 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    if let Some(host) = raft_host {
+        let mut shutdown = shutdown_rx.clone();
+        handles.push(tokio::spawn(async move {
+            let _ = shutdown.wait_for(|v| *v).await;
+            if let Err(error) = host.shutdown().await {
+                eprintln!("raft member shutdown: {}", error.message());
+            }
+            Ok(())
+        }));
+    }
+
     for handle in handles {
         handle.await??;
     }
@@ -583,6 +597,150 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         node.snapshot_vocab_on_shutdown();
     }
     Ok(())
+}
+
+/// The Raft member this process serves as, from `--raft-*`; `None` when
+/// none is configured. Serving opens existing state and creates nothing.
+#[cfg(all(feature = "raft", feature = "tls"))]
+async fn start_raft_member(
+    cfg: &Config,
+) -> Result<Option<pipestream_search::raft::RaftHost>, Box<dyn std::error::Error>> {
+    use pipestream_search::raft::{operator, RaftHost};
+    let Some(member) = &cfg.raft else {
+        return Ok(None);
+    };
+    let identity = operator::identity(member);
+    let host_config = operator::host_config(member)?;
+    let transport = operator::cluster_transport(member, cfg.tls.as_ref(), cfg.client_tls.as_ref())?;
+    let host = RaftHost::start_member(
+        &member.dir,
+        &identity,
+        member.node_id,
+        &host_config,
+        transport,
+    )
+    .await
+    .map_err(|status| format!("raft member: {}", status.message()))?;
+    eprintln!(
+        "raft member {} of group {} listening on {} (peers dial {}), timing {}",
+        member.node_id,
+        hex(&member.group_id),
+        host.listen_addr()
+            .map_or_else(String::new, |a| a.to_string()),
+        host.advertised_addr().unwrap_or(""),
+        host_config.timing_agreement()
+    );
+    Ok(Some(host))
+}
+
+#[cfg(not(all(feature = "raft", feature = "tls")))]
+async fn start_raft_member(cfg: &Config) -> Result<Option<()>, Box<dyn std::error::Error>> {
+    match &cfg.raft {
+        Some(_) => {
+            Err("this build has no Raft support (features `raft` and `tls` are needed)".into())
+        }
+        None => Ok(None),
+    }
+}
+
+/// The relay over its coordinator's shard set, routing on the committed map
+/// of the Raft member when `--raft-map-*` names one, and on the file-polled
+/// map otherwise.
+#[cfg(all(feature = "raft", feature = "tls"))]
+fn relay_service(
+    cfg: &Config,
+    host: Option<&pipestream_search::raft::RaftHost>,
+    coordinator: pipestream_search::coordinator::CoordinatorServiceImpl,
+) -> Result<pipestream_search::relay::RelayService, Box<dyn std::error::Error>> {
+    use pipestream_search::relay::RelayService;
+    let base = std::sync::Arc::new(coordinator);
+    let map = cfg.raft.as_ref().and_then(|member| member.map.as_ref());
+    match (host, map) {
+        (Some(host), Some(map)) => {
+            let key = pipestream_search::pb::storage::LogicalSourceOwner {
+                workspace: map.workspace.clone(),
+                collection: map.collection.clone(),
+                owner_id: Vec::new(),
+            };
+            let source = pipestream_search::source_authority::AuthorityMapSource::attach(
+                host.store_handle(),
+                &map.principal,
+                &key,
+            )
+            .map_err(|status| format!("raft map source: {}", status.message()))?;
+            eprintln!(
+                "relay routes on the committed map of {}/{} (revision {})",
+                map.workspace,
+                map.collection,
+                pipestream_search::relay::MapSource::current(&source).control_revision
+            );
+            Ok(RelayService::with_map(base, std::sync::Arc::new(source)))
+        }
+        _ => Ok(RelayService::new(base)),
+    }
+}
+
+#[cfg(not(all(feature = "raft", feature = "tls")))]
+fn relay_service(
+    _cfg: &Config,
+    _host: Option<&()>,
+    coordinator: pipestream_search::coordinator::CoordinatorServiceImpl,
+) -> Result<pipestream_search::relay::RelayService, Box<dyn std::error::Error>> {
+    Ok(pipestream_search::relay::RelayService::new(
+        std::sync::Arc::new(coordinator),
+    ))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from(b"0123456789abcdef"[usize::from(byte >> 4)]));
+        out.push(char::from(b"0123456789abcdef"[usize::from(byte & 15)]));
+    }
+    out
+}
+
+/// `raft-prepare --raft-dir=... --raft-node-id=... --raft-group-id=...
+/// --raft-authority-incarnation=... --raft-listen=... --raft-peers=...`:
+/// create the durable state of a member that will join by snapshot. The
+/// genesis policy and limits are placeholders the group's image replaces;
+/// no entry applies before that (docs/raft-hosting.md, "Membership").
+fn raft_prepare(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = parse(args)?;
+    let Some(member) = &cfg.raft else {
+        return Err("raft-prepare needs --raft-dir and the other --raft-* options".into());
+    };
+    #[cfg(all(feature = "raft", feature = "tls"))]
+    {
+        use pipestream_search::raft::{operator, RaftHost};
+        let identity = operator::identity(member);
+        let policy = pipestream_search::pb::AccessPolicy {
+            format_version: 1,
+            revision: 1,
+            resources: Vec::new(),
+            grants: Vec::new(),
+        };
+        let limits = pipestream_search::pb::storage::SourceAuthorityLimits {
+            max_owners: 16,
+            max_decisions: 256,
+            max_payload_bytes: 16 << 20,
+            max_command_bytes: 64 << 10,
+        };
+        RaftHost::prepare_member(&member.dir, &identity, member.node_id, &policy, &limits)
+            .map_err(|status| format!("raft-prepare: {}", status.message()))?;
+        println!(
+            "prepared raft member {} of group {} in {}; add it as a learner from the leader",
+            member.node_id,
+            hex(&member.group_id),
+            member.dir.display()
+        );
+        Ok(())
+    }
+    #[cfg(not(all(feature = "raft", feature = "tls")))]
+    {
+        let _ = member;
+        Err("this build has no Raft support (features `raft` and `tls` are needed)".into())
+    }
 }
 
 /// Copy provider-owned construction state from one node to empty peers.
@@ -1124,6 +1282,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("configure-backend" | "calibrate")
     ) {
         return configure_backend(&argv[1..]).await;
+    }
+    if argv.first().map(String::as_str) == Some("raft-prepare") {
+        return raft_prepare(&argv[1..]);
     }
     let cfg = parse(&argv)?;
     run(cfg).await

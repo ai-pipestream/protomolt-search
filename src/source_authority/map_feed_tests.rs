@@ -25,7 +25,7 @@ fn tree() -> PlacementTree {
     }
 }
 
-fn imported(
+pub(super) fn imported(
     name: &str,
 ) -> (
     Directory,
@@ -57,7 +57,10 @@ fn imported(
     (dir, authority, store, revision)
 }
 
-fn prepare(authority: &SourceAuthorityIdentity, revision: u64) -> SourceAuthorityCommand {
+pub(super) fn prepare(
+    authority: &SourceAuthorityIdentity,
+    revision: u64,
+) -> SourceAuthorityCommand {
     SourceAuthorityCommand {
         format_version: 1,
         authority: Some(authority.clone()),

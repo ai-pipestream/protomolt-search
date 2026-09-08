@@ -1250,6 +1250,16 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   destination store remains unchanged. See [retirement and crash recovery](docs/control-retirement.md);
   transactional import, worker fencing and activation remain separate steps.
 
+- **Foundation branch: relay on the committed map, Raft operator
+  configuration.** `AuthorityMapSource` feeds a relay from a source
+  authority's `published_map` through the map consumer's rules, waking on
+  the applied watch; `--raft-*` options make a serving process a member
+  (peers file of node ids and certificates, listen/advertise, timing
+  values validated at start), `raft-prepare` creates a member's durable
+  state, and `--raft-map-*` routes the relay on the committed map. Read
+  only: the relay admits nothing by the map. See
+  [raft hosting](docs/raft-hosting.md).
+
 - **Foundation branch: admission lease repaired (Astra review A1/A2 of
   240be9f).** The lease interval is anchored before the read barrier is
   invoked, so it includes every response, catch-up and scheduling delay

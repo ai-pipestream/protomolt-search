@@ -652,6 +652,21 @@ impl RaftHost {
         gate
     }
 
+    /// A handle that yields the current store on every call, for consumers
+    /// that outlive one snapshot install (the relay's map source).
+    pub fn store_handle(
+        &self,
+    ) -> impl Fn() -> Result<SourceAuthorityStore, Status> + Send + Sync + 'static {
+        let shared = Arc::clone(&self.store);
+        move || {
+            shared
+                .read()
+                .map_err(|_| Status::internal("host store lock poisoned"))?
+                .clone()
+                .ok_or_else(|| Status::unavailable("store is being replaced by a snapshot install"))
+        }
+    }
+
     /// The current store handle, for reads (maps, snapshots, decisions).
     /// Direct commands on it refuse; propose through the host.
     pub fn store(&self) -> Result<SourceAuthorityStore, Status> {
