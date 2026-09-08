@@ -69,6 +69,7 @@ impl<'a> CatalogCheckpoint<'a> {
             decode(record.value())?
         };
         validate_current_header(&header)?;
+        actors::validate_read_counts(&read, &header)?;
         let (indexes, journal_tables) =
             publication::checkpoint_states(&read, &header, max_metadata_bytes)?;
         let metadata = DocumentCatalogCheckpoint {
@@ -83,6 +84,15 @@ impl<'a> CatalogCheckpoint<'a> {
             ));
         }
         let mut binary_tables = vec![HEADS, VERSIONS, OPERATIONS, DESCRIPTORS, SOURCES];
+        if metadata
+            .header
+            .as_ref()
+            .expect("captured header")
+            .format_version
+            == ACCESS_CONTROLLED_FORMAT
+        {
+            binary_tables.push(actors::OPERATIONS);
+        }
         binary_tables.extend(journal_tables);
         let mut expected = vec![META.name().to_string(), CHANGES.name().to_string()];
         expected.extend(binary_tables.iter().map(|t| t.name().to_string()));

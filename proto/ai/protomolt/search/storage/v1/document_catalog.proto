@@ -21,6 +21,34 @@ message DocumentCatalogHeader {
   // Format 7 requires the access-controlled API on open and every mutation.
   // Retirement and seal markers retain their meaning without changing format.
   SourceResourceBinding resource_binding = 8;
+  // Format 8: actor-scoped retries. Required even when no legacy records exist.
+  SourceActorNamespace actor_namespace = 9;
+}
+
+// Canonical lookup key in the separate actor_operations table. Principals are
+// authenticated stable subjects, never display names or caller-supplied aliases.
+message ActorOperationKey {
+  uint32 format_version = 1; // 1
+  string principal = 2; // 1..16384 UTF-8 bytes, never reassigned to another actor.
+  bytes operation_id = 3; // 1..1024 bytes.
+}
+
+// Migration watermark. All acceptance is fenced until assignment is complete.
+message SourceActorNamespace {
+  uint32 format_version = 1; // 1
+  uint64 legacy_operations = 2;
+  uint64 assigned_operations = 3;
+}
+
+// Explicit Admin attribution of one actorless decision. Preserves the exact
+// stored operation value, history, versions, watermark and lifecycle fences.
+// It grants no permission to the named actor and no replacement ownership.
+message SourceActorAssignment {
+  uint32 format_version = 1; // 1
+  bytes history_id = 2;
+  bytes operation_id = 3;
+  string principal = 4;
+  bytes request_sha256 = 5;
 }
 
 // Immutable local resource scope, not a replacement-owner or residency grant.

@@ -22,6 +22,7 @@ use crate::pb::{
 use crate::sha256;
 
 mod access;
+mod actors;
 mod backup;
 mod checkpoint;
 mod projection;
@@ -46,7 +47,8 @@ const FORMAT_VERSION: u32 = 3;
 const SEALED_FORMAT_VERSION: u32 = 4;
 const RETIRING_FORMAT_VERSION: u32 = 5;
 const RETIRED_FORMAT_VERSION: u32 = 6;
-const ACCESS_CONTROLLED_FORMAT: u32 = 7;
+const LEGACY_ACCESS_CONTROLLED_FORMAT: u32 = 7;
+const ACCESS_CONTROLLED_FORMAT: u32 = 8;
 const CACHE_BYTES: usize = 8 << 20;
 
 fn storage(error: impl std::fmt::Display) -> Status {
@@ -78,6 +80,7 @@ fn validate_current_header(header: &DocumentCatalogHeader) -> Result<(), Status>
             | SEALED_FORMAT_VERSION
             | RETIRING_FORMAT_VERSION
             | RETIRED_FORMAT_VERSION
+            | LEGACY_ACCESS_CONTROLLED_FORMAT
             | ACCESS_CONTROLLED_FORMAT
     ) || !valid_history_id(&header.history_id)
         || header.legacy_receipts_through_sequence > header.accepted_sequence
@@ -87,6 +90,7 @@ fn validate_current_header(header: &DocumentCatalogHeader) -> Result<(), Status>
         ));
     }
     seal::validate_header_seal(header)?;
+    actors::validate_namespace(header)?;
     Ok(())
 }
 
@@ -227,6 +231,7 @@ impl DocumentCatalog {
                 || header.history_seal.is_some()
                 || header.retirement_intent.is_some()
                 || header.resource_binding.is_some()
+                || header.actor_namespace.is_some()
             {
                 return Err(Status::data_loss(
                     "legacy catalog contains unexpected history identity metadata",
@@ -246,6 +251,15 @@ impl DocumentCatalog {
                 return self.upgrade_history();
             }
             transaction.open_table(CHANGES).map_err(storage)?;
+            actors::validate_read_counts(&transaction, &header)?;
+            if header.format_version == LEGACY_ACCESS_CONTROLLED_FORMAT
+                && header.accepted_sequence == 0
+            {
+                drop(bytes);
+                drop(table);
+                drop(transaction);
+                return self.upgrade_empty_actor_namespace();
+            }
             return Ok(());
         }
         let mut transaction = self.database.begin_write().map_err(storage)?;
@@ -267,6 +281,7 @@ impl DocumentCatalog {
                 history_seal: None,
                 retirement_intent: None,
                 resource_binding: self.resource_binding.clone(),
+                actor_namespace: self.resource_binding.as_ref().map(|_| actors::namespace(0)),
             }
             .encode_to_vec();
             table.insert("header", header.as_slice()).map_err(storage)?;
@@ -275,6 +290,11 @@ impl DocumentCatalog {
             transaction.open_table(definition).map_err(storage)?;
         }
         transaction.open_table(CHANGES).map_err(storage)?;
+        if self.resource_binding.is_some() {
+            transaction
+                .open_table(actors::OPERATIONS)
+                .map_err(storage)?;
+        }
         transaction.commit().map_err(storage)
     }
 
@@ -344,6 +364,15 @@ impl DocumentCatalog {
     /// before the version precondition or retirement fence, including after
     /// later writes, deletion or sealing. A replay does not mutate the catalog.
     pub fn accept(&self, request: &AcceptDocumentRequest) -> Result<DocumentWriteReceipt, Status> {
+        self.accept_as(request, None)
+    }
+
+    fn accept_as(
+        &self,
+        request: &AcceptDocumentRequest,
+        principal: Option<&str>,
+    ) -> Result<DocumentWriteReceipt, Status> {
+        let operation_key = actors::OperationKey::new(principal, &request.operation_id)?;
         match request.contract_version {
             1 if request.history_id.is_empty() => {}
             2 if valid_history_id(&request.history_id) => {}
@@ -372,7 +401,7 @@ impl DocumentCatalog {
             }
         }
         let request_sha = sha256::digest(&request.encode_to_vec());
-        if let Some(receipt) = self.accepted_retry(request, &request_sha)? {
+        if let Some(receipt) = self.accepted_retry(request, &request_sha, &operation_key)? {
             return Ok(receipt);
         }
         // Another acceptance or retirement may commit after the read snapshot.
@@ -383,10 +412,14 @@ impl DocumentCatalog {
             .map_err(storage)?;
         let mut header = seal::header_from(self, &transaction)?;
         retry::check_history(&header, request)?;
+        operation_key.check_header(&header)?;
+        actors::validate_write_counts(&transaction, &header)?;
         {
-            let operations = transaction.open_table(OPERATIONS).map_err(storage)?;
+            let operations = transaction
+                .open_table(operation_key.table())
+                .map_err(storage)?;
             if let Some(previous) = operations
-                .get(request.operation_id.as_slice())
+                .get(operation_key.bytes.as_slice())
                 .map_err(storage)?
             {
                 return retry::receipt(&header, previous.value(), &request_sha);
@@ -499,9 +532,9 @@ impl DocumentCatalog {
         }
         .encode_to_vec();
         transaction
-            .open_table(OPERATIONS)
+            .open_table(operation_key.table())
             .map_err(storage)?
-            .insert(request.operation_id.as_slice(), operation.as_slice())
+            .insert(operation_key.bytes.as_slice(), operation.as_slice())
             .map_err(storage)?;
         transaction
             .open_table(META)

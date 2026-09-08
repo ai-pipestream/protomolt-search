@@ -89,8 +89,19 @@ impl AccessControlledCatalog {
         permit: &AccessPermit,
         request: &AcceptDocumentRequest,
     ) -> Result<DocumentWriteReceipt, Status> {
-        let _guard = authorize(&self.binding, permit, AccessAction::Ingest)?;
-        self.inner.accept(request)
+        let guard = authorize(&self.binding, permit, AccessAction::Ingest)?;
+        self.inner
+            .accept_as(request, Some(&guard.decision().principal))
+    }
+
+    /// Attribute one legacy retry decision without changing its receipt or source.
+    pub fn assign_legacy_actor(
+        &self,
+        permit: &AccessPermit,
+        request: &crate::pb::storage::SourceActorAssignment,
+    ) -> Result<(), Status> {
+        let _guard = authorize(&self.binding, permit, AccessAction::Admin)?;
+        self.inner.assign_legacy_actor(request)
     }
 
     pub fn begin_retirement(

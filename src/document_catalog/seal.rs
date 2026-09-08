@@ -19,7 +19,10 @@ pub(super) fn validate_header_seal(header: &DocumentCatalogHeader) -> Result<(),
             && !intent.operation_id.is_empty()
             && intent.operation_id.len() <= 1024
     });
-    let lifecycle_format = if header.format_version == ACCESS_CONTROLLED_FORMAT {
+    let lifecycle_format = if matches!(
+        header.format_version,
+        LEGACY_ACCESS_CONTROLLED_FORMAT | ACCESS_CONTROLLED_FORMAT
+    ) {
         let binding = header.resource_binding.as_ref().ok_or_else(|| {
             Status::data_loss("access-controlled catalog resource binding missing")
         })?;
@@ -41,7 +44,7 @@ pub(super) fn validate_header_seal(header: &DocumentCatalogHeader) -> Result<(),
     } else {
         if header.resource_binding.is_some() {
             return Err(Status::data_loss(
-                "source resource binding requires catalog format 7",
+                "source resource binding requires catalog format 7 or 8",
             ));
         }
         header.format_version
@@ -191,7 +194,7 @@ impl DocumentCatalog {
             operation_id: request.operation_id.clone(),
         };
         header.format_version = if self.resource_binding.is_some() {
-            ACCESS_CONTROLLED_FORMAT
+            header.format_version
         } else {
             RETIRING_FORMAT_VERSION
         };
@@ -290,7 +293,7 @@ impl DocumentCatalog {
             operation_id: request.operation_id.clone(),
         };
         header.format_version = if self.resource_binding.is_some() {
-            ACCESS_CONTROLLED_FORMAT
+            header.format_version
         } else if header.retirement_intent.is_some() {
             RETIRED_FORMAT_VERSION
         } else {

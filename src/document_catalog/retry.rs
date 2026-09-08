@@ -47,6 +47,7 @@ impl DocumentCatalog {
         &self,
         request: &AcceptDocumentRequest,
         request_sha: &[u8; 32],
+        operation_key: &actors::OperationKey,
     ) -> Result<Option<DocumentWriteReceipt>, Status> {
         let read = self.database.begin_read().map_err(storage)?;
         let meta = read.open_table(META).map_err(storage)?;
@@ -59,9 +60,11 @@ impl DocumentCatalog {
         validate_current_header(&header)?;
         self.validate_resource_binding(&header)?;
         check_history(&header, request)?;
-        let operations = read.open_table(OPERATIONS).map_err(storage)?;
+        operation_key.check_header(&header)?;
+        actors::validate_read_counts(&read, &header)?;
+        let operations = read.open_table(operation_key.table()).map_err(storage)?;
         let result = operations
-            .get(request.operation_id.as_slice())
+            .get(operation_key.bytes.as_slice())
             .map_err(storage)?
             .map(|previous| receipt(&header, previous.value(), request_sha))
             .transpose();

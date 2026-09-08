@@ -10,6 +10,7 @@ user grants or a cached permission decision.
 | Explicit create or open | Admin |
 | Accept a conditional write or retry | Ingest |
 | Begin retirement or seal history | Admin |
+| Attribute an actorless legacy retry decision | Admin |
 | Read retirement or seal metadata | Admin |
 
 Admin does not imply Ingest or Search. The wrapper exposes no inner
@@ -49,9 +50,10 @@ report enforcement when the provider has actually completed replacement.
 
 The storage protobuf `SourceResourceBinding` has version 1 and an exact
 workspace/collection pair. Catalog header field 8 retains it. Controlled
-catalogs use format 7 in every lifecycle state; admission closure and terminal
-seal remain represented by their existing markers. Readers predating format 7
-refuse it. Current readers validate resource and lifecycle metadata together.
+catalogs use format 8 in every lifecycle state; admission closure and terminal
+seal remain represented by their existing markers. Format 7 is the legacy
+controlled format with actorless retry records. Older readers refuse format 8.
+Current readers validate resource, lifecycle and actor migration metadata together.
 
 Factories validate the caller's action and resource before opening any file.
 Open never creates a missing history. It requires the persisted binding to
@@ -66,7 +68,7 @@ explicit standalone operation retain their previous behavior. This API protects
 application access; it is not encryption or a defense against a process that
 can arbitrarily edit the database file.
 
-Retirement and sealing retain format 7 and the resource binding across reopen.
+Retirement and sealing retain the controlled format and resource binding across reopen.
 A file copy retains these fences, but making a copy is not permission to
 activate a second writer. The [source activation design](source-authority-activation.md)
 still requires committed ownership, incarnation and generation checks, complete
@@ -90,9 +92,9 @@ rechecks the operation while holding the database writer before applying the
 new-write fence, so a concurrent acceptance followed by retirement cannot hide
 the stored decision. Existing retries do not acquire the database writer.
 
-This correction does not scope operation IDs by actor: that separate storage
-and authorization change remains required. Existing actorless retry records
-contain no evidence from which to infer the authenticated principal.
+The retirement correction originally retained actorless retry keys. The actor
+namespace extension below now separates controlled receipts by principal;
+legacy records still contain no evidence from which to infer their owner.
 
 The focused regression run reproduced five retirement/seal failures before the
 fix. After the change and correction of an older test that expected retry
@@ -153,3 +155,70 @@ creation. The 31 catalog/access integration tests and 71 catalog unit tests
 passed afterward, including the child process check. This follow-up changes no
 protobuf or stored identity bytes; it was validated with the focused catalog
 suite rather than repeating the preceding complete gate.
+
+## Actor-scoped retry ownership (implementation under validation)
+
+Controlled acceptance keys the retry decision by the pinned authenticated
+principal and exact operation ID, within the persisted workspace/collection
+history. The caller cannot supply or override this principal. Principal strings
+must be stable subject identifiers, never reassigned to another actor; display
+names are unsuitable. The storage bound is 1..16384 UTF-8 bytes for the principal
+and 1..1024 bytes for the operation ID. Policy revision is not part of the key:
+a permission change does not create another actor or erase its decisions.
+Current Ingest permission is still required before any lookup or replay.
+
+Format 8 stores canonical format-1 `ActorOperationKey` protobuf bytes in a
+separate `actor_operations` table. The original `operations` table holds only
+unattributed legacy decisions. Separate tables prevent a caller's arbitrary
+raw operation ID from colliding with an encoded actor key. Request digests
+continue to hash the original request, and receipt values retain their exact
+serialized bytes. Trusted unbound local catalogs keep their existing raw-key
+semantics; ordinary open and acceptance cannot bypass the controlled wrapper.
+
+An empty format-7 catalog upgrades atomically during an Admin-authorized open.
+A populated format-7 catalog opens for administrative migration but refuses
+all controlled acceptance, including retries, until every old decision has an
+explicit owner. No principal is guessed, and no old history is deleted.
+
+`assign_legacy_actor` takes a version-1 `SourceActorAssignment` naming the exact
+history, operation ID, original request SHA-256 and stable principal. It requires
+current pinned Admin permission. Each transaction bounds the stored operation
+record to 64 KiB, moves one exact decision into the actor table, and increments
+the persisted assignment count. The first
+successful assignment captures the old accepted sequence as the migration
+watermark and upgrades the format. A failed assignment rolls the whole transaction
+back. Repeating the same attribution succeeds; changed digests or another actor
+cannot rewrite the assignment. A newly accepted operation beyond the migration
+watermark cannot be mistaken for an earlier attribution.
+
+Partial attribution survives restart and checkpoint copying. New acceptance and
+receipt disclosure remain fenced until assignment completes. Assignment itself
+grants no Ingest permission and does not change accepted versions, source bytes,
+receipts, history identity or lifecycle markers. A sealed legacy source can be
+attributed, but stays sealed and cannot admit new writes. Earlier backups remain
+actorless and require their own explicit attribution before controlled acceptance.
+
+Open and acceptance check operation-table counts against the migration metadata.
+An incomplete migration cannot contain acceptances beyond its captured watermark.
+The complete source-history audit validates canonical actor keys, checks migrated
+receipt counts against their watermark, and uses one sequence-uniqueness proof
+across both tables. Checkpoints copy both tables without re-encoding their records.
+This local migration does not implement network source routing or distributed
+owner activation.
+
+Focused validation passed 77 catalog unit tests, 21 catalog integration tests,
+11 source-access tests, two actor-isolation regressions and seven migration
+tests. The isolation regressions failed on the preceding implementation before
+the fix. The expanded catalog run initially exposed an old assertion expecting
+a missing receipt to reach the full history audit; capture now refuses that
+inconsistency earlier. The corrected assertion and all other corruption cases
+passed in the final run. Both final drivers verified unchanged runtime and test
+file hashes. Peak memory was 3.06 GiB and 1.25 GiB respectively, under an 8 GiB
+limit with swap disabled and zero OOM events. The additive storage descriptor
+comparison passed. Three literal persisted-key fixtures were then added for the
+full gate, whose result is still pending.
+
+The proposed [network ingest authorization boundary](network-ingest-authorization.md)
+records why a coordinator guard held across an RPC is insufficient, how durable
+source acceptance could establish the authorization decision, and the cancellation,
+revocation and partial-progress cases the network integration must prove.

@@ -1237,6 +1237,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: actor-scoped retry ownership, under validation.**
+  Controlled source acceptance keys receipts by the pinned authenticated principal
+  and operation ID. Format 8 retains legacy decisions until explicit Admin
+  attribution completes; migration preserves original receipts and lifecycle
+  fences. Checkpoints include both retry namespaces. See
+  [source access and migration](docs/source-access.md#actor-scoped-retry-ownership-implementation-under-validation).
+
 - **Foundation branch: protobuf wire-type compatibility.** A known field number
   with an incompatible wire type is treated as unknown before changing presence
   or oneof state. Framing and required-field checks remain strict. The reference
@@ -1261,7 +1268,7 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   request private `0600` permissions, with a permissive-umask regression test.
   Checkpoint `7be8a3a`
   passed 1,546 tests, all five mobile checks and wire compatibility validation.
-  See [source access](docs/source-access.md) for format 7 and remaining ownership
+  See [source access](docs/source-access.md) for controlled formats and remaining ownership
   and routing integration.
 
 - **Foundation branch: durable admission closure before source retirement.**

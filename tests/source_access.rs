@@ -245,7 +245,7 @@ fn controlled_header_without_its_binding_is_data_loss() {
             let mut header =
                 DocumentCatalogHeader::decode(metadata.get("header").unwrap().unwrap().value())
                     .unwrap();
-            assert_eq!(header.format_version, 7);
+            assert_eq!(header.format_version, 8);
             header.resource_binding = None;
             metadata
                 .insert("header", header.encode_to_vec().as_slice())
@@ -304,7 +304,7 @@ fn policy_replacement_and_workspace_remapping_invalidate_access() {
 }
 
 #[test]
-fn retirement_seal_and_private_copy_retain_format_seven_binding() {
+fn retirement_seal_and_private_copy_retain_controlled_binding() {
     let dir = Directory::new("lifecycle");
     let authority: Arc<dyn Authorizer> =
         Arc::new(PolicyAuthority::new(policy(1, "workspace-a")).unwrap());
@@ -354,7 +354,7 @@ fn retirement_seal_and_private_copy_retain_format_seven_binding() {
     assert!(error.message().contains("sealed"), "{error}");
     drop(catalog);
     let header = stored_header(&path);
-    assert_eq!(header.format_version, 7);
+    assert_eq!(header.format_version, 8);
     assert_eq!(header.resource_binding, Some(binding("workspace-a")));
     assert_eq!(header.retirement_intent, Some(retirement.clone()));
     assert_eq!(header.history_seal, Some(seal.clone()));
@@ -370,7 +370,7 @@ fn retirement_seal_and_private_copy_retain_format_seven_binding() {
     assert_eq!(error.code(), Code::FailedPrecondition);
     assert!(error.message().contains("sealed"), "{error}");
     drop(copied);
-    assert_eq!(stored_header(&copy).format_version, 7);
+    assert_eq!(stored_header(&copy).format_version, 8);
 }
 
 #[test]
@@ -395,7 +395,7 @@ fn direct_seal_retains_the_controlled_format_and_binding() {
         .unwrap();
     drop(catalog);
     let header = stored_header(&dir.catalog());
-    assert_eq!(header.format_version, 7);
+    assert_eq!(header.format_version, 8);
     assert_eq!(header.resource_binding, Some(binding("workspace-a")));
     assert!(header.retirement_intent.is_none());
     assert_eq!(header.history_seal, Some(seal.clone()));
