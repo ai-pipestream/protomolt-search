@@ -1237,6 +1237,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: policy publication and completed revocation.** Local
+  permission pins retain an admitted policy epoch through synchronous commit.
+  Replacement publishes new grants, then drains old admissions
+  before returning success; new checks remain available during that drain.
+  Concurrent replacements cannot skip an unfinished drain. See
+  [source access](docs/source-access.md#policy-admission-validation).
+
 - **Foundation branch: validated main reconciliation.** Checkpoint `12ba5433`
   incorporates main `9c7f0d9`, including WAL-free partitioned compaction and the
   Boolean empty-MUST short circuit. The combined local gate passed 1,592

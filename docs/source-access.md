@@ -27,12 +27,31 @@ this is a creation rule, not a permissions migration for existing data.
 ## Permission through commit
 
 `AccessPermit::pin` requires the provider to hold the exact admitted decision
-valid until its guard is dropped. `PolicyAuthority` implements this with the
-policy read lock; policy replacement takes the write lock and cannot complete
-until admitted synchronous operations release their guards. A stale permit
+valid until its guard is dropped. `PolicyAuthority` implements this with an
+immutable policy epoch and a counted admission guard. Admission checks the full
+decision and increments that epoch's count under the short publication lock.
+Replacement publishes a new epoch and watched revision, releases the publication
+lock, then waits for the previous epoch's admitted operations to finish. A stale permit
 refuses even when a newer policy would allow the same action; callers reacquire
 permission. A retry also needs current Ingest permission before its stored
 receipt can be returned.
+
+New checks and admissions use the new policy while the old epoch drains. An
+operation already admitted under the previous epoch may finish its synchronous
+commit. Seeing the new watched revision proves publication; only successful
+return from `PolicyAuthority::replace` proves the old admissions have drained.
+Concurrent replacements remain serialized through that completion boundary,
+so a later replacement cannot skip an earlier unfinished drain. A new-epoch
+pin does not delay the previous epoch's drain, but does delay the following
+replacement's completion.
+
+Admission count exhaustion refuses with `ResourceExhausted` and leaves the
+count unchanged. Guard destruction releases admission on both ordinary return
+and unwinding. The notification mutex protects wakeup ordering, not mutable
+policy state; its poison can be recovered to finish cleanup. Poison of the
+replacement serializer instead refuses later replacements by name, because an
+earlier replacement may have published without finishing its drain. That error
+does not roll back the published revision or report completed revocation.
 
 An authorizer that supports snapshot decisions but has no pin implementation
 returns `Unimplemented`. There is no check-then-write fallback. Remote providers
@@ -42,9 +61,40 @@ serialize a remote revocation with a local commit.
 Acquire the pin before node/catalog locks and the source database writer, and
 retain it through the synchronous commit or failure. Never hold it across an
 async suspension or call authorization/policy replacement recursively while it
-is held: a queued policy writer can make recursive acquisition deadlock.
+is held: a provider may retain locks, and replacement waits for admitted work.
 Long synchronous operations can delay policy replacement; use bounded work and
 report enforcement when the provider has actually completed replacement.
+
+## Policy admission validation
+
+Three new public regressions reproduced the old implementation's inability to
+publish a policy while an admitted operation retained its read lock. Each
+test exited 101 with the intended publication assertion. The first also
+reported a worker `SendError` during teardown after the observation timeout;
+the unwind test deliberately injected an admitted-operation panic. These
+failed invocations remain under `/tmp/psearch-policy-admission-red-*` on the
+validation host. Their input hashes were unchanged, peak memory was
+1,478,643,712 bytes, and swap/OOM remained zero.
+
+With counted epochs, the focused gate passed four pin unit tests and 47
+integration cases across authorization, existing pin contracts, diagnostics,
+controlled source access and actor-scoped retries/migration. The source-access
+target additionally runs a child-process regression. Actual grant revocation
+denies fresh reader requests while allowing a still-granted writer; the old
+admitted operation retains its original decision until release. Concurrent
+replacement coverage checks both public completion and retention of the
+internal replacement serializer during the old epoch's drain. The source
+commit-before-guard-release checks remain unchanged and pass.
+
+The focused green scope reached its 8 GiB hard limit with 893 memory-limit
+events and zero swap/OOM. A fifth unit test then verified recovery from poison
+of the notification-only mutex without skipping a nonzero admission count;
+all five pin unit tests passed in a scope peaking at 4,042,563,584 bytes, with
+zero swap/OOM. Both gates retained identical before/after hashes for all 648
+input files. Evidence uses `/tmp/psearch-policy-admission-green-*` and
+`/tmp/psearch-policy-admission-final-pin-*`. These tests establish the local
+admission/drain behavior; remote write authorization remains a separate
+[network integration requirement](network-ingest-authorization.md).
 
 ## Persistent resource scope
 
@@ -123,10 +173,10 @@ ingest commit authorization remain unfinished.
 
 ## Verification scope
 
-The focused tests cover action separation, stale decisions, workspace remapping,
+The initial focused tests covered action separation, stale decisions, workspace remapping,
 refusal by providers without pinning, binding persistence, unsupported ordinary
-open, and lifecycle markers. Policy-lock exclusion is checked directly without
-thread scheduling assumptions. An observing provider reads the accepted sequence
+open, and lifecycle markers. The original guard's policy-lock exclusion was
+checked directly without thread scheduling assumptions. An observing provider reads the accepted sequence
 when its guard drops, proving the source commit precedes permission release.
 
 The focused gate passed 71 catalog unit tests, one direct policy-lock test,

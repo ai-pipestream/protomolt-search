@@ -1,8 +1,8 @@
 # Network ingest authorization: next integration constraints
 
-Proposed integration constraints, read against the foundations branch at
-`202446c` and the actor-catalog extension under validation. Network enforcement
-is unfinished. The synchronous local boundary is documented in
+Proposed integration constraints, originally read at `202446c`; the local
+admission description includes the epoch/drain change following `48a4f50`.
+Network enforcement is unfinished. The synchronous local boundary is documented in
 [source access](source-access.md); ownership and activation requirements are in
 [source authority activation](source-authority-activation.md).
 
@@ -17,8 +17,10 @@ Evidence:
   user-policy commit authorization. The user principal/permit is not passed to
   the node calls in this function.
 - `src/authorization.rs` AccessPermit::pin verifies a matching guard decision and
-  policy revision; the current PolicyAuthority guard holds a local policy read
-  lock. That proves the synchronous catalog commit boundary, not a remote one.
+  policy revision; the PolicyAuthority guard retains a counted local admission
+  until synchronous commit finishes. Replacement publishes the next revision
+  before draining old admissions, and returns success only after that drain.
+  This proves the synchronous catalog commit boundary, not a remote one.
 
 Do not implement A4 as an owned coordinator-side guard held across an RPC and
 claim remote fencing. A timeout, cancellation or lost reply can release that
