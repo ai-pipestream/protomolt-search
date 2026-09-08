@@ -68,6 +68,39 @@ const ANALYSIS_STREAMS: usize = 2;
 /// The commit marker's format, for a reader that finds a newer one.
 const MARKER_FORMAT: u32 = 1;
 
+#[cfg(test)]
+pub(crate) mod segment_staging_hook {
+    //! A test seam in the from-segments compaction: called on the
+    /// compaction thread once the outputs are staged, before the tail
+    /// catch-up, so a test can write through the node exactly then (or
+    /// fail the build there). Keyed by index path; one-shot.
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    type Hook = Box<dyn FnOnce(&super::NodeServiceImpl) -> Result<(), String> + Send>;
+    static HOOKS: std::sync::Mutex<BTreeMap<PathBuf, Hook>> =
+        std::sync::Mutex::new(BTreeMap::new());
+
+    pub(crate) fn install(
+        index_path: PathBuf,
+        hook: impl FnOnce(&super::NodeServiceImpl) -> Result<(), String> + Send + 'static,
+    ) {
+        assert!(HOOKS
+            .lock()
+            .unwrap()
+            .insert(index_path, Box::new(hook))
+            .is_none());
+    }
+
+    pub(super) fn run(node: &super::NodeServiceImpl, index_path: &Path) -> Result<(), String> {
+        let hook = HOOKS.lock().unwrap().remove(index_path);
+        match hook {
+            Some(hook) => hook(node),
+            None => Ok(()),
+        }
+    }
+}
+
 /// The analyzer the build and the tail share: [`crate::reshard::Analyzer`]
 /// over the node's own backend.
 type Analyze<'a> = dyn FnMut(
@@ -112,6 +145,11 @@ struct CommitMarker {
     layout: String,
     old_wal_generation: u64,
     new_wal_generation: u64,
+    /// The from-segments path (a catalog without a WAL) writes no
+    /// rewritten generation: both generations above are 0 and a rollback
+    /// removes no log.
+    #[serde(default)]
+    walless: bool,
     work_dir: PathBuf,
     /// Single-image: whether the shard served a snapshot generation
     /// before the cutover (moved to `<index>.snap-old`), as opposed to
@@ -227,13 +265,21 @@ pub(crate) fn recover_interrupted(index_path: &Path) {
             marker.format
         );
     }
-    eprintln!(
-        "compaction: {} names a cutover to WAL generation {} that never reached its closing \
-         flush; rolling back to generation {}",
-        path.display(),
-        marker.new_wal_generation,
-        marker.old_wal_generation
-    );
+    if marker.walless {
+        eprintln!(
+            "compaction: {} names a from-segments cutover that never reached its closing \
+             flush; rolling back to the manifest the cutover kept",
+            path.display()
+        );
+    } else {
+        eprintln!(
+            "compaction: {} names a cutover to WAL generation {} that never reached its closing \
+             flush; rolling back to generation {}",
+            path.display(),
+            marker.new_wal_generation,
+            marker.old_wal_generation
+        );
+    }
     let must = |what: &str, result: std::io::Result<()>| {
         if let Err(error) = result {
             panic!("compaction rollback: {what}: {error}");
@@ -289,12 +335,14 @@ pub(crate) fn recover_interrupted(index_path: &Path) {
             );
         }
     }
-    let new_gen = wal::gen_dir(&wal::wal_dir(index_path), marker.new_wal_generation);
-    if new_gen.exists() {
-        must(
-            "remove the rewritten WAL generation",
-            std::fs::remove_dir_all(&new_gen),
-        );
+    if !marker.walless {
+        let new_gen = wal::gen_dir(&wal::wal_dir(index_path), marker.new_wal_generation);
+        if new_gen.exists() {
+            must(
+                "remove the rewritten WAL generation",
+                std::fs::remove_dir_all(&new_gen),
+            );
+        }
     }
     must("remove the marker", std::fs::remove_file(&path));
     must("fsync", crate::postings::fsync_parent(&path));
@@ -340,11 +388,69 @@ struct Preflight {
     columns: Option<crate::reshard::ColumnTables>,
 }
 
+/// The row source the cutoff qualified for: the log (the historical
+/// path), or the sealed segments of a catalog without one
+/// (docs/replay-from-segments.md, "Partitioned compaction of a catalog
+/// without a log").
+enum PreflightKind {
+    Wal(Box<Preflight>),
+    Segments(Box<SegmentPreflight>),
+}
+
+/// What the preflight of a catalog WITHOUT a WAL learned under the read
+/// lock. The cutoff is the sealed set as it stood once the tail was
+/// sealed at the start of the run; the tail that arrives after it is
+/// caught up by sealing, never replayed (there is no log).
+struct SegmentPreflight {
+    index_path: PathBuf,
+    work_dir: PathBuf,
+    /// The cutoff snapshot: the sealed set and the shard-wide overlay as
+    /// of the cutoff seal. The build reads only these.
+    set: std::sync::Arc<crate::segments::OpenedSegmentSet>,
+    overlay: LiveDocs,
+    /// The catalog epoch at the cutoff.
+    epoch: u64,
+    rows_now: u64,
+    tombstones_now: u64,
+    /// The partition column the outputs are ordered by. Required on this
+    /// path: there is no log whose bucket layout an unkeyed compaction
+    /// would keep.
+    partition: String,
+    /// The shard's field table and per-field fingerprints.
+    fields: Option<(Vec<String>, Vec<u64>)>,
+    backend_kind: String,
+    scoring_fingerprint: String,
+    stats_epoch: u64,
+}
+
 /// A segment-layout tail caught between the two calls of a legacy append:
 /// the documents count and the vectors count differ.
 struct MidRow {
     documents: usize,
     vectors: usize,
+}
+
+/// The cutover preparation of the from-segments path
+/// (`docs/replay-from-segments.md`): the catalog over the final manifest
+/// (staged, uncommitted), the shadow serving state opened over it, the
+/// translated overlay, and the fence values the install re-checks.
+struct PreparedSegmentCutover {
+    catalog: SegmentCatalog,
+    shard: Option<crate::segmented::SegmentedShard>,
+    index: Option<VectorIndex>,
+    exact_vectors: Option<ExactVectorStore>,
+    /// The live overlay translated onto the new labels.
+    overlay: LiveDocs,
+    /// The live catalog epoch this was prepared against.
+    epoch: u64,
+    /// The live overlay revision this was prepared against.
+    revision: u64,
+    /// The staged outputs (the rebuilt partitions), for the marker.
+    staged_ids: Vec<String>,
+    /// The cutoff set's segments, which the outputs replace.
+    replaced_ids: Vec<String>,
+    /// Rows sealed after the cutoff, carried over by the cutover.
+    carried_rows: u64,
 }
 
 /// The shadow: a [`ShardState`] over the compacted image whose WAL is the
@@ -372,19 +478,14 @@ fn layout_name(segmented: bool) -> &'static str {
 impl NodeServiceImpl {
     /// Compact this shard online (`docs/mutations.md`): the blocking
     /// entry point behind `NodeService.CompactShard`, also for an
-    /// in-process control-plane worker. Needs a Tokio runtime on the
-    /// calling thread's context for the analysis sessions
-    /// (`spawn_blocking` threads have one).
+    /// in-process control-plane worker. The WAL path needs a Tokio
+    /// runtime on the calling thread's context for the analysis sessions
+    /// (`spawn_blocking` threads have one); the from-segments path of a
+    /// catalog without a WAL analyzes nothing and needs none.
     pub fn compact_shard(
         &self,
         request: &CompactShardRequest,
     ) -> Result<CompactShardResponse, Status> {
-        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
-            Status::failed_precondition(
-                "compaction analyzes documents through the node's analysis backend and needs a \
-                 Tokio runtime context",
-            )
-        })?;
         let tail_bound = if request.tail_bound == 0 {
             DEFAULT_TAIL_BOUND
         } else {
@@ -406,6 +507,18 @@ impl NodeServiceImpl {
         }
         let _gate = CompactingGuard(std::sync::Arc::clone(&self.compacting));
         let preflight = self.preflight_at_row_boundary(request)?;
+        let preflight = match preflight {
+            PreflightKind::Wal(preflight) => preflight,
+            PreflightKind::Segments(preflight) => {
+                return self.compact_from_segments(request, *preflight, tail_bound);
+            }
+        };
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+            Status::failed_precondition(
+                "compaction analyzes documents through the node's analysis backend and needs a \
+                 Tokio runtime context",
+            )
+        })?;
         if request.dry_run {
             return Ok(CompactShardResponse {
                 rows_before: preflight.rows_now,
@@ -453,17 +566,19 @@ impl NodeServiceImpl {
         }
     }
 
-    /// Preflight at a row boundary. The cut is the log's high-water mark,
-    /// read under the shard lock; a legacy two-RPC append (AddDocuments,
-    /// then AddVectors) can be halfway through at that instant, and on
-    /// the segment layout the replay through such a cut builds a bucket
-    /// with one document more than vectors, which the layout refuses to
-    /// seal. The row completes with the client's next call, so this waits
-    /// that out for a bounded time, then refuses naming the counts.
+    /// Preflight at a row boundary. The cut is the log's high-water mark
+    /// (or, for a catalog without a WAL, the sealed set once the cutoff
+    /// seal lands), read under the shard lock; a legacy two-RPC append
+    /// (AddDocuments, then AddVectors) can be halfway through at that
+    /// instant, and on the segment layout the replay through such a cut
+    /// builds a bucket with one document more than vectors, which the
+    /// layout refuses to seal. The row completes with the client's next
+    /// call, so this waits that out for a bounded time, then refuses
+    /// naming the counts.
     fn preflight_at_row_boundary(
         &self,
         request: &CompactShardRequest,
-    ) -> Result<Preflight, Status> {
+    ) -> Result<PreflightKind, Status> {
         const ATTEMPTS: usize = 200;
         const PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
         for attempt in 1..=ATTEMPTS {
@@ -485,10 +600,12 @@ impl NodeServiceImpl {
 
     /// One preflight under the read lock: `Ok(Err(_))` when the segment
     /// layout's tail is mid-row (see [`Self::preflight_at_row_boundary`]).
+    /// A shard without a WAL qualifies for the from-segments path here or
+    /// refuses by name.
     fn preflight(
         &self,
         request: &CompactShardRequest,
-    ) -> Result<Result<Preflight, MidRow>, Status> {
+    ) -> Result<Result<PreflightKind, MidRow>, Status> {
         let index_path = self.config.index_path.clone().ok_or_else(|| {
             Status::failed_precondition(
                 "compaction needs a persisted shard (index_path); an in-memory shard has no log \
@@ -502,12 +619,17 @@ impl NodeServiceImpl {
                 "a compaction cutover is pending its closing flush on this shard; call Flush",
             ));
         }
-        let wal = guard.wal.as_ref().ok_or_else(|| {
-            Status::failed_precondition(
-                "this shard has no WAL; compaction replays the log, so a shard without one can \
-                 only be rebuilt from source",
-            )
-        })?;
+        let Some(wal) = guard.wal.as_ref() else {
+            return self
+                .preflight_segments(request, &guard, &index_path)
+                .map(|r| r.map(|p| PreflightKind::Segments(Box::new(p))));
+        };
+        if request.build_threads != 0 || request.build_queue != 0 || request.build_memory != 0 {
+            return Err(Status::invalid_argument(
+                "build_threads, build_queue and build_memory bound the from-segments build of a \
+                 catalog without a WAL; this shard compacts from its log",
+            ));
+        }
         if wal.has_legacy_clock_records() {
             return Err(Status::failed_precondition(format!(
                 "WAL generation {} carries legacy unclocked records; compaction needs a fully \
@@ -698,7 +820,7 @@ impl NodeServiceImpl {
             }
         }
         let rows_now = crate::node::physical_rows(&guard);
-        Ok(Ok(Preflight {
+        Ok(Ok(PreflightKind::Wal(Box::new(Preflight {
             index_path,
             work_dir,
             segmented,
@@ -714,6 +836,145 @@ impl NodeServiceImpl {
             stats_epoch: guard.stats_epoch,
             partition,
             columns,
+        }))))
+    }
+
+    /// The preflight of a catalog WITHOUT a WAL: the from-segments path
+    /// (docs/replay-from-segments.md, "Partitioned compaction of a
+    /// catalog without a log"). Only a catalog that qualifies enters it:
+    /// the segmented layout with at least one sealed segment and the
+    /// generation binding the outputs must carry. Anything less refuses
+    /// by name, as does a missing partition column: with no log there is
+    /// no bucket layout to keep, so this path builds the partitioned
+    /// layout only.
+    fn preflight_segments(
+        &self,
+        request: &CompactShardRequest,
+        guard: &ShardState,
+        index_path: &Path,
+    ) -> Result<Result<SegmentPreflight, MidRow>, Status> {
+        let no_wal = "this shard has no WAL; compaction replays the log, so a shard without one \
+                      can only be rebuilt from source";
+        let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
+            return Err(Status::failed_precondition(no_wal));
+        };
+        let set = shard.snapshot().clone();
+        if set.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "{no_wal} — and this catalog has no sealed segments to compact from; flush it \
+                 first"
+            )));
+        }
+        if set.binding().is_none() {
+            return Err(Status::failed_precondition(format!(
+                "{no_wal} — and this catalog carries no generation binding for the outputs to \
+                 keep"
+            )));
+        }
+        if request.partition_column.is_empty() {
+            return Err(Status::failed_precondition(
+                "compaction of a catalog without a WAL replays its sealed segments and needs \
+                 partition_column to order the outputs; without one there is no layout to build",
+            ));
+        }
+        let column = request.partition_column.as_str();
+        if shard.integer_index(column).is_none() {
+            let kind = if shard.numeric_index(column).is_some() {
+                "a double column"
+            } else if shard.facet_index(column).is_some() {
+                "a facet column"
+            } else {
+                "not a column of this shard"
+            };
+            return Err(Status::invalid_argument(format!(
+                "partition_column {column:?} is {kind}; a partitioned compaction orders by an \
+                 integer column (--integer-fields, timestamps included)"
+            )));
+        }
+        crate::node::check_attached_derived(
+            &self.config,
+            shard.derived(),
+            shard.doc_count(),
+            "the catalog",
+        )
+        .map_err(Status::failed_precondition)?;
+        let fields = Some(
+            (0..shard.field_count())
+                .map(|f| {
+                    (
+                        shard.field_name(f).to_string(),
+                        shard.analysis_fingerprint(f),
+                    )
+                })
+                .unzip(),
+        );
+        let (backend_kind, scoring_fingerprint) = guard
+            .index
+            .as_ref()
+            .map(|index| {
+                let d = index.descriptor();
+                (d.backend_kind, d.scoring_fingerprint)
+            })
+            .unwrap_or_default();
+        let work_dir = if request.work_dir.is_empty() {
+            default_work_dir(index_path)
+        } else {
+            PathBuf::from(&request.work_dir)
+        };
+        if work_dir.exists()
+            && std::fs::read_dir(&work_dir)
+                .map_err(|e| Status::internal(format!("read {}: {e}", work_dir.display())))?
+                .next()
+                .is_some()
+        {
+            return Err(Status::failed_precondition(format!(
+                "compaction work directory {} is not empty; a previous compaction left it — \
+                 inspect and remove it",
+                work_dir.display()
+            )));
+        }
+        // A staged leftover of an interrupted run is never adopted: a
+        // retry refuses it by name until an operator removes it.
+        let root = crate::node::segments_root(index_path);
+        if let Ok(entries) = std::fs::read_dir(root.join("segments")) {
+            let published: std::collections::BTreeSet<&str> = set
+                .manifest()
+                .segments
+                .iter()
+                .map(|s| s.segment_id.as_str())
+                .collect();
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with("cmp-") && !published.contains(name.as_str()) {
+                    return Err(Status::failed_precondition(format!(
+                        "staged segment directory {} exists; a previous compaction left it — \
+                         remove it before retrying",
+                        entry.path().display()
+                    )));
+                }
+            }
+        }
+        if let Some(provider) = guard.index.as_ref().and_then(VectorIndex::as_segmented) {
+            let documents = shard.tail().next_doc_id() as usize;
+            let vectors = provider.tail().len();
+            if documents != vectors {
+                return Ok(Err(MidRow { documents, vectors }));
+            }
+        }
+        let rows_now = crate::node::physical_rows(guard);
+        Ok(Ok(SegmentPreflight {
+            index_path: index_path.to_path_buf(),
+            work_dir,
+            set,
+            overlay: guard.live_docs.clone(),
+            epoch: shard.snapshot().epoch(),
+            rows_now,
+            tombstones_now: guard.live_docs.deleted_count().min(rows_now),
+            partition: column.to_string(),
+            fields,
+            backend_kind,
+            scoring_fingerprint,
+            stats_epoch: guard.stats_epoch,
         }))
     }
 
@@ -1019,7 +1280,7 @@ impl NodeServiceImpl {
         let bm25 = if image.bm25_path.is_some() {
             let shard = Bm25Shard::open(&bm25_path)
                 .map_err(|e| Status::internal(format!("open {}: {e}", bm25_path.display())))?;
-            self.check_shadow_fingerprints(pre, &shard)?;
+            self.check_shadow_fingerprints(pre.fields.as_ref(), &shard)?;
             Some(shard)
         } else {
             // No documents through the cutoff. A document the tail brings
@@ -1158,7 +1419,7 @@ impl NodeServiceImpl {
                 .map_err(|e| Status::internal(format!("open the compacted shard: {e}")))?;
             let set = shard.snapshot().clone();
             let bm25 = Bm25Shard::Segmented(shard);
-            self.check_shadow_fingerprints(pre, &bm25)?;
+            self.check_shadow_fingerprints(pre.fields.as_ref(), &bm25)?;
             let mut index = None;
             let mut exact_vectors = None;
             if let Some(empty) = self.empty_configured_index(pre)? {
@@ -1254,8 +1515,12 @@ impl NodeServiceImpl {
     /// be the live shard's: same names, and the same fingerprint wherever
     /// both record one (a field whose every document was tombstoned has
     /// none in the dense image).
-    fn check_shadow_fingerprints(&self, pre: &Preflight, built: &Bm25Shard) -> Result<(), Status> {
-        let Some((names, fingerprints)) = pre.fields.as_ref() else {
+    fn check_shadow_fingerprints(
+        &self,
+        fields: Option<&(Vec<String>, Vec<u64>)>,
+        built: &Bm25Shard,
+    ) -> Result<(), Status> {
+        let Some((names, fingerprints)) = fields else {
             return Ok(());
         };
         if built.field_count() != names.len() {
@@ -1673,6 +1938,7 @@ impl NodeServiceImpl {
             layout: layout_name(pre.segmented).to_string(),
             old_wal_generation: pre.cutoff_generation,
             new_wal_generation: new_generation,
+            walless: false,
             work_dir: pre.work_dir.clone(),
             previous_snapshot,
             legacy_files,
@@ -1763,6 +2029,656 @@ impl NodeServiceImpl {
             }
         }
     }
+
+    // ----- The from-segments path: a catalog without a WAL -----
+    //
+    // docs/replay-from-segments.md, "Partitioned compaction of a catalog
+    // without a log". The cutoff is the sealed catalog once the current
+    // tail is sealed; the build transplants its live rows through
+    // `reshard::compact_segments_partitioned` (the analyzer never runs);
+    // writes that arrive after the cutoff are caught up by the same seal
+    // ingest uses (`seal_tail`), landing in the live catalog as unordered
+    // segments the cutover carries over; the cutover keeps the
+    // shadow/marker/closing-flush contract of docs/mutations.md.
+
+    /// Seal the tail when it holds rows (or a frozen part is waiting on
+    /// its publication), waiting out a legacy two-RPC append caught
+    /// mid-row the way the closing flush waits it out. Returns the rows
+    /// the seal covered, 0 when there was nothing to seal.
+    fn seal_tail_wait(&self) -> Result<u64, Status> {
+        const ATTEMPTS: usize = 200;
+        const PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
+        for attempt in 1..=ATTEMPTS {
+            let (pending, frozen) = {
+                let guard = crate::node::read_shard(&self.state);
+                let (documents, vectors) = match guard.bm25.as_ref() {
+                    Some(Bm25Shard::Segmented(shard)) => (
+                        shard.tail().next_doc_id() as usize,
+                        guard
+                            .index
+                            .as_ref()
+                            .and_then(VectorIndex::as_segmented)
+                            .map_or(0, |p| p.tail().len()),
+                    ),
+                    _ => (0, 0),
+                };
+                (
+                    documents.max(vectors) as u64,
+                    matches!(guard.bm25.as_ref(), Some(Bm25Shard::Segmented(shard)) if shard.frozen().is_some()),
+                )
+            };
+            if pending == 0 && !frozen {
+                return Ok(0);
+            }
+            match self.seal_tail() {
+                Ok(_) => return Ok(pending),
+                Err(status)
+                    if attempt < ATTEMPTS
+                        && status.code() == tonic::Code::FailedPrecondition
+                        && status
+                            .message()
+                            .contains("a segment's artifacts cover the same rows") =>
+                {
+                    std::thread::sleep(PAUSE);
+                }
+                Err(status) => return Err(status),
+            }
+        }
+        unreachable!("the last attempt returns")
+    }
+
+    /// The tail is empty on both legs and no seal is in flight.
+    fn segment_tail_is_clear(guard: &ShardState) -> bool {
+        let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
+            return false;
+        };
+        if shard.tail().next_doc_id() != 0 || shard.frozen().is_some() {
+            return false;
+        }
+        guard
+            .index
+            .as_ref()
+            .and_then(VectorIndex::as_segmented)
+            .is_none_or(|p| p.tail().is_empty() && p.frozen().is_none())
+    }
+
+    /// The from-segments compaction of a catalog without a WAL, start to
+    /// closing flush. On any failure before the cutover commits, the live
+    /// shard is untouched and the staged outputs are removed.
+    fn compact_from_segments(
+        &self,
+        request: &CompactShardRequest,
+        mut pre: SegmentPreflight,
+        tail_bound: usize,
+    ) -> Result<CompactShardResponse, Status> {
+        let options = crate::reshard::SegmentCompactionOptions {
+            build_threads: request.build_threads.max(1) as usize,
+            build_queue: (request.build_queue != 0).then_some(request.build_queue as usize),
+            build_memory: (request.build_memory != 0).then_some(request.build_memory),
+        };
+        if request.dry_run {
+            return Ok(CompactShardResponse {
+                rows_before: pre.rows_now,
+                rows_after: pre.rows_now,
+                tombstones_reclaimed: pre.tombstones_now,
+                layout: layout_name(true).to_string(),
+                dry_run: true,
+                stats_epoch: pre.stats_epoch,
+                partition_column: pre.partition.clone(),
+                ..Default::default()
+            });
+        }
+        std::fs::create_dir_all(&pre.work_dir)
+            .map_err(|e| Status::internal(format!("mkdir {}: {e}", pre.work_dir.display())))?;
+        let outcome = self.build_stage_and_cut_over_segments(&mut pre, tail_bound, &options);
+        if outcome.is_ok() {
+            // Everything the work directory held was copied into place at
+            // staging (the catalog hashes its own copies).
+            if let Err(error) = std::fs::remove_dir_all(&pre.work_dir) {
+                eprintln!(
+                    "compaction: removing the work directory {} failed: {error}",
+                    pre.work_dir.display()
+                );
+            }
+        }
+        outcome
+    }
+
+    fn build_stage_and_cut_over_segments(
+        &self,
+        pre: &mut SegmentPreflight,
+        tail_bound: usize,
+        options: &crate::reshard::SegmentCompactionOptions,
+    ) -> Result<CompactShardResponse, Status> {
+        // The cutoff seal: the current tail joins the sealed set, so the
+        // cutoff is the sealed catalog and only later writes are caught
+        // up. Writes continue; nothing here locks them out.
+        self.seal_tail_wait()?;
+        {
+            let guard = crate::node::read_shard(&self.state);
+            let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
+                return Err(Status::internal(
+                    "the shard changed layout while a compaction was starting",
+                ));
+            };
+            if !Self::segment_tail_is_clear(&guard) {
+                return Err(Status::internal("the cutoff seal left an unsealed tail"));
+            }
+            pre.set = shard.snapshot().clone();
+            pre.overlay = guard.live_docs.clone();
+            pre.epoch = shard.snapshot().epoch();
+            pre.stats_epoch = guard.stats_epoch;
+        }
+        // A column no sealed row carries cannot order the outputs (the
+        // build refuses a column no LIVE row carries; this refuses before
+        // any work when even the physical rows lack it).
+        let sealed: u64 = pre
+            .set
+            .manifest()
+            .segments
+            .iter()
+            .filter_map(|segment| segment.summary.as_ref())
+            .flat_map(|summary| summary.int_columns.iter())
+            .filter(|c| c.name == pre.partition)
+            .map(|c| c.present)
+            .sum();
+        if sealed == 0 {
+            return Err(Status::failed_precondition(format!(
+                "partition_column {:?}: no document of this shard carries it, so it cannot \
+                 order the rows",
+                pre.partition
+            )));
+        }
+        let build_dir = pre.work_dir.join("build");
+        let build = crate::reshard::compact_segments_partitioned(
+            &pre.set,
+            &pre.overlay,
+            self.config.slot_offset,
+            &build_dir,
+            crate::reshard::PartitionSpec {
+                column: &pre.partition,
+                bound: tail_bound,
+            },
+            options,
+        )
+        .map_err(|e| Status::failed_precondition(format!("compaction build: {e}")))?;
+        let staged = self.stage_segment_outputs(pre, &build)?;
+        let root = crate::node::segments_root(&pre.index_path);
+        #[cfg(test)]
+        if let Err(error) = segment_staging_hook::run(self, &pre.index_path) {
+            crate::segments::remove_segment_dirs(&root, &staged);
+            return Err(Status::internal(format!(
+                "segment compaction staging hook: {error}"
+            )));
+        }
+
+        // The tail catch-up: whatever arrived after the cutoff seals into
+        // the live catalog as unordered segments through the same seal
+        // ingest uses. Each pass seals the whole tail; the loop ends when
+        // one finds nothing.
+        let mut tail_passes = 0u64;
+        let mut smallest = u64::MAX;
+        let mut stalled = 0u64;
+        loop {
+            tail_passes += 1;
+            if tail_passes > MAX_TAIL_PASSES {
+                crate::segments::remove_segment_dirs(&root, &staged);
+                return Err(Status::resource_exhausted(format!(
+                    "writes outpace compaction: {MAX_TAIL_PASSES} tail seals never left the \
+                     tail empty"
+                )));
+            }
+            let sealed = self.seal_tail_wait()?;
+            if sealed == 0 {
+                break;
+            }
+            if sealed < smallest {
+                smallest = sealed;
+                stalled = 0;
+            } else {
+                stalled += 1;
+                if stalled >= STALLED_TAIL_PASSES {
+                    crate::segments::remove_segment_dirs(&root, &staged);
+                    return Err(Status::resource_exhausted(format!(
+                        "writes outpace compaction: {STALLED_TAIL_PASSES} consecutive tail \
+                         seals each sealed at least {smallest} rows; pause writes, then retry"
+                    )));
+                }
+            }
+        }
+
+        // The cutover. Reserve commits first: with the gate held, no
+        // write but a gate-bypassing one can land, and the fence below
+        // catches those. The seal lock keeps a seal from racing the
+        // manifest read.
+        let _mutation = self.mutation_gate.blocking_write();
+        let mut attempt = 0usize;
+        let (write_lock_ms, carried_rows) = loop {
+            attempt += 1;
+            self.seal_tail_wait()?;
+            let _seal = self.seal_lock.lock().expect("seal lock poisoned");
+            {
+                let guard = crate::node::read_shard(&self.state);
+                if !Self::segment_tail_is_clear(&guard) {
+                    if attempt >= CUTOVER_RETRIES {
+                        crate::segments::remove_segment_dirs(&root, &staged);
+                        return Err(Status::resource_exhausted(format!(
+                            "writes outpace compaction: the tail was not empty after \
+                             {CUTOVER_RETRIES} cutover preparations"
+                        )));
+                    }
+                    continue;
+                }
+            }
+            let prepared = match self.prepare_segment_cutover(pre, &build, &staged) {
+                Ok(prepared) => prepared,
+                Err(status) => {
+                    crate::segments::remove_segment_dirs(&root, &staged);
+                    return Err(status);
+                }
+            };
+            let mut guard = crate::node::write_shard(&self.state);
+            let started = Instant::now();
+            if !self.segment_cutover_fence(&guard, &prepared) {
+                drop(guard);
+                if attempt >= CUTOVER_RETRIES {
+                    crate::segments::remove_segment_dirs(&root, &staged);
+                    return Err(Status::resource_exhausted(format!(
+                        "writes outpace compaction: the live catalog or its overlay advanced \
+                         during all {CUTOVER_RETRIES} cutover preparations"
+                    )));
+                }
+                continue;
+            }
+            let carried_rows = prepared.carried_rows;
+            match self.install_segments(pre, prepared, &mut guard) {
+                Ok(()) => break (started.elapsed().as_millis() as u64, carried_rows),
+                Err(status) => return Err(status),
+            }
+        };
+        // rows_after is the cutover's answer: the dense partitions plus
+        // the carried rows. Read it before the closing flush, whose seal
+        // would fold in writes that landed after the swap.
+        let (rows_after, stats_epoch) = {
+            let guard = crate::node::read_shard(&self.state);
+            (crate::node::physical_rows(&guard), guard.stats_epoch)
+        };
+        let closing = Instant::now();
+        self.closing_flush()?;
+        let closing_flush_ms = closing.elapsed().as_millis() as u64;
+        let stats_epoch = {
+            let guard = crate::node::read_shard(&self.state);
+            guard.stats_epoch.max(stats_epoch)
+        };
+        Ok(CompactShardResponse {
+            rows_before: build.rows_before,
+            rows_after,
+            tombstones_reclaimed: build.tombstones,
+            tail_records_applied: carried_rows,
+            locked_tail_records: 0,
+            write_lock_ms,
+            wal_generation: 0,
+            cutoff_clock: 0,
+            layout: layout_name(true).to_string(),
+            dry_run: false,
+            closing_flush_ms,
+            tail_passes,
+            stats_epoch,
+            partition_column: pre.partition.clone(),
+        })
+    }
+
+    /// Stage the build's images under the live catalog root (hashed,
+    /// fsynced, unpublished, `cmp-<epoch>-NNNN` ids), then open them once
+    /// as a set for validation: the field table and fingerprints are the
+    /// shard's, the declaration the segments', the provider state the
+    /// live shard's.
+    fn stage_segment_outputs(
+        &self,
+        pre: &SegmentPreflight,
+        build: &crate::reshard::SegmentCompactionBuild,
+    ) -> Result<Vec<SegmentMetadata>, Status> {
+        let root = crate::node::segments_root(&pre.index_path);
+        let generation = pre
+            .epoch
+            .checked_add(1)
+            .ok_or_else(|| Status::out_of_range("compaction staging epoch exhausted"))?;
+        let mut live_paths = Vec::with_capacity(build.images.len());
+        for image in &build.images {
+            if image.num_vectors != 0 && image.num_vectors as usize != image.row_parent_ids.len() {
+                return Err(Status::failed_precondition(format!(
+                    "compaction output {} has {} vectors over {} rows; a segment's artifacts \
+                     cover the same rows",
+                    image.vector_path.display(),
+                    image.num_vectors,
+                    image.row_parent_ids.len()
+                )));
+            }
+            if image.bm25_path.is_none() {
+                return Err(Status::failed_precondition(format!(
+                    "compaction output {} has no BM25 image; the segment layout seals documents",
+                    image.vector_path.display()
+                )));
+            }
+            let path = crate::node::live_docs_sidecar_path(&image.vector_path);
+            LiveDocs::default()
+                .write(&path, image.row_parent_ids.len() as u64)
+                .map_err(|e| Status::internal(format!("write {}: {e}", path.display())))?;
+            live_paths.push(path);
+        }
+        let ids: Vec<String> = (0..build.images.len())
+            .map(|i| format!("cmp-{generation:06}-{i:04}"))
+            .collect();
+        let sources: Vec<SegmentSource<'_>> = build
+            .images
+            .iter()
+            .zip(&ids)
+            .zip(&live_paths)
+            .map(|((image, id), live)| SegmentSource {
+                segment_id: id,
+                generation,
+                base_label: image.slot_offset,
+                backend_kind: &pre.backend_kind,
+                vector_path: (image.num_vectors > 0).then_some(image.vector_path.as_path()),
+                exact_vector_path: (image.num_vectors > 0)
+                    .then_some(image.exact_vector_path.as_path()),
+                bm25_path: image.bm25_path.as_deref().expect("checked above"),
+                live_docs_path: live,
+                partition_column: Some(&pre.partition),
+            })
+            .collect();
+        let staged = crate::segments::stage_segments(&root, sources)
+            .map_err(|e| Status::internal(format!("stage compacted segments: {e}")))?;
+        let opened = (|| -> Result<(), Status> {
+            let manifest = SegmentSetManifest {
+                epoch: pre.epoch,
+                segments: staged.clone(),
+                partition_key: Some(pre.partition.clone()),
+                generation_declaration: pre.set.manifest().generation_declaration.clone(),
+                ..Default::default()
+            }
+            .with_binding(build.binding.as_ref())
+            .map_err(Status::failed_precondition)?;
+            let catalog = SegmentCatalog::open_staged(&root, manifest, self.config.vector_load())
+                .map_err(|e| Status::internal(format!("open the compacted set: {e}")))?;
+            let tail =
+                crate::node::heap_store(&self.config).map_err(Status::failed_precondition)?;
+            let shard =
+                crate::segmented::SegmentedShard::open_catalog(catalog, tail).map_err(|e| {
+                    Status::failed_precondition(format!("the compacted set does not open: {e}"))
+                })?;
+            let set = shard.snapshot().clone();
+            self.check_shadow_fingerprints(pre.fields.as_ref(), &Bm25Shard::Segmented(shard))?;
+            if let Some(first) = (0..set.len()).find_map(|i| set.vector(i)) {
+                let d = first.descriptor();
+                if d.backend_kind != pre.backend_kind
+                    || d.scoring_fingerprint != pre.scoring_fingerprint
+                {
+                    return Err(Status::failed_precondition(format!(
+                        "the compacted segments score under {}/{} but the shard serves {}/{}; \
+                         the catalog's provider state does not reproduce the live generation",
+                        d.backend_kind,
+                        d.scoring_fingerprint,
+                        pre.backend_kind,
+                        pre.scoring_fingerprint
+                    )));
+                }
+            }
+            Ok(())
+        })();
+        if opened.is_err() {
+            crate::segments::remove_segment_dirs(&root, &staged);
+        }
+        opened?;
+        Ok(staged)
+    }
+
+    /// Prepare the cutover with no lock held past a read: the final
+    /// manifest (the rebuilt partitions, then every segment sealed after
+    /// the cutoff, re-based onto the dense row count), the live overlay
+    /// translated onto the new labels, and the shadow serving state
+    /// opened over the prepared catalog. The fence at install re-checks
+    /// the epoch, the overlay revision, and the tail.
+    fn prepare_segment_cutover(
+        &self,
+        pre: &SegmentPreflight,
+        build: &crate::reshard::SegmentCompactionBuild,
+        staged: &[SegmentMetadata],
+    ) -> Result<PreparedSegmentCutover, Status> {
+        let slot_offset = self.config.slot_offset;
+        let root = crate::node::segments_root(&pre.index_path);
+        let (manifest_now, overlay_now) = {
+            let guard = crate::node::read_shard(&self.state);
+            let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
+                return Err(Status::internal(
+                    "the shard changed layout while a compaction was running",
+                ));
+            };
+            (shard.snapshot().manifest().clone(), guard.live_docs.clone())
+        };
+        let source = &pre.set.manifest().segments;
+        let s_rows = source
+            .iter()
+            .try_fold(0u64, |rows, s| rows.checked_add(s.rows))
+            .ok_or_else(|| Status::internal("cutoff set row count overflow"))?;
+        let prefix_holds = manifest_now.segments.len() >= source.len()
+            && manifest_now.segments[..source.len()]
+                .iter()
+                .zip(source)
+                .all(|(now, at_cutoff)| {
+                    now.segment_id == at_cutoff.segment_id && now.base_label == at_cutoff.base_label
+                });
+        if !prefix_holds {
+            return Err(Status::aborted(
+                "the catalog's sealed set changed under the compaction; the build transplanted \
+                 the set at its cutoff, so this run cannot cut over — retry",
+            ));
+        }
+        let carried = &manifest_now.segments[source.len()..];
+        let mut total = s_rows;
+        for segment in carried {
+            if segment.base_label != total {
+                return Err(Status::internal(format!(
+                    "carried segment {} starts at label {} but the segments before it end at \
+                     {total}; the live catalog is not one contiguous id space",
+                    segment.segment_id, segment.base_label
+                )));
+            }
+            total += segment.rows;
+        }
+        let dense = build
+            .images
+            .iter()
+            .try_fold(0u64, |rows, image| {
+                rows.checked_add(image.row_parent_ids.len() as u64)
+            })
+            .ok_or_else(|| Status::internal("compacted row count overflow"))?;
+        // The outputs, then the carried segments re-based onto them.
+        let mut segments: Vec<SegmentMetadata> = staged.to_vec();
+        let mut base = dense;
+        for segment in carried {
+            let mut rebased = segment.clone();
+            rebased.base_label = base;
+            base += segment.rows;
+            segments.push(rebased);
+        }
+        // The live overlay is the tombstone authority. A bit under the
+        // cutoff's rows names a rebuilt row through the id map (absent =
+        // already dead at the cutoff, dropped by the build); a bit above
+        // them names a carried row, shifted by the reclaimed tombstones.
+        let mut overlay = LiveDocs::default();
+        if let Some(words) = overlay_now.words() {
+            for (wi, &word) in words.iter().enumerate() {
+                let mut bits = word;
+                while bits != 0 {
+                    let bit = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let label = (wi * 64 + bit) as u64;
+                    if label < s_rows {
+                        let global = slot_offset
+                            .checked_add(label)
+                            .ok_or_else(|| Status::internal("compaction id overflow"))?;
+                        if let Some(&new_local) = build.id_map.get(&global) {
+                            overlay.delete(new_local as usize);
+                        }
+                    } else if label < total {
+                        overlay.delete((dense + (label - s_rows)) as usize);
+                    } else {
+                        return Err(Status::internal(format!(
+                            "the live overlay names row {label}, past the catalog's {total} rows"
+                        )));
+                    }
+                }
+            }
+        }
+        let final_manifest = SegmentSetManifest {
+            epoch: manifest_now.epoch,
+            segments,
+            partition_key: Some(pre.partition.clone()),
+            generation_declaration: manifest_now.generation_declaration.clone(),
+            ..Default::default()
+        }
+        .with_binding(build.binding.as_ref())
+        .map_err(Status::failed_precondition)?;
+        let catalog = SegmentCatalog::open_staged(&root, final_manifest, self.config.vector_load())
+            .map_err(|e| Status::internal(format!("open the compacted set: {e}")))?;
+        let tail = crate::node::heap_store(&self.config).map_err(Status::failed_precondition)?;
+        let shard =
+            crate::segmented::SegmentedShard::open_catalog(catalog.clone(), tail).map_err(|e| {
+                Status::failed_precondition(format!("the compacted set does not open: {e}"))
+            })?;
+        let set = shard.snapshot().clone();
+        let mut index = None;
+        let mut exact_vectors = None;
+        if let Some(first) = (0..set.len()).find_map(|i| set.vector(i)) {
+            let backend = first
+                .backend_config()
+                .map_err(|e| Status::internal(format!("segment vector backend: {e}")))?;
+            let dim = first
+                .dim_opt()
+                .ok_or_else(|| Status::internal("segment vector image has no dimension"))?;
+            let tail_image = VectorIndex::from_backend_config(dim, &backend)
+                .map_err(|e| Status::internal(format!("segment tail image: {e}")))?;
+            let provider =
+                crate::segmented_vectors::SegmentedProvider::open(set.clone(), tail_image)
+                    .map_err(|e| Status::internal(format!("segment vectors: {e}")))?;
+            index = Some(VectorIndex::from_provider(provider));
+            exact_vectors = Some(ExactVectorStore::from_segments(&set, dim).map_err(|error| {
+                Status::internal(format!("compacted exact-vector view: {error}"))
+            })?);
+        }
+        Ok(PreparedSegmentCutover {
+            catalog,
+            shard: Some(shard),
+            index,
+            exact_vectors,
+            overlay,
+            epoch: manifest_now.epoch,
+            revision: overlay_now.revision(),
+            staged_ids: staged.iter().map(|s| s.segment_id.clone()).collect(),
+            replaced_ids: source.iter().map(|s| s.segment_id.clone()).collect(),
+            carried_rows: total - s_rows,
+        })
+    }
+
+    /// The fence under the write lock: the catalog, the overlay, and the
+    /// tail are exactly what the preparation read. Anything else means a
+    /// gate-bypassing write landed; release and prepare again.
+    fn segment_cutover_fence(&self, guard: &ShardState, prepared: &PreparedSegmentCutover) -> bool {
+        let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
+            return false;
+        };
+        shard.snapshot().epoch() == prepared.epoch
+            && guard.live_docs.revision() == prepared.revision
+            && Self::segment_tail_is_clear(guard)
+    }
+
+    /// The on-disk cutover, under the write lock the caller holds: the
+    /// manifest backup, the commit marker, one manifest publish through
+    /// the catalog's own path, the state swap. No WAL moves: this path
+    /// writes none.
+    fn install_segments(
+        &self,
+        pre: &SegmentPreflight,
+        mut prepared: PreparedSegmentCutover,
+        guard: &mut ShardState,
+    ) -> Result<(), Status> {
+        let root = crate::node::segments_root(&pre.index_path);
+        let current = SegmentCatalog::read_manifest(&root)
+            .map_err(Status::internal)?
+            .unwrap_or_default();
+        crate::segments::write_manifest_file(&manifest_backup_path(&root), &current)
+            .map_err(Status::internal)?;
+        let marker = CommitMarker {
+            format: MARKER_FORMAT,
+            layout: layout_name(true).to_string(),
+            old_wal_generation: 0,
+            new_wal_generation: 0,
+            walless: true,
+            work_dir: pre.work_dir.clone(),
+            previous_snapshot: false,
+            legacy_files: Vec::new(),
+            staged_segments: prepared.staged_ids.clone(),
+            replaced_segments: prepared.replaced_ids.clone(),
+        };
+        write_marker(&pre.index_path, &marker)
+            .map_err(|e| Status::internal(format!("write the compaction marker: {e}")))?;
+        // From here every failure leaves the marker, and a restart rolls
+        // back; a failure returned here also rolls back at once.
+        let result = (|| -> Result<(), Status> {
+            let epoch = prepared
+                .epoch
+                .checked_add(1)
+                .ok_or_else(|| Status::out_of_range("compaction publication epoch exhausted"))?;
+            let published = prepared
+                .catalog
+                .commit_current(epoch)
+                .map_err(|e| Status::internal(format!("publish the compacted set: {e}")))?;
+            let shard = prepared.shard.as_mut().expect("prepared once");
+            shard
+                .republish(published.clone())
+                .map_err(|e| Status::internal(format!("adopt compacted documents: {e}")))?;
+            if let Some(provider) = prepared
+                .index
+                .as_mut()
+                .and_then(VectorIndex::as_segmented_mut)
+            {
+                provider
+                    .republish(published)
+                    .map_err(|e| Status::internal(format!("adopt compacted vectors: {e}")))?;
+            }
+            let shard = prepared.shard.take().expect("checked above");
+            let mapped_binding = shard.binding().cloned();
+            let mut state = ShardState {
+                index: prepared.index.take(),
+                exact_vectors: prepared.exact_vectors.take(),
+                bm25: Some(Bm25Shard::Segmented(shard)),
+                live_docs: prepared.overlay.clone(),
+                generation: None,
+                wal: None,
+                parents: None,
+                mapped_binding,
+                stats_epoch: guard.stats_epoch,
+                files_current: false,
+                stats_incarnation: Default::default(),
+                pending_compaction: Some(PendingCommit {
+                    index_path: pre.index_path.clone(),
+                    marker,
+                }),
+            };
+            state.advance_stats_epoch();
+            let previous = std::mem::replace(guard, state);
+            drop(previous);
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(()),
+            Err(status) => {
+                recover_interrupted(&pre.index_path);
+                Err(status)
+            }
+        }
+    }
 }
 
 fn map_tailed(id_map: &mut BTreeMap<u64, u64>, old: u64, new: u64) -> Result<(), Status> {
@@ -1814,6 +2730,8 @@ mod tests {
     use crate::analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND};
     use crate::node::NodeConfig;
     use crate::vector::EMBEDDED_TURBOVEC;
+    use prost::Message;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn a_reserved_cutover_yields_writers_without_blocking_reads() {
@@ -1910,9 +2828,12 @@ mod tests {
             };
             append(0);
             node.flush_index().unwrap();
-            let pre = node
+            let preflight = node
                 .preflight_at_row_boundary(&CompactShardRequest::default())
                 .unwrap();
+            let PreflightKind::Wal(pre) = preflight else {
+                panic!("a WAL-backed shard preflights to the log path")
+            };
             std::fs::create_dir_all(&pre.work_dir).unwrap();
             let mut calls = 0;
             let mut analyze = |docs: &[(
@@ -1975,5 +2896,384 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    /// A bound, WAL-less, segmented catalog served in-process: the shape
+    /// the children of a re-placement split come in
+    /// (docs/replay-from-segments.md).
+    fn walless_fixture(label: &str, rows: usize) -> (PathBuf, NodeServiceImpl) {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "psearch-walless-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let index_path = dir.join("shard.tv");
+        let plan = crate::mapping::derive_plan(
+            include_bytes!("../tests/fixtures/vector-binding/descriptor.bin"),
+            "vector_binding.Named",
+        )
+        .unwrap();
+        let binding = crate::postings::StoredBinding {
+            plan_fingerprint: plan.fingerprint,
+            body_path: "body".into(),
+            vector_binding: plan.vector_binding.unwrap().encode_to_vec(),
+            ..Default::default()
+        };
+        SegmentCatalog::open(crate::node::segments_root(&index_path))
+            .unwrap()
+            .publish_binding(&binding)
+            .unwrap();
+        let node = NodeServiceImpl::open(
+            NodeConfig {
+                index_path: Some(index_path.clone()),
+                analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
+                wal: false,
+                layout: crate::node::Layout::Segments,
+                integer_fields: vec!["num".into()],
+                ..Default::default()
+            },
+            None,
+            false,
+        )
+        .unwrap();
+        let sample = crate::harness::unit_vectors(rows.max(64), 64, 7);
+        let config =
+            VectorIndex::fit_backend_config(EMBEDDED_TURBOVEC, 64, 4, &sample[..64 * 64]).unwrap();
+        {
+            let mut guard = crate::node::write_shard(&node.state);
+            let index = VectorIndex::from_backend_config(64, &config).unwrap();
+            guard.index = Some(NodeServiceImpl::adopt_layout(guard.bm25.as_ref(), index).unwrap());
+        }
+        let spec = body_spec();
+        for i in 0..rows {
+            let text = format!("row{i} common {}", ["red", "green", "blue"][i % 3]);
+            let analyzed = crate::analyzer::analyze_document_native(&text, Some(&spec)).unwrap();
+            let mut guard = crate::node::write_shard(&node.state);
+            node.apply_document_locked(
+                &mut guard,
+                AddDocumentsRequest {
+                    text,
+                    analysis: Some(spec.clone()),
+                    integers: vec![crate::pb::IntegerValue {
+                        field: "num".into(),
+                        value: (i / 3) as i64,
+                    }],
+                    position_fields: Vec::new(),
+                    ..Default::default()
+                },
+                analyzed,
+                Some(sample[i * 64..(i + 1) * 64].to_vec()),
+                None,
+                &mut 0,
+                &mut 0,
+            )
+            .unwrap();
+        }
+        node.flush_index().unwrap();
+        (index_path, node)
+    }
+
+    /// The texts the shard serves, in label order.
+    fn served_texts(node: &NodeServiceImpl) -> Vec<String> {
+        let guard = crate::node::read_shard(&node.state);
+        let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
+            panic!("a segmented fixture")
+        };
+        let rows = crate::node::physical_rows(&guard);
+        (0..rows)
+            .filter(|&row| !guard.live_docs.is_deleted(row as usize))
+            .map(|row| {
+                shard
+                    .text(row as u32)
+                    .unwrap_or_else(|| panic!("row {row} has no text"))
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn walless_compaction_catches_up_writes_and_deletes_made_after_the_build() {
+        let (index_path, node) = walless_fixture("tail", 120);
+        // A tombstone the build must reclaim.
+        {
+            let mut guard = crate::node::write_shard(&node.state);
+            node.delete_documents_locked(&mut guard, &[3], None)
+                .unwrap();
+        }
+        // After the outputs are staged and before the tail catch-up, one
+        // more row lands in the tail and one sealed row is deleted. The
+        // cutover must carry the row and the tombstone.
+        segment_staging_hook::install(index_path.clone(), |node| {
+            let spec = body_spec();
+            let text = "late arrival common".to_string();
+            let analyzed = crate::analyzer::analyze_document_native(&text, Some(&spec)).unwrap();
+            let mut guard = crate::node::write_shard(&node.state);
+            node.apply_document_locked(
+                &mut guard,
+                AddDocumentsRequest {
+                    text,
+                    analysis: Some(spec),
+                    integers: vec![crate::pb::IntegerValue {
+                        field: "num".into(),
+                        value: 10_000,
+                    }],
+                    ..Default::default()
+                },
+                analyzed,
+                Some(crate::harness::unit_vectors(1, 64, 99)),
+                None,
+                &mut 0,
+                &mut 0,
+            )
+            .map_err(|status| status.message().to_string())?;
+            let deleted = node
+                .delete_documents_locked(&mut guard, &[5], None)
+                .map_err(|status| status.message().to_string())?;
+            assert_eq!(deleted.deleted, 1);
+            Ok(())
+        });
+        let worker = node.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            worker.compact_shard(&CompactShardRequest {
+                partition_column: "num".into(),
+                tail_bound: 16,
+                ..Default::default()
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.rows_before, 120);
+        assert_eq!(response.tombstones_reclaimed, 1);
+        assert_eq!(
+            response.tail_records_applied, 1,
+            "the late row was caught up"
+        );
+        // The dense partitions plus the caught-up row; the tombstone the
+        // hook wrote is a physical row the overlay marks.
+        assert_eq!(response.rows_after, 120);
+        let texts = served_texts(&node);
+        assert_eq!(texts.len(), 119);
+        assert_eq!(
+            texts.iter().filter(|t| *t == "late arrival common").count(),
+            1,
+            "the late row appears exactly once"
+        );
+        for gone in ["row3 common red", "row5 common blue"] {
+            assert!(!texts.iter().any(|t| t == gone), "{gone} is tombstoned");
+        }
+        assert_eq!(texts.iter().filter(|t| *t == "row0 common red").count(), 1);
+        drop(node);
+        std::fs::remove_dir_all(index_path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_interrupted_walless_build_leaves_the_serving_catalog_untouched() {
+        let (index_path, node) = walless_fixture("interrupted", 120);
+        let manifest_before = std::fs::read(SegmentCatalog::manifest_path(
+            &crate::node::segments_root(&index_path),
+        ))
+        .unwrap();
+        segment_staging_hook::install(index_path.clone(), |_| Err("injected kill".to_string()));
+        let worker = node.clone();
+        let status = tokio::task::spawn_blocking(move || {
+            worker.compact_shard(&CompactShardRequest {
+                partition_column: "num".into(),
+                tail_bound: 16,
+                ..Default::default()
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(status.message().contains("injected kill"), "{status}");
+        // The serving catalog is untouched, and no staged output survived.
+        assert_eq!(served_texts(&node).len(), 120);
+        assert_eq!(
+            std::fs::read(SegmentCatalog::manifest_path(&crate::node::segments_root(
+                &index_path
+            )))
+            .unwrap(),
+            manifest_before
+        );
+        let segments_dir = crate::node::segments_root(&index_path).join("segments");
+        assert!(
+            !std::fs::read_dir(&segments_dir).unwrap().any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("cmp-")),
+            "the failed build's staging was removed"
+        );
+        // A retry from clean staging succeeds, serves the same rows, and
+        // writes byte-identical outputs to an uninterrupted run's.
+        std::fs::remove_dir_all(default_work_dir(&index_path)).unwrap();
+        let worker = node.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            worker.compact_shard(&CompactShardRequest {
+                partition_column: "num".into(),
+                tail_bound: 16,
+                ..Default::default()
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.rows_before, 120);
+        assert_eq!(response.rows_after, 120);
+        assert_eq!(served_texts(&node).len(), 120);
+        let (clean_path, clean_node) = walless_fixture("uninterrupted", 120);
+        let clean = clean_node.clone();
+        let clean_response = tokio::task::spawn_blocking(move || {
+            clean.compact_shard(&CompactShardRequest {
+                partition_column: "num".into(),
+                tail_bound: 16,
+                ..Default::default()
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(clean_response.rows_after, 120);
+        let bytes_of = |index_path: &Path| {
+            let root = crate::node::segments_root(index_path);
+            let mut out = BTreeMap::new();
+            let mut stack = vec![root.clone()];
+            while let Some(dir) = stack.pop() {
+                for entry in std::fs::read_dir(&dir).unwrap() {
+                    let entry = entry.unwrap();
+                    if entry.file_type().unwrap().is_dir() {
+                        stack.push(entry.path());
+                    } else {
+                        let relative = entry
+                            .path()
+                            .strip_prefix(&root)
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned();
+                        out.insert(relative, std::fs::read(entry.path()).unwrap());
+                    }
+                }
+            }
+            out
+        };
+        assert_eq!(bytes_of(&index_path), bytes_of(&clean_path));
+        drop(node);
+        drop(clean_node);
+        std::fs::remove_dir_all(index_path.parent().unwrap()).unwrap();
+        std::fs::remove_dir_all(clean_path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn walless_compaction_under_a_changed_declaration_refuses_naming_both() {
+        use crate::pb::{DerivedColumn, DerivedColumns, DerivedDisclosure, MaterializeKind};
+        let declaration = |name: &str| {
+            Arc::new(
+                crate::derived::Declaration::compile(&DerivedColumns {
+                    columns: vec![DerivedColumn {
+                        name: name.into(),
+                        expression: "num + 1".into(),
+                        kind: MaterializeKind::I64 as i32,
+                        disclosure: DerivedDisclosure::Inputs as i32,
+                    }],
+                })
+                .unwrap(),
+            )
+        };
+        let (index_path, mut node) = {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "psearch-walless-derived-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let index_path = dir.join("shard.tv");
+            let plan = crate::mapping::derive_plan(
+                include_bytes!("../tests/fixtures/vector-binding/descriptor.bin"),
+                "vector_binding.Named",
+            )
+            .unwrap();
+            let binding = crate::postings::StoredBinding {
+                plan_fingerprint: plan.fingerprint,
+                body_path: "body".into(),
+                vector_binding: plan.vector_binding.unwrap().encode_to_vec(),
+                ..Default::default()
+            };
+            SegmentCatalog::open(crate::node::segments_root(&index_path))
+                .unwrap()
+                .publish_binding(&binding)
+                .unwrap();
+            let node = NodeServiceImpl::open(
+                NodeConfig {
+                    index_path: Some(index_path.clone()),
+                    analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
+                    wal: false,
+                    layout: crate::node::Layout::Segments,
+                    integer_fields: vec!["num".into()],
+                    derived: Some(declaration("num_d")),
+                    ..Default::default()
+                },
+                None,
+                false,
+            )
+            .unwrap();
+            (index_path, node)
+        };
+        let spec = body_spec();
+        for i in 0..30 {
+            let text = format!("row{i} common");
+            let analyzed = crate::analyzer::analyze_document_native(&text, Some(&spec)).unwrap();
+            let mut guard = crate::node::write_shard(&node.state);
+            node.apply_document_locked(
+                &mut guard,
+                AddDocumentsRequest {
+                    text,
+                    analysis: Some(spec.clone()),
+                    integers: vec![crate::pb::IntegerValue {
+                        field: "num".into(),
+                        value: i as i64,
+                    }],
+                    ..Default::default()
+                },
+                analyzed,
+                None,
+                None,
+                &mut 0,
+                &mut 0,
+            )
+            .unwrap();
+        }
+        node.flush_index().unwrap();
+        // The node now declares a changed declaration; the catalog's rows
+        // carry the old one's values. The refusal names both.
+        node.config.derived = Some(declaration("num_e"));
+        let status = node
+            .compact_shard(&CompactShardRequest {
+                partition_column: "num".into(),
+                tail_bound: 16,
+                ..Default::default()
+            })
+            .unwrap_err();
+        let message = status.message();
+        assert!(
+            message.contains("was written under derived-column declaration"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&declaration("num_d").fingerprint().to_string()),
+            "{message}"
+        );
+        assert!(
+            message.contains(&declaration("num_e").fingerprint().to_string()),
+            "{message}"
+        );
+        drop(node);
+        std::fs::remove_dir_all(index_path.parent().unwrap()).unwrap();
     }
 }

@@ -1255,6 +1255,21 @@ message CompactShardRequest {
   // layout. A column no document carries, or a non-integer column,
   // is rejected by name.
   string partition_column = 4;
+  // The from-segments build of a catalog without a WAL
+  // (docs/replay-from-segments.md, "Partitioned compaction of a catalog
+  // without a log"): this many partitions build at once. 0 = 1. The
+  // output catalog is the single-threaded build's, byte for byte.
+  // Refused by name on a WAL-backed shard, whose build replays one log
+  // bucket at a time.
+  uint32 build_threads = 5;
+  // Sealed-but-unpublished partition images the threaded from-segments
+  // build holds at once. 0 = the thread count.
+  uint32 build_queue = 6;
+  // A planning admission estimate in bytes (70 KiB/row) for the
+  // from-segments build: the largest partition alone, and the thread
+  // count times it, must fit, or the build refuses by name before
+  // writing anything. Not an actual memory limit. 0 = no check.
+  uint64 build_memory = 7;
 }
 
 message CompactShardResponse {
@@ -1268,7 +1283,9 @@ message CompactShardResponse {
   // not reclaimed; the next compaction takes them.
   uint64 tombstones_reclaimed = 3;
   // Live WAL records applied to the shadow after the cutoff, over every
-  // tail pass and cutover preparation.
+  // tail pass and cutover preparation. On the from-segments path (a
+  // catalog without a WAL): the post-cutoff rows the catch-up sealed
+  // into the live catalog, which the cutover carried over.
   uint64 tail_records_applied = 4;
   // Records applied inside the write-locked cutover. Always zero with
   // unlocked tail preparation; retained for older server responses.
@@ -1278,8 +1295,12 @@ message CompactShardResponse {
   uint64 write_lock_ms = 6;
   // The rewritten full-history WAL generation the shard logs to after
   // the cutover; the superseded generation stays on disk as history.
+  // 0 on the from-segments path (a catalog without a WAL): no log is
+  // rewritten and the catalog stays unlogged.
   uint64 wal_generation = 7;
-  // The generation clock the dense image was built through.
+  // The generation clock the dense image was built through. 0 on the
+  // from-segments path, whose cutoff is the sealed catalog at a manifest
+  // epoch, not a log clock.
   uint64 cutoff_clock = 8;
   // "single-image" or "segments".
   string layout = 9;

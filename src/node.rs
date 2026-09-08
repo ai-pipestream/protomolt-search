@@ -259,7 +259,7 @@ pub(crate) fn stored_derived(config: &NodeConfig) -> Option<crate::postings::Sto
 /// A store or catalog attached to this shard was written under this
 /// shard's declaration, or under none while still empty; anything else
 /// is an index compatibility event, refused by name.
-fn check_attached_derived(
+pub(crate) fn check_attached_derived(
     config: &NodeConfig,
     held: Option<&crate::postings::StoredDerived>,
     rows: u64,
@@ -6407,7 +6407,10 @@ impl NodeServiceImpl {
     /// that creates the shard's first index goes through here, so a
     /// calibrated-then-ingested segmented shard seals its vectors like
     /// an ingested-then-calibrated one.
-    fn adopt_layout(bm25: Option<&Bm25Shard>, created: VectorIndex) -> Result<VectorIndex, Status> {
+    pub(crate) fn adopt_layout(
+        bm25: Option<&Bm25Shard>,
+        created: VectorIndex,
+    ) -> Result<VectorIndex, Status> {
         match bm25 {
             Some(Bm25Shard::Segmented(g)) => {
                 let provider = SegmentedProvider::open(g.snapshot().clone(), created)
@@ -6431,7 +6434,7 @@ impl NodeServiceImpl {
     /// next attempt. The WAL is untouched: sealing changes the on-disk
     /// layout, not the log's history. Returns whether a segment was
     /// written.
-    fn seal_tail(&self) -> Result<bool, Status> {
+    pub(crate) fn seal_tail(&self) -> Result<bool, Status> {
         let _one_at_a_time = self.seal_lock.lock().expect("seal lock poisoned");
         let Some(plan) = self.freeze_tail()? else {
             return Ok(false);
