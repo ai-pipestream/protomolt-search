@@ -74,6 +74,34 @@ history recovery and explicit retirement before replacement. Routing public
 source writes and connecting this local guard to that authority remain work
 under the foundations goal.
 
+## Retried acceptance after retirement
+
+Admission closure and a terminal seal prevent new source writes. They do not
+erase committed retry decisions. An exact accepted request still returns its
+original receipt with `replayed=true`, including after reopening or recovering
+an abrupt process exit. Changed input under an existing operation ID still
+returns `ALREADY_EXISTS`; a new operation remains fenced. A replay neither
+advances the accepted sequence nor changes the retired watermark.
+
+The controlled API checks and pins current Ingest permission before looking up
+the receipt. Both the read-only retry path and the writer recheck validate the
+persisted resource binding and requested history. After a read miss, acceptance
+rechecks the operation while holding the database writer before applying the
+new-write fence, so a concurrent acceptance followed by retirement cannot hide
+the stored decision. Existing retries do not acquire the database writer.
+
+This correction does not scope operation IDs by actor: that separate storage
+and authorization change remains required. Existing actorless retry records
+contain no evidence from which to infer the authenticated principal.
+
+The focused regression run reproduced five retirement/seal failures before the
+fix. After the change and correction of an older test that expected retry
+refusal, 73 catalog unit tests and 32 catalog/access integration tests pass,
+including the isolated file-mode child check. A held-writer test verifies the
+receipt lookup does not wait for an unrelated database writer. Validation used
+unchanged runtime/test hashes, an 8 GiB swap-disabled scope, 3.34 GiB peak memory,
+and zero OOM events. The complete gate is recorded after it finishes.
+
 ## Verification scope
 
 The focused tests cover action separation, stale decisions, workspace remapping,

@@ -67,7 +67,7 @@ field made the count 19 rather than 18. Commit `de96f0b` changes only that
 assertion. A manifest comparison verified every other tracked file against the
 initial run before resuming at the affected integration group. The original
 failure logs were preserved; the resumed run passed with unchanged file hashes.
-Combined unique results are 1,555 passed, zero failed and one existing ignored
+Combined reported results are 1,555 passed, zero failed and one existing ignored
 test across the library, 146 integration targets, embedded package and IVF
 adapter. This is combined evidence across the test-only correction, not a claim
 that the initial invocation succeeded.

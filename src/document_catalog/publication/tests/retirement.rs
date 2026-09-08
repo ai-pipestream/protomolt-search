@@ -98,28 +98,34 @@ async fn retirement_is_persistent_idempotent_and_closes_source_writes() {
         f.source.begin_retirement(&changed).unwrap_err().code(),
         Code::AlreadyExists
     );
-    for write in [
-        AcceptDocumentRequest {
-            contract_version: 1,
-            document_key: KEY.to_vec(),
-            operation_id: [KEY, &1u64.to_be_bytes()].concat(),
-            expected_version: Some(0),
-            mutation: Some(Mutation::Source(original)),
-            ..Default::default()
-        },
-        AcceptDocumentRequest {
-            contract_version: 1,
-            document_key: b"new-during-retirement".to_vec(),
-            operation_id: b"new-during-retirement".to_vec(),
-            expected_version: Some(0),
-            mutation: Some(Mutation::Delete(true)),
-            ..Default::default()
-        },
-    ] {
-        let error = f.source.accept(&write).unwrap_err();
-        assert_eq!(error.code(), Code::FailedPrecondition);
-        assert!(error.message().contains("retiring"), "{error}");
-    }
+    let retry = AcceptDocumentRequest {
+        contract_version: 1,
+        document_key: KEY.to_vec(),
+        operation_id: [KEY, &1u64.to_be_bytes()].concat(),
+        expected_version: Some(0),
+        mutation: Some(Mutation::Source(original)),
+        ..Default::default()
+    };
+    let replayed = f.source.accept(&retry).unwrap();
+    assert!(replayed.replayed);
+    assert_eq!((replayed.version, replayed.accepted_sequence), (1, 1));
+    let mut altered = retry.clone();
+    altered.mutation = Some(Mutation::Delete(true));
+    assert_eq!(
+        f.source.accept(&altered).unwrap_err().code(),
+        Code::AlreadyExists
+    );
+    let write = AcceptDocumentRequest {
+        contract_version: 1,
+        document_key: b"new-during-retirement".to_vec(),
+        operation_id: b"new-during-retirement".to_vec(),
+        expected_version: Some(0),
+        mutation: Some(Mutation::Delete(true)),
+        ..Default::default()
+    };
+    let error = f.source.accept(&write).unwrap_err();
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert!(error.message().contains("retiring"), "{error}");
     assert!(f.source.get(KEY, Some(1)).unwrap().is_some());
     let node = f.node.clone();
     let source = f.source.clone();
@@ -515,4 +521,57 @@ fn reopen_refuses_incoherent_retirement_header_states() {
         assert_eq!(error.code(), Code::DataLoss, "{case}");
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[tokio::test]
+async fn accepted_operation_retries_survive_retirement_and_seal_fences() {
+    let f = Fixture::new();
+    publish(&f, 1, 1).await;
+    let source = f.source.get(KEY, Some(1)).unwrap().unwrap().1.unwrap();
+    let exact = AcceptDocumentRequest {
+        contract_version: 1,
+        document_key: KEY.to_vec(),
+        operation_id: [KEY, &1u64.to_be_bytes()].concat(),
+        expected_version: Some(0),
+        mutation: Some(Mutation::Source(source)),
+        ..Default::default()
+    };
+    let expected = f.source.accept(&exact).unwrap();
+    assert!(expected.replayed);
+    let retirement = f
+        .source
+        .begin_retirement(&request(&f, b"move-retries"))
+        .unwrap();
+    assert_eq!(f.source.accept(&exact).unwrap(), expected);
+
+    let mut altered = exact.clone();
+    altered.mutation = Some(Mutation::Delete(true));
+    assert_eq!(
+        f.source.accept(&altered).unwrap_err().code(),
+        Code::AlreadyExists
+    );
+    let new = AcceptDocumentRequest {
+        operation_id: b"new-during-retirement".to_vec(),
+        document_key: b"new-during-retirement".to_vec(),
+        mutation: Some(Mutation::Delete(true)),
+        expected_version: Some(0),
+        contract_version: 1,
+        ..Default::default()
+    };
+    let error = f.source.accept(&new).unwrap_err();
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert!(error.message().contains("retiring"), "{error}");
+
+    f.source.seal_history(&seal_request(&retirement)).unwrap();
+    assert_eq!(f.source.accept(&exact).unwrap(), expected);
+    assert_eq!(
+        f.source.accept(&altered).unwrap_err().code(),
+        Code::AlreadyExists
+    );
+    let mut after_seal = new;
+    after_seal.operation_id = b"new-after-seal".to_vec();
+    after_seal.document_key = b"new-after-seal".to_vec();
+    let error = f.source.accept(&after_seal).unwrap_err();
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert!(error.message().contains("sealed"), "{error}");
 }

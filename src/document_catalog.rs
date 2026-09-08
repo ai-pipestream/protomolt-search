@@ -27,6 +27,7 @@ mod checkpoint;
 mod projection;
 mod publication;
 mod restore;
+mod retry;
 mod seal;
 pub use access::AccessControlledCatalog;
 pub use backup::CapturedBackup;
@@ -340,7 +341,8 @@ impl DocumentCatalog {
     }
 
     /// Atomically accept a version and its retry decision. A retry is resolved
-    /// before the version precondition, including after later writes or delete.
+    /// before the version precondition or retirement fence, including after
+    /// later writes, deletion or sealing. A replay does not mutate the catalog.
     pub fn accept(&self, request: &AcceptDocumentRequest) -> Result<DocumentWriteReceipt, Status> {
         match request.contract_version {
             1 if request.history_id.is_empty() => {}
@@ -370,53 +372,27 @@ impl DocumentCatalog {
             }
         }
         let request_sha = sha256::digest(&request.encode_to_vec());
-        let transaction = self.writable_transaction()?;
-        let mut header: DocumentCatalogHeader = {
-            let meta = transaction.open_table(META).map_err(storage)?;
-            let header = decode(
-                meta.get("header")
-                    .map_err(storage)?
-                    .ok_or_else(|| Status::data_loss("catalog header missing"))?
-                    .value(),
-            )?;
-            header
-        };
-        validate_current_header(&header)?;
-        if request.contract_version == 2 && request.history_id != header.history_id {
-            return Err(Status::failed_precondition(
-                "document write belongs to another catalog history",
-            ));
+        if let Some(receipt) = self.accepted_retry(request, &request_sha)? {
+            return Ok(receipt);
         }
+        // Another acceptance or retirement may commit after the read snapshot.
+        // Recheck the retry under the writer before fencing genuinely new work.
+        let mut transaction = self.database.begin_write().map_err(storage)?;
+        transaction
+            .set_durability(Durability::Immediate)
+            .map_err(storage)?;
+        let mut header = seal::header_from(self, &transaction)?;
+        retry::check_history(&header, request)?;
         {
             let operations = transaction.open_table(OPERATIONS).map_err(storage)?;
             if let Some(previous) = operations
                 .get(request.operation_id.as_slice())
                 .map_err(storage)?
             {
-                let previous: DocumentOperation = decode(previous.value())?;
-                if previous.request_sha256 != request_sha {
-                    return Err(Status::already_exists(
-                        "operation_id was used for a different document write",
-                    ));
-                }
-                let mut receipt = previous
-                    .receipt
-                    .ok_or_else(|| Status::data_loss("operation receipt missing"))?;
-                if receipt.history_id.is_empty()
-                    && receipt.accepted_sequence > 0
-                    && receipt.accepted_sequence <= header.legacy_receipts_through_sequence
-                {
-                    // Enrich only pre-migration receipts; the stored retry decision stays intact.
-                    receipt.history_id = header.history_id.clone();
-                } else if receipt.history_id != header.history_id {
-                    return Err(Status::data_loss(
-                        "operation receipt belongs to another catalog history",
-                    ));
-                }
-                receipt.replayed = true;
-                return Ok(receipt);
+                return retry::receipt(&header, previous.value(), &request_sha);
             };
         }
+        seal::require_admission(&header, false)?;
         let previous: Option<DocumentVersion> = {
             let heads = transaction.open_table(HEADS).map_err(storage)?;
             let previous = heads

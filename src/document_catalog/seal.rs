@@ -69,7 +69,7 @@ pub(super) fn validate_header_seal(header: &DocumentCatalogHeader) -> Result<(),
     Ok(())
 }
 
-fn header_from(
+pub(super) fn header_from(
     catalog: &DocumentCatalog,
     tx: &redb::WriteTransaction,
 ) -> Result<DocumentCatalogHeader, Status> {
@@ -83,6 +83,25 @@ fn header_from(
     validate_current_header(&header)?;
     catalog.validate_resource_binding(&header)?;
     Ok(header)
+}
+
+/// Call only after validating the header while holding the database writer.
+/// Acceptance resolves existing retries first; this gate controls new work.
+pub(super) fn require_admission(
+    header: &DocumentCatalogHeader,
+    recovery: bool,
+) -> Result<(), Status> {
+    if header.history_seal.is_some() {
+        return Err(Status::failed_precondition(
+            "source history is sealed; acceptance and index mutations are retired",
+        ));
+    }
+    if header.retirement_intent.is_some() && !recovery {
+        return Err(Status::failed_precondition(
+            "source history is retiring; new acceptance and index preparations are closed",
+        ));
+    }
+    Ok(())
 }
 
 impl DocumentCatalog {
@@ -102,16 +121,7 @@ impl DocumentCatalog {
         let mut tx = self.database.begin_write().map_err(storage)?;
         tx.set_durability(Durability::Immediate).map_err(storage)?;
         let header = header_from(self, &tx)?;
-        if header.history_seal.is_some() {
-            return Err(Status::failed_precondition(
-                "source history is sealed; acceptance and index mutations are retired",
-            ));
-        }
-        if header.retirement_intent.is_some() && !recovery {
-            return Err(Status::failed_precondition(
-                "source history is retiring; new acceptance and index preparations are closed",
-            ));
-        }
+        require_admission(&header, recovery)?;
         Ok(tx)
     }
 
