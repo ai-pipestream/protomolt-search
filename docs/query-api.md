@@ -145,12 +145,17 @@ postings, a dense clause as the universe of rows with a vector), applies the
 group rule below on the words, scores the members for every scoring clause,
 and answers its best `depth` members by summed score, doc id ascending on
 ties, each with its per-clause signals and the clauses whose membership holds
-it. A filter leaf the tree reaches only under MUST, beside exact (lexical or
-dense) siblings, resolves its column reads over the intersection of those
+it. A filter leaf the tree reaches only under MUST, beside a lexical
+sibling, resolves its column reads over the intersection of those
 siblings' memberships, narrowed by every ancestor MUST bound: a row outside
 that intersection can never satisfy the group, so the filter's verdict there
-is never consulted. SHOULD and MUST_NOT filters and filters without an exact
-MUST sibling still resolve over the whole shard.
+is never consulted. SHOULD and MUST_NOT filters and filters without a
+lexical MUST sibling still resolve over the whole shard. Leaves resolve
+cheapest first — lexical clauses, then filters, then nested groups, then
+dense clauses — and once a group's MUST intersection is empty on a
+MUST-only path from the root, the group and the root admit no row, so the
+remaining leaves resolve as the empty set (a filter still validates and
+reports its handshake; a dense clause's bitmap is never built).
 The coordinator merges the shards' lists by the same order and cuts them
 to `depth`. No membership crosses the wire: what a filter excludes is never
 materialized anywhere but in a shard's own bitmap, and the coordinator holds
