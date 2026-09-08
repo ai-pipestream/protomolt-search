@@ -105,10 +105,20 @@ certificate does not certify the soundness of caller-supplied pruning metadata.
 
 Memory: [`BATCH_ROW_BYTES`] (32) per batch row, at most 1,048,576 rows
 (32 MiB), plus one reconstructed source row or posting at a time and an 8 MiB
-redb cache for the on-disk identity/digest tables. A mapped vector image
-materializes its packed rows once on first use (bits × dim / 8 bytes per row,
-retained by the index for its lifetime). The batch limit is not a
-total-process memory quota.
+redb cache for the on-disk identity/digest tables. Provider row transcripts
+are read in pieces of `TRANSCRIPT_BLOCK_ROWS` (1,024) rows —
+`rows × (16 + bits × dim / 8)` bytes, 256 KiB at 384 dimensions and 4 bits —
+and the embedded engine (`TurboQuantIndex::stored_rows`, chain s21) converts
+one 32-row block at a time from the layout it already serves, assembling a
+mapped block straight from its pages outside the search's chunk cache. No
+packed image is materialized or retained by the proof: `packed_ready()`
+stays false on every loaded and mapped segment afterwards
+(`mapped_proof_leaves_packed_codes_unmaterialized`), and at a fixed batch the
+proof's own allocation does not grow with the image
+(`proof_allocation_is_independent_of_vector_image_size`: 16,384 rows at 8
+versus 512 dimensions, a 64× larger image, measured 3,913,010 versus 3,929,138 bytes of peak allocation on the proof thread, 16 KiB apart). Two
+proofs running at once cost two of everything above; the batch limit is not
+a total-process memory quota.
 
 Time: every live row is reconstructed once; every field's vocabulary is
 walked once per batch of each segment, with posting cursors skipped to the

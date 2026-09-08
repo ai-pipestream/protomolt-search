@@ -7,6 +7,7 @@
 //! dependency is contained in [`embedded_turbovec`].
 
 use std::fmt;
+use std::ops::Range;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -264,22 +265,51 @@ pub trait VectorProvider: Send + Sync {
     fn as_segmented_mut(&mut self) -> Option<&mut crate::segmented_vectors::SegmentedProvider> {
         None
     }
-    /// The provider's stored encoding of one row: the bytes its scorer reads
-    /// for that row and the per-row scoring metadata kept beside them, in a
-    /// fixed layout that does not depend on the row's physical position. A
-    /// rewrite proof compares this by document identity
+    /// The provider's stored encoding of each row in `rows`, delivered to
+    /// `sink` as `(row, transcript)` in row order: the bytes its scorer
+    /// reads for that row and the per-row scoring metadata kept beside
+    /// them, in a fixed layout that does not depend on the row's physical
+    /// position. A rewrite proof compares this by document identity
     /// (`src/segments/rewrite_proof.rs`), so equal FP32 source rows cannot
-    /// stand in for it. A provider that cannot expose its representation
-    /// refuses here, and the proof refuses with it: a certificate never
-    /// covers a dense image it could not read.
-    fn row_transcript(&self, _row: usize) -> Result<Vec<u8>, VectorError> {
+    /// stand in for it. The provider must serve the range in bounded pieces
+    /// without materializing its whole image, and must leave any lazily
+    /// built representation state as it found it. A provider that cannot
+    /// expose its representation refuses here, and the proof refuses with
+    /// it: a certificate never covers a dense image it could not read.
+    fn row_transcripts(
+        &self,
+        _rows: Range<usize>,
+        _sink: &mut dyn FnMut(usize, &[u8]),
+    ) -> Result<(), VectorError> {
         Err(VectorError::new(format!(
             "vector backend {:?} does not expose its stored row encoding; a rewrite proof \
              cannot certify its dense image",
             self.descriptor().backend_kind
         )))
     }
+
+    /// One row's transcript: [`Self::row_transcripts`] over a single row.
+    fn row_transcript(&self, row: usize) -> Result<Vec<u8>, VectorError> {
+        let mut out = None;
+        self.row_transcripts(row..row + 1, &mut |_, transcript| {
+            out = Some(transcript.to_vec());
+        })?;
+        out.ok_or_else(|| VectorError::new(format!("row {row} produced no transcript")))
+    }
+
+    /// Whether the provider currently holds a materialized copy of its
+    /// stored rows beyond the image it serves from — for the embedded
+    /// engine, its packed-row cache. `None` when the provider has no such
+    /// state. A rewrite proof over a mapped image must leave this `false`.
+    fn representation_materialized(&self) -> Option<bool> {
+        None
+    }
 }
+
+/// Rows a provider is asked for at once by the rewrite proof: bounds the
+/// transcript buffer at `rows * (16 + bits * dim / 8)` bytes, 256 KiB at
+/// 384 dimensions and 4 bits, 8 MiB at the engine's 16,384-dimension ceiling.
+pub const TRANSCRIPT_BLOCK_ROWS: usize = 1024;
 
 /// Sized product-side handle around an arbitrary vector engine.
 pub struct VectorIndex {
@@ -388,9 +418,23 @@ impl VectorIndex {
         self.engine.is_mapped()
     }
 
+    /// See [`VectorProvider::row_transcripts`].
+    pub fn row_transcripts(
+        &self,
+        rows: Range<usize>,
+        sink: &mut dyn FnMut(usize, &[u8]),
+    ) -> Result<(), VectorError> {
+        self.engine.row_transcripts(rows, sink)
+    }
+
     /// See [`VectorProvider::row_transcript`].
     pub fn row_transcript(&self, row: usize) -> Result<Vec<u8>, VectorError> {
         self.engine.row_transcript(row)
+    }
+
+    /// See [`VectorProvider::representation_materialized`].
+    pub fn representation_materialized(&self) -> Option<bool> {
+        self.engine.representation_materialized()
     }
 
     pub fn descriptor(&self) -> VectorBackendDescriptor {
@@ -681,17 +725,23 @@ mod embedded_turbovec {
         }
 
         /// Bit width, dimension, the row's bit-plane packed codes and its
-        /// correction scale bits. The packed image is row-major with stride
-        /// `bits * dim / 8` (turbovec `pack.rs`); the whole image is checked
-        /// against that layout before a row is sliced, so a layout the
-        /// engine changes under this adapter refuses instead of certifying
-        /// the wrong bytes. A mapped image materializes its packed rows once
-        /// on the first call (O(n * dim), retained by the index).
-        fn row_transcript(&self, row: usize) -> Result<Vec<u8>, VectorError> {
-            let rows = self.index.len();
-            if row >= rows {
+        /// correction scale bits, read through `TurboQuantIndex::stored_rows`
+        /// in pieces of at most [`TRANSCRIPT_BLOCK_ROWS`] rows. The engine
+        /// converts one 32-row block at a time from the layout it already
+        /// serves, so a loaded or mapped image is never materialized as
+        /// packed rows and `packed_ready()` is unchanged. Each piece is
+        /// checked against the `bits * dim / 8` row stride before it is
+        /// sliced, so a layout the engine changes under this adapter refuses
+        /// instead of certifying the wrong bytes.
+        fn row_transcripts(
+            &self,
+            rows: Range<usize>,
+            sink: &mut dyn FnMut(usize, &[u8]),
+        ) -> Result<(), VectorError> {
+            let total = self.index.len();
+            if rows.end > total || rows.start > rows.end {
                 return Err(VectorError::new(format!(
-                    "row {row} is outside the {rows} stored vectors"
+                    "rows {rows:?} are outside the {total} stored vectors"
                 )));
             }
             let dim = self
@@ -707,22 +757,38 @@ mod embedded_turbovec {
                     )))
                 }
             };
-            let codes = self.index.packed_codes();
-            let scales = self.index.scales();
-            if codes.len() != rows * stride || scales.len() != rows {
-                return Err(VectorError::new(format!(
-                    "packed image holds {} code bytes and {} scales for {rows} rows of {stride} \
-                     bytes; the layout differs from the adapter's",
-                    codes.len(),
-                    scales.len()
-                )));
-            }
+            let mut codes = Vec::new();
+            let mut scales = Vec::new();
             let mut out = Vec::with_capacity(16 + stride);
-            out.extend_from_slice(&(bits as u32).to_le_bytes());
-            out.extend_from_slice(&(dim as u64).to_le_bytes());
-            out.extend_from_slice(&codes[row * stride..(row + 1) * stride]);
-            out.extend_from_slice(&scales[row].to_bits().to_le_bytes());
-            Ok(out)
+            let mut start = rows.start;
+            while start < rows.end {
+                let end = rows.end.min(start + TRANSCRIPT_BLOCK_ROWS);
+                self.index
+                    .stored_rows(start..end, &mut codes, &mut scales)
+                    .map_err(|e| VectorError::new(e.to_string()))?;
+                if codes.len() != (end - start) * stride || scales.len() != end - start {
+                    return Err(VectorError::new(format!(
+                        "stored rows {start}..{end} came back as {} code bytes and {} scales \
+                         for a {stride}-byte row stride; the layout differs from the adapter's",
+                        codes.len(),
+                        scales.len()
+                    )));
+                }
+                for (i, row) in (start..end).enumerate() {
+                    out.clear();
+                    out.extend_from_slice(&(bits as u32).to_le_bytes());
+                    out.extend_from_slice(&(dim as u64).to_le_bytes());
+                    out.extend_from_slice(&codes[i * stride..(i + 1) * stride]);
+                    out.extend_from_slice(&scales[i].to_bits().to_le_bytes());
+                    sink(row, &out);
+                }
+                start = end;
+            }
+            Ok(())
+        }
+
+        fn representation_materialized(&self) -> Option<bool> {
+            Some(self.index.packed_ready())
         }
 
         fn descriptor(&self) -> VectorBackendDescriptor {

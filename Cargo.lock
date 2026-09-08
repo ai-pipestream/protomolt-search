@@ -1184,7 +1184,7 @@ dependencies = [
  "tonic",
  "tonic-build",
  "tower 0.5.3",
- "turbovec",
+ "turbovec 1.0.0 (git+https://github.com/ai-pipestream/turbovec.git?branch=turbovec-pipestream-s21)",
  "turbovec-grpc",
  "webpki-roots",
 ]
@@ -2182,6 +2182,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "turbovec"
+version = "1.0.0"
+source = "git+https://github.com/ai-pipestream/turbovec.git?branch=turbovec-pipestream-s21#3cce294ea80cb46697fb3bef6af6be996fca52c5"
+dependencies = [
+ "memmap2",
+ "ordered-float 4.6.0",
+ "rand",
+ "rand_chacha",
+ "rayon",
+ "statrs",
+]
+
+[[package]]
 name = "turbovec-grpc"
 version = "0.1.0"
 source = "git+https://github.com/ai-pipestream/turbovec-grpc.git?rev=0b21a161d008936d21feb474e801e456415e6622#0b21a161d008936d21feb474e801e456415e6622"
@@ -2199,7 +2212,7 @@ dependencies = [
  "tonic-reflection",
  "tracing",
  "tracing-subscriber",
- "turbovec",
+ "turbovec 1.0.0 (git+https://github.com/ai-pipestream/turbovec.git?branch=turbovec-pipestream-s20)",
  "uuid",
 ]
 

@@ -435,16 +435,46 @@ impl VectorProvider for SegmentedProvider {
         Some(self)
     }
 
-    /// The image holding `row` answers for it; a row without a vector
-    /// (a documents-only part, or a tail row whose vector has not arrived)
-    /// refuses.
-    fn row_transcript(&self, row: usize) -> Result<Vec<u8>, VectorError> {
-        for (base, rows, image) in self.images() {
-            if row >= base && row < base + rows {
-                return image.row_transcript(row - base);
+    /// Each image answers for the rows it holds, in row order; a row without
+    /// a vector (a documents-only part, or a tail row whose vector has not
+    /// arrived) refuses.
+    fn row_transcripts(
+        &self,
+        rows: std::ops::Range<usize>,
+        sink: &mut dyn FnMut(usize, &[u8]),
+    ) -> Result<(), VectorError> {
+        let mut next = rows.start;
+        for (base, count, image) in self.images() {
+            if next >= rows.end {
+                break;
             }
+            let lo = next.max(base);
+            let hi = rows.end.min(base + count);
+            if lo >= hi {
+                continue;
+            }
+            if lo != next {
+                return Err(VectorError::new(format!("row {next} holds no vector")));
+            }
+            image.row_transcripts(lo - base..hi - base, &mut |row, transcript| {
+                sink(row + base, transcript)
+            })?;
+            next = hi;
         }
-        Err(VectorError::new(format!("row {row} holds no vector")))
+        if next < rows.end {
+            return Err(VectorError::new(format!("row {next} holds no vector")));
+        }
+        Ok(())
+    }
+
+    /// `Some(true)` if any image holds a materialized copy, `Some(false)` if
+    /// every image that reports the state reports none, `None` if no image
+    /// reports it.
+    fn representation_materialized(&self) -> Option<bool> {
+        self.images()
+            .into_iter()
+            .filter_map(|(_, _, image)| image.representation_materialized())
+            .reduce(|a, b| a || b)
     }
 
     fn as_segmented(&self) -> Option<&SegmentedProvider> {

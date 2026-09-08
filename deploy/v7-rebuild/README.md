@@ -13,7 +13,8 @@ configuration and mTLS client identity. Run `plan` with the actual host's disk
 headroom before `up`; the historical size measurements below are estimates,
 not a current capacity guarantee.
 
-The current `turbovec-pipestream-s20` lockfile pins `0c6cf820`, whose reader and
+The current `turbovec-pipestream-s21` lockfile pins `3cce294e` (s20 `0c6cf820` plus
+bounded stored-row reads for the rewrite proof), whose reader and
 writer use the v7 container. The normal loader refuses v5/v6 vector images.
 This v7 container is different from the abandoned per-block calibration branch
 that originally gave this directory its name. Calibration is one explicit

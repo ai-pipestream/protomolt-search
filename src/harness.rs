@@ -1101,8 +1101,16 @@ pub mod fake_ann {
             self.inner.write(path)
         }
 
-        fn row_transcript(&self, row: usize) -> Result<Vec<u8>, VectorError> {
-            self.inner.row_transcript(row)
+        fn row_transcripts(
+            &self,
+            rows: std::ops::Range<usize>,
+            sink: &mut dyn FnMut(usize, &[u8]),
+        ) -> Result<(), VectorError> {
+            self.inner.row_transcripts(rows, sink)
+        }
+
+        fn representation_materialized(&self) -> Option<bool> {
+            self.inner.representation_materialized()
         }
 
         fn search(

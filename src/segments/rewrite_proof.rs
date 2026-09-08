@@ -350,10 +350,7 @@ fn fill(
         for start in (0..rows).step_by(batch_rows) {
             let end = rows.min(start + batch_rows);
             let mut digests = vec![[0u8; 32]; end - start];
-            for row in start..end {
-                if live.is_deleted(row) {
-                    continue;
-                }
+            let digest_row = |row: usize, transcript: Option<&[u8]>| -> Result<[u8; 32], String> {
                 let doc = reconstruct_document(reader, row as u32, &tables, true)?;
                 if doc.original_source.is_none() {
                     return Err(err("live source row has no original protobuf"));
@@ -384,13 +381,50 @@ fn fill(
                 // The provider's stored encoding of the row, not a recomputation
                 // from the FP32 source: two images that agree on every exact row
                 // and differ in what their scorer reads are different indexes.
-                if let Some(vector) = set.vector(segment) {
-                    hash.update(&[1]);
-                    part(&mut hash, &vector.row_transcript(row).map_err(err)?);
-                } else {
-                    hash.update(&[0]);
+                match transcript {
+                    Some(transcript) => {
+                        hash.update(&[1]);
+                        part(&mut hash, transcript);
+                    }
+                    None => hash.update(&[0]),
                 }
-                digests[row - start] = hash.finalize();
+                Ok(hash.finalize())
+            };
+            match set.vector(segment) {
+                Some(vector) => {
+                    // Transcripts arrive in pieces of TRANSCRIPT_BLOCK_ROWS: the
+                    // provider converts its own layout one block at a time and
+                    // keeps no materialized copy, so a large image is read
+                    // inside the batch's budget.
+                    let mut block = start;
+                    while block < end {
+                        let block_end = end.min(block + crate::vector::TRANSCRIPT_BLOCK_ROWS);
+                        let mut failure = None;
+                        vector
+                            .row_transcripts(block..block_end, &mut |row, transcript| {
+                                if failure.is_some() || live.is_deleted(row) {
+                                    return;
+                                }
+                                match digest_row(row, Some(transcript)) {
+                                    Ok(digest) => digests[row - start] = digest,
+                                    Err(error) => failure = Some(error),
+                                }
+                            })
+                            .map_err(err)?;
+                        if let Some(error) = failure {
+                            return Err(error);
+                        }
+                        block = block_end;
+                    }
+                }
+                None => {
+                    for row in start..end {
+                        if live.is_deleted(row) {
+                            continue;
+                        }
+                        digests[row - start] = digest_row(row, None)?;
+                    }
+                }
             }
             for fi in 0..reader.field_count() {
                 #[cfg(test)]
@@ -478,7 +512,7 @@ mod tests {
     use super::*;
     use crate::pb::{DocumentIdentity, ProtobufSource};
     use crate::postings::{AnalyzedDoc, AnalyzedField, Bm25Store};
-    struct Fixture(PathBuf);
+    struct Fixture(PathBuf, usize);
     impl Fixture {
         fn new() -> Self {
             static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -488,7 +522,7 @@ mod tests {
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
             std::fs::create_dir(&root).unwrap();
-            Self(root)
+            Self(root, 8)
         }
         fn set(
             &self,
@@ -512,9 +546,10 @@ mod tests {
             let root = self.0.join(name);
             std::fs::create_dir(&root).unwrap();
             let catalog = SegmentCatalog::open(&root).unwrap();
-            let sample: Vec<f32> = (0..64).map(|i| (i as f32 * 0.3).sin()).collect();
+            let dim = self.1;
+            let sample: Vec<f32> = (0..8 * dim).map(|i| (i as f32 * 0.3).sin()).collect();
             let backend =
-                VectorIndex::fit_backend_config(crate::vector::EMBEDDED_TURBOVEC, 8, 4, &sample)
+                VectorIndex::fit_backend_config(crate::vector::EMBEDDED_TURBOVEC, dim, 4, &sample)
                     .unwrap();
             let mut base = 0;
             for (segment, ids) in ids.chunks(splits).enumerate() {
@@ -683,7 +718,7 @@ mod tests {
                             },
                         )
                         .unwrap();
-                    let exact_row: Vec<_> = (0..8)
+                    let exact_row: Vec<_> = (0..dim)
                         .map(|i| {
                             (id as f32 + i as f32) / 8.0 + if variant("vector") { 0.1 } else { 0.0 }
                         })
@@ -701,13 +736,13 @@ mod tests {
                         live.delete(row);
                     }
                 }
-                let mut vector = VectorIndex::from_backend_config(8, &backend).unwrap();
-                vector.add(&vectors, 8).unwrap();
+                let mut vector = VectorIndex::from_backend_config(dim, &backend).unwrap();
+                vector.add(&vectors, dim).unwrap();
                 vector.prepare().unwrap();
                 let vp = dir.join("vector");
                 vector.write(&vp).unwrap();
                 let ep = dir.join("exact");
-                ExactVectorStore::from_values(8, exact_vectors)
+                ExactVectorStore::from_values(dim, exact_vectors)
                     .unwrap()
                     .write(&ep)
                     .unwrap();
@@ -959,6 +994,140 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "child exited with {status}");
+    }
+
+    /// Net allocation on the calling thread, for the proof's own thread:
+    /// the proof allocates and frees on that thread, and the engine's
+    /// per-block conversions stay below its parallel threshold.
+    mod allocation {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+        thread_local! {
+            static LIVE: Cell<i64> = const { Cell::new(0) };
+            static PEAK: Cell<i64> = const { Cell::new(0) };
+        }
+        struct Counting;
+        fn record(delta: i64) {
+            let _ = LIVE.try_with(|live| {
+                let now = live.get() + delta;
+                live.set(now);
+                let _ = PEAK.try_with(|peak| {
+                    if now > peak.get() {
+                        peak.set(now);
+                    }
+                });
+            });
+        }
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                let pointer = System.alloc(layout);
+                if !pointer.is_null() {
+                    record(layout.size() as i64);
+                }
+                pointer
+            }
+            unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+                System.dealloc(pointer, layout);
+                record(-(layout.size() as i64));
+            }
+            unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                let moved = System.realloc(pointer, layout, new_size);
+                if !moved.is_null() {
+                    record(new_size as i64 - layout.size() as i64);
+                }
+                moved
+            }
+        }
+        #[global_allocator]
+        static GLOBAL: Counting = Counting;
+        pub fn reset() {
+            LIVE.with(|live| live.set(0));
+            PEAK.with(|peak| peak.set(0));
+        }
+        pub fn peak() -> i64 {
+            PEAK.with(|peak| peak.get())
+        }
+    }
+
+    fn materialized(set: &OpenedSegmentSet) -> Vec<Option<bool>> {
+        (0..set.len())
+            .map(|i| set.vector(i).and_then(|v| v.representation_materialized()))
+            .collect()
+    }
+
+    /// A proof over mapped images (the default open mode) reads them in
+    /// bounded pieces: afterwards no segment of either set holds a
+    /// materialized packed-row copy, and the certificate equals the one the
+    /// heap-loaded form produces.
+    #[test]
+    fn mapped_proof_leaves_packed_codes_unmaterialized() {
+        let fixture = Fixture::new();
+        let before = fixture.set("before", &[0, 1, 2, 3], &[0], "", 2);
+        let after = fixture.set("after", &[3, 1, 2], &[], "", 3);
+        assert_eq!(materialized(&before), vec![Some(false); 2]);
+        assert_eq!(materialized(&after), vec![Some(false); 1]);
+        let proof = before
+            .verify_source_rewrite(&after, &fixture.0.join("proof"), 2)
+            .unwrap();
+        assert_eq!(proof.live_rows, 3);
+        assert_eq!(
+            materialized(&before),
+            vec![Some(false); 2],
+            "before materialized"
+        );
+        assert_eq!(
+            materialized(&after),
+            vec![Some(false); 1],
+            "after materialized"
+        );
+        let heap = OpenedSegmentSet::open_manifest(
+            after.root().to_path_buf(),
+            after.published_manifest(),
+            VectorLoad::Heap,
+        )
+        .unwrap();
+        assert_eq!(
+            before
+                .verify_source_rewrite(&heap, &fixture.0.join("heap-proof"), 2)
+                .unwrap(),
+            proof
+        );
+        assert_eq!(
+            materialized(&heap),
+            vec![Some(false); 1],
+            "heap image materialized"
+        );
+    }
+
+    /// Proof memory at a fixed batch does not grow with the vector image:
+    /// the same rows at 8 and at 512 dimensions, a 64x larger image, allocate
+    /// within one transcript piece of each other on the proof's thread. A
+    /// materialized image at 512 dimensions would be 16,384 rows x 256 bytes
+    /// = 4 MiB of packed rows per set, plus a transient of the same size.
+    #[test]
+    fn proof_allocation_is_independent_of_vector_image_size() {
+        let rows: Vec<u32> = (0..16_384).collect();
+        let mut peaks = Vec::new();
+        for dim in [8usize, 512] {
+            let mut fixture = Fixture::new();
+            fixture.1 = dim;
+            let before = fixture.set("before", &rows, &[], "", 4096);
+            let after = fixture.set("after", &rows, &[], "", 4096);
+            allocation::reset();
+            let proof = before
+                .verify_source_rewrite(&after, &fixture.0.join("proof"), 1024)
+                .unwrap();
+            let peak = allocation::peak();
+            assert_eq!(proof.live_rows, rows.len() as u64);
+            assert_eq!(materialized(&before), vec![Some(false); 4]);
+            assert_eq!(materialized(&after), vec![Some(false); 4]);
+            eprintln!("proof peak allocation at {dim} dimensions, batch 1024: {peak} bytes");
+            peaks.push(peak);
+        }
+        assert!(
+            peaks[1] - peaks[0] < 1 << 20,
+            "proof memory grew with the image: {peaks:?}"
+        );
     }
 
     #[test]
