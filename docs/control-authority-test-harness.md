@@ -439,3 +439,110 @@ fault-injection,raft` is clean; rustfmt clean; no production changes, no
 new dependencies, no commit. The leg remains local single-process evidence:
 no Raft leader change, log replication, or snapshot installation across
 processes is claimed.
+
+## Slice 3c: raft-host regressions for review findings R1, R2, R4
+
+A fourth target, `tests/control_raft_regressions.rs` (11 tests), pins the
+checkpoint-review findings against the real single-node `RaftHost`. It runs
+only under `--features raft` and is gated with
+`cargo test --test control_raft_regressions --features raft,fault-injection
+-- --test-threads=1`. The tests pin REQUIRED behavior quoted from the review;
+at the frozen checkpoint `331c18f` eight of them FAIL, and each failure is a
+minimized reproduction for Fable — assertions are deliberately not weakened
+to make a finding pass. Positive coverage (`r1_positive_...`,
+`active_fence_...`, `recover_...`) passes there.
+
+Kit additions: `tests/control_adversarial/raft_kit.rs` (compiled under the
+`raft` feature; `#![allow(dead_code)]` because the other targets link it
+without using every helper) mirrors the in-crate `src/raft/tests.rs`
+single-node recipe — `HostConfig` 50/150/300 ms heartbeats/elections,
+snapshots on demand only — and exposes `bootstrap_host`, `bootstrap_host_with`
+(explicit policy; the ACTIVE fence test needs the Ingest grant the kit
+policy omits), `start_host`, `wait_leader`, `last_applied`, `wait_applied`
+(polls raft metrics: a `propose` resolves on commit, and the apply — plus
+the metrics watch — lands a tick later, so a bare metrics read races the
+state machine), `raw_proposal`, `snapshot_image` (decodes the prost
+`RaftSnapshotMeta`; its `last_log_id.index` is the durable applied position,
+the R2 observable, since `raft_applied` is otherwise pub(crate)), and
+`install_image` (drives `begin_receiving_snapshot`/`install_snapshot` on a
+standalone `ControlStateMachine`, the only install path a single node can
+exercise — `replace_from` is pub(crate) and the host cannot drive an install
+through its own raft core). `kit::prepare_action_history(workflow,
+history_id)` adds a Prepare variant carrying a real catalog history id for
+the managed-bind leg. Two load-bearing facts the tests encode: raft's
+`initialize` commits a membership entry at log index 1, so after N proposals
+the applied index is N+1; and a `SourceAdmission` is a read guard on the
+store's admission lock, so it must not span a propose (the raft apply takes
+that lock exclusively — holding one deadlocks the apply) nor may any store
+clone outlive `shutdown` if the group is to reopen (redb's exclusive file
+lock would block).
+
+Results at `331c18f` (3 passed, 8 failed; wall time under a second for the
+whole target):
+
+- `r1_raw_propose_begin_without_holder_is_refused` — FAILED (repro). A raw
+  Begin envelope through `host.propose` and through `raft().client_write`
+  applies with no retirement holder; both workflows exist afterwards. The
+  admitted path with the holder (`propose_import(..., Some(&retired))`) works
+  and is exercised first as the positive control.
+- `r1_raw_propose_confirm_ready_without_binding_is_refused` — FAILED
+  (repro). A raw ConfirmReady through both raw surfaces turns the owner
+  READY (phase 3) with no managed binding ever presented.
+- `r1_read_handle_cannot_mutate` — FAILED (repro). Every pub replay surface
+  on a handle advertised for reads by `host.store()` applies mutations with
+  no committed log entry: `replay_control_import` (begin, three chunks,
+  commit), `replay_capacity_configure`, `replay_capacity_transition`, and
+  `replay_command` (Prepare at the post-import revision); the read handle
+  then shows the staged workflow, capacity state and PREPARED owner. The
+  direct `execute` path already refuses (a positive guard inside the same
+  test). One run reports every violated surface.
+- `r2_exact_retry_advances_durable_applied_position` — FAILED (repro).
+  After prepare (index 2), a changed-content retry (consumed refusal, index
+  3) and an exact retry last (index 4, stored decision verbatim), the
+  snapshot meta bound index 3: `assertion failed: left: 3, right: 4` — the
+  retry path returns the stored decision before `write_pending_applied`. The
+  retry is deliberately last: any fresh entry after it would overwrite the
+  lagging position, which is exactly the masking the review warned about.
+  After the (future) fix, the restart leg replays the log, recovers at index
+  4, and serves the PREPARED owner.
+- `r2_import_chunk_retry_advances_durable_applied_position` — FAILED
+  (repro). Begin (2), chunk-0 (3), changed-content chunk-0 (consumed refusal,
+  4), exact chunk-0 retry last (5, identical stored decision); the snapshot
+  bound 4: `left: 4, right: 5`.
+- `r2_capacity_retries_and_observation_transition` — FAILED (repro). The
+  full placement flow (retire, begin, three chunks, commit, configure,
+  changed-content configure refusal, both reporter registrations, a landed
+  report and the review's positive unchanged report) commits indices 2..=12,
+  then the exact configure retry last (13, identical stored decision); the
+  snapshot bound 12: `left: 12, right: 13`. The unchanged report itself is
+  pinned positive: it consumes index 12 and `wait_applied(12)` observes it.
+- `r4_install_refusal_preserves_the_live_handle` — FAILED (repro). With a
+  reader clone outstanding, `install_snapshot` refuses (replace_from's
+  "outstanding handles" check) and the machine's shared store slot is None:
+  `state_machine` took the store out before `replace_from` and the refusal
+  path never put it back. The reader held across the refused install still
+  serves (pinned positive), and with it dropped the same image installs
+  cleanly (pinned positive).
+- `r4_subscription_rebinding_after_install` — FAILED (repro). A
+  `subscribe_applied` receiver taken before a clean install never observes
+  the post-install revision (a hand-applied entry at image index+1); it
+  stays attached to the retired database: "the pre-install receiver never
+  observed the new applied revision 2". Managed owner access on the
+  installed store reflects the image (pinned positive).
+- `r1_positive_replay_through_the_host`, `active_fence_through_the_host`,
+  `recover_through_the_host` — PASS. The trusted entry points admit the same
+  command families the raw paths accept holder-free; Prepare → managed bind
+  → ConfirmReady → Activate commits the write fence (epoch 1 admits, epoch 2
+  refuses, phase ACTIVE) and survives a host restart; bob's Recover keeps
+  alice as initiator with bob as the terminal step and turns a later Commit
+  into a recorded refusal.
+
+Observation limits: single-node groups only — no leader change, log
+replication or multi-node install is claimed; the durable-position
+observable is the snapshot meta because `raft_applied` is pub(crate);
+snapshot installs are exercised on a standalone state machine for the same
+pub(crate) reason; and the admission-guard/file-lock discipline above is
+test-shape, not product behavior. Gate: the three pre-existing targets pass
+with and without `--features fault-injection,raft` (adversarial 11, model 1,
+planner 9); `cargo check --tests --features raft,fault-injection` is clean;
+rustfmt clean; no production changes, no new dependencies, no commit.
