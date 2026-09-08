@@ -101,8 +101,23 @@ The pinned reference generator reproduced all 26 observations with only the
 two protoc timestamp/PID prefixes normalized for comparison. Both raw outputs
 were retained. Nine comparator tests and the command-line same-path and
 existing-output refusals passed; the reference scope peaked at 33,472,512 bytes
-with zero swap/OOM and 647 unchanged input hashes. Full validation remains
-pending.
+with zero swap/OOM and 647 unchanged input hashes.
+
+The full gate at `e9854f3` passed 680 library tests, all 148 integration targets
+(887 reported passes and one existing ignored live-OpenNLP test), 13 embedded
+tests and two IVF tests. The nine reference-comparator tests also passed.
+All five Android/iOS compilation checks, tests/examples compilation, formatting,
+vendored-proto checks and diff checks passed. All 21 product/vendored protobuf
+files and the original `cases.json` and `descriptor.bin` fixtures are
+byte-identical to `3575772`.
+
+The driver verified a clean, unchanged HEAD and identical hashes for all 647
+files before and after validation. The full scope reached its 8 GiB cap,
+recorded 39,518 memory-limit events and four socket-throttling events, with zero
+swap and zero OOM events. Another task's release build ran concurrently for part
+of the gate; these are correctness results, not a latency or fleet measurement.
+This validates the scalar-boundary and empty-field checkpoint; source routing
+and remote permission enforcement remain unfinished.
 
 The focused gate passes 117 reference cases within the protobuf unit test, all
 20 public semantic tests and the mapped-ingest binding/reopen regression. The
