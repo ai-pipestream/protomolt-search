@@ -155,12 +155,14 @@ impl DocumentCatalog {
             _ => storage(error),
         };
         let directory = File::open(parent).map_err(opening_error)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(create)
-            .open(path)
-            .map_err(opening_error)?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(create);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(path).map_err(opening_error)?;
         let new = create;
         file.try_lock().map_err(|e| {
             Status::failed_precondition(format!("exclusive document catalog lock unavailable: {e}"))

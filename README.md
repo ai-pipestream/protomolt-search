@@ -1241,7 +1241,9 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   Source history has an immutable persisted workspace/collection binding.
   Ingest and administration require separate permissions held through each
   synchronous commit; policy replacement serializes with admitted operations.
-  Ordinary opening cannot bypass the controlled API. Checkpoint `7be8a3a`
+  Ordinary opening cannot bypass the controlled API. New Unix source files
+  request private `0600` permissions, with a permissive-umask regression test.
+  Checkpoint `7be8a3a`
   passed 1,546 tests, all five mobile checks and wire compatibility validation.
   See [source access](docs/source-access.md) for format 7 and remaining ownership
   and routing integration.

@@ -421,3 +421,48 @@ fn legacy_authorizer_without_pinning_cannot_create_a_source() {
     assert_eq!(error.code(), Code::Unimplemented);
     assert!(!dir.catalog().exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn source_catalog_creation_is_private_under_a_permissive_umask() {
+    let dir = Directory::new("creation-mode");
+    let status = std::process::Command::new("/bin/sh")
+        .args(["-c", "umask 000; exec \"$@\"", "sh"])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "source_catalog_creation_mode_worker",
+            "--nocapture",
+        ])
+        .env("PSEARCH_SOURCE_MODE_DIR", &dir.0)
+        .status()
+        .unwrap();
+    assert!(status.success(), "creation-mode worker failed: {status}");
+}
+
+#[cfg(unix)]
+#[test]
+fn source_catalog_creation_mode_worker() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(root) = std::env::var_os("PSEARCH_SOURCE_MODE_DIR") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let ordinary = root.join("ordinary.redb");
+    drop(DocumentCatalog::create(&ordinary, "books").unwrap());
+    assert_eq!(
+        std::fs::metadata(&ordinary).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    let authority: Arc<dyn Authorizer> =
+        Arc::new(PolicyAuthority::new(policy(1, "workspace-a")).unwrap());
+    let admin = permit(authority, "administrator", AccessAction::Admin);
+    let controlled = root.join("controlled.redb");
+    drop(AccessControlledCatalog::create(&controlled, &binding("workspace-a"), &admin).unwrap());
+    assert_eq!(
+        std::fs::metadata(&controlled).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}

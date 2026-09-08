@@ -18,6 +18,11 @@ Those adapters still need their own document and field disclosure rules. A
 workspace binding does not grant exclusive distributed ownership or authorize
 replacement of another source owner.
 
+New Unix source files request mode `0600`, for both standalone and controlled
+catalogs, matching the backup writers. A permissive host umask cannot make the
+source bytes group- or world-readable. Open preserves existing file permissions;
+this is a creation rule, not a permissions migration for existing data.
+
 ## Permission through commit
 
 `AccessPermit::pin` requires the provider to hold the exact admitted decision
@@ -96,3 +101,10 @@ that limit, and recorded zero OOM events or kills. Memory-limit events and
 socket throttling occurred; this is correctness evidence, not a performance
 measurement. These local tests do not claim distributed owner or server-route
 conformance.
+
+The subsequent file-creation regression reproduced mode `0666` under an isolated
+child's `umask 000`. Requesting `0600` fixed both ordinary and controlled source
+creation. The 31 catalog/access integration tests and 71 catalog unit tests
+passed afterward, including the child process check. This follow-up changes no
+protobuf or stored identity bytes; it was validated with the focused catalog
+suite rather than repeating the preceding complete gate.
