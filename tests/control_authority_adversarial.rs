@@ -13,7 +13,10 @@ use std::time::Duration;
 use control_adversarial::kit;
 use pipestream_search::control_plane::DurableControlPlane;
 use pipestream_search::pb::storage::control_import_command::Action as ImportAction;
-use pipestream_search::pb::storage::LegacyControlRetirementRequest;
+use pipestream_search::pb::storage::{
+    ControlImportPhase, LegacyControlRetirementRequest, LogicalSourceOwner,
+    PreparedSourceOwnerPhase,
+};
 use prost::Message;
 use tonic::Code;
 
@@ -674,4 +677,535 @@ fn sigkill_recovery_at_every_import_boundary() {
 #[test]
 fn sigkill_import_worker() {
     kit::sigkill_import_worker_body();
+}
+
+/// Administrative recovery (docs/control-import.md, "Administrative
+/// recovery"): the non-initiating Admin bob terminates alice's stranded
+/// staging workflow. The row keeps alice as initiator and names bob as the
+/// terminal actor; the reservation and staged chunks are released (a fresh
+/// workflow imports the resource afterwards); the workflow id is spent; and
+/// every later step on the terminal workflow is a recorded refusal.
+#[test]
+fn recover_terminates_a_stranded_import_without_transfer() {
+    let dir = kit::TestDir::new("recover-no-transfer");
+    let (store, authority) = kit::create_store(&dir);
+    let legacy = kit::legacy_plane(&dir, 2);
+    let (retired, _request) = kit::retire(&store, &legacy, 1);
+    let payload = kit::import_payload(&retired);
+    let (chunk_bytes, chunk_count) = kit::plan_three_chunks(payload.len());
+    assert_eq!(chunk_count, kit::CHUNKS);
+
+    // alice begins and stages two of three chunks, then goes silent.
+    let begin = store
+        .begin_control_import(
+            "alice",
+            &kit::import_command(
+                &authority,
+                "begin",
+                1,
+                kit::WORKFLOW,
+                kit::begin_action(&retired, &payload, chunk_bytes, chunk_count),
+            ),
+            &retired,
+        )
+        .unwrap();
+    assert_eq!(begin.code, 0, "{}", begin.message);
+    let mut revision = 2u64;
+    let mut chunk_one_revision = 0;
+    for ordinal in 0..2 {
+        let decision = store
+            .execute_control_import(
+                "alice",
+                &kit::import_command(
+                    &authority,
+                    &format!("chunk-{ordinal}"),
+                    revision,
+                    kit::WORKFLOW,
+                    kit::chunk_action(&payload, chunk_bytes, ordinal),
+                ),
+            )
+            .unwrap();
+        assert_eq!(decision.code, 0, "chunk {ordinal}: {}", decision.message);
+        if ordinal == 1 {
+            chunk_one_revision = decision.control_revision;
+        }
+        revision += 1;
+    }
+
+    // bob, the other Admin, recovers: no initiator requirement, no holder.
+    let recover = store
+        .execute_control_import(
+            "bob",
+            &kit::import_command(
+                &authority,
+                "bob-recover",
+                revision,
+                kit::WORKFLOW,
+                kit::recover_action(),
+            ),
+        )
+        .unwrap();
+    assert_eq!(recover.code, 0, "{}", recover.message);
+    assert!(recover.receipt.is_none(), "recovery never commits");
+    // Exact retry returns the stored decision verbatim.
+    let retry = store
+        .execute_control_import(
+            "bob",
+            &kit::import_command(
+                &authority,
+                "bob-recover",
+                revision,
+                kit::WORKFLOW,
+                kit::recover_action(),
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        retry, recover,
+        "recover retry must return the stored decision"
+    );
+    revision += 1;
+
+    // The row keeps the initiator; the terminal step names the recoverer.
+    let workflow = store
+        .control_import_workflow("alice", &kit::key(), kit::WORKFLOW)
+        .unwrap();
+    assert_eq!(
+        workflow.phase,
+        ControlImportPhase::Recovered as i32,
+        "workflow must be RECOVERED, got {}",
+        workflow.phase
+    );
+    assert_eq!(
+        workflow.principal, "alice",
+        "the workflow keeps its initiator"
+    );
+    assert_eq!(
+        workflow.terminal.as_ref().expect("terminal step").principal,
+        "bob",
+        "the terminal step names the recoverer"
+    );
+    assert_eq!(
+        (workflow.reserved_bytes, workflow.reserved_decisions),
+        (0, 0),
+        "recovery must release the reservation"
+    );
+
+    // No applied control state yet.
+    assert_eq!(
+        store
+            .control_snapshot("alice", &kit::key())
+            .err()
+            .unwrap()
+            .code(),
+        Code::NotFound
+    );
+
+    // Alice's exact retry of her last chunk returns its stored decision.
+    let chunk_retry = store
+        .execute_control_import(
+            "alice",
+            &kit::import_command(
+                &authority,
+                "chunk-1",
+                3,
+                kit::WORKFLOW,
+                kit::chunk_action(&payload, chunk_bytes, 1),
+            ),
+        )
+        .unwrap();
+    assert_eq!(chunk_retry.code, 0);
+    assert_eq!(
+        chunk_retry.control_revision, chunk_one_revision,
+        "the stored chunk decision must come back verbatim"
+    );
+
+    // The workflow id is spent; every later step is a recorded refusal.
+    let again = store
+        .begin_control_import(
+            "alice",
+            &kit::import_command(
+                &authority,
+                "begin-again",
+                revision,
+                kit::WORKFLOW,
+                kit::begin_action(&retired, &payload, chunk_bytes, chunk_count),
+            ),
+            &retired,
+        )
+        .unwrap();
+    assert_eq!(again.code, Code::AlreadyExists as u32, "{}", again.message);
+    for (actor, id, action) in [
+        ("bob", "recover-2", kit::recover_action()),
+        ("alice", "late-abort", kit::abort_action()),
+        ("alice", "late-commit", kit::commit_action()),
+    ] {
+        let decision = store
+            .execute_control_import(
+                actor,
+                &kit::import_command(&authority, id, revision, kit::WORKFLOW, action),
+            )
+            .unwrap();
+        assert_eq!(
+            decision.code,
+            Code::FailedPrecondition as u32,
+            "{id}: {}",
+            decision.message
+        );
+        assert!(
+            decision.receipt.is_none(),
+            "{id}: terminal refusals carry no receipt"
+        );
+    }
+
+    // The resource remains importable under a fresh workflow.
+    let workflow_two = b"import-2";
+    let begin_two = store
+        .begin_control_import(
+            "alice",
+            &kit::import_command(
+                &authority,
+                "begin-2",
+                revision,
+                workflow_two,
+                kit::begin_action(&retired, &payload, chunk_bytes, chunk_count),
+            ),
+            &retired,
+        )
+        .unwrap();
+    assert_eq!(begin_two.code, 0, "{}", begin_two.message);
+    let mut revision = revision + 1;
+    for ordinal in 0..chunk_count {
+        let decision = store
+            .execute_control_import(
+                "alice",
+                &kit::import_command(
+                    &authority,
+                    &format!("two-chunk-{ordinal}"),
+                    revision,
+                    workflow_two,
+                    kit::chunk_action(&payload, chunk_bytes, ordinal),
+                ),
+            )
+            .unwrap();
+        assert_eq!(decision.code, 0, "chunk {ordinal}: {}", decision.message);
+        revision += 1;
+    }
+    let commit_two = store
+        .execute_control_import(
+            "alice",
+            &kit::import_command(
+                &authority,
+                "two-commit",
+                revision,
+                workflow_two,
+                kit::commit_action(),
+            ),
+        )
+        .unwrap();
+    assert_eq!(commit_two.code, 0, "{}", commit_two.message);
+    assert_eq!(commit_two.receipt.expect("second import commits").routes, 2);
+    eprintln!("recover: stranded import terminated without transfer, resource re-importable");
+}
+
+/// A Commit and a Recover serialize on the admission lock and the revision:
+/// exactly one becomes the terminal decision, the other is a recorded
+/// refusal — in both orderings.
+#[test]
+fn commit_and_recover_serialize_exactly_once() {
+    // Ordering 1: Commit wins; the later Recover refuses.
+    let dir = kit::TestDir::new("race-commit-first");
+    let (store, authority) = kit::create_store(&dir);
+    let legacy = kit::legacy_plane(&dir, 2);
+    let (retired, _request) = kit::retire(&store, &legacy, 1);
+    let payload = kit::import_payload(&retired);
+    let (chunk_bytes, chunk_count) = kit::plan_three_chunks(payload.len());
+    let (_receipt, _count) = kit::run_import(&store, &authority, &retired, &payload);
+    let revision = 1 + 1 + u64::from(kit::CHUNKS) + 1;
+    let recover = store
+        .execute_control_import(
+            "bob",
+            &kit::import_command(
+                &authority,
+                "too-late",
+                revision,
+                kit::WORKFLOW,
+                kit::recover_action(),
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        recover.code,
+        Code::FailedPrecondition as u32,
+        "{}",
+        recover.message
+    );
+    // The resource holds its applied import; no second import may begin.
+    let snapshot = store.control_snapshot("alice", &kit::key()).unwrap();
+    assert_eq!(snapshot.control_revision, revision);
+    let again = store
+        .begin_control_import(
+            "alice",
+            &kit::import_command(
+                &authority,
+                "begin-2",
+                revision,
+                b"import-2",
+                kit::begin_action(&retired, &payload, chunk_bytes, chunk_count),
+            ),
+            &retired,
+        )
+        .unwrap();
+    assert_eq!(again.code, Code::AlreadyExists as u32, "{}", again.message);
+    drop(store);
+
+    // Ordering 2: Recover wins; the later Commit refuses without a receipt
+    // and the resource stays importable under a fresh workflow.
+    let dir = kit::TestDir::new("race-recover-first");
+    let (store, authority) = kit::create_store(&dir);
+    let legacy = kit::legacy_plane(&dir, 2);
+    let (retired, _request) = kit::retire(&store, &legacy, 1);
+    let payload = kit::import_payload(&retired);
+    let begin = store
+        .begin_control_import(
+            "alice",
+            &kit::import_command(
+                &authority,
+                "begin",
+                1,
+                kit::WORKFLOW,
+                kit::begin_action(&retired, &payload, chunk_bytes, chunk_count),
+            ),
+            &retired,
+        )
+        .unwrap();
+    assert_eq!(begin.code, 0, "{}", begin.message);
+    let mut revision = 2u64;
+    for ordinal in 0..chunk_count {
+        let decision = store
+            .execute_control_import(
+                "alice",
+                &kit::import_command(
+                    &authority,
+                    &format!("chunk-{ordinal}"),
+                    revision,
+                    kit::WORKFLOW,
+                    kit::chunk_action(&payload, chunk_bytes, ordinal),
+                ),
+            )
+            .unwrap();
+        assert_eq!(decision.code, 0, "chunk {ordinal}: {}", decision.message);
+        revision += 1;
+    }
+    let recover = store
+        .execute_control_import(
+            "bob",
+            &kit::import_command(
+                &authority,
+                "recover",
+                revision,
+                kit::WORKFLOW,
+                kit::recover_action(),
+            ),
+        )
+        .unwrap();
+    assert_eq!(recover.code, 0, "{}", recover.message);
+    let workflow = store
+        .control_import_workflow("alice", &kit::key(), kit::WORKFLOW)
+        .unwrap();
+    assert_eq!(workflow.phase, ControlImportPhase::Recovered as i32);
+    let commit = store
+        .execute_control_import(
+            "alice",
+            &kit::import_command(
+                &authority,
+                "too-late",
+                revision + 1,
+                kit::WORKFLOW,
+                kit::commit_action(),
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        commit.code,
+        Code::FailedPrecondition as u32,
+        "{}",
+        commit.message
+    );
+    assert!(
+        commit.receipt.is_none(),
+        "a refused commit carries no receipt"
+    );
+    assert_eq!(
+        store
+            .control_snapshot("alice", &kit::key())
+            .err()
+            .unwrap()
+            .code(),
+        Code::NotFound,
+        "recovery must leave the resource unimported"
+    );
+    eprintln!("race: commit/recover serialize to exactly one terminal in both orderings");
+}
+
+/// Activation is the committed fence and only follows READY
+/// (docs/source-owner-admission.md). From tests READY is unreachable (the
+/// readiness proof is pub(crate)), so every Activate here is a refusal: on
+/// a PREPARED owner, on a CANCELLED owner, with the wrong workflow id, and
+/// on a missing owner — and none of them records an activation row.
+#[test]
+fn activate_refusals_before_ready() {
+    let dir = kit::TestDir::new("activate-refusals");
+    let (store, authority) = kit::create_store(&dir);
+    let owner_key = kit::owner_key();
+    let workflow = b"owner-wf-1";
+
+    // Prepare the owner: generation 1, control revision 2.
+    let prepare = store
+        .execute(
+            "alice",
+            &kit::source_command(
+                &authority,
+                &owner_key,
+                "prepare",
+                1,
+                1,
+                0,
+                kit::prepare_action(workflow),
+            ),
+        )
+        .unwrap();
+    assert_eq!(prepare.code, 0, "{}", prepare.message);
+
+    // A non-admin is refused before anything is validated or recorded.
+    let error = store
+        .execute(
+            "mallory",
+            &kit::source_command(
+                &authority,
+                &owner_key,
+                "mallory-activate",
+                2,
+                1,
+                1,
+                kit::activate_action(workflow),
+            ),
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), Code::PermissionDenied);
+
+    // PREPARED is not READY: recorded refusal, no fence.
+    let early = store
+        .execute(
+            "alice",
+            &kit::source_command(
+                &authority,
+                &owner_key,
+                "activate-prepared",
+                2,
+                1,
+                1,
+                kit::activate_action(workflow),
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        early.code,
+        Code::FailedPrecondition as u32,
+        "{}",
+        early.message
+    );
+    // The wrong workflow on the prepared owner is the same recorded refusal.
+    let wrong = store
+        .execute(
+            "alice",
+            &kit::source_command(
+                &authority,
+                &owner_key,
+                "activate-wrong-wf",
+                2,
+                1,
+                1,
+                kit::activate_action(b"owner-wf-2"),
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        wrong.code,
+        Code::FailedPrecondition as u32,
+        "{}",
+        wrong.message
+    );
+    let owner = store.owner("alice", &owner_key).unwrap();
+    assert_eq!(owner.phase, PreparedSourceOwnerPhase::Prepared as i32);
+    assert!(
+        owner.activation.is_none(),
+        "a refused activation must not record a fence"
+    );
+    assert_eq!(owner.ownership_generation, 1);
+
+    // Cancel; activation on the CANCELLED owner refuses the same way.
+    let cancel = store
+        .execute(
+            "alice",
+            &kit::source_command(
+                &authority,
+                &owner_key,
+                "cancel",
+                2,
+                1,
+                1,
+                kit::cancel_action(workflow),
+            ),
+        )
+        .unwrap();
+    assert_eq!(cancel.code, 0, "{}", cancel.message);
+    let late = store
+        .execute(
+            "alice",
+            &kit::source_command(
+                &authority,
+                &owner_key,
+                "activate-cancelled",
+                3,
+                1,
+                1,
+                kit::activate_action(workflow),
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        late.code,
+        Code::FailedPrecondition as u32,
+        "{}",
+        late.message
+    );
+    let owner = store.owner("alice", &owner_key).unwrap();
+    assert_eq!(owner.phase, PreparedSourceOwnerPhase::Cancelled as i32);
+    assert!(
+        owner.activation.is_none(),
+        "no activation on a cancelled owner"
+    );
+
+    // A missing owner is a recorded NotFound.
+    let ghost = LogicalSourceOwner {
+        owner_id: b"ghost-owner".to_vec(),
+        ..kit::key()
+    };
+    let missing = store
+        .execute(
+            "alice",
+            &kit::source_command(
+                &authority,
+                &ghost,
+                "activate-ghost",
+                3,
+                1,
+                0,
+                kit::activate_action(workflow),
+            ),
+        )
+        .unwrap();
+    assert_eq!(missing.code, Code::NotFound as u32, "{}", missing.message);
+    eprintln!("activate: prepared/cancelled/missing/wrong-workflow/non-admin all refuse, no fence recorded");
 }

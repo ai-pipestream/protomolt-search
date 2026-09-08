@@ -321,3 +321,81 @@ target uses only part of the shared module) are silenced with the same
 Gate: all three targets pass under the 8 GiB, swap-disabled scope in
 `--release` with zero warnings; rustfmt clean; no production changes, no
 commit.
+
+## Slice 3a: administrative recovery and activation refusals (post-Raft rebase)
+
+Rebased onto the frozen foundations checkpoint `331c18f` (Raft hosting);
+the capacity-planner leg is untouched (`src/capacity_tiers.rs` is unchanged
+since `43596c9`). Two new vocabulary items from the task list land in the
+model and the fuzzer, plus three focused tests in
+`tests/control_authority_adversarial.rs`.
+
+Model rules added (`tests/control_adversarial/model.rs`), docs-first:
+
+- `Recover` (import namespace, so its retry/journal keys stay separate from
+  owner commands): docs/control-import.md "Administrative recovery" —
+  "any current Admin of the resource may terminate a staging workflow into
+  phase RECOVERED under the same revision CAS and actor-scoped retry rules".
+  Unlike stage/commit/abort there is deliberately NO initiator check. A
+  concurrent Commit and Recover "serialize ...: exactly one becomes the
+  terminal decision, the other is a recorded refusal" — AMBIGUOUS (doc names
+  no code): FailedPrecondition, the implementation's "import workflow is
+  already terminal" (`src/source_authority/import.rs:887-919`, which also
+  shows Recover skipping the initiator check that gates Abort/Chunk/Commit).
+  Unknown workflow: NotFound, as for the other steps. The model keeps the
+  terminal row with its initiating principal, never sets `applied_import`,
+  and treats RECOVERED like ABORTED/COMMITTED for every later step.
+- `Activate` (owner namespace): docs/source-owner-admission.md "Activation:
+  the committed fence" — activation "follows READY through
+  `ActivateSourceOwner { workflow_id }`, a control command any current Admin
+  may issue through `execute`" and records `SourceOwnerActivation {
+  write_epoch = ownership_generation, activated_control_revision }`. Refusal
+  codes are unnamed in the doc: a missing owner is NotFound (AMBIGUOUS, as
+  Cancel's canonical reading) and a non-READY owner or wrong workflow is
+  FailedPrecondition (AMBIGUOUS; the implementation agrees,
+  `src/source_authority/transition.rs:168-192`). The success branch is
+  unreachable from tests — READY requires `VerifiedOwnerCompletion`, which
+  is pub(crate) — so the model only holds PREPARED/CANCELLED owners and the
+  fuzzer exercises the refusal paths; the READY→ACTIVE happy path is a later
+  slice through the managed-catalog bridge.
+
+Fuzzer (`tests/control_authority_model.rs`): the op mix is rebalanced —
+Prepare 12, ReplaceGrants 13, Begin 8, Cancel 12, Activate 8, Chunk 18,
+Commit 10, Recover 10, Abort 9 — and Recover ops carry a plausible expected
+policy revision via the new `kit::import_command_policy` (the other import
+steps keep the slice-1 pinning of the bootstrap revision). Mutated retries
+of Activate perturb the workflow id. The seed values are unchanged
+(`0x5EED_0000 + n`, pinned 1..=24); the streams shifted with the new ops,
+which is expected. The extended run is re-pinned at 200 seeds
+(`PSEARCH_ADV_SEEDS=200`, ~12.4k ops) with zero mismatches.
+
+Focused tests (`tests/control_authority_adversarial.rs`):
+
+- `recover_terminates_a_stranded_import_without_transfer` — alice begins and
+  stages two chunks; bob (the other Admin, no holder) Recovers. Assertions:
+  phase RECOVERED; the row keeps alice as initiator while the terminal step
+  names bob; reservation released (`reserved_bytes == reserved_decisions ==
+  0`); no applied control state (`control_snapshot` → NotFound); alice's
+  exact retry of her last chunk returns the stored decision verbatim; the
+  workflow id is spent (re-Begin → recorded AlreadyExists); second
+  Recover/Abort/Commit → recorded FailedPrecondition without receipts; and a
+  fresh workflow imports the resource end-to-end afterwards.
+- `commit_and_recover_serialize_exactly_once` — both orderings on separate
+  stores: Commit-then-Recover leaves the resource imported (Recover refuses,
+  a second Begin records AlreadyExists); Recover-then-Commit leaves it
+  unimported (Commit refuses with no receipt, `control_snapshot` → NotFound).
+- `activate_refusals_before_ready` — mallory is refused with
+  PermissionDenied before anything is recorded; Activate on a PREPARED
+  owner, with the wrong workflow id, on a CANCELLED owner, and on a missing
+  owner are recorded FailedPrecondition/FailedPrecondition/FailedPrecondition
+  /NotFound respectively; `owner()` shows the phase unchanged and
+  `activation` absent after every refusal.
+
+No model/implementation mismatches arose in the re-pinned 24-seed set or
+the 200-seed extended run — the Recover and Activate refusal codes the
+implementation gives match the docs-first readings above.
+
+Gate: `cargo check --tests --features fault-injection,raft` clean; the
+model and adversarial targets pass both with `--features fault-injection,raft`
+and without; the planner target passes unchanged; rustfmt clean; no
+production changes, no commit.
