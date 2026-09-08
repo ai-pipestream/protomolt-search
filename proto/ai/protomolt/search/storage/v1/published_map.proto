@@ -1,0 +1,55 @@
+syntax = "proto3";
+package ai.protomolt.search.storage.v1;
+
+import "ai/protomolt/search/v1/search.proto";
+import "ai/protomolt/search/storage/v1/source_authority.proto";
+import "ai/protomolt/search/storage/v1/control_checkpoint.proto";
+import "ai/protomolt/search/storage/v1/control_import.proto";
+
+// The committed map at the consumer boundary (docs/map-feed.md): one value
+// per applied control revision of one resource, produced from committed
+// rows only. No consumer observes an uncommitted proposal. It grants no
+// ownership and carries no lease credential.
+message PublishedMap {
+  uint32 format_version = 1; // 1
+  SourceAuthorityIdentity authority = 2;
+  LogicalSourceOwner key = 3; // the collection resource; owner_id empty
+  // The applied control revision this value was produced at. Advances on
+  // every accepted control change, including capacity-only ones.
+  uint64 control_revision = 4;
+  // Advances only when a different map is published; one generation never
+  // names two different maps.
+  uint64 topology_generation = 5;
+  repeated LegacyControlRoute routes = 6; // committed order
+  bool codes_available = 7;
+  repeated PlacementRouteCode codes = 8;
+  ai.protomolt.search.v1.PlacementTree tree = 9; // absent for no_placement
+  repeated uint64 history_generations = 10;
+  repeated LegacyControlReplica replicas = 11; // replica_key order
+  repeated PublishedNode nodes = 12; // node_id order
+  repeated PublishedOwner owners = 13; // owner_id order
+  // SHA-256 over the canonical value with this field empty.
+  bytes digest = 14;
+}
+
+message PublishedNode {
+  string node_id = 1;
+  string addr = 2;
+  ai.protomolt.search.v1.ClusterNodeState state = 3;
+  SourceResidency residency = 4;
+  string failure_domain = 5;
+}
+
+// A logical source owner of the resource with its committed phase; the
+// write epoch is present only for ACTIVE owners and is the fence data-plane
+// requests must carry.
+message PublishedOwner {
+  bytes owner_id = 1;
+  string node_id = 2;
+  bytes storage_incarnation = 3;
+  bytes history_id = 4;
+  SourceResidency residency = 5;
+  uint64 ownership_generation = 6;
+  PreparedSourceOwnerPhase phase = 7;
+  uint64 write_epoch = 8;
+}

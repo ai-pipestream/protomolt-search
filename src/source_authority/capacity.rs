@@ -971,6 +971,7 @@ impl SourceAuthorityStore {
         self.inject(false)?;
         tx.commit().map_err(storage)?;
         self.inner.revisions.send_replace(decision.policy_revision);
+        self.publish_applied(decision.control_revision);
         #[cfg(test)]
         self.inject(true)?;
         Ok(decision)

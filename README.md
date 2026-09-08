@@ -1250,6 +1250,16 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   destination store remains unchanged. See [retirement and crash recovery](docs/control-retirement.md);
   transactional import, worker fencing and activation remain separate steps.
 
+- **Foundation branch: the committed map feed (implemented).**
+  `published_map` produces a `PublishedMap` from committed rows in one read
+  (routes, codes, tree, replicas, nodes, owners with their phase and write
+  epoch, canonical digest) at the applied control revision;
+  `subscribe_applied` wakes consumers only when a commit moved the revision;
+  `MapConsumer::offer` ignores older frames, refuses same-revision
+  different-content and generation-conflicting frames by name, and swaps
+  atomically otherwise. Reopen reproduces the map byte for byte. See
+  [map feed](docs/map-feed.md). Open: transport and relay wiring.
+
 - **Foundation branch: writable managed activation under the committed
   fence (implemented).** `ActivateSourceOwner` moves a READY owner to ACTIVE
   and commits the write epoch (the ownership generation); the owner persists

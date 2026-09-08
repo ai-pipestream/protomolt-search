@@ -22,6 +22,7 @@ use tonic::{Code, Status};
 mod capacity;
 mod contract;
 mod import;
+mod map_feed;
 mod recovery;
 mod retirement;
 mod transition;
@@ -33,6 +34,7 @@ pub use import::{
     chunk_capacity, chunk_digest, payload_digest, plan_chunks, retirement_digest,
     MAX_IMPORT_CHUNKS, MAX_IMPORT_PAYLOAD_BYTES, MAX_SUPPLEMENT_BYTES, MIN_CHUNK_CAPACITY,
 };
+pub use map_feed::MapConsumer;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("source_authority_meta");
 const OWNERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("source_authority_owners");
@@ -59,6 +61,9 @@ struct Inner {
     // The committed policy revision, published after each commit under the
     // exclusive admission guard: one ordered history for permits.
     revisions: watch::Sender<u64>,
+    // The applied control revision, published after each commit: the map
+    // feed's wake-up. A reader then serves committed rows, never a proposal.
+    applied: watch::Sender<u64>,
     // All public operations acquire this before opening a database transaction.
     // The boolean permanently closes the instance after a storage failure.
     closed: Mutex<bool>,
@@ -500,6 +505,7 @@ impl SourceAuthorityStore {
         tx.commit().map_err(storage)?;
         parent.sync_all().map_err(storage)?;
         store.inner.revisions.send_replace(policy.revision);
+        store.inner.applied.send_replace(header.control_revision);
         Ok(store)
     }
 
@@ -510,7 +516,7 @@ impl SourceAuthorityStore {
         let (store, _) = Self::open_file(path, expected_identity, false)?;
         import::adopt(&store)?;
         recovery::validate(&store)?;
-        let revision = {
+        let (revision, applied) = {
             let tx = store.inner.database.begin_read().map_err(storage)?;
             let meta = tx.open_table(META).map_err(storage)?;
             let policy: AccessPolicy = contract::decode(
@@ -519,9 +525,16 @@ impl SourceAuthorityStore {
                     .ok_or_else(|| missing("policy"))?
                     .value(),
             )?;
-            policy.revision
+            let header: SourceAuthorityHeader = contract::decode(
+                meta.get("header")
+                    .map_err(storage)?
+                    .ok_or_else(|| missing("header"))?
+                    .value(),
+            )?;
+            (policy.revision, header.control_revision)
         };
         store.inner.revisions.send_replace(revision);
+        store.inner.applied.send_replace(applied);
         Ok(store)
     }
 
@@ -568,6 +581,7 @@ impl SourceAuthorityStore {
                     database,
                     admission: RwLock::new(()),
                     revisions: watch::Sender::new(0),
+                    applied: watch::Sender::new(0),
                     closed: Mutex::new(false),
                     identity: identity.clone(),
                     #[cfg(test)]
@@ -856,9 +870,23 @@ impl SourceAuthorityStore {
         self.inject(false)?;
         tx.commit().map_err(storage)?;
         self.inner.revisions.send_replace(decision.policy_revision);
+        self.publish_applied(decision.control_revision);
         #[cfg(test)]
         self.inject(true)?;
         Ok(decision)
+    }
+
+    /// Wake map-feed subscribers only when the applied revision moved: a
+    /// recorded rejection commits a decision, not a new revision.
+    fn publish_applied(&self, revision: u64) {
+        self.inner.applied.send_if_modified(|current| {
+            if *current == revision {
+                false
+            } else {
+                *current = revision;
+                true
+            }
+        });
     }
 
     #[cfg(test)]
@@ -1002,5 +1030,7 @@ mod admission_tests;
 mod capacity_tests;
 #[cfg(test)]
 mod import_tests;
+#[cfg(test)]
+mod map_feed_tests;
 #[cfg(test)]
 mod retirement_tests;
