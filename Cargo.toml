@@ -11,8 +11,8 @@ exclude = ["sidecars/route-cost"]
 resolver = "2"
 
 [dependencies]
-turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "turbovec-pipestream-s20" }
-turbovec-grpc = { git = "https://github.com/ai-pipestream/turbovec-grpc.git", rev = "0b21a161d008936d21feb474e801e456415e6622", optional = true }
+turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "turbovec-pipestream-s21" }
+turbovec-grpc = { git = "https://github.com/ai-pipestream/turbovec-grpc.git", rev = "a862d3f8b04eb40ecde9aa6f23907b2ef9718ef1", optional = true }
 # tonic's core (Status, Request, codegen, the prost codec) is all the
 # embedded runtime needs; the HTTP/2 transport rides the `net` feature.
 tonic = { version = "0.12", default-features = false, features = ["codegen", "prost"] }

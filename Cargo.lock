@@ -2171,7 +2171,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "turbovec"
 version = "1.0.0"
-source = "git+https://github.com/ai-pipestream/turbovec.git?branch=turbovec-pipestream-s20#0c6cf820090825a31f75566830c1b85c019d0a80"
+source = "git+https://github.com/ai-pipestream/turbovec.git?branch=turbovec-pipestream-s21#3cce294ea80cb46697fb3bef6af6be996fca52c5"
 dependencies = [
  "memmap2",
  "ordered-float 4.6.0",
@@ -2184,7 +2184,7 @@ dependencies = [
 [[package]]
 name = "turbovec-grpc"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turbovec-grpc.git?rev=0b21a161d008936d21feb474e801e456415e6622#0b21a161d008936d21feb474e801e456415e6622"
+source = "git+https://github.com/ai-pipestream/turbovec-grpc.git?rev=a862d3f8b04eb40ecde9aa6f23907b2ef9718ef1#a862d3f8b04eb40ecde9aa6f23907b2ef9718ef1"
 dependencies = [
  "crc32fast",
  "prost",

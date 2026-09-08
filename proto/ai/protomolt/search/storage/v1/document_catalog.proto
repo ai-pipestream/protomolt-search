@@ -167,6 +167,10 @@ message SourceIndexOwner {
 
 // Local artifact comparison, not an authorization grant or a write receipt.
 // The maintenance publisher must compute this from its held before/after views.
+// Format 1 certified stored content and exact FP32 rows only; format 2 also
+// certifies the vector provider's stored encoding of every live row. A journal
+// keeps format-1 records readable; only format 2 says anything about the
+// dense image (docs/source-index-maintenance.md).
 message SourceRewriteCertificate {
   uint32 format_version = 1;
   SourceIndexOwner owner = 2;

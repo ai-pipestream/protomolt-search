@@ -13,9 +13,9 @@ New here? The user manual is [docs/manual/README.md](docs/manual/README.md).
 | Repository | Role | Depends on |
 |---|---|---|
 | [RyanCodrai/turbovec](https://github.com/RyanCodrai/turbovec) | Upstream vector index library: 4-bit TurboQuant encoding, SIMD top-k search | — |
-| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream-s20` | Patch fork carrying the seedable top-k floor, live-floor streaming collector, and mapped-image reader. Rebased onto upstream `main`; explicit TQ+ calibration is now upstream | upstream `main` |
-| [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) | Network and sharding facade for the local turbovec engine | fork branch `turbovec-pipestream-s20` |
-| [Pipestream Search](https://github.com/ai-pipestream/protomolt-search) (this repository) | Full search product: distributed vector, BM25, CEL selection, hybrid ranking, document semantics, persistence, and operations | fork branch `turbovec-pipestream-s20` |
+| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream-s21` | Patch fork carrying the seedable top-k floor, live-floor streaming collector, and mapped-image reader. Rebased onto upstream `main`; explicit TQ+ calibration is now upstream | upstream `main` |
+| [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) | Network and sharding facade for the local turbovec engine | fork branch `turbovec-pipestream-s21` |
+| [Pipestream Search](https://github.com/ai-pipestream/protomolt-search) (this repository) | Full search product: distributed vector, BM25, CEL selection, hybrid ranking, document semantics, persistence, and operations | fork branch `turbovec-pipestream-s21` |
 | [ai-pipestream/grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis) | Text-analysis sidecar: sentence/token spans, term vectors, static embeddings, served over gRPC | — |
 
 The in-repository [`protomolt-analyzer`](crates/protomolt-analyzer) crate is
@@ -2151,6 +2151,25 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   declaration mismatches before row or log mutation. Derived network WAL
   replay remains unavailable through fresh ingest and is refused before
   transmission. [Compatibility and remaining replay work](docs/derived-columns.md#compatibility-with-the-parallel-integer-map-branch).
+- **Branch checkpoint 2026-09-07: the rewrite proof certifies the dense
+  image.** The preservation certificate compared stored content and exact
+  FP32 rows but not the encoded rows the scorer reads, so a compaction whose
+  quantized codes came from other vectors passed unchanged.
+  `VectorProvider::row_transcript` now exposes the provider's stored encoding
+  of a row (the embedded TurboVec adapter: bit width, dimension, packed codes,
+  correction scale), the proof hashes it per identity, certificates are format
+  2 (format 1 stays readable in journals and certifies no dense image), and a
+  provider without a representation refuses by name. Proof cost is stated
+  with measured vocabulary passes per batch (`fields × Σ ceil(rows/batch)`),
+  `proof_batch_rows = 0` selects the 1,048,576-row default, and the scratch
+  is created 0700/0600 from the first syscall, checked by a child process
+  under umask 0. The provider serves transcripts in 1,024-row pieces through
+  TurboVec chain s21's `stored_rows`, which converts one 32-row block at a
+  time from the layout it already holds: no packed image is materialized
+  (`packed_ready()` stays false on mapped segments after a proof) and proof
+  memory at a fixed batch does not grow with the image. Tests:
+  `segments::rewrite_proof`, `vector::tests`.
+  [Source-index maintenance](docs/source-index-maintenance.md).
 - **Branch checkpoint 2026-09-07: exact derived absolute value.**
   Declared columns reject `math.abs(i64::MIN)`, which has no exact signed
   64-bit result. Missing input, per-request materialization absence and untaken

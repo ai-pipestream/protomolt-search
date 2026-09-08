@@ -465,10 +465,16 @@ impl NodeServiceImpl {
         if !(1..=65536).contains(&request.batch_rows)
             || !(1..=64 * 1024 * 1024).contains(&request.batch_bytes)
             || request.max_staged_bytes == 0
-            || !(1..=1048576).contains(&request.proof_batch_rows)
+            || request.proof_batch_rows as usize > crate::segments::rewrite_proof::MAX_BATCH_ROWS
         {
-            return Err(Status::invalid_argument("source compaction requires batch_rows 1..65536, batch_bytes 1..64MiB, positive max_staged_bytes and proof_batch_rows 1..1048576"));
+            return Err(Status::invalid_argument("source compaction requires batch_rows 1..65536, batch_bytes 1..64MiB, positive max_staged_bytes and proof_batch_rows 0..1048576 (0 selects the 1048576-row default)"));
         }
+        // Zero asks for the default: the largest batch, 32 MiB of digests. A
+        // smaller batch only repeats vocabulary passes (rewrite_proof.rs).
+        let proof_batch_rows = match request.proof_batch_rows as usize {
+            0 => crate::segments::rewrite_proof::DEFAULT_PROOF_BATCH_ROWS,
+            rows => rows,
+        };
         if source.collection()? != self.config.collection {
             return Err(failure("source and target collections differ"));
         }
@@ -561,7 +567,7 @@ impl NodeServiceImpl {
             before.epoch(),
             sources,
             &builder.directory.0.join("proof"),
-            request.proof_batch_rows as usize,
+            proof_batch_rows,
         );
         drop(builder);
         #[cfg(test)]
