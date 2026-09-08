@@ -84,6 +84,30 @@ impl AccessControlledCatalog {
         &self.binding
     }
 
+    /// Discover the pinned local history without disclosing source records.
+    pub fn write_target(
+        &self,
+        permit: &AccessPermit,
+    ) -> Result<crate::pb::DocumentWriteTarget, Status> {
+        let _guard = authorize(&self.binding, permit, AccessAction::Ingest)?;
+        let transaction = self.inner.database.begin_read().map_err(storage)?;
+        let metadata = transaction.open_table(META).map_err(storage)?;
+        let header: DocumentCatalogHeader = decode(
+            metadata
+                .get("header")
+                .map_err(storage)?
+                .ok_or_else(|| Status::data_loss("catalog header missing"))?
+                .value(),
+        )?;
+        validate_current_header(&header)?;
+        self.inner.validate_resource_binding(&header)?;
+        Ok(crate::pb::DocumentWriteTarget {
+            workspace: self.binding.workspace.clone(),
+            collection: self.binding.collection.clone(),
+            history_id: header.history_id,
+        })
+    }
+
     pub fn accept(
         &self,
         permit: &AccessPermit,

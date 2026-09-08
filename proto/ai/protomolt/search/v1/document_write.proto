@@ -2,6 +2,47 @@ syntax = "proto3";
 package ai.protomolt.search.v1;
 import "ai/protomolt/search/v1/source.proto";
 
+// Receiving-side adapter for explicitly provisioned local source catalogs.
+// The receiver enforces current Ingest permission through its source commit.
+// This service does not activate, transfer or replicate a managed source owner.
+service DocumentWriteService {
+  // Requires Ingest. Returns only the exact local resource/history binding;
+  // it grants no ownership, source disclosure or permission to write.
+  rpc GetWriteTarget(GetDocumentWriteTargetRequest) returns (DocumentWriteTarget);
+  // One logical source transaction. Requires version-2 history-pinned input.
+  // Cancellation or a lost reply leaves the outcome unknown; retry the same
+  // operation under current permission. A committed write may outlive the RPC.
+  // Successful acceptance reports searchable=false until separate publication.
+  rpc AcceptDocument(DocumentWriteRequest) returns (DocumentWriteReceipt);
+}
+
+message GetDocumentWriteTargetRequest {
+  // Exact collection; empty names the explicitly configured unnamed catalog.
+  string collection = 1;
+}
+
+message DocumentWriteTarget {
+  string workspace = 1;
+  string collection = 2;
+  bytes history_id = 3;
+}
+
+message DocumentWriteRequest {
+  string collection = 1;
+  AcceptDocumentRequest document = 2;
+}
+
+// Required receiver execution limits. These account encoded requests, not
+// total process memory or transport buffers across every connection.
+message DocumentWriteServiceLimits {
+  // 1..64 MiB, including the complete unary request envelope.
+  uint64 max_request_bytes = 1;
+  // 1..256 MiB across admitted queued/running work; at least max_request_bytes.
+  uint64 max_pending_bytes = 2;
+  // 1..1024 queued/running operations. Full capacity refuses rather than queues.
+  uint32 max_in_flight = 3;
+}
+
 // Acceptance of a logical document, independent of physical index rows.
 // Version 1 persists source and retry history. It does not publish a search
 // projection; successful receipts explicitly report searchable=false.

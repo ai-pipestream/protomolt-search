@@ -1237,6 +1237,17 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: receiving-side logical source writes.** The programmatic
+  `DocumentWriteService` adapter authenticates each caller and pins local Ingest
+  permission through the catalog transaction. Version-2 requests bind the exact
+  source history; actor-scoped retries recover the original durable receipt.
+  Blocking work retains its byte and execution permits after RPC cancellation.
+  The full local gate passed 688 library tests, 150 integration targets and all
+  five mobile compilation checks under an 8 GiB, swap-disabled memory cap.
+  This adapter serves explicitly provisioned local catalogs; runtime routing,
+  managed owner activation and remote authority enforcement remain integration
+  work. See [network source acceptance](docs/network-ingest-authorization.md).
+
 - **Foundation branch: policy publication and completed revocation.** Local
   permission pins retain an admitted policy epoch through synchronous commit.
   Replacement publishes new grants, then drains old admissions

@@ -46,6 +46,8 @@ pub mod derived;
 pub mod diagnostics;
 pub mod document_catalog;
 pub mod document_contract;
+#[cfg(feature = "net")]
+pub mod document_write_service;
 pub mod embedded;
 pub mod error_disclosure;
 pub mod exact_vectors;
