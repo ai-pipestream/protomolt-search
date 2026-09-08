@@ -751,3 +751,82 @@ documents, 237 fields) has 0 problems; the band-filter shapes on
 tables above (boolean lexical with `court == "scotus"` 568 ms against
 the plain shape's 95 ms, the lexical `year >= 2018` pair 651 against
 47 ms, the same top ids on each pair).
+
+## 2026-09-07: the boolean rollout, prepared (cutover awaits authorization)
+
+The narrowed MUST filter leaf (`1a74f97`, "The boolean lexical clause"
+above) is proven offline; the fleet proof waits on an authorized
+cutover of the serving binary. Everything short of the cutover is done.
+
+**The build.** Current `main` `92b11fb`, staged on krick-1 as
+`bin-v11/pipestream-search.92b11fb` (md5 `a600b23b…`); the serving
+fleet is verified at `a9bf470` (md5 `cf03f4bd…`, all 15 processes).
+The new binary carries the filter-domain narrowing plus the merged
+foundations work; the A/B switch
+`PIPESTREAM_SEARCH_BOOLEAN_FILTER_FULL_SCAN` forces the old whole-shard
+scan on the new binary.
+
+**Reversibility, from the code.** A serve-only roll to `92b11fb` is
+reversible to `a9bf470` without touching shard data:
+
+- WAL manifests of populated generations are not re-stamped on open
+  (the re-stamp fires only when the manifest already declares derived
+  columns or a column table, `src/wal.rs`); an EMPTY generation would
+  be stamped format 8 and refused by the old binary, so the runbook
+  checks for empty `gen-*` dirs first. The fleet's generations are all
+  populated.
+- No ingest during the window: new-feature appends (index policy,
+  derived, integer map, identity) are what bump the WAL format past
+  what `a9bf470` reads. Flushes and seals trip no gate.
+- A segment sealed during the window stays within the column kinds the
+  old binary knows, because the fleet's mapping declares no integer
+  maps, derived columns, or index policies (the kinds added by the
+  merge are emitted only when those are present).
+- The replay journal has no production caller on this main; the
+  coordinator persists nothing versioned; the turbovec pin
+  (`turbovec-pipestream-s20`) and the `.tv`/`PMEXACT1` constants are
+  unchanged between the two builds.
+
+**The driver.** `examples/fleet_boolean.rs` runs the documented shapes
+through a root over mTLS, k = 10, printing per-round wall time, the
+profile's selection/total ms and segment/shard pruning counters, the
+hits as `doc_id:score_bits:rank`, and per-shape FNV-1a digests over
+every round's hits. Equal digests are the answer-equality gate; the
+boolean and allowlist variants of one filter already digest equal on
+both roots.
+
+**Before, `a9bf470`, warm (round 3 of 3), from krick:**
+
+| shape | all 7 shards (`:19391`) | the 6 krick-1 shards (`:19394`) | Pi/relay share |
+|---|---|---|---|
+| lexical "grandfathered status" AND dense row 7 | 308 ms | 136 ms | 172 ms |
+| lexical "qualified immunity" AND dense row 7 | 387 ms | 175 ms | 212 ms |
+| lexical "qualified immunity", `court == "scotus"` | 532 ms | 130 ms | 402 ms |
+| lexical "qualified immunity", `year >= 2018` | 619 ms | 8 ms (no rows) | 611 ms |
+| dense row 7, `court == "scotus"` | 565 ms | 139 ms | 426 ms |
+| dense row 7, `year >= 2018` | 848 ms | 15 ms | 833 ms |
+| allowlist "qualified immunity", `court == "scotus"` | 51 ms | 18 ms | 33 ms |
+| allowlist "qualified immunity", `year >= 2018` | 10 ms | 1 ms | 9 ms |
+
+Roots' VmHWM 24 MB before and after the runs; the `search-v10` scope
+sits at 15.2 GB current / 21.5 GB peak. Digests on `:19391`:
+`lex-qualified+scotus` = `9ed31c7d…`, `lex-qualified+year2018` =
+`3deb03a0…`, `dense+scotus` = `0b08d071…`, `dense+year2018` =
+`67b67745…`, the two AND shapes `f8cc2722…` / `50dafed0…`.
+
+**The cutover plan, when authorized.** krick-1 first, Pis second,
+roots last, one scope at a time, each step verified before the next:
+(1) confirm no empty `gen-*` WAL dir on any shard; (2) `rebuild.sh
+down`, swap `bin-v11/pipestream-search` to the staged file by rename
+(the old file stays as `pipestream-search.a9bf470`), `rebuild.sh
+serve`, wait for health on every shard; (3) the same on pi5v1 and
+pi5v3 with their binary built on pi5v1 from the pinned commit; (4)
+restart the three roots and the krick-only root on the new binary;
+(5) re-run the driver against `:19391` and `:19394`, compare digests
+per shape first, then warm and cold (first round after the restart)
+latencies and the pruning counters; (6) read every scope's
+`memory.stat` and each root's VmHWM. Reversal is the same procedure
+with the old file renamed back; the conditions above keep the shards
+untouched either way. Any digest mismatch stops the roll at the step
+that introduced it, and the discrepancy is investigated before any
+improvement is claimed.
