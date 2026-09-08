@@ -107,6 +107,92 @@ pub fn last_applied(host: &RaftHost) -> u64 {
         .index
 }
 
+// ---- slice 3d: standalone snapshot-protocol helpers ------------------------
+//
+// These drive a `ControlStateMachine` built over a kit store (never a
+// `RaftHost`) so installs can be exercised directly, exactly as a follower
+// receiver would see them.
+
+use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+use openraft::{LeaderId, LogId, Membership, SnapshotMeta, StoredMembership};
+
+/// One committed control entry at `(term 1, node 1, index)`, the shape every
+/// standalone fixture in this suite uses.
+pub fn control_entry(
+    index: u64,
+    command: pipestream_search::pb::storage::SourceAuthorityCommand,
+) -> openraft::Entry<pipestream_search::raft::ControlRaft> {
+    openraft::Entry {
+        log_id: LogId::new(LeaderId::new(1, NODE_ID), index),
+        payload: openraft::EntryPayload::Normal(raw_proposal(
+            pipestream_search::pb::storage::raft_proposal::Command::Control(command),
+        )),
+    }
+}
+
+/// Build the current generation through the real snapshot builder and return
+/// the published image bytes together with the openraft meta.
+pub async fn build_current(
+    machine: &mut ControlStateMachine,
+) -> (Vec<u8>, SnapshotMeta<u64, openraft::BasicNode>) {
+    let mut builder = RaftStateMachine::get_snapshot_builder(machine).await;
+    let snapshot = builder.build_snapshot().await.unwrap();
+    let mut bytes = Vec::new();
+    use tokio::io::AsyncReadExt;
+    let mut file = snapshot.snapshot;
+    file.read_to_end(&mut bytes).await.unwrap();
+    (bytes, snapshot.meta)
+}
+
+/// A `SnapshotMeta` naming `index` for exactly `image` bytes, with the given
+/// voter set — the snapshot id format the receiver verifies.
+pub fn meta_for(
+    index: u64,
+    image: &[u8],
+    voters: &[u64],
+) -> SnapshotMeta<u64, openraft::BasicNode> {
+    let digest = pipestream_search::sha256::digest(image);
+    let log_id = LogId::new(LeaderId::new(1, NODE_ID), index);
+    let config: Vec<std::collections::BTreeSet<u64>> = voters
+        .iter()
+        .map(|v| std::collections::BTreeSet::from([*v]))
+        .collect();
+    SnapshotMeta {
+        last_log_id: Some(log_id),
+        last_membership: StoredMembership::new(Some(log_id), Membership::new(config, ())),
+        snapshot_id: format!(
+            "{}-{}-{}",
+            index,
+            image.len(),
+            pipestream_search::sha256::to_hex(&digest)
+        ),
+    }
+}
+
+/// Receive `image` through the machine's own receive path and install it
+/// under `meta`. The receive file identity is preserved end to end.
+pub async fn install_received(
+    machine: &mut ControlStateMachine,
+    image: &[u8],
+    meta: &SnapshotMeta<u64, openraft::BasicNode>,
+) -> Result<(), String> {
+    use openraft::storage::RaftStateMachine;
+    let mut file = RaftStateMachine::begin_receiving_snapshot(machine)
+        .await
+        .map_err(|e| e.to_string())?;
+    file.write_all(image).await.map_err(|e| e.to_string())?;
+    RaftStateMachine::install_snapshot(machine, meta, file)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Copy the store file out of `dir` as an image. Every clone of the store
+/// (including the state machine that owns it) must be dropped first: redb
+/// holds an exclusive file lock and the copy must see quiesced bytes.
+pub fn image_of(dir: &TestDir) -> Vec<u8> {
+    std::fs::read(dir.authority()).unwrap()
+}
+
 /// A raw envelope as `host.propose` and `raft().client_write` accept it —
 /// no admission, holder or binding checks beyond envelope shape.
 pub fn raw_proposal(

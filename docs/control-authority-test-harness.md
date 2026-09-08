@@ -546,3 +546,136 @@ test-shape, not product behavior. Gate: the three pre-existing targets pass
 with and without `--features fault-injection,raft` (adversarial 11, model 1,
 planner 9); `cargo check --tests --features raft,fault-injection` is clean;
 rustfmt clean; no production changes, no new dependencies, no commit.
+
+## Slice 3d: snapshot-protocol reproductions (R3, R5) and the crash matrix
+
+Two final targets complete the build. `tests/control_raft_snapshots.rs`
+(10 tests, `--features raft`) pins the checkpoint-review findings R3
+(snapshot generation publication) and R5 (receive identity, bounded
+buffering) against a standalone `ControlStateMachine` over a kit store —
+never a `RaftHost` — so installs are exercised exactly as a follower
+receiver sees them: `begin_receiving_snapshot` → write → `install_snapshot`.
+`tests/control_crash_faults.rs` (7 tests, `--features fault-injection`)
+re-drives the durable-commit crash windows (capacity configure/report,
+import administrative recovery, managed bind/activate) through the public
+worker/parent fault-injection surface. Both are gated together with 3c:
+`cargo test --test control_raft_snapshots --features raft,fault-injection --
+--test-threads=1` (about 13 s) and `cargo test --test control_crash_faults
+--features raft,fault-injection -- --test-threads=2` (under a second).
+
+Kit additions: `raft_kit.rs` gains `control_entry` (a committed
+`(term 1, node 1, index)` entry), `build_current` (publishes a generation
+through the real snapshot builder and returns image + openraft meta),
+`meta_for` (a meta naming an index, image bytes, and voter set — the
+snapshot id format the receiver verifies), `install_received` (receive +
+install preserving the receive file identity), and `image_of`. The crash
+target reuses the kit's worker/parent split (`spawn_worker`, `KillOnDrop`,
+`TestDir::from_env` via `PSEARCH_ADV_DIR`) with its own env selection
+(`PSEARCH_CRASH_WORKER/FAMILY/FAULT`). Two load-bearing facts: an
+`SourceAdmission` guard must not span a control command (the apply takes
+the admission lock exclusively — holding one deadlocks), and a worker that
+survives an armed exit fault must panic so the parent's exit-code assertion
+stays honest.
+
+### Snapshot results at `331c18f` (2 passed, 8 failed; 12.5 s)
+
+Every failure is a minimized reproduction for Fable; assertions pin the
+REQUIRED behavior and are not weakened.
+
+- `r3_wrong_group_valid_image_is_refused_and_previous_survives` — FAILED
+  (repro). The foreign-group image passes length/digest verification, is
+  copied over `current.redb` in place, and `current.meta` is published
+  before the group check runs; the install then errors naming the group,
+  but `get_current_snapshot` serves the foreign bytes (snapshot id
+  `1-1056768-c7c06cb9…`), `current.redb` on disk no longer equals the
+  previous generation, and the live handle's slot was taken and never
+  restored (`control_snapshot` → NotFound "resource has no applied control
+  state").
+- `r3_correct_index_wrong_membership_is_refused` — FAILED (repro). The
+  machine's own image back at its real applied index but with voters `{9}`
+  installs cleanly: only the applied index is compared and the in-memory
+  membership is then set from the meta.
+- `r3_rejected_install_leaves_previous_usable_after_restart` — FAILED
+  (repro). After the refused wrong-group install, reopening the store and
+  rebuilding the machine serves the foreign image, not the previous
+  generation.
+- `r3_interrupted_publication_boundaries` — FAILED at case (d2) only;
+  (a) image-swapped-under-old-meta, (b) leftover `current.meta.tmp`, (c)
+  leftover `staged.redb`, and (d1) meta with a bumped index under old
+  bytes all behave as required (serve the complete previous generation or
+  refuse loudly). (d2) — old image bytes under a self-consistent
+  recomputed newer-index meta, the forged generation pointer — is served
+  silently: the reader pairs names, it does not validate content before
+  publication.
+- `r3_reader_held_across_publication` — FAILED (repro). A reader held on
+  the served generation observes the new bytes after a successful install:
+  the copy over `current.redb` is in place, so the open fd's contents
+  change mid-read.
+- `r5_install_uses_the_actual_receive_not_the_newest_filename` — FAILED
+  (repro). With an abandoned `incoming-<later>.redb` planted, the install
+  selects it (`newest_incoming` is a lexicographic filename max) and
+  refuses with DataLoss "snapshot image length 4096 and digest differ from
+  the announced 557056" — or would install a valid foreign file.
+- `r5_interrupted_receive_leaves_no_selected_artifact` — FAILED at (ii)
+  only; (i) a plain earlier-named leftover is accidentally harmless (the
+  fresh receive wins by name). (ii) a later-named planted partial is
+  selected: DataLoss "snapshot image length 8192 and digest differ from
+  the announced 557056".
+- `r5_install_hashing_is_bounded` — FAILED (repro). A `#[global_allocator]`
+  peak tracker (watermark reset immediately before the install, so growth
+  is attributable to it) measures a peak live growth of **8,847,524 bytes
+  for an 8,847,360-byte image** — `image_signature` reads the whole file
+  into one Vec.
+- `r5_oversize_and_truncated_images_refuse_before_replacement` — PASS.
+  Announced-length and digest verification happen before any copy, so both
+  shapes refuse loudly and the previous generation is intact. (Positive
+  self-check.)
+- `r5_announced_length_is_checked_only_at_install` — PASS (API-gap
+  documentation). The receive sink is an unbounded `File`; bytes beyond
+  the announcement are accepted while receiving and the refusal happens
+  late, at install. The REQUIRED "enforce announced lengths WHILE
+  receiving" is unreachable through the current surface — there is no
+  announced length at `begin_receiving_snapshot` at all.
+
+### Crash-matrix results at `331c18f` (7 passed; 0.2 s)
+
+The control group: every window the review documents already behaves,
+proving the worker/parent fault machinery before Fable touches the
+snapshot path. Parents compute a no-crash baseline in a twin directory
+first, then assert the documented recovery window and convergence through
+the public reopen/retry API only; every worker exits 87 (the armed
+`ExitFault::{BeforeCommit,AfterCommit}`), and a worker that survives its
+fault panics so the parent's exit-code assertion stays honest.
+
+- `crash_capacity_configure_before_and_after_commit` — PASS ×2. Before:
+  no configuration committed (NotFound), a fresh configure lands. After:
+  `configured_control_revision` equals the reopened revision and an exact
+  retry (previous revision) returns the stored decision. Both converge to
+  the baseline planner view digest and final control revision (11).
+- `crash_capacity_report_before_and_after_commit` — PASS ×2. Before:
+  `observation_count == 0`, the re-issued report reports Landed. After:
+  `(observation_count, observation_epoch) == (1, 1)`, the exact repeat
+  reports Unchanged. Both converge to the baseline view and revision.
+- `crash_recover_before_and_after_commit` — PASS ×2. Before: the workflow
+  is still Staging with its reservation held and no recovery decision
+  recorded. After: Recovered with the reservation released. Both accept
+  the exact recovery retry (control revision 5, stored decision) and
+  record a non-zero refusal for a later Commit attempt without disturbing
+  the terminal workflow; the state survives a reopen.
+- `crash_managed_bind_and_activate_boundaries` — PASS ×4. Bind before:
+  the catalog is still format 8 (`AccessControlledCatalog::open`) and the
+  owner is still Prepared on the authority. Bind after: a committed
+  format-9 binding recovered through `PreparedManagedCatalog::recover`
+  (`bound_at_sequence == 1`). Activate before: the authority owner is
+  ACTIVE on the control side but the catalog is still format 9 — active
+  recovery refuses FailedPrecondition, prepared recovery works and
+  activates. Activate after: format 10 recovered directly through
+  `ActiveManagedCatalog::recover`. All four serve the next write at
+  sequence 2. (A fresh import after recovery is covered by the slice-3b
+  SIGKILL recovery matrix, which re-runs the whole import.)
+
+Gate: the four pre-existing targets are unchanged (adversarial 11, model
+1, planner 9 pass with and without features; raft-regressions keeps its
+3-pass/8-repro tally); `cargo check --tests --features raft,fault-injection`
+is clean; rustfmt clean; no production changes, no new dependencies, no
+commit.
