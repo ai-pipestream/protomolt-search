@@ -1250,6 +1250,20 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   destination store remains unchanged. See [retirement and crash recovery](docs/control-retirement.md);
   transactional import, worker fencing and activation remain separate steps.
 
+- **Foundation branch: Raft hosting, single-node stage (feature `raft`,
+  `openraft = "=0.9.25"` with `storage-v2`).** Typed envelopes for
+  proposals, replies, entries, votes, membership and the applied position;
+  a redb log store with one write order and saved committed position; a
+  state machine that applies committed commands through the store's replay
+  paths with the applied position in the same transaction and closes the
+  direct command paths; file snapshots signed by length and digest, verified
+  as a store of the group before an atomic swap; an in-process host with
+  proposal admission (holder for Begin, binding for ConfirmReady). Evidence
+  is single-node: restart in place, committed-but-unapplied replay,
+  snapshot install into a fresh replica. See
+  [raft hosting](docs/raft-hosting.md). Next: tonic transport, membership,
+  three-voter fault scenarios.
+
 - **Foundation branch: `fault-injection` feature.** Out-of-crate crash
   harnesses (`tests/*.rs`, `--features fault-injection,net`) can arm one
   process exit (code 87) before or after the next transaction commit:

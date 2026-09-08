@@ -1,0 +1,118 @@
+syntax = "proto3";
+package ai.protomolt.search.storage.v1;
+
+import "ai/protomolt/search/storage/v1/source_authority.proto";
+import "ai/protomolt/search/storage/v1/control_import.proto";
+import "ai/protomolt/search/storage/v1/capacity_observations.proto";
+
+// Raft hosting of the source authority (docs/raft-control-design.md,
+// docs/raft-hosting.md). Typed, versioned envelopes for everything that is
+// replicated or stored by the consensus layer: the application command, its
+// reply, log entries, votes, membership and the applied position. Every
+// mapping to the pinned library's types is explicit; nothing here is a
+// serialized Rust object.
+
+// A proposal: the principal the proposing node authenticated and admitted,
+// with the command it admitted. Admission happened at proposal; application
+// replays the command as committed evidence.
+message RaftProposal {
+  uint32 format_version = 1; // 1
+  string principal = 2;
+  oneof command {
+    SourceAuthorityCommand control = 10;
+    ControlImportCommand import = 11;
+    CapacityConfigureCommand capacity = 12;
+    CapacityTransition observation = 13;
+  }
+}
+
+// The recorded reply of an applied proposal.
+message RaftReply {
+  uint32 format_version = 1; // 1
+  oneof reply {
+    SourceAuthorityDecision control = 10;
+    ControlImportDecision import = 11;
+    CapacityConfigureDecision capacity = 12;
+    CapacityTransitionReceipt observation = 13;
+    RaftRefusal refusal = 14;
+  }
+}
+
+// An envelope, admission or storage refusal at application time, recorded
+// exactly like the reply so a retry sees the same outcome.
+message RaftRefusal {
+  uint32 code = 1; // canonical gRPC status
+  string message = 2;
+}
+
+message RaftLogId {
+  uint64 term = 1;
+  uint64 node_id = 2;
+  uint64 index = 3;
+}
+
+message RaftVote {
+  uint64 term = 1;
+  uint64 node_id = 2;
+  bool committed = 3;
+}
+
+message RaftNode {
+  uint64 node_id = 1;
+  string addr = 2;
+}
+
+message RaftVoterSet {
+  repeated uint64 node_ids = 1; // ascending, distinct
+}
+
+// Joint configs in order plus every known node (voters and learners).
+message RaftMembership {
+  repeated RaftVoterSet configs = 1;
+  repeated RaftNode nodes = 2; // ascending node id
+}
+
+message RaftStoredMembership {
+  RaftLogId log_id = 1; // absent for the initial empty membership
+  RaftMembership membership = 2;
+}
+
+message RaftEntry {
+  RaftLogId log_id = 1;
+  oneof payload {
+    bool blank = 2;
+    RaftProposal proposal = 3;
+    RaftMembership membership = 4;
+  }
+}
+
+// The state machine's applied position, kept under the meta key "raft" of
+// the source authority store and written in the same transaction as the
+// applied command.
+message RaftApplied {
+  uint32 format_version = 1; // 1
+  RaftLogId last_applied = 2;
+  RaftStoredMembership membership = 3;
+}
+
+// The log store's header: group identity, this node's id, the vote, the
+// committed position and the last purged log id.
+message RaftLogHeader {
+  uint32 format_version = 1; // 1
+  SourceAuthorityIdentity group = 2;
+  uint64 node_id = 3;
+  RaftVote vote = 4;
+  RaftLogId committed = 5;
+  RaftLogId last_purged = 6;
+}
+
+// Snapshot metadata carried beside the snapshot bytes.
+message RaftSnapshotMeta {
+  uint32 format_version = 1; // 1
+  SourceAuthorityIdentity group = 2;
+  RaftLogId last_log_id = 3;
+  RaftStoredMembership membership = 4;
+  string snapshot_id = 5;
+  uint64 length = 6;
+  bytes sha256 = 7;
+}

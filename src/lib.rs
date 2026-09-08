@@ -30,6 +30,8 @@ pub mod bm25;
 pub mod boolean_bits;
 pub mod calendar;
 pub mod capacity_tiers;
+#[cfg(feature = "raft")]
+pub mod raft;
 pub mod cel;
 pub mod chunked;
 pub mod clustered_turbovec;

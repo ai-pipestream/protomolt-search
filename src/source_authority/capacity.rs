@@ -741,6 +741,16 @@ impl SourceAuthorityStore {
         principal: &str,
         command: &CapacityConfigureCommand,
     ) -> Result<CapacityConfigureDecision, Status> {
+        self.direct()?;
+        self.replay_capacity_configure(principal, command)
+    }
+
+    /// The committed-log path of `configure_capacity`: no direct-path check.
+    pub fn replay_capacity_configure(
+        &self,
+        principal: &str,
+        command: &CapacityConfigureCommand,
+    ) -> Result<CapacityConfigureDecision, Status> {
         let _exclusive = self.exclusive()?;
         self.guarded(|| {
             let decision = self.configure_locked(principal, command)?;
@@ -966,6 +976,7 @@ impl SourceAuthorityStore {
                 .map_err(storage)?;
             meta.insert(CAPACITY_HEADER, capacity_header.encode_to_vec().as_slice())
                 .map_err(storage)?;
+            self.write_pending_applied(&mut meta)?;
         }
         #[cfg(any(test, feature = "fault-injection"))]
         self.inject(false)?;
@@ -985,6 +996,16 @@ impl SourceAuthorityStore {
         principal: &str,
         transition: &CapacityTransition,
     ) -> Result<CapacityTransitionReceipt, Status> {
+        self.direct()?;
+        self.replay_capacity_transition(principal, transition)
+    }
+
+    /// The committed-log path of `capacity_transition`: no direct-path check.
+    pub fn replay_capacity_transition(
+        &self,
+        principal: &str,
+        transition: &CapacityTransition,
+    ) -> Result<CapacityTransitionReceipt, Status> {
         let _exclusive = self.exclusive()?;
         self.guarded(|| self.transition_locked(principal, transition))
     }
@@ -997,7 +1018,7 @@ impl SourceAuthorityStore {
         let mut tx = self.inner.database.begin_write().map_err(storage)?;
         tx.set_durability(Durability::Immediate).map_err(storage)?;
         let receipt;
-        let changed;
+        let changed_or_positioned;
         {
             let mut meta = tx.open_table(META).map_err(storage)?;
             let (mut header, policy) = read_headers(&meta, &self.inner.identity)?;
@@ -1133,7 +1154,7 @@ impl SourceAuthorityStore {
                     }
                 }
             }
-            changed = store.epoch() != before || dropped > 0 || added_bytes > 0;
+            let changed = store.epoch() != before || dropped > 0 || added_bytes > 0;
             if dropped > 0 {
                 state.observation_count = state
                     .observation_count
@@ -1178,6 +1199,12 @@ impl SourceAuthorityStore {
                 meta.insert(CAPACITY_HEADER, capacity_header.encode_to_vec().as_slice())
                     .map_err(storage)?;
             }
+            // An applied position is written whether or not the set changed:
+            // under Raft the entry is consumed either way.
+            let pending = self
+                .write_pending_applied(&mut meta)
+                .map(|_| self.inner.raft_pending.lock().unwrap().is_some())?;
+            changed_or_positioned = changed || pending;
             receipt = CapacityTransitionReceipt {
                 format_version: 1,
                 outcome: outcome as i32,
@@ -1186,7 +1213,7 @@ impl SourceAuthorityStore {
                 control_revision: header.source.control_revision,
             };
         }
-        if !changed {
+        if !changed_or_positioned {
             tx.abort().map_err(storage)?;
             return Ok(receipt);
         }

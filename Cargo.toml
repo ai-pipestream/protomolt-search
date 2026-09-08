@@ -13,6 +13,10 @@ resolver = "2"
 [dependencies]
 turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "turbovec-pipestream-s21" }
 turbovec-grpc = { git = "https://github.com/ai-pipestream/turbovec-grpc.git", rev = "a862d3f8b04eb40ecde9aa6f23907b2ef9718ef1", optional = true }
+# Control consensus (docs/raft-control-design.md). Pinned exactly: the
+# storage-v2 contracts are what the log store and state machine implement,
+# and the typed envelopes map to this version's types explicitly.
+openraft = { version = "=0.9.25", default-features = false, features = ["storage-v2"], optional = true }
 # tonic's core (Status, Request, codegen, the prost codec) is all the
 # embedded runtime needs; the HTTP/2 transport rides the `net` feature.
 tonic = { version = "0.12", default-features = false, features = ["codegen", "prost"] }
@@ -61,6 +65,10 @@ redb = "=4.1.0"
 getrandom = "=0.2.17"
 
 [features]
+# Raft hosting of the source authority (docs/raft-control-design.md): the
+# redb log store, the state machine over the committed-replay paths and the
+# in-process host. Transport needs `net` as well.
+raft = ["dep:openraft"]
 # Process-exit fault injection at store and source transaction boundaries,
 # for out-of-crate crash-recovery harnesses (tests/*.rs). Never on in a
 # serving binary.

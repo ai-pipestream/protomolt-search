@@ -15,6 +15,8 @@ use redb::{
 use source_authority_command::Action;
 use std::fs::{File, OpenOptions};
 use std::path::Path;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use tokio::sync::watch;
 use tonic::{Code, Status};
@@ -39,6 +41,8 @@ pub use import::{
 pub use map_feed::MapConsumer;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("source_authority_meta");
+/// Meta key of the Raft applied position (docs/raft-hosting.md).
+pub(crate) const RAFT_META: &str = "raft";
 const OWNERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("source_authority_owners");
 const DECISIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("source_authority_decisions");
 const WORKFLOWS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("source_authority_workflows");
@@ -81,6 +85,12 @@ struct Inner {
     // The boolean permanently closes the instance after a storage failure.
     closed: Mutex<bool>,
     identity: SourceAuthorityIdentity,
+    path: PathBuf,
+    // Raft hosting: while hosted, the direct command paths refuse and only
+    // the committed-replay paths apply, each writing the pending applied
+    // position in its own transaction (docs/raft-hosting.md).
+    hosted: AtomicBool,
+    raft_pending: Mutex<Option<RaftApplied>>,
     #[cfg(any(test, feature = "fault-injection"))]
     fault: Mutex<Option<Fault>>,
     // Keep the same open-file description locked until after Database drops.
@@ -432,6 +442,7 @@ impl SourceAuthorityStore {
         command: &SourceAuthorityCommand,
         verified: &VerifiedOwnerCompletion,
     ) -> Result<SourceAuthorityDecision, Status> {
+        self.direct()?;
         if !matches!(command.action, Some(Action::ConfirmReady(_))) {
             return Err(Status::invalid_argument(
                 "confirm_owner_ready takes a ConfirmReady command",
@@ -597,6 +608,9 @@ impl SourceAuthorityStore {
                     applied: watch::Sender::new(0),
                     closed: Mutex::new(false),
                     identity: identity.clone(),
+                    path: path.to_path_buf(),
+                    hosted: AtomicBool::new(false),
+                    raft_pending: Mutex::new(None),
                     #[cfg(any(test, feature = "fault-injection"))]
                     fault: Mutex::new(None),
                     _file_lock: file,
@@ -634,6 +648,7 @@ impl SourceAuthorityStore {
         principal: &str,
         command: &SourceAuthorityCommand,
     ) -> Result<SourceAuthorityDecision, Status> {
+        self.direct()?;
         if matches!(command.action, Some(Action::ConfirmReady(_))) {
             return Err(Status::permission_denied(
                 "readiness confirmation requires the hosting adapter with the managed binding",
@@ -878,6 +893,7 @@ impl SourceAuthorityStore {
                 .map_err(storage)?;
             meta.insert("header", header.encode_to_vec().as_slice())
                 .map_err(storage)?;
+            self.write_pending_applied(&mut meta)?;
         }
         #[cfg(any(test, feature = "fault-injection"))]
         self.inject(false)?;
@@ -897,6 +913,181 @@ impl SourceAuthorityStore {
             ExitFault::BeforeCommit => Fault::ExitBeforeCommit,
             ExitFault::AfterCommit => Fault::ExitAfterCommit,
         });
+    }
+
+    /// Proposal admission of a readiness confirmation, the same checks the
+    /// direct path performs before its transition, as a read.
+    pub(crate) fn proposal_admits_readiness(
+        &self,
+        principal: &str,
+        command: &SourceAuthorityCommand,
+        verified: &VerifiedOwnerCompletion,
+    ) -> Result<(), Status> {
+        let Some(Action::ConfirmReady(request)) = command.action.as_ref() else {
+            return Err(Status::invalid_argument(
+                "proposal_admits_readiness takes a ConfirmReady command",
+            ));
+        };
+        if verified.binding.authority.as_ref() != Some(&self.inner.identity) {
+            return Err(Status::failed_precondition(
+                "managed binding names another source authority",
+            ));
+        }
+        let key = command
+            .key
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("source authority command key is required"))?;
+        contract::key(key, true)?;
+        contract::principal(principal)?;
+        self.guarded(|| {
+            let tx = self.inner.database.begin_read().map_err(storage)?;
+            self.read_policy(&tx, principal, key)?;
+            let owners = tx.open_table(OWNERS).map_err(storage)?;
+            let before: Option<PreparedSourceOwner> = owners
+                .get(key.encode_to_vec().as_slice())
+                .map_err(storage)?
+                .map(|v| contract::decode(v.value()))
+                .transpose()?;
+            if verified.binding.preparation.as_ref() != before.as_ref() {
+                return Err(Status::failed_precondition(
+                    "managed binding preparation differs from the committed owner",
+                ));
+            }
+            if request.completion.as_ref() != Some(&verified.completion) {
+                return Err(Status::permission_denied(
+                    "readiness confirmation differs from the held binding's completion",
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    /// The direct command paths are closed while the store is Raft-hosted:
+    /// every mutation then arrives as a committed log entry.
+    fn direct(&self) -> Result<(), Status> {
+        if self.inner.hosted.load(Ordering::Acquire) {
+            return Err(Status::failed_precondition(
+                "source authority is Raft-hosted; propose through the host, the direct command path is closed",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Write the pending Raft applied position, if any, into the transaction
+    /// that applies the command it belongs to.
+    fn write_pending_applied(
+        &self,
+        meta: &mut redb::Table<&'static str, &'static [u8]>,
+    ) -> Result<(), Status> {
+        if let Some(applied) = self.inner.raft_pending.lock().unwrap().as_ref() {
+            meta.insert(RAFT_META, applied.encode_to_vec().as_slice())
+                .map_err(storage)?;
+        }
+        Ok(())
+    }
+
+    /// Mark the store as Raft-hosted; the direct command paths refuse from
+    /// here on. The host owns proposal admission.
+    pub(crate) fn set_raft_hosted(&self) {
+        self.inner.hosted.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn raft_hosted(&self) -> bool {
+        self.inner.hosted.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.inner.path
+    }
+
+    /// Run one committed-replay application with `applied` recorded in the
+    /// same transaction. The state machine applies entries one at a time.
+    pub(crate) fn raft_apply<T>(
+        &self,
+        applied: RaftApplied,
+        run: impl FnOnce() -> Result<T, Status>,
+    ) -> Result<T, Status> {
+        *self.inner.raft_pending.lock().unwrap() = Some(applied);
+        let result = run();
+        *self.inner.raft_pending.lock().unwrap() = None;
+        result
+    }
+
+    /// Record an applied position with no application change: blank and
+    /// membership entries, and entries refused at their envelope.
+    pub(crate) fn apply_raft_position(&self, applied: &RaftApplied) -> Result<(), Status> {
+        let _exclusive = self.exclusive()?;
+        self.guarded(|| {
+            let mut tx = self.inner.database.begin_write().map_err(storage)?;
+            tx.set_durability(Durability::Immediate).map_err(storage)?;
+            {
+                let mut meta = tx.open_table(META).map_err(storage)?;
+                meta.insert(RAFT_META, applied.encode_to_vec().as_slice())
+                    .map_err(storage)?;
+            }
+            tx.commit().map_err(storage)
+        })
+    }
+
+    /// The applied Raft position recorded with the last applied entry.
+    pub(crate) fn raft_applied(&self) -> Result<Option<RaftApplied>, Status> {
+        self.guarded(|| {
+            let tx = self.inner.database.begin_read().map_err(storage)?;
+            let meta = tx.open_table(META).map_err(storage)?;
+            meta.get(RAFT_META)
+                .map_err(storage)?
+                .map(|v| contract::decode(v.value()))
+                .transpose()
+        })
+    }
+
+    /// Hold every store transaction off while `run` reads the file: the
+    /// snapshot builder copies a consistent image. The applied position is
+    /// read under the same hold, so image and position agree.
+    pub(crate) fn quiesced<T>(
+        &self,
+        run: impl FnOnce(&Path, Option<RaftApplied>) -> Result<T, Status>,
+    ) -> Result<T, Status> {
+        let _exclusive = self.exclusive()?;
+        self.guarded(|| {
+            let applied = {
+                let tx = self.inner.database.begin_read().map_err(storage)?;
+                let meta = tx.open_table(META).map_err(storage)?;
+                meta.get(RAFT_META)
+                    .map_err(storage)?
+                    .map(|v| contract::decode(v.value()))
+                    .transpose()?
+            };
+            run(&self.inner.path, applied)
+        })
+    }
+
+    /// Replace this store's file with a verified staged image and reopen.
+    /// Needs exclusive ownership of the handle: an outstanding clone keeps
+    /// the old file open, so the swap refuses by name rather than racing it.
+    pub(crate) fn replace_from(self, staged: &Path) -> Result<Self, Status> {
+        let identity = self.inner.identity.clone();
+        let path = self.inner.path.clone();
+        let hosted = self.raft_hosted();
+        if Arc::strong_count(&self.inner) != 1 {
+            return Err(Status::failed_precondition(
+                "source authority store has outstanding handles; snapshot install needs exclusive ownership",
+            ));
+        }
+        drop(self);
+        std::fs::rename(staged, &path).map_err(storage)?;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        File::open(parent)
+            .and_then(|d| d.sync_all())
+            .map_err(storage)?;
+        let store = Self::open(&path, &identity)?;
+        if hosted {
+            store.set_raft_hosted();
+        }
+        Ok(store)
     }
 
     /// Wake map-feed subscribers only when the applied revision moved: a

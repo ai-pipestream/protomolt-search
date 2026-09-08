@@ -190,8 +190,20 @@ pub(super) fn validate(store: &SourceAuthorityStore) -> Result<(), Status> {
         return Err(corrupt("unexpected or missing control tables"));
     }
     let meta = tx.open_table(META).map_err(corrupt)?;
-    if meta.len().map_err(storage)? != 4 {
+    let raft = meta.get(RAFT_META).map_err(storage)?.is_some();
+    if meta.len().map_err(storage)? != 4 + u64::from(raft) {
         return Err(corrupt("unexpected metadata keys"));
+    }
+    if raft {
+        let applied: RaftApplied = contract::decode(
+            meta.get(RAFT_META)
+                .map_err(storage)?
+                .ok_or_else(|| missing("raft applied position"))?
+                .value(),
+        )?;
+        if applied.format_version != 1 || applied.last_applied.is_none() {
+            return Err(corrupt("raft applied position format or log id is invalid"));
+        }
     }
     let control: ControlStoreHeader = contract::decode(
         meta.get(import::CONTROL_HEADER)

@@ -380,6 +380,7 @@ impl SourceAuthorityStore {
         command: &ControlImportCommand,
         retired: &RetiredLegacyControl,
     ) -> Result<ControlImportDecision, Status> {
+        self.direct()?;
         let key = command
             .key
             .as_ref()
@@ -393,6 +394,40 @@ impl SourceAuthorityStore {
         self.import(principal, command, Admission::Holder(admitted))
     }
 
+    /// Proposal admission of an import step: a Begin needs the retirement
+    /// holder and its digests must match; every other step needs no holder.
+    pub(crate) fn proposal_admits_import(
+        &self,
+        principal: &str,
+        command: &ControlImportCommand,
+        retired: Option<&RetiredLegacyControl>,
+    ) -> Result<(), Status> {
+        let key = command
+            .key
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("control import resource key is required"))?;
+        match (command.action.as_ref(), retired) {
+            (Some(ImportAction::Begin(begin)), Some(retired)) => {
+                let admitted = admit_retirement(&self.inner.identity, principal, key, retired)?;
+                if begin.retirement_sha256 != admitted.sha256
+                    || begin.retirement_operation.as_ref() != Some(&admitted.operation)
+                {
+                    return Err(Status::failed_precondition(
+                        "begin import digests differ from the admitted retirement",
+                    ));
+                }
+                Ok(())
+            }
+            (Some(ImportAction::Begin(_)), None) => Err(Status::permission_denied(
+                "begin import requires the hosting admission path with a retirement holder",
+            )),
+            (Some(_), _) => Ok(()),
+            (None, _) => Err(Status::invalid_argument(
+                "control import action is missing or unsupported",
+            )),
+        }
+    }
+
     /// Chunk, Commit, Abort and Recover. A Begin here refuses: it needs the
     /// retirement holder through `begin_control_import`.
     pub fn execute_control_import(
@@ -400,6 +435,7 @@ impl SourceAuthorityStore {
         principal: &str,
         command: &ControlImportCommand,
     ) -> Result<ControlImportDecision, Status> {
+        self.direct()?;
         if matches!(command.action, Some(ImportAction::Begin(_))) {
             return Err(Status::permission_denied(
                 "begin import requires the hosting admission path with a retirement holder",
@@ -989,6 +1025,7 @@ impl SourceAuthorityStore {
                 .map_err(storage)?;
             meta.insert("header", header.source.encode_to_vec().as_slice())
                 .map_err(storage)?;
+            self.write_pending_applied(&mut meta)?;
             meta.insert(CONTROL_HEADER, header.control.encode_to_vec().as_slice())
                 .map_err(storage)?;
             decision = result;
