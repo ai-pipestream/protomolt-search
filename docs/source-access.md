@@ -82,5 +82,17 @@ five authorization integration tests, 21 existing catalog integration tests and
 eight resource-access integration tests: 106 passed, zero failures. The two new
 catalog unit tests also passed after a source-fixture correction, under an
 8 GiB hard memory limit with swap disabled (2.51 GiB peak, zero OOM events).
-Full regression, mobile and wire compatibility validation is pending. These
-local tests do not claim distributed owner or server-route conformance.
+The complete gate at `7be8a3a` passed 667 library tests, 864 integration tests
+across 146 targets, 13 embedded tests and two IVF tests: 1,546 passed and zero
+failures. The existing `native_matches_opennlp_contract` test remains ignored
+because it requires a live OpenNLP service. All five Android/iOS compilation
+checks, test/example compilation, formatting, vendored protos and diff checks
+passed. A descriptor comparison against `92b11fb` preserved every existing
+search/storage declaration; the resource binding is additive.
+
+The driver verified identical HEAD and hashes for all 636 files before and
+after the gate. It ran under an 8 GiB hard limit with swap disabled, reached
+that limit, and recorded zero OOM events or kills. Memory-limit events and
+socket throttling occurred; this is correctness evidence, not a performance
+measurement. These local tests do not claim distributed owner or server-route
+conformance.

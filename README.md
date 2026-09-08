@@ -1237,12 +1237,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
-- **Foundation branch: access-controlled local source catalogs (validation pending).**
+- **Foundation branch: access-controlled local source catalogs.**
   Source history has an immutable persisted workspace/collection binding.
   Ingest and administration require separate permissions held through each
   synchronous commit; policy replacement serializes with admitted operations.
-  Ordinary opening cannot bypass the controlled API. See
-  [source access](docs/source-access.md) for format 7 and remaining ownership
+  Ordinary opening cannot bypass the controlled API. Checkpoint `7be8a3a`
+  passed 1,546 tests, all five mobile checks and wire compatibility validation.
+  See [source access](docs/source-access.md) for format 7 and remaining ownership
   and routing integration.
 
 - **Foundation branch: durable admission closure before source retirement.**
