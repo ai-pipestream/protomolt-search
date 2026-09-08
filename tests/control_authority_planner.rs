@@ -287,3 +287,285 @@ fn observation_bound_to_committed_resource() {
     );
     eprintln!("planner resource binding: foreign resource and generation refused, twin landed");
 }
+
+/// Run the canonical import once and return the directory (kept alive) and
+/// the committed snapshot, for tests that only need the planner's committed
+/// view rather than an import permutation.
+fn imported_snapshot() -> (kit::TestDir, ControlCollectionSnapshot) {
+    let dir = kit::TestDir::new("planner-lifecycle");
+    let (store, authority) = kit::create_store(&dir);
+    let legacy = kit::legacy_plane(&dir, 2);
+    let (retired, _request) = kit::retire(&store, &legacy, 1);
+    let payload = kit::import_payload(&retired);
+    kit::run_import(&store, &authority, &retired, &payload);
+    let snapshot = store.control_snapshot("alice", &kit::key()).unwrap();
+    (dir, snapshot)
+}
+
+fn inc_0d() -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out[15] = 0x0d;
+    out
+}
+
+/// One full supersession sequence: feed the fixture reports, re-register
+/// krick-1 with a new process incarnation, watch the late old-incarnation
+/// report refused, then accept the new process's report for (s6, L4).
+/// Returns the store, the digest after feeding, and the digest after the
+/// supersession.
+fn supersession_sequence(
+    view: &pipestream_search::capacity_tiers::CommittedView,
+) -> (
+    pipestream_search::capacity_tiers::ObservationStore,
+    [u8; 32],
+    [u8; 32],
+) {
+    let t = kit::PLANNING_INSTANT_UNIX_MS;
+    let mut store = kit::feed_reports(view, false);
+    let fed = store.observation_set_digest();
+    store
+        .register_incarnation("krick-1", inc_0d())
+        .expect("re-register krick-1");
+    let superseded = store.observation_set_digest();
+    assert_ne!(
+        fed, superseded,
+        "supersession did not change the set digest"
+    );
+    assert!(
+        store
+            .observations()
+            .iter()
+            .all(|obs| obs.reporter.node_id != "krick-1"),
+        "the superseded node's reports are still present"
+    );
+    // A late duplicate from the old process is refused, never matched.
+    let late = kit::planner_reports(view).remove(0);
+    let error = store
+        .ingest(late)
+        .expect_err("a superseded process's report must be refused");
+    assert!(error.contains("superseded"), "{error}");
+    // The new process reports with the committed storage incarnation.
+    let new_process = kit::PlannerCopySpec {
+        node: "krick-1",
+        proc_inc: 0x0d,
+        stor_inc: 0xa1,
+        domain: "krick",
+    };
+    let fresh = kit::planner_obs(
+        view,
+        &new_process,
+        "L4",
+        "s6",
+        3,
+        5,
+        1_000_000,
+        268_435_456,
+        3_000_000,
+        t - 5000,
+    );
+    assert_eq!(
+        store.ingest(fresh).expect("the new process reports"),
+        IngestOutcome::Landed
+    );
+    (store, fed, superseded)
+}
+
+/// `register_incarnation` replaces a node's incarnation and drops its
+/// reports at every other incarnation (verified against
+/// `src/capacity_tiers.rs:488`). A late report from the superseded process
+/// is refused naming the current incarnation; the replacement process
+/// reports with the committed storage incarnation; two stores taken through
+/// the same sequence end with equal set digests and equal plan digests.
+#[test]
+fn supersession_drops_the_old_incarnation_and_is_deterministic() {
+    let (_dir, snapshot) = imported_snapshot();
+    let view = kit::planner_committed_view(&snapshot);
+
+    let (first, fed, superseded) = supersession_sequence(&view);
+    let first_digest = first.observation_set_digest();
+    let (second, fed_2, superseded_2) = supersession_sequence(&view);
+    let second_digest = second.observation_set_digest();
+
+    assert_eq!(fed, fed_2);
+    assert_eq!(superseded, superseded_2);
+    assert_eq!(
+        first_digest, second_digest,
+        "identical supersession sequences diverged"
+    );
+    assert_ne!(
+        superseded, first_digest,
+        "the replacement report did not change the set digest"
+    );
+
+    // The plan digest is a pure function of the snapshot: equal snapshots
+    // (same observations, same observation epoch) plan digests equal.
+    let first_input = kit::planner_input(&snapshot, &view, &first);
+    let second_input = kit::planner_input(&snapshot, &view, &second);
+    let first_plan = TierSnapshot::validated(first_input)
+        .expect("valid")
+        .plan_digest();
+    let second_plan = TierSnapshot::validated(second_input)
+        .expect("valid")
+        .plan_digest();
+    assert_eq!(
+        first_plan, second_plan,
+        "plan digest diverged after supersession"
+    );
+    eprintln!(
+        "supersession: old incarnation dropped and refused, replacement landed, digests equal"
+    );
+}
+
+/// `commit_expiry` ages observations on `window_end_unix_ms` and expires one
+/// only when `now - window_end` is STRICTLY greater than `max_age`
+/// (verified against `src/capacity_tiers.rs:533` and the in-crate boundary
+/// test). Two identical stores expire identically; the expired ids leave the
+/// set; a plan over the survivors classifies the affected fragment exactly
+/// as a store that only ever held them.
+#[test]
+fn expiry_is_deterministic_and_excludes_the_expired() {
+    let (_dir, snapshot) = imported_snapshot();
+    let view = kit::planner_committed_view(&snapshot);
+    let t = kit::PLANNING_INSTANT_UNIX_MS;
+    let cohort = kit::COHORT_LENGTH_MS;
+
+    // Boundary: age == max_age survives, strictly greater expires.
+    let mut bounded = kit::feed_reports(&view, false);
+    let digest_full = bounded.observation_set_digest();
+    assert_eq!(
+        bounded.commit_expiry(t, 0).expect("expiry"),
+        0,
+        "now == window_end must expire nothing"
+    );
+    assert_eq!(bounded.observation_set_digest(), digest_full);
+    assert_eq!(
+        bounded.commit_expiry(t + 599_999, 599_999).expect("expiry"),
+        0,
+        "age == max_age must survive"
+    );
+    assert_eq!(bounded.observation_set_digest(), digest_full);
+    assert_eq!(
+        bounded.commit_expiry(t + 600_000, 599_999).expect("expiry"),
+        5,
+        "age > max_age must expire"
+    );
+    let digest_empty = bounded.observation_set_digest();
+    assert_ne!(digest_full, digest_empty);
+    assert!(bounded.observations().is_empty());
+    assert_eq!(
+        bounded.commit_expiry(t + 600_000, 599_999).expect("expiry"),
+        0,
+        "a repeat expiry is a no-op"
+    );
+    assert_eq!(bounded.observation_set_digest(), digest_empty);
+
+    // Strict-subset expiry: move s7's two reports to the next cohort window
+    // so now = T + cohort expires exactly s6's three.
+    let mut reports = kit::planner_reports(&view);
+    for report in &mut reports[3..] {
+        report.window_start_unix_ms = t;
+        report.window_end_unix_ms = t + cohort;
+    }
+    let mut first = kit::planner_observation_store(&view);
+    let mut second = kit::planner_observation_store(&view);
+    for report in &reports {
+        assert_eq!(
+            first.ingest(report.clone()).expect("ingest"),
+            IngestOutcome::Landed
+        );
+        assert_eq!(
+            second.ingest(report.clone()).expect("ingest"),
+            IngestOutcome::Landed
+        );
+    }
+    let digest_before = first.observation_set_digest();
+    assert_eq!(first.commit_expiry(t + cohort, 0).expect("expiry"), 3);
+    assert_eq!(second.commit_expiry(t + cohort, 0).expect("expiry"), 3);
+    let digest_after = first.observation_set_digest();
+    assert_eq!(
+        digest_after,
+        second.observation_set_digest(),
+        "identical stores expired differently"
+    );
+    assert_ne!(
+        digest_before, digest_after,
+        "expiry did not change the observation set digest"
+    );
+    let remaining = first.observations();
+    assert_eq!(remaining.len(), 2);
+    assert!(
+        remaining.iter().all(|obs| obs.shard.shard == "s7"),
+        "expired s6 observations are still present"
+    );
+    assert_eq!(
+        first.commit_expiry(t + cohort, 0).expect("expiry"),
+        0,
+        "a repeat expiry must be a no-op"
+    );
+    assert_eq!(
+        first.observation_set_digest(),
+        digest_after,
+        "the repeat expiry changed the digest"
+    );
+
+    // now before every window end expires nothing.
+    let mut early = kit::planner_observation_store(&view);
+    for report in &reports {
+        assert_eq!(
+            early.ingest(report.clone()).expect("ingest"),
+            IngestOutcome::Landed
+        );
+    }
+    let digest_early_full = early.observation_set_digest();
+    assert_eq!(early.commit_expiry(t, 0).expect("expiry"), 0);
+    assert_eq!(
+        early.observation_set_digest(),
+        digest_early_full,
+        "expiry before the timestamps changed the set"
+    );
+
+    // Plan over the survivors: at instant T + cohort the current cohort is
+    // [T, T + cohort), exactly where the s7 survivors report. The L7
+    // classification is field-equal to a store that only ever held them.
+    let mut input = kit::planner_input(&snapshot, &view, &first);
+    input.planning_instant_unix_ms = t + cohort;
+    input
+        .fragment_requests
+        .retain(|request| request.leaf == "L7");
+    let plan = plan_tiers(&TierSnapshot::validated(input).expect("valid"))
+        .expect("plan over the survivors");
+    assert_eq!(plan.placements.len(), 1);
+
+    let mut survivors = kit::planner_observation_store(&view);
+    for report in &reports[3..] {
+        assert_eq!(
+            survivors.ingest(report.clone()).expect("ingest"),
+            IngestOutcome::Landed
+        );
+    }
+    let mut survivor_input = kit::planner_input(&snapshot, &view, &survivors);
+    survivor_input.planning_instant_unix_ms = t + cohort;
+    survivor_input
+        .fragment_requests
+        .retain(|request| request.leaf == "L7");
+    let survivor_plan = plan_tiers(&TierSnapshot::validated(survivor_input).expect("valid"))
+        .expect("plan over the survivors only");
+
+    assert_eq!(
+        plan.placements, survivor_plan.placements,
+        "classification changed with history the plan cannot see"
+    );
+    assert_eq!(plan.refusals, survivor_plan.refusals);
+    assert_eq!(plan.policy_fingerprint, survivor_plan.policy_fingerprint);
+
+    // The expired fragment refuses loudly instead of planning from memory.
+    let mut l4_input = kit::planner_input(&snapshot, &view, &first);
+    l4_input.planning_instant_unix_ms = t + cohort;
+    l4_input
+        .fragment_requests
+        .retain(|request| request.leaf == "L4");
+    let error = plan_tiers(&TierSnapshot::validated(l4_input).expect("valid"))
+        .expect_err("the expired fragment must not plan");
+    assert!(error.contains("no current observation"), "{error}");
+    eprintln!("expiry: boundary inclusive, strict subset expired, survivors classify identically");
+}
