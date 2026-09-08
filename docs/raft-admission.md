@@ -1,7 +1,8 @@
 # Admission under Raft: leases, isolation and revocation
 
-Status: contract, 2026-09-08, with the single-node mechanism implemented
-(`RaftHost::with_admission`, `SourceAdmission` leases, `HostConfig::validate`).
+Status: contract, 2026-09-08, with the mechanism implemented
+(`RaftHost::with_admission`, `SourceAdmission` leases, `HostConfig::validate`)
+and three-voter evidence over the tonic transport.
 It answers one question before any owner write is admitted through a
 replicated authority: what makes an admission authoritative when the node
 that granted it may be isolated, and when the surviving quorum may have
@@ -88,11 +89,22 @@ unavailable, and no path activates a second writer.
 
 ## Evidence and remaining gaps
 
-Implemented and tested single-node: the hosted store refuses local
-admission, the host grants leased admissions after the read barrier, an
-expired lease admits nothing, `HostConfig::validate` rejects a lease beyond
-the election floor. Multi-node evidence — leader isolation, revocation on
-the surviving quorum, writes attempted through the old side — needs the
-tonic transport and a three-voter harness; those tests are the gate before
-distributed owner writes are enabled, and the mechanism above is the
-contract they hold to.
+Single node: the hosted store refuses local admission, the host grants
+leased admissions after the read barrier, an expired lease admits nothing,
+`HostConfig::validate` rejects a lease beyond the election floor.
+
+Three voters over the tonic transport
+(`src/raft/transport_tests.rs`, "an isolated leader admits nothing and the
+surviving quorum revokes"): a lease granted with a quorum admits; the
+leader isolated in both directions is replaced no sooner than the election
+floor, past which every lease it issued has expired; its read barrier
+collects no quorum and the admission refuses within
+`election_timeout_max_ms` (`Unavailable`, naming the linearizable read); the
+survivors commit a revocation while the old side still shows the stale
+policy and grants nothing on it; after healing the old leader applies the
+revocation and, as a follower, still refuses; a fresh admission on the
+current leader sees the revocation. Remaining before distributed owner
+writes are enabled: the relay and owner-side callers must obtain their
+admission through `with_admission`, and a source commit must be refused at
+its own boundary when its lease has lapsed (`admit_write` checks the lease;
+the callers are not yet wired).

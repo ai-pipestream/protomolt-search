@@ -1250,6 +1250,19 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   destination store remains unchanged. See [retirement and crash recovery](docs/control-retirement.md);
   transactional import, worker fencing and activation remain separate steps.
 
+- **Foundation branch: Raft transport and membership (feature `raft` +
+  `tls`).** The library's vote, append and snapshot operations as typed
+  RPCs over the cluster's mTLS channels; peer identity bound on both sides
+  through a `PeerDirectory` of certificate fingerprints (an address is
+  where a node is dialed, never who it is); size and deadline bounds on
+  every call; members prepared with a store that refuses to apply until
+  the group's verified snapshot seeds it, added as learners, promoted and
+  removed through the library's joint procedure. Evidence: three voters
+  over loopback mTLS — identity refusals, seeding by snapshot, leader
+  isolation with revocation on the surviving quorum, member restart and
+  voter replacement. See [raft hosting](docs/raft-hosting.md) and
+  [admission under Raft](docs/raft-admission.md).
+
 - **Foundation branch: Raft hosting hardening (Astra review of 331c18f).**
   Raw submission and committed replay are no longer reachable by product
   callers; exact retries advance the applied position in the same

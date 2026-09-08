@@ -1,0 +1,86 @@
+syntax = "proto3";
+package ai.protomolt.search.storage.v1;
+
+import "ai/protomolt/search/storage/v1/source_authority.proto";
+import "ai/protomolt/search/storage/v1/raft_control.proto";
+
+// The cluster-internal Raft transport (docs/raft-hosting.md): one RPC per
+// library operation, each request carrying the group identity and both node
+// ids. A listener authenticates the peer by the client certificate its
+// cluster CA issued, binds that certificate to the claimed sender, and
+// refuses a request for another group or another node before the library
+// sees it. An address is never an identity.
+
+message RaftRpcHeader {
+  uint32 protocol_version = 1; // 1
+  SourceAuthorityIdentity group = 2;
+  uint64 from_node_id = 3;
+  uint64 to_node_id = 4;
+}
+
+message RaftAppendEntriesRequest {
+  RaftRpcHeader header = 1;
+  RaftVote vote = 2;
+  RaftLogId prev_log_id = 3; // absent at the start of the log
+  repeated RaftEntry entries = 4;
+  RaftLogId leader_commit = 5; // absent while nothing is committed
+}
+
+message RaftPartialSuccess {
+  RaftLogId matching = 1; // absent when nothing matched
+}
+
+message RaftAppendEntriesResponse {
+  RaftRpcHeader header = 1; // the responder, checked by the caller
+  oneof outcome {
+    bool success = 2;
+    RaftPartialSuccess partial_success = 3;
+    bool conflict = 4;
+    RaftVote higher_vote = 5;
+  }
+}
+
+message RaftVoteRequest {
+  RaftRpcHeader header = 1;
+  RaftVote vote = 2;
+  RaftLogId last_log_id = 3;
+}
+
+message RaftVoteResponse {
+  RaftRpcHeader header = 1;
+  RaftVote vote = 2;
+  bool vote_granted = 3;
+  RaftLogId last_log_id = 4;
+}
+
+// One chunk of a snapshot image, in the library's chunked protocol: the
+// receiver reassembles by (snapshot_id, offset) and installs on `done`.
+message RaftInstallSnapshotRequest {
+  RaftRpcHeader header = 1;
+  RaftVote vote = 2;
+  RaftSnapshotMeta meta = 3;
+  uint64 offset = 4;
+  bytes data = 5;
+  bool done = 6;
+}
+
+message RaftSnapshotMismatch {
+  string expect_id = 1;
+  uint64 expect_offset = 2;
+  string got_id = 3;
+  uint64 got_offset = 4;
+}
+
+message RaftInstallSnapshotResponse {
+  RaftRpcHeader header = 1;
+  oneof outcome {
+    RaftVote vote = 2;
+    RaftSnapshotMismatch mismatch = 3;
+  }
+}
+
+service RaftTransport {
+  rpc AppendEntries(RaftAppendEntriesRequest) returns (RaftAppendEntriesResponse);
+  rpc Vote(RaftVoteRequest) returns (RaftVoteResponse);
+  rpc InstallSnapshot(RaftInstallSnapshotRequest) returns (RaftInstallSnapshotResponse);
+}

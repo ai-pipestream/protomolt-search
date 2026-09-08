@@ -20,10 +20,10 @@ use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 use tonic::Code;
 
-struct Directory(PathBuf);
+pub(super) struct Directory(pub(super) PathBuf);
 
 impl Directory {
-    fn new(name: &str) -> Self {
+    pub(super) fn new(name: &str) -> Self {
         let path = std::env::temp_dir().join(format!(
             "raft-host-{name}-{}-{}",
             std::process::id(),
@@ -43,7 +43,7 @@ impl Drop for Directory {
     }
 }
 
-fn identity(seed: u8) -> SourceAuthorityIdentity {
+pub(super) fn identity(seed: u8) -> SourceAuthorityIdentity {
     SourceAuthorityIdentity {
         format_version: 1,
         group_id: vec![seed; 16],
@@ -51,7 +51,7 @@ fn identity(seed: u8) -> SourceAuthorityIdentity {
     }
 }
 
-fn policy() -> AccessPolicy {
+pub(super) fn policy() -> AccessPolicy {
     AccessPolicy {
         format_version: 1,
         revision: 1,
@@ -69,7 +69,7 @@ fn policy() -> AccessPolicy {
     }
 }
 
-fn limits() -> SourceAuthorityLimits {
+pub(super) fn limits() -> SourceAuthorityLimits {
     SourceAuthorityLimits {
         max_owners: 16,
         max_decisions: 256,
@@ -78,7 +78,7 @@ fn limits() -> SourceAuthorityLimits {
     }
 }
 
-fn config() -> HostConfig {
+pub(super) fn config() -> HostConfig {
     HostConfig {
         heartbeat_interval_ms: 50,
         election_timeout_min_ms: 150,
@@ -90,7 +90,7 @@ fn config() -> HostConfig {
     }
 }
 
-fn owner(id: &str) -> LogicalSourceOwner {
+pub(super) fn owner(id: &str) -> LogicalSourceOwner {
     LogicalSourceOwner {
         workspace: "workspace-a".into(),
         collection: "books".into(),
@@ -98,7 +98,7 @@ fn owner(id: &str) -> LogicalSourceOwner {
     }
 }
 
-fn prepare(
+pub(super) fn prepare(
     authority: &SourceAuthorityIdentity,
     owner_id: &str,
     command_id: &str,
@@ -125,7 +125,7 @@ fn prepare(
     }
 }
 
-fn proposal(principal: &str, command: &SourceAuthorityCommand) -> RaftProposal {
+pub(super) fn proposal(principal: &str, command: &SourceAuthorityCommand) -> RaftProposal {
     RaftProposal {
         format_version: 1,
         principal: principal.into(),
@@ -135,7 +135,7 @@ fn proposal(principal: &str, command: &SourceAuthorityCommand) -> RaftProposal {
     }
 }
 
-fn log_id(term: u64, node: u64, index: u64) -> LogId<u64> {
+pub(super) fn log_id(term: u64, node: u64, index: u64) -> LogId<u64> {
     LogId::new(LeaderId::new(term, node), index)
 }
 

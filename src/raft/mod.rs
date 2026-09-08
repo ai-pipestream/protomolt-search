@@ -4,8 +4,12 @@
 pub mod host;
 pub mod log_store;
 pub mod state_machine;
+#[cfg(feature = "tls")]
+pub mod transport;
 pub mod types;
 
+#[cfg(feature = "tls")]
+pub use host::ClusterTransport;
 pub use host::{HostConfig, NoNetwork, RaftHost};
 pub use log_store::RaftLogStore;
 pub use state_machine::ControlStateMachine;
@@ -13,3 +17,5 @@ pub use types::ControlRaft;
 
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, feature = "tls"))]
+mod transport_tests;

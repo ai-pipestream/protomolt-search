@@ -40,6 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "proto/ai/protomolt/search/storage/v1/capacity_observations.proto",
                 "proto/ai/protomolt/search/storage/v1/published_map.proto",
                 "proto/ai/protomolt/search/storage/v1/raft_control.proto",
+                "proto/ai/protomolt/search/storage/v1/raft_transport.proto",
                 "proto/ai/protomolt/search/mobile/v1/mobile.proto",
                 "proto/ai/protomolt/search/wal/v1/wal.proto",
                 "proto/ai/pipestream/opennlp/analysis/v1/analysis.proto",

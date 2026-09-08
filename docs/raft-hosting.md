@@ -1,11 +1,13 @@
 # Raft hosting of the source authority
 
-Status: implemented 2026-09-08 as the single-node stage of the accepted
+Status: implemented 2026-09-08 from the accepted
 [control-authority design](raft-control-design.md): `src/raft/` behind the
-cargo feature `raft` (`openraft = "=0.9.25"`, `storage-v2`). Tests in
-`src/raft/tests.rs`. Transport, membership changes beyond the bootstrap
-voter and multi-node fault scenarios are the next stage; nothing here is
-multi-node evidence.
+cargo feature `raft` (`openraft = "=0.9.25"`, `storage-v2`), the tonic
+transport and membership operations behind `raft` + `tls`. Tests in
+`src/raft/tests.rs` (single node) and `src/raft/transport_tests.rs` (three
+voters over loopback mTLS). Distributed owner writes stay disabled until the
+relay and the owner-side callers are wired to `with_admission`; the
+multi-node evidence below is what they hold to.
 
 ## Envelopes
 
@@ -87,21 +89,93 @@ subscribers stay attached. Build and install never overlap.
 ## Host
 
 `RaftHost::bootstrap_single` is the explicit one-time creation of a group of
-one voter; `RaftHost::start` opens existing state and never creates. The
-host admits proposals the way the direct paths did — a `ConfirmReady` needs
-the managed binding (`propose_confirm_ready`), a `Begin` needs the
-retirement holder (`propose_import`) — then writes them through
-`Raft::client_write` and returns the committed reply. Raw submission and
-committed application are not reachable by product callers: the submit
-path is private, the replay paths, the log store's constructors and writes
-and the state machine's constructor are crate-private, and a hosted store
-refuses every direct command and every local `admission()`. `store()` hands
-out the current store for reads (maps, snapshots, decisions);
-`with_admission` grants the leased admission owner-side work needs
+one voter with no transport; `RaftHost::start` opens existing state and
+never creates. The networked forms are `bootstrap_cluster` (the first
+member, listening), `prepare_member` (the durable state of a member that
+will join, see below) and `start_member` (a prepared member, or any member
+restarting, listening on its recorded address). The host admits proposals
+the way the direct paths did — a `ConfirmReady` needs the managed binding
+(`propose_confirm_ready`), a `Begin` needs the retirement holder
+(`propose_import`) — then writes them through `Raft::client_write` and
+returns the committed reply. Raw submission and committed application are
+not reachable by product callers: the submit path is private, the replay
+paths, the log store's constructors and writes and the state machine's
+constructor are crate-private, and a hosted store refuses every direct
+command and every local `admission()`. `store()` hands out the current
+store for reads (maps, snapshots, decisions); `with_admission` grants the
+leased admission owner-side work needs, with the linearizable read bounded
+by the longest election so an isolated leader refuses instead of waiting
 ([admission under Raft](raft-admission.md)). A proposal on a non-leader is
 `Unavailable` naming the leader.
 
-## Evidence (single node)
+## Transport
+
+`raft_transport.proto` carries the library's three operations as typed
+RPCs: `AppendEntries`, `Vote` and `InstallSnapshot` (one chunk per call in
+the library's chunked protocol, with the snapshot meta naming group, last
+log id, membership and the checksum its id encodes). Every request and
+reply carries a `RaftRpcHeader`: protocol version, group identity, the
+sender's and the receiver's node id.
+
+Identity is bound on both sides (`src/raft/transport.rs`):
+
+- A `PeerDirectory` binds each node id of one group to the SHA-256 of its
+  certificate's DER (`certificate_sha256` over a PEM with exactly one
+  leaf). A certificate binds to one node and a node to one certificate;
+  rebinding refuses.
+- The listener requires a client certificate from the cluster CA (mTLS), looks
+  the leaf up in the directory, and refuses before the library sees the
+  call when the certificate is unregistered (`Unauthenticated`), when the
+  header claims another node than the certificate is registered to, names
+  another group or is addressed to another node (`PermissionDenied`), or
+  when the header is missing or of another protocol version
+  (`InvalidArgument`). A certificate of another CA does not complete the
+  handshake.
+- The caller dials the address the membership records, presents its own
+  certificate, names the target in every request and checks the responder
+  named in every reply; a reply from another node or group is a network
+  error, never a result.
+
+Bounds: `TransportLimits { max_message_bytes, connect_timeout_ms }` is
+enforced by both sides' codecs and validated to hold one snapshot chunk
+(`HostConfig::snapshot_chunk_bytes`) with its envelope; an append batch
+above the bound is reported to the library as too large so it halves the
+batch, and a single entry above it is a named refusal. Each RPC carries the
+library's hard deadline; a connect failure or refused connection is
+`Unreachable`, a deadline is `Timeout`, and any other status is a network
+error. `Isolation` (tests and the `fault-injection` feature) makes a node
+refuse every RPC to and from chosen peers in both directions.
+
+## Membership
+
+Membership changes go through the library's joint-consensus procedure,
+never through files:
+
+1. `RaftHost::prepare_member(dir, identity, node_id, policy, limits)`
+   creates the member's store and empty log. The store carries the meta key
+   `member` ("awaiting-snapshot"): while it is present, no log entry applies
+   to it (`FailedPrecondition`, "awaits the group's first snapshot"), and
+   recovery refuses a store that carries both the marker and an applied
+   position. A member therefore never replays the group's log onto its own
+   genesis image, which could differ from the group's silently.
+2. `add_learner(node_id, addr)` on the leader requires the node's
+   certificate to be registered, builds a snapshot at the current applied
+   position, purges the log to it, adds the learner and waits until the
+   learner holds the membership entry that added it. The learner is seeded
+   by the verified image (group, position, membership checked on a probe
+   copy), which replaces the marked store; the marker is gone with it.
+3. `promote(learners)` upgrades caught-up learners to voters
+   (`AddVoterIds`); `remove_member(node_id)` removes a voter
+   (`RemoveVoters`, not retained as a learner) or a learner (`RemoveNodes`).
+   A removed member proposes nothing and admits nothing.
+
+A member restarts with `start_member` on the address the membership
+records for it; the address is where it is dialed, its certificate is who
+it is.
+
+## Evidence
+
+Single node (`src/raft/tests.rs`):
 
 - Envelope round trips and malformed refusals.
 - Log store: vote, consecutive append, hole refusal, ranges, truncate,
@@ -128,10 +202,45 @@ out the current store for reads (maps, snapshots, decisions);
   on the leader and admits nothing once expired; a lease beyond the
   election floor is refused at configuration.
 
+Three voters over the transport (`src/raft/transport_tests.rs`, loopback
+mTLS with the fixtures under `tests/certs/raft`, regenerated by
+`scripts/gen-raft-test-certs.sh`):
+
+- Peer identity: a registered member is answered by the node it dialed; the
+  same certificate cannot speak for another node, reach another node or
+  name another group; a missing or unversioned header is malformed; a
+  CA-issued but unregistered certificate is unauthenticated whatever node it
+  claims; a certificate of another CA does not complete the handshake; an
+  unregistered node cannot be added; the directory refuses to rebind.
+- Seeding and replication: members 2 and 3 join a bootstrapped node 1 by
+  snapshot (marker gone, owner rows present, generation published beside
+  each member's store), are promoted, and every later proposal applies on
+  all three with the same position and rows; a follower's proposal names
+  the leader; a prepared member store refuses to apply before its seed.
+- Leader isolation and revocation: a lease granted on the leader with a
+  quorum admits; with the leader isolated in both directions the survivors
+  elect a successor no sooner than the election floor, by which time every
+  lease the old leader issued has expired; the old leader's admission
+  refuses within the read bound; the successor commits a revocation of the
+  grant while the old side still shows the stale policy and grants nothing
+  on it (local admission closed, leased admission refused); after healing
+  the old leader catches up to the revoked policy, still admits nothing as
+  a follower, and a fresh admission on the current leader sees the
+  revocation.
+- Restart: a stopped member restarted on its recorded address replays the
+  entries it missed; a restarted leader yields a successor and proposals
+  continue.
+- Replacement: a fourth member joins by snapshot, is promoted, a voter is
+  removed through the same procedure, proposals apply on the new voter set,
+  and the removed member proposes nothing.
+
 ## Not yet
 
-- The tonic transport with typed RPC envelopes, peer certificate identity
-  and size/deadline limits; learners, promotion and voter replacement;
-  three-voter fault scenarios; cross-process replay; the map feed from a
-  learner's applied state. Kimi's harness stays on the local authority until
-  these land.
+- Wiring the relay and the owner-side callers to `with_admission` and the
+  map feed of a learner's applied state; distributed owner writes stay
+  disabled until then.
+- Operator surfaces: a peers file for the `PeerDirectory`, command-line
+  flags for `ClusterTransport` and `HostConfig`.
+- Cross-process fault injection (a member killed at a transaction boundary
+  while the others continue) is Kimi's harness, on `fault-injection` and the
+  transport's `Isolation`.

@@ -191,8 +191,14 @@ pub(super) fn validate(store: &SourceAuthorityStore) -> Result<(), Status> {
     }
     let meta = tx.open_table(META).map_err(corrupt)?;
     let raft = meta.get(RAFT_META).map_err(storage)?.is_some();
-    if meta.len().map_err(storage)? != 4 + u64::from(raft) {
+    let member = meta.get(MEMBER_META).map_err(storage)?.is_some();
+    if meta.len().map_err(storage)? != 4 + u64::from(raft) + u64::from(member) {
         return Err(corrupt("unexpected metadata keys"));
+    }
+    if member && raft {
+        return Err(corrupt(
+            "a prepared member store carries an applied position",
+        ));
     }
     if raft {
         let applied: RaftApplied = contract::decode(

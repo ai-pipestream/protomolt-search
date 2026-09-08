@@ -1,6 +1,7 @@
-//! The in-process Raft host: owns the store, the log store and the Raft
-//! instance; admits proposals the way the direct paths did and turns the
-//! committed reply back into the caller's decision.
+//! The Raft host: owns the store, the log store, the Raft instance and,
+//! for a networked member, the transport listener; admits proposals the
+//! way the direct paths did and turns the committed reply back into the
+//! caller's decision.
 use super::log_store::RaftLogStore;
 use super::state_machine::{ControlStateMachine, SharedStore};
 use super::types::{validate_proposal, ControlRaft, NodeId};
@@ -19,12 +20,24 @@ use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
+#[cfg(feature = "tls")]
+use openraft::ChangeMembers;
 use openraft::{BasicNode, Config, Raft, RaftMetrics, SnapshotPolicy};
 use std::collections::BTreeMap;
+#[cfg(feature = "tls")]
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::watch;
 use tonic::Status;
+
+#[cfg(feature = "tls")]
+use super::transport::{
+    Isolation, PeerDirectory, RaftTransportService, TonicNetworkFactory, TransportLimits,
+};
+#[cfg(feature = "tls")]
+use crate::security::{ClientTls, ServerTls};
 
 pub const STORE_FILE: &str = "authority.redb";
 pub const LOG_FILE: &str = "raft-log.redb";
@@ -97,6 +110,17 @@ pub struct HostConfig {
     pub snapshot_logs_since_last: u64,
     /// Largest store image a snapshot may carry, in bytes.
     pub max_snapshot_bytes: u64,
+    /// One snapshot chunk on the wire.
+    pub snapshot_chunk_bytes: u64,
+    /// Sending and installing one snapshot chunk must finish within this.
+    pub install_snapshot_timeout_ms: u64,
+    /// Entries per append; the transport halves it when a batch exceeds
+    /// its message bound.
+    pub max_payload_entries: u64,
+    /// Entries kept behind a snapshot before the log is purged; adding a
+    /// member purges to the snapshot regardless, so the member is seeded
+    /// by the verified image.
+    pub max_in_snapshot_log_to_keep: u64,
     /// How long a leased admission stays authoritative after the
     /// linearizable read that granted it (docs/raft-admission.md).
     pub admission_lease_ms: u64,
@@ -113,6 +137,10 @@ impl Default for HostConfig {
             election_timeout_max_ms: 2_000,
             snapshot_logs_since_last: 1_024,
             max_snapshot_bytes: 4 << 30,
+            snapshot_chunk_bytes: 1 << 20,
+            install_snapshot_timeout_ms: 10_000,
+            max_payload_entries: 64,
+            max_in_snapshot_log_to_keep: 1_000,
             admission_lease_ms: 500,
             clock_skew_ms: 250,
         }
@@ -141,8 +169,49 @@ impl HostConfig {
                 "max_snapshot_bytes must be positive",
             ));
         }
+        if self.snapshot_chunk_bytes == 0 || self.snapshot_chunk_bytes > self.max_snapshot_bytes {
+            return Err(Status::invalid_argument(
+                "snapshot_chunk_bytes must be positive and within max_snapshot_bytes",
+            ));
+        }
+        if self.install_snapshot_timeout_ms == 0 || self.max_payload_entries == 0 {
+            return Err(Status::invalid_argument(
+                "install_snapshot_timeout_ms and max_payload_entries must be positive",
+            ));
+        }
         Ok(())
     }
+
+    /// The bound on a linearizable read: an isolated leader cannot collect
+    /// a quorum, and past the longest election it is no longer the leader
+    /// anyone else believes in.
+    fn read_timeout(&self) -> Duration {
+        Duration::from_millis(self.election_timeout_max_ms)
+    }
+}
+
+/// The transport material of a networked member (docs/raft-hosting.md).
+#[cfg(feature = "tls")]
+pub struct ClusterTransport {
+    /// Which certificate speaks for which node; this node's own
+    /// certificate is registered too.
+    pub directory: Arc<PeerDirectory>,
+    /// The listener's identity; the cluster CA is required of every peer.
+    pub server_tls: ServerTls,
+    /// What this node presents when it dials a peer.
+    pub client_tls: ClientTls,
+    pub listen: std::net::SocketAddr,
+    /// The address peers dial, when it is not the bound one.
+    pub advertise: Option<String>,
+    pub limits: TransportLimits,
+}
+
+#[cfg_attr(not(feature = "tls"), allow(dead_code))]
+struct Listener {
+    addr: std::net::SocketAddr,
+    advertised: String,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
 }
 
 pub struct RaftHost {
@@ -151,7 +220,13 @@ pub struct RaftHost {
     log_store: RaftLogStore,
     node_id: NodeId,
     dir: PathBuf,
-    lease: std::time::Duration,
+    lease: Duration,
+    read_timeout: Duration,
+    listener: Option<Listener>,
+    #[cfg(feature = "tls")]
+    directory: Option<Arc<PeerDirectory>>,
+    #[cfg(feature = "tls")]
+    isolation: Isolation,
 }
 
 impl RaftHost {
@@ -163,6 +238,10 @@ impl RaftHost {
             election_timeout_min: config.election_timeout_min_ms,
             election_timeout_max: config.election_timeout_max_ms,
             snapshot_policy: SnapshotPolicy::LogsSinceLast(config.snapshot_logs_since_last),
+            snapshot_max_chunk_size: config.snapshot_chunk_bytes,
+            install_snapshot_timeout: config.install_snapshot_timeout_ms,
+            max_payload_entries: config.max_payload_entries,
+            max_in_snapshot_log_to_keep: config.max_in_snapshot_log_to_keep,
             ..Default::default()
         }
         .validate()
@@ -183,23 +262,9 @@ impl RaftHost {
     ) -> Result<Self, Status> {
         let store = SourceAuthorityStore::create(&dir.join(STORE_FILE), identity, policy, limits)?;
         let log_store = RaftLogStore::create(&dir.join(LOG_FILE), identity, node_id)?;
-        let host = Self::start_with(dir, store, log_store, node_id, config).await?;
-        let mut members = BTreeMap::new();
-        members.insert(
-            node_id,
-            BasicNode {
-                addr: addr.to_string(),
-            },
-        );
-        host.raft
-            .initialize(members)
-            .await
-            .map_err(|e| Status::internal(format!("raft initialize: {e}")))?;
-        host.raft
-            .wait(Some(std::time::Duration::from_secs(30)))
-            .state(openraft::ServerState::Leader, "bootstrap leader")
-            .await
-            .map_err(|e| Status::internal(format!("raft bootstrap: {e}")))?;
+        let host =
+            Self::start_with(dir, store, log_store, node_id, config, NoNetwork, None).await?;
+        host.initialize(addr).await?;
         Ok(host)
     }
 
@@ -213,15 +278,134 @@ impl RaftHost {
     ) -> Result<Self, Status> {
         let store = SourceAuthorityStore::open(&dir.join(STORE_FILE), identity)?;
         let log_store = RaftLogStore::open(&dir.join(LOG_FILE), identity, node_id)?;
-        Self::start_with(dir, store, log_store, node_id, config).await
+        Self::start_with(dir, store, log_store, node_id, config, NoNetwork, None).await
     }
 
-    async fn start_with(
+    /// Bootstrap a networked group of one voter: the first member, from
+    /// which every later member is seeded by snapshot.
+    #[cfg(feature = "tls")]
+    pub async fn bootstrap_cluster(
+        dir: &Path,
+        identity: &SourceAuthorityIdentity,
+        node_id: NodeId,
+        policy: &AccessPolicy,
+        limits: &SourceAuthorityLimits,
+        config: &HostConfig,
+        transport: ClusterTransport,
+    ) -> Result<Self, Status> {
+        let store = SourceAuthorityStore::create(&dir.join(STORE_FILE), identity, policy, limits)?;
+        let log_store = RaftLogStore::create(&dir.join(LOG_FILE), identity, node_id)?;
+        let host =
+            Self::start_networked(dir, identity, store, log_store, node_id, config, transport)
+                .await?;
+        let advertised = host.advertised_addr().expect("networked host").to_string();
+        host.initialize(&advertised).await?;
+        Ok(host)
+    }
+
+    /// Create the durable state of a member that will join by snapshot:
+    /// a store marked pending, on which no log entry applies until the
+    /// group's image replaces it, and an empty log. No host is started.
+    pub fn prepare_member(
+        dir: &Path,
+        identity: &SourceAuthorityIdentity,
+        node_id: NodeId,
+        policy: &AccessPolicy,
+        limits: &SourceAuthorityLimits,
+    ) -> Result<(), Status> {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| Status::internal(format!("member directory: {e}")))?;
+        SourceAuthorityStore::create_member(&dir.join(STORE_FILE), identity, policy, limits)?;
+        RaftLogStore::create(&dir.join(LOG_FILE), identity, node_id)?;
+        Ok(())
+    }
+
+    /// Start a networked member from existing durable state (a prepared
+    /// member, or any member restarting). Nothing is created.
+    #[cfg(feature = "tls")]
+    pub async fn start_member(
+        dir: &Path,
+        identity: &SourceAuthorityIdentity,
+        node_id: NodeId,
+        config: &HostConfig,
+        transport: ClusterTransport,
+    ) -> Result<Self, Status> {
+        let store = SourceAuthorityStore::open(&dir.join(STORE_FILE), identity)?;
+        let log_store = RaftLogStore::open(&dir.join(LOG_FILE), identity, node_id)?;
+        Self::start_networked(dir, identity, store, log_store, node_id, config, transport).await
+    }
+
+    #[cfg(feature = "tls")]
+    async fn start_networked(
+        dir: &Path,
+        identity: &SourceAuthorityIdentity,
+        store: SourceAuthorityStore,
+        log_store: RaftLogStore,
+        node_id: NodeId,
+        config: &HostConfig,
+        transport: ClusterTransport,
+    ) -> Result<Self, Status> {
+        transport.limits.validate(config.snapshot_chunk_bytes)?;
+        if transport.directory.group() != identity {
+            return Err(Status::invalid_argument(
+                "peer directory is for another group",
+            ));
+        }
+        if !transport.directory.knows(node_id) {
+            return Err(Status::failed_precondition(format!(
+                "peer directory does not register this node ({node_id}); its own certificate must be bound before it serves"
+            )));
+        }
+        let socket = tokio::net::TcpListener::bind(transport.listen)
+            .await
+            .map_err(|e| Status::unavailable(format!("raft listener {}: {e}", transport.listen)))?;
+        let addr = socket
+            .local_addr()
+            .map_err(|e| Status::internal(format!("raft listener address: {e}")))?;
+        let isolation = Isolation::default();
+        let factory = TonicNetworkFactory::new(
+            node_id,
+            Arc::clone(&transport.directory),
+            transport.client_tls,
+            transport.limits.clone(),
+            isolation.clone(),
+        );
+        let mut host =
+            Self::start_with(dir, store, log_store, node_id, config, factory, None).await?;
+        let service = RaftTransportService::new(
+            host.raft.clone(),
+            node_id,
+            Arc::clone(&transport.directory),
+            isolation.clone(),
+        );
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = tonic::transport::Server::builder()
+            .tls_config(transport.server_tls.server_config(true))
+            .map_err(|e| Status::internal(format!("raft listener TLS: {e}")))?
+            .add_service(service.into_server(&transport.limits))
+            .serve_with_incoming_shutdown(crate::harness::nodelay_incoming(socket), async {
+                let _ = stopped.await;
+            });
+        let task = tokio::spawn(server);
+        host.listener = Some(Listener {
+            addr,
+            advertised: transport.advertise.unwrap_or_else(|| addr.to_string()),
+            stop: Some(stop),
+            task,
+        });
+        host.directory = Some(transport.directory);
+        host.isolation = isolation;
+        Ok(host)
+    }
+
+    async fn start_with<N: RaftNetworkFactory<ControlRaft>>(
         dir: &Path,
         store: SourceAuthorityStore,
         log_store: RaftLogStore,
         node_id: NodeId,
         config: &HostConfig,
+        network: N,
+        listener: Option<Listener>,
     ) -> Result<Self, Status> {
         let machine =
             ControlStateMachine::new(store, &dir.join(SNAPSHOT_DIR), config.max_snapshot_bytes)?;
@@ -229,7 +413,7 @@ impl RaftHost {
         let raft = Raft::new(
             node_id,
             Self::raft_config(config)?,
-            NoNetwork,
+            network,
             log_store.clone(),
             machine,
         )
@@ -241,8 +425,34 @@ impl RaftHost {
             log_store,
             node_id,
             dir: dir.to_path_buf(),
-            lease: std::time::Duration::from_millis(config.admission_lease_ms),
+            lease: Duration::from_millis(config.admission_lease_ms),
+            read_timeout: config.read_timeout(),
+            listener,
+            #[cfg(feature = "tls")]
+            directory: None,
+            #[cfg(feature = "tls")]
+            isolation: Isolation::default(),
         })
+    }
+
+    async fn initialize(&self, addr: &str) -> Result<(), Status> {
+        let mut members = BTreeMap::new();
+        members.insert(
+            self.node_id,
+            BasicNode {
+                addr: addr.to_string(),
+            },
+        );
+        self.raft
+            .initialize(members)
+            .await
+            .map_err(|e| Status::internal(format!("raft initialize: {e}")))?;
+        self.raft
+            .wait(Some(Duration::from_secs(30)))
+            .state(openraft::ServerState::Leader, "bootstrap leader")
+            .await
+            .map_err(|e| Status::internal(format!("raft bootstrap: {e}")))?;
+        Ok(())
     }
 
     pub fn node_id(&self) -> NodeId {
@@ -251,6 +461,16 @@ impl RaftHost {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Where the transport listens, for a networked member.
+    pub fn listen_addr(&self) -> Option<std::net::SocketAddr> {
+        self.listener.as_ref().map(|l| l.addr)
+    }
+
+    /// The address peers dial, for a networked member.
+    pub fn advertised_addr(&self) -> Option<&str> {
+        self.listener.as_ref().map(|l| l.advertised.as_str())
     }
 
     /// Every entry the log holds, in index order: a read for audits.
@@ -265,7 +485,7 @@ impl RaftHost {
     /// Wait for a metrics condition (state, applied index, snapshot).
     pub fn wait(
         &self,
-        timeout: Option<std::time::Duration>,
+        timeout: Option<Duration>,
     ) -> openraft::metrics::Wait<NodeId, BasicNode, openraft::TokioRuntime> {
         self.raft.wait(timeout)
     }
@@ -275,19 +495,43 @@ impl RaftHost {
         Ok(self.store()?.raft_applied()?.and_then(|a| a.last_applied))
     }
 
+    /// Whether this member's store is still the prepared genesis image
+    /// waiting for the group's first snapshot.
+    pub fn awaiting_snapshot(&self) -> Result<bool, Status> {
+        self.store()?.awaiting_snapshot()
+    }
+
+    /// The leader this node currently believes in, if any: an applied
+    /// view, never an admission.
+    pub fn believed_leader(&self) -> Option<NodeId> {
+        self.raft.metrics().borrow().current_leader
+    }
+
     /// Run owner-side work under a leased admission: a linearizable read
     /// proves this node is the leader with a quorum now, and the lease is
     /// the bound under which that stays true. Past it the admission admits
     /// nothing, so an isolated former leader cannot admit work a surviving
-    /// quorum has revoked (docs/raft-admission.md).
+    /// quorum has revoked (docs/raft-admission.md). The read itself is
+    /// bounded: an isolated leader collects no quorum and refuses.
     pub async fn with_admission<T>(
         &self,
         principal: &str,
         run: impl FnOnce(&SourceAdmission<'_>) -> Result<T, Status>,
     ) -> Result<T, Status> {
-        self.raft.ensure_linearizable().await.map_err(|e| {
-            Status::unavailable(format!("admission needs a linearizable read: {e}"))
-        })?;
+        match tokio::time::timeout(self.read_timeout, self.raft.ensure_linearizable()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                return Err(Status::unavailable(format!(
+                    "admission needs a linearizable read: {e}"
+                )))
+            }
+            Err(_) => {
+                return Err(Status::unavailable(format!(
+                    "admission needs a linearizable read: no quorum acknowledged within {} ms",
+                    self.read_timeout.as_millis()
+                )))
+            }
+        }
         let granted = std::time::Instant::now();
         let store = self.store()?;
         let admission = store.leased_admission(principal, granted + self.lease)?;
@@ -304,6 +548,21 @@ impl RaftHost {
             .ok_or_else(|| Status::unavailable("store is being replaced by a snapshot install"))
     }
 
+    fn write_error<E: std::fmt::Display>(
+        error: RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>,
+        what: E,
+    ) -> Status {
+        match error {
+            RaftError::APIError(ClientWriteError::ForwardToLeader(forward)) => {
+                Status::unavailable(format!("not the leader; leader is {:?}", forward.leader_id))
+            }
+            RaftError::APIError(ClientWriteError::ChangeMembershipError(change)) => {
+                Status::failed_precondition(format!("{what}: {change}"))
+            }
+            other => Status::unavailable(format!("{what}: {other}")),
+        }
+    }
+
     /// Submit an admitted proposal and wait for its committed reply. Private:
     /// every public entry admits its command first.
     async fn propose(&self, proposal: RaftProposal) -> Result<RaftReply, Status> {
@@ -312,15 +571,7 @@ impl RaftHost {
             .raft
             .client_write(proposal)
             .await
-            .map_err(|error| match error {
-                RaftError::APIError(ClientWriteError::ForwardToLeader(forward)) => {
-                    Status::unavailable(format!(
-                        "not the leader; leader is {:?}",
-                        forward.leader_id
-                    ))
-                }
-                other => Status::unavailable(format!("raft proposal: {other}")),
-            })?;
+            .map_err(|error| Self::write_error(error, "raft proposal"))?;
         Ok(response.data)
     }
 
@@ -444,11 +695,173 @@ impl RaftHost {
             .map_err(|e| Status::internal(format!("raft snapshot trigger: {e}")))
     }
 
-    pub async fn shutdown(self) -> Result<(), Status> {
+    // -----------------------------------------------------------------
+    // Membership (docs/raft-hosting.md): learner, promotion, removal
+    // -----------------------------------------------------------------
+
+    /// Add a prepared member as a learner and wait until it is caught up.
+    /// Leader only. The member's certificate must be registered in this
+    /// node's directory. A snapshot is built and the log purged to it
+    /// first, so the learner is seeded by the verified image rather than
+    /// by replaying onto its own genesis.
+    #[cfg(feature = "tls")]
+    pub async fn add_learner(&self, node_id: NodeId, addr: &str) -> Result<(), Status> {
+        let directory = self.directory.as_ref().ok_or_else(|| {
+            Status::failed_precondition("membership changes need a networked member")
+        })?;
+        if !directory.knows(node_id) {
+            return Err(Status::failed_precondition(format!(
+                "node {node_id} has no registered certificate; bind it before it joins"
+            )));
+        }
+        if addr.is_empty() || addr.len() > 1024 {
+            return Err(Status::invalid_argument(
+                "member address must be 1..1024 bytes",
+            ));
+        }
+        self.seed_boundary().await?;
+        // The library's blocking mode returns once the learner is within
+        // its lag threshold; a member is caught up when it holds the
+        // membership entry that added it.
+        let added = self
+            .raft
+            .add_learner(
+                node_id,
+                BasicNode {
+                    addr: addr.to_string(),
+                },
+                false,
+            )
+            .await
+            .map_err(|e| Self::write_error(e, format!("add learner {node_id}")))?
+            .log_id;
         self.raft
+            .wait(Some(Duration::from_secs(60)))
+            .metrics(
+                |metrics| {
+                    metrics
+                        .replication
+                        .as_ref()
+                        .and_then(|replication| replication.get(&node_id).copied().flatten())
+                        .is_some_and(|matching| matching >= added)
+                },
+                "learner caught up",
+            )
+            .await
+            .map_err(|e| Status::unavailable(format!("learner {node_id} did not catch up: {e}")))?;
+        Ok(())
+    }
+
+    /// A snapshot at the current applied position with the log purged up
+    /// to it: the boundary every new member is seeded from.
+    async fn seed_boundary(&self) -> Result<(), Status> {
+        let metrics = self.raft.metrics().borrow().clone();
+        if metrics.state != openraft::ServerState::Leader {
+            return Err(Status::unavailable(format!(
+                "not the leader; leader is {:?}",
+                metrics.current_leader
+            )));
+        }
+        let applied = metrics
+            .last_applied
+            .ok_or_else(|| Status::failed_precondition("nothing is applied yet"))?;
+        if metrics.snapshot != Some(applied) {
+            self.trigger_snapshot().await?;
+            self.raft
+                .wait(Some(Duration::from_secs(60)))
+                .snapshot(applied, "seed snapshot")
+                .await
+                .map_err(|e| Status::unavailable(format!("seed snapshot: {e}")))?;
+        }
+        if metrics.purged != Some(applied) {
+            self.raft
+                .trigger()
+                .purge_log(applied.index)
+                .await
+                .map_err(|e| Status::internal(format!("purge log: {e}")))?;
+            self.raft
+                .wait(Some(Duration::from_secs(60)))
+                .purged(Some(applied), "seed purge")
+                .await
+                .map_err(|e| Status::unavailable(format!("seed purge: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Promote caught-up learners to voters through the library's joint
+    /// consensus. Leader only.
+    #[cfg(feature = "tls")]
+    pub async fn promote(&self, learners: BTreeSet<NodeId>) -> Result<(), Status> {
+        if learners.is_empty() {
+            return Err(Status::invalid_argument("no learners to promote"));
+        }
+        self.raft
+            .change_membership(ChangeMembers::AddVoterIds(learners), false)
+            .await
+            .map_err(|e| Self::write_error(e, "promote"))?;
+        Ok(())
+    }
+
+    /// Remove a member (voter or learner) from the group through joint
+    /// consensus. Leader only; a removed member's proposals and admissions
+    /// refuse from the committed change on.
+    #[cfg(feature = "tls")]
+    pub async fn remove_member(&self, node_id: NodeId) -> Result<(), Status> {
+        let membership = self.raft.metrics().borrow().membership_config.clone();
+        let voter = membership.membership().voter_ids().any(|id| id == node_id);
+        if voter {
+            self.raft
+                .change_membership(
+                    ChangeMembers::RemoveVoters(BTreeSet::from([node_id])),
+                    false,
+                )
+                .await
+                .map_err(|e| Self::write_error(e, format!("remove voter {node_id}")))?;
+        } else {
+            self.raft
+                .change_membership(ChangeMembers::RemoveNodes(BTreeSet::from([node_id])), false)
+                .await
+                .map_err(|e| Self::write_error(e, format!("remove learner {node_id}")))?;
+        }
+        Ok(())
+    }
+
+    /// Fault injection: refuse every RPC to and from these peers.
+    #[cfg(all(feature = "tls", any(test, feature = "fault-injection")))]
+    pub fn isolate(&self, peers: impl IntoIterator<Item = NodeId>) {
+        self.isolation.isolate(peers);
+    }
+
+    #[cfg(all(feature = "tls", any(test, feature = "fault-injection")))]
+    pub fn heal(&self) {
+        self.isolation.heal();
+    }
+
+    pub async fn shutdown(mut self) -> Result<(), Status> {
+        let stopped = self
+            .raft
             .shutdown()
             .await
-            .map_err(|e| Status::internal(format!("raft shutdown: {e}")))
+            .map_err(|e| Status::internal(format!("raft shutdown: {e}")));
+        if let Some(mut listener) = self.listener.take() {
+            if let Some(stop) = listener.stop.take() {
+                let _ = stop.send(());
+            }
+            match tokio::time::timeout(Duration::from_secs(10), &mut listener.task).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(e))) => {
+                    return Err(Status::internal(format!("raft listener: {e}")));
+                }
+                Ok(Err(e)) => return Err(Status::internal(format!("raft listener task: {e}"))),
+                Err(_) => {
+                    listener.task.abort();
+                    return Err(Status::internal(
+                        "raft listener did not stop within 10 s; aborted",
+                    ));
+                }
+            }
+        }
+        stopped
     }
 }
 

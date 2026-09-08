@@ -43,6 +43,11 @@ pub use map_feed::MapConsumer;
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("source_authority_meta");
 /// Meta key of the Raft applied position (docs/raft-hosting.md).
 pub(crate) const RAFT_META: &str = "raft";
+/// Present only in a store prepared for a member that has not received its
+/// first snapshot: log entries refuse to apply until the leader's image
+/// replaces the file, so a member never replays onto its own genesis.
+pub(crate) const MEMBER_META: &str = "member";
+const MEMBER_PENDING: &[u8] = b"awaiting-snapshot";
 const OWNERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("source_authority_owners");
 const DECISIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("source_authority_decisions");
 const WORKFLOWS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("source_authority_workflows");
@@ -590,6 +595,36 @@ impl SourceAuthorityStore {
         Ok(store)
     }
 
+    /// The store of a member that will be seeded by the group's snapshot:
+    /// a bootstrap image marked pending, on which no log entry applies
+    /// until the leader's image replaces it (docs/raft-hosting.md).
+    pub(crate) fn create_member(
+        path: &Path,
+        identity: &SourceAuthorityIdentity,
+        policy: &AccessPolicy,
+        limits: &SourceAuthorityLimits,
+    ) -> Result<Self, Status> {
+        let store = Self::create(path, identity, policy, limits)?;
+        let mut tx = store.inner.database.begin_write().map_err(storage)?;
+        tx.set_durability(Durability::Immediate).map_err(storage)?;
+        {
+            let mut meta = tx.open_table(META).map_err(storage)?;
+            meta.insert(MEMBER_META, MEMBER_PENDING).map_err(storage)?;
+        }
+        tx.commit().map_err(storage)?;
+        Ok(store)
+    }
+
+    /// Whether this store is a prepared member still waiting for the
+    /// group's first snapshot.
+    pub(crate) fn awaiting_snapshot(&self) -> Result<bool, Status> {
+        self.guarded(|| {
+            let tx = self.inner.database.begin_read().map_err(storage)?;
+            let meta = tx.open_table(META).map_err(storage)?;
+            Ok(meta.get(MEMBER_META).map_err(storage)?.is_some())
+        })
+    }
+
     /// Existing-state recovery only. An empty/missing/corrupt authority never
     /// initializes a fresh identity, policy or retry history.
     pub fn open(path: &Path, expected_identity: &SourceAuthorityIdentity) -> Result<Self, Status> {
@@ -1052,6 +1087,7 @@ impl SourceAuthorityStore {
     ) -> Result<(), Status> {
         match self.inner.raft_pending.lock().unwrap().as_ref() {
             Some(applied) => {
+                Self::refuse_unseeded(meta)?;
                 meta.insert(RAFT_META, applied.encode_to_vec().as_slice())
                     .map_err(storage)?;
                 Ok(())
@@ -1061,6 +1097,18 @@ impl SourceAuthorityStore {
             )),
             None => Ok(()),
         }
+    }
+
+    /// A prepared member applies nothing before the group's snapshot has
+    /// replaced its genesis image; replaying onto that image would diverge
+    /// from the group silently.
+    fn refuse_unseeded(meta: &redb::Table<&'static str, &'static [u8]>) -> Result<(), Status> {
+        if meta.get(MEMBER_META).map_err(storage)?.is_some() {
+            return Err(Status::failed_precondition(
+                "prepared member store awaits the group's first snapshot; log entries do not apply to its genesis image",
+            ));
+        }
+        Ok(())
     }
 
     /// An exact retry changes no application state; it commits only when a
@@ -1109,6 +1157,7 @@ impl SourceAuthorityStore {
             tx.set_durability(Durability::Immediate).map_err(storage)?;
             {
                 let mut meta = tx.open_table(META).map_err(storage)?;
+                Self::refuse_unseeded(&meta)?;
                 meta.insert(RAFT_META, applied.encode_to_vec().as_slice())
                     .map_err(storage)?;
             }
