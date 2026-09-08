@@ -7,7 +7,9 @@
 //! node-to-node WAL/snapshot paths; this module owns decisions, validated
 //! action completion, and complete topology publication.
 
+mod checkpoint;
 mod storage;
+pub use checkpoint::LegacyControlCheckpoint;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -63,6 +65,7 @@ enum StoredNodeState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct StoredCapacity {
     disk_bytes: u64,
     used_disk_bytes: u64,
@@ -118,6 +121,7 @@ impl From<&StoredCapacity> for NodeCapacity {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredNode {
     node_id: String,
     addr: String,
@@ -134,6 +138,7 @@ enum StoredRole {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredReplica {
     shard_id: String,
     node_id: String,
@@ -153,6 +158,7 @@ struct StoredReplica {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct StoredRoute {
     addr: String,
     replica: Option<String>,
@@ -161,12 +167,14 @@ struct StoredRoute {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredTopology {
     generation: u64,
     routes: Vec<StoredRoute>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredAction {
     action_id: u64,
     kind: i32,
@@ -193,6 +201,7 @@ struct ActionSpec<'a> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredState {
     format: u32,
     /// The collection this plane governs (docs/collections.md); empty in
@@ -205,10 +214,12 @@ struct StoredState {
     next_action: u64,
     topology: StoredTopology,
     history: Vec<StoredTopology>,
+    #[serde(deserialize_with = "checkpoint::unique_map")]
     nodes: BTreeMap<String, StoredNode>,
+    #[serde(deserialize_with = "checkpoint::unique_map")]
     replicas: BTreeMap<String, StoredReplica>,
     actions: Vec<StoredAction>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "checkpoint::unique_set")]
     completed_actions: BTreeSet<u64>,
 }
 
@@ -2418,6 +2429,9 @@ impl ClusterControl for ClusterControlService {
         .await
     }
 }
+
+#[cfg(test)]
+mod checkpoint_tests;
 
 #[cfg(test)]
 mod ownership_tests;

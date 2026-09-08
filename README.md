@@ -1237,6 +1237,15 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: typed legacy control checkpoint.** A bounded private
+  protobuf preserves full authority history, lease credentials, allocator and
+  retained retry IDs, with exact optional presence and explicit legacy provenance.
+  Unknown JSON/protobuf fields refuse instead of disappearing. See the
+  [checkpoint contract](docs/control-checkpoint.md); transactional import and
+  owner activation remain separate integration steps. Validation: 739 library
+  tests, 150 integration targets, embedded/mobile and descriptor compatibility
+  gates passed within 8 GiB, with swap and OOM counters zero.
+
 - **Foundation branch: exclusive control-store ownership.** The JSON authority
   keeps one persistent file lock across state replacements and every service
   clone. Recovery requires closing all prior holders; private temporary files

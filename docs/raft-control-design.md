@@ -312,6 +312,10 @@ learner membership remains an explicit operator action.
 
 ## Single-authority convergence boundary (2026-09-08)
 
+The [typed legacy checkpoint](control-checkpoint.md) now preserves the complete
+legacy state and captured runtime policy under explicit bounds. It is an import
+input, not a new authority or an activated source owner.
+
 The implemented source-owner store and the legacy topology adapter are still
 separate authorities. `SourceAuthorityStore::execute_locked` commits policy,
 owner/workflow state, revision and retry decisions in one redb transaction;

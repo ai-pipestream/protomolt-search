@@ -1,0 +1,104 @@
+syntax = "proto3";
+package ai.protomolt.search.storage.v1;
+
+import "ai/protomolt/search/v1/search.proto";
+
+// Privileged local migration input, never a public response or activation
+// credential. Contains lease secrets. Preserve every legacy JSON decision;
+// absent workspace, placement, ownership, geometry and policy history must be
+// supplied and verified separately by the transactional import workflow.
+message LegacyControlImport {
+  uint32 format_version = 1; // 1
+  LegacyControlState state = 2;
+  // Captured constructor policy, not proof of the policy used for old decisions.
+  LegacyControlPolicy policy = 3;
+}
+
+message LegacyControlPolicy {
+  uint64 lease_ms = 1;
+  uint64 replication_factor = 2;
+  uint64 split_rows = 3;
+  uint64 merge_rows = 4;
+  uint32 compact_segments = 5;
+  uint32 compact_tombstone_ppm = 6;
+  uint64 history_limit = 7;
+}
+
+message LegacyControlState {
+  uint32 format = 1; // legacy JSON format 1
+  string collection = 2;
+  uint64 revision = 3;
+  uint64 next_token = 4;
+  uint64 next_action = 5;
+  LegacyControlTopology topology = 6;
+  repeated LegacyControlTopology history = 7; // preserve order
+  repeated LegacyControlNodeEntry nodes = 8; // sorted unique keys
+  repeated LegacyControlReplicaEntry replicas = 9; // sorted unique keys
+  repeated LegacyControlAction actions = 10; // preserve order
+  // Retained legacy IDs only; no payload hashes/responses or evicted history.
+  repeated uint64 completed_actions = 11; // sorted unique IDs
+}
+
+message LegacyControlTopology {
+  uint64 generation = 1;
+  repeated LegacyControlRoute routes = 2; // preserve order, including history
+}
+
+message LegacyControlRoute {
+  string addr = 1;
+  optional string replica = 2; // absent and present-empty are different
+  uint64 hash_lo = 3;
+  uint64 hash_hi = 4;
+}
+
+message LegacyControlNodeEntry {
+  string key = 1; // must equal node.node_id
+  LegacyControlNode node = 2;
+}
+
+message LegacyControlNode {
+  string node_id = 1;
+  string addr = 2;
+  ai.protomolt.search.v1.ClusterNodeState state = 3;
+  uint64 lease_token = 4;
+  uint64 expires_unix_ms = 5;
+  ai.protomolt.search.v1.NodeCapacity capacity = 6;
+}
+
+message LegacyControlReplicaEntry {
+  string key = 1; // exact legacy shard_id + NUL + node_id key
+  LegacyControlReplica replica = 2;
+}
+
+message LegacyControlReplica {
+  string shard_id = 1;
+  string node_id = 2;
+  string addr = 3;
+  uint64 generation = 4;
+  uint64 hash_lo = 5;
+  uint64 hash_hi = 6;
+  uint64 slot_offset = 7;
+  uint64 rows = 8;
+  uint64 bytes = 9;
+  ai.protomolt.search.v1.ShardReplicaRole role = 10;
+  bool ready = 11;
+  string scoring_fingerprint = 12;
+  string analysis_fingerprint = 13;
+  uint32 immutable_segments = 14;
+  uint64 tombstones = 15;
+}
+
+message LegacyControlAction {
+  uint64 action_id = 1;
+  ai.protomolt.search.v1.PlacementActionKind kind = 2;
+  string shard_id = 3;
+  string peer_shard_id = 4;
+  uint64 peer_source_generation = 5;
+  string source_node_id = 6;
+  string target_node_id = 7;
+  uint64 source_generation = 8;
+  uint64 target_generation = 9;
+  uint64 hash_lo = 10;
+  uint64 hash_hi = 11;
+  string reason = 12;
+}
