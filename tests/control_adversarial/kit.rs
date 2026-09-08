@@ -1228,3 +1228,18 @@ pub fn sigkill_capacity_worker_body() {
     let payload = import_payload_placement(&retired);
     import_with_markers(&store, &authority, &retired, &payload, &dir, arm);
 }
+
+/// A Prepare action carrying the caller's catalog history id (the
+/// managed-catalog bridge binds the preparation to that history).
+pub fn prepare_action_history(workflow: &[u8], history_id: Vec<u8>) -> Action {
+    Action::Prepare(pipestream_search::pb::storage::PrepareSourceOwner {
+        workflow_id: workflow.to_vec(),
+        target: Some(SourceStorageTarget {
+            node_id: "server-a".into(),
+            storage_incarnation: vec![41; 16],
+            history_id,
+            residency: SourceResidency::Server as i32,
+            resident_device_id: String::new(),
+        }),
+    })
+}
