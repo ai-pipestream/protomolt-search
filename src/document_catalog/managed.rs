@@ -570,6 +570,13 @@ mod adapter {
             &self.activation
         }
 
+        /// Fault injection: pause the next write inside its source
+        /// transaction, just before its final admission check.
+        #[cfg(any(test, feature = "fault-injection"))]
+        pub fn arm_precommit_pause(&self, pause: std::time::Duration) {
+            self.inner.arm_precommit_pause(pause);
+        }
+
         pub fn binding(&self) -> &SourceManagedBinding {
             &self.binding
         }
@@ -598,15 +605,22 @@ mod adapter {
         }
 
         /// Accept one write under the admission: current Ingest for the actor
-        /// and the owner ACTIVE under this handle's epoch, held through the
-        /// source commit. Retries resolve from the actor-scoped record.
+        /// and the owner ACTIVE under this handle's epoch at entry, and the
+        /// admission still within its lease at the final check inside the
+        /// source transaction, immediately before commit. Between the two
+        /// checks the admission's shared guard keeps policy and ownership
+        /// from changing on this store; only time passes, and the final check
+        /// is where it is measured. Retries resolve from the actor-scoped
+        /// record.
         pub fn accept(
             &self,
             admission: &SourceAdmission<'_>,
             request: &crate::pb::AcceptDocumentRequest,
         ) -> Result<crate::pb::DocumentWriteReceipt, Status> {
             let decision = self.admit(admission, AccessAction::Ingest)?;
-            self.inner.accept_as(request, Some(&decision.principal))
+            let fence = || admission.check_fresh();
+            self.inner
+                .accept_as(request, Some(&decision.principal), Some(&fence))
         }
 
         /// The pinned local history for pinned writes, under Ingest admission.

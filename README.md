@@ -1250,6 +1250,17 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   destination store remains unchanged. See [retirement and crash recovery](docs/control-retirement.md);
   transactional import, worker fencing and activation remain separate steps.
 
+- **Foundation branch: admission lease repaired (Astra review A1/A2 of
+  240be9f).** The lease interval is anchored before the read barrier is
+  invoked, so it includes every response, catch-up and scheduling delay
+  and a grant whose interval already elapsed is refused; a leader
+  withholds its vote while an interval may be open (the pinned library
+  would grant it); every transport RPC presents the group's timing
+  agreement; a source write becomes authorized at its final admission
+  check inside the transaction, immediately before commit, with the
+  residual to durability named. Pause hooks for the harness on
+  `fault-injection`. See [admission under Raft](docs/raft-admission.md).
+
 - **Foundation branch: Raft transport and membership (feature `raft` +
   `tls`).** The library's vote, append and snapshot operations as typed
   RPCs over the cluster's mTLS channels; peer identity bound on both sides

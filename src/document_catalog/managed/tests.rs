@@ -479,7 +479,7 @@ fn binding_preserves_history_actor_retry_and_closes_every_source_writer() {
     };
     let error = managed
         .inner
-        .accept_as(&fresh_write, Some("alice"))
+        .accept_as(&fresh_write, Some("alice"), None)
         .unwrap_err();
     assert_eq!(error.code(), Code::FailedPrecondition);
     assert!(error.message().contains("managed"), "{error}");
@@ -583,7 +583,7 @@ fn binding_preserves_history_actor_retry_and_closes_every_source_writer() {
     assert_managed_records(&reopened, 1);
     let error = reopened
         .inner
-        .accept_as(&fresh_write, Some("alice"))
+        .accept_as(&fresh_write, Some("alice"), None)
         .unwrap_err();
     assert_eq!(error.code(), Code::FailedPrecondition);
     assert!(error.message().contains("managed"), "{error}");
@@ -1608,4 +1608,58 @@ fn abrupt_activation_exit_recovers_format_nine_or_the_activated_source() {
         );
         active_records(&active, 2);
     }
+}
+
+/// A write admitted under a lease and paused inside its source transaction
+/// past the lease is refused at its final check, before the commit: no
+/// durable change and no retry record (docs/raft-admission.md, "Source
+/// write boundary").
+#[test]
+fn a_write_paused_before_commit_past_its_lease_leaves_no_durable_change() {
+    let fixture = fixture("paused-write", false);
+    let identity = authority_identity(7);
+    let (fixture, managed) = ready(fixture);
+    assert_eq!(
+        fixture
+            .authority
+            .execute("alice", &activate_command(&identity, 3))
+            .unwrap()
+            .code,
+        0
+    );
+    let active = {
+        let admission = fixture.authority.admission("alice").unwrap();
+        managed.activate(&admission).unwrap()
+    };
+    let lease = crate::source_authority::AdmissionLease {
+        anchor: std::time::Instant::now(),
+        anchor_wall: std::time::SystemTime::now(),
+        ttl: std::time::Duration::from_millis(40),
+    };
+    let admission = fixture.authority.leased_admission("alice", lease).unwrap();
+    // Entry admits; the write then waits past the lease before its commit.
+    active.arm_precommit_pause(std::time::Duration::from_millis(80));
+    let error = active.accept(&admission, &second_write()).unwrap_err();
+    assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
+    assert!(error.message().contains("lease expired"), "{error}");
+    drop(admission);
+    // Nothing became durable and no retry record exists: a fresh admission
+    // accepts the same request as new work at the next sequence.
+    let admission = fixture.authority.admission("alice").unwrap();
+    let receipt = active.accept(&admission, &second_write()).unwrap();
+    assert!(!receipt.replayed);
+    assert_eq!(receipt.accepted_sequence, 2);
+    // A pause that ends within the lease commits; the final check is where
+    // the interval is measured.
+    let lease = crate::source_authority::AdmissionLease {
+        anchor: std::time::Instant::now(),
+        anchor_wall: std::time::SystemTime::now(),
+        ttl: std::time::Duration::from_millis(500),
+    };
+    let leased = fixture.authority.leased_admission("alice", lease).unwrap();
+    active.arm_precommit_pause(std::time::Duration::from_millis(20));
+    let mut third = second_write();
+    third.document_key = b"document-three".to_vec();
+    third.operation_id = b"accept-three".to_vec();
+    assert_eq!(active.accept(&leased, &third).unwrap().accepted_sequence, 3);
 }

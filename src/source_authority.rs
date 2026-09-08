@@ -128,13 +128,55 @@ impl std::fmt::Debug for SourceAuthorityStore {
 /// source commit it admits; never acquire a second one, pin a permit, or run
 /// a control command while holding it — an exclusive waiter would then block
 /// the second acquisition behind this one.
+/// The validity interval of a Raft-hosted admission (docs/raft-admission.md).
+/// `anchor` is taken before the host's read barrier is invoked, so it is at
+/// or before the instant the barrier's heartbeats were sent; every follower
+/// that acknowledged them refreshed its own leader lease at a later instant,
+/// and none grants a vote before that instant plus the election ceiling.
+/// The interval therefore includes every response, catch-up and scheduling
+/// delay between the barrier and the grant. The wall-clock anchor catches a
+/// suspend the monotonic clock does not count.
+#[derive(Clone, Copy, Debug)]
+pub struct AdmissionLease {
+    pub anchor: std::time::Instant,
+    pub anchor_wall: std::time::SystemTime,
+    pub ttl: std::time::Duration,
+}
+
+impl AdmissionLease {
+    pub fn deadline(&self) -> std::time::Instant {
+        self.anchor + self.ttl
+    }
+
+    /// Expired on the monotonic clock, expired on the wall clock (a
+    /// suspended process or machine), or a wall clock that moved backwards:
+    /// each is a named refusal, never an extension.
+    pub fn fresh(&self) -> Result<(), Status> {
+        if std::time::Instant::now() >= self.deadline() {
+            return Err(Status::failed_precondition(
+                "admission lease expired; obtain a fresh admission through the host",
+            ));
+        }
+        match std::time::SystemTime::now().duration_since(self.anchor_wall) {
+            Ok(elapsed) if elapsed < self.ttl => Ok(()),
+            Ok(_) => Err(Status::failed_precondition(
+                "admission lease expired on the wall clock (the process or machine was suspended); obtain a fresh admission through the host",
+            )),
+            Err(_) => Err(Status::failed_precondition(
+                "wall clock moved backwards under an admission lease; obtain a fresh admission through the host",
+            )),
+        }
+    }
+}
+
 #[must_use = "dropping the admission releases the fence"]
 pub struct SourceAdmission<'a> {
     store: &'a SourceAuthorityStore,
     principal: String,
     // A Raft-hosted admission is a lease: the host granted it after a
-    // linearizable read and it admits nothing past this instant.
-    deadline: Option<std::time::Instant>,
+    // linearizable read anchored before the barrier, and it admits nothing
+    // past the anchor plus the lease.
+    lease: Option<AdmissionLease>,
     _shared: RwLockReadGuard<'a, ()>,
 }
 
@@ -143,22 +185,29 @@ impl SourceAdmission<'_> {
         &self.store.inner.identity
     }
 
-    /// A leased admission past its deadline admits nothing; the lease is
+    /// A leased admission past its interval admits nothing; the lease is
     /// what keeps admission authoritative under leader isolation
     /// (docs/raft-admission.md).
     fn fresh(&self) -> Result<(), Status> {
-        match self.deadline {
-            Some(deadline) if std::time::Instant::now() >= deadline => {
-                Err(Status::failed_precondition(
-                    "admission lease expired; obtain a fresh admission through the host",
-                ))
-            }
-            _ => Ok(()),
+        match &self.lease {
+            Some(lease) => lease.fresh(),
+            None => Ok(()),
         }
     }
 
+    /// The final check a source write performs inside its own transaction,
+    /// immediately before commit: the boundary at which the write becomes
+    /// authorized (docs/raft-admission.md, "Source write boundary").
+    pub fn check_fresh(&self) -> Result<(), Status> {
+        self.fresh()
+    }
+
+    pub fn lease(&self) -> Option<&AdmissionLease> {
+        self.lease.as_ref()
+    }
+
     pub fn expires_at(&self) -> Option<std::time::Instant> {
-        self.deadline
+        self.lease.as_ref().map(AdmissionLease::deadline)
     }
 
     pub fn principal(&self) -> &str {
@@ -427,19 +476,26 @@ impl SourceAuthorityStore {
     }
 
     /// A leased admission granted by the Raft host after a linearizable
-    /// read; it admits nothing past `deadline`.
+    /// read; it admits nothing past the lease's interval, and is not
+    /// granted at all when that interval has already elapsed.
     pub(crate) fn leased_admission(
         &self,
         principal: &str,
-        deadline: std::time::Instant,
+        lease: AdmissionLease,
     ) -> Result<SourceAdmission<'_>, Status> {
-        self.admission_with(principal, Some(deadline))
+        lease.fresh().map_err(|e| {
+            Status::failed_precondition(format!(
+                "admission interval elapsed before the grant: {}",
+                e.message()
+            ))
+        })?;
+        self.admission_with(principal, Some(lease))
     }
 
     fn admission_with(
         &self,
         principal: &str,
-        deadline: Option<std::time::Instant>,
+        lease: Option<AdmissionLease>,
     ) -> Result<SourceAdmission<'_>, Status> {
         contract::principal(principal)?;
         let shared = self
@@ -450,7 +506,7 @@ impl SourceAuthorityStore {
         Ok(SourceAdmission {
             store: self,
             principal: principal.to_string(),
-            deadline,
+            lease,
             _shared: shared,
         })
     }

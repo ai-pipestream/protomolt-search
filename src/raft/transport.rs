@@ -165,6 +165,11 @@ impl TransportLimits {
     }
 }
 
+pub use super::host::LeaseHold;
+
+/// The metadata key that carries the timing agreement on every RPC.
+pub const TIMING_METADATA: &str = "protomolt-raft-timing";
+
 /// A fault-injection switch: peers this node refuses to speak to or hear
 /// from. Empty outside tests and the `fault-injection` feature.
 #[derive(Clone, Default)]
@@ -202,6 +207,8 @@ pub struct RaftTransportService {
     node_id: NodeId,
     directory: Arc<PeerDirectory>,
     isolation: Isolation,
+    timing: String,
+    hold: LeaseHold,
 }
 
 impl RaftTransportService {
@@ -210,12 +217,16 @@ impl RaftTransportService {
         node_id: NodeId,
         directory: Arc<PeerDirectory>,
         isolation: Isolation,
+        timing: String,
+        hold: LeaseHold,
     ) -> Self {
         Self {
             raft,
             node_id,
             directory,
             isolation,
+            timing,
+            hold,
         }
     }
 
@@ -277,6 +288,17 @@ impl RaftTransportService {
                 "node {registered} is isolated from this node (fault injection)"
             )));
         }
+        let timing = request.metadata().get(TIMING_METADATA).ok_or_else(|| {
+            Status::failed_precondition(
+                "raft rpc carries no timing agreement; the peer runs another build",
+            )
+        })?;
+        if timing.as_bytes() != self.timing.as_bytes() {
+            return Err(Status::failed_precondition(format!(
+                "peer timing configuration {:?} differs from this node's {}; election and lease values must agree across the group",
+                timing, self.timing
+            )));
+        }
         Ok(registered)
     }
 
@@ -318,9 +340,28 @@ impl RaftTransport for RaftTransportService {
     ) -> Result<Response<RaftVoteResponse>, Status> {
         let from = self.authenticate(&request, request.get_ref().header.as_ref())?;
         let rpc = vote_request_from_proto(request.into_inner())?;
-        let response = match self.raft.vote(rpc).await {
-            Ok(response) => response,
-            Err(error) => return Err(core_stopped(error)),
+        // A leader with an admission interval possibly open withholds its
+        // vote; the library would grant it (see `LeaseHold`).
+        let held = {
+            let metrics = self.raft.metrics().borrow().clone();
+            if metrics.state == openraft::ServerState::Leader
+                && self.hold.holds(std::time::Instant::now())
+            {
+                Some(metrics.vote)
+            } else {
+                None
+            }
+        };
+        let response = match held {
+            Some(vote) => VoteResponse {
+                vote,
+                vote_granted: false,
+                last_log_id: None,
+            },
+            None => match self.raft.vote(rpc).await {
+                Ok(response) => response,
+                Err(error) => return Err(core_stopped(error)),
+            },
         };
         Ok(Response::new(vote_response_to_proto(
             self.header(from),
@@ -560,6 +601,7 @@ struct Shared {
     client_tls: ClientTls,
     limits: TransportLimits,
     isolation: Isolation,
+    timing: tonic::metadata::MetadataValue<tonic::metadata::Ascii>,
 }
 
 /// Builds one `TonicNetwork` per target for the library.
@@ -575,6 +617,7 @@ impl TonicNetworkFactory {
         client_tls: ClientTls,
         limits: TransportLimits,
         isolation: Isolation,
+        timing: String,
     ) -> Self {
         Self {
             shared: Arc::new(Shared {
@@ -583,6 +626,9 @@ impl TonicNetworkFactory {
                 client_tls,
                 limits,
                 isolation,
+                timing: timing
+                    .parse()
+                    .expect("timing agreement is ASCII digits and punctuation"),
             }),
         }
     }
@@ -666,6 +712,9 @@ impl TonicNetwork {
     fn request<T>(&self, message: T, option: &RPCOption) -> Request<T> {
         let mut request = Request::new(message);
         request.set_timeout(option.hard_ttl());
+        request
+            .metadata_mut()
+            .insert(TIMING_METADATA, self.shared.timing.clone());
         request
     }
 

@@ -12,7 +12,7 @@ use crate::pb::storage::{
     SourceAuthorityLimits,
 };
 use crate::pb::AccessPolicy;
-use crate::source_authority::SourceAdmission;
+use crate::source_authority::{AdmissionLease, SourceAdmission};
 use crate::source_authority::{SourceAuthorityStore, VerifiedOwnerCompletion};
 use openraft::error::{ClientWriteError, RaftError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
@@ -188,6 +188,83 @@ impl HostConfig {
     fn read_timeout(&self) -> Duration {
         Duration::from_millis(self.election_timeout_max_ms)
     }
+
+    /// The timing values the lease argument depends on, as every peer must
+    /// hold them; the transport refuses a peer whose values differ.
+    pub fn timing_agreement(&self) -> String {
+        format!(
+            "v1:heartbeat={}:election={}-{}:lease={}:skew={}",
+            self.heartbeat_interval_ms,
+            self.election_timeout_min_ms,
+            self.election_timeout_max_ms,
+            self.admission_lease_ms,
+            self.clock_skew_ms
+        )
+    }
+}
+
+/// While an admission interval anchored at a read barrier may still be
+/// open, this node withholds its vote from every candidate: the pinned
+/// library refreshes a leader's own vote timer only when its vote changes,
+/// so an established leader would otherwise grant a vote to an up-to-date
+/// candidate at once, and a vote quorum could then avoid every follower
+/// that acknowledged the barrier (docs/raft-admission.md).
+#[derive(Clone)]
+pub struct LeaseHold {
+    anchor: Arc<std::sync::RwLock<Option<std::time::Instant>>>,
+    window: Duration,
+}
+
+impl LeaseHold {
+    pub(crate) fn new(window: Duration) -> Self {
+        Self {
+            anchor: Arc::new(std::sync::RwLock::new(None)),
+            window,
+        }
+    }
+
+    pub(crate) fn extend(&self, anchor: std::time::Instant) {
+        let mut held = self.anchor.write().unwrap_or_else(|e| e.into_inner());
+        if held.is_none_or(|current| anchor > current) {
+            *held = Some(anchor);
+        }
+    }
+
+    /// Whether an interval anchored at the latest barrier is still open.
+    pub(crate) fn holds(&self, now: std::time::Instant) -> bool {
+        self.anchor
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|anchor| now < anchor + self.window)
+    }
+}
+
+/// A test and fault-injection hook: the next `with_admission` pauses after
+/// its read barrier and before its grant until `release`.
+#[cfg(any(test, feature = "fault-injection"))]
+pub struct GrantGate {
+    reached: tokio::sync::watch::Sender<bool>,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+impl GrantGate {
+    fn new() -> Self {
+        Self {
+            reached: tokio::sync::watch::Sender::new(false),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Resolves once an admission has passed its barrier and is paused.
+    pub async fn reached(&self) {
+        let mut receiver = self.reached.subscribe();
+        let _ = receiver.wait_for(|reached| *reached).await;
+    }
+
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
 }
 
 /// The transport material of a networked member (docs/raft-hosting.md).
@@ -222,11 +299,17 @@ pub struct RaftHost {
     dir: PathBuf,
     lease: Duration,
     read_timeout: Duration,
+    /// The anchor of the latest barrier that granted an admission; the
+    /// transport withholds this node's vote while an interval that started
+    /// there may still be open.
+    hold: LeaseHold,
     listener: Option<Listener>,
     #[cfg(feature = "tls")]
     directory: Option<Arc<PeerDirectory>>,
     #[cfg(feature = "tls")]
     isolation: Isolation,
+    #[cfg(any(test, feature = "fault-injection"))]
+    grant_gate: std::sync::Mutex<Option<Arc<GrantGate>>>,
 }
 
 impl RaftHost {
@@ -363,12 +446,14 @@ impl RaftHost {
             .local_addr()
             .map_err(|e| Status::internal(format!("raft listener address: {e}")))?;
         let isolation = Isolation::default();
+        let timing = config.timing_agreement();
         let factory = TonicNetworkFactory::new(
             node_id,
             Arc::clone(&transport.directory),
             transport.client_tls,
             transport.limits.clone(),
             isolation.clone(),
+            timing.clone(),
         );
         let mut host =
             Self::start_with(dir, store, log_store, node_id, config, factory, None).await?;
@@ -377,6 +462,8 @@ impl RaftHost {
             node_id,
             Arc::clone(&transport.directory),
             isolation.clone(),
+            timing,
+            host.hold.clone(),
         );
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let server = tonic::transport::Server::builder()
@@ -427,11 +514,14 @@ impl RaftHost {
             dir: dir.to_path_buf(),
             lease: Duration::from_millis(config.admission_lease_ms),
             read_timeout: config.read_timeout(),
+            hold: LeaseHold::new(Duration::from_millis(config.election_timeout_max_ms)),
             listener,
             #[cfg(feature = "tls")]
             directory: None,
             #[cfg(feature = "tls")]
             isolation: Isolation::default(),
+            #[cfg(any(test, feature = "fault-injection"))]
+            grant_gate: std::sync::Mutex::new(None),
         })
     }
 
@@ -507,17 +597,25 @@ impl RaftHost {
         self.raft.metrics().borrow().current_leader
     }
 
-    /// Run owner-side work under a leased admission: a linearizable read
-    /// proves this node is the leader with a quorum now, and the lease is
-    /// the bound under which that stays true. Past it the admission admits
-    /// nothing, so an isolated former leader cannot admit work a surviving
-    /// quorum has revoked (docs/raft-admission.md). The read itself is
+    /// Run owner-side work under a leased admission (docs/raft-admission.md).
+    /// The lease is anchored before the read barrier is invoked: the
+    /// barrier's heartbeats are sent after that instant, every follower
+    /// that acknowledges them refreshes its own leader lease later still,
+    /// and none of them grants a vote before that plus the election
+    /// ceiling. The interval therefore includes every response, catch-up
+    /// and scheduling delay between the barrier and the grant, and a grant
+    /// whose interval has already elapsed is refused. The read itself is
     /// bounded: an isolated leader collects no quorum and refuses.
     pub async fn with_admission<T>(
         &self,
         principal: &str,
         run: impl FnOnce(&SourceAdmission<'_>) -> Result<T, Status>,
     ) -> Result<T, Status> {
+        let lease = AdmissionLease {
+            anchor: std::time::Instant::now(),
+            anchor_wall: std::time::SystemTime::now(),
+            ttl: self.lease,
+        };
         match tokio::time::timeout(self.read_timeout, self.raft.ensure_linearizable()).await {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => {
@@ -532,10 +630,26 @@ impl RaftHost {
                 )))
             }
         }
-        let granted = std::time::Instant::now();
+        self.hold.extend(lease.anchor);
+        #[cfg(any(test, feature = "fault-injection"))]
+        {
+            let gate = self.grant_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.reached.send_replace(true);
+                gate.release.notified().await;
+            }
+        }
         let store = self.store()?;
-        let admission = store.leased_admission(principal, granted + self.lease)?;
+        let admission = store.leased_admission(principal, lease)?;
         run(&admission)
+    }
+
+    /// Arm a pause between the next admission's read barrier and its grant.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn arm_grant_gate(&self) -> Arc<GrantGate> {
+        let gate = Arc::new(GrantGate::new());
+        *self.grant_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        gate
     }
 
     /// The current store handle, for reads (maps, snapshots, decisions).

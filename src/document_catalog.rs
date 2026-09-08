@@ -131,6 +131,10 @@ pub struct DocumentCatalog {
     // the same open file description exclusively for this catalog's lifetime.
     // Drop the database before releasing this guard.
     _file_lock: Option<File>,
+    // Fault injection: a pause inside the write transaction, after every
+    // wait and before the write's final admission check.
+    #[cfg(any(test, feature = "fault-injection"))]
+    precommit_pause: std::sync::Mutex<Option<std::time::Duration>>,
 }
 
 impl DocumentCatalog {
@@ -266,6 +270,8 @@ impl DocumentCatalog {
             managed_binding,
             managed_activation,
             _file_lock: Some(file),
+            #[cfg(any(test, feature = "fault-injection"))]
+            precommit_pause: std::sync::Mutex::new(None),
         };
         catalog.initialize(collection, new)?;
         catalog.validate_projection_journal()?;
@@ -286,6 +292,8 @@ impl DocumentCatalog {
             managed_binding: None,
             managed_activation: None,
             _file_lock: None,
+            #[cfg(any(test, feature = "fault-injection"))]
+            precommit_pause: std::sync::Mutex::new(None),
         };
         catalog.initialize(collection, true)?;
         Ok(catalog)
@@ -451,13 +459,26 @@ impl DocumentCatalog {
     /// before the version precondition or retirement fence, including after
     /// later writes, deletion or sealing. A replay does not mutate the catalog.
     pub fn accept(&self, request: &AcceptDocumentRequest) -> Result<DocumentWriteReceipt, Status> {
-        self.accept_as(request, None)
+        self.accept_as(request, None, None)
     }
 
+    /// Pause the next write inside its transaction, after the writer lock
+    /// and every table write, just before its final admission check.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn arm_precommit_pause(&self, pause: std::time::Duration) {
+        *self.precommit_pause.lock().unwrap() = Some(pause);
+    }
+
+    /// `fence` is the write's final admission check, run inside the
+    /// transaction after every wait and write and immediately before the
+    /// commit: the boundary at which the write becomes authorized
+    /// (docs/raft-admission.md, "Source write boundary"). A fence that
+    /// refuses leaves no durable change and no retry record.
     fn accept_as(
         &self,
         request: &AcceptDocumentRequest,
         principal: Option<&str>,
+        fence: Option<&dyn Fn() -> Result<(), Status>>,
     ) -> Result<DocumentWriteReceipt, Status> {
         let operation_key = actors::OperationKey::new(principal, &request.operation_id)?;
         match request.contract_version {
@@ -628,6 +649,13 @@ impl DocumentCatalog {
             .map_err(storage)?
             .insert("header", header.encode_to_vec().as_slice())
             .map_err(storage)?;
+        #[cfg(any(test, feature = "fault-injection"))]
+        if let Some(pause) = self.precommit_pause.lock().unwrap().take() {
+            std::thread::sleep(pause);
+        }
+        if let Some(fence) = fence {
+            fence()?;
+        }
         transaction.commit().map_err(storage)?;
         Ok(receipt)
     }

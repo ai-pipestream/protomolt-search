@@ -918,16 +918,37 @@ async fn a_hosted_store_refuses_direct_mutation_and_local_admission() {
     })
     .await
     .unwrap();
-    let expired = store
-        .leased_admission("alice", std::time::Instant::now())
-        .unwrap();
-    let error = expired
+    // An interval that elapsed before the grant is not granted at all; one
+    // that elapses while held admits nothing from then on.
+    let elapsed = crate::source_authority::AdmissionLease {
+        anchor: std::time::Instant::now() - std::time::Duration::from_millis(200),
+        anchor_wall: std::time::SystemTime::now() - std::time::Duration::from_millis(200),
+        ttl: std::time::Duration::from_millis(100),
+    };
+    let error = match store.leased_admission("alice", elapsed) {
+        Ok(_) => panic!("an elapsed interval was granted"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert!(
+        error.message().contains("elapsed before the grant"),
+        "{error}"
+    );
+    let short = crate::source_authority::AdmissionLease {
+        anchor: std::time::Instant::now(),
+        anchor_wall: std::time::SystemTime::now(),
+        ttl: std::time::Duration::from_millis(30),
+    };
+    let expiring = store.leased_admission("alice", short).unwrap();
+    expiring.authorize("books", AccessAction::Admin).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    let error = expiring
         .authorize("books", AccessAction::Admin)
         .err()
         .unwrap();
     assert_eq!(error.code(), Code::FailedPrecondition);
     assert!(error.message().contains("lease expired"), "{error}");
-    drop(expired);
+    drop(expiring);
     drop(store);
     host.shutdown().await.unwrap();
 }

@@ -119,7 +119,7 @@ impl AccessControlledCatalog {
     ) -> Result<DocumentWriteReceipt, Status> {
         let guard = authorize(&self.binding, permit, AccessAction::Ingest)?;
         self.inner
-            .accept_as(request, Some(&guard.decision().principal))
+            .accept_as(request, Some(&guard.decision().principal), None)
     }
 
     /// Attribute one legacy retry decision without changing its receipt or source.
