@@ -78,6 +78,18 @@ pub enum ModelCommand {
     Abort {
         workflow: Vec<u8>,
     },
+    /// Administrative recovery: abort-only, admissible by ANY current Admin
+    /// (docs/control-import.md, "Administrative recovery").
+    Recover {
+        workflow: Vec<u8>,
+    },
+    /// Owner activation through `execute`
+    /// (docs/source-owner-admission.md, "Activation: the committed fence").
+    /// From tests only the refusal paths are reachable: READY requires the
+    /// pub(crate) readiness proof, so the model never holds a READY owner.
+    Activate {
+        workflow: Vec<u8>,
+    },
 }
 
 impl ModelCommand {
@@ -91,6 +103,7 @@ impl ModelCommand {
                 | ModelCommand::Chunk { .. }
                 | ModelCommand::Commit { .. }
                 | ModelCommand::Abort { .. }
+                | ModelCommand::Recover { .. }
         )
     }
 }
@@ -544,6 +557,50 @@ impl Model {
                     .staging = None;
                 self.control_revision += 1;
                 self.record(op, 0)
+            }
+            ModelCommand::Recover { workflow } => {
+                // Administrative recovery (docs/control-import.md,
+                // "Administrative recovery"): "any current Admin of the
+                // resource may terminate a staging workflow into phase
+                // RECOVERED under the same revision CAS and actor-scoped
+                // retry rules". Unlike stage/commit/abort there is NO
+                // initiator check — the recovery actor need not be the
+                // initiating principal. A concurrent Commit and Recover
+                // "serialize ...: exactly one becomes the terminal decision,
+                // the other is a recorded refusal" — AMBIGUOUS: the doc
+                // names no code; FailedPrecondition (the implementation's
+                // "import workflow is already terminal"). An unknown
+                // workflow is NotFound, as for the other steps.
+                let Some(import) = self.imports.get(workflow) else {
+                    return self.record(op, Code::NotFound as u32); // AMBIGUOUS, as Chunk.
+                };
+                if import.staging.is_none() {
+                    return self.record(op, Code::FailedPrecondition as u32);
+                }
+                // The row keeps its initiating principal and its charged
+                // history; the workflow id stays spent; no import applies.
+                let import = self.imports.get_mut(workflow).expect("checked above");
+                import.staging = None;
+                self.control_revision += 1;
+                self.record(op, 0)
+            }
+            ModelCommand::Activate { .. } => {
+                // docs/source-owner-admission.md, "Activation: the committed
+                // fence": activation "follows READY"; a missing owner is most
+                // naturally NotFound (AMBIGUOUS, as Cancel). Activating a
+                // non-READY owner or one of another workflow is a recorded
+                // refusal — the doc names no code; AMBIGUOUS:
+                // FailedPrecondition (the implementation agrees,
+                // transition.rs: "activation requires the READY owner of the
+                // current workflow"). The success branch records
+                // SourceOwnerActivation { write_epoch = ownership_generation,
+                // activated_control_revision }; it is unreachable here
+                // because READY requires the pub(crate) readiness proof and
+                // this model can only hold PREPARED or CANCELLED owners.
+                if !self.owners.contains_key(&op.owner_id) {
+                    return self.record(op, Code::NotFound as u32);
+                }
+                self.record(op, Code::FailedPrecondition as u32)
             }
         }
     }

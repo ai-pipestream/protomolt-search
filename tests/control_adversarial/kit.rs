@@ -30,12 +30,13 @@ use pipestream_search::pb::storage::legacy_control_import_supplement::{
 };
 use pipestream_search::pb::storage::source_authority_command::Action;
 use pipestream_search::pb::storage::{
-    AbortControlImport, BeginControlImport, CommitControlImport, ConfirmSourceOwnerReady,
-    ControlCollectionSnapshot, ControlImportChunk, ControlImportCommand, ControlImportPayload,
-    ControlImportReceipt, ControlPlannerPolicy, ControlProviderGeometry,
-    LegacyControlImportSupplement, LegacyControlRetirementRequest, LogicalSourceOwner,
-    ReplaceSourceCollectionGrants, SourceAuthorityCommand, SourceAuthorityIdentity,
-    SourceAuthorityLimits, SourceOwnerCompletion, SourceResidency, SourceStorageTarget,
+    AbortControlImport, ActivateSourceOwner, BeginControlImport, CancelPreparedSourceOwner,
+    CommitControlImport, ConfirmSourceOwnerReady, ControlCollectionSnapshot, ControlImportChunk,
+    ControlImportCommand, ControlImportPayload, ControlImportReceipt, ControlPlannerPolicy,
+    ControlProviderGeometry, LegacyControlImportSupplement, LegacyControlRetirementRequest,
+    LogicalSourceOwner, RecoverControlImport, ReplaceSourceCollectionGrants,
+    SourceAuthorityCommand, SourceAuthorityIdentity, SourceAuthorityLimits, SourceOwnerCompletion,
+    SourceResidency, SourceStorageTarget,
 };
 use pipestream_search::pb::{AccessAction, AccessPolicy, CollectionGrant, CollectionResource};
 use pipestream_search::sha256;
@@ -306,13 +307,26 @@ pub fn import_command(
     workflow: &[u8],
     action: ImportAction,
 ) -> ControlImportCommand {
+    import_command_policy(authority, id, control_revision, 1, workflow, action)
+}
+
+/// The import-command builder with an explicit expected policy revision
+/// (the fixed-suite [`import_command`] pins 1, the bootstrap revision).
+pub fn import_command_policy(
+    authority: &SourceAuthorityIdentity,
+    id: &str,
+    control_revision: u64,
+    policy_revision: u64,
+    workflow: &[u8],
+    action: ImportAction,
+) -> ControlImportCommand {
     ControlImportCommand {
         format_version: 1,
         authority: Some(authority.clone()),
         key: Some(key()),
         command_id: id.as_bytes().to_vec(),
         expected_control_revision: control_revision,
-        expected_policy_revision: 1,
+        expected_policy_revision: policy_revision,
         workflow_id: workflow.to_vec(),
         action: Some(action),
     }
@@ -350,6 +364,12 @@ pub fn commit_action() -> ImportAction {
 
 pub fn abort_action() -> ImportAction {
     ImportAction::Abort(AbortControlImport {})
+}
+
+/// Administrative recovery: any current Admin may terminate a staging
+/// workflow (docs/control-import.md, "Administrative recovery").
+pub fn recover_action() -> ImportAction {
+    ImportAction::Recover(RecoverControlImport {})
 }
 
 /// Begin at control revision 1, stage every chunk, commit; returns the receipt.
@@ -452,6 +472,21 @@ pub fn prepare_action(workflow: &[u8]) -> Action {
 
 pub fn replace_grants_action(grants: Vec<CollectionGrant>) -> Action {
     Action::ReplaceGrants(ReplaceSourceCollectionGrants { grants })
+}
+
+pub fn cancel_action(workflow: &[u8]) -> Action {
+    Action::Cancel(CancelPreparedSourceOwner {
+        workflow_id: workflow.to_vec(),
+    })
+}
+
+/// Activation of a prepared owner (docs/source-owner-admission.md,
+/// "Activation: the committed fence"); from tests only the refusal paths
+/// are reachable, since READY requires the pub(crate) readiness proof.
+pub fn activate_action(workflow: &[u8]) -> Action {
+    Action::Activate(ActivateSourceOwner {
+        workflow_id: workflow.to_vec(),
+    })
 }
 
 /// A syntactically complete ConfirmReady action; the general `execute` path

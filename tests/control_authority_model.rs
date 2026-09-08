@@ -19,8 +19,7 @@ use control_adversarial::rng::XorShift64;
 use pipestream_search::pb::storage::control_import_command::Action as ImportAction;
 use pipestream_search::pb::storage::source_authority_command::Action;
 use pipestream_search::pb::storage::{
-    CancelPreparedSourceOwner, ControlImportChunk, ControlImportCommand, LogicalSourceOwner,
-    SourceAuthorityCommand,
+    ControlImportChunk, ControlImportCommand, LogicalSourceOwner, SourceAuthorityCommand,
 };
 use pipestream_search::source_authority::chunk_digest;
 use prost::Message;
@@ -83,6 +82,9 @@ fn model_op_for_source(actor: &str, cmd: &SourceAuthorityCommand) -> ModelOp {
         Action::Cancel(request) => ModelCommand::Cancel {
             workflow: request.workflow_id,
         },
+        Action::Activate(request) => ModelCommand::Activate {
+            workflow: request.workflow_id,
+        },
         Action::ReplaceGrants(grants) => ModelCommand::ReplaceGrants {
             admins: grants.grants.iter().map(|g| g.principal.clone()).collect(),
         },
@@ -115,6 +117,9 @@ fn model_op_for_import(actor: &str, cmd: &ControlImportCommand) -> ModelOp {
             workflow: cmd.workflow_id.clone(),
         },
         ImportAction::Abort(_) => ModelCommand::Abort {
+            workflow: cmd.workflow_id.clone(),
+        },
+        ImportAction::Recover(_) => ModelCommand::Recover {
             workflow: cmd.workflow_id.clone(),
         },
     };
@@ -256,8 +261,8 @@ fn gen_fresh(
 
     let roll = rng.below(100);
     match roll {
-        // Prepare: 15%
-        0..=14 => {
+        // Prepare: 12%
+        0..=11 => {
             let owner = &OWNER_IDS[rng.below(OWNER_IDS.len() as u64) as usize];
             let wf = WORKFLOW_POOL[rng.below(WORKFLOW_POOL.len() as u64) as usize].to_vec();
             let generation = model.owner_generation(owner);
@@ -287,8 +292,8 @@ fn gen_fresh(
                 ),
             }
         }
-        // ReplaceGrants: 15%
-        15..=29 => {
+        // ReplaceGrants: 13%
+        12..=24 => {
             let mut set: Vec<String> = model.admins();
             if rng.chance(40) {
                 toggle(&mut set, "mallory");
@@ -324,8 +329,8 @@ fn gen_fresh(
                 ),
             }
         }
-        // Begin: 10%
-        30..=39 => {
+        // Begin: 8%
+        25..=32 => {
             let wf = import_wf(rng, model, plausible);
             let cmd = kit::import_command(
                 authority,
@@ -345,8 +350,8 @@ fn gen_fresh(
                 ),
             }
         }
-        // Cancel: 15%
-        40..=54 => {
+        // Cancel: 12%
+        33..=44 => {
             let owner = &OWNER_IDS[rng.below(OWNER_IDS.len() as u64) as usize];
             let wf = if plausible {
                 match model.owner_view(owner) {
@@ -369,9 +374,7 @@ fn gen_fresh(
                 ecr,
                 epr,
                 eg,
-                Action::Cancel(CancelPreparedSourceOwner {
-                    workflow_id: wf.clone(),
-                }),
+                kit::cancel_action(&wf),
             );
             let op = model_op_for_source(&actor, &cmd);
             Generated {
@@ -385,8 +388,48 @@ fn gen_fresh(
                 ),
             }
         }
-        // Chunk: 20%
-        55..=74 => {
+        // Activate: 8%. From tests only the refusal paths are reachable
+        // (READY needs the pub(crate) readiness proof); plausible rolls
+        // target a prepared owner with its own workflow.
+        45..=52 => {
+            let owner = &OWNER_IDS[rng.below(OWNER_IDS.len() as u64) as usize];
+            let wf = if plausible {
+                match model.owner_view(owner) {
+                    Some((_, wf, true)) => wf,
+                    _ => WORKFLOW_POOL[rng.below(WORKFLOW_POOL.len() as u64) as usize].to_vec(),
+                }
+            } else {
+                WORKFLOW_POOL[rng.below(WORKFLOW_POOL.len() as u64) as usize].to_vec()
+            };
+            let generation = model.owner_generation(owner);
+            let eg = if plausible {
+                generation
+            } else {
+                off_by_one(generation)
+            };
+            let cmd = kit::source_command(
+                authority,
+                &owner_key(owner),
+                &id,
+                ecr,
+                epr,
+                eg,
+                kit::activate_action(&wf),
+            );
+            let op = model_op_for_source(&actor, &cmd);
+            Generated {
+                actor,
+                cmd: IssuedCmd::Source(cmd),
+                op,
+                desc: format!(
+                    "activate owner={} wf={} ecr={ecr} epr={epr} plausible={plausible}",
+                    String::from_utf8_lossy(owner),
+                    String::from_utf8_lossy(&wf),
+                ),
+            }
+        }
+        // Chunk: 18%
+        53..=70 => {
             let wf = import_wf(rng, model, plausible);
             let ordinal = rng.below(CHUNK_COUNT as u64) as u32;
             let start = ordinal as usize * chunk_bytes as usize;
@@ -417,8 +460,8 @@ fn gen_fresh(
                 ),
             }
         }
-        // Commit: 12%
-        75..=86 => {
+        // Commit: 10%
+        71..=80 => {
             let wf = import_wf(rng, model, plausible);
             let cmd = kit::import_command(authority, &id, ecr, &wf, kit::commit_action());
             let op = model_op_for_import(&actor, &cmd);
@@ -432,7 +475,27 @@ fn gen_fresh(
                 ),
             }
         }
-        // Abort: 13%
+        // Recover: 10%. Carries a plausible policy revision (unlike the other
+        // import steps, which pin the bootstrap revision) so the recovery
+        // transition itself is exercised after grants change. Any current
+        // Admin may recover; the actor pick above already includes
+        // non-initiator admins and mallory.
+        81..=90 => {
+            let wf = import_wf(rng, model, plausible);
+            let cmd =
+                kit::import_command_policy(authority, &id, ecr, epr, &wf, kit::recover_action());
+            let op = model_op_for_import(&actor, &cmd);
+            Generated {
+                actor,
+                cmd: IssuedCmd::Import(cmd),
+                op,
+                desc: format!(
+                    "import-recover wf={} ecr={ecr} epr={epr} plausible={plausible}",
+                    String::from_utf8_lossy(&wf),
+                ),
+            }
+        }
+        // Abort: 9%
         _ => {
             let wf = import_wf(rng, model, plausible);
             let cmd = kit::import_command(authority, &id, ecr, &wf, kit::abort_action());
@@ -491,6 +554,7 @@ fn gen_retry(rng: &mut XorShift64, issued: &[Generated]) -> Generated {
                 match c.action.as_mut() {
                     Some(Action::Prepare(request)) => request.workflow_id.push(b'!'),
                     Some(Action::Cancel(request)) => request.workflow_id.push(b'!'),
+                    Some(Action::Activate(request)) => request.workflow_id.push(b'!'),
                     _ => c.expected_policy_revision = off_by_one(c.expected_policy_revision),
                 }
             }
