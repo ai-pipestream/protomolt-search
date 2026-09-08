@@ -1,167 +1,496 @@
-//! Capacity-planner integration leg (slice 2b;
+//! Capacity-planner integration leg (slice 3b;
 //! `docs/control-authority-test-harness.md`).
 //!
-//! Maps real imported `ControlCollectionSnapshot`s to the capacity planner's
-//! public `TierSnapshotInput` and pins the plan digest across chunk replay
-//! order, store reopen, observation ingest permutation, and SIGKILL recovery
-//! at a chunk boundary. Also pins the observation store's resource binding:
-//! a report of any other resource or topology generation is refused, never
-//! silently matched by shard and leaf.
+//! Everything the planner sees here comes from the real persisted adapter:
+//! `SourceAuthorityStore::planner_input`, fed by `configure_capacity` and
+//! `capacity_transition` (Register/Report/Expire) on top of a legacy control
+//! plane that registered its nodes and shard replicas through the public
+//! `ClusterControl` routes before retirement. The plan digest is pinned
+//! across chunk staging order, store reopen, observation identity refusals,
+//! idempotent transitions, expiry, supersession, and SIGKILL recovery at a
+//! chunk boundary.
 
 mod control_adversarial;
 
 use std::time::Duration;
 
 use control_adversarial::kit;
-use pipestream_search::capacity_tiers::{plan_tiers, IngestOutcome, TierSnapshot};
-use pipestream_search::pb::storage::{ControlCollectionSnapshot, LegacyControlRetirementRequest};
+use pipestream_search::capacity_tiers::{plan_tiers, TierSnapshot};
+use pipestream_search::pb::storage::{CapacityTransitionOutcome, LegacyControlRetirementRequest};
+use pipestream_search::pb::AccessAction;
+use pipestream_search::sha256;
 use prost::Message;
+use tonic::Code;
 
 const MARKER_TIMEOUT: Duration = Duration::from_secs(60);
+const T: u64 = kit::PLANNING_INSTANT_UNIX_MS;
+const COHORT: u64 = kit::CAPACITY_COHORT_MS;
 
-/// Derive the capacity plan digest from a committed snapshot: build the
-/// harness committed view and observations, map the snapshot to the planner
-/// input, validate, and plan.
-fn plan_digest_of(snapshot: &ControlCollectionSnapshot) -> [u8; 32] {
-    let view = kit::planner_committed_view(snapshot);
-    let observations = kit::feed_reports(&view, false);
-    let input = kit::planner_input(snapshot, &view, &observations);
-    let planned = TierSnapshot::validated(input).expect("harness planner input must validate");
-    plan_tiers(&planned)
-        .expect("plan_tiers must accept the harness input")
-        .plan_digest
+/// The adapter binds the input to the authority identity, the committed
+/// control and policy revisions, the resource, the topology generation and
+/// the observation epoch; reopening the store recomputes every one of them
+/// identically and the plan digest does not move.
+#[test]
+fn adapter_input_and_plan_digest_stable_across_reopen() {
+    let fixture = kit::adapter_fixture("adapter-reopen");
+    let before = kit::planner_view(&fixture.store, T);
+    assert!(before.0.contains("control_revision: 7"), "{}", before.0);
+    assert!(before.0.contains("policy_revision: 1"), "{}", before.0);
+    assert!(before.0.contains("observation_epoch: 2"), "{}", before.0);
+    assert!(
+        before
+            .0
+            .contains(&format!("topology_generation: {}", fixture.generation)),
+        "{}",
+        before.0
+    );
+
+    let snapshot_before = fixture
+        .store
+        .control_snapshot("alice", &kit::key())
+        .unwrap();
+    let kit::AdapterFixture {
+        dir,
+        authority,
+        store,
+        ..
+    } = fixture;
+    drop(store);
+    let reopened = kit::open_store(&dir, &authority);
+    let snapshot_after = reopened.control_snapshot("alice", &kit::key()).unwrap();
+    assert_eq!(
+        snapshot_before.digest, snapshot_after.digest,
+        "reopen changed the committed snapshot digest"
+    );
+    let after = kit::planner_view(&reopened, T);
+    assert_eq!(after, before, "reopen changed the adapter's plan view");
+    eprintln!(
+        "adapter reopen: plan digest {} stable",
+        sha256::to_hex(&after.1)
+    );
 }
 
-/// Full Begin -> three Chunks -> Commit on a fresh 2-route legacy plane;
-/// `reverse` stages the chunk ordinals in reverse order (the protocol keys
-/// chunks by ordinal and accepts any staging order). Returns the plan digest
-/// and the committed snapshot.
-fn import_and_plan(dir: &kit::TestDir, reverse: bool) -> ([u8; 32], ControlCollectionSnapshot) {
-    let (store, authority) = kit::create_store(dir);
-    let legacy = kit::legacy_plane(dir, 2);
-    let (retired, _request) = kit::retire(&store, &legacy, 1);
-    let payload = kit::import_payload(&retired);
-    let (chunk_bytes, chunk_count) = kit::plan_three_chunks(payload.len());
-    let begin = store
-        .begin_control_import(
+/// Forward and reverse chunk staging produce byte-identical adapter inputs
+/// and plan digests: the protocol keys chunks by ordinal, and every
+/// authority-derived field — nodes, replicas, placement codes — comes from
+/// the committed import, not from the staging order.
+#[test]
+fn adapter_plan_digest_stable_across_chunk_permutation() {
+    let forward = kit::adapter_fixture_staged("adapter-perm-fwd", false);
+    let reverse = kit::adapter_fixture_staged("adapter-perm-rev", true);
+    let forward_view = kit::planner_view(&forward.store, T);
+    let reverse_view = kit::planner_view(&reverse.store, T);
+    assert_eq!(
+        forward_view, reverse_view,
+        "reverse chunk staging changed the adapter's plan view"
+    );
+    eprintln!(
+        "adapter chunk permutation: plan digest {} stable",
+        sha256::to_hex(&forward_view.1)
+    );
+}
+
+/// Transitions are idempotent by content and scoped to the observation
+/// epoch: an exact report retry is UNCHANGED, a re-registration repeats the
+/// same receipt, a repeat expiry drops nothing, and no transition ever moves
+/// the control revision. A report whose leaf the committed shard does not
+/// cover refuses with the identity error and stores nothing.
+#[test]
+fn adapter_transitions_are_idempotent_and_epoch_scoped() {
+    let fixture = kit::adapter_fixture("adapter-idempotent");
+    let store = &fixture.store;
+    let authority = &fixture.authority;
+    let generation = fixture.generation;
+    let input = store
+        .planner_input("alice", &kit::key(), &kit::planning_context(T, generation))
+        .unwrap();
+    assert_eq!(input.control_revision, 7);
+
+    // Exact retry of the scanned report: UNCHANGED, epoch still 2.
+    let again = store
+        .capacity_transition(
             "alice",
-            &kit::import_command(
-                &authority,
-                "begin",
-                1,
-                kit::WORKFLOW,
-                kit::begin_action(&retired, &payload, chunk_bytes, chunk_count),
+            &kit::report_transition(
+                authority,
+                kit::scanned_observation(kit::NODE_A, kit::INC_A, generation),
             ),
-            &retired,
         )
         .unwrap();
-    assert_eq!(begin.code, 0, "{}", begin.message);
-    let ordinals: Vec<u32> = if reverse {
-        (0..chunk_count).rev().collect()
-    } else {
-        (0..chunk_count).collect()
-    };
-    let mut revision = 2u64;
-    for ordinal in ordinals {
-        let decision = store
-            .execute_control_import(
+    assert_eq!(again.outcome, CapacityTransitionOutcome::Unchanged as i32);
+    assert_eq!(again.observation_epoch, 2);
+    assert_eq!(again.control_revision, 7);
+
+    // Re-registration of the same incarnation repeats the same receipt.
+    let first = store
+        .capacity_transition(
+            "alice",
+            &kit::register_transition(authority, kit::NODE_A, kit::INC_A),
+        )
+        .unwrap();
+    let second = store
+        .capacity_transition(
+            "alice",
+            &kit::register_transition(authority, kit::NODE_A, kit::INC_A),
+        )
+        .unwrap();
+    assert_eq!(first, second);
+    assert_eq!(second.observation_epoch, 2);
+
+    // A repeat expiry with a wide horizon drops nothing and moves nothing.
+    let repeat = store
+        .capacity_transition(
+            "alice",
+            &kit::expire_transition(authority, T + 2 * COHORT, 10 * COHORT),
+        )
+        .unwrap();
+    assert_eq!(repeat.dropped, 0);
+    assert_eq!(repeat.observation_epoch, 2);
+
+    // The control revision is still 7: transitions never move it.
+    let input = store
+        .planner_input("alice", &kit::key(), &kit::planning_context(T, generation))
+        .unwrap();
+    assert_eq!(input.control_revision, 7);
+    assert_eq!(input.policy_revision, 1);
+
+    // A report whose leaf the committed shard does not cover refuses with
+    // the identity error; nothing is stored and the epoch does not move.
+    let mut foreign_leaf = kit::scanned_observation(kit::NODE_A, kit::INC_A, generation);
+    foreign_leaf.leaf = "elsewhere".into();
+    let error = store
+        .capacity_transition("alice", &kit::report_transition(authority, foreign_leaf))
+        .err()
+        .unwrap();
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert!(
+        error.message().contains("covers no rows in leaf"),
+        "{}",
+        error.message()
+    );
+    assert_eq!(
+        store
+            .capacity_state("alice", &kit::key())
+            .unwrap()
+            .observation_epoch,
+        2
+    );
+    eprintln!("adapter transitions: idempotent by content, epoch-scoped, revision-static");
+}
+
+/// The plan digest binds the access-policy revision and the tier policy: a
+/// ReplaceGrants command that advances the policy revision moves the digest,
+/// a reconfigure with different tier thresholds (same cohort) moves it
+/// again, a cohort shift while observations are retained refuses as a
+/// recorded FailedPrecondition decision without moving anything, and a
+/// reopen reproduces the final view exactly.
+#[test]
+fn adapter_plan_digest_moves_with_policy_and_tier_changes() {
+    let fixture = kit::adapter_fixture("adapter-digest-moves");
+    let store = &fixture.store;
+    let authority = &fixture.authority;
+    let base = kit::planner_view(store, T);
+
+    // (a) An access-policy change advances the revision the plan binds.
+    let mut alice = kit::grant("alice", kit::COLLECTION);
+    alice.actions.push(AccessAction::Search as i32);
+    let decision = store
+        .execute(
+            "alice",
+            &kit::source_command(
+                authority,
+                &kit::key(),
+                "grants",
+                7,
+                1,
+                0,
+                kit::replace_grants_action(vec![alice, kit::grant("bob", kit::COLLECTION)]),
+            ),
+        )
+        .unwrap();
+    assert_eq!(decision.code, 0, "{}", decision.message);
+    let after_grants = kit::planner_view(store, T);
+    assert_ne!(
+        after_grants.1, base.1,
+        "policy revision did not move the digest"
+    );
+    assert!(
+        after_grants.0.contains("policy_revision: 2"),
+        "{}",
+        after_grants.0
+    );
+
+    // (b) A tier-policy change is a retained control command too; same
+    // cohort, different thresholds.
+    let decision = store
+        .configure_capacity(
+            "alice",
+            &kit::configure_command(
+                authority,
+                "cfg-2",
+                8,
+                2,
+                kit::capacity_configuration(100_000_000_000),
+            ),
+        )
+        .unwrap();
+    assert_eq!(decision.code, 0, "{}", decision.message);
+    let after_policy = kit::planner_view(store, T);
+    assert_ne!(
+        after_policy.1, after_grants.1,
+        "tier thresholds did not move the digest"
+    );
+    assert!(
+        after_policy.0.contains("observation_epoch: 2"),
+        "the reconfigure touched the observations: {}",
+        after_policy.0
+    );
+
+    // (c) A cohort shift with observations retained refuses as a recorded
+    // decision and moves nothing.
+    let mut shifted = kit::capacity_configuration(100_000_000_000);
+    shifted.cohort_phase_unix_ms = 5;
+    let refused = store
+        .configure_capacity(
+            "alice",
+            &kit::configure_command(authority, "cfg-3", 9, 2, shifted),
+        )
+        .unwrap();
+    assert_eq!(
+        refused.code,
+        Code::FailedPrecondition as u32,
+        "{}",
+        refused.message
+    );
+    let after_refusal = kit::planner_view(store, T);
+    assert_eq!(
+        after_refusal, after_policy,
+        "the refused cohort shift moved the plan view"
+    );
+
+    // Reopen reproduces the final view exactly.
+    let kit::AdapterFixture {
+        dir,
+        authority,
+        store,
+        ..
+    } = fixture;
+    drop(store);
+    let reopened = kit::open_store(&dir, &authority);
+    assert_eq!(
+        kit::planner_view(&reopened, T),
+        after_policy,
+        "reopen changed the plan view"
+    );
+    eprintln!("adapter digest moves: policy revision and tier thresholds bound, refusal inert");
+}
+
+/// Expiry through the Expire transition drops aged rows identically across
+/// twin stores: `now - window_end` strictly greater than `max_age` expires,
+/// the epoch moves once, a repeat expiry is a no-op, and planning the
+/// evicted leaves refuses loudly instead of planning from memory.
+#[test]
+fn adapter_expiry_is_deterministic_and_epoch_scoped() {
+    let run = |name: &str| {
+        let fixture = kit::adapter_fixture(name);
+        let store = &fixture.store;
+        let generation = fixture.generation;
+        let before = kit::planner_view(store, T);
+        let expired = store
+            .capacity_transition(
                 "alice",
-                &kit::import_command(
-                    &authority,
-                    &format!("chunk-{ordinal}"),
-                    revision,
-                    kit::WORKFLOW,
-                    kit::chunk_action(&payload, chunk_bytes, ordinal),
+                &kit::expire_transition(&fixture.authority, T + 2 * COHORT, COHORT),
+            )
+            .unwrap();
+        assert_eq!(expired.dropped, 2, "both reports are one cohort old");
+        assert_eq!(expired.observation_epoch, 3);
+        let repeat = store
+            .capacity_transition(
+                "alice",
+                &kit::expire_transition(&fixture.authority, T + 2 * COHORT, COHORT),
+            )
+            .unwrap();
+        assert_eq!(repeat.dropped, 0, "a repeat expiry must drop nothing");
+        assert_eq!(repeat.observation_epoch, 3);
+
+        let state = store.capacity_state("alice", &kit::key()).unwrap();
+        assert_eq!(
+            (
+                state.reporter_count,
+                state.observation_count,
+                state.observation_epoch
+            ),
+            (2, 0, 3)
+        );
+        let input = store
+            .planner_input("alice", &kit::key(), &kit::planning_context(T, generation))
+            .unwrap();
+        assert!(
+            input.observations.is_empty(),
+            "expired observations are still visible to the adapter"
+        );
+        let snapshot = TierSnapshot::validated(input).expect("adapter input must validate");
+        let error = plan_tiers(&snapshot).expect_err("the evicted leaves must not plan");
+        assert!(error.contains("no current observation"), "{error}");
+        (before, expired, snapshot.plan_digest())
+    };
+    let first = run("adapter-expiry-a");
+    let second = run("adapter-expiry-b");
+    assert_eq!(first, second, "identical twin stores expired differently");
+    eprintln!("adapter expiry: dropped 2, epoch 3, repeat inert, twins identical, plan refuses");
+}
+
+/// A restarted reporter supersedes its old incarnation through the Register
+/// transition: the old process's rows drop in the same committed transition,
+/// its late report is refused naming the new incarnation, the new process
+/// reports with the committed storage incarnation and lands, and twin stores
+/// taken through the sequence end with equal receipts and equal plan views.
+#[test]
+fn adapter_supersession_drops_old_incarnation_and_is_deterministic() {
+    const NEW_INC: u8 = 0x0d;
+    let run = |name: &str| {
+        let fixture = kit::adapter_fixture(name);
+        let store = &fixture.store;
+        let generation = fixture.generation;
+        let before = kit::planner_view(store, T);
+        let restarted = store
+            .capacity_transition(
+                "alice",
+                &kit::register_transition(&fixture.authority, kit::NODE_A, NEW_INC),
+            )
+            .unwrap();
+        assert_eq!(restarted.dropped, 1);
+        assert_eq!(restarted.observation_epoch, 3);
+
+        // The old process's late report is refused, never matched.
+        let late = kit::report_transition(
+            &fixture.authority,
+            kit::scanned_observation(kit::NODE_A, kit::INC_A, generation),
+        );
+        let error = store.capacity_transition("alice", &late).err().unwrap();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(
+            error.message().contains("is superseded by"),
+            "{}",
+            error.message()
+        );
+
+        // The new process reports and lands.
+        let landed = store
+            .capacity_transition(
+                "alice",
+                &kit::report_transition(
+                    &fixture.authority,
+                    kit::scanned_observation(kit::NODE_A, NEW_INC, generation),
                 ),
             )
             .unwrap();
-        assert_eq!(decision.code, 0, "chunk {ordinal}: {}", decision.message);
-        revision += 1;
-    }
-    let commit = store
-        .execute_control_import(
-            "alice",
-            &kit::import_command(
-                &authority,
-                "commit",
-                revision,
-                kit::WORKFLOW,
-                kit::commit_action(),
-            ),
-        )
-        .unwrap();
-    assert_eq!(commit.code, 0, "{}", commit.message);
-    let snapshot = store.control_snapshot("alice", &kit::key()).unwrap();
-    let digest = plan_digest_of(&snapshot);
-    (digest, snapshot)
-}
-
-/// The committed snapshot digest and the derived plan digest are identical
-/// for forward and reverse chunk staging, identical after a store reopen,
-/// and identical when the same observations are ingested in reverse order.
-#[test]
-fn plan_digest_stable_across_replay_reopen_and_permutation() {
-    let dir_a = kit::TestDir::new("planner-replay-a");
-    let (digest_a, snapshot_a) = import_and_plan(&dir_a, false);
-    let dir_b = kit::TestDir::new("planner-replay-b");
-    let (digest_b, _snapshot_b) = import_and_plan(&dir_b, true);
-    assert_eq!(
-        digest_a, digest_b,
-        "reverse chunk staging changed the plan digest"
-    );
-
-    // Reopen the committed store and re-derive the planner input from the
-    // reopened snapshot.
-    let authority = kit::identity(kit::SEED);
-    let reopened = kit::open_store(&dir_a, &authority);
-    let snapshot_reopened = reopened.control_snapshot("alice", &kit::key()).unwrap();
-    assert_eq!(
-        snapshot_a.digest, snapshot_reopened.digest,
-        "reopen changed the committed snapshot digest"
-    );
-    let digest_reopened = plan_digest_of(&snapshot_reopened);
-    assert_eq!(digest_a, digest_reopened, "reopen changed the plan digest");
-
-    // Same reports, opposite ingest order: the stored set and its digest are
-    // canonical, and the plan digest must not move.
-    let view = kit::planner_committed_view(&snapshot_a);
-    let forward = kit::feed_reports(&view, false);
-    let reversed = kit::feed_reports(&view, true);
-    assert_eq!(
-        forward.observation_set_digest(),
-        reversed.observation_set_digest(),
-        "ingest order changed the observation set digest"
-    );
-    let input = kit::planner_input(&snapshot_a, &view, &reversed);
-    let planned = TierSnapshot::validated(input).expect("harness planner input must validate");
-    let permuted = plan_tiers(&planned)
-        .expect("plan_tiers must accept the harness input")
-        .plan_digest;
-    assert_eq!(
-        digest_a, permuted,
-        "observation ingest permutation changed the plan digest"
+        assert_eq!(landed.outcome, CapacityTransitionOutcome::Landed as i32);
+        assert_eq!(landed.observation_epoch, 4);
+        (before, restarted, landed, kit::planner_view(store, T))
+    };
+    let first = run("adapter-supersession-a");
+    let second = run("adapter-supersession-b");
+    assert_eq!(first, second, "identical supersession sequences diverged");
+    assert_ne!(
+        (first.0).1,
+        (first.3).1,
+        "supersession and the replacement report did not move the plan view"
     );
     eprintln!(
-        "planner replay/reopen/permutation: plan digest {} stable",
-        pipestream_search::sha256::to_hex(&digest_a)
+        "adapter supersession: old incarnation dropped and refused, replacement landed, twins equal"
     );
 }
 
-/// Kill the import worker with SIGKILL right after its first staged chunk
-/// (marker 2), recover the import through the public API, and pin the plan
-/// digest to the no-crash baseline.
+/// The adapter serves one committed resource: a report of another
+/// collection or another topology generation refuses with the identity
+/// error, never silently matched by shard and leaf; the committed-matching
+/// twin lands.
+#[test]
+fn adapter_refuses_reports_outside_the_committed_resource() {
+    let fixture = kit::adapter_fixture("adapter-resource-binding");
+    let store = &fixture.store;
+    let authority = &fixture.authority;
+    let generation = fixture.generation;
+
+    // Another resource is refused even though the shard, leaf and node all
+    // exist in the committed view: identity is resource equality first.
+    let mut wrong_resource = kit::scanned_observation(kit::NODE_A, kit::INC_A, generation);
+    wrong_resource.partition.as_mut().unwrap().collection = "other-books".into();
+    let error = store
+        .capacity_transition("alice", &kit::report_transition(authority, wrong_resource))
+        .err()
+        .unwrap();
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert!(
+        error.message().contains("is not this resource"),
+        "{}",
+        error.message()
+    );
+
+    // A report ahead of the committed topology generation refuses in the
+    // same committed transition path.
+    let mut wrong_generation = kit::scanned_observation(kit::NODE_A, kit::INC_A, generation);
+    wrong_generation.topology_generation = generation + 1;
+    let error = store
+        .capacity_transition(
+            "alice",
+            &kit::report_transition(authority, wrong_generation),
+        )
+        .err()
+        .unwrap();
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert!(
+        error.message().contains("topology_generation"),
+        "{}",
+        error.message()
+    );
+
+    // Nothing was stored; a corrected report for the next cohort window
+    // lands and advances the epoch.
+    assert_eq!(
+        store
+            .capacity_state("alice", &kit::key())
+            .unwrap()
+            .observation_epoch,
+        2
+    );
+    let mut next_window = kit::scanned_observation(kit::NODE_A, kit::INC_A, generation);
+    next_window.window_start_unix_ms = T;
+    next_window.window_end_unix_ms = T + COHORT;
+    next_window.last_scanned_unix_ms = T + 100;
+    let landed = store
+        .capacity_transition("alice", &kit::report_transition(authority, next_window))
+        .unwrap();
+    assert_eq!(
+        landed.outcome,
+        CapacityTransitionOutcome::Landed as i32,
+        "the corrected report did not land"
+    );
+    assert_eq!(landed.observation_epoch, 3);
+    eprintln!(
+        "adapter resource binding: foreign resource and generation refused, corrected twin landed"
+    );
+}
+
+/// Kill the capacity worker with SIGKILL right after its first staged chunk
+/// (marker 2), recover the import through the public API, run the capacity
+/// steps deterministically, and pin the adapter's plan view to the no-crash
+/// baseline. The baseline and the recovered store are different directories
+/// registered at different wall-clock times; the comparison is the plan
+/// view, because node eligibility is judged at the fixed planning instant,
+/// not against the wall clock.
 #[test]
 fn plan_digest_stable_across_sigkill_recovery() {
-    let baseline_dir = kit::TestDir::new("planner-sigkill-baseline");
-    let (baseline_digest, _baseline) = import_and_plan(&baseline_dir, false);
+    let baseline = kit::adapter_fixture("adapter-sigkill-baseline");
+    let baseline_view = kit::planner_view(&baseline.store, T);
     eprintln!(
-        "planner sigkill baseline: digest {}",
-        pipestream_search::sha256::to_hex(&baseline_digest)
+        "adapter sigkill baseline: plan digest {}",
+        sha256::to_hex(&baseline_view.1)
     );
 
-    let dir = kit::TestDir::new("planner-sigkill-k2");
+    let dir = kit::TestDir::new("adapter-sigkill-k2");
     let mut worker = kit::KillOnDrop(kit::spawn_worker(
-        "sigkill_import_worker",
+        "sigkill_capacity_worker",
         &[
             (kit::WORKER_ENV, "1"),
             (kit::WORKER_DIR_ENV, dir.path().to_str().unwrap()),
@@ -181,391 +510,63 @@ fn plan_digest_stable_across_sigkill_recovery() {
     let retired = store
         .recover_legacy_retirement("alice", &request, &dir.legacy())
         .unwrap();
-    let payload = kit::import_payload(&retired);
-    let (chunk_bytes, chunk_count) = kit::plan_three_chunks(payload.len());
-    let begin = store
-        .begin_control_import(
+    let payload = kit::import_payload_placement(&retired);
+    kit::run_import_staged(&store, &authority, &retired, &payload, false);
+    let generation = kit::committed_generation(&store);
+
+    let decision = store
+        .configure_capacity(
             "alice",
-            &kit::import_command(
+            &kit::configure_command(
                 &authority,
-                "begin",
+                "cfg",
+                6,
                 1,
-                kit::WORKFLOW,
-                kit::begin_action(&retired, &payload, chunk_bytes, chunk_count),
+                kit::capacity_configuration(1_000_000_000_000),
             ),
-            &retired,
         )
         .unwrap();
-    assert_eq!(begin.code, 0, "{}", begin.message);
-    let mut revision = 2u64;
-    for ordinal in 0..chunk_count {
-        let decision = store
-            .execute_control_import(
+    assert_eq!(decision.code, 0, "{}", decision.message);
+    for (node, incarnation) in [(kit::NODE_A, kit::INC_A), (kit::NODE_B, kit::INC_B)] {
+        store
+            .capacity_transition(
                 "alice",
-                &kit::import_command(
-                    &authority,
-                    &format!("chunk-{ordinal}"),
-                    revision,
-                    kit::WORKFLOW,
-                    kit::chunk_action(&payload, chunk_bytes, ordinal),
-                ),
+                &kit::register_transition(&authority, node, incarnation),
             )
             .unwrap();
-        assert_eq!(decision.code, 0, "chunk {ordinal}: {}", decision.message);
-        revision += 1;
     }
-    let commit = store
-        .execute_control_import(
+    store
+        .capacity_transition(
             "alice",
-            &kit::import_command(
+            &kit::report_transition(
                 &authority,
-                "commit",
-                revision,
-                kit::WORKFLOW,
-                kit::commit_action(),
+                kit::scanned_observation(kit::NODE_A, kit::INC_A, generation),
             ),
         )
         .unwrap();
-    assert_eq!(commit.code, 0, "{}", commit.message);
+    store
+        .capacity_transition(
+            "alice",
+            &kit::report_transition(
+                &authority,
+                kit::silent_observation(kit::NODE_B, kit::INC_B, generation),
+            ),
+        )
+        .unwrap();
 
-    let snapshot = store.control_snapshot("alice", &kit::key()).unwrap();
-    let recovered = plan_digest_of(&snapshot);
+    let recovered = kit::planner_view(&store, T);
     assert_eq!(
-        baseline_digest, recovered,
-        "crash recovery changed the plan digest"
+        baseline_view, recovered,
+        "crash recovery changed the adapter's plan view"
     );
-    eprintln!("planner sigkill k=2: recovered, plan digest matches baseline");
+    eprintln!("adapter sigkill k=2: recovered, plan digest matches baseline");
 }
 
 /// Worker for `plan_digest_stable_across_sigkill_recovery`; the body lives
-/// in `kit::sigkill_import_worker_body` (shared with the slice-1 target).
-/// Early-returns unless `PSEARCH_ADV_WORKER` is set.
+/// in `kit::sigkill_capacity_worker_body` (same marker schedule as the
+/// slice-1 import worker, plus the cluster registration and the placement
+/// supplement). Early-returns unless `PSEARCH_ADV_WORKER` is set.
 #[test]
-fn sigkill_import_worker() {
-    kit::sigkill_import_worker_body();
-}
-
-/// The observation store's committed view serves one resource: reports of
-/// another collection or another topology generation are refused with the
-/// identity error, and the committed-matching report lands.
-#[test]
-fn observation_bound_to_committed_resource() {
-    let dir = kit::TestDir::new("planner-resource-binding");
-    let (store, authority) = kit::create_store(&dir);
-    let legacy = kit::legacy_plane(&dir, 2);
-    let (retired, _request) = kit::retire(&store, &legacy, 1);
-    let payload = kit::import_payload(&retired);
-    kit::run_import(&store, &authority, &retired, &payload);
-    let snapshot = store.control_snapshot("alice", &kit::key()).unwrap();
-
-    let view = kit::planner_committed_view(&snapshot);
-    let mut observations = kit::planner_observation_store(&view);
-    let reports = kit::planner_reports(&view);
-
-    // Another resource is refused even though the shard, leaf, and node all
-    // exist in the committed view: identity is resource equality first.
-    let mut wrong_resource = reports[0].clone();
-    wrong_resource.partition.collection = "other-books".to_string();
-    let error = observations
-        .ingest(wrong_resource)
-        .expect_err("a cross-resource report must be refused");
-    assert!(error.contains("is not this resource"), "{error}");
-
-    // A report ahead of the committed topology generation is likewise
-    // refused in both directions.
-    let mut wrong_generation = reports[0].clone();
-    wrong_generation.topology_generation = view.topology_generation + 1;
-    let error = observations
-        .ingest(wrong_generation)
-        .expect_err("a wrong-generation report must be refused");
-    assert!(error.contains("topology_generation"), "{error}");
-
-    // The committed-matching twin of the refused reports lands.
-    assert_eq!(
-        observations.ingest(reports[0].clone()).expect("ingest"),
-        IngestOutcome::Landed
-    );
-    eprintln!("planner resource binding: foreign resource and generation refused, twin landed");
-}
-
-/// Run the canonical import once and return the directory (kept alive) and
-/// the committed snapshot, for tests that only need the planner's committed
-/// view rather than an import permutation.
-fn imported_snapshot() -> (kit::TestDir, ControlCollectionSnapshot) {
-    let dir = kit::TestDir::new("planner-lifecycle");
-    let (store, authority) = kit::create_store(&dir);
-    let legacy = kit::legacy_plane(&dir, 2);
-    let (retired, _request) = kit::retire(&store, &legacy, 1);
-    let payload = kit::import_payload(&retired);
-    kit::run_import(&store, &authority, &retired, &payload);
-    let snapshot = store.control_snapshot("alice", &kit::key()).unwrap();
-    (dir, snapshot)
-}
-
-fn inc_0d() -> [u8; 16] {
-    let mut out = [0u8; 16];
-    out[15] = 0x0d;
-    out
-}
-
-/// One full supersession sequence: feed the fixture reports, re-register
-/// krick-1 with a new process incarnation, watch the late old-incarnation
-/// report refused, then accept the new process's report for (s6, L4).
-/// Returns the store, the digest after feeding, and the digest after the
-/// supersession.
-fn supersession_sequence(
-    view: &pipestream_search::capacity_tiers::CommittedView,
-) -> (
-    pipestream_search::capacity_tiers::ObservationStore,
-    [u8; 32],
-    [u8; 32],
-) {
-    let t = kit::PLANNING_INSTANT_UNIX_MS;
-    let mut store = kit::feed_reports(view, false);
-    let fed = store.observation_set_digest();
-    store
-        .register_incarnation("krick-1", inc_0d())
-        .expect("re-register krick-1");
-    let superseded = store.observation_set_digest();
-    assert_ne!(
-        fed, superseded,
-        "supersession did not change the set digest"
-    );
-    assert!(
-        store
-            .observations()
-            .iter()
-            .all(|obs| obs.reporter.node_id != "krick-1"),
-        "the superseded node's reports are still present"
-    );
-    // A late duplicate from the old process is refused, never matched.
-    let late = kit::planner_reports(view).remove(0);
-    let error = store
-        .ingest(late)
-        .expect_err("a superseded process's report must be refused");
-    assert!(error.contains("superseded"), "{error}");
-    // The new process reports with the committed storage incarnation.
-    let new_process = kit::PlannerCopySpec {
-        node: "krick-1",
-        proc_inc: 0x0d,
-        stor_inc: 0xa1,
-        domain: "krick",
-    };
-    let fresh = kit::planner_obs(
-        view,
-        &new_process,
-        "L4",
-        "s6",
-        3,
-        5,
-        1_000_000,
-        268_435_456,
-        3_000_000,
-        t - 5000,
-    );
-    assert_eq!(
-        store.ingest(fresh).expect("the new process reports"),
-        IngestOutcome::Landed
-    );
-    (store, fed, superseded)
-}
-
-/// `register_incarnation` replaces a node's incarnation and drops its
-/// reports at every other incarnation (verified against
-/// `src/capacity_tiers.rs:488`). A late report from the superseded process
-/// is refused naming the current incarnation; the replacement process
-/// reports with the committed storage incarnation; two stores taken through
-/// the same sequence end with equal set digests and equal plan digests.
-#[test]
-fn supersession_drops_the_old_incarnation_and_is_deterministic() {
-    let (_dir, snapshot) = imported_snapshot();
-    let view = kit::planner_committed_view(&snapshot);
-
-    let (first, fed, superseded) = supersession_sequence(&view);
-    let first_digest = first.observation_set_digest();
-    let (second, fed_2, superseded_2) = supersession_sequence(&view);
-    let second_digest = second.observation_set_digest();
-
-    assert_eq!(fed, fed_2);
-    assert_eq!(superseded, superseded_2);
-    assert_eq!(
-        first_digest, second_digest,
-        "identical supersession sequences diverged"
-    );
-    assert_ne!(
-        superseded, first_digest,
-        "the replacement report did not change the set digest"
-    );
-
-    // The plan digest is a pure function of the snapshot: equal snapshots
-    // (same observations, same observation epoch) plan digests equal.
-    let first_input = kit::planner_input(&snapshot, &view, &first);
-    let second_input = kit::planner_input(&snapshot, &view, &second);
-    let first_plan = TierSnapshot::validated(first_input)
-        .expect("valid")
-        .plan_digest();
-    let second_plan = TierSnapshot::validated(second_input)
-        .expect("valid")
-        .plan_digest();
-    assert_eq!(
-        first_plan, second_plan,
-        "plan digest diverged after supersession"
-    );
-    eprintln!(
-        "supersession: old incarnation dropped and refused, replacement landed, digests equal"
-    );
-}
-
-/// `commit_expiry` ages observations on `window_end_unix_ms` and expires one
-/// only when `now - window_end` is STRICTLY greater than `max_age`
-/// (verified against `src/capacity_tiers.rs:533` and the in-crate boundary
-/// test). Two identical stores expire identically; the expired ids leave the
-/// set; a plan over the survivors classifies the affected fragment exactly
-/// as a store that only ever held them.
-#[test]
-fn expiry_is_deterministic_and_excludes_the_expired() {
-    let (_dir, snapshot) = imported_snapshot();
-    let view = kit::planner_committed_view(&snapshot);
-    let t = kit::PLANNING_INSTANT_UNIX_MS;
-    let cohort = kit::COHORT_LENGTH_MS;
-
-    // Boundary: age == max_age survives, strictly greater expires.
-    let mut bounded = kit::feed_reports(&view, false);
-    let digest_full = bounded.observation_set_digest();
-    assert_eq!(
-        bounded.commit_expiry(t, 0).expect("expiry"),
-        0,
-        "now == window_end must expire nothing"
-    );
-    assert_eq!(bounded.observation_set_digest(), digest_full);
-    assert_eq!(
-        bounded.commit_expiry(t + 599_999, 599_999).expect("expiry"),
-        0,
-        "age == max_age must survive"
-    );
-    assert_eq!(bounded.observation_set_digest(), digest_full);
-    assert_eq!(
-        bounded.commit_expiry(t + 600_000, 599_999).expect("expiry"),
-        5,
-        "age > max_age must expire"
-    );
-    let digest_empty = bounded.observation_set_digest();
-    assert_ne!(digest_full, digest_empty);
-    assert!(bounded.observations().is_empty());
-    assert_eq!(
-        bounded.commit_expiry(t + 600_000, 599_999).expect("expiry"),
-        0,
-        "a repeat expiry is a no-op"
-    );
-    assert_eq!(bounded.observation_set_digest(), digest_empty);
-
-    // Strict-subset expiry: move s7's two reports to the next cohort window
-    // so now = T + cohort expires exactly s6's three.
-    let mut reports = kit::planner_reports(&view);
-    for report in &mut reports[3..] {
-        report.window_start_unix_ms = t;
-        report.window_end_unix_ms = t + cohort;
-    }
-    let mut first = kit::planner_observation_store(&view);
-    let mut second = kit::planner_observation_store(&view);
-    for report in &reports {
-        assert_eq!(
-            first.ingest(report.clone()).expect("ingest"),
-            IngestOutcome::Landed
-        );
-        assert_eq!(
-            second.ingest(report.clone()).expect("ingest"),
-            IngestOutcome::Landed
-        );
-    }
-    let digest_before = first.observation_set_digest();
-    assert_eq!(first.commit_expiry(t + cohort, 0).expect("expiry"), 3);
-    assert_eq!(second.commit_expiry(t + cohort, 0).expect("expiry"), 3);
-    let digest_after = first.observation_set_digest();
-    assert_eq!(
-        digest_after,
-        second.observation_set_digest(),
-        "identical stores expired differently"
-    );
-    assert_ne!(
-        digest_before, digest_after,
-        "expiry did not change the observation set digest"
-    );
-    let remaining = first.observations();
-    assert_eq!(remaining.len(), 2);
-    assert!(
-        remaining.iter().all(|obs| obs.shard.shard == "s7"),
-        "expired s6 observations are still present"
-    );
-    assert_eq!(
-        first.commit_expiry(t + cohort, 0).expect("expiry"),
-        0,
-        "a repeat expiry must be a no-op"
-    );
-    assert_eq!(
-        first.observation_set_digest(),
-        digest_after,
-        "the repeat expiry changed the digest"
-    );
-
-    // now before every window end expires nothing.
-    let mut early = kit::planner_observation_store(&view);
-    for report in &reports {
-        assert_eq!(
-            early.ingest(report.clone()).expect("ingest"),
-            IngestOutcome::Landed
-        );
-    }
-    let digest_early_full = early.observation_set_digest();
-    assert_eq!(early.commit_expiry(t, 0).expect("expiry"), 0);
-    assert_eq!(
-        early.observation_set_digest(),
-        digest_early_full,
-        "expiry before the timestamps changed the set"
-    );
-
-    // Plan over the survivors: at instant T + cohort the current cohort is
-    // [T, T + cohort), exactly where the s7 survivors report. The L7
-    // classification is field-equal to a store that only ever held them.
-    let mut input = kit::planner_input(&snapshot, &view, &first);
-    input.planning_instant_unix_ms = t + cohort;
-    input
-        .fragment_requests
-        .retain(|request| request.leaf == "L7");
-    let plan = plan_tiers(&TierSnapshot::validated(input).expect("valid"))
-        .expect("plan over the survivors");
-    assert_eq!(plan.placements.len(), 1);
-
-    let mut survivors = kit::planner_observation_store(&view);
-    for report in &reports[3..] {
-        assert_eq!(
-            survivors.ingest(report.clone()).expect("ingest"),
-            IngestOutcome::Landed
-        );
-    }
-    let mut survivor_input = kit::planner_input(&snapshot, &view, &survivors);
-    survivor_input.planning_instant_unix_ms = t + cohort;
-    survivor_input
-        .fragment_requests
-        .retain(|request| request.leaf == "L7");
-    let survivor_plan = plan_tiers(&TierSnapshot::validated(survivor_input).expect("valid"))
-        .expect("plan over the survivors only");
-
-    assert_eq!(
-        plan.placements, survivor_plan.placements,
-        "classification changed with history the plan cannot see"
-    );
-    assert_eq!(plan.refusals, survivor_plan.refusals);
-    assert_eq!(plan.policy_fingerprint, survivor_plan.policy_fingerprint);
-
-    // The expired fragment refuses loudly instead of planning from memory.
-    let mut l4_input = kit::planner_input(&snapshot, &view, &first);
-    l4_input.planning_instant_unix_ms = t + cohort;
-    l4_input
-        .fragment_requests
-        .retain(|request| request.leaf == "L4");
-    let error = plan_tiers(&TierSnapshot::validated(l4_input).expect("valid"))
-        .expect_err("the expired fragment must not plan");
-    assert!(error.contains("no current observation"), "{error}");
-    eprintln!("expiry: boundary inclusive, strict subset expired, survivors classify identically");
+fn sigkill_capacity_worker() {
+    kit::sigkill_capacity_worker_body();
 }
