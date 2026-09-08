@@ -7,6 +7,8 @@
 //! node-to-node WAL/snapshot paths; this module owns decisions, validated
 //! action completion, and complete topology publication.
 
+mod storage;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -612,7 +614,7 @@ impl StateWriteError {
 }
 
 const UNCERTAIN_CONTROL_STATE: &str =
-    "control state persistence outcome is uncertain; reopen existing durable state before continuing";
+    "control state persistence outcome is uncertain; close every clone and reopen existing durable state before continuing";
 
 fn write_state(
     path: &Path,
@@ -623,26 +625,14 @@ fn write_state(
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)
-        .map_err(|error| format!("mkdir {}: {error}", parent.display()))?;
-    let mut temp = path.as_os_str().to_owned();
-    temp.push(format!(".tmp-{}", std::process::id()));
-    let temp = PathBuf::from(temp);
     let bytes = serde_json::to_vec_pretty(state)
         .map_err(|error| format!("encode control state: {error}"))?;
-    {
-        use std::io::Write;
-        let mut file = std::fs::File::create(&temp)
-            .map_err(|error| format!("create {}: {error}", temp.display()))?;
-        file.write_all(&bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|error| format!("write {}: {error}", temp.display()))?;
-    }
+    let candidate = storage::Candidate::write(path, &bytes)?;
     #[cfg(test)]
     inject_state_write_fault(fault, StateWriteFault::BeforeRename)?;
     // Once publication has been attempted, a failed syscall must not be
     // interpreted as proof that the old state is still authoritative.
-    std::fs::rename(&temp, path).map_err(|error| {
+    candidate.publish(path).map_err(|error| {
         StateWriteError::publication(format!("replace {}: {error}", path.display()))
     })?;
     #[cfg(test)]
@@ -665,6 +655,8 @@ pub struct DurableControlPlane {
     persistence_uncertain: Arc<AtomicBool>,
     #[cfg(test)]
     write_fault: Arc<Mutex<Option<StateWriteFault>>>,
+    // Every clone retains the same open lock file through its lifetime.
+    _ownership_lock: Option<Arc<std::fs::File>>,
 }
 
 impl DurableControlPlane {
@@ -673,8 +665,8 @@ impl DurableControlPlane {
     }
 
     /// Recover an existing control store without bootstrapping missing history.
-    /// A successful reopen reads and syncs the stored decision again; it never
-    /// clears the failure latch on any older instance or its clones.
+    /// A successful reopen reads and syncs the stored decision again. All prior
+    /// instances and clones must be dropped to release exclusive file ownership.
     pub fn open_existing(path: impl Into<PathBuf>, policy: ControlPolicy) -> Result<Self, String> {
         Self::open_state(path.into(), policy, false)
     }
@@ -684,7 +676,8 @@ impl DurableControlPlane {
         policy: ControlPolicy,
         allow_create: bool,
     ) -> Result<Self, String> {
-        let state = match std::fs::read(&path) {
+        let (path, ownership_lock) = storage::acquire(&path, allow_create)?;
+        let state = match storage::read(&path) {
             Ok(bytes) => {
                 let state: StoredState = serde_json::from_slice(&bytes)
                     .map_err(|error| format!("parse control state {}: {error}", path.display()))?;
@@ -714,6 +707,7 @@ impl DurableControlPlane {
             persistence_uncertain: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             write_fault: Arc::new(Mutex::new(None)),
+            _ownership_lock: Some(ownership_lock),
         };
         this.persist()?;
         Ok(this)
@@ -727,6 +721,7 @@ impl DurableControlPlane {
             persistence_uncertain: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             write_fault: Arc::new(Mutex::new(None)),
+            _ownership_lock: None,
         }
     }
 
@@ -2423,6 +2418,9 @@ impl ClusterControl for ClusterControlService {
         .await
     }
 }
+
+#[cfg(test)]
+mod ownership_tests;
 
 #[cfg(test)]
 mod persistence_tests;

@@ -45,12 +45,28 @@ fn arm(plane: &DurableControlPlane, fault: StateWriteFault) {
     *plane.write_fault.lock().unwrap() = Some(fault);
 }
 
+fn candidate_files(dir: &Directory) -> Vec<PathBuf> {
+    let mut files: Vec<_> = std::fs::read_dir(&dir.0)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("state.json.tmp-")
+        })
+        .collect();
+    files.sort();
+    files
+}
+
 #[test]
 fn failure_before_rename_rolls_back_disk_and_memory_and_remains_usable() {
     let dir = Directory::new("before-rename");
     let plane = DurableControlPlane::open(dir.state(), ControlPolicy::default()).unwrap();
     let before = plane.plan().unwrap();
     assert_eq!(before.control_revision, 1);
+    let candidates_before = candidate_files(&dir);
 
     arm(&plane, StateWriteFault::BeforeRename);
     let error = plane.register(registration("a"), 100).unwrap_err();
@@ -62,6 +78,7 @@ fn failure_before_rename_rolls_back_disk_and_memory_and_remains_usable() {
     assert!(memory.nodes.is_empty());
     assert_eq!(disk.revision, before.control_revision);
     assert!(disk.nodes.is_empty());
+    assert_eq!(candidate_files(&dir), candidates_before);
 
     let accepted = plane.register(registration("b"), 100).unwrap();
     assert_eq!(accepted.control_revision, 2);
@@ -138,13 +155,22 @@ fn failure_after_rename_latches_every_clone_until_an_explicit_reopen() {
 
     let latched = clone;
     drop(plane);
-    let reopened =
-        DurableControlPlane::open_existing(dir.state(), ControlPolicy::default()).unwrap();
+    let locked = DurableControlPlane::open_existing(dir.state(), ControlPolicy::default())
+        .err()
+        .expect("a live failed clone must retain exclusive ownership");
+    assert!(
+        locked.contains("exclusive") && locked.contains("lock"),
+        "{locked}"
+    );
     let still_latched = latched
         .plan()
         .err()
-        .expect("opening a new instance must not reactivate an old clone");
+        .expect("old clone must remain latched before recovery");
     assert_eq!(still_latched.code(), tonic::Code::FailedPrecondition);
+    drop(service);
+    drop(latched);
+    let reopened =
+        DurableControlPlane::open_existing(dir.state(), ControlPolicy::default()).unwrap();
     let recovered = reopened.plan().unwrap();
     assert_eq!(recovered.control_revision, 2);
     assert_eq!(recovered.nodes.len(), 1);
@@ -202,14 +228,22 @@ fn collection_binding_after_rename_requires_an_explicit_reopen() {
     );
 
     drop(plane);
-    let reopened = DurableControlPlane::open_existing(dir.state(), ControlPolicy::default())
-        .unwrap()
-        .with_collection("books")
-        .unwrap();
+    let locked = DurableControlPlane::open_existing(dir.state(), ControlPolicy::default())
+        .err()
+        .expect("observer clone must retain exclusive ownership");
+    assert!(
+        locked.contains("exclusive") && locked.contains("lock"),
+        "{locked}"
+    );
     assert_eq!(
         observer.plan().err().unwrap().code(),
         tonic::Code::FailedPrecondition
     );
+    drop(observer);
+    let reopened = DurableControlPlane::open_existing(dir.state(), ControlPolicy::default())
+        .unwrap()
+        .with_collection("books")
+        .unwrap();
     assert_eq!(reopened.collection(), "books");
     assert_eq!(reopened.plan().unwrap().control_revision, 1);
 }

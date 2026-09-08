@@ -1237,6 +1237,16 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: exclusive control-store ownership.** The JSON authority
+  keeps one persistent file lock across state replacements and every service
+  clone. Recovery requires closing all prior holders; private temporary files
+  cannot truncate an existing path. See [control ownership](docs/cluster-control.md#exclusive-file-ownership)
+  and the [authority convergence boundary](docs/raft-control-design.md#single-authority-convergence-boundary-2026-09-08).
+  The [capacity-tier review](docs/capacity-tiers-review.md) records the contract
+  corrections required before planner implementation.
+  Validation: 730 library tests, 150 integration targets, embedded/mobile and
+  unchanged-wire checks passed within the 8 GiB cap, with no swap or OOM.
+
 - **Foundation branch: closed managed-source storage.** An existing controlled
   catalog can bind to an exact committed owner preparation while preserving
   history and actor-scoped retries. Managed reopen stays closed and legacy
