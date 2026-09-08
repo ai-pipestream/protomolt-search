@@ -103,7 +103,31 @@ were retained. Nine comparator tests and the command-line same-path and
 existing-output refusals passed; the reference scope peaked at 33,472,512 bytes
 with zero swap/OOM and 647 unchanged input hashes.
 
-The full gate at `e9854f3` passed 680 library tests, all 148 integration targets
+The combined full gate at `12ba5433`, after incorporating main `9c7f0d9`,
+passed 684 library tests, all 149 integration targets (893 reported passes and
+one existing ignored live-OpenNLP test), 13 embedded tests and two IVF tests:
+1,592 reported Rust passes. The nine reference-comparator tests, all five
+Android/iOS compilation checks, tests/examples compilation, formatting,
+vendored-proto checks and diff checks also passed. Reported counts include the
+child-process regression invocation in `source_access`.
+
+The merge-aware contract checked all 21 product/vendored protobuf files.
+Relative to common ancestor `0c5c7ef`, main changes only `search.proto`, adding
+`CompactShardRequest.build_threads`, `build_queue` and `build_memory` at fields
+5, 6 and 7, plus response comment clarifications. The feature parent `c2b704d`
+changes only `document_catalog.proto` and `document_write.proto` for controlled
+source binding and actor retry ownership. These delta sets are disjoint; every
+merged proto equals its selected parent's bytes. The original `cases.json`
+and `descriptor.bin` fixtures remain byte-identical to `3575772`.
+
+The driver verified clean HEAD `12ba5433` and identical hashes for all 648 input
+files before and after validation. Its 8 GiB hard memory limit was reached,
+with 45,509 memory-limit events and 417 socket-throttling events, zero swap and
+zero OOM events. The preserved driver, per-target logs, hash manifest and
+resource record use `/tmp/psearch-main9c-full-*` on the validation host. This
+is local correctness evidence, not hosted CI or fleet performance evidence.
+
+The earlier full gate at `e9854f3` passed 680 library tests, all 148 integration targets
 (887 reported passes and one existing ignored live-OpenNLP test), 13 embedded
 tests and two IVF tests. The nine reference-comparator tests also passed.
 All five Android/iOS compilation checks, tests/examples compilation, formatting,

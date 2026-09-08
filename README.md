@@ -1237,6 +1237,14 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: validated main reconciliation.** Checkpoint `12ba5433`
+  incorporates main `9c7f0d9`, including WAL-free partitioned compaction and the
+  Boolean empty-MUST short circuit. The combined local gate passed 1,592
+  reported Rust tests across the library, 149 integration targets, embedded
+  package and IVF adapter, plus nine comparator tests and five mobile checks.
+  All 648 input hashes remained unchanged; the 8 GiB scope had zero swap/OOM.
+  See [protobuf wire semantics](docs/protobuf-wire-semantics.md).
+
 - **Foundation branch: measured proto2/proto3 wire boundaries.** The 26-case
   fixture records strict UTF-8 and 64-bit varint boundaries against pinned C++
   and upb observations. Empty mapped secondary text retains extraction presence
