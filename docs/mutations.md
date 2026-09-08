@@ -133,11 +133,22 @@ the bucket layout. A double or facet column, a name that is not a column,
 a column no document carries, and the single-image layout are each
 rejected by name before any work. A child of a segmented re-placement
 split has no log to replay; cut its spill by the column at the split
-(`docs/replay-from-segments.md`, "Cutting the spill") and it needs no
-compaction to be partitioned.
+(`docs/replay-from-segments.md`, "Cutting the spill") and it comes out
+partitioned — and when such a child later needs the compaction (deletes
+to reclaim, a finer cut), the same request runs the from-segments path:
+the row source is the sealed segments, never the log and never the
+analyzer (`docs/replay-from-segments.md`, "Partitioned compaction of a
+catalog without a log"). That path keeps this whole contract — the staged
+outputs, the cutoff at a seal, the tail caught up by the same seal ingest
+uses, one manifest published at the cutover, the marker and the closing
+flush — with `wal_generation` and `cutoff_clock` reported as 0, since no
+log is rewritten.
 
-Refused by name: an in-memory shard; a shard without a WAL; a generation
-with legacy unclocked records; a generation that began with preexisting
+Refused by name: an in-memory shard; a shard without a WAL whose catalog
+does not qualify for the from-segments path (the single-image layout, no
+sealed segments, or no generation binding — `docs/replay-from-segments.md`
+has the path and its qualification); a generation with legacy unclocked
+records; a generation that began with preexisting
 state its log does not hold (a snapshot install's; compaction would drop the
 image); a compaction already running on the shard; a bulk BM25 build in
 progress; no analysis backend; a non-empty work directory or a leftover

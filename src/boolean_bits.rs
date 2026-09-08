@@ -149,6 +149,42 @@ impl Bits {
         })
     }
 
+    /// The set slots in `[start, end)`, ascending, word-wise: a span
+    /// covering no set bit costs its words, not its slots.
+    pub fn iter_range(&self, start: usize, end: usize) -> impl Iterator<Item = usize> + '_ {
+        let end = end.min(self.len);
+        let start = start.min(end);
+        let last_word = end.saturating_sub(1) / 64;
+        let mask_for = move |wi: usize| {
+            let mut mask = u64::MAX;
+            if wi == start / 64 {
+                mask &= u64::MAX << (start % 64);
+            }
+            if wi == last_word && !end.is_multiple_of(64) {
+                mask &= (1u64 << (end % 64)) - 1;
+            }
+            mask
+        };
+        let mut word_index = start / 64;
+        let mut held = if start < end {
+            self.words[word_index] & mask_for(word_index)
+        } else {
+            0
+        };
+        std::iter::from_fn(move || loop {
+            if held != 0 {
+                let bit = held.trailing_zeros() as usize;
+                held &= held - 1;
+                return Some(word_index * 64 + bit);
+            }
+            if word_index >= last_word {
+                return None;
+            }
+            word_index += 1;
+            held = self.words[word_index] & mask_for(word_index);
+        })
+    }
+
     /// A per-slot admission list, the shape the vector kernel masks with.
     pub fn to_bools(&self) -> Vec<bool> {
         (0..self.len).map(|slot| self.test(slot)).collect()
@@ -303,6 +339,36 @@ mod tests {
         assert_eq!(
             Bits::at_least(&sets, 1, 130).iter().collect::<Vec<_>>(),
             vec![1, 2, 3, 5, 64, 100, 129]
+        );
+    }
+
+    #[test]
+    fn iter_range_walks_a_span_wordwise() {
+        let bits = of(200, &[0, 3, 63, 64, 65, 129, 199]);
+        assert_eq!(
+            bits.iter_range(0, 200).collect::<Vec<_>>(),
+            vec![0, 3, 63, 64, 65, 129, 199]
+        );
+        assert_eq!(
+            bits.iter_range(60, 130).collect::<Vec<_>>(),
+            vec![63, 64, 65, 129]
+        );
+        assert_eq!(
+            bits.iter_range(4, 63).collect::<Vec<_>>(),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            bits.iter_range(64, 64).collect::<Vec<_>>(),
+            Vec::<usize>::new()
+        );
+        assert_eq!(bits.iter_range(199, 400).collect::<Vec<_>>(), vec![199]);
+        assert_eq!(
+            bits.iter_range(200, 400).collect::<Vec<_>>(),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            Bits::empty(10).iter_range(0, 10).collect::<Vec<_>>(),
+            Vec::<usize>::new()
         );
     }
 

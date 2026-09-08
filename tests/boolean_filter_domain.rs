@@ -444,6 +444,11 @@ fn route_count(rpc: &str) -> u64 {
 #[allow(clippy::await_holding_lock)] // the guard serializes the process-wide switch
 async fn both_modes(c: &CoordinatorServiceImpl, selection: SelectionQuery, k: u32) {
     let _guard = SCAN_MODE.lock().unwrap();
+    both_modes_locked(c, selection, k).await;
+}
+
+/// `both_modes` for a caller already holding `SCAN_MODE`.
+async fn both_modes_locked(c: &CoordinatorServiceImpl, selection: SelectionQuery, k: u32) {
     let narrowed = query(c, request(selection.clone(), k)).await;
     std::env::set_var("PIPESTREAM_SEARCH_BOOLEAN_FILTER_FULL_SCAN", "1");
     let full = query(c, request(selection, k)).await;
@@ -736,10 +741,12 @@ async fn narrowed_and_full_scans_agree_across_vector_gaps() {
 /// The composite AND route (no bitmap route) and the boolean route
 /// agree under the narrowed scan, the flat-versus-relay equivalence the
 /// pushdown tests pin for the whole-shard scan.
+#[allow(clippy::await_holding_lock)] // the guard serializes the counter windows
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_narrowed_scan_keeps_the_composite_equivalence() {
     let fleet = fleet("relay").await;
     let c = &fleet.coordinator;
+    let _guard = SCAN_MODE.lock().unwrap();
     let common = vocab()[0].clone();
     let flat = SelectionQuery {
         node: Some(selection_query::Node::Composite(CompositeSearchStrategy {
@@ -761,5 +768,91 @@ async fn the_narrowed_scan_keeps_the_composite_equivalence() {
     let flat_ids: Vec<u64> = flat.hits.iter().map(|h| h.doc_id).collect();
     let relay_ids: Vec<u64> = relay.hits.iter().map(|h| h.doc_id).collect();
     assert_eq!(flat_ids, relay_ids);
+    fleet.stop();
+}
+
+/// A MUST group whose intersection is already empty resolves its
+/// remaining siblings as the empty set: the skip counter proves the
+/// cheap path ran, and the answer matches the forced whole-shard scan
+/// exactly.
+#[allow(clippy::await_holding_lock)] // the guard serializes the counter window
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_empty_must_group_skips_the_dense_membership() {
+    let fleet = fleet("shortcircuit").await;
+    let c = &fleet.coordinator;
+    let _guard = SCAN_MODE.lock().unwrap();
+    let counter = || {
+        pipestream_search::node::BOOLEAN_MUST_SHORT_CIRCUIT_SKIPS
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    // A filter that matches no row: the dense membership is never built.
+    let empty_filter = boolean(
+        vec![dense("d", 5), cel("y", "year >= 3000")],
+        vec![],
+        vec![],
+        0,
+        None,
+    );
+    let before = counter();
+    let narrowed = query(c, request(empty_filter.clone(), 50)).await;
+    let skipped = counter() - before;
+    assert!(narrowed.hits.is_empty());
+    assert!(
+        skipped >= 2,
+        "two shards, each replacing the dense membership: {skipped}"
+    );
+    both_modes_locked(c, empty_filter, 50).await;
+    // A term the corpus never saw empties the group the same way, and
+    // the dense leaf is skipped again.
+    let empty_lexical = boolean(
+        vec![lexical("l", "zzq"), dense("d", 5)],
+        vec![],
+        vec![],
+        0,
+        None,
+    );
+    let before = counter();
+    let r = query(c, request(empty_lexical, 50)).await;
+    assert!(r.hits.is_empty());
+    assert!(
+        counter() >= before + 2,
+        "the empty lexical leaf short-circuits the dense leaf on both shards"
+    );
+    // Control: a filter that admits rows pays the dense membership.
+    let before = counter();
+    let r = query(
+        c,
+        request(
+            boolean(
+                vec![dense("d", 5), cel("y", "year >= 1950")],
+                vec![],
+                vec![],
+                0,
+                None,
+            ),
+            50,
+        ),
+    )
+    .await;
+    assert!(!r.hits.is_empty());
+    assert_eq!(
+        counter(),
+        before,
+        "a surviving group resolves its dense leaf"
+    );
+    // SHOULD clauses never short-circuit: an empty SHOULD filter still
+    // lets the lexical clause win the minimum.
+    both_modes_locked(
+        c,
+        boolean(
+            vec![],
+            vec![cel("y", "year >= 3000"), lexical("s", &vocab()[0])],
+            vec![],
+            1,
+            None,
+        ),
+        50,
+    )
+    .await;
     fleet.stop();
 }
