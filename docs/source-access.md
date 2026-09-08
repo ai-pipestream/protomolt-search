@@ -156,7 +156,7 @@ passed afterward, including the child process check. This follow-up changes no
 protobuf or stored identity bytes; it was validated with the focused catalog
 suite rather than repeating the preceding complete gate.
 
-## Actor-scoped retry ownership (implementation under validation)
+## Actor-scoped retry ownership
 
 Controlled acceptance keys the retry decision by the pinned authenticated
 principal and exact operation ID, within the persisted workspace/collection
@@ -215,8 +215,24 @@ inconsistency earlier. The corrected assertion and all other corruption cases
 passed in the final run. Both final drivers verified unchanged runtime and test
 file hashes. Peak memory was 3.06 GiB and 1.25 GiB respectively, under an 8 GiB
 limit with swap disabled and zero OOM events. The additive storage descriptor
-comparison passed. Three literal persisted-key fixtures were then added for the
-full gate, whose result is still pending.
+comparison passed. Three literal persisted-key fixtures then pinned binary
+operation IDs, UTF-8 principal lengths and protobuf key framing.
+
+The complete gate at `ceaa86d`, including main's fleet documentation at
+`0c5c7ef`, passed 676 library tests and all 148 integration targets. Across the
+library, integration, embedded and IVF logs there were 1,574 reported passes,
+zero failures and one existing ignored test requiring a live OpenNLP service.
+All five mobile target checks, tests/examples compilation, formatting, vendored
+protos and diff checks passed. The descriptor comparison preserved every prior
+product declaration; only the actor messages and header field 9 were added.
+
+The driver verified identical HEAD, clean status and hashes for all 644 files
+before and after validation. The scope reached its 8 GiB hard limit and recorded
+memory-limit events, with zero swap and zero OOM events or kills. Another agent
+started a build during this gate; these results establish local correctness,
+not performance under an idle host. The following validation record changes
+documentation only. This checkpoint does not activate network source routing,
+distributed ownership, or a fleet rollout.
 
 The proposed [network ingest authorization boundary](network-ingest-authorization.md)
 records why a coordinator guard held across an RPC is insufficient, how durable

@@ -1237,12 +1237,12 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
-- **Foundation branch: actor-scoped retry ownership, under validation.**
+- **Foundation branch: actor-scoped retry ownership.**
   Controlled source acceptance keys receipts by the pinned authenticated principal
   and operation ID. Format 8 retains legacy decisions until explicit Admin
   attribution completes; migration preserves original receipts and lifecycle
   fences. Checkpoints include both retry namespaces. See
-  [source access and migration](docs/source-access.md#actor-scoped-retry-ownership-implementation-under-validation).
+  [source access and migration](docs/source-access.md#actor-scoped-retry-ownership).
 
 - **Foundation branch: protobuf wire-type compatibility.** A known field number
   with an incompatible wire type is treated as unknown before changing presence
