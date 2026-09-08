@@ -282,3 +282,42 @@ Gate: all three targets (`control_authority_adversarial` 8 tests,
 new dependencies. The planner leg remains local single-process evidence the
 same way slice 1 is: no Raft leader change, log replication, or
 snapshot installation across processes is claimed.
+
+## Slice 2c: observation expiry and incarnation supersession
+
+Two focused tests in `tests/control_authority_planner.rs` pin the
+observation store's two committed lifecycle transitions, verified against
+`src/capacity_tiers.rs` (`commit_expiry` at line 533, `register_incarnation`
+at line 488, and the in-crate boundary test at line 3141):
+
+- `expiry_is_deterministic_and_excludes_the_expired` — expiry ages
+  observations on `window_end_unix_ms`, never `last_scanned_unix_ms`, and
+  expires one only when `now - window_end` is STRICTLY greater than
+  `max_age` (age == max_age survives; the boundary is inclusive). A repeat
+  `commit_expiry` with the same arguments is a no-op (`Ok(0)`, digest
+  unchanged), and a `now` at or before every window end expires nothing.
+  Two identical stores fed the same reports (three in the current cohort,
+  two advanced into the next one so a strict subset can expire) return the
+  same drop count, end with equal `observation_set_digest()` values that
+  differ from the pre-expiry digest, and no longer carry the expired shard's
+  reports. A plan built at the survivors' cohort instant classifies the
+  surviving fragment field-equal (placements, refusals, policy fingerprint)
+  to a store that only ever held the survivors; the fully expired fragment
+  refuses loudly ("no current observation; unknown is not idle") instead of
+  planning from memory.
+- `supersession_drops_the_old_incarnation_and_is_deterministic` —
+  re-registering a node drops its reports at every other process
+  incarnation (epoch advances once, only when the set changes). A late
+  duplicate report from the superseded process is refused naming the current
+  incarnation ("... is superseded by ..."); the replacement process reports
+  with the committed storage incarnation and lands. Two stores taken through
+  the identical sequence end with equal set digests and equal
+  `TierSnapshot::plan_digest()` values.
+
+Also: the pre-existing dead-code warnings from `model.rs`/`rng.rs` (each
+target uses only part of the shared module) are silenced with the same
+`#![allow(dead_code)]` rationale used in `kit.rs`.
+
+Gate: all three targets pass under the 8 GiB, swap-disabled scope in
+`--release` with zero warnings; rustfmt clean; no production changes, no
+commit.

@@ -1,5 +1,8 @@
 //! Deterministic xorshift64 RNG for the adversarial harness. Seeded per test
 //! so every trace reproduces exactly; no external crates.
+//!
+//! Shared between the harness targets, each of which uses a subset.
+#![allow(dead_code)]
 
 /// xorshift64* is not used here; plain xorshift64 with the classic
 /// 13/7/17 shifts, nonzero seed required.

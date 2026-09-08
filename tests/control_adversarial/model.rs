@@ -11,6 +11,9 @@
 //! Begin/Chunk/Commit/Abort on one collection. Capacity accounting, malformed
 //! envelopes, supplement validation and cross-resource rules are out of
 //! scope (the generator only emits well-formed envelopes).
+//!
+//! Shared between the harness targets, each of which uses a subset.
+#![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
 use tonic::Code;

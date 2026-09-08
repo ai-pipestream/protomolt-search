@@ -796,7 +796,11 @@ pub fn planner_committed_view(snapshot: &ControlCollectionSnapshot) -> Committed
     }
 }
 
-fn planner_obs(
+/// Build one observation bound to `view`'s resource and topology
+/// generation; `spec` names the reporting node and its process/storage
+/// incarnations (pass a spec with the committed `stor_inc` and a new
+/// `proc_inc` to report from a superseding process).
+pub fn planner_obs(
     view: &CommittedView,
     spec: &PlannerCopySpec,
     leaf: &str,
