@@ -18,6 +18,16 @@ message DocumentCatalogHeader {
   // retains this decision together with the final seal. Older readers refuse
   // both formats; neither reopen nor backup can discard the admission fence.
   SourceRetirementIntent retirement_intent = 7;
+  // Format 7 requires the access-controlled API on open and every mutation.
+  // Retirement and seal markers retain their meaning without changing format.
+  SourceResourceBinding resource_binding = 8;
+}
+
+// Immutable local resource scope, not a replacement-owner or residency grant.
+message SourceResourceBinding {
+  uint32 format_version = 1; // 1
+  string workspace = 2;
+  string collection = 3;
 }
 
 // Trusted local admission closure. The database writer chooses the accepted

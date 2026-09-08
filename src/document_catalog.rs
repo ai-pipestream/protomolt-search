@@ -12,6 +12,7 @@ use tonic::Status;
 
 use crate::pb::storage::{
     DocumentCatalogHeader, DocumentOperation, DocumentVersion, DocumentVersionKey, SourceRecord,
+    SourceResourceBinding,
 };
 use crate::pb::{
     accept_document_request::Mutation, AcceptDocumentRequest, AcceptedDocumentVersion,
@@ -20,12 +21,14 @@ use crate::pb::{
 };
 use crate::sha256;
 
+mod access;
 mod backup;
 mod checkpoint;
 mod projection;
 mod publication;
 mod restore;
 mod seal;
+pub use access::AccessControlledCatalog;
 pub use backup::CapturedBackup;
 pub use checkpoint::CatalogCheckpoint;
 pub use publication::{MaintenanceRecovery, ProjectionRecovery};
@@ -42,6 +45,7 @@ const FORMAT_VERSION: u32 = 3;
 const SEALED_FORMAT_VERSION: u32 = 4;
 const RETIRING_FORMAT_VERSION: u32 = 5;
 const RETIRED_FORMAT_VERSION: u32 = 6;
+const ACCESS_CONTROLLED_FORMAT: u32 = 7;
 const CACHE_BYTES: usize = 8 << 20;
 
 fn storage(error: impl std::fmt::Display) -> Status {
@@ -69,7 +73,11 @@ fn new_history_id() -> Result<Vec<u8>, Status> {
 fn validate_current_header(header: &DocumentCatalogHeader) -> Result<(), Status> {
     if !matches!(
         header.format_version,
-        FORMAT_VERSION | SEALED_FORMAT_VERSION | RETIRING_FORMAT_VERSION | RETIRED_FORMAT_VERSION
+        FORMAT_VERSION
+            | SEALED_FORMAT_VERSION
+            | RETIRING_FORMAT_VERSION
+            | RETIRED_FORMAT_VERSION
+            | ACCESS_CONTROLLED_FORMAT
     ) || !valid_history_id(&header.history_id)
         || header.legacy_receipts_through_sequence > header.accepted_sequence
     {
@@ -84,6 +92,7 @@ fn validate_current_header(header: &DocumentCatalogHeader) -> Result<(), Status>
 pub struct DocumentCatalog {
     database: Database,
     durable: bool,
+    resource_binding: Option<SourceResourceBinding>,
     // redb's fallback backend does not lock on every mobile platform. Hold
     // the same open file description exclusively for this catalog's lifetime.
     // Drop the database before releasing this guard.
@@ -91,6 +100,15 @@ pub struct DocumentCatalog {
 }
 
 impl DocumentCatalog {
+    fn validate_resource_binding(&self, header: &DocumentCatalogHeader) -> Result<(), Status> {
+        if header.resource_binding != self.resource_binding {
+            return Err(Status::failed_precondition(
+                "document catalog resource binding differs; access-controlled catalogs require their bound workspace and collection",
+            ));
+        }
+        Ok(())
+    }
+
     /// Immutable collection binding of this local source authority.
     pub fn collection(&self) -> Result<String, Status> {
         let transaction = self.database.begin_read().map_err(storage)?;
@@ -108,14 +126,19 @@ impl DocumentCatalog {
     /// Reopen an existing authority. A missing file must never initialize new
     /// version or retry history; callers explicitly create a new catalog.
     pub fn open(path: &Path, collection: &str) -> Result<Self, Status> {
-        Self::open_file(path, collection, false)
+        Self::open_file(path, collection, false, None)
     }
 
     pub fn create(path: &Path, collection: &str) -> Result<Self, Status> {
-        Self::open_file(path, collection, true)
+        Self::open_file(path, collection, true, None)
     }
 
-    fn open_file(path: &Path, collection: &str, create: bool) -> Result<Self, Status> {
+    fn open_file(
+        path: &Path,
+        collection: &str,
+        create: bool,
+        resource_binding: Option<SourceResourceBinding>,
+    ) -> Result<Self, Status> {
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -153,6 +176,7 @@ impl DocumentCatalog {
         let catalog = Self {
             database,
             durable: true,
+            resource_binding,
             _file_lock: Some(file),
         };
         catalog.initialize(collection, new)?;
@@ -170,6 +194,7 @@ impl DocumentCatalog {
         let catalog = Self {
             database,
             durable: false,
+            resource_binding: None,
             _file_lock: None,
         };
         catalog.initialize(collection, true)?;
@@ -185,28 +210,30 @@ impl DocumentCatalog {
                 .map_err(storage)?
                 .ok_or_else(|| Status::data_loss("existing document catalog header missing"))?;
             let header: DocumentCatalogHeader = decode(bytes.value())?;
-            if !(1..=RETIRED_FORMAT_VERSION).contains(&header.format_version)
+            if !(1..=ACCESS_CONTROLLED_FORMAT).contains(&header.format_version)
                 || header.collection != collection
             {
                 return Err(Status::failed_precondition(
                     "document catalog format or collection differs",
                 ));
             }
+            if header.format_version >= FORMAT_VERSION {
+                validate_current_header(&header)?;
+            } else if !header.history_id.is_empty()
+                || header.legacy_receipts_through_sequence != 0
+                || header.history_seal.is_some()
+                || header.retirement_intent.is_some()
+                || header.resource_binding.is_some()
+            {
+                return Err(Status::data_loss(
+                    "legacy catalog contains unexpected history identity metadata",
+                ));
+            }
+            self.validate_resource_binding(&header)?;
             for definition in [HEADS, VERSIONS, OPERATIONS, DESCRIPTORS, SOURCES] {
                 transaction.open_table(definition).map_err(storage)?;
             }
-            if header.format_version >= FORMAT_VERSION {
-                validate_current_header(&header)?;
-            } else {
-                if !header.history_id.is_empty()
-                    || header.legacy_receipts_through_sequence != 0
-                    || header.history_seal.is_some()
-                    || header.retirement_intent.is_some()
-                {
-                    return Err(Status::data_loss(
-                        "legacy catalog contains unexpected history identity metadata",
-                    ));
-                }
+            if header.format_version < FORMAT_VERSION {
                 if header.format_version == 2 {
                     transaction.open_table(CHANGES).map_err(storage)?;
                 }
@@ -225,13 +252,18 @@ impl DocumentCatalog {
         {
             let mut table = transaction.open_table(META).map_err(storage)?;
             let header = DocumentCatalogHeader {
-                format_version: FORMAT_VERSION,
+                format_version: if self.resource_binding.is_some() {
+                    ACCESS_CONTROLLED_FORMAT
+                } else {
+                    FORMAT_VERSION
+                },
                 collection: collection.into(),
                 accepted_sequence: 0,
                 history_id: new_history_id()?,
                 legacy_receipts_through_sequence: 0,
                 history_seal: None,
                 retirement_intent: None,
+                resource_binding: self.resource_binding.clone(),
             }
             .encode_to_vec();
             table.insert("header", header.as_slice()).map_err(storage)?;

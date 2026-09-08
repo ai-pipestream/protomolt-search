@@ -3,7 +3,7 @@
 use crate::pb::{AccessAction, AccessDecision, AccessPolicy};
 use std::collections::{BTreeMap, BTreeSet};
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::task::{Context, Poll};
 use tokio::sync::watch;
 use tokio_stream::{wrappers::WatchStream, Stream};
@@ -20,6 +20,33 @@ pub trait Authorizer: std::fmt::Debug + Send + Sync {
         action: AccessAction,
     ) -> Result<AccessDecision, Status>;
     fn subscribe(&self) -> watch::Receiver<u64>;
+
+    /// Serialize policy replacement against a synchronous operation. The guard
+    /// must keep this exact decision valid until dropped. Remote adapters need
+    /// an equivalent enforcement protocol; snapshot checks are insufficient.
+    fn pin(&self, _expected: &AccessDecision) -> Result<Box<dyn AuthorizationGuard + '_>, Status> {
+        Err(Status::unimplemented(
+            "authorization provider does not support pinned authorization",
+        ))
+    }
+}
+
+/// Provider-owned admission guard. Dropping it releases the policy fence.
+pub trait AuthorizationGuard {
+    fn decision(&self) -> &AccessDecision;
+}
+
+/// Permission held through synchronous work and its commit. Acquire before
+/// node/catalog locks and the database writer. Never hold across an await or
+/// reenter authorization or policy replacement while a pin is held.
+#[must_use = "dropping the pin releases authorization admission"]
+pub struct PinnedAccess<'a> {
+    guard: Box<dyn AuthorizationGuard + 'a>,
+}
+impl PinnedAccess<'_> {
+    pub fn decision(&self) -> &AccessDecision {
+        self.guard.decision()
+    }
 }
 
 #[derive(Debug)]
@@ -122,6 +149,59 @@ impl Policy {
     }
 }
 
+impl Policy {
+    fn authorize(
+        &self,
+        principal: &str,
+        collection: &str,
+        action: AccessAction,
+    ) -> Result<AccessDecision, Status> {
+        let policy = self;
+        let allowed = policy
+            .grants
+            .get(&(principal.to_owned(), collection.to_owned()))
+            .is_some_and(|actions| actions.contains(&(action as i32)));
+        if !allowed {
+            return Err(Status::permission_denied(
+                "operation is not authorized for this collection",
+            ));
+        }
+        Ok(AccessDecision {
+            policy_revision: policy.revision,
+            principal: principal.into(),
+            collection: collection.into(),
+            workspace: policy.resources[collection].clone(),
+            action: action as i32,
+            field_permissions: if action == AccessAction::Search {
+                policy
+                    .fields
+                    .get(&(principal.to_owned(), collection.to_owned()))
+                    .cloned()
+            } else {
+                None
+            },
+            document_visibility: if action == AccessAction::Search {
+                policy
+                    .views
+                    .get(&(principal.to_owned(), collection.to_owned()))
+                    .cloned()
+            } else {
+                None
+            },
+        })
+    }
+}
+
+struct PolicyGuard<'a> {
+    _policy: RwLockReadGuard<'a, Policy>,
+    decision: AccessDecision,
+}
+impl AuthorizationGuard for PolicyGuard<'_> {
+    fn decision(&self) -> &AccessDecision {
+        &self.decision
+    }
+}
+
 /// In-process snapshot authority. Loading and validating a replacement happens
 /// before publication; readers never observe a partially replaced policy.
 #[derive(Debug)]
@@ -163,39 +243,25 @@ impl Authorizer for PolicyAuthority {
             .policy
             .read()
             .map_err(|_| Status::internal("access policy lock poisoned"))?;
-        let allowed = policy
-            .grants
-            .get(&(principal.to_owned(), collection.to_owned()))
-            .is_some_and(|actions| actions.contains(&(action as i32)));
-        if !allowed {
-            return Err(Status::permission_denied(
-                "operation is not authorized for this collection",
-            ));
-        }
-        Ok(AccessDecision {
-            policy_revision: policy.revision,
-            principal: principal.into(),
-            collection: collection.into(),
-            workspace: policy.resources[collection].clone(),
-            action: action as i32,
-            field_permissions: if action == AccessAction::Search {
-                policy
-                    .fields
-                    .get(&(principal.to_owned(), collection.to_owned()))
-                    .cloned()
-            } else {
-                None
-            },
-            document_visibility: if action == AccessAction::Search {
-                policy
-                    .views
-                    .get(&(principal.to_owned(), collection.to_owned()))
-                    .cloned()
-            } else {
-                None
-            },
-        })
+        policy.authorize(principal, collection, action)
     }
+    fn pin(&self, expected: &AccessDecision) -> Result<Box<dyn AuthorizationGuard + '_>, Status> {
+        let policy = self
+            .policy
+            .read()
+            .map_err(|_| Status::internal("access policy lock poisoned"))?;
+        let action = AccessAction::try_from(expected.action)
+            .map_err(|_| Status::permission_denied("invalid authorization action"))?;
+        let decision = policy.authorize(&expected.principal, &expected.collection, action)?;
+        if &decision != expected {
+            return Err(crate::error_disclosure::policy_changed());
+        }
+        Ok(Box::new(PolicyGuard {
+            _policy: policy,
+            decision,
+        }))
+    }
+
     fn subscribe(&self) -> watch::Receiver<u64> {
         self.revisions.subscribe()
     }
@@ -255,6 +321,23 @@ impl AccessPermit {
     }
     pub fn decision(&self) -> &AccessDecision {
         &self.decision
+    }
+    /// Pin the admitted revision through a synchronous commit. Do not call
+    /// `check` under this guard: a recursive read can deadlock a queued writer.
+    pub fn pin(&self) -> Result<PinnedAccess<'_>, Status> {
+        if *self.revisions.borrow() != self.decision.policy_revision {
+            return Err(crate::error_disclosure::policy_changed());
+        }
+        let guard = self.authority.pin(&self.decision)?;
+        if guard.decision() != &self.decision {
+            return Err(Status::permission_denied(
+                "invalid pinned authorization decision",
+            ));
+        }
+        if *self.revisions.borrow() != self.decision.policy_revision {
+            return Err(crate::error_disclosure::policy_changed());
+        }
+        Ok(PinnedAccess { guard })
     }
     pub fn check(&self) -> Result<(), Status> {
         if *self.revisions.borrow() != self.decision.policy_revision {
@@ -331,5 +414,46 @@ where
             self.inner = None;
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+    use crate::pb::{CollectionGrant, CollectionResource};
+    use std::sync::TryLockError;
+
+    fn policy() -> AccessPolicy {
+        AccessPolicy {
+            format_version: 1,
+            revision: 1,
+            resources: vec![CollectionResource {
+                workspace: "workspace".into(),
+                collection: "books".into(),
+            }],
+            grants: vec![CollectionGrant {
+                principal: "reader".into(),
+                workspace: "workspace".into(),
+                collection: "books".into(),
+                actions: vec![AccessAction::Search as i32],
+                ..Default::default()
+            }],
+        }
+    }
+
+    #[test]
+    fn policy_pin_excludes_a_writer_until_drop() {
+        let authority = Arc::new(PolicyAuthority::new(policy()).unwrap());
+        let permit =
+            AccessPermit::acquire(authority.clone(), "reader", "books", AccessAction::Search)
+                .unwrap();
+        let pinned = permit.pin().unwrap();
+
+        let blocked = authority.policy.try_write();
+        assert!(matches!(blocked, Err(TryLockError::WouldBlock)));
+        drop(blocked);
+
+        drop(pinned);
+        assert!(authority.policy.try_write().is_ok());
     }
 }

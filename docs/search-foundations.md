@@ -16,6 +16,11 @@ This is a trusted local lifecycle only. Distributed authority activation,
 explicit server routing, remaining protobuf shape semantics and the remaining
 authorization scope are unfinished. The foundation goal is not complete.
 
+The current working increment adds [access-controlled local source catalogs](source-access.md):
+format 7 persists resource scope, and policy pins serialize synchronous commits
+against revocation. Its validation is pending. It does not yet connect source
+writes to public server routing or exclusive distributed owner admission.
+
 ## Historical map-projection checkpoint
 
 The following introduction records the earlier `73a420b` map-projection
