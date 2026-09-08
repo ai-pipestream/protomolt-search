@@ -564,6 +564,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    #[cfg(all(feature = "raft", feature = "tls"))]
     if let Some(host) = raft_host {
         let mut shutdown = shutdown_rx.clone();
         handles.push(tokio::spawn(async move {
@@ -574,6 +575,8 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }));
     }
+    #[cfg(not(all(feature = "raft", feature = "tls")))]
+    let _ = raft_host;
 
     for handle in handles {
         handle.await??;
