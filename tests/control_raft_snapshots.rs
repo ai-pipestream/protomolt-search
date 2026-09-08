@@ -10,7 +10,8 @@
 //! failure is a minimized reproduction to hand to Fable, not a test bug.
 //!
 //! Run: `cargo test --test control_raft_snapshots --features
-//! raft,fault-injection -- --test-threads=1`.
+//! raft,fault-injection -- --test-threads=1` (the target holds a
+//! target-wide serial lock, so any `--test-threads` value is safe).
 #![cfg(feature = "raft")]
 
 mod control_adversarial;
@@ -56,6 +57,25 @@ unsafe impl std::alloc::GlobalAlloc for Tracking {
 
 #[global_allocator]
 static ALLOC: Tracking = Tracking;
+
+/// Target-wide serialization for the parallel release gate. The tests share
+/// one piece of process-global state: the allocation tracker above, a
+/// `#[global_allocator]` watermark that `r5_install_hashing_is_bounded`
+/// resets and re-records around one install; every fixture otherwise lives
+/// in its own `TestDir`. Every test nevertheless holds this lock for its
+/// whole body so the measurement window can never overlap another test's
+/// allocations. The guard is taken before the first `.await` and is `Send`,
+/// so it is safe inside `#[tokio::test(flavor = "multi_thread")]`. Panics
+/// are expected here (the failing `rN`/`r5` tests are the reproductions),
+/// so the lock is re-acquired across poisoning; mutual exclusion is what
+/// matters, not mutex state.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn live_bytes() -> usize {
     LIVE.load(Ordering::Relaxed)
@@ -144,6 +164,7 @@ async fn served(
 /// generation is destroyed even though the install then errors.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r3_wrong_group_valid_image_is_refused_and_previous_survives() {
+    let _serial = serial();
     let (dir_a, mut machine_a, image_a, _meta_a) = machine_with_generation("r3-group-a").await;
     let reader = machine_a
         .shared_store()
@@ -234,6 +255,7 @@ async fn r3_wrong_group_valid_image_is_refused_and_previous_survives() {
 /// then set from the meta, so the install succeeds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r3_correct_index_wrong_membership_is_refused() {
+    let _serial = serial();
     let (_dir, mut machine, image, real_meta) = machine_with_generation("r3-membership").await;
     // Same bytes, same applied index, voters {9} instead of {1}.
     let forged = raft_kit::meta_for(real_meta.last_log_id.unwrap().index, &image, &[9]);
@@ -255,6 +277,7 @@ async fn r3_correct_index_wrong_membership_is_refused() {
 /// snapshot files, so the previous generation is gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r3_rejected_install_leaves_previous_usable_after_restart() {
+    let _serial = serial();
     let (dir, mut machine, image_a, _meta_a) = machine_with_generation("r3-restart").await;
 
     // Same wrong-group attempt as r3_wrong_group: refused, but late.
@@ -318,6 +341,7 @@ async fn r3_rejected_install_leaves_previous_usable_after_restart() {
 /// either serve the COMPLETE previous generation or refuse loudly by name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r3_interrupted_publication_boundaries() {
+    let _serial = serial();
     let snapshots = |dir: &kit::TestDir| dir.path().join("raft-snapshots");
 
     // (a) current.redb replaced with newer bytes, meta still the old one
@@ -433,6 +457,7 @@ async fn r3_interrupted_publication_boundaries() {
 /// generation observes the overwritten bytes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r3_reader_held_across_publication() {
+    let _serial = serial();
     let (_dir_a, mut machine, _image_a1, _meta_a1) = machine_with_generation("r3-reader-a").await;
     // Hold the served generation-1 file open and remember its bytes.
     let mut held = RaftStateMachine::get_current_snapshot(&mut machine)
@@ -480,6 +505,7 @@ async fn r3_reader_held_across_publication() {
 /// a valid foreign file would install).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r5_install_uses_the_actual_receive_not_the_newest_filename() {
+    let _serial = serial();
     let (dir, mut machine, _image, _meta) = machine_with_generation("r5-newest").await;
     // A valid same-group image at applied index 2, to receive for real.
     let dir_b = kit::TestDir::new("r5-newest-b");
@@ -547,6 +573,7 @@ async fn r5_install_uses_the_actual_receive_not_the_newest_filename() {
 /// deliberately LATER name is selected and must not be.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r5_interrupted_receive_leaves_no_selected_artifact() {
+    let _serial = serial();
     let snapshots = |dir: &kit::TestDir| dir.path().join("raft-snapshots");
 
     // (i) plain leftover: fresh receive wins by name at 331c18f.
@@ -622,6 +649,7 @@ async fn r5_interrupted_receive_leaves_no_selected_artifact() {
 /// intact. (The bounded-allocation half of R5 is the next test.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r5_oversize_and_truncated_images_refuse_before_replacement() {
+    let _serial = serial();
     // (i) an announced length larger than the received image.
     {
         let (dir, mut machine, image, meta) = machine_with_generation("r5-oversize").await;
@@ -670,6 +698,7 @@ async fn r5_oversize_and_truncated_images_refuse_before_replacement() {
 /// the missing bounded receive sink, documented here and in the harness doc.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r5_announced_length_is_checked_only_at_install() {
+    let _serial = serial();
     let (dir, mut machine, image, meta) = machine_with_generation("r5-late-check").await;
     let mut receive = RaftStateMachine::begin_receiving_snapshot(&mut machine)
         .await
@@ -695,6 +724,7 @@ async fn r5_announced_length_is_checked_only_at_install() {
 /// Vec, so the peak reaches the image size.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r5_install_hashing_is_bounded() {
+    let _serial = serial();
     // A store whose image is several MiB: distinct prepares accumulate
     // decision records. Custom limits: the kit decision budget is far too
     // small for this many commands.
@@ -734,6 +764,9 @@ async fn r5_install_hashing_is_bounded() {
     let (store_dst, _authority) = kit::create_store(&dir_dst);
     let mut machine_dst =
         ControlStateMachine::new(store_dst, &dir_dst.path().join("raft-snapshots")).unwrap();
+    // Baseline re-recorded here, inside the target-wide SERIAL section (the
+    // guard was taken at test entry): no other test can allocate between
+    // this reset and the peak read below.
     let watermark = live_bytes();
     PEAK.store(watermark, Ordering::Relaxed);
     let outcome = raft_kit::install_received(&mut machine_dst, &image, &meta).await;

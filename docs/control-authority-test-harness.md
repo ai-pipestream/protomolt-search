@@ -563,6 +563,15 @@ worker/parent fault-injection surface. Both are gated together with 3c:
 --test-threads=1` (about 13 s) and `cargo test --test control_crash_faults
 --features raft,fault-injection -- --test-threads=2` (under a second).
 
+Parallel gate: both raft targets take a target-wide `SERIAL` mutex for
+each test's whole body, so the combined release gate
+(`cargo test --release --features raft,fault-injection --no-fail-fast --
+--test-threads=4`) may run them alongside everything else. The lock is
+load-bearing in both: every host in `control_raft_regressions` bootstraps
+on the kit's fixed `127.0.0.1:9917`, and `r5_install_hashing_is_bounded`
+resets and re-records its process-wide allocation watermark inside the
+lock so no other test's allocations can overlap the measurement window.
+
 Kit additions: `raft_kit.rs` gains `control_entry` (a committed
 `(term 1, node 1, index)` entry), `build_current` (publishes a generation
 through the real snapshot builder and returns image + openraft meta),
