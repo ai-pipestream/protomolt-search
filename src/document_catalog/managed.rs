@@ -2,7 +2,8 @@
 use super::*;
 use crate::pb::storage::{PreparedSourceOwnerPhase, SourceManagedActivation, SourceManagedBinding};
 
-#[cfg(all(test, feature = "net"))]
+#[cfg(all(any(test, feature = "fault-injection"), feature = "net"))]
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy)]
 pub(super) enum BindFault {
     BeforeCommit,
@@ -11,7 +12,7 @@ pub(super) enum BindFault {
     ExitAfterCommit,
 }
 
-#[cfg(all(test, feature = "net"))]
+#[cfg(all(any(test, feature = "fault-injection"), feature = "net"))]
 fn inject(fault: Option<BindFault>, after: bool) -> Result<(), Status> {
     match (fault, after) {
         (Some(BindFault::BeforeCommit), false) => Err(Status::aborted(
@@ -137,7 +138,7 @@ mod adapter {
         pub(super) inner: DocumentCatalog,
         binding: SourceManagedBinding,
         authority: SourceAuthorityStore,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "fault-injection"))]
         pub(super) activate_fault: Option<BindFault>,
     }
 
@@ -153,6 +154,15 @@ mod adapter {
     }
 
     impl AccessControlledCatalog {
+        /// Arm one process-exit fault at the binding's source commit.
+        #[cfg(any(test, feature = "fault-injection"))]
+        pub fn arm_bind_exit_fault(&mut self, fault: crate::source_authority::ExitFault) {
+            self.bind_fault = Some(match fault {
+                crate::source_authority::ExitFault::BeforeCommit => BindFault::ExitBeforeCommit,
+                crate::source_authority::ExitFault::AfterCommit => BindFault::ExitAfterCommit,
+            });
+        }
+
         /// Consume the sole local controlled handle and durably close it under
         /// an exact committed preparation. No source/history bytes are rebuilt.
         /// The one admission resolves current Admin and the pending owner and
@@ -224,10 +234,10 @@ mod adapter {
                     meta.insert("header", header.encode_to_vec().as_slice())
                         .map_err(storage)?;
                 }
-                #[cfg(test)]
+                #[cfg(any(test, feature = "fault-injection"))]
                 inject(self.bind_fault, false)?;
                 tx.commit().map_err(storage)?;
-                #[cfg(test)]
+                #[cfg(any(test, feature = "fault-injection"))]
                 inject(self.bind_fault, true)?;
                 drop(checkpoint);
                 Ok(binding)
@@ -237,7 +247,7 @@ mod adapter {
                 inner,
                 binding,
                 authority: authority.clone(),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "fault-injection"))]
                 activate_fault: None,
             })
         }
@@ -279,7 +289,7 @@ mod adapter {
                 inner,
                 binding: binding.clone(),
                 authority: authority.clone(),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "fault-injection"))]
                 activate_fault: None,
             })
         }
@@ -339,9 +349,18 @@ mod adapter {
                 inner,
                 binding,
                 authority: authority.clone(),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "fault-injection"))]
                 activate_fault: None,
             })
+        }
+
+        /// Arm one process-exit fault at the activation's source commit.
+        #[cfg(any(test, feature = "fault-injection"))]
+        pub fn arm_activate_exit_fault(&mut self, fault: crate::source_authority::ExitFault) {
+            self.activate_fault = Some(match fault {
+                crate::source_authority::ExitFault::BeforeCommit => BindFault::ExitBeforeCommit,
+                crate::source_authority::ExitFault::AfterCommit => BindFault::ExitAfterCommit,
+            });
         }
 
         /// Persist the committed fence and open the source for admitted
@@ -401,10 +420,10 @@ mod adapter {
                     meta.insert("header", header.encode_to_vec().as_slice())
                         .map_err(storage)?;
                 }
-                #[cfg(test)]
+                #[cfg(any(test, feature = "fault-injection"))]
                 inject(self.activate_fault, false)?;
                 tx.commit().map_err(storage)?;
-                #[cfg(test)]
+                #[cfg(any(test, feature = "fault-injection"))]
                 inject(self.activate_fault, true)?;
                 Ok(activation)
             })()?;

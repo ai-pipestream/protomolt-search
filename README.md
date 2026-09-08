@@ -1250,6 +1250,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   destination store remains unchanged. See [retirement and crash recovery](docs/control-retirement.md);
   transactional import, worker fencing and activation remain separate steps.
 
+- **Foundation branch: `fault-injection` feature.** Out-of-crate crash
+  harnesses (`tests/*.rs`, `--features fault-injection,net`) can arm one
+  process exit (code 87) before or after the next transaction commit:
+  `SourceAuthorityStore::arm_exit_fault`, `AccessControlledCatalog::arm_bind_exit_fault`,
+  `PreparedManagedCatalog::arm_activate_exit_fault`. Never on in a serving
+  binary.
+
 - **Foundation branch: the committed map feed (implemented).**
   `published_map` produces a `PublishedMap` from committed rows in one read
   (routes, codes, tree, replicas, nodes, owners with their phase and write

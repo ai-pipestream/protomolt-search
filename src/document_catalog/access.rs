@@ -45,7 +45,7 @@ pub(super) fn authorize<'a>(
 pub struct AccessControlledCatalog {
     pub(super) inner: DocumentCatalog,
     pub(super) binding: SourceResourceBinding,
-    #[cfg(all(test, feature = "net"))]
+    #[cfg(all(any(test, feature = "fault-injection"), feature = "net"))]
     pub(super) bind_fault: Option<super::managed::BindFault>,
 }
 
@@ -79,7 +79,7 @@ impl AccessControlledCatalog {
         Ok(Self {
             inner,
             binding: binding.clone(),
-            #[cfg(all(test, feature = "net"))]
+            #[cfg(all(any(test, feature = "fault-injection"), feature = "net"))]
             bind_fault: None,
         })
     }

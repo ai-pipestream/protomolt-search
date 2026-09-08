@@ -61,6 +61,10 @@ redb = "=4.1.0"
 getrandom = "=0.2.17"
 
 [features]
+# Process-exit fault injection at store and source transaction boundaries,
+# for out-of-crate crash-recovery harnesses (tests/*.rs). Never on in a
+# serving binary.
+fault-injection = []
 # The network stack (docs/embedded-mobile.md): tonic's HTTP/2 transport,
 # Tokio's sockets and signals, the clustered TurboVec gRPC client, and
 # everything that listens or dials — the serving binary, the harness,

@@ -967,12 +967,12 @@ impl SourceAuthorityStore {
             meta.insert(CAPACITY_HEADER, capacity_header.encode_to_vec().as_slice())
                 .map_err(storage)?;
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "fault-injection"))]
         self.inject(false)?;
         tx.commit().map_err(storage)?;
         self.inner.revisions.send_replace(decision.policy_revision);
         self.publish_applied(decision.control_revision);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "fault-injection"))]
         self.inject(true)?;
         Ok(decision)
     }
@@ -1190,10 +1190,10 @@ impl SourceAuthorityStore {
             tx.abort().map_err(storage)?;
             return Ok(receipt);
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "fault-injection"))]
         self.inject(false)?;
         tx.commit().map_err(storage)?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "fault-injection"))]
         self.inject(true)?;
         Ok(receipt)
     }

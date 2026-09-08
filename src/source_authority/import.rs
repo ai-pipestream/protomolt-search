@@ -993,11 +993,11 @@ impl SourceAuthorityStore {
                 .map_err(storage)?;
             decision = result;
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "fault-injection"))]
         self.inject(false)?;
         tx.commit().map_err(storage)?;
         self.publish_applied(decision.control_revision);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "fault-injection"))]
         self.inject(true)?;
         Ok(decision)
     }

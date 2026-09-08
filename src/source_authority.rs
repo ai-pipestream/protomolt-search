@@ -27,6 +27,8 @@ mod recovery;
 mod retirement;
 mod transition;
 
+#[cfg(any(test, feature = "fault-injection"))]
+pub use self::ExitFault as SourceExitFault;
 pub use capacity::{
     PlanningContext, MAX_CAPACITY_BYTES, MAX_CAPACITY_RECORDS, MAX_CAPACITY_REPORTERS,
 };
@@ -42,13 +44,24 @@ const DECISIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("source_au
 const WORKFLOWS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("source_authority_workflows");
 const CLOSED: &str = "source authority storage failed; close every clone and reopen existing state before continuing";
 
-#[cfg(test)]
+#[cfg(any(test, feature = "fault-injection"))]
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fault {
     BeforeCommit,
     AfterCommit,
     ExitBeforeCommit,
     ExitAfterCommit,
+}
+
+/// A process-exit fault at the next store transaction boundary, for
+/// crash-recovery harnesses: the process exits with code 87 either before
+/// the transaction commits or right after it, before any reply.
+#[cfg(any(test, feature = "fault-injection"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitFault {
+    BeforeCommit,
+    AfterCommit,
 }
 
 struct Inner {
@@ -68,7 +81,7 @@ struct Inner {
     // The boolean permanently closes the instance after a storage failure.
     closed: Mutex<bool>,
     identity: SourceAuthorityIdentity,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fault-injection"))]
     fault: Mutex<Option<Fault>>,
     // Keep the same open-file description locked until after Database drops.
     _file_lock: File,
@@ -584,7 +597,7 @@ impl SourceAuthorityStore {
                     applied: watch::Sender::new(0),
                     closed: Mutex::new(false),
                     identity: identity.clone(),
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "fault-injection"))]
                     fault: Mutex::new(None),
                     _file_lock: file,
                 }),
@@ -866,14 +879,24 @@ impl SourceAuthorityStore {
             meta.insert("header", header.encode_to_vec().as_slice())
                 .map_err(storage)?;
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "fault-injection"))]
         self.inject(false)?;
         tx.commit().map_err(storage)?;
         self.inner.revisions.send_replace(decision.policy_revision);
         self.publish_applied(decision.control_revision);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "fault-injection"))]
         self.inject(true)?;
         Ok(decision)
+    }
+
+    /// Arm one process-exit fault for the next control transaction of this
+    /// store: control commands, import steps and capacity configuration.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn arm_exit_fault(&self, fault: ExitFault) {
+        *self.inner.fault.lock().unwrap() = Some(match fault {
+            ExitFault::BeforeCommit => Fault::ExitBeforeCommit,
+            ExitFault::AfterCommit => Fault::ExitAfterCommit,
+        });
     }
 
     /// Wake map-feed subscribers only when the applied revision moved: a
@@ -889,7 +912,7 @@ impl SourceAuthorityStore {
         });
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fault-injection"))]
     fn inject(&self, after: bool) -> Result<(), Status> {
         let mut fault = self.inner.fault.lock().unwrap();
         match (*fault, after) {
