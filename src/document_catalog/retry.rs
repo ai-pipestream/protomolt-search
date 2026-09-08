@@ -51,7 +51,7 @@ impl DocumentCatalog {
     ) -> Result<Option<DocumentWriteReceipt>, Status> {
         let read = self.database.begin_read().map_err(storage)?;
         let meta = read.open_table(META).map_err(storage)?;
-        let header: DocumentCatalogHeader = decode(
+        let header: DocumentCatalogHeader = decode_header(
             meta.get("header")
                 .map_err(storage)?
                 .ok_or_else(|| Status::data_loss("catalog header missing"))?

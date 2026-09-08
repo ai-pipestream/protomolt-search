@@ -2,6 +2,7 @@ syntax = "proto3";
 package ai.protomolt.search.storage.v1;
 import "ai/protomolt/search/v1/document_write.proto";
 import "ai/protomolt/search/v1/search.proto";
+import "ai/protomolt/search/storage/v1/source_authority.proto";
 
 message DocumentCatalogHeader {
   uint32 format_version = 1;
@@ -23,6 +24,18 @@ message DocumentCatalogHeader {
   SourceResourceBinding resource_binding = 8;
   // Format 8: actor-scoped retries. Required even when no legacy records exist.
   SourceActorNamespace actor_namespace = 9;
+  // Format 9 binds this exact local history to a prepared logical owner.
+  // Reopen starts closed; persisted metadata never grants write admission.
+  SourceManagedBinding managed_binding = 10;
+}
+
+// The source-side completion of a committed preparation, not activation or
+// permission to export a phone's bytes. All original history and retries stay.
+message SourceManagedBinding {
+  uint32 format_version = 1; // 1
+  SourceAuthorityIdentity authority = 2;
+  PreparedSourceOwner preparation = 3;
+  uint64 bound_at_sequence = 4;
 }
 
 // Canonical lookup key in the separate actor_operations table. Principals are

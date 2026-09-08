@@ -11,8 +11,8 @@ use redb::{
 use tonic::Status;
 
 use crate::pb::storage::{
-    DocumentCatalogHeader, DocumentOperation, DocumentVersion, DocumentVersionKey, SourceRecord,
-    SourceResourceBinding,
+    DocumentCatalogHeader, DocumentOperation, DocumentVersion, DocumentVersionKey,
+    SourceManagedBinding, SourceRecord, SourceResourceBinding,
 };
 use crate::pb::{
     accept_document_request::Mutation, AcceptDocumentRequest, AcceptedDocumentVersion,
@@ -25,6 +25,7 @@ mod access;
 mod actors;
 mod backup;
 mod checkpoint;
+mod managed;
 mod projection;
 mod publication;
 mod restore;
@@ -33,6 +34,8 @@ mod seal;
 pub use access::AccessControlledCatalog;
 pub use backup::CapturedBackup;
 pub use checkpoint::CatalogCheckpoint;
+#[cfg(feature = "net")]
+pub use managed::PreparedManagedCatalog;
 pub use publication::{MaintenanceRecovery, ProjectionRecovery};
 pub use restore::VerifiedSourceRestore;
 
@@ -49,6 +52,7 @@ const RETIRING_FORMAT_VERSION: u32 = 5;
 const RETIRED_FORMAT_VERSION: u32 = 6;
 const LEGACY_ACCESS_CONTROLLED_FORMAT: u32 = 7;
 const ACCESS_CONTROLLED_FORMAT: u32 = 8;
+const MANAGED_FORMAT: u32 = 9;
 const CACHE_BYTES: usize = 8 << 20;
 
 fn storage(error: impl std::fmt::Display) -> Status {
@@ -56,6 +60,19 @@ fn storage(error: impl std::fmt::Display) -> Status {
 }
 fn decode<T: Message + Default>(bytes: &[u8]) -> Result<T, Status> {
     T::decode(bytes).map_err(|e| Status::data_loss(format!("document catalog record: {e}")))
+}
+
+fn decode_header(bytes: &[u8]) -> Result<DocumentCatalogHeader, Status> {
+    if bytes.len() > 256 * 1024 {
+        return Err(Status::data_loss("source catalog header exceeds 256KiB"));
+    }
+    let header: DocumentCatalogHeader = decode(bytes)?;
+    if header.format_version == MANAGED_FORMAT && header.encode_to_vec() != bytes {
+        return Err(Status::data_loss(
+            "managed source header has unknown or noncanonical fields",
+        ));
+    }
+    Ok(header)
 }
 
 fn valid_history_id(id: &[u8]) -> bool {
@@ -82,6 +99,7 @@ fn validate_current_header(header: &DocumentCatalogHeader) -> Result<(), Status>
             | RETIRED_FORMAT_VERSION
             | LEGACY_ACCESS_CONTROLLED_FORMAT
             | ACCESS_CONTROLLED_FORMAT
+            | MANAGED_FORMAT
     ) || !valid_history_id(&header.history_id)
         || header.legacy_receipts_through_sequence > header.accepted_sequence
     {
@@ -91,6 +109,7 @@ fn validate_current_header(header: &DocumentCatalogHeader) -> Result<(), Status>
     }
     seal::validate_header_seal(header)?;
     actors::validate_namespace(header)?;
+    managed::validate_header(header)?;
     Ok(())
 }
 
@@ -98,6 +117,7 @@ pub struct DocumentCatalog {
     database: Database,
     durable: bool,
     resource_binding: Option<SourceResourceBinding>,
+    managed_binding: Option<SourceManagedBinding>,
     // redb's fallback backend does not lock on every mobile platform. Hold
     // the same open file description exclusively for this catalog's lifetime.
     // Drop the database before releasing this guard.
@@ -106,6 +126,11 @@ pub struct DocumentCatalog {
 
 impl DocumentCatalog {
     fn validate_resource_binding(&self, header: &DocumentCatalogHeader) -> Result<(), Status> {
+        if header.managed_binding != self.managed_binding {
+            return Err(Status::failed_precondition(
+                "managed source binding differs; managed storage requires its exact owner and closed recovery adapter",
+            ));
+        }
         if header.resource_binding != self.resource_binding {
             return Err(Status::failed_precondition(
                 "document catalog resource binding differs; access-controlled catalogs require their bound workspace and collection",
@@ -118,7 +143,7 @@ impl DocumentCatalog {
     pub fn collection(&self) -> Result<String, Status> {
         let transaction = self.database.begin_read().map_err(storage)?;
         let meta = transaction.open_table(META).map_err(storage)?;
-        let header: DocumentCatalogHeader = decode(
+        let header: DocumentCatalogHeader = decode_header(
             meta.get("header")
                 .map_err(storage)?
                 .ok_or_else(|| Status::data_loss("catalog header missing"))?
@@ -143,6 +168,35 @@ impl DocumentCatalog {
         collection: &str,
         create: bool,
         resource_binding: Option<SourceResourceBinding>,
+    ) -> Result<Self, Status> {
+        Self::open_bound_file(path, collection, create, resource_binding, None)
+    }
+
+    fn open_bound_file(
+        path: &Path,
+        collection: &str,
+        create: bool,
+        resource_binding: Option<SourceResourceBinding>,
+        managed_binding: Option<SourceManagedBinding>,
+    ) -> Result<Self, Status> {
+        if create && managed_binding.is_some() {
+            return Err(Status::failed_precondition(
+                "managed source recovery never creates or replaces source history",
+            ));
+        }
+        Self::open_file_resolving_binding(path, collection, create, resource_binding, |_| {
+            Ok(managed_binding)
+        })
+    }
+
+    // Resolve expected managed metadata only after taking the existing file's
+    // exclusive lock, retained through validation and for the returned handle.
+    fn open_file_resolving_binding(
+        path: &Path,
+        collection: &str,
+        create: bool,
+        resource_binding: Option<SourceResourceBinding>,
+        resolve_binding: impl FnOnce(&Database) -> Result<Option<SourceManagedBinding>, Status>,
     ) -> Result<Self, Status> {
         let parent = path
             .parent()
@@ -180,10 +234,12 @@ impl DocumentCatalog {
         let database = builder
             .create_file(file.try_clone().map_err(storage)?)
             .map_err(storage)?;
+        let managed_binding = resolve_binding(&database)?;
         let catalog = Self {
             database,
             durable: true,
             resource_binding,
+            managed_binding,
             _file_lock: Some(file),
         };
         catalog.initialize(collection, new)?;
@@ -202,6 +258,7 @@ impl DocumentCatalog {
             database,
             durable: false,
             resource_binding: None,
+            managed_binding: None,
             _file_lock: None,
         };
         catalog.initialize(collection, true)?;
@@ -216,8 +273,8 @@ impl DocumentCatalog {
                 .get("header")
                 .map_err(storage)?
                 .ok_or_else(|| Status::data_loss("existing document catalog header missing"))?;
-            let header: DocumentCatalogHeader = decode(bytes.value())?;
-            if !(1..=ACCESS_CONTROLLED_FORMAT).contains(&header.format_version)
+            let header: DocumentCatalogHeader = decode_header(bytes.value())?;
+            if !(1..=MANAGED_FORMAT).contains(&header.format_version)
                 || header.collection != collection
             {
                 return Err(Status::failed_precondition(
@@ -232,6 +289,7 @@ impl DocumentCatalog {
                 || header.retirement_intent.is_some()
                 || header.resource_binding.is_some()
                 || header.actor_namespace.is_some()
+                || header.managed_binding.is_some()
             {
                 return Err(Status::data_loss(
                     "legacy catalog contains unexpected history identity metadata",
@@ -282,6 +340,7 @@ impl DocumentCatalog {
                 retirement_intent: None,
                 resource_binding: self.resource_binding.clone(),
                 actor_namespace: self.resource_binding.as_ref().map(|_| actors::namespace(0)),
+                managed_binding: None,
             }
             .encode_to_vec();
             table.insert("header", header.as_slice()).map_err(storage)?;
@@ -305,7 +364,7 @@ impl DocumentCatalog {
             .map_err(storage)?;
         {
             let mut meta = transaction.open_table(META).map_err(storage)?;
-            let mut header: DocumentCatalogHeader = decode(
+            let mut header: DocumentCatalogHeader = decode_header(
                 meta.get("header")
                     .map_err(storage)?
                     .ok_or_else(|| Status::data_loss("catalog header missing"))?
@@ -636,7 +695,7 @@ impl DocumentCatalog {
         }
         let transaction = self.database.begin_read().map_err(storage)?;
         let meta = transaction.open_table(META).map_err(storage)?;
-        let header: DocumentCatalogHeader = decode(
+        let header: DocumentCatalogHeader = decode_header(
             meta.get("header")
                 .map_err(storage)?
                 .ok_or_else(|| Status::data_loss("catalog header missing"))?

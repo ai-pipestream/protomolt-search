@@ -80,6 +80,64 @@ fn payload_change(total: u64, removed: usize, added: usize) -> Result<u64, Statu
 }
 
 impl SourceAuthorityStore {
+    // Owner-side preparation work holds current authority through its source
+    // commit. This is an adapter fence, never called from pure state application.
+    pub(crate) fn with_prepared_owner<T>(
+        &self,
+        principal: &str,
+        expected: &PreparedSourceOwner,
+        run: impl FnOnce(&SourceAuthorityIdentity) -> Result<T, Status>,
+    ) -> Result<T, Status> {
+        contract::owner(expected).map_err(|e| Status::invalid_argument(e.message()))?;
+        self.guarded(|| {
+            let key = expected
+                .key
+                .as_ref()
+                .ok_or_else(|| missing("prepared owner key"))?;
+            let tx = self.inner.database.begin_read().map_err(storage)?;
+            self.read_policy(&tx, principal, key)?;
+            let table = tx.open_table(OWNERS).map_err(storage)?;
+            let bytes = key.encode_to_vec();
+            let held: PreparedSourceOwner = contract::decode(
+                table
+                    .get(bytes.as_slice())
+                    .map_err(storage)?
+                    .ok_or_else(|| {
+                        Status::failed_precondition("source owner has no committed preparation")
+                    })?
+                    .value(),
+            )?;
+            contract::owner(&held).map_err(corrupt)?;
+            if &held != expected || held.phase != PreparedSourceOwnerPhase::Prepared as i32 {
+                return Err(Status::failed_precondition(
+                    "source owner preparation changed or is no longer pending",
+                ));
+            }
+            // Only failures of this control store latch its instance closed.
+            // A source-side refusal/failure belongs to the source adapter.
+            Ok(run(&self.inner.identity))
+        })?
+    }
+
+    pub(crate) fn with_resource_admin<T>(
+        &self,
+        principal: &str,
+        identity: &SourceAuthorityIdentity,
+        key: &LogicalSourceOwner,
+        run: impl FnOnce() -> Result<T, Status>,
+    ) -> Result<T, Status> {
+        self.guarded(|| {
+            if identity != &self.inner.identity {
+                return Err(Status::failed_precondition(
+                    "managed source authority identity differs",
+                ));
+            }
+            let tx = self.inner.database.begin_read().map_err(storage)?;
+            self.read_policy(&tx, principal, key)?;
+            Ok(run())
+        })?
+    }
+
     /// Explicit trusted bootstrap in an existing durable directory. The supplied
     /// identity, limits and resource bindings become immutable. No source exists
     /// as a consequence of creating this control database.

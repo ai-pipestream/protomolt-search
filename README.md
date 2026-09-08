@@ -1237,6 +1237,14 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: closed managed-source storage.** An existing controlled
+  catalog can bind to an exact committed owner preparation while preserving
+  history and actor-scoped retries. Managed reopen stays closed and legacy
+  writers refuse it. See [managed source binding](docs/managed-source-binding.md)
+  for the durable boundary and remaining readiness/admission work. Validation:
+  720 library tests, 150 integration targets, embedded/mobile and wire checks;
+  lost-response recovery and metadata-budget refusals are covered.
+
 - **Foundation branch: transactional source-owner preparation.** A separate
   protobuf-defined control store commits owner/workflow state, current policy
   and actor-scoped retry decisions atomically. Preparation and cancellation

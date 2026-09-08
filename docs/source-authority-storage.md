@@ -106,8 +106,10 @@ control machine before managed activation and map publication are exposed.
 The source database remains separate: durable intents and completion facts
 must cover every cross-database crash boundary.
 
-Still required are verified initial readiness, managed catalog bindings and
-admission guards, owner retirement execution and evidence, replacement phases,
+[Closed managed catalog binding](managed-source-binding.md) now persists the
+source-side preparation completion without granting admission. Still required
+are verified initial readiness and managed admission guards, owner retirement
+execution and evidence, replacement phases,
 published owner metadata, remote revocation enforcement, OpenRaft log/application
 storage and transport, and runtime integration. Phones remain outside the
 control consensus group and keep all source/index/WAL/snapshot bytes locally.

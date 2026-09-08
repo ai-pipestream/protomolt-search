@@ -66,7 +66,7 @@ impl<'a> CatalogCheckpoint<'a> {
                     "checkpoint metadata budget exceeded",
                 ));
             }
-            decode(record.value())?
+            decode_header(record.value())?
         };
         validate_current_header(&header)?;
         actors::validate_read_counts(&read, &header)?;
@@ -84,13 +84,14 @@ impl<'a> CatalogCheckpoint<'a> {
             ));
         }
         let mut binary_tables = vec![HEADS, VERSIONS, OPERATIONS, DESCRIPTORS, SOURCES];
-        if metadata
-            .header
-            .as_ref()
-            .expect("captured header")
-            .format_version
-            == ACCESS_CONTROLLED_FORMAT
-        {
+        if matches!(
+            metadata
+                .header
+                .as_ref()
+                .expect("captured header")
+                .format_version,
+            ACCESS_CONTROLLED_FORMAT | MANAGED_FORMAT
+        ) {
             binary_tables.push(actors::OPERATIONS);
         }
         binary_tables.extend(journal_tables);

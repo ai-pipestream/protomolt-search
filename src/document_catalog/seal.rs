@@ -21,7 +21,7 @@ pub(super) fn validate_header_seal(header: &DocumentCatalogHeader) -> Result<(),
     });
     let lifecycle_format = if matches!(
         header.format_version,
-        LEGACY_ACCESS_CONTROLLED_FORMAT | ACCESS_CONTROLLED_FORMAT
+        LEGACY_ACCESS_CONTROLLED_FORMAT | ACCESS_CONTROLLED_FORMAT | MANAGED_FORMAT
     ) {
         let binding = header.resource_binding.as_ref().ok_or_else(|| {
             Status::data_loss("access-controlled catalog resource binding missing")
@@ -44,7 +44,7 @@ pub(super) fn validate_header_seal(header: &DocumentCatalogHeader) -> Result<(),
     } else {
         if header.resource_binding.is_some() {
             return Err(Status::data_loss(
-                "source resource binding requires catalog format 7 or 8",
+                "source resource binding requires catalog format 7, 8 or 9",
             ));
         }
         header.format_version
@@ -77,7 +77,7 @@ pub(super) fn header_from(
     tx: &redb::WriteTransaction,
 ) -> Result<DocumentCatalogHeader, Status> {
     let meta = tx.open_table(META).map_err(storage)?;
-    let header = decode(
+    let header = decode_header(
         meta.get("header")
             .map_err(storage)?
             .ok_or_else(|| Status::data_loss("catalog header missing"))?
@@ -85,6 +85,11 @@ pub(super) fn header_from(
     )?;
     validate_current_header(&header)?;
     catalog.validate_resource_binding(&header)?;
+    if header.managed_binding.is_some() {
+        return Err(Status::failed_precondition(
+            "managed source admission is closed; preparation and persisted binding do not authorize mutations",
+        ));
+    }
     Ok(header)
 }
 
@@ -132,7 +137,7 @@ impl DocumentCatalog {
     pub fn retirement_intent(&self) -> Result<Option<SourceRetirementIntent>, Status> {
         let read = self.database.begin_read().map_err(storage)?;
         let meta = read.open_table(META).map_err(storage)?;
-        let header: DocumentCatalogHeader = decode(
+        let header: DocumentCatalogHeader = decode_header(
             meta.get("header")
                 .map_err(storage)?
                 .ok_or_else(|| Status::data_loss("catalog header missing"))?
@@ -213,7 +218,7 @@ impl DocumentCatalog {
     pub fn history_seal(&self) -> Result<Option<SourceHistorySeal>, Status> {
         let read = self.database.begin_read().map_err(storage)?;
         let meta = read.open_table(META).map_err(storage)?;
-        let header: DocumentCatalogHeader = decode(
+        let header: DocumentCatalogHeader = decode_header(
             meta.get("header")
                 .map_err(storage)?
                 .ok_or_else(|| Status::data_loss("catalog header missing"))?

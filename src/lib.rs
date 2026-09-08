@@ -108,6 +108,7 @@ pub mod sortkeys;
 pub mod source_archive;
 #[cfg(feature = "net")]
 pub mod source_authority;
+mod source_owner;
 pub mod stats_cache;
 pub mod stats_identity;
 mod stream_signal;

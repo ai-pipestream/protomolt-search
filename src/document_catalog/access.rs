@@ -19,7 +19,7 @@ pub(super) fn validate_binding(binding: &SourceResourceBinding) -> Result<(), St
     Ok(())
 }
 
-fn authorize<'a>(
+pub(super) fn authorize<'a>(
     binding: &SourceResourceBinding,
     permit: &'a AccessPermit,
     action: AccessAction,
@@ -43,8 +43,10 @@ fn authorize<'a>(
 /// No inner catalog accessor exists: future retrieval/publication adapters must
 /// enforce their own document/field grants and admission protocol.
 pub struct AccessControlledCatalog {
-    inner: DocumentCatalog,
-    binding: SourceResourceBinding,
+    pub(super) inner: DocumentCatalog,
+    pub(super) binding: SourceResourceBinding,
+    #[cfg(all(test, feature = "net"))]
+    pub(super) bind_fault: Option<super::managed::BindFault>,
 }
 
 impl AccessControlledCatalog {
@@ -77,6 +79,8 @@ impl AccessControlledCatalog {
         Ok(Self {
             inner,
             binding: binding.clone(),
+            #[cfg(all(test, feature = "net"))]
+            bind_fault: None,
         })
     }
 
@@ -92,7 +96,7 @@ impl AccessControlledCatalog {
         let _guard = authorize(&self.binding, permit, AccessAction::Ingest)?;
         let transaction = self.inner.database.begin_read().map_err(storage)?;
         let metadata = transaction.open_table(META).map_err(storage)?;
-        let header: DocumentCatalogHeader = decode(
+        let header: DocumentCatalogHeader = decode_header(
             metadata
                 .get("header")
                 .map_err(storage)?
