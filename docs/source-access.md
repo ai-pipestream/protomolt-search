@@ -100,7 +100,24 @@ refusal, 73 catalog unit tests and 32 catalog/access integration tests pass,
 including the isolated file-mode child check. A held-writer test verifies the
 receipt lookup does not wait for an unrelated database writer. Validation used
 unchanged runtime/test hashes, an 8 GiB swap-disabled scope, 3.34 GiB peak memory,
-and zero OOM events. The complete gate is recorded after it finishes.
+and zero OOM events.
+
+The complete run at `610203c` passed 669 library tests, all 146 integration
+targets, the embedded package, all five mobile targets and test/example
+compilation. It stopped at formatting drift in the fleet benchmark example
+merged from main. Commit `18b62e7` changes only that example's formatting.
+The final checks recompiled the example and passed formatting, vendored proto
+checks, diff checks and both IVF adapter tests. The preserved full-run manifest
+and final-run manifest prove that every other file is unchanged. Combined
+reported test results are 1,558 passed and one existing ignored live-OpenNLP
+test; the original formatting failure remains recorded as a failed invocation.
+Product protobuf files are byte-identical to `c4f5eb4`.
+
+The full run reached its 8 GiB cap and recorded memory-limit and socket-throttling
+events, with zero swap and zero OOM events. The final checks peaked at 3.60 GiB
+with zero swap and OOM events. This is correctness evidence, not a performance
+measurement or a fleet deployment. Actor-scoped retry ownership and network
+ingest commit authorization remain unfinished.
 
 ## Verification scope
 
