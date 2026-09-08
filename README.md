@@ -1237,6 +1237,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: transactional source-owner preparation.** A separate
+  protobuf-defined control store commits owner/workflow state, current policy
+  and actor-scoped retry decisions atomically. Preparation and cancellation
+  preserve source history and phone residency without activating a writer.
+  See [source authority storage](docs/source-authority-storage.md) for the
+  contract, full-suite validation and remaining managed-owner/Raft integration.
+
 - **Foundation branch: control-state failure boundaries.** Ambiguous state-file
   publication closes the shared control authority until an explicit existing-file
   reopen. Collection binding and reconciliation keep failed candidate changes

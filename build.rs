@@ -33,6 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "proto/ai/protomolt/search/storage/v1/document_catalog.proto",
                 "proto/ai/protomolt/search/v1/schema_report.proto",
                 "proto/ai/protomolt/search/storage/v1/source_archive.proto",
+                "proto/ai/protomolt/search/storage/v1/source_authority.proto",
                 "proto/ai/protomolt/search/mobile/v1/mobile.proto",
                 "proto/ai/protomolt/search/wal/v1/wal.proto",
                 "proto/ai/pipestream/opennlp/analysis/v1/analysis.proto",

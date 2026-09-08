@@ -150,6 +150,25 @@ impl Policy {
     }
 }
 
+// Reuse the same policy semantics in deterministic control-state application.
+// The caller supplies committed state; this never reads a live policy or clock.
+#[cfg(feature = "net")]
+pub(crate) fn validate_policy_snapshot(input: &AccessPolicy) -> Result<(), String> {
+    Policy::validate(input.clone()).map(|_| ())
+}
+
+#[cfg(feature = "net")]
+pub(crate) fn authorize_policy_snapshot(
+    input: &AccessPolicy,
+    principal: &str,
+    collection: &str,
+    action: AccessAction,
+) -> Result<AccessDecision, Status> {
+    Policy::validate(input.clone())
+        .map_err(|error| Status::data_loss(format!("committed control policy: {error}")))?
+        .authorize(principal, collection, action)
+}
+
 impl Policy {
     fn authorize(
         &self,
