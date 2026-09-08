@@ -5,6 +5,10 @@
 //! helpers through the public API only: same fixtures, same command shapes,
 //! same revisions. No new dependencies; temp dirs and process control are
 //! hand-rolled (`tests/multiprocess.rs` idiom).
+//!
+//! Shared between the `control_authority_adversarial` and
+//! `control_authority_model` targets, each of which uses a subset.
+#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
