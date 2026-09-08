@@ -1,8 +1,10 @@
-# Control-authority adversarial test harness (slice 1)
+# Control-authority adversarial test harness (slices 1 and 2)
 
 Coordination record and design for the adversarial integration-test harness
-around the source-authority control plane. This slice is test-only: it adds
-`tests/control_authority_adversarial.rs` plus the shared kit under
+around the source-authority control plane. This is test-only work: it adds
+`tests/control_authority_adversarial.rs` (slice 1),
+`tests/control_authority_model.rs` (slice 2a), and
+`tests/control_authority_planner.rs` (slice 2b) plus the shared kit under
 `tests/control_adversarial/` and this document. No production source, proto,
 or Cargo manifest changes.
 
@@ -168,3 +170,115 @@ collection's snapshot digest on the new leader equals the local baseline.
 - The supplement is the minimal valid 2-route shape (`NoPlacement`,
   `NoDerived`, `Geometry` provider); placement-tree and derived-column
   imports are covered by Fable's unit suite, not duplicated.
+
+## Slice 2a: differential model + seeded fuzzer
+
+`tests/control_adversarial/model.rs` is an independent reference model of
+the documented control rules, written from `docs/source-authority-storage.md`
+and `docs/control-import.md` ONLY — it is deliberately not derived from
+`src/source_authority/import.rs`. State: Admin set, policy/control revisions,
+a retry journal keyed by (actor, owner id, command id, namespace) with content
+bytes and the recorded code/revisions, owner preparations (workflow,
+generation, prepared/cancelled), used owner-workflow ids, import workflows
+(staging ordinal → bytes, or terminal), and an applied-import flag per
+resource. `apply()` implements the documented decision order: current
+permission (unrecorded `PermissionDenied`, checked before retry disclosure) →
+Begin holder-actor binding (unrecorded) → cross-namespace id reuse (unrecorded
+`FailedPrecondition`) → retry lookup (verbatim stored decision; changed
+content is an unrecorded `FailedPrecondition`) → recorded CAS on the
+control/policy/ownership-generation revisions → per-action transition rules,
+with a self-revoking `ReplaceGrants` modeled as `Suppressed` (decision
+recorded, revisions advance, the caller sees `PermissionDenied`). Every code
+choice the docs do not name exactly is marked `AMBIGUOUS` with the chosen
+reading and a doc-line citation in a comment.
+
+`tests/control_authority_model.rs` is the differential fuzzer over that
+model, deterministic via a hand-rolled xorshift64
+(`tests/control_adversarial/rng.rs`). Pinned seeds 1..=24 (`0x5EED_0000 + n`,
+printed per seed; `PSEARCH_ADV_SEEDS=<end>` extends the range;
+`PSEARCH_ADV_TRACE_DIR=<dir>` keeps per-seed op traces). Per seed: fresh
+`TestDir`, store, 2-route legacy plane, retire (alice), payload; 60 ops at
+roughly 65% model-guided / 35% adversarial (a non-admin actor, stale
+revisions ±1, ids reused from a 24-id pool, out-of-phase import steps,
+flipped chunk bytes), plus exact (~45%) and mutated (~55%) retries of earlier
+ops at about 15% of steps. Every op runs against the real store and the
+model, comparing `Err(code)` vs `Status`/`Suppressed` and the decision code
+plus both revisions. Mid-trace recovery at op 20 and op 40 (drop store and
+holder, reopen, `recover_legacy_retirement`; a current admin regrants alice
+first as a real compared op if she was revoked). After each reopen and at
+trace end: sampled `decision()` / `control_import_decision()` checks
+(verbatim codes+revisions for admins, `PermissionDenied` for revoked or
+never-granted actors) and deferred verification that suppressed decisions
+reappear verbatim after a regrant. A mismatch panics with the seed, op index,
+and the full serialized trace.
+
+Finding of the slice, resolved per protocol: seed `0x5eed0004` op #15 —
+Cancel on a never-prepared owner. The model said recorded
+`FailedPrecondition`; the real store records `NotFound` (and uses
+`FailedPrecondition` only for a wrong-workflow cancel on an existing
+preparation, `src/source_authority/transition.rs:120-131`). The docs name no
+code for this case; `NotFound` for a missing resource is the canonical
+reading and no doc contradicts it, so the model was fixed (comment cites the
+doc line and the distinction). After the fix the pinned 24-seed set passes,
+and an extended env-only run of 600 seeds (~37k ops, ~26 s) passed with zero
+further mismatches — evidence the remaining `AMBIGUOUS` readings all agree
+with the implementation. No reportable production issue; no
+doc-implementation contradiction found. Runtime headroom is large (24 seeds ≈
+1 s), so the pinned seed count can grow cheaply in a later slice.
+
+Gate: model target passes under the 8 GiB, swap-disabled scope in ~1.0 s;
+the slice-1 target still passes; rustfmt clean; no production changes.
+
+## Slice 2b: capacity-planner integration leg
+
+`tests/control_authority_planner.rs` closes the loop from the committed
+authority state to the capacity planner's public input
+(`pipestream_search::capacity_tiers::TierSnapshotInput`,
+`TierSnapshot::validated`, `plan_tiers`). The kit maps a real imported
+`ControlCollectionSnapshot` to a planner input (`kit::planner_input`) with an
+explicit split:
+
+- Authority-derived fields come from the snapshot itself: the authority id
+  (hex of the SHA-256 of the identity's `group_id`) and incarnation, both
+  revisions, the workspace/collection key, the topology generation from the
+  imported collection state, the derived fingerprint (SHA-256 of the
+  supplement's `derived_fingerprint` string), and the provider geometry
+  digest (SHA-256 of the supplement's canonical prost encoding).
+- Harness-built fields mirror the in-crate planner fixtures
+  (`src/capacity_tiers.rs` test module): the three-node registry, the
+  three-tier policy, the two fragment requests (bucket 7, leaves L4/L7), the
+  cohort configuration (600 s, phase 0, planning instant
+  2026-09-08T12:00:00Z), and the five fixture observations. The committed
+  view (`kit::planner_committed_view`) carries the fixture-A shard/leaf/copy
+  shape (s6/s7, leaves L4/L7, five copy specs) bound to the snapshot's
+  resource triple and topology generation. Hand-building is expected: the
+  imported 2-route plane registers no nodes, exactly as the in-crate
+  fixtures hand-build theirs.
+
+Tests:
+
+- `plan_digest_stable_across_replay_reopen_and_permutation` — four-way plan
+  digest equality (`plan_tiers(...).plan_digest`): forward vs reverse chunk
+  staging (the protocol keys chunks by ordinal and accepts any staging
+  order), committed store vs reopened store, and forward vs reverse
+  observation ingest order (the observation set and its digest are canonical,
+  so the plan cannot move). Also pins snapshot-digest equality across the
+  reopen and observation-set-digest equality across the permutation.
+- `plan_digest_stable_across_sigkill_recovery` — the shared
+  `kit::sigkill_import_worker_body` worker (refactored out of the slice-1
+  target; both targets now carry a thin env-gated `#[test]` wrapper, and the
+  slice-1 test names and behavior are unchanged) is armed at marker 2
+  (killed right after its first staged chunk), recovered through the public
+  API, and the recovered import's plan digest equals the no-crash baseline.
+- `observation_bound_to_committed_resource` — the observation store's
+  committed view serves one resource: a report of another collection is
+  refused with "is not this resource" and a report one topology generation
+  ahead is refused with the identity error, even though the shard, leaf, and
+  node all exist in the committed view; the committed-matching twin lands.
+
+Gate: all three targets (`control_authority_adversarial` 8 tests,
+`control_authority_model` 1, `control_authority_planner` 4) pass under the
+8 GiB, swap-disabled systemd scope; rustfmt clean; no production changes, no
+new dependencies. The planner leg remains local single-process evidence the
+same way slice 1 is: no Raft leader change, log replication, or
+snapshot installation across processes is claimed.

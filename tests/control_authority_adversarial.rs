@@ -18,7 +18,6 @@ use prost::Message;
 use tonic::Code;
 
 const MARKER_TIMEOUT: Duration = Duration::from_secs(60);
-const GO_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Full Begin -> three Chunks -> Commit on a 2-route legacy plane; reopen is
 /// digest-stable and a second import for the resource is a recorded refusal.
@@ -669,74 +668,10 @@ fn sigkill_recovery_at_every_import_boundary() {
     }
 }
 
-/// Worker for `sigkill_recovery_at_every_import_boundary`: builds the same
-/// deterministic state as the parent's baseline, writes marker `mk` after
-/// each durable step, and when armed at `k` waits (up to `GO_TIMEOUT`) for a
-/// `go` file so the parent controls the exact kill point. Early-returns
-/// unless `PSEARCH_ADV_WORKER` is set.
+/// Worker for `sigkill_recovery_at_every_import_boundary`; the body lives
+/// in `kit::sigkill_import_worker_body` so the planner leg can drive the
+/// same crash schedule. Early-returns unless `PSEARCH_ADV_WORKER` is set.
 #[test]
 fn sigkill_import_worker() {
-    if std::env::var_os(kit::WORKER_ENV).is_none() {
-        return;
-    }
-    let dir = kit::TestDir::from_env();
-    let arm: u32 = std::env::var(kit::WORKER_ARM_ENV)
-        .unwrap()
-        .parse()
-        .expect("PSEARCH_ADV_ARM is a marker index");
-    let (store, authority) = kit::create_store(&dir);
-    let legacy = kit::legacy_plane(&dir, 2);
-    let (retired, request) = kit::retire(&store, &legacy, 1);
-    std::fs::write(dir.request(), request.encode_to_vec()).unwrap();
-    kit::pause_for_go(&dir, arm, 0, GO_TIMEOUT);
-
-    let payload = kit::import_payload(&retired);
-    let (chunk_bytes, chunk_count) = kit::plan_three_chunks(payload.len());
-    let begin = store
-        .begin_control_import(
-            "alice",
-            &kit::import_command(
-                &authority,
-                "begin",
-                1,
-                kit::WORKFLOW,
-                kit::begin_action(&retired, &payload, chunk_bytes, chunk_count),
-            ),
-            &retired,
-        )
-        .unwrap();
-    assert_eq!(begin.code, 0, "{}", begin.message);
-    kit::pause_for_go(&dir, arm, 1, GO_TIMEOUT);
-    let mut revision = 2u64;
-    for ordinal in 0..chunk_count {
-        let decision = store
-            .execute_control_import(
-                "alice",
-                &kit::import_command(
-                    &authority,
-                    &format!("chunk-{ordinal}"),
-                    revision,
-                    kit::WORKFLOW,
-                    kit::chunk_action(&payload, chunk_bytes, ordinal),
-                ),
-            )
-            .unwrap();
-        assert_eq!(decision.code, 0, "{}", decision.message);
-        revision += 1;
-        kit::pause_for_go(&dir, arm, 2 + ordinal, GO_TIMEOUT);
-    }
-    let commit = store
-        .execute_control_import(
-            "alice",
-            &kit::import_command(
-                &authority,
-                "commit",
-                revision,
-                kit::WORKFLOW,
-                kit::commit_action(),
-            ),
-        )
-        .unwrap();
-    assert_eq!(commit.code, 0, "{}", commit.message);
-    kit::pause_for_go(&dir, arm, 5, GO_TIMEOUT);
+    kit::sigkill_import_worker_body();
 }
