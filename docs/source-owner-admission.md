@@ -66,6 +66,46 @@ READY. Its admission is the adapter's held binding, not caller bytes:
 READY is terminal for the ownership generation: cancellation refuses, and a
 new preparation refuses until a complete ownership transition exists.
 
+## Activation: the committed fence
+
+`PreparedSourceOwnerPhase::ACTIVE` follows READY through
+`ActivateSourceOwner { workflow_id }`, a control command any current Admin
+may issue through `execute` (the committed READY fact is the evidence; no
+holder is involved). The transition records `SourceOwnerActivation {
+write_epoch, activated_control_revision }`; the write epoch is the activated
+owner's ownership generation, so every generation has exactly one committed
+fence and nothing else allocates one — not a lease, not a clock, not a
+restart. ACTIVE is terminal for the generation: cancellation and a new
+preparation refuse, and the initial release has no deactivation, so a
+replacement writer needs the full ownership transition that does not exist
+yet. Recovery requires an ACTIVE row to carry readiness and an activation
+whose epoch equals its generation and whose revision equals the row's.
+
+READY alone authorizes no write, on either side:
+
+- `SourceAdmission::activated_owner(binding)` requires current Admin and the
+  owner ACTIVE for exactly that managed binding (key, target, workflow,
+  generation, and a readiness completion derived from those binding bytes).
+  `PreparedManagedCatalog::activate(admission)` calls it, then persists
+  `SourceManagedActivation` into the source header (catalog format 10) in
+  one source transaction under the same admission and returns the
+  `ActiveManagedCatalog`. A READY owner refuses here by name.
+- `SourceAdmission::admit_write(key, write_epoch, action)` is the data-plane
+  check at the actual commit boundary: current permission for the action on
+  the collection and the owner ACTIVE under exactly that epoch, held through
+  the source commit. `ActiveManagedCatalog::accept` runs every write through
+  it. A handle without the recorded activation never writes a managed source
+  (`validate_resource_binding` compares header and handle activation; the
+  format-9 state stays closed); `AccessControlledCatalog::open` and
+  `PreparedManagedCatalog::recover` refuse an activated file, and
+  `ActiveManagedCatalog::recover` reopens it only when the file's activation
+  equals the committed fence.
+
+Crash windows (tested by process exit): before the source activation commit
+the file stays format 9 and the prepared adapter recovers and activates;
+after it, format 10 and the active adapter recovers; the control activation
+itself is an ordinary retryable command.
+
 ## Joined through the source commit
 
 The two databases share no transaction; each boundary has a durable state
@@ -104,9 +144,10 @@ nothing.
 
 ## What this does not decide
 
-- Writable managed activation and the committed map feed
-  (`same-revision/different-map` refusal, publication).
-- Replacement of a READY owner (retire, capture, activate, install).
+- The committed map feed (`same-revision/different-map` refusal,
+  publication) and the relay wiring to it.
+- Replacement of an ACTIVE owner (retire, capture, activate, install) and
+  deactivation; lease-expiry-only replacement stays unavailable.
 - A replacement administrator's abort or override paths.
 - Raft storage, transport and membership. The shape is already the
   committed-log one: the admission checks above run at proposal, and

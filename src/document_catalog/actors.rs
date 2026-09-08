@@ -94,7 +94,7 @@ pub(super) fn validate_key(bytes: &[u8]) -> Result<(), Status> {
 
 pub(super) fn validate_namespace(header: &DocumentCatalogHeader) -> Result<(), Status> {
     match (&header.actor_namespace, header.format_version) {
-        (Some(n), ACCESS_CONTROLLED_FORMAT | MANAGED_FORMAT)
+        (Some(n), ACCESS_CONTROLLED_FORMAT | MANAGED_FORMAT | ACTIVE_MANAGED_FORMAT)
             if n.format_version == 1
                 && n.assigned_operations <= n.legacy_operations
                 && n.legacy_operations <= header.accepted_sequence
@@ -103,7 +103,14 @@ pub(super) fn validate_namespace(header: &DocumentCatalogHeader) -> Result<(), S
         {
             Ok(())
         }
-        (None, version) if !matches!(version, ACCESS_CONTROLLED_FORMAT | MANAGED_FORMAT) => Ok(()),
+        (None, version)
+            if !matches!(
+                version,
+                ACCESS_CONTROLLED_FORMAT | MANAGED_FORMAT | ACTIVE_MANAGED_FORMAT
+            ) =>
+        {
+            Ok(())
+        }
         _ => Err(Status::data_loss(
             "catalog format and actor namespace migration metadata disagree",
         )),

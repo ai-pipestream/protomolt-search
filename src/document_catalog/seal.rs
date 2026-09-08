@@ -21,7 +21,10 @@ pub(super) fn validate_header_seal(header: &DocumentCatalogHeader) -> Result<(),
     });
     let lifecycle_format = if matches!(
         header.format_version,
-        LEGACY_ACCESS_CONTROLLED_FORMAT | ACCESS_CONTROLLED_FORMAT | MANAGED_FORMAT
+        LEGACY_ACCESS_CONTROLLED_FORMAT
+            | ACCESS_CONTROLLED_FORMAT
+            | MANAGED_FORMAT
+            | ACTIVE_MANAGED_FORMAT
     ) {
         let binding = header.resource_binding.as_ref().ok_or_else(|| {
             Status::data_loss("access-controlled catalog resource binding missing")
@@ -44,7 +47,7 @@ pub(super) fn validate_header_seal(header: &DocumentCatalogHeader) -> Result<(),
     } else {
         if header.resource_binding.is_some() {
             return Err(Status::data_loss(
-                "source resource binding requires catalog format 7, 8 or 9",
+                "source resource binding requires catalog format 7, 8, 9 or 10",
             ));
         }
         header.format_version
@@ -85,7 +88,11 @@ pub(super) fn header_from(
     )?;
     validate_current_header(&header)?;
     catalog.validate_resource_binding(&header)?;
-    if header.managed_binding.is_some() {
+    // A managed source writes only through a handle activated under the
+    // committed fence the file records; `validate_resource_binding` above
+    // proved the handle's activation equals the header's, so only the
+    // unactivated (format 9) state is closed here.
+    if header.managed_binding.is_some() && header.managed_activation.is_none() {
         return Err(Status::failed_precondition(
             "managed source admission is closed; preparation and persisted binding do not authorize mutations",
         ));

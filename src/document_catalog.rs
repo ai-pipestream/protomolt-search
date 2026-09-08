@@ -12,7 +12,7 @@ use tonic::Status;
 
 use crate::pb::storage::{
     DocumentCatalogHeader, DocumentOperation, DocumentVersion, DocumentVersionKey,
-    SourceManagedBinding, SourceRecord, SourceResourceBinding,
+    SourceManagedActivation, SourceManagedBinding, SourceRecord, SourceResourceBinding,
 };
 use crate::pb::{
     accept_document_request::Mutation, AcceptDocumentRequest, AcceptedDocumentVersion,
@@ -35,7 +35,7 @@ pub use access::AccessControlledCatalog;
 pub use backup::CapturedBackup;
 pub use checkpoint::CatalogCheckpoint;
 #[cfg(feature = "net")]
-pub use managed::PreparedManagedCatalog;
+pub use managed::{ActiveManagedCatalog, PreparedManagedCatalog};
 pub use publication::{MaintenanceRecovery, ProjectionRecovery};
 pub use restore::VerifiedSourceRestore;
 
@@ -53,6 +53,7 @@ const RETIRED_FORMAT_VERSION: u32 = 6;
 const LEGACY_ACCESS_CONTROLLED_FORMAT: u32 = 7;
 const ACCESS_CONTROLLED_FORMAT: u32 = 8;
 const MANAGED_FORMAT: u32 = 9;
+const ACTIVE_MANAGED_FORMAT: u32 = 10;
 const CACHE_BYTES: usize = 8 << 20;
 
 fn storage(error: impl std::fmt::Display) -> Status {
@@ -67,7 +68,11 @@ fn decode_header(bytes: &[u8]) -> Result<DocumentCatalogHeader, Status> {
         return Err(Status::data_loss("source catalog header exceeds 256KiB"));
     }
     let header: DocumentCatalogHeader = decode(bytes)?;
-    if header.format_version == MANAGED_FORMAT && header.encode_to_vec() != bytes {
+    if matches!(
+        header.format_version,
+        MANAGED_FORMAT | ACTIVE_MANAGED_FORMAT
+    ) && header.encode_to_vec() != bytes
+    {
         return Err(Status::data_loss(
             "managed source header has unknown or noncanonical fields",
         ));
@@ -100,6 +105,7 @@ fn validate_current_header(header: &DocumentCatalogHeader) -> Result<(), Status>
             | LEGACY_ACCESS_CONTROLLED_FORMAT
             | ACCESS_CONTROLLED_FORMAT
             | MANAGED_FORMAT
+            | ACTIVE_MANAGED_FORMAT
     ) || !valid_history_id(&header.history_id)
         || header.legacy_receipts_through_sequence > header.accepted_sequence
     {
@@ -118,6 +124,9 @@ pub struct DocumentCatalog {
     durable: bool,
     resource_binding: Option<SourceResourceBinding>,
     managed_binding: Option<SourceManagedBinding>,
+    // The committed fence this handle was activated under. A handle without
+    // it never writes a managed source, whatever the file records.
+    managed_activation: Option<SourceManagedActivation>,
     // redb's fallback backend does not lock on every mobile platform. Hold
     // the same open file description exclusively for this catalog's lifetime.
     // Drop the database before releasing this guard.
@@ -129,6 +138,11 @@ impl DocumentCatalog {
         if header.managed_binding != self.managed_binding {
             return Err(Status::failed_precondition(
                 "managed source binding differs; managed storage requires its exact owner and closed recovery adapter",
+            ));
+        }
+        if header.managed_activation != self.managed_activation {
+            return Err(Status::failed_precondition(
+                "managed source activation differs; writes require the handle activated under the committed fence",
             ));
         }
         if header.resource_binding != self.resource_binding {
@@ -185,7 +199,7 @@ impl DocumentCatalog {
             ));
         }
         Self::open_file_resolving_binding(path, collection, create, resource_binding, |_| {
-            Ok(managed_binding)
+            Ok((managed_binding, None))
         })
     }
 
@@ -196,7 +210,15 @@ impl DocumentCatalog {
         collection: &str,
         create: bool,
         resource_binding: Option<SourceResourceBinding>,
-        resolve_binding: impl FnOnce(&Database) -> Result<Option<SourceManagedBinding>, Status>,
+        resolve_binding: impl FnOnce(
+            &Database,
+        ) -> Result<
+            (
+                Option<SourceManagedBinding>,
+                Option<SourceManagedActivation>,
+            ),
+            Status,
+        >,
     ) -> Result<Self, Status> {
         let parent = path
             .parent()
@@ -234,12 +256,13 @@ impl DocumentCatalog {
         let database = builder
             .create_file(file.try_clone().map_err(storage)?)
             .map_err(storage)?;
-        let managed_binding = resolve_binding(&database)?;
+        let (managed_binding, managed_activation) = resolve_binding(&database)?;
         let catalog = Self {
             database,
             durable: true,
             resource_binding,
             managed_binding,
+            managed_activation,
             _file_lock: Some(file),
         };
         catalog.initialize(collection, new)?;
@@ -259,6 +282,7 @@ impl DocumentCatalog {
             durable: false,
             resource_binding: None,
             managed_binding: None,
+            managed_activation: None,
             _file_lock: None,
         };
         catalog.initialize(collection, true)?;
@@ -274,7 +298,7 @@ impl DocumentCatalog {
                 .map_err(storage)?
                 .ok_or_else(|| Status::data_loss("existing document catalog header missing"))?;
             let header: DocumentCatalogHeader = decode_header(bytes.value())?;
-            if !(1..=MANAGED_FORMAT).contains(&header.format_version)
+            if !(1..=ACTIVE_MANAGED_FORMAT).contains(&header.format_version)
                 || header.collection != collection
             {
                 return Err(Status::failed_precondition(
@@ -290,6 +314,7 @@ impl DocumentCatalog {
                 || header.resource_binding.is_some()
                 || header.actor_namespace.is_some()
                 || header.managed_binding.is_some()
+                || header.managed_activation.is_some()
             {
                 return Err(Status::data_loss(
                     "legacy catalog contains unexpected history identity metadata",
@@ -341,6 +366,7 @@ impl DocumentCatalog {
                 resource_binding: self.resource_binding.clone(),
                 actor_namespace: self.resource_binding.as_ref().map(|_| actors::namespace(0)),
                 managed_binding: None,
+                managed_activation: None,
             }
             .encode_to_vec();
             table.insert("header", header.as_slice()).map_err(storage)?;

@@ -1250,6 +1250,18 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   destination store remains unchanged. See [retirement and crash recovery](docs/control-retirement.md);
   transactional import, worker fencing and activation remain separate steps.
 
+- **Foundation branch: writable managed activation under the committed
+  fence (implemented).** `ActivateSourceOwner` moves a READY owner to ACTIVE
+  and commits the write epoch (the ownership generation); the owner persists
+  it as catalog format 10 through `PreparedManagedCatalog::activate`, and
+  `ActiveManagedCatalog::accept` admits every write through
+  `SourceAdmission::admit_write` — current permission plus the owner ACTIVE
+  under exactly that epoch, held through the source commit. READY alone
+  writes nothing on either side; the closed adapters refuse the activated
+  file; process exit on either side of the source activation recovers by
+  format. No deactivation or replacement exists yet, so lease expiry can
+  activate nothing. See [owner admission](docs/source-owner-admission.md).
+
 - **Foundation branch: administrative import recovery and proposal-time
   admission (implemented).** `Recover` is the abort-only step any current
   resource Admin may take on a stranded import: reservation released,

@@ -105,6 +105,7 @@ pub(super) fn command(
             }
             Ok(())
         }
+        Some(Action::Activate(request)) => workflow_id(&request.workflow_id),
         Some(_) => Ok(()),
     }
 }

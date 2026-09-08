@@ -27,6 +27,20 @@ message DocumentCatalogHeader {
   // Format 9 binds this exact local history to a prepared logical owner.
   // Reopen starts closed; persisted metadata never grants write admission.
   SourceManagedBinding managed_binding = 10;
+  // Format 10 records the committed ownership fence. Writes are admitted only
+  // through the activated adapter, under an authority admission that finds
+  // the owner ACTIVE with this exact epoch at every commit.
+  SourceManagedActivation managed_activation = 11;
+}
+
+// The fence the owner persisted from its committed activation.
+message SourceManagedActivation {
+  uint32 format_version = 1; // 1
+  SourceAuthorityIdentity authority = 2;
+  uint64 ownership_generation = 3;
+  uint64 write_epoch = 4;
+  uint64 activated_control_revision = 5;
+  uint64 activated_at_sequence = 6;
 }
 
 // The source-side completion of a committed preparation, not activation or

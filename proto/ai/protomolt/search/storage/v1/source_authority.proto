@@ -43,6 +43,9 @@ enum PreparedSourceOwnerPhase {
   // The owner persisted its managed binding and the hosting adapter verified
   // that completion. Still not a published map or a live writer.
   PREPARED_SOURCE_OWNER_PHASE_READY = 3;
+  // Activation committed the ownership fence (write epoch). Installation is
+  // authorized; the owner admits writes only under this exact epoch.
+  PREPARED_SOURCE_OWNER_PHASE_ACTIVE = 4;
 }
 
 // PREPARED and CANCELLED admit no writes and authorize no installation.
@@ -58,7 +61,18 @@ message PreparedSourceOwner {
   PreparedSourceOwnerPhase phase = 6;
   uint64 control_revision = 7;
   SourceAuthorityOperationKey last_command = 8;
-  SourceOwnerReadiness readiness = 9; // present exactly when phase is READY
+  SourceOwnerReadiness readiness = 9; // present from READY on
+  SourceOwnerActivation activation = 10; // present exactly when phase is ACTIVE
+}
+
+// The committed ownership fence. write_epoch is the ownership generation of
+// the activated owner; every source write validates it at its commit
+// boundary through the authority's admission. Lease expiry never allocates
+// one: only a committed activation does.
+message SourceOwnerActivation {
+  uint32 format_version = 1; // 1
+  uint64 write_epoch = 2;
+  uint64 activated_control_revision = 3;
 }
 
 // The verified completion fact recorded at readiness.
@@ -94,6 +108,12 @@ message ConfirmSourceOwnerReady {
   SourceOwnerCompletion completion = 2;
 }
 
+// READY -> ACTIVE by a current Admin: commits the write epoch. It does not
+// claim the owner is serving; the owner records the fence before it writes.
+message ActivateSourceOwner {
+  bytes workflow_id = 1;
+}
+
 // Replace grants for this command's one immutable resource only. No action
 // implies another; existing document/field restrictions retain their meaning.
 // The state machine increments the policy revision. Empty grants deny all.
@@ -115,6 +135,7 @@ message SourceAuthorityCommand {
     CancelPreparedSourceOwner cancel = 11;
     ReplaceSourceCollectionGrants replace_grants = 12;
     ConfirmSourceOwnerReady confirm_ready = 13;
+    ActivateSourceOwner activate = 14;
   }
 }
 

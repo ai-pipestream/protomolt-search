@@ -114,6 +114,7 @@ pub(super) fn apply(
                     control_revision: revision,
                     last_command: Some(operation.clone()),
                     readiness: None,
+                    activation: None,
                 });
                 result.reserve_workflow = true;
             }
@@ -163,6 +164,31 @@ pub(super) fn apply(
                     completion: Some(completion.clone()),
                 });
                 result.owner = Some(ready);
+            }
+            Action::Activate(request) => {
+                let held = before.ok_or_else(|| {
+                    Status::not_found("source authority owner has no preparation")
+                })?;
+                if held.phase != PreparedSourceOwnerPhase::Ready as i32
+                    || held.workflow_id != request.workflow_id
+                {
+                    return Err(Status::failed_precondition(
+                        "source authority activation requires the READY owner of the current workflow",
+                    ));
+                }
+                // The write epoch is the activated owner's generation: one
+                // committed fence per ownership generation, never allocated
+                // by a lease or a clock.
+                let mut active = held.clone();
+                active.phase = PreparedSourceOwnerPhase::Active as i32;
+                active.control_revision = revision;
+                active.last_command = Some(operation.clone());
+                active.activation = Some(SourceOwnerActivation {
+                    format_version: 1,
+                    write_epoch: held.ownership_generation,
+                    activated_control_revision: revision,
+                });
+                result.owner = Some(active);
             }
             Action::ReplaceGrants(request) => {
                 if request.grants.iter().any(|grant| {

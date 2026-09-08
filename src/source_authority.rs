@@ -112,6 +112,93 @@ impl SourceAdmission<'_> {
         self.store.authorize(&self.principal, collection, action)
     }
 
+    /// The committed owner row for `key`; `disclose` requires current Admin.
+    fn owner_row(
+        &self,
+        key: &LogicalSourceOwner,
+        disclose: bool,
+    ) -> Result<PreparedSourceOwner, Status> {
+        self.store.guarded(|| {
+            let tx = self.store.inner.database.begin_read().map_err(storage)?;
+            if disclose {
+                self.store.read_policy(&tx, &self.principal, key)?;
+            }
+            let table = tx.open_table(OWNERS).map_err(storage)?;
+            let bytes = key.encode_to_vec();
+            let held: PreparedSourceOwner = contract::decode(
+                table
+                    .get(bytes.as_slice())
+                    .map_err(storage)?
+                    .ok_or_else(|| {
+                        Status::failed_precondition("source owner has no committed preparation")
+                    })?
+                    .value(),
+            )?;
+            contract::owner(&held).map_err(corrupt)?;
+            Ok(held)
+        })
+    }
+
+    /// Current Admin and the owner ACTIVE for exactly this managed binding:
+    /// same key, target, workflow and generation as its preparation, and a
+    /// readiness completion derived from these binding bytes. Returns the row
+    /// with its committed fence, for the owner to persist before it admits
+    /// any write.
+    pub fn activated_owner(
+        &self,
+        binding: &SourceManagedBinding,
+    ) -> Result<PreparedSourceOwner, Status> {
+        let verified = VerifiedOwnerCompletion::from_binding(binding)?;
+        if binding.authority.as_ref() != Some(&self.store.inner.identity) {
+            return Err(Status::failed_precondition(
+                "managed binding names another source authority",
+            ));
+        }
+        let ready = binding.preparation.as_ref().expect("validated preparation");
+        let key = ready.key.as_ref().expect("validated key");
+        let held = self.owner_row(key, true)?;
+        if held.phase != PreparedSourceOwnerPhase::Active as i32
+            || held.target != ready.target
+            || held.workflow_id != ready.workflow_id
+            || held.ownership_generation != ready.ownership_generation
+            || held.readiness.as_ref().and_then(|r| r.completion.as_ref())
+                != Some(&verified.completion)
+            || held.activation.is_none()
+        {
+            return Err(Status::failed_precondition(
+                "source owner is not ACTIVE for this binding; READY alone admits no write",
+            ));
+        }
+        Ok(held)
+    }
+
+    /// Admission of one source write: current permission for `action` on the
+    /// owner's collection and the owner ACTIVE under exactly `write_epoch`.
+    /// Held through the source commit, so no activation change can be missed.
+    pub fn admit_write(
+        &self,
+        key: &LogicalSourceOwner,
+        write_epoch: u64,
+        action: AccessAction,
+    ) -> Result<AccessDecision, Status> {
+        contract::key(key, true)?;
+        let decision = self.authorize(&key.collection, action)?;
+        if decision.workspace != key.workspace {
+            return Err(Status::permission_denied(
+                "source write permission names another workspace",
+            ));
+        }
+        let held = self.owner_row(key, false)?;
+        if held.phase != PreparedSourceOwnerPhase::Active as i32
+            || held.activation.as_ref().map(|a| a.write_epoch) != Some(write_epoch)
+        {
+            return Err(Status::failed_precondition(
+                "source owner is not ACTIVE under this write epoch; the fence has moved",
+            ));
+        }
+        Ok(decision)
+    }
+
     /// Current Admin on the owner's collection and the exact pending
     /// preparation. Owner-side work runs under this admission through its
     /// source commit; no command can change the owner or the policy meanwhile.

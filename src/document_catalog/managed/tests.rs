@@ -975,7 +975,7 @@ fn managed_open_refuses_missing_and_malformed_or_mismatched_bindings() {
                     header.managed_binding = None;
                     header.encode_to_vec()
                 } else if damage == "newer-format" {
-                    header.format_version = MANAGED_FORMAT + 1;
+                    header.format_version = ACTIVE_MANAGED_FORMAT + 1;
                     header.encode_to_vec()
                 } else {
                     let mut encoded = header.encode_to_vec();
@@ -1144,5 +1144,467 @@ fn abrupt_binding_exit_recovers_format_eight_or_committed_format_nine() {
                 .revision,
             1
         );
+    }
+}
+
+fn activate_command(
+    identity: &SourceAuthorityIdentity,
+    control_revision: u64,
+) -> SourceAuthorityCommand {
+    SourceAuthorityCommand {
+        format_version: 1,
+        authority: Some(identity.clone()),
+        key: Some(owner_key()),
+        command_id: b"activate".to_vec(),
+        expected_control_revision: control_revision,
+        expected_policy_revision: 1,
+        expected_ownership_generation: 1,
+        action: Some(Action::Activate(ActivateSourceOwner {
+            workflow_id: b"installation-one".to_vec(),
+        })),
+    }
+}
+
+fn second_write() -> AcceptDocumentRequest {
+    AcceptDocumentRequest {
+        document_key: b"document-two".to_vec(),
+        operation_id: b"accept-two".to_vec(),
+        ..write()
+    }
+}
+
+/// Bind the fixture's catalog and confirm readiness; the control revision
+/// afterwards is 3 (prepare, confirm).
+fn ready(fixture: Fixture) -> (Fixture, PreparedManagedCatalog) {
+    let identity = authority_identity(7);
+    let Fixture {
+        dir,
+        catalog,
+        authority,
+        admin,
+        preparation,
+        receipt,
+    } = fixture;
+    let managed = catalog
+        .bind_prepared_owner(
+            &authority.admission("alice").unwrap(),
+            &authority,
+            &preparation,
+            1 << 20,
+        )
+        .unwrap();
+    let completion = managed.completion().unwrap().completion().clone();
+    assert_eq!(
+        managed
+            .confirm_ready("alice", &confirm_command(&identity, 2, completion))
+            .unwrap()
+            .code,
+        0
+    );
+    let placeholder =
+        AccessControlledCatalog::create(&dir.0.join("placeholder.redb"), &resource(), &admin)
+            .unwrap();
+    (
+        Fixture {
+            dir,
+            catalog: placeholder,
+            authority,
+            admin,
+            preparation,
+            receipt,
+        },
+        managed,
+    )
+}
+
+fn active_records(active: &ActiveManagedCatalog, sequence: u64) {
+    let read = active.inner.database.begin_read().unwrap();
+    let meta = read.open_table(META).unwrap();
+    let header = decode_header(meta.get("header").unwrap().unwrap().value()).unwrap();
+    assert_eq!(header.format_version, 10);
+    assert_eq!(header.accepted_sequence, sequence);
+    assert!(header.managed_binding.is_some());
+    assert_eq!(header.managed_activation.as_ref().unwrap().write_epoch, 1);
+    // One actor-scoped operation per accepted write; identical source bytes
+    // are stored once.
+    assert_eq!(
+        read.open_table(actors::OPERATIONS).unwrap().len().unwrap(),
+        sequence
+    );
+    assert_eq!(read.open_table(SOURCES).unwrap().len().unwrap(), 1);
+}
+
+fn replayed(receipt: &crate::pb::DocumentWriteReceipt) -> crate::pb::DocumentWriteReceipt {
+    crate::pb::DocumentWriteReceipt {
+        replayed: true,
+        ..receipt.clone()
+    }
+}
+
+#[test]
+fn activation_admits_writes_only_under_the_committed_fence() {
+    let fixture = fixture("activation", false);
+    let identity = authority_identity(7);
+    let (fixture, managed) = ready(fixture);
+    // READY alone activates nothing on the source.
+    let managed = {
+        let admission = fixture.authority.admission("alice").unwrap();
+        let error = match managed.activate(&admission) {
+            Ok(_) => panic!("READY must not activate the source"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("READY alone"), "{error}");
+        PreparedManagedCatalog::recover(
+            &fixture.dir.catalog(),
+            &fixture.authority,
+            "alice",
+            &identity,
+            &fixture.preparation,
+        )
+        .unwrap()
+    };
+    // The control activation commits the fence: epoch = generation 1.
+    let activated = fixture
+        .authority
+        .execute("alice", &activate_command(&identity, 3))
+        .unwrap();
+    assert_eq!(activated.code, 0, "{}", activated.message);
+    let owner = activated.owner.clone().unwrap();
+    assert_eq!(owner.phase, PreparedSourceOwnerPhase::Active as i32);
+    assert_eq!(owner.activation.as_ref().unwrap().write_epoch, 1);
+    assert_eq!(
+        owner
+            .activation
+            .as_ref()
+            .unwrap()
+            .activated_control_revision,
+        4
+    );
+    assert_eq!(
+        fixture
+            .authority
+            .execute("alice", &activate_command(&identity, 3))
+            .unwrap(),
+        activated
+    );
+    // The owner persists the fence and admits writes under it.
+    let active = {
+        let admission = fixture.authority.admission("alice").unwrap();
+        managed.activate(&admission).unwrap()
+    };
+    assert_eq!(active.activation().write_epoch, 1);
+    assert_eq!(active.activation().activated_at_sequence, 1);
+    active_records(&active, 1);
+    let receipt = {
+        let admission = fixture.authority.admission("alice").unwrap();
+        active.accept(&admission, &second_write()).unwrap()
+    };
+    assert_eq!(receipt.accepted_sequence, 2);
+    assert_eq!(receipt.history_id, fixture.receipt.history_id);
+    {
+        let admission = fixture.authority.admission("alice").unwrap();
+        assert_eq!(
+            active.accept(&admission, &second_write()).unwrap(),
+            replayed(&receipt)
+        );
+        assert_eq!(
+            active.write_target(&admission).unwrap().history_id,
+            fixture.receipt.history_id
+        );
+    }
+    active_records(&active, 2);
+    // Ingest is a current grant: another actor, and the same actor after a
+    // revocation, are refused at the write's own admission.
+    for actor in ["bob", "carol"] {
+        let admission = fixture.authority.admission(actor).unwrap();
+        assert_eq!(
+            active
+                .accept(&admission, &second_write())
+                .err()
+                .unwrap()
+                .code(),
+            Code::PermissionDenied,
+            "{actor}"
+        );
+    }
+    let revoke = |id: &str, revision: u64, policy: u64, grants: Vec<CollectionGrant>| {
+        SourceAuthorityCommand {
+            format_version: 1,
+            authority: Some(identity.clone()),
+            key: Some(LogicalSourceOwner {
+                workspace: "workspace-a".into(),
+                collection: "books".into(),
+                owner_id: Vec::new(),
+            }),
+            command_id: id.as_bytes().to_vec(),
+            expected_control_revision: revision,
+            expected_policy_revision: policy,
+            expected_ownership_generation: 0,
+            action: Some(Action::ReplaceGrants(ReplaceSourceCollectionGrants {
+                grants,
+            })),
+        }
+    };
+    assert_eq!(
+        fixture
+            .authority
+            .execute(
+                "alice",
+                &revoke(
+                    "admin-only",
+                    4,
+                    1,
+                    vec![grant("alice", AccessAction::Admin)]
+                )
+            )
+            .unwrap()
+            .code,
+        0
+    );
+    {
+        let admission = fixture.authority.admission("alice").unwrap();
+        let mut third = second_write();
+        third.document_key = b"document-three".to_vec();
+        third.operation_id = b"accept-three".to_vec();
+        assert_eq!(
+            active.accept(&admission, &third).err().unwrap().code(),
+            Code::PermissionDenied
+        );
+    }
+    let mut both = grant("alice", AccessAction::Admin);
+    both.actions.push(AccessAction::Ingest as i32);
+    assert_eq!(
+        fixture
+            .authority
+            .execute("alice", &revoke("restore", 5, 2, vec![both]))
+            .unwrap()
+            .code,
+        0
+    );
+    // ACTIVE is terminal for the generation: no second preparation, no
+    // cancellation, and no command allocates a fence from a lease.
+    let mut again = prepare_command(&identity, fixture.receipt.history_id.clone());
+    again.command_id = b"prepare-again".to_vec();
+    again.expected_control_revision = 6;
+    again.expected_policy_revision = 3;
+    again.expected_ownership_generation = 1;
+    if let Some(Action::Prepare(request)) = again.action.as_mut() {
+        request.workflow_id = b"installation-two".to_vec();
+    }
+    let again = fixture.authority.execute("alice", &again).unwrap();
+    assert_eq!(
+        again.code,
+        Code::FailedPrecondition as u32,
+        "{}",
+        again.message
+    );
+    let cancel = SourceAuthorityCommand {
+        command_id: b"cancel".to_vec(),
+        expected_control_revision: 6,
+        expected_policy_revision: 3,
+        action: Some(Action::Cancel(CancelPreparedSourceOwner {
+            workflow_id: b"installation-one".to_vec(),
+        })),
+        ..activate_command(&identity, 6)
+    };
+    assert_eq!(
+        fixture.authority.execute("alice", &cancel).unwrap().code,
+        Code::FailedPrecondition as u32
+    );
+    // Reopen paths: the closed adapters refuse the activated file, the
+    // active adapter recovers it under the committed fence.
+    let binding = active.binding().clone();
+    drop(active);
+    assert_eq!(
+        AccessControlledCatalog::open(&fixture.dir.catalog(), &resource(), &fixture.admin)
+            .err()
+            .unwrap()
+            .code(),
+        Code::FailedPrecondition
+    );
+    assert_eq!(
+        PreparedManagedCatalog::recover(
+            &fixture.dir.catalog(),
+            &fixture.authority,
+            "alice",
+            &identity,
+            &fixture.preparation,
+        )
+        .err()
+        .unwrap()
+        .code(),
+        Code::FailedPrecondition
+    );
+    let admission = fixture.authority.admission("alice").unwrap();
+    let recovered = ActiveManagedCatalog::recover(
+        &fixture.dir.catalog(),
+        &fixture.authority,
+        &admission,
+        &binding,
+    )
+    .unwrap();
+    assert_eq!(
+        recovered.accept(&admission, &second_write()).unwrap(),
+        replayed(&receipt)
+    );
+    let mut third = second_write();
+    third.document_key = b"document-three".to_vec();
+    third.operation_id = b"accept-three".to_vec();
+    assert_eq!(
+        recovered
+            .accept(&admission, &third)
+            .unwrap()
+            .accepted_sequence,
+        3
+    );
+    active_records(&recovered, 3);
+    drop(admission);
+    // A revoked administrator cannot even reopen it.
+    drop(recovered);
+    assert_eq!(
+        fixture
+            .authority
+            .execute("alice", &revoke("self-revoke", 6, 3, Vec::new()))
+            .unwrap_err()
+            .code(),
+        Code::PermissionDenied
+    );
+    let admission = fixture.authority.admission("alice").unwrap();
+    assert_eq!(
+        ActiveManagedCatalog::recover(
+            &fixture.dir.catalog(),
+            &fixture.authority,
+            &admission,
+            &binding
+        )
+        .err()
+        .unwrap()
+        .code(),
+        Code::PermissionDenied
+    );
+}
+
+#[test]
+fn activation_exit_worker() {
+    let Some(mode) = std::env::var_os("PSEARCH_MANAGED_ACTIVATE_EXIT") else {
+        return;
+    };
+    let root = PathBuf::from(std::env::var_os("PSEARCH_MANAGED_ACTIVATE_ROOT").unwrap());
+    let local_authorizer: Arc<dyn Authorizer> =
+        Arc::new(PolicyAuthority::new(access_policy(false)).unwrap());
+    let admin = AccessPermit::acquire(
+        local_authorizer.clone(),
+        "alice",
+        "books",
+        AccessAction::Admin,
+    )
+    .unwrap();
+    let ingest =
+        AccessPermit::acquire(local_authorizer, "alice", "books", AccessAction::Ingest).unwrap();
+    let catalog =
+        AccessControlledCatalog::create(&root.join("source.redb"), &resource(), &admin).unwrap();
+    let receipt = catalog.accept(&ingest, &write()).unwrap();
+    let identity = authority_identity(7);
+    let authority = SourceAuthorityStore::create(
+        &root.join("authority.redb"),
+        &identity,
+        &access_policy(false),
+        &authority_limits(),
+    )
+    .unwrap();
+    let preparation = authority
+        .execute("alice", &prepare_command(&identity, receipt.history_id))
+        .unwrap()
+        .owner
+        .unwrap();
+    let mut managed = catalog
+        .bind_prepared_owner(
+            &authority.admission("alice").unwrap(),
+            &authority,
+            &preparation,
+            1 << 20,
+        )
+        .unwrap();
+    let completion = managed.completion().unwrap().completion().clone();
+    managed
+        .confirm_ready("alice", &confirm_command(&identity, 2, completion))
+        .unwrap();
+    authority
+        .execute("alice", &activate_command(&identity, 3))
+        .unwrap();
+    managed.activate_fault = Some(match mode.to_str().unwrap() {
+        "before" => BindFault::ExitBeforeCommit,
+        "after" => BindFault::ExitAfterCommit,
+        other => panic!("unknown activation exit mode {other}"),
+    });
+    let admission = authority.admission("alice").unwrap();
+    managed.activate(&admission).unwrap();
+    panic!("activation exit fault did not terminate the worker");
+}
+
+#[test]
+fn abrupt_activation_exit_recovers_format_nine_or_the_activated_source() {
+    for mode in ["before", "after"] {
+        let dir = Directory::new(&format!("activation-abrupt-{mode}"));
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("document_catalog::managed::tests::activation_exit_worker")
+            .arg("--nocapture")
+            .env("PSEARCH_MANAGED_ACTIVATE_EXIT", mode)
+            .env("PSEARCH_MANAGED_ACTIVATE_ROOT", &dir.0)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(87));
+        let identity = authority_identity(7);
+        let authority = SourceAuthorityStore::open(&dir.authority(), &identity).unwrap();
+        let owner = authority.owner("alice", &owner_key()).unwrap();
+        assert_eq!(owner.phase, PreparedSourceOwnerPhase::Active as i32);
+        let preparation = PreparedSourceOwner {
+            phase: PreparedSourceOwnerPhase::Prepared as i32,
+            control_revision: 2,
+            last_command: Some(SourceAuthorityOperationKey {
+                command_id: b"prepare-owner".to_vec(),
+                ..owner.last_command.clone().unwrap()
+            }),
+            readiness: None,
+            activation: None,
+            ..owner.clone()
+        };
+        let binding = SourceManagedBinding {
+            format_version: 1,
+            authority: Some(identity.clone()),
+            preparation: Some(preparation.clone()),
+            bound_at_sequence: 1,
+        };
+        let admission = authority.admission("alice").unwrap();
+        let active = if mode == "before" {
+            assert_eq!(
+                ActiveManagedCatalog::recover(&dir.catalog(), &authority, &admission, &binding)
+                    .err()
+                    .unwrap()
+                    .code(),
+                Code::FailedPrecondition
+            );
+            let managed = PreparedManagedCatalog::recover(
+                &dir.catalog(),
+                &authority,
+                "alice",
+                &identity,
+                &preparation,
+            )
+            .unwrap();
+            managed.activate(&admission).unwrap()
+        } else {
+            ActiveManagedCatalog::recover(&dir.catalog(), &authority, &admission, &binding).unwrap()
+        };
+        assert_eq!(
+            active
+                .accept(&admission, &second_write())
+                .unwrap()
+                .accepted_sequence,
+            2
+        );
+        active_records(&active, 2);
     }
 }

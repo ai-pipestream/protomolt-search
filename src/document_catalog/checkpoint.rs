@@ -90,7 +90,7 @@ impl<'a> CatalogCheckpoint<'a> {
                 .as_ref()
                 .expect("captured header")
                 .format_version,
-            ACCESS_CONTROLLED_FORMAT | MANAGED_FORMAT
+            ACCESS_CONTROLLED_FORMAT | MANAGED_FORMAT | ACTIVE_MANAGED_FORMAT
         ) {
             binary_tables.push(actors::OPERATIONS);
         }

@@ -105,15 +105,17 @@ pub(crate) fn owner(value: &PreparedSourceOwner) -> Result<(), Status> {
     }
     principal(&command.principal)?;
     operation_id(&command.command_id)?;
-    match PreparedSourceOwnerPhase::try_from(value.phase) {
-        Ok(PreparedSourceOwnerPhase::Prepared | PreparedSourceOwnerPhase::Cancelled) => {
-            if value.readiness.is_some() {
+    let phase = PreparedSourceOwnerPhase::try_from(value.phase)
+        .map_err(|_| Status::data_loss("source authority owner phase is unsupported"))?;
+    match phase {
+        PreparedSourceOwnerPhase::Prepared | PreparedSourceOwnerPhase::Cancelled => {
+            if value.readiness.is_some() || value.activation.is_some() {
                 return Err(Status::data_loss(
-                    "source authority owner carries readiness before READY",
+                    "source authority owner carries readiness or activation before READY",
                 ));
             }
         }
-        Ok(PreparedSourceOwnerPhase::Ready) => {
+        PreparedSourceOwnerPhase::Ready | PreparedSourceOwnerPhase::Active => {
             let readiness = value.readiness.as_ref().ok_or_else(|| {
                 Status::data_loss("source authority READY owner has no readiness")
             })?;
@@ -128,8 +130,26 @@ pub(crate) fn owner(value: &PreparedSourceOwner) -> Result<(), Status> {
                 .ok_or_else(|| Status::data_loss("source authority readiness has no completion"))?;
             completion_matches(completion, value.target.as_ref().expect("validated target"))
                 .map_err(|error| Status::data_loss(error.message().to_string()))?;
+            match (phase, value.activation.as_ref()) {
+                (PreparedSourceOwnerPhase::Ready, None) => {}
+                (PreparedSourceOwnerPhase::Active, Some(activation)) => {
+                    if activation.format_version != 1
+                        || activation.write_epoch != value.ownership_generation
+                        || activation.activated_control_revision != value.control_revision
+                    {
+                        return Err(Status::data_loss(
+                            "source authority activation fence differs from its owner",
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(Status::data_loss(
+                        "source authority owner activation and phase disagree",
+                    ))
+                }
+            }
         }
-        _ => {
+        PreparedSourceOwnerPhase::Unspecified => {
             return Err(Status::data_loss(
                 "source authority owner phase is unsupported",
             ))

@@ -160,6 +160,19 @@ pub(super) fn operation(
                         return Err(corrupt("readiness decision differs from its command"));
                     }
                 }
+                Action::Activate(request) => {
+                    if owner.workflow_id != request.workflow_id
+                        || owner.phase != PreparedSourceOwnerPhase::Active as i32
+                        || owner.ownership_generation != command.expected_ownership_generation
+                        || owner
+                            .activation
+                            .as_ref()
+                            .map(|a| a.activated_control_revision)
+                            != Some(decision.control_revision)
+                    {
+                        return Err(corrupt("activation decision differs from its command"));
+                    }
+                }
                 Action::ReplaceGrants(_) => {
                     return Err(corrupt("policy command cannot carry an owner transition"))
                 }
