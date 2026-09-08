@@ -116,8 +116,10 @@ The preparation kernel is not a completed managed-write or Raft implementation.
 ## Validation (2026-09-08)
 
 The full gate on the foundations worktree based on `f327f69` passed: 709 library
-tests, 150 integration targets (903 top-level tests and one nested worker),
-13 embedded tests, two IVF tests and nine Python protobuf-oracle tests. All five
+tests, 150 integration targets (903 top-level passes and one nested worker),
+13 embedded tests, two IVF tests and nine Python protobuf-oracle tests. The
+existing `native_matches_opennlp_contract` test remained ignored: it requires
+an OpenNLP endpoint and scans every Unicode scalar. All five
 Android/iOS target checks, tests/examples compilation, formatting and vendored
 protobuf checks passed. The three mobile-only unused-item warnings were already
 present in the baseline. All 658 tracked and untracked inputs remained identical
