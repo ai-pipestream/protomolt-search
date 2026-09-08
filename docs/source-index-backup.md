@@ -253,6 +253,22 @@ index snapshots in application code.
 
 ## Validation
 
+At `ab16d93`, including durable retirement admission from `f85e345` and the
+reconciliation of main `3cf7982`, the full local run passed 664 library tests,
+851 integration tests across 144 targets, 13 embedded tests and 2 IVF-provider
+tests: 1,530 passed, 0 failed. The existing live OpenNLP test remains ignored.
+All 5 Android/iOS targets, tests/examples compilation, formatting,
+vendored-proto identity and diff checks passed. The descriptor comparison
+against `8113076` preserved all existing wire declarations; retirement adds one
+header field and two storage messages. All 631 tracked files and `HEAD` remained
+unchanged throughout the gate. The scope had an 8 GiB hard limit, peaked at
+8 GiB, used no swap and recorded 0 OOM, OOM-kill or OOM-group-kill events.
+This is local validation; hosted CI, merge to `main` and fleet rollout were not
+performed. Distributed authority activation, server routing and the remaining
+authorization work are unfinished.
+
+### Historical validation at `21c21a1`
+
 At `21c21a1`, the reconciled source-authority and checked-budget run passed 658
 library tests, 850 integration tests across 144 targets, 13 embedded tests and
 2 IVF-provider tests: 1,523 passed, 0 failed. The existing live OpenNLP test

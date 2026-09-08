@@ -129,9 +129,13 @@ a persisted old grant or numeric generation alone is insufficient. The local
 standalone mode remains explicit, and a managed store cannot fall back to it.
 
 The owner holds the admission/policy guard through the source write commit.
-Guard acquisition precedes the database writer consistently, including seal and
-recovery paths. Do not take that guard after a transaction has already acquired
-the writer. Revocation and replacement serialize against admitted operations;
+The managed adapter acquires that guard before node operation locks and catalog
+publication fences, and acquires the source database writer last. This order
+also applies to recovery. A retirement driver must not hold an exclusive policy
+guard while waiting for a publisher that holds a node/catalog lock and is
+waiting for that guard. Persist local admission closure without node/catalog
+locks, release its database writer, then drain through the ordinary recovery
+lock order. Revocation and replacement serialize against admitted operations;
 the control API must define when a revocation has been enforced by the owner,
 rather than reporting enforcement merely because a policy file changed.
 

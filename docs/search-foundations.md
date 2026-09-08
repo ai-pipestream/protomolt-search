@@ -1,18 +1,20 @@
 # Search foundations
 
 Foundation work began on `feat/search-foundations` from `PRE_ASTRA`. At
-`2546712`, the current source-authority increment preserves original source and
-immutable retry history, journals local publication and maintenance, audits
-complete accepted-source and journal histories, writes coherent source/index
-backups, verifies incoming bundles in private read-only staging, and adds
-explicit terminal retirement of a local source writer. See [Document
-writes](document-writes.md) and [Source/index
+`ab16d93`, the current source-authority increment includes durable retirement
+admission from `f85e345` and reconciles main `3cf7982`. It preserves original
+source and immutable retry history, journals local publication and maintenance,
+audits complete histories, writes coherent backups, verifies incoming bundles
+in private read-only staging, and retires a local source writer. Beginning
+retirement durably closes new acceptance and publication or maintenance
+preparation while allowing existing recovery to finish before the final seal.
+Header format 5 retains that intent; final format 6 retains both the intent and
+seal. See [Document writes](document-writes.md) and [Source/index
 backup](source-index-backup.md).
 
-This remains local authority work. Explicit server routing, activation of a
-verified restore under the current collection authority, remaining protobuf
-shape semantics, and the remaining authorization scope are unfinished. The
-foundation goal is not complete.
+This is a trusted local lifecycle only. Distributed authority activation,
+explicit server routing, remaining protobuf shape semantics and the remaining
+authorization scope are unfinished. The foundation goal is not complete.
 
 ## Historical map-projection checkpoint
 
