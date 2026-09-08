@@ -19,15 +19,19 @@ pub const MAX_BATCH_ROWS: usize = 1_048_576;
 /// passes (`proof_batch_rows_for_budget`).
 pub const DEFAULT_PROOF_BATCH_ROWS: usize = MAX_BATCH_ROWS;
 
-/// The batch size a digest budget of `bytes` affords, clamped to
-/// `1..=MAX_BATCH_ROWS`. The proof walks every term of every field once per
+/// The batch size a digest budget of `bytes` affords, capped at
+/// `MAX_BATCH_ROWS`. Fewer than 32 bytes cannot hold one row and refuse.
+/// The proof walks every term of every field once per
 /// batch of each segment, so the number of vocabulary passes is
 /// `sum over segments of ceil(rows / batch)` per field: the batch bounds the
 /// digest memory and nothing else, and the result is identical at any size.
-pub fn proof_batch_rows_for_budget(bytes: u64) -> usize {
-    usize::try_from(bytes / BATCH_ROW_BYTES as u64)
+pub fn proof_batch_rows_for_budget(bytes: u64) -> Result<usize, String> {
+    if bytes < BATCH_ROW_BYTES as u64 {
+        return Err(err("digest budget cannot hold one 32-byte proof row"));
+    }
+    Ok(usize::try_from(bytes / BATCH_ROW_BYTES as u64)
         .unwrap_or(MAX_BATCH_ROWS)
-        .clamp(1, MAX_BATCH_ROWS)
+        .min(MAX_BATCH_ROWS))
 }
 
 #[cfg(test)]
@@ -218,8 +222,8 @@ impl OpenedSegmentSet {
     /// `scratch` must not exist; it is created private (0700, its database
     /// 0600) and only this method's directory is removed. Digests use
     /// [`BATCH_ROW_BYTES`] per batch row (`1..=MAX_BATCH_ROWS`), plus one
-    /// reconstructed row/posting and an 8 MiB disk-table cache; a mapped
-    /// vector image materializes its packed rows once. No whole source
+    /// reconstructed row/posting, bounded provider transcript pieces and an
+    /// 8 MiB disk-table cache. Mapped vector images stay unmaterialized. No whole source
     /// corpus, vocabulary transpose or identity set is materialized. The
     /// vocabulary of every field is walked once per batch of each segment.
     pub fn verify_source_rewrite(
@@ -938,9 +942,16 @@ mod tests {
         }
         // Recorded in docs/source-index-maintenance.md.
         eprintln!("vocabulary passes by batch (280 rows, 2 fields, 1 + 3 segments): {measured:?}");
-        assert_eq!(proof_batch_rows_for_budget(0), 1);
-        assert_eq!(proof_batch_rows_for_budget(32 * 1000), 1000);
-        assert_eq!(proof_batch_rows_for_budget(u64::MAX), MAX_BATCH_ROWS);
+        assert!(proof_batch_rows_for_budget(0).is_err());
+        assert!(proof_batch_rows_for_budget(31).is_err());
+        assert_eq!(proof_batch_rows_for_budget(32).unwrap(), 1);
+        assert_eq!(proof_batch_rows_for_budget(63).unwrap(), 1);
+        assert_eq!(proof_batch_rows_for_budget(64).unwrap(), 2);
+        assert_eq!(proof_batch_rows_for_budget(32 * 1000).unwrap(), 1000);
+        assert_eq!(
+            proof_batch_rows_for_budget(u64::MAX).unwrap(),
+            MAX_BATCH_ROWS
+        );
         assert_eq!(DEFAULT_PROOF_BATCH_ROWS, MAX_BATCH_ROWS);
     }
 

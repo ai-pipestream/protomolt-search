@@ -1237,6 +1237,12 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: bounded dense-proof reconciliation.** The embedded row
+  reader uses TurboVec s21 without materializing mapped images; the product and
+  gRPC facade pin the same engine source. Proofs compare actual encoded rows and
+  refuse incomplete, duplicate or out-of-order transcript callbacks. Digest
+  budgets below one row refuse. See [proof scope and memory bounds](docs/source-index-maintenance.md).
+
 - **Foundation branch: durable legacy-authority retirement.** A current Admin
   can retire an exact checkpoint before import, fencing live clones and legacy
   reopen. A private checksummed record preserves the actor/resource/operation

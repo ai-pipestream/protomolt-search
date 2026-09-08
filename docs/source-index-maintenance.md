@@ -129,7 +129,8 @@ one-segment before and a three-segment after), passes by batch size:
 1 → 1,120; 7 → 164; 64 → 22; 280 → 8; 1,024 and above → 8. The certificate
 is byte-identical at every size. `proof_batch_rows = 0` selects the default,
 the largest batch; `proof_batch_rows_for_budget(bytes)` derives a batch from
-a digest budget for callers that need a smaller one. Choose a smaller batch
+a digest budget for callers that need a smaller one. It returns an error below
+32 bytes; a hard zero-byte budget never becomes a one-row allocation. Choose a smaller batch
 only when 32 MiB of digests is unaffordable.
 
 Scratch: the directory must not exist. It is created with mode 0700 and its
@@ -138,6 +139,12 @@ removed after all database handles close. Existing paths are never reused or
 cleaned up.
 
 ### Transcript
+
+The product wrapper requires every requested row exactly once, in increasing
+order, before accepting a successful provider transcript call. Missing,
+duplicate, reordered and out-of-range callbacks refuse; invalid indices never
+reach the proof's bitmap or digest array. Single-row requests use checked range
+arithmetic. Provider failure remains a proof failure even after partial output.
 
 The format-2 transcript uses SHA-256 with length-prefixed byte strings and
 fixed-width little-endian counts, under the domain strings

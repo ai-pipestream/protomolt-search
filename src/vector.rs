@@ -290,10 +290,17 @@ pub trait VectorProvider: Send + Sync {
 
     /// One row's transcript: [`Self::row_transcripts`] over a single row.
     fn row_transcript(&self, row: usize) -> Result<Vec<u8>, VectorError> {
+        let end = row
+            .checked_add(1)
+            .ok_or_else(|| VectorError::new("row transcript range overflow"))?;
         let mut out = None;
-        self.row_transcripts(row..row + 1, &mut |_, transcript| {
-            out = Some(transcript.to_vec());
-        })?;
+        checked_row_transcripts(
+            row..end,
+            &mut |_, transcript| {
+                out = Some(transcript.to_vec());
+            },
+            |rows, sink| self.row_transcripts(rows, sink),
+        )?;
         out.ok_or_else(|| VectorError::new(format!("row {row} produced no transcript")))
     }
 
@@ -310,6 +317,38 @@ pub trait VectorProvider: Send + Sync {
 /// transcript buffer at `rows * (16 + bits * dim / 8)` bytes, 256 KiB at
 /// 384 dimensions and 4 bits, 8 MiB at the engine's 16,384-dimension ceiling.
 pub const TRANSCRIPT_BLOCK_ROWS: usize = 1024;
+
+// Validate the complete transcript stream before a proof can succeed. Check
+// each index before forwarding: an invalid provider must never index the
+// caller's bitmap/digest array, or omit a row and leave its digest zeroed.
+pub(crate) fn checked_row_transcripts(
+    rows: Range<usize>,
+    sink: &mut dyn FnMut(usize, &[u8]),
+    emit: impl FnOnce(Range<usize>, &mut dyn FnMut(usize, &[u8])) -> Result<(), VectorError>,
+) -> Result<(), VectorError> {
+    if rows.start > rows.end {
+        return Err(VectorError::new("row transcript range is reversed"));
+    }
+    let mut next = rows.start;
+    let mut invalid = false;
+    emit(rows.clone(), &mut |row, transcript| {
+        if invalid {
+            return;
+        }
+        if row != next || row >= rows.end {
+            invalid = true;
+            return;
+        }
+        next += 1; // row < end, so this cannot overflow even at usize::MAX.
+        sink(row, transcript);
+    })?;
+    if invalid || next != rows.end {
+        return Err(VectorError::new(
+            "row transcript stream must contain every requested row exactly once in order",
+        ));
+    }
+    Ok(())
+}
 
 /// Sized product-side handle around an arbitrary vector engine.
 pub struct VectorIndex {
@@ -424,12 +463,26 @@ impl VectorIndex {
         rows: Range<usize>,
         sink: &mut dyn FnMut(usize, &[u8]),
     ) -> Result<(), VectorError> {
-        self.engine.row_transcripts(rows, sink)
+        if rows.end > self.len() {
+            return Err(VectorError::new(
+                "row transcript range exceeds stored vectors",
+            ));
+        }
+        checked_row_transcripts(rows, sink, |rows, sink| {
+            self.engine.row_transcripts(rows, sink)
+        })
     }
 
     /// See [`VectorProvider::row_transcript`].
     pub fn row_transcript(&self, row: usize) -> Result<Vec<u8>, VectorError> {
-        self.engine.row_transcript(row)
+        let end = row
+            .checked_add(1)
+            .ok_or_else(|| VectorError::new("row transcript range overflow"))?;
+        let mut out = None;
+        self.row_transcripts(row..end, &mut |_, transcript| {
+            out = Some(transcript.to_vec());
+        })?;
+        out.ok_or_else(|| VectorError::new(format!("row {row} produced no transcript")))
     }
 
     /// See [`VectorProvider::representation_materialized`].
@@ -992,6 +1045,70 @@ mod tests {
                 completed: true,
             })
         }
+    }
+
+    fn scripted_transcripts(
+        rows: Range<usize>,
+        emitted: &[usize],
+    ) -> (Result<(), VectorError>, Vec<usize>) {
+        let requested = rows.clone();
+        let mut forwarded = Vec::new();
+        let result =
+            checked_row_transcripts(rows, &mut |row, _| forwarded.push(row), |seen, sink| {
+                assert_eq!(seen, requested);
+                for &row in emitted {
+                    sink(row, &[row as u8]);
+                }
+                Ok(())
+            });
+        (result, forwarded)
+    }
+
+    #[test]
+    fn checked_transcripts_require_each_requested_row_once_in_order() {
+        let (result, forwarded) = scripted_transcripts(3..6, &[3, 4, 5]);
+        result.unwrap();
+        assert_eq!(forwarded, [3, 4, 5]);
+
+        for (emitted, expected_forwarded) in [
+            (&[][..], &[][..]),
+            (&[3, 4][..], &[3, 4][..]),
+            (&[3, 3, 4, 5][..], &[3][..]),
+            (&[3, 5, 4][..], &[3][..]),
+            (&[2, 3, 4, 5][..], &[][..]),
+            (&[3, 4, 5, 6][..], &[3, 4, 5][..]),
+        ] {
+            let (result, forwarded) = scripted_transcripts(3..6, emitted);
+            assert!(result.is_err(), "accepted {emitted:?}");
+            assert_eq!(
+                forwarded, expected_forwarded,
+                "forwarded invalid callback from {emitted:?}"
+            );
+        }
+
+        let (result, forwarded) = scripted_transcripts(4..4, &[]);
+        result.unwrap();
+        assert!(forwarded.is_empty());
+        assert!(scripted_transcripts(6..3, &[]).0.is_err());
+
+        let mut forwarded = Vec::new();
+        let error = checked_row_transcripts(0..1, &mut |row, _| forwarded.push(row), |_, _| {
+            Err(VectorError::new("scripted provider failure"))
+        })
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("scripted provider failure"),
+            "{error}"
+        );
+        assert!(forwarded.is_empty());
+    }
+
+    #[test]
+    fn one_row_transcript_refuses_usize_max_without_wrapping() {
+        let error = VectorIndex::from_provider(FakeProvider)
+            .row_transcript(usize::MAX)
+            .unwrap_err();
+        assert!(error.to_string().contains("overflow"), "{error}");
     }
 
     #[test]

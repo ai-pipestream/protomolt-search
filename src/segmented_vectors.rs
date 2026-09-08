@@ -443,6 +443,11 @@ impl VectorProvider for SegmentedProvider {
         rows: std::ops::Range<usize>,
         sink: &mut dyn FnMut(usize, &[u8]),
     ) -> Result<(), VectorError> {
+        if rows.start > rows.end || rows.end > self.len() {
+            return Err(VectorError::new(
+                "segmented row transcript range is outside stored rows",
+            ));
+        }
         let mut next = rows.start;
         for (base, count, image) in self.images() {
             if next >= rows.end {
