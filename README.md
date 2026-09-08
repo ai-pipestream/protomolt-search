@@ -1250,6 +1250,17 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   destination store remains unchanged. See [retirement and crash recovery](docs/control-retirement.md);
   transactional import, worker fencing and activation remain separate steps.
 
+- **Foundation branch: administrative import recovery and proposal-time
+  admission (implemented).** `Recover` is the abort-only step any current
+  resource Admin may take on a stranded import: reservation released,
+  references dropped, charged history and the initiating actor retained,
+  the recovering actor named as the terminal command; no transfer, no
+  commit of another actor's import, no touch of the retired file, no
+  writer. Retirement-holder and managed-binding checks now run only at
+  proposal; `replay_control_import` and `replay_command` apply committed
+  commands with no holder or file access, and the replay tests compare
+  every table byte for byte. See [control import](docs/control-import.md).
+
 - **Foundation branch: capacity observations as committed state
   (implemented).** Store format 3 keeps the planner configuration, reporter
   incarnations and observations as rows of the source authority; configure

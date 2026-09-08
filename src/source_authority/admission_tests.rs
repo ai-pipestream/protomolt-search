@@ -635,3 +635,60 @@ fn abrupt_exit_around_the_readiness_commit_recovers_prepared_or_ready() {
         SourceAuthorityStore::open(&dir.authority(), &authority).unwrap();
     }
 }
+
+#[test]
+fn a_committed_readiness_command_replays_without_the_binding() {
+    let dir = Directory::new("readiness-replay");
+    let authority = identity(7);
+    let store =
+        SourceAuthorityStore::create(&dir.authority(), &authority, &policy(false), &limits())
+            .unwrap();
+    let preparation = store
+        .execute("alice", &prepare(&authority))
+        .unwrap()
+        .owner
+        .unwrap();
+    let verified =
+        VerifiedOwnerCompletion::from_binding(&binding(&authority, &preparation, 3)).unwrap();
+    let confirmation = confirm(&authority, "c", 2, verified.completion().clone());
+    let ready = store
+        .confirm_owner_ready("alice", &confirmation, &verified)
+        .unwrap();
+    assert_eq!(ready.code, 0);
+
+    // The same two committed commands applied to a fresh replica of the same
+    // identity, with no managed binding in reach, yield the same owner row.
+    let replica_dir = Directory::new("readiness-replica");
+    let replica = SourceAuthorityStore::create(
+        &replica_dir.authority(),
+        &authority,
+        &policy(false),
+        &limits(),
+    )
+    .unwrap();
+    assert_eq!(
+        replica
+            .replay_command("alice", &prepare(&authority))
+            .unwrap()
+            .owner
+            .unwrap(),
+        preparation
+    );
+    assert_eq!(
+        replica.replay_command("alice", &confirmation).unwrap(),
+        ready
+    );
+    assert_eq!(
+        replica.owner("alice", &key()).unwrap(),
+        store.owner("alice", &key()).unwrap()
+    );
+    // The general path still refuses the same bytes.
+    assert_eq!(
+        replica
+            .execute("alice", &confirmation)
+            .err()
+            .unwrap()
+            .code(),
+        Code::PermissionDenied
+    );
+}

@@ -160,7 +160,11 @@ pub(super) fn validate(
                 reserved.0 += row.reserved_bytes;
                 reserved.1 += row.reserved_decisions;
             }
-            Ok(phase @ (ControlImportPhase::Committed | ControlImportPhase::Aborted)) => {
+            Ok(
+                phase @ (ControlImportPhase::Committed
+                | ControlImportPhase::Aborted
+                | ControlImportPhase::Recovered),
+            ) => {
                 if row.reserved_bytes != 0 || row.reserved_decisions != 0 {
                     return Err(corrupt("terminal workflow still holds a reservation"));
                 }
@@ -178,9 +182,17 @@ pub(super) fn validate(
                         decision.receipt.is_some()
                     }
                     (ControlImportPhase::Aborted, Some(ImportAction::Abort(_))) => true,
+                    // Recovery is the one terminal step another administrator
+                    // may take; the row keeps the initiator, the terminal
+                    // command names the recoverer.
+                    (ControlImportPhase::Recovered, Some(ImportAction::Recover(_))) => true,
                     _ => false,
                 };
-                if !matches || decision.code != 0 || terminal_key.principal != row.principal {
+                let same_actor = terminal_key.principal == row.principal;
+                if !matches
+                    || decision.code != 0
+                    || (phase != ControlImportPhase::Recovered && !same_actor)
+                {
                     return Err(corrupt("terminal workflow decision differs from its phase"));
                 }
                 if phase == ControlImportPhase::Committed {

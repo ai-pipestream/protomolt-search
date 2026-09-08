@@ -178,6 +178,17 @@ pub(super) struct AdmittedRetirement {
     operation: SourceAuthorityOperationKey,
 }
 
+/// How a command reached the store. Admission happens once, at proposal;
+/// application of a committed command performs no holder check.
+pub(super) enum Admission {
+    /// The general command path: no holder, so no Begin.
+    None,
+    /// The hosting adapter's retirement holder, checked before the transition.
+    Holder(AdmittedRetirement),
+    /// A command from the committed log, replayed as committed evidence.
+    Committed,
+}
+
 pub(super) fn admit_retirement(
     identity: &SourceAuthorityIdentity,
     principal: &str,
@@ -277,7 +288,9 @@ fn validate_command(
             }
             Ok(())
         }
-        Some(ImportAction::Commit(_)) | Some(ImportAction::Abort(_)) => Ok(()),
+        Some(ImportAction::Commit(_))
+        | Some(ImportAction::Abort(_))
+        | Some(ImportAction::Recover(_)) => Ok(()),
     }
 }
 
@@ -377,11 +390,11 @@ impl SourceAuthorityStore {
             ));
         }
         let admitted = admit_retirement(&self.inner.identity, principal, key, retired)?;
-        self.import(principal, command, Some(admitted))
+        self.import(principal, command, Admission::Holder(admitted))
     }
 
-    /// Chunk, Commit and Abort. A Begin here refuses: it needs the retirement
-    /// holder through `begin_control_import`.
+    /// Chunk, Commit, Abort and Recover. A Begin here refuses: it needs the
+    /// retirement holder through `begin_control_import`.
     pub fn execute_control_import(
         &self,
         principal: &str,
@@ -392,14 +405,26 @@ impl SourceAuthorityStore {
                 "begin import requires the hosting admission path with a retirement holder",
             ));
         }
-        self.import(principal, command, None)
+        self.import(principal, command, Admission::None)
+    }
+
+    /// Apply a command that a trusted proposal already admitted: the
+    /// committed-log path. It needs no holder and touches no file beyond the
+    /// store; every digest and identity check runs against the committed
+    /// evidence the command and the workflow row carry.
+    pub fn replay_control_import(
+        &self,
+        principal: &str,
+        command: &ControlImportCommand,
+    ) -> Result<ControlImportDecision, Status> {
+        self.import(principal, command, Admission::Committed)
     }
 
     fn import(
         &self,
         principal: &str,
         command: &ControlImportCommand,
-        admitted: Option<AdmittedRetirement>,
+        admitted: Admission,
     ) -> Result<ControlImportDecision, Status> {
         let _exclusive = self.exclusive()?;
         self.guarded(|| {
@@ -418,7 +443,7 @@ impl SourceAuthorityStore {
         &self,
         principal: &str,
         command: &ControlImportCommand,
-        admitted: Option<AdmittedRetirement>,
+        admitted: Admission,
     ) -> Result<ControlImportDecision, Status> {
         let mut tx = self.inner.database.begin_write().map_err(storage)?;
         tx.set_durability(Durability::Immediate).map_err(storage)?;
@@ -498,6 +523,26 @@ impl SourceAuthorityStore {
             let mut added_bytes = 0usize;
             let mut control_delta = ControlStoreHeader::default();
             let mut freed_reservation = (0u64, 0u64);
+            // Proposal admission of a Begin: the holder's digests against
+            // the command's. Direct refusals, nothing recorded; a committed
+            // command carries the admitted evidence and is applied as is.
+            if let Some(ImportAction::Begin(begin)) = command.action.as_ref() {
+                match &admitted {
+                    Admission::Holder(holder) => {
+                        if begin.retirement_sha256 != holder.sha256
+                            || begin.retirement_operation.as_ref() != Some(&holder.operation)
+                        {
+                            return Err(Status::failed_precondition(
+                                "begin import digests differ from the admitted retirement",
+                            ));
+                        }
+                    }
+                    Admission::None => return Err(Status::permission_denied(
+                        "begin import requires the hosting admission path with a retirement holder",
+                    )),
+                    Admission::Committed => {}
+                }
+            }
             let transition = (|| -> Result<(), Status> {
                 if command.expected_control_revision != header.source.control_revision {
                     return Err(reject(
@@ -513,18 +558,6 @@ impl SourceAuthorityStore {
                 }
                 match command.action.as_ref().expect("validated action") {
                     ImportAction::Begin(begin) => {
-                        let admitted = admitted.as_ref().ok_or_else(|| {
-                            Status::permission_denied(
-                                "begin import requires the hosting admission path with a retirement holder",
-                            )
-                        })?;
-                        if begin.retirement_sha256 != admitted.sha256
-                            || begin.retirement_operation.as_ref() != Some(&admitted.operation)
-                        {
-                            return Err(Status::failed_precondition(
-                                "begin import digests differ from the admitted retirement",
-                            ));
-                        }
                         if workflow.is_some() {
                             return Err(reject(
                                 Code::AlreadyExists,
@@ -815,6 +848,39 @@ impl SourceAuthorityStore {
                         row.reserved_bytes = 0;
                         row.reserved_decisions = 0;
                     }
+                    ImportAction::Recover(_) => {
+                        // Abort-only recovery by any current Admin of the
+                        // resource: the workflow keeps its initiating actor
+                        // and its charged history; the terminal command names
+                        // the recovering actor.
+                        let row = workflow.as_mut().ok_or_else(|| {
+                            reject(
+                                Code::NotFound,
+                                "import workflow is unknown for this resource",
+                            )
+                        })?;
+                        if row.phase != ControlImportPhase::Staging as i32 {
+                            return Err(reject(
+                                Code::FailedPrecondition,
+                                "import workflow is already terminal",
+                            ));
+                        }
+                        let declared = row.declared.clone().expect("validated declaration");
+                        for ordinal in 0..declared.chunk_count {
+                            let chunk_bytes_key = chunk_key(key, ordinal);
+                            if let Some(existing) =
+                                chunks.remove(chunk_bytes_key.as_slice()).map_err(storage)?
+                            {
+                                removed_bytes += chunk_bytes_key.len() + existing.value().len();
+                                control_delta.staged_chunk_count += 1;
+                            }
+                        }
+                        freed_reservation = (own.0, own.1);
+                        row.phase = ControlImportPhase::Recovered as i32;
+                        row.terminal = Some(operation_key.clone());
+                        row.reserved_bytes = 0;
+                        row.reserved_decisions = 0;
+                    }
                 }
                 result.control_revision = revision;
                 Ok(())
@@ -892,7 +958,9 @@ impl SourceAuthorityStore {
                 c.completed_count += control_delta.completed_count;
                 match command.action.as_ref() {
                     Some(ImportAction::Chunk(_)) => c.staged_chunk_count += 1,
-                    Some(ImportAction::Commit(_)) | Some(ImportAction::Abort(_)) => {
+                    Some(ImportAction::Commit(_))
+                    | Some(ImportAction::Abort(_))
+                    | Some(ImportAction::Recover(_)) => {
                         c.staged_chunk_count = c
                             .staged_chunk_count
                             .checked_sub(control_delta.staged_chunk_count)

@@ -188,6 +188,17 @@ impl Authorizer for SourceAuthorityStore {
     }
 }
 
+/// How a control command reached the store. Admission happens once, at
+/// proposal; application of a committed command performs no holder check.
+enum OwnerAdmission<'a> {
+    /// The general command path: no holder, so no readiness confirmation.
+    None,
+    /// The hosting adapter's held binding, checked before the transition.
+    Holder(&'a VerifiedOwnerCompletion),
+    /// A command from the committed log, replayed as committed evidence.
+    Committed,
+}
+
 /// The verified completion a hosting adapter derives from the managed
 /// binding it holds under its exclusive source lock. Only that adapter can
 /// construct it; readiness is never confirmed from caller bytes.
@@ -326,7 +337,18 @@ impl SourceAuthorityStore {
                 "managed binding names another source authority",
             ));
         }
-        self.execute_admitted(principal, command, Some(verified))
+        self.execute_admitted(principal, command, OwnerAdmission::Holder(verified))
+    }
+
+    /// Apply a command that a trusted proposal already admitted: the
+    /// committed-log path. A ConfirmReady replays without the managed
+    /// binding; every other check runs against the committed rows.
+    pub fn replay_command(
+        &self,
+        principal: &str,
+        command: &SourceAuthorityCommand,
+    ) -> Result<SourceAuthorityDecision, Status> {
+        self.execute_admitted(principal, command, OwnerAdmission::Committed)
     }
 
     pub(crate) fn with_resource_admin<T>(
@@ -503,14 +525,14 @@ impl SourceAuthorityStore {
                 "readiness confirmation requires the hosting adapter with the managed binding",
             ));
         }
-        self.execute_admitted(principal, command, None)
+        self.execute_admitted(principal, command, OwnerAdmission::None)
     }
 
     fn execute_admitted(
         &self,
         principal: &str,
         command: &SourceAuthorityCommand,
-        verified: Option<&VerifiedOwnerCompletion>,
+        verified: OwnerAdmission<'_>,
     ) -> Result<SourceAuthorityDecision, Status> {
         let _exclusive = self.exclusive()?;
         self.guarded(|| {
@@ -531,7 +553,7 @@ impl SourceAuthorityStore {
         &self,
         principal: &str,
         command: &SourceAuthorityCommand,
-        verified: Option<&VerifiedOwnerCompletion>,
+        verified: OwnerAdmission<'_>,
     ) -> Result<SourceAuthorityDecision, Status> {
         let mut tx = self.inner.database.begin_write().map_err(storage)?;
         tx.set_durability(Durability::Immediate).map_err(storage)?;
@@ -618,20 +640,25 @@ impl SourceAuthorityStore {
             // that binding's completion. Nothing here is recorded; a replica
             // applying the committed command performs no such check.
             if let Some(Action::ConfirmReady(request)) = command.action.as_ref() {
-                let verified = verified.ok_or_else(|| {
-                    Status::permission_denied(
-                        "readiness confirmation requires the hosting adapter with the managed binding",
-                    )
-                })?;
-                if verified.binding.preparation.as_ref() != before.as_ref() {
-                    return Err(Status::failed_precondition(
-                        "managed binding preparation differs from the committed owner",
-                    ));
-                }
-                if request.completion.as_ref() != Some(&verified.completion) {
-                    return Err(Status::permission_denied(
-                        "readiness confirmation differs from the held binding's completion",
-                    ));
+                match verified {
+                    OwnerAdmission::Holder(verified) => {
+                        if verified.binding.preparation.as_ref() != before.as_ref() {
+                            return Err(Status::failed_precondition(
+                                "managed binding preparation differs from the committed owner",
+                            ));
+                        }
+                        if request.completion.as_ref() != Some(&verified.completion) {
+                            return Err(Status::permission_denied(
+                                "readiness confirmation differs from the held binding's completion",
+                            ));
+                        }
+                    }
+                    OwnerAdmission::None => {
+                        return Err(Status::permission_denied(
+                            "readiness confirmation requires the hosting adapter with the managed binding",
+                        ))
+                    }
+                    OwnerAdmission::Committed => {}
                 }
             }
             let mut workflows = tx.open_table(WORKFLOWS).map_err(storage)?;

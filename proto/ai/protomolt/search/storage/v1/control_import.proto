@@ -46,6 +46,7 @@ message ControlImportCommand {
     ControlImportChunk chunk = 11;
     CommitControlImport commit = 12;
     AbortControlImport abort = 13;
+    RecoverControlImport recover = 14;
   }
 }
 
@@ -77,6 +78,13 @@ message ControlImportChunk {
 message CommitControlImport {}
 
 message AbortControlImport {}
+
+// Abort-only administrative recovery of a stranded workflow by any current
+// resource Admin: releases the reservation and the staged references,
+// retains the charged history, records the recovering actor as the terminal
+// command. It never transfers the workflow, commits another actor's import,
+// touches the retired legacy file or activates a writer.
+message RecoverControlImport {}
 
 // The staged bytes: the exact retirement payload and the explicit inputs the
 // legacy authority never held.
@@ -173,6 +181,7 @@ enum ControlImportPhase {
   CONTROL_IMPORT_PHASE_STAGING = 1;
   CONTROL_IMPORT_PHASE_COMMITTED = 2;
   CONTROL_IMPORT_PHASE_ABORTED = 3;
+  CONTROL_IMPORT_PHASE_RECOVERED = 4; // terminated by administrative recovery
 }
 
 // One row per resource. Terminal rows stay as tombstones: the workflow id is

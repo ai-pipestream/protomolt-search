@@ -108,6 +108,8 @@ nothing.
   (`same-revision/different-map` refusal, publication).
 - Replacement of a READY owner (retire, capture, activate, install).
 - A replacement administrator's abort or override paths.
-- Raft storage, transport and membership; under Raft the admission checks
-  above run at proposal on the leader and the committed command applies
-  without them.
+- Raft storage, transport and membership. The shape is already the
+  committed-log one: the admission checks above run at proposal, and
+  `replay_command` applies a committed `ConfirmReady` without the managed
+  binding (tested: the same two commands on a fresh replica yield the same
+  READY row, while the general path still refuses them).

@@ -503,6 +503,15 @@ fn begin_binds_the_retirement_holder_to_authority_actor_resource_and_digests() {
             .code(),
         Code::FailedPrecondition
     );
+    // Proposal admission records nothing: the id stays free.
+    assert_eq!(
+        store
+            .control_import_decision("alice", &key("books"), b"b")
+            .err()
+            .unwrap()
+            .code(),
+        Code::NotFound
+    );
     // A payload whose retirement bytes are a forgery — syntactically valid,
     // bound to the wrong checkpoint — refuses at Commit, durably.
     let mut record = retired.record().clone();
@@ -1224,9 +1233,7 @@ fn replaying_the_retained_commands_reproduces_the_identical_store() {
             .unwrap();
     for command in &recorded {
         let decision = if matches!(command.action, Some(ImportAction::Begin(_))) {
-            replica
-                .begin_control_import("alice", command, &retired)
-                .unwrap()
+            replica.replay_control_import("alice", command).unwrap()
         } else {
             replica.execute_control_import("alice", command).unwrap()
         };
@@ -1489,4 +1496,535 @@ fn format_one_stores_adopt_and_incomplete_stores_refuse() {
         .unwrap();
     assert_eq!(error.code(), Code::DataLoss);
     assert!(error.message().contains("format 2"), "{error}");
+}
+
+fn grants(
+    authority: &SourceAuthorityIdentity,
+    id: &str,
+    control: u64,
+    policy_revision: u64,
+    grants: Vec<CollectionGrant>,
+) -> SourceAuthorityCommand {
+    SourceAuthorityCommand {
+        format_version: 1,
+        authority: Some(authority.clone()),
+        key: Some(key("books")),
+        command_id: id.as_bytes().to_vec(),
+        expected_control_revision: control,
+        expected_policy_revision: policy_revision,
+        expected_ownership_generation: 0,
+        action: Some(Action::ReplaceGrants(ReplaceSourceCollectionGrants {
+            grants,
+        })),
+    }
+}
+
+fn recover(
+    authority: &SourceAuthorityIdentity,
+    id: &str,
+    control: u64,
+    policy_revision: u64,
+) -> ControlImportCommand {
+    let mut c = command(
+        authority,
+        id,
+        control,
+        ImportAction::Recover(RecoverControlImport {}),
+    );
+    c.expected_policy_revision = policy_revision;
+    c
+}
+
+fn retained_operations(store: &SourceAuthorityStore) -> u64 {
+    let tx = store.inner.database.begin_read().unwrap();
+    tx.open_table(IMPORT_OPERATIONS).unwrap().len().unwrap()
+}
+
+#[test]
+fn administrative_recovery_terminates_a_stranded_import_without_transfer() {
+    let dir = Directory::new("admin-recovery");
+    let limits = limits(8 << 10, 128);
+    let authority = identity(7);
+    let store = store(&dir, 7, &limits);
+    let legacy = legacy(&dir, 120);
+    let (retired, request) = retire(&store, &legacy, 1);
+    let checkpoint = checkpoint_of(&retired);
+    let payload = payload(&retired, supplement(&checkpoint));
+    let (chunk_bytes, chunk_count) =
+        plan_chunks(&limits, &authority, &key("books"), &payload).unwrap();
+    assert!(chunk_count >= 2);
+    assert_eq!(
+        store
+            .begin_control_import(
+                "alice",
+                &command(
+                    &authority,
+                    "begin",
+                    1,
+                    begin_action(&retired, &payload, chunk_bytes, chunk_count)
+                ),
+                &retired
+            )
+            .unwrap()
+            .code,
+        0
+    );
+    assert_eq!(
+        store
+            .execute_control_import(
+                "alice",
+                &command(
+                    &authority,
+                    "chunk-0",
+                    2,
+                    chunk_action(&payload, chunk_bytes, 0)
+                )
+            )
+            .unwrap()
+            .code,
+        0
+    );
+    let retained = retained_operations(&store);
+    // Nobody but the initiator can continue or abort; a recovery by another
+    // administrator before any revocation is also an abort-only step.
+    let intruder = store
+        .execute_control_import(
+            "bob",
+            &command(
+                &authority,
+                "bob-abort",
+                3,
+                ImportAction::Abort(AbortControlImport {}),
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        intruder.code,
+        Code::FailedPrecondition as u32,
+        "{}",
+        intruder.message
+    );
+    // The initiator loses Admin: her steps refuse and the reservation stays.
+    assert_eq!(
+        store
+            .execute(
+                "bob",
+                &grants(&authority, "bob-revokes", 3, 1, vec![grant("bob", "books")])
+            )
+            .unwrap()
+            .code,
+        0
+    );
+    let mut stranded = command(
+        &authority,
+        "chunk-1",
+        5,
+        chunk_action(&payload, chunk_bytes, 1),
+    );
+    stranded.expected_policy_revision = 2;
+    assert_eq!(
+        store
+            .execute_control_import("alice", &stranded)
+            .err()
+            .unwrap()
+            .code(),
+        Code::PermissionDenied
+    );
+    let workflow = store
+        .control_import_workflow("bob", &key("books"), b"import-1")
+        .unwrap();
+    assert_eq!(workflow.phase, ControlImportPhase::Staging as i32);
+    assert!(workflow.reserved_bytes > 0 && workflow.reserved_decisions > 0);
+    // Stale revision refuses durably; the current one recovers.
+    let stale = store
+        .execute_control_import("bob", &recover(&authority, "bob-recover-stale", 3, 2))
+        .unwrap();
+    assert_eq!(stale.code, Code::FailedPrecondition as u32);
+    let recovered = store
+        .execute_control_import("bob", &recover(&authority, "bob-recover", 4, 2))
+        .unwrap();
+    assert_eq!(recovered.code, 0, "{}", recovered.message);
+    assert_eq!(recovered.control_revision, 5);
+    assert_eq!(
+        store
+            .execute_control_import("bob", &recover(&authority, "bob-recover", 4, 2))
+            .unwrap(),
+        recovered
+    );
+    let workflow = store
+        .control_import_workflow("bob", &key("books"), b"import-1")
+        .unwrap();
+    assert_eq!(workflow.phase, ControlImportPhase::Recovered as i32);
+    assert_eq!(
+        workflow.principal, "alice",
+        "the workflow keeps its initiator"
+    );
+    assert_eq!(
+        workflow.terminal.as_ref().unwrap().principal,
+        "bob",
+        "the terminal step names the recoverer"
+    );
+    assert_eq!(
+        (workflow.reserved_bytes, workflow.reserved_decisions),
+        (0, 0)
+    );
+    assert_eq!(workflow.staged_chunks, 1);
+    // Charged history is retained: the staged chunk's command and the two
+    // recovery decisions are there; the references are gone; the store has
+    // no applied control state and the resource remains importable.
+    assert_eq!(retained_operations(&store), retained + 3);
+    {
+        let tx = store.inner.database.begin_read().unwrap();
+        assert_eq!(tx.open_table(CHUNKS).unwrap().len().unwrap(), 0);
+        let meta = tx.open_table(META).unwrap();
+        let control: ControlStoreHeader =
+            contract::decode(meta.get(CONTROL_HEADER).unwrap().unwrap().value()).unwrap();
+        assert_eq!(
+            (
+                control.reserved_bytes,
+                control.reserved_decisions,
+                control.staged_chunk_count
+            ),
+            (0, 0, 0)
+        );
+    }
+    assert_eq!(
+        store
+            .control_snapshot("bob", &key("books"))
+            .err()
+            .unwrap()
+            .code(),
+        Code::NotFound
+    );
+    // Terminal: a second recovery and a later commit or abort all refuse.
+    for (actor, id, action) in [
+        (
+            "bob",
+            "bob-recover-2",
+            ImportAction::Recover(RecoverControlImport {}),
+        ),
+        (
+            "bob",
+            "bob-commit",
+            ImportAction::Commit(CommitControlImport {}),
+        ),
+    ] {
+        let mut c = command(&authority, id, 5, action);
+        c.expected_policy_revision = 2;
+        let decision = store.execute_control_import(actor, &c).unwrap();
+        assert_eq!(
+            decision.code,
+            Code::FailedPrecondition as u32,
+            "{id}: {}",
+            decision.message
+        );
+    }
+    // Recovery did not transfer the retirement: bob cannot begin with
+    // alice's holder, and the legacy file stays retired.
+    let mut bob_begin = command(
+        &authority,
+        "bob-begin",
+        5,
+        begin_action(&retired, &payload, chunk_bytes, chunk_count),
+    );
+    bob_begin.expected_policy_revision = 2;
+    bob_begin.workflow_id = b"import-2".to_vec();
+    assert_eq!(
+        store
+            .begin_control_import("bob", &bob_begin, &retired)
+            .err()
+            .unwrap()
+            .code(),
+        Code::PermissionDenied
+    );
+    assert_eq!(
+        legacy.checkpoint_for_import().err().unwrap().code(),
+        Code::FailedPrecondition
+    );
+    // With rights restored, the initiator recovers her retirement holder
+    // and imports under a new workflow id; the old one is never reusable.
+    assert_eq!(
+        store
+            .execute(
+                "bob",
+                &grants(
+                    &authority,
+                    "bob-restores",
+                    5,
+                    2,
+                    vec![grant("alice", "books"), grant("bob", "books")]
+                )
+            )
+            .unwrap()
+            .code,
+        0
+    );
+    drop(retired);
+    drop(legacy);
+    let holder = store
+        .recover_legacy_retirement("alice", &request, &dir.legacy())
+        .unwrap();
+    let mut reused = command(
+        &authority,
+        "begin-reuse",
+        6,
+        begin_action(&holder, &payload, chunk_bytes, chunk_count),
+    );
+    reused.expected_policy_revision = 3;
+    let reused = store
+        .begin_control_import("alice", &reused, &holder)
+        .unwrap();
+    assert_eq!(
+        reused.code,
+        Code::AlreadyExists as u32,
+        "{}",
+        reused.message
+    );
+    let mut fresh = command(
+        &authority,
+        "begin-2",
+        6,
+        begin_action(&holder, &payload, chunk_bytes, chunk_count),
+    );
+    fresh.expected_policy_revision = 3;
+    fresh.workflow_id = b"import-2".to_vec();
+    let fresh = store
+        .begin_control_import("alice", &fresh, &holder)
+        .unwrap();
+    assert_eq!(fresh.code, 0, "{}", fresh.message);
+    let mut revision = 7;
+    for ordinal in 0..chunk_count {
+        let mut c = command(
+            &authority,
+            &format!("c2-{ordinal}"),
+            revision,
+            chunk_action(&payload, chunk_bytes, ordinal),
+        );
+        c.expected_policy_revision = 3;
+        c.workflow_id = b"import-2".to_vec();
+        assert_eq!(store.execute_control_import("alice", &c).unwrap().code, 0);
+        revision += 1;
+    }
+    let mut commit = command(
+        &authority,
+        "commit-2",
+        revision,
+        ImportAction::Commit(CommitControlImport {}),
+    );
+    commit.expected_policy_revision = 3;
+    commit.workflow_id = b"import-2".to_vec();
+    let commit = store.execute_control_import("alice", &commit).unwrap();
+    assert_eq!(commit.code, 0, "{}", commit.message);
+    assert_eq!(commit.receipt.unwrap().routes, 120);
+    drop(store);
+    SourceAuthorityStore::open(&dir.authority(), &authority).unwrap();
+}
+
+#[test]
+fn a_commit_and_a_recovery_race_to_exactly_one_terminal_decision() {
+    let dir = Directory::new("race");
+    let limits = limits(64 << 10, 128);
+    let authority = identity(7);
+    let store = store(&dir, 7, &limits);
+    let legacy = legacy(&dir, 2);
+    let (retired, _) = retire(&store, &legacy, 1);
+    let checkpoint = checkpoint_of(&retired);
+    let payload = payload(&retired, supplement(&checkpoint));
+    assert_eq!(
+        store
+            .begin_control_import(
+                "alice",
+                &command(
+                    &authority,
+                    "begin",
+                    1,
+                    begin_action(&retired, &payload, payload.len() as u32, 1)
+                ),
+                &retired
+            )
+            .unwrap()
+            .code,
+        0
+    );
+    assert_eq!(
+        store
+            .execute_control_import(
+                "alice",
+                &command(
+                    &authority,
+                    "c0",
+                    2,
+                    chunk_action(&payload, payload.len() as u32, 0)
+                )
+            )
+            .unwrap()
+            .code,
+        0
+    );
+    let committing = {
+        let store = store.clone();
+        let authority = authority.clone();
+        std::thread::spawn(move || {
+            store
+                .execute_control_import(
+                    "alice",
+                    &command(
+                        &authority,
+                        "commit",
+                        3,
+                        ImportAction::Commit(CommitControlImport {}),
+                    ),
+                )
+                .unwrap()
+        })
+    };
+    let recovering = {
+        let store = store.clone();
+        let authority = authority.clone();
+        std::thread::spawn(move || {
+            store
+                .execute_control_import("bob", &recover(&authority, "bob-recover", 3, 1))
+                .unwrap()
+        })
+    };
+    let commit = committing.join().unwrap();
+    let recovery = recovering.join().unwrap();
+    let codes = [commit.code, recovery.code];
+    assert!(
+        codes.contains(&0) && codes.contains(&(Code::FailedPrecondition as u32)),
+        "exactly one terminal step wins: {codes:?}"
+    );
+    let workflow = store
+        .control_import_workflow("bob", &key("books"), b"import-1")
+        .unwrap();
+    if commit.code == 0 {
+        assert_eq!(workflow.phase, ControlImportPhase::Committed as i32);
+        assert!(store.control_snapshot("bob", &key("books")).is_ok());
+    } else {
+        assert_eq!(workflow.phase, ControlImportPhase::Recovered as i32);
+        assert_eq!(
+            store
+                .control_snapshot("bob", &key("books"))
+                .err()
+                .unwrap()
+                .code(),
+            Code::NotFound
+        );
+    }
+    assert_eq!(
+        (workflow.reserved_bytes, workflow.reserved_decisions),
+        (0, 0)
+    );
+    drop(store);
+    SourceAuthorityStore::open(&dir.authority(), &authority).unwrap();
+}
+
+#[test]
+fn recovery_exit_worker() {
+    let Some(mode) = std::env::var_os("PSEARCH_IMPORT_RECOVERY_EXIT_FAULT") else {
+        return;
+    };
+    let root = PathBuf::from(std::env::var_os("PSEARCH_IMPORT_RECOVERY_DIR").unwrap());
+    let limits = limits(64 << 10, 64);
+    let authority = identity(7);
+    let store =
+        SourceAuthorityStore::create(&root.join("authority.redb"), &authority, &policy(), &limits)
+            .unwrap();
+    let legacy = DurableControlPlane::open_existing(
+        root.join("legacy.json"),
+        test_fixtures::populated_policy(),
+    )
+    .unwrap()
+    .with_collection("books")
+    .unwrap();
+    let (retired, _) = retire(&store, &legacy, 1);
+    let checkpoint = checkpoint_of(&retired);
+    let payload = payload(&retired, supplement(&checkpoint));
+    store
+        .begin_control_import(
+            "alice",
+            &command(
+                &authority,
+                "begin",
+                1,
+                begin_action(&retired, &payload, payload.len() as u32, 1),
+            ),
+            &retired,
+        )
+        .unwrap();
+    store
+        .execute_control_import(
+            "alice",
+            &command(
+                &authority,
+                "c0",
+                2,
+                chunk_action(&payload, payload.len() as u32, 0),
+            ),
+        )
+        .unwrap();
+    *store.inner.fault.lock().unwrap() = Some(match mode.to_str().unwrap() {
+        "before" => Fault::ExitBeforeCommit,
+        "after" => Fault::ExitAfterCommit,
+        other => panic!("unknown exit fault {other}"),
+    });
+    store
+        .execute_control_import("bob", &recover(&authority, "bob-recover", 3, 1))
+        .unwrap();
+    panic!("exit fault did not terminate the worker");
+}
+
+#[test]
+fn abrupt_exit_around_the_recovery_commit_leaves_staging_or_recovered() {
+    for fault in ["before", "after"] {
+        let dir = Directory::new(&format!("recovery-exit-{fault}"));
+        std::fs::write(
+            dir.legacy(),
+            test_fixtures::populated_state_json("books", 2),
+        )
+        .unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("source_authority::import_tests::recovery_exit_worker")
+            .arg("--nocapture")
+            .env("PSEARCH_IMPORT_RECOVERY_EXIT_FAULT", fault)
+            .env("PSEARCH_IMPORT_RECOVERY_DIR", &dir.0)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(87), "{fault}");
+        let authority = identity(7);
+        let store = SourceAuthorityStore::open(&dir.authority(), &authority).unwrap();
+        let workflow = store
+            .control_import_workflow("bob", &key("books"), b"import-1")
+            .unwrap();
+        if fault == "before" {
+            assert_eq!(workflow.phase, ControlImportPhase::Staging as i32);
+            assert!(workflow.reserved_bytes > 0);
+            assert_eq!(
+                store
+                    .control_import_decision("bob", &key("books"), b"bob-recover")
+                    .err()
+                    .unwrap()
+                    .code(),
+                Code::NotFound
+            );
+        } else {
+            assert_eq!(workflow.phase, ControlImportPhase::Recovered as i32);
+            assert_eq!(workflow.reserved_bytes, 0);
+        }
+        let decision = store
+            .execute_control_import("bob", &recover(&authority, "bob-recover", 3, 1))
+            .unwrap();
+        assert_eq!(decision.code, 0, "{fault}: {}", decision.message);
+        assert_eq!(decision.control_revision, 4);
+        assert_eq!(
+            store
+                .control_import_workflow("bob", &key("books"), b"import-1")
+                .unwrap()
+                .phase,
+            ControlImportPhase::Recovered as i32
+        );
+        drop(store);
+        SourceAuthorityStore::open(&dir.authority(), &authority).unwrap();
+    }
 }

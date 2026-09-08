@@ -95,9 +95,20 @@ row count and the payload bytes, and refuses on any difference.
   resource. Another Admin cannot stage, commit or abort it (recorded
   `FailedPrecondition`); revoking the initiator's Admin blocks every further
   step (`PermissionDenied`) until rights are restored or the policy is
-  replaced. A replacement administrator has no abort path in this release;
-  a stranded workflow keeps its reservation, and that rule is deliberate
-  until a retirement-scoped override exists.
+  replaced.
+- **Administrative recovery** (`Recover`, abort-only): any current Admin of
+  the resource may terminate a staging workflow into phase `RECOVERED` under
+  the same revision CAS and actor-scoped retry rules. It deletes the staged
+  references, releases the reservation and keeps the charged history: the
+  row keeps its initiating principal, the terminal command names the
+  recovering actor, and both stay auditable through `control_import_workflow`.
+  It never transfers the workflow (the id is spent; the initiator's
+  retirement holder remains hers), never commits another actor's import,
+  never touches the retired legacy file and never activates a writer. A
+  concurrent `Commit` and `Recover` serialize on the exclusive admission
+  lock and the revision: exactly one becomes the terminal decision, the
+  other is a recorded refusal. Process exit before or after the recovery
+  transaction leaves staging or `RECOVERED`; the retry converges.
 - Every step carries `expected_control_revision` and
   `expected_policy_revision` against the current values: unrelated committed
   commands (grants, ownership) advance the revision and a stale step is a
@@ -173,14 +184,24 @@ header is recomputed against the tables at open.
 
 ## Replication semantics
 
+Admission happens once, at proposal: `begin_control_import` compares the
+command's digests with the holder's and refuses before anything is
+recorded; `execute_control_import` refuses every `Begin`. Application of a
+committed command performs no holder check and opens no file:
+`replay_control_import` applies a `Begin` from the committed log as admitted
+evidence, and every later step checks digests and identities against the
+committed workflow row and the retained chunk commands. The replay test
+applies the recorded sequence, `Begin` included, to a fresh store of the same
+identity without a holder and compares every table byte for byte. Readiness
+follows the same shape (`replay_command`, see
+[owner admission](source-owner-admission.md)).
+
 Under Raft each step is one log entry and the retained commands and staged
 references are state-machine state, included in control snapshots. A
 follower installs a snapshot taken mid-import and continues from the same
 staging. Apply of `Commit` is deterministic over committed inputs: it reads
 the chunks from the retained commands, never from disk or the network, and
-the leader supplies no clock. The replay test applies the recorded command
-sequence to a fresh store of the same identity and compares every table byte
-for byte.
+the leader supplies no clock.
 
 ## The committed snapshot
 
