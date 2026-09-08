@@ -59,6 +59,22 @@ non-Debug success type; after correcting that test compilation error, both
 public failures were reproduced before applying the fix.
 
 The focused gate passed with unchanged runtime/fixture hashes in an 8 GiB,
-swap-disabled scope: 5.25 GiB peak, zero swap and zero OOM events. Full-suite
-validation is recorded separately when complete; these focused checks do not
-establish the entire foundations goal or a fleet deployment.
+swap-disabled scope: 5.25 GiB peak, zero swap and zero OOM events.
+
+The full gate at `5710605` passed 667 library tests and the first 102 integration
+targets, then stopped on a schema-report fixture assertion: the added double
+field made the count 19 rather than 18. Commit `de96f0b` changes only that
+assertion. A manifest comparison verified every other tracked file against the
+initial run before resuming at the affected integration group. The original
+failure logs were preserved; the resumed run passed with unchanged file hashes.
+Combined unique results are 1,555 passed, zero failed and one existing ignored
+test across the library, 146 integration targets, embedded package and IVF
+adapter. This is combined evidence across the test-only correction, not a claim
+that the initial invocation succeeded.
+
+All five mobile target checks, tests/examples compilation, formatting, vendored
+proto checks and the product-proto compatibility gate passed. Product protobuf
+files are byte-identical to `5cd1039`. Both full validation scopes reached their
+8 GiB memory cap with zero swap and zero OOM events. This validates the decoder
+checkpoint; it does not establish the entire foundations goal or a fleet
+deployment.
