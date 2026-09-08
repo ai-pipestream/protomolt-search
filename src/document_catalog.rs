@@ -245,6 +245,8 @@ impl DocumentCatalog {
         }
         let file = options.open(path).map_err(opening_error)?;
         let new = create;
+        #[cfg(test)]
+        let _handoff = crate::test_support::lock_handoff();
         file.try_lock().map_err(|e| {
             Status::failed_precondition(format!("exclusive document catalog lock unavailable: {e}"))
         })?;

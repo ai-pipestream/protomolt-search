@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_support::ForkGuarded;
 
 struct Directory(PathBuf);
 
@@ -120,7 +121,7 @@ fn another_process_cannot_open_the_live_control_store() {
         .arg("control_plane::ownership_tests::independent_open_worker")
         .arg("--nocapture")
         .env("PSEARCH_CONTROL_OWNERSHIP_PATH", dir.state())
-        .status()
+        .status_guarded()
         .unwrap();
     assert_eq!(status.code(), Some(73));
     let winner = plane.plan().unwrap();
@@ -237,7 +238,7 @@ fn abrupt_holder_exit_releases_lock_and_preserves_committed_state() {
         .arg("--nocapture")
         .env("PSEARCH_CONTROL_ABRUPT_HOLDER_PATH", dir.state())
         .env_remove("PSEARCH_CONTROL_OWNERSHIP_PATH")
-        .status()
+        .status_guarded()
         .unwrap();
     assert_eq!(status.code(), Some(87));
 

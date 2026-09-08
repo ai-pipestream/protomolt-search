@@ -12,6 +12,7 @@ use crate::pb::{
     AccessAction, AccessPolicy, CollectionGrant, CollectionResource, DerivedColumn, DerivedColumns,
     DerivedDisclosure, MaterializeKind, PlacementNode, PlacementTree,
 };
+use crate::test_support::ForkGuarded;
 use redb::{ReadableTable, TableHandle};
 use std::path::PathBuf;
 use tonic::Code;
@@ -1331,7 +1332,7 @@ fn abrupt_exit_at_every_phase_recovers_identical_accounting_and_finishes() {
                     format!("{phase}:{fault}"),
                 )
                 .env("PSEARCH_CONTROL_IMPORT_DIR", &dir.0)
-                .status()
+                .status_guarded()
                 .unwrap();
             assert_eq!(status.code(), Some(87), "{phase}:{fault}");
 
@@ -1989,7 +1990,7 @@ fn abrupt_exit_around_the_recovery_commit_leaves_staging_or_recovered() {
             .arg("--nocapture")
             .env("PSEARCH_IMPORT_RECOVERY_EXIT_FAULT", fault)
             .env("PSEARCH_IMPORT_RECOVERY_DIR", &dir.0)
-            .status()
+            .status_guarded()
             .unwrap();
         assert_eq!(status.code(), Some(87), "{fault}");
         let authority = identity(7);

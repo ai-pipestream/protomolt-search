@@ -1,6 +1,7 @@
 use super::log_store::RaftLogStore;
 use super::state_machine::{
-    format_snapshot_id, parse_snapshot_id, ControlStateMachine, ImageSignature,
+    format_snapshot_id, parse_snapshot_id, published_generation, ControlStateMachine,
+    ImageSignature,
 };
 use super::types::*;
 use super::{HostConfig, RaftHost};
@@ -83,6 +84,8 @@ fn config() -> HostConfig {
         election_timeout_min_ms: 150,
         election_timeout_max_ms: 300,
         snapshot_logs_since_last: 1_000_000,
+        admission_lease_ms: 100,
+        clock_skew_ms: 50,
         ..HostConfig::default()
     }
 }
@@ -384,15 +387,14 @@ async fn a_single_node_host_applies_through_the_log_and_restarts_in_place() {
             .code(),
         Code::NotFound
     );
-    let entries = host.log_store().entries().unwrap().len();
+    let entries = host.log_entries().unwrap().len();
     drop(store);
     host.shutdown().await.unwrap();
 
     // Restart from durable state: the applied position and the owner are
     // there, no entry applies twice, and proposals continue.
     let host = RaftHost::start(&dir.0, &group, 1, &config()).await.unwrap();
-    host.raft()
-        .wait(Some(std::time::Duration::from_secs(30)))
+    host.wait(Some(std::time::Duration::from_secs(30)))
         .state(openraft::ServerState::Leader, "re-elected")
         .await
         .unwrap();
@@ -409,7 +411,7 @@ async fn a_single_node_host_applies_through_the_log_and_restarts_in_place() {
         last.index
     );
     // Nothing applied twice: the log holds exactly what it held before.
-    assert!(host.log_store().entries().unwrap().len() >= entries);
+    assert!(host.log_entries().unwrap().len() >= entries);
     let second = host
         .propose_command("alice", &prepare(&group, "other", "second", 2))
         .await
@@ -446,7 +448,7 @@ async fn committed_entries_apply_on_restart_and_the_position_is_in_the_same_tran
     .await
     .unwrap();
     let vote = host.metrics().borrow().vote;
-    let last = host.log_store().entries().unwrap().last().unwrap().log_id;
+    let last = host.log_entries().unwrap().last().unwrap().log_id;
     host.shutdown().await.unwrap();
     // A crash between commit and apply: the log holds a committed entry the
     // state machine never saw.
@@ -463,8 +465,7 @@ async fn committed_entries_apply_on_restart_and_the_position_is_in_the_same_tran
     }
     drop(log);
     let host = RaftHost::start(&dir.0, &group, 1, &config()).await.unwrap();
-    host.raft()
-        .wait(Some(std::time::Duration::from_secs(30)))
+    host.wait(Some(std::time::Duration::from_secs(30)))
         .applied_index_at_least(Some(next.index), "committed entry applied")
         .await
         .unwrap();
@@ -504,8 +505,7 @@ async fn a_snapshot_installs_into_a_fresh_replica_with_the_same_map() {
     host.trigger_snapshot().await.unwrap();
     let applied = host.store().unwrap().raft_applied().unwrap().unwrap();
     let last = log_id_from_proto(applied.last_applied.as_ref().unwrap());
-    host.raft()
-        .wait(Some(std::time::Duration::from_secs(30)))
+    host.wait(Some(std::time::Duration::from_secs(30)))
         .snapshot(last, "snapshot built")
         .await
         .unwrap();
@@ -514,9 +514,11 @@ async fn a_snapshot_installs_into_a_fresh_replica_with_the_same_map() {
         .unwrap()
         .owner("alice", &owner("tablet"))
         .unwrap();
-    let image = std::fs::read(dir.0.join(super::host::SNAPSHOT_DIR).join("current.redb")).unwrap();
-    let meta_bytes =
-        std::fs::read(dir.0.join(super::host::SNAPSHOT_DIR).join("current.meta")).unwrap();
+    let generation = published_generation(&dir.0.join(super::host::SNAPSHOT_DIR))
+        .unwrap()
+        .unwrap();
+    let image = std::fs::read(generation.join("image.redb")).unwrap();
+    let meta_bytes = std::fs::read(generation.join("meta")).unwrap();
     host.shutdown().await.unwrap();
 
     // A fresh replica of the same group receives the image and installs it.
@@ -531,6 +533,7 @@ async fn a_snapshot_installs_into_a_fresh_replica_with_the_same_map() {
     let mut machine = ControlStateMachine::new(
         replica_store,
         &replica_dir.0.join(super::host::SNAPSHOT_DIR),
+        64 << 20,
     )
     .unwrap();
     let (before, _) = machine.applied_state().await.unwrap();
@@ -559,12 +562,95 @@ async fn a_snapshot_installs_into_a_fresh_replica_with_the_same_map() {
     assert!(refused.is_err());
     let (still, _) = machine.applied_state().await.unwrap();
     assert_eq!(still, None);
+    // A valid image of another group is refused on the probe, and a meta
+    // whose membership differs from the image is refused too; the replica
+    // keeps its state and has no published snapshot yet.
+    let foreign_dir = Directory::new("snapshot-foreign");
+    let foreign_bytes = {
+        let foreign = crate::source_authority::SourceAuthorityStore::create(
+            &foreign_dir.0.join("foreign.redb"),
+            &identity(9),
+            &policy(),
+            &limits(),
+        )
+        .unwrap();
+        drop(foreign);
+        std::fs::read(foreign_dir.0.join("foreign.redb")).unwrap()
+    };
+    let mut file = machine.begin_receiving_snapshot().await.unwrap();
+    file.write_all(&foreign_bytes).await.unwrap();
+    let mut foreign_meta = meta.clone();
+    foreign_meta.snapshot_id = format_snapshot_id(
+        meta.last_log_id.as_ref(),
+        &ImageSignature {
+            length: foreign_bytes.len() as u64,
+            sha256: crate::sha256::digest(&foreign_bytes),
+        },
+    );
+    assert!(machine.install_snapshot(&foreign_meta, file).await.is_err());
+    let mut file = machine.begin_receiving_snapshot().await.unwrap();
+    file.write_all(&image).await.unwrap();
+    let mut wrong_membership = meta.clone();
+    wrong_membership.last_membership = openraft::StoredMembership::new(
+        meta.last_log_id,
+        Membership::new(
+            vec![BTreeSet::from([1, 2])],
+            BTreeMap::from([
+                (1, BasicNode { addr: "a".into() }),
+                (2, BasicNode { addr: "b".into() }),
+            ]),
+        ),
+    );
+    assert!(machine
+        .install_snapshot(&wrong_membership, file)
+        .await
+        .is_err());
+    assert_eq!(machine.applied_state().await.unwrap().0, None);
+    assert!(machine.get_current_snapshot().await.unwrap().is_none());
+    // Every refused receive left nothing behind.
+    let leftovers = std::fs::read_dir(replica_dir.0.join(super::host::SNAPSHOT_DIR))
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("incoming-")
+        })
+        .count();
+    assert_eq!(leftovers, 0);
+
+    // A held handle makes the swap refuse by name while the old state stays
+    // readable; the subscriber attached before the install wakes after it.
+    let mut applied_watch = machine
+        .shared_store()
+        .read()
+        .unwrap()
+        .clone()
+        .unwrap()
+        .subscribe_applied();
+    let held = machine.shared_store().read().unwrap().clone().unwrap();
+    let mut file = machine.begin_receiving_snapshot().await.unwrap();
+    file.write_all(&image).await.unwrap();
+    let refused = machine.install_snapshot(&meta, file).await.err().unwrap();
+    assert!(
+        refused.to_string().contains("outstanding handles"),
+        "{refused}"
+    );
+    assert_eq!(
+        held.owner("alice", &owner("tablet")).err().unwrap().code(),
+        Code::NotFound
+    );
+    assert!(machine.get_current_snapshot().await.unwrap().is_none());
+    drop(held);
     let mut file = machine.begin_receiving_snapshot().await.unwrap();
     file.write_all(&image).await.unwrap();
     machine.install_snapshot(&meta, file).await.unwrap();
     let (after, membership) = machine.applied_state().await.unwrap();
     assert_eq!(after, Some(last));
     assert_eq!(membership, meta.last_membership);
+    assert!(applied_watch.has_changed().unwrap());
+    assert_eq!(*applied_watch.borrow_and_update(), 3);
     let replica = machine.shared_store().read().unwrap().clone().unwrap();
     assert_eq!(
         replica.owner("alice", &owner("tablet")).unwrap(),
@@ -573,4 +659,275 @@ async fn a_snapshot_installs_into_a_fresh_replica_with_the_same_map() {
     let current = machine.get_current_snapshot().await.unwrap().unwrap();
     assert_eq!(current.meta, meta);
     drop(replica);
+
+    // A bound below the image refuses the receive; abandoned receives,
+    // partial builds and an unpublished generation are swept at startup
+    // while the published generation stays.
+    let snapshots = replica_dir.0.join(super::host::SNAPSHOT_DIR);
+    drop(machine);
+    let store = crate::source_authority::SourceAuthorityStore::open(
+        &replica_dir.0.join(super::host::STORE_FILE),
+        &group,
+    )
+    .unwrap();
+    std::fs::create_dir(snapshots.join("incoming-1-0")).unwrap();
+    std::fs::create_dir(snapshots.join("build-1")).unwrap();
+    std::fs::create_dir(snapshots.join("generations").join("99")).unwrap();
+    let mut machine = ControlStateMachine::new(store, &snapshots, 1024).unwrap();
+    assert!(!snapshots.join("incoming-1-0").exists());
+    assert!(!snapshots.join("build-1").exists());
+    assert!(!snapshots.join("generations").join("99").exists());
+    assert_eq!(
+        machine.get_current_snapshot().await.unwrap().unwrap().meta,
+        meta
+    );
+    let mut file = machine.begin_receiving_snapshot().await.unwrap();
+    file.write_all(&image).await.unwrap();
+    let oversize = machine.install_snapshot(&meta, file).await.err().unwrap();
+    assert!(oversize.to_string().contains("bound"), "{oversize}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_retries_advance_the_applied_position_in_every_command_family() {
+    let dir = Directory::new("retry-position");
+    let group = identity(7);
+    let host = RaftHost::bootstrap_single(
+        &dir.0,
+        &group,
+        1,
+        "https://node-1:19291",
+        &policy(),
+        &limits(),
+        &config(),
+    )
+    .await
+    .unwrap();
+    let last_index = |host: &RaftHost| host.log_entries().unwrap().last().unwrap().log_id.index;
+    let applied_index = |host: &RaftHost| host.applied_position().unwrap().unwrap().index;
+    // Control: accepted, then the exact retry.
+    let command = prepare(&group, "phone", "prepare", 1);
+    let first = host.propose_command("alice", &command).await.unwrap();
+    let again = host.propose_command("alice", &command).await.unwrap();
+    assert_eq!(first, again);
+    assert_eq!(applied_index(&host), last_index(&host));
+    // Import: a recorded rejection (no workflow), then its exact retry.
+    let chunk = crate::pb::storage::ControlImportCommand {
+        format_version: 1,
+        authority: Some(group.clone()),
+        key: Some(LogicalSourceOwner {
+            workspace: "workspace-a".into(),
+            collection: "books".into(),
+            owner_id: Vec::new(),
+        }),
+        command_id: b"chunk".to_vec(),
+        expected_control_revision: 2,
+        expected_policy_revision: 1,
+        workflow_id: b"import-1".to_vec(),
+        action: Some(crate::pb::storage::control_import_command::Action::Chunk(
+            crate::pb::storage::ControlImportChunk {
+                ordinal: 0,
+                bytes: vec![1, 2, 3],
+                sha256: crate::source_authority::chunk_digest(&[1, 2, 3]),
+            },
+        )),
+    };
+    let first = host.propose_import("alice", &chunk, None).await.unwrap();
+    assert_eq!(first.code, Code::NotFound as u32);
+    let again = host.propose_import("alice", &chunk, None).await.unwrap();
+    assert_eq!(first, again);
+    assert_eq!(applied_index(&host), last_index(&host));
+    // Capacity configure: a recorded rejection (no applied control state),
+    // then its exact retry.
+    let configure = crate::pb::storage::CapacityConfigureCommand {
+        format_version: 1,
+        authority: Some(group.clone()),
+        key: chunk.key.clone(),
+        command_id: b"configure".to_vec(),
+        expected_control_revision: 2,
+        expected_policy_revision: 1,
+        configuration: Some(crate::pb::storage::CapacityConfiguration {
+            format_version: 1,
+            cohort_length_ms: 60_000,
+            cohort_phase_unix_ms: 0,
+            max_total_records: 16,
+            max_total_bytes: 1 << 20,
+            max_registered_nodes: 4,
+            policy: Some(crate::pb::storage::CapacityTierPolicy {
+                format_version: 1,
+                tiers: vec![crate::pb::storage::CapacityTierSpec {
+                    name: "hot".into(),
+                    residency: crate::pb::storage::CapacityResidency::Server as i32,
+                    min_replicas: 1,
+                    scans_per_byte_nanos_lo: 0,
+                    scans_per_byte_nanos_hi: 1_000,
+                    max_seconds_since_scan: 60,
+                }],
+            }),
+        }),
+    };
+    let first = host
+        .propose_capacity_configure("alice", &configure)
+        .await
+        .unwrap();
+    assert_eq!(first.code, Code::FailedPrecondition as u32);
+    let again = host
+        .propose_capacity_configure("alice", &configure)
+        .await
+        .unwrap();
+    assert_eq!(first, again);
+    assert_eq!(applied_index(&host), last_index(&host));
+    // Observation transition: refused at its envelope (no configuration),
+    // recorded as the reply; the entry is consumed both times.
+    let transition = crate::pb::storage::CapacityTransition {
+        format_version: 1,
+        authority: Some(group.clone()),
+        key: chunk.key.clone(),
+        action: Some(crate::pb::storage::capacity_transition::Action::Register(
+            crate::pb::storage::RegisterCapacityReporter {
+                node_id: "server-a".into(),
+                process_incarnation: vec![5; 16],
+            },
+        )),
+    };
+    for _ in 0..2 {
+        assert_eq!(
+            host.propose_capacity_transition("alice", &transition)
+                .await
+                .err()
+                .unwrap()
+                .code(),
+            Code::FailedPrecondition
+        );
+        assert_eq!(applied_index(&host), last_index(&host));
+    }
+    // Changed content under a used id is refused at the envelope and still
+    // consumes its entry.
+    let mut changed = command.clone();
+    changed.expected_policy_revision = 7;
+    assert_eq!(
+        host.propose_command("alice", &changed)
+            .await
+            .err()
+            .unwrap()
+            .code(),
+        Code::FailedPrecondition
+    );
+    assert_eq!(applied_index(&host), last_index(&host));
+    let last = applied_index(&host);
+    host.shutdown().await.unwrap();
+    let host = RaftHost::start(&dir.0, &group, 1, &config()).await.unwrap();
+    assert_eq!(applied_index(&host), last);
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hosted_store_refuses_direct_mutation_and_local_admission() {
+    let dir = Directory::new("hosted-refusals");
+    let group = identity(7);
+    let host = RaftHost::bootstrap_single(
+        &dir.0,
+        &group,
+        1,
+        "https://node-1:19291",
+        &policy(),
+        &limits(),
+        &config(),
+    )
+    .await
+    .unwrap();
+    let store = host.store().unwrap();
+    let hosted = |result: Result<(), tonic::Status>| {
+        let error = result.err().unwrap();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("Raft-hosted"), "{error}");
+    };
+    hosted(
+        store
+            .execute("alice", &prepare(&group, "phone", "prepare", 1))
+            .map(|_| ()),
+    );
+    let key = LogicalSourceOwner {
+        workspace: "workspace-a".into(),
+        collection: "books".into(),
+        owner_id: Vec::new(),
+    };
+    hosted(
+        store
+            .execute_control_import(
+                "alice",
+                &crate::pb::storage::ControlImportCommand {
+                    format_version: 1,
+                    authority: Some(group.clone()),
+                    key: Some(key.clone()),
+                    command_id: b"abort".to_vec(),
+                    expected_control_revision: 1,
+                    expected_policy_revision: 1,
+                    workflow_id: b"import-1".to_vec(),
+                    action: Some(crate::pb::storage::control_import_command::Action::Abort(
+                        crate::pb::storage::AbortControlImport {},
+                    )),
+                },
+            )
+            .map(|_| ()),
+    );
+    hosted(
+        store
+            .capacity_transition(
+                "alice",
+                &crate::pb::storage::CapacityTransition {
+                    format_version: 1,
+                    authority: Some(group.clone()),
+                    key: Some(key.clone()),
+                    action: Some(crate::pb::storage::capacity_transition::Action::Expire(
+                        crate::pb::storage::CommitCapacityExpiry {
+                            now_unix_ms: 1,
+                            max_age_ms: 1,
+                        },
+                    )),
+                },
+            )
+            .map(|_| ()),
+    );
+    hosted(store.admission("alice").map(|_| ()));
+    // The general proposal path never admits a readiness confirmation.
+    let confirm = SourceAuthorityCommand {
+        command_id: b"confirm".to_vec(),
+        action: Some(Action::ConfirmReady(
+            crate::pb::storage::ConfirmSourceOwnerReady {
+                workflow_id: b"install-phone".to_vec(),
+                completion: None,
+            },
+        )),
+        ..prepare(&group, "phone", "prepare", 1)
+    };
+    assert_eq!(
+        host.propose_command("alice", &confirm)
+            .await
+            .err()
+            .unwrap()
+            .code(),
+        Code::PermissionDenied
+    );
+    // A leased admission from the host works while it leads; past its
+    // deadline it admits nothing.
+    host.with_admission("alice", |admission| {
+        assert!(admission.expires_at().is_some());
+        admission
+            .authorize("books", AccessAction::Admin)
+            .map(|d| assert_eq!(d.principal, "alice"))
+    })
+    .await
+    .unwrap();
+    let expired = store
+        .leased_admission("alice", std::time::Instant::now())
+        .unwrap();
+    let error = expired
+        .authorize("books", AccessAction::Admin)
+        .err()
+        .unwrap();
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert!(error.message().contains("lease expired"), "{error}");
+    drop(expired);
+    drop(store);
+    host.shutdown().await.unwrap();
 }

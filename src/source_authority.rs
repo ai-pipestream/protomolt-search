@@ -102,6 +102,14 @@ pub struct SourceAuthorityStore {
     inner: Arc<Inner>,
 }
 
+/// Why a snapshot swap did not happen.
+pub(crate) enum ReplaceFailure {
+    /// The handle is intact and usable; nothing changed on disk.
+    Refused(SourceAuthorityStore, Status),
+    /// The handle was closed and the reopen failed; reopen from durable state.
+    Lost(Status),
+}
+
 impl std::fmt::Debug for SourceAuthorityStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SourceAuthorityStore")
@@ -119,12 +127,33 @@ impl std::fmt::Debug for SourceAuthorityStore {
 pub struct SourceAdmission<'a> {
     store: &'a SourceAuthorityStore,
     principal: String,
+    // A Raft-hosted admission is a lease: the host granted it after a
+    // linearizable read and it admits nothing past this instant.
+    deadline: Option<std::time::Instant>,
     _shared: RwLockReadGuard<'a, ()>,
 }
 
 impl SourceAdmission<'_> {
     pub fn identity(&self) -> &SourceAuthorityIdentity {
         &self.store.inner.identity
+    }
+
+    /// A leased admission past its deadline admits nothing; the lease is
+    /// what keeps admission authoritative under leader isolation
+    /// (docs/raft-admission.md).
+    fn fresh(&self) -> Result<(), Status> {
+        match self.deadline {
+            Some(deadline) if std::time::Instant::now() >= deadline => {
+                Err(Status::failed_precondition(
+                    "admission lease expired; obtain a fresh admission through the host",
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub fn expires_at(&self) -> Option<std::time::Instant> {
+        self.deadline
     }
 
     pub fn principal(&self) -> &str {
@@ -137,6 +166,7 @@ impl SourceAdmission<'_> {
         collection: &str,
         action: AccessAction,
     ) -> Result<AccessDecision, Status> {
+        self.fresh()?;
         self.store.authorize(&self.principal, collection, action)
     }
 
@@ -176,6 +206,7 @@ impl SourceAdmission<'_> {
         &self,
         binding: &SourceManagedBinding,
     ) -> Result<PreparedSourceOwner, Status> {
+        self.fresh()?;
         let verified = VerifiedOwnerCompletion::from_binding(binding)?;
         if binding.authority.as_ref() != Some(&self.store.inner.identity) {
             return Err(Status::failed_precondition(
@@ -209,6 +240,7 @@ impl SourceAdmission<'_> {
         write_epoch: u64,
         action: AccessAction,
     ) -> Result<AccessDecision, Status> {
+        self.fresh()?;
         contract::key(key, true)?;
         let decision = self.authorize(&key.collection, action)?;
         if decision.workspace != key.workspace {
@@ -231,6 +263,7 @@ impl SourceAdmission<'_> {
     /// preparation. Owner-side work runs under this admission through its
     /// source commit; no command can change the owner or the policy meanwhile.
     pub fn prepared_owner(&self, expected: &PreparedSourceOwner) -> Result<(), Status> {
+        self.fresh()?;
         contract::owner(expected).map_err(|e| Status::invalid_argument(e.message()))?;
         self.store.guarded(|| {
             let key = expected
@@ -380,6 +413,29 @@ impl SourceAuthorityStore {
     /// principal; rights are resolved per collection by the admission's own
     /// methods, so a revoked actor holds a fence that admits nothing.
     pub fn admission(&self, principal: &str) -> Result<SourceAdmission<'_>, Status> {
+        if self.raft_hosted() {
+            return Err(Status::failed_precondition(
+                "source authority is Raft-hosted; a local admission is not authoritative, obtain a leased admission through the host",
+            ));
+        }
+        self.admission_with(principal, None)
+    }
+
+    /// A leased admission granted by the Raft host after a linearizable
+    /// read; it admits nothing past `deadline`.
+    pub(crate) fn leased_admission(
+        &self,
+        principal: &str,
+        deadline: std::time::Instant,
+    ) -> Result<SourceAdmission<'_>, Status> {
+        self.admission_with(principal, Some(deadline))
+    }
+
+    fn admission_with(
+        &self,
+        principal: &str,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<SourceAdmission<'_>, Status> {
         contract::principal(principal)?;
         let shared = self
             .inner
@@ -389,6 +445,7 @@ impl SourceAuthorityStore {
         Ok(SourceAdmission {
             store: self,
             principal: principal.to_string(),
+            deadline,
             _shared: shared,
         })
     }
@@ -459,7 +516,7 @@ impl SourceAuthorityStore {
     /// Apply a command that a trusted proposal already admitted: the
     /// committed-log path. A ConfirmReady replays without the managed
     /// binding; every other check runs against the committed rows.
-    pub fn replay_command(
+    pub(crate) fn replay_command(
         &self,
         principal: &str,
         command: &SourceAuthorityCommand,
@@ -588,6 +645,8 @@ impl SourceAuthorityStore {
             ),
             _ => storage(error),
         })?;
+        #[cfg(test)]
+        let _handoff = crate::test_support::lock_handoff();
         file.try_lock().map_err(|error| {
             Status::failed_precondition(format!("source authority exclusive file lock: {error}"))
         })?;
@@ -687,7 +746,8 @@ impl SourceAuthorityStore {
         let mut tx = self.inner.database.begin_write().map_err(storage)?;
         tx.set_durability(Durability::Immediate).map_err(storage)?;
         let decision;
-        {
+        let mut retried = false;
+        'apply: {
             let mut meta = tx.open_table(META).map_err(storage)?;
             let mut header: SourceAuthorityHeader = contract::decode(
                 meta.get("header")
@@ -739,7 +799,14 @@ impl SourceAuthorityStore {
                         "source authority command_id was already used with different content",
                     ));
                 }
-                return operation.decision.ok_or_else(|| missing("retry decision"));
+                decision = operation
+                    .decision
+                    .ok_or_else(|| missing("retry decision"))?;
+                retried = true;
+                // Under Raft the entry is consumed: the applied position
+                // advances for an exact retry too, with no other change.
+                self.write_pending_applied(&mut meta)?;
+                break 'apply;
             }
             if header
                 .decision_count
@@ -895,6 +962,10 @@ impl SourceAuthorityStore {
                 .map_err(storage)?;
             self.write_pending_applied(&mut meta)?;
         }
+        if retried {
+            self.finish_retry(tx)?;
+            return Ok(decision);
+        }
         #[cfg(any(test, feature = "fault-injection"))]
         self.inject(false)?;
         tx.commit().map_err(storage)?;
@@ -979,11 +1050,27 @@ impl SourceAuthorityStore {
         &self,
         meta: &mut redb::Table<&'static str, &'static [u8]>,
     ) -> Result<(), Status> {
-        if let Some(applied) = self.inner.raft_pending.lock().unwrap().as_ref() {
-            meta.insert(RAFT_META, applied.encode_to_vec().as_slice())
-                .map_err(storage)?;
+        match self.inner.raft_pending.lock().unwrap().as_ref() {
+            Some(applied) => {
+                meta.insert(RAFT_META, applied.encode_to_vec().as_slice())
+                    .map_err(storage)?;
+                Ok(())
+            }
+            None if self.raft_hosted() => Err(Status::failed_precondition(
+                "Raft-hosted store applied a command outside the state machine; no applied position is pending",
+            )),
+            None => Ok(()),
         }
-        Ok(())
+    }
+
+    /// An exact retry changes no application state; it commits only when a
+    /// Raft applied position was written for the consumed entry.
+    fn finish_retry(&self, tx: redb::WriteTransaction) -> Result<(), Status> {
+        if self.inner.raft_pending.lock().unwrap().is_some() {
+            tx.commit().map_err(storage)
+        } else {
+            tx.abort().map_err(storage)
+        }
     }
 
     /// Mark the store as Raft-hosted; the direct command paths refuse from
@@ -1065,25 +1152,69 @@ impl SourceAuthorityStore {
     /// Replace this store's file with a verified staged image and reopen.
     /// Needs exclusive ownership of the handle: an outstanding clone keeps
     /// the old file open, so the swap refuses by name rather than racing it.
-    pub(crate) fn replace_from(self, staged: &Path) -> Result<Self, Status> {
+    /// On refusal the handle comes back unchanged, so the host keeps its
+    /// usable store. Subscribers of the policy and applied watches stay
+    /// attached: the channels move to the reopened store. `Lost` means the
+    /// old handle is closed and the caller must reopen from durable state.
+    pub(crate) fn replace_from(self, staged: &Path) -> Result<Self, ReplaceFailure> {
         let identity = self.inner.identity.clone();
         let path = self.inner.path.clone();
         let hosted = self.raft_hosted();
-        if Arc::strong_count(&self.inner) != 1 {
-            return Err(Status::failed_precondition(
-                "source authority store has outstanding handles; snapshot install needs exclusive ownership",
-            ));
+        // Short-lived read clones drain quickly; anything longer is refused.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while Arc::strong_count(&self.inner) != 1 {
+            if std::time::Instant::now() >= deadline {
+                return Err(ReplaceFailure::Refused(
+                    self,
+                    Status::failed_precondition(
+                        "source authority store has outstanding handles; snapshot install needs exclusive ownership",
+                    ),
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        drop(self);
-        std::fs::rename(staged, &path).map_err(storage)?;
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        File::open(parent)
-            .and_then(|d| d.sync_all())
-            .map_err(storage)?;
-        let store = Self::open(&path, &identity)?;
+        let inner = match Arc::try_unwrap(self.inner) {
+            Ok(inner) => inner,
+            Err(shared) => {
+                return Err(ReplaceFailure::Refused(
+                    Self { inner: shared },
+                    Status::failed_precondition(
+                        "source authority handle count changed during a snapshot swap",
+                    ),
+                ))
+            }
+        };
+        let Inner {
+            database,
+            revisions,
+            applied,
+            _file_lock,
+            ..
+        } = inner;
+        drop(database);
+        drop(_file_lock);
+        let reopen = (|| -> Result<Self, Status> {
+            std::fs::rename(staged, &path).map_err(storage)?;
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            File::open(parent)
+                .and_then(|d| d.sync_all())
+                .map_err(storage)?;
+            Self::open(&path, &identity)
+        })();
+        let mut store = match reopen {
+            Ok(store) => store,
+            // The old file may still be in place (rename failed) or the new
+            // one may not open; either way this handle is gone.
+            Err(error) => return Err(ReplaceFailure::Lost(error)),
+        };
+        let fresh = Arc::get_mut(&mut store.inner).expect("freshly opened store has one handle");
+        revisions.send_replace(*fresh.revisions.borrow());
+        applied.send_replace(*fresh.applied.borrow());
+        fresh.revisions = revisions;
+        fresh.applied = applied;
         if hosted {
             store.set_raft_hosted();
         }

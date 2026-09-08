@@ -1250,13 +1250,23 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   destination store remains unchanged. See [retirement and crash recovery](docs/control-retirement.md);
   transactional import, worker fencing and activation remain separate steps.
 
+- **Foundation branch: Raft hosting hardening (Astra review of 331c18f).**
+  Raw submission and committed replay are no longer reachable by product
+  callers; exact retries advance the applied position in the same
+  transaction; snapshots are immutable generations behind one pointer,
+  verified on a probe copy (group, position, membership) with bounded
+  streaming and receive identity; a refused swap keeps the old handle and
+  watch channels move with a successful one. Admission on a hosted store is
+  a lease granted by the host after a linearizable read, bounded under the
+  election floor — see [admission under Raft](docs/raft-admission.md).
+
 - **Foundation branch: Raft hosting, single-node stage (feature `raft`,
   `openraft = "=0.9.25"` with `storage-v2`).** Typed envelopes for
   proposals, replies, entries, votes, membership and the applied position;
   a redb log store with one write order and saved committed position; a
   state machine that applies committed commands through the store's replay
   paths with the applied position in the same transaction and closes the
-  direct command paths; file snapshots signed by length and digest, verified
+  direct command paths; file snapshots checksummed by length and digest (integrity, not a signature), verified
   as a store of the group before an atomic swap; an in-process host with
   proposal admission (holder for Begin, binding for ConfirmReady). Evidence
   is single-node: restart in place, committed-but-unapplied replay,

@@ -1105,6 +1105,7 @@ pub async fn serve(listener: tokio::net::TcpListener, gauges: Vec<GaugeProvider>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::ForkGuarded;
     use tokio_stream::StreamExt;
 
     /// The value of the first sample line starting with `needle`.
@@ -1335,7 +1336,7 @@ mod tests {
                     "--nocapture",
                 ])
                 .env(ISOLATED, "1")
-                .output()
+                .output_guarded()
                 .unwrap();
             assert!(
                 output.status.success(),
@@ -1445,7 +1446,7 @@ mod tests {
                     "--nocapture",
                 ])
                 .env(ISOLATED, "1")
-                .output()
+                .output_guarded()
                 .unwrap();
             assert!(
                 output.status.success(),

@@ -9,6 +9,7 @@ use crate::pb::storage::capacity_transition::Action as TransitionAction;
 use crate::pb::storage::control_import_command::Action as ImportAction;
 use crate::pb::storage::legacy_control_import_supplement::Placement;
 use crate::pb::{AccessAction, CollectionGrant, PlacementNode, PlacementTree};
+use crate::test_support::ForkGuarded;
 use std::path::PathBuf;
 use tonic::Code;
 
@@ -728,7 +729,7 @@ fn abrupt_exit_around_capacity_commits_recovers_and_replays() {
                 .arg("--nocapture")
                 .env("PSEARCH_CAPACITY_EXIT_FAULT", format!("{phase}:{fault}"))
                 .env("PSEARCH_CAPACITY_DIR", &dir.0)
-                .status()
+                .status_guarded()
                 .unwrap();
             assert_eq!(status.code(), Some(87), "{phase}:{fault}");
             let authority = identity(7);

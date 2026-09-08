@@ -128,6 +128,8 @@ pub(super) fn acquire(path: &Path, allow_create: bool) -> Result<(PathBuf, Arc<F
             lock_path.display()
         ));
     }
+    #[cfg(test)]
+    let _handoff = crate::test_support::lock_handoff();
     lock.try_lock().map_err(|e| {
         error(
             "exclusive control ownership lock unavailable",

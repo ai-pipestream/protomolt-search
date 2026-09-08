@@ -46,17 +46,43 @@ error that stops the node; a business rejection is a recorded decision; an
 envelope or admission refusal is a recorded `RaftRefusal`. Recovery at open
 validates the applied position when present.
 
-Snapshots are consistent copies of the store file taken while every store
-transaction is held off (`quiesced`), signed by length and SHA-256; the
-snapshot id names both, and `current.meta` beside `current.redb` carries
-group, last log id, membership and signature. Install writes into an
-isolated incoming file, verifies length and digest against the announced
-id, opens the image as a store of this group (running the full recovery
-audit) and requires its applied position to equal the meta, keeps it as the
-current snapshot, then swaps: the live store is closed, the image renamed
-into place and reopened. The swap needs exclusive ownership of the store
-handle and refuses by name otherwise; an outstanding clone keeps the old
-file open. Restart sees the old complete state or the new complete state.
+An exact retry of a committed entry consumes the entry like any other: the
+retry lookup and the applied position share one transaction, so the
+position advances with no change to revisions, effects or receipt bytes.
+After every entry the state machine reads the position back and stops the
+node if it is not the entry just applied.
+
+### Snapshots
+
+Snapshots are immutable generations under `raft-snapshots/generations/<n>/`
+(`image.redb`, `meta`), published through one small pointer file
+(`current`, written to a temporary file, synced, renamed, directory synced).
+The image is a copy of the store file taken while every store transaction
+is held off (`quiesced`, which also reads the applied position under the
+same hold), streamed through a bounded buffer and checksummed by length and
+SHA-256 — an integrity check, not an authenticated signature; the snapshot
+id names both and the meta carries group, last log id, membership and the
+checksum. A store larger than `max_snapshot_bytes` refuses to snapshot by
+name. Build writes a `build-*` directory, syncs, renames it into a new
+generation, publishes the pointer and only then removes older generations;
+an interruption anywhere leaves the previous generation published and
+usable, and startup sweeps partial builds, abandoned receives and
+unpublished generations while verifying the published one.
+
+Install receives into `incoming-<token>/image.redb`, the exact directory the
+receive was started in (one receive at a time; a superseded receive is
+removed with its bytes). It refuses an announced length above the bound,
+verifies length and digest streaming, then opens a **separate probe copy**
+as a store of this group (the full recovery audit; the received bytes stay
+identical to their checksum), requires the probe's applied position and
+stored membership to equal the meta, writes the meta, renames the receive
+into a generation, and only then swaps the live store for a fresh copy of
+the image. The swap needs exclusive ownership of the store handle (short
+read clones drain within a bounded wait); on refusal the old handle is kept,
+the unpublished generation removed and the error named — the host keeps
+its usable store and the previous snapshot. On success the pointer moves and
+the policy/applied watch channels move to the reopened store, so
+subscribers stay attached. Build and install never overlap.
 
 ## Host
 
@@ -65,9 +91,15 @@ one voter; `RaftHost::start` opens existing state and never creates. The
 host admits proposals the way the direct paths did — a `ConfirmReady` needs
 the managed binding (`propose_confirm_ready`), a `Begin` needs the
 retirement holder (`propose_import`) — then writes them through
-`Raft::client_write` and returns the committed reply. `store()` hands out
-the current store for reads (maps, snapshots, decisions). A proposal on a
-non-leader is `Unavailable` naming the leader.
+`Raft::client_write` and returns the committed reply. Raw submission and
+committed application are not reachable by product callers: the submit
+path is private, the replay paths, the log store's constructors and writes
+and the state machine's constructor are crate-private, and a hosted store
+refuses every direct command and every local `admission()`. `store()` hands
+out the current store for reads (maps, snapshots, decisions);
+`with_admission` grants the leased admission owner-side work needs
+([admission under Raft](raft-admission.md)). A proposal on a non-leader is
+`Unavailable` naming the leader.
 
 ## Evidence (single node)
 
@@ -81,8 +113,20 @@ non-leader is `Unavailable` naming the leader.
 - A committed but unapplied entry applies on restart with the position in
   the same transaction.
 - A snapshot built on one node installs into a fresh replica of the group
-  with the same owner rows; a corrupted image refuses before anything is
-  replaced.
+  with the same owner rows; a corrupted image, a valid image of another
+  group and a meta with another membership refuse before anything is
+  replaced and leave no receive behind; a held handle makes the swap refuse
+  by name while the old state stays readable; a subscriber attached before
+  the install wakes after it; an image above the bound refuses; startup
+  sweeps abandoned receives, partial builds and an unpublished generation
+  and keeps the published one.
+- Exact retries in every command family advance the applied position, a
+  changed-content refusal and an unchanged observation transition consume
+  their entries, and the position survives restart.
+- A hosted store refuses direct mutation and local admission; the general
+  proposal path refuses a readiness confirmation; a leased admission works
+  on the leader and admits nothing once expired; a lease beyond the
+  election floor is refused at configuration.
 
 ## Not yet
 

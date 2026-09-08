@@ -448,7 +448,7 @@ impl SourceAuthorityStore {
     /// committed-log path. It needs no holder and touches no file beyond the
     /// store; every digest and identity check runs against the committed
     /// evidence the command and the workflow row carry.
-    pub fn replay_control_import(
+    pub(crate) fn replay_control_import(
         &self,
         principal: &str,
         command: &ControlImportCommand,
@@ -484,7 +484,8 @@ impl SourceAuthorityStore {
         let mut tx = self.inner.database.begin_write().map_err(storage)?;
         tx.set_durability(Durability::Immediate).map_err(storage)?;
         let decision;
-        {
+        let mut retried = false;
+        'apply: {
             let mut meta = tx.open_table(META).map_err(storage)?;
             let (mut header, policy) = read_headers(&meta, &self.inner.identity)?;
             validate_command(command, &self.inner.identity, &header.limits)?;
@@ -522,7 +523,14 @@ impl SourceAuthorityStore {
                         "control import command_id was already used with different content",
                     ));
                 }
-                return operation.decision.ok_or_else(|| missing("retry decision"));
+                decision = operation
+                    .decision
+                    .ok_or_else(|| missing("retry decision"))?;
+                retried = true;
+                // Under Raft the entry is consumed: the applied position
+                // advances for an exact retry too, with no other change.
+                self.write_pending_applied(&mut meta)?;
+                break 'apply;
             }
             let mut imports = tx.open_table(IMPORTS).map_err(storage)?;
             let workflow_bytes = workflow_key(key, &command.workflow_id);
@@ -1029,6 +1037,10 @@ impl SourceAuthorityStore {
             meta.insert(CONTROL_HEADER, header.control.encode_to_vec().as_slice())
                 .map_err(storage)?;
             decision = result;
+        }
+        if retried {
+            self.finish_retry(tx)?;
+            return Ok(decision);
         }
         #[cfg(any(test, feature = "fault-injection"))]
         self.inject(false)?;

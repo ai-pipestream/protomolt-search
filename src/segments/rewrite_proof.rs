@@ -516,6 +516,7 @@ mod tests {
     use super::*;
     use crate::pb::{DocumentIdentity, ProtobufSource};
     use crate::postings::{AnalyzedDoc, AnalyzedField, Bm25Store};
+    use crate::test_support::ForkGuarded;
     struct Fixture(PathBuf, usize);
     impl Fixture {
         fn new() -> Self {
@@ -1002,7 +1003,7 @@ mod tests {
                 "--nocapture",
             ])
             .env(CHILD, "1")
-            .status()
+            .status_guarded()
             .unwrap();
         assert!(status.success(), "child exited with {status}");
     }

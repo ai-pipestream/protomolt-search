@@ -57,7 +57,7 @@ fn storage_status(error: impl std::fmt::Display) -> Status {
 
 impl RaftLogStore {
     /// Create the log store for one group and node. Refuses an existing file.
-    pub fn create(
+    pub(crate) fn create(
         path: &Path,
         group: &SourceAuthorityIdentity,
         node_id: NodeId,
@@ -87,7 +87,7 @@ impl RaftLogStore {
 
     /// Open an existing log store; the recorded group and node id must equal
     /// the expected ones. A missing or empty file never becomes a new log.
-    pub fn open(
+    pub(crate) fn open(
         path: &Path,
         group: &SourceAuthorityIdentity,
         node_id: NodeId,
@@ -128,6 +128,8 @@ impl RaftLogStore {
             }
             _ => storage_status(error),
         })?;
+        #[cfg(test)]
+        let _handoff = crate::test_support::lock_handoff();
         file.try_lock().map_err(|error| {
             Status::failed_precondition(format!("raft log store exclusive lock: {error}"))
         })?;
@@ -365,7 +367,7 @@ impl RaftLogStorage<ControlRaft> for RaftLogStore {
 impl RaftLogStore {
     /// Append consecutive entries in one immediate transaction; the entries
     /// are durable when this returns.
-    pub fn append_sync<I>(&self, entries: I) -> Result<(), StorageError<NodeId>>
+    pub(crate) fn append_sync<I>(&self, entries: I) -> Result<(), StorageError<NodeId>>
     where
         I: IntoIterator<Item = Entry<ControlRaft>>,
     {
@@ -419,7 +421,7 @@ impl RaftLogStore {
     }
 
     /// Delete every entry at or after `log_id`.
-    pub fn truncate_sync(&self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
+    pub(crate) fn truncate_sync(&self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         let _order = self.inner.write.lock().unwrap();
         let mut tx = self
             .inner
@@ -440,7 +442,7 @@ impl RaftLogStore {
     }
 
     /// Delete every entry at or before `log_id` and record it as purged.
-    pub fn purge_sync(&self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
+    pub(crate) fn purge_sync(&self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         {
             let _order = self.inner.write.lock().unwrap();
             let mut tx = self

@@ -1,6 +1,7 @@
 use super::*;
 use crate::authorization::AccessPermit;
 use crate::pb::{AccessAction, AccessPolicy, CollectionGrant, CollectionResource};
+use crate::test_support::ForkGuarded;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -592,7 +593,7 @@ fn abrupt_exit_around_the_readiness_commit_recovers_prepared_or_ready() {
             .arg("--nocapture")
             .env("PSEARCH_READINESS_EXIT_FAULT", mode)
             .env("PSEARCH_READINESS_PATH", dir.authority())
-            .status()
+            .status_guarded()
             .unwrap();
         assert_eq!(status.code(), Some(87));
         let authority = identity(7);

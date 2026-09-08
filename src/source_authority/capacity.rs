@@ -746,7 +746,7 @@ impl SourceAuthorityStore {
     }
 
     /// The committed-log path of `configure_capacity`: no direct-path check.
-    pub fn replay_capacity_configure(
+    pub(crate) fn replay_capacity_configure(
         &self,
         principal: &str,
         command: &CapacityConfigureCommand,
@@ -772,7 +772,8 @@ impl SourceAuthorityStore {
         let mut tx = self.inner.database.begin_write().map_err(storage)?;
         tx.set_durability(Durability::Immediate).map_err(storage)?;
         let decision;
-        {
+        let mut retried = false;
+        'apply: {
             let mut meta = tx.open_table(META).map_err(storage)?;
             let (mut header, policy) = read_headers(&meta, &self.inner.identity)?;
             let mut capacity_header = header_of(&meta)?;
@@ -812,7 +813,14 @@ impl SourceAuthorityStore {
                         "capacity command_id was already used with different content",
                     ));
                 }
-                return operation.decision.ok_or_else(|| missing("retry decision"));
+                decision = operation
+                    .decision
+                    .ok_or_else(|| missing("retry decision"))?;
+                retried = true;
+                // Under Raft the entry is consumed: the applied position
+                // advances for an exact retry too, with no other change.
+                self.write_pending_applied(&mut meta)?;
+                break 'apply;
             }
             let (reserved_bytes, reserved_decisions, retained) = import::reserved(&meta)?;
             if header
@@ -978,6 +986,10 @@ impl SourceAuthorityStore {
                 .map_err(storage)?;
             self.write_pending_applied(&mut meta)?;
         }
+        if retried {
+            self.finish_retry(tx)?;
+            return Ok(decision);
+        }
         #[cfg(any(test, feature = "fault-injection"))]
         self.inject(false)?;
         tx.commit().map_err(storage)?;
@@ -1001,7 +1013,7 @@ impl SourceAuthorityStore {
     }
 
     /// The committed-log path of `capacity_transition`: no direct-path check.
-    pub fn replay_capacity_transition(
+    pub(crate) fn replay_capacity_transition(
         &self,
         principal: &str,
         transition: &CapacityTransition,

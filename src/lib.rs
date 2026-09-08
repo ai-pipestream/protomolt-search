@@ -30,8 +30,6 @@ pub mod bm25;
 pub mod boolean_bits;
 pub mod calendar;
 pub mod capacity_tiers;
-#[cfg(feature = "raft")]
-pub mod raft;
 pub mod cel;
 pub mod chunked;
 pub mod clustered_turbovec;
@@ -89,6 +87,8 @@ pub mod query;
 mod query_cursor;
 mod query_disclosure;
 mod query_identity;
+#[cfg(feature = "raft")]
+pub mod raft;
 mod rangefacet;
 pub mod rankdiff;
 pub mod reconcile;
@@ -116,6 +116,8 @@ pub mod stats_cache;
 pub mod stats_identity;
 mod stream_signal;
 pub mod synonyms;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod values;
 pub mod vector;
 pub mod visibility;

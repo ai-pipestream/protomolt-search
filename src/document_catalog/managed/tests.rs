@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_support::ForkGuarded;
 use crate::{
     authorization::{AccessPermit, Authorizer, PolicyAuthority},
     pb::{
@@ -297,7 +298,7 @@ fn a_binding_committed_before_a_crash_is_confirmed_after_recovery() {
         .arg("--nocapture")
         .env("PSEARCH_MANAGED_BIND_EXIT", "after")
         .env("PSEARCH_MANAGED_BIND_ROOT", &dir.0)
-        .status()
+        .status_guarded()
         .unwrap();
     assert_eq!(status.code(), Some(87));
     let identity = authority_identity(7);
@@ -1104,7 +1105,7 @@ fn abrupt_binding_exit_recovers_format_eight_or_committed_format_nine() {
             .arg("--nocapture")
             .env("PSEARCH_MANAGED_BIND_EXIT", mode)
             .env("PSEARCH_MANAGED_BIND_ROOT", &dir.0)
-            .status()
+            .status_guarded()
             .unwrap();
         assert_eq!(status.code(), Some(87));
 
@@ -1553,7 +1554,7 @@ fn abrupt_activation_exit_recovers_format_nine_or_the_activated_source() {
             .arg("--nocapture")
             .env("PSEARCH_MANAGED_ACTIVATE_EXIT", mode)
             .env("PSEARCH_MANAGED_ACTIVATE_ROOT", &dir.0)
-            .status()
+            .status_guarded()
             .unwrap();
         assert_eq!(status.code(), Some(87));
         let identity = authority_identity(7);

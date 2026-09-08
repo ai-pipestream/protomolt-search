@@ -1,5 +1,6 @@
 use super::*;
 use crate::pb::{AccessAction, AccessPolicy, CollectionGrant, CollectionResource};
+use crate::test_support::ForkGuarded;
 use prost::Message;
 use redb::{ReadableTable, ReadableTableMetadata};
 use std::{path::PathBuf, sync::Arc};
@@ -716,7 +717,7 @@ fn abrupt_exit_distinguishes_uncommitted_and_committed_commands() {
             .arg("--nocapture")
             .env("PSEARCH_SOURCE_AUTHORITY_EXIT_FAULT", mode)
             .env("PSEARCH_SOURCE_AUTHORITY_PATH", dir.store())
-            .status()
+            .status_guarded()
             .unwrap();
         assert_eq!(status.code(), Some(87));
 

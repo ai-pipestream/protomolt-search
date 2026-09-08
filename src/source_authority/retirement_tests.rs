@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_support::ForkGuarded;
 use crate::{
     control_plane::{ControlPolicy, DurableControlPlane, LegacyControlCheckpoint, StateWriteFault},
     pb::{
@@ -371,7 +372,7 @@ fn abrupt_retirement_boundaries_preserve_or_recover_the_exact_checkpoint() {
             .arg("--nocapture")
             .env("PSEARCH_LEGACY_RETIREMENT_EXIT", mode)
             .env("PSEARCH_LEGACY_RETIREMENT_ROOT", &dir.0)
-            .status()
+            .status_guarded()
             .unwrap();
         assert_eq!(status.code(), Some(87));
 

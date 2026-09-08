@@ -11,6 +11,7 @@ use crate::pb::storage::{
     SourceAuthorityLimits,
 };
 use crate::pb::AccessPolicy;
+use crate::source_authority::SourceAdmission;
 use crate::source_authority::{SourceAuthorityStore, VerifiedOwnerCompletion};
 use openraft::error::{ClientWriteError, RaftError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
@@ -94,6 +95,13 @@ pub struct HostConfig {
     pub election_timeout_max_ms: u64,
     /// Build a snapshot after this many applied entries since the last.
     pub snapshot_logs_since_last: u64,
+    /// Largest store image a snapshot may carry, in bytes.
+    pub max_snapshot_bytes: u64,
+    /// How long a leased admission stays authoritative after the
+    /// linearizable read that granted it (docs/raft-admission.md).
+    pub admission_lease_ms: u64,
+    /// Clock skew the lease budget tolerates between members.
+    pub clock_skew_ms: u64,
 }
 
 impl Default for HostConfig {
@@ -104,7 +112,36 @@ impl Default for HostConfig {
             election_timeout_min_ms: 1_000,
             election_timeout_max_ms: 2_000,
             snapshot_logs_since_last: 1_024,
+            max_snapshot_bytes: 4 << 30,
+            admission_lease_ms: 500,
+            clock_skew_ms: 250,
         }
+    }
+}
+
+impl HostConfig {
+    /// A lease plus the skew budget must end before any other member can
+    /// win an election; otherwise an isolated leader could admit work a
+    /// surviving quorum already revoked.
+    pub fn validate(&self) -> Result<(), Status> {
+        if self.admission_lease_ms == 0 {
+            return Err(Status::invalid_argument(
+                "admission_lease_ms must be positive",
+            ));
+        }
+        if self.admission_lease_ms.saturating_add(self.clock_skew_ms) > self.election_timeout_min_ms
+        {
+            return Err(Status::invalid_argument(format!(
+                "admission_lease_ms {} plus clock_skew_ms {} must not exceed election_timeout_min_ms {}",
+                self.admission_lease_ms, self.clock_skew_ms, self.election_timeout_min_ms
+            )));
+        }
+        if self.max_snapshot_bytes == 0 {
+            return Err(Status::invalid_argument(
+                "max_snapshot_bytes must be positive",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -114,10 +151,12 @@ pub struct RaftHost {
     log_store: RaftLogStore,
     node_id: NodeId,
     dir: PathBuf,
+    lease: std::time::Duration,
 }
 
 impl RaftHost {
     fn raft_config(config: &HostConfig) -> Result<Arc<Config>, Status> {
+        config.validate()?;
         let raft = Config {
             cluster_name: config.cluster_name.clone(),
             heartbeat_interval: config.heartbeat_interval_ms,
@@ -184,7 +223,8 @@ impl RaftHost {
         node_id: NodeId,
         config: &HostConfig,
     ) -> Result<Self, Status> {
-        let machine = ControlStateMachine::new(store, &dir.join(SNAPSHOT_DIR))?;
+        let machine =
+            ControlStateMachine::new(store, &dir.join(SNAPSHOT_DIR), config.max_snapshot_bytes)?;
         let shared = machine.shared_store();
         let raft = Raft::new(
             node_id,
@@ -201,6 +241,7 @@ impl RaftHost {
             log_store,
             node_id,
             dir: dir.to_path_buf(),
+            lease: std::time::Duration::from_millis(config.admission_lease_ms),
         })
     }
 
@@ -212,16 +253,45 @@ impl RaftHost {
         &self.dir
     }
 
-    pub fn log_store(&self) -> &RaftLogStore {
-        &self.log_store
-    }
-
-    pub fn raft(&self) -> &Raft<ControlRaft> {
-        &self.raft
+    /// Every entry the log holds, in index order: a read for audits.
+    pub fn log_entries(&self) -> Result<Vec<openraft::Entry<ControlRaft>>, Status> {
+        self.log_store.entries()
     }
 
     pub fn metrics(&self) -> watch::Receiver<RaftMetrics<NodeId, BasicNode>> {
         self.raft.metrics()
+    }
+
+    /// Wait for a metrics condition (state, applied index, snapshot).
+    pub fn wait(
+        &self,
+        timeout: Option<std::time::Duration>,
+    ) -> openraft::metrics::Wait<NodeId, BasicNode, openraft::TokioRuntime> {
+        self.raft.wait(timeout)
+    }
+
+    /// The applied position the store recorded, as a read.
+    pub fn applied_position(&self) -> Result<Option<crate::pb::storage::RaftLogId>, Status> {
+        Ok(self.store()?.raft_applied()?.and_then(|a| a.last_applied))
+    }
+
+    /// Run owner-side work under a leased admission: a linearizable read
+    /// proves this node is the leader with a quorum now, and the lease is
+    /// the bound under which that stays true. Past it the admission admits
+    /// nothing, so an isolated former leader cannot admit work a surviving
+    /// quorum has revoked (docs/raft-admission.md).
+    pub async fn with_admission<T>(
+        &self,
+        principal: &str,
+        run: impl FnOnce(&SourceAdmission<'_>) -> Result<T, Status>,
+    ) -> Result<T, Status> {
+        self.raft.ensure_linearizable().await.map_err(|e| {
+            Status::unavailable(format!("admission needs a linearizable read: {e}"))
+        })?;
+        let granted = std::time::Instant::now();
+        let store = self.store()?;
+        let admission = store.leased_admission(principal, granted + self.lease)?;
+        run(&admission)
     }
 
     /// The current store handle, for reads (maps, snapshots, decisions).
@@ -234,8 +304,9 @@ impl RaftHost {
             .ok_or_else(|| Status::unavailable("store is being replaced by a snapshot install"))
     }
 
-    /// Propose an admitted command and wait for its committed reply.
-    pub async fn propose(&self, proposal: RaftProposal) -> Result<RaftReply, Status> {
+    /// Submit an admitted proposal and wait for its committed reply. Private:
+    /// every public entry admits its command first.
+    async fn propose(&self, proposal: RaftProposal) -> Result<RaftReply, Status> {
         validate_proposal(&proposal)?;
         let response = self
             .raft
