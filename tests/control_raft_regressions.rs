@@ -9,7 +9,8 @@
 //! never weakened to make a finding pass.
 //!
 //! Run: `cargo test --test control_raft_regressions --features
-//! raft,fault-injection -- --test-threads=1`.
+//! raft,fault-injection -- --test-threads=1` (the target holds a
+//! target-wide serial lock, so any `--test-threads` value is safe).
 #![cfg(feature = "raft")]
 
 mod control_adversarial;
@@ -34,6 +35,24 @@ use pipestream_search::source_authority::SourceAuthorityStore;
 use tonic::Code;
 
 const OWNER_WORKFLOW: &[u8] = b"installation-one";
+
+/// Target-wide serialization for the parallel release gate. The tests share
+/// one piece of process-global state: the raft kit's fixed `NODE_ADDR` —
+/// every host in this target bootstraps on `127.0.0.1:9917`, so two
+/// concurrent tests would collide on the bind. Every test holds this lock
+/// for its whole body (the suite is small; the serialized wall time is
+/// unchanged in practice). The guard is taken before the first `.await` and
+/// is `Send`, so it is safe inside `#[tokio::test(flavor = "multi_thread")]`.
+/// Panics are expected here (the failing `rN` tests are the reproductions),
+/// so the lock is re-acquired across poisoning; mutual exclusion is what
+/// matters, not mutex state.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// One accepted document, mirroring `src/document_catalog/managed/tests.rs`:
 /// the history id it returns is what the managed bridge binds to.
@@ -115,6 +134,7 @@ fn confirm_command(
 /// presented. That is the reproduction.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r1_raw_propose_begin_without_holder_is_refused() {
+    let _serial = serial();
     let dir = kit::TestDir::new("r1-raw-begin");
     let guard = HostGuard::new(raft_kit::bootstrap_host(&dir).await);
     let store = guard.store().unwrap();
@@ -194,6 +214,7 @@ async fn r1_raw_propose_begin_without_holder_is_refused() {
 /// owner turns READY without any binding proof.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r1_raw_propose_confirm_ready_without_binding_is_refused() {
+    let _serial = serial();
     let dir = kit::TestDir::new("r1-raw-confirm");
     let guard = HostGuard::new(raft_kit::bootstrap_host(&dir).await);
     let authority = kit::identity(kit::SEED);
@@ -259,6 +280,7 @@ async fn r1_raw_propose_confirm_ready_without_binding_is_refused() {
 /// of them in one run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r1_read_handle_cannot_mutate() {
+    let _serial = serial();
     let dir = kit::TestDir::new("r1-read-handle");
     let guard = HostGuard::new(raft_kit::bootstrap_host(&dir).await);
     let authority = kit::identity(kit::SEED);
@@ -400,6 +422,7 @@ async fn r1_read_handle_cannot_mutate() {
 /// their holders here, so the R1 refusals cannot be read as "raft is off".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r1_positive_replay_through_trusted_host() {
+    let _serial = serial();
     let dir = kit::TestDir::new("r1-positive");
     let guard = HostGuard::new(raft_kit::bootstrap_host(&dir).await);
     let authority = kit::identity(kit::SEED);
@@ -457,6 +480,7 @@ async fn r1_positive_replay_through_trusted_host() {
 /// after N proposals the applied index is N+1.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r2_exact_retry_advances_durable_applied_position() {
+    let _serial = serial();
     let dir = kit::TestDir::new("r2-control-retry");
     let guard = HostGuard::new(raft_kit::bootstrap_host(&dir).await);
     let authority = kit::identity(kit::SEED);
@@ -542,6 +566,7 @@ async fn r2_exact_retry_advances_durable_applied_position() {
 /// them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r2_import_chunk_retry_advances_durable_applied_position() {
+    let _serial = serial();
     let dir = kit::TestDir::new("r2-import-retry");
     let guard = HostGuard::new(raft_kit::bootstrap_host(&dir).await);
     let authority = kit::identity(kit::SEED);
@@ -617,6 +642,7 @@ async fn r2_import_chunk_retry_advances_durable_applied_position() {
 /// three consume entries; the durable position must include them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r2_capacity_retries_and_observation_transition() {
+    let _serial = serial();
     let dir = kit::TestDir::new("r2-capacity-retry");
     let guard = HostGuard::new(raft_kit::bootstrap_host(&dir).await);
     let authority = kit::identity(kit::SEED);
@@ -818,6 +844,7 @@ fn standalone_machine(name: &str) -> (kit::TestDir, ControlStateMachine, SourceA
 /// `shared_store()` reports unavailable — the reproduction.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r4_install_refusal_preserves_the_live_handle() {
+    let _serial = serial();
     let (_image_dir, image, meta) = snapshot_with_prepare("r4-image-refusal").await;
     let (_dir, mut machine, store) = standalone_machine("r4-refusal");
     let reader = machine
@@ -868,6 +895,7 @@ async fn r4_install_refusal_preserves_the_live_handle() {
 /// on the installed store must reflect the image.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r4_subscription_rebinding_after_install() {
+    let _serial = serial();
     let (_image_dir, image, meta) = snapshot_with_prepare("r4-image-rebind").await;
     let (_dir, mut machine, store) = standalone_machine("r4-rebind");
     let mut rx = store.subscribe_applied();
@@ -950,6 +978,7 @@ async fn r4_subscription_rebinding_after_install() {
 /// restart. Positive coverage; expected to pass at 331c18f.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn active_fence_through_the_host() {
+    let _serial = serial();
     let dir = kit::TestDir::new("active-through-host");
     // The fence admission checks the store's policy for the write action, so
     // the hosted authority needs the Ingest grant the kit policy omits.
@@ -1058,6 +1087,7 @@ async fn active_fence_through_the_host() {
 /// later Commit is a recorded refusal. Positive coverage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recover_through_the_host() {
+    let _serial = serial();
     let dir = kit::TestDir::new("recover-through-host");
     let guard = HostGuard::new(raft_kit::bootstrap_host(&dir).await);
     let authority = kit::identity(kit::SEED);
