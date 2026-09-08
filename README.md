@@ -1241,7 +1241,9 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   permission pins retain an admitted policy epoch through synchronous commit.
   Replacement publishes new grants, then drains old admissions
   before returning success; new checks remain available during that drain.
-  Concurrent replacements cannot skip an unfinished drain. See
+  Concurrent replacements cannot skip an unfinished drain. The full local gate
+  at `d0e623fc` passed 1,600 reported Rust tests, nine comparator tests and all
+  five mobile checks, with zero swap/OOM in an 8 GiB scope. See
   [source access](docs/source-access.md#policy-admission-validation).
 
 - **Foundation branch: validated main reconciliation.** Checkpoint `12ba5433`

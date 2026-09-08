@@ -7,6 +7,14 @@ Network enforcement is unfinished. The synchronous local boundary is documented 
 [source authority activation](source-authority-activation.md).
 
 Evidence:
+- At `d0e623fc`, `document_write.proto` defines acceptance requests and receipts
+  but no service exposes an `AcceptDocument` RPC. Production server construction
+  has no `AccessControlledCatalog` wiring. The embedded adapter's plain local
+  catalog is a trusted local API; its authorized search accessor does not expose
+  catalog writes. `AccessControlledCatalog::accept` already pins Ingest and
+  records the authenticated actor, but requires a real owner-bound network
+  adapter. Row-level `original_source` and `identity` fields do not supply that
+  adapter or its durable retry transaction.
 - `src/collections.rs` routed_ingest_mapped resolves an Ingest permit, wraps the
   incoming stream with AuthorizedStream, forwards to routed_ingest_mapped_bound,
   then calls access.check() after the result. The underlying node commits can

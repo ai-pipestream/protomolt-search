@@ -96,6 +96,22 @@ input files. Evidence uses `/tmp/psearch-policy-admission-green-*` and
 admission/drain behavior; remote write authorization remains a separate
 [network integration requirement](network-ingest-authorization.md).
 
+The complete local gate at `d0e623fc`, incorporating main `02150a7`, passed
+688 library tests and all 149 integration targets (897 reported passes and
+one existing ignored live-OpenNLP test), 13 embedded tests and two IVF tests:
+1,600 reported Rust passes, including the source-access child invocation.
+The nine reference-comparator tests, all five Android/iOS compilation checks,
+tests/examples compilation, formatting, vendored-proto checks and diff checks
+also passed. All 21 product/vendored protobuf files and the original protobuf
+fixtures remain byte-identical to `48a4f50`.
+
+The full driver verified clean HEAD and all 648 identical input hashes before
+and after the run. Its scope reached the 8 GiB hard limit and recorded 42,041
+memory-limit events, with zero swap, OOM or socket-throttling events. Raw
+evidence uses `/tmp/psearch-policy-admission-full-*` on the validation host.
+This is local correctness validation; it does not establish a fleet rollout,
+hosted CI or the unfinished network authorization/owner activation protocol.
+
 ## Persistent resource scope
 
 The storage protobuf `SourceResourceBinding` has version 1 and an exact
