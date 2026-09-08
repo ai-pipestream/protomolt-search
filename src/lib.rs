@@ -29,6 +29,7 @@ pub mod authorization;
 pub mod bm25;
 pub mod boolean_bits;
 pub mod calendar;
+pub mod capacity_tiers;
 pub mod cel;
 pub mod chunked;
 pub mod clustered_turbovec;

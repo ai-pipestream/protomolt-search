@@ -20,6 +20,15 @@ number below is allocated; every one is marked DRAFT and becomes
 contract only when the number is reserved in
 `proto/ai/protomolt/search/v1/search.proto`.
 
+Implementation state, 2026-09-08: the bounded observation store and the
+deterministic dry-run planner are built as a pure library module
+(`src/capacity_tiers.rs`) on branch `feat/capacity-tiers`, with §10's
+literals as its golden tests and `scripts/verify_capacity_tier_fixtures.py`
+as the independent oracle. The module allocates no protocol fields,
+opens no routes, and executes nothing; the typed snapshot it plans
+from is the coordination seam with the control-plane track, which owns
+persistence, revision allocation, and Raft wiring.
+
 The documents this one extends: the measurement and the dry run in
 [bandwidth-budget.md](bandwidth-budget.md), the predicate tree and its
 codes in [placement.md](placement.md), the declared hash column and its
