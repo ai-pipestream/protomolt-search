@@ -2034,6 +2034,33 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   Declared columns reject `math.abs(i64::MIN)`, which has no exact signed
   64-bit result. Missing input, per-request materialization absence and untaken
   ternary branches keep their prior behavior. [Derived columns](docs/derived-columns.md).
+- **Landed 2026-09-07: derived-column proofs, a bounded transplant
+  budget, and a narrowed Boolean filter leaf.** Derived columns close
+  out: boundary proofs through the evaluator (year 1, epoch zero,
+  negative micros, leap days, the i64 ends), `hash.fnv64` pinned to the
+  coordinator's routing hash, arithmetic overflow in a declaration
+  refusing the document by name rather than storing absence, the
+  declaration proven across an empty store, an installed snapshot (a
+  mismatched one is refused before the swap), a torn seal, and a WAL
+  resume under another declaration, and the inputs-disclosure rule
+  proven on every query route. The proof child's 9 dateless rows are
+  identified: two CourtListener opinions absent from the source cluster
+  metadata. The re-placement split takes `--build-queue` (a bounded
+  backlog of sealed bucket images) and `--build-memory` (an enforced
+  budget estimated from the spill's per-bucket row counts at 70 KiB a
+  row, refusing by name rather than lowering the thread count): the
+  proof child builds serial in 11 min 48 s and on four threads in
+  8 min 12 s inside an 8 GiB cgroup, catalogs byte-identical. A
+  MUST-position Boolean filter leaf resolves over its exact MUST
+  siblings' members when narrower: on the 1.95M-row proof shard the
+  filter phase drops from 14.5-14.9 ms to 0.0-6.7 ms tracking the
+  sibling's width, membership and scores bitwise equal. Tests:
+  `tests/derived_columns.rs`, `tests/replay_from_segments.rs`,
+  `tests/boolean_filter_domain.rs`.
+  [Derived columns](docs/derived-columns.md),
+  [Memory](docs/replay-from-segments.md),
+  [the boolean cost](docs/benchmarks/fleet-placement-2026-09.md).
+
 - **Landed 2026-09-07: the reconciled child, and the transplant under 8 GiB.**
   `examples/reconcile.rs` reads a re-placement child back against its
   sources' sealed segments document for document (text, lineage, identity,
