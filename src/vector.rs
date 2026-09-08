@@ -264,6 +264,21 @@ pub trait VectorProvider: Send + Sync {
     fn as_segmented_mut(&mut self) -> Option<&mut crate::segmented_vectors::SegmentedProvider> {
         None
     }
+    /// The provider's stored encoding of one row: the bytes its scorer reads
+    /// for that row and the per-row scoring metadata kept beside them, in a
+    /// fixed layout that does not depend on the row's physical position. A
+    /// rewrite proof compares this by document identity
+    /// (`src/segments/rewrite_proof.rs`), so equal FP32 source rows cannot
+    /// stand in for it. A provider that cannot expose its representation
+    /// refuses here, and the proof refuses with it: a certificate never
+    /// covers a dense image it could not read.
+    fn row_transcript(&self, _row: usize) -> Result<Vec<u8>, VectorError> {
+        Err(VectorError::new(format!(
+            "vector backend {:?} does not expose its stored row encoding; a rewrite proof \
+             cannot certify its dense image",
+            self.descriptor().backend_kind
+        )))
+    }
 }
 
 /// Sized product-side handle around an arbitrary vector engine.
@@ -371,6 +386,11 @@ impl VectorIndex {
     /// Whether this index serves from a mapped file ([`Self::load_mapped`]).
     pub fn is_mapped(&self) -> bool {
         self.engine.is_mapped()
+    }
+
+    /// See [`VectorProvider::row_transcript`].
+    pub fn row_transcript(&self, row: usize) -> Result<Vec<u8>, VectorError> {
+        self.engine.row_transcript(row)
     }
 
     pub fn descriptor(&self) -> VectorBackendDescriptor {
@@ -660,6 +680,51 @@ mod embedded_turbovec {
             self.index.is_mapped()
         }
 
+        /// Bit width, dimension, the row's bit-plane packed codes and its
+        /// correction scale bits. The packed image is row-major with stride
+        /// `bits * dim / 8` (turbovec `pack.rs`); the whole image is checked
+        /// against that layout before a row is sliced, so a layout the
+        /// engine changes under this adapter refuses instead of certifying
+        /// the wrong bytes. A mapped image materializes its packed rows once
+        /// on the first call (O(n * dim), retained by the index).
+        fn row_transcript(&self, row: usize) -> Result<Vec<u8>, VectorError> {
+            let rows = self.index.len();
+            if row >= rows {
+                return Err(VectorError::new(format!(
+                    "row {row} is outside the {rows} stored vectors"
+                )));
+            }
+            let dim = self
+                .index
+                .dim_opt()
+                .ok_or_else(|| VectorError::new("vector dimension is absent"))?;
+            let bits = self.index.bit_width();
+            let stride = match (dim % 8, bits.checked_mul(dim)) {
+                (0, Some(bits_per_row)) if bits_per_row > 0 => bits_per_row / 8,
+                _ => {
+                    return Err(VectorError::new(format!(
+                        "packed row layout is undefined for dimension {dim} at {bits} bits"
+                    )))
+                }
+            };
+            let codes = self.index.packed_codes();
+            let scales = self.index.scales();
+            if codes.len() != rows * stride || scales.len() != rows {
+                return Err(VectorError::new(format!(
+                    "packed image holds {} code bytes and {} scales for {rows} rows of {stride} \
+                     bytes; the layout differs from the adapter's",
+                    codes.len(),
+                    scales.len()
+                )));
+            }
+            let mut out = Vec::with_capacity(16 + stride);
+            out.extend_from_slice(&(bits as u32).to_le_bytes());
+            out.extend_from_slice(&(dim as u64).to_le_bytes());
+            out.extend_from_slice(&codes[row * stride..(row + 1) * stride]);
+            out.extend_from_slice(&scales[row].to_bits().to_le_bytes());
+            Ok(out)
+        }
+
         fn descriptor(&self) -> VectorBackendDescriptor {
             let config = self
                 .backend_config()
@@ -912,5 +977,73 @@ mod tests {
         assert_eq!(result.query_count, 1);
         assert_eq!(result.result_count, 3);
         assert_eq!(result.slots_for_query(0).len(), 3);
+    }
+
+    /// The embedded adapter's row transcript is the stored encoding: it
+    /// follows a row through reordering, differs when the stored codes do
+    /// even with equal source rows, and is the same whether the image is
+    /// heap-loaded or mapped. A provider without a representation refuses
+    /// by name instead of certifying nothing.
+    #[test]
+    fn row_transcript_is_the_stored_encoding_and_refuses_without_one() {
+        let dim = 64;
+        let rows: Vec<Vec<f32>> = (0..4)
+            .map(|r| {
+                (0..dim)
+                    .map(|i| ((i * (r + 3)) % 17) as f32 / 17.0)
+                    .collect()
+            })
+            .collect();
+        let build = |order: &[usize]| {
+            let mut index = VectorIndex::create(EMBEDDED_TURBOVEC, dim, 4).unwrap();
+            let flat: Vec<f32> = order.iter().flat_map(|&r| rows[r].clone()).collect();
+            index.add(&flat, dim).unwrap();
+            index.prepare().unwrap();
+            index
+        };
+        let forward = build(&[0, 1, 2, 3]);
+        let reversed = build(&[3, 2, 1, 0]);
+        for r in 0..4 {
+            let transcript = forward.row_transcript(r).unwrap();
+            assert_eq!(transcript.len(), 16 + 4 * dim / 8);
+            assert_eq!(transcript, reversed.row_transcript(3 - r).unwrap());
+        }
+        assert_ne!(
+            forward.row_transcript(0).unwrap(),
+            forward.row_transcript(1).unwrap()
+        );
+        assert!(forward.row_transcript(4).is_err());
+
+        // A different calibration stores different codes for equal rows.
+        let sample: Vec<f32> = (0..8 * dim)
+            .map(|i| ((i % 13) as f32 - 6.0) / 6.0)
+            .collect();
+        let calibrated =
+            VectorIndex::fit_backend_config(EMBEDDED_TURBOVEC, dim, 4, &sample).unwrap();
+        let mut other = VectorIndex::from_backend_config(dim, &calibrated).unwrap();
+        other.add(&rows.concat(), dim).unwrap();
+        other.prepare().unwrap();
+        assert_ne!(
+            other.row_transcript(0).unwrap(),
+            forward.row_transcript(0).unwrap()
+        );
+
+        let dir = std::env::temp_dir().join(format!("row-transcript-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("image");
+        forward.write(&path).unwrap();
+        let loaded = VectorIndex::load(EMBEDDED_TURBOVEC, &path).unwrap();
+        let mapped = VectorIndex::load_mapped(EMBEDDED_TURBOVEC, &path).unwrap();
+        for r in 0..4 {
+            let expected = forward.row_transcript(r).unwrap();
+            assert_eq!(loaded.row_transcript(r).unwrap(), expected);
+            assert_eq!(mapped.row_transcript(r).unwrap(), expected);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let error = VectorIndex::from_provider(FakeProvider)
+            .row_transcript(0)
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot certify"), "{error}");
     }
 }

@@ -23,8 +23,12 @@ use crate::vector::{QualityContract, ScoreDirection, VectorIndex, VectorSearchOp
 use prost::Message;
 
 pub(crate) mod generation;
-mod rewrite_proof;
+pub(crate) mod rewrite_proof;
 pub use generation::SegmentGenerationDeclaration;
+pub use rewrite_proof::{
+    proof_batch_rows_for_budget, BATCH_ROW_BYTES, CERTIFICATE_FORMAT, DEFAULT_PROOF_BATCH_ROWS,
+    MAX_BATCH_ROWS as MAX_PROOF_BATCH_ROWS,
+};
 mod row_update;
 pub use row_update::SegmentRowRetirement;
 

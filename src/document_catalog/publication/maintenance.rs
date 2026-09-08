@@ -55,7 +55,11 @@ pub(super) fn validate_maintenance(
         || intent.previous.as_ref().is_some_and(|p| {
             p.after_epoch == 0 || p.after_epoch > intent.before_epoch || p.intent_id.len() != 32
         })
-        || proof.format_version != 1
+        // Format 1 certified stored content and exact FP32 rows; format 2
+        // adds the provider's own encoded rows (docs/source-index-maintenance.md).
+        // Journals written under format 1 stay readable; only a format-2
+        // certificate says anything about the dense image.
+        || !matches!(proof.format_version, 1 | 2)
         || proof.owner.as_ref() != Some(owner)
         || proof.schema_sha256.len() != 32
         || proof.identity_content_sha256.len() != 32

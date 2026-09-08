@@ -435,6 +435,18 @@ impl VectorProvider for SegmentedProvider {
         Some(self)
     }
 
+    /// The image holding `row` answers for it; a row without a vector
+    /// (a documents-only part, or a tail row whose vector has not arrived)
+    /// refuses.
+    fn row_transcript(&self, row: usize) -> Result<Vec<u8>, VectorError> {
+        for (base, rows, image) in self.images() {
+            if row >= base && row < base + rows {
+                return image.row_transcript(row - base);
+            }
+        }
+        Err(VectorError::new(format!("row {row} holds no vector")))
+    }
+
     fn as_segmented(&self) -> Option<&SegmentedProvider> {
         Some(self)
     }

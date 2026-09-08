@@ -7,7 +7,40 @@ use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinitio
 
 const BEFORE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("before");
 const AFTER: TableDefinition<&[u8], &[u8]> = TableDefinition::new("after");
-const MAX_BATCH_ROWS: usize = 1_048_576;
+/// The certificate this module writes. Format 1 covered stored content and
+/// exact FP32 rows; format 2 adds the provider's own encoded rows.
+pub const CERTIFICATE_FORMAT: u32 = 2;
+/// Digest bytes held per batch row.
+pub const BATCH_ROW_BYTES: usize = 32;
+/// The largest batch: 32 MiB of digests.
+pub const MAX_BATCH_ROWS: usize = 1_048_576;
+/// The batch a caller gets by asking for none (`proof_batch_rows == 0`): the
+/// largest, because a smaller batch buys nothing but repeated vocabulary
+/// passes (`proof_batch_rows_for_budget`).
+pub const DEFAULT_PROOF_BATCH_ROWS: usize = MAX_BATCH_ROWS;
+
+/// The batch size a digest budget of `bytes` affords, clamped to
+/// `1..=MAX_BATCH_ROWS`. The proof walks every term of every field once per
+/// batch of each segment, so the number of vocabulary passes is
+/// `sum over segments of ceil(rows / batch)` per field: the batch bounds the
+/// digest memory and nothing else, and the result is identical at any size.
+pub fn proof_batch_rows_for_budget(bytes: u64) -> usize {
+    usize::try_from(bytes / BATCH_ROW_BYTES as u64)
+        .unwrap_or(MAX_BATCH_ROWS)
+        .clamp(1, MAX_BATCH_ROWS)
+}
+
+#[cfg(test)]
+type ScratchObserver = Box<dyn FnOnce(&Path)>;
+#[cfg(test)]
+thread_local! {
+    /// Vocabulary passes the current thread's proofs have made: one per
+    /// (segment, field, batch) posting walk.
+    pub(crate) static VOCABULARY_PASSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Observes the private scratch after its directory and database exist.
+    pub(crate) static AFTER_SCRATCH_CREATED: std::cell::RefCell<Option<ScratchObserver>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 fn err(error: impl std::fmt::Display) -> String {
     format!("source rewrite proof: {error}")
@@ -177,14 +210,18 @@ impl Drop for Scratch {
 }
 
 impl OpenedSegmentSet {
-    /// Compare every live document/chunk and its stored query content. Physical
-    /// slots and segment cuts may differ. Duplicate identities refuse, even if
-    /// their values match. The result is not permission to publish either view.
+    /// Compare every live document/chunk, its stored query content, its exact
+    /// FP32 row and the vector provider's own encoding of it. Physical slots
+    /// and segment cuts may differ. Duplicate identities refuse, even if their
+    /// values match. The result is not permission to publish either view.
     ///
-    /// `scratch` must not exist; only this method's temporary directory is
-    /// removed. Digests use at most 32 bytes per batch row (1..=1,048,576), plus
-    /// one reconstructed row/posting and an 8 MiB disk-table cache. No whole
-    /// source corpus, vocabulary transpose or identity set is materialized.
+    /// `scratch` must not exist; it is created private (0700, its database
+    /// 0600) and only this method's directory is removed. Digests use
+    /// [`BATCH_ROW_BYTES`] per batch row (`1..=MAX_BATCH_ROWS`), plus one
+    /// reconstructed row/posting and an 8 MiB disk-table cache; a mapped
+    /// vector image materializes its packed rows once. No whole source
+    /// corpus, vocabulary transpose or identity set is materialized. The
+    /// vocabulary of every field is walked once per batch of each segment.
     pub fn verify_source_rewrite(
         &self,
         after: &OpenedSegmentSet,
@@ -216,17 +253,32 @@ impl OpenedSegmentSet {
         if before_backend != after_backend {
             return Err(err("rewrite changes or drops vector backend state"));
         }
-        std::fs::create_dir(scratch).map_err(err)?;
-        let scratch = Scratch(scratch.to_path_buf());
+        // Private from the first syscall: the directory is created 0700 and
+        // the database file 0600, so a permissive umask never exposes
+        // document identities through the scratch.
+        let mut directory = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&scratch.0, std::fs::Permissions::from_mode(0o700))
-                .map_err(err)?;
+            use std::os::unix::fs::DirBuilderExt;
+            directory.mode(0o700);
         }
+        directory.create(scratch).map_err(err)?;
+        let scratch = Scratch(scratch.to_path_buf());
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(scratch.0.join("rows.redb")).map_err(err)?;
         let mut builder = Database::builder();
         builder.set_cache_size(8 * 1024 * 1024);
-        let database = builder.create(scratch.0.join("rows.redb")).map_err(err)?;
+        let database = builder.create_file(file).map_err(err)?;
+        #[cfg(test)]
+        if let Some(observe) = AFTER_SCRATCH_CREATED.with(|hook| hook.borrow_mut().take()) {
+            observe(&scratch.0);
+        }
         let rows = fill(&database, BEFORE, self, batch_rows)?;
         if rows != fill(&database, AFTER, after, batch_rows)? {
             return Err(err("live row count differs"));
@@ -235,12 +287,15 @@ impl OpenedSegmentSet {
         let before = tx.open_table(BEFORE).map_err(err)?;
         let after = tx.open_table(AFTER).map_err(err)?;
         let mut hash = Sha256::new();
-        part(&mut hash, b"protomolt.source-rewrite.rows.v1");
+        part(&mut hash, b"protomolt.source-rewrite.rows.v2");
         for (left, right) in before.iter().map_err(err)?.zip(after.iter().map_err(err)?) {
             let (lk, lv) = left.map_err(err)?;
             let (rk, rv) = right.map_err(err)?;
             if lk.value() != rk.value() || lv.value() != rv.value() {
-                return Err(err("document identity or stored query content differs"));
+                return Err(err(
+                    "document identity, stored query content, exact vector or encoded dense \
+                     row differs",
+                ));
             }
             part(&mut hash, lk.value());
             part(&mut hash, lv.value());
@@ -254,7 +309,7 @@ impl OpenedSegmentSet {
             part(&mut schema_digest, &config.payload);
         }
         Ok(SourceRewriteCertificate {
-            format_version: 1,
+            format_version: CERTIFICATE_FORMAT,
             owner: Some(owner.decode()?),
             live_rows: rows,
             schema_sha256: schema_digest.finalize().to_vec(),
@@ -304,7 +359,7 @@ fn fill(
                     return Err(err("live source row has no original protobuf"));
                 }
                 let mut hash = Sha256::new();
-                part(&mut hash, b"protomolt.source-rewrite.row.v1");
+                part(&mut hash, b"protomolt.source-rewrite.row.v2");
                 part(&mut hash, &doc.encode_to_vec());
                 // Protobuf scalar default elision normalizes -0. Preserve its
                 // stored bits too, just as the FP32 vector transcript does.
@@ -326,9 +381,20 @@ fn fill(
                 } else {
                     hash.update(&[0]);
                 }
+                // The provider's stored encoding of the row, not a recomputation
+                // from the FP32 source: two images that agree on every exact row
+                // and differ in what their scorer reads are different indexes.
+                if let Some(vector) = set.vector(segment) {
+                    hash.update(&[1]);
+                    part(&mut hash, &vector.row_transcript(row).map_err(err)?);
+                } else {
+                    hash.update(&[0]);
+                }
                 digests[row - start] = hash.finalize();
             }
             for fi in 0..reader.field_count() {
+                #[cfg(test)]
+                VOCABULARY_PASSES.with(|passes| passes.set(passes.get() + 1));
                 let field = reader.field(fi);
                 for row in start..end {
                     if live.is_deleted(row) {
@@ -432,6 +498,17 @@ mod tests {
             change: &str,
             splits: usize,
         ) -> OpenedSegmentSet {
+            self.set_with_quantized_rows(name, ids, deleted, change, splits, false)
+        }
+        fn set_with_quantized_rows(
+            &self,
+            name: &str,
+            ids: &[u32],
+            deleted: &[usize],
+            change: &str,
+            splits: usize,
+            perturb_quantized: bool,
+        ) -> OpenedSegmentSet {
             let root = self.0.join(name);
             std::fs::create_dir(&root).unwrap();
             let catalog = SegmentCatalog::open(&root).unwrap();
@@ -464,6 +541,7 @@ mod tests {
                     .unwrap();
                 store.set_analysis_fingerprint(1, 22).unwrap();
                 let mut vectors = Vec::new();
+                let mut exact_vectors = Vec::new();
                 let mut live = LiveDocs::default();
                 for (row, &id) in ids.iter().enumerate() {
                     let mutate = id == 1;
@@ -605,9 +683,20 @@ mod tests {
                             },
                         )
                         .unwrap();
-                    vectors.extend((0..8).map(|i| {
-                        (id as f32 + i as f32) / 8.0 + if variant("vector") { 0.1 } else { 0.0 }
+                    let exact_row: Vec<_> = (0..8)
+                        .map(|i| {
+                            (id as f32 + i as f32) / 8.0 + if variant("vector") { 0.1 } else { 0.0 }
+                        })
+                        .collect();
+                    vectors.extend(exact_row.iter().map(|value| {
+                        *value
+                            + if perturb_quantized && id == 1 {
+                                0.25
+                            } else {
+                                0.0
+                            }
                     }));
+                    exact_vectors.extend(exact_row);
                     if deleted.contains(&(base + row)) {
                         live.delete(row);
                     }
@@ -618,7 +707,7 @@ mod tests {
                 let vp = dir.join("vector");
                 vector.write(&vp).unwrap();
                 let ep = dir.join("exact");
-                ExactVectorStore::from_values(8, vectors)
+                ExactVectorStore::from_values(8, exact_vectors)
                     .unwrap()
                     .write(&ep)
                     .unwrap();
@@ -742,6 +831,134 @@ mod tests {
             }
             assert!(!scratch.exists());
         }
+    }
+
+    #[test]
+    /// Equal exact rows and equal configuration do not certify a dense image
+    /// whose stored codes came from other vectors. The same rows encoded
+    /// unchanged, or in another order and cut, still certify.
+    fn rewrite_proof_rejects_quantized_image_built_from_different_rows() {
+        let fixture = Fixture::new();
+        let before = fixture.set("before", &[0, 1], &[], "", 2);
+        let after = fixture.set_with_quantized_rows("after", &[0, 1], &[], "", 2, true);
+        let scratch = fixture.0.join("proof");
+        let error = before
+            .verify_source_rewrite(&after, &scratch, 1)
+            .unwrap_err();
+        assert!(error.contains("encoded dense row"), "{error}");
+        assert!(!scratch.exists());
+
+        let same = fixture.set_with_quantized_rows("same", &[0, 1], &[], "", 2, false);
+        let proof = before.verify_source_rewrite(&same, &scratch, 1).unwrap();
+        assert_eq!(proof.format_version, CERTIFICATE_FORMAT);
+        assert_eq!(proof.live_rows, 2);
+        let reordered = fixture.set_with_quantized_rows("reordered", &[1, 0], &[], "", 1, false);
+        assert_eq!(
+            before
+                .verify_source_rewrite(&reordered, &scratch, 1)
+                .unwrap(),
+            proof
+        );
+        let perturbed_reordered =
+            fixture.set_with_quantized_rows("perturbed-reordered", &[1, 0], &[], "", 1, true);
+        assert!(before
+            .verify_source_rewrite(&perturbed_reordered, &scratch, 1)
+            .is_err());
+    }
+
+    /// The batch bounds digest memory and nothing else: the certificate is
+    /// identical at every size, and the vocabulary is walked once per
+    /// (segment, field, batch), so passes = fields * sum(ceil(rows / batch)).
+    #[test]
+    fn vocabulary_passes_scale_with_batches_and_the_certificate_does_not() {
+        let fixture = Fixture::new();
+        let ids: Vec<u32> = (0..280).collect();
+        let before = fixture.set("before", &ids, &[], "", 280);
+        let after = fixture.set("after", &ids, &[], "", 100);
+        let fields = 2u64;
+        let segments = |cut: u64| {
+            (0..280u64)
+                .step_by(cut as usize)
+                .map(move |s| (280 - s).min(cut))
+        };
+        let expected_passes = |batch: u64| -> u64 {
+            let before: u64 = segments(280).map(|rows| rows.div_ceil(batch)).sum();
+            let after: u64 = segments(100).map(|rows| rows.div_ceil(batch)).sum();
+            fields * (before + after)
+        };
+        let mut certificate = None;
+        let mut measured = Vec::new();
+        for batch in [1u64, 7, 64, 280, 1024, MAX_BATCH_ROWS as u64] {
+            VOCABULARY_PASSES.with(|passes| passes.set(0));
+            let proof = before
+                .verify_source_rewrite(&after, &fixture.0.join("scratch"), batch as usize)
+                .unwrap();
+            let passes = VOCABULARY_PASSES.with(|passes| passes.get());
+            assert_eq!(passes, expected_passes(batch), "batch {batch}");
+            measured.push((batch, passes));
+            match &certificate {
+                Some(expected) => assert_eq!(expected, &proof, "batch {batch}"),
+                None => certificate = Some(proof),
+            }
+        }
+        // Recorded in docs/source-index-maintenance.md.
+        eprintln!("vocabulary passes by batch (280 rows, 2 fields, 1 + 3 segments): {measured:?}");
+        assert_eq!(proof_batch_rows_for_budget(0), 1);
+        assert_eq!(proof_batch_rows_for_budget(32 * 1000), 1000);
+        assert_eq!(proof_batch_rows_for_budget(u64::MAX), MAX_BATCH_ROWS);
+        assert_eq!(DEFAULT_PROOF_BATCH_ROWS, MAX_BATCH_ROWS);
+    }
+
+    /// The scratch is private from creation. The check runs in a child
+    /// process whose umask permits everything, so the modes observed are
+    /// the ones requested at creation, not the process default.
+    #[cfg(unix)]
+    #[test]
+    fn scratch_is_private_under_a_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "REWRITE_PROOF_UMASK_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            // SAFETY: the child process is single-purpose; nothing else in it
+            // depends on the creation mask.
+            unsafe { libc::umask(0) };
+            let fixture = Fixture::new();
+            let before = fixture.set("before", &[0, 1], &[], "", 2);
+            let observed = std::rc::Rc::new(std::cell::Cell::new(false));
+            let seen = observed.clone();
+            AFTER_SCRATCH_CREATED.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |scratch: &Path| {
+                    let mode = |path: &Path| {
+                        std::fs::symlink_metadata(path)
+                            .unwrap()
+                            .permissions()
+                            .mode()
+                            & 0o7777
+                    };
+                    assert_eq!(mode(scratch), 0o700, "scratch directory mode");
+                    assert_eq!(
+                        mode(&scratch.join("rows.redb")),
+                        0o600,
+                        "scratch database mode"
+                    );
+                    seen.set(true);
+                }));
+            });
+            before
+                .verify_source_rewrite(&before, &fixture.0.join("proof"), 1)
+                .unwrap();
+            assert!(observed.get(), "the scratch observer did not run");
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "segments::rewrite_proof::tests::scratch_is_private_under_a_permissive_umask",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "child exited with {status}");
     }
 
     #[test]

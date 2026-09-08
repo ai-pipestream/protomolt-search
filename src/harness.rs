@@ -1101,6 +1101,10 @@ pub mod fake_ann {
             self.inner.write(path)
         }
 
+        fn row_transcript(&self, row: usize) -> Result<Vec<u8>, VectorError> {
+            self.inner.row_transcript(row)
+        }
+
         fn search(
             &self,
             queries: &[f32],
