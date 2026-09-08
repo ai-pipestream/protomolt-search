@@ -89,12 +89,11 @@ pub(super) fn validate_header(header: &DocumentCatalogHeader) -> Result<(), Stat
 #[cfg(feature = "net")]
 mod adapter {
     use super::*;
-    use crate::authorization::AccessPermit;
-    use crate::pb::{
-        storage::{DocumentCatalogCheckpoint, PreparedSourceOwner},
-        AccessAction,
+    use crate::pb::storage::{
+        DocumentCatalogCheckpoint, PreparedSourceOwner, SourceAuthorityCommand,
+        SourceAuthorityDecision,
     };
-    use crate::source_authority::SourceAuthorityStore;
+    use crate::source_authority::{SourceAdmission, SourceAuthorityStore, VerifiedOwnerCompletion};
 
     /// A locally bound source retained under its committed preparation. It has
     /// no acceptance, journal mutation, export or inner-catalog accessor. Open
@@ -108,25 +107,28 @@ mod adapter {
     impl AccessControlledCatalog {
         /// Consume the sole local controlled handle and durably close it under
         /// an exact committed preparation. No source/history bytes are rebuilt.
-        /// Lock order: existing policy pin, control authority, source DB writer.
+        /// The one admission resolves current Admin and the pending owner and
+        /// stays held through the source commit; no separate policy pin is
+        /// taken, so no second authority acquisition can deadlock a waiting
+        /// control command. Lock order: admission, source DB writer.
         /// A failed/ambiguous commit drops this handle; existing-state recovery
         /// determines whether the old format or closed managed binding persisted.
         pub fn bind_prepared_owner(
             self,
-            permit: &AccessPermit,
+            admission: &SourceAdmission<'_>,
             authority: &SourceAuthorityStore,
-            principal: &str,
             preparation: &PreparedSourceOwner,
             max_metadata_bytes: usize,
         ) -> Result<PreparedManagedCatalog, Status> {
-            let pinned = access::authorize(&self.binding, permit, AccessAction::Admin)?;
-            if pinned.decision().principal != principal {
-                return Err(Status::permission_denied(
-                    "managed binding actor differs from the source administration permit",
+            if admission.identity() != authority.identity() {
+                return Err(Status::failed_precondition(
+                    "admission was acquired from another source authority",
                 ));
             }
+            admission.prepared_owner(preparation)?;
+            let identity = admission.identity();
             let mut inner = self.inner;
-            let binding = authority.with_prepared_owner(principal, preparation, |identity| {
+            let binding = (|| -> Result<SourceManagedBinding, Status> {
                 // A pending source or maintenance publication must resolve before
                 // this adapter closes all mutations. This also bounds inspection.
                 let checkpoint = inner.capture_checkpoint(max_metadata_bytes)?;
@@ -181,7 +183,7 @@ mod adapter {
                 inject(self.bind_fault, true)?;
                 drop(checkpoint);
                 Ok(binding)
-            })?;
+            })()?;
             inner.managed_binding = Some(binding.clone());
             Ok(PreparedManagedCatalog {
                 inner,
@@ -286,6 +288,24 @@ mod adapter {
                 binding,
                 authority: authority.clone(),
             })
+        }
+
+        /// The completion fact this adapter vouches for: derived from the exact
+        /// binding it validated against the file it holds exclusively.
+        pub fn completion(&self) -> Result<VerifiedOwnerCompletion, Status> {
+            VerifiedOwnerCompletion::from_binding(&self.binding)
+        }
+
+        /// PREPARED -> READY in the control store under this adapter's held
+        /// binding. The command's completion must equal `completion()`; the
+        /// decision is actor-scoped and retryable like every control command.
+        pub fn confirm_ready(
+            &self,
+            principal: &str,
+            command: &SourceAuthorityCommand,
+        ) -> Result<SourceAuthorityDecision, Status> {
+            self.authority
+                .confirm_owner_ready(principal, command, &self.completion()?)
         }
 
         pub fn binding(&self, principal: &str) -> Result<SourceManagedBinding, Status> {

@@ -1250,6 +1250,17 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   destination store remains unchanged. See [retirement and crash recovery](docs/control-retirement.md);
   transactional import, worker fencing and activation remain separate steps.
 
+- **Foundation branch: owner admission and readiness (implemented).** The
+  source authority store is an `Authorizer` over its committed policy with one
+  ordered revision history; a `SourceAdmission` is the single acquisition an
+  owner-side commit holds, and every control command waits for admitted work
+  to drain. `PreparedSourceOwnerPhase::READY` records the verified managed
+  binding; it is reachable only through the adapter holding that binding,
+  retryable, terminal for the generation, and recovered across process exit
+  on either side of the commit. See
+  [owner admission](docs/source-owner-admission.md). Open: writable
+  activation and the committed map feed, replacement of a READY owner, Raft.
+
 - **Foundation branch: bounded transactional import (implemented).** Store
   format 2 adopts format-1 stores at open and adds the unified control rows.
   The retired record moves through the destination's ordinary command path as

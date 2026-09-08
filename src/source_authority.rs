@@ -5,8 +5,9 @@
 //! There is no RPC or source admission adapter here. Prepared/cancelled records
 //! never grant access to a catalog, activate a writer or authorize a transfer.
 
+use crate::authorization::{AuthorizationGuard, Authorizer};
 use crate::pb::storage::*;
-use crate::pb::AccessPolicy;
+use crate::pb::{AccessAction, AccessDecision, AccessPolicy};
 use prost::Message;
 use redb::{
     Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
@@ -14,7 +15,8 @@ use redb::{
 use source_authority_command::Action;
 use std::fs::{File, OpenOptions};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+use tokio::sync::watch;
 use tonic::{Code, Status};
 
 mod contract;
@@ -45,6 +47,14 @@ enum Fault {
 
 struct Inner {
     database: Database,
+    // Admitted operations hold this shared; every control command holds it
+    // exclusively, so a policy or ownership change waits for admitted work to
+    // drain and no admitted operation observes a change under its guard.
+    // Acquired before `closed`, never while `closed` is held.
+    admission: RwLock<()>,
+    // The committed policy revision, published after each commit under the
+    // exclusive admission guard: one ordered history for permits.
+    revisions: watch::Sender<u64>,
     // All public operations acquire this before opening a database transaction.
     // The boolean permanently closes the instance after a storage failure.
     closed: Mutex<bool>,
@@ -58,6 +68,155 @@ struct Inner {
 #[derive(Clone)]
 pub struct SourceAuthorityStore {
     inner: Arc<Inner>,
+}
+
+impl std::fmt::Debug for SourceAuthorityStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceAuthorityStore")
+            .field("group_id", &self.inner.identity.group_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One admission acquisition: current committed policy and ownership resolved
+/// under a guard that every control command waits for. Hold it through the
+/// source commit it admits; never acquire a second one, pin a permit, or run
+/// a control command while holding it — an exclusive waiter would then block
+/// the second acquisition behind this one.
+#[must_use = "dropping the admission releases the fence"]
+pub struct SourceAdmission<'a> {
+    store: &'a SourceAuthorityStore,
+    principal: String,
+    _shared: RwLockReadGuard<'a, ()>,
+}
+
+impl SourceAdmission<'_> {
+    pub fn identity(&self) -> &SourceAuthorityIdentity {
+        &self.store.inner.identity
+    }
+
+    pub fn principal(&self) -> &str {
+        &self.principal
+    }
+
+    /// The current committed decision for this actor on one collection.
+    pub fn authorize(
+        &self,
+        collection: &str,
+        action: AccessAction,
+    ) -> Result<AccessDecision, Status> {
+        self.store.authorize(&self.principal, collection, action)
+    }
+
+    /// Current Admin on the owner's collection and the exact pending
+    /// preparation. Owner-side work runs under this admission through its
+    /// source commit; no command can change the owner or the policy meanwhile.
+    pub fn prepared_owner(&self, expected: &PreparedSourceOwner) -> Result<(), Status> {
+        contract::owner(expected).map_err(|e| Status::invalid_argument(e.message()))?;
+        self.store.guarded(|| {
+            let key = expected
+                .key
+                .as_ref()
+                .ok_or_else(|| missing("prepared owner key"))?;
+            let tx = self.store.inner.database.begin_read().map_err(storage)?;
+            self.store.read_policy(&tx, &self.principal, key)?;
+            let table = tx.open_table(OWNERS).map_err(storage)?;
+            let bytes = key.encode_to_vec();
+            let held: PreparedSourceOwner = contract::decode(
+                table
+                    .get(bytes.as_slice())
+                    .map_err(storage)?
+                    .ok_or_else(|| {
+                        Status::failed_precondition("source owner has no committed preparation")
+                    })?
+                    .value(),
+            )?;
+            contract::owner(&held).map_err(corrupt)?;
+            if &held != expected || held.phase != PreparedSourceOwnerPhase::Prepared as i32 {
+                return Err(Status::failed_precondition(
+                    "source owner preparation changed or is no longer pending",
+                ));
+            }
+            Ok(())
+        })
+    }
+}
+
+struct AdmittedDecision<'a> {
+    _admission: SourceAdmission<'a>,
+    decision: AccessDecision,
+}
+
+impl AuthorizationGuard for AdmittedDecision<'_> {
+    fn decision(&self) -> &AccessDecision {
+        &self.decision
+    }
+}
+
+/// The committed collection policy is the workspace authority for managed
+/// hosting: permits resolve against it, and a pin is one `SourceAdmission`.
+impl Authorizer for SourceAuthorityStore {
+    fn authorize(
+        &self,
+        principal: &str,
+        collection: &str,
+        action: AccessAction,
+    ) -> Result<AccessDecision, Status> {
+        SourceAuthorityStore::authorize(self, principal, collection, action)
+    }
+
+    fn subscribe(&self) -> watch::Receiver<u64> {
+        self.inner.revisions.subscribe()
+    }
+
+    fn pin(&self, expected: &AccessDecision) -> Result<Box<dyn AuthorizationGuard + '_>, Status> {
+        let admission = self.admission(&expected.principal)?;
+        let action = AccessAction::try_from(expected.action)
+            .map_err(|_| Status::permission_denied("invalid authorization action"))?;
+        let decision = admission.authorize(&expected.collection, action)?;
+        if &decision != expected {
+            return Err(crate::error_disclosure::policy_changed());
+        }
+        Ok(Box::new(AdmittedDecision {
+            _admission: admission,
+            decision,
+        }))
+    }
+}
+
+/// The verified completion a hosting adapter derives from the managed
+/// binding it holds under its exclusive source lock. Only that adapter can
+/// construct it; readiness is never confirmed from caller bytes.
+pub struct VerifiedOwnerCompletion {
+    binding: SourceManagedBinding,
+    completion: SourceOwnerCompletion,
+}
+
+impl VerifiedOwnerCompletion {
+    pub(crate) fn from_binding(binding: &SourceManagedBinding) -> Result<Self, Status> {
+        let preparation = binding
+            .preparation
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("managed binding has no preparation"))?;
+        contract::owner(preparation).map_err(|e| Status::invalid_argument(e.message()))?;
+        let target = preparation.target.as_ref().expect("validated target");
+        Ok(Self {
+            binding: binding.clone(),
+            completion: SourceOwnerCompletion {
+                format_version: 1,
+                binding_sha256: crate::sha256::digest(&binding.encode_to_vec()).to_vec(),
+                bound_at_sequence: binding.bound_at_sequence,
+                history_id: target.history_id.clone(),
+                node_id: target.node_id.clone(),
+                storage_incarnation: target.storage_incarnation.clone(),
+            },
+        })
+    }
+
+    /// The completion the confirmation command must carry.
+    pub fn completion(&self) -> &SourceOwnerCompletion {
+        &self.completion
+    }
 }
 
 fn storage(error: impl std::fmt::Display) -> Status {
@@ -87,43 +246,83 @@ fn payload_change(total: u64, removed: usize, added: usize) -> Result<u64, Statu
 }
 
 impl SourceAuthorityStore {
-    // Owner-side preparation work holds current authority through its source
-    // commit. This is an adapter fence, never called from pure state application.
-    pub(crate) fn with_prepared_owner<T>(
+    /// Acquire shared admission for one actor. The actor must be a valid
+    /// principal; rights are resolved per collection by the admission's own
+    /// methods, so a revoked actor holds a fence that admits nothing.
+    pub fn admission(&self, principal: &str) -> Result<SourceAdmission<'_>, Status> {
+        contract::principal(principal)?;
+        let shared = self
+            .inner
+            .admission
+            .read()
+            .map_err(|_| storage("admission lock poisoned"))?;
+        Ok(SourceAdmission {
+            store: self,
+            principal: principal.to_string(),
+            _shared: shared,
+        })
+    }
+
+    pub fn identity(&self) -> &SourceAuthorityIdentity {
+        &self.inner.identity
+    }
+
+    fn exclusive(&self) -> Result<std::sync::RwLockWriteGuard<'_, ()>, Status> {
+        self.inner
+            .admission
+            .write()
+            .map_err(|_| storage("admission lock poisoned"))
+    }
+
+    /// The current committed decision for an actor on one collection: the
+    /// same evaluation the general authorizer performs on a policy snapshot.
+    pub fn authorize(
         &self,
         principal: &str,
-        expected: &PreparedSourceOwner,
-        run: impl FnOnce(&SourceAuthorityIdentity) -> Result<T, Status>,
-    ) -> Result<T, Status> {
-        contract::owner(expected).map_err(|e| Status::invalid_argument(e.message()))?;
+        collection: &str,
+        action: AccessAction,
+    ) -> Result<AccessDecision, Status> {
+        contract::principal(principal)?;
         self.guarded(|| {
-            let key = expected
-                .key
-                .as_ref()
-                .ok_or_else(|| missing("prepared owner key"))?;
             let tx = self.inner.database.begin_read().map_err(storage)?;
-            self.read_policy(&tx, principal, key)?;
-            let table = tx.open_table(OWNERS).map_err(storage)?;
-            let bytes = key.encode_to_vec();
-            let held: PreparedSourceOwner = contract::decode(
-                table
-                    .get(bytes.as_slice())
+            let meta = tx.open_table(META).map_err(storage)?;
+            let header: SourceAuthorityHeader = contract::decode(
+                meta.get("header")
                     .map_err(storage)?
-                    .ok_or_else(|| {
-                        Status::failed_precondition("source owner has no committed preparation")
-                    })?
+                    .ok_or_else(|| missing("header"))?
                     .value(),
             )?;
-            contract::owner(&held).map_err(corrupt)?;
-            if &held != expected || held.phase != PreparedSourceOwnerPhase::Prepared as i32 {
-                return Err(Status::failed_precondition(
-                    "source owner preparation changed or is no longer pending",
-                ));
-            }
-            // Only failures of this control store latch its instance closed.
-            // A source-side refusal/failure belongs to the source adapter.
-            Ok(run(&self.inner.identity))
-        })?
+            recovery::header(&header, &self.inner.identity)?;
+            let policy: AccessPolicy = contract::decode(
+                meta.get("policy")
+                    .map_err(storage)?
+                    .ok_or_else(|| missing("policy"))?
+                    .value(),
+            )?;
+            contract::policy(&policy).map_err(corrupt)?;
+            crate::authorization::authorize_policy_snapshot(&policy, principal, collection, action)
+        })
+    }
+
+    /// PREPARED -> READY under the hosting adapter's verified completion. The
+    /// general `execute` path refuses this action.
+    pub fn confirm_owner_ready(
+        &self,
+        principal: &str,
+        command: &SourceAuthorityCommand,
+        verified: &VerifiedOwnerCompletion,
+    ) -> Result<SourceAuthorityDecision, Status> {
+        if !matches!(command.action, Some(Action::ConfirmReady(_))) {
+            return Err(Status::invalid_argument(
+                "confirm_owner_ready takes a ConfirmReady command",
+            ));
+        }
+        if verified.binding.authority.as_ref() != Some(&self.inner.identity) {
+            return Err(Status::failed_precondition(
+                "managed binding names another source authority",
+            ));
+        }
+        self.execute_admitted(principal, command, Some(verified))
     }
 
     pub(crate) fn with_resource_admin<T>(
@@ -186,6 +385,7 @@ impl SourceAuthorityStore {
         import::create_tables(&tx)?;
         tx.commit().map_err(storage)?;
         parent.sync_all().map_err(storage)?;
+        store.inner.revisions.send_replace(policy.revision);
         Ok(store)
     }
 
@@ -196,6 +396,18 @@ impl SourceAuthorityStore {
         let (store, _) = Self::open_file(path, expected_identity, false)?;
         import::adopt(&store)?;
         recovery::validate(&store)?;
+        let revision = {
+            let tx = store.inner.database.begin_read().map_err(storage)?;
+            let meta = tx.open_table(META).map_err(storage)?;
+            let policy: AccessPolicy = contract::decode(
+                meta.get("policy")
+                    .map_err(storage)?
+                    .ok_or_else(|| missing("policy"))?
+                    .value(),
+            )?;
+            policy.revision
+        };
+        store.inner.revisions.send_replace(revision);
         Ok(store)
     }
 
@@ -240,6 +452,8 @@ impl SourceAuthorityStore {
             Self {
                 inner: Arc::new(Inner {
                     database,
+                    admission: RwLock::new(()),
+                    revisions: watch::Sender::new(0),
                     closed: Mutex::new(false),
                     identity: identity.clone(),
                     #[cfg(test)]
@@ -279,8 +493,23 @@ impl SourceAuthorityStore {
         principal: &str,
         command: &SourceAuthorityCommand,
     ) -> Result<SourceAuthorityDecision, Status> {
+        if matches!(command.action, Some(Action::ConfirmReady(_))) {
+            return Err(Status::permission_denied(
+                "readiness confirmation requires the hosting adapter with the managed binding",
+            ));
+        }
+        self.execute_admitted(principal, command, None)
+    }
+
+    fn execute_admitted(
+        &self,
+        principal: &str,
+        command: &SourceAuthorityCommand,
+        verified: Option<&VerifiedOwnerCompletion>,
+    ) -> Result<SourceAuthorityDecision, Status> {
+        let _exclusive = self.exclusive()?;
         self.guarded(|| {
-            let decision = self.execute_locked(principal, command)?;
+            let decision = self.execute_locked(principal, command, verified)?;
             // A policy command can revoke its own issuer. Its durable decision
             // remains retryable, but disclosure still needs the current grant.
             let tx = self.inner.database.begin_read().map_err(storage)?;
@@ -297,6 +526,7 @@ impl SourceAuthorityStore {
         &self,
         principal: &str,
         command: &SourceAuthorityCommand,
+        verified: Option<&VerifiedOwnerCompletion>,
     ) -> Result<SourceAuthorityDecision, Status> {
         let mut tx = self.inner.database.begin_write().map_err(storage)?;
         tx.set_durability(Durability::Immediate).map_err(storage)?;
@@ -371,6 +601,27 @@ impl SourceAuthorityStore {
                 .transpose()?;
             if let Some(owner) = &before {
                 contract::owner(owner).map_err(corrupt)?;
+            }
+            // Admission of a readiness confirmation: the adapter's held binding
+            // must be for exactly this pending owner and the command must carry
+            // that binding's completion. Nothing here is recorded; a replica
+            // applying the committed command performs no such check.
+            if let Some(Action::ConfirmReady(request)) = command.action.as_ref() {
+                let verified = verified.ok_or_else(|| {
+                    Status::permission_denied(
+                        "readiness confirmation requires the hosting adapter with the managed binding",
+                    )
+                })?;
+                if verified.binding.preparation.as_ref() != before.as_ref() {
+                    return Err(Status::failed_precondition(
+                        "managed binding preparation differs from the committed owner",
+                    ));
+                }
+                if request.completion.as_ref() != Some(&verified.completion) {
+                    return Err(Status::permission_denied(
+                        "readiness confirmation differs from the held binding's completion",
+                    ));
+                }
             }
             let mut workflows = tx.open_table(WORKFLOWS).map_err(storage)?;
             let workflow_key = match command.action.as_ref() {
@@ -479,6 +730,7 @@ impl SourceAuthorityStore {
         #[cfg(test)]
         self.inject(false)?;
         tx.commit().map_err(storage)?;
+        self.inner.revisions.send_replace(decision.policy_revision);
         #[cfg(test)]
         self.inject(true)?;
         Ok(decision)
@@ -619,6 +871,8 @@ impl SourceAuthorityStore {
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod admission_tests;
 #[cfg(test)]
 mod import_tests;
 #[cfg(test)]

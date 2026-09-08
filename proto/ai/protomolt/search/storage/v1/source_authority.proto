@@ -40,10 +40,15 @@ enum PreparedSourceOwnerPhase {
   PREPARED_SOURCE_OWNER_PHASE_UNSPECIFIED = 0;
   PREPARED_SOURCE_OWNER_PHASE_PREPARED = 1;
   PREPARED_SOURCE_OWNER_PHASE_CANCELLED = 2;
+  // The owner persisted its managed binding and the hosting adapter verified
+  // that completion. Still not a published map or a live writer.
+  PREPARED_SOURCE_OWNER_PHASE_READY = 3;
 }
 
-// Neither phase admits writes or authorizes installation. Cancellation retains
-// the generation allocator and the workflow; a later preparation advances it.
+// PREPARED and CANCELLED admit no writes and authorize no installation.
+// Cancellation retains the generation allocator and the workflow; a later
+// preparation advances it. READY is terminal for this generation: it cannot be
+// cancelled, and replacement needs a complete ownership transition.
 message PreparedSourceOwner {
   uint32 format_version = 1; // 1
   LogicalSourceOwner key = 2;
@@ -53,6 +58,24 @@ message PreparedSourceOwner {
   PreparedSourceOwnerPhase phase = 6;
   uint64 control_revision = 7;
   SourceAuthorityOperationKey last_command = 8;
+  SourceOwnerReadiness readiness = 9; // present exactly when phase is READY
+}
+
+// The verified completion fact recorded at readiness.
+message SourceOwnerReadiness {
+  uint32 format_version = 1; // 1
+  SourceOwnerCompletion completion = 2;
+}
+
+// What the owner's durable managed binding states, as verified by the hosting
+// adapter that holds that binding. Never accepted from caller bytes alone.
+message SourceOwnerCompletion {
+  uint32 format_version = 1; // 1
+  bytes binding_sha256 = 2; // SHA-256 over the canonical SourceManagedBinding
+  uint64 bound_at_sequence = 3;
+  bytes history_id = 4; // must equal the prepared target
+  string node_id = 5; // must equal the prepared target
+  bytes storage_incarnation = 6; // must equal the prepared target
 }
 
 message PrepareSourceOwner {
@@ -62,6 +85,13 @@ message PrepareSourceOwner {
 
 message CancelPreparedSourceOwner {
   bytes workflow_id = 1;
+}
+
+// PREPARED -> READY. Admitted only through the hosting adapter that holds the
+// owner's managed binding; the general command path refuses it.
+message ConfirmSourceOwnerReady {
+  bytes workflow_id = 1;
+  SourceOwnerCompletion completion = 2;
 }
 
 // Replace grants for this command's one immutable resource only. No action
@@ -84,6 +114,7 @@ message SourceAuthorityCommand {
     PrepareSourceOwner prepare = 10;
     CancelPreparedSourceOwner cancel = 11;
     ReplaceSourceCollectionGrants replace_grants = 12;
+    ConfirmSourceOwnerReady confirm_ready = 13;
   }
 }
 

@@ -7,9 +7,11 @@ boundary between preparation and readiness in the
 writer, publish a map, verify a host's live process or replace another source.
 
 `AccessControlledCatalog::bind_prepared_owner` consumes the local catalog handle.
-It pins its current Admin permit, requires the same authenticated actor to have
-current Admin permission in the control store, and compares the complete pending
-owner record with the supplied preparation. The resource and history must match
+Since 2026-09-08 it takes one `SourceAdmission` from the control store
+([owner admission](source-owner-admission.md)) rather than a separate local
+policy pin: the admission resolves the actor's current Admin permission in the
+control store and compares the complete pending owner record with the supplied
+preparation, and it stays held through the source commit. The resource and history must match
 the existing source. Actor attribution must be complete, retirement/sealing must
 not have begun, and pending source/index maintenance decisions must already be
 resolved. The explicit metadata byte budget covers both the existing checkpoint
@@ -23,8 +25,8 @@ version and retry decision, the actor namespace and the index journals. No
 source history is created, reconstructed or renamed by this operation. A new
 header field is not a document wire change.
 
-The lock order is existing source policy pin, control authority, source database
-writer. The control preparation already exists durably before source binding;
+The lock order is control admission, then source database writer; no second
+authority acquisition happens under the admission. The control preparation already exists durably before source binding;
 the pure control transition never performs source IO. Failure before source
 commit leaves the prior catalog format. Failure after commit leaves a closed
 managed catalog. Either outcome is recovered by inspecting the exact existing

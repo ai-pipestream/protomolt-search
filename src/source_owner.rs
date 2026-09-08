@@ -105,12 +105,56 @@ pub(crate) fn owner(value: &PreparedSourceOwner) -> Result<(), Status> {
     }
     principal(&command.principal)?;
     operation_id(&command.command_id)?;
-    if !matches!(
-        PreparedSourceOwnerPhase::try_from(value.phase),
-        Ok(PreparedSourceOwnerPhase::Prepared | PreparedSourceOwnerPhase::Cancelled)
-    ) {
-        return Err(Status::data_loss(
-            "source authority owner phase is unsupported",
+    match PreparedSourceOwnerPhase::try_from(value.phase) {
+        Ok(PreparedSourceOwnerPhase::Prepared | PreparedSourceOwnerPhase::Cancelled) => {
+            if value.readiness.is_some() {
+                return Err(Status::data_loss(
+                    "source authority owner carries readiness before READY",
+                ));
+            }
+        }
+        Ok(PreparedSourceOwnerPhase::Ready) => {
+            let readiness = value.readiness.as_ref().ok_or_else(|| {
+                Status::data_loss("source authority READY owner has no readiness")
+            })?;
+            if readiness.format_version != 1 {
+                return Err(Status::data_loss(
+                    "source authority readiness format is unsupported",
+                ));
+            }
+            let completion = readiness
+                .completion
+                .as_ref()
+                .ok_or_else(|| Status::data_loss("source authority readiness has no completion"))?;
+            completion_matches(completion, value.target.as_ref().expect("validated target"))
+                .map_err(|error| Status::data_loss(error.message().to_string()))?;
+        }
+        _ => {
+            return Err(Status::data_loss(
+                "source authority owner phase is unsupported",
+            ))
+        }
+    }
+    Ok(())
+}
+
+/// A completion is well formed and names the prepared target's history, host
+/// and storage incarnation exactly.
+pub(crate) fn completion_matches(
+    value: &SourceOwnerCompletion,
+    target: &SourceStorageTarget,
+) -> Result<(), Status> {
+    if value.format_version != 1 || value.binding_sha256.len() != 32 {
+        return Err(Status::invalid_argument(
+            "source owner completion requires format 1 and a 32-byte binding digest",
+        ));
+    }
+    if value.history_id != target.history_id
+        || value.node_id != target.node_id
+        || value.storage_incarnation != target.storage_incarnation
+    {
+        return Err(Status::failed_precondition(
+            "source owner completion names another history, host or storage incarnation than the prepared target",
         ));
     }
     Ok(())

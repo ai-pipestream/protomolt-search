@@ -150,6 +150,16 @@ pub(super) fn operation(
                         return Err(corrupt("cancellation decision differs from its command"));
                     }
                 }
+                Action::ConfirmReady(request) => {
+                    if owner.workflow_id != request.workflow_id
+                        || owner.phase != PreparedSourceOwnerPhase::Ready as i32
+                        || owner.ownership_generation != command.expected_ownership_generation
+                        || owner.readiness.as_ref().and_then(|r| r.completion.as_ref())
+                            != request.completion.as_ref()
+                    {
+                        return Err(corrupt("readiness decision differs from its command"));
+                    }
+                }
                 Action::ReplaceGrants(_) => {
                     return Err(corrupt("policy command cannot carry an owner transition"))
                 }

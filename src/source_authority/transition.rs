@@ -113,6 +113,7 @@ pub(super) fn apply(
                     phase: PreparedSourceOwnerPhase::Prepared as i32,
                     control_revision: revision,
                     last_command: Some(operation.clone()),
+                    readiness: None,
                 });
                 result.reserve_workflow = true;
             }
@@ -133,6 +134,35 @@ pub(super) fn apply(
                 cancelled.control_revision = revision;
                 cancelled.last_command = Some(operation.clone());
                 result.owner = Some(cancelled);
+            }
+            Action::ConfirmReady(request) => {
+                // Admission (the adapter's held binding) is checked before this
+                // command reaches the transition; apply trusts the committed
+                // command, as a replica applying the same log entry must.
+                let completion = request.completion.as_ref().expect("validated completion");
+                let held = before.ok_or_else(|| {
+                    Status::not_found("source authority owner has no preparation")
+                })?;
+                if held.phase != PreparedSourceOwnerPhase::Prepared as i32
+                    || held.workflow_id != request.workflow_id
+                {
+                    return Err(Status::failed_precondition(
+                        "source authority readiness requires the current prepared workflow",
+                    ));
+                }
+                contract::completion_matches(
+                    completion,
+                    held.target.as_ref().expect("validated owner target"),
+                )?;
+                let mut ready = held.clone();
+                ready.phase = PreparedSourceOwnerPhase::Ready as i32;
+                ready.control_revision = revision;
+                ready.last_command = Some(operation.clone());
+                ready.readiness = Some(SourceOwnerReadiness {
+                    format_version: 1,
+                    completion: Some(completion.clone()),
+                });
+                result.owner = Some(ready);
             }
             Action::ReplaceGrants(request) => {
                 if request.grants.iter().any(|grant| {

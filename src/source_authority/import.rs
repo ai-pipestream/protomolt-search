@@ -401,6 +401,7 @@ impl SourceAuthorityStore {
         command: &ControlImportCommand,
         admitted: Option<AdmittedRetirement>,
     ) -> Result<ControlImportDecision, Status> {
+        let _exclusive = self.exclusive()?;
         self.guarded(|| {
             let decision = self.import_locked(principal, command, admitted)?;
             let tx = self.inner.database.begin_read().map_err(storage)?;
