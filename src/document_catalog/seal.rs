@@ -19,7 +19,10 @@ pub(super) fn validate_header_seal(header: &DocumentCatalogHeader) -> Result<(),
             && !intent.operation_id.is_empty()
             && intent.operation_id.len() <= 1024
     });
-    let lifecycle_format = if header.format_version == ACCESS_CONTROLLED_FORMAT {
+    let lifecycle_format = if matches!(
+        header.format_version,
+        LEGACY_ACCESS_CONTROLLED_FORMAT | ACCESS_CONTROLLED_FORMAT | MANAGED_FORMAT
+    ) {
         let binding = header.resource_binding.as_ref().ok_or_else(|| {
             Status::data_loss("access-controlled catalog resource binding missing")
         })?;
@@ -41,7 +44,7 @@ pub(super) fn validate_header_seal(header: &DocumentCatalogHeader) -> Result<(),
     } else {
         if header.resource_binding.is_some() {
             return Err(Status::data_loss(
-                "source resource binding requires catalog format 7",
+                "source resource binding requires catalog format 7, 8 or 9",
             ));
         }
         header.format_version
@@ -69,12 +72,12 @@ pub(super) fn validate_header_seal(header: &DocumentCatalogHeader) -> Result<(),
     Ok(())
 }
 
-fn header_from(
+pub(super) fn header_from(
     catalog: &DocumentCatalog,
     tx: &redb::WriteTransaction,
 ) -> Result<DocumentCatalogHeader, Status> {
     let meta = tx.open_table(META).map_err(storage)?;
-    let header = decode(
+    let header = decode_header(
         meta.get("header")
             .map_err(storage)?
             .ok_or_else(|| Status::data_loss("catalog header missing"))?
@@ -82,7 +85,31 @@ fn header_from(
     )?;
     validate_current_header(&header)?;
     catalog.validate_resource_binding(&header)?;
+    if header.managed_binding.is_some() {
+        return Err(Status::failed_precondition(
+            "managed source admission is closed; preparation and persisted binding do not authorize mutations",
+        ));
+    }
     Ok(header)
+}
+
+/// Call only after validating the header while holding the database writer.
+/// Acceptance resolves existing retries first; this gate controls new work.
+pub(super) fn require_admission(
+    header: &DocumentCatalogHeader,
+    recovery: bool,
+) -> Result<(), Status> {
+    if header.history_seal.is_some() {
+        return Err(Status::failed_precondition(
+            "source history is sealed; acceptance and index mutations are retired",
+        ));
+    }
+    if header.retirement_intent.is_some() && !recovery {
+        return Err(Status::failed_precondition(
+            "source history is retiring; new acceptance and index preparations are closed",
+        ));
+    }
+    Ok(())
 }
 
 impl DocumentCatalog {
@@ -102,16 +129,7 @@ impl DocumentCatalog {
         let mut tx = self.database.begin_write().map_err(storage)?;
         tx.set_durability(Durability::Immediate).map_err(storage)?;
         let header = header_from(self, &tx)?;
-        if header.history_seal.is_some() {
-            return Err(Status::failed_precondition(
-                "source history is sealed; acceptance and index mutations are retired",
-            ));
-        }
-        if header.retirement_intent.is_some() && !recovery {
-            return Err(Status::failed_precondition(
-                "source history is retiring; new acceptance and index preparations are closed",
-            ));
-        }
+        require_admission(&header, recovery)?;
         Ok(tx)
     }
 
@@ -119,7 +137,7 @@ impl DocumentCatalog {
     pub fn retirement_intent(&self) -> Result<Option<SourceRetirementIntent>, Status> {
         let read = self.database.begin_read().map_err(storage)?;
         let meta = read.open_table(META).map_err(storage)?;
-        let header: DocumentCatalogHeader = decode(
+        let header: DocumentCatalogHeader = decode_header(
             meta.get("header")
                 .map_err(storage)?
                 .ok_or_else(|| Status::data_loss("catalog header missing"))?
@@ -181,7 +199,7 @@ impl DocumentCatalog {
             operation_id: request.operation_id.clone(),
         };
         header.format_version = if self.resource_binding.is_some() {
-            ACCESS_CONTROLLED_FORMAT
+            header.format_version
         } else {
             RETIRING_FORMAT_VERSION
         };
@@ -200,7 +218,7 @@ impl DocumentCatalog {
     pub fn history_seal(&self) -> Result<Option<SourceHistorySeal>, Status> {
         let read = self.database.begin_read().map_err(storage)?;
         let meta = read.open_table(META).map_err(storage)?;
-        let header: DocumentCatalogHeader = decode(
+        let header: DocumentCatalogHeader = decode_header(
             meta.get("header")
                 .map_err(storage)?
                 .ok_or_else(|| Status::data_loss("catalog header missing"))?
@@ -280,7 +298,7 @@ impl DocumentCatalog {
             operation_id: request.operation_id.clone(),
         };
         header.format_version = if self.resource_binding.is_some() {
-            ACCESS_CONTROLLED_FORMAT
+            header.format_version
         } else if header.retirement_intent.is_some() {
             RETIRED_FORMAT_VERSION
         } else {

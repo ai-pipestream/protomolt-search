@@ -105,9 +105,9 @@ async fn seal_is_terminal_persistent_idempotent_and_bound_to_its_watermark() {
         mutation: Some(Mutation::Source(original_source.unwrap())),
         ..Default::default()
     };
-    let error = reopened.accept(&retry).unwrap_err();
-    assert_eq!(error.code(), Code::FailedPrecondition);
-    assert!(error.message().contains("sealed"), "{error}");
+    let replayed = reopened.accept(&retry).unwrap();
+    assert!(replayed.replayed);
+    assert_eq!((replayed.version, replayed.accepted_sequence), (1, 1));
     let new_write = AcceptDocumentRequest {
         contract_version: 1,
         document_key: b"new-after-seal".to_vec(),

@@ -241,7 +241,7 @@ impl DocumentCatalog {
         }
         let tx = self.database.begin_read().map_err(storage)?;
         let meta = tx.open_table(META).map_err(storage)?;
-        let header: DocumentCatalogHeader = decode(
+        let header: DocumentCatalogHeader = decode_header(
             meta.get("header")
                 .map_err(storage)?
                 .ok_or_else(|| Status::data_loss("catalog header missing"))?
@@ -270,7 +270,7 @@ impl DocumentCatalog {
         catalog.with_durable_snapshot(|snapshot| {
             let tx = self.database.begin_read().map_err(storage)?;
             let meta = tx.open_table(META).map_err(storage)?;
-            let header: DocumentCatalogHeader = decode(
+            let header: DocumentCatalogHeader = decode_header(
                 meta.get("header")
                     .map_err(storage)?
                     .ok_or_else(|| Status::data_loss("catalog header missing"))?
@@ -302,7 +302,7 @@ impl DocumentCatalog {
     pub(super) fn validate_projection_journal(&self) -> Result<bool, Status> {
         let tx = self.database.begin_read().map_err(storage)?;
         let meta = tx.open_table(META).map_err(storage)?;
-        let header: DocumentCatalogHeader = decode(
+        let header: DocumentCatalogHeader = decode_header(
             meta.get("header")
                 .map_err(storage)?
                 .ok_or_else(|| Status::data_loss("catalog header missing"))?
@@ -407,7 +407,7 @@ impl DocumentCatalog {
             .collect::<Vec<_>>();
         {
             let mut meta = tx.open_table(META).map_err(storage)?;
-            let header: DocumentCatalogHeader = decode(
+            let header: DocumentCatalogHeader = decode_header(
                 meta.get("header")
                     .map_err(storage)?
                     .ok_or_else(|| Status::data_loss("catalog header missing"))?
@@ -531,7 +531,7 @@ impl DocumentCatalog {
             let result;
             {
                 let meta = tx.open_table(META).map_err(storage)?;
-                let header: DocumentCatalogHeader = decode(meta.get("header").map_err(storage)?.ok_or_else(|| Status::data_loss("catalog header missing"))?.value())?;
+                let header: DocumentCatalogHeader = decode_header(meta.get("header").map_err(storage)?.ok_or_else(|| Status::data_loss("catalog header missing"))?.value())?;
                 validate_current_header(&header)?;
                 let mut states = tx.open_table(STATES).map_err(storage)?;
                 let mut state: ProjectionJournalState = decode(states.get(key).map_err(storage)?.ok_or_else(|| Status::not_found("projection index is not registered"))?.value())?;
@@ -583,7 +583,7 @@ impl DocumentCatalog {
         }
         let tx = self.database.begin_read().map_err(storage)?;
         let meta = tx.open_table(META).map_err(storage)?;
-        let header: DocumentCatalogHeader = decode(
+        let header: DocumentCatalogHeader = decode_header(
             meta.get("header")
                 .map_err(storage)?
                 .ok_or_else(|| Status::data_loss("catalog header missing"))?

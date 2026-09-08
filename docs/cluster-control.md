@@ -36,6 +36,103 @@ authority: a newer durable generation is published before serving, while a
 state file behind the live generation or conflicting at the same generation is
 refused.
 
+### Exclusive file ownership
+
+The foundations branch acquires an exclusive OS lock on `<control-state>.lock`
+before reading the JSON authority. The same open lock file is retained by every
+clone and by services holding those clones. A second independent open, including
+one in another process, refuses until the last holder closes. Lock ownership
+survives every atomic replacement of the state file; locking the replaceable
+JSON inode itself would not provide that guarantee.
+
+The lock sidecar is persistent. Do not delete, rename or replace it while any
+owner may be alive. Parent directory aliases are canonicalized to the same lock;
+a symlink or special file at the state or lock leaf refuses. On Unix, newly
+created lock/state/candidate files are mode 0600 and newly created container
+directories are mode 0700. Bootstrap syncs each newly created directory entry.
+State writes use random, exclusive-create candidates, sync before rename and
+remove only their own unpublished candidate on a returned failure. They never
+truncate an existing temporary file. Process exit can leave a private candidate;
+recovery reads the authoritative JSON file and does not guess that an orphan
+candidate committed.
+
+This is cooperative ownership of one configured store in its operator-owned
+container. It does not fence a copied state file, a noncooperating older binary,
+or a separate distributed owner. Stop the old control writer before upgrading
+or importing it into the transactional authority. Source residency and managed
+activation still require their own committed enforcement protocol.
+
+Ownership validation (2026-09-08, working tree above `60525ae`): the initial
+regressions reproduced both same-process and cross-process independent opens
+accepting the same live authority. The focused gate then passed 28 control tests
+and 22 collection/placement tests. Coverage includes clones, repeated state-file
+replacement, parent aliases, leaf symlink refusals, private file modes, abrupt
+process exit, and cleanup of only the writer's own candidate.
+
+The final combined gate passed 730 library tests and all 150 integration targets
+(903 top-level passes plus one nested worker, with one existing external OpenNLP
+test ignored), 13 embedded tests, two IVF tests and nine Python reference tests.
+All five mobile compilation targets, tests/examples compilation, formatting,
+vendored-proto and diff checks passed. All 22 proto files and the reference
+fixtures remained byte-identical to `60525ae`. The 665 tracked and untracked
+inputs, HEAD and dirty status matched before and after the run. Only this
+validation record and the README count were added afterward. The scope reached
+its 8 GiB cap; swap and OOM counters remained zero. A separate vector-engine
+build was active at launch, so this is correctness evidence, not a performance
+measurement.
+
+### Persistence failures and recovery
+
+The foundation branch distinguishes a failure before publishing a replacement
+state file from an ambiguous publication. A failure before rename leaves the
+prior in-memory and durable state usable. An error from rename or the following
+directory sync closes that `DurableControlPlane` instance and every clone.
+Later authority reads, mutations, admission and topology publication return
+`FAILED_PRECONDITION` naming the uncertain persistence outcome. The configuration
+collection label remains readable; it is not a current-authority decision.
+The state mutex covers both the failure latch and synchronous map publication.
+
+Collection binding and reconciliation compute a private candidate and publish
+it in memory only after persistence succeeds. A late validation error, including
+topology-generation overflow, cannot leave uncommitted candidate changes in the
+shared state.
+
+`DurableControlPlane::open_existing` is the explicit recovery entry point. It
+requires an existing, valid state file and syncs the loaded state before use;
+missing, malformed or unsupported-format state refuses instead of creating a
+new history. Close every old instance and service clone, including failed ones,
+before reopening; the ownership lock stays held until the last clone drops.
+Preserve the intended state file and resolve storage errors before reopening it. The
+legacy `open` constructor still permits initial bootstrap; that behavior must
+not be used to recover missing managed authority state.
+
+This is fail-closed handling for the existing single-authority JSON adapter.
+It does not supply replicated control storage, source-owner activation,
+distributed fencing or atomicity across the multiple mutations of a control
+RPC. Those remain in the accepted [Raft design](raft-control-design.md).
+
+Validation (2026-09-08, working tree above `ddfb7b6`): fault injection first
+reproduced usable old memory after a post-rename failure, an uncommitted
+collection binding after a pre-rename failure, and changed reconciliation
+history after topology-generation overflow. The six regression tests now pass,
+including strict reopen refusals and failure propagation across clones. The
+newer ownership guard additionally requires closing all those clones before
+recovery can open the store.
+The focused gate passed 18 control tests and 23 collection/placement tests.
+
+The full gate passed 694 library tests and all 150 integration targets (903
+top-level passes plus one nested retry worker); the existing native OpenNLP
+test remains ignored because it requires its external analysis service.
+Embedded tests (13), IVF tests (2), protobuf reference tests (9), all five
+Android/iOS compilation targets, tests/examples compilation, formatting and
+vendored-proto checks passed. All 21 proto files and the original protobuf
+fixtures remained byte-identical to `ddfb7b6`; 651 input hashes matched before
+and after validation. Terra executed the gates and Astra reviewed raw exits,
+logs and hashes. The full scope reached its 8 GiB memory limit (41,469 limit
+events), with no swap or OOM events. These are correctness checks under a cap,
+not performance measurements. Raw evidence uses the local
+`/tmp/psearch-control-persistence-{red,red2,green,full}-*` prefixes.
+
 ## Node lifecycle
 
 1. `RegisterNode` returns a lease token only to that node.

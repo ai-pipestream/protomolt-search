@@ -46,6 +46,8 @@ pub mod derived;
 pub mod diagnostics;
 pub mod document_catalog;
 pub mod document_contract;
+#[cfg(feature = "net")]
+pub mod document_write_service;
 pub mod embedded;
 pub mod error_disclosure;
 pub mod exact_vectors;
@@ -104,6 +106,9 @@ pub mod snapshot;
 pub mod snapshot_repository;
 pub mod sortkeys;
 pub mod source_archive;
+#[cfg(feature = "net")]
+pub mod source_authority;
+mod source_owner;
 pub mod stats_cache;
 pub mod stats_identity;
 mod stream_signal;

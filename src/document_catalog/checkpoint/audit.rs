@@ -59,12 +59,11 @@ impl CatalogCheckpoint<'_> {
         let versions = self.read.open_table(VERSIONS).map_err(storage)?;
         let changes = self.read.open_table(CHANGES).map_err(storage)?;
         let heads = self.read.open_table(HEADS).map_err(storage)?;
-        let operations = self.read.open_table(OPERATIONS).map_err(storage)?;
+        actors::validate_read_counts(&self.read, header)?;
         let sources = self.read.open_table(SOURCES).map_err(storage)?;
         let descriptors = self.read.open_table(DESCRIPTORS).map_err(storage)?;
         if versions.len().map_err(storage)? != header.accepted_sequence
             || changes.len().map_err(storage)? != header.accepted_sequence
-            || operations.len().map_err(storage)? != header.accepted_sequence
         {
             return Err(damaged(
                 "accepted history table counts differ from the header",
@@ -215,65 +214,102 @@ impl CatalogCheckpoint<'_> {
             }
         };
         within_budget()?;
-        let mut entries = operations.iter().map_err(storage)?;
-        loop {
-            let mut tx = proof.begin_write().map_err(storage)?;
-            tx.set_durability(Durability::None).map_err(storage)?;
-            let mut seen = tx.open_table(SEEN).map_err(storage)?;
-            let mut count = 0;
-            for _ in 0..BATCH {
-                let Some(entry) = entries.next() else { break };
-                let (key, value) = entry.map_err(storage)?;
-                let operation: DocumentOperation = bounded(value.value(), record_bytes)?;
-                if key.value().is_empty()
-                    || key.value().len() > 1024
-                    || operation.request_sha256.len() != 32
-                {
-                    return Err(damaged("invalid operation ID or request digest"));
-                }
-                let receipt = operation
-                    .receipt
-                    .ok_or_else(|| damaged("operation receipt is missing"))?;
-                let legacy = receipt.history_id.is_empty()
-                    && receipt.accepted_sequence <= header.legacy_receipts_through_sequence;
-                if !receipt.accepted
-                    || receipt.searchable
-                    || !receipt.durable
-                    || receipt.replayed
-                    || receipt.accepted_sequence == 0
-                    || receipt.accepted_sequence > header.accepted_sequence
-                    || (!legacy && receipt.history_id != header.history_id)
-                {
-                    return Err(damaged("invalid immutable acceptance receipt"));
-                }
-                let key = DocumentVersionKey {
-                    document_key: receipt.document_key.clone(),
-                    version: receipt.version,
-                }
-                .encode_to_vec();
-                let version = versions
-                    .get(key.as_slice())
-                    .map_err(storage)?
-                    .ok_or_else(|| damaged("operation receipt has no accepted version"))?;
-                let version: DocumentVersion = bounded(version.value(), record_bytes)?;
-                if receipt.accepted_sequence != version.accepted_sequence {
-                    return Err(damaged("operation receipt differs from accepted history"));
-                }
-                if seen
-                    .insert(receipt.accepted_sequence, 1)
-                    .map_err(storage)?
-                    .is_some()
-                {
-                    return Err(damaged("multiple operations claim one accepted sequence"));
-                }
-                count += 1;
+        let mut attributed = 0u64;
+        for definition in [OPERATIONS, actors::OPERATIONS] {
+            let scoped = definition.name() == actors::OPERATIONS.name();
+            if scoped && header.actor_namespace.is_none() {
+                continue;
             }
-            drop(seen);
-            if count == 0 {
-                break;
+            let operations = self.read.open_table(definition).map_err(storage)?;
+            let mut entries = operations.iter().map_err(storage)?;
+            loop {
+                let mut tx = proof.begin_write().map_err(storage)?;
+                tx.set_durability(Durability::None).map_err(storage)?;
+                let mut seen = tx.open_table(SEEN).map_err(storage)?;
+                let mut count = 0;
+                for _ in 0..BATCH {
+                    let Some(entry) = entries.next() else { break };
+                    let (key, value) = entry.map_err(storage)?;
+                    let operation: DocumentOperation = bounded(value.value(), record_bytes)?;
+                    if scoped {
+                        if key.value().len() > record_bytes {
+                            return Err(Status::resource_exhausted(
+                                "actor key exceeds source_batch_bytes",
+                            ));
+                        }
+                        actors::validate_key(key.value())?;
+                    }
+                    if (!scoped && (key.value().is_empty() || key.value().len() > 1024))
+                        || operation.request_sha256.len() != 32
+                    {
+                        return Err(damaged("invalid operation ID or request digest"));
+                    }
+                    let receipt = operation
+                        .receipt
+                        .ok_or_else(|| damaged("operation receipt is missing"))?;
+                    let legacy = receipt.history_id.is_empty()
+                        && receipt.accepted_sequence <= header.legacy_receipts_through_sequence;
+                    if !receipt.accepted
+                        || receipt.searchable
+                        || !receipt.durable
+                        || receipt.replayed
+                        || receipt.accepted_sequence == 0
+                        || receipt.accepted_sequence > header.accepted_sequence
+                        || (!legacy && receipt.history_id != header.history_id)
+                    {
+                        return Err(damaged("invalid immutable acceptance receipt"));
+                    }
+                    if let Some(n) = &header.actor_namespace {
+                        if receipt.accepted_sequence <= n.legacy_operations {
+                            if scoped {
+                                attributed = attributed
+                                    .checked_add(1)
+                                    .ok_or_else(|| damaged("attribution count overflow"))?;
+                            }
+                        } else if !scoped {
+                            return Err(damaged(
+                                "actorless operation exceeds legacy attribution watermark",
+                            ));
+                        }
+                    }
+                    let key = DocumentVersionKey {
+                        document_key: receipt.document_key.clone(),
+                        version: receipt.version,
+                    }
+                    .encode_to_vec();
+                    let version = versions
+                        .get(key.as_slice())
+                        .map_err(storage)?
+                        .ok_or_else(|| damaged("operation receipt has no accepted version"))?;
+                    let version: DocumentVersion = bounded(version.value(), record_bytes)?;
+                    if receipt.accepted_sequence != version.accepted_sequence {
+                        return Err(damaged("operation receipt differs from accepted history"));
+                    }
+                    if seen
+                        .insert(receipt.accepted_sequence, 1)
+                        .map_err(storage)?
+                        .is_some()
+                    {
+                        return Err(damaged("multiple operations claim one accepted sequence"));
+                    }
+                    count += 1;
+                }
+                drop(seen);
+                if count == 0 {
+                    break;
+                }
+                tx.commit().map_err(storage)?;
+                within_budget()?;
             }
-            tx.commit().map_err(storage)?;
-            within_budget()?;
+        }
+        if header
+            .actor_namespace
+            .as_ref()
+            .is_some_and(|n| n.assigned_operations != attributed)
+        {
+            return Err(damaged(
+                "attributed receipt count differs from namespace watermark",
+            ));
         }
         drop(proof);
         within_budget()?;

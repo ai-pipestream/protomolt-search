@@ -467,16 +467,14 @@ root cost what they cost before (0.24 to 0.88 s, a 23 MB root).
   band gives segment pruning something to skip within a leaf
   (`docs/segment-pruning.md`).
 - The boolean lexical clause's MUST filter leaf now resolves over its
-  narrower exact siblings' members instead of every row of the shard
-  ("The boolean lexical clause", below): on the proof child the filter
-  phase fell from 14.6 ms to 0.0-6.7 ms depending on the sibling's
-  width, with identical answers. The fleet's 600 ms on the shape is
-  not re-measured since; the Pi two-thirds should fall the same way.
+  narrower exact siblings' members instead of every row of the shard,
+  and an empty MUST intersection short-circuits before the dense
+  membership. Fleet-proven on 2026-09-07/08 (the rollout section
+  below): the lexical+filter boolean shapes fell 532 to 59 ms and 619
+  to 130 ms warm over 86.6M rows with bitwise-identical answers, and
+  the dense+filter surcharge the first roll introduced is closed.
 - The log replay's children declare their column tables in record
   order; they should pin the sources' order as the transplant does.
-- The partitioned compaction of a served catalog that has no log (the
-  split's children): the transplant fed into the shadow build,
-  designed in `docs/replay-from-segments.md`.
 - Control-plane leases for the scan rate.
 
 ## The backfill proof (2026-09-07)
@@ -751,3 +749,156 @@ documents, 237 fields) has 0 problems; the band-filter shapes on
 tables above (boolean lexical with `court == "scotus"` 568 ms against
 the plain shape's 95 ms, the lexical `year >= 2018` pair 651 against
 47 ms, the same top ids on each pair).
+
+## 2026-09-07: the boolean rollout, prepared (cutover awaits authorization)
+
+The narrowed MUST filter leaf (`1a74f97`, "The boolean lexical clause"
+above) is proven offline; the fleet proof waits on an authorized
+cutover of the serving binary. Everything short of the cutover is done.
+
+**The build.** Current `main` `92b11fb`, staged on krick-1 as
+`bin-v11/pipestream-search.92b11fb` (md5 `a600b23b…`); the serving
+fleet is verified at `a9bf470` (md5 `cf03f4bd…`, all 15 processes).
+The new binary carries the filter-domain narrowing plus the merged
+foundations work; the A/B switch
+`PIPESTREAM_SEARCH_BOOLEAN_FILTER_FULL_SCAN` forces the old whole-shard
+scan on the new binary.
+
+**Reversibility, from the code.** A serve-only roll to `92b11fb` is
+reversible to `a9bf470` without touching shard data:
+
+- WAL manifests of populated generations are not re-stamped on open
+  (the re-stamp fires only when the manifest already declares derived
+  columns or a column table, `src/wal.rs`); an EMPTY generation would
+  be stamped format 8 and refused by the old binary, so the runbook
+  checks for empty `gen-*` dirs first. The fleet's generations are all
+  populated.
+- No ingest during the window: new-feature appends (index policy,
+  derived, integer map, identity) are what bump the WAL format past
+  what `a9bf470` reads. Flushes and seals trip no gate.
+- A segment sealed during the window stays within the column kinds the
+  old binary knows, because the fleet's mapping declares no integer
+  maps, derived columns, or index policies (the kinds added by the
+  merge are emitted only when those are present).
+- The replay journal has no production caller on this main; the
+  coordinator persists nothing versioned; the turbovec pin
+  (`turbovec-pipestream-s20`) and the `.tv`/`PMEXACT1` constants are
+  unchanged between the two builds.
+
+**The driver.** `examples/fleet_boolean.rs` runs the documented shapes
+through a root over mTLS, k = 10, printing per-round wall time, the
+profile's selection/total ms and segment/shard pruning counters, the
+hits as `doc_id:score_bits:rank`, and per-shape FNV-1a digests over
+every round's hits. Equal digests are the answer-equality gate; the
+boolean and allowlist variants of one filter already digest equal on
+both roots.
+
+**Before, `a9bf470`, warm (round 3 of 3), from krick:**
+
+| shape | all 7 shards (`:19391`) | the 6 krick-1 shards (`:19394`) | Pi/relay share |
+|---|---|---|---|
+| lexical "grandfathered status" AND dense row 7 | 308 ms | 136 ms | 172 ms |
+| lexical "qualified immunity" AND dense row 7 | 387 ms | 175 ms | 212 ms |
+| lexical "qualified immunity", `court == "scotus"` | 532 ms | 130 ms | 402 ms |
+| lexical "qualified immunity", `year >= 2018` | 619 ms | 8 ms (no rows) | 611 ms |
+| dense row 7, `court == "scotus"` | 565 ms | 139 ms | 426 ms |
+| dense row 7, `year >= 2018` | 848 ms | 15 ms | 833 ms |
+| allowlist "qualified immunity", `court == "scotus"` | 51 ms | 18 ms | 33 ms |
+| allowlist "qualified immunity", `year >= 2018` | 10 ms | 1 ms | 9 ms |
+
+Roots' VmHWM 24 MB before and after the runs; the `search-v10` scope
+sits at 15.2 GB current / 21.5 GB peak. Digests on `:19391`:
+`lex-qualified+scotus` = `9ed31c7d…`, `lex-qualified+year2018` =
+`3deb03a0…`, `dense+scotus` = `0b08d071…`, `dense+year2018` =
+`67b67745…`, the two AND shapes `f8cc2722…` / `50dafed0…`.
+
+**The cutover plan, when authorized.** krick-1 first, Pis second,
+roots last, one scope at a time, each step verified before the next:
+(1) confirm no empty `gen-*` WAL dir on any shard; (2) `rebuild.sh
+down`, swap `bin-v11/pipestream-search` to the staged file by rename
+(the old file stays as `pipestream-search.a9bf470`), `rebuild.sh
+serve`, wait for health on every shard; (3) the same on pi5v1 and
+pi5v3 with their binary built on pi5v1 from the pinned commit; (4)
+restart the three roots and the krick-only root on the new binary;
+(5) re-run the driver against `:19391` and `:19394`, compare digests
+per shape first, then warm and cold (first round after the restart)
+latencies and the pruning counters; (6) read every scope's
+`memory.stat` and each root's VmHWM. Reversal is the same procedure
+with the old file renamed back; the conditions above keep the shards
+untouched either way. Any digest mismatch stops the roll at the step
+that introduced it, and the discrepancy is investigated before any
+improvement is claimed.
+
+**After, `92b11fb`, measured 2026-09-07 23:25-23:31 under operator
+authorization.** The roll followed the plan above: roots stopped,
+`rebuild.sh down`, binary swapped by rename (the old file stays as
+`pipestream-search.a9bf470.serving`), `serve` (1,179 s), the Pis on an
+aarch64 build of the same commit (pi5v3 then pi5v1 with the relay), the
+three roots last. Every node process verified by `/proc/<pid>/exe` md5
+against the staged file. The v11 bands and their root stayed on
+`a9bf470` and are not part of this measurement. Every shape's digest
+matches the before run on both roots — ids, scores, and ranks bitwise
+identical over all 240 hits.
+
+| shape (warm, round 3) | all 7 shards before | after | krick-1 only before | after |
+|---|---|---|---|---|
+| lexical "grandfathered status" AND dense row 7 | 308 ms | 295 ms | 136 ms | 107 ms |
+| lexical "qualified immunity" AND dense row 7 | 387 ms | 377 ms | 175 ms | 151 ms |
+| lexical "qualified immunity", `court == "scotus"` | 532 ms | **59 ms** | 130 ms | **23 ms** |
+| lexical "qualified immunity", `year >= 2018` | 619 ms | **130 ms** | 8 ms | 10 ms |
+| dense row 7, `court == "scotus"` | 565 ms | 588 ms | 139 ms | 155 ms |
+| dense row 7, `year >= 2018` | 848 ms | 896 ms | 15 ms | 31 ms |
+| allowlist "qualified immunity", `court == "scotus"` | 51 ms | 49 ms | 18 ms | 18 ms |
+| allowlist "qualified immunity", `year >= 2018` | 10 ms | 10 ms | 1 ms | 1 ms |
+
+The lexical+filter boolean shapes — the ones whose cost was the filter
+leaf's whole-shard column scan — drop 5.7 to 9 times on the krick-1
+shards and 4.8 to 9 times across the fleet, landing at the allowlist
+shape's cost (59 ms against 49 ms), because the filter now reads its
+column only over the lexical sibling's members. The AND-dense shapes
+gain a little (the filter leaf is absent there; the residual is the
+dense scan and the coordinator). The two dense+filter shapes gain
+nothing and pay a small, stable surcharge — +23 to +48 ms on the full
+root, +16 ms on the krick-1 set where the filter matches no rows at
+all: the new evaluation order resolves the exact leaves first, so the
+dense membership bitmap (rows with a vector, a per-shard structure the
+segment pruning does not shrink) is paid even when the filter leaf
+would have emptied the group first. An empty-MUST short-circuit is the
+fix; the allowlist controls (unchanged route) hold at 51/49 and 10/10,
+so the conditions are comparable. Cold rows (first round after the
+restart) have no before counterpart on the previously warm fleet; the
+after cold rows run 1.1 to 11 times the warm figures
+(lex-grandfathered+dense 3,295 ms cold against 295 ms warm is the
+dense scan's cold read), recorded here so the next roll measures cold
+against cold. Roots' VmHWM after: 24.7 MB (`:19391`), 24.2 MB
+(`:19394`); the search-v10 scope peaks at 21.5 GB of its 28 GB cap,
+all from the fresh segment read at serve.
+
+**The surcharge fix, rolled and re-measured (2026-09-08 01:25-02:00).**
+The dense+filter surcharge was root-caused offline: the domain fill
+walked every domain bit with a per-slot pruned-range check even inside
+fully pruned spans, and a domain as wide as the shard paid that fill
+for no narrowing. `9c7f0d9` walks domain bits by word within admitted
+spans only, fills by domain only when the domain is under half the
+admitted set, and resolves each group's MUST children cheapest-first
+with an empty-intersection short-circuit (the dense membership is
+skipped once a MUST group is provably empty). The fleet rolled to
+`9c7f0d9` by the same procedure (krick-1 serve 1,179 s, the Pis, the
+roots); every shape's digest matches the before run again on both
+roots. Warm, round 3, against the `a9bf470` before column above:
+
+| shape | before | 92b11fb | 9c7f0d9 |
+|---|---|---|---|
+| `:19391` lexical, `court == "scotus"` | 532 ms | 59 ms | 57 ms |
+| `:19391` lexical, `year >= 2018` | 619 ms | 130 ms | 129 ms |
+| `:19391` dense, `court == "scotus"` | 565 ms | 588 ms | 572 ms |
+| `:19391` dense, `year >= 2018` | 848 ms | 896 ms | 870 ms |
+| `:19394` dense, `year >= 2018` (no rows) | 15 ms | 31 ms | 6 ms |
+| `:19394` dense, `court == "scotus"` | 139 ms | 155 ms | 140 ms |
+| `:19391` allowlist, `court == "scotus"` (control) | 51 ms | 49 ms | 51 ms |
+
+The zero-match shape lands under the old baseline (the dense membership
+is skipped outright); the non-empty dense+filter shapes return to
+within 1-3% of baseline, the deliberate residual of resolving the dense
+membership before the filters in a non-empty group. Roots' VmHWM 24 MB;
+the search-v10 scope peak 21.5 GB, unchanged.

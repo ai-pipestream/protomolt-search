@@ -1237,6 +1237,83 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: exclusive control-store ownership.** The JSON authority
+  keeps one persistent file lock across state replacements and every service
+  clone. Recovery requires closing all prior holders; private temporary files
+  cannot truncate an existing path. See [control ownership](docs/cluster-control.md#exclusive-file-ownership)
+  and the [authority convergence boundary](docs/raft-control-design.md#single-authority-convergence-boundary-2026-09-08).
+  The [capacity-tier review](docs/capacity-tiers-review.md) records the contract
+  corrections required before planner implementation.
+  Validation: 730 library tests, 150 integration targets, embedded/mobile and
+  unchanged-wire checks passed within the 8 GiB cap, with no swap or OOM.
+
+- **Foundation branch: closed managed-source storage.** An existing controlled
+  catalog can bind to an exact committed owner preparation while preserving
+  history and actor-scoped retries. Managed reopen stays closed and legacy
+  writers refuse it. See [managed source binding](docs/managed-source-binding.md)
+  for the durable boundary and remaining readiness/admission work. Validation:
+  720 library tests, 150 integration targets, embedded/mobile and wire checks;
+  lost-response recovery and metadata-budget refusals are covered.
+
+- **Foundation branch: transactional source-owner preparation.** A separate
+  protobuf-defined control store commits owner/workflow state, current policy
+  and actor-scoped retry decisions atomically. Preparation and cancellation
+  preserve source history and phone residency without activating a writer.
+  See [source authority storage](docs/source-authority-storage.md) for the
+  contract, full-suite validation and remaining managed-owner/Raft integration.
+
+- **Foundation branch: control-state failure boundaries.** Ambiguous state-file
+  publication closes the shared control authority until an explicit existing-file
+  reopen. Collection binding and reconciliation keep failed candidate changes
+  out of shared memory. Six fault/recovery regressions, the full 150-target
+  integration gate and five mobile compilation targets pass under the 8 GiB,
+  swap-disabled scope. See [control recovery](docs/cluster-control.md#persistence-failures-and-recovery)
+  for the single-authority scope and remaining managed-owner work.
+
+- **Foundation branch: receiving-side logical source writes.** The programmatic
+  `DocumentWriteService` adapter authenticates each caller and pins local Ingest
+  permission through the catalog transaction. Version-2 requests bind the exact
+  source history; actor-scoped retries recover the original durable receipt.
+  Blocking work retains its byte and execution permits after RPC cancellation.
+  The full local gate passed 688 library tests, 150 integration targets and all
+  five mobile compilation checks under an 8 GiB, swap-disabled memory cap.
+  This adapter serves explicitly provisioned local catalogs; runtime routing,
+  managed owner activation and remote authority enforcement remain integration
+  work. See [network source acceptance](docs/network-ingest-authorization.md).
+
+- **Foundation branch: policy publication and completed revocation.** Local
+  permission pins retain an admitted policy epoch through synchronous commit.
+  Replacement publishes new grants, then drains old admissions
+  before returning success; new checks remain available during that drain.
+  Concurrent replacements cannot skip an unfinished drain. The full local gate
+  at `d0e623fc` passed 1,600 reported Rust tests, nine comparator tests and all
+  five mobile checks, with zero swap/OOM in an 8 GiB scope. See
+  [source access](docs/source-access.md#policy-admission-validation).
+
+- **Foundation branch: validated main reconciliation.** Checkpoint `12ba5433`
+  incorporates main `9c7f0d9`, including WAL-free partitioned compaction and the
+  Boolean empty-MUST short circuit. The combined local gate passed 1,592
+  reported Rust tests across the library, 149 integration targets, embedded
+  package and IVF adapter, plus nine comparator tests and five mobile checks.
+  All 648 input hashes remained unchanged; the 8 GiB scope had zero swap/OOM.
+  See [protobuf wire semantics](docs/protobuf-wire-semantics.md).
+
+- **Foundation branch: measured proto2/proto3 wire boundaries.** The 26-case
+  fixture records strict UTF-8 and 64-bit varint boundaries against pinned C++
+  and upb observations. Empty mapped secondary text retains extraction presence
+  and source bytes but is omitted from the secondary analyzer input. The full
+  gate at `e9854f3` passed 1,582 reported Rust tests, nine comparator tests and
+  all five mobile compilation checks, with zero swap/OOM in an 8 GiB scope.
+  See [protobuf wire semantics](docs/protobuf-wire-semantics.md) and the
+  [fixture contract](tests/fixtures/protobuf-semantics/README.md).
+
+- **Foundation branch: actor-scoped retry ownership.**
+  Controlled source acceptance keys receipts by the pinned authenticated principal
+  and operation ID. Format 8 retains legacy decisions until explicit Admin
+  attribution completes; migration preserves original receipts and lifecycle
+  fences. Checkpoints include both retry namespaces. See
+  [source access and migration](docs/source-access.md#actor-scoped-retry-ownership).
+
 - **Foundation branch: protobuf wire-type compatibility.** A known field number
   with an incompatible wire type is treated as unknown before changing presence
   or oneof state. Framing and required-field checks remain strict. The reference
@@ -1261,7 +1338,7 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   request private `0600` permissions, with a permissive-umask regression test.
   Checkpoint `7be8a3a`
   passed 1,546 tests, all five mobile checks and wire compatibility validation.
-  See [source access](docs/source-access.md) for format 7 and remaining ownership
+  See [source access](docs/source-access.md) for controlled formats and remaining ownership
   and routing integration.
 
 - **Foundation branch: durable admission closure before source retirement.**
@@ -2080,6 +2157,31 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   Declared columns reject `math.abs(i64::MIN)`, which has no exact signed
   64-bit result. Missing input, per-request materialization absence and untaken
   ternary branches keep their prior behavior. [Derived columns](docs/derived-columns.md).
+- **Landed 2026-09-08: the fleet boolean proof, the short-circuit, and
+  compaction without a log.** The fleet rolled to the merged main under
+  operator authorization (reversible: populated WAL generations are not
+  re-stamped, the rolled-back binary reads every byte the new one
+  writes in a serve-only window); the boolean driver
+  (`examples/fleet_boolean.rs`) proves identical ids, scores, and ranks
+  per shape before and after, and the lexical+filter boolean shapes run
+  532 to 59 ms and 619 to 130 ms warm over 86.6M rows, the filter leaf
+  resolved over its narrower sibling's members. The dense+filter
+  surcharge the first roll introduced was root-caused (a per-slot
+  pruned-range check inside fully pruned spans) and fixed: domain fills
+  walk admitted spans by word, wide domains take the plain fill, and an
+  empty MUST intersection short-circuits before the dense membership —
+  the zero-match shape now beats the old baseline. `CompactShard` now
+  compacts a catalog with no WAL: rows come from the sealed segments
+  through the transpose, keyed by the partition column, with the
+  bounded parallel build (`build_threads`/`build_queue`/`build_memory`
+  on the request), post-cutoff writes caught up through the ingest
+  apply path, tombstones translated through the id map, declared
+  columns and derived fingerprints preserved, and a crash around the
+  manifest publish rolled back at open. Tests:
+  `tests/compaction_from_segments.rs`, `tests/boolean_filter_domain.rs`.
+  [Rollout and proof](docs/benchmarks/fleet-placement-2026-09.md),
+  [replay from segments](docs/replay-from-segments.md).
+
 - **Landed 2026-09-07: derived-column proofs, a bounded transplant
   budget, and a narrowed Boolean filter leaf.** Derived columns close
   out: boundary proofs through the evaluator (year 1, epoch zero,

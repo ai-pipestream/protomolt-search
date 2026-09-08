@@ -34,6 +34,38 @@ cases and retain both parser observations. The other cases keep their pinned
 upb reference; this is not a blanket claim that either runtime defines every
 protobuf edge case. See the [fixture generation contract](../tests/fixtures/protobuf-semantics/README.md).
 
+## Measured proto2/proto3 scalar boundaries
+
+A separate boundary fixture records 26 inputs, 13 under each syntax, observed
+with C++ `protoc 25.1` and Python protobuf 6.33.5 using upb. Product
+dispositions are explicit rather than inferred from either reference or from a
+Rust run: 14 cases are accepted and 12 are refused. Accepted controls include
+ASCII and multibyte UTF-8, canonical zero, a noncanonical ten-byte zero,
+`uint64` maximum, `int64` minimum and ten-byte negative one. Their projected
+signed and unsigned values are asserted exactly. These wire-width cases do not
+change or test later `int32` narrowing.
+
+Strings must be valid UTF-8 under both syntaxes. Varints whose final byte carries
+payload above 64 bits and truncated varints are malformed. These rules match the
+[proto2 string requirement](https://protobuf.dev/programming-guides/proto2/#scalar)
+and the [ten-byte unsigned-64 varint domain](https://protobuf.dev/programming-guides/encoding/#varints).
+They intentionally refuse eight inputs accepted by both measured references:
+the two invalid-UTF-8 proto2 strings, plus three overwide final-byte varints
+under each syntax. Proto3 invalid UTF-8 and truncated varints agree with the
+reference refusals. For malformed recognized fields, errors name the innermost
+known field or registered extension without including values; unknown framing
+may have only enclosing or document context. The strict UTF-8 and
+greater-than-64-bit refusal policy is unchanged; the fixture makes its
+boundaries and diagnostics permanent.
+
+The empty-secondary-mapped-text correction preserves the data-model boundary.
+Mapped extraction and accepted-source prepared protobuf rows retain explicit
+empty field presence. At `IngestSource::next`, only an empty mapped secondary
+string is omitted from the actual secondary analyzer input. Original source
+bytes remain unchanged. Plain ingest keeps its existing raw-empty refusal, and
+the main body, facets, whitespace-only and stopword-only values keep their
+existing rules.
+
 ## Preservation and compatibility
 
 The original descriptor and payload are retained independently of the projection
@@ -51,6 +83,66 @@ permission enforcement remain unfinished.
 
 ## Verification
 
+Both empty-secondary ingestion paths reproduced their rejection before the fix.
+Malformed UTF-8 and overwide-varint tests also failed before field context was
+added to their errors. An initial attempt
+omitted the value during mapping and failed the existing optional-presence
+regression; it was reverted and the boundary moved without weakening that test.
+A staged fixture initially dropped unknown options, so its reflected edit was
+corrected before reproducing the staging rejection.
+
+Focused validation then passed 6 library and 94 integration tests: 14
+descriptor, 7 projection, 21 staging, 24 mapped, 8 multi-field wire and 20
+semantic tests. The existing optional-presence test passed. All 646 input hashes
+remained stable in an 8 GiB, swap-disabled scope that reached the cap, recorded
+99 `memory.max` events and zero OOM events.
+
+The pinned reference generator reproduced all 26 observations with only the
+two protoc timestamp/PID prefixes normalized for comparison. Both raw outputs
+were retained. Nine comparator tests and the command-line same-path and
+existing-output refusals passed; the reference scope peaked at 33,472,512 bytes
+with zero swap/OOM and 647 unchanged input hashes.
+
+The combined full gate at `12ba5433`, after incorporating main `9c7f0d9`,
+passed 684 library tests, all 149 integration targets (893 reported passes and
+one existing ignored live-OpenNLP test), 13 embedded tests and two IVF tests:
+1,592 reported Rust passes. The nine reference-comparator tests, all five
+Android/iOS compilation checks, tests/examples compilation, formatting,
+vendored-proto checks and diff checks also passed. Reported counts include the
+child-process regression invocation in `source_access`.
+
+The merge-aware contract checked all 21 product/vendored protobuf files.
+Relative to common ancestor `0c5c7ef`, main changes only `search.proto`, adding
+`CompactShardRequest.build_threads`, `build_queue` and `build_memory` at fields
+5, 6 and 7, plus response comment clarifications. The feature parent `c2b704d`
+changes only `document_catalog.proto` and `document_write.proto` for controlled
+source binding and actor retry ownership. These delta sets are disjoint; every
+merged proto equals its selected parent's bytes. The original `cases.json`
+and `descriptor.bin` fixtures remain byte-identical to `3575772`.
+
+The driver verified clean HEAD `12ba5433` and identical hashes for all 648 input
+files before and after validation. Its 8 GiB hard memory limit was reached,
+with 45,509 memory-limit events and 417 socket-throttling events, zero swap and
+zero OOM events. The preserved driver, per-target logs, hash manifest and
+resource record use `/tmp/psearch-main9c-full-*` on the validation host. This
+is local correctness evidence, not hosted CI or fleet performance evidence.
+
+The earlier full gate at `e9854f3` passed 680 library tests, all 148 integration targets
+(887 reported passes and one existing ignored live-OpenNLP test), 13 embedded
+tests and two IVF tests. The nine reference-comparator tests also passed.
+All five Android/iOS compilation checks, tests/examples compilation, formatting,
+vendored-proto checks and diff checks passed. All 21 product/vendored protobuf
+files and the original `cases.json` and `descriptor.bin` fixtures are
+byte-identical to `3575772`.
+
+The driver verified a clean, unchanged HEAD and identical hashes for all 647
+files before and after validation. The full scope reached its 8 GiB cap,
+recorded 39,518 memory-limit events and four socket-throttling events, with zero
+swap and zero OOM events. Another task's release build ran concurrently for part
+of the gate; these are correctness results, not a latency or fleet measurement.
+This validates the scalar-boundary and empty-field checkpoint; source routing
+and remote permission enforcement remain unfinished.
+
 The focused gate passes 117 reference cases within the protobuf unit test, all
 20 public semantic tests and the mapped-ingest binding/reopen regression. The
 two public regressions and the ingest regression reproduced semantic failures
@@ -67,7 +159,7 @@ field made the count 19 rather than 18. Commit `de96f0b` changes only that
 assertion. A manifest comparison verified every other tracked file against the
 initial run before resuming at the affected integration group. The original
 failure logs were preserved; the resumed run passed with unchanged file hashes.
-Combined unique results are 1,555 passed, zero failed and one existing ignored
+Combined reported results are 1,555 passed, zero failed and one existing ignored
 test across the library, 146 integration targets, embedded package and IVF
 adapter. This is combined evidence across the test-only correction, not a claim
 that the initial invocation succeeded.

@@ -73,8 +73,8 @@ pub mod wal {
 /// includes them flat — re-export the referenced ones under that name.
 pub mod v1 {
     pub use super::{
-        AcceptDocumentRequest, AddDocumentsRequest, AddVectorsRequest, DerivedColumns,
-        DocumentWriteReceipt, FlushResponse, IngestMappedRequest, QueryStreamResponse,
-        ReplayStreamBinding, SnapshotArtifact, VectorBackendConfig,
+        AcceptDocumentRequest, AddDocumentsRequest, AddVectorsRequest, CollectionGrant,
+        DerivedColumns, DocumentWriteReceipt, FlushResponse, IngestMappedRequest,
+        QueryStreamResponse, ReplayStreamBinding, SnapshotArtifact, VectorBackendConfig,
     };
 }

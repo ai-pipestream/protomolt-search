@@ -259,7 +259,7 @@ impl DocumentCatalog {
                 .map(|t| t.name().to_owned())
                 .collect::<Vec<_>>();
             let mut meta = tx.open_table(META).map_err(storage)?;
-            let header: DocumentCatalogHeader = decode(
+            let header: DocumentCatalogHeader = decode_header(
                 meta.get("header")
                     .map_err(storage)?
                     .ok_or_else(|| Status::data_loss("catalog header missing"))?
@@ -527,7 +527,7 @@ impl DocumentCatalog {
         catalog.with_durable_snapshot(|snapshot| {
             let tx = self.database.begin_read().map_err(storage)?;
             let meta = tx.open_table(META).map_err(storage)?;
-            let header: DocumentCatalogHeader = decode(
+            let header: DocumentCatalogHeader = decode_header(
                 meta.get("header")
                     .map_err(storage)?
                     .ok_or_else(|| Status::data_loss("catalog header missing"))?
@@ -590,7 +590,7 @@ impl DocumentCatalog {
         };
         let intent: MaintenanceIntent = decode(bytes.value())?;
         let meta = tx.open_table(META).map_err(storage)?;
-        let header: DocumentCatalogHeader = decode(
+        let header: DocumentCatalogHeader = decode_header(
             meta.get("header")
                 .map_err(storage)?
                 .ok_or_else(|| Status::data_loss("catalog header missing"))?
@@ -653,7 +653,7 @@ impl DocumentCatalog {
             let result;
             {
                 let meta = tx.open_table(META).map_err(storage)?;
-                let header: DocumentCatalogHeader = decode(meta.get("header").map_err(storage)?.ok_or_else(|| Status::data_loss("catalog header missing"))?.value())?;
+                let header: DocumentCatalogHeader = decode_header(meta.get("header").map_err(storage)?.ok_or_else(|| Status::data_loss("catalog header missing"))?.value())?;
                 validate_current_header(&header)?;
                 let mut states = tx.open_table(STATES).map_err(storage)?;
                 let mut state: ProjectionJournalState = decode(states.get(key).map_err(storage)?.ok_or_else(|| Status::not_found("maintenance index is not registered"))?.value())?;

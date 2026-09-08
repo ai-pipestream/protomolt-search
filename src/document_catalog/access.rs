@@ -19,7 +19,7 @@ pub(super) fn validate_binding(binding: &SourceResourceBinding) -> Result<(), St
     Ok(())
 }
 
-fn authorize<'a>(
+pub(super) fn authorize<'a>(
     binding: &SourceResourceBinding,
     permit: &'a AccessPermit,
     action: AccessAction,
@@ -43,8 +43,10 @@ fn authorize<'a>(
 /// No inner catalog accessor exists: future retrieval/publication adapters must
 /// enforce their own document/field grants and admission protocol.
 pub struct AccessControlledCatalog {
-    inner: DocumentCatalog,
-    binding: SourceResourceBinding,
+    pub(super) inner: DocumentCatalog,
+    pub(super) binding: SourceResourceBinding,
+    #[cfg(all(test, feature = "net"))]
+    pub(super) bind_fault: Option<super::managed::BindFault>,
 }
 
 impl AccessControlledCatalog {
@@ -77,6 +79,8 @@ impl AccessControlledCatalog {
         Ok(Self {
             inner,
             binding: binding.clone(),
+            #[cfg(all(test, feature = "net"))]
+            bind_fault: None,
         })
     }
 
@@ -84,13 +88,48 @@ impl AccessControlledCatalog {
         &self.binding
     }
 
+    /// Discover the pinned local history without disclosing source records.
+    pub fn write_target(
+        &self,
+        permit: &AccessPermit,
+    ) -> Result<crate::pb::DocumentWriteTarget, Status> {
+        let _guard = authorize(&self.binding, permit, AccessAction::Ingest)?;
+        let transaction = self.inner.database.begin_read().map_err(storage)?;
+        let metadata = transaction.open_table(META).map_err(storage)?;
+        let header: DocumentCatalogHeader = decode_header(
+            metadata
+                .get("header")
+                .map_err(storage)?
+                .ok_or_else(|| Status::data_loss("catalog header missing"))?
+                .value(),
+        )?;
+        validate_current_header(&header)?;
+        self.inner.validate_resource_binding(&header)?;
+        Ok(crate::pb::DocumentWriteTarget {
+            workspace: self.binding.workspace.clone(),
+            collection: self.binding.collection.clone(),
+            history_id: header.history_id,
+        })
+    }
+
     pub fn accept(
         &self,
         permit: &AccessPermit,
         request: &AcceptDocumentRequest,
     ) -> Result<DocumentWriteReceipt, Status> {
-        let _guard = authorize(&self.binding, permit, AccessAction::Ingest)?;
-        self.inner.accept(request)
+        let guard = authorize(&self.binding, permit, AccessAction::Ingest)?;
+        self.inner
+            .accept_as(request, Some(&guard.decision().principal))
+    }
+
+    /// Attribute one legacy retry decision without changing its receipt or source.
+    pub fn assign_legacy_actor(
+        &self,
+        permit: &AccessPermit,
+        request: &crate::pb::storage::SourceActorAssignment,
+    ) -> Result<(), Status> {
+        let _guard = authorize(&self.binding, permit, AccessAction::Admin)?;
+        self.inner.assign_legacy_actor(request)
     }
 
     pub fn begin_retirement(

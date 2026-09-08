@@ -398,8 +398,18 @@ fn source_history_audit_rejects_corruption_beyond_the_latest_head() {
             _ => unreachable!(),
         }
         tx.commit().unwrap();
-        let checkpoint = source.capture_checkpoint(1 << 20).unwrap();
         let scratch = dir.0.join("audit");
+        if damage == "receipt_missing" {
+            let error = source.capture_checkpoint(1 << 20).err().unwrap();
+            assert_eq!(error.code(), Code::DataLoss, "{damage}: {error}");
+            assert!(
+                error.message().contains("operation table counts"),
+                "{error}"
+            );
+            assert!(!scratch.exists(), "{damage}");
+            continue;
+        }
+        let checkpoint = source.capture_checkpoint(1 << 20).unwrap();
         let error = checkpoint
             .verify_source_history(&scratch, 1 << 20, 32 << 20)
             .unwrap_err();

@@ -251,30 +251,71 @@ appended, and every child segment carries the declaration entry.
 ## Partitioned compaction of a catalog without a log
 
 The children of a segmented split have no WAL: the spill logs build the
-catalog and are removed. `CompactShard` replays the log into its
-outputs and refuses a shard without one by name (`src/compaction.rs`),
-so the partitioned compaction cannot run on such a child today. The
-year cut above removes the need for a fresh split. For a catalog that
-is served and takes writes (a tail sealed by row count, in ingest
-order), the compaction wants the same transplant: build the outputs
-from the shard's sealed segments through `FieldTranspose`, rows keyed
-by the partition column, the tail that arrives after the cutoff sealed
-unordered as it is now. That keeps the shadow and cutover contract
-(`docs/mutations.md`): the outputs are staged under the work directory,
-the tail is caught up through the same apply functions ingest uses,
-and the cutover publishes one manifest. The pieces that differ from the
-log replay: the row source (segments, the live overlay applied, instead
-of log records), the analysis (transplanted, never the sidecar), and
-the precondition (a catalog with a generation binding and sealed
-segments, instead of a complete log). It is not in this change; the
-plan is recorded here so the next step starts from the same transpose.
+catalog and are removed. `CompactShard` on such a catalog compacts it
+from the segments now (`src/compaction.rs`, the from-segments path;
+`src/reshard.rs`, `compact_segments_partitioned`): the transplant above,
+online, under the shadow and cutover contract of `docs/mutations.md`.
+Anything less qualified keeps the old refusal by name — the single-image
+layout, a catalog with no sealed segment, one with no generation binding
+— and a catalog with a WAL replays it as before; the build knobs below
+are the from-segments path's alone and a logged shard refuses them by
+name.
+
+The pieces that differ from the log replay:
+
+- **The row source** is the sealed set as of a seal the run performs
+  first (the cutoff): every field transposed per segment, the
+  live-document overlay at the cutoff applied, and text, lineage,
+  original protobuf source and identity, columns, and the FP32 rows
+  copied; the analyzer never runs. Every segment must share one field
+  table, one fingerprint per field, one column table, one derived-column
+  declaration, and one provider state; a difference is refused naming
+  the segment. The outputs pin the tables and the declaration (the
+  kind-15 entry) on every segment, and a node whose declaration differs
+  from the catalog's refuses, naming both.
+- **The cut** reuses the split's: `partition_column` is required (with
+  no log there is no bucket layout to keep), the live rows are keyed by
+  it and cut at `tail_bound` rows per segment through `ChildCutPlan`,
+  the rows without the value in one final unkeyed segment. The build
+  takes the split's bounds — `build_threads`, `build_queue`, and
+  `build_memory` on the request map to `SegmentCompactionOptions`: the
+  cuts' slot ranges come from the spill's own row counts, so the
+  threaded build appends in cut order and is byte for byte the serial
+  build's (`tests/compaction_from_segments.rs`), and a plan over the 70
+  KiB/row estimate refuses by name, nothing lowered to fit.
+- **The tail** is caught up through the same seal ingest uses
+  (`seal_tail`), never a log replay: writes that arrive after the cutoff
+  land in the live catalog as ordinary unordered segments and the
+  cutover re-bases them behind the dense partitions; deletes and
+  replacements after the cutoff translate through the build's id map
+  into the new overlay, which stays the tombstone authority.
+
+The cutover holds the `docs/mutations.md` contract: the outputs staged
+under the catalog root hashed, fsynced, and unpublished; one manifest
+published through the catalog's own commit (so the source-owner and
+pending-publication fences apply, and a source-managed catalog is
+refused at the preflight like any legacy mutation); the manifest backup
+and the commit marker first (the marker carries `walless`, and its
+rollback removes no log); the closing flush completes the marker and
+retires the replaced segments. A crash before the marker leaves torn
+staging that a retry refuses by name; a crash between the marker and
+the closing flush rolls back at open to the manifest the cutover kept.
+The response's `wal_generation` and `cutoff_clock` are 0 on this path:
+no log is rewritten, and the catalog stays unlogged, so a later
+compaction transplants it again and `reshard` still takes the source
+catalogs of a new split.
 
 ## Reference
 
 `src/postings.rs` (`FieldView::transpose`, `FieldTranspose`),
 `src/reshard.rs` (`TreeRowSource`, `SpillCut`, the analysis sidecar,
-`build_child` with transplanted fields, `BUILD_BYTES_PER_ROW`),
+`build_child` with transplanted fields, `BUILD_BYTES_PER_ROW`,
+`compact_segments_partitioned` with `SegmentCompactionOptions`),
 `src/wal.rs` (`WalWriter::append_to_bucket`), `src/segments.rs`
-(`SegmentCatalog::publish_partition_key`), `examples/reshard.rs`
-(`--from-segments`, `--cut-column`, `--cut-rows`, `--build-threads`,
-`--build-queue`, `--build-memory`), `tests/replay_from_segments.rs`.
+(`SegmentCatalog::publish_partition_key`), `src/compaction.rs` (the
+from-segments path: `preflight_segments`,
+`compact_from_segments`, the tail seal catch-up, and the
+marker/`walless` cutover), `examples/reshard.rs` (`--from-segments`,
+`--cut-column`, `--cut-rows`, `--build-threads`, `--build-queue`,
+`--build-memory`), `tests/replay_from_segments.rs`,
+`tests/compaction_from_segments.rs`.

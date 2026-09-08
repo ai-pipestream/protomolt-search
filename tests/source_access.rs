@@ -245,7 +245,7 @@ fn controlled_header_without_its_binding_is_data_loss() {
             let mut header =
                 DocumentCatalogHeader::decode(metadata.get("header").unwrap().unwrap().value())
                     .unwrap();
-            assert_eq!(header.format_version, 7);
+            assert_eq!(header.format_version, 8);
             header.resource_binding = None;
             metadata
                 .insert("header", header.encode_to_vec().as_slice())
@@ -304,7 +304,7 @@ fn policy_replacement_and_workspace_remapping_invalidate_access() {
 }
 
 #[test]
-fn retirement_seal_and_private_copy_retain_format_seven_binding() {
+fn retirement_seal_and_private_copy_retain_controlled_binding() {
     let dir = Directory::new("lifecycle");
     let authority: Arc<dyn Authorizer> =
         Arc::new(PolicyAuthority::new(policy(1, "workspace-a")).unwrap());
@@ -324,7 +324,13 @@ fn retirement_seal_and_private_copy_retain_format_seven_binding() {
         .unwrap();
     drop(catalog);
     let catalog = AccessControlledCatalog::open(&path, &binding("workspace-a"), &admin).unwrap();
-    let error = catalog.accept(&ingest, &write()).unwrap_err();
+    let replayed = catalog.accept(&ingest, &write()).unwrap();
+    assert!(replayed.replayed);
+    assert_eq!(replayed.accepted_sequence, receipt.accepted_sequence);
+    let mut new_write = write();
+    new_write.operation_id = b"accept-two".to_vec();
+    new_write.expected_version = Some(1);
+    let error = catalog.accept(&ingest, &new_write).unwrap_err();
     assert_eq!(error.code(), Code::FailedPrecondition);
     assert!(error.message().contains("retiring"), "{error}");
     let seal = catalog
@@ -342,9 +348,13 @@ fn retirement_seal_and_private_copy_retain_format_seven_binding() {
         Some(retirement.clone())
     );
     assert_eq!(catalog.history_seal(&admin).unwrap(), Some(seal.clone()));
+    assert!(catalog.accept(&ingest, &write()).unwrap().replayed);
+    let error = catalog.accept(&ingest, &new_write).unwrap_err();
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert!(error.message().contains("sealed"), "{error}");
     drop(catalog);
     let header = stored_header(&path);
-    assert_eq!(header.format_version, 7);
+    assert_eq!(header.format_version, 8);
     assert_eq!(header.resource_binding, Some(binding("workspace-a")));
     assert_eq!(header.retirement_intent, Some(retirement.clone()));
     assert_eq!(header.history_seal, Some(seal.clone()));
@@ -355,8 +365,12 @@ fn retirement_seal_and_private_copy_retain_format_seven_binding() {
     assert_eq!(copied.resource_binding(), &binding("workspace-a"));
     assert_eq!(copied.retirement_intent(&admin).unwrap(), Some(retirement));
     assert_eq!(copied.history_seal(&admin).unwrap(), Some(seal));
+    assert!(copied.accept(&ingest, &write()).unwrap().replayed);
+    let error = copied.accept(&ingest, &new_write).unwrap_err();
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert!(error.message().contains("sealed"), "{error}");
     drop(copied);
-    assert_eq!(stored_header(&copy).format_version, 7);
+    assert_eq!(stored_header(&copy).format_version, 8);
 }
 
 #[test]
@@ -381,7 +395,7 @@ fn direct_seal_retains_the_controlled_format_and_binding() {
         .unwrap();
     drop(catalog);
     let header = stored_header(&dir.catalog());
-    assert_eq!(header.format_version, 7);
+    assert_eq!(header.format_version, 8);
     assert_eq!(header.resource_binding, Some(binding("workspace-a")));
     assert!(header.retirement_intent.is_none());
     assert_eq!(header.history_seal, Some(seal.clone()));
@@ -465,4 +479,29 @@ fn source_catalog_creation_mode_worker() {
         std::fs::metadata(&controlled).unwrap().permissions().mode() & 0o777,
         0o600
     );
+}
+
+#[test]
+fn revoked_ingest_permission_denies_a_stored_retry_during_retirement() {
+    let dir = Directory::new("revoked-retirement-retry");
+    let authority = Arc::new(PolicyAuthority::new(policy(1, "workspace-a")).unwrap());
+    let admin = permit(authority.clone(), "administrator", AccessAction::Admin);
+    let ingest = permit(authority.clone(), "writer", AccessAction::Ingest);
+    let catalog =
+        AccessControlledCatalog::create(&dir.catalog(), &binding("workspace-a"), &admin).unwrap();
+    let receipt = catalog.accept(&ingest, &write()).unwrap();
+    catalog
+        .begin_retirement(
+            &admin,
+            &SourceRetirementRequest {
+                history_id: receipt.history_id,
+                operation_id: b"move-source".to_vec(),
+            },
+        )
+        .unwrap();
+    let mut revoked = policy(2, "workspace-a");
+    revoked.grants.retain(|grant| grant.principal != "writer");
+    authority.replace(revoked).unwrap();
+    let error = catalog.accept(&ingest, &write()).unwrap_err();
+    assert_eq!(error.code(), Code::PermissionDenied);
 }
