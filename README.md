@@ -1252,7 +1252,8 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   cannot truncate an existing path. See [control ownership](docs/cluster-control.md#exclusive-file-ownership)
   and the [authority convergence boundary](docs/raft-control-design.md#single-authority-convergence-boundary-2026-09-08).
   The [capacity-tier review](docs/capacity-tiers-review.md) records the contract
-  corrections required before planner implementation.
+  corrections required before planner implementation, including the remaining
+  fixture and aggregation issues in main's `3456c20` amendment.
   Validation: 730 library tests, 150 integration targets, embedded/mobile and
   unchanged-wire checks passed within the 8 GiB cap, with no swap or OOM.
 
