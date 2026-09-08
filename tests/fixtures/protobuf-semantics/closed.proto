@@ -38,6 +38,7 @@ message Doc {
   }
   optional OpenState open_state = 14;
   required bytes required_token = 15;
+  optional double score = 16;
   extensions 100 to max;
 }
 

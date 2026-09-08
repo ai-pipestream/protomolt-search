@@ -1387,7 +1387,10 @@ async fn binding_survives_restart_and_refuses_a_different_plan() {
     })
     .await;
     seed_calibration(&addr).await;
-    let response = ingest(&addr, bind(), (0..3).map(|i| doc(i).encode()).collect())
+    let mut wrong_wire_title = doc(2).encode();
+    wrong_wire_title.extend([0x10, 0x01]);
+    let original_documents = vec![doc(0).encode(), doc(1).encode(), wrong_wire_title];
+    let response = ingest(&addr, bind(), original_documents.clone())
         .await
         .expect("mapped ingest succeeds");
     assert_eq!(response.added, 3);
@@ -1409,7 +1412,7 @@ async fn binding_survives_restart_and_refuses_a_different_plan() {
                 ProtobufSource {
                     descriptor_set: case_set(),
                     message_type: "law.v1.Case".into(),
-                    payload: doc(row as usize).encode(),
+                    payload: original_documents[row as usize].clone(),
                 },
                 None
             ))

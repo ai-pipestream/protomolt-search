@@ -1237,6 +1237,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: protobuf wire-type compatibility.** A known field number
+  with an incompatible wire type is treated as unknown before changing presence
+  or oneof state. Framing and required-field checks remain strict. The reference
+  fixtures explicitly distinguish C++ and Python upb map-entry behavior; original
+  source bytes survive mapped ingest and flush unchanged. See
+  [wire semantics and compatibility](docs/protobuf-wire-semantics.md).
+
 - **2026-09-07 — Embedded collection authorization binding.** Named local
   shards now register their actual collection in the authorized facade and
   coordinator. Default requests resolve to that name before authorization;

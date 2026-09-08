@@ -135,7 +135,25 @@ impl Message for ProjectionDecoder<'_> {
         let Some(field) = field else {
             return self.message.merge_field(number, wire, buf, ctx);
         };
-        match field.kind() {
+        let kind = field.kind();
+        let expected_wire = if field.is_group() {
+            WireType::StartGroup
+        } else {
+            kind.wire_type()
+        };
+        let packed = field.is_list()
+            && wire == WireType::LengthDelimited
+            && matches!(
+                expected_wire,
+                WireType::Varint | WireType::ThirtyTwoBit | WireType::SixtyFourBit
+            );
+        if wire != expected_wire && !packed {
+            // A known number with an incompatible wire type is still unknown
+            // data. Skip before selecting a oneof or establishing presence.
+            // The source archive retains the original bytes independently.
+            return encoding::skip_field(wire, number, buf, ctx);
+        }
+        match kind {
             Kind::Enum(enumeration) if enumeration.parent_file().syntax() == Syntax::Proto2 => {
                 let mut values = Vec::new();
                 if field.is_list() {
