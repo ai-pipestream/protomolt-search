@@ -1237,6 +1237,15 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **2026-09-07 — Embedded collection authorization binding.** Named local
+  shards now register their actual collection in the authorized facade and
+  coordinator. Default requests resolve to that name before authorization;
+  an unrelated unnamed-collection grant cannot read the shard. Startup rejects
+  mixed or invalid collection names, including without a document catalog.
+  Four regressions failed against the prior runtime and pass with the fix;
+  the focused embedded target passes all eight tests. See
+  [authenticated delegation](docs/embedded-mobile.md#authenticated-delegation).
+
 - **Foundation branch: access-controlled local source catalogs.**
   Source history has an immutable persisted workspace/collection binding.
   Ingest and administration require separate permissions held through each
