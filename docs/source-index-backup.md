@@ -154,11 +154,38 @@ off-phone or other remote export.
 
 ## Terminal retirement of the source writer
 
+`DocumentCatalog::begin_retirement(SourceRetirementRequest)` closes new source
+admission before the trusted owner drains pending publication and maintenance
+work. The request binds the history and an operation ID of 1..1024 bytes. Under
+the same database writer as acceptance, it captures the current accepted
+sequence and persists a `SourceRetirementIntent` with immediate durability.
+Every write that committed before admission closed is included; the caller
+does not guess a watermark and race ongoing ingestion. It requires a durable
+catalog and does not require pending intents to have resolved yet.
+
+The source becomes format 5. New acceptance, including an exact write retry,
+new publication and maintenance preparations, and maintenance enablement all
+refuse as `retiring`. Recovery of existing source and maintenance intents
+remains allowed under the actual durable index publication fences. This is a
+narrow recovery path, not permission to prepare new work. A candidate built
+privately before closure has no admission reservation. Readers remain available.
+
+The intent remains after reopen and backup/staging, including when no index is
+registered. There is no cancellation or automatic reopening. The same begin
+request returns its original decision even after sealing; another operation ID
+refuses. An owner that loses the begin reply reads `retirement_intent()` or
+retries the request. Absence of a final `history_seal()` alone does not mean
+admission is open. This local closure does not grant control authority or
+authorize a replacement writer.
+
 `DocumentCatalog::seal_history(SourceSealRequest)` is the trusted local owner's
 durable retirement operation. The request names the source history, its exact
 expected accepted sequence and an operation ID of 1..1024 bytes. It requires
 a durable catalog. It does not accept a lease-expiry observation or an index
 epoch as a substitute for the accepted watermark.
+After admission closure, the seal must use that intent's history, captured
+sequence and operation ID. Pending decisions must still be resolved first;
+a failed seal leaves admission closed so the owner can finish recovery.
 
 The seal takes the same redb writer used by acceptance and by all projection
 and maintenance journal mutations. Before changing anything it captures the
@@ -177,9 +204,11 @@ outside a database transaction. A private staged candidate has no reservation:
 if sealing wins first, its later publication must refuse at preparation.
 
 The header and `SourceHistorySeal` are committed together with immediate
-durability. Active catalogs remain format 3. A sealed catalog becomes format 4,
-which older writers refuse; a format-3 header carrying a seal or a format-4
-header missing its seal is corrupt. The seal binds the unchanged history ID,
+durability. Active catalogs remain format 3. Direct sealing of an active catalog
+still produces format 4. Sealing a retiring format-5 catalog produces format 6,
+retaining both the retirement intent and matching seal. Older readers refuse
+formats 5 and 6 instead of forgetting the admission or retry decision. Any
+format/intent/seal disagreement is corrupt. The seal binds the unchanged history ID,
 final accepted sequence and operation ID. Retrying the exact request returns
 the stored seal after restart. Another operation ID refuses. No unseal API or
 automatic expiry exists.
@@ -209,7 +238,8 @@ authority, including an explicit rule for replacing newer accepted history
 with an older checkpoint. Mobile activation must retain local-device residency.
 The staging verifier and local terminal seal do not supply this distributed
 activation contract. The seal implements the old-store retirement primitive;
-committed prepare/activate decisions, replacement catch-up proof, rollback
+durable admission closure also prevents new work while existing intents drain.
+Committed prepare/activate decisions, replacement catch-up proof, rollback
 policy and recovery of that authority transaction remain to be implemented.
 The proposed [source authority activation contract](source-authority-activation.md)
 sets the ownership, admission, rollback and crash-recovery requirements for that

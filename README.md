@@ -1237,6 +1237,15 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: durable admission closure before source retirement.**
+  `begin_retirement` atomically captures the accepted watermark and persists
+  closure before pending index work drains. New acceptance and preparations
+  refuse, while existing source and maintenance intents remain recoverable.
+  Restart preserves closure; sealing retains the original begin decision for
+  exact retries. Formats 5 and 6 prevent older readers from dropping that
+  state. This is a trusted local primitive; distributed owner activation and
+  current-policy integration remain separate. See
+  [source/index backup](docs/source-index-backup.md).
 - **Foundation branch: reconciled source authority and checked transplant build budgets.**
   Checkpoint `21c21a1` reconciles main `16305a3` through `537efd1`. Transplant
   build-memory arithmetic refuses overflow; planning estimates describe the

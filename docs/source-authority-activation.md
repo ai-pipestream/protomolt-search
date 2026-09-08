@@ -9,9 +9,13 @@ RPC, field allocation, runtime activation, transfer or fleet action.
 
 `DocumentCatalog::seal_history` retires one local store at an exact accepted
 sequence. The database writer serializes it with acceptance and every source
-and maintenance journal mutation. Pending intents prevent sealing. Format 4
-keeps that store sealed after restart and after copying its backup; old writers
-refuse the format. The seal neither fences an earlier independent copy nor
+and maintenance journal mutation. `begin_retirement` first persists admission
+closure and its atomically captured accepted watermark in format 5. New writes
+and preparations then refuse, while existing intents can drain through recovery.
+Pending intents prevent sealing. Direct sealing produces format 4; sealing
+after closure produces format 6 and retains the begin decision. Both remain
+sealed after restart and after copying a backup; old readers refuse the new
+formats. The seal neither fences an earlier independent copy nor
 authorizes another writer.
 
 `VerifiedSourceRestore` holds a verified private bundle and a shared source-file
@@ -70,12 +74,12 @@ refuses new operations instead of discarding retry history.
    constraints. A target must belong to an explicit allowed owner; address
    discovery cannot choose one. The old owner remains the published owner until
    activation, with admission closed before retirement is acknowledged.
-2. **Retire.** The trusted owner resolves pending source/maintenance decisions
-   against their actual durable catalogs, then seals the source at the required
-   accepted watermark. A stale watermark refuses; the control operation must
-   record any new attempt and its exact inputs before issuing it. A lost reply
-   is recovered by retrying the same seal request or reading its persisted
-   decision. Neither a timeout nor lease expiry counts as a seal.
+2. **Retire.** The trusted owner closes admission with `begin_retirement`, then
+   resolves pending source/maintenance decisions against their actual durable
+   catalogs and seals the captured accepted watermark under the same operation
+   ID. The control operation records both requests and their completion facts.
+   A lost reply is recovered by retrying the same request or reading its
+   persisted decision. Neither a timeout nor lease expiry counts as a seal.
 3. **Capture and stage.** Produce the final bundle from the sealed source and
    its journaled indexes. Verify the replacement through the existing private
    staging operation. Require the same source history, exact seal and accepted
@@ -97,7 +101,9 @@ refuses new operations instead of discarding retry history.
 Record distinct durable phases for preparation, verified retirement,
 activation commitment and target readiness. Before retirement, cancellation
 may reopen the same owner's admission only under a current authority decision.
-After a seal commits, cancellation cannot reopen that store. Preserve the
+The implemented local begin operation has no cancellation; after it commits,
+the owner must drain and seal. After a seal commits, cancellation cannot reopen
+that store. Preserve the
 sealed source and resume recovery or authorize another explicitly bound target;
 never interpret an aborted control request as an unseal. Before activation
 commitment, a replacement-target change invalidates the previous target's
@@ -108,12 +114,12 @@ installation decision. Changing the control record alone cannot fence it;
 require its durable retirement or the explicit external fence allowed by the
 control-authority contract before authorizing any other writable target.
 
-Closing admission needs a collection-owner gate covering source acceptance as
-well as all index writers; the existing node ingest fence alone does not cover
-`DocumentCatalog::accept`. Retirement must not depend on winning repeated
-watermark races against an unlimited stream of new writes. The managed owner
-must prevent such admission while it drains pending work. That integration is
-not supplied by the terminal seal primitive.
+The persistent local retirement gate covers source acceptance and new index
+decisions, avoiding repeated watermark races against continuing writes. The
+managed owner must still connect that gate to committed control operations,
+current authorization and every routed write entry point. The existing node
+ingest fence alone does not cover `DocumentCatalog::accept`. Local closure is
+not that distributed authority integration.
 
 The replacement must not clear `history_seal` and call ordinary `open`. Managed
 storage needs a versioned authority binding and a guarded write transaction.

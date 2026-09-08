@@ -1,23 +1,45 @@
 //! Terminal local write retirement, serialized with every source transaction.
 use super::*;
-use crate::pb::storage::{SourceHistorySeal, SourceSealRequest};
+use crate::pb::storage::{
+    SourceHistorySeal, SourceRetirementIntent, SourceRetirementRequest, SourceSealRequest,
+};
 
 pub(super) fn validate_header_seal(header: &DocumentCatalogHeader) -> Result<(), Status> {
-    match (header.format_version, &header.history_seal) {
-        (FORMAT_VERSION, None) => Ok(()),
-        (SEALED_FORMAT_VERSION, Some(seal))
-            if seal.format_version == 1
-                && seal.history_id == header.history_id
-                && seal.accepted_sequence == header.accepted_sequence
-                && !seal.operation_id.is_empty()
-                && seal.operation_id.len() <= 1024 =>
-        {
-            Ok(())
+    let seal_valid = header.history_seal.as_ref().is_some_and(|seal| {
+        seal.format_version == 1
+            && seal.history_id == header.history_id
+            && seal.accepted_sequence == header.accepted_sequence
+            && !seal.operation_id.is_empty()
+            && seal.operation_id.len() <= 1024
+    });
+    let retirement_valid = header.retirement_intent.as_ref().is_some_and(|intent| {
+        intent.format_version == 1
+            && intent.history_id == header.history_id
+            && intent.accepted_sequence == header.accepted_sequence
+            && !intent.operation_id.is_empty()
+            && intent.operation_id.len() <= 1024
+    });
+    let valid = match header.format_version {
+        FORMAT_VERSION => header.history_seal.is_none() && header.retirement_intent.is_none(),
+        SEALED_FORMAT_VERSION => seal_valid && header.retirement_intent.is_none(),
+        RETIRING_FORMAT_VERSION => retirement_valid && header.history_seal.is_none(),
+        RETIRED_FORMAT_VERSION => {
+            seal_valid
+                && retirement_valid
+                && header.history_seal.as_ref().map(|seal| &seal.operation_id)
+                    == header
+                        .retirement_intent
+                        .as_ref()
+                        .map(|intent| &intent.operation_id)
         }
-        _ => Err(Status::data_loss(
-            "document catalog format and terminal history seal disagree",
-        )),
+        _ => false,
+    };
+    if !valid {
+        return Err(Status::data_loss(
+            "document catalog format, retirement intent and terminal history seal disagree",
+        ));
     }
+    Ok(())
 }
 
 fn header_from(tx: &redb::WriteTransaction) -> Result<DocumentCatalogHeader, Status> {
@@ -36,14 +58,105 @@ impl DocumentCatalog {
     /// Acquire the DB writer before checking the persistent fence. Checking in
     /// an earlier read would let a queued write cross a successful retirement.
     pub(super) fn writable_transaction(&self) -> Result<redb::WriteTransaction, Status> {
+        self.source_transaction(false)
+    }
+
+    /// Resolve only already-prepared decisions during retirement. This must not
+    /// be used by acceptance, journal enablement, or a new preparation.
+    pub(super) fn recovery_transaction(&self) -> Result<redb::WriteTransaction, Status> {
+        self.source_transaction(true)
+    }
+
+    fn source_transaction(&self, recovery: bool) -> Result<redb::WriteTransaction, Status> {
         let mut tx = self.database.begin_write().map_err(storage)?;
         tx.set_durability(Durability::Immediate).map_err(storage)?;
-        if header_from(&tx)?.history_seal.is_some() {
+        let header = header_from(&tx)?;
+        if header.history_seal.is_some() {
             return Err(Status::failed_precondition(
                 "source history is sealed; acceptance and index mutations are retired",
             ));
         }
+        if header.retirement_intent.is_some() && !recovery {
+            return Err(Status::failed_precondition(
+                "source history is retiring; new acceptance and index preparations are closed",
+            ));
+        }
         Ok(tx)
+    }
+
+    /// Read the durable admission decision, including after the final seal.
+    pub fn retirement_intent(&self) -> Result<Option<SourceRetirementIntent>, Status> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let meta = read.open_table(META).map_err(storage)?;
+        let header: DocumentCatalogHeader = decode(
+            meta.get("header")
+                .map_err(storage)?
+                .ok_or_else(|| Status::data_loss("catalog header missing"))?
+                .value(),
+        )?;
+        validate_current_header(&header)?;
+        Ok(header.retirement_intent)
+    }
+
+    /// Close new admission durably before draining existing index intents.
+    /// The writer atomically captures every previously accepted write. There is
+    /// no cancellation: reopen preserves closure, recovery may resolve pending
+    /// work, and the same operation must finish through `seal_history`.
+    /// This trusted local operation grants no replacement ownership.
+    pub fn begin_retirement(
+        &self,
+        request: &SourceRetirementRequest,
+    ) -> Result<SourceRetirementIntent, Status> {
+        if !self.durable {
+            return Err(Status::failed_precondition(
+                "source retirement requires a durable catalog",
+            ));
+        }
+        if !valid_history_id(&request.history_id)
+            || request.operation_id.is_empty()
+            || request.operation_id.len() > 1024
+        {
+            return Err(Status::invalid_argument(
+                "source retirement needs a nonzero 16-byte history_id and operation_id of 1..1024 bytes",
+            ));
+        }
+        let mut tx = self.database.begin_write().map_err(storage)?;
+        tx.set_durability(Durability::Immediate).map_err(storage)?;
+        let mut header = header_from(&tx)?;
+        if header.history_id != request.history_id {
+            return Err(Status::failed_precondition(
+                "source retirement belongs to another catalog history",
+            ));
+        }
+        if let Some(previous) = header.retirement_intent {
+            return if previous.operation_id == request.operation_id {
+                Ok(previous)
+            } else {
+                Err(Status::already_exists(
+                    "source retirement was begun by another operation",
+                ))
+            };
+        }
+        if header.history_seal.is_some() {
+            return Err(Status::failed_precondition(
+                "source history is already sealed without a retirement intent",
+            ));
+        }
+        let intent = SourceRetirementIntent {
+            format_version: 1,
+            history_id: header.history_id.clone(),
+            accepted_sequence: header.accepted_sequence,
+            operation_id: request.operation_id.clone(),
+        };
+        header.format_version = RETIRING_FORMAT_VERSION;
+        header.retirement_intent = Some(intent.clone());
+        {
+            let mut meta = tx.open_table(META).map_err(storage)?;
+            meta.insert("header", header.encode_to_vec().as_slice())
+                .map_err(storage)?;
+        }
+        tx.commit().map_err(storage)?;
+        Ok(intent)
     }
 
     /// Read retirement evidence without granting replacement ownership. The
@@ -98,6 +211,15 @@ impl DocumentCatalog {
                 ))
             };
         }
+        if header
+            .retirement_intent
+            .as_ref()
+            .is_some_and(|intent| intent.operation_id != request.operation_id)
+        {
+            return Err(Status::already_exists(
+                "source retirement was begun by another operation",
+            ));
+        }
 
         // No mutations have been made in tx. Holding its writer excludes new
         // accepts, preparations and recovery commits while this read validates
@@ -120,7 +242,11 @@ impl DocumentCatalog {
             accepted_sequence: header.accepted_sequence,
             operation_id: request.operation_id.clone(),
         };
-        header.format_version = SEALED_FORMAT_VERSION;
+        header.format_version = if header.retirement_intent.is_some() {
+            RETIRED_FORMAT_VERSION
+        } else {
+            SEALED_FORMAT_VERSION
+        };
         header.history_seal = Some(seal.clone());
         {
             let mut meta = tx.open_table(META).map_err(storage)?;

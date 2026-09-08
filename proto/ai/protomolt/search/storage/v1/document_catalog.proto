@@ -14,6 +14,27 @@ message DocumentCatalogHeader {
   // Format 4 is a terminal sealed source. Readers predating sealing refuse it.
   // A backup preserves this fence; reopening never makes the source writable.
   SourceHistorySeal history_seal = 6;
+  // Format 5 closes new write admission while existing intents drain. Format 6
+  // retains this decision together with the final seal. Older readers refuse
+  // both formats; neither reopen nor backup can discard the admission fence.
+  SourceRetirementIntent retirement_intent = 7;
+}
+
+// Trusted local admission closure. The database writer chooses the accepted
+// watermark atomically; the caller cannot omit writes admitted before it.
+message SourceRetirementRequest {
+  bytes history_id = 1;
+  bytes operation_id = 2;
+}
+
+// Durable admission closure, not a final seal or replacement-owner grant.
+// Existing source/maintenance intents may still require recovery. The exact
+// decision is retained after sealing so a lost begin reply remains retryable.
+message SourceRetirementIntent {
+  uint32 format_version = 1;
+  bytes history_id = 2;
+  uint64 accepted_sequence = 3;
+  bytes operation_id = 4;
 }
 
 // Trusted local retirement operation, not permission to activate a replacement.

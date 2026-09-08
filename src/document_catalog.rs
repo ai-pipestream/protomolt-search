@@ -40,6 +40,8 @@ const SOURCES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("sources");
 const CHANGES: TableDefinition<u64, &[u8]> = TableDefinition::new("changes");
 const FORMAT_VERSION: u32 = 3;
 const SEALED_FORMAT_VERSION: u32 = 4;
+const RETIRING_FORMAT_VERSION: u32 = 5;
+const RETIRED_FORMAT_VERSION: u32 = 6;
 const CACHE_BYTES: usize = 8 << 20;
 
 fn storage(error: impl std::fmt::Display) -> Status {
@@ -67,7 +69,7 @@ fn new_history_id() -> Result<Vec<u8>, Status> {
 fn validate_current_header(header: &DocumentCatalogHeader) -> Result<(), Status> {
     if !matches!(
         header.format_version,
-        FORMAT_VERSION | SEALED_FORMAT_VERSION
+        FORMAT_VERSION | SEALED_FORMAT_VERSION | RETIRING_FORMAT_VERSION | RETIRED_FORMAT_VERSION
     ) || !valid_history_id(&header.history_id)
         || header.legacy_receipts_through_sequence > header.accepted_sequence
     {
@@ -183,7 +185,7 @@ impl DocumentCatalog {
                 .map_err(storage)?
                 .ok_or_else(|| Status::data_loss("existing document catalog header missing"))?;
             let header: DocumentCatalogHeader = decode(bytes.value())?;
-            if !(1..=SEALED_FORMAT_VERSION).contains(&header.format_version)
+            if !(1..=RETIRED_FORMAT_VERSION).contains(&header.format_version)
                 || header.collection != collection
             {
                 return Err(Status::failed_precondition(
@@ -199,6 +201,7 @@ impl DocumentCatalog {
                 if !header.history_id.is_empty()
                     || header.legacy_receipts_through_sequence != 0
                     || header.history_seal.is_some()
+                    || header.retirement_intent.is_some()
                 {
                     return Err(Status::data_loss(
                         "legacy catalog contains unexpected history identity metadata",
@@ -228,6 +231,7 @@ impl DocumentCatalog {
                 history_id: new_history_id()?,
                 legacy_receipts_through_sequence: 0,
                 history_seal: None,
+                retirement_intent: None,
             }
             .encode_to_vec();
             table.insert("header", header.as_slice()).map_err(storage)?;

@@ -645,7 +645,7 @@ impl DocumentCatalog {
         }
         catalog.with_durable_snapshot(|snapshot| {
             let hash = manifest_hash(snapshot.manifest())?;
-            let tx = self.writable_transaction()?;
+            let tx = self.recovery_transaction()?;
             let result;
             {
                 let meta = tx.open_table(META).map_err(storage)?;

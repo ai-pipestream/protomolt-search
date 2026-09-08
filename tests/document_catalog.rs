@@ -5,13 +5,15 @@ use pipestream_search::document_catalog::DocumentCatalog;
 use pipestream_search::embedded::{
     EmbeddedDocumentCatalogConfig, EmbeddedSearch, EmbeddedSearchConfig, EmbeddedShardConfig,
 };
-use pipestream_search::pb::storage::SourceSealRequest;
+use pipestream_search::pb::storage::{
+    DocumentCatalogHeader, SourceRetirementRequest, SourceSealRequest,
+};
 use pipestream_search::pb::{
     accept_document_request::Mutation, AcceptDocumentRequest, ProtobufSource,
 };
 use pipestream_search::pb::{accepted_document_version, ReadAcceptedDocumentsRequest};
 use prost::Message;
-use redb::ReadableTable;
+use redb::{ReadableDatabase, ReadableTable};
 use tonic::Code;
 
 fn page(after_sequence: u64) -> ReadAcceptedDocumentsRequest {
@@ -65,6 +67,15 @@ fn write(operation: &[u8], expected: Option<u64>) -> AcceptDocumentRequest {
         mutation: Some(Mutation::Source(source())),
         ..Default::default()
     }
+}
+
+fn stored_header(path: &std::path::Path) -> DocumentCatalogHeader {
+    let database = redb::Database::open(path).unwrap();
+    let read = database.begin_read().unwrap();
+    let metadata = read
+        .open_table(redb::TableDefinition::<&str, &[u8]>::new("metadata"))
+        .unwrap();
+    DocumentCatalogHeader::decode(metadata.get("header").unwrap().unwrap().value()).unwrap()
 }
 
 #[test]
@@ -233,6 +244,7 @@ fn committed_receipt_survives_process_exit_without_dropping_database() {
         .args(["--exact", "abrupt_exit_worker", "--nocapture"])
         .env("PSEARCH_CATALOG_CRASH_PATH", dir.catalog())
         .env_remove("PSEARCH_CATALOG_CRASH_SEAL")
+        .env_remove("PSEARCH_CATALOG_CRASH_RETIRE")
         .status()
         .unwrap();
     assert_eq!(status.code(), Some(73));
@@ -253,6 +265,7 @@ fn committed_seal_survives_process_exit_without_dropping_database() {
         .args(["--exact", "abrupt_exit_worker", "--nocapture"])
         .env("PSEARCH_CATALOG_CRASH_PATH", dir.catalog())
         .env("PSEARCH_CATALOG_CRASH_SEAL", "1")
+        .env_remove("PSEARCH_CATALOG_CRASH_RETIRE")
         .status()
         .unwrap();
     assert_eq!(status.code(), Some(73));
@@ -284,6 +297,53 @@ fn committed_seal_survives_process_exit_without_dropping_database() {
 }
 
 #[test]
+fn committed_retirement_intent_survives_process_exit_and_closes_admission() {
+    let dir = Directory::new("retirement-crash");
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "abrupt_exit_worker", "--nocapture"])
+        .env("PSEARCH_CATALOG_CRASH_PATH", dir.catalog())
+        .env_remove("PSEARCH_CATALOG_CRASH_SEAL")
+        .env("PSEARCH_CATALOG_CRASH_RETIRE", "1")
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(73));
+    assert_eq!(stored_header(&dir.catalog()).format_version, 5);
+
+    let catalog = DocumentCatalog::open(&dir.catalog(), "books").unwrap();
+    let intent = catalog
+        .retirement_intent()
+        .unwrap()
+        .expect("retirement intent committed before abrupt exit");
+    assert_eq!(intent.format_version, 1);
+    assert_eq!(intent.accepted_sequence, 1);
+    assert_eq!(intent.operation_id, b"crash-retire");
+    assert_eq!(catalog.read_accepted(&page(0)).unwrap().documents.len(), 1);
+    for request in [
+        write(b"crash-retry", Some(0)),
+        write(b"new-after-crash-retirement", Some(1)),
+    ] {
+        let error = catalog.accept(&request).unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("retiring"), "{error}");
+    }
+    let retirement = SourceRetirementRequest {
+        history_id: intent.history_id.clone(),
+        operation_id: intent.operation_id.clone(),
+    };
+    assert_eq!(catalog.begin_retirement(&retirement).unwrap(), intent);
+    catalog
+        .seal_history(&SourceSealRequest {
+            history_id: intent.history_id.clone(),
+            expected_accepted_sequence: intent.accepted_sequence,
+            operation_id: intent.operation_id.clone(),
+        })
+        .unwrap();
+    assert_eq!(catalog.begin_retirement(&retirement).unwrap(), intent);
+    drop(catalog);
+    assert_eq!(stored_header(&dir.catalog()).format_version, 6);
+}
+
+#[test]
 fn abrupt_exit_worker() {
     let Some(path) = std::env::var_os("PSEARCH_CATALOG_CRASH_PATH") else {
         return;
@@ -295,7 +355,16 @@ fn abrupt_exit_worker() {
             .unwrap()
             .durable
     );
-    if std::env::var_os("PSEARCH_CATALOG_CRASH_SEAL").is_some() {
+    if std::env::var_os("PSEARCH_CATALOG_CRASH_RETIRE").is_some() {
+        let receipt = catalog.accept(&write(b"crash-retry", Some(0))).unwrap();
+        let intent = catalog
+            .begin_retirement(&SourceRetirementRequest {
+                history_id: receipt.history_id,
+                operation_id: b"crash-retire".to_vec(),
+            })
+            .unwrap();
+        assert_eq!((intent.format_version, intent.accepted_sequence), (1, 1));
+    } else if std::env::var_os("PSEARCH_CATALOG_CRASH_SEAL").is_some() {
         let receipt = catalog.accept(&write(b"crash-retry", Some(0))).unwrap();
         let seal = catalog
             .seal_history(&SourceSealRequest {
@@ -548,7 +617,6 @@ fn legacy_history_upgrades_atomically_and_keeps_retry_receipts() {
         Code::DataLoss
     );
     // Failed migration must not commit the new format or a partial change index.
-    use redb::ReadableDatabase;
     let database = redb::Database::open(dir.catalog()).unwrap();
     let transaction = database.begin_read().unwrap();
     let meta = transaction
@@ -699,7 +767,6 @@ fn change_catalog_header(
 }
 
 fn stored_operation(path: &std::path::Path, key: &[u8]) -> Vec<u8> {
-    use redb::ReadableDatabase;
     let database = redb::Database::open(path).unwrap();
     let transaction = database.begin_read().unwrap();
     let operations = transaction
