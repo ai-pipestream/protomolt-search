@@ -497,6 +497,10 @@ impl RaftHost {
         let machine =
             ControlStateMachine::new(store, &dir.join(SNAPSHOT_DIR), config.max_snapshot_bytes)?;
         let shared = machine.shared_store();
+        let mut log_store = log_store;
+        log_store
+            .bind_applied_floor(Arc::clone(&shared))
+            .map_err(|e| Status::data_loss(format!("raft log and store disagree: {e}")))?;
         let raft = Raft::new(
             node_id,
             Self::raft_config(config)?,

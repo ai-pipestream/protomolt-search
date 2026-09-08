@@ -409,10 +409,25 @@ fn required_vote(
         .ok_or_else(|| Status::invalid_argument("raft rpc carries no vote"))
 }
 
+/// Entries and snapshots come from a leader, and a leader's vote is
+/// committed by definition; the library asserts as much when it accepts
+/// them, so a request under an uncommitted vote is refused before it.
+fn leader_vote(
+    vote: Option<&crate::pb::storage::RaftVote>,
+) -> Result<openraft::Vote<NodeId>, Status> {
+    let vote = required_vote(vote)?;
+    if !vote.is_committed() {
+        return Err(Status::invalid_argument(
+            "entries and snapshots come from a leader; this vote is not committed",
+        ));
+    }
+    Ok(vote)
+}
+
 fn append_request_from_proto(
     value: RaftAppendEntriesRequest,
 ) -> Result<AppendEntriesRequest<ControlRaft>, Status> {
-    let vote = required_vote(value.vote.as_ref())?;
+    let vote = leader_vote(value.vote.as_ref())?;
     let entries = value
         .entries
         .into_iter()
@@ -567,9 +582,21 @@ fn install_request_from_proto(
         .meta
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("snapshot chunk carries no meta"))?;
+    let meta = snapshot_meta_from_proto(group, meta)?;
+    // The announced length bounds the receive while it happens, not only
+    // at install: a chunk past it is refused before the library sees it.
+    let announced = super::state_machine::parse_snapshot_id(&meta.snapshot_id)
+        .map_err(wire)?
+        .length;
+    let end = value.offset.saturating_add(value.data.len() as u64);
+    if end > announced {
+        return Err(Status::invalid_argument(format!(
+            "snapshot chunk ends at byte {end}, beyond the announced length {announced}"
+        )));
+    }
     Ok(InstallSnapshotRequest {
-        vote: required_vote(value.vote.as_ref())?,
-        meta: snapshot_meta_from_proto(group, meta)?,
+        vote: leader_vote(value.vote.as_ref())?,
+        meta,
         offset: value.offset,
         data: value.data,
         done: value.done,

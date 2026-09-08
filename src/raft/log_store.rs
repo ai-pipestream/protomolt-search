@@ -41,6 +41,11 @@ struct Inner {
 #[derive(Clone)]
 pub struct RaftLogStore {
     inner: Arc<Inner>,
+    // The state machine's store, once hosted: a purge never passes its
+    // applied position, so a snapshot install the state machine refuses
+    // leaves the log consistent with the store it kept (the library purges
+    // for an incoming snapshot before the state machine has installed it).
+    floor: Option<super::state_machine::SharedStore>,
 }
 
 fn io<E: std::fmt::Display>(
@@ -151,6 +156,7 @@ impl RaftLogStore {
                 .map_err(storage_status)?;
         }
         Ok(Self {
+            floor: None,
             inner: Arc::new(Inner {
                 database,
                 group: group.clone(),
@@ -360,11 +366,122 @@ impl RaftLogStorage<ControlRaft> for RaftLogStore {
     }
 
     async fn purge(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
-        self.purge_sync(log_id)
+        // The library purges for an incoming snapshot before the state
+        // machine has installed it; a purge never passes what the store has
+        // applied, so a refused install leaves the log consistent with the
+        // store it kept. The rest is purged when the store catches up
+        // (`append_sync`, `bind_applied_floor`).
+        let upto = match self.applied_floor()? {
+            Floor::Unbound => Some(log_id),
+            Floor::Applied(applied) if applied.index >= log_id.index => Some(log_id),
+            Floor::Applied(applied) => Some(applied),
+            Floor::Nothing => None,
+        };
+        match upto {
+            Some(upto) => {
+                let _order = self.inner.write.lock().unwrap();
+                self.purge_locked(upto)
+            }
+            None => Ok(()),
+        }
     }
 }
 
+/// What the hosted store has applied, as a bound on purges.
+enum Floor {
+    /// No store is bound (the log alone, in tests).
+    Unbound,
+    /// The store is between swaps or has applied nothing.
+    Nothing,
+    Applied(LogId<NodeId>),
+}
+
 impl RaftLogStore {
+    /// Bind the hosted store whose applied position bounds every purge,
+    /// and complete a purge the store has since caught up with: an empty
+    /// log behind the store's position is purged to it. A log with entries
+    /// after a gap is data loss and refuses.
+    pub(crate) fn bind_applied_floor(
+        &mut self,
+        store: super::state_machine::SharedStore,
+    ) -> Result<(), StorageError<NodeId>> {
+        self.floor = Some(store);
+        let _order = self.inner.write.lock().unwrap();
+        self.settle_locked()
+    }
+
+    fn applied_floor(&self) -> Result<Floor, StorageError<NodeId>> {
+        let Some(floor) = &self.floor else {
+            return Ok(Floor::Unbound);
+        };
+        let store = floor
+            .read()
+            .map_err(|_| {
+                io(
+                    ErrorSubject::Logs,
+                    ErrorVerb::Delete,
+                    "host store lock poisoned",
+                )
+            })?
+            .clone();
+        let Some(store) = store else {
+            return Ok(Floor::Nothing);
+        };
+        Ok(store
+            .raft_applied()
+            .map_err(|e| io(ErrorSubject::Logs, ErrorVerb::Delete, e))?
+            .and_then(|a| a.last_applied)
+            .map_or(Floor::Nothing, |id| Floor::Applied(log_id_from_proto(&id))))
+    }
+
+    /// Under the write order: when the store has applied past the purged
+    /// position and the log holds nothing in between, purge to the store's
+    /// position (the deferred half of a purge bounded earlier). Entries
+    /// after a gap are a hole the log cannot explain.
+    fn settle_locked(&self) -> Result<(), StorageError<NodeId>> {
+        let Floor::Applied(applied) = self.applied_floor()? else {
+            return Ok(());
+        };
+        let purged = self
+            .header()
+            .ok()
+            .and_then(|h| h.last_purged.map(|p| p.index));
+        if purged.is_some_and(|p| p >= applied.index) {
+            return Ok(());
+        }
+        match self.first_log_index()? {
+            None => self.purge_locked(applied),
+            // The log starts at index 0; entries are contiguous from the
+            // purged position.
+            Some(first) if first == purged.map_or(0, |p| p + 1) => Ok(()),
+            Some(first) => Err(io(
+                ErrorSubject::Logs,
+                ErrorVerb::Read,
+                format!(
+                    "raft log holds entries from index {first} after a purge at {}; the store applied {}",
+                    purged.unwrap_or(0),
+                    applied.index
+                ),
+            )),
+        }
+    }
+
+    fn first_log_index(&self) -> Result<Option<u64>, StorageError<NodeId>> {
+        let tx = self
+            .inner
+            .database
+            .begin_read()
+            .map_err(|e| io(ErrorSubject::Logs, ErrorVerb::Read, e))?;
+        let log = tx
+            .open_table(LOG)
+            .map_err(|e| io(ErrorSubject::Logs, ErrorVerb::Read, e))?;
+        let first = log
+            .first()
+            .map_err(|e| io(ErrorSubject::Logs, ErrorVerb::Read, e))?
+            .map(|(index, _)| index.value());
+        Ok(first)
+    }
+
     /// Append consecutive entries in one immediate transaction; the entries
     /// are durable when this returns.
     pub(crate) fn append_sync<I>(&self, entries: I) -> Result<(), StorageError<NodeId>>
@@ -373,6 +490,7 @@ impl RaftLogStore {
     {
         {
             let _order = self.inner.write.lock().unwrap();
+            self.settle_locked()?;
             let mut expected = self.last_log_id()?.map(|id| id.index + 1).or_else(|| {
                 self.header()
                     .ok()
@@ -443,8 +561,12 @@ impl RaftLogStore {
 
     /// Delete every entry at or before `log_id` and record it as purged.
     pub(crate) fn purge_sync(&self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
+        let _order = self.inner.write.lock().unwrap();
+        self.purge_locked(log_id)
+    }
+
+    fn purge_locked(&self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         {
-            let _order = self.inner.write.lock().unwrap();
             let mut tx = self
                 .inner
                 .database

@@ -165,7 +165,24 @@ impl ControlStateMachine {
                 .join(generation.to_string());
             // A pointer without a complete generation is data loss, never a
             // reason to start over.
-            read_generation(&dir, &self.identity)?;
+            let (meta, _) = read_generation(&dir, &self.identity)?;
+            // A generation is an image of this store at its applied position;
+            // one claiming a position the store never applied is data loss
+            // too (a forged pointer, or a store restored from an older copy),
+            // and the library's own invariants would fail on it.
+            let claimed = meta.last_log_id.map(|id| id.index);
+            let applied = self
+                .store()?
+                .raft_applied()?
+                .and_then(|a| a.last_applied)
+                .map(|id| id.index);
+            if claimed > applied {
+                return Err(Status::data_loss(format!(
+                    "published snapshot generation {generation} claims position {} past the store's applied position {}",
+                    claimed.map_or_else(|| "none".to_string(), |i| i.to_string()),
+                    applied.map_or_else(|| "none".to_string(), |i| i.to_string())
+                )));
+            }
         }
         Ok(())
     }

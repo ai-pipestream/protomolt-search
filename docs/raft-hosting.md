@@ -86,6 +86,30 @@ its usable store and the previous snapshot. On success the pointer moves and
 the policy/applied watch channels move to the reopened store, so
 subscribers stay attached. Build and install never overlap.
 
+### Log and store agreement
+
+The library purges the log for an incoming snapshot before the state
+machine has installed it, and treats the state machine's refusal as a
+fatal storage error. A purge therefore never passes the hosted store's
+applied position (`RaftLogStore::bind_applied_floor`): a purge that would
+is cut at the store's position, and the deferred remainder is completed
+when the store catches up (at the next append, and at start). A refused
+install thus leaves the log consistent with the store it kept, and the
+member restarts and is seeded again. A log holding entries after a gap is
+data loss and refuses to start. Startup also refuses a published
+generation whose position is past the store's applied position (a forged
+pointer, or a store restored from an older copy), naming both positions.
+
+Two more refusals sit in the transport in front of the library: appends
+and snapshot chunks under an uncommitted vote (both come only from a
+leader, and the library asserts as much), and a snapshot chunk ending past
+the announced length (enforced while receiving, not only at install).
+
+A refused install stops the receiving core, by the library's contract;
+the member recovers by restart, and the safety properties hold either
+way. That liveness effect is recorded for review in
+`docs/control-authority-test-harness.md`.
+
 ## Host
 
 `RaftHost::bootstrap_single` is the explicit one-time creation of a group of

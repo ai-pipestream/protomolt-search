@@ -1250,6 +1250,16 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   destination store remains unchanged. See [retirement and crash recovery](docs/control-retirement.md);
   transactional import, worker fencing and activation remain separate steps.
 
+- **Foundation branch: adversarial harness integrated.** Kimi's harness
+  (611ceb0, written against 331c18f) runs on the repaired branch: the raft
+  kit rebuilt on the supported surface, the R1 accessibility reproductions
+  as `compile_fail` doctests, R3 and R5 driven through the transport by a
+  raw registered peer. Integration found and fixed three defects: a purge
+  passing the store after a refused install, a local generation past the
+  store's position accepted at start, and a debug assertion reachable from
+  a registered peer under an uncommitted vote. Accounting for all sixteen
+  reproductions in [the harness document](docs/control-authority-test-harness.md).
+
 - **Foundation branch: relay on the committed map, Raft operator
   configuration.** `AuthorityMapSource` feeds a relay from a source
   authority's `published_map` through the map consumer's rules, waking on
