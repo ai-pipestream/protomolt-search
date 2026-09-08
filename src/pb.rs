@@ -75,7 +75,7 @@ pub mod v1 {
     pub use super::{
         AcceptDocumentRequest, AddDocumentsRequest, AddVectorsRequest, ClusterNodeState,
         CollectionGrant, DerivedColumns, DocumentWriteReceipt, FlushResponse, IngestMappedRequest,
-        NodeCapacity, PlacementActionKind, QueryStreamResponse, ReplayStreamBinding,
+        NodeCapacity, PlacementActionKind, PlacementTree, QueryStreamResponse, ReplayStreamBinding,
         ShardReplicaRole, SnapshotArtifact, VectorBackendConfig,
     };
 }

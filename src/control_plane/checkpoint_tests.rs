@@ -3,6 +3,13 @@ use crate::pb::storage::*;
 use prost::Message;
 
 fn complete_state() -> StoredState {
+    complete_state_with("books/2026", 2)
+}
+
+/// The complete nondefault state under `collection`, with the current
+/// topology widened to `routes` routes so import tests can force several
+/// bounded chunks. The first two routes are the fixture's originals.
+pub(super) fn complete_state_with(collection: &str, routes: usize) -> StoredState {
     let capacity = StoredCapacity {
         disk_bytes: (1u64 << 53) + 10_000,
         used_disk_bytes: (1u64 << 53) + 4_321,
@@ -76,16 +83,28 @@ fn complete_state() -> StoredState {
     };
     StoredState {
         format: 1,
-        collection: "books/2026".into(),
+        collection: collection.into(),
         revision: u64::MAX,
         next_token: u64::MAX,
         next_action: u64::MAX,
         topology: StoredTopology {
             generation: 3,
-            routes: vec![
-                route("http://node-a:9000", Some("replica-a"), 0, 99),
-                route("https://node-b:9443/", None, 100, u64::MAX),
-            ],
+            routes: {
+                let mut all = vec![
+                    route("http://node-a:9000", Some("replica-a"), 0, 99),
+                    route("https://node-b:9443/", None, 100, u64::MAX),
+                ];
+                for extra in 2..routes {
+                    let lo = 100 + (extra as u64 - 2) * 3;
+                    all.push(route(
+                        &format!("https://node-{extra:04}.example:9443/shard"),
+                        Some(&format!("replica-{extra:04}")),
+                        lo,
+                        lo + 2,
+                    ));
+                }
+                all
+            },
         },
         history: vec![
             StoredTopology {
@@ -133,7 +152,7 @@ fn complete_state() -> StoredState {
     }
 }
 
-fn complete_policy() -> ControlPolicy {
+pub(super) fn complete_policy() -> ControlPolicy {
     ControlPolicy {
         lease_ms: 31_337,
         replication_factor: 3,

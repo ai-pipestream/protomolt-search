@@ -1250,14 +1250,22 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   destination store remains unchanged. See [retirement and crash recovery](docs/control-retirement.md);
   transactional import, worker fencing and activation remain separate steps.
 
-- **Foundation branch: bounded staged import contract (for review).** The
-  retired record moves through the destination's ordinary 1 MiB command path
-  as committed chunks under one workflow, is re-validated at commit against
-  the retirement's own digest, actor and destination identity, and applies
-  with allocators preserved, node leases as observations, pending actions
+- **Foundation branch: bounded transactional import (implemented).** Store
+  format 2 adopts format-1 stores at open and adds the unified control rows.
+  The retired record moves through the destination's ordinary command path as
+  retained chunk commands under one workflow, admitted only with the
+  `RetiredLegacyControl` holder, re-validated at commit against the
+  retirement's own digest, actor and destination identity, and applied with
+  allocators preserved, node leases as observations, pending actions
   unreconciled and the placement tree, derived declaration, geometry and
-  policy supplied explicitly. One actor-scoped receipt; no local-file replay.
-  Nothing is implemented yet. See [control import](docs/control-import.md).
+  planner policy supplied explicitly. Reservations keep terminal headroom on
+  a full store; recovery recomputes every count. Tested: multi-chunk round
+  trip, admission, capacity bounds, retry/CAS/ownership/revocation rules,
+  headroom, supplement refusals, process exit before and after every phase,
+  byte-identical replay, format adoption. `control_snapshot` is the immutable
+  committed view for observation and planning. See
+  [control import](docs/control-import.md). Open: managed-owner admission
+  through source commit, Raft hosting, trees for historical generations.
 
 - **Foundation branch: typed legacy control checkpoint.** A bounded private
   protobuf preserves full authority history, lease credentials, allocator and

@@ -1,6 +1,8 @@
 //! Bounded record validation before an existing authority becomes usable.
 use super::*;
 
+mod control;
+
 pub(super) fn header(
     value: &SourceAuthorityHeader,
     expected: &SourceAuthorityIdentity,
@@ -31,6 +33,15 @@ pub(super) fn header(
         || value.payload_bytes > limits.max_payload_bytes
     {
         return Err(corrupt("header counters exceed configured capacity"));
+    }
+    Ok(())
+}
+
+pub(super) fn control_header(value: &ControlStoreHeader) -> Result<(), Status> {
+    if value.format_version != import::STORE_FORMAT {
+        return Err(corrupt(
+            "unsupported control store format; this reader serves format 2 only",
+        ));
     }
     Ok(())
 }
@@ -150,15 +161,22 @@ pub(super) fn operation(
 
 pub(super) fn validate(store: &SourceAuthorityStore) -> Result<(), Status> {
     let tx = store.inner.database.begin_read().map_err(storage)?;
-    if tx.list_tables().map_err(storage)?.count() != 4
+    if tx.list_tables().map_err(storage)?.count() != import::FORMAT_2_TABLES
         || tx.list_multimap_tables().map_err(storage)?.next().is_some()
     {
         return Err(corrupt("unexpected or missing control tables"));
     }
     let meta = tx.open_table(META).map_err(corrupt)?;
-    if meta.len().map_err(storage)? != 2 {
+    if meta.len().map_err(storage)? != 3 {
         return Err(corrupt("unexpected metadata keys"));
     }
+    let control: ControlStoreHeader = contract::decode(
+        meta.get(import::CONTROL_HEADER)
+            .map_err(storage)?
+            .ok_or_else(|| missing("control header"))?
+            .value(),
+    )?;
+    control_header(&control)?;
     let state: SourceAuthorityHeader = contract::decode(
         meta.get("header")
             .map_err(storage)?
@@ -202,7 +220,14 @@ pub(super) fn validate(store: &SourceAuthorityStore) -> Result<(), Status> {
             key_bytes.value().len() + value_bytes.value().len(),
         )?;
     }
-    if accepted.checked_add(1) != Some(state.control_revision) {
+    let (accepted_imports, control_payload) =
+        control::validate(&tx, &state, &control, &policy, &decisions)?;
+    payload = payload_change(payload, 0, control_payload)?;
+    if accepted
+        .checked_add(accepted_imports)
+        .and_then(|n| n.checked_add(1))
+        != Some(state.control_revision)
+    {
         return Err(corrupt(
             "control revision differs from accepted decision count",
         ));

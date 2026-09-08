@@ -2497,6 +2497,22 @@ impl ClusterControl for ClusterControlService {
 
 #[cfg(test)]
 mod checkpoint_tests;
+#[cfg(test)]
+pub(crate) mod test_fixtures {
+    //! Legacy state files for tests in other modules.
+    /// A populated legacy state file body under `collection`, with `routes`
+    /// current routes (at least 2).
+    pub(crate) fn populated_state_json(collection: &str, routes: usize) -> String {
+        serde_json::to_string(&super::checkpoint_tests::complete_state_with(
+            collection, routes,
+        ))
+        .unwrap()
+    }
+    /// The policy that state was captured under.
+    pub(crate) fn populated_policy() -> super::ControlPolicy {
+        super::checkpoint_tests::complete_policy()
+    }
+}
 
 #[cfg(test)]
 mod ownership_tests;
