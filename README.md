@@ -2034,6 +2034,31 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   Declared columns reject `math.abs(i64::MIN)`, which has no exact signed
   64-bit result. Missing input, per-request materialization absence and untaken
   ternary branches keep their prior behavior. [Derived columns](docs/derived-columns.md).
+- **Landed 2026-09-08: the fleet boolean proof, the short-circuit, and
+  compaction without a log.** The fleet rolled to the merged main under
+  operator authorization (reversible: populated WAL generations are not
+  re-stamped, the rolled-back binary reads every byte the new one
+  writes in a serve-only window); the boolean driver
+  (`examples/fleet_boolean.rs`) proves identical ids, scores, and ranks
+  per shape before and after, and the lexical+filter boolean shapes run
+  532 to 59 ms and 619 to 130 ms warm over 86.6M rows, the filter leaf
+  resolved over its narrower sibling's members. The dense+filter
+  surcharge the first roll introduced was root-caused (a per-slot
+  pruned-range check inside fully pruned spans) and fixed: domain fills
+  walk admitted spans by word, wide domains take the plain fill, and an
+  empty MUST intersection short-circuits before the dense membership —
+  the zero-match shape now beats the old baseline. `CompactShard` now
+  compacts a catalog with no WAL: rows come from the sealed segments
+  through the transpose, keyed by the partition column, with the
+  bounded parallel build (`build_threads`/`build_queue`/`build_memory`
+  on the request), post-cutoff writes caught up through the ingest
+  apply path, tombstones translated through the id map, declared
+  columns and derived fingerprints preserved, and a crash around the
+  manifest publish rolled back at open. Tests:
+  `tests/compaction_from_segments.rs`, `tests/boolean_filter_domain.rs`.
+  [Rollout and proof](docs/benchmarks/fleet-placement-2026-09.md),
+  [replay from segments](docs/replay-from-segments.md).
+
 - **Landed 2026-09-07: derived-column proofs, a bounded transplant
   budget, and a narrowed Boolean filter leaf.** Derived columns close
   out: boundary proofs through the evaluator (year 1, epoch zero,

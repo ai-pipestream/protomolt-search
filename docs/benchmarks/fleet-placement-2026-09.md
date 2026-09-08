@@ -467,16 +467,14 @@ root cost what they cost before (0.24 to 0.88 s, a 23 MB root).
   band gives segment pruning something to skip within a leaf
   (`docs/segment-pruning.md`).
 - The boolean lexical clause's MUST filter leaf now resolves over its
-  narrower exact siblings' members instead of every row of the shard
-  ("The boolean lexical clause", below): on the proof child the filter
-  phase fell from 14.6 ms to 0.0-6.7 ms depending on the sibling's
-  width, with identical answers. The fleet's 600 ms on the shape is
-  not re-measured since; the Pi two-thirds should fall the same way.
+  narrower exact siblings' members instead of every row of the shard,
+  and an empty MUST intersection short-circuits before the dense
+  membership. Fleet-proven on 2026-09-07/08 (the rollout section
+  below): the lexical+filter boolean shapes fell 532 to 59 ms and 619
+  to 130 ms warm over 86.6M rows with bitwise-identical answers, and
+  the dense+filter surcharge the first roll introduced is closed.
 - The log replay's children declare their column tables in record
   order; they should pin the sources' order as the transplant does.
-- The partitioned compaction of a served catalog that has no log (the
-  split's children): the transplant fed into the shadow build,
-  designed in `docs/replay-from-segments.md`.
 - Control-plane leases for the scan rate.
 
 ## The backfill proof (2026-09-07)
@@ -875,3 +873,32 @@ dense scan's cold read), recorded here so the next roll measures cold
 against cold. Roots' VmHWM after: 24.7 MB (`:19391`), 24.2 MB
 (`:19394`); the search-v10 scope peaks at 21.5 GB of its 28 GB cap,
 all from the fresh segment read at serve.
+
+**The surcharge fix, rolled and re-measured (2026-09-08 01:25-02:00).**
+The dense+filter surcharge was root-caused offline: the domain fill
+walked every domain bit with a per-slot pruned-range check even inside
+fully pruned spans, and a domain as wide as the shard paid that fill
+for no narrowing. `9c7f0d9` walks domain bits by word within admitted
+spans only, fills by domain only when the domain is under half the
+admitted set, and resolves each group's MUST children cheapest-first
+with an empty-intersection short-circuit (the dense membership is
+skipped once a MUST group is provably empty). The fleet rolled to
+`9c7f0d9` by the same procedure (krick-1 serve 1,179 s, the Pis, the
+roots); every shape's digest matches the before run again on both
+roots. Warm, round 3, against the `a9bf470` before column above:
+
+| shape | before | 92b11fb | 9c7f0d9 |
+|---|---|---|---|
+| `:19391` lexical, `court == "scotus"` | 532 ms | 59 ms | 57 ms |
+| `:19391` lexical, `year >= 2018` | 619 ms | 130 ms | 129 ms |
+| `:19391` dense, `court == "scotus"` | 565 ms | 588 ms | 572 ms |
+| `:19391` dense, `year >= 2018` | 848 ms | 896 ms | 870 ms |
+| `:19394` dense, `year >= 2018` (no rows) | 15 ms | 31 ms | 6 ms |
+| `:19394` dense, `court == "scotus"` | 139 ms | 155 ms | 140 ms |
+| `:19391` allowlist, `court == "scotus"` (control) | 51 ms | 49 ms | 51 ms |
+
+The zero-match shape lands under the old baseline (the dense membership
+is skipped outright); the non-empty dense+filter shapes return to
+within 1-3% of baseline, the deliberate residual of resolving the dense
+membership before the filters in a non-empty group. Roots' VmHWM 24 MB;
+the search-v10 scope peak 21.5 GB, unchanged.
