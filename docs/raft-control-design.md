@@ -381,15 +381,24 @@ index, WAL or snapshot bytes from a phone enter this control state or its log.
    collection binding and full map. Preserve allocated IDs and generations.
    Missing placement state is an import error until supplied and verified from
    the quiesced map. Do not silently discard it.
-3. Explicitly bootstrap the agreed voter set and commit the import once.
+3. Durably retire the legacy authority **before** committing the new import.
+   The [legacy retirement adapter](control-retirement.md) replaces its JSON
+   with a checksummed record containing the complete validated checkpoint,
+   authenticated actor/resource/operation and destination authority identity.
+   Every legacy clone is fenced; reopening that path as a writer refuses.
+   Recovery must finish the same migration forward. A marker written after
+   the new import would leave a crash window with two restartable authorities.
+4. Explicitly bootstrap the agreed voter set and commit the import once.
    Compare all replicas' applied state/digests and exercise restart/catch-up.
    Adopt existing data owners only after their epoch enforcement is verified.
-4. Switch consumers to the applied map feed. Persist a consumed/import marker
-   so the old JSON authority cannot restart and compete with the Raft group.
-   Retain the original file and import record as recovery evidence.
-5. Before Raft accepts new operations, migration can be rolled back under a
-   deliberate shutdown. Afterwards, restarting the old authority from that
-   file would lose acknowledged decisions and is forbidden.
+5. Switch consumers to the applied map feed. Retain the retirement checkpoint
+   and new import decision as recovery evidence. Retirement itself does not
+   prove that the destination imported the checkpoint or fenced old data-plane
+   work; those are separate acceptance obligations.
+6. There is no automatic rollback from a retired record to the legacy writer.
+   An operator recovery from backup requires deliberate shutdown, proof of
+   fencing and a declared recovery point. Once new operations are acknowledged,
+   restoring the old JSON would lose those decisions and is forbidden.
 
 Ordinary restart reopens the same group and store, restores applied state and
 membership, replays committed unapplied entries, and catches up before serving

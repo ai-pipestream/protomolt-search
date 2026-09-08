@@ -1237,6 +1237,13 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: durable legacy-authority retirement.** A current Admin
+  can retire an exact checkpoint before import, fencing live clones and legacy
+  reopen. A private checksummed record preserves the actor/resource/operation
+  and permits exact authorized recovery after interrupted publication. The
+  destination store remains unchanged. See [retirement and crash recovery](docs/control-retirement.md);
+  transactional import, worker fencing and activation remain separate steps.
+
 - **Foundation branch: typed legacy control checkpoint.** A bounded private
   protobuf preserves full authority history, lease credentials, allocator and
   retained retry IDs, with exact optional presence and explicit legacy provenance.

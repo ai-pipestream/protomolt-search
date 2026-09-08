@@ -19,6 +19,7 @@ use tonic::{Code, Status};
 
 mod contract;
 mod recovery;
+mod retirement;
 mod transition;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("source_authority_meta");
@@ -592,3 +593,6 @@ impl SourceAuthorityStore {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod retirement_tests;

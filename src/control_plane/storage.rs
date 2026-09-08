@@ -207,3 +207,23 @@ impl Candidate {
         std::fs::rename(&self.path, destination)
     }
 }
+
+#[cfg(feature = "net")]
+pub(super) fn read_bounded(path: &Path, max: usize) -> Result<(Vec<u8>, File), std::io::Error> {
+    let mut file = private_options().read(true).open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "control state must be a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    (&mut file).take(max as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "retired control record exceeds 17MiB",
+        ));
+    }
+    Ok((bytes, file))
+}

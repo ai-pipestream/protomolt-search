@@ -38,6 +38,11 @@ impl LegacyControlCheckpoint {
         Ok(Self { value })
     }
 
+    /// SHA-256 of the exact canonical bytes, used by retirement preconditions.
+    pub fn sha256(&self) -> [u8; 32] {
+        crate::sha256::digest(&self.value.encode_to_vec())
+    }
+
     /// Contains privileged state, including lease credentials. Do not expose
     /// these bytes through the public query, diagnostics or map subscription API.
     pub fn encode(&self) -> Vec<u8> {
