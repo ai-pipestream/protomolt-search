@@ -51,7 +51,7 @@ const CHUNK_DOMAIN: &[u8] = b"protomolt.control-import.chunk.v1\0";
 const COMMAND_DOMAIN: &[u8] = b"protomolt.control-import.command.v1\0";
 const SNAPSHOT_DOMAIN: &[u8] = b"protomolt.control-snapshot.v1\0";
 
-fn hash(domain: &[u8], bytes: &[u8]) -> Vec<u8> {
+pub(super) fn hash(domain: &[u8], bytes: &[u8]) -> Vec<u8> {
     let mut hasher = crate::sha256::Sha256::new();
     hasher.update(domain);
     hasher.update(bytes);
@@ -93,7 +93,7 @@ fn chunk_key(key: &LogicalSourceOwner, ordinal: u32) -> Vec<u8> {
     .encode_to_vec()
 }
 
-fn resource_prefix(key: &LogicalSourceOwner) -> Vec<u8> {
+pub(super) fn resource_prefix(key: &LogicalSourceOwner) -> Vec<u8> {
     // Field 1 of every keyed record is the resource, so its encoding is the
     // byte prefix shared by every row of that resource.
     let mut prefix = Vec::new();
@@ -101,7 +101,7 @@ fn resource_prefix(key: &LogicalSourceOwner) -> Vec<u8> {
     prefix
 }
 
-fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+pub(super) fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
     let mut end = prefix.to_vec();
     while let Some(last) = end.pop() {
         if last < u8::MAX {
@@ -285,13 +285,13 @@ fn reject(code: Code, message: impl Into<String>) -> Status {
     Status::new(code, message.into())
 }
 
-struct Header {
-    source: SourceAuthorityHeader,
-    control: ControlStoreHeader,
-    limits: SourceAuthorityLimits,
+pub(super) struct Header {
+    pub(super) source: SourceAuthorityHeader,
+    pub(super) control: ControlStoreHeader,
+    pub(super) limits: SourceAuthorityLimits,
 }
 
-fn read_headers(
+pub(super) fn read_headers(
     meta: &impl ReadableTable<&'static str, &'static [u8]>,
     identity: &SourceAuthorityIdentity,
 ) -> Result<(Header, AccessPolicy), Status> {
@@ -437,9 +437,15 @@ impl SourceAuthorityStore {
                 .get(operation_bytes.as_slice())
                 .map_err(storage)?
                 .is_some()
+                || tx
+                    .open_table(capacity::CAPACITY_OPERATIONS)
+                    .map_err(storage)?
+                    .get(operation_bytes.as_slice())
+                    .map_err(storage)?
+                    .is_some()
             {
                 return Err(Status::failed_precondition(
-                    "command_id was already used by a source authority command",
+                    "command_id was already used by another source authority command",
                 ));
             }
             let mut operations = tx.open_table(IMPORT_OPERATIONS).map_err(storage)?;
@@ -1301,10 +1307,27 @@ fn apply(
             node_id: entry.key.clone(),
         }
         .encode_to_vec();
+        // The legacy capacity report carries the node's own residency
+        // declaration; it is copied exactly, never widened or defaulted.
+        let residency = match node
+            .capacity
+            .as_ref()
+            .and_then(|c| crate::pb::NodeResidency::try_from(c.residency).ok())
+        {
+            Some(crate::pb::NodeResidency::Server) => SourceResidency::Server,
+            Some(crate::pb::NodeResidency::Device) => SourceResidency::DeviceLocal,
+            Some(crate::pb::NodeResidency::Unspecified) => SourceResidency::Unspecified,
+            None => {
+                return Err(bad(&format!(
+                    "node {} declares an unknown residency",
+                    entry.key
+                )))
+            }
+        };
         let v = ControlNode {
             format_version: 1,
             node: Some(node),
-            residency: SourceResidency::Unspecified as i32,
+            residency: residency as i32,
             provenance: ControlFactProvenance::LegacyImport as i32,
         }
         .encode_to_vec();
@@ -1537,50 +1560,36 @@ fn validate_supplement(
 /// format-2 header are added in one transaction. A store that is neither a
 /// complete format 1 nor a complete format 2 refuses; nothing is defaulted.
 pub(super) fn adopt(store: &SourceAuthorityStore) -> Result<(), Status> {
-    let (tables, has_control) = {
+    let (tables, has_control, has_capacity) = {
         let tx = store.inner.database.begin_read().map_err(storage)?;
         let tables = tx.list_tables().map_err(storage)?.count();
         let meta = tx.open_table(META).map_err(corrupt)?;
         let has_control = meta.get(CONTROL_HEADER).map_err(storage)?.is_some();
-        (tables, has_control)
+        let has_capacity = meta
+            .get(capacity::CAPACITY_HEADER)
+            .map_err(storage)?
+            .is_some();
+        (tables, has_control, has_capacity)
     };
-    match (tables, has_control) {
-        (FORMAT_2_TABLES, true) => Ok(()),
-        (4, false) => {
-            let mut tx = store.inner.database.begin_write().map_err(storage)?;
-            tx.set_durability(Durability::Immediate).map_err(storage)?;
-            {
-                for definition in [
-                    IMPORT_OPERATIONS,
-                    IMPORTS,
-                    CHUNKS,
-                    CONTROL,
-                    TOPOLOGIES,
-                    NODES,
-                    REPLICAS,
-                    ACTIONS,
-                    COMPLETED,
-                ] {
-                    tx.open_table(definition).map_err(storage)?;
-                }
-                let mut meta = tx.open_table(META).map_err(storage)?;
-                meta.insert(
-                    CONTROL_HEADER,
-                    ControlStoreHeader {
-                        format_version: STORE_FORMAT,
-                        ..Default::default()
-                    }
-                    .encode_to_vec()
-                    .as_slice(),
-                )
-                .map_err(storage)?;
-            }
-            tx.commit().map_err(storage)
+    let (control, capacity) = match (tables, has_control, has_capacity) {
+        (capacity::FORMAT_3_TABLES, true, true) => return Ok(()),
+        (FORMAT_2_TABLES, true, false) => (false, true),
+        (4, false, false) => (true, true),
+        _ => {
+            return Err(corrupt(
+                "control tables and headers disagree; not a complete format 1, 2 or 3 store",
+            ))
         }
-        _ => Err(corrupt(
-            "control tables and header disagree; neither a complete format 1 nor format 2 store",
-        )),
+    };
+    let mut tx = store.inner.database.begin_write().map_err(storage)?;
+    tx.set_durability(Durability::Immediate).map_err(storage)?;
+    if control {
+        create_tables(&tx)?;
     }
+    if capacity {
+        capacity::create_tables(&tx)?;
+    }
+    tx.commit().map_err(storage)
 }
 
 pub(super) fn create_tables(tx: &redb::WriteTransaction) -> Result<(), Status> {
@@ -1622,10 +1631,14 @@ pub(super) fn reserved(
             .value(),
     )?;
     recovery::control_header(&control)?;
+    let capacity = capacity::header(meta)?;
     Ok((
         control.reserved_bytes,
         control.reserved_decisions,
-        control.import_decision_count,
+        control
+            .import_decision_count
+            .checked_add(capacity.configure_decision_count)
+            .ok_or_else(|| corrupt("retained decision count overflow"))?,
     ))
 }
 

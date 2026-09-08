@@ -171,13 +171,13 @@ pub(super) fn operation(
 
 pub(super) fn validate(store: &SourceAuthorityStore) -> Result<(), Status> {
     let tx = store.inner.database.begin_read().map_err(storage)?;
-    if tx.list_tables().map_err(storage)?.count() != import::FORMAT_2_TABLES
+    if tx.list_tables().map_err(storage)?.count() != capacity::FORMAT_3_TABLES
         || tx.list_multimap_tables().map_err(storage)?.next().is_some()
     {
         return Err(corrupt("unexpected or missing control tables"));
     }
     let meta = tx.open_table(META).map_err(corrupt)?;
-    if meta.len().map_err(storage)? != 3 {
+    if meta.len().map_err(storage)? != 4 {
         return Err(corrupt("unexpected metadata keys"));
     }
     let control: ControlStoreHeader = contract::decode(
@@ -233,8 +233,12 @@ pub(super) fn validate(store: &SourceAuthorityStore) -> Result<(), Status> {
     let (accepted_imports, control_payload) =
         control::validate(&tx, &state, &control, &policy, &decisions)?;
     payload = payload_change(payload, 0, control_payload)?;
+    let (accepted_configures, capacity_payload) =
+        capacity::validate(&tx, &meta, &state, &policy, &decisions)?;
+    payload = payload_change(payload, 0, capacity_payload)?;
     if accepted
         .checked_add(accepted_imports)
+        .and_then(|n| n.checked_add(accepted_configures))
         .and_then(|n| n.checked_add(1))
         != Some(state.control_revision)
     {

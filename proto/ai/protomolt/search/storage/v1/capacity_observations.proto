@@ -1,0 +1,195 @@
+syntax = "proto3";
+package ai.protomolt.search.storage.v1;
+
+import "ai/protomolt/search/storage/v1/source_authority.proto";
+
+// Capacity observations as committed state (docs/capacity-observations.md):
+// the durable rows behind the capacity-tier planner's frozen snapshot
+// (docs/capacity-tiers.md). Internal records: not RPCs, not a plan, not an
+// execution credential.
+
+// Store format 3 header under the meta key "capacity". Every count is
+// recomputed and compared at open.
+message CapacityStoreHeader {
+  uint32 format_version = 1; // 1
+  uint64 configure_decision_count = 2;
+  uint64 state_count = 3;
+  uint64 reporter_count = 4;
+  uint64 observation_count = 5;
+}
+
+enum CapacityResidency {
+  CAPACITY_RESIDENCY_UNSPECIFIED = 0;
+  CAPACITY_RESIDENCY_SERVER = 1;
+  CAPACITY_RESIDENCY_DEVICE = 2;
+}
+
+message CapacityTierSpec {
+  string name = 1;
+  CapacityResidency residency = 2;
+  uint32 min_replicas = 3;
+  uint64 scans_per_byte_nanos_lo = 4;
+  uint64 scans_per_byte_nanos_hi = 5;
+  uint64 max_seconds_since_scan = 6;
+}
+
+// Tiers in precedence order; the order is part of the policy's identity.
+message CapacityTierPolicy {
+  uint32 format_version = 1; // 1
+  repeated CapacityTierSpec tiers = 2;
+}
+
+// Per-resource committed planner configuration. The cohort cannot change
+// while observations are retained; bounds cannot drop below what is held.
+message CapacityConfiguration {
+  uint32 format_version = 1; // 1
+  uint64 cohort_length_ms = 2; // 1..2^40
+  uint64 cohort_phase_unix_ms = 3;
+  uint64 max_total_records = 4; // 1..65536
+  uint64 max_total_bytes = 5; // 1..64 MiB, Kimi's heap accounting
+  uint64 max_registered_nodes = 6; // 1..4096
+  CapacityTierPolicy policy = 7;
+}
+
+// A control command: actor-scoped, retryable by command_id in the shared
+// command_id namespace, one durable decision, advances the control revision.
+message CapacityConfigureCommand {
+  uint32 format_version = 1; // 1
+  SourceAuthorityIdentity authority = 2;
+  LogicalSourceOwner key = 3; // the collection resource; owner_id empty
+  bytes command_id = 4;
+  uint64 expected_control_revision = 5;
+  uint64 expected_policy_revision = 6;
+  CapacityConfiguration configuration = 7;
+}
+
+message CapacityConfigureDecision {
+  uint32 format_version = 1; // 1
+  uint32 code = 2; // canonical gRPC status; zero is an accepted transition
+  string message = 3;
+  uint64 control_revision = 4;
+  uint64 policy_revision = 5;
+  uint64 observation_epoch = 6;
+}
+
+message CapacityConfigureOperation {
+  uint32 format_version = 1; // 1
+  bytes request_sha256 = 2;
+  CapacityConfigureCommand command = 3;
+  CapacityConfigureDecision decision = 4;
+}
+
+// §2 of the planner contract: a declared hash partition of one resource.
+message CapacityPartition {
+  string workspace = 1;
+  string collection = 2;
+  bytes derived_fingerprint = 3; // 32 bytes
+  string column = 4;
+  uint64 bucket = 5;
+}
+
+message CapacityShardRef {
+  string shard = 1;
+  uint64 source_generation = 2;
+  bytes storage_incarnation = 3; // 16 bytes
+  uint64 ownership_epoch = 4;
+}
+
+// §3: one node's measured statement, stored exactly as validated.
+message CapacityObservation {
+  uint32 format_version = 1; // 1
+  CapacityPartition partition = 2;
+  string node_id = 3;
+  bytes process_incarnation = 4; // 16 bytes
+  CapacityShardRef shard = 5;
+  uint64 topology_generation = 6;
+  string leaf = 7;
+  uint64 rows = 8;
+  uint64 resident_bytes = 9;
+  uint64 scans_observed = 10;
+  uint64 scan_bytes = 11;
+  uint64 queue_wait_p50_us = 12;
+  uint64 queue_wait_p99_us = 13;
+  uint32 samples = 14;
+  uint64 last_scanned_unix_ms = 15;
+  uint64 window_start_unix_ms = 16;
+  uint64 window_end_unix_ms = 17;
+}
+
+// Observation transitions advance the observation epoch, never the control
+// revision, and are idempotent by content: an identical report is
+// UNCHANGED, a re-registered incarnation is a no-op, a repeated expiry drops
+// nothing. They carry no retry record; refusals are returned, not stored.
+message CapacityTransition {
+  uint32 format_version = 1; // 1
+  SourceAuthorityIdentity authority = 2;
+  LogicalSourceOwner key = 3;
+  oneof action {
+    RegisterCapacityReporter register = 10;
+    CapacityObservation report = 11;
+    CommitCapacityExpiry expire = 12;
+  }
+}
+
+message RegisterCapacityReporter {
+  string node_id = 1;
+  bytes process_incarnation = 2; // 16 bytes
+}
+
+message CommitCapacityExpiry {
+  uint64 now_unix_ms = 1;
+  uint64 max_age_ms = 2;
+}
+
+enum CapacityTransitionOutcome {
+  CAPACITY_TRANSITION_OUTCOME_UNSPECIFIED = 0;
+  CAPACITY_TRANSITION_OUTCOME_LANDED = 1;
+  CAPACITY_TRANSITION_OUTCOME_UNCHANGED = 2;
+  CAPACITY_TRANSITION_OUTCOME_SUPERSEDED = 3;
+}
+
+message CapacityTransitionReceipt {
+  uint32 format_version = 1; // 1
+  CapacityTransitionOutcome outcome = 2;
+  uint64 observation_epoch = 3;
+  uint64 dropped = 4; // observations removed by a registration or expiry
+  uint64 control_revision = 5;
+}
+
+// One row per configured resource.
+message CapacityState {
+  uint32 format_version = 1; // 1
+  LogicalSourceOwner key = 2;
+  CapacityConfiguration configuration = 3;
+  uint64 observation_epoch = 4;
+  uint64 configured_control_revision = 5;
+  uint64 reporter_count = 6;
+  uint64 observation_count = 7;
+}
+
+message CapacityReporterKey {
+  LogicalSourceOwner key = 1;
+  string node_id = 2;
+}
+
+message CapacityReporter {
+  uint32 format_version = 1; // 1
+  bytes process_incarnation = 2;
+}
+
+// The stored observation key: the resource, then the planner's canonical
+// identity tuple. Workspace and collection are the resource's.
+message CapacityObservationKey {
+  LogicalSourceOwner key = 1;
+  bytes derived_fingerprint = 2;
+  string column = 3;
+  uint64 bucket = 4;
+  uint64 topology_generation = 5;
+  string leaf = 6;
+  string shard = 7;
+  uint64 source_generation = 8;
+  uint64 ownership_epoch = 9;
+  string node_id = 10;
+  bytes process_incarnation = 11;
+  bytes storage_incarnation = 12;
+}

@@ -19,12 +19,16 @@ use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use tokio::sync::watch;
 use tonic::{Code, Status};
 
+mod capacity;
 mod contract;
 mod import;
 mod recovery;
 mod retirement;
 mod transition;
 
+pub use capacity::{
+    PlanningContext, MAX_CAPACITY_BYTES, MAX_CAPACITY_RECORDS, MAX_CAPACITY_REPORTERS,
+};
 pub use import::{
     chunk_capacity, chunk_digest, payload_digest, plan_chunks, retirement_digest,
     MAX_IMPORT_CHUNKS, MAX_IMPORT_PAYLOAD_BYTES, MAX_SUPPLEMENT_BYTES, MIN_CHUNK_CAPACITY,
@@ -383,6 +387,7 @@ impl SourceAuthorityStore {
             tx.open_table(WORKFLOWS).map_err(storage)?;
         }
         import::create_tables(&tx)?;
+        capacity::create_tables(&tx)?;
         tx.commit().map_err(storage)?;
         parent.sync_all().map_err(storage)?;
         store.inner.revisions.send_replace(policy.revision);
@@ -561,9 +566,15 @@ impl SourceAuthorityStore {
                 .get(operation_bytes.as_slice())
                 .map_err(storage)?
                 .is_some()
+                || tx
+                    .open_table(capacity::CAPACITY_OPERATIONS)
+                    .map_err(storage)?
+                    .get(operation_bytes.as_slice())
+                    .map_err(storage)?
+                    .is_some()
             {
                 return Err(Status::failed_precondition(
-                    "command_id was already used by a control import command",
+                    "command_id was already used by a control import or capacity command",
                 ));
             }
             let mut decisions = tx.open_table(DECISIONS).map_err(storage)?;
@@ -873,6 +884,8 @@ mod tests;
 
 #[cfg(test)]
 mod admission_tests;
+#[cfg(test)]
+mod capacity_tests;
 #[cfg(test)]
 mod import_tests;
 #[cfg(test)]

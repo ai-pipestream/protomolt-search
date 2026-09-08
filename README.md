@@ -1250,6 +1250,18 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   destination store remains unchanged. See [retirement and crash recovery](docs/control-retirement.md);
   transactional import, worker fencing and activation remain separate steps.
 
+- **Foundation branch: capacity observations as committed state
+  (implemented).** Store format 3 keeps the planner configuration, reporter
+  incarnations and observations as rows of the source authority; configure
+  is a retained control command, observation transitions (register, report,
+  expire) advance the observation epoch and are idempotent by content, and
+  `planner_input` transcribes one read of committed rows into Kimi's
+  `TierSnapshotInput` with `TierSnapshot::validated` as the only validator.
+  Reopen and crash recovery reproduce identical planner inputs and plans;
+  policy and tier changes move the plan digest. The legacy node residency is
+  now copied exactly on import (it was defaulted). See
+  [capacity observations](docs/capacity-observations.md).
+
 - **Foundation branch: owner admission and readiness (implemented).** The
   source authority store is an `Authorizer` over its committed policy with one
   ordered revision history; a `SourceAdmission` is the single acquisition an

@@ -16,10 +16,10 @@ use redb::{ReadableTable, TableHandle};
 use std::path::PathBuf;
 use tonic::Code;
 
-struct Directory(PathBuf);
+pub(super) struct Directory(pub(super) PathBuf);
 
 impl Directory {
-    fn new(name: &str) -> Self {
+    pub(super) fn new(name: &str) -> Self {
         let path = std::env::temp_dir().join(format!(
             "control-import-{name}-{}-{}",
             std::process::id(),
@@ -31,10 +31,10 @@ impl Directory {
         std::fs::create_dir(&path).unwrap();
         Self(path)
     }
-    fn authority(&self) -> PathBuf {
+    pub(super) fn authority(&self) -> PathBuf {
         self.0.join("authority.redb")
     }
-    fn legacy(&self) -> PathBuf {
+    pub(super) fn legacy(&self) -> PathBuf {
         self.0.join("legacy.json")
     }
 }
@@ -45,7 +45,7 @@ impl Drop for Directory {
     }
 }
 
-fn identity(seed: u8) -> SourceAuthorityIdentity {
+pub(super) fn identity(seed: u8) -> SourceAuthorityIdentity {
     SourceAuthorityIdentity {
         format_version: 1,
         group_id: vec![seed; 16],
@@ -53,7 +53,7 @@ fn identity(seed: u8) -> SourceAuthorityIdentity {
     }
 }
 
-fn grant(principal: &str, collection: &str) -> CollectionGrant {
+pub(super) fn grant(principal: &str, collection: &str) -> CollectionGrant {
     CollectionGrant {
         principal: principal.into(),
         workspace: "workspace-a".into(),
@@ -63,7 +63,7 @@ fn grant(principal: &str, collection: &str) -> CollectionGrant {
     }
 }
 
-fn policy() -> AccessPolicy {
+pub(super) fn policy() -> AccessPolicy {
     AccessPolicy {
         format_version: 1,
         revision: 1,
@@ -81,7 +81,7 @@ fn policy() -> AccessPolicy {
     }
 }
 
-fn limits(max_command_bytes: u32, max_decisions: u64) -> SourceAuthorityLimits {
+pub(super) fn limits(max_command_bytes: u32, max_decisions: u64) -> SourceAuthorityLimits {
     SourceAuthorityLimits {
         max_owners: 16,
         max_decisions,
@@ -90,7 +90,7 @@ fn limits(max_command_bytes: u32, max_decisions: u64) -> SourceAuthorityLimits {
     }
 }
 
-fn key(collection: &str) -> LogicalSourceOwner {
+pub(super) fn key(collection: &str) -> LogicalSourceOwner {
     LogicalSourceOwner {
         workspace: "workspace-a".into(),
         collection: collection.into(),
@@ -99,7 +99,7 @@ fn key(collection: &str) -> LogicalSourceOwner {
 }
 
 /// A populated legacy authority with `routes` current routes, opened durably.
-fn legacy(dir: &Directory, routes: usize) -> DurableControlPlane {
+pub(super) fn legacy(dir: &Directory, routes: usize) -> DurableControlPlane {
     std::fs::write(
         dir.legacy(),
         test_fixtures::populated_state_json("books", routes),
@@ -111,11 +111,15 @@ fn legacy(dir: &Directory, routes: usize) -> DurableControlPlane {
         .unwrap()
 }
 
-fn store(dir: &Directory, seed: u8, limits: &SourceAuthorityLimits) -> SourceAuthorityStore {
+pub(super) fn store(
+    dir: &Directory,
+    seed: u8,
+    limits: &SourceAuthorityLimits,
+) -> SourceAuthorityStore {
     SourceAuthorityStore::create(&dir.authority(), &identity(seed), &policy(), limits).unwrap()
 }
 
-fn retire(
+pub(super) fn retire(
     store: &SourceAuthorityStore,
     legacy: &DurableControlPlane,
     control_revision: u64,
@@ -135,7 +139,7 @@ fn retire(
     (retired, request)
 }
 
-fn geometry() -> ControlProviderGeometry {
+pub(super) fn geometry() -> ControlProviderGeometry {
     ControlProviderGeometry {
         format_version: 1,
         backend_kind: "embedded-turbovec".into(),
@@ -149,7 +153,7 @@ fn geometry() -> ControlProviderGeometry {
     }
 }
 
-fn supplement(checkpoint: &LegacyControlCheckpoint) -> LegacyControlImportSupplement {
+pub(super) fn supplement(checkpoint: &LegacyControlCheckpoint) -> LegacyControlImportSupplement {
     LegacyControlImportSupplement {
         format_version: 1,
         placement: Some(Placement::NoPlacement(true)),
@@ -166,7 +170,10 @@ fn supplement(checkpoint: &LegacyControlCheckpoint) -> LegacyControlImportSupple
     }
 }
 
-fn payload(retired: &RetiredLegacyControl, supplement: LegacyControlImportSupplement) -> Vec<u8> {
+pub(super) fn payload(
+    retired: &RetiredLegacyControl,
+    supplement: LegacyControlImportSupplement,
+) -> Vec<u8> {
     ControlImportPayload {
         format_version: 1,
         retirement: retired.record().encode_to_vec(),
@@ -175,11 +182,11 @@ fn payload(retired: &RetiredLegacyControl, supplement: LegacyControlImportSupple
     .encode_to_vec()
 }
 
-fn checkpoint_of(retired: &RetiredLegacyControl) -> LegacyControlCheckpoint {
+pub(super) fn checkpoint_of(retired: &RetiredLegacyControl) -> LegacyControlCheckpoint {
     LegacyControlCheckpoint::decode(retired.checkpoint_bytes()).unwrap()
 }
 
-fn command(
+pub(super) fn command(
     authority: &SourceAuthorityIdentity,
     id: &str,
     control: u64,
@@ -197,7 +204,7 @@ fn command(
     }
 }
 
-fn begin_action(
+pub(super) fn begin_action(
     retired: &RetiredLegacyControl,
     payload: &[u8],
     chunk_bytes: u32,
@@ -213,7 +220,7 @@ fn begin_action(
     })
 }
 
-fn chunk_action(payload: &[u8], chunk_bytes: u32, ordinal: u32) -> ImportAction {
+pub(super) fn chunk_action(payload: &[u8], chunk_bytes: u32, ordinal: u32) -> ImportAction {
     let start = ordinal as usize * chunk_bytes as usize;
     let end = payload.len().min(start + chunk_bytes as usize);
     ImportAction::Chunk(ControlImportChunk {
@@ -224,7 +231,7 @@ fn chunk_action(payload: &[u8], chunk_bytes: u32, ordinal: u32) -> ImportAction 
 }
 
 /// Begin, every chunk, Commit; returns the receipt and the next revision.
-fn run_import(
+pub(super) fn run_import(
     store: &SourceAuthorityStore,
     authority: &SourceAuthorityIdentity,
     limits: &SourceAuthorityLimits,
@@ -278,9 +285,9 @@ fn run_import(
     (commit.receipt.unwrap(), revision + 1, chunk_count)
 }
 
-type TableRows = Vec<(Vec<u8>, Vec<u8>)>;
+pub(super) type TableRows = Vec<(Vec<u8>, Vec<u8>)>;
 
-fn table_bytes(store: &SourceAuthorityStore) -> Vec<(String, TableRows)> {
+pub(super) fn table_bytes(store: &SourceAuthorityStore) -> Vec<(String, TableRows)> {
     let tx = store.inner.database.begin_read().unwrap();
     let mut names: Vec<String> = tx
         .list_tables()
@@ -363,10 +370,19 @@ fn round_trip_imports_the_populated_legacy_authority_in_bounded_chunks() {
     assert_eq!(topology.routes, state.topology.as_ref().unwrap().routes);
     assert!(topology.current && !topology.codes_available);
     assert_eq!(snapshot.nodes.len(), 2);
-    assert!(snapshot
+    // Residency is the legacy node's own declaration, copied exactly.
+    let residency: Vec<(String, i32)> = snapshot
         .nodes
         .iter()
-        .all(|n| n.residency == SourceResidency::Unspecified as i32));
+        .map(|n| (n.node_id.clone(), n.residency))
+        .collect();
+    assert_eq!(
+        residency,
+        [
+            ("node z".to_string(), SourceResidency::DeviceLocal as i32),
+            ("node/α".to_string(), SourceResidency::Server as i32),
+        ]
+    );
     assert_eq!(snapshot.replicas.len(), 2);
     assert_eq!(snapshot.actions.len(), 1);
     assert_eq!(
@@ -1409,12 +1425,17 @@ fn format_one_stores_adopt_and_incomplete_stores_refuse() {
             REPLICAS,
             ACTIONS,
             COMPLETED,
+            capacity::CAPACITY_OPERATIONS,
+            capacity::CAPACITY,
+            capacity::REPORTERS,
+            capacity::OBSERVATIONS,
         ] {
             tx.delete_table(definition).unwrap();
         }
         {
             let mut meta = tx.open_table(META).unwrap();
             meta.remove(CONTROL_HEADER).unwrap();
+            meta.remove(capacity::CAPACITY_HEADER).unwrap();
         }
         tx.commit().unwrap();
     }
