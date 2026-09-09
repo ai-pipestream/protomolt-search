@@ -1100,3 +1100,31 @@ second run of the combined gate passed in full. Closing it means either
 exposing the library hook behind a feature or a harness-local copy of it
 in `kit.rs`, with its own sensitivity probe; that is a slice of its own
 and is left named here.
+
+### Found after slice 4c: the purge the store bounds is now recorded (Fable)
+
+The open item above is fixed at the checkpoint after 537917b, in `src/raft/log_store.rs`. The
+library's purge position is recorded in the log (`purge_deferred` in the
+log's meta table, a `RaftLogId`; no proto change) when a purge is cut at
+the hosted store's applied position, or moves no entry because the store
+had applied no entry. `settle_locked` completes a recorded purge to its own
+position once the store is at or past it, and to the store's position
+until then, at the next append and at start; a purge completed in full
+clears the record. With no record the log behaves as before: an empty log
+behind the store's position is purged to it, entries contiguous from the
+purged position are kept (the library keeps entries behind a snapshot on
+purpose), and entries after a gap refuse.
+
+`a_purge_deferred_by_the_store_completes_when_the_store_is_at_the_position`
+(`src/raft/tests.rs`) drives three logs against one replica machine: with
+the store at no position, a purge to the first snapshot, the install, then the
+append (log a) or a start (log b); and with the store at the first
+snapshot, a purge to the second cut at the first (log c), completed by the
+second install and the append after it. Against the log store of before,
+log a's append fails with the finding's own text, `appending index 3 would
+leave a hole; the next index is 2` (`deferred-purge-unit-unfixed.log`);
+with the record it passes (`deferred-purge-unit.log`). The `#[ignore]` on
+`a_pending_member_with_an_advanced_log_and_no_apply_is_seeded_and_applies`
+is removed and the test passes as written: the seed installs, the leader's
+next append is applied at the member, both cores run
+(`deferred-purge-pending-member.log`). Gates, in the 8 GiB scope with two build jobs and four test threads: the snapshot target 17 pass (`deferred-purge-control_raft_snapshots.log`); regressions 10, admission 10, crash faults 7 and the worker 1 (`deferred-purge-raft-targets.log`); the lib with raft, tls and fault-injection 833 pass (`deferred-purge-lib-raft.log`); clippy with the same features, the pre-existing deny at `src/vector.rs:1092` and pre-existing warnings, none in the changed files (`deferred-purge-clippy.log`); the combined release gate 164 targets, 1813 pass, 0 fail, 1 ignored, the pre-existing `native_matches_opennlp_contract` (`deferred-purge-combined-gate.log`); rustfmt on the changed files.

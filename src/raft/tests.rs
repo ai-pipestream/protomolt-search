@@ -686,6 +686,175 @@ async fn a_snapshot_installs_into_a_fresh_replica_with_the_same_map() {
     assert!(oversize.to_string().contains("bound"), "{oversize}");
 }
 
+/// The library purges to a snapshot before the state machine installs it,
+/// and the purge is bounded by the store's applied position. The
+/// remainder is recorded and completed once the store is at the position:
+/// at the next append (log `a`) and at start (log `b`), both with a store
+/// that applied nothing when the purge came, and with a store that had
+/// applied an earlier snapshot, where the purge is cut at that position
+/// (log `c`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_purge_deferred_by_the_store_completes_when_the_store_is_at_the_position() {
+    let dir = Directory::new("deferred-purge");
+    let group = identity(7);
+    let host = RaftHost::bootstrap_single(
+        &dir.0,
+        &group,
+        1,
+        "https://node-1:19291",
+        &policy(),
+        &limits(),
+        &config(),
+    )
+    .await
+    .unwrap();
+    let mut snapshots = Vec::new();
+    for (owner_id, id, revision) in [("phone", "p1", 1), ("tablet", "p2", 2)] {
+        host.propose_command("alice", &prepare(&group, owner_id, id, revision))
+            .await
+            .unwrap();
+        host.trigger_snapshot().await.unwrap();
+        let applied = host.store().unwrap().raft_applied().unwrap().unwrap();
+        let last = log_id_from_proto(applied.last_applied.as_ref().unwrap());
+        host.wait(Some(std::time::Duration::from_secs(30)))
+            .snapshot(last, "snapshot built")
+            .await
+            .unwrap();
+        let generation = published_generation(&dir.0.join(super::host::SNAPSHOT_DIR))
+            .unwrap()
+            .unwrap();
+        let image = std::fs::read(generation.join("image.redb")).unwrap();
+        let meta_bytes = std::fs::read(generation.join("meta")).unwrap();
+        let meta_value =
+            <crate::pb::storage::RaftSnapshotMeta as prost::Message>::decode(meta_bytes.as_slice())
+                .unwrap();
+        let meta = openraft::storage::SnapshotMeta {
+            last_log_id: meta_value.last_log_id.as_ref().map(log_id_from_proto),
+            last_membership: stored_membership_from_proto(meta_value.membership.as_ref().unwrap())
+                .unwrap(),
+            snapshot_id: meta_value.snapshot_id.clone(),
+        };
+        snapshots.push((image, meta, last));
+    }
+    host.shutdown().await.unwrap();
+    let (first_image, first_meta, first) = snapshots.remove(0);
+    let (second_image, second_meta, second) = snapshots.remove(0);
+    assert!(second.index > first.index);
+
+    let replica_dir = Directory::new("deferred-purge-replica");
+    let replica_store = crate::source_authority::SourceAuthorityStore::create(
+        &replica_dir.0.join(super::host::STORE_FILE),
+        &group,
+        &policy(),
+        &limits(),
+    )
+    .unwrap();
+    let mut machine = ControlStateMachine::new(
+        replica_store,
+        &replica_dir.0.join(super::host::SNAPSHOT_DIR),
+        64 << 20,
+    )
+    .unwrap();
+    let blanks = |from: u64, upto: u64| -> Vec<Entry<ControlRaft>> {
+        (from..=upto)
+            .map(|index| Entry {
+                log_id: log_id(1, 1, index),
+                payload: EntryPayload::Blank,
+            })
+            .collect()
+    };
+    let log_path = |name: &str| replica_dir.0.join(format!("raft-log-{name}.redb"));
+    let mut a = RaftLogStore::create(&log_path("a"), &group, 2).unwrap();
+    let mut b = RaftLogStore::create(&log_path("b"), &group, 2).unwrap();
+    for log in [&mut a, &mut b] {
+        log.bind_applied_floor(machine.shared_store()).unwrap();
+        log.append_sync(blanks(0, 1)).unwrap();
+        // The store applied nothing: the purge moves no entry and is deferred.
+        log.purge(first).await.unwrap();
+        assert_eq!(log.entries().unwrap().len(), 2);
+        let state = log.get_log_state().await.unwrap();
+        assert_eq!(state.last_purged_log_id, None);
+        assert_eq!(state.last_log_id, Some(log_id(1, 1, 1)));
+    }
+    drop(b);
+    let mut file = machine.begin_receiving_snapshot().await.unwrap();
+    file.write_all(&first_image).await.unwrap();
+    machine.install_snapshot(&first_meta, file).await.unwrap();
+    assert_eq!(machine.applied_state().await.unwrap().0, Some(first));
+
+    // Log a: the next append completes the purge first, then lands.
+    let after_first = LogId::new(first.leader_id, first.index + 1);
+    a.append_sync(vec![Entry {
+        log_id: after_first,
+        payload: EntryPayload::Blank,
+    }])
+    .unwrap();
+    let state = a.get_log_state().await.unwrap();
+    assert_eq!(state.last_purged_log_id, Some(first));
+    assert_eq!(state.last_log_id, Some(after_first));
+    assert_eq!(a.entries().unwrap().len(), 1);
+    // Log b: a start completes it.
+    let mut b = RaftLogStore::open(&log_path("b"), &group, 2).unwrap();
+    b.bind_applied_floor(machine.shared_store()).unwrap();
+    let state = b.get_log_state().await.unwrap();
+    assert_eq!(state.last_purged_log_id, Some(first));
+    assert_eq!(state.last_log_id, Some(first));
+    assert_eq!(b.entries().unwrap().len(), 0);
+    b.append_sync(vec![Entry {
+        log_id: after_first,
+        payload: EntryPayload::Blank,
+    }])
+    .unwrap();
+    assert_eq!(
+        b.get_log_state().await.unwrap().last_log_id,
+        Some(after_first)
+    );
+
+    // Log c: the store is at the first snapshot, and an empty log bound to
+    // it starts after that position. A purge to the second is cut at the
+    // first and the rest deferred, then completed by the install of the
+    // second and the append after it.
+    let mut c = RaftLogStore::create(&log_path("c"), &group, 2).unwrap();
+    c.bind_applied_floor(machine.shared_store()).unwrap();
+    assert_eq!(
+        c.get_log_state().await.unwrap().last_purged_log_id,
+        Some(first)
+    );
+    c.append_sync(blanks(first.index + 1, second.index + 1))
+        .unwrap();
+    c.purge(second).await.unwrap();
+    let state = c.get_log_state().await.unwrap();
+    assert_eq!(state.last_purged_log_id, Some(first));
+    assert_eq!(state.last_log_id, Some(log_id(1, 1, second.index + 1)));
+    assert_eq!(
+        c.entries().unwrap().len() as u64,
+        second.index + 1 - first.index
+    );
+    let mut file = machine.begin_receiving_snapshot().await.unwrap();
+    file.write_all(&second_image).await.unwrap();
+    machine.install_snapshot(&second_meta, file).await.unwrap();
+    assert_eq!(machine.applied_state().await.unwrap().0, Some(second));
+    let after_second = LogId::new(second.leader_id, second.index + 2);
+    c.append_sync(vec![Entry {
+        log_id: after_second,
+        payload: EntryPayload::Blank,
+    }])
+    .unwrap();
+    let state = c.get_log_state().await.unwrap();
+    assert_eq!(state.last_purged_log_id, Some(second));
+    assert_eq!(state.last_log_id, Some(after_second));
+    assert_eq!(c.entries().unwrap().len(), 2);
+    // A purge completed in full clears the record: a later start keeps the
+    // entries after the snapshot.
+    drop(c);
+    let mut c = RaftLogStore::open(&log_path("c"), &group, 2).unwrap();
+    c.bind_applied_floor(machine.shared_store()).unwrap();
+    let state = c.get_log_state().await.unwrap();
+    assert_eq!(state.last_purged_log_id, Some(second));
+    assert_eq!(state.last_log_id, Some(after_second));
+    assert_eq!(c.entries().unwrap().len(), 2);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exact_retries_advance_the_applied_position_in_every_command_family() {
     let dir = Directory::new("retry-position");

@@ -140,11 +140,19 @@ The library purges the log for an incoming snapshot before the state
 machine has installed it, and treats the state machine's refusal as a
 fatal storage error. A purge therefore never passes the hosted store's
 applied position (`RaftLogStore::bind_applied_floor`): a purge that would
-is cut at the store's position, and the deferred remainder is completed
-when the store catches up (at the next append, and at start). A refused
-install thus leaves the log consistent with the store it kept, and the
-member restarts and is seeded again. A log holding entries after a gap is
-data loss and refuses to start. Startup also refuses a published
+is cut at the store's position, the library's position is recorded in the
+log as the deferred purge, and the remainder is completed when the store
+catches up (at the next append, and at start), as far as the store's
+position and no further. A refused install thus leaves the log consistent
+with the store it kept, and the member restarts and is seeded again. The
+record is what makes the seed of a member with a log that advanced
+without an apply hold: with the store at no position the purge moves no
+entry, the install applies the snapshot's position, and the next append
+completes the purge to it first, so the entries from before the seed go
+and the append is written at the position after the snapshot. Without the record the
+log kept those entries and the append opened a gap, which stopped the
+member's core (`a_pending_member_with_an_advanced_log_and_no_apply_is_seeded_and_applies`).
+A log holding entries after a gap is data loss and refuses to start. Startup also refuses a published
 generation whose position is past the store's applied position (a forged
 pointer, or a store restored from an older copy), naming both positions.
 

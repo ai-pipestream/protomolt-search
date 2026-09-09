@@ -1562,21 +1562,17 @@ async fn a_pending_member_with_an_advanced_log_and_no_apply_starts_again() {
 
 /// The group's recovery of that member by seeding, which
 /// `docs/raft-hosting.md` states as "the member restarts and is seeded
-/// again". The seed itself lands: the image installs, the marker goes and
-/// the store applies the leader's position. What does not hold is the step
-/// after it. The library purges the member's log for the incoming snapshot
-/// before the state machine has installed it, and that purge is bounded by
-/// the store's applied position, which is nothing at that moment, so it
-/// moves no entry. The install then applies the leader's position, and the
-/// deferred half of the purge is never completed: `settle_locked` takes a
-/// log whose first index is the purged position plus one as contiguous and
-/// leaves it, although its last index is below the position the store now
-/// applies. The log's next index is therefore two behind the state
-/// machine's, and the leader's next append opens a gap the log names as
-/// data loss, which stops the member's core.
+/// again". The library purges the member's log for the incoming snapshot
+/// before the state machine has installed it; that purge is bounded by the
+/// store's applied position, which is nothing at that moment, so it moves
+/// no entry and is recorded as deferred. The install applies the leader's
+/// position, and the leader's next append completes the purge to it first,
+/// so the entries from before the seed go and the append lands at the
+/// position after the snapshot; the member applies it with its core
+/// running. Before the record (slice 4c), the log kept those entries and
+/// the append opened a gap the log named as data loss, which stopped the
+/// member's core (`kimi-recovery-residual2.log`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "open for Fable: a member seeded after its log advanced without an apply keeps its \
-            pre-seed entries, so the leader's next append opens a gap and the member core stops"]
 async fn a_pending_member_with_an_advanced_log_and_no_apply_is_seeded_and_applies() {
     let _serial = serial();
     let group = kit::identity(kit::SEED);

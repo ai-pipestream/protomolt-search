@@ -1250,6 +1250,15 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   destination store remains unchanged. See [retirement and crash recovery](docs/control-retirement.md);
   transactional import, worker fencing and activation remain separate steps.
 
+- **Foundation branch: a purge the store bounds is recorded and completed.**
+  The library purges the log to a snapshot before the state machine
+  installs it. A purge cut at the hosted store's applied position, or one
+  that moves no entry because the store had applied no entry, now records the
+  library's position in the log and completes to it once the store is
+  there, at the next append or at start. A member seeded after its log
+  advanced without an apply keeps running and applies the leader's next
+  entry; before, that append opened a gap and stopped the member's core.
+  See [raft hosting](docs/raft-hosting.md).
 - **Foundation branch: the snapshot bound is the receiver's.** A store
   image over `max_snapshot_bytes` no longer stops the building node: the
   bound applies where an image arrives, so a peer configured below the
