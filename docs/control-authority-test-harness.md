@@ -922,3 +922,143 @@ stable across consecutive runs; the combined release gate
 passes in full. No deviation from docs/raft-admission.md was observed; no
 assertion was adjusted to match implementation behavior. Test files and
 this document only; no production changes.
+
+## Slice 4c: port onto d3b90b3, residual #3 in its natural shape, residual #2 status
+
+The slice-4b commit was re-anchored from `945b484` onto `d3b90b3`
+(`git rebase --onto d3b90b3 945b484`), the branch being
+`test/control-authority-adversarial-d3b90b3`. The two commits in between
+are Fable's: `fceb636` closes the fork window in the lib test binary
+(`src/test_support.rs` only) and `d3b90b3` makes `max_snapshot_bytes` the
+receiver's bound, with `Cluster::bootstrap_with_config` and
+`start_member_with` added to the kit. No admission code changed in either.
+
+One conflict, in this file, where each branch had appended a section at
+the end. Both were kept, Fable's "Found in the default gate of the serve
+checkpoint: the fork window" first and slice 4b's "Slice 4b (port)" after
+it; no other line changed.
+`tests/control_adversarial/raft_kit.rs` merged on its own, and the merged
+file compiles with both additions in place: the three-voter `Voters` group
+of slice 4b and Fable's two new `Cluster` constructors.
+
+Gates for the port, every cargo run inside the 8 GiB systemd scope with
+`CARGO_BUILD_JOBS=2` and `--test-threads=4`. The admission target three
+times over: 10 pass each time, 4.65 s / 4.39 s / 4.40 s
+(`/tmp/psearch-import-evidence/kimi-recovery-admission-{1,2,3}.log`). The
+combined release gate
+`cargo test --release --features raft,tls,fault-injection --no-fail-fast`:
+161 targets (160 binaries and the doctest target), 1809 pass, 0 fail
+(`kimi-recovery-combined-port.log`); at `d3b90b3` without this target
+Fable counted 1798, and the admission target's 11 results account for the
+difference.
+
+### Residual #3 in its natural shape
+
+`a_trigger_racing_a_join_seeds_the_learner_with_the_leader_core_running`
+(snapshot target, no gate) drives the shape the 4a report named: a leader
+with a published generation, a committed change past it, then
+`trigger_snapshot` and `add_learner` issued in one `tokio::join!` on a
+prepared member. `add_learner` runs its own seed boundary (build, then
+purge) and serves the learner from the pointer, so the two builds and the
+serve overlap on their own schedule. Sixteen rounds per run, each round on
+a fresh group. What it pins, from `docs/raft-hosting.md` ("Log and store
+agreement", Serve): the leader's core keeps running, the trigger and the
+join both answer with no error, the learner ends the round seeded (the
+marker removed, a generation of its own published, its position at or past
+the leader's), and the next command commits and arrives at the learner.
+
+Whether the natural shape catches the two-step read was then put to the
+test. The serve was returned to its pre-`945b484` shape in the worktree —
+the pointer read under the lock, the lock dropped, the generation and
+image opened by path afterwards — with no other change, and the patch was
+reverted before anything was committed. Against that serve the natural
+shape came out clean in every round: 6 runs of 16 rounds, 96 rounds, 0
+rounds with the leader core stopped
+(`kimi-recovery-residual3-unfixed.log`). The gated target in the same
+binary and the same run stopped the core on its first attempt, naming the
+serve outcome: `raft snapshot read: when Read Snapshot(None): status:
+Internal, message: "raft snapshot storage: No such file or directory (os
+error 2)"`, with the pointer moved to generation 2 and generation 1's
+image deleted. So the interleaving stays pinned by
+`a_serve_under_a_concurrent_publish_returns_the_generation_it_read` and
+its two `fault-injection` gates; the natural shape adds the outcome
+contract (leader liveness and seeding across a trigger racing a join) and
+no probabilistic assertion. On the branch as committed both pass:
+16 pass, 1 ignored, 17.3 s (`kimi-recovery-residual3-fixed.log`).
+
+### Residual #2 is closed; a new item takes its place
+
+Residual #2 of slice 4a was a pending member with an advanced log and no
+apply: at `0fe7081` the start ended in
+`raft start: when Write Snapshot(None): status: FailedPrecondition, "no
+applied position; nothing to snapshot"`, because the library builds a
+snapshot at startup when the log names a purged position and no generation
+is published, and the builder has no position to image. Fable's purge
+bound (`RaftLogStore::purge` against the hosted store's applied position,
+integrated at `82090d9`) means such a member's log names no purged
+position at all, so the start requests no snapshot.
+
+The fixture is `pending_member_with_an_advanced_log`: the raw registered
+peer of the R3/R5 model (node 3's certificate) sends two blank entries
+under the leader's committed vote with `leader_commit` absent, so the
+member's log takes them (`last_log_index = Some(1)`) and the marked store
+applies none of them (`applied_position = None`, the marker in place, the
+core running). openraft numbers a log from index 0, so the first entry has
+no previous log id; an entry at index 1 behind an absent previous log id
+trips the library's own
+`x.get_log_id().index == prev_log_id.next_index()` in a debug build, from
+a registered peer, which is recorded separately below.
+
+`a_pending_member_with_an_advanced_log_and_no_apply_starts_again` stops
+that member and starts it again on the same directory. At `d3b90b3` the
+start succeeds and the member comes back on its own state: log at index 1,
+no applied position, still awaiting the group's first snapshot, core
+running, no generation of its own. Residual #2 is closed, and the test is
+a regular one.
+
+The step after it does not hold, and it is left as an open item for
+Fable, marked `#[ignore]`:
+`a_pending_member_with_an_advanced_log_and_no_apply_is_seeded_and_applies`.
+`docs/raft-hosting.md` states the recovery as "the member restarts and is
+seeded again". The seed itself completes — the image installs, the marker
+is removed, the store applies the leader's position at index 2 — and then
+the member's core stops on the leader's next append:
+
+```
+the member core stopped after its seed: Err(StorageError(IO { source:
+StorageIOError { subject: LogIndex(3), verb: Write, source: appending
+index 3 would leave a hole; the next index is 2, backtrace: None } }))
+(join outcome Err(Elapsed(())), applied Ok(Some(RaftLogId { term: 1,
+node_id: 1, index: 2 })))
+```
+
+The trace (`kimi-recovery-residual2.log`): the library purges the log for
+the incoming snapshot before the state machine has installed it, and that
+purge is bounded by the store's applied position, which at that moment is
+unset, so no entry moves. The install then applies index 2. The deferred
+part of the purge is not completed afterwards, because `settle_locked`
+takes a log starting at the purged position plus one (0, with no purge
+recorded) as contiguous and leaves it, although its last index (1) is
+below the position the store now applies (2). The log's next index stays 2
+while the state machine is at 2, and the leader's append at index 3 opens
+the gap the log names as data loss. The member is left in `Shutdown` with
+its store seeded, and `add_learner` on the leader times out; the leader's
+core keeps running throughout. A fresh prepared member joins cleanly, so
+the group still recovers by replacement.
+
+Named alongside it, no test attached: a registered peer that is not the
+leader can reach a debug assertion inside the library with an append
+where the first entry index is not the previous log id's next index
+(`openraft-0.9.25/src/engine/handler/following_handler/mod.rs:71`,
+`assertion failed: x.get_log_id().index == prev_log_id.next_index()`).
+The transport answers `Unavailable`, "raft core: panicked". It is the same
+family as the uncommitted-vote appends the transport already turns away in
+front of the library, and the certificate is the only barrier in front of
+it.
+
+Kit change: `raft_kit::append_blanks(client, group, from, to, vote, count)`,
+which sends `count` blank entries at indexes `0..count` from a registered
+peer with no commit position. Test files and this document only; no
+production change is committed on this branch. The patch that returned the
+serve to its two-step shape lived in the worktree for the measurement above
+and was reverted.

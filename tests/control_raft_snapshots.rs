@@ -1401,3 +1401,209 @@ async fn a_store_image_over_a_peers_bound_is_rejected_at_that_peer_with_both_cor
     assert!(raft_kit::core_running(cluster.leader()));
     cluster.shutdown().await;
 }
+
+/// Residual #3 in its natural shape, with no fault-injection gate: a
+/// snapshot trigger and an `add_learner` issued at the same instant on a
+/// leader that already holds a published generation. `add_learner` runs its
+/// own seed boundary (build, then purge) and serves the learner from the
+/// pointer, so one build's publish and the other path's read of the
+/// generation overlap.
+///
+/// The contract is `docs/raft-hosting.md`, "Log and store agreement",
+/// Serve: a serve is one step under the pointer lock, a publish waits for
+/// it, and only a local storage failure stops a core. The leader's core
+/// keeps running, the learner is seeded, and the group commits afterwards.
+///
+/// The gated target
+/// (`a_serve_under_a_concurrent_publish_returns_the_generation_it_read`) is
+/// what pins the interleaving itself; this one pins the outcome in the
+/// shape a group produces on its own, `ROUNDS` times over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_trigger_racing_a_join_seeds_the_learner_with_the_leader_core_running() {
+    const ROUNDS: u64 = 16;
+    let _serial = serial();
+    let group = kit::identity(kit::SEED);
+    for round in 0..ROUNDS {
+        let mut cluster = Cluster::bootstrap(
+            &format!("trigger-join-race-{round}"),
+            &group,
+            &kit::policy(),
+            &kit::limits(),
+        )
+        .await;
+        propose_ok(cluster.leader(), &prepare_command(&group, 1)).await;
+        raft_kit::snapshot_image(&cluster.leader_dir, cluster.leader()).await;
+        let first = raft_kit::published_generation(cluster.leader_dir.path())
+            .expect("the leader publishes its first generation");
+        // A committed change past that generation, so the trigger racing
+        // the join has a newer position to image.
+        propose_ok(cluster.leader(), &grant_command(&group, 2, 1, "bob")).await;
+        let applied = raft_kit::durable_position(cluster.leader());
+        raft_kit::wait_applied(cluster.leader(), applied).await;
+        cluster.start_member().await;
+        assert!(cluster.member().awaiting_snapshot().unwrap());
+        let addr = cluster.member().advertised_addr().unwrap().to_string();
+
+        let (triggered, joined) = tokio::join!(
+            cluster.leader().trigger_snapshot(),
+            cluster.leader().add_learner(raft_kit::MEMBER_ID, &addr),
+        );
+        assert!(
+            raft_kit::core_running(cluster.leader()),
+            "round {round}: the leader core stopped under a trigger racing the join \
+             (trigger {triggered:?}, join {joined:?}, generation at entry {first})"
+        );
+        triggered.unwrap_or_else(|e| panic!("round {round}: the trigger did not run: {e}"));
+        joined.unwrap_or_else(|e| panic!("round {round}: the join did not complete: {e}"));
+
+        assert!(
+            !cluster.member().awaiting_snapshot().unwrap(),
+            "round {round}: the learner was not seeded"
+        );
+        assert!(
+            raft_kit::published_generation(cluster.member_dir.path()).is_some(),
+            "round {round}: the learner holds no generation of its own"
+        );
+        assert!(raft_kit::core_running(cluster.member()));
+        let seeded = raft_kit::durable_position(cluster.member());
+        assert!(
+            seeded >= applied,
+            "round {round}: the learner is at {seeded}, behind the leader's {applied}"
+        );
+
+        // The group commits afterwards and the learner applies it.
+        propose_ok(cluster.leader(), &grant_command(&group, 3, 2, "carol")).await;
+        let after = raft_kit::durable_position(cluster.leader());
+        assert!(after > applied, "round {round}: the leader did not advance");
+        raft_kit::wait_applied(cluster.member(), after).await;
+        assert!(raft_kit::core_running(cluster.leader()));
+        cluster.shutdown().await;
+    }
+}
+
+/// The fixture for residual #2 and for the finding below it: a prepared
+/// member whose log advanced while its state machine applied nothing. The
+/// raw registered peer (node 3's certificate, the R3/R5 adversary) appends
+/// two blank entries under the leader's committed vote with nothing
+/// committed, so the log takes them and the marked store applies none of
+/// them.
+async fn pending_member_with_an_advanced_log(
+    name: &str,
+    group: &SourceAuthorityIdentity,
+) -> (Cluster, std::net::SocketAddr) {
+    let mut cluster = Cluster::bootstrap(name, group, &kit::policy(), &kit::limits()).await;
+    propose_ok(cluster.leader(), &prepare_command(group, 1)).await;
+    cluster.start_member().await;
+    let listen = cluster.member().listen_addr().unwrap();
+    let vote = raft_kit::current_vote(cluster.leader());
+    let mut peer = raft_kit::peer_client(listen, raft_kit::PEER_ID).await;
+    raft_kit::append_blanks(
+        &mut peer,
+        group,
+        raft_kit::PEER_ID,
+        raft_kit::MEMBER_ID,
+        &vote,
+        2,
+    )
+    .await
+    .expect("the registered peer's appends are taken");
+    let metrics = cluster.member().metrics().borrow().clone();
+    assert_eq!(
+        metrics.last_log_index,
+        Some(1),
+        "the member's log did not advance: {metrics}"
+    );
+    assert_eq!(metrics.last_applied, None, "the member applied an entry");
+    assert_eq!(cluster.member().applied_position().unwrap(), None);
+    assert!(cluster.member().awaiting_snapshot().unwrap());
+    assert!(raft_kit::core_running(cluster.member()));
+    (cluster, listen)
+}
+
+/// Residual #2 of slice 4a: such a member, stopped and started again on the
+/// same directory. At 0fe7081 the start ended in the builder's
+/// `FailedPrecondition` ("no applied position; nothing to snapshot"),
+/// because the library builds a snapshot at startup when the log names a
+/// purged position and no generation is published. `RaftLogStore` bounds
+/// every purge by the hosted store's applied position (`docs/raft-hosting.md`,
+/// "Log and store agreement"), which for this member is nothing, so the log
+/// names no purged position and the start has no snapshot to build.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pending_member_with_an_advanced_log_and_no_apply_starts_again() {
+    let _serial = serial();
+    let group = kit::identity(kit::SEED);
+    let (mut cluster, listen) =
+        pending_member_with_an_advanced_log("pending-log-restart", &group).await;
+
+    cluster.stop_member().await;
+    let started = RaftHost::start_member(
+        cluster.member_dir.path(),
+        &group,
+        raft_kit::MEMBER_ID,
+        &raft_kit::host_config(),
+        raft_kit::transport(raft_kit::MEMBER_ID, &cluster.directory, listen),
+    )
+    .await;
+    let member = started.unwrap_or_else(|status| {
+        panic!(
+            "a pending member whose log advanced without an apply did not start again: {:?} {}",
+            status.code(),
+            status.message()
+        )
+    });
+    assert_eq!(member.metrics().borrow().last_log_index, Some(1));
+    assert_eq!(member.applied_position().unwrap(), None);
+    assert!(member.awaiting_snapshot().unwrap());
+    assert!(raft_kit::core_running(&member));
+    assert!(raft_kit::published_generation(cluster.member_dir.path()).is_none());
+    cluster.member = Some(member);
+    cluster.shutdown().await;
+}
+
+/// The group's recovery of that member by seeding, which
+/// `docs/raft-hosting.md` states as "the member restarts and is seeded
+/// again". The seed itself lands: the image installs, the marker goes and
+/// the store applies the leader's position. What does not hold is the step
+/// after it. The library purges the member's log for the incoming snapshot
+/// before the state machine has installed it, and that purge is bounded by
+/// the store's applied position, which is nothing at that moment, so it
+/// moves no entry. The install then applies the leader's position, and the
+/// deferred half of the purge is never completed: `settle_locked` takes a
+/// log whose first index is the purged position plus one as contiguous and
+/// leaves it, although its last index is below the position the store now
+/// applies. The log's next index is therefore two behind the state
+/// machine's, and the leader's next append opens a gap the log names as
+/// data loss, which stops the member's core.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "open for Fable: a member seeded after its log advanced without an apply keeps its \
+            pre-seed entries, so the leader's next append opens a gap and the member core stops"]
+async fn a_pending_member_with_an_advanced_log_and_no_apply_is_seeded_and_applies() {
+    let _serial = serial();
+    let group = kit::identity(kit::SEED);
+    let (cluster, _) = pending_member_with_an_advanced_log("pending-log-seed", &group).await;
+
+    let addr = cluster.member().advertised_addr().unwrap().to_string();
+    let joined = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        cluster.leader().add_learner(raft_kit::MEMBER_ID, &addr),
+    )
+    .await;
+    assert!(
+        raft_kit::core_running(cluster.member()),
+        "the member core stopped after its seed: {:?} (join outcome {joined:?}, applied {:?})",
+        cluster.member().metrics().borrow().running_state,
+        cluster.member().applied_position()
+    );
+    joined
+        .expect("the join answered inside 20 s")
+        .expect("the learner was added");
+    assert!(!cluster.member().awaiting_snapshot().unwrap());
+    assert!(raft_kit::published_generation(cluster.member_dir.path()).is_some());
+    propose_ok(cluster.leader(), &grant_command(&group, 2, 1, "bob")).await;
+    let after = raft_kit::durable_position(cluster.leader());
+    raft_kit::wait_applied(cluster.member(), after).await;
+    assert_eq!(raft_kit::durable_position(cluster.member()), after);
+    assert!(raft_kit::core_running(cluster.member()));
+    assert!(raft_kit::core_running(cluster.leader()));
+    cluster.shutdown().await;
+}

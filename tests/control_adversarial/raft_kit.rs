@@ -28,10 +28,10 @@ use std::time::Instant;
 
 use pipestream_search::pb::storage::raft_transport_client::RaftTransportClient;
 use pipestream_search::pb::storage::{
-    raft_install_snapshot_response::Outcome as InstallOutcome, RaftInstallSnapshotRequest,
-    RaftInstallSnapshotResponse, RaftLogId, RaftMembership, RaftNode, RaftRpcHeader,
-    RaftSnapshotMeta, RaftStoredMembership, RaftVote, RaftVoterSet, SourceAuthorityIdentity,
-    SourceAuthorityLimits,
+    raft_entry::Payload, raft_install_snapshot_response::Outcome as InstallOutcome,
+    RaftAppendEntriesRequest, RaftEntry, RaftInstallSnapshotRequest, RaftInstallSnapshotResponse,
+    RaftLogId, RaftMembership, RaftNode, RaftRpcHeader, RaftSnapshotMeta, RaftStoredMembership,
+    RaftVote, RaftVoterSet, SourceAuthorityIdentity, SourceAuthorityLimits,
 };
 use pipestream_search::pb::AccessPolicy;
 use pipestream_search::raft::transport::{
@@ -599,6 +599,45 @@ pub fn chunk_request(
         data: data.to_vec(),
         done,
     }
+}
+
+/// Append `count` blank entries at indexes `0..count` to `to` from
+/// registered peer `from` under `vote`, with nothing committed: the
+/// receiver's log advances and its state machine applies none of them.
+/// `vote` must be a committed vote (the transport refuses appends under
+/// any other), and openraft numbers a log from index 0, so the first
+/// entry carries no previous log id.
+pub async fn append_blanks(
+    client: &mut RaftTransportClient<Channel>,
+    group: &SourceAuthorityIdentity,
+    from: u64,
+    to: u64,
+    vote: &RaftVote,
+    count: u64,
+) -> Result<(), Status> {
+    for index in 0..count {
+        client
+            .append_entries(timed(RaftAppendEntriesRequest {
+                header: Some(header(group, from, to)),
+                vote: Some(*vote),
+                prev_log_id: index.checked_sub(1).map(|previous| RaftLogId {
+                    term: vote.term,
+                    node_id: vote.node_id,
+                    index: previous,
+                }),
+                entries: vec![RaftEntry {
+                    log_id: Some(RaftLogId {
+                        term: vote.term,
+                        node_id: vote.node_id,
+                        index,
+                    }),
+                    payload: Some(Payload::Blank(true)),
+                }],
+                leader_commit: None,
+            }))
+            .await?;
+    }
+    Ok(())
 }
 
 /// Stream `bytes` to `to` as chunks of [`CHUNK_BYTES`] under `meta` from
