@@ -24,6 +24,20 @@
 //!   vector. The engine refuses zero vectors, so this surfaces as `None`
 //!   here rather than a zero row there.
 //!
+//! Further rules, mirrored from the OpenNLP-side Java implementation
+//! (`StaticEmbeddingModel`), which serves as the second reference:
+//!
+//! - rows are resolved by piece STRING through the vocabulary map, never by
+//!   trusting numeric id spaces beyond them: the vocabulary is validated to
+//!   be a bijection of piece to row, and the added-token overlay must agree
+//!   with it;
+//! - an optional `weights` tensor scales each pooled row by its per-token
+//!   weight, but the pooled sum still divides by the COUNT of pooled pieces,
+//!   never the weight sum;
+//! - loading is strict: every malformed-content path is a `LoadError`, sizes
+//!   are bounded before allocation, and non-finite table values are rejected
+//!   rather than allowed to poison every pooled vector silently.
+//!
 //! Case mapping is deliberately `char::to_lowercase` (Rust std), NOT
 //! icu_casemap: HF tokenizers is itself Rust and lowercases with std, so
 //! std is oracle-exact. The lexical analyzer's fuller case folding serves a
@@ -197,15 +211,26 @@ pub fn wordpiece(vocab: &HashMap<String, u32>, unk_id: u32, max_word_chars: usiz
     out.extend(ids);
 }
 
+/// Largest `tokenizer.json` and safetensors header accepted: both are parsed
+/// fully in memory, so their size is bounded before allocation.
+const MAX_TOKENIZER_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_SAFETENSORS_HEADER_BYTES: usize = 64 * 1024 * 1024;
+
 /// A loaded Model2Vec model: WordPiece vocabulary plus the mmapped f32
 /// table. The table never fully loads; pages are clean and evictable, which
 /// is what a mobile host wants from a 100 MB-class asset.
+///
+/// Row resolution is string-keyed: `vocab` maps each piece to its table row,
+/// and `[UNK]`/special rows are looked up through that map by content, so
+/// nothing trusts the numeric id spaces of `tokenizer.json` and the table
+/// beyond what the validated vocabulary bijection states.
 pub struct StaticEmbedder {
     vocab: HashMap<String, u32>,
     unk_id: u32,
     special: Vec<u32>,
     max_word_chars: usize,
     table: memmap2::Mmap,
+    weights: Option<Vec<f32>>,
     data_offset: usize,
     dim: usize,
     rows: usize,
@@ -214,6 +239,15 @@ pub struct StaticEmbedder {
 impl StaticEmbedder {
     pub fn load(dir: &Path) -> Result<Self, LoadError> {
         let tok_path = dir.join("tokenizer.json");
+        let tok_len = std::fs::metadata(&tok_path)
+            .map_err(|e| LoadError::Io(format!("{}: {e}", tok_path.display())))?
+            .len();
+        if tok_len > MAX_TOKENIZER_BYTES {
+            return Err(LoadError::Format(format!(
+                "{}: {tok_len} bytes exceeds the {MAX_TOKENIZER_BYTES}-byte tokenizer limit",
+                tok_path.display()
+            )));
+        }
         let tok: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(&tok_path)
                 .map_err(|e| LoadError::Io(format!("{}: {e}", tok_path.display())))?,
@@ -243,27 +277,62 @@ impl StaticEmbedder {
             return Err(LoadError::Format("pre_tokenizer is not BertPreTokenizer".into()));
         }
 
-        let vocab: HashMap<String, u32> = model["vocab"]
+        let vocab_json = model["vocab"]
             .as_object()
-            .ok_or_else(|| LoadError::Format("vocab is not an object".into()))?
-            .iter()
-            .map(|(k, v)| (k.clone(), v.as_u64().unwrap_or(u64::MAX) as u32))
-            .collect();
+            .ok_or_else(|| LoadError::Format("vocab is not an object".into()))?;
+        let mut vocab: HashMap<String, u32> = HashMap::with_capacity(vocab_json.len());
+        for (piece, id) in vocab_json {
+            let id = id
+                .as_u64()
+                .filter(|&v| v <= u64::from(u32::MAX))
+                .ok_or_else(|| {
+                    LoadError::Format(format!("vocab id for {piece:?} is not a u32"))
+                })? as u32;
+            vocab.insert(piece.clone(), id);
+        }
+        // The piece-to-row map must be a bijection: two pieces naming one row
+        // would make added-token and unk resolution ambiguous.
+        let mut seen_ids = std::collections::HashSet::with_capacity(vocab.len());
+        for (piece, &id) in &vocab {
+            if !seen_ids.insert(id) {
+                return Err(LoadError::Format(format!(
+                    "vocab id {id} is claimed by more than one piece ({piece:?})"
+                )));
+            }
+        }
         let unk = model["unk_token"]
             .as_str()
             .ok_or_else(|| LoadError::Format("missing unk_token".into()))?;
         let unk_id = *vocab
             .get(unk)
             .ok_or_else(|| LoadError::Format(format!("unk token {unk:?} not in vocab")))?;
-        let special = tok["added_tokens"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter(|t| t["special"].as_bool().unwrap_or(false))
-                    .map(|t| t["id"].as_u64().unwrap_or(u64::MAX) as u32)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut special = Vec::new();
+        if let Some(added) = tok["added_tokens"].as_array() {
+            for entry in added {
+                let id = entry["id"]
+                    .as_u64()
+                    .filter(|&v| v <= u64::from(u32::MAX))
+                    .ok_or_else(|| {
+                        LoadError::Format("added_tokens entry with a missing or invalid id".into())
+                    })? as u32;
+                let content = entry["content"].as_str().ok_or_else(|| {
+                    LoadError::Format("added_tokens entry without content".into())
+                })?;
+                // The overlay may alias a vocab piece, but it must not
+                // contradict it: an id that disagrees with the vocabulary is
+                // a packaging bug, not a variant to tolerate.
+                if let Some(&vocab_id) = vocab.get(content) {
+                    if vocab_id != id {
+                        return Err(LoadError::Format(format!(
+                            "added_tokens id {id} for {content:?} disagrees with vocab id {vocab_id}"
+                        )));
+                    }
+                }
+                if entry["special"].as_bool().unwrap_or(false) {
+                    special.push(id);
+                }
+            }
+        }
         let max_word_chars = model["max_input_chars_per_word"].as_u64().unwrap_or(100) as usize;
 
         let st_path = dir.join("model.safetensors");
@@ -275,33 +344,76 @@ impl StaticEmbedder {
             return Err(LoadError::Format("safetensors shorter than its length header".into()));
         }
         let header_len = u64::from_le_bytes(table[0..8].try_into().unwrap()) as usize;
+        if header_len > MAX_SAFETENSORS_HEADER_BYTES {
+            return Err(LoadError::Format(format!(
+                "safetensors header of {header_len} bytes exceeds the {MAX_SAFETENSORS_HEADER_BYTES}-byte limit"
+            )));
+        }
         let header: serde_json::Value = serde_json::from_slice(
             table
                 .get(8..8 + header_len)
                 .ok_or_else(|| LoadError::Format("safetensors header exceeds file".into()))?,
         )
         .map_err(|e| LoadError::Format(format!("safetensors header: {e}")))?;
-        let emb = &header["embeddings"];
-        if emb["dtype"] != "F32" {
-            return Err(LoadError::Format(format!("embeddings dtype {} is not F32", emb["dtype"])));
+        let header_end = 8 + header_len;
+        let (shape, emb_offset, emb_bytes) =
+            tensor_region(&header, "embeddings", 2, header_end, table.len())?;
+        let rows = shape[0];
+        let dim = shape[1];
+        if rows == 0 || dim == 0 {
+            return Err(LoadError::Format("embeddings shape has a zero dimension".into()));
         }
-        let shape = emb["shape"]
-            .as_array()
-            .ok_or_else(|| LoadError::Format("embeddings shape missing".into()))?;
-        let rows = shape[0].as_u64().unwrap_or(0) as usize;
-        let dim = shape[1].as_u64().unwrap_or(0) as usize;
-        let start = emb["data_offsets"][0].as_u64().unwrap_or(0) as usize;
-        let data_offset = 8 + header_len + start;
         if rows != vocab.len() {
             return Err(LoadError::Format(format!(
                 "table rows {rows} != vocabulary size {}; table and tokenizer are from different models",
                 vocab.len()
             )));
         }
-        if table.len() < data_offset + rows * dim * 4 {
-            return Err(LoadError::Format("safetensors data shorter than shape".into()));
+        if let Some(&id) = vocab.values().find(|&&id| id as usize >= rows) {
+            return Err(LoadError::Format(format!(
+                "vocab id {id} names a row outside the {rows}-row table"
+            )));
         }
-        Ok(Self { vocab, unk_id, special, max_word_chars, table, data_offset, dim, rows })
+        if let Some(&id) = special.iter().find(|&&id| id as usize >= rows) {
+            return Err(LoadError::Format(format!(
+                "special token id {id} names a row outside the {rows}-row table"
+            )));
+        }
+        // A non-finite row would silently poison every pooled vector, so the
+        // table is scanned once at load. This touches every page once; the
+        // pages stay clean and evictable, so the resident cost is transient.
+        for chunk in table[emb_offset..emb_offset + emb_bytes].chunks_exact(4) {
+            if !f32::from_le_bytes(chunk.try_into().unwrap()).is_finite() {
+                return Err(LoadError::Format(
+                    "embeddings table holds a non-finite value".into(),
+                ));
+            }
+        }
+        let weights = match header.get("weights") {
+            Some(tensor) if !tensor.is_null() => {
+                let (wshape, woffset, wbytes) =
+                    tensor_region(&header, "weights", 1, header_end, table.len())?;
+                if wshape[0] != rows {
+                    return Err(LoadError::Format(format!(
+                        "weights length {} != table rows {rows}",
+                        wshape[0]
+                    )));
+                }
+                let mut values = Vec::with_capacity(wshape[0]);
+                for chunk in table[woffset..woffset + wbytes].chunks_exact(4) {
+                    let w = f32::from_le_bytes(chunk.try_into().unwrap());
+                    if !w.is_finite() || w < 0.0 {
+                        return Err(LoadError::Format(
+                            "weights must be finite and non-negative".into(),
+                        ));
+                    }
+                    values.push(w);
+                }
+                Some(values)
+            }
+            _ => None,
+        };
+        Ok(Self { vocab, unk_id, special, max_word_chars, table, weights, data_offset: emb_offset, dim, rows })
     }
 
     pub fn dim(&self) -> usize {
@@ -325,6 +437,11 @@ impl StaticEmbedder {
     /// The unit-length pooled vector, or `None` when nothing pools (empty,
     /// whitespace-only, or all-`[UNK]` text). Accumulates in f64 — the same
     /// choice as the engine's `embed_text` pooling — then narrows once.
+    ///
+    /// With a `weights` tensor, each row is scaled by its per-token weight,
+    /// but the sum still divides by the COUNT of pooled pieces, never the
+    /// weight sum — the Model2Vec rule, pinned by
+    /// `tests::embed_applies_per_token_weights_but_divides_by_token_count`.
     pub fn embed(&self, text: &str) -> Option<Vec<f32>> {
         let ids: Vec<u32> = self
             .tokenize(text)
@@ -337,10 +454,14 @@ impl StaticEmbedder {
         let stride = self.dim * 4;
         let mut acc = vec![0.0f64; self.dim];
         for &id in &ids {
+            let w = self
+                .weights
+                .as_ref()
+                .map_or(1.0, |ws| f64::from(ws[id as usize]));
             let at = self.data_offset + id as usize * stride;
             let row = &self.table[at..at + stride];
             for (a, chunk) in acc.iter_mut().zip(row.chunks_exact(4)) {
-                *a += f64::from(f32::from_le_bytes(chunk.try_into().unwrap()));
+                *a += w * f64::from(f32::from_le_bytes(chunk.try_into().unwrap()));
             }
         }
         let n = ids.len() as f64;
@@ -350,6 +471,79 @@ impl StaticEmbedder {
         }
         Some(acc.iter().map(|v| ((v / n) / norm) as f32).collect())
     }
+}
+
+/// Validates one safetensors tensor entry and returns its shape, its absolute
+/// data offset in the file, and its byte length. Every bound is checked
+/// before it is used: malformed shapes, offsets, and sizes are `LoadError`s,
+/// never panics.
+fn tensor_region(
+    header: &serde_json::Value,
+    name: &str,
+    expected_dims: usize,
+    header_end: usize,
+    table_len: usize,
+) -> Result<(Vec<usize>, usize, usize), LoadError> {
+    let tensor = &header[name];
+    if tensor.is_null() {
+        return Err(LoadError::Format(format!("safetensors has no {name} tensor")));
+    }
+    if tensor["dtype"] != "F32" {
+        return Err(LoadError::Format(format!("{name} dtype {} is not F32", tensor["dtype"])));
+    }
+    let shape: Vec<usize> = tensor["shape"]
+        .as_array()
+        .ok_or_else(|| LoadError::Format(format!("{name} shape missing")))?
+        .iter()
+        .map(|d| {
+            d.as_u64()
+                .filter(|&v| v <= usize::MAX as u64)
+                .map(|v| v as usize)
+                .ok_or_else(|| LoadError::Format(format!("{name} shape has an invalid dimension")))
+        })
+        .collect::<Result<_, _>>()?;
+    if shape.len() != expected_dims {
+        return Err(LoadError::Format(format!(
+            "{name} shape {shape:?} is not {expected_dims}-dimensional"
+        )));
+    }
+    let elements = shape
+        .iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+        .ok_or_else(|| LoadError::Format(format!("{name} shape overflows addressable memory")))?;
+    let bytes = elements
+        .checked_mul(4)
+        .ok_or_else(|| LoadError::Format(format!("{name} byte size overflows addressable memory")))?;
+    let offsets = tensor["data_offsets"]
+        .as_array()
+        .ok_or_else(|| LoadError::Format(format!("{name} data_offsets missing")))?;
+    if offsets.len() != 2 {
+        return Err(LoadError::Format(format!("{name} data_offsets is not [start, end]")));
+    }
+    let start = offsets[0]
+        .as_u64()
+        .and_then(|v| usize::try_from(v).ok())
+        .ok_or_else(|| LoadError::Format(format!("{name} data start is invalid")))?;
+    let end = offsets[1]
+        .as_u64()
+        .and_then(|v| usize::try_from(v).ok())
+        .ok_or_else(|| LoadError::Format(format!("{name} data end is invalid")))?;
+    if end < start || end - start != bytes {
+        return Err(LoadError::Format(format!(
+            "{name} data_offsets span {} bytes, shape requires {bytes}",
+            end.saturating_sub(start)
+        )));
+    }
+    let data_offset = header_end
+        .checked_add(start)
+        .ok_or_else(|| LoadError::Format(format!("{name} data offset overflows")))?;
+    let data_end = data_offset
+        .checked_add(bytes)
+        .ok_or_else(|| LoadError::Format(format!("{name} data end overflows")))?;
+    if data_end > table_len {
+        return Err(LoadError::Format(format!("{name} data extends past end of file")));
+    }
+    Ok((shape, data_offset, bytes))
 }
 
 #[cfg(test)]
@@ -395,36 +589,86 @@ mod tests {
         assert_eq!(out, vec![1]);
     }
 
+    /// Writes a synthetic model directory: tokenizer.json from the given
+    /// vocab/added-tokens, safetensors from the given rows (vocab id order)
+    /// plus an optional weights tensor appended after the table.
+    fn write_model(
+        name: &str,
+        vocab: &[(&str, u32)],
+        added_tokens: serde_json::Value,
+        rows: &[&[f32]],
+        weights: Option<&[f32]>,
+    ) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("pm-embedder-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let vocab_json: serde_json::Map<String, serde_json::Value> = vocab
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), serde_json::json!(v)))
+            .collect();
+        let tokenizer = serde_json::json!({
+            "normalizer": {"type": "BertNormalizer", "clean_text": true,
+                            "handle_chinese_chars": true, "strip_accents": null, "lowercase": true},
+            "pre_tokenizer": {"type": "BertPreTokenizer"},
+            "added_tokens": added_tokens,
+            "model": {"type": "WordPiece", "unk_token": "[UNK]",
+                       "continuing_subword_prefix": "##", "max_input_chars_per_word": 100,
+                       "vocab": vocab_json}
+        });
+        std::fs::write(dir.join("tokenizer.json"), tokenizer.to_string()).unwrap();
+
+        let dim = rows[0].len();
+        let table_bytes = rows.len() * dim * 4;
+        let weights_bytes = weights.map_or(0, <[f32]>::len) * 4;
+        let mut header = format!(
+            r#"{{"embeddings":{{"dtype":"F32","shape":[{},{}],"data_offsets":[0,{}]}}"#,
+            rows.len(),
+            dim,
+            table_bytes
+        );
+        if weights.is_some() {
+            header.push_str(&format!(
+                r#","weights":{{"dtype":"F32","shape":[{}],"data_offsets":[{},{}]}}"#,
+                weights.unwrap().len(),
+                table_bytes,
+                table_bytes + weights_bytes
+            ));
+        }
+        header.push('}');
+        let mut st = Vec::new();
+        st.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        st.extend_from_slice(header.as_bytes());
+        for row in rows {
+            for &v in *row {
+                st.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        if let Some(ws) = weights {
+            for &w in ws {
+                st.extend_from_slice(&w.to_le_bytes());
+            }
+        }
+        std::fs::write(dir.join("model.safetensors"), st).unwrap();
+        dir
+    }
+
+    fn basic_vocab() -> Vec<(&'static str, u32)> {
+        vec![("[UNK]", 0), ("left", 1), ("right", 2)]
+    }
+
     /// End-to-end over a synthetic two-word model written to a temp dir:
     /// exercises the safetensors reader, UNK exclusion, and normalization
     /// without any model download.
     #[test]
     fn embed_pools_and_excludes_unk() {
-        let dir = std::env::temp_dir().join(format!("pm-embedder-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let tokenizer = serde_json::json!({
-            "normalizer": {"type": "BertNormalizer", "clean_text": true,
-                            "handle_chinese_chars": true, "strip_accents": null, "lowercase": true},
-            "pre_tokenizer": {"type": "BertPreTokenizer"},
-            "added_tokens": [{"id": 0, "content": "[UNK]", "special": true}],
-            "model": {"type": "WordPiece", "unk_token": "[UNK]",
-                       "continuing_subword_prefix": "##", "max_input_chars_per_word": 100,
-                       "vocab": {"[UNK]": 0, "left": 1, "right": 2}}
-        });
-        std::fs::write(dir.join("tokenizer.json"), tokenizer.to_string()).unwrap();
         // rows follow vocab id order; [UNK] deliberately NON-zero so a
         // pooling bug that includes it cannot pass.
-        let rows: [[f32; 2]; 3] = [[9.0, 9.0], [3.0, 0.0], [0.0, 4.0]];
-        let header = br#"{"embeddings":{"dtype":"F32","shape":[3,2],"data_offsets":[0,24]}}"#;
-        let mut st = Vec::new();
-        st.extend_from_slice(&(header.len() as u64).to_le_bytes());
-        st.extend_from_slice(header);
-        for row in rows {
-            for v in row {
-                st.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        std::fs::write(dir.join("model.safetensors"), st).unwrap();
+        let dir = write_model(
+            "pool",
+            &basic_vocab(),
+            serde_json::json!([{"id": 0, "content": "[UNK]", "special": true}]),
+            &[&[9.0, 9.0], &[3.0, 0.0], &[0.0, 4.0]],
+            None,
+        );
 
         let e = StaticEmbedder::load(&dir).unwrap();
         assert_eq!((e.rows(), e.dim()), (3, 2));
@@ -434,6 +678,114 @@ mod tests {
         assert!((v[0] - 0.6).abs() < 1e-7 && (v[1] - 0.8).abs() < 1e-7, "{v:?}");
         assert_eq!(e.embed("zzz qqq"), None);
         assert_eq!(e.embed("   "), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The Model2Vec rule: per-token weights scale the pooled rows, but the
+    /// sum divides by the COUNT of pooled pieces, never the weight sum.
+    /// Mirrors the Java reference's
+    /// testEmbedAppliesPerTokenWeightsButDividesByTokenCount.
+    #[test]
+    fn embed_applies_per_token_weights_but_divides_by_token_count() {
+        let dir = write_model(
+            "weights",
+            &basic_vocab(),
+            serde_json::json!([{"id": 0, "content": "[UNK]", "special": true}]),
+            &[&[0.0, 0.0], &[3.0, 0.0], &[0.0, 4.0]],
+            Some(&[1.0, 2.0, 1.0]),
+        );
+
+        let e = StaticEmbedder::load(&dir).unwrap();
+        // weighted sum = 2*[3,0] + 1*[0,4] = [6,4]; divide by count 2 -> [3,2]
+        // -> normalized [3/sqrt(13), 2/sqrt(13)].
+        let v = e.embed("left right").unwrap();
+        let s = 13.0f32.sqrt();
+        assert!(
+            (v[0] - 3.0 / s).abs() < 1e-7 && (v[1] - 2.0 / s).abs() < 1e-7,
+            "{v:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_rejects_malformed_content_instead_of_panicking() {
+        // One-dimensional shape: previously an index-out-of-bounds panic.
+        let dir = std::env::temp_dir().join(format!("pm-embedder-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tokenizer = serde_json::json!({
+            "normalizer": {"type": "BertNormalizer", "clean_text": true,
+                            "handle_chinese_chars": true, "strip_accents": null, "lowercase": true},
+            "pre_tokenizer": {"type": "BertPreTokenizer"},
+            "model": {"type": "WordPiece", "unk_token": "[UNK]",
+                       "continuing_subword_prefix": "##", "vocab": {"[UNK]": 0, "a": 1}}
+        });
+        std::fs::write(dir.join("tokenizer.json"), tokenizer.to_string()).unwrap();
+        let header = br#"{"embeddings":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#;
+        let mut st = Vec::new();
+        st.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        st.extend_from_slice(header);
+        st.extend_from_slice(&[0u8; 8]);
+        std::fs::write(dir.join("model.safetensors"), st).unwrap();
+        assert!(matches!(
+            StaticEmbedder::load(&dir),
+            Err(LoadError::Format(_))
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Duplicate vocab ids: two pieces claiming one row.
+        let dir = write_model(
+            "dup",
+            &[("[UNK]", 0), ("left", 1), ("right", 1)],
+            serde_json::json!([]),
+            &[&[1.0], &[2.0]],
+            None,
+        );
+        assert!(matches!(
+            StaticEmbedder::load(&dir),
+            Err(LoadError::Format(_))
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+
+        // An added-token overlay id that contradicts the vocabulary.
+        let dir = write_model(
+            "overlay",
+            &basic_vocab(),
+            serde_json::json!([{"id": 2, "content": "left", "special": true}]),
+            &[&[9.0, 9.0], &[3.0, 0.0], &[0.0, 4.0]],
+            None,
+        );
+        assert!(matches!(
+            StaticEmbedder::load(&dir),
+            Err(LoadError::Format(_))
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+
+        // A non-finite table value.
+        let dir = write_model(
+            "nan",
+            &basic_vocab(),
+            serde_json::json!([]),
+            &[&[f32::NAN, 0.0], &[3.0, 0.0], &[0.0, 4.0]],
+            None,
+        );
+        assert!(matches!(
+            StaticEmbedder::load(&dir),
+            Err(LoadError::Format(_))
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+
+        // A vocab id naming a row outside the table.
+        let dir = write_model(
+            "oor",
+            &[("[UNK]", 0), ("left", 1), ("right", 7)],
+            serde_json::json!([]),
+            &[&[9.0, 9.0], &[3.0, 0.0], &[0.0, 4.0]],
+            None,
+        );
+        assert!(matches!(
+            StaticEmbedder::load(&dir),
+            Err(LoadError::Format(_))
+        ));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

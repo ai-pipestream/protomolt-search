@@ -106,6 +106,9 @@ distillation, not to this crate.
 - a model fingerprint (content hash of `tokenizer.json` + table) recorded
   next to vectors, the analogue of `analysis_fingerprint`;
 - the sidecar (or its conversion successor) as a second differential oracle,
-  three-way with the Python reference;
+  three-way with the Python reference; once the OpenNLP-side Java
+  implementation (`opennlp-embeddings`, `StaticEmbeddingModel`) lands
+  somewhere public, it becomes a third oracle — its loader strictness and
+  weighted-pooling rules are already mirrored here;
 - table asset shipping (bundle vs first-launch download) and, if int8 ever
   ships, a stated position on score-space forking.
