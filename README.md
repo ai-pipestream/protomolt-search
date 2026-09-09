@@ -1250,6 +1250,14 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   destination store remains unchanged. See [retirement and crash recovery](docs/control-retirement.md);
   transactional import, worker fencing and activation remain separate steps.
 
+- **Foundation branch: the fork window in the lib test binary closed.**
+  A child spawned by one test thread kept the parent's file locks for a
+  moment after `Command::spawn` returned (the kernel resumes a vfork parent
+  before the child's close-on-exec sweep), so a sibling test re-taking a
+  lock it had dropped could be rejected with no lock fault anywhere. The
+  spawn helper now closes the child's inherited regular files before exec,
+  inside the existing fork guard. See [the harness
+  document](docs/control-authority-test-harness.md).
 - **Foundation branch: snapshot serve under the pointer lock.** Serving
   the published generation to a lagging peer is one step under the pointer
   lock, from reading the pointer to opening the image, so a build

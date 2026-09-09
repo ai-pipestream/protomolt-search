@@ -829,3 +829,53 @@ a prepared member that has applied nothing, is refused by
 without the guard the member core stops on the builder's refusal; with it
 the trigger is `FailedPrecondition`, the core runs, and the member is
 seeded and snapshots afterwards).
+
+### Found in the default gate of the serve checkpoint: the fork window
+
+The default `cargo test --lib` gate for 945b484 failed once, in
+the retirement test for corrupt frames (its "checksum" case), with the control ownership lock unavailable right after
+the test dropped its holder: "lock acquisition failed because the operation
+would block" (`/tmp/psearch-import-evidence/serve-lock-lib-default.log`).
+The lock code was not at fault. `flock` locks belong to an open file
+description, and a child spawned by another test thread keeps duplicates of
+the parent's descriptors between fork and exec, so a lock released in that
+window stays in force until the child's close-on-exec sweep. The crate already
+guarded this (`src/test_support.rs`: spawns under the write side of one
+RwLock, lock takes under the read side) on the assumption that
+`Command::spawn` returns after the sweep. It does not. std spawns with
+`clone3(CLONE_VM|CLONE_VFORK)` (`flock-guard-race-strace.txt`), and the
+kernel resumes a vfork parent when the child gives up the shared address
+space (`exec_mmap`), which is before `do_close_on_exec`. A probe in the
+test's shape (hold, spawn under the guard, drop, re-take through a fresh
+open; `flock-guard-race.rs`, `flock-guard-race-probe.txt`) saw the parent's
+file still in the child's table after `spawn` returned and the re-take
+rejected: 6 rejections in 120,000 rounds.
+
+The fix keeps the guard and adds the second layer it needed: the child
+closes its inherited regular-file descriptors before it execs
+(`close_regular_files_after_fork`, a pre-exec hook that walks
+`/proc/self/fd` with raw system calls and makes no allocation, since it runs
+in the forked child of a multithreaded process). With the hook a returned
+`spawn` means the descriptions are closed however the parent was
+resumed. Regular files only: locks live on them, and the pipes std reports
+an exec failure over must survive. The probe with the hook: 0 rejections in
+160,000 rounds. Two tests in `test_support::tests`:
+`a_spawned_child_has_no_inherited_regular_file` (the child lists its own
+descriptors while the parent keeps a locked file open across the spawn,
+and no regular file is among them) and
+`a_lock_dropped_during_spawns_is_free_at_once` (take, drop and re-take in
+a loop while a second thread spawns two hundred children under the guard).
+Without the hook the second test fails within a few runs
+(`fork-hook-sensitivity.txt`); with it the full default lib gate and the
+`raft,fault-injection` lib gate pass (`fork-hook-lib-default.log`,
+`fork-hook-lib-raft.log`).
+
+What the fix covers: the lib test binary. Its 14 worker spawns go
+through `ForkGuarded` and its production lock takes call
+`lock_handoff` under `cfg(test)`. The six spawn sites in the integration
+binaries (`tests/document_catalog.rs`, `tests/replay_journal.rs`,
+`tests/source_access.rs`, `tests/control_adversarial/kit.rs`) have no layer of the two: the library they link is compiled without `cfg(test)`, so the
+handoff is not in their lock code, and `test_support` is crate-private.
+Giving them the same protection means compiling the handoff into the
+library under a feature and exposing the module; that is a design choice
+for the owner of the storage contracts and is left open here, named.
