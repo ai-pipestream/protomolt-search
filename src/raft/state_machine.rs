@@ -295,12 +295,33 @@ impl SnapshotGates {
     }
 }
 
+/// What the latest build of this node's own store came to, against the
+/// bound this node applies to images it receives. A node whose image is
+/// over its own bound cannot be seeded from a peer's image of the same
+/// store until the bound is raised.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotBuildReport {
+    pub generation: u64,
+    pub bytes: u64,
+    pub receiver_bound: u64,
+    pub last_log_id: Option<LogId<NodeId>>,
+}
+
+impl SnapshotBuildReport {
+    pub fn over_receiver_bound(&self) -> bool {
+        self.bytes > self.receiver_bound
+    }
+}
+
+pub(crate) type LastBuild = Arc<Mutex<Option<SnapshotBuildReport>>>;
+
 pub struct ControlStateMachine {
     store: SharedStore,
     identity: SourceAuthorityIdentity,
     snapshots: PathBuf,
     membership: Mutex<StoredMembership<NodeId, BasicNode>>,
     staging: Arc<SnapshotStaging>,
+    last_build: LastBuild,
     // Build and install never overlap; the builder shares this lock.
     snapshot_lock: Arc<Mutex<()>>,
     // A serve reads the pointer, the generation's meta and its image under
@@ -345,6 +366,7 @@ impl ControlStateMachine {
                 receiving: Mutex::new(None),
                 counter: AtomicU64::new(0),
             }),
+            last_build: Arc::new(Mutex::new(None)),
             snapshot_lock: Arc::new(Mutex::new(())),
             pointer_lock: Arc::new(Mutex::new(())),
             #[cfg(any(test, feature = "fault-injection"))]
@@ -357,6 +379,11 @@ impl ControlStateMachine {
     /// The staging area the transport receives and validates images in.
     pub(crate) fn staging(&self) -> Arc<SnapshotStaging> {
         Arc::clone(&self.staging)
+    }
+
+    /// The latest build's report, shared with the host.
+    pub(crate) fn last_build(&self) -> LastBuild {
+        Arc::clone(&self.last_build)
     }
 
     /// The pause hooks on the snapshot build and serve paths.
@@ -561,6 +588,8 @@ impl RaftStateMachine<ControlRaft> for ControlStateMachine {
             store: Arc::clone(&self.store),
             identity: self.identity.clone(),
             snapshots: self.snapshots.clone(),
+            receiver_bound: self.staging.max_image_bytes,
+            last_build: Arc::clone(&self.last_build),
             snapshot_lock: Arc::clone(&self.snapshot_lock),
             pointer_lock: Arc::clone(&self.pointer_lock),
             #[cfg(any(test, feature = "fault-injection"))]
@@ -611,7 +640,10 @@ impl RaftStateMachine<ControlRaft> for ControlStateMachine {
         // waits, so the generation this serve is on is not removed under
         // it. Once open, the file outlives the directory's removal. A read
         // that fails here is a real storage failure, and fatal by the
-        // library's contract.
+        // library's contract. The image's length is checked; its digest
+        // is not read here (a serve is repeated for as long as a peer
+        // rejects the image): the receiver verifies the digest and rejects
+        // by name, and this node's start verifies it in the sweep.
         let _pointer = self.pointer_lock.lock().unwrap();
         let Some(generation) =
             read_pointer(&self.snapshots).map_err(|e| snapshot_error(ErrorVerb::Read, e))?
@@ -624,7 +656,7 @@ impl RaftStateMachine<ControlRaft> for ControlStateMachine {
             .snapshots
             .join(GENERATIONS)
             .join(generation.to_string());
-        let (meta, _) = read_generation(&dir, &self.identity)
+        let (meta, _) = read_generation_by_length(&dir, &self.identity)
             .map_err(|e| snapshot_error(ErrorVerb::Read, e))?;
         let file =
             std::fs::File::open(dir.join(IMAGE)).map_err(|e| snapshot_error(ErrorVerb::Read, e))?;
@@ -688,6 +720,10 @@ pub struct ControlSnapshotBuilder {
     store: SharedStore,
     identity: SourceAuthorityIdentity,
     snapshots: PathBuf,
+    /// The bound this node applies to images it receives; the build is not
+    /// bounded, the report compares.
+    receiver_bound: u64,
+    last_build: LastBuild,
     snapshot_lock: Arc<Mutex<()>>,
     pointer_lock: Arc<Mutex<()>>,
     #[cfg(any(test, feature = "fault-injection"))]
@@ -756,6 +792,14 @@ impl ControlSnapshotBuilder {
             #[cfg(any(test, feature = "fault-injection"))]
             self.gates.pause_build();
             publish(&self.pointer_lock, &self.snapshots, generation)?;
+            if let Ok(mut last) = self.last_build.lock() {
+                *last = Some(SnapshotBuildReport {
+                    generation,
+                    bytes: signature.length,
+                    receiver_bound: self.receiver_bound,
+                    last_log_id,
+                });
+            }
             let file = std::fs::File::open(target.join(IMAGE)).map_err(io)?;
             Ok(Snapshot {
                 meta,
@@ -959,6 +1003,34 @@ fn read_generation(
     dir: &Path,
     group: &SourceAuthorityIdentity,
 ) -> Result<(SnapshotMeta<NodeId, BasicNode>, ImageSignature), Status> {
+    read_generation_with(dir, group, |image, signature| {
+        verify_image(image, signature, u64::MAX)
+    })
+}
+
+/// [`read_generation`] with the image checked by length only: the serve
+/// path, where the receiver verifies the digest.
+fn read_generation_by_length(
+    dir: &Path,
+    group: &SourceAuthorityIdentity,
+) -> Result<(SnapshotMeta<NodeId, BasicNode>, ImageSignature), Status> {
+    read_generation_with(dir, group, |image, signature| {
+        let length = std::fs::metadata(image).map_err(io)?.len();
+        if length != signature.length {
+            return Err(Status::data_loss(format!(
+                "snapshot image length {length} differs from the announced {}",
+                signature.length
+            )));
+        }
+        Ok(())
+    })
+}
+
+fn read_generation_with(
+    dir: &Path,
+    group: &SourceAuthorityIdentity,
+    check: impl FnOnce(&Path, &ImageSignature) -> Result<(), Status>,
+) -> Result<(SnapshotMeta<NodeId, BasicNode>, ImageSignature), Status> {
     let bytes = std::fs::read(dir.join(META)).map_err(io)?;
     let value = RaftSnapshotMeta::decode(bytes.as_slice())
         .map_err(|e| Status::data_loss(format!("snapshot meta: {e}")))?;
@@ -974,7 +1046,7 @@ fn read_generation(
         length: value.length,
         sha256: value.sha256.as_slice().try_into().expect("checked length"),
     };
-    verify_image(&dir.join(IMAGE), &signature, u64::MAX)?;
+    check(&dir.join(IMAGE), &signature)?;
     let last_log_id = value.last_log_id.as_ref().map(log_id_from_proto);
     if value.snapshot_id != format_snapshot_id(last_log_id.as_ref(), &signature) {
         return Err(Status::data_loss("snapshot meta id differs from its image"));

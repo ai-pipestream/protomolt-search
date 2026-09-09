@@ -106,7 +106,9 @@ pub mod types;
 pub use host::ClusterTransport;
 pub use host::{HostConfig, NoNetwork, RaftHost};
 pub use log_store::RaftLogStore;
-pub use state_machine::ControlStateMachine;
+pub use state_machine::{ControlStateMachine, SnapshotBuildReport};
+#[cfg(feature = "tls")]
+pub use transport::{PeerRejection, PeerRejections, SnapshotRejection, SnapshotRejections};
 pub use types::ControlRaft;
 
 #[cfg(test)]

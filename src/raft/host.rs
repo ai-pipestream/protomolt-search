@@ -34,7 +34,8 @@ use tonic::Status;
 
 #[cfg(feature = "tls")]
 use super::transport::{
-    Isolation, PeerDirectory, RaftTransportService, TonicNetworkFactory, TransportLimits,
+    Isolation, PeerDirectory, PeerRejection, PeerRejections, RaftTransportService,
+    SnapshotRejections, TonicNetworkFactory, TransportLimits,
 };
 #[cfg(feature = "tls")]
 use crate::security::{ClientTls, ServerTls};
@@ -110,7 +111,11 @@ pub struct HostConfig {
     pub snapshot_logs_since_last: u64,
     /// Largest store image this node accepts from a peer, in bytes. A
     /// build of this node's own store is not bounded by it: a store over
-    /// a peer's bound is rejected at that peer, by name.
+    /// a peer's bound is rejected at that peer, by name, and the leader
+    /// records the rejection (`RaftHost::peer_rejections`). The bound must be
+    /// at least the group's store image for this node to be seeded after
+    /// a wipe or caught up by a snapshot; the build report
+    /// (`RaftHost::last_snapshot_build`) compares the two.
     pub max_snapshot_bytes: u64,
     /// One snapshot chunk on the wire.
     pub snapshot_chunk_bytes: u64,
@@ -306,9 +311,14 @@ pub struct RaftHost {
     /// there may still be open.
     hold: LeaseHold,
     staging: Arc<super::state_machine::SnapshotStaging>,
+    last_build: super::state_machine::LastBuild,
     listener: Option<Listener>,
     #[cfg(feature = "tls")]
     directory: Option<Arc<PeerDirectory>>,
+    #[cfg(feature = "tls")]
+    peer_rejections: Option<PeerRejections>,
+    #[cfg(feature = "tls")]
+    snapshot_rejections: Arc<SnapshotRejections>,
     #[cfg(feature = "tls")]
     isolation: Isolation,
     #[cfg(any(test, feature = "fault-injection"))]
@@ -460,8 +470,10 @@ impl RaftHost {
             isolation.clone(),
             timing.clone(),
         );
+        let peer_rejections = factory.rejections();
         let mut host =
             Self::start_with(dir, store, log_store, node_id, config, factory, None).await?;
+        host.peer_rejections = Some(peer_rejections);
         let service = RaftTransportService::new(
             host.raft.clone(),
             node_id,
@@ -470,6 +482,7 @@ impl RaftHost {
             timing,
             host.hold.clone(),
             Arc::clone(&host.staging),
+            Arc::clone(&host.snapshot_rejections),
             &transport.limits,
         );
         let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -505,6 +518,7 @@ impl RaftHost {
             ControlStateMachine::new(store, &dir.join(SNAPSHOT_DIR), config.max_snapshot_bytes)?;
         let shared = machine.shared_store();
         let staging = machine.staging();
+        let last_build = machine.last_build();
         #[cfg(any(test, feature = "fault-injection"))]
         let snapshot_gates = machine.gates();
         let mut log_store = log_store;
@@ -530,9 +544,14 @@ impl RaftHost {
             read_timeout: config.read_timeout(),
             hold: LeaseHold::new(Duration::from_millis(config.election_timeout_max_ms)),
             staging,
+            last_build,
             listener,
             #[cfg(feature = "tls")]
             directory: None,
+            #[cfg(feature = "tls")]
+            peer_rejections: None,
+            #[cfg(feature = "tls")]
+            snapshot_rejections: Arc::new(SnapshotRejections::default()),
             #[cfg(feature = "tls")]
             isolation: Isolation::default(),
             #[cfg(any(test, feature = "fault-injection"))]
@@ -606,6 +625,28 @@ impl RaftHost {
     /// waiting for the group's first snapshot.
     pub fn awaiting_snapshot(&self) -> Result<bool, Status> {
         self.store()?.awaiting_snapshot()
+    }
+
+    /// The latest build of this node's own store: its size against the
+    /// bound this node applies to images it receives.
+    pub fn last_snapshot_build(&self) -> Option<super::state_machine::SnapshotBuildReport> {
+        self.last_build.lock().ok().and_then(|last| last.clone())
+    }
+
+    /// The latest rejection each peer answered to this node's RPCs (empty
+    /// for a node with no transport).
+    #[cfg(feature = "tls")]
+    pub fn peer_rejections(&self) -> BTreeMap<NodeId, PeerRejection> {
+        self.peer_rejections
+            .as_ref()
+            .map(PeerRejections::latest)
+            .unwrap_or_default()
+    }
+
+    /// Installs this node rejected at the announce, before any byte.
+    #[cfg(feature = "tls")]
+    pub fn snapshot_rejections(&self) -> &SnapshotRejections {
+        &self.snapshot_rejections
     }
 
     /// The leader this node currently believes in, if any: an applied
@@ -915,6 +956,7 @@ impl RaftHost {
             ));
         }
         self.seed_boundary().await?;
+        let started = std::time::Instant::now();
         // The library's blocking mode returns once the learner is within
         // its lag threshold; a member is caught up when it holds the
         // membership entry that added it.
@@ -930,21 +972,62 @@ impl RaftHost {
             .await
             .map_err(|e| Self::write_error(e, format!("add learner {node_id}")))?
             .log_id;
-        self.raft
-            .wait(Some(Duration::from_secs(60)))
-            .metrics(
-                |metrics| {
-                    metrics
-                        .replication
-                        .as_ref()
-                        .and_then(|replication| replication.get(&node_id).copied().flatten())
-                        .is_some_and(|matching| matching >= added)
-                },
-                "learner caught up",
-            )
-            .await
-            .map_err(|e| Status::unavailable(format!("learner {node_id} did not catch up: {e}")))?;
-        Ok(())
+        // A rejection the learner answers meanwhile (its bound, its identity,
+        // an image it finds invalid) is named at once, with the peer's own
+        // code: waiting out the timeout would hide it. The learner stays
+        // in the membership and the leader keeps retrying with backoff.
+        let mut rejections = self.peer_rejections.as_ref().map(PeerRejections::subscribe);
+        let wait = self.raft.wait(Some(Duration::from_secs(60)));
+        let caught_up = wait.metrics(
+            |metrics| {
+                metrics
+                    .replication
+                    .as_ref()
+                    .and_then(|replication| replication.get(&node_id).copied().flatten())
+                    .is_some_and(|matching| matching >= added)
+            },
+            "learner caught up",
+        );
+        let rejected = async {
+            match rejections.as_mut() {
+                Some(rejections) => Self::rejection_from(rejections, node_id, started).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            outcome = caught_up => outcome
+                .map(|_| ())
+                .map_err(|e| Status::unavailable(format!("learner {node_id} did not catch up: {e}"))),
+            rejection = rejected => Err(Status::new(
+                rejection.code,
+                format!(
+                    "learner {node_id} rejected the {} ({:?}): {}; it stays in the membership and this node keeps retrying with backoff",
+                    rejection.action, rejection.code, rejection.message
+                ),
+            )),
+        }
+    }
+
+    /// The first rejection `node_id` answers at or after `since`.
+    #[cfg(feature = "tls")]
+    async fn rejection_from(
+        rejections: &mut watch::Receiver<BTreeMap<NodeId, PeerRejection>>,
+        node_id: NodeId,
+        since: std::time::Instant,
+    ) -> PeerRejection {
+        loop {
+            let found = rejections
+                .borrow_and_update()
+                .get(&node_id)
+                .filter(|rejection| rejection.at >= since)
+                .cloned();
+            if let Some(found) = found {
+                return found;
+            }
+            if rejections.changed().await.is_err() {
+                return std::future::pending().await;
+            }
+        }
     }
 
     /// A snapshot at the current applied position with the log purged up
@@ -960,23 +1043,39 @@ impl RaftHost {
         let applied = metrics
             .last_applied
             .ok_or_else(|| Status::failed_precondition("nothing is applied yet"))?;
-        if metrics.snapshot != Some(applied) {
+        // The store may be past the position this read saw (a committed
+        // proposal reaches the store before the metric), and a build images
+        // the store where it is. So the snapshot waited for is one at or
+        // past the position read, and the purge goes to the snapshot's
+        // position. Waiting for a snapshot at exactly the position read
+        // waited out its timeout whenever the store was one entry ahead.
+        if !metrics.snapshot.is_some_and(|snapshot| snapshot >= applied) {
             self.trigger_snapshot().await?;
             self.raft
                 .wait(Some(Duration::from_secs(60)))
-                .snapshot(applied, "seed snapshot")
+                .metrics(
+                    |metrics| metrics.snapshot.is_some_and(|snapshot| snapshot >= applied),
+                    "seed snapshot at or past the applied position",
+                )
                 .await
                 .map_err(|e| Status::unavailable(format!("seed snapshot: {e}")))?;
         }
-        if metrics.purged != Some(applied) {
+        let snapshot = self.raft.metrics().borrow().snapshot;
+        let snapshot =
+            snapshot.ok_or_else(|| Status::internal("no snapshot after the seed build"))?;
+        let purged = self.raft.metrics().borrow().purged;
+        if !purged.is_some_and(|purged| purged >= snapshot) {
             self.raft
                 .trigger()
-                .purge_log(applied.index)
+                .purge_log(snapshot.index)
                 .await
                 .map_err(|e| Status::internal(format!("purge log: {e}")))?;
             self.raft
                 .wait(Some(Duration::from_secs(60)))
-                .purged(Some(applied), "seed purge")
+                .metrics(
+                    |metrics| metrics.purged.is_some_and(|purged| purged >= snapshot),
+                    "seed purge to the snapshot",
+                )
                 .await
                 .map_err(|e| Status::unavailable(format!("seed purge: {e}")))?;
         }

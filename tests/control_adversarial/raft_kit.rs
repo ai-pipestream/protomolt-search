@@ -147,7 +147,9 @@ pub fn durable_position(host: &RaftHost) -> u64 {
 
 /// Whether the raft core is still running (a refused install is a storage
 /// error the library treats as fatal; the observation is recorded, the
-/// safety assertions do not depend on it).
+/// safety assertions do not depend on it). Read one `metrics().borrow()`
+/// at a time: two live borrows of the same host in one expression block
+/// the core's next `send_replace`, and with it the test.
 pub fn core_running(host: &RaftHost) -> bool {
     host.metrics().borrow().running_state.is_ok()
 }

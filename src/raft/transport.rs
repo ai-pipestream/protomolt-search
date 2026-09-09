@@ -221,7 +221,12 @@ pub struct RaftTransportService {
     timing: String,
     hold: LeaseHold,
     staging: Arc<SnapshotStaging>,
+    rejections: Arc<SnapshotRejections>,
     transfer: Mutex<Option<Transfer>>,
+    /// The last transfer rejected on its final chunk, by its meta, with
+    /// the rejection: a sender continuing that transfer is rejected the
+    /// same way again (see `stage`).
+    rejected: Mutex<Option<(SnapshotMeta<NodeId, BasicNode>, Status)>>,
     idle: Duration,
 }
 
@@ -265,6 +270,7 @@ impl RaftTransportService {
         timing: String,
         hold: LeaseHold,
         staging: Arc<SnapshotStaging>,
+        rejections: Arc<SnapshotRejections>,
         limits: &TransportLimits,
     ) -> Self {
         Self {
@@ -275,8 +281,16 @@ impl RaftTransportService {
             timing,
             hold,
             staging,
+            rejections,
             transfer: Mutex::new(None),
+            rejected: Mutex::new(None),
             idle: Duration::from_millis(limits.snapshot_idle_timeout_ms),
+        }
+    }
+
+    fn remember_rejected(&self, meta: &SnapshotMeta<NodeId, BasicNode>, error: &Status) {
+        if let Ok(mut rejected) = self.rejected.lock() {
+            *rejected = Some((meta.clone(), error.clone()));
         }
     }
 
@@ -299,9 +313,11 @@ impl RaftTransportService {
             .map_err(wire)?
             .length;
         if announced > self.staging.max_image_bytes() {
+            let bound = self.staging.max_image_bytes();
+            self.rejections.record(from, announced, bound);
             return Err(Status::resource_exhausted(format!(
-                "snapshot announces {announced} bytes, beyond the {} byte image bound",
-                self.staging.max_image_bytes()
+                "snapshot announces {announced} bytes, beyond the {bound} byte image bound of node {}",
+                self.node_id
             )));
         }
         let now = std::time::Instant::now();
@@ -332,7 +348,34 @@ impl RaftTransportService {
                 self.staging.discard(&superseded.dir);
             }
             if rpc.offset != 0 {
+                // A chunk of a transfer this node has no record of. When it
+                // continues the transfer this node rejected on its final
+                // chunk (the same meta), it is rejected the same way again, so the sender
+                // gives that transfer up (its retry budget) and serves its
+                // snapshot afresh, instead of starting the rejected bytes
+                // over from offset zero on a mismatch, without end. A new
+                // transfer of any id begins at offset zero.
+                let rejected = self
+                    .rejected
+                    .lock()
+                    .map_err(|_| Status::internal("snapshot rejection lock poisoned"))?
+                    .clone();
+                if let Some((meta, status)) = rejected {
+                    if meta == rpc.meta {
+                        return Err(Status::new(
+                            status.code(),
+                            format!(
+                                "snapshot {} was rejected: {}",
+                                meta.snapshot_id,
+                                status.message()
+                            ),
+                        ));
+                    }
+                }
                 return Ok(Staged::Mismatch { expect_offset: 0 });
+            }
+            if let Ok(mut rejected) = self.rejected.lock() {
+                *rejected = None;
             }
             let (dir, file) = self.staging.begin()?;
             *guard = Some(Transfer {
@@ -379,12 +422,13 @@ impl RaftTransportService {
                 expect_offset: active.received,
             });
         }
-        if rpc.offset.saturating_add(rpc.data.len() as u64) > active.announced {
+        let end = rpc.offset.saturating_add(rpc.data.len() as u64);
+        if end > active.announced {
             let announced = active.announced;
             let broken = guard.take().expect("checked");
             self.staging.discard(&broken.dir);
             return Err(Status::invalid_argument(format!(
-                "snapshot chunk ends past the announced length {announced}; the transfer is dropped"
+                "snapshot chunk ends at byte {end}, beyond the announced length {announced}; the transfer is dropped"
             )));
         }
         {
@@ -404,10 +448,12 @@ impl RaftTransportService {
         drop(guard);
         if complete.received != complete.announced {
             self.staging.discard(&complete.dir);
-            return Err(Status::invalid_argument(format!(
+            let error = Status::invalid_argument(format!(
                 "snapshot transfer ended at {} bytes of the announced length {}",
                 complete.received, complete.announced
-            )));
+            ));
+            self.remember_rejected(&complete.meta, &error);
+            return Err(error);
         }
         if let Err(error) = complete.file.sync_all() {
             self.staging.discard(&complete.dir);
@@ -416,6 +462,7 @@ impl RaftTransportService {
         drop(complete.file);
         if let Err(error) = self.staging.verify(&complete.dir, &complete.meta) {
             self.staging.discard(&complete.dir);
+            self.remember_rejected(&complete.meta, &error);
             return Err(error);
         }
         Ok(Staged::Complete {
@@ -809,17 +856,8 @@ fn install_request_from_proto(
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("snapshot chunk carries no meta"))?;
     let meta = snapshot_meta_from_proto(group, meta)?;
-    // The announced length bounds the receive while it happens, not only
-    // at install: a chunk past it is refused before the library sees it.
-    let announced = super::state_machine::parse_snapshot_id(&meta.snapshot_id)
-        .map_err(wire)?
-        .length;
-    let end = value.offset.saturating_add(value.data.len() as u64);
-    if end > announced {
-        return Err(Status::invalid_argument(format!(
-            "snapshot chunk ends at byte {end}, beyond the announced length {announced}"
-        )));
-    }
+    // A chunk past the announced length is rejected in `stage`, which
+    // drops the transfer it belongs to with its bytes.
     Ok(InstallSnapshotRequest {
         vote: leader_vote(value.vote.as_ref())?,
         meta,
@@ -855,6 +893,106 @@ struct Shared {
     limits: TransportLimits,
     isolation: Isolation,
     timing: tonic::metadata::MetadataValue<tonic::metadata::Ascii>,
+    rejections: PeerRejections,
+}
+
+/// A rejection a peer answered to one of this node's RPCs: a definite
+/// answer from the peer (a bound, an identity, an invalid image, a timing
+/// disagreement), not a transport failure. Kept per target for the
+/// operator surface and for `RaftHost::add_learner`, which names the
+/// rejection instead of waiting out its timeout.
+#[derive(Clone, Debug)]
+pub struct PeerRejection {
+    /// The RPC rejected: "append", "vote" or "snapshot".
+    pub action: &'static str,
+    pub code: tonic::Code,
+    pub message: String,
+    pub at: std::time::Instant,
+    /// Rejections answered by this peer since this node started.
+    pub count: u64,
+}
+
+/// The latest rejection from each peer, shared by the network clients and
+/// the host.
+#[derive(Clone)]
+pub struct PeerRejections {
+    sender: Arc<tokio::sync::watch::Sender<BTreeMap<NodeId, PeerRejection>>>,
+}
+
+impl PeerRejections {
+    fn new() -> Self {
+        let (sender, _) = tokio::sync::watch::channel(BTreeMap::new());
+        Self {
+            sender: Arc::new(sender),
+        }
+    }
+
+    fn record(&self, target: NodeId, action: &'static str, status: &Status) {
+        self.sender.send_modify(|rejections| {
+            let count = rejections.get(&target).map_or(0, |r| r.count) + 1;
+            rejections.insert(
+                target,
+                PeerRejection {
+                    action,
+                    code: status.code(),
+                    message: status.message().to_string(),
+                    at: std::time::Instant::now(),
+                    count,
+                },
+            );
+        });
+    }
+
+    /// The latest rejection from each peer.
+    pub fn latest(&self) -> BTreeMap<NodeId, PeerRejection> {
+        self.sender.borrow().clone()
+    }
+
+    pub(crate) fn subscribe(
+        &self,
+    ) -> tokio::sync::watch::Receiver<BTreeMap<NodeId, PeerRejection>> {
+        self.sender.subscribe()
+    }
+}
+
+/// Installs this node rejected at the announce, before any byte was
+/// received: what an operator reads at a peer that is not being seeded.
+#[derive(Default)]
+pub struct SnapshotRejections {
+    count: std::sync::atomic::AtomicU64,
+    last: Mutex<Option<SnapshotRejection>>,
+}
+
+/// One install rejected at the announce.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotRejection {
+    pub from: NodeId,
+    pub announced: u64,
+    pub bound: u64,
+}
+
+impl SnapshotRejections {
+    fn record(&self, from: NodeId, announced: u64, bound: u64) {
+        self.count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut last) = self.last.lock() {
+            *last = Some(SnapshotRejection {
+                from,
+                announced,
+                bound,
+            });
+        }
+    }
+
+    /// Installs rejected at the announce since this node started.
+    pub fn count(&self) -> u64 {
+        self.count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The latest rejection.
+    pub fn last(&self) -> Option<SnapshotRejection> {
+        self.last.lock().ok().and_then(|last| last.clone())
+    }
 }
 
 /// Builds one `TonicNetwork` per target for the library.
@@ -882,8 +1020,14 @@ impl TonicNetworkFactory {
                 timing: timing
                     .parse()
                     .expect("timing agreement is ASCII digits and punctuation"),
+                rejections: PeerRejections::new(),
             }),
         }
+    }
+
+    /// The rejections peers answer to this node's RPCs.
+    pub(crate) fn rejections(&self) -> PeerRejections {
+        self.shared.rejections.clone()
     }
 }
 
@@ -1011,12 +1155,29 @@ impl TonicNetwork {
                 target: self.target,
                 timeout: ttl,
             }),
-            _ => Self::network(format!(
-                "node {}: {} ({:?})",
-                self.target,
-                status.message(),
-                status.code()
-            )),
+            _ => {
+                // The peer answered: a rejection, recorded for the operator
+                // surface and for `add_learner`. A rejected snapshot is
+                // returned as unreachable so the library backs off before
+                // it serves the image again, rather than retrying at once.
+                let (name, rejected_snapshot) = match action {
+                    RPCTypes::AppendEntries => ("append", false),
+                    RPCTypes::Vote => ("vote", false),
+                    RPCTypes::InstallSnapshot => ("snapshot", true),
+                };
+                self.shared.rejections.record(self.target, name, &status);
+                let message = format!(
+                    "node {} rejected the {name}: {} ({:?})",
+                    self.target,
+                    status.message(),
+                    status.code()
+                );
+                if rejected_snapshot {
+                    Self::unreachable(message)
+                } else {
+                    Self::network(message)
+                }
+            }
         }
     }
 }

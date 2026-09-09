@@ -1250,6 +1250,18 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   destination store remains unchanged. See [retirement and crash recovery](docs/control-retirement.md);
   transactional import, worker fencing and activation remain separate steps.
 
+- **Foundation branch: a peer's rejection is recorded and named.** A
+  rejection a peer answers to a raft RPC is kept at the node that sent it
+  (`RaftHost::peer_rejections`), an install rejected at the announce is
+  counted at the receiver (`RaftHost::snapshot_rejections`), and
+  `add_learner` names a learner's rejection with the learner's own code
+  instead of waiting out its timeout. A rejected snapshot makes the leader
+  back off between attempts, and a serve no longer reads the image's
+  digest (the receiver verifies it, by name), so a peer that keeps
+  rejecting costs the leader one RPC per attempt. A chunk past the
+  announced length drops its transfer with its bytes. The build reports
+  its image's length against the node's own receiver bound
+  (`RaftHost::last_snapshot_build`). See [raft hosting](docs/raft-hosting.md).
 - **Foundation branch: a purge the store bounds is recorded and completed.**
   The library purges the log to a snapshot before the state machine
   installs it. A purge cut at the hosted store's applied position, or one

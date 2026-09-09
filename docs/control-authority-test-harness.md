@@ -1128,3 +1128,145 @@ with the record it passes (`deferred-purge-unit.log`). The `#[ignore]` on
 is removed and the test passes as written: the seed installs, the leader's
 next append is applied at the member, both cores run
 (`deferred-purge-pending-member.log`). Gates, in the 8 GiB scope with two build jobs and four test threads: the snapshot target 17 pass (`deferred-purge-control_raft_snapshots.log`); regressions 10, admission 10, crash faults 7 and the worker 1 (`deferred-purge-raft-targets.log`); the lib with raft, tls and fault-injection 833 pass (`deferred-purge-lib-raft.log`); clippy with the same features, the pre-existing deny at `src/vector.rs:1092` and pre-existing warnings, none in the changed files (`deferred-purge-clippy.log`); the combined release gate 164 targets, 1813 pass, 0 fail, 1 ignored, the pre-existing `native_matches_opennlp_contract` (`deferred-purge-combined-gate.log`); rustfmt on the changed files.
+
+## Review of d3b90b3 (second reader, 2026-09-09) and the response (Fable)
+
+A second reader took the receiver-side bound commit `d3b90b3` with eight
+questions (retry cadence, growth at the leader, visibility, raising the
+bound, the node's own bound, chunk bound interplay, rejection wording and
+state left behind, test strength) and met them with source lines
+and three probes (`peer-bound-review-probe{,2,3}.log`). The narrow claim
+of the commit was found earned: the bound applies where an image
+arrives, the builder images an oversized store with its core running,
+the peer rejects before a byte arrives, both cores keep running, and the
+peer is recoverable by a restart under a larger bound, with no advanced
+log on that path (the seed is the leader's only channel to a member it
+purged past). What was not earned, ranked by the reader:
+
+1. The rejection was invisible: no tracing subscriber in the process, no
+   raft entry in the metrics route table, no gRPC surface, and the one
+   metric that moves (`replication[peer] == None`) reads the same for a
+   learner added a moment ago. Blocker.
+2. The retry was a loop with no backoff, about 183 ms between serves (8
+   serves in 1.29 s), and each serve streamed and hashed the full
+   published image under the pointer lock. Should fix.
+3. The builder had lost the number it could warn with: `max_image_bytes`
+   was removed from it at d3b90b3. Should fix.
+4. The test did not pin the retry: a leader that gave up after one
+   rejection passed it the same way. Should fix.
+5. A chunk past the announced length was rejected in
+   `install_request_from_proto`, before `stage` ran, so the transfer it
+   belonged to kept its receive directory and its slot until the idle
+   timeout; the `stage` branch that drops the transfer was unreachable
+   from the wire, and the document stated the contrary. Shown by probe 3.
+   Should fix.
+6. The self-lockout was not stated: a node with a store over its
+   own bound cannot be re-seeded after a wipe or caught up by a snapshot.
+7. The rejection named both numbers but not the rejecting node.
+8. The documented recovery (raise the bound, restart) had no test.
+9. "The leader keeps committing" is near-vacuous in a one-voter group.
+10. Receiver disk is up to three times the bound, against a document
+    that said "the announced length".
+11. The 64 KiB envelope allowance in `TransportLimits::validate` is a
+    constant, not a measurement: a large enough membership makes every chunk
+    exceed `max_message_bytes` while both validators pass.
+12. Two live `metrics().borrow()` values of one host in one expression
+    block the core's `send_replace` (harness note).
+
+The response, at the checkpoint after 5b48a0b, takes 1 through 8, 10 and 12; 9 and 11 are
+recorded here as open notes.
+
+- **Visibility (1, 7).** `PeerRejections` in `src/raft/transport.rs`: the
+  caller side records a rejection a peer returns (a definite status, not a
+  transport failure) per target with the peer's code, message and a
+  count, behind `RaftHost::peer_rejections`; `SnapshotRejections` on the
+  receiver counts installs rejected at the announce with the announced
+  length, the bound and the sender, behind `RaftHost::snapshot_rejections`;
+  the announce rejection names the rejecting node. `RaftHost::add_learner`
+  selects between the library's catch-up wait and the first rejection the
+  learner returns after the add, and returns that rejection with the
+  learner's own code at once. The learner stays in the membership and
+  the leader keeps retrying, which the message states.
+- **Cost of the retry (2).** A rejected snapshot is returned to the
+  library as `Unreachable`, so the chunked sender waits the library's
+  500 ms backoff between its attempts and the replication core backs off
+  again before the next serve; and `get_current_snapshot` reads the
+  generation by length (`read_generation_by_length`) and does not hash
+  the image. The digest is verified where it matters: at the receiver,
+  by name, and at this node's start (the sweep). A serve of an image
+  with bytes that changed on disk is therefore rejected at the receiver as
+  `DataLoss` and named at the leader, with the leader's core running; the
+  leader's next build publishes a sound image and the peer is seeded
+  from it. Before this change the serve's own digest check stopped the
+  leader's core on such an image.
+- **The builder's number (3, 6).** `ControlSnapshotBuilder` keeps the
+  receiver bound and records `SnapshotBuildReport { generation, bytes,
+  receiver_bound, last_log_id }` on each publish, behind
+  `RaftHost::last_snapshot_build`, with `over_receiver_bound()`; the
+  `HostConfig::max_snapshot_bytes` comment and the hosting document
+  state the corollary: a node with an image over its own bound cannot
+  be seeded from a peer's image of the same store until its bound is
+  raised.
+- **The dropped transfer (5, 10).** The check moved into `stage`, after
+  the transfer is identified, where the transfer is dropped with its
+  bytes; the wire message names the byte and the announced length and
+  states that the transfer is dropped. The document's disk bound now reads up
+  to three times the announced length while an install completes.
+
+Tests (`tests/control_raft_snapshots.rs`):
+
+- `a_store_image_over_a_peers_bound_is_rejected_at_that_peer_with_both_cores_running`
+  now asserts the `add_learner` answer inside 10 s, `ResourceExhausted`,
+  naming the learner, the snapshot, the announced length, the bound and
+  the rejecting node; the leader's record of the rejection; the peer's
+  rejection count and last rejection (the raw push and the leader's
+  seed); and the leader's build report over its own bound.
+- `the_leader_keeps_serving_a_peer_that_rejects_its_seed_with_backoff`
+  (`fault-injection`): three crossings of the serve gate after the
+  rejection, none closer than 500 ms, the leader's rejection count at three
+  or more. The retry is a contract now, not a property of two library
+  constants.
+- `a_peer_rejected_at_its_bound_is_seeded_after_a_restart_under_a_larger_bound`:
+  the recovery the document states, with the member's log at `None`
+  while it rejects.
+- `a_chunk_past_the_announced_length_drops_the_transfer_and_the_next_one_installs`:
+  a sound first chunk, a second one byte past the announce, no
+  receive directory left, the next transfer installs at once.
+- `a_served_image_with_changed_bytes_is_rejected_at_the_receiver_and_named_at_the_leader`:
+  a byte of the leader's published image inverted on disk; the join is
+  rejected as `DataLoss` naming the digest, the leader's core runs, the
+  rejection is recorded, and the next join (after a change moved the
+  applied position) seeds the member from a fresh build.
+
+Kit: `core_running`'s comment has the borrow note (12).
+### Found by the changed-bytes test: the seed waited for a snapshot at the position it read
+
+`a_served_image_with_changed_bytes_is_rejected_at_the_receiver_and_named_at_the_leader`
+failed five runs in eight before its second join passed
+(`review-response-changed-bytes-loop-{1..8}.log`), with the leader's
+core running, its log at `[3, 4]`, its snapshot at index 4 and its
+purge at 2, and with a 90 s window the join's outcome named the step:
+`seed snapshot: timeout after 60s when seed snapshot .snapshot==T1-N1-3`
+(`review-response-changed-bytes-debug3-2.log`). `RaftHost::seed_boundary`
+read `last_applied` from the metrics (3), triggered a build, and waited
+for a snapshot at that exact position; the store was one entry ahead (a committed proposal is in the store before the metric moves), the build
+imaged the store at 4, and the wait did not hold. The purge went to the
+position read for the same reason. Fixed in this checkpoint: the seed
+waits for a snapshot at or past the position read and purges to the
+snapshot's position. This is a production change on the seed path,
+present since the operator surface for `add_learner`; a join issued
+right after a commit could wait out 60 s and return `Unavailable`.
+
+The same runs showed the library's chunked sender starting a rejected
+transfer over without end: the receiver rejected the final chunk by
+its digest, the sender retried that chunk after the backoff, the receiver (no transfer in progress) returned a mismatch at offset zero,
+the sender began again from its opened handle of the same bytes, and
+so on, 57 rejections in 30 s with no return to the replication core
+and so no fresh serve. The transport now remembers the last transfer
+it rejected on its final chunk, by its meta, and rejects a chunk continuing it (the same meta at a nonzero offset) the same way, so the sender spends its retry budget,
+returns, backs off and serves its snapshot afresh; a new transfer of
+any id begins at offset zero and clears the memory. After both fixes
+the test passed eight runs in eight
+(`review-response-changed-bytes-fixed-{1..8}.log`).
+
+Gates, in the 8 GiB scope with two build jobs and four test threads: the snapshot target 21 pass (`review-response-control_raft_snapshots.log`); the changed-bytes test eight runs in eight after the fixes (`review-response-changed-bytes-fixed-{1..8}.log`); regressions 10, admission 10, crash faults 7 and the worker 1 (`review-response-raft-targets.log`); the lib with raft, tls and fault-injection 833 pass (`review-response-lib-raft.log`); `cargo check --tests` with raft only and with the default features (`review-response-check-{raft,default}.log`); clippy with the raft features, the pre-existing deny at `src/vector.rs:1092` and pre-existing warnings, none in `src/raft` (`review-response-clippy.log`); the combined release gate 164 targets, 1817 pass, 0 fail, 1 ignored, the pre-existing `native_matches_opennlp_contract` (`review-response-combined-gate.log`); rustfmt on the changed files.

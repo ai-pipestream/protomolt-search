@@ -97,9 +97,13 @@ library a validated image only (`RaftTransportService::stage`,
 `SnapshotStaging` in `src/raft/state_machine.rs`):
 
 - **Bounds.** Chunks go straight to the receive file, so memory is one
-  chunk (`TransportLimits::max_message_bytes`); disk is the announced
-  length, which must be within `HostConfig::max_snapshot_bytes` before the
-  first byte lands, and a chunk past the announcement drops the transfer;
+  chunk (`TransportLimits::max_message_bytes`); disk is up to three times
+  the announced length while an install completes (the receive, the probe
+  copy, the staged copy), and the announced length must be within
+  `HostConfig::max_snapshot_bytes` before the first byte arrives; a chunk
+  past the announcement drops the transfer with its bytes, and the next
+  transfer from the peer begins at once
+  (`a_chunk_past_the_announced_length_drops_the_transfer_and_the_next_one_installs`);
   one transfer at a time; a transfer with no chunk for
   `TransportLimits::snapshot_idle_timeout_ms` is dropped with its bytes.
 - **Binding.** A transfer is bound to the authenticated peer that began
@@ -117,6 +121,17 @@ library a validated image only (`RaftTransportService::stage`,
   applied position and membership must equal the meta. Any refusal is
   returned to the peer by name, the receive directory is removed, and the
   core is untouched.
+- **Visibility.** A rejection a peer answers is recorded at the node that
+  sent it, per peer, with the peer's code and message
+  (`RaftHost::peer_rejections`); an install rejected at the announce is
+  counted at the receiver with the announced length and the bound
+  (`RaftHost::snapshot_rejections`); and `RaftHost::add_learner` names a
+  rejection the learner answers, with the learner's own code, instead of
+  waiting out its timeout (the learner stays in the membership and the
+  leader keeps retrying). A rejected snapshot is returned to the library as
+  unreachable, so the leader backs off between attempts (500 ms, the
+  library's own) rather than serving the image again at once
+  (`the_leader_keeps_serving_a_peer_that_rejects_its_seed_with_backoff`).
 - **Hand-off.** A validated image goes to `Raft::install_full_snapshot`,
   which applies the library's own rules: a vote older than the receiver's
   is answered without installing, a position the receiver already holds is
@@ -173,11 +188,19 @@ member recovers by restart:
   publishing. The image is not bounded here: `HostConfig::max_snapshot_bytes`
   is each receiver's bound, applied where an image arrives, so a store
   over a peer's bound is rejected at that peer by name
-  (`ResourceExhausted`, naming the announced length and the bound) before
-  any byte is received, with that peer's core and the leader's running; the leader
-  keeps retrying the peer, which stays unseeded until its bound is raised
-  or the store shrinks
-  (`a_store_image_over_a_peers_bound_is_rejected_at_that_peer_with_both_cores_running`).
+  (`ResourceExhausted`, naming the announced length, the bound and the
+  rejecting node) before any byte is received, with that peer's core and
+  the leader's running; the leader records the rejection, names it on the
+  `add_learner` that met it, and keeps retrying the peer with backoff; the
+  peer stays unseeded until its bound is raised or the store shrinks
+  (`a_store_image_over_a_peers_bound_is_rejected_at_that_peer_with_both_cores_running`,
+  `a_peer_rejected_at_its_bound_is_seeded_after_a_restart_under_a_larger_bound`).
+  The build reports its image's length against this node's own receiver
+  bound (`RaftHost::last_snapshot_build`): a node with a store image
+  over its own bound cannot be seeded from a peer's image of that store
+  after a wipe, nor caught up by a snapshot once it falls behind the
+  leader's purge point, until its bound is raised. The bound is a
+  configuration of each node, read at start.
   The one rejection left on this path is a condition, not a failure: a
   build with no applied position cannot happen through the host.
   `RaftHost::trigger_snapshot` rejects it on such a store before the
@@ -187,7 +210,14 @@ member recovers by restart:
   (`get_current_snapshot`). A serve is one step under the pointer lock,
   from reading the pointer to opening the image; a build or install
   publishing meanwhile waits for it, and once open the file outlives the
-  directory's removal. Before this lock a publish between the two reads
+  directory's removal. A serve checks the meta and the image's length and
+  does not read the image's digest: the receiver verifies the digest and
+  rejects by name, this node's start verifies it in the sweep, and a
+  serve is repeated for as long as a peer rejects. An image with bytes
+  that changed on disk is therefore served, rejected at the receiver
+  (`DataLoss`, the digest) and named at the leader, with the leader's
+  core running; the next build publishes a sound image
+  (`a_served_image_with_changed_bytes_is_rejected_at_the_receiver_and_named_at_the_leader`). Before this lock a publish between the two reads
   removed the generation under the serve, the read failed as a storage
   error and the core stopped with no fault anywhere. The interleaving is
   pinned with two `fault-injection` gates, `RaftHost::arm_snapshot_build_gate`
@@ -278,11 +308,15 @@ never through files:
    position. A member therefore never replays the group's log onto its own
    genesis image, which could differ from the group's silently.
 2. `add_learner(node_id, addr)` on the leader requires the node's
-   certificate to be registered, builds a snapshot at the current applied
-   position, purges the log to it, adds the learner and waits until the
-   learner holds the membership entry that added it. The learner is seeded
-   by the verified image (group, position, membership checked on a probe
-   copy), which replaces the marked store; the marker is gone with it.
+   certificate to be registered, builds a snapshot at or past the applied
+   position it read (the store may be one entry ahead of the metric, and
+   a build images the store where it is), purges the log to the
+   snapshot's position, adds the learner and waits until the learner holds
+   the membership entry that added it, or until the learner rejects the
+   seed, which is returned at once with the learner's code. The learner is
+   seeded by the verified image (group, position, membership checked on a
+   probe copy), which replaces the marked store; the marker is gone with
+   it.
 3. `promote(learners)` upgrades caught-up learners to voters
    (`AddVoterIds`); `remove_member(node_id)` removes a voter
    (`RemoveVoters`, not retained as a learner) or a learner (`RemoveNodes`).
