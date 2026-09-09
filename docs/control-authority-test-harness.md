@@ -879,3 +879,46 @@ handoff is not in their lock code, and `test_support` is crate-private.
 Giving them the same protection means compiling the handoff into the
 library under a feature and exposing the module; that is a design choice
 for the owner of the storage contracts and is left open here, named.
+
+## Slice 4b (port): admission timing target on the 945b484 kit
+
+The branch was re-anchored onto Fable's foundations checkpoint `945b484`
+(0fe7081 -> 82090d9 -> 32a3b50 -> b5c6f48 -> 945b484: transport-side
+snapshot admission, the in-place store swap with contract-first R4
+semantics, serve-under-pointer-lock race fix, `trigger_snapshot` refusal
+for unapplied stores, and the `arm_snapshot_build_gate` /
+`arm_snapshot_serve_gate` / `serve_snapshot` hooks). The pre-port harness
+state is archived at `archive/harness-timing-922ba2a`. Everything from the
+0fe7081 slices except the admission target was superseded by Fable's
+rebuilt integration; `tests/control_raft_admission.rs` is ported here onto
+the rebuilt kit with every test's semantic content preserved and no
+assertion weakened — the oracle remains docs/raft-admission.md.
+
+Kit changes: the rebuilt `tests/control_adversarial/raft_kit.rs` names its
+networked config `host_config` (lease 100 ms, skew 50 ms, election
+150/300 ms, small snapshot chunks) and its two-member group `Cluster`;
+neither fits the admission scenarios, which need a surviving pair to elect
+a successor while the old leader is isolated. The kit gains a three-voter
+`Voters` group (`three_voters`, `join` with snapshot seeding, `propose`
+with control-revision tracking, `leader` / `leader_other_than`,
+`wait_applied`, take/insert for the Arc recipe) mirroring the in-crate
+`src/raft/transport_tests.rs::three_voters` recipe, built on the rebuilt
+kit's `transport(node, &directory, listen)` signature and its `directory`
+fixture (nodes 1-3 are already registered). The target's cfg gate follows
+the `control_raft_snapshots` convention (`raft` + `tls`) plus
+`fault-injection`, which the pause hooks require:
+`#![cfg(all(feature = "raft", feature = "tls", feature = "fault-injection"))]`.
+
+The production surface the target pins is unchanged at 945b484:
+`RaftHost::with_admission` anchors the lease before the barrier and bounds
+the barrier by the election ceiling; `arm_grant_gate` pauses the next
+grant after the barrier; `ActiveManagedCatalog::arm_precommit_pause`
+pauses the next write inside its source transaction before the final
+check; `isolate` / `heal` drive the partition. Results at 945b484 (all 10
+pass: the 8 scenario tests plus the 2 crash-recovery workers; every cargo
+run inside the 8 GiB systemd scope, `--test-threads=4`): debug 5.0 s,
+stable across consecutive runs; the combined release gate
+`cargo test --release --features raft,tls,fault-injection --no-fail-fast`
+passes in full. No deviation from docs/raft-admission.md was observed; no
+assertion was adjusted to match implementation behavior. Test files and
+this document only; no production changes.

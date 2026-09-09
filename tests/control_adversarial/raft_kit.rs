@@ -19,11 +19,12 @@
 #![cfg(all(feature = "raft", feature = "tls"))]
 #![allow(dead_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use pipestream_search::pb::storage::raft_transport_client::RaftTransportClient;
 use pipestream_search::pb::storage::{
@@ -678,4 +679,222 @@ pub fn voters(host: &RaftHost) -> BTreeSet<u64> {
         .membership()
         .voter_ids()
         .collect()
+}
+
+// ---- three voters over the transport (slice 4b) ------------------------------
+//
+// The admission-timing target needs a group whose surviving pair can elect a
+// successor while the old leader is isolated, so it builds on a third voter
+// instead of the two-member `Cluster` above. Mirrors the in-crate
+// `src/raft/transport_tests.rs::three_voters` recipe.
+
+use pipestream_search::pb::storage::{
+    source_authority_command::Action, LogicalSourceOwner, SourceAuthorityCommand,
+};
+
+/// A throwaway owner for the bootstrap prepare; distinct from any bridge
+/// owner the tests prepare afterwards (a second Prepare on a held key
+/// refuses).
+fn bootstrap_owner_key() -> LogicalSourceOwner {
+    LogicalSourceOwner {
+        owner_id: b"admission-bootstrap".to_vec(),
+        ..super::kit::key()
+    }
+}
+
+/// A three-voter group over loopback mTLS with control-revision tracking.
+pub struct Voters {
+    pub group: SourceAuthorityIdentity,
+    pub directory: Arc<PeerDirectory>,
+    dirs: BTreeMap<u64, TestDir>,
+    hosts: BTreeMap<u64, RaftHost>,
+    /// The control revision the next command must expect.
+    pub revision: u64,
+}
+
+impl Voters {
+    pub fn host(&self, node: u64) -> &RaftHost {
+        &self.hosts[&node]
+    }
+
+    /// Take a host out to wrap in an `Arc` (the paused-grant recipe spawns
+    /// a `with_admission` against it); put it back with [`Voters::insert`].
+    pub fn take(&mut self, node: u64) -> RaftHost {
+        self.hosts.remove(&node).unwrap()
+    }
+
+    pub fn insert(&mut self, node: u64, host: RaftHost) {
+        self.hosts.insert(node, host);
+    }
+
+    pub fn nodes(&self) -> Vec<u64> {
+        self.hosts.keys().copied().collect()
+    }
+
+    /// Poll until some host leads; bounded and loud.
+    pub async fn leader(&self) -> u64 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            for host in self.hosts.values() {
+                if host.metrics().borrow().state == openraft::ServerState::Leader {
+                    return host.node_id();
+                }
+            }
+            assert!(Instant::now() < deadline, "no leader within 10 s");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Wait until some running host other than `not` believes in a leader
+    /// that is not `not`; returns that leader.
+    pub async fn leader_other_than(&self, not: u64) -> u64 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            for (id, host) in &self.hosts {
+                if *id == not {
+                    continue;
+                }
+                if let Some(leader) = host.believed_leader() {
+                    if leader != not
+                        && self.hosts[&leader].metrics().borrow().state
+                            == openraft::ServerState::Leader
+                    {
+                        return leader;
+                    }
+                }
+            }
+            assert!(Instant::now() < deadline, "no other leader within 10 s");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Propose `action` on `leader`, asserting the commit, and advance the
+    /// revision tracker.
+    pub async fn propose(
+        &mut self,
+        leader: u64,
+        principal: &str,
+        id: &str,
+        key: &LogicalSourceOwner,
+        action: Action,
+    ) -> pipestream_search::pb::storage::SourceAuthorityDecision {
+        let command = SourceAuthorityCommand {
+            format_version: 1,
+            authority: Some(self.group.clone()),
+            key: Some(key.clone()),
+            command_id: id.as_bytes().to_vec(),
+            expected_control_revision: self.revision,
+            expected_policy_revision: 1,
+            expected_ownership_generation: 0,
+            action: Some(action),
+        };
+        let decision = self
+            .host(leader)
+            .propose_command(principal, &command)
+            .await
+            .unwrap();
+        assert_eq!(decision.code, 0, "{}", decision.message);
+        self.revision += 1;
+        decision
+    }
+
+    /// Poll raft metrics until `node` has applied at least `index`.
+    pub async fn wait_applied(&self, node: u64, index: u64) {
+        self.host(node)
+            .wait(Some(Duration::from_secs(30)))
+            .applied_index_at_least(Some(index), "applied")
+            .await
+            .unwrap_or_else(|e| panic!("applied position never reached index {index}: {e}"));
+    }
+
+    /// Prepare and start `node`, let `leader` seed it by snapshot, and
+    /// wait until the seed is installed.
+    async fn join(&mut self, node: u64, leader: u64) {
+        let dir = TestDir::new(&format!("voters-{node}"));
+        RaftHost::prepare_member(dir.path(), &self.group, node, &policy(), &limits()).unwrap();
+        let host = RaftHost::start_member(
+            dir.path(),
+            &self.group,
+            node,
+            &host_config(),
+            transport(node, &self.directory, ephemeral()),
+        )
+        .await
+        .unwrap();
+        assert!(host.awaiting_snapshot().unwrap());
+        let addr = host.advertised_addr().unwrap().to_string();
+        self.dirs.insert(node, dir);
+        self.hosts.insert(node, host);
+        self.host(leader).add_learner(node, &addr).await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while self.host(node).awaiting_snapshot().unwrap() {
+            assert!(Instant::now() < deadline, "member {node} never seeded");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    pub async fn shutdown(mut self) {
+        for (_, host) in std::mem::take(&mut self.hosts) {
+            let _ = host.shutdown().await;
+        }
+    }
+}
+
+/// Bootstrap node 1 with a throwaway prepared owner, seed 2 and 3 from its
+/// snapshot and promote them: a group of three voters on `policy`.
+pub async fn three_voters(name: &str, policy: &AccessPolicy) -> Voters {
+    let group = identity(SEED);
+    let directory = directory(&group);
+    let dir = TestDir::new(&format!("{name}-1"));
+    let leader = RaftHost::bootstrap_cluster(
+        dir.path(),
+        &group,
+        NODE_ID,
+        policy,
+        &limits(),
+        &host_config(),
+        transport(NODE_ID, &directory, ephemeral()),
+    )
+    .await
+    .unwrap();
+    let mut voters = Voters {
+        group,
+        directory,
+        dirs: BTreeMap::from([(1, dir)]),
+        hosts: BTreeMap::from([(1, leader)]),
+        revision: 1,
+    };
+    let target = pipestream_search::pb::storage::SourceStorageTarget {
+        node_id: "server-a".into(),
+        storage_incarnation: vec![41; 16],
+        history_id: vec![42; 16],
+        residency: pipestream_search::pb::storage::SourceResidency::Server as i32,
+        resident_device_id: String::new(),
+    };
+    voters
+        .propose(
+            1,
+            "alice",
+            "bootstrap-prepare",
+            &bootstrap_owner_key(),
+            Action::Prepare(pipestream_search::pb::storage::PrepareSourceOwner {
+                workflow_id: b"admission-bootstrap".to_vec(),
+                target: Some(target),
+            }),
+        )
+        .await;
+    voters.join(2, 1).await;
+    voters.join(3, 1).await;
+    voters
+        .host(1)
+        .promote(BTreeSet::from([2, 3]))
+        .await
+        .unwrap();
+    voters
+        .host(1)
+        .wait(Some(Duration::from_secs(30)))
+        .voter_ids([1, 2, 3], "three voters")
+        .await
+        .unwrap();
+    voters
 }
