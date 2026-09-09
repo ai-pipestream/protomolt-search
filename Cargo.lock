@@ -1489,9 +1489,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "6725596c3f2c3a0aef021139e145d4eafe314a6623e4680ca83852b2c67ab2ba"
 dependencies = [
  "log",
  "once_cell",
@@ -2171,7 +2171,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "turbovec"
 version = "1.0.0"
-source = "git+https://github.com/ai-pipestream/turbovec.git?branch=turbovec-pipestream-s20#0c6cf820090825a31f75566830c1b85c019d0a80"
+source = "git+https://github.com/ai-pipestream/turbovec.git?branch=turbovec-pipestream-s21#3cce294ea80cb46697fb3bef6af6be996fca52c5"
 dependencies = [
  "memmap2",
  "ordered-float 4.6.0",
@@ -2184,7 +2184,7 @@ dependencies = [
 [[package]]
 name = "turbovec-grpc"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turbovec-grpc.git?rev=0b21a161d008936d21feb474e801e456415e6622#0b21a161d008936d21feb474e801e456415e6622"
+source = "git+https://github.com/ai-pipestream/turbovec-grpc.git?rev=ce2f9de#ce2f9de00762763dff94f814bd06876c8970971f"
 dependencies = [
  "crc32fast",
  "prost",
@@ -2497,18 +2497,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.56"
+version = "0.8.57"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "556764e583adb45a9f8d413c2a147fa7e8d821e48e12b14fd560b607998b75eb"
+checksum = "d35102a9f36d089ccae9e4c6802bc118be4487b80aaffc0ab4e0cf5ce92d2873"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.56"
+version = "0.8.57"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2ab42fc20575779bd240faa45f94a74256f755c0fa9e89f0ede20d91d0cdfc1"
+checksum = "146c01f5ab44258da43cf276c74a2763db2ff3969c9c652c3f2de07041d0b2bc"
 dependencies = [
  "proc-macro2",
  "quote",
