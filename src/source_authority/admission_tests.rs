@@ -456,7 +456,7 @@ fn readiness_needs_the_held_binding_and_is_terminal_for_the_generation() {
 
     // A READY row without its completion is corruption, not a default.
     {
-        let tx = reopened.inner.database.begin_write().unwrap();
+        let tx = reopened.inner.database().begin_write().unwrap();
         {
             let mut owners = tx.open_table(OWNERS).unwrap();
             let mut stripped = owner.clone();
@@ -818,7 +818,7 @@ fn activation_commits_the_fence_only_from_ready_and_never_from_a_lease() {
     let reopened = SourceAuthorityStore::open(&dir.authority(), &authority).unwrap();
     assert_eq!(reopened.owner("alice", &key()).unwrap(), owner);
     {
-        let tx = reopened.inner.database.begin_write().unwrap();
+        let tx = reopened.inner.database().begin_write().unwrap();
         {
             let mut owners = tx.open_table(OWNERS).unwrap();
             let mut forged = owner.clone();

@@ -810,66 +810,53 @@ async fn leader_with_image(
 
 /// R4 (review): "make refusal preserve the old usable handle ... At 331c18f
 /// state_machine.rs:307-314 takes the live store out of the shared Option
-/// before replace_from; on refusal the slot stays None." REQUIRED: a
-/// refused install leaves the host's handle slot serving reads (and the
-/// held reader keeps working). Through the supported path the install
-/// arrives from a registered peer over the transport; the refusal is
-/// returned to that peer by name. The library treats a refused install as a
-/// fatal storage error and may stop the receiving core; that liveness
-/// observation is recorded, and the safety assertions do not depend on it.
+/// before replace_from; on refusal the slot stays None." REQUIRED: the live
+/// handle stays usable across an install. The repaired store swaps its
+/// database in place under the operation lock, so a held handle blocks
+/// nothing and is not refused: the install proceeds with the handle held,
+/// the held handle and the host's store both serve the installed state on
+/// their next operation, and the core keeps running.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn r4_install_refusal_preserves_the_live_handle() {
     let _serial = serial();
-    let (mut cluster, image, meta) = leader_with_image("r4-refusal").await;
-    let group = cluster.group.clone();
+    let (cluster, image, meta) = leader_with_image("r4-refusal").await;
     let held = cluster.member().store().unwrap();
-    let refused = cluster.push(&meta, &image).await;
-    let error = match refused {
-        Ok(_) => panic!("the install must refuse: a reader is outstanding"),
-        Err(error) => error,
-    };
-    assert!(
-        error.message().contains("outstanding handles"),
-        "the refusal must name the outstanding handle: {error}"
+    assert_eq!(
+        held.owner("alice", &kit::owner_key())
+            .err()
+            .map(|e| e.code()),
+        Some(Code::NotFound),
+        "the prepared genesis has no owner yet"
     );
-    let core_running = raft_kit::core_running(cluster.member());
-    eprintln!("r4: member core running after the refused install: {core_running}");
-
-    // REQUIRED (R4): the refusal preserves the old usable handle.
-    let slot = cluster
-        .member()
-        .store()
-        .expect("R4 REQUIRED the refused install to preserve the live handle");
-    slot.policy("alice", kit::WORKSPACE, kit::COLLECTION)
-        .expect("the preserved handle must still serve reads");
-    assert!(
-        cluster.member().awaiting_snapshot().unwrap(),
-        "nothing was installed under the refused swap"
-    );
-    // The reader held across the refused install must still work.
-    held.policy("alice", kit::WORKSPACE, kit::COLLECTION)
-        .expect("the held reader must survive the refused install");
-    drop(held);
-    drop(slot);
-
-    // With no outstanding handles the same image installs cleanly (on a
-    // restarted member if the library stopped the core).
-    if !core_running {
-        cluster.restart_member().await;
-    }
     cluster
         .push(&meta, &image)
         .await
-        .expect("a clean install must succeed");
-    let _ = group;
-    assert!(!cluster.member().awaiting_snapshot().unwrap());
-    let owner = cluster
+        .expect("a held handle must not refuse the install");
+    assert!(
+        raft_kit::core_running(cluster.member()),
+        "the member core stopped across an install with a held handle"
+    );
+    // REQUIRED (R4): the live handle stays usable, and it is the installed
+    // state it serves.
+    let owner = held
+        .owner("alice", &kit::owner_key())
+        .expect("the held handle serves the installed state");
+    assert_eq!(owner.phase, PreparedSourceOwnerPhase::Prepared as i32);
+    let slot = cluster
         .member()
         .store()
-        .unwrap()
-        .owner("alice", &kit::owner_key())
-        .expect("the installed store serves the image's owner");
-    assert_eq!(owner.phase, PreparedSourceOwnerPhase::Prepared as i32);
+        .expect("the host's handle stays usable");
+    assert_eq!(
+        slot.owner("alice", &kit::owner_key()).unwrap().phase,
+        PreparedSourceOwnerPhase::Prepared as i32
+    );
+    assert!(!cluster.member().awaiting_snapshot().unwrap());
+    assert_eq!(
+        raft_kit::durable_position(cluster.member()),
+        meta.last_log_id.unwrap().index
+    );
+    drop(held);
+    drop(slot);
     cluster.shutdown().await;
 }
 

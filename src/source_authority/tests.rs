@@ -876,7 +876,7 @@ fn transition_refuses_owner_state_from_another_logical_key() {
         prepared.ownership_generation,
     );
     let operation = contract::operation_key("alice", &owner_a, &command.command_id);
-    let read = store.inner.database.begin_read().unwrap();
+    let read = store.inner.database().begin_read().unwrap();
     let meta = read.open_table(META).unwrap();
     let header =
         SourceAuthorityHeader::decode(meta.get("header").unwrap().unwrap().value()).unwrap();
@@ -899,7 +899,7 @@ fn transition_refuses_owner_state_from_another_logical_key() {
 fn committed_state(
     store: &SourceAuthorityStore,
 ) -> (SourceAuthorityHeader, AccessPolicy, u64, u64, u64) {
-    let read = store.inner.database.begin_read().unwrap();
+    let read = store.inner.database().begin_read().unwrap();
     let meta = read.open_table(META).unwrap();
     let header =
         SourceAuthorityHeader::decode(meta.get("header").unwrap().unwrap().value()).unwrap();

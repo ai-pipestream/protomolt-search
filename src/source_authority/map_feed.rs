@@ -32,7 +32,7 @@ impl SourceAuthorityStore {
     ) -> Result<PublishedMap, Status> {
         self.guarded(|| {
             contract::key(key, false)?;
-            let tx = self.inner.database.begin_read().map_err(storage)?;
+            let tx = self.inner.database().begin_read().map_err(storage)?;
             self.read_policy(&tx, principal, key)?;
             let meta = tx.open_table(META).map_err(storage)?;
             let (header, _) = read_headers(&meta, &self.inner.identity)?;

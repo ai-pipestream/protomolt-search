@@ -754,7 +754,7 @@ impl SourceAuthorityStore {
         let _exclusive = self.exclusive()?;
         self.guarded(|| {
             let decision = self.configure_locked(principal, command)?;
-            let tx = self.inner.database.begin_read().map_err(storage)?;
+            let tx = self.inner.database().begin_read().map_err(storage)?;
             self.read_policy(
                 &tx,
                 principal,
@@ -769,7 +769,7 @@ impl SourceAuthorityStore {
         principal: &str,
         command: &CapacityConfigureCommand,
     ) -> Result<CapacityConfigureDecision, Status> {
-        let mut tx = self.inner.database.begin_write().map_err(storage)?;
+        let mut tx = self.inner.database().begin_write().map_err(storage)?;
         tx.set_durability(Durability::Immediate).map_err(storage)?;
         let decision;
         let mut retried = false;
@@ -1027,7 +1027,7 @@ impl SourceAuthorityStore {
         principal: &str,
         transition: &CapacityTransition,
     ) -> Result<CapacityTransitionReceipt, Status> {
-        let mut tx = self.inner.database.begin_write().map_err(storage)?;
+        let mut tx = self.inner.database().begin_write().map_err(storage)?;
         tx.set_durability(Durability::Immediate).map_err(storage)?;
         let receipt;
         let changed_or_positioned;
@@ -1244,7 +1244,7 @@ impl SourceAuthorityStore {
     ) -> Result<CapacityState, Status> {
         self.guarded(|| {
             contract::key(key, false)?;
-            let tx = self.inner.database.begin_read().map_err(storage)?;
+            let tx = self.inner.database().begin_read().map_err(storage)?;
             self.read_policy(&tx, principal, key)?;
             let states = tx.open_table(CAPACITY).map_err(storage)?;
             contract::decode(
@@ -1265,7 +1265,7 @@ impl SourceAuthorityStore {
     ) -> Result<CapacityConfigureDecision, Status> {
         self.guarded(|| {
             contract::operation_id(command_id)?;
-            let tx = self.inner.database.begin_read().map_err(storage)?;
+            let tx = self.inner.database().begin_read().map_err(storage)?;
             self.read_policy(&tx, principal, key)?;
             let operations = tx.open_table(CAPACITY_OPERATIONS).map_err(storage)?;
             let bytes = contract::operation_key(principal, key, command_id).encode_to_vec();
@@ -1291,7 +1291,7 @@ impl SourceAuthorityStore {
     ) -> Result<tiers::TierSnapshotInput, Status> {
         self.guarded(|| {
             contract::key(key, false)?;
-            let tx = self.inner.database.begin_read().map_err(storage)?;
+            let tx = self.inner.database().begin_read().map_err(storage)?;
             let policy = self.read_policy(&tx, principal, key)?;
             let meta = tx.open_table(META).map_err(storage)?;
             let (header, _) = read_headers(&meta, &self.inner.identity)?;

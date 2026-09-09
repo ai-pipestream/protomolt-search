@@ -12,7 +12,7 @@ use crate::pb::storage::{
     raft_proposal::Command, raft_reply::Reply, RaftApplied, RaftProposal, RaftRefusal, RaftReply,
     RaftSnapshotMeta, SourceAuthorityIdentity,
 };
-use crate::source_authority::{ReplaceFailure, SourceAuthorityStore};
+use crate::source_authority::SourceAuthorityStore;
 use openraft::storage::{RaftStateMachine, Snapshot, SnapshotMeta};
 use openraft::{
     AnyError, BasicNode, Entry, EntryPayload, ErrorSubject, ErrorVerb, LogId, Membership,
@@ -211,7 +211,6 @@ impl SnapshotStaging {
 pub struct ControlStateMachine {
     store: SharedStore,
     identity: SourceAuthorityIdentity,
-    live_path: PathBuf,
     snapshots: PathBuf,
     max_image_bytes: u64,
     membership: Mutex<StoredMembership<NodeId, BasicNode>>,
@@ -243,7 +242,6 @@ impl ControlStateMachine {
         let store_identity = store.identity().clone();
         let machine = Self {
             identity: store.identity().clone(),
-            live_path: store.path().to_path_buf(),
             store: Arc::new(RwLock::new(Some(store))),
             snapshots: snapshots.to_path_buf(),
             max_image_bytes,
@@ -549,53 +547,22 @@ impl ControlStateMachine {
             .join(generation.to_string());
         std::fs::rename(&receive.dir, &target).map_err(io)?;
         sync_dir(&self.snapshots.join(GENERATIONS))?;
-        // Swap the live store for a fresh copy of the verified image; the
-        // generation's image stays pristine. On refusal the old handle is
-        // kept and the unpublished generation removed.
+        // Swap the live store to a fresh copy of the verified image in
+        // place; the generation's image stays pristine. Every handle sees
+        // the installed state on its next operation; on refusal nothing
+        // changed and the unpublished generation is removed.
         let staged = self.snapshots.join(STAGED);
         std::fs::copy(target.join(IMAGE), &staged).map_err(io)?;
         std::fs::File::open(&staged)
             .and_then(|f| f.sync_all())
             .map_err(io)?;
-        let swap = {
-            let mut guard = self
-                .store
-                .write()
-                .map_err(|_| Status::internal("state machine store lock poisoned"))?;
-            let store = guard
-                .take()
-                .ok_or_else(|| Status::internal("state machine store is absent"))?;
-            match store.replace_from(&staged) {
-                Ok(replaced) => {
-                    *guard = Some(replaced);
-                    Ok(())
-                }
-                Err(ReplaceFailure::Refused(old, status)) => {
-                    *guard = Some(old);
-                    Err(status)
-                }
-                Err(ReplaceFailure::Lost(status)) => {
-                    // The old handle is closed; reopen whatever is durable.
-                    match SourceAuthorityStore::open(&self.live_path, &self.identity) {
-                        Ok(reopened) => {
-                            reopened.set_raft_hosted();
-                            *guard = Some(reopened);
-                            Err(status)
-                        }
-                        Err(reopen) => Err(Status::internal(format!(
-                            "snapshot swap failed ({}) and the live store did not reopen ({})",
-                            status.message(),
-                            reopen.message()
-                        ))),
-                    }
-                }
-            }
-        };
-        if let Err(status) = swap {
+        let store = self.store()?;
+        if let Err(status) = store.replace_from(&staged) {
             let _ = std::fs::remove_file(&staged);
             let _ = std::fs::remove_dir_all(&target);
             return Err(status);
         }
+        drop(store);
         publish(&self.snapshots, generation)?;
         *self.membership.lock().unwrap() = meta.last_membership.clone();
         Ok(())

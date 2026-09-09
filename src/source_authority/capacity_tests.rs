@@ -832,7 +832,7 @@ fn rows_that_disagree_with_the_committed_view_refuse_the_open() {
     let Imported { dir, store, .. } = fixture;
     // A value whose identity differs from its key.
     {
-        let tx = store.inner.database.begin_write().unwrap();
+        let tx = store.inner.database().begin_write().unwrap();
         {
             let mut observations = tx.open_table(OBSERVATIONS).unwrap();
             let mut forged = observation(1, 5, 10);

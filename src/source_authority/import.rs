@@ -465,7 +465,7 @@ impl SourceAuthorityStore {
         let _exclusive = self.exclusive()?;
         self.guarded(|| {
             let decision = self.import_locked(principal, command, admitted)?;
-            let tx = self.inner.database.begin_read().map_err(storage)?;
+            let tx = self.inner.database().begin_read().map_err(storage)?;
             self.read_policy(
                 &tx,
                 principal,
@@ -481,7 +481,7 @@ impl SourceAuthorityStore {
         command: &ControlImportCommand,
         admitted: Admission,
     ) -> Result<ControlImportDecision, Status> {
-        let mut tx = self.inner.database.begin_write().map_err(storage)?;
+        let mut tx = self.inner.database().begin_write().map_err(storage)?;
         tx.set_durability(Durability::Immediate).map_err(storage)?;
         let decision;
         let mut retried = false;
@@ -1060,7 +1060,7 @@ impl SourceAuthorityStore {
     ) -> Result<ControlImportDecision, Status> {
         self.guarded(|| {
             contract::operation_id(command_id)?;
-            let tx = self.inner.database.begin_read().map_err(storage)?;
+            let tx = self.inner.database().begin_read().map_err(storage)?;
             self.read_policy(&tx, principal, key)?;
             let operations = tx.open_table(IMPORT_OPERATIONS).map_err(storage)?;
             let bytes = contract::operation_key(principal, key, command_id).encode_to_vec();
@@ -1084,7 +1084,7 @@ impl SourceAuthorityStore {
     ) -> Result<ControlImportWorkflow, Status> {
         self.guarded(|| {
             contract::workflow_id(workflow_id)?;
-            let tx = self.inner.database.begin_read().map_err(storage)?;
+            let tx = self.inner.database().begin_read().map_err(storage)?;
             self.read_policy(&tx, principal, key)?;
             let imports = tx.open_table(IMPORTS).map_err(storage)?;
             let bytes = workflow_key(key, workflow_id);
@@ -1107,7 +1107,7 @@ impl SourceAuthorityStore {
     ) -> Result<ControlCollectionSnapshot, Status> {
         self.guarded(|| {
             contract::key(key, false)?;
-            let tx = self.inner.database.begin_read().map_err(storage)?;
+            let tx = self.inner.database().begin_read().map_err(storage)?;
             let policy = self.read_policy(&tx, principal, key)?;
             let meta = tx.open_table(META).map_err(storage)?;
             let (header, _) = read_headers(&meta, &self.inner.identity)?;
@@ -1677,9 +1677,9 @@ fn validate_supplement(
 /// Versioned adoption of a format-1 store: the nine control tables and the
 /// format-2 header are added in one transaction. A store that is neither a
 /// complete format 1 nor a complete format 2 refuses; nothing is defaulted.
-pub(super) fn adopt(store: &SourceAuthorityStore) -> Result<(), Status> {
+pub(super) fn adopt(database: &Database) -> Result<(), Status> {
     let (tables, has_control, has_capacity) = {
-        let tx = store.inner.database.begin_read().map_err(storage)?;
+        let tx = database.begin_read().map_err(storage)?;
         let tables = tx.list_tables().map_err(storage)?.count();
         let meta = tx.open_table(META).map_err(corrupt)?;
         let has_control = meta.get(CONTROL_HEADER).map_err(storage)?.is_some();
@@ -1699,7 +1699,7 @@ pub(super) fn adopt(store: &SourceAuthorityStore) -> Result<(), Status> {
             ))
         }
     };
-    let mut tx = store.inner.database.begin_write().map_err(storage)?;
+    let mut tx = database.begin_write().map_err(storage)?;
     tx.set_durability(Durability::Immediate).map_err(storage)?;
     if control {
         create_tables(&tx)?;

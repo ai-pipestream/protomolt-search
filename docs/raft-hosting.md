@@ -79,12 +79,16 @@ as a store of this group (the full recovery audit; the received bytes stay
 identical to their checksum), requires the probe's applied position and
 stored membership to equal the meta, writes the meta, renames the receive
 into a generation, and only then swaps the live store for a fresh copy of
-the image. The swap needs exclusive ownership of the store handle (short
-read clones drain within a bounded wait); on refusal the old handle is kept,
-the unpublished generation removed and the error named — the host keeps
-its usable store and the previous snapshot. On success the pointer moves and
-the policy/applied watch channels move to the reopened store, so
-subscribers stay attached. Build and install never overlap.
+the image. The swap replaces the store's database in place
+(`SourceAuthorityStore::replace_from`): the staged copy is opened, adopted
+and validated as this identity, renamed over the store's path, and moved
+into the store's backing slot under the admission lock held exclusively and
+the operation lock every store operation runs under, so no admitted work
+and no transaction spans it. A handle held across the install, and every
+clone, serves the installed state on its next operation; the policy and
+applied watches publish the installed revisions on the same channels. On
+refusal nothing changed, the unpublished generation is removed and the
+error named. On success the pointer moves. Build and install never overlap.
 
 ### Snapshot admission
 
@@ -117,9 +121,10 @@ library a validated image only (`RaftTransportService::stage`,
   which applies the library's own rules: a vote older than the receiver's
   is answered without installing, a position the receiver already holds is
   declined, and a declined image is discarded. The state machine's install
-  then swaps the image in without re-validating it; a storage failure in
-  that swap, or a swap refused for an outstanding handle, stays a fatal
-  storage error, as the library's contract requires.
+  then swaps the image in without re-validating it, in place under the
+  store's locks, so a held handle neither blocks nor refuses it; only a
+  real storage failure in that swap is fatal, as the library's contract
+  requires.
 
 Evidence (`tests/control_raft_snapshots.rs`, "snapshot admission refuses
 invalid transfers without stopping the core"): oversized, foreign,
@@ -149,9 +154,10 @@ leader, and the library asserts as much), and a snapshot chunk ending past
 the announced length (enforced while receiving, not only at install).
 
 Invalid incoming data never reaches the library (see "Snapshot
-admission" above). A refusal inside the library's own install path is a
-local storage condition and stops the core by the library's contract; the
-member recovers by restart.
+admission" above), and the swap holds no precondition a caller could
+fail; only a real local storage failure inside the library's install path
+stops the core, by the library's contract, and the member recovers by
+restart.
 
 ## Host
 

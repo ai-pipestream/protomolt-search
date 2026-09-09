@@ -289,7 +289,7 @@ pub(super) fn run_import(
 pub(super) type TableRows = Vec<(Vec<u8>, Vec<u8>)>;
 
 pub(super) fn table_bytes(store: &SourceAuthorityStore) -> Vec<(String, TableRows)> {
-    let tx = store.inner.database.begin_read().unwrap();
+    let tx = store.inner.database().begin_read().unwrap();
     let mut names: Vec<String> = tx
         .list_tables()
         .unwrap()
@@ -987,7 +987,7 @@ fn terminal_headroom_is_reserved_while_an_import_is_pending() {
     commit.expected_policy_revision = 2;
     let commit = store.execute_control_import("alice", &commit).unwrap();
     assert_eq!(commit.code, 0, "{}", commit.message);
-    let tx = store.inner.database.begin_read().unwrap();
+    let tx = store.inner.database().begin_read().unwrap();
     let meta = tx.open_table(META).unwrap();
     let control: ControlStoreHeader =
         contract::decode(meta.get(CONTROL_HEADER).unwrap().unwrap().value()).unwrap();
@@ -1213,7 +1213,7 @@ fn replaying_the_retained_commands_reproduces_the_identical_store() {
     let payload = payload(&retired, supplement(&checkpoint));
     run_import(&store, &authority, &limits, &retired, &payload, 1);
     let recorded: Vec<ControlImportCommand> = {
-        let tx = store.inner.database.begin_read().unwrap();
+        let tx = store.inner.database().begin_read().unwrap();
         let ops = tx.open_table(IMPORT_OPERATIONS).unwrap();
         let mut commands: Vec<ControlImportOperation> = ops
             .iter()
@@ -1422,7 +1422,7 @@ fn format_one_stores_adopt_and_incomplete_stores_refuse() {
     let store = store(&dir, 7, &limits);
     // Strip the format-2 tables and header: the shape a format-1 store has.
     {
-        let tx = store.inner.database.begin_write().unwrap();
+        let tx = store.inner.database().begin_write().unwrap();
         for definition in [
             IMPORT_OPERATIONS,
             IMPORTS,
@@ -1458,7 +1458,7 @@ fn format_one_stores_adopt_and_incomplete_stores_refuse() {
     );
     // A store missing one control table is neither format and refuses.
     {
-        let tx = adopted.inner.database.begin_write().unwrap();
+        let tx = adopted.inner.database().begin_write().unwrap();
         tx.delete_table(COMPLETED).unwrap();
         tx.commit().unwrap();
     }
@@ -1475,7 +1475,7 @@ fn format_one_stores_adopt_and_incomplete_stores_refuse() {
     let store2 =
         SourceAuthorityStore::create(&dir2.authority(), &authority, &policy(), &limits).unwrap();
     {
-        let tx = store2.inner.database.begin_write().unwrap();
+        let tx = store2.inner.database().begin_write().unwrap();
         {
             let mut meta = tx.open_table(META).unwrap();
             meta.insert(
@@ -1537,7 +1537,7 @@ fn recover(
 }
 
 fn retained_operations(store: &SourceAuthorityStore) -> u64 {
-    let tx = store.inner.database.begin_read().unwrap();
+    let tx = store.inner.database().begin_read().unwrap();
     tx.open_table(IMPORT_OPERATIONS).unwrap().len().unwrap()
 }
 
@@ -1675,7 +1675,7 @@ fn administrative_recovery_terminates_a_stranded_import_without_transfer() {
     // no applied control state and the resource remains importable.
     assert_eq!(retained_operations(&store), retained + 3);
     {
-        let tx = store.inner.database.begin_read().unwrap();
+        let tx = store.inner.database().begin_read().unwrap();
         assert_eq!(tx.open_table(CHUNKS).unwrap().len().unwrap(), 0);
         let meta = tx.open_table(META).unwrap();
         let control: ControlStoreHeader =

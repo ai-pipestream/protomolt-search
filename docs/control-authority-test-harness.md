@@ -742,7 +742,7 @@ safety assertions never depend on it.
 | 4 | R2 `r2_exact_retry_advances_durable_applied_position`: the snapshot bound index 3 after the exact retry at 4. | The retry lookup and the applied position share one transaction in every command family. | Same test on `durable_position` and the published meta: 4 after the retry, 4 after restart. |
 | 5 | R2 `r2_import_chunk_retry_advances_durable_applied_position`: bound 4, required 5. | Same. | Same test: durable position 5, snapshot meta 5. |
 | 6 | R2 `r2_capacity_retries_and_observation_transition`: bound 12, required 13. | Same; the unchanged observation transition consumes its entry (12). | Same test: 12 after the unchanged report, 13 after the configure retry, snapshot meta 13. |
-| 7 | R4 `r4_install_refusal_preserves_the_live_handle`: a refused install left the shared store slot `None`. | `replace_from` returns the old handle on refusal; the slot is never left empty. | `r4_install_refusal_preserves_the_live_handle` through the transport: the refusal names the outstanding handle, `host.store()` still serves, the held reader still serves, nothing installed; the clean install then succeeds and the member serves the image's owner. |
+| 7 | R4 `r4_install_refusal_preserves_the_live_handle`: a refused install left the shared store slot `None`. | The store swaps its database in place under its own locks; a held handle neither blocks nor refuses an install and serves the installed state afterwards; nothing is ever taken out of the slot. | `r4_install_refusal_preserves_the_live_handle` through the transport: the install proceeds with a handle held, the core keeps running, the held handle and `host.store()` both serve the installed owner, the applied position is the image's. |
 | 8 | R4 `r4_subscription_rebinding_after_install`: a pre-install `subscribe_applied` receiver never fired again. | The policy and applied watch channels move to the reopened store. | `r4_subscription_rebinding_after_install`: the pre-install receiver observes the image's revision, and keeps waking on entries replicated after the member joins. |
 | 9 | R3 `r3_wrong_group_valid_image_is_refused_and_previous_survives`: the foreign image replaced `current.redb` and `current.meta` before the group check. | Install verifies the checksum, probes a copy as a store of this group and checks position and membership before any publication; generations are immutable. | Same test through the transport: an honest foreign meta is refused by the transport (`PermissionDenied`, names the group) before the library sees it; a forged this-group meta over the foreign bytes is refused by the probe (names the group or incarnation); the member's published generation is byte-identical and its owner row unchanged. |
 | 10 | R3 `r3_correct_index_wrong_membership_is_refused`: membership never compared, then taken from the meta. | The probe's stored membership must equal the meta. | Same test: refused naming the membership; the genuine newer image installs afterwards. |
@@ -785,7 +785,10 @@ refused with the core running (`docs/raft-hosting.md`, "Snapshot
 admission"; the acceptance test
 `snapshot_admission_refuses_invalid_transfers_without_stopping_the_core`
 in the snapshot target, which now asserts the core keeps running after
-each refusal). One local condition remains fatal on purpose: a swap
-refused for an outstanding store handle happens inside the library's
-install path and is a storage condition, not incoming data
-(`r4_install_refusal_preserves_the_live_handle` records it).
+each refusal). The one local condition that stayed fatal at that checkpoint, a swap
+refused for an outstanding store handle, is gone as well: the store now
+swaps its database in place under its own locks, so a held handle neither
+blocks nor refuses an install and serves the installed state afterwards
+(`r4_install_refusal_preserves_the_live_handle` pins it with the core
+running). Only a real storage failure inside the library's install path
+is fatal.

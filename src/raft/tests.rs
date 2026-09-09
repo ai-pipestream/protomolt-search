@@ -620,8 +620,10 @@ async fn a_snapshot_installs_into_a_fresh_replica_with_the_same_map() {
         .count();
     assert_eq!(leftovers, 0);
 
-    // A held handle makes the swap refuse by name while the old state stays
-    // readable; the subscriber attached before the install wakes after it.
+    // A held handle never blocks the swap: the install replaces the
+    // database in place, the held handle observes the installed state on
+    // its next operation, and the subscriber attached before the install
+    // wakes after it.
     let mut applied_watch = machine
         .shared_store()
         .read()
@@ -630,19 +632,10 @@ async fn a_snapshot_installs_into_a_fresh_replica_with_the_same_map() {
         .unwrap()
         .subscribe_applied();
     let held = machine.shared_store().read().unwrap().clone().unwrap();
-    let mut file = machine.begin_receiving_snapshot().await.unwrap();
-    file.write_all(&image).await.unwrap();
-    let refused = machine.install_snapshot(&meta, file).await.err().unwrap();
-    assert!(
-        refused.to_string().contains("outstanding handles"),
-        "{refused}"
-    );
     assert_eq!(
         held.owner("alice", &owner("tablet")).err().unwrap().code(),
         Code::NotFound
     );
-    assert!(machine.get_current_snapshot().await.unwrap().is_none());
-    drop(held);
     let mut file = machine.begin_receiving_snapshot().await.unwrap();
     file.write_all(&image).await.unwrap();
     machine.install_snapshot(&meta, file).await.unwrap();
@@ -651,6 +644,12 @@ async fn a_snapshot_installs_into_a_fresh_replica_with_the_same_map() {
     assert_eq!(membership, meta.last_membership);
     assert!(applied_watch.has_changed().unwrap());
     assert_eq!(*applied_watch.borrow_and_update(), 3);
+    assert_eq!(
+        held.owner("alice", &owner("tablet")).unwrap(),
+        source_owner,
+        "the held handle serves the installed state"
+    );
+    drop(held);
     let replica = machine.shared_store().read().unwrap().clone().unwrap();
     assert_eq!(
         replica.owner("alice", &owner("tablet")).unwrap(),

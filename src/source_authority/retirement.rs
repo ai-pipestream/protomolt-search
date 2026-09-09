@@ -15,7 +15,7 @@ impl SourceAuthorityStore {
         retirement::validate_request(request)?;
         self.guarded(|| {
             let key = request.key.as_ref().expect("validated resource");
-            let tx = self.inner.database.begin_read().map_err(storage)?;
+            let tx = self.inner.database().begin_read().map_err(storage)?;
             let policy = self.read_policy(&tx, principal, key)?;
             let meta = tx.open_table(META).map_err(storage)?;
             let header: SourceAuthorityHeader = contract::decode(
@@ -54,7 +54,7 @@ impl SourceAuthorityStore {
         retirement::validate_request(request)?;
         self.guarded(|| {
             let key = request.key.as_ref().expect("validated resource");
-            let tx = self.inner.database.begin_read().map_err(storage)?;
+            let tx = self.inner.database().begin_read().map_err(storage)?;
             self.read_policy(&tx, principal, key)?;
             let operation = contract::operation_key(principal, key, &request.command_id);
             Ok(retirement::recover(

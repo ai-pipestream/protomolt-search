@@ -126,7 +126,7 @@ for another:
 | Read | Guarantee |
 |---|---|
 | Admission (`with_admission`) | linearizable, leased from an anchor taken before the barrier, refuses off-leader and refuses when the interval elapsed before the grant |
-| Owner, policy and decision reads on `host.store()` | the applied view of this replica; correct for audit and retry lookup, never for admitting a write |
+| Owner, policy and decision reads on `host.store()` | the applied view of this replica, which a snapshot install moves forward under the same handle; correct for audit and retry lookup, never for admitting a write |
 | Map distribution (`published_map`, `subscribe_applied`) | revisioned and monotonic per consumer; may lag; a consumer refuses same-revision/different-content and generation conflicts |
 
 ## Source write boundary

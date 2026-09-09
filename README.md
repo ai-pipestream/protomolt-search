@@ -1250,6 +1250,12 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   destination store remains unchanged. See [retirement and crash recovery](docs/control-retirement.md);
   transactional import, worker fencing and activation remain separate steps.
 
+- **Foundation branch: in-place store swap.** A snapshot install replaces
+  the source authority's database in place under its own locks, so a held
+  handle neither blocks nor refuses it and serves the installed state
+  afterwards. The exclusive-ownership drain and the lost-handle outcome are
+  gone; only a real storage failure in the swap is fatal. See
+  [raft hosting](docs/raft-hosting.md).
 - **Foundation branch: snapshot admission.** The transport stages an
   incoming snapshot under bounded memory, disk, concurrency and idle
   limits, binds the transfer to its authenticated peer, vote, snapshot id

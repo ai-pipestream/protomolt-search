@@ -77,8 +77,27 @@ pub enum ExitFault {
     AfterCommit,
 }
 
-struct Inner {
+/// The open database and the exclusive lock on its file, replaced together
+/// by a snapshot install (`replace_from`).
+struct Backing {
     database: Database,
+    // Keep the same open-file description locked until after Database drops.
+    _file_lock: File,
+}
+
+impl std::ops::Deref for Backing {
+    type Target = Database;
+    fn deref(&self) -> &Database {
+        &self.database
+    }
+}
+
+struct Inner {
+    // Interior mutability for the in-place swap only: every operation runs
+    // under `closed`, and the swap holds `closed` too, so no transaction
+    // ever crosses a swap. Readers take this guard for the instant a
+    // transaction begins (transactions do not borrow the database).
+    backing: RwLock<Backing>,
     // Admitted operations hold this shared; every control command holds it
     // exclusively, so a policy or ownership change waits for admitted work to
     // drain and no admitted operation observes a change under its guard.
@@ -102,21 +121,19 @@ struct Inner {
     raft_pending: Mutex<Option<RaftApplied>>,
     #[cfg(any(test, feature = "fault-injection"))]
     fault: Mutex<Option<Fault>>,
-    // Keep the same open-file description locked until after Database drops.
-    _file_lock: File,
+}
+
+impl Inner {
+    fn database(&self) -> std::sync::RwLockReadGuard<'_, Backing> {
+        self.backing
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 #[derive(Clone)]
 pub struct SourceAuthorityStore {
     inner: Arc<Inner>,
-}
-
-/// Why a snapshot swap did not happen.
-pub(crate) enum ReplaceFailure {
-    /// The handle is intact and usable; nothing changed on disk.
-    Refused(SourceAuthorityStore, Status),
-    /// The handle was closed and the reopen failed; reopen from durable state.
-    Lost(Status),
 }
 
 impl std::fmt::Debug for SourceAuthorityStore {
@@ -235,7 +252,7 @@ impl SourceAdmission<'_> {
         disclose: bool,
     ) -> Result<PreparedSourceOwner, Status> {
         self.store.guarded(|| {
-            let tx = self.store.inner.database.begin_read().map_err(storage)?;
+            let tx = self.store.inner.database().begin_read().map_err(storage)?;
             if disclose {
                 self.store.read_policy(&tx, &self.principal, key)?;
             }
@@ -328,7 +345,7 @@ impl SourceAdmission<'_> {
                 .key
                 .as_ref()
                 .ok_or_else(|| missing("prepared owner key"))?;
-            let tx = self.store.inner.database.begin_read().map_err(storage)?;
+            let tx = self.store.inner.database().begin_read().map_err(storage)?;
             self.store.read_policy(&tx, &self.principal, key)?;
             let table = tx.open_table(OWNERS).map_err(storage)?;
             let bytes = key.encode_to_vec();
@@ -536,7 +553,7 @@ impl SourceAuthorityStore {
     ) -> Result<AccessDecision, Status> {
         contract::principal(principal)?;
         self.guarded(|| {
-            let tx = self.inner.database.begin_read().map_err(storage)?;
+            let tx = self.inner.database().begin_read().map_err(storage)?;
             let meta = tx.open_table(META).map_err(storage)?;
             let header: SourceAuthorityHeader = contract::decode(
                 meta.get("header")
@@ -602,7 +619,7 @@ impl SourceAuthorityStore {
                     "managed source authority identity differs",
                 ));
             }
-            let tx = self.inner.database.begin_read().map_err(storage)?;
+            let tx = self.inner.database().begin_read().map_err(storage)?;
             self.read_policy(&tx, principal, key)?;
             Ok(run())
         })?
@@ -634,7 +651,7 @@ impl SourceAuthorityStore {
             payload_bytes: policy.encoded_len() as u64,
             ..Default::default()
         };
-        let mut tx = store.inner.database.begin_write().map_err(storage)?;
+        let mut tx = store.inner.database().begin_write().map_err(storage)?;
         tx.set_durability(Durability::Immediate).map_err(storage)?;
         {
             let mut meta = tx.open_table(META).map_err(storage)?;
@@ -665,7 +682,7 @@ impl SourceAuthorityStore {
         limits: &SourceAuthorityLimits,
     ) -> Result<Self, Status> {
         let store = Self::create(path, identity, policy, limits)?;
-        let mut tx = store.inner.database.begin_write().map_err(storage)?;
+        let mut tx = store.inner.database().begin_write().map_err(storage)?;
         tx.set_durability(Durability::Immediate).map_err(storage)?;
         {
             let mut meta = tx.open_table(META).map_err(storage)?;
@@ -679,7 +696,7 @@ impl SourceAuthorityStore {
     /// group's first snapshot.
     pub(crate) fn awaiting_snapshot(&self) -> Result<bool, Status> {
         self.guarded(|| {
-            let tx = self.inner.database.begin_read().map_err(storage)?;
+            let tx = self.inner.database().begin_read().map_err(storage)?;
             let meta = tx.open_table(META).map_err(storage)?;
             Ok(meta.get(MEMBER_META).map_err(storage)?.is_some())
         })
@@ -690,10 +707,13 @@ impl SourceAuthorityStore {
     pub fn open(path: &Path, expected_identity: &SourceAuthorityIdentity) -> Result<Self, Status> {
         contract::identity(expected_identity)?;
         let (store, _) = Self::open_file(path, expected_identity, false)?;
-        import::adopt(&store)?;
-        recovery::validate(&store)?;
+        {
+            let backing = store.inner.database();
+            import::adopt(&backing)?;
+            recovery::validate(&backing, expected_identity)?;
+        }
         let (revision, applied) = {
-            let tx = store.inner.database.begin_read().map_err(storage)?;
+            let tx = store.inner.database().begin_read().map_err(storage)?;
             let meta = tx.open_table(META).map_err(storage)?;
             let policy: AccessPolicy = contract::decode(
                 meta.get("policy")
@@ -714,11 +734,9 @@ impl SourceAuthorityStore {
         Ok(store)
     }
 
-    fn open_file(
-        path: &Path,
-        identity: &SourceAuthorityIdentity,
-        create: bool,
-    ) -> Result<(Self, File), Status> {
+    /// Open (or create) the file at `path` under its exclusive lock, with
+    /// its database. Nothing here reads the store's content.
+    fn open_backing(path: &Path, create: bool) -> Result<(Backing, File), Status> {
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -754,9 +772,24 @@ impl SourceAuthorityStore {
             .create_file(file.try_clone().map_err(storage)?)
             .map_err(storage)?;
         Ok((
+            Backing {
+                database,
+                _file_lock: file,
+            },
+            directory,
+        ))
+    }
+
+    fn open_file(
+        path: &Path,
+        identity: &SourceAuthorityIdentity,
+        create: bool,
+    ) -> Result<(Self, File), Status> {
+        let (backing, directory) = Self::open_backing(path, create)?;
+        Ok((
             Self {
                 inner: Arc::new(Inner {
-                    database,
+                    backing: RwLock::new(backing),
                     admission: RwLock::new(()),
                     revisions: watch::Sender::new(0),
                     applied: watch::Sender::new(0),
@@ -767,11 +800,29 @@ impl SourceAuthorityStore {
                     raft_pending: Mutex::new(None),
                     #[cfg(any(test, feature = "fault-injection"))]
                     fault: Mutex::new(None),
-                    _file_lock: file,
                 }),
             },
             directory,
         ))
+    }
+
+    /// The committed policy revision and control revision of a database.
+    fn revisions_of(database: &Database) -> Result<(u64, u64), Status> {
+        let tx = database.begin_read().map_err(storage)?;
+        let meta = tx.open_table(META).map_err(storage)?;
+        let policy: AccessPolicy = contract::decode(
+            meta.get("policy")
+                .map_err(storage)?
+                .ok_or_else(|| missing("policy"))?
+                .value(),
+        )?;
+        let header: SourceAuthorityHeader = contract::decode(
+            meta.get("header")
+                .map_err(storage)?
+                .ok_or_else(|| missing("header"))?
+                .value(),
+        )?;
+        Ok((policy.revision, header.control_revision))
     }
 
     fn guarded<T>(&self, run: impl FnOnce() -> Result<T, Status>) -> Result<T, Status> {
@@ -822,7 +873,7 @@ impl SourceAuthorityStore {
             let decision = self.execute_locked(principal, command, verified)?;
             // A policy command can revoke its own issuer. Its durable decision
             // remains retryable, but disclosure still needs the current grant.
-            let tx = self.inner.database.begin_read().map_err(storage)?;
+            let tx = self.inner.database().begin_read().map_err(storage)?;
             self.read_policy(
                 &tx,
                 principal,
@@ -838,7 +889,7 @@ impl SourceAuthorityStore {
         command: &SourceAuthorityCommand,
         verified: OwnerAdmission<'_>,
     ) -> Result<SourceAuthorityDecision, Status> {
-        let mut tx = self.inner.database.begin_write().map_err(storage)?;
+        let mut tx = self.inner.database().begin_write().map_err(storage)?;
         tx.set_durability(Durability::Immediate).map_err(storage)?;
         let decision;
         let mut retried = false;
@@ -1106,7 +1157,7 @@ impl SourceAuthorityStore {
         contract::key(key, true)?;
         contract::principal(principal)?;
         self.guarded(|| {
-            let tx = self.inner.database.begin_read().map_err(storage)?;
+            let tx = self.inner.database().begin_read().map_err(storage)?;
             self.read_policy(&tx, principal, key)?;
             let owners = tx.open_table(OWNERS).map_err(storage)?;
             let before: Option<PreparedSourceOwner> = owners
@@ -1213,7 +1264,7 @@ impl SourceAuthorityStore {
     pub(crate) fn apply_raft_position(&self, applied: &RaftApplied) -> Result<(), Status> {
         let _exclusive = self.exclusive()?;
         self.guarded(|| {
-            let mut tx = self.inner.database.begin_write().map_err(storage)?;
+            let mut tx = self.inner.database().begin_write().map_err(storage)?;
             tx.set_durability(Durability::Immediate).map_err(storage)?;
             {
                 let mut meta = tx.open_table(META).map_err(storage)?;
@@ -1228,7 +1279,7 @@ impl SourceAuthorityStore {
     /// The applied Raft position recorded with the last applied entry.
     pub(crate) fn raft_applied(&self) -> Result<Option<RaftApplied>, Status> {
         self.guarded(|| {
-            let tx = self.inner.database.begin_read().map_err(storage)?;
+            let tx = self.inner.database().begin_read().map_err(storage)?;
             let meta = tx.open_table(META).map_err(storage)?;
             meta.get(RAFT_META)
                 .map_err(storage)?
@@ -1247,7 +1298,7 @@ impl SourceAuthorityStore {
         let _exclusive = self.exclusive()?;
         self.guarded(|| {
             let applied = {
-                let tx = self.inner.database.begin_read().map_err(storage)?;
+                let tx = self.inner.database().begin_read().map_err(storage)?;
                 let meta = tx.open_table(META).map_err(storage)?;
                 meta.get(RAFT_META)
                     .map_err(storage)?
@@ -1258,76 +1309,57 @@ impl SourceAuthorityStore {
         })
     }
 
-    /// Replace this store's file with a verified staged image and reopen.
-    /// Needs exclusive ownership of the handle: an outstanding clone keeps
-    /// the old file open, so the swap refuses by name rather than racing it.
-    /// On refusal the handle comes back unchanged, so the host keeps its
-    /// usable store. Subscribers of the policy and applied watches stay
-    /// attached: the channels move to the reopened store. `Lost` means the
-    /// old handle is closed and the caller must reopen from durable state.
-    pub(crate) fn replace_from(self, staged: &Path) -> Result<Self, ReplaceFailure> {
-        let identity = self.inner.identity.clone();
-        let path = self.inner.path.clone();
-        let hosted = self.raft_hosted();
-        // Short-lived read clones drain quickly; anything longer is refused.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while Arc::strong_count(&self.inner) != 1 {
-            if std::time::Instant::now() >= deadline {
-                return Err(ReplaceFailure::Refused(
-                    self,
-                    Status::failed_precondition(
-                        "source authority store has outstanding handles; snapshot install needs exclusive ownership",
-                    ),
-                ));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+    /// Replace this store's database in place with a verified staged image.
+    /// The staged file is opened, adopted and validated as this identity
+    /// first; only then is it renamed over the store's path and swapped in.
+    /// The swap holds the admission lock exclusively and the operation
+    /// lock, so no admitted work and no transaction spans it; every handle,
+    /// held or not, observes the installed state on its next operation, and
+    /// the policy and applied watches publish the installed revisions. On
+    /// any refusal nothing changed and the handle serves as before.
+    pub(crate) fn replace_from(&self, staged: &Path) -> Result<(), Status> {
+        let _exclusive = self.exclusive()?;
+        let mut closed = self
+            .inner
+            .closed
+            .lock()
+            .map_err(|_| storage("authority lock poisoned"))?;
+        if *closed {
+            return Err(Status::failed_precondition(CLOSED));
         }
-        let inner = match Arc::try_unwrap(self.inner) {
-            Ok(inner) => inner,
-            Err(shared) => {
-                return Err(ReplaceFailure::Refused(
-                    Self { inner: shared },
-                    Status::failed_precondition(
-                        "source authority handle count changed during a snapshot swap",
-                    ),
-                ))
-            }
-        };
-        let Inner {
-            database,
-            revisions,
-            applied,
-            _file_lock,
-            ..
-        } = inner;
-        drop(database);
-        drop(_file_lock);
-        let reopen = (|| -> Result<Self, Status> {
-            std::fs::rename(staged, &path).map_err(storage)?;
-            let parent = path
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or(Path::new("."));
-            File::open(parent)
-                .and_then(|d| d.sync_all())
-                .map_err(storage)?;
-            Self::open(&path, &identity)
-        })();
-        let mut store = match reopen {
-            Ok(store) => store,
-            // The old file may still be in place (rename failed) or the new
-            // one may not open; either way this handle is gone.
-            Err(error) => return Err(ReplaceFailure::Lost(error)),
-        };
-        let fresh = Arc::get_mut(&mut store.inner).expect("freshly opened store has one handle");
-        revisions.send_replace(*fresh.revisions.borrow());
-        applied.send_replace(*fresh.applied.borrow());
-        fresh.revisions = revisions;
-        fresh.applied = applied;
-        if hosted {
-            store.set_raft_hosted();
+        if self.inner.raft_pending.lock().unwrap().is_some() {
+            return Err(Status::internal(
+                "a committed apply is in flight; the store cannot be replaced under it",
+            ));
         }
-        Ok(store)
+        let (backing, _directory) = Self::open_backing(staged, false)?;
+        import::adopt(&backing)?;
+        recovery::validate(&backing, &self.inner.identity)?;
+        let (revision, control_revision) = Self::revisions_of(&backing)?;
+        std::fs::rename(staged, &self.inner.path).map_err(storage)?;
+        let parent = self
+            .inner
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        File::open(parent)
+            .and_then(|d| d.sync_all())
+            .map_err(storage)?;
+        {
+            let mut slot = self
+                .inner
+                .backing
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // The old database and its file lock drop here, after the new
+            // file is durably in place and its own lock is held.
+            *slot = backing;
+        }
+        *closed = false;
+        self.inner.revisions.send_replace(revision);
+        self.inner.applied.send_replace(control_revision);
+        Ok(())
     }
 
     /// Wake map-feed subscribers only when the applied revision moved: a
@@ -1397,7 +1429,7 @@ impl SourceAuthorityStore {
     ) -> Result<PreparedSourceOwner, Status> {
         self.guarded(|| {
             contract::key(key, true)?;
-            let tx = self.inner.database.begin_read().map_err(storage)?;
+            let tx = self.inner.database().begin_read().map_err(storage)?;
             self.read_policy(&tx, principal, key)?;
             let owners = tx.open_table(OWNERS).map_err(storage)?;
             let bytes = key.encode_to_vec();
@@ -1424,7 +1456,7 @@ impl SourceAuthorityStore {
     ) -> Result<SourceAuthorityDecision, Status> {
         self.guarded(|| {
             contract::operation_id(command_id)?;
-            let tx = self.inner.database.begin_read().map_err(storage)?;
+            let tx = self.inner.database().begin_read().map_err(storage)?;
             let policy = self.read_policy(&tx, principal, key)?;
             let meta = tx.open_table(META).map_err(storage)?;
             let header: SourceAuthorityHeader = contract::decode(
@@ -1462,7 +1494,7 @@ impl SourceAuthorityStore {
                 collection: collection.into(),
                 owner_id: Vec::new(),
             };
-            let tx = self.inner.database.begin_read().map_err(storage)?;
+            let tx = self.inner.database().begin_read().map_err(storage)?;
             let mut policy = self.read_policy(&tx, principal, &key)?;
             policy.resources.retain(|resource| {
                 resource.workspace == workspace && resource.collection == collection

@@ -182,8 +182,11 @@ pub(super) fn operation(
     Ok(())
 }
 
-pub(super) fn validate(store: &SourceAuthorityStore) -> Result<(), Status> {
-    let tx = store.inner.database.begin_read().map_err(storage)?;
+pub(super) fn validate(
+    database: &Database,
+    identity: &SourceAuthorityIdentity,
+) -> Result<(), Status> {
+    let tx = database.begin_read().map_err(storage)?;
     if tx.list_tables().map_err(storage)?.count() != capacity::FORMAT_3_TABLES
         || tx.list_multimap_tables().map_err(storage)?.next().is_some()
     {
@@ -224,7 +227,7 @@ pub(super) fn validate(store: &SourceAuthorityStore) -> Result<(), Status> {
             .ok_or_else(|| missing("header"))?
             .value(),
     )?;
-    header(&state, &store.inner.identity)?;
+    header(&state, identity)?;
     let policy: AccessPolicy = contract::decode(
         meta.get("policy")
             .map_err(storage)?
