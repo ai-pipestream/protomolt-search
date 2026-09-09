@@ -303,6 +303,7 @@ pub struct RaftHost {
     /// transport withholds this node's vote while an interval that started
     /// there may still be open.
     hold: LeaseHold,
+    staging: Arc<super::state_machine::SnapshotStaging>,
     listener: Option<Listener>,
     #[cfg(feature = "tls")]
     directory: Option<Arc<PeerDirectory>>,
@@ -464,6 +465,8 @@ impl RaftHost {
             isolation.clone(),
             timing,
             host.hold.clone(),
+            Arc::clone(&host.staging),
+            &transport.limits,
         );
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let server = tonic::transport::Server::builder()
@@ -497,6 +500,7 @@ impl RaftHost {
         let machine =
             ControlStateMachine::new(store, &dir.join(SNAPSHOT_DIR), config.max_snapshot_bytes)?;
         let shared = machine.shared_store();
+        let staging = machine.staging();
         let mut log_store = log_store;
         log_store
             .bind_applied_floor(Arc::clone(&shared))
@@ -519,6 +523,7 @@ impl RaftHost {
             lease: Duration::from_millis(config.admission_lease_ms),
             read_timeout: config.read_timeout(),
             hold: LeaseHold::new(Duration::from_millis(config.election_timeout_max_ms)),
+            staging,
             listener,
             #[cfg(feature = "tls")]
             directory: None,

@@ -188,14 +188,17 @@ fn member_state(cluster: &Cluster) -> ((Vec<u8>, RaftSnapshotMeta), i32) {
     (pair, owner.phase)
 }
 
-/// Restart the member when the library stopped its core after a refusal,
-/// recording the observation.
+/// Invalid incoming data is refused by the transport's staging before the
+/// library sees it: the receiving core keeps running. (A refusal inside the
+/// library's own install path, such as a swap with an outstanding handle,
+/// is a local storage condition and stays fatal; the regression target
+/// records that one.)
 async fn recover_if_stopped(cluster: &mut Cluster, what: &str) -> bool {
     let running = raft_kit::core_running(cluster.member());
-    eprintln!("{what}: member core running after the refusal: {running}");
-    if !running {
-        cluster.restart_member().await;
-    }
+    assert!(
+        running,
+        "{what}: the member core stopped on invalid incoming data"
+    );
     running
 }
 
@@ -945,5 +948,220 @@ async fn r5_install_hashing_is_bounded() {
          demonstrates the whole-file Vec read)",
         image.len()
     );
+    cluster.shutdown().await;
+}
+
+/// Snapshot admission (docs/raft-hosting.md, "Snapshot admission"): every
+/// invalid transfer is refused by the transport's staging, by name, with
+/// the core running and its state intact throughout — oversized, foreign,
+/// truncated, wrong membership, out of order, interrupted, superseded,
+/// bound to another peer, meta changed within a transfer — and a valid
+/// snapshot then installs without a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshot_admission_refuses_invalid_transfers_without_stopping_the_core() {
+    let _serial = serial();
+    let (cluster, image, newer) = detached("admission").await;
+    let (before, phase_before) = member_state(&cluster);
+    let position_before = raft_kit::durable_position(cluster.member());
+    let (_dir_b, host_b, image_b, meta_b) = foreign_image("admission-b").await;
+    let index = newer.last_log_id.unwrap().index;
+    let group = cluster.group.clone();
+    let intact = |what: &str| {
+        assert!(
+            raft_kit::core_running(cluster.member()),
+            "{what}: the member core stopped"
+        );
+        let (now, phase) = member_state(&cluster);
+        assert_eq!(
+            now.1.snapshot_id, before.1.snapshot_id,
+            "{what}: generation replaced"
+        );
+        assert_eq!(now.0, before.0, "{what}: image bytes changed");
+        assert_eq!(phase, phase_before, "{what}: owner row changed");
+        assert_eq!(
+            raft_kit::durable_position(cluster.member()),
+            position_before,
+            "{what}: applied position moved"
+        );
+        assert!(
+            raft_kit::incoming_dirs(cluster.member_dir.path()).is_empty(),
+            "{what}: a refused transfer left its bytes behind"
+        );
+    };
+    let mut peer =
+        raft_kit::peer_client(cluster.member().listen_addr().unwrap(), raft_kit::PEER_ID).await;
+    let vote = raft_kit::current_vote(cluster.leader());
+    let chunk = |meta: &RaftSnapshotMeta, offset: usize, data: &[u8], done: bool| {
+        raft_kit::timed(raft_kit::chunk_request(
+            &group,
+            raft_kit::PEER_ID,
+            raft_kit::MEMBER_ID,
+            &vote,
+            meta,
+            offset,
+            data,
+            done,
+        ))
+    };
+
+    // Oversized: an announcement past the image bound is refused before
+    // any byte lands.
+    let mut huge = raft_kit::renamed(&newer, index, &image);
+    huge.length = (4u64 << 30) + 1;
+    huge.snapshot_id = format!(
+        "{}-{}-{}",
+        index,
+        (4u64 << 30) + 1,
+        pipestream_search::sha256::to_hex(&pipestream_search::sha256::digest(&image))
+    );
+    let error = peer
+        .install_snapshot(chunk(&huge, 0, &image[..1024], false))
+        .await
+        .err()
+        .expect("an oversized announcement must refuse");
+    assert_eq!(error.code(), Code::ResourceExhausted, "{error}");
+    assert!(error.message().contains("image bound"), "{error}");
+    intact("oversized");
+
+    // Foreign bytes under a forged meta of this group: refused at the
+    // probe, named.
+    let forged = raft_kit::renamed(&raft_kit::with_group(&meta_b, &group), index, &image_b);
+    let error = cluster
+        .push(&forged, &image_b)
+        .await
+        .err()
+        .expect("foreign image refused");
+    assert!(
+        error.message().contains("group") || error.message().contains("incarnation"),
+        "{error}"
+    );
+    intact("foreign");
+
+    // Truncated: the final chunk arrives short of the announcement.
+    let error = cluster
+        .push(&newer, &image[..image.len() / 2])
+        .await
+        .err()
+        .expect("a truncated transfer must refuse");
+    assert!(error.message().contains("announced"), "{error}");
+    intact("truncated");
+
+    // Wrong membership over the genuine bytes.
+    let wrong = raft_kit::meta_pb_for(&group, index, &image, &[9]);
+    let error = cluster
+        .push(&wrong, &image)
+        .await
+        .err()
+        .expect("wrong membership refused");
+    assert!(error.message().contains("membership"), "{error}");
+    intact("membership");
+
+    // Out of order: a first chunk at a nonzero offset is a mismatch the
+    // sender restarts from; nothing is staged.
+    let reply = peer
+        .install_snapshot(chunk(&newer, 4096, &image[4096..8192], false))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(matches!(
+        reply.outcome,
+        Some(pipestream_search::pb::storage::raft_install_snapshot_response::Outcome::Mismatch(_))
+    ));
+    intact("out of order");
+
+    // Interrupted, then superseded by the same peer: the half receive is
+    // dropped with its bytes when the next id begins.
+    let half = &image[..image.len() / 2];
+    let mut offset = 0;
+    for piece in half.chunks(raft_kit::CHUNK_BYTES) {
+        peer.install_snapshot(chunk(&newer, offset, piece, false))
+            .await
+            .unwrap();
+        offset += piece.len();
+    }
+    assert_eq!(raft_kit::incoming_dirs(cluster.member_dir.path()).len(), 1);
+    let other_id = raft_kit::renamed(&newer, index + 1, &image);
+    let error = cluster
+        .push(&other_id, &image)
+        .await
+        .err()
+        .expect("a renamed image fails its position check");
+    assert!(error.message().contains("applied position"), "{error}");
+    intact("superseded");
+
+    // Meta changed within one transfer: dropped, named.
+    peer.install_snapshot(chunk(&newer, 0, &image[..4096], false))
+        .await
+        .unwrap();
+    let error = peer
+        .install_snapshot(chunk(&wrong, 4096, &image[4096..8192], false))
+        .await
+        .err()
+        .expect("a changed meta must refuse");
+    assert_eq!(error.code(), Code::InvalidArgument, "{error}");
+    assert!(error.message().contains("changed"), "{error}");
+    intact("meta changed");
+
+    // Bound to its peer: while node 3's transfer is open, node 1's own
+    // certificate cannot continue it, and cannot start another under the
+    // same vote; node 3 superseding its own transfer is allowed.
+    peer.install_snapshot(chunk(&newer, 0, &image[..4096], false))
+        .await
+        .unwrap();
+    let mut other =
+        raft_kit::peer_client(cluster.member().listen_addr().unwrap(), raft_kit::NODE_ID).await;
+    let error = other
+        .install_snapshot(raft_kit::timed(raft_kit::chunk_request(
+            &group,
+            raft_kit::NODE_ID,
+            raft_kit::MEMBER_ID,
+            &vote,
+            &newer,
+            4096,
+            &image[4096..8192],
+            false,
+        )))
+        .await
+        .err()
+        .expect("another peer cannot continue a bound transfer");
+    assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
+    assert!(error.message().contains("bound to node 3"), "{error}");
+    let error = other
+        .install_snapshot(raft_kit::timed(raft_kit::chunk_request(
+            &group,
+            raft_kit::NODE_ID,
+            raft_kit::MEMBER_ID,
+            &vote,
+            &other_id,
+            0,
+            &image[..4096],
+            false,
+        )))
+        .await
+        .err()
+        .expect("another peer cannot start a transfer under the same vote");
+    assert_eq!(error.code(), Code::Unavailable, "{error}");
+    assert!(error.message().contains("in progress"), "{error}");
+    assert!(raft_kit::core_running(cluster.member()));
+
+    // The genuine newer image installs on the same running core: the
+    // interrupted transfer of node 3 is superseded by its own new one.
+    cluster.push(&newer, &image).await.unwrap();
+    assert!(raft_kit::core_running(cluster.member()));
+    assert_eq!(raft_kit::durable_position(cluster.member()), index);
+    assert!(raft_kit::incoming_dirs(cluster.member_dir.path()).is_empty());
+    let (after, _) = member_state(&cluster);
+    assert_eq!(after.1.snapshot_id, newer.snapshot_id);
+    assert_eq!(
+        cluster
+            .member()
+            .store()
+            .unwrap()
+            .policy("alice", kit::WORKSPACE, kit::COLLECTION)
+            .unwrap()
+            .revision,
+        2
+    );
+    host_b.shutdown().await.unwrap();
     cluster.shutdown().await;
 }

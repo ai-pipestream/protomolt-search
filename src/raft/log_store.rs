@@ -560,6 +560,7 @@ impl RaftLogStore {
     }
 
     /// Delete every entry at or before `log_id` and record it as purged.
+    #[cfg(test)]
     pub(crate) fn purge_sync(&self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         let _order = self.inner.write.lock().unwrap();
         self.purge_locked(log_id)

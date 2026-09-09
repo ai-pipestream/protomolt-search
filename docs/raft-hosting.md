@@ -86,6 +86,49 @@ its usable store and the previous snapshot. On success the pointer moves and
 the policy/applied watch channels move to the reopened store, so
 subscribers stay attached. Build and install never overlap.
 
+### Snapshot admission
+
+The transport owns an incoming snapshot transfer end to end and hands the
+library a validated image only (`RaftTransportService::stage`,
+`SnapshotStaging` in `src/raft/state_machine.rs`):
+
+- **Bounds.** Chunks go straight to the receive file, so memory is one
+  chunk (`TransportLimits::max_message_bytes`); disk is the announced
+  length, which must be within `HostConfig::max_snapshot_bytes` before the
+  first byte lands, and a chunk past the announcement drops the transfer;
+  one transfer at a time; a transfer with no chunk for
+  `TransportLimits::snapshot_idle_timeout_ms` is dropped with its bytes.
+- **Binding.** A transfer is bound to the authenticated peer that began
+  it, the vote it came under, its snapshot id and its meta. Another peer
+  cannot continue it (`FailedPrecondition`, naming the bound node) or start
+  one under the same vote while it is open (`Unavailable`); the same peer,
+  or a higher vote, supersedes it; a chunk with a changed meta or vote
+  drops it; an out-of-order chunk is a mismatch the sender restarts from,
+  and a chunk at offset zero restarts the same transfer, as the library's
+  own sender does.
+- **Validation before the library.** On the final chunk the complete
+  image must have the announced length, then its digest is streamed, then
+  a separate probe copy is opened as a store of this group (a redb open
+  rewrites recovery state, so the received bytes stay untouched) and its
+  applied position and membership must equal the meta. Any refusal is
+  returned to the peer by name, the receive directory is removed, and the
+  core is untouched.
+- **Hand-off.** A validated image goes to `Raft::install_full_snapshot`,
+  which applies the library's own rules: a vote older than the receiver's
+  is answered without installing, a position the receiver already holds is
+  declined, and a declined image is discarded. The state machine's install
+  then swaps the image in without re-validating it; a storage failure in
+  that swap, or a swap refused for an outstanding handle, stays a fatal
+  storage error, as the library's contract requires.
+
+Evidence (`tests/control_raft_snapshots.rs`, "snapshot admission refuses
+invalid transfers without stopping the core"): oversized, foreign,
+truncated, wrong-membership, out-of-order, interrupted-then-superseded,
+meta-changed and other-peer transfers are each refused by name with the
+core running, the generation, owner row and applied position unchanged and
+no receive left behind, and the genuine image then installs on the same
+running core. The idle timeout is covered in `src/raft/transport_tests.rs`.
+
 ### Log and store agreement
 
 The library purges the log for an incoming snapshot before the state
@@ -105,10 +148,10 @@ and snapshot chunks under an uncommitted vote (both come only from a
 leader, and the library asserts as much), and a snapshot chunk ending past
 the announced length (enforced while receiving, not only at install).
 
-A refused install stops the receiving core, by the library's contract;
-the member recovers by restart, and the safety properties hold either
-way. That liveness effect is recorded for review in
-`docs/control-authority-test-harness.md`.
+Invalid incoming data never reaches the library (see "Snapshot
+admission" above). A refusal inside the library's own install path is a
+local storage condition and stops the core by the library's contract; the
+member recovers by restart.
 
 ## Host
 

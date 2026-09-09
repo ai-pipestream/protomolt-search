@@ -1250,6 +1250,16 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   destination store remains unchanged. See [retirement and crash recovery](docs/control-retirement.md);
   transactional import, worker fencing and activation remain separate steps.
 
+- **Foundation branch: snapshot admission.** The transport stages an
+  incoming snapshot under bounded memory, disk, concurrency and idle
+  limits, binds the transfer to its authenticated peer, vote, snapshot id
+  and meta, validates the complete image (length, digest, store identity
+  on a probe copy, applied position, membership) and only then hands it to
+  the library's completed-install path, which applies its own term and
+  position rules. Invalid incoming data is refused by name with the core
+  running; a storage failure in the swap stays fatal. See
+  [raft hosting](docs/raft-hosting.md).
+
 - **Foundation branch: adversarial harness integrated.** Kimi's harness
   (611ceb0, written against 331c18f) runs on the repaired branch: the raft
   kit rebuilt on the supported surface, the R1 accessibility reproductions

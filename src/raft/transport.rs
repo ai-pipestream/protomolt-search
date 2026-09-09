@@ -9,6 +9,7 @@
 //! `to_node_id` must be this node. A caller names the target in every
 //! request and checks the responder named in every reply. An address is
 //! where a node is dialed, never who it is.
+use super::state_machine::SnapshotStaging;
 use super::types::{
     entry_from_proto, entry_to_proto, log_id_from_proto, log_id_to_proto,
     stored_membership_from_proto, stored_membership_to_proto, vote_from_proto, vote_to_proto,
@@ -33,11 +34,12 @@ use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
-use openraft::storage::SnapshotMeta;
+use openraft::storage::{Snapshot, SnapshotMeta};
 use openraft::{BasicNode, RPCTypes, Raft, SnapshotSegmentId};
 use prost::Message;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, RwLock};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
@@ -131,6 +133,9 @@ pub struct TransportLimits {
     /// Largest encoded request or reply either side accepts.
     pub max_message_bytes: usize,
     pub connect_timeout_ms: u64,
+    /// A snapshot transfer with no chunk for this long is dropped with its
+    /// bytes; the next transfer may then take its place.
+    pub snapshot_idle_timeout_ms: u64,
 }
 
 impl Default for TransportLimits {
@@ -138,6 +143,7 @@ impl Default for TransportLimits {
         Self {
             max_message_bytes: 16 << 20,
             connect_timeout_ms: 2_000,
+            snapshot_idle_timeout_ms: 30_000,
         }
     }
 }
@@ -159,6 +165,11 @@ impl TransportLimits {
         if self.connect_timeout_ms == 0 {
             return Err(Status::invalid_argument(
                 "connect_timeout_ms must be positive",
+            ));
+        }
+        if self.snapshot_idle_timeout_ms == 0 {
+            return Err(Status::invalid_argument(
+                "snapshot_idle_timeout_ms must be positive",
             ));
         }
         Ok(())
@@ -209,9 +220,43 @@ pub struct RaftTransportService {
     isolation: Isolation,
     timing: String,
     hold: LeaseHold,
+    staging: Arc<SnapshotStaging>,
+    transfer: Mutex<Option<Transfer>>,
+    idle: Duration,
+}
+
+/// One snapshot transfer in progress: bound to the authenticated peer that
+/// began it, the vote it came under, the snapshot id and meta, and the
+/// receive directory holding its bytes. Chunks are appended in order to
+/// the file; nothing is buffered beyond one chunk.
+struct Transfer {
+    peer: NodeId,
+    vote: openraft::Vote<NodeId>,
+    meta: SnapshotMeta<NodeId, BasicNode>,
+    announced: u64,
+    dir: PathBuf,
+    file: std::fs::File,
+    received: u64,
+    last_chunk: std::time::Instant,
+}
+
+/// What staging one chunk led to.
+enum Staged {
+    /// The chunk was appended; more to come.
+    Partial,
+    /// The chunk is out of order: the sender restarts from `expect_offset`.
+    Mismatch { expect_offset: u64 },
+    /// The transfer is complete and the image validated; hand it to the
+    /// library.
+    Complete {
+        meta: SnapshotMeta<NodeId, BasicNode>,
+        vote: openraft::Vote<NodeId>,
+        dir: PathBuf,
+    },
 }
 
 impl RaftTransportService {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         raft: Raft<ControlRaft>,
         node_id: NodeId,
@@ -219,6 +264,8 @@ impl RaftTransportService {
         isolation: Isolation,
         timing: String,
         hold: LeaseHold,
+        staging: Arc<SnapshotStaging>,
+        limits: &TransportLimits,
     ) -> Self {
         Self {
             raft,
@@ -227,7 +274,155 @@ impl RaftTransportService {
             isolation,
             timing,
             hold,
+            staging,
+            transfer: Mutex::new(None),
+            idle: Duration::from_millis(limits.snapshot_idle_timeout_ms),
         }
+    }
+
+    /// Stage one chunk of a snapshot transfer from `from`. The transfer is
+    /// bound to the peer, the vote, the snapshot id and the meta of its
+    /// first chunk; bytes go straight to the receive file; the announced
+    /// length bounds the disk it may take and the image bound caps that.
+    /// One transfer at a time: a chunk of another id from the same peer or
+    /// under a higher vote supersedes the transfer in progress, an idle
+    /// transfer is dropped, and anything else waits. On the final chunk
+    /// the complete image is validated (length, digest, store identity,
+    /// applied position, membership on a probe copy); an invalid image is
+    /// refused here, by name, and never reaches the library.
+    fn stage(
+        &self,
+        from: NodeId,
+        rpc: InstallSnapshotRequest<ControlRaft>,
+    ) -> Result<Staged, Status> {
+        let announced = super::state_machine::parse_snapshot_id(&rpc.meta.snapshot_id)
+            .map_err(wire)?
+            .length;
+        if announced > self.staging.max_image_bytes() {
+            return Err(Status::resource_exhausted(format!(
+                "snapshot announces {announced} bytes, beyond the {} byte image bound",
+                self.staging.max_image_bytes()
+            )));
+        }
+        let now = std::time::Instant::now();
+        let mut guard = self
+            .transfer
+            .lock()
+            .map_err(|_| Status::internal("snapshot transfer lock poisoned"))?;
+        if guard
+            .as_ref()
+            .is_some_and(|active| now.duration_since(active.last_chunk) > self.idle)
+        {
+            let stale = guard.take().expect("checked");
+            self.staging.discard(&stale.dir);
+        }
+        let same_id = guard
+            .as_ref()
+            .is_some_and(|active| active.meta.snapshot_id == rpc.meta.snapshot_id);
+        if !same_id {
+            if let Some(active) = guard.as_ref() {
+                let supersedes = active.peer == from || rpc.vote > active.vote;
+                if !supersedes {
+                    return Err(Status::unavailable(format!(
+                        "a snapshot transfer from node {} is in progress",
+                        active.peer
+                    )));
+                }
+                let superseded = guard.take().expect("checked");
+                self.staging.discard(&superseded.dir);
+            }
+            if rpc.offset != 0 {
+                return Ok(Staged::Mismatch { expect_offset: 0 });
+            }
+            let (dir, file) = self.staging.begin()?;
+            *guard = Some(Transfer {
+                peer: from,
+                vote: rpc.vote,
+                meta: rpc.meta.clone(),
+                announced,
+                dir,
+                file,
+                received: 0,
+                last_chunk: now,
+            });
+        }
+        let active = guard.as_mut().expect("a transfer is in progress");
+        if active.peer != from {
+            return Err(Status::failed_precondition(format!(
+                "snapshot transfer {} is bound to node {}",
+                active.meta.snapshot_id, active.peer
+            )));
+        }
+        if active.meta != rpc.meta || active.vote != rpc.vote {
+            let broken = guard.take().expect("checked");
+            self.staging.discard(&broken.dir);
+            return Err(Status::invalid_argument(
+                "snapshot meta or vote changed within one transfer; the transfer is dropped",
+            ));
+        }
+        if rpc.offset == 0 && active.received != 0 {
+            // The sender starts this transfer over (the library's own
+            // response to a mismatch): the bytes so far are discarded.
+            use std::io::Seek;
+            if let Err(error) = active
+                .file
+                .set_len(0)
+                .and_then(|()| active.file.seek(std::io::SeekFrom::Start(0)))
+            {
+                let broken = guard.take().expect("checked");
+                self.staging.discard(&broken.dir);
+                return Err(Status::internal(format!("snapshot receive: {error}")));
+            }
+            active.received = 0;
+        } else if rpc.offset != active.received {
+            return Ok(Staged::Mismatch {
+                expect_offset: active.received,
+            });
+        }
+        if rpc.offset.saturating_add(rpc.data.len() as u64) > active.announced {
+            let announced = active.announced;
+            let broken = guard.take().expect("checked");
+            self.staging.discard(&broken.dir);
+            return Err(Status::invalid_argument(format!(
+                "snapshot chunk ends past the announced length {announced}; the transfer is dropped"
+            )));
+        }
+        {
+            use std::io::Write;
+            if let Err(error) = active.file.write_all(&rpc.data) {
+                let broken = guard.take().expect("checked");
+                self.staging.discard(&broken.dir);
+                return Err(Status::internal(format!("snapshot receive: {error}")));
+            }
+        }
+        active.received += rpc.data.len() as u64;
+        active.last_chunk = now;
+        if !rpc.done {
+            return Ok(Staged::Partial);
+        }
+        let complete = guard.take().expect("checked");
+        drop(guard);
+        if complete.received != complete.announced {
+            self.staging.discard(&complete.dir);
+            return Err(Status::invalid_argument(format!(
+                "snapshot transfer ended at {} bytes of the announced length {}",
+                complete.received, complete.announced
+            )));
+        }
+        if let Err(error) = complete.file.sync_all() {
+            self.staging.discard(&complete.dir);
+            return Err(Status::internal(format!("snapshot receive: {error}")));
+        }
+        drop(complete.file);
+        if let Err(error) = self.staging.verify(&complete.dir, &complete.meta) {
+            self.staging.discard(&complete.dir);
+            return Err(error);
+        }
+        Ok(Staged::Complete {
+            meta: complete.meta,
+            vote: complete.vote,
+            dir: complete.dir,
+        })
     }
 
     pub(crate) fn into_server(self, limits: &TransportLimits) -> RaftTransportServer<Self> {
@@ -375,17 +570,48 @@ impl RaftTransport for RaftTransportService {
     ) -> Result<Response<RaftInstallSnapshotResponse>, Status> {
         let from = self.authenticate(&request, request.get_ref().header.as_ref())?;
         let rpc = install_request_from_proto(self.directory.group(), request.into_inner())?;
-        let outcome = match self.raft.install_snapshot(rpc).await {
-            Ok(response) => InstallOutcome::Vote(vote_to_proto(&response.vote)),
-            Err(RaftError::APIError(InstallSnapshotError::SnapshotMismatch(mismatch))) => {
-                InstallOutcome::Mismatch(RaftSnapshotMismatch {
-                    expect_id: mismatch.expect.id,
-                    expect_offset: mismatch.expect.offset,
-                    got_id: mismatch.got.id,
-                    got_offset: mismatch.got.offset,
-                })
+        let snapshot_id = rpc.meta.snapshot_id.clone();
+        let offset = rpc.offset;
+        let outcome = match self.stage(from, rpc)? {
+            Staged::Partial => {
+                InstallOutcome::Vote(vote_to_proto(&self.raft.metrics().borrow().vote))
             }
-            Err(error) => return Err(core_stopped(error)),
+            Staged::Mismatch { expect_offset } => InstallOutcome::Mismatch(RaftSnapshotMismatch {
+                expect_id: snapshot_id.clone(),
+                expect_offset,
+                got_id: snapshot_id,
+                got_offset: offset,
+            }),
+            Staged::Complete { meta, vote, dir } => {
+                // The image is validated; the library applies its own term
+                // and position rules and may decline it (an older vote, a
+                // position it already holds). Only a storage failure in the
+                // swap is fatal, as before.
+                let file = match tokio::fs::File::open(SnapshotStaging::image_path(&dir)).await {
+                    Ok(file) => file,
+                    Err(error) => {
+                        self.staging.discard(&dir);
+                        return Err(Status::internal(format!("snapshot receive: {error}")));
+                    }
+                };
+                let response = self
+                    .raft
+                    .install_full_snapshot(
+                        vote,
+                        Snapshot {
+                            meta,
+                            snapshot: Box::new(file),
+                        },
+                    )
+                    .await
+                    .map_err(|e| Status::unavailable(format!("raft core: {e}")))?;
+                if self.staging.is_current(&dir) {
+                    // Declined by the library: the validated bytes are of no
+                    // further use.
+                    self.staging.discard(&dir);
+                }
+                InstallOutcome::Vote(vote_to_proto(&response.vote))
+            }
         };
         Ok(Response::new(RaftInstallSnapshotResponse {
             header: Some(self.header(from)),

@@ -63,6 +63,7 @@ fn transport(node: NodeId, directory: &Arc<PeerDirectory>) -> ClusterTransport {
         limits: TransportLimits {
             max_message_bytes: 1 << 20,
             connect_timeout_ms: 1_000,
+            snapshot_idle_timeout_ms: 300,
         },
     }
 }
@@ -839,4 +840,136 @@ async fn a_leader_withholds_its_vote_while_an_admission_interval_may_be_open() {
     let reply = client.vote(timed(request)).await.unwrap().into_inner();
     assert!(reply.vote.is_some());
     cluster.shutdown().await;
+}
+
+/// A snapshot transfer with no chunk for the idle timeout is dropped with
+/// its bytes and its place is free: another peer under the same vote is
+/// refused while the transfer is live and accepted once it has gone idle,
+/// and its complete transfer installs on the running core.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_idle_snapshot_transfer_is_dropped_and_its_place_freed() {
+    use crate::pb::storage::{
+        raft_install_snapshot_response::Outcome as InstallOutcome, RaftInstallSnapshotRequest,
+        RaftSnapshotMeta,
+    };
+    use prost::Message as _;
+    let group = identity(9);
+    let directory = directory(&group, &[1, 2, 3, 4]);
+    let leader_dir = Directory::new("idle-leader");
+    let leader = RaftHost::bootstrap_cluster(
+        &leader_dir.0,
+        &group,
+        1,
+        &policy(),
+        &limits(),
+        &cluster_config(),
+        transport(1, &directory),
+    )
+    .await
+    .unwrap();
+    let decision = leader
+        .propose_command("alice", &prepare(&group, "phone-a", "phone-a", 1))
+        .await
+        .unwrap();
+    assert_eq!(decision.code, 0, "{}", decision.message);
+    let applied = leader.applied_position().unwrap().unwrap().index;
+    leader.trigger_snapshot().await.unwrap();
+    leader
+        .wait(Some(Duration::from_secs(30)))
+        .metrics(
+            |m| m.snapshot.is_some_and(|s| s.index >= applied),
+            "leader snapshot",
+        )
+        .await
+        .unwrap();
+    let generation =
+        super::state_machine::published_generation(&leader_dir.0.join(super::host::SNAPSHOT_DIR))
+            .unwrap()
+            .unwrap();
+    let image = std::fs::read(generation.join("image.redb")).unwrap();
+    let meta = RaftSnapshotMeta::decode(std::fs::read(generation.join("meta")).unwrap().as_slice())
+        .unwrap();
+    let member_dir = Directory::new("idle-member");
+    RaftHost::prepare_member(&member_dir.0, &group, 2, &policy(), &limits()).unwrap();
+    let member = RaftHost::start_member(
+        &member_dir.0,
+        &group,
+        2,
+        &cluster_config(),
+        transport(2, &directory),
+    )
+    .await
+    .unwrap();
+    let addr = member.listen_addr().unwrap();
+    let vote = {
+        let v = leader.metrics().borrow().vote;
+        crate::pb::storage::RaftVote {
+            term: v.leader_id.term,
+            node_id: v.leader_id.node_id,
+            committed: v.committed,
+        }
+    };
+    let chunk = |from: NodeId, offset: usize, data: &[u8], done: bool| {
+        timed(RaftInstallSnapshotRequest {
+            header: Some(header(&group, from, 2)),
+            vote: Some(vote.clone()),
+            meta: Some(meta.clone()),
+            offset: offset as u64,
+            data: data.to_vec(),
+            done,
+        })
+    };
+    // Node 4 begins and goes quiet after one chunk.
+    let mut quiet = raw_client(addr, "node-4").await.unwrap();
+    quiet
+        .install_snapshot(chunk(4, 0, &image[..4096], false))
+        .await
+        .unwrap();
+    // Node 1 is refused while that transfer is live: the same snapshot id
+    // is bound to node 4.
+    let mut sender = raw_client(addr, "node-1").await.unwrap();
+    let error = sender
+        .install_snapshot(chunk(1, 0, &image[..4096], false))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
+    assert!(error.message().contains("bound to node 4"), "{error}");
+    // Past the idle timeout the quiet transfer is dropped and node 1's
+    // transfer takes its place and completes; the core ran throughout.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut offset = 0;
+    let chunks: Vec<&[u8]> = image.chunks(128 << 10).collect();
+    for (i, piece) in chunks.iter().enumerate() {
+        let reply = sender
+            .install_snapshot(chunk(1, offset, piece, i + 1 == chunks.len()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(matches!(reply.outcome, Some(InstallOutcome::Vote(_))));
+        offset += piece.len();
+    }
+    assert!(member.metrics().borrow().running_state.is_ok());
+    assert!(!member.awaiting_snapshot().unwrap());
+    assert_eq!(member.applied_position().unwrap().unwrap().index, applied);
+    // The quiet peer's stale continuation is out of order for nothing: no
+    // transfer is open, so it is a mismatch, not a refusal of the core.
+    let reply = quiet
+        .install_snapshot(chunk(4, 4096, &image[4096..8192], false))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(matches!(reply.outcome, Some(InstallOutcome::Mismatch(_))));
+    let incoming = std::fs::read_dir(member_dir.0.join(super::host::SNAPSHOT_DIR))
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("incoming-")
+        })
+        .count();
+    assert_eq!(incoming, 0);
+    member.shutdown().await.unwrap();
+    leader.shutdown().await.unwrap();
 }

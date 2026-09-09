@@ -777,10 +777,15 @@ state machine directly, could not see. All three are fixed on the branch:
   refuses appends and snapshot chunks whose vote is not committed, since
   both come only from a leader.
 
-One observation stays open for review: through the supported path a
-refused install stops the receiving core (openraft's contract), and the
-member recovers by restart. The safety properties hold either way; the
-liveness effect is that a registered peer sending an invalid image takes a
-follower down until it is restarted. Closing that needs either library
-support for a non-fatal install refusal or a transport-level validation of
-the complete image before the library sees the final chunk.
+The liveness observation recorded at first integration (a refused install
+stopped the receiving core, openraft's contract) is closed by the snapshot
+admission checkpoint: the transport stages, binds and validates the
+complete image before the library sees it, so invalid incoming data is
+refused with the core running (`docs/raft-hosting.md`, "Snapshot
+admission"; the acceptance test
+`snapshot_admission_refuses_invalid_transfers_without_stopping_the_core`
+in the snapshot target, which now asserts the core keeps running after
+each refusal). One local condition remains fatal on purpose: a swap
+refused for an outstanding store handle happens inside the library's
+install path and is a storage condition, not incoming data
+(`r4_install_refusal_preserves_the_live_handle` records it).

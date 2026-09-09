@@ -71,9 +71,141 @@ fn io(error: impl std::fmt::Display) -> Status {
 }
 
 /// One received image, identified by the exact directory the receive was
-/// started in; install consumes only this receive's artifacts.
+/// started in; install consumes only this receive's artifacts. `verified`
+/// names the snapshot id the complete image was validated against.
 struct Receive {
     dir: PathBuf,
+    verified: Option<String>,
+}
+
+/// Staging of incoming snapshot bytes, shared by the transport (which
+/// receives and validates the complete image before the library sees it)
+/// and the state machine (which swaps a validated image in). One receive
+/// at a time; a receive is its own directory, and only that receive's
+/// artifacts are ever consumed.
+pub(crate) struct SnapshotStaging {
+    snapshots: PathBuf,
+    identity: SourceAuthorityIdentity,
+    max_image_bytes: u64,
+    receiving: Mutex<Option<Receive>>,
+    counter: AtomicU64,
+}
+
+impl SnapshotStaging {
+    pub(crate) fn max_image_bytes(&self) -> u64 {
+        self.max_image_bytes
+    }
+
+    pub(crate) fn image_path(dir: &Path) -> PathBuf {
+        dir.join(IMAGE)
+    }
+
+    /// Begin a receive: a fresh directory with an empty image file. A
+    /// previous unfinished receive is dropped with its bytes.
+    pub(crate) fn begin(&self) -> Result<(PathBuf, std::fs::File), Status> {
+        if let Some(previous) = self.receiving.lock().unwrap().take() {
+            let _ = std::fs::remove_dir_all(&previous.dir);
+        }
+        let token = format!(
+            "incoming-{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+            self.counter.fetch_add(1, Ordering::Relaxed)
+        );
+        let dir = self.snapshots.join(token);
+        std::fs::create_dir(&dir).map_err(io)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(dir.join(IMAGE))
+            .map_err(io)?;
+        *self.receiving.lock().unwrap() = Some(Receive {
+            dir: dir.clone(),
+            verified: None,
+        });
+        Ok((dir, file))
+    }
+
+    /// Whether `dir` is the current receive.
+    pub(crate) fn is_current(&self, dir: &Path) -> bool {
+        self.receiving
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|r| r.dir == dir)
+    }
+
+    /// Validate the complete image in `dir` against `meta`: the announced
+    /// bound, its length and digest, then a separate probe copy opened as a
+    /// store of this group whose applied position and membership must
+    /// equal the meta. The received bytes stay untouched and are marked
+    /// verified for this meta.
+    pub(crate) fn verify(
+        &self,
+        dir: &Path,
+        meta: &SnapshotMeta<NodeId, BasicNode>,
+    ) -> Result<ImageSignature, Status> {
+        let image = dir.join(IMAGE);
+        let signature = parse_snapshot_id(&meta.snapshot_id)?;
+        if signature.length > self.max_image_bytes {
+            return Err(Status::resource_exhausted(format!(
+                "snapshot image of {} bytes exceeds the {} byte bound",
+                signature.length, self.max_image_bytes
+            )));
+        }
+        verify_image(&image, &signature, self.max_image_bytes)?;
+        // Probe a separate copy: a redb open may rewrite recovery state, and
+        // the received bytes must stay identical to their checksum.
+        let probe = dir.join(PROBE);
+        std::fs::copy(&image, &probe).map_err(io)?;
+        let checked =
+            (|| -> Result<(), Status> {
+                let opened = SourceAuthorityStore::open(&probe, &self.identity)
+                    .map_err(|e| Status::data_loss(format!("snapshot image: {}", e.message())))?;
+                let applied = opened.raft_applied()?.ok_or_else(|| {
+                    Status::data_loss("snapshot image carries no applied position")
+                })?;
+                if applied.last_applied.as_ref().map(log_id_from_proto) != meta.last_log_id {
+                    return Err(Status::data_loss(
+                        "snapshot image applied position differs from the snapshot meta",
+                    ));
+                }
+                let membership =
+                    stored_membership_from_proto(applied.membership.as_ref().ok_or_else(
+                        || Status::data_loss("snapshot image carries no membership"),
+                    )?)?;
+                if membership != meta.last_membership {
+                    return Err(Status::data_loss(
+                        "snapshot image membership differs from the snapshot meta",
+                    ));
+                }
+                Ok(())
+            })();
+        let _ = std::fs::remove_file(&probe);
+        checked?;
+        if let Some(receive) = self.receiving.lock().unwrap().as_mut() {
+            if receive.dir == dir {
+                receive.verified = Some(meta.snapshot_id.clone());
+            }
+        }
+        Ok(signature)
+    }
+
+    /// Drop a receive and its bytes.
+    pub(crate) fn discard(&self, dir: &Path) {
+        let mut receiving = self.receiving.lock().unwrap();
+        if receiving.as_ref().is_some_and(|r| r.dir == dir) {
+            *receiving = None;
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn take(&self) -> Option<Receive> {
+        self.receiving.lock().unwrap().take()
+    }
 }
 
 pub struct ControlStateMachine {
@@ -83,10 +215,9 @@ pub struct ControlStateMachine {
     snapshots: PathBuf,
     max_image_bytes: u64,
     membership: Mutex<StoredMembership<NodeId, BasicNode>>,
-    receiving: Mutex<Option<Receive>>,
+    staging: Arc<SnapshotStaging>,
     // Build and install never overlap; the builder shares this lock.
     snapshot_lock: Arc<Mutex<()>>,
-    receive_counter: AtomicU64,
 }
 
 impl ControlStateMachine {
@@ -109,6 +240,7 @@ impl ControlStateMachine {
             )?,
             None => StoredMembership::new(None, Membership::new(Vec::new(), BTreeMap::new())),
         };
+        let store_identity = store.identity().clone();
         let machine = Self {
             identity: store.identity().clone(),
             live_path: store.path().to_path_buf(),
@@ -116,12 +248,22 @@ impl ControlStateMachine {
             snapshots: snapshots.to_path_buf(),
             max_image_bytes,
             membership: Mutex::new(membership),
-            receiving: Mutex::new(None),
+            staging: Arc::new(SnapshotStaging {
+                snapshots: snapshots.to_path_buf(),
+                identity: store_identity,
+                max_image_bytes,
+                receiving: Mutex::new(None),
+                counter: AtomicU64::new(0),
+            }),
             snapshot_lock: Arc::new(Mutex::new(())),
-            receive_counter: AtomicU64::new(0),
         };
         machine.sweep()?;
         Ok(machine)
+    }
+
+    /// The staging area the transport receives and validates images in.
+    pub(crate) fn staging(&self) -> Arc<SnapshotStaging> {
+        Arc::clone(&self.staging)
     }
 
     pub(crate) fn shared_store(&self) -> SharedStore {
@@ -328,30 +470,11 @@ impl RaftStateMachine<ControlRaft> for ControlStateMachine {
     async fn begin_receiving_snapshot(
         &mut self,
     ) -> Result<Box<tokio::fs::File>, StorageError<NodeId>> {
-        // One receive at a time; a previous unfinished receive is dropped
-        // with its bytes.
-        if let Some(previous) = self.receiving.lock().unwrap().take() {
-            let _ = std::fs::remove_dir_all(&previous.dir);
-        }
-        let token = format!(
-            "incoming-{}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0),
-            self.receive_counter.fetch_add(1, Ordering::Relaxed)
-        );
-        let dir = self.snapshots.join(token);
-        std::fs::create_dir(&dir).map_err(|e| snapshot_error(ErrorVerb::Write, e))?;
-        let file = tokio::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(dir.join(IMAGE))
-            .await
+        let (_, file) = self
+            .staging
+            .begin()
             .map_err(|e| snapshot_error(ErrorVerb::Write, e))?;
-        *self.receiving.lock().unwrap() = Some(Receive { dir });
-        Ok(Box::new(file))
+        Ok(Box::new(tokio::fs::File::from_std(file)))
     }
 
     async fn install_snapshot(
@@ -369,9 +492,7 @@ impl RaftStateMachine<ControlRaft> for ControlStateMachine {
             .map_err(|e| snapshot_error(ErrorVerb::Write, e))?;
         drop(snapshot);
         let receive = self
-            .receiving
-            .lock()
-            .unwrap()
+            .staging
             .take()
             .ok_or_else(|| snapshot_error(ErrorVerb::Read, "no receive is in progress"))?;
         let result = self.install_received(meta, &receive);
@@ -412,43 +533,14 @@ impl ControlStateMachine {
         receive: &Receive,
     ) -> Result<(), Status> {
         let _serial = self.snapshot_lock.lock().unwrap();
-        let image = receive.dir.join(IMAGE);
-        let signature = parse_snapshot_id(&meta.snapshot_id)?;
-        if signature.length > self.max_image_bytes {
-            return Err(Status::resource_exhausted(format!(
-                "snapshot image of {} bytes exceeds the {} byte bound",
-                signature.length, self.max_image_bytes
-            )));
-        }
-        verify_image(&image, &signature, self.max_image_bytes)?;
-        // Probe a separate copy: a redb open may rewrite recovery state, and
-        // the received bytes must stay identical to their checksum.
-        let probe = receive.dir.join(PROBE);
-        std::fs::copy(&image, &probe).map_err(io)?;
-        {
-            let opened = SourceAuthorityStore::open(&probe, &self.identity)
-                .map_err(|e| Status::data_loss(format!("snapshot image: {}", e.message())))?;
-            let applied = opened
-                .raft_applied()?
-                .ok_or_else(|| Status::data_loss("snapshot image carries no applied position"))?;
-            if applied.last_applied.as_ref().map(log_id_from_proto) != meta.last_log_id {
-                return Err(Status::data_loss(
-                    "snapshot image applied position differs from the snapshot meta",
-                ));
-            }
-            let membership = stored_membership_from_proto(
-                applied
-                    .membership
-                    .as_ref()
-                    .ok_or_else(|| Status::data_loss("snapshot image carries no membership"))?,
-            )?;
-            if membership != meta.last_membership {
-                return Err(Status::data_loss(
-                    "snapshot image membership differs from the snapshot meta",
-                ));
-            }
-        }
-        std::fs::remove_file(&probe).map_err(io)?;
+        // The transport validates the complete image before the library's
+        // install runs; a receive that arrived another way is validated
+        // here, on the same rules.
+        let signature = if receive.verified.as_deref() == Some(meta.snapshot_id.as_str()) {
+            parse_snapshot_id(&meta.snapshot_id)?
+        } else {
+            self.staging.verify(&receive.dir, meta)?
+        };
         write_meta(&receive.dir, &self.identity, meta, &signature)?;
         let generation = next_generation(&self.snapshots)?;
         let target = self
