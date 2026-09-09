@@ -35,8 +35,10 @@ const PROBE: &str = "probe.redb";
 const STAGED: &str = "staged.redb";
 const STREAM_BUFFER: usize = 1024 * 1024;
 
-/// The store behind the state machine. `None` only while a snapshot swap
-/// is between closing the old file and opening the new one.
+/// The store behind the state machine. Set once at construction; a
+/// snapshot install swaps the database in place under the store's own
+/// locks (`SourceAuthorityStore::replace_from`), so the slot is never
+/// emptied. The `None` refusal names that impossible state.
 pub type SharedStore = Arc<RwLock<Option<SourceAuthorityStore>>>;
 
 fn sm_error(verb: ErrorVerb, error: impl std::fmt::Display) -> StorageError<NodeId> {
@@ -208,6 +210,91 @@ impl SnapshotStaging {
     }
 }
 
+/// A test and fault-injection hook on the snapshot paths: the next build
+/// pauses once its generation directory is in place and before it
+/// publishes; the next serve pauses after it read the pointer and before
+/// it opens the generation. Each pauses on its own thread, under the locks
+/// it holds there, so the pause shows what those locks exclude. An armed
+/// gate that is reached must be released.
+#[cfg(any(test, feature = "fault-injection"))]
+pub struct SnapshotGate {
+    reached: tokio::sync::watch::Sender<bool>,
+    release: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    wait: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+impl SnapshotGate {
+    fn new() -> Self {
+        let (release, wait) = std::sync::mpsc::channel();
+        Self {
+            reached: tokio::sync::watch::Sender::new(false),
+            release: Mutex::new(Some(release)),
+            wait: Mutex::new(Some(wait)),
+        }
+    }
+
+    /// Resolves once the paused path is at the gate.
+    pub async fn reached(&self) {
+        let mut receiver = self.reached.subscribe();
+        let _ = receiver.wait_for(|reached| *reached).await;
+    }
+
+    pub fn release(&self) {
+        if let Some(release) = self.release.lock().unwrap().take() {
+            let _ = release.send(());
+        }
+    }
+
+    /// Block the calling thread at the gate until released.
+    fn pause(&self) {
+        let wait = self.wait.lock().unwrap().take();
+        self.reached.send_replace(true);
+        if let Some(wait) = wait {
+            let _ = wait.recv();
+        }
+    }
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+#[derive(Default)]
+pub(crate) struct SnapshotGates {
+    build: Mutex<Option<Arc<SnapshotGate>>>,
+    serve: Mutex<Option<Arc<SnapshotGate>>>,
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+impl SnapshotGates {
+    pub(crate) fn arm_build(&self) -> Arc<SnapshotGate> {
+        Self::arm(&self.build)
+    }
+
+    pub(crate) fn arm_serve(&self) -> Arc<SnapshotGate> {
+        Self::arm(&self.serve)
+    }
+
+    fn pause_build(&self) {
+        Self::pause(&self.build)
+    }
+
+    fn pause_serve(&self) {
+        Self::pause(&self.serve)
+    }
+
+    fn arm(slot: &Mutex<Option<Arc<SnapshotGate>>>) -> Arc<SnapshotGate> {
+        let gate = Arc::new(SnapshotGate::new());
+        *slot.lock().unwrap() = Some(Arc::clone(&gate));
+        gate
+    }
+
+    fn pause(slot: &Mutex<Option<Arc<SnapshotGate>>>) {
+        let gate = slot.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.pause();
+        }
+    }
+}
+
 pub struct ControlStateMachine {
     store: SharedStore,
     identity: SourceAuthorityIdentity,
@@ -217,6 +304,13 @@ pub struct ControlStateMachine {
     staging: Arc<SnapshotStaging>,
     // Build and install never overlap; the builder shares this lock.
     snapshot_lock: Arc<Mutex<()>>,
+    // A serve reads the pointer, the generation's meta and its image under
+    // this lock; a publish (which moves the pointer and removes the other
+    // generations) takes it too, so no generation goes away between a
+    // serve reading the pointer and opening the image.
+    pointer_lock: Arc<Mutex<()>>,
+    #[cfg(any(test, feature = "fault-injection"))]
+    gates: Arc<SnapshotGates>,
 }
 
 impl ControlStateMachine {
@@ -254,6 +348,9 @@ impl ControlStateMachine {
                 counter: AtomicU64::new(0),
             }),
             snapshot_lock: Arc::new(Mutex::new(())),
+            pointer_lock: Arc::new(Mutex::new(())),
+            #[cfg(any(test, feature = "fault-injection"))]
+            gates: Arc::new(SnapshotGates::default()),
         };
         machine.sweep()?;
         Ok(machine)
@@ -262,6 +359,12 @@ impl ControlStateMachine {
     /// The staging area the transport receives and validates images in.
     pub(crate) fn staging(&self) -> Arc<SnapshotStaging> {
         Arc::clone(&self.staging)
+    }
+
+    /// The pause hooks on the snapshot build and serve paths.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub(crate) fn gates(&self) -> Arc<SnapshotGates> {
+        Arc::clone(&self.gates)
     }
 
     pub(crate) fn shared_store(&self) -> SharedStore {
@@ -462,6 +565,9 @@ impl RaftStateMachine<ControlRaft> for ControlStateMachine {
             snapshots: self.snapshots.clone(),
             max_image_bytes: self.max_image_bytes,
             snapshot_lock: Arc::clone(&self.snapshot_lock),
+            pointer_lock: Arc::clone(&self.pointer_lock),
+            #[cfg(any(test, feature = "fault-injection"))]
+            gates: Arc::clone(&self.gates),
         }
     }
 
@@ -503,23 +609,31 @@ impl RaftStateMachine<ControlRaft> for ControlStateMachine {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<ControlRaft>>, StorageError<NodeId>> {
+        // One step under the pointer lock, from reading the pointer to
+        // opening the image: a build publishing in its own task meanwhile
+        // waits, so the generation this serve is on is not removed under
+        // it. Once open, the file outlives the directory's removal. A read
+        // that fails here is a real storage failure, and fatal by the
+        // library's contract.
+        let _pointer = self.pointer_lock.lock().unwrap();
         let Some(generation) =
             read_pointer(&self.snapshots).map_err(|e| snapshot_error(ErrorVerb::Read, e))?
         else {
             return Ok(None);
         };
+        #[cfg(any(test, feature = "fault-injection"))]
+        self.gates.pause_serve();
         let dir = self
             .snapshots
             .join(GENERATIONS)
             .join(generation.to_string());
         let (meta, _) = read_generation(&dir, &self.identity)
             .map_err(|e| snapshot_error(ErrorVerb::Read, e))?;
-        let file = tokio::fs::File::open(dir.join(IMAGE))
-            .await
-            .map_err(|e| snapshot_error(ErrorVerb::Read, e))?;
+        let file =
+            std::fs::File::open(dir.join(IMAGE)).map_err(|e| snapshot_error(ErrorVerb::Read, e))?;
         Ok(Some(Snapshot {
             meta,
-            snapshot: Box::new(file),
+            snapshot: Box::new(tokio::fs::File::from_std(file)),
         }))
     }
 }
@@ -563,7 +677,7 @@ impl ControlStateMachine {
             return Err(status);
         }
         drop(store);
-        publish(&self.snapshots, generation)?;
+        publish(&self.pointer_lock, &self.snapshots, generation)?;
         *self.membership.lock().unwrap() = meta.last_membership.clone();
         Ok(())
     }
@@ -575,6 +689,9 @@ pub struct ControlSnapshotBuilder {
     snapshots: PathBuf,
     max_image_bytes: u64,
     snapshot_lock: Arc<Mutex<()>>,
+    pointer_lock: Arc<Mutex<()>>,
+    #[cfg(any(test, feature = "fault-injection"))]
+    gates: Arc<SnapshotGates>,
 }
 
 impl RaftSnapshotBuilder<ControlRaft> for ControlSnapshotBuilder {
@@ -643,7 +760,9 @@ impl ControlSnapshotBuilder {
                 .join(generation.to_string());
             std::fs::rename(&build_dir, &target).map_err(io)?;
             sync_dir(&self.snapshots.join(GENERATIONS))?;
-            publish(&self.snapshots, generation)?;
+            #[cfg(any(test, feature = "fault-injection"))]
+            self.gates.pause_build();
+            publish(&self.pointer_lock, &self.snapshots, generation)?;
             let file = std::fs::File::open(target.join(IMAGE)).map_err(io)?;
             Ok(Snapshot {
                 meta,
@@ -670,9 +789,12 @@ fn next_generation(snapshots: &Path) -> Result<u64, Status> {
         .ok_or_else(|| Status::resource_exhausted("snapshot generations exhausted"))
 }
 
-/// Publish one generation through the pointer, then drop every other
-/// generation. The previous generation stays usable until the pointer moved.
-fn publish(snapshots: &Path, generation: u64) -> Result<(), Status> {
+/// Publish one generation through the pointer, then drop the other
+/// generations, under the pointer lock a serve holds from reading the
+/// pointer to opening its image. The previous generation stays usable
+/// until the pointer moved.
+fn publish(lock: &Mutex<()>, snapshots: &Path, generation: u64) -> Result<(), Status> {
+    let _pointer = lock.lock().unwrap();
     write_pointer(snapshots, generation)?;
     for entry in std::fs::read_dir(snapshots.join(GENERATIONS)).map_err(io)? {
         let entry = entry.map_err(io)?;
@@ -779,13 +901,14 @@ fn sync_dir(dir: &Path) -> Result<(), Status> {
         .map_err(io)
 }
 
-fn write_meta(
-    dir: &Path,
+/// The stored form of a snapshot meta: the group, the position, the
+/// membership, the id and the image's length and digest.
+pub(crate) fn meta_to_proto(
     group: &SourceAuthorityIdentity,
     meta: &SnapshotMeta<NodeId, BasicNode>,
     signature: &ImageSignature,
-) -> Result<(), Status> {
-    let value = RaftSnapshotMeta {
+) -> RaftSnapshotMeta {
+    RaftSnapshotMeta {
         format_version: 1,
         group: Some(group.clone()),
         last_log_id: meta.last_log_id.as_ref().map(log_id_to_proto),
@@ -793,7 +916,16 @@ fn write_meta(
         snapshot_id: meta.snapshot_id.clone(),
         length: signature.length,
         sha256: signature.sha256.to_vec(),
-    };
+    }
+}
+
+fn write_meta(
+    dir: &Path,
+    group: &SourceAuthorityIdentity,
+    meta: &SnapshotMeta<NodeId, BasicNode>,
+    signature: &ImageSignature,
+) -> Result<(), Status> {
+    let value = meta_to_proto(group, meta, signature);
     let path = dir.join(META);
     std::fs::write(&path, value.encode_to_vec()).map_err(io)?;
     std::fs::File::open(&path)

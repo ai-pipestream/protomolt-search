@@ -311,6 +311,8 @@ pub struct RaftHost {
     isolation: Isolation,
     #[cfg(any(test, feature = "fault-injection"))]
     grant_gate: std::sync::Mutex<Option<Arc<GrantGate>>>,
+    #[cfg(any(test, feature = "fault-injection"))]
+    snapshot_gates: Arc<super::state_machine::SnapshotGates>,
 }
 
 impl RaftHost {
@@ -501,6 +503,8 @@ impl RaftHost {
             ControlStateMachine::new(store, &dir.join(SNAPSHOT_DIR), config.max_snapshot_bytes)?;
         let shared = machine.shared_store();
         let staging = machine.staging();
+        #[cfg(any(test, feature = "fault-injection"))]
+        let snapshot_gates = machine.gates();
         let mut log_store = log_store;
         log_store
             .bind_applied_floor(Arc::clone(&shared))
@@ -531,6 +535,8 @@ impl RaftHost {
             isolation: Isolation::default(),
             #[cfg(any(test, feature = "fault-injection"))]
             grant_gate: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "fault-injection"))]
+            snapshot_gates,
         })
     }
 
@@ -659,6 +665,46 @@ impl RaftHost {
         let gate = Arc::new(GrantGate::new());
         *self.grant_gate.lock().unwrap() = Some(Arc::clone(&gate));
         gate
+    }
+
+    /// Arm a pause in the next snapshot build, once its generation
+    /// directory is in place and before it publishes.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn arm_snapshot_build_gate(&self) -> Arc<super::state_machine::SnapshotGate> {
+        self.snapshot_gates.arm_build()
+    }
+
+    /// Arm a pause in the next snapshot serve, after it read the pointer
+    /// and before it opens the generation.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn arm_snapshot_serve_gate(&self) -> Arc<super::state_machine::SnapshotGate> {
+        self.snapshot_gates.arm_serve()
+    }
+
+    /// The snapshot the state machine serves to a peer right now, read in
+    /// full on the state machine worker's path: its stored meta and the
+    /// image bytes. `None` when no generation is published.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub async fn serve_snapshot(
+        &self,
+    ) -> Result<Option<(crate::pb::storage::RaftSnapshotMeta, Vec<u8>)>, Status> {
+        let Some(snapshot) = self
+            .raft
+            .get_snapshot()
+            .await
+            .map_err(|e| Status::internal(format!("raft snapshot read: {e}")))?
+        else {
+            return Ok(None);
+        };
+        let signature = super::state_machine::parse_snapshot_id(&snapshot.meta.snapshot_id)?;
+        let group = self.store()?.identity().clone();
+        let meta = super::state_machine::meta_to_proto(&group, &snapshot.meta, &signature);
+        let mut file = snapshot.snapshot;
+        let mut bytes = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut *file, &mut bytes)
+            .await
+            .map_err(|e| Status::internal(format!("raft snapshot read: {e}")))?;
+        Ok(Some((meta, bytes)))
     }
 
     /// A handle that yields the current store on every call, for consumers
@@ -824,8 +870,17 @@ impl RaftHost {
         }
     }
 
-    /// Ask the state machine for a snapshot now (tests and operators).
+    /// Ask the state machine for a snapshot now (tests and operators). A
+    /// store that has applied nothing yet (a prepared member before its
+    /// first install) has nothing to snapshot; the library would send the
+    /// build regardless and treat the builder's refusal as fatal, so the
+    /// trigger is refused here by name.
     pub async fn trigger_snapshot(&self) -> Result<(), Status> {
+        if self.applied_position()?.is_none() {
+            return Err(Status::failed_precondition(
+                "no applied position; nothing to snapshot",
+            ));
+        }
         self.raft
             .trigger()
             .snapshot()

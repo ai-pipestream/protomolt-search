@@ -792,3 +792,40 @@ blocks nor refuses an install and serves the installed state afterwards
 (`r4_install_refusal_preserves_the_live_handle` pins it with the core
 running). Only a real storage failure inside the library's install path
 is fatal.
+
+### Found in review of the swap
+
+Kimi's review of the swap checkpoint (b5c6f48) found the claim "no install
+path stops a core except a real storage failure" earned for the install
+path and asked for it to be scoped, or for the serve/publish race to be
+taken as the next finding. Both are done. `docs/raft-hosting.md` ("Log and
+store agreement") now names the three snapshot paths (install, build,
+serve) and what stops the core on each. And the race is fixed: the serve
+path (`get_current_snapshot`, on the state machine worker) read the
+pointer and then the generation with no lock between them, while a build,
+in its own task, published the next generation and removed the rest; a
+publish landing between the two reads removed the generation under the
+serve, the read failed as a storage error and the core stopped, with no
+invalid data and no storage fault anywhere. A serve is now one step under
+the pointer lock and every publish takes it.
+
+`a_serve_under_a_concurrent_publish_returns_the_generation_it_read`
+(snapshot target, `fault-injection`) pins the interleaving with two new
+gates, `RaftHost::arm_snapshot_build_gate` (the build paused before it
+publishes) and `arm_snapshot_serve_gate` (the serve paused after it read
+the pointer), released build first, and reads the served snapshot through
+`RaftHost::serve_snapshot`. Against the unlocked serve it fails with the
+pointer moved to generation 2, generation 1 gone and the core stopped on
+"No such file or directory"
+(`/tmp/psearch-import-evidence/serve-publish-race-unfixed.log`); with the
+lock the serve returns generation 1's meta and bytes, the pointer has not
+moved under it, the build publishes generation 2 afterwards and the core
+keeps committing (`serve-publish-race-fixed.log`).
+
+The other non-storage condition on the build path, a snapshot trigger at
+a prepared member that has applied nothing, is refused by
+`RaftHost::trigger_snapshot` by name before the library sees it
+(`a_snapshot_trigger_with_nothing_applied_is_refused_before_the_library`:
+without the guard the member core stops on the builder's refusal; with it
+the trigger is `FailedPrecondition`, the core runs, and the member is
+seeded and snapshots afterwards).

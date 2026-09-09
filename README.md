@@ -1250,6 +1250,14 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   destination store remains unchanged. See [retirement and crash recovery](docs/control-retirement.md);
   transactional import, worker fencing and activation remain separate steps.
 
+- **Foundation branch: snapshot serve under the pointer lock.** Serving
+  the published generation to a lagging peer is one step under the pointer
+  lock, from reading the pointer to opening the image, so a build
+  publishing meanwhile waits instead of removing the generation under the
+  serve (which stopped the core with no fault anywhere). A snapshot trigger
+  on a store with nothing applied is refused by the host before the library
+  sees it. The hosting document names, per snapshot path, what stops a
+  core. See [raft hosting](docs/raft-hosting.md).
 - **Foundation branch: in-place store swap.** A snapshot install replaces
   the source authority's database in place under its own locks, so a held
   handle neither blocks nor refuses it and serves the installed state

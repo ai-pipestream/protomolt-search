@@ -189,10 +189,9 @@ fn member_state(cluster: &Cluster) -> ((Vec<u8>, RaftSnapshotMeta), i32) {
 }
 
 /// Invalid incoming data is refused by the transport's staging before the
-/// library sees it: the receiving core keeps running. (A refusal inside the
-/// library's own install path, such as a swap with an outstanding handle,
-/// is a local storage condition and stays fatal; the regression target
-/// records that one.)
+/// library sees it: the receiving core keeps running. (Only a real local
+/// storage failure inside the library's own install path is fatal; the
+/// in-place swap holds no precondition a caller could fail.)
 async fn recover_if_stopped(cluster: &mut Cluster, what: &str) -> bool {
     let running = raft_kit::core_running(cluster.member());
     assert!(
@@ -1163,5 +1162,158 @@ async fn snapshot_admission_refuses_invalid_transfers_without_stopping_the_core(
         2
     );
     host_b.shutdown().await.unwrap();
+    cluster.shutdown().await;
+}
+
+/// The serve path beside the publish path. The leader serves its published
+/// generation to a lagging peer on the state machine worker
+/// (`get_current_snapshot`) while a build, in its own task, publishes the
+/// next generation and removes the rest. Before this checkpoint the serve
+/// read the pointer and then the generation with no lock between them; a
+/// publish landing between the two removed the generation under the
+/// serve, the read failed as a storage error and the core stopped, with
+/// no invalid data and no storage fault anywhere. Now a serve is one step
+/// under the pointer lock, from reading the pointer to opening the image;
+/// a publish waits for it, and an open file outlives the directory's
+/// removal. The two gates pin the interleaving: the build is paused just
+/// before it publishes, the serve just after it read the pointer, and the
+/// build is released first.
+#[cfg(feature = "fault-injection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_serve_under_a_concurrent_publish_returns_the_generation_it_read() {
+    let _serial = serial();
+    let group = kit::identity(kit::SEED);
+    let dir = kit::TestDir::new("serve-under-publish");
+    let host = std::sync::Arc::new(raft_kit::bootstrap_host(&dir).await);
+    propose_ok(&host, &prepare_command(&group, 1)).await;
+    let (first_image, first_meta) = raft_kit::snapshot_image(&dir, &host).await;
+    let first = raft_kit::published_generation(dir.path()).unwrap();
+    propose_ok(&host, &grant_command(&group, 2, 1, "bob")).await;
+    let applied = raft_kit::durable_position(&host);
+    raft_kit::wait_applied(&host, applied).await;
+    assert!(first_meta.last_log_id.unwrap().index < applied);
+
+    // A build in flight in its own task: image copied, generation
+    // directory in place, paused before it publishes.
+    let build_gate = host.arm_snapshot_build_gate();
+    host.trigger_snapshot().await.unwrap();
+    build_gate.reached().await;
+
+    // A serve on the state machine worker, paused after it read the
+    // pointer and before it opened the generation.
+    let serve_gate = host.arm_snapshot_serve_gate();
+    let serving = {
+        let host = std::sync::Arc::clone(&host);
+        tokio::spawn(async move { host.serve_snapshot().await })
+    };
+    serve_gate.reached().await;
+
+    // The build may publish now. It has this long to move the pointer and
+    // remove the first generation under the paused serve.
+    build_gate.release();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let pointer_during_pause = raft_kit::published_generation(dir.path());
+    let first_image_present = raft_kit::generation_dir(dir.path(), first)
+        .join("image.redb")
+        .exists();
+
+    serve_gate.release();
+    let served = serving.await.unwrap();
+    let outcome = served.as_ref().map(|s| {
+        s.as_ref()
+            .map(|(meta, image)| (meta.snapshot_id.clone(), image.len()))
+    });
+    assert!(
+        raft_kit::core_running(&host),
+        "the core stopped: the serve read generation {first}, the publish moved the pointer \
+         to {pointer_during_pause:?} under it (image present: {first_image_present}); \
+         serve outcome {outcome:?}"
+    );
+    let (served_meta, served_image) = served
+        .expect("the serve completed")
+        .expect("a generation was published");
+    assert_eq!(
+        served_meta, first_meta,
+        "the serve returned another generation's meta"
+    );
+    assert_eq!(served_image, first_image, "the serve returned other bytes");
+    assert_eq!(
+        pointer_during_pause,
+        Some(first),
+        "the pointer moved under a serve that had read it"
+    );
+    assert!(
+        first_image_present,
+        "the generation was removed under a serve that had read the pointer to it"
+    );
+
+    // The build publishes once the serve is done; the first generation goes
+    // with it, and the core keeps committing.
+    host.wait(Some(std::time::Duration::from_secs(30)))
+        .metrics(
+            |metrics| metrics.snapshot.is_some_and(|s| s.index >= applied),
+            "the next generation built",
+        )
+        .await
+        .unwrap();
+    let second = raft_kit::published_generation(dir.path()).unwrap();
+    assert!(second > first, "the build did not publish after the serve");
+    assert!(!raft_kit::generation_dir(dir.path(), first).exists());
+    let (_, second_meta) = raft_kit::published_pair(dir.path()).unwrap();
+    assert_eq!(second_meta.last_log_id.unwrap().index, applied);
+    assert!(raft_kit::core_running(&host));
+    propose_ok(&host, &grant_command(&group, 3, 2, "carol")).await;
+    assert_eq!(raft_kit::durable_position(&host), applied + 1);
+    std::sync::Arc::try_unwrap(host)
+        .ok()
+        .expect("no task holds the host")
+        .shutdown()
+        .await
+        .unwrap();
+}
+
+/// The other non-storage condition on the build path: a snapshot trigger
+/// at a prepared member that has applied nothing yet. The library sends
+/// the build regardless, the builder has no position to snapshot, and its
+/// refusal would stop the core the way a storage failure does. The host
+/// refuses the trigger by name before the library sees it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_trigger_with_nothing_applied_is_refused_before_the_library() {
+    let _serial = serial();
+    let group = kit::identity(kit::SEED);
+    let mut cluster =
+        Cluster::bootstrap("trigger-unseeded", &group, &kit::policy(), &kit::limits()).await;
+    propose_ok(cluster.leader(), &prepare_command(&group, 1)).await;
+    cluster.start_member().await;
+    assert!(cluster.member().awaiting_snapshot().unwrap());
+
+    let refused = cluster.member().trigger_snapshot().await.err();
+    // A build the library was sent would fail on its own task shortly
+    // after; the core must still be running once it had that time.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        raft_kit::core_running(cluster.member()),
+        "the member core stopped on a snapshot trigger with nothing applied (trigger outcome: \
+         {refused:?})"
+    );
+    let refused = refused.expect("the trigger is refused by name");
+    assert_eq!(refused.code(), Code::FailedPrecondition, "{refused}");
+    assert!(refused.message().contains("applied position"), "{refused}");
+    assert!(raft_kit::published_generation(cluster.member_dir.path()).is_none());
+
+    // The member is seeded afterwards as usual, and can snapshot then.
+    cluster.add_member().await;
+    assert!(!cluster.member().awaiting_snapshot().unwrap());
+    raft_kit::wait_applied(
+        cluster.member(),
+        raft_kit::durable_position(cluster.leader()),
+    )
+    .await;
+    let (_, meta) = raft_kit::snapshot_image(&cluster.member_dir, cluster.member()).await;
+    assert_eq!(
+        meta.last_log_id.unwrap().index,
+        raft_kit::durable_position(cluster.member())
+    );
+    assert!(raft_kit::core_running(cluster.member()));
     cluster.shutdown().await;
 }

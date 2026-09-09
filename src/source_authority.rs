@@ -1242,10 +1242,6 @@ impl SourceAuthorityStore {
         self.inner.hosted.load(Ordering::Acquire)
     }
 
-    pub(crate) fn path(&self) -> &Path {
-        &self.inner.path
-    }
-
     /// Run one committed-replay application with `applied` recorded in the
     /// same transaction. The state machine applies entries one at a time.
     pub(crate) fn raft_apply<T>(

@@ -155,9 +155,34 @@ the announced length (enforced while receiving, not only at install).
 
 Invalid incoming data never reaches the library (see "Snapshot
 admission" above), and the swap holds no precondition a caller could
-fail; only a real local storage failure inside the library's install path
-stops the core, by the library's contract, and the member recovers by
-restart.
+fail. What stops the core is a real local storage failure on one of the
+state machine's three snapshot paths, by the library's contract, and the
+member recovers by restart:
+
+- **Install**: the swap (`SourceAuthorityStore::replace_from`) and the
+  generation rename and publish around it.
+- **Build**: quiescing and copying the store, hashing the copy,
+  publishing. Two refusals on this path are conditions rather than
+  failures and are named as such. A store image over
+  `HostConfig::max_snapshot_bytes` (the receivers' bound, applied to the
+  builder as well) is a configuration stop of the building node rather
+  than a stream of refused installs at its peers. A build with no applied
+  position cannot happen through the host: `RaftHost::trigger_snapshot`
+  refuses on such a store before the library sees it, the library's own
+  policy never asks for one, and the builder's refusal is for the
+  impossible state.
+- **Serve**: reading the published generation for a lagging peer
+  (`get_current_snapshot`). A serve is one step under the pointer lock,
+  from reading the pointer to opening the image; a build or install
+  publishing meanwhile waits for it, and once open the file outlives the
+  directory's removal. Before this lock a publish between the two reads
+  removed the generation under the serve, the read failed as a storage
+  error and the core stopped with no fault anywhere. The interleaving is
+  pinned with two `fault-injection` gates, `RaftHost::arm_snapshot_build_gate`
+  (paused before publish) and `arm_snapshot_serve_gate` (paused after the
+  pointer read), and `RaftHost::serve_snapshot`, which reads what the
+  state machine serves (`tests/control_raft_snapshots.rs`, "a serve under
+  a concurrent publish returns the generation it read").
 
 ## Host
 
