@@ -350,6 +350,15 @@ fn parse_integrity(full: &[u8]) -> io::Result<IntegrityTable> {
     if n_entries == 0 {
         return Err(invalid("v8 integrity table with zero entries".into()));
     }
+    // One entry costs at least 2 + 1 + 20 bytes and the section also
+    // carries the 4-byte count and 4-byte table CRC, so the file bounds
+    // the count before any allocation trusts it.
+    let max_entries = (trailer - integrity_off).saturating_sub(8) / 23;
+    if u64::from(n_entries) > max_entries {
+        return Err(invalid(format!(
+            "v8 integrity table declares {n_entries} entries, at most {max_entries} fit its section"
+        )));
+    }
     let mut entries = Vec::with_capacity(n_entries as usize);
     for i in 0..n_entries {
         need(cur, 2)?;
