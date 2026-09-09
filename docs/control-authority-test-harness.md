@@ -688,3 +688,117 @@ Gate: the four pre-existing targets are unchanged (adversarial 11, model
 3-pass/8-repro tally); `cargo check --tests --features raft,fault-injection`
 is clean; rustfmt clean; no production changes, no new dependencies, no
 commit.
+
+
+## Slice 4a: rewiring the raft targets onto the repaired contract (0fe7081)
+
+The branch was rebased onto the frozen checkpoint `0fe7081` ("Integrate the
+adversarial harness onto the repaired branch; three findings fixed" —
+Fable's repair of the R1/R2/R4 findings plus the raft-host work). The
+pre-rebase harness state is preserved at `archive/harness-baseline-611ceb0`.
+Against `0fe7081` the old 3c/3d expectations are wrong in three ways: the
+read-authority violations are fixed (a hosted read handle now refuses every
+public mutation path), the exact-retry durable-position lag is fixed
+(`write_pending_applied` runs before the stored decision is returned), and
+installs now flow through a real two-node cluster instead of a standalone
+state machine. This slice rewrites `tests/control_raft_regressions.rs`
+(R1/R2/R4, 10 tests) and `tests/control_raft_snapshots.rs` (R3/R5, 10
+tests) to pin the repaired contract; `tests/control_adversarial/raft_kit.rs`
+gains a two-node cluster kit (`bootstrap_cluster_node`, `start_member_node`,
+`cluster_host_config`, generation-layout helpers `snapshots_dir` /
+`read_pointer` / `generation_dir` / `snapshot_image` / `wait_snapshot_at`,
+and a `tls`-gated re-export of the transport cluster module).
+
+What each finding now pins at `0fe7081`:
+
+- **R1 (private propose, read-handle integrity, ConfirmReady binding).**
+  `r1_hosted_read_handle_refuses_every_public_mutation_path` drives every
+  public replay surface (`replay_control_import` begin/chunks/commit,
+  `replay_capacity_configure`, `replay_capacity_transition`,
+  `replay_command`) through `host.store()` and pins the runtime refusals by
+  name; `r1_confirm_ready_through_the_general_path_is_refused` pins the
+  PermissionDenied "readiness confirmation requires the hosted adapter with
+  the managed binding" on the general path; `r1_positive_replay_through_the_host`
+  stays as the positive control (the trusted entry points still admit the
+  same command families).
+- **R2 (exact retry must advance the durable applied position).** The three
+  retry tests keep the review's ordering discipline — the exact retry is
+  deliberately last so any fresh entry after it would overwrite a lagging
+  position — and now pass: prepare (index 2), changed-content refusal (3),
+  exact retry (4) binds snapshot index 4; the import-chunk leg binds 5; the
+  capacity leg commits 2..=12 and the exact configure retry binds 13. The
+  snapshot meta's `last_log_id.index` remains the durable observable because
+  `raft_applied` is pub(crate).
+- **R4 (install refusal and subscription rebinding).** With the transport
+  available, the refusal is now driven through the member's real install
+  path: `r4_install_refusal_preserves_the_live_handle` holds a reader across
+  a leader publish so the member's `replace_from` refuses ("outstanding
+  handles") and pins that the leader keeps serving and the member survives
+  to accept a clean image after the reader drops. `r4_subscription_rebinding_after_install`
+  pins that a `subscribe_applied` receiver taken before a clean install
+  never observes the post-install revision, and that a fresh receiver does
+  (rebinding is explicit, not retroactive).
+- **R3 (generation publication).** `r3_publish_drops_previous_generation`
+  and `r3_reader_held_across_publication` use the real generation layout
+  (`archive/snapshots/<generation>/meta` + `pointer`): the pointer's
+  `last_log_id.index` must advance past the second publication's minimum
+  before the old generation is asserted dropped, and a reader opened on the
+  old image must stay readable after the pointer moves. Learner seeding,
+  disk generation naming/verification, and the startup sweep of interrupted
+  artifacts complete the set.
+- **R5 (receive identity, bounded hashing, oversize refusal, exact id).**
+  `r5_install_hashing_is_bounded` seeds a multi-MiB image through 12 000
+  distinct-owner prepares, resets the allocation watermark inside the
+  serial lock, and asserts peak live-allocation growth over the leader
+  build → transport → member receive/verify/install stays below the image
+  length (a whole-file buffer would meet or exceed it) — the streamed-hash
+  fix holds in both debug and release. `r5_oversize_image_refuses` pins the
+  external contract: with `max_snapshot_bytes: 1024`, `trigger_snapshot`
+  only queues the build, so the refusal surfaces as no generation ever
+  publishing and the leader staying healthy, not as the trigger's return
+  value. `r5_snapshot_id_names_the_exact_bytes` pins
+  `<index>-<length>-<sha256 hex>` against a fresh streamed pass over the
+  published image, and the receive-identity test pins exact
+  length/digest/membership verification with abandoned receives left alone.
+
+Results at `0fe7081` (all 20 pass; every cargo run inside an 8 GiB
+systemd scope with `CARGO_BUILD_JOBS=2`, shared target dir
+`protomolt-workspace-target`, `--test-threads=4`):
+
+- Debug: `control_raft_regressions` 10/10 in 60.6 s (the
+  `r4_install_refusal` internal add-learner timeout fires by design),
+  `control_raft_snapshots` 10/10 in 40.5 s.
+- Release gate, run twice: `control_raft_regressions` 10/10 in 60.3 s,
+  `control_raft_snapshots` 10/10 in 10.1 s, both passes identical.
+- The other four targets pass with features (adversarial 11, model 1,
+  planner 9, crash-faults 7) and without (crash-faults compiles to 0
+  tests, as designed); `cargo check --tests` is clean with and without
+  `raft,fault-injection`; rustfmt clean. No production changes, no new
+  dependencies, no commit.
+
+Three residual findings ride along for Fable (reproductions minimized;
+none is worked around silently in the tests):
+
+1. **A refused snapshot install through the transport is fatal to the
+   member's raft core.** openraft treats the state-machine storage error
+   from `replace_from`'s "outstanding handles" refusal as fatal: the
+   member's metrics show `running_state: Err(...)` and `state: Shutdown`.
+   The docs' "the host keeps its usable store" holds only at the
+   machine/store level, not at raft-core level — the member leaves the
+   group. The tests pin the refusal itself but deliberately do not keep a
+   refused member in the group.
+2. **Restarting a pending member whose log advanced but whose state machine
+   never applied refuses to start.** The restart path returns
+   `raft start: when Write Snapshot(None): status: FailedPrecondition, "no
+   applied position; nothing to snapshot"`. A fresh prepared member joins
+   cleanly, so the group recovers by replacement, not restart.
+3. **Generation deletion races the two-step snapshot read.**
+   Pre-triggering a snapshot and then calling `add_learner` makes openraft
+   build a second, membership-inclusive generation; `publish()` deletes
+   generation 1 while a concurrent `get_current_snapshot` two-step read
+   (pointer, then files by path) can hit ENOENT on the deleted directory →
+   fatal `StorageError(verb Read, "No such file or directory")` and the
+   leader core shuts down. This contradicts the `publish` doc comment "The
+   previous generation stays usable until the pointer moved". The tests
+   order their triggers to avoid the race; the race itself is reported
+   here, not pinned.
