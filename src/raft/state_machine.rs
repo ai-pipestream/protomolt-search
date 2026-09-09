@@ -299,7 +299,6 @@ pub struct ControlStateMachine {
     store: SharedStore,
     identity: SourceAuthorityIdentity,
     snapshots: PathBuf,
-    max_image_bytes: u64,
     membership: Mutex<StoredMembership<NodeId, BasicNode>>,
     staging: Arc<SnapshotStaging>,
     // Build and install never overlap; the builder shares this lock.
@@ -338,7 +337,6 @@ impl ControlStateMachine {
             identity: store.identity().clone(),
             store: Arc::new(RwLock::new(Some(store))),
             snapshots: snapshots.to_path_buf(),
-            max_image_bytes,
             membership: Mutex::new(membership),
             staging: Arc::new(SnapshotStaging {
                 snapshots: snapshots.to_path_buf(),
@@ -563,7 +561,6 @@ impl RaftStateMachine<ControlRaft> for ControlStateMachine {
             store: Arc::clone(&self.store),
             identity: self.identity.clone(),
             snapshots: self.snapshots.clone(),
-            max_image_bytes: self.max_image_bytes,
             snapshot_lock: Arc::clone(&self.snapshot_lock),
             pointer_lock: Arc::clone(&self.pointer_lock),
             #[cfg(any(test, feature = "fault-injection"))]
@@ -683,11 +680,14 @@ impl ControlStateMachine {
     }
 }
 
+/// Images the node's own store. The image is not bounded here:
+/// `max_snapshot_bytes` is each receiver's bound, applied where an image
+/// arrives, so a store over a peer's bound is rejected at that peer by name
+/// and the building node keeps running.
 pub struct ControlSnapshotBuilder {
     store: SharedStore,
     identity: SourceAuthorityIdentity,
     snapshots: PathBuf,
-    max_image_bytes: u64,
     snapshot_lock: Arc<Mutex<()>>,
     pointer_lock: Arc<Mutex<()>>,
     #[cfg(any(test, feature = "fault-injection"))]
@@ -719,15 +719,8 @@ impl ControlSnapshotBuilder {
         ));
         std::fs::create_dir(&build_dir).map_err(io)?;
         let image = build_dir.join(IMAGE);
-        let max = self.max_image_bytes;
         let outcome = (|| -> Result<Snapshot<ControlRaft>, Status> {
             let applied = store.quiesced(|path, applied| {
-                let length = std::fs::metadata(path).map_err(io)?.len();
-                if length > max {
-                    return Err(Status::resource_exhausted(format!(
-                        "store image of {length} bytes exceeds the {max} byte snapshot bound"
-                    )));
-                }
                 std::fs::copy(path, &image).map_err(io)?;
                 std::fs::File::open(&image)
                     .and_then(|f| f.sync_all())
@@ -746,7 +739,7 @@ impl ControlSnapshotBuilder {
                     .as_ref()
                     .ok_or_else(|| Status::data_loss("applied position has no membership"))?,
             )?;
-            let signature = image_signature(&image, max)?;
+            let signature = image_signature(&image, u64::MAX)?;
             let meta = SnapshotMeta {
                 last_log_id,
                 last_membership: membership,

@@ -64,8 +64,8 @@ is held off (`quiesced`, which also reads the applied position under the
 same hold), streamed through a bounded buffer and checksummed by length and
 SHA-256 — an integrity check, not an authenticated signature; the snapshot
 id names both and the meta carries group, last log id, membership and the
-checksum. A store larger than `max_snapshot_bytes` refuses to snapshot by
-name. Build writes a `build-*` directory, syncs, renames it into a new
+checksum. `max_snapshot_bytes` is a receiver's bound and does not apply
+to a build of the node's own store. Build writes a `build-*` directory, syncs, renames it into a new
 generation, publishes the pointer and only then removes older generations;
 an interruption anywhere leaves the previous generation published and
 usable, and startup sweeps partial builds, abandoned receives and
@@ -162,15 +162,19 @@ member recovers by restart:
 - **Install**: the swap (`SourceAuthorityStore::replace_from`) and the
   generation rename and publish around it.
 - **Build**: quiescing and copying the store, hashing the copy,
-  publishing. Two refusals on this path are conditions rather than
-  failures and are named as such. A store image over
-  `HostConfig::max_snapshot_bytes` (the receivers' bound, applied to the
-  builder as well) is a configuration stop of the building node rather
-  than a stream of refused installs at its peers. A build with no applied
-  position cannot happen through the host: `RaftHost::trigger_snapshot`
-  refuses on such a store before the library sees it, the library's own
-  policy never asks for one, and the builder's refusal is for the
-  impossible state.
+  publishing. The image is not bounded here: `HostConfig::max_snapshot_bytes`
+  is each receiver's bound, applied where an image arrives, so a store
+  over a peer's bound is rejected at that peer by name
+  (`ResourceExhausted`, naming the announced length and the bound) before
+  any byte is received, with that peer's core and the leader's running; the leader
+  keeps retrying the peer, which stays unseeded until its bound is raised
+  or the store shrinks
+  (`a_store_image_over_a_peers_bound_is_rejected_at_that_peer_with_both_cores_running`).
+  The one rejection left on this path is a condition, not a failure: a
+  build with no applied position cannot happen through the host.
+  `RaftHost::trigger_snapshot` rejects it on such a store before the
+  library sees it, the library's own policy does not ask for one, and the
+  builder's rejection is for the impossible state.
 - **Serve**: reading the published generation for a lagging peer
   (`get_current_snapshot`). A serve is one step under the pointer lock,
   from reading the pointer to opening the image; a build or install

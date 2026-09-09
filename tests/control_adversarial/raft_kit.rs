@@ -376,6 +376,17 @@ impl Cluster {
         policy: &AccessPolicy,
         limits: &SourceAuthorityLimits,
     ) -> Self {
+        Self::bootstrap_with_config(name, group, policy, limits, &host_config()).await
+    }
+
+    /// [`bootstrap`](Self::bootstrap) with the leader under `config`.
+    pub async fn bootstrap_with_config(
+        name: &str,
+        group: &SourceAuthorityIdentity,
+        policy: &AccessPolicy,
+        limits: &SourceAuthorityLimits,
+        config: &HostConfig,
+    ) -> Self {
         let directory = directory(group);
         let leader_dir = TestDir::new(&format!("{name}-leader"));
         let member_dir = TestDir::new(&format!("{name}-member"));
@@ -385,7 +396,7 @@ impl Cluster {
             NODE_ID,
             policy,
             limits,
-            &host_config(),
+            config,
             transport(NODE_ID, &directory, ephemeral()),
         )
         .await
@@ -413,12 +424,18 @@ impl Cluster {
     /// Start node 2 from its directory (on its recorded address after a
     /// restart) without adding it to the group.
     pub async fn start_member(&mut self) {
+        self.start_member_with(&host_config()).await;
+    }
+
+    /// [`start_member`](Self::start_member) under `config` (e.g. a smaller
+    /// `max_snapshot_bytes` than the leader's image).
+    pub async fn start_member_with(&mut self, config: &HostConfig) {
         let listen = self.member_listen.unwrap_or_else(ephemeral);
         let member = RaftHost::start_member(
             self.member_dir.path(),
             &self.group,
             MEMBER_ID,
-            &host_config(),
+            config,
             transport(MEMBER_ID, &self.directory, listen),
         )
         .await

@@ -108,7 +108,9 @@ pub struct HostConfig {
     pub election_timeout_max_ms: u64,
     /// Build a snapshot after this many applied entries since the last.
     pub snapshot_logs_since_last: u64,
-    /// Largest store image a snapshot may carry, in bytes.
+    /// Largest store image this node accepts from a peer, in bytes. A
+    /// build of this node's own store is not bounded by it: a store over
+    /// a peer's bound is rejected at that peer, by name.
     pub max_snapshot_bytes: u64,
     /// One snapshot chunk on the wire.
     pub snapshot_chunk_bytes: u64,

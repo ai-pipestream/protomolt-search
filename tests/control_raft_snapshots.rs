@@ -1317,3 +1317,87 @@ async fn a_snapshot_trigger_with_nothing_applied_is_refused_before_the_library()
     assert!(raft_kit::core_running(cluster.member()));
     cluster.shutdown().await;
 }
+
+/// `max_snapshot_bytes` is a receiver's bound. Both nodes run under a
+/// bound below the store image: the leader builds and serves its image
+/// as usual (its own bound does not apply to its build), and the peer
+/// rejects each install by name before any byte is received, with its
+/// core and the leader's running, and the leader keeps committing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_store_image_over_a_peers_bound_is_rejected_at_that_peer_with_both_cores_running() {
+    let _serial = serial();
+    let group = kit::identity(kit::SEED);
+    let bound = raft_kit::CHUNK_BYTES as u64;
+    let mut small = raft_kit::host_config();
+    small.max_snapshot_bytes = bound;
+    let mut cluster = Cluster::bootstrap_with_config(
+        "peer-bound",
+        &group,
+        &kit::policy(),
+        &kit::limits(),
+        &small,
+    )
+    .await;
+    propose_ok(cluster.leader(), &prepare_command(&group, 1)).await;
+    // The leader's build is not bounded by its own max_snapshot_bytes.
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        raft_kit::snapshot_image(&cluster.leader_dir, cluster.leader()),
+    )
+    .await;
+    assert!(
+        raft_kit::core_running(cluster.leader()),
+        "the leader core stopped on a build over its own bound (build outcome: {})",
+        outcome.as_ref().map(|(image, _)| image.len()).unwrap_or(0)
+    );
+    let (image, meta) = outcome.expect("the leader builds its image under its own bound");
+    assert!(
+        image.len() as u64 > bound,
+        "the store image ({} bytes) is not over the bound ({bound})",
+        image.len()
+    );
+    cluster.start_member_with(&small).await;
+    assert!(cluster.member().awaiting_snapshot().unwrap());
+
+    // The raw push the leader's transfer reduces to: rejected by name,
+    // before any byte is received.
+    let rejected = cluster
+        .push(&meta, &image)
+        .await
+        .err()
+        .expect("the peer rejects an image over its bound");
+    assert_eq!(rejected.code(), Code::ResourceExhausted, "{rejected}");
+    assert!(
+        rejected
+            .message()
+            .contains(&format!("beyond the {bound} byte image bound")),
+        "{rejected}"
+    );
+    assert!(raft_kit::incoming_dirs(cluster.member_dir.path()).is_empty());
+    assert!(raft_kit::core_running(cluster.member()));
+
+    // Through the leader: the seed transfer is rejected the same way, the
+    // learner does not catch up, and both cores keep running.
+    let addr = cluster.member().advertised_addr().unwrap().to_string();
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        cluster.leader().add_learner(raft_kit::MEMBER_ID, &addr),
+    )
+    .await;
+    assert!(
+        !matches!(outcome, Ok(Ok(()))),
+        "the learner was seeded past its bound: {outcome:?}"
+    );
+    assert!(
+        raft_kit::core_running(cluster.leader()),
+        "the leader core stopped on a peer's rejection"
+    );
+    assert!(raft_kit::core_running(cluster.member()));
+    assert!(cluster.member().awaiting_snapshot().unwrap());
+    assert!(raft_kit::published_generation(cluster.member_dir.path()).is_none());
+    assert!(raft_kit::incoming_dirs(cluster.member_dir.path()).is_empty());
+    propose_ok(cluster.leader(), &grant_command(&group, 2, 1, "bob")).await;
+    assert_eq!(raft_kit::durable_position(cluster.leader()), 4);
+    assert!(raft_kit::core_running(cluster.leader()));
+    cluster.shutdown().await;
+}

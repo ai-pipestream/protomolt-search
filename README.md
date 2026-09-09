@@ -1250,6 +1250,12 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   destination store remains unchanged. See [retirement and crash recovery](docs/control-retirement.md);
   transactional import, worker fencing and activation remain separate steps.
 
+- **Foundation branch: the snapshot bound is the receiver's.** A store
+  image over `max_snapshot_bytes` no longer stops the building node: the
+  bound applies where an image arrives, so a peer configured below the
+  leader's image rejects each install by name before any byte is received, with
+  both cores running, and stays unseeded until its bound is raised. See
+  [raft hosting](docs/raft-hosting.md).
 - **Foundation branch: the fork window in the lib test binary closed.**
   A child spawned by one test thread kept the parent's file locks for a
   moment after `Command::spawn` returned (the kernel resumes a vfork parent
