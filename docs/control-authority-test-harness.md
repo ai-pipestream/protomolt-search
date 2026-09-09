@@ -1062,3 +1062,41 @@ peer with no commit position. Test files and this document only; no
 production change is committed on this branch. The patch that returned the
 serve to its two-step shape lived in the worktree for the measurement above
 and was reverted.
+
+### Gates after slice 4c, and the crash target's fork window
+
+The combined release gate over the committed branch: 161 targets, 1811
+pass, 0 fail, 2 ignored — the new `#[ignore]` above and the pre-existing
+`native_matches_opennlp_contract`
+(`kimi-recovery-combined-final-2.log`). `rustfmt --edition 2021` on the
+two changed test files. `cargo clippy --features raft,tls,fault-injection
+--tests`: 91 warnings, all pre-existing bar one in the new kit helper (a
+clone on `RaftVote`, which is `Copy`; corrected before the commit), and
+one hard error, the `deny(clippy::reversed_empty_ranges)` at
+`src/vector.rs:1092`, which was there before this branch
+(`kimi-recovery-clippy.log`).
+
+The first run of that gate ended with one failure, in
+`control_crash_faults::crash_capacity_report_before_and_after_commit`
+(`kimi-recovery-combined-final.log`):
+
+```
+called `Result::unwrap()` on an `Err` value: "exclusive control ownership
+lock unavailable /tmp/control-adversarial-crash-cap-report-baseline-.../
+legacy.json.lock: lock acquisition failed because the operation would
+block"
+```
+
+That is the window Fable's `fceb636` closed for the lib test binary and
+named as open for the six spawn sites in the integration binaries.
+`control_adversarial::kit::spawn_worker` is a bare `Command::spawn` with
+no layer of the two: the `ForkGuarded` handoff is `cfg(test)` in the
+library and `close_regular_files_after_fork` is crate-private, so an
+out-of-crate target gets no protection from either. Run on its own the
+target passed 8 times out of 8
+(`kimi-recovery-crash-faults-rate.log`); the failure needs the rest of the
+suite alongside it, taking and dropping locks while this target forks. The
+second run of the combined gate passed in full. Closing it means either
+exposing the library hook behind a feature or a harness-local copy of it
+in `kit.rs`, with its own sensitivity probe; that is a slice of its own
+and is left named here.
