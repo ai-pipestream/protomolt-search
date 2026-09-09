@@ -802,3 +802,113 @@ none is worked around silently in the tests):
    previous generation stays usable until the pointer moved". The tests
    order their triggers to avoid the race; the race itself is reported
    here, not pinned.
+
+
+## Slice 4b: admission timing gaps against docs/raft-admission.md
+
+A seventh target, `tests/control_raft_admission.rs` (8 tests plus two
+crash-recovery workers), pins the three admission timing gaps against the
+agreed oracle in `docs/raft-admission.md`, whose "Contract for in-flight
+work" is quoted in the test header: an operation that passed its final
+check may finish; revocation takes effect for every write whose final check
+happens after the interval has lapsed, and for every new admission; a
+refusing final check leaves no durable change and no retry record; the
+receipt discloses nothing about the lease. Assertions encode the contract,
+not the implementation; a failure is a contract violation to report, not
+an assertion to weaken. The target is gated
+`#![cfg(all(feature = "raft", feature = "fault-injection"))]`; leader
+isolation additionally needs `tls` (a default feature). All timing derives
+from `raft_kit::cluster_host_config` (lease 100 ms, skew 50 ms, election
+150/300 ms); the kit gained a three-voter `Cluster` (bootstrap with a
+throwaway prepared owner, snapshot-seed joins, promotion, control-revision
+tracking, leader discovery by polling metrics) mirroring the in-crate
+`src/raft/transport_tests.rs` helper. Tests hold a target-wide serial lock
+like the slice-4a raft targets: they share timing-sensitive election
+windows, so `--test-threads=4` is safe but serialized.
+
+Scenario 1 — a grant paused after the barrier cannot race a revocation:
+
+- `paused_grant_after_barrier_survives_no_revocation_race` — with the
+  leader's grant paused after its read barrier, the test isolates the
+  leader both directions, asserts the survivors' election took at least
+  `election_timeout_min` from isolation (the floor past which every lease
+  the old leader issued has expired), commits alice's revocation on the
+  successor, and releases the pause: the grant refuses
+  `FailedPrecondition` "interval elapsed before the grant". The old leader
+  then grants nothing (`Unavailable`, no quorum); after heal and catch-up
+  it applies the revocation (bob's policy is revision 2 there) and still
+  grants nothing as a follower; the current leader denies alice
+  (`PermissionDenied`).
+- `paused_grant_resumed_within_interval_is_granted` — the same pause
+  released after half the lease is granted: the anchor lies between the
+  arm and the pause, the deadline is exactly `anchor + ttl` (grant time
+  played no role), about half the interval remains, the admission
+  authorizes, and once the ttl has run out `check_fresh` refuses by name
+  ("lease expired") — expiry is scheduled from the anchor, on time.
+
+Scenario 2 — elapsed time alone consumes the interval:
+
+- `delayed_quorum_response_cannot_extend_the_interval` — a pause held for
+  80% of the lease grants with the deadline still `anchor + ttl` and at
+  most ~20% of the interval left (plus a small scheduling slack); a second
+  admission held past the whole ttl on a healthy quorum — no election, no
+  revocation — is refused at the grant "interval elapsed before the
+  grant". Pure timing defeats the grant.
+- `isolated_leader_barrier_fails_within_election_max` — a direct
+  `with_admission` on an isolated leader refuses `Unavailable` naming the
+  linearizable read, measured to complete within `election_timeout_max`
+  plus slack.
+
+Scenario 3 — the source write boundary (full ACTIVE owner built on the
+three-voter leader: Prepare -> bind -> ConfirmReady -> Activate, then
+`ActiveManagedCatalog`):
+
+- `write_paused_past_lease_leaves_no_durable_change` — a write whose
+  precommit pause outlasts the lease refuses at the final check
+  (`FailedPrecondition`, "lease expired"); re-accepting the same request
+  under a fresh admission returns `replayed == false` at sequence 2 — the
+  fixture write is sequence 1, so the refused write consumed nothing and
+  left no retry record. A pause ending within the lease commits (sequence
+  3).
+- `write_paused_during_revocation_is_refused_and_epoch_fenced` — while the
+  owner is ACTIVE, the committed epoch admits and a never-allocated epoch
+  refuses "the fence has moved" (the epoch fence exists before anything
+  moves; a genuine epoch bump needs a replacement activation, which the
+  contract keeps unavailable until replacement exists). A write then
+  pauses inside its transaction while the leader is isolated; the
+  survivors elect and revoke alice; the write's final check refuses "lease
+  expired"; after heal and catch-up alice is `PermissionDenied` at the
+  current leader and `Unavailable` at the old one.
+- `receipt_discloses_nothing_about_the_lease` — the successful write's
+  `DocumentWriteReceipt` destructures exhaustively into exactly
+  `document_key, version, accepted_sequence, accepted, searchable,
+  durable, replayed, history_id` at 0fe7081 (a lease field added to the
+  struct fails the destructure at compile time); the encoded receipt does
+  not contain the admission's wall-clock milliseconds, and the debug form
+  names no lease material. (Version is per document: the first accept of a
+  new document is version 1 at accepted sequence 2.)
+- `crash_after_final_check_converges` — the exit-fault hook fires on the
+  authority store's control transactions, not on the document catalog's
+  source commit, and the window between the final check and the commit has
+  no deterministic external trigger; this arm therefore kills the process
+  (SIGKILL) immediately after a successful accept returned — the
+  "operation that passed its final check may finish" half of the contract,
+  at the deterministic point where durability is promised. Single-node
+  hosted by design (multi-node catalog recovery is not what this timing
+  gap covers). The verify worker reopens the group with the slice-3c
+  bounded retry, recovers the ACTIVE owner from the exact binding bytes
+  the worker persisted (the readiness check hashes the binding, so a
+  reconstruction from the owner row is not byte-identical — the persisted
+  bytes are the faithful recovery input), and re-accepts the same request:
+  `replayed == true` at sequence 2, version 1 — durable exactly once, the
+  retry recorded.
+
+Results at `0fe7081` (all 10 pass; every cargo run inside the 8 GiB
+systemd scope, shared target dir, `--test-threads=4`): debug 4.6-4.9 s,
+stable across three consecutive runs; release 3.5 s. The other five
+targets pass unchanged with features (adversarial 11, model 1, planner 9,
+crash-faults 7, raft-snapshots 10, raft-regressions 10);
+`cargo check --tests --features raft,fault-injection` is clean (zero
+warnings); rustfmt clean. No deviations from the contract found — no
+assertion was weakened. No production changes, no new dependencies, no
+commit.

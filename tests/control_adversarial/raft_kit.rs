@@ -286,6 +286,216 @@ mod cluster {
         assert!(host.awaiting_snapshot().unwrap());
         host
     }
+
+    // ---- slice 4b: three voters over the transport -----------------------------
+    //
+    // Mirrors `src/raft/transport_tests.rs::three_voters`: bootstrap node 1
+    // with a throwaway prepared owner, seed 2 and 3 from its snapshot,
+    // promote them, and track the control revision the next command must
+    // expect.
+
+    use pipestream_search::pb::storage::source_authority_command::Action;
+    use pipestream_search::pb::storage::{LogicalSourceOwner, SourceAuthorityCommand};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::time::Instant;
+
+    /// A throwaway owner for the bootstrap prepare; distinct from any
+    /// bridge owner the tests prepare afterwards (a second Prepare on a
+    /// held key refuses).
+    fn bootstrap_owner_key() -> LogicalSourceOwner {
+        LogicalSourceOwner {
+            owner_id: b"admission-bootstrap".to_vec(),
+            ..super::super::kit::key()
+        }
+    }
+
+    /// A three-voter group over loopback mTLS with control-revision
+    /// tracking, mirroring the in-crate `Cluster` test helper.
+    pub struct Cluster {
+        pub group: pipestream_search::pb::storage::SourceAuthorityIdentity,
+        pub directory: Arc<PeerDirectory>,
+        dirs: BTreeMap<u64, TestDir>,
+        hosts: BTreeMap<u64, RaftHost>,
+        /// The control revision the next command must expect.
+        pub revision: u64,
+    }
+
+    impl Cluster {
+        pub fn host(&self, node: u64) -> &RaftHost {
+            &self.hosts[&node]
+        }
+
+        /// Take a host out to wrap in an `Arc` (the paused-grant recipe
+        /// spawns a `with_admission` against it); put it back with
+        /// [`Cluster::insert`].
+        pub fn take(&mut self, node: u64) -> RaftHost {
+            self.hosts.remove(&node).unwrap()
+        }
+
+        pub fn insert(&mut self, node: u64, host: RaftHost) {
+            self.hosts.insert(node, host);
+        }
+
+        pub fn nodes(&self) -> Vec<u64> {
+            self.hosts.keys().copied().collect()
+        }
+
+        /// Poll until some host leads; bounded and loud.
+        pub async fn leader(&self) -> u64 {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                for host in self.hosts.values() {
+                    if host.metrics().borrow().state == openraft::ServerState::Leader {
+                        return host.node_id();
+                    }
+                }
+                assert!(Instant::now() < deadline, "no leader within 10 s");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// Wait until some running host other than `not` believes in a
+        /// leader that is not `not`; returns that leader.
+        pub async fn leader_other_than(&self, not: u64) -> u64 {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                for (id, host) in &self.hosts {
+                    if *id == not {
+                        continue;
+                    }
+                    if let Some(leader) = host.believed_leader() {
+                        if leader != not
+                            && self.hosts[&leader].metrics().borrow().state
+                                == openraft::ServerState::Leader
+                        {
+                            return leader;
+                        }
+                    }
+                }
+                assert!(Instant::now() < deadline, "no other leader within 10 s");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// Propose `action` on `leader`, asserting the commit, and advance
+        /// the revision tracker.
+        pub async fn propose(
+            &mut self,
+            leader: u64,
+            principal: &str,
+            id: &str,
+            key: &LogicalSourceOwner,
+            action: Action,
+        ) -> pipestream_search::pb::storage::SourceAuthorityDecision {
+            let command = SourceAuthorityCommand {
+                format_version: 1,
+                authority: Some(self.group.clone()),
+                key: Some(key.clone()),
+                command_id: id.as_bytes().to_vec(),
+                expected_control_revision: self.revision,
+                expected_policy_revision: 1,
+                expected_ownership_generation: 0,
+                action: Some(action),
+            };
+            let decision = self
+                .host(leader)
+                .propose_command(principal, &command)
+                .await
+                .unwrap();
+            assert_eq!(decision.code, 0, "{}", decision.message);
+            self.revision += 1;
+            decision
+        }
+
+        /// Poll raft metrics until `node` has applied at least `index`.
+        pub async fn wait_applied(&self, node: u64, index: u64) {
+            self.host(node)
+                .wait(Some(Duration::from_secs(30)))
+                .applied_index_at_least(Some(index), "applied")
+                .await
+                .unwrap();
+        }
+
+        /// Prepare and start `node`, let `leader` seed it by snapshot, and
+        /// wait until the seed is installed.
+        pub async fn join(&mut self, node: u64, leader: u64) {
+            let dir = TestDir::new(&format!("cluster-{node}"));
+            let host = start_member_node(&dir, node, &self.directory).await;
+            let addr = host.advertised_addr().unwrap().to_string();
+            self.dirs.insert(node, dir);
+            self.hosts.insert(node, host);
+            self.host(leader).add_learner(node, &addr).await.unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while self.host(node).awaiting_snapshot().unwrap() {
+                assert!(Instant::now() < deadline, "member {node} never seeded");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        pub async fn shutdown(mut self) {
+            for (_, host) in std::mem::take(&mut self.hosts) {
+                host.shutdown().await.unwrap();
+            }
+        }
+    }
+
+    /// Bootstrap node 1 with a throwaway prepared owner, seed 2 and 3 from
+    /// its snapshot and promote them: a group of three voters on `policy`.
+    pub async fn three_voters(name: &str, policy: &pipestream_search::pb::AccessPolicy) -> Cluster {
+        let group = identity(SEED);
+        let directory = peer_directory(&group, &[1, 2, 3]);
+        let dir = TestDir::new(&format!("{name}-1"));
+        let host = RaftHost::bootstrap_cluster(
+            dir.path(),
+            &group,
+            1,
+            policy,
+            &limits(),
+            &cluster_host_config(),
+            node_transport(1, &directory),
+        )
+        .await
+        .unwrap();
+        let mut cluster = Cluster {
+            group,
+            directory,
+            dirs: BTreeMap::from([(1, dir)]),
+            hosts: BTreeMap::from([(1, host)]),
+            revision: 1,
+        };
+        cluster
+            .propose(
+                1,
+                "alice",
+                "bootstrap-prepare",
+                &bootstrap_owner_key(),
+                Action::Prepare(pipestream_search::pb::storage::PrepareSourceOwner {
+                    workflow_id: b"admission-bootstrap".to_vec(),
+                    target: Some(pipestream_search::pb::storage::SourceStorageTarget {
+                        node_id: "server-a".into(),
+                        storage_incarnation: vec![41; 16],
+                        history_id: vec![42; 16],
+                        residency: pipestream_search::pb::storage::SourceResidency::Server as i32,
+                        resident_device_id: String::new(),
+                    }),
+                }),
+            )
+            .await;
+        cluster.join(2, 1).await;
+        cluster.join(3, 1).await;
+        cluster
+            .host(1)
+            .promote(BTreeSet::from([2, 3]))
+            .await
+            .unwrap();
+        cluster
+            .host(1)
+            .wait(Some(Duration::from_secs(30)))
+            .voter_ids([1, 2, 3], "three voters")
+            .await
+            .unwrap();
+        cluster
+    }
 }
 // Re-exported for the raft targets; the non-raft targets link this kit
 // without using the cluster helpers.
