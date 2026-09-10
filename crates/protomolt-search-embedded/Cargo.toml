@@ -22,4 +22,4 @@ tonic = { version = "0.12", default-features = false, features = ["codegen", "pr
 jni = "0.22.4"
 
 [dev-dependencies]
-prost-types = "0.13"
+prost-types = "0.14"
