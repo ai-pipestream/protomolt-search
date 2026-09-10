@@ -386,6 +386,16 @@ impl ControlStateMachine {
         Arc::clone(&self.last_build)
     }
 
+    /// The published generation, for a check of its image by digest from
+    /// outside the machine (the host, on a peer's digest rejection).
+    pub(crate) fn published_image(&self) -> Arc<PublishedImage> {
+        Arc::new(PublishedImage {
+            identity: self.identity.clone(),
+            snapshots: self.snapshots.clone(),
+            pointer_lock: Arc::clone(&self.pointer_lock),
+        })
+    }
+
     /// The pause hooks on the snapshot build and serve paths.
     #[cfg(any(test, feature = "fault-injection"))]
     pub(crate) fn gates(&self) -> Arc<SnapshotGates> {
@@ -1064,6 +1074,35 @@ fn read_generation_with(
         },
         signature,
     ))
+}
+
+/// The published generation, read by digest on request. A serve reads the
+/// image by length and the receiver verifies the digest; when a receiver
+/// rejects the image by digest, this is how the node tells its own disk
+/// from the wire.
+pub(crate) struct PublishedImage {
+    identity: SourceAuthorityIdentity,
+    snapshots: PathBuf,
+    pointer_lock: Arc<Mutex<()>>,
+}
+
+impl PublishedImage {
+    /// Verify the published image by digest, under the pointer lock (a
+    /// publish waits for it). `Ok(None)`: no generation is published.
+    /// `Err`: the image differs from what its meta announces, or cannot be
+    /// read.
+    pub(crate) fn verify(&self) -> Result<Option<u64>, Status> {
+        let _pointer = self.pointer_lock.lock().unwrap();
+        let Some(generation) = read_pointer(&self.snapshots)? else {
+            return Ok(None);
+        };
+        let dir = self
+            .snapshots
+            .join(GENERATIONS)
+            .join(generation.to_string());
+        read_generation(&dir, &self.identity)?;
+        Ok(Some(generation))
+    }
 }
 
 /// The published generation's directory, for tests.

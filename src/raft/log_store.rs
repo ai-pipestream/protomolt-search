@@ -37,7 +37,23 @@ struct Inner {
     node_id: NodeId,
     // Serializes every write: votes and entries share one order.
     write: Mutex<()>,
+    /// The highest index the library asked to purge to in this run. A
+    /// purge deferred by the store's position is completed at an append
+    /// only up to this: the library records a purge as done before it asks
+    /// for it, so a completion up to here removes entries it has given up,
+    /// and a completion past here would remove entries it still reads
+    /// (across a restart it reads the log state afresh, so a record from
+    /// an earlier run completes at start or when it is asked again).
+    requested_purge: Mutex<Option<u64>>,
     _file_lock: File,
+}
+
+/// Where a settle runs: at start, before the library reads the log state,
+/// or at an append, in a run whose purge point the library holds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Settle {
+    Start,
+    Append,
 }
 
 /// Cloneable handle; clones share the store and the write order.
@@ -165,6 +181,7 @@ impl RaftLogStore {
                 group: group.clone(),
                 node_id,
                 write: Mutex::new(()),
+                requested_purge: Mutex::new(None),
                 _file_lock: file,
             }),
         })
@@ -373,15 +390,36 @@ impl RaftLogStorage<ControlRaft> for RaftLogStore {
         // machine has installed it; a purge never passes what the store has
         // applied, so a refused install leaves the log consistent with the
         // store it kept. The rest is recorded as deferred and purged when
-        // the store catches up (`settle_locked`: at the next append and at
-        // start).
+        // the store catches up (`settle_locked`: at the next append in this
+        // run, and at start). The floor is read under the write order, so
+        // the position it cuts at is the one the purge is written against.
+        let _order = self.inner.write.lock().unwrap();
         let upto = match self.applied_floor()? {
             Floor::Unbound => Some(log_id),
             Floor::Applied(applied) if applied.index >= log_id.index => Some(log_id),
             Floor::Applied(applied) => Some(applied),
             Floor::Nothing => None,
         };
-        let _order = self.inner.write.lock().unwrap();
+        // The purge point moves forward only. The library asks in order and
+        // the store's position is at or past the purge point (the log is
+        // purged up to what the store applied, no further), so a target
+        // below it is a state this log cannot explain.
+        if let (Some(upto), Some(purged)) = (upto, self.purged_index()?) {
+            if upto.index < purged {
+                return Err(io(
+                    ErrorSubject::Logs,
+                    ErrorVerb::Delete,
+                    format!(
+                        "raft log purge to index {} is below the purge point {purged} (the library asked {}, the store's position bounds it)",
+                        upto.index, log_id.index
+                    ),
+                ));
+            }
+        }
+        {
+            let mut requested = self.inner.requested_purge.lock().unwrap();
+            *requested = Some(requested.map_or(log_id.index, |r| r.max(log_id.index)));
+        }
         let recorded = self.deferred_purge()?;
         let deferred = match upto {
             Some(upto) if upto.index >= log_id.index => recorded.filter(|d| d.index > upto.index),
@@ -410,16 +448,30 @@ enum Floor {
 impl RaftLogStore {
     /// Bind the hosted store whose applied position bounds every purge,
     /// and complete a purge the store has since caught up with: a deferred
-    /// purge is completed as far as the store's position, and an empty log
-    /// behind the store's position is purged to it. A log with entries
-    /// after a gap is data loss and refuses.
+    /// purge is completed to its position once the store is at or past it
+    /// and as far as the store's position until then, and an empty log
+    /// behind the store's position is purged to it. This runs before the
+    /// library reads the log state (`RaftHost::start_with` binds before
+    /// `Raft::new`), which is what makes a purge here one the library
+    /// never has to know about; moving the bind after the start would
+    /// change that. A log with entries after a gap is data loss and
+    /// refuses.
     pub(crate) fn bind_applied_floor(
         &mut self,
         store: super::state_machine::SharedStore,
     ) -> Result<(), StorageError<NodeId>> {
         self.floor = Some(store);
         let _order = self.inner.write.lock().unwrap();
-        self.settle_locked()
+        self.settle_locked(Settle::Start)
+    }
+
+    /// The purge point, as an index.
+    fn purged_index(&self) -> Result<Option<u64>, StorageError<NodeId>> {
+        Ok(self
+            .header()
+            .map_err(|e| io(ErrorSubject::Logs, ErrorVerb::Read, e))?
+            .last_purged
+            .map(|p| p.index))
     }
 
     fn applied_floor(&self) -> Result<Floor, StorageError<NodeId>> {
@@ -448,35 +500,58 @@ impl RaftLogStore {
 
     /// Under the write order: when the store has applied past the purged
     /// position, complete a purge bounded earlier. A deferred purge is
-    /// completed to its own position once the store is at or past it, and
-    /// to the store's position until then; the entries it removes are
-    /// behind what the store applied. With no purge deferred, an empty log
-    /// behind the store's position is purged to it, and entries contiguous
-    /// from the purged position are kept (the library keeps entries behind
-    /// a snapshot on purpose). Entries after a gap are a hole the log
-    /// cannot explain.
-    fn settle_locked(&self) -> Result<(), StorageError<NodeId>> {
+    /// completed to its own position once the store is at or past it; the
+    /// entries it removes are behind what the store applied. With no purge
+    /// deferred, an empty log behind the store's position is purged to it.
+    /// At start (before the library reads the log state) a pending record
+    /// is also carried as far as the store's position. At an append, a
+    /// purge here goes only as far as the library asked in this run
+    /// (`requested_purge`): the library holds its own purge point and
+    /// reads entries above it, so a purge it did not ask for would remove
+    /// entries it still sends, and it guards that by assertion only. A
+    /// record from an earlier run that the store reaches in this one waits
+    /// for the next purge the library asks or the next start; the log
+    /// keeps entries meanwhile, contiguous from its purge point. Entries
+    /// contiguous from the purged position are kept in every case (the
+    /// library keeps entries behind a snapshot on purpose); entries after
+    /// a gap are a hole the log cannot explain, whatever is pending.
+    fn settle_locked(&self, at: Settle) -> Result<(), StorageError<NodeId>> {
         let Floor::Applied(applied) = self.applied_floor()? else {
             return Ok(());
         };
-        let purged = self
-            .header()
-            .ok()
-            .and_then(|h| h.last_purged.map(|p| p.index));
-        if purged.is_some_and(|p| p >= applied.index) {
-            return Ok(());
-        }
-        if let Some(deferred) = self.deferred_purge()? {
-            if !purged.is_some_and(|p| p >= deferred.index) {
-                return if applied.index >= deferred.index {
-                    self.purge_locked(deferred, None)
-                } else {
-                    self.purge_locked(applied, Some(deferred))
-                };
+        let mut purged = self.purged_index()?;
+        let deferred = self.deferred_purge()?;
+        let (target, keep) = match (at, deferred) {
+            (_, Some(deferred)) if applied.index >= deferred.index => (Some(deferred), None),
+            (Settle::Start, Some(deferred)) => (Some(applied), Some(deferred)),
+            (Settle::Append, Some(deferred)) => (None, Some(deferred)),
+            (_, None) if self.first_log_index()?.is_none() => (Some(applied), None),
+            (_, None) => (None, None),
+        };
+        if let Some(target) = target {
+            let asked = match at {
+                Settle::Start => true,
+                Settle::Append => self
+                    .inner
+                    .requested_purge
+                    .lock()
+                    .unwrap()
+                    .is_some_and(|requested| requested >= target.index),
+            };
+            if purged.is_some_and(|p| p >= target.index) {
+                // The purge point is at or past a record: the record is
+                // done and stale (a purge clears what it completes, so this
+                // is not reached in practice).
+                if deferred.is_some() && keep.is_none() {
+                    self.record_deferred_purge_locked(None)?;
+                }
+            } else if asked {
+                self.purge_locked(target, keep)?;
+                purged = Some(target.index);
             }
         }
         match self.first_log_index()? {
-            None => self.purge_locked(applied, None),
+            None => Ok(()),
             // The log starts at index 0; entries are contiguous from the
             // purged position.
             Some(first) if first == purged.map_or(0, |p| p + 1) => Ok(()),
@@ -493,7 +568,7 @@ impl RaftLogStore {
     }
 
     /// The purge position recorded as deferred, if any.
-    fn deferred_purge(&self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
+    pub(crate) fn deferred_purge(&self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
         let tx = self
             .inner
             .database
@@ -585,7 +660,7 @@ impl RaftLogStore {
     {
         {
             let _order = self.inner.write.lock().unwrap();
-            self.settle_locked()?;
+            self.settle_locked(Settle::Append)?;
             let mut expected = self.last_log_id()?.map(|id| id.index + 1).or_else(|| {
                 self.header()
                     .ok()
@@ -636,6 +711,22 @@ impl RaftLogStore {
     /// Delete every entry at or after `log_id`.
     pub(crate) fn truncate_sync(&self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         let _order = self.inner.write.lock().unwrap();
+        // The library truncates at or above its committed position, and a
+        // purge is deferred at or below the snapshot it was asked for,
+        // which is committed. A truncation reaching into a deferred purge
+        // would leave a record naming entries the log no longer holds.
+        if let Some(deferred) = self.deferred_purge()? {
+            if log_id.index <= deferred.index {
+                return Err(io(
+                    ErrorSubject::Logs,
+                    ErrorVerb::Delete,
+                    format!(
+                        "raft log truncate from index {} reaches into a purge deferred to {}",
+                        log_id.index, deferred.index
+                    ),
+                ));
+            }
+        }
         let mut tx = self
             .inner
             .database

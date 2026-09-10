@@ -1063,17 +1063,21 @@ async fn snapshot_admission_refuses_invalid_transfers_without_stopping_the_core(
     assert!(error.message().contains("membership"), "{error}");
     intact("membership");
 
-    // Out of order: a first chunk at a nonzero offset is a mismatch the
-    // sender restarts from; nothing is staged.
-    let reply = peer
+    // Out of order: a first chunk at a nonzero offset continues no
+    // transfer (the sender begins every transfer at offset zero), so it is
+    // rejected by name and nothing is staged. A mismatch answer in its
+    // place made the sender start the same bytes over on the same opened
+    // image without end after a rejection on the final chunk.
+    let error = peer
         .install_snapshot(chunk(&newer, 4096, &image[4096..8192], false))
         .await
-        .unwrap()
-        .into_inner();
-    assert!(matches!(
-        reply.outcome,
-        Some(pipestream_search::pb::storage::raft_install_snapshot_response::Outcome::Mismatch(_))
-    ));
+        .err()
+        .expect("a first chunk at a nonzero offset refused");
+    assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
+    assert!(
+        error.message().contains("continues no transfer at node"),
+        "{error}"
+    );
     intact("out of order");
 
     // Interrupted, then superseded by the same peer: the half receive is
@@ -1536,9 +1540,35 @@ async fn a_served_image_with_changed_bytes_is_rejected_at_the_receiver_and_named
     assert_eq!(recorded.action, "snapshot");
     assert_eq!(recorded.code, Code::DataLoss);
 
-    // A later change moves the applied position past the published
-    // generation, so the next join builds a fresh image and seeds from it.
-    propose_ok(cluster.leader(), &grant_command(&group, 2, 1, "bob")).await;
+    // The rejection names bytes that differ from the meta; the leader reads
+    // its published image by digest, finds the difference on its own disk
+    // and builds afresh: a new generation is published with no proposal in
+    // between, and the leader's own check passes again.
+    let rebuilt = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            if cluster.leader().last_snapshot_build().map(|b| b.generation) > Some(generation)
+                && cluster.leader().verify_published_image().is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(
+        rebuilt.is_ok(),
+        "the leader did not replace the generation it served with changed bytes: {:?}",
+        cluster.leader().last_snapshot_build()
+    );
+    assert!(raft_kit::core_running(cluster.leader()));
+    // The second join is seeded from the fresh image. Its window is the
+    // pin for the sender's return to the library's core: a continuation
+    // of a dropped transfer is refused, so the sender spends its retry
+    // budget (five chunks, about two seconds), returns, backs off and
+    // serves the fresh generation, well inside 30 s. A mismatch answer in
+    // its place made the sender start the same bytes over from offset
+    // zero on the same opened image, without end, and the fresh generation
+    // was never served.
     tokio::time::timeout(
         std::time::Duration::from_secs(30),
         cluster.leader().add_learner(raft_kit::MEMBER_ID, &addr),
@@ -1664,6 +1694,7 @@ async fn a_store_image_over_a_peers_bound_is_rejected_at_that_peer_with_both_cor
     // instead of waiting out its timeout, both nodes record it, and both
     // cores keep running.
     let addr = cluster.member().advertised_addr().unwrap().to_string();
+    let before = raft_kit::durable_position(cluster.leader());
     let outcome = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         cluster.leader().add_learner(raft_kit::MEMBER_ID, &addr),
@@ -1699,14 +1730,14 @@ async fn a_store_image_over_a_peers_bound_is_rejected_at_that_peer_with_both_cor
         "the peer counted {} rejections; the raw push and the leader's seed are two",
         rejections.count()
     );
-    assert_eq!(
-        rejections.last(),
-        Some(SnapshotRejection {
-            from: raft_kit::NODE_ID,
-            announced: image.len() as u64,
-            bound,
-        })
-    );
+    let last: SnapshotRejection = rejections
+        .last()
+        .expect("the peer recorded the last rejection");
+    assert_eq!(last.from, raft_kit::NODE_ID);
+    assert_eq!(last.bound, bound);
+    // The seed may have built afresh since the raw push, so the announced
+    // length is the leader's current image, over the bound either way.
+    assert!(last.announced > bound, "{last:?}");
     let build = cluster
         .leader()
         .last_snapshot_build()
@@ -1723,8 +1754,62 @@ async fn a_store_image_over_a_peers_bound_is_rejected_at_that_peer_with_both_cor
     assert!(raft_kit::published_generation(cluster.member_dir.path()).is_none());
     assert!(raft_kit::incoming_dirs(cluster.member_dir.path()).is_empty());
     propose_ok(cluster.leader(), &grant_command(&group, 2, 1, "bob")).await;
-    assert_eq!(raft_kit::durable_position(cluster.leader()), 4);
+    // Two entries since the join was asked: the membership entry the
+    // rejected join wrote (the learner stays in the membership) and the
+    // grant.
+    assert_eq!(raft_kit::durable_position(cluster.leader()), before + 2);
     assert!(raft_kit::core_running(cluster.leader()));
+    cluster.shutdown().await;
+}
+
+/// A join asked while a build is in flight, begun before the position
+/// moved: the library drops the join's trigger without a word, and the
+/// in-flight build lands below the applied position. The seed repeats its
+/// trigger, so the join is seeded from a build at the position and
+/// answered, instead of waiting out its window on a leader that is well.
+#[cfg(feature = "fault-injection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_join_issued_during_a_build_in_flight_is_seeded_after_that_build_completes() {
+    let _serial = serial();
+    let group = kit::identity(kit::SEED);
+    let mut cluster =
+        Cluster::bootstrap("join-during-build", &group, &kit::policy(), &kit::limits()).await;
+    propose_ok(cluster.leader(), &prepare_command(&group, 1)).await;
+    // A build parked before it publishes, at the position before the
+    // grant; the grant moves the applied position past it.
+    let build_gate = cluster.leader().arm_snapshot_build_gate();
+    cluster.leader().trigger_snapshot().await.unwrap();
+    build_gate.reached().await;
+    propose_ok(cluster.leader(), &grant_command(&group, 2, 1, "bob")).await;
+    let applied = raft_kit::durable_position(cluster.leader());
+    cluster.start_member().await;
+    let addr = cluster.member().advertised_addr().unwrap().to_string();
+    // The join's own trigger is dropped while the build is parked; it is
+    // inside its wait when the build lands below the position.
+    let (join, ()) = tokio::join!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            cluster.leader().add_learner(raft_kit::MEMBER_ID, &addr),
+        ),
+        async {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            build_gate.release();
+        }
+    );
+    join.expect("the join answers inside 30 s")
+        .expect("the join was seeded after the in-flight build landed");
+    let build = cluster
+        .leader()
+        .last_snapshot_build()
+        .expect("the leader reports its build");
+    assert!(
+        build.last_log_id.is_some_and(|id| id.index >= applied),
+        "the seed's build is below the applied position: {build:?}"
+    );
+    assert!(!cluster.member().awaiting_snapshot().unwrap());
+    raft_kit::wait_applied(cluster.member(), applied).await;
+    assert!(raft_kit::core_running(cluster.leader()));
+    assert!(raft_kit::core_running(cluster.member()));
     cluster.shutdown().await;
 }
 

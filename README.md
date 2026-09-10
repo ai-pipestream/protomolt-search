@@ -1285,6 +1285,22 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   spawn helper now closes the child's inherited regular files before exec,
   inside the existing fork guard. See [the harness
   document](docs/control-authority-test-harness.md).
+- **Foundation branch: second review of the deferred purge and the peer
+  rejections, with its response.** A purge deferred by the store's
+  position now completes at an append only to its recorded position and
+  only where the library requested it in this run (the library keeps its
+  own purge point and guards it by assertion only); a purge target below
+  the purge point and a truncation into a deferred purge are rejected by
+  name. A status from a peer is a rejection only when it bears the
+  service's mark, so a connection closed between two nodes no longer
+  fails a healthy join. The seed repeats a build trigger the library
+  dropped for a build in flight. A peer's digest rejection makes the
+  leader check its own image and build afresh when the bytes changed on
+  its disk, and a continuation of a dropped transfer is rejected by name
+  instead of met with a mismatch, so the library's sender returns to its
+  core. The hosting document states that the rejection numbers are
+  in-process. See [the harness
+  document](docs/control-authority-test-harness.md).
 - **Foundation branch: the fork window at the integration binaries closed.**
   The `fork-guard` feature, on for every test build through the crate's
   dev-dependency on itself and on for no serving binary, compiles the lock

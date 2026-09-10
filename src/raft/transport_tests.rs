@@ -951,14 +951,18 @@ async fn an_idle_snapshot_transfer_is_dropped_and_its_place_freed() {
     assert!(member.metrics().borrow().running_state.is_ok());
     assert!(!member.awaiting_snapshot().unwrap());
     assert_eq!(member.applied_position().unwrap().unwrap().index, applied);
-    // The quiet peer's stale continuation is out of order for nothing: no
-    // transfer is open, so it is a mismatch, not a refusal of the core.
-    let reply = quiet
+    // The quiet peer's stale continuation continues no transfer: it is
+    // rejected by name (the sender begins a transfer at offset zero), and
+    // the core is not involved.
+    let error = quiet
         .install_snapshot(chunk(4, 4096, &image[4096..8192], false))
         .await
-        .unwrap()
-        .into_inner();
-    assert!(matches!(reply.outcome, Some(InstallOutcome::Mismatch(_))));
+        .unwrap_err();
+    assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
+    assert!(
+        error.message().contains("continues no transfer at node"),
+        "{error}"
+    );
     let incoming = std::fs::read_dir(member_dir.0.join(super::host::SNAPSHOT_DIR))
         .unwrap()
         .filter(|e| {

@@ -223,10 +223,6 @@ pub struct RaftTransportService {
     staging: Arc<SnapshotStaging>,
     rejections: Arc<SnapshotRejections>,
     transfer: Mutex<Option<Transfer>>,
-    /// The last transfer rejected on its final chunk, by its meta, with
-    /// the rejection: a sender continuing that transfer is rejected the
-    /// same way again (see `stage`).
-    rejected: Mutex<Option<(SnapshotMeta<NodeId, BasicNode>, Status)>>,
     idle: Duration,
 }
 
@@ -283,14 +279,7 @@ impl RaftTransportService {
             staging,
             rejections,
             transfer: Mutex::new(None),
-            rejected: Mutex::new(None),
             idle: Duration::from_millis(limits.snapshot_idle_timeout_ms),
-        }
-    }
-
-    fn remember_rejected(&self, meta: &SnapshotMeta<NodeId, BasicNode>, error: &Status) {
-        if let Ok(mut rejected) = self.rejected.lock() {
-            *rejected = Some((meta.clone(), error.clone()));
         }
     }
 
@@ -348,34 +337,20 @@ impl RaftTransportService {
                 self.staging.discard(&superseded.dir);
             }
             if rpc.offset != 0 {
-                // A chunk of a transfer this node has no record of. When it
-                // continues the transfer this node rejected on its final
-                // chunk (the same meta), it is rejected the same way again, so the sender
-                // gives that transfer up (its retry budget) and serves its
-                // snapshot afresh, instead of starting the rejected bytes
-                // over from offset zero on a mismatch, without end. A new
-                // transfer of any id begins at offset zero.
-                let rejected = self
-                    .rejected
-                    .lock()
-                    .map_err(|_| Status::internal("snapshot rejection lock poisoned"))?
-                    .clone();
-                if let Some((meta, status)) = rejected {
-                    if meta == rpc.meta {
-                        return Err(Status::new(
-                            status.code(),
-                            format!(
-                                "snapshot {} was rejected: {}",
-                                meta.snapshot_id,
-                                status.message()
-                            ),
-                        ));
-                    }
-                }
-                return Ok(Staged::Mismatch { expect_offset: 0 });
-            }
-            if let Ok(mut rejected) = self.rejected.lock() {
-                *rejected = None;
+                // A chunk of a transfer this node has no record of. The
+                // library's sender begins every transfer at offset zero and
+                // returns to zero on a mismatch, so a nonzero offset with no
+                // transfer in progress is a continuation of one this node
+                // dropped (a rejection on its final chunk, or the idle
+                // timeout). A mismatch answer here made the sender start the
+                // same bytes over from zero on the same opened image,
+                // without end and without a fresh serve; a definite refusal
+                // spends the sender's retry budget, so it returns to the
+                // library's core, backs off and serves its snapshot afresh.
+                return Err(Status::failed_precondition(format!(
+                    "snapshot chunk at offset {} of {} continues no transfer at node {}: the transfer was dropped, and a transfer begins at offset zero",
+                    rpc.offset, rpc.meta.snapshot_id, self.node_id
+                )));
             }
             let (dir, file) = self.staging.begin()?;
             *guard = Some(Transfer {
@@ -448,12 +423,10 @@ impl RaftTransportService {
         drop(guard);
         if complete.received != complete.announced {
             self.staging.discard(&complete.dir);
-            let error = Status::invalid_argument(format!(
+            return Err(Status::invalid_argument(format!(
                 "snapshot transfer ended at {} bytes of the announced length {}",
                 complete.received, complete.announced
-            ));
-            self.remember_rejected(&complete.meta, &error);
-            return Err(error);
+            )));
         }
         if let Err(error) = complete.file.sync_all() {
             self.staging.discard(&complete.dir);
@@ -462,7 +435,6 @@ impl RaftTransportService {
         drop(complete.file);
         if let Err(error) = self.staging.verify(&complete.dir, &complete.meta) {
             self.staging.discard(&complete.dir);
-            self.remember_rejected(&complete.meta, &error);
             return Err(error);
         }
         Ok(Staged::Complete {
@@ -558,9 +530,8 @@ fn core_stopped<E: std::error::Error>(error: RaftError<NodeId, E>) -> Status {
     Status::unavailable(format!("raft core: {error}"))
 }
 
-#[tonic::async_trait]
-impl RaftTransport for RaftTransportService {
-    async fn append_entries(
+impl RaftTransportService {
+    async fn answer_append_entries(
         &self,
         request: Request<RaftAppendEntriesRequest>,
     ) -> Result<Response<RaftAppendEntriesResponse>, Status> {
@@ -576,7 +547,7 @@ impl RaftTransport for RaftTransportService {
         )))
     }
 
-    async fn vote(
+    async fn answer_vote(
         &self,
         request: Request<RaftVoteRequest>,
     ) -> Result<Response<RaftVoteResponse>, Status> {
@@ -611,7 +582,7 @@ impl RaftTransport for RaftTransportService {
         )))
     }
 
-    async fn install_snapshot(
+    async fn answer_install_snapshot(
         &self,
         request: Request<RaftInstallSnapshotRequest>,
     ) -> Result<Response<RaftInstallSnapshotResponse>, Status> {
@@ -664,6 +635,46 @@ impl RaftTransport for RaftTransportService {
             header: Some(self.header(from)),
             outcome: Some(outcome),
         }))
+    }
+}
+
+/// Metadata key on every status this service answers with. The client
+/// records a rejection only for a status that carries it: a status
+/// without it was made by the transport (a connection closed, a frame
+/// refused, a message past the client's own decode bound) and is a
+/// transport failure to retry, not a peer's answer.
+pub(crate) const ANSWERED: &str = "psearch-raft-answer";
+
+fn answered(mut status: Status) -> Status {
+    status
+        .metadata_mut()
+        .insert(ANSWERED, tonic::metadata::MetadataValue::from_static("1"));
+    status
+}
+
+#[tonic::async_trait]
+impl RaftTransport for RaftTransportService {
+    async fn append_entries(
+        &self,
+        request: Request<RaftAppendEntriesRequest>,
+    ) -> Result<Response<RaftAppendEntriesResponse>, Status> {
+        self.answer_append_entries(request).await.map_err(answered)
+    }
+
+    async fn vote(
+        &self,
+        request: Request<RaftVoteRequest>,
+    ) -> Result<Response<RaftVoteResponse>, Status> {
+        self.answer_vote(request).await.map_err(answered)
+    }
+
+    async fn install_snapshot(
+        &self,
+        request: Request<RaftInstallSnapshotRequest>,
+    ) -> Result<Response<RaftInstallSnapshotResponse>, Status> {
+        self.answer_install_snapshot(request)
+            .await
+            .map_err(answered)
     }
 }
 
@@ -1055,6 +1066,35 @@ pub struct TonicNetwork {
 
 type Rpc<E> = RPCError<NodeId, BasicNode, E>;
 
+/// What a status from a peer's transport is to this node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Answer {
+    /// The peer's transport is not reachable, or it answers that its core
+    /// is stopped or the node isolated: retried with the library's backoff.
+    Unreachable,
+    /// The call ran out its deadline or was cancelled.
+    Timeout,
+    /// A status without the service's mark: made by the transport between
+    /// the two nodes (a connection closed, a frame refused, a message past
+    /// this client's decode bound), not by the peer's service. Retried
+    /// with the library's backoff, and not recorded as the peer's answer.
+    Transport,
+    /// The peer's service answered with a refusal, by name: recorded.
+    Rejection,
+}
+
+/// Unavailable and Unknown first, whoever made them (the service answers
+/// Unavailable for a stopped core, an isolated node and a transfer in
+/// progress); then the deadline codes; then the mark decides.
+pub(crate) fn classify(status: &Status) -> Answer {
+    match status.code() {
+        tonic::Code::Unavailable | tonic::Code::Unknown => Answer::Unreachable,
+        tonic::Code::DeadlineExceeded | tonic::Code::Cancelled => Answer::Timeout,
+        _ if status.metadata().contains_key(ANSWERED) => Answer::Rejection,
+        _ => Answer::Transport,
+    }
+}
+
 impl TonicNetwork {
     fn header(&self) -> RaftRpcHeader {
         RaftRpcHeader {
@@ -1142,22 +1182,29 @@ impl TonicNetwork {
         ttl: Duration,
         status: Status,
     ) -> Rpc<E> {
-        match status.code() {
-            tonic::Code::Unavailable | tonic::Code::Unknown => Self::unreachable(format!(
+        match classify(&status) {
+            Answer::Unreachable => Self::unreachable(format!(
                 "node {} at {}: {}",
                 self.target,
                 self.addr,
                 status.message()
             )),
-            tonic::Code::DeadlineExceeded | tonic::Code::Cancelled => RPCError::Timeout(Timeout {
+            Answer::Timeout => RPCError::Timeout(Timeout {
                 action,
                 id: self.shared.node_id,
                 target: self.target,
                 timeout: ttl,
             }),
-            _ => {
-                // The peer answered: a rejection, recorded for the operator
-                // surface and for `add_learner`. A rejected snapshot is
+            Answer::Transport => Self::unreachable(format!(
+                "node {} at {}: transport failure ({:?}): {}",
+                self.target,
+                self.addr,
+                status.code(),
+                status.message()
+            )),
+            Answer::Rejection => {
+                // The peer answered: a rejection, recorded for the host's
+                // accessors and for `add_learner`. A rejected snapshot is
                 // returned as unreachable so the library backs off before
                 // it serves the image again, rather than retrying at once.
                 let (name, rejected_snapshot) = match action {
@@ -1284,5 +1331,56 @@ impl RaftNetwork<ControlRaft> for TonicNetwork {
         self.check_reply(reply.header.as_ref())
             .and_then(|()| vote_response_from_proto(reply))
             .map_err(|status| Self::network(status.message().to_string()))
+    }
+}
+
+#[cfg(test)]
+mod answer_tests {
+    use super::{answered, classify, Answer};
+    use tonic::{Code, Status};
+
+    /// The codes tonic uses for transport events (a connection closed
+    /// with NO_ERROR is Internal, ENHANCE_YOUR_CALM is ResourceExhausted,
+    /// an unexpected end of stream and this client's own decode bound are
+    /// OutOfRange) are the codes the service answers with too; only the
+    /// service's mark tells them apart.
+    #[test]
+    fn a_status_is_a_rejection_only_with_the_services_mark() {
+        for code in [
+            Code::Internal,
+            Code::ResourceExhausted,
+            Code::OutOfRange,
+            Code::DataLoss,
+            Code::PermissionDenied,
+            Code::FailedPrecondition,
+            Code::InvalidArgument,
+            Code::Unauthenticated,
+            Code::Aborted,
+        ] {
+            assert_eq!(
+                classify(&Status::new(code, "transport")),
+                Answer::Transport,
+                "{code:?}"
+            );
+            assert_eq!(
+                classify(&answered(Status::new(code, "answer"))),
+                Answer::Rejection,
+                "{code:?}"
+            );
+        }
+        for code in [Code::Unavailable, Code::Unknown] {
+            assert_eq!(classify(&Status::new(code, "down")), Answer::Unreachable);
+            assert_eq!(
+                classify(&answered(Status::new(code, "down"))),
+                Answer::Unreachable
+            );
+        }
+        for code in [Code::DeadlineExceeded, Code::Cancelled] {
+            assert_eq!(classify(&Status::new(code, "late")), Answer::Timeout);
+            assert_eq!(
+                classify(&answered(Status::new(code, "late"))),
+                Answer::Timeout
+            );
+        }
     }
 }

@@ -121,16 +121,28 @@ library a validated image only (`RaftTransportService::stage`,
   applied position and membership must equal the meta. Any refusal is
   returned to the peer by name, the receive directory is removed, and the
   core is untouched.
-- **Visibility.** A rejection a peer answers is recorded at the node that
-  sent it, per peer, with the peer's code and message
+- **Visibility.** A rejection a peer's service answers is recorded at
+  the node that sent it, per peer, with the peer's code and message
   (`RaftHost::peer_rejections`); an install rejected at the announce is
   counted at the receiver with the announced length and the bound
-  (`RaftHost::snapshot_rejections`); and `RaftHost::add_learner` names a
+  (`RaftHost::snapshot_rejections`); each build is reported
+  (`RaftHost::last_snapshot_build`); and `RaftHost::add_learner` names a
   rejection the learner answers, with the learner's own code, instead of
-  waiting out its timeout (the learner stays in the membership and the
-  leader keeps retrying). A rejected snapshot is returned to the library as
-  unreachable, so the leader backs off between attempts (500 ms, the
-  library's own) rather than serving the image again at once
+  waiting out its window (the learner stays in the membership and the
+  leader keeps retrying). A status is a rejection only when it carries the
+  service's mark (`psearch-raft-answer` in the status metadata): the
+  transport between two nodes makes statuses in the same code space (a
+  connection closed is `Internal`, an end of stream and a message past
+  the client's own decode bound are `OutOfRange`), and those are retried
+  with the library's backoff, not recorded, and do not end a join. These
+  accessors are in-process: no code in the serving binary reads them, no
+  `/metrics` row and no log line carries them, so outside an `add_learner`
+  call a peer's rejection is visible to a caller of the host and to no
+  operator; the operator route for them is open ("Not yet"). A rejected
+  snapshot is returned to the library as unreachable, so the leader backs
+  off between attempts: the library's sender retries the chunk five times
+  with 500 ms between, returns to the replication core, backs off 500 ms
+  more and serves afresh, about 2.5 s between fresh serves
   (`the_leader_keeps_serving_a_peer_that_rejects_its_seed_with_backoff`).
 - **Hand-off.** A validated image goes to `Raft::install_full_snapshot`,
   which applies the library's own rules: a vote older than the receiver's
@@ -156,10 +168,21 @@ machine has installed it, and treats the state machine's refusal as a
 fatal storage error. A purge therefore never passes the hosted store's
 applied position (`RaftLogStore::bind_applied_floor`): a purge that would
 is cut at the store's position, the library's position is recorded in the
-log as the deferred purge, and the remainder is completed when the store
-catches up (at the next append, and at start), as far as the store's
-position and no further. A refused install thus leaves the log consistent
-with the store it kept, and the member restarts and is seeded again. The
+log as the deferred purge, and the remainder is completed once the store
+is at or past the recorded position: at start, before the library reads
+the log state, and at the next append in the run that asked for it. The
+library keeps its own purge point and reads entries above it, and it
+guards a purge it did not ask for by assertion only (a release build would
+send a follower entries with a gap, and that follower's core would stop
+at the gap check), so a record left by an earlier run (a refused install,
+a crash) is not completed at an append until the library asks for a purge
+at or past it, or the next start; the log keeps the entries meanwhile,
+contiguous from its purge point. A purge target below the purge point,
+and a truncation reaching into a deferred purge, are rejected by name.
+The library's `purged` metric reports the position it asked for, not the
+log's, for as long as a purge is deferred. A refused install thus leaves
+the log consistent with the store it kept, and the member restarts and is
+seeded again. The
 record is what makes the seed of a member with a log that advanced
 without an apply hold: with the store at no position the purge moves no
 entry, the install applies the snapshot's position, and the next append
@@ -200,7 +223,13 @@ member recovers by restart:
   over its own bound cannot be seeded from a peer's image of that store
   after a wipe, nor caught up by a snapshot once it falls behind the
   leader's purge point, until its bound is raised. The bound is a
-  configuration of each node, read at start.
+  configuration of each node, read at start. A peer that rejects the
+  image by digest (`DataLoss`) names bytes that differ from the meta; the
+  leader then reads its published image by digest
+  (`RaftHost::verify_published_image`, under the pointer lock) and, when
+  its own copy fails, builds afresh into a new generation, so the next
+  serve is sound and the cycle ends; when its copy passes, the difference
+  was on the way or at the peer, and the rejection stands as recorded.
   The one rejection left on this path is a condition, not a failure: a
   build with no applied position cannot happen through the host.
   `RaftHost::trigger_snapshot` rejects it on such a store before the
@@ -216,8 +245,20 @@ member recovers by restart:
   serve is repeated for as long as a peer rejects. An image with bytes
   that changed on disk is therefore served, rejected at the receiver
   (`DataLoss`, the digest) and named at the leader, with the leader's
-  core running; the next build publishes a sound image
-  (`a_served_image_with_changed_bytes_is_rejected_at_the_receiver_and_named_at_the_leader`). Before this lock a publish between the two reads
+  core running; the leader's own check of the image fails and a fresh
+  build replaces the generation, with no proposal in between
+  (`a_served_image_with_changed_bytes_is_rejected_at_the_receiver_and_named_at_the_leader`).
+  A continuation of a transfer the receiver dropped (a nonzero offset
+  with no transfer in progress: after a rejection on the final chunk, or
+  the idle timeout) is rejected by name rather than answered with a
+  mismatch: on a mismatch the library's sender starts the same bytes over
+  from offset zero on the same opened image, without end and with no
+  fresh serve; on a rejection it spends its retry budget, returns to the
+  core and serves afresh. A node with a published image that fails its
+  digest at start does not start (the sweep names the generation); the
+  repair is to remove the published generation and the pointer, after
+  which the node starts on the store it has and is caught up or seeded by
+  the leader. Before this lock a publish between the two reads
   removed the generation under the serve, the read failed as a storage
   error and the core stopped with no fault anywhere. The interleaving is
   pinned with two `fault-injection` gates, `RaftHost::arm_snapshot_build_gate`
@@ -312,11 +353,18 @@ never through files:
    position it read (the store may be one entry ahead of the metric, and
    a build images the store where it is), purges the log to the
    snapshot's position, adds the learner and waits until the learner holds
-   the membership entry that added it, or until the learner rejects the
-   seed, which is returned at once with the learner's code. The learner is
-   seeded by the verified image (group, position, membership checked on a
-   probe copy), which replaces the marked store; the marker is gone with
-   it.
+   the membership entry that added it, or until the learner's service
+   rejects the seed, which is returned at once with the learner's code (a
+   failure of the transport between the nodes is retried inside the
+   window, not returned). The seed repeats its build trigger every 2 s
+   while a build is in flight: the library drops a trigger during a build
+   and reports it taken, and a build begun before the position moved ends
+   below it. A repeated `add_learner` for the same node writes one more
+   membership entry (the library writes the entry whether or not the
+   membership changes) and seeds again from the position after it. The
+   learner is seeded by the verified image (group, position, membership
+   checked on a probe copy), which replaces the marked store; the marker
+   is gone with it.
 3. `promote(learners)` upgrades caught-up learners to voters
    (`AddVoterIds`); `remove_member(node_id)` removes a voter
    (`RemoveVoters`, not retained as a learner) or a learner (`RemoveNodes`).
@@ -469,6 +517,10 @@ mTLS with the fixtures under `tests/certs/raft`, regenerated by
 - An operator surface for authoring the first member's policy and limits
   (`bootstrap_cluster`), and for `add_learner`, `promote` and
   `remove_member` from the command line.
+- An operator route for the rejection and build numbers
+  (`peer_rejections`, `snapshot_rejections`, `last_snapshot_build`,
+  `verify_published_image`): a `/metrics` row and a log line. Until then
+  they are in-process accessors.
 - Cross-process fault injection (a member killed at a transaction boundary
   while the others continue) is Kimi's harness, on `fault-injection` and the
   transport's `Isolation`.

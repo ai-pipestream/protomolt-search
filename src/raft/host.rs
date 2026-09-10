@@ -298,6 +298,51 @@ struct Listener {
     task: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
 }
 
+/// A peer that rejects this node's image by digest names bytes that
+/// differ from what the meta announces. The image was served by length,
+/// so the difference is on this node's disk or on the way: this reads the
+/// published image by digest, and when it fails, triggers a build, which
+/// images the store afresh into a new generation and publishes it, so the
+/// next serve is sound. When the image passes, the bytes changed on the
+/// way or at the peer, and the peer's rejection stands as recorded. One
+/// check per rejection recorded (each fresh serve the peer rejects is
+/// one); a trigger the library drops for a build in flight is repeated
+/// at the next rejection, so a corrupt generation is replaced within a few
+/// serve cycles and the cycle ends.
+#[cfg(feature = "tls")]
+async fn rebuild_on_digest_rejection(
+    mut rejections: watch::Receiver<BTreeMap<NodeId, PeerRejection>>,
+    published: Arc<super::state_machine::PublishedImage>,
+    raft: Raft<ControlRaft>,
+) {
+    let mut seen: BTreeMap<NodeId, u64> = BTreeMap::new();
+    loop {
+        let fresh: Vec<(NodeId, u64)> = rejections
+            .borrow_and_update()
+            .iter()
+            .filter(|(node, rejection)| {
+                rejection.action == "snapshot"
+                    && rejection.code == tonic::Code::DataLoss
+                    && seen.get(node).is_none_or(|count| rejection.count > *count)
+            })
+            .map(|(node, rejection)| (*node, rejection.count))
+            .collect();
+        for (node, count) in fresh {
+            seen.insert(node, count);
+            let checked = {
+                let published = Arc::clone(&published);
+                tokio::task::spawn_blocking(move || published.verify()).await
+            };
+            if let Ok(Err(_)) = checked {
+                let _ = raft.trigger().snapshot().await;
+            }
+        }
+        if rejections.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 pub struct RaftHost {
     raft: Raft<ControlRaft>,
     store: SharedStore,
@@ -312,7 +357,12 @@ pub struct RaftHost {
     hold: LeaseHold,
     staging: Arc<super::state_machine::SnapshotStaging>,
     last_build: super::state_machine::LastBuild,
+    published: Arc<super::state_machine::PublishedImage>,
     listener: Option<Listener>,
+    /// Reacts to a peer's digest rejection of this node's image (see
+    /// `rebuild_on_digest_rejection`); aborted at shutdown.
+    #[cfg(feature = "tls")]
+    digest_watch: Option<tokio::task::JoinHandle<()>>,
     #[cfg(feature = "tls")]
     directory: Option<Arc<PeerDirectory>>,
     #[cfg(feature = "tls")]
@@ -473,6 +523,11 @@ impl RaftHost {
         let peer_rejections = factory.rejections();
         let mut host =
             Self::start_with(dir, store, log_store, node_id, config, factory, None).await?;
+        host.digest_watch = Some(tokio::spawn(rebuild_on_digest_rejection(
+            peer_rejections.subscribe(),
+            Arc::clone(&host.published),
+            host.raft.clone(),
+        )));
         host.peer_rejections = Some(peer_rejections);
         let service = RaftTransportService::new(
             host.raft.clone(),
@@ -519,6 +574,7 @@ impl RaftHost {
         let shared = machine.shared_store();
         let staging = machine.staging();
         let last_build = machine.last_build();
+        let published = machine.published_image();
         #[cfg(any(test, feature = "fault-injection"))]
         let snapshot_gates = machine.gates();
         let mut log_store = log_store;
@@ -545,7 +601,10 @@ impl RaftHost {
             hold: LeaseHold::new(Duration::from_millis(config.election_timeout_max_ms)),
             staging,
             last_build,
+            published,
             listener,
+            #[cfg(feature = "tls")]
+            digest_watch: None,
             #[cfg(feature = "tls")]
             directory: None,
             #[cfg(feature = "tls")]
@@ -940,6 +999,14 @@ impl RaftHost {
     /// node's directory. A snapshot is built and the log purged to it
     /// first, so the learner is seeded by the verified image rather than
     /// by replaying onto its own genesis.
+    ///
+    /// A rejection the learner's service answers meanwhile is returned at
+    /// once with the learner's code; a failure of the transport between
+    /// the nodes is not a rejection and is retried with backoff inside the
+    /// window. The learner stays in the membership either way, and a call
+    /// repeated for the same node writes one more membership entry (the
+    /// library writes the entry whether or not the membership changes) and
+    /// seeds again from the position after it.
     #[cfg(feature = "tls")]
     pub async fn add_learner(&self, node_id: NodeId, addr: &str) -> Result<(), Status> {
         let directory = self.directory.as_ref().ok_or_else(|| {
@@ -1008,6 +1075,16 @@ impl RaftHost {
         }
     }
 
+    /// The published image, verified by digest: `Ok(Some(generation))`
+    /// when it matches its meta, `Ok(None)` with no generation published,
+    /// `Err` when the bytes differ from what the meta announces. A serve
+    /// reads the image by length only; this is the check a peer's digest
+    /// rejection asks for (`rebuild_on_digest_rejection`), and an
+    /// operator's.
+    pub fn verify_published_image(&self) -> Result<Option<u64>, Status> {
+        self.published.verify()
+    }
+
     /// The first rejection `node_id` answers at or after `since`.
     #[cfg(feature = "tls")]
     async fn rejection_from(
@@ -1050,15 +1127,33 @@ impl RaftHost {
         // position. Waiting for a snapshot at exactly the position read
         // waited out its timeout whenever the store was one entry ahead.
         if !metrics.snapshot.is_some_and(|snapshot| snapshot >= applied) {
-            self.trigger_snapshot().await?;
-            self.raft
-                .wait(Some(Duration::from_secs(60)))
-                .metrics(
-                    |metrics| metrics.snapshot.is_some_and(|snapshot| snapshot >= applied),
-                    "seed snapshot at or past the applied position",
-                )
-                .await
-                .map_err(|e| Status::unavailable(format!("seed snapshot: {e}")))?;
+            // The library drops a trigger while a build is in flight and
+            // reports the trigger as taken; a build that began before the
+            // position moved lands below it, and the library's own policy
+            // builds next after many more entries. So the trigger is
+            // repeated, with a short wait between, until a snapshot at or
+            // past the position is reported or the seed's window is out.
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            loop {
+                self.trigger_snapshot().await?;
+                let wait = self.raft.wait(Some(Duration::from_secs(2)));
+                match wait
+                    .metrics(
+                        |metrics| metrics.snapshot.is_some_and(|snapshot| snapshot >= applied),
+                        "seed snapshot at or past the applied position",
+                    )
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(openraft::metrics::WaitError::Timeout(..))
+                        if std::time::Instant::now() < deadline => {}
+                    Err(e) => {
+                        return Err(Status::unavailable(format!(
+                            "seed snapshot: {e} (the trigger was repeated for 60 s)"
+                        )))
+                    }
+                }
+            }
         }
         let snapshot = self.raft.metrics().borrow().snapshot;
         let snapshot =
@@ -1132,6 +1227,10 @@ impl RaftHost {
     }
 
     pub async fn shutdown(mut self) -> Result<(), Status> {
+        #[cfg(feature = "tls")]
+        if let Some(watch) = self.digest_watch.take() {
+            watch.abort();
+        }
         let stopped = self
             .raft
             .shutdown()

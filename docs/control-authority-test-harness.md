@@ -1341,3 +1341,112 @@ guarded reopen blocks on the handoff until the spawn returns, by which time
 the child has closed the inherited file.
 
 Gates, in the 8 GiB scope with two build jobs and four test threads: `cargo check --tests` with raft, tls and fault-injection and with raft only (`fork-guard-check-raft-all.log`, `fork-guard-check-raft-only.log`) and with the default features (`fork-guard-check-default.log`); the four default-feature targets, catalog 21, journal 9, source access 11, the new target 1 (`fork-guard-default-targets.log`); the `test_support` tests 2 (`fork-guard-lib-test-support.log`); with the raft features, crash faults 7, regressions 10, admission 10 and the adversarial worker 11 (`fork-guard-raft-targets.log`); the lib with the default features 815 pass and with raft, tls and fault-injection 833 pass (`fork-guard-lib-default.log`, `fork-guard-lib-raft.log`); clippy with the raft features, the pre-existing deny at `src/vector.rs:1092` and pre-existing warnings, none in the changed files (`fork-guard-clippy.log`); the combined release gate 165 targets, 1818 pass, 0 fail, 1 ignored, the pre-existing `native_matches_opennlp_contract` (`fork-guard-combined-gate.log`); rustfmt on the changed files.
+
+## Review of 5b48a0b and fa8dfc5 (second reader, 2026-09-09) and the response (Fable)
+
+A second Opus reader took the two checkpoints above with 14
+questions and the openraft 0.9.25 source, made no change and ran no cargo
+(`checkpoint-review.md` in the session scratchpad; the file is cited by
+the coordination note). Verified as correct: the deferred computation in
+all ten `Floor` cases, the record written in the same transaction as the
+purge, `bind_applied_floor` before `Raft::new`, the chunked sender's
+constants (a budget of five, a mismatch resetting offset and budget on the
+same handle), a serve by length unable to enter the leader's own store,
+the builder's position at or below the store's under the quiesce, no lost
+wakeup in `rejection_from`, no borrow kept across an await.
+
+The findings, ranked by the reader, and what this checkpoint does with
+each:
+
+1. **A `purge_deferred` record that outlives a restart let `settle_locked`
+   purge to the store's position at an append**, a position the library
+   did not request in this run; the library keeps its own purge point,
+   reads entries above it, and guards a purge it did not request by
+   assertion only, so a release build would send a follower entries with a
+   gap and stop that follower's core at the gap check. Done: a settle at
+   an append completes a record only to its recorded position, and only
+   when the library requested a purge at or past it in this run
+   (`requested_purge`, in memory); at start, before the library reads the
+   log state, a record is completed as before. The intermediate purge to
+   the store's position is removed.
+2. **`TonicNetwork::failure` recorded transport failures as peer
+   rejections**: it selected by exclusion, and tonic makes statuses for a
+   connection closed (`Internal`), an end of stream and a message past the
+   client's own decode bound (`OutOfRange`) in the codes the service
+   answers with, so one closed connection failed a healthy join. Done: the
+   service marks every status it answers with (`psearch-raft-answer` in
+   the status metadata), the client records a rejection only for a marked
+   status, and an unmarked one is a transport failure retried with the
+   library's backoff (`classify`, pinned over the code table by
+   `a_status_is_a_rejection_only_with_the_services_mark`).
+3. **`seed_boundary` waited out its window when its trigger was dropped**:
+   the library drops a snapshot trigger during a build and reports it
+   taken, and a build begun before the position moved ends below it, so a
+   join issued during a build returned `Unavailable` after 60 s from a
+   leader that was well. Done: the seed repeats its trigger every 2 s
+   until a snapshot at or past the position is reported or its window is
+   out (`a_join_issued_during_a_build_in_flight_is_seeded_after_that_build_completes`,
+   with the build gate closed across a proposal).
+4. **The rejection is visible in-process only**: the three accessors are
+   read by the test file and by no code in the serving binary, and the
+   hosting document's Visibility bullet read as an operator surface. Done
+   in the document, which now states it and names the operator route as
+   open with the bootstrap and membership surface; a `/metrics` row is not
+   in this checkpoint.
+5. **The corrupt-image cycle was bounded in rate, not ended**: the leader
+   re-served the same generation every 2.5 s or so, and a fresh build came
+   only with the library's own policy after many entries. Done: a peer's
+   digest rejection (`DataLoss` on a snapshot) makes the leader read its
+   published image by digest (`RaftHost::verify_published_image`, under
+   the pointer lock) and, when its own copy fails, trigger a build, which
+   images the store afresh into a new generation; the changed-bytes test
+   now pins a new generation published with no proposal in between and the
+   leader's own check passing again.
+6. **The rejected-transfer memory masked the library's mismatch reset
+   loop for one meta only**: a rebuilt image with the same fault had a
+   new id, missed the memory, and the loop was back. Done as the reader
+   proposed: the memory is removed, and a nonzero offset with no transfer in
+   progress is rejected by name (the library's sender begins every transfer
+   at offset zero and returns to zero on a mismatch, so such a chunk is
+   always a continuation of a transfer this node dropped); the sender
+   spends its budget, returns to the core, backs off and serves afresh.
+   The changed-bytes test's 30 s second join is the pin for that return,
+   and its comment now states it (note 17). Two tests that expected the
+   mismatch answer for a first chunk at a nonzero offset
+   (`snapshot_admission_refuses_invalid_transfers_without_stopping_the_core`,
+   `an_idle_snapshot_transfer_is_dropped_and_its_place_freed`) now assert
+   the rejection by name.
+7. **The unit test did not run the branch the commit message advertised**
+   (the purge to the store's position, now removed) nor a second purge with
+   a record pending. Done: `a_purge_deferred_across_a_restart_completes_only_where_the_library_requested_it`
+   (a record cut at the first snapshot, a smaller purge while it is
+   pending, a reopen with the store behind it, an append in a run with
+   no purge requested and the store past it, a purge below the record,
+   the purge at the record, and the start path with the store past the
+   record) and
+   `a_purge_below_the_purge_point_and_a_gap_after_it_refuse`.
+8. **The raft log store had no crash coverage.** Not in this checkpoint:
+   the branch session that ran the reader takes it on a side branch
+   (exit-fault points under `fault-injection` on the purge and install
+   commits, a crash target in `tests/`), to be rebased onto this
+   checkpoint.
+
+Notes: (9) a purge target below the purge point is now rejected by name,
+and (13) the floor is read under the write order, so the position the cut
+is made at is the one it is written against; (10) the gap check runs
+whatever is pending; (11) the library's `purged` metric reports the
+position it requested, not the log's, while a purge is deferred, which the
+hosting document now states; (12) a node with a published image that fails its
+digest at start does not start, and the document names the repair;
+(14) the memory that was one global slot is removed; (15) the kit's
+`add_member` takes its two metrics one at a time; (16) the document gives
+the real interval between fresh serves (about 2.5 s: five chunk attempts at
+500 ms intervals, then the core's 500 ms); (17) the bound test compares the
+last rejection's sender and bound and asserts the announced length over
+the bound (a seed may build afresh and change it), and the durable
+position is relative to the position before the join (the rejected join's
+membership entry and the grant), stated. A truncation reaching into a
+deferred purge is rejected by name (the reader's unstated invariant under
+its question 2).
+
+Gates, in the 8 GiB scope with two build jobs and four test threads: `cargo check --tests` with raft, tls and fault-injection, with raft only and with the default features (`review2-check-{raft,raft-only,default}.log`); the focused lib tests 4 (`review2-lib-focused.log`); the snapshot target 22 pass, with the new dropped-trigger test (`review2-control_raft_snapshots.log`); the three timing-sensitive tests of that target (the dropped trigger, the changed bytes, the backoff) five runs in five (`review2-repeat-{1..5}.log`); crash faults 7, regressions 10, admission 10 and the adversarial worker 11 (`review2-raft-targets.log`); the lib with the default features 815 pass (`review2-lib-default.log`) and with raft, tls and fault-injection 836 pass (`review2-lib-raft.log`); clippy with the raft features, the pre-existing deny at `src/vector.rs:1092` and pre-existing warnings, none in `src/raft` (`review2-clippy.log`); the combined release gate 165 targets, 1822 pass, 0 fail, 1 ignored, the pre-existing `native_matches_opennlp_contract` (`review2-combined-gate.log`); rustfmt on the changed files.

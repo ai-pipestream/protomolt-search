@@ -452,11 +452,11 @@ impl Cluster {
     pub async fn add_member(&self) {
         let addr = self.member().advertised_addr().unwrap().to_string();
         if let Err(error) = self.leader().add_learner(MEMBER_ID, &addr).await {
-            panic!(
-                "add_learner: {error}\nmember metrics: {}\nleader metrics: {}",
-                self.member().metrics().borrow().clone(),
-                self.leader().metrics().borrow().clone()
-            );
+            // One borrow at a time (see `core_running`): a second live
+            // borrow in the same expression would hold both cores.
+            let member = self.member().metrics().borrow().clone();
+            let leader = self.leader().metrics().borrow().clone();
+            panic!("add_learner: {error}\nmember metrics: {member}\nleader metrics: {leader}");
         }
     }
 
