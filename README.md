@@ -13,9 +13,9 @@ New here? The user manual is [docs/manual/README.md](docs/manual/README.md).
 | Repository | Role | Depends on |
 |---|---|---|
 | [RyanCodrai/turbovec](https://github.com/RyanCodrai/turbovec) | Upstream vector index library: 4-bit TurboQuant encoding, SIMD top-k search | — |
-| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream-s20` | Patch fork carrying the seedable top-k floor, live-floor streaming collector, and mapped-image reader. Rebased onto upstream `main`; explicit TQ+ calibration is now upstream | upstream `main` |
-| [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) | Network and sharding facade for the local turbovec engine | fork branch `turbovec-pipestream-s20` |
-| [Pipestream Search](https://github.com/ai-pipestream/protomolt-search) (this repository) | Full search product: distributed vector, BM25, CEL selection, hybrid ranking, document semantics, persistence, and operations | fork branch `turbovec-pipestream-s20` |
+| [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `turbovec-pipestream-s21` | Patch fork carrying the seedable top-k floor, live-floor streaming collector, and mapped-image reader. Rebased onto upstream `main`; explicit TQ+ calibration is now upstream | upstream `main` |
+| [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) | Network and sharding facade for the local turbovec engine | fork branch `turbovec-pipestream-s21` |
+| [Pipestream Search](https://github.com/ai-pipestream/protomolt-search) (this repository) | Full search product: distributed vector, BM25, CEL selection, hybrid ranking, document semantics, persistence, and operations | fork branch `turbovec-pipestream-s21` |
 | [ai-pipestream/grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis) | Text-analysis sidecar: sentence/token spans, term vectors, static embeddings, served over gRPC | — |
 
 The in-repository [`protomolt-analyzer`](crates/protomolt-analyzer) crate is
@@ -1237,6 +1237,374 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: bounded dense-proof reconciliation.** The embedded row
+  reader uses TurboVec s21 without materializing mapped images; the product and
+  gRPC facade pin the same engine source. Proofs compare actual encoded rows and
+  refuse incomplete, duplicate or out-of-order transcript callbacks. Digest
+  budgets below one row refuse. See [proof scope and memory bounds](docs/source-index-maintenance.md).
+
+- **Foundation branch: durable legacy-authority retirement.** A current Admin
+  can retire an exact checkpoint before import, fencing live clones and legacy
+  reopen. A private checksummed record preserves the actor/resource/operation
+  and permits exact authorized recovery after interrupted publication. The
+  destination store remains unchanged. See [retirement and crash recovery](docs/control-retirement.md);
+  transactional import, worker fencing and activation remain separate steps.
+
+- **Foundation branch: a peer's rejection is recorded and named.** A
+  rejection a peer answers to a raft RPC is kept at the node that sent it
+  (`RaftHost::peer_rejections`), an install rejected at the announce is
+  counted at the receiver (`RaftHost::snapshot_rejections`), and
+  `add_learner` names a learner's rejection with the learner's own code
+  instead of waiting out its timeout. A rejected snapshot makes the leader
+  back off between attempts, and a serve no longer reads the image's
+  digest (the receiver verifies it, by name), so a peer that keeps
+  rejecting costs the leader one RPC per attempt. A chunk past the
+  announced length drops its transfer with its bytes. The build reports
+  its image's length against the node's own receiver bound
+  (`RaftHost::last_snapshot_build`). See [raft hosting](docs/raft-hosting.md).
+- **Foundation branch: a purge the store bounds is recorded and completed.**
+  The library purges the log to a snapshot before the state machine
+  installs it. A purge cut at the hosted store's applied position, or one
+  that moves no entry because the store had applied no entry, now records the
+  library's position in the log and completes to it once the store is
+  there, at the next append or at start. A member seeded after its log
+  advanced without an apply keeps running and applies the leader's next
+  entry; before, that append opened a gap and stopped the member's core.
+  See [raft hosting](docs/raft-hosting.md).
+- **Foundation branch: the raft log and the snapshot install under crash
+  faults.** `tests/control_raft_crash_faults.rs` kills a worker process
+  before and after the log's purge transactions (the library's purge, the
+  record of a purge the store bounds, its completion at an append) and the
+  store's replacement by a received image, with the order between the two
+  commits fixed by an install gate, then reads both nodes' on-disk state,
+  restarts them and drives an append through the seeded member. Eight
+  windows, each checked. See [the harness
+  document](docs/control-authority-test-harness.md).
+- **Foundation branch: the snapshot bound is the receiver's.** A store
+  image over `max_snapshot_bytes` no longer stops the building node: the
+  bound applies where an image arrives, so a peer configured below the
+  leader's image rejects each install by name before any byte is received, with
+  both cores running, and stays unseeded until its bound is raised. See
+  [raft hosting](docs/raft-hosting.md).
+- **Foundation branch: the fork window in the lib test binary closed.**
+  A child spawned by one test thread kept the parent's file locks for a
+  moment after `Command::spawn` returned (the kernel resumes a vfork parent
+  before the child's close-on-exec sweep), so a sibling test re-taking a
+  lock it had dropped could be rejected with no lock fault anywhere. The
+  spawn helper now closes the child's inherited regular files before exec,
+  inside the existing fork guard. See [the harness
+  document](docs/control-authority-test-harness.md).
+- **Foundation branch: second review of the deferred purge and the peer
+  rejections, with its response.** A purge deferred by the store's
+  position now completes at an append only to its recorded position and
+  only where the library requested it in this run (the library keeps its
+  own purge point and guards it by assertion only); a purge target below
+  the purge point and a truncation into a deferred purge are rejected by
+  name. A status from a peer is a rejection only when it bears the
+  service's mark, so a connection closed between two nodes no longer
+  fails a healthy join. The seed repeats a build trigger the library
+  dropped for a build in flight. A peer's digest rejection makes the
+  leader check its own image and build afresh when the bytes changed on
+  its disk, and a continuation of a dropped transfer is rejected by name
+  instead of met with a mismatch, so the library's sender returns to its
+  core. The hosting document states that the rejection numbers are
+  in-process. See [the harness
+  document](docs/control-authority-test-harness.md).
+- **Foundation branch: the fork window at the integration binaries closed.**
+  The `fork-guard` feature, on for every test build through the crate's
+  dev-dependency on itself and on for no serving binary, compiles the lock
+  handoff into the library and makes the spawn helper public; the seven
+  spawn sites in the four integration binaries that fork this same
+  executable go through it, and a new target pins the window through the
+  control ownership lock: with the guard removed the reopen is rejected on
+  every run, with it on none. See [the harness
+  document](docs/control-authority-test-harness.md).
+- **Foundation branch: snapshot serve under the pointer lock.** Serving
+  the published generation to a lagging peer is one step under the pointer
+  lock, from reading the pointer to opening the image, so a build
+  publishing meanwhile waits instead of removing the generation under the
+  serve (which stopped the core with no fault anywhere). A snapshot trigger
+  on a store with nothing applied is refused by the host before the library
+  sees it. The hosting document names, per snapshot path, what stops a
+  core. See [raft hosting](docs/raft-hosting.md).
+- **Foundation branch: in-place store swap.** A snapshot install replaces
+  the source authority's database in place under its own locks, so a held
+  handle neither blocks nor refuses it and serves the installed state
+  afterwards. The exclusive-ownership drain and the lost-handle outcome are
+  gone; only a real storage failure in the swap is fatal. See
+  [raft hosting](docs/raft-hosting.md).
+- **Foundation branch: snapshot admission.** The transport stages an
+  incoming snapshot under bounded memory, disk, concurrency and idle
+  limits, binds the transfer to its authenticated peer, vote, snapshot id
+  and meta, validates the complete image (length, digest, store identity
+  on a probe copy, applied position, membership) and only then hands it to
+  the library's completed-install path, which applies its own term and
+  position rules. Invalid incoming data is refused by name with the core
+  running; a storage failure in the swap stays fatal. See
+  [raft hosting](docs/raft-hosting.md).
+
+- **Foundation branch: adversarial harness integrated.** Kimi's harness
+  (611ceb0, written against 331c18f) runs on the repaired branch: the raft
+  kit rebuilt on the supported surface, the R1 accessibility reproductions
+  as `compile_fail` doctests, R3 and R5 driven through the transport by a
+  raw registered peer. Integration found and fixed three defects: a purge
+  passing the store after a refused install, a local generation past the
+  store's position accepted at start, and a debug assertion reachable from
+  a registered peer under an uncommitted vote. Accounting for all sixteen
+  reproductions in [the harness document](docs/control-authority-test-harness.md).
+
+- **Foundation branch: relay on the committed map, Raft operator
+  configuration.** `AuthorityMapSource` feeds a relay from a source
+  authority's `published_map` through the map consumer's rules, waking on
+  the applied watch; `--raft-*` options make a serving process a member
+  (peers file of node ids and certificates, listen/advertise, timing
+  values validated at start), `raft-prepare` creates a member's durable
+  state, and `--raft-map-*` routes the relay on the committed map. Read
+  only: the relay admits nothing by the map. See
+  [raft hosting](docs/raft-hosting.md).
+
+- **Foundation branch: admission lease repaired (Astra review A1/A2 of
+  240be9f).** The lease interval is anchored before the read barrier is
+  invoked, so it includes every response, catch-up and scheduling delay
+  and a grant whose interval already elapsed is refused; a leader
+  withholds its vote while an interval may be open (the pinned library
+  would grant it); every transport RPC presents the group's timing
+  agreement; a source write becomes authorized at its final admission
+  check inside the transaction, immediately before commit, with the
+  residual to durability named. Pause hooks for the harness on
+  `fault-injection`. See [admission under Raft](docs/raft-admission.md).
+
+- **Foundation branch: Raft transport and membership (feature `raft` +
+  `tls`).** The library's vote, append and snapshot operations as typed
+  RPCs over the cluster's mTLS channels; peer identity bound on both sides
+  through a `PeerDirectory` of certificate fingerprints (an address is
+  where a node is dialed, never who it is); size and deadline bounds on
+  every call; members prepared with a store that refuses to apply until
+  the group's verified snapshot seeds it, added as learners, promoted and
+  removed through the library's joint procedure. Evidence: three voters
+  over loopback mTLS — identity refusals, seeding by snapshot, leader
+  isolation with revocation on the surviving quorum, member restart and
+  voter replacement. See [raft hosting](docs/raft-hosting.md) and
+  [admission under Raft](docs/raft-admission.md).
+
+- **Foundation branch: Raft hosting hardening (Astra review of 331c18f).**
+  Raw submission and committed replay are no longer reachable by product
+  callers; exact retries advance the applied position in the same
+  transaction; snapshots are immutable generations behind one pointer,
+  verified on a probe copy (group, position, membership) with bounded
+  streaming and receive identity; a refused swap keeps the old handle and
+  watch channels move with a successful one. Admission on a hosted store is
+  a lease granted by the host after a linearizable read, bounded under the
+  election floor — see [admission under Raft](docs/raft-admission.md).
+
+- **Foundation branch: Raft hosting, single-node stage (feature `raft`,
+  `openraft = "=0.9.25"` with `storage-v2`).** Typed envelopes for
+  proposals, replies, entries, votes, membership and the applied position;
+  a redb log store with one write order and saved committed position; a
+  state machine that applies committed commands through the store's replay
+  paths with the applied position in the same transaction and closes the
+  direct command paths; file snapshots checksummed by length and digest (integrity, not a signature), verified
+  as a store of the group before an atomic swap; an in-process host with
+  proposal admission (holder for Begin, binding for ConfirmReady). Evidence
+  is single-node: restart in place, committed-but-unapplied replay,
+  snapshot install into a fresh replica. See
+  [raft hosting](docs/raft-hosting.md). Next: tonic transport, membership,
+  three-voter fault scenarios.
+
+- **Foundation branch: `fault-injection` feature.** Out-of-crate crash
+  harnesses (`tests/*.rs`, `--features fault-injection,net`) can arm one
+  process exit (code 87) before or after the next transaction commit:
+  `SourceAuthorityStore::arm_exit_fault`, `AccessControlledCatalog::arm_bind_exit_fault`,
+  `PreparedManagedCatalog::arm_activate_exit_fault`. Never on in a serving
+  binary.
+
+- **Foundation branch: the committed map feed (implemented).**
+  `published_map` produces a `PublishedMap` from committed rows in one read
+  (routes, codes, tree, replicas, nodes, owners with their phase and write
+  epoch, canonical digest) at the applied control revision;
+  `subscribe_applied` wakes consumers only when a commit moved the revision;
+  `MapConsumer::offer` ignores older frames, refuses same-revision
+  different-content and generation-conflicting frames by name, and swaps
+  atomically otherwise. Reopen reproduces the map byte for byte. See
+  [map feed](docs/map-feed.md). Open: transport and relay wiring.
+
+- **Foundation branch: writable managed activation under the committed
+  fence (implemented).** `ActivateSourceOwner` moves a READY owner to ACTIVE
+  and commits the write epoch (the ownership generation); the owner persists
+  it as catalog format 10 through `PreparedManagedCatalog::activate`, and
+  `ActiveManagedCatalog::accept` admits every write through
+  `SourceAdmission::admit_write` — current permission plus the owner ACTIVE
+  under exactly that epoch, held through the source commit. READY alone
+  writes nothing on either side; the closed adapters refuse the activated
+  file; process exit on either side of the source activation recovers by
+  format. No deactivation or replacement exists yet, so lease expiry can
+  activate nothing. See [owner admission](docs/source-owner-admission.md).
+
+- **Foundation branch: administrative import recovery and proposal-time
+  admission (implemented).** `Recover` is the abort-only step any current
+  resource Admin may take on a stranded import: reservation released,
+  references dropped, charged history and the initiating actor retained,
+  the recovering actor named as the terminal command; no transfer, no
+  commit of another actor's import, no touch of the retired file, no
+  writer. Retirement-holder and managed-binding checks now run only at
+  proposal; `replay_control_import` and `replay_command` apply committed
+  commands with no holder or file access, and the replay tests compare
+  every table byte for byte. See [control import](docs/control-import.md).
+
+- **Foundation branch: capacity observations as committed state
+  (implemented).** Store format 3 keeps the planner configuration, reporter
+  incarnations and observations as rows of the source authority; configure
+  is a retained control command, observation transitions (register, report,
+  expire) advance the observation epoch and are idempotent by content, and
+  `planner_input` transcribes one read of committed rows into Kimi's
+  `TierSnapshotInput` with `TierSnapshot::validated` as the only validator.
+  Reopen and crash recovery reproduce identical planner inputs and plans;
+  policy and tier changes move the plan digest. The legacy node residency is
+  now copied exactly on import (it was defaulted). See
+  [capacity observations](docs/capacity-observations.md).
+
+- **Foundation branch: owner admission and readiness (implemented).** The
+  source authority store is an `Authorizer` over its committed policy with one
+  ordered revision history; a `SourceAdmission` is the single acquisition an
+  owner-side commit holds, and every control command waits for admitted work
+  to drain. `PreparedSourceOwnerPhase::READY` records the verified managed
+  binding; it is reachable only through the adapter holding that binding,
+  retryable, terminal for the generation, and recovered across process exit
+  on either side of the commit. See
+  [owner admission](docs/source-owner-admission.md). Open: writable
+  activation and the committed map feed, replacement of a READY owner, Raft.
+
+- **Foundation branch: bounded transactional import (implemented).** Store
+  format 2 adopts format-1 stores at open and adds the unified control rows.
+  The retired record moves through the destination's ordinary command path as
+  retained chunk commands under one workflow, admitted only with the
+  `RetiredLegacyControl` holder, re-validated at commit against the
+  retirement's own digest, actor and destination identity, and applied with
+  allocators preserved, node leases as observations, pending actions
+  unreconciled and the placement tree, derived declaration, geometry and
+  planner policy supplied explicitly. Reservations keep terminal headroom on
+  a full store; recovery recomputes every count. Tested: multi-chunk round
+  trip, admission, capacity bounds, retry/CAS/ownership/revocation rules,
+  headroom, supplement refusals, process exit before and after every phase,
+  byte-identical replay, format adoption. `control_snapshot` is the immutable
+  committed view for observation and planning. See
+  [control import](docs/control-import.md). Open: managed-owner admission
+  through source commit, Raft hosting, trees for historical generations.
+
+- **Foundation branch: typed legacy control checkpoint.** A bounded private
+  protobuf preserves full authority history, lease credentials, allocator and
+  retained retry IDs, with exact optional presence and explicit legacy provenance.
+  Unknown JSON/protobuf fields refuse instead of disappearing. See the
+  [checkpoint contract](docs/control-checkpoint.md); transactional import and
+  owner activation remain separate integration steps. Validation: 739 library
+  tests, 150 integration targets, embedded/mobile and descriptor compatibility
+  gates passed within 8 GiB, with swap and OOM counters zero.
+
+- **Foundation branch: exclusive control-store ownership.** The JSON authority
+  keeps one persistent file lock across state replacements and every service
+  clone. Recovery requires closing all prior holders; private temporary files
+  cannot truncate an existing path. See [control ownership](docs/cluster-control.md#exclusive-file-ownership)
+  and the [authority convergence boundary](docs/raft-control-design.md#single-authority-convergence-boundary-2026-09-08).
+  The [capacity-tier review](docs/capacity-tiers-review.md) records the contract
+  corrections required before planner implementation, including the remaining
+  fixture and aggregation issues in main's `3456c20` amendment.
+  Validation: 730 library tests, 150 integration targets, embedded/mobile and
+  unchanged-wire checks passed within the 8 GiB cap, with no swap or OOM.
+
+- **Foundation branch: closed managed-source storage.** An existing controlled
+  catalog can bind to an exact committed owner preparation while preserving
+  history and actor-scoped retries. Managed reopen stays closed and legacy
+  writers refuse it. See [managed source binding](docs/managed-source-binding.md)
+  for the durable boundary and remaining readiness/admission work. Validation:
+  720 library tests, 150 integration targets, embedded/mobile and wire checks;
+  lost-response recovery and metadata-budget refusals are covered.
+
+- **Foundation branch: transactional source-owner preparation.** A separate
+  protobuf-defined control store commits owner/workflow state, current policy
+  and actor-scoped retry decisions atomically. Preparation and cancellation
+  preserve source history and phone residency without activating a writer.
+  See [source authority storage](docs/source-authority-storage.md) for the
+  contract, full-suite validation and remaining managed-owner/Raft integration.
+
+- **Foundation branch: control-state failure boundaries.** Ambiguous state-file
+  publication closes the shared control authority until an explicit existing-file
+  reopen. Collection binding and reconciliation keep failed candidate changes
+  out of shared memory. Six fault/recovery regressions, the full 150-target
+  integration gate and five mobile compilation targets pass under the 8 GiB,
+  swap-disabled scope. See [control recovery](docs/cluster-control.md#persistence-failures-and-recovery)
+  for the single-authority scope and remaining managed-owner work.
+
+- **Foundation branch: receiving-side logical source writes.** The programmatic
+  `DocumentWriteService` adapter authenticates each caller and pins local Ingest
+  permission through the catalog transaction. Version-2 requests bind the exact
+  source history; actor-scoped retries recover the original durable receipt.
+  Blocking work retains its byte and execution permits after RPC cancellation.
+  The full local gate passed 688 library tests, 150 integration targets and all
+  five mobile compilation checks under an 8 GiB, swap-disabled memory cap.
+  This adapter serves explicitly provisioned local catalogs; runtime routing,
+  managed owner activation and remote authority enforcement remain integration
+  work. See [network source acceptance](docs/network-ingest-authorization.md).
+
+- **Foundation branch: policy publication and completed revocation.** Local
+  permission pins retain an admitted policy epoch through synchronous commit.
+  Replacement publishes new grants, then drains old admissions
+  before returning success; new checks remain available during that drain.
+  Concurrent replacements cannot skip an unfinished drain. The full local gate
+  at `d0e623fc` passed 1,600 reported Rust tests, nine comparator tests and all
+  five mobile checks, with zero swap/OOM in an 8 GiB scope. See
+  [source access](docs/source-access.md#policy-admission-validation).
+
+- **Foundation branch: validated main reconciliation.** Checkpoint `12ba5433`
+  incorporates main `9c7f0d9`, including WAL-free partitioned compaction and the
+  Boolean empty-MUST short circuit. The combined local gate passed 1,592
+  reported Rust tests across the library, 149 integration targets, embedded
+  package and IVF adapter, plus nine comparator tests and five mobile checks.
+  All 648 input hashes remained unchanged; the 8 GiB scope had zero swap/OOM.
+  See [protobuf wire semantics](docs/protobuf-wire-semantics.md).
+
+- **Foundation branch: measured proto2/proto3 wire boundaries.** The 26-case
+  fixture records strict UTF-8 and 64-bit varint boundaries against pinned C++
+  and upb observations. Empty mapped secondary text retains extraction presence
+  and source bytes but is omitted from the secondary analyzer input. The full
+  gate at `e9854f3` passed 1,582 reported Rust tests, nine comparator tests and
+  all five mobile compilation checks, with zero swap/OOM in an 8 GiB scope.
+  See [protobuf wire semantics](docs/protobuf-wire-semantics.md) and the
+  [fixture contract](tests/fixtures/protobuf-semantics/README.md).
+
+- **Foundation branch: actor-scoped retry ownership.**
+  Controlled source acceptance keys receipts by the pinned authenticated principal
+  and operation ID. Format 8 retains legacy decisions until explicit Admin
+  attribution completes; migration preserves original receipts and lifecycle
+  fences. Checkpoints include both retry namespaces. See
+  [source access and migration](docs/source-access.md#actor-scoped-retry-ownership).
+
+- **Foundation branch: protobuf wire-type compatibility.** A known field number
+  with an incompatible wire type is treated as unknown before changing presence
+  or oneof state. Framing and required-field checks remain strict. The reference
+  fixtures explicitly distinguish C++ and Python upb map-entry behavior; original
+  source bytes survive mapped ingest and flush unchanged. See
+  [wire semantics and compatibility](docs/protobuf-wire-semantics.md).
+
+- **2026-09-07 — Embedded collection authorization binding.** Named local
+  shards now register their actual collection in the authorized facade and
+  coordinator. Default requests resolve to that name before authorization;
+  an unrelated unnamed-collection grant cannot read the shard. Startup rejects
+  mixed or invalid collection names, including without a document catalog.
+  Four regressions failed against the prior runtime and pass with the fix;
+  the focused embedded target passes all eight tests. See
+  [authenticated delegation](docs/embedded-mobile.md#authenticated-delegation).
+
+- **Foundation branch: access-controlled local source catalogs.**
+  Source history has an immutable persisted workspace/collection binding.
+  Ingest and administration require separate permissions held through each
+  synchronous commit; policy replacement serializes with admitted operations.
+  Ordinary opening cannot bypass the controlled API. New Unix source files
+  request private `0600` permissions, with a permissive-umask regression test.
+  Checkpoint `7be8a3a`
+  passed 1,546 tests, all five mobile checks and wire compatibility validation.
+  See [source access](docs/source-access.md) for controlled formats and remaining ownership
+  and routing integration.
+
 - **Foundation branch: durable admission closure before source retirement.**
   `begin_retirement` atomically captures the accepted watermark and persists
   closure before pending index work drains. New acceptance and preparations
@@ -2030,6 +2398,25 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   declaration mismatches before row or log mutation. Derived network WAL
   replay remains unavailable through fresh ingest and is refused before
   transmission. [Compatibility and remaining replay work](docs/derived-columns.md#compatibility-with-the-parallel-integer-map-branch).
+- **Branch checkpoint 2026-09-07: the rewrite proof certifies the dense
+  image.** The preservation certificate compared stored content and exact
+  FP32 rows but not the encoded rows the scorer reads, so a compaction whose
+  quantized codes came from other vectors passed unchanged.
+  `VectorProvider::row_transcript` now exposes the provider's stored encoding
+  of a row (the embedded TurboVec adapter: bit width, dimension, packed codes,
+  correction scale), the proof hashes it per identity, certificates are format
+  2 (format 1 stays readable in journals and certifies no dense image), and a
+  provider without a representation refuses by name. Proof cost is stated
+  with measured vocabulary passes per batch (`fields × Σ ceil(rows/batch)`),
+  `proof_batch_rows = 0` selects the 1,048,576-row default, and the scratch
+  is created 0700/0600 from the first syscall, checked by a child process
+  under umask 0. The provider serves transcripts in 1,024-row pieces through
+  TurboVec chain s21's `stored_rows`, which converts one 32-row block at a
+  time from the layout it already holds: no packed image is materialized
+  (`packed_ready()` stays false on mapped segments after a proof) and proof
+  memory at a fixed batch does not grow with the image. Tests:
+  `segments::rewrite_proof`, `vector::tests`.
+  [Source-index maintenance](docs/source-index-maintenance.md).
 - **Branch checkpoint 2026-09-07: exact derived absolute value.**
   Declared columns reject `math.abs(i64::MIN)`, which has no exact signed
   64-bit result. Missing input, per-request materialization absence and untaken

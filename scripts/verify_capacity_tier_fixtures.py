@@ -189,17 +189,86 @@ PROV_D = sha(b"example provider geometry: turbovec 64-shard mapped image; "
              b"committed free bytes: krick-1=26843545600, pi5v1=16106127360, pi5v3=0")
 AUTH_INC = bytes.fromhex("00" * 15 + "01")
 
+# Plan-input encoding version 2 (2026-09-08): binds every effective input.
+# The v1 encoding omitted the cohort, the node registry (capacity, domains,
+# residency, eligibility) and the fragment records; v2 adds them as the
+# cohort pair plus two canonical subdigests.
 
-def plan_input(instant, max_moves, max_age, skew, epoch, obs_digest):
-    return sha(b"protomolt.capacity-plan-input.v1\x00" + u32(1)
+# Canonical node registry: domain, version, count, then per node ordered by
+# node id: id, residency (0=Unspecified, 1=Server, 2=Device), eligible flag,
+# failure domain, total and resident bytes.
+def nodes_digest(records):
+    b = b"protomolt.capacity-plan-nodes.v1\x00" + u32(1) + u32(len(records))
+    for node_id, residency, eligible, domain, total, resident in sorted(records):
+        b += s(node_id) + bytes([residency]) + bytes([eligible]) + s(domain) + u64(total) + u64(resident)
+    return sha(b)
+
+
+NODES = [
+    ("krick-1", 1, 1, "krick", 26_843_545_600, 0),
+    ("pi5v1", 1, 1, "pi5-west", 16_106_127_360, 0),
+    ("pi5v3", 1, 1, "pi5-east", 0, 0),
+]
+NODES_D = nodes_digest(NODES)
+
+
+# Canonical fragment records: domain, version, count, then per fragment
+# ordered by (workspace, collection, fingerprint, column, bucket, topology
+# generation, leaf): partition, generation, leaf, pool (node-id order),
+# shard owners (shard order), copies ((node, storage) order).
+def fragment(ws, coll, fp, col, bucket, tgen, leaf, pool, owners, copies):
+    b = s(ws) + s(coll) + fp + s(col) + u64(bucket) + u64(tgen) + s(leaf)
+    b += u32(len(pool))
+    for node in sorted(pool):
+        b += s(node)
+    b += u32(len(owners))
+    for shard, owner in sorted(owners):
+        b += s(shard) + s(owner)
+    b += u32(len(copies))
+    for node, sinc, domain, complete, cov in sorted(copies):
+        b += s(node) + sinc + s(domain) + bytes([complete]) + cov
+    return b
+
+
+def fragments_digest(frags):
+    return sha(b"protomolt.capacity-plan-fragments.v1\x00" + u32(1) + u32(len(frags)) + b"".join(frags))
+
+
+def fparts(bucket, leaf, pool, owners, copies):
+    return fragment("ws-court", "cases", DECL_FP, "key_bucket", bucket, 9, leaf, pool, owners, copies)
+
+
+POOL_L4 = ["krick-1", "pi5v1", "pi5v3"]
+POOL_L7 = ["krick-1", "pi5v1"]
+COPIES_L4 = [("krick-1", STOR_A1, "krick", 1, COV_L4),
+             ("pi5v1", STOR_B1, "pi5-west", 1, COV_L4),
+             ("pi5v3", STOR_C1, "pi5-east", 1, COV_L4)]
+COPIES_L7 = [("krick-1", STOR_A2, "krick", 1, COV_L7),
+             ("pi5v1", STOR_B2, "pi5-west", 1, COV_L7)]
+COPIES_M = [("pi5v3", STOR_C1, "pi5-east", 1, COV_L4)]
+
+FRAGS_A = fragments_digest([
+    fparts(7, "L4", POOL_L4, [("s6", "krick-1")], COPIES_L4),
+    fparts(7, "L7", POOL_L7, [("s7", "pi5v1")], COPIES_L7),
+])
+FRAGS_M = fragments_digest([
+    fparts(5, "L4", POOL_L4, [("s6", "pi5v3")], COPIES_M),
+    fparts(6, "L4", POOL_L4, [("s6", "pi5v3")], COPIES_M),
+])
+
+
+def plan_input(instant, max_moves, max_age, skew, epoch, obs_digest, frags_digest):
+    return sha(b"protomolt.capacity-plan-input.v1\x00" + u32(2)
                + u64(instant) + u64(max_moves) + u64(max_age) + u64(skew)
                + s("control-0") + AUTH_INC + u64(41) + u64(7) + POLICY_FP
                + u64(epoch) + obs_digest + u64(9) + TREE_D
-               + s("ws-court") + s("cases") + DECL_FP + PROV_D)
+               + s("ws-court") + s("cases") + DECL_FP + PROV_D
+               + u64(COHORT_MS) + u64(0) + NODES_D + frags_digest)
 
 
-PLAN_A = plan_input(T, 16, 600_000, 5_000, 118, OBS_A)
-PLAN_M = plan_input(T, 16, 600_000, 5_000, 119, OBS_M)
+PLAN_A = plan_input(T, 16, 600_000, 5_000, 118, OBS_A, FRAGS_A)
+PLAN_M = plan_input(T, 16, 600_000, 5_000, 119, OBS_M, FRAGS_M)
+check("nodes subdigest is stable", NODES_D == nodes_digest(list(reversed(NODES))), True)
 
 # Move-plan arithmetic for fixture M (section 4's repair loop).
 FREE = {"krick-1": 26_843_545_600, "pi5v1": 16_106_127_360}

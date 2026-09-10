@@ -5,6 +5,11 @@ Status: proposed implementation contract, 2026-09-07. This extends the accepted
 [backup, staging and terminal seal](source-index-backup.md). It introduces no
 RPC, field allocation, runtime activation, transfer or fleet action.
 
+The [transactional preparation kernel](source-authority-storage.md) now defines
+an internal protobuf command/store contract for preparing and cancelling owners
+and committing collection policy with retry decisions. It does not implement
+the writable activation and replacement sequence below.
+
 ## The boundary established by the code
 
 `DocumentCatalog::seal_history` retires one local store at an exact accepted

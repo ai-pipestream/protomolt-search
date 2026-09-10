@@ -12,6 +12,7 @@ use pipestream_search::pb::{
     accept_document_request::Mutation, AcceptDocumentRequest, ProtobufSource,
 };
 use pipestream_search::pb::{accepted_document_version, ReadAcceptedDocumentsRequest};
+use pipestream_search::test_support::ForkGuarded;
 use prost::Message;
 use redb::{ReadableDatabase, ReadableTable};
 use tonic::Code;
@@ -245,7 +246,7 @@ fn committed_receipt_survives_process_exit_without_dropping_database() {
         .env("PSEARCH_CATALOG_CRASH_PATH", dir.catalog())
         .env_remove("PSEARCH_CATALOG_CRASH_SEAL")
         .env_remove("PSEARCH_CATALOG_CRASH_RETIRE")
-        .status()
+        .status_guarded()
         .unwrap();
     assert_eq!(status.code(), Some(73));
     let catalog = DocumentCatalog::open(&dir.catalog(), "books").unwrap();
@@ -266,7 +267,7 @@ fn committed_seal_survives_process_exit_without_dropping_database() {
         .env("PSEARCH_CATALOG_CRASH_PATH", dir.catalog())
         .env("PSEARCH_CATALOG_CRASH_SEAL", "1")
         .env_remove("PSEARCH_CATALOG_CRASH_RETIRE")
-        .status()
+        .status_guarded()
         .unwrap();
     assert_eq!(status.code(), Some(73));
     let catalog = DocumentCatalog::open(&dir.catalog(), "books").unwrap();
@@ -286,14 +287,13 @@ fn committed_seal_survives_process_exit_without_dropping_database() {
             .unwrap(),
         seal
     );
-    for request in [
-        write(b"crash-retry", Some(0)),
-        write(b"new-after-crash-seal", Some(1)),
-    ] {
-        let error = catalog.accept(&request).unwrap_err();
-        assert_eq!(error.code(), Code::FailedPrecondition);
-        assert!(error.message().contains("sealed"), "{error}");
-    }
+    let retry = catalog.accept(&write(b"crash-retry", Some(0))).unwrap();
+    assert!(retry.replayed && retry.durable);
+    let error = catalog
+        .accept(&write(b"new-after-crash-seal", Some(1)))
+        .unwrap_err();
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert!(error.message().contains("sealed"), "{error}");
 }
 
 #[test]
@@ -304,7 +304,7 @@ fn committed_retirement_intent_survives_process_exit_and_closes_admission() {
         .env("PSEARCH_CATALOG_CRASH_PATH", dir.catalog())
         .env_remove("PSEARCH_CATALOG_CRASH_SEAL")
         .env("PSEARCH_CATALOG_CRASH_RETIRE", "1")
-        .status()
+        .status_guarded()
         .unwrap();
     assert_eq!(status.code(), Some(73));
     assert_eq!(stored_header(&dir.catalog()).format_version, 5);
@@ -318,14 +318,13 @@ fn committed_retirement_intent_survives_process_exit_and_closes_admission() {
     assert_eq!(intent.accepted_sequence, 1);
     assert_eq!(intent.operation_id, b"crash-retire");
     assert_eq!(catalog.read_accepted(&page(0)).unwrap().documents.len(), 1);
-    for request in [
-        write(b"crash-retry", Some(0)),
-        write(b"new-after-crash-retirement", Some(1)),
-    ] {
-        let error = catalog.accept(&request).unwrap_err();
-        assert_eq!(error.code(), Code::FailedPrecondition);
-        assert!(error.message().contains("retiring"), "{error}");
-    }
+    let retry = catalog.accept(&write(b"crash-retry", Some(0))).unwrap();
+    assert!(retry.replayed && retry.durable);
+    let error = catalog
+        .accept(&write(b"new-after-crash-retirement", Some(1)))
+        .unwrap_err();
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert!(error.message().contains("retiring"), "{error}");
     let retirement = SourceRetirementRequest {
         history_id: intent.history_id.clone(),
         operation_id: intent.operation_id.clone(),
@@ -338,6 +337,12 @@ fn committed_retirement_intent_survives_process_exit_and_closes_admission() {
             operation_id: intent.operation_id.clone(),
         })
         .unwrap();
+    assert!(
+        catalog
+            .accept(&write(b"crash-retry", Some(0)))
+            .unwrap()
+            .replayed
+    );
     assert_eq!(catalog.begin_retirement(&retirement).unwrap(), intent);
     drop(catalog);
     assert_eq!(stored_header(&dir.catalog()).format_version, 6);

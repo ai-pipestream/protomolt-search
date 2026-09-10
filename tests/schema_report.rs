@@ -320,7 +320,7 @@ fn graph_retains_extension_group_required_default_and_enum_declarations() {
         .iter()
         .find(|m| m.full_name == "semantics.Doc")
         .unwrap();
-    assert_eq!(doc.fields.len(), 18);
+    assert_eq!(doc.fields.len(), 19);
     assert_eq!(doc.syntax, "proto2");
     let extra = field(report, "semantics.extra");
     assert!(extra.extension);

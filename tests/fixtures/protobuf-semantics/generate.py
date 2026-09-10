@@ -6,9 +6,11 @@ import struct
 import subprocess
 
 import google.protobuf
-from google.protobuf import descriptor, descriptor_pb2, descriptor_pool, message_factory
+from google.protobuf import descriptor, descriptor_pb2, descriptor_pool, message_factory, text_format
+from google.protobuf.internal import api_implementation
 
 assert google.protobuf.__version__ == "6.33.5"
+assert api_implementation.Type() == "upb"
 assert subprocess.check_output(["protoc", "--version"], text=True).strip() == "libprotoc 25.1"
 root = pathlib.Path(__file__).resolve().parent
 subprocess.run(
@@ -45,6 +47,24 @@ def group(tag, value, end=None):
     return varint((tag << 3) | 3) + value + varint(((end or tag) << 3) | 4)
 
 
+def fixed32(tag, value=1):
+    return varint((tag << 3) | 5) + struct.pack("<I", value)
+
+
+def fixed64(tag, value=1):
+    return varint((tag << 3) | 1) + struct.pack("<Q", value)
+
+
+def by_wire(tag, wire_type):
+    return {
+        0: scalar(tag, 1),
+        1: fixed64(tag),
+        2: payload(tag, b"\x08\x01"),
+        3: group(tag, scalar(99, 1)),
+        5: fixed32(tag),
+    }[wire_type]
+
+
 def entry(key, value):
     return payload(1, key.encode()) + value
 
@@ -71,13 +91,15 @@ def values(message):
     return result
 
 
-base = scalar(1, 1) + payload(2, b"x") + payload(3, struct.pack("<f", 1)) + payload(15, b"")
+base_without_required = scalar(1, 1) + payload(2, b"x") + payload(3, struct.pack("<f", 1))
+base = base_without_required + payload(15, b"")
 complete = scalar(1, 3) + scalar(2, 4)
 left = scalar(1, 3)
 right = scalar(2, 4)
 cases = {
+    "fixed64 scalar present": base + fixed64(16, 0x3ff0000000000000),
     "required bytes present empty": base,
-    "required unindexed bytes missing": base[:-2],
+    "required unindexed bytes missing": base_without_required,
     "closed enum absent default": base,
     "closed enum unknown only": base + scalar(7, 99),
     "closed enum known then unknown": base + scalar(7, 1) + scalar(7, 99),
@@ -120,15 +142,134 @@ cases = {
     "closed repeated enum extension": base + payload(102, bytes([0, 99, 1])) + scalar(102, 99),
     "malformed unindexed repeated child": base + payload(10, b"\x08\x80"),
 }
+for label, tag, compatible in [
+    ("scalar", 1, {0}),
+    ("repeated packable", 3, {2, 5}),
+    ("string", 2, {2}),
+    ("message", 11, {2}),
+    ("map", 9, {2}),
+    ("group", 13, {3}),
+    ("enum", 7, {0}),
+    ("message extension", 100, {2}),
+    ("fixed64", 16, {1}),
+]:
+    for wire_type in sorted({0, 1, 2, 3, 5} - compatible):
+        prefix = base + fixed64(16, 0x3ff0000000000000) if label == "fixed64" else base
+        cases[f"wrong wire {label} as type {wire_type}"] = prefix + by_wire(tag, wire_type)
+
+for wire_type in [1, 2, 3, 5]:
+    cases[f"wrong wire oneof preserves member type {wire_type}"] = (
+        base + scalar(4, 1) + by_wire(5, wire_type)
+    )
+for wire_type in [0, 1, 3, 5]:
+    cases[f"wrong wire required bytes absent type {wire_type}"] = base_without_required + by_wire(15, wire_type)
+    cases[f"wrong wire nested scalar preserves value type {wire_type}"] = (
+        base + payload(11, complete + by_wire(1, wire_type))
+    )
+    cases[f"wrong wire nested required scalar absent type {wire_type}"] = (
+        base + payload(11, scalar(2, 4) + by_wire(1, wire_type))
+    )
+
+for wire_type in [0, 1, 3, 5]:
+    cases[f"closed enum map entry key wire type {wire_type}"] = (
+        base + payload(9, by_wire(1, wire_type) + scalar(2, 1))
+    )
+for wire_type in [1, 2, 3, 5]:
+    cases[f"closed enum map entry value wire type {wire_type}"] = (
+        base + payload(9, payload(1, b"a") + by_wire(2, wire_type))
+    )
+
+known_enum_entry = payload(9, entry("a", scalar(2, 1)))
+known_detail_entry = payload(12, entry("a", payload(2, complete)))
+cases.update({
+    "closed enum map valid prior then key wire type 1": (
+        base + known_enum_entry + payload(9, by_wire(1, 1) + scalar(2, 0))
+    ),
+    "closed enum map valid prior then value wire type 1": (
+        base + known_enum_entry + payload(9, payload(1, b"a") + by_wire(2, 1))
+    ),
+    "closed enum map entry synthetic field 3": (
+        base + payload(9, entry("a", scalar(2, 1)) + scalar(3, 7))
+    ),
+    "closed enum map valid prior then synthetic field 3": (
+        base + known_enum_entry
+        + payload(9, entry("a", scalar(2, 0)) + scalar(3, 7))
+    ),
+    "message map valid prior then key wire type 1": (
+        base + known_detail_entry
+        + payload(12, by_wire(1, 1) + payload(2, complete))
+    ),
+    "message map valid prior then value wire type 1": (
+        base + known_detail_entry
+        + payload(12, payload(1, b"a") + by_wire(2, 1))
+    ),
+    "message map entry synthetic field 3": (
+        base + payload(12, entry("a", payload(2, complete)) + scalar(3, 7))
+    ),
+    "message map valid prior then synthetic field 3": (
+        base + known_detail_entry
+        + payload(12, entry("a", payload(2, scalar(1, 8) + scalar(2, 9))) + scalar(3, 7))
+    ),
+    "message map complete value plus nested left wire type 1": (
+        base + payload(12, entry("a", payload(2, complete + by_wire(1, 1))))
+    ),
+})
+
+cpp_map_cases = {
+    *(f"closed enum map entry key wire type {wire_type}" for wire_type in [0, 1, 3, 5]),
+    *(f"closed enum map entry value wire type {wire_type}" for wire_type in [1, 2, 3, 5]),
+    "closed enum map valid prior then key wire type 1",
+    "closed enum map valid prior then value wire type 1",
+    "closed enum map entry synthetic field 3",
+    "closed enum map valid prior then synthetic field 3",
+    "message map valid prior then key wire type 1",
+    "message map valid prior then value wire type 1",
+    "message map entry synthetic field 3",
+    "message map valid prior then synthetic field 3",
+    "message map complete value plus nested left wire type 1",
+}
+assert cpp_map_cases <= cases.keys()
+
+cases.update({
+    "malformed skipped fixed64": base + varint((1 << 3) | 1) + b"\x00" * 7,
+    "malformed skipped length": base + varint((1 << 3) | 2) + b"\x02\x00",
+    "malformed skipped group missing end": base + varint((2 << 3) | 3) + scalar(99, 1),
+    "malformed skipped group mismatched end": base + group(2, scalar(99, 1), 3),
+    "malformed skipped nested group": (
+        base + varint((2 << 3) | 3) + varint((99 << 3) | 3) + scalar(1, 1)
+        + varint((2 << 3) | 4) + varint((99 << 3) | 4)
+    ),
+})
 records = []
 for name, wire in cases.items():
     record = {"name": name, "wire": wire.hex()}
     message = doc_type()
     try:
         message.ParseFromString(wire)
-        record["valid"] = message.IsInitialized()
-        if record["valid"]:
-            record["fields"] = values(message)
+        upb = {"valid": message.IsInitialized()}
+        if upb["valid"]:
+            upb["fields"] = values(message)
+        if name in cpp_map_cases:
+            decoded = subprocess.run(
+                ["protoc", "--decode=semantics.Doc",
+                 f"--descriptor_set_in={root / 'descriptor.bin'}"],
+                input=wire,
+                capture_output=True,
+                check=True,
+            )
+            cpp_text = decoded.stdout.decode()
+            reference = doc_type()
+            text_format.Parse(cpp_text, reference, allow_unknown_field=True)
+            record["reference"] = "cpp_25_1_text_parse"
+            record["observations"] = {
+                "upb_6_33_5_binary": upb,
+                "cpp_25_1_text": cpp_text,
+            }
+            record["valid"] = reference.IsInitialized()
+            if record["valid"]:
+                record["fields"] = values(reference)
+        else:
+            record.update(upb)
     except google.protobuf.message.DecodeError:
         record["valid"] = False
     records.append(record)

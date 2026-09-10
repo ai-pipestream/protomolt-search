@@ -120,6 +120,9 @@ message CompactDocumentIndexRequest {
   // Positive budget for completed private output files, checked per cut.
   // Not a filesystem quota; publication also copies outputs into the catalog.
   uint64 max_staged_bytes = 4;
-  // 1..1048576 rows per preservation-proof batch.
+  // Rows per preservation-proof batch, 1..1048576; 0 selects the 1048576-row
+  // default. A batch holds 32 bytes per row; the proof walks every field's
+  // vocabulary once per batch of each segment, so a smaller batch only adds
+  // passes. The certificate is identical at any size.
   uint32 proof_batch_rows = 5;
 }

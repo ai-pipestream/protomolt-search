@@ -7,6 +7,7 @@
 //! dependency is contained in [`embedded_turbovec`].
 
 use std::fmt;
+use std::ops::Range;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -264,6 +265,89 @@ pub trait VectorProvider: Send + Sync {
     fn as_segmented_mut(&mut self) -> Option<&mut crate::segmented_vectors::SegmentedProvider> {
         None
     }
+    /// The provider's stored encoding of each row in `rows`, delivered to
+    /// `sink` as `(row, transcript)` in row order: the bytes its scorer
+    /// reads for that row and the per-row scoring metadata kept beside
+    /// them, in a fixed layout that does not depend on the row's physical
+    /// position. A rewrite proof compares this by document identity
+    /// (`src/segments/rewrite_proof.rs`), so equal FP32 source rows cannot
+    /// stand in for it. The provider must serve the range in bounded pieces
+    /// without materializing its whole image, and must leave any lazily
+    /// built representation state as it found it. A provider that cannot
+    /// expose its representation refuses here, and the proof refuses with
+    /// it: a certificate never covers a dense image it could not read.
+    fn row_transcripts(
+        &self,
+        _rows: Range<usize>,
+        _sink: &mut dyn FnMut(usize, &[u8]),
+    ) -> Result<(), VectorError> {
+        Err(VectorError::new(format!(
+            "vector backend {:?} does not expose its stored row encoding; a rewrite proof \
+             cannot certify its dense image",
+            self.descriptor().backend_kind
+        )))
+    }
+
+    /// One row's transcript: [`Self::row_transcripts`] over a single row.
+    fn row_transcript(&self, row: usize) -> Result<Vec<u8>, VectorError> {
+        let end = row
+            .checked_add(1)
+            .ok_or_else(|| VectorError::new("row transcript range overflow"))?;
+        let mut out = None;
+        checked_row_transcripts(
+            row..end,
+            &mut |_, transcript| {
+                out = Some(transcript.to_vec());
+            },
+            |rows, sink| self.row_transcripts(rows, sink),
+        )?;
+        out.ok_or_else(|| VectorError::new(format!("row {row} produced no transcript")))
+    }
+
+    /// Whether the provider currently holds a materialized copy of its
+    /// stored rows beyond the image it serves from — for the embedded
+    /// engine, its packed-row cache. `None` when the provider has no such
+    /// state. A rewrite proof over a mapped image must leave this `false`.
+    fn representation_materialized(&self) -> Option<bool> {
+        None
+    }
+}
+
+/// Rows a provider is asked for at once by the rewrite proof: bounds the
+/// transcript buffer at `rows * (16 + bits * dim / 8)` bytes, 256 KiB at
+/// 384 dimensions and 4 bits, 8 MiB at the engine's 16,384-dimension ceiling.
+pub const TRANSCRIPT_BLOCK_ROWS: usize = 1024;
+
+// Validate the complete transcript stream before a proof can succeed. Check
+// each index before forwarding: an invalid provider must never index the
+// caller's bitmap/digest array, or omit a row and leave its digest zeroed.
+pub(crate) fn checked_row_transcripts(
+    rows: Range<usize>,
+    sink: &mut dyn FnMut(usize, &[u8]),
+    emit: impl FnOnce(Range<usize>, &mut dyn FnMut(usize, &[u8])) -> Result<(), VectorError>,
+) -> Result<(), VectorError> {
+    if rows.start > rows.end {
+        return Err(VectorError::new("row transcript range is reversed"));
+    }
+    let mut next = rows.start;
+    let mut invalid = false;
+    emit(rows.clone(), &mut |row, transcript| {
+        if invalid {
+            return;
+        }
+        if row != next || row >= rows.end {
+            invalid = true;
+            return;
+        }
+        next += 1; // row < end, so this cannot overflow even at usize::MAX.
+        sink(row, transcript);
+    })?;
+    if invalid || next != rows.end {
+        return Err(VectorError::new(
+            "row transcript stream must contain every requested row exactly once in order",
+        ));
+    }
+    Ok(())
 }
 
 /// Sized product-side handle around an arbitrary vector engine.
@@ -371,6 +455,39 @@ impl VectorIndex {
     /// Whether this index serves from a mapped file ([`Self::load_mapped`]).
     pub fn is_mapped(&self) -> bool {
         self.engine.is_mapped()
+    }
+
+    /// See [`VectorProvider::row_transcripts`].
+    pub fn row_transcripts(
+        &self,
+        rows: Range<usize>,
+        sink: &mut dyn FnMut(usize, &[u8]),
+    ) -> Result<(), VectorError> {
+        if rows.end > self.len() {
+            return Err(VectorError::new(
+                "row transcript range exceeds stored vectors",
+            ));
+        }
+        checked_row_transcripts(rows, sink, |rows, sink| {
+            self.engine.row_transcripts(rows, sink)
+        })
+    }
+
+    /// See [`VectorProvider::row_transcript`].
+    pub fn row_transcript(&self, row: usize) -> Result<Vec<u8>, VectorError> {
+        let end = row
+            .checked_add(1)
+            .ok_or_else(|| VectorError::new("row transcript range overflow"))?;
+        let mut out = None;
+        self.row_transcripts(row..end, &mut |_, transcript| {
+            out = Some(transcript.to_vec());
+        })?;
+        out.ok_or_else(|| VectorError::new(format!("row {row} produced no transcript")))
+    }
+
+    /// See [`VectorProvider::representation_materialized`].
+    pub fn representation_materialized(&self) -> Option<bool> {
+        self.engine.representation_materialized()
     }
 
     pub fn descriptor(&self) -> VectorBackendDescriptor {
@@ -660,6 +777,73 @@ mod embedded_turbovec {
             self.index.is_mapped()
         }
 
+        /// Bit width, dimension, the row's bit-plane packed codes and its
+        /// correction scale bits, read through `TurboQuantIndex::stored_rows`
+        /// in pieces of at most [`TRANSCRIPT_BLOCK_ROWS`] rows. The engine
+        /// converts one 32-row block at a time from the layout it already
+        /// serves, so a loaded or mapped image is never materialized as
+        /// packed rows and `packed_ready()` is unchanged. Each piece is
+        /// checked against the `bits * dim / 8` row stride before it is
+        /// sliced, so a layout the engine changes under this adapter refuses
+        /// instead of certifying the wrong bytes.
+        fn row_transcripts(
+            &self,
+            rows: Range<usize>,
+            sink: &mut dyn FnMut(usize, &[u8]),
+        ) -> Result<(), VectorError> {
+            let total = self.index.len();
+            if rows.end > total || rows.start > rows.end {
+                return Err(VectorError::new(format!(
+                    "rows {rows:?} are outside the {total} stored vectors"
+                )));
+            }
+            let dim = self
+                .index
+                .dim_opt()
+                .ok_or_else(|| VectorError::new("vector dimension is absent"))?;
+            let bits = self.index.bit_width();
+            let stride = match (dim % 8, bits.checked_mul(dim)) {
+                (0, Some(bits_per_row)) if bits_per_row > 0 => bits_per_row / 8,
+                _ => {
+                    return Err(VectorError::new(format!(
+                        "packed row layout is undefined for dimension {dim} at {bits} bits"
+                    )))
+                }
+            };
+            let mut codes = Vec::new();
+            let mut scales = Vec::new();
+            let mut out = Vec::with_capacity(16 + stride);
+            let mut start = rows.start;
+            while start < rows.end {
+                let end = rows.end.min(start + TRANSCRIPT_BLOCK_ROWS);
+                self.index
+                    .stored_rows(start..end, &mut codes, &mut scales)
+                    .map_err(|e| VectorError::new(e.to_string()))?;
+                if codes.len() != (end - start) * stride || scales.len() != end - start {
+                    return Err(VectorError::new(format!(
+                        "stored rows {start}..{end} came back as {} code bytes and {} scales \
+                         for a {stride}-byte row stride; the layout differs from the adapter's",
+                        codes.len(),
+                        scales.len()
+                    )));
+                }
+                for (i, row) in (start..end).enumerate() {
+                    out.clear();
+                    out.extend_from_slice(&(bits as u32).to_le_bytes());
+                    out.extend_from_slice(&(dim as u64).to_le_bytes());
+                    out.extend_from_slice(&codes[i * stride..(i + 1) * stride]);
+                    out.extend_from_slice(&scales[i].to_bits().to_le_bytes());
+                    sink(row, &out);
+                }
+                start = end;
+            }
+            Ok(())
+        }
+
+        fn representation_materialized(&self) -> Option<bool> {
+            Some(self.index.packed_ready())
+        }
+
         fn descriptor(&self) -> VectorBackendDescriptor {
             let config = self
                 .backend_config()
@@ -863,6 +1047,70 @@ mod tests {
         }
     }
 
+    fn scripted_transcripts(
+        rows: Range<usize>,
+        emitted: &[usize],
+    ) -> (Result<(), VectorError>, Vec<usize>) {
+        let requested = rows.clone();
+        let mut forwarded = Vec::new();
+        let result =
+            checked_row_transcripts(rows, &mut |row, _| forwarded.push(row), |seen, sink| {
+                assert_eq!(seen, requested);
+                for &row in emitted {
+                    sink(row, &[row as u8]);
+                }
+                Ok(())
+            });
+        (result, forwarded)
+    }
+
+    #[test]
+    fn checked_transcripts_require_each_requested_row_once_in_order() {
+        let (result, forwarded) = scripted_transcripts(3..6, &[3, 4, 5]);
+        result.unwrap();
+        assert_eq!(forwarded, [3, 4, 5]);
+
+        for (emitted, expected_forwarded) in [
+            (&[][..], &[][..]),
+            (&[3, 4][..], &[3, 4][..]),
+            (&[3, 3, 4, 5][..], &[3][..]),
+            (&[3, 5, 4][..], &[3][..]),
+            (&[2, 3, 4, 5][..], &[][..]),
+            (&[3, 4, 5, 6][..], &[3, 4, 5][..]),
+        ] {
+            let (result, forwarded) = scripted_transcripts(3..6, emitted);
+            assert!(result.is_err(), "accepted {emitted:?}");
+            assert_eq!(
+                forwarded, expected_forwarded,
+                "forwarded invalid callback from {emitted:?}"
+            );
+        }
+
+        let (result, forwarded) = scripted_transcripts(4..4, &[]);
+        result.unwrap();
+        assert!(forwarded.is_empty());
+        assert!(scripted_transcripts(6..3, &[]).0.is_err());
+
+        let mut forwarded = Vec::new();
+        let error = checked_row_transcripts(0..1, &mut |row, _| forwarded.push(row), |_, _| {
+            Err(VectorError::new("scripted provider failure"))
+        })
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("scripted provider failure"),
+            "{error}"
+        );
+        assert!(forwarded.is_empty());
+    }
+
+    #[test]
+    fn one_row_transcript_refuses_usize_max_without_wrapping() {
+        let error = VectorIndex::from_provider(FakeProvider)
+            .row_transcript(usize::MAX)
+            .unwrap_err();
+        assert!(error.to_string().contains("overflow"), "{error}");
+    }
+
     #[test]
     fn unknown_backend_refuses() {
         let err = VectorIndex::create("surprise", 64, 4).unwrap_err();
@@ -912,5 +1160,73 @@ mod tests {
         assert_eq!(result.query_count, 1);
         assert_eq!(result.result_count, 3);
         assert_eq!(result.slots_for_query(0).len(), 3);
+    }
+
+    /// The embedded adapter's row transcript is the stored encoding: it
+    /// follows a row through reordering, differs when the stored codes do
+    /// even with equal source rows, and is the same whether the image is
+    /// heap-loaded or mapped. A provider without a representation refuses
+    /// by name instead of certifying nothing.
+    #[test]
+    fn row_transcript_is_the_stored_encoding_and_refuses_without_one() {
+        let dim = 64;
+        let rows: Vec<Vec<f32>> = (0..4)
+            .map(|r| {
+                (0..dim)
+                    .map(|i| ((i * (r + 3)) % 17) as f32 / 17.0)
+                    .collect()
+            })
+            .collect();
+        let build = |order: &[usize]| {
+            let mut index = VectorIndex::create(EMBEDDED_TURBOVEC, dim, 4).unwrap();
+            let flat: Vec<f32> = order.iter().flat_map(|&r| rows[r].clone()).collect();
+            index.add(&flat, dim).unwrap();
+            index.prepare().unwrap();
+            index
+        };
+        let forward = build(&[0, 1, 2, 3]);
+        let reversed = build(&[3, 2, 1, 0]);
+        for r in 0..4 {
+            let transcript = forward.row_transcript(r).unwrap();
+            assert_eq!(transcript.len(), 16 + 4 * dim / 8);
+            assert_eq!(transcript, reversed.row_transcript(3 - r).unwrap());
+        }
+        assert_ne!(
+            forward.row_transcript(0).unwrap(),
+            forward.row_transcript(1).unwrap()
+        );
+        assert!(forward.row_transcript(4).is_err());
+
+        // A different calibration stores different codes for equal rows.
+        let sample: Vec<f32> = (0..8 * dim)
+            .map(|i| ((i % 13) as f32 - 6.0) / 6.0)
+            .collect();
+        let calibrated =
+            VectorIndex::fit_backend_config(EMBEDDED_TURBOVEC, dim, 4, &sample).unwrap();
+        let mut other = VectorIndex::from_backend_config(dim, &calibrated).unwrap();
+        other.add(&rows.concat(), dim).unwrap();
+        other.prepare().unwrap();
+        assert_ne!(
+            other.row_transcript(0).unwrap(),
+            forward.row_transcript(0).unwrap()
+        );
+
+        let dir = std::env::temp_dir().join(format!("row-transcript-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("image");
+        forward.write(&path).unwrap();
+        let loaded = VectorIndex::load(EMBEDDED_TURBOVEC, &path).unwrap();
+        let mapped = VectorIndex::load_mapped(EMBEDDED_TURBOVEC, &path).unwrap();
+        for r in 0..4 {
+            let expected = forward.row_transcript(r).unwrap();
+            assert_eq!(loaded.row_transcript(r).unwrap(), expected);
+            assert_eq!(mapped.row_transcript(r).unwrap(), expected);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let error = VectorIndex::from_provider(FakeProvider)
+            .row_transcript(0)
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot certify"), "{error}");
     }
 }

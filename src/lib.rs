@@ -29,6 +29,7 @@ pub mod authorization;
 pub mod bm25;
 pub mod boolean_bits;
 pub mod calendar;
+pub mod capacity_tiers;
 pub mod cel;
 pub mod chunked;
 pub mod clustered_turbovec;
@@ -46,6 +47,8 @@ pub mod derived;
 pub mod diagnostics;
 pub mod document_catalog;
 pub mod document_contract;
+#[cfg(feature = "net")]
+pub mod document_write_service;
 pub mod embedded;
 pub mod error_disclosure;
 pub mod exact_vectors;
@@ -84,6 +87,8 @@ pub mod query;
 mod query_cursor;
 mod query_disclosure;
 mod query_identity;
+#[cfg(feature = "raft")]
+pub mod raft;
 mod rangefacet;
 pub mod rankdiff;
 pub mod reconcile;
@@ -104,10 +109,15 @@ pub mod snapshot;
 pub mod snapshot_repository;
 pub mod sortkeys;
 pub mod source_archive;
+#[cfg(feature = "net")]
+pub mod source_authority;
+mod source_owner;
 pub mod stats_cache;
 pub mod stats_identity;
 mod stream_signal;
 pub mod synonyms;
+#[cfg(any(test, feature = "fork-guard"))]
+pub mod test_support;
 pub mod values;
 pub mod vector;
 pub mod visibility;

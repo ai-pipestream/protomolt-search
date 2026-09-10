@@ -116,12 +116,14 @@ pub enum Route {
     /// `NodeService.EvaluateBoolean` (docs/query-api.md, "Recursive
     /// boolean execution").
     EvaluateBoolean,
+    GetDocumentWriteTarget,
+    AcceptSourceDocument,
 }
 
 /// Route names as they appear in the `rpc` label, parallel to the
 /// counter tables, with whether the route answers with a response
 /// stream (and so reports two latency phases).
-const REQUEST_ROUTES: [(Route, &str, bool); 66] = [
+const REQUEST_ROUTES: [(Route, &str, bool); 68] = [
     (Route::SearchShard, "search_shard", true),
     (Route::StreamSearch, "stream_search", true),
     (Route::BrowseShard, "browse_shard", false),
@@ -196,6 +198,12 @@ const REQUEST_ROUTES: [(Route, &str, bool); 66] = [
     (Route::DescribeSchema, "describe_schema", false),
     (Route::PlanBalance, "plan_balance", false),
     (Route::EvaluateBoolean, "evaluate_boolean", false),
+    (
+        Route::GetDocumentWriteTarget,
+        "get_document_write_target",
+        false,
+    ),
+    (Route::AcceptSourceDocument, "accept_source_document", false),
 ];
 
 const N_ROUTES: usize = REQUEST_ROUTES.len();
@@ -1097,6 +1105,7 @@ pub async fn serve(listener: tokio::net::TcpListener, gauges: Vec<GaugeProvider>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::ForkGuarded;
     use tokio_stream::StreamExt;
 
     /// The value of the first sample line starting with `needle`.
@@ -1327,7 +1336,7 @@ mod tests {
                     "--nocapture",
                 ])
                 .env(ISOLATED, "1")
-                .output()
+                .output_guarded()
                 .unwrap();
             assert!(
                 output.status.success(),
@@ -1437,7 +1446,7 @@ mod tests {
                     "--nocapture",
                 ])
                 .env(ISOLATED, "1")
-                .output()
+                .output_guarded()
                 .unwrap();
             assert!(
                 output.status.success(),

@@ -1,0 +1,335 @@
+syntax = "proto3";
+package ai.protomolt.search.storage.v1;
+
+import "ai/protomolt/search/v1/search.proto";
+import "ai/protomolt/search/storage/v1/source_authority.proto";
+import "ai/protomolt/search/storage/v1/control_checkpoint.proto";
+
+// Bounded staged import of a retired legacy control authority into the
+// transactional source authority (docs/control-import.md), and the unified
+// collection control state it applies. Internal durable records: not RPCs,
+// not credentials, not a published map, not an activated owner.
+
+// Store format 2 header, kept under the meta key "control". Every count is
+// recomputed and compared at open; a missing table or header refuses.
+message ControlStoreHeader {
+  uint32 format_version = 1; // 2
+  uint64 import_decision_count = 2;
+  uint64 import_workflow_count = 3; // pending and terminal workflow rows
+  uint64 staged_chunk_count = 4;
+  uint64 control_count = 5;
+  uint64 topology_count = 6;
+  uint64 node_count = 7;
+  uint64 replica_count = 8;
+  uint64 action_count = 9;
+  uint64 completed_count = 10;
+  // Headroom held for pending import workflows: bytes and decisions their
+  // remaining chunks and one terminal command may still need. Every capacity
+  // check adds these, so a full store cannot strand a pending import.
+  uint64 reserved_bytes = 11;
+  uint64 reserved_decisions = 12;
+}
+
+// One import step. Actor-scoped and retryable by command_id exactly like a
+// SourceAuthorityCommand; the same command_id namespace, so an id used here
+// cannot be reused there and vice versa.
+message ControlImportCommand {
+  uint32 format_version = 1; // 1
+  SourceAuthorityIdentity authority = 2;
+  LogicalSourceOwner key = 3; // the collection resource; owner_id empty
+  bytes command_id = 4; // 1..1024 bytes
+  uint64 expected_control_revision = 5;
+  uint64 expected_policy_revision = 6;
+  bytes workflow_id = 7; // 1..1024 bytes, one import per workflow
+  oneof action {
+    BeginControlImport begin = 10;
+    ControlImportChunk chunk = 11;
+    CommitControlImport commit = 12;
+    AbortControlImport abort = 13;
+    RecoverControlImport recover = 14;
+  }
+}
+
+// Begin is admitted only by the hosting adapter that holds the retirement
+// (RetiredLegacyControl); the digests below are checked against that holder
+// before the command is committed, never trusted from the caller.
+message BeginControlImport {
+  // SHA-256 over the canonical LegacyControlRetirement payload: the bytes the
+  // PCTRLRET frame checksums, so actor, resource, operation and destination
+  // identity of the retirement are bound, not just its checkpoint.
+  bytes retirement_sha256 = 1;
+  // The retirement's own operation key, distinct from every import command.
+  SourceAuthorityOperationKey retirement_operation = 2;
+  // Canonical ControlImportPayload length and domain-separated SHA-256.
+  uint64 payload_bytes = 3;
+  bytes payload_sha256 = 4;
+  // Every chunk but the last carries exactly chunk_bytes; the last carries
+  // the remainder. chunk_count = ceil(payload_bytes / chunk_bytes).
+  uint32 chunk_bytes = 5;
+  uint32 chunk_count = 6;
+}
+
+message ControlImportChunk {
+  uint32 ordinal = 1; // 0..chunk_count
+  bytes bytes = 2;
+  bytes sha256 = 3; // domain-separated SHA-256 of bytes
+}
+
+message CommitControlImport {}
+
+message AbortControlImport {}
+
+// Abort-only administrative recovery of a stranded workflow by any current
+// resource Admin: releases the reservation and the staged references,
+// retains the charged history, records the recovering actor as the terminal
+// command. It never transfers the workflow, commits another actor's import,
+// touches the retired legacy file or activates a writer.
+message RecoverControlImport {}
+
+// The staged bytes: the exact retirement payload and the explicit inputs the
+// legacy authority never held.
+message ControlImportPayload {
+  uint32 format_version = 1; // 1
+  bytes retirement = 2; // canonical LegacyControlRetirement payload
+  LegacyControlImportSupplement supplement = 3;
+}
+
+message LegacyControlImportSupplement {
+  uint32 format_version = 1; // 1
+  // Presence-bearing: absence of both refuses; a tree requires one code per
+  // current route; no_placement requires no codes.
+  oneof placement {
+    ai.protomolt.search.v1.PlacementTree tree = 2;
+    bool no_placement = 3;
+  }
+  repeated PlacementRouteCode route_codes = 4; // current topology, route order
+  oneof derived {
+    ai.protomolt.search.v1.DerivedColumns declaration = 5;
+    bool no_derived = 6;
+  }
+  // Required with a declaration; must equal the declaration's fingerprint.
+  string derived_fingerprint = 7;
+  oneof provider {
+    ControlProviderGeometry geometry = 8;
+    bool no_provider = 9;
+  }
+  ControlPlannerPolicy policy = 10;
+  // Format 1 accepts only true: legacy history carries no trees or codes, so
+  // rollback to a historical generation stays unavailable until supplied.
+  bool history_placement_unavailable = 11;
+}
+
+message PlacementRouteCode {
+  bool has_placement = 1;
+  uint64 placement = 2;
+}
+
+// Backend identity and construction state of the collection's vector rows.
+message ControlProviderGeometry {
+  uint32 format_version = 1; // 1
+  string backend_kind = 2;
+  string backend_version = 3;
+  string config_format = 4;
+  bytes config_payload = 5;
+  uint64 dimension = 6;
+  uint32 bits_per_component = 7;
+  uint32 row_bytes_formula_version = 8; // 1: bits * dimension / 8
+  string scoring_fingerprint = 9;
+}
+
+// Planner inputs. control must equal the checkpoint's captured policy.
+message ControlPlannerPolicy {
+  uint32 format_version = 1; // 1
+  uint32 planner_version = 2;
+  LegacyControlPolicy control = 3;
+}
+
+message ControlImportDecision {
+  uint32 format_version = 1; // 1
+  uint32 code = 2; // canonical gRPC status; zero is an accepted transition
+  string message = 3;
+  uint64 control_revision = 4;
+  uint64 policy_revision = 5;
+  ControlImportReceipt receipt = 6; // only on an accepted Commit
+}
+
+// The one durable statement that this destination imported this retirement.
+message ControlImportReceipt {
+  uint32 format_version = 1; // 1
+  bytes retirement_sha256 = 2;
+  bytes payload_sha256 = 3;
+  uint64 imported_legacy_revision = 4;
+  uint64 imported_generation = 5;
+  uint64 control_revision = 6;
+  uint64 routes = 7;
+  uint64 history = 8;
+  uint64 nodes = 9;
+  uint64 replicas = 10;
+  uint64 actions = 11;
+  uint64 completed_actions = 12;
+}
+
+message ControlImportOperation {
+  uint32 format_version = 1; // 1
+  bytes request_sha256 = 2;
+  ControlImportCommand command = 3;
+  ControlImportDecision decision = 4;
+}
+
+enum ControlImportPhase {
+  CONTROL_IMPORT_PHASE_UNSPECIFIED = 0;
+  CONTROL_IMPORT_PHASE_STAGING = 1;
+  CONTROL_IMPORT_PHASE_COMMITTED = 2;
+  CONTROL_IMPORT_PHASE_ABORTED = 3;
+  CONTROL_IMPORT_PHASE_RECOVERED = 4; // terminated by administrative recovery
+}
+
+// One row per resource. Terminal rows stay as tombstones: the workflow id is
+// never reusable and the row keeps its accounting.
+message ControlImportWorkflow {
+  uint32 format_version = 1; // 1
+  LogicalSourceOwner key = 2;
+  bytes workflow_id = 3;
+  string principal = 4; // bound at Begin; every later step must match
+  SourceAuthorityOperationKey begin = 5;
+  BeginControlImport declared = 6;
+  ControlImportPhase phase = 7;
+  uint64 begun_control_revision = 8;
+  uint64 begun_policy_revision = 9;
+  uint32 staged_chunks = 10;
+  SourceAuthorityOperationKey terminal = 11;
+  // Headroom this workflow still holds (see ControlStoreHeader).
+  uint64 reserved_bytes = 12;
+  uint64 reserved_decisions = 13;
+}
+
+message ControlImportChunkKey {
+  LogicalSourceOwner key = 1;
+  uint32 ordinal = 2;
+}
+
+// A reference into the retained chunk command's own retry record; the bytes
+// are stored once, in that record.
+message ControlImportChunkRef {
+  uint32 format_version = 1; // 1
+  SourceAuthorityOperationKey command = 2;
+  bytes sha256 = 3;
+  uint32 length = 4;
+}
+
+enum ControlFactProvenance {
+  CONTROL_FACT_PROVENANCE_UNSPECIFIED = 0;
+  CONTROL_FACT_PROVENANCE_LEGACY_IMPORT = 1;
+}
+
+// Applied collection control state, one row per resource. The destination's
+// control revision at which it last changed; the legacy revision is
+// provenance only and is never mirrored into the destination counter.
+message ControlCollectionState {
+  uint32 format_version = 1; // 1
+  LogicalSourceOwner key = 2;
+  ControlImportReceipt import = 3;
+  uint64 control_revision = 4;
+  uint32 legacy_format = 5;
+  uint64 imported_legacy_revision = 6;
+  uint64 next_token = 7;
+  uint64 next_action = 8;
+  uint64 topology_generation = 9;
+  repeated uint64 history_generations = 10; // legacy order
+  LegacyControlImportSupplement configuration = 11;
+  bool history_rollback_available = 12;
+}
+
+message ControlTopologyKey {
+  LogicalSourceOwner key = 1;
+  uint64 generation = 2;
+}
+
+message ControlTopology {
+  uint32 format_version = 1; // 1
+  uint64 generation = 2;
+  repeated LegacyControlRoute routes = 3;
+  bool codes_available = 4; // true only for the current generation with a tree
+  repeated PlacementRouteCode codes = 5;
+  bool current = 6;
+  uint32 history_index = 7; // position in legacy history when not current
+}
+
+message ControlNodeKey {
+  LogicalSourceOwner key = 1;
+  string node_id = 2;
+}
+
+// Imported registrations are observations. A lease here authorizes nothing;
+// readiness and replacement need their own committed facts.
+message ControlNode {
+  uint32 format_version = 1; // 1
+  LegacyControlNode node = 2;
+  // UNSPECIFIED means the legacy authority never declared it.
+  SourceResidency residency = 3;
+  ControlFactProvenance provenance = 4;
+}
+
+message ControlReplicaKey {
+  LogicalSourceOwner key = 1;
+  string replica_key = 2; // the exact legacy shard_id + NUL + node_id key
+}
+
+message ControlReplica {
+  uint32 format_version = 1; // 1
+  LegacyControlReplica replica = 2;
+  ControlFactProvenance provenance = 3;
+}
+
+enum ControlActionState {
+  CONTROL_ACTION_STATE_UNSPECIFIED = 0;
+  // No worker consumes it until reconciliation runs under the new authority.
+  CONTROL_ACTION_STATE_IMPORTED_UNRECONCILED = 1;
+}
+
+message ControlActionKey {
+  LogicalSourceOwner key = 1;
+  uint64 action_id = 2;
+}
+
+message ControlAction {
+  uint32 format_version = 1; // 1
+  LegacyControlAction action = 2;
+  uint32 order = 3; // legacy pending order
+  ControlActionState state = 4;
+  ControlFactProvenance provenance = 5;
+}
+
+// A legacy completed id. It has no request fingerprint, so it is never a
+// verified retry receipt; a retry claiming it is refused as unsupported.
+message ControlCompletedAction {
+  uint32 format_version = 1; // 1
+  ControlFactProvenance provenance = 2;
+}
+
+// Immutable committed view for planners and observers. Lease tokens are
+// omitted; nothing here grants ownership or authorizes a move.
+message ControlCollectionSnapshot {
+  uint32 format_version = 1; // 1
+  SourceAuthorityIdentity authority = 2;
+  LogicalSourceOwner key = 3;
+  uint64 control_revision = 4;
+  uint64 policy_revision = 5;
+  ControlCollectionState state = 6;
+  ControlTopology topology = 7;
+  repeated ControlNodeSnapshot nodes = 8; // node_id order
+  repeated ControlReplica replicas = 9; // replica_key order
+  repeated ControlAction actions = 10; // action_id order
+  repeated uint64 completed_actions = 11; // ascending
+  // SHA-256 over the canonical snapshot with this field empty.
+  bytes digest = 12;
+}
+
+message ControlNodeSnapshot {
+  string node_id = 1;
+  string addr = 2;
+  ai.protomolt.search.v1.ClusterNodeState state = 3;
+  uint64 expires_unix_ms = 4;
+  ai.protomolt.search.v1.NodeCapacity capacity = 5;
+  SourceResidency residency = 6;
+}

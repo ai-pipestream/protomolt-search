@@ -64,35 +64,99 @@ and returns a protobuf `SourceRewriteCertificate`. It checks:
 - each live document's exact key, version and optional chunk ordinal;
 - stored text, lineage, original descriptor/message/payload bytes, source ordinal,
   every stored scalar and map column including presence, and exact FP32 rows;
+- the vector provider's own stored encoding of each live row: the bytes its
+  scorer reads for that row and the per-row scoring metadata beside them
+  (`VectorProvider::row_transcript`; for the embedded TurboVec adapter the bit
+  width, dimension, the row's bit-plane packed codes and its correction scale);
 - per-field lengths, terms, term frequencies, spans, positions and sentence spans.
 
 Physical row numbers, segment ids, dictionary ordinals and tombstoned rows are
 excluded from the logical comparison. Each identity must occur exactly once in
 each live view; equal row totals do not excuse a duplicate or missing identity.
-No whole-field transpose is needed. A batch holds 32 bytes per row, capped at
-1,048,576 rows. An 8 MiB redb cache backs temporary identity/digest tables on disk.
-The reader visits posting skip runs only over the batch's row interval. It also
-holds one reconstructed source row or posting at a time; the batch limit is not
-a total-process memory quota. Scratch directories must be new, are private on
-Unix, and are removed after all database handles close. Existing paths are never
-reused or cleaned up.
 
-The format-1 transcript uses SHA-256 with length-prefixed byte strings and
-fixed-width little-endian counts. Row content starts with the reconstructed
-`AddDocumentsRequest` protobuf. Stored f64 bits are included separately because
-protobuf default elision normalizes negative zero. FP32 vector bits are included
-explicitly. Ordered field metadata and postings extend each row digest. The
-identity table is sorted by encoded `DocumentIdentity`; its complete key/digest
+### What a format-2 certificate guarantees
+
+A `SourceRewriteCertificate` with `format_version = 2` states that, for the
+two catalogs the publisher held while computing it, the multiset of
+(document identity, row content) over live rows is equal, where row content
+is everything listed above including the dense encoding the provider actually
+serves from. Equal FP32 source rows alone do not satisfy it: an image whose
+stored codes were built from other vectors, or under other calibration, has
+different row transcripts and refuses, even when every exact row and the
+backend configuration agree. Valid row reordering and different segment cuts
+still certify, because the transcript follows the identity, not the slot.
+
+A provider that cannot expose its stored representation refuses
+`row_transcript` by name, and the proof refuses with it; no certificate is
+issued for a dense image the proof could not read. Format 1 certificates,
+which older journals hold, remain valid records of stored content and exact
+rows only; they say nothing about the dense image, and nothing rewrites them.
+The journal accepts both formats on recovery (`validate_maintenance`); new
+publications always write format 2.
+
+The certificate is still an artifact-content comparison, not proof of source
+acceptance, authorization, durability, or runtime activation. The publisher
+must compute it from its own held views, never trust a caller-provided
+certificate. The builder must still derive and validate segment summaries
+(the publisher recomputes pruning summaries against stored rows), and a
+certificate does not certify the soundness of caller-supplied pruning metadata.
+
+### Cost
+
+Memory: [`BATCH_ROW_BYTES`] (32) per batch row, at most 1,048,576 rows
+(32 MiB), plus one reconstructed source row or posting at a time and an 8 MiB
+redb cache for the on-disk identity/digest tables. Provider row transcripts
+are read in pieces of `TRANSCRIPT_BLOCK_ROWS` (1,024) rows —
+`rows × (16 + bits × dim / 8)` bytes, 256 KiB at 384 dimensions and 4 bits —
+and the embedded engine (`TurboQuantIndex::stored_rows`, chain s21) converts
+one 32-row block at a time from the layout it already serves, assembling a
+mapped block straight from its pages outside the search's chunk cache. No
+packed image is materialized or retained by the proof: `packed_ready()`
+stays false on every loaded and mapped segment afterwards
+(`mapped_proof_leaves_packed_codes_unmaterialized`), and at a fixed batch the
+proof's own allocation does not grow with the image
+(`proof_allocation_is_independent_of_vector_image_size`: 16,384 rows at 8
+versus 512 dimensions, a 64× larger image, measured 3,913,010 versus 3,929,138 bytes of peak allocation on the proof thread, 16 KiB apart). Two
+proofs running at once cost two of everything above; the batch limit is not
+a total-process memory quota.
+
+Time: every live row is reconstructed once; every field's vocabulary is
+walked once per batch of each segment, with posting cursors skipped to the
+batch's row interval. The number of vocabulary passes is therefore
+`fields × Σ_segments ceil(rows_segment / batch)`, and the batch bounds digest
+memory and nothing else. Measured on the 280-row test fixture (two fields, a
+one-segment before and a three-segment after), passes by batch size:
+1 → 1,120; 7 → 164; 64 → 22; 280 → 8; 1,024 and above → 8. The certificate
+is byte-identical at every size. `proof_batch_rows = 0` selects the default,
+the largest batch; `proof_batch_rows_for_budget(bytes)` derives a batch from
+a digest budget for callers that need a smaller one. It returns an error below
+32 bytes; a hard zero-byte budget never becomes a one-row allocation. Choose a smaller batch
+only when 32 MiB of digests is unaffordable.
+
+Scratch: the directory must not exist. It is created with mode 0700 and its
+database with mode 0600 at creation, independent of the process umask, and
+removed after all database handles close. Existing paths are never reused or
+cleaned up.
+
+### Transcript
+
+The product wrapper requires every requested row exactly once, in increasing
+order, before accepting a successful provider transcript call. Missing,
+duplicate, reordered and out-of-range callbacks refuse; invalid indices never
+reach the proof's bitmap or digest array. Single-row requests use checked range
+arithmetic. Provider failure remains a proof failure even after partial output.
+
+The format-2 transcript uses SHA-256 with length-prefixed byte strings and
+fixed-width little-endian counts, under the domain strings
+`protomolt.source-rewrite.row.v2` and `protomolt.source-rewrite.rows.v2`, so
+a format-1 digest never equals a format-2 digest. Row content starts with the
+reconstructed `AddDocumentsRequest` protobuf. Stored f64 bits are included
+separately because protobuf default elision normalizes negative zero. FP32
+vector bits are included explicitly, then the provider row transcript.
+Ordered field metadata and postings extend each row digest. The identity
+table is sorted by encoded `DocumentIdentity`; its complete key/digest
 sequence determines the content digest. Schema and backend construction state
 have a separate digest. Batch size and physical row order do not enter either.
-
-This is an artifact-content comparison, not proof of source acceptance,
-authorization, durability, or runtime activation. The publisher must compute it
-from its own held views, never trust a caller-provided certificate. It compares
-exact vectors and backend construction state; the maintenance builder must still
-rebuild provider images through the same backend and derive/validate segment
-summaries. A certificate alone does not certify opaque provider code bytes or
-soundness of caller-supplied pruning metadata.
 
 ## Empty generations must keep declarations
 

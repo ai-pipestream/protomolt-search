@@ -3,6 +3,20 @@
     "fields": {
       "1": 1,
       "15": "",
+      "16": 1.0,
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "fixed64 scalar present",
+    "valid": true,
+    "wire": "08011201781a040000803f7a008101000000000000f03f"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
       "2": "x",
       "3": [
         1.0
@@ -533,5 +547,1231 @@
     "name": "malformed unindexed repeated child",
     "valid": false,
     "wire": "08011201781a040000803f7a0052020880"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire scalar as type 1",
+    "valid": true,
+    "wire": "08011201781a040000803f7a00090100000000000000"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire scalar as type 2",
+    "valid": true,
+    "wire": "08011201781a040000803f7a000a020801"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire scalar as type 3",
+    "valid": true,
+    "wire": "08011201781a040000803f7a000b9806010c"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire scalar as type 5",
+    "valid": true,
+    "wire": "08011201781a040000803f7a000d01000000"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire repeated packable as type 0",
+    "valid": true,
+    "wire": "08011201781a040000803f7a001801"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire repeated packable as type 1",
+    "valid": true,
+    "wire": "08011201781a040000803f7a00190100000000000000"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire repeated packable as type 3",
+    "valid": true,
+    "wire": "08011201781a040000803f7a001b9806011c"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire string as type 0",
+    "valid": true,
+    "wire": "08011201781a040000803f7a001001"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire string as type 1",
+    "valid": true,
+    "wire": "08011201781a040000803f7a00110100000000000000"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire string as type 3",
+    "valid": true,
+    "wire": "08011201781a040000803f7a001398060114"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire string as type 5",
+    "valid": true,
+    "wire": "08011201781a040000803f7a001501000000"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire message as type 0",
+    "valid": true,
+    "wire": "08011201781a040000803f7a005801"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire message as type 1",
+    "valid": true,
+    "wire": "08011201781a040000803f7a00590100000000000000"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire message as type 3",
+    "valid": true,
+    "wire": "08011201781a040000803f7a005b9806015c"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire message as type 5",
+    "valid": true,
+    "wire": "08011201781a040000803f7a005d01000000"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire map as type 0",
+    "valid": true,
+    "wire": "08011201781a040000803f7a004801"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire map as type 1",
+    "valid": true,
+    "wire": "08011201781a040000803f7a00490100000000000000"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire map as type 3",
+    "valid": true,
+    "wire": "08011201781a040000803f7a004b9806014c"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire map as type 5",
+    "valid": true,
+    "wire": "08011201781a040000803f7a004d01000000"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire group as type 0",
+    "valid": true,
+    "wire": "08011201781a040000803f7a006801"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire group as type 1",
+    "valid": true,
+    "wire": "08011201781a040000803f7a00690100000000000000"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire group as type 2",
+    "valid": true,
+    "wire": "08011201781a040000803f7a006a020801"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire group as type 5",
+    "valid": true,
+    "wire": "08011201781a040000803f7a006d01000000"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire enum as type 1",
+    "valid": true,
+    "wire": "08011201781a040000803f7a00390100000000000000"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire enum as type 2",
+    "valid": true,
+    "wire": "08011201781a040000803f7a003a020801"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire enum as type 3",
+    "valid": true,
+    "wire": "08011201781a040000803f7a003b9806013c"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire enum as type 5",
+    "valid": true,
+    "wire": "08011201781a040000803f7a003d01000000"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire message extension as type 0",
+    "valid": true,
+    "wire": "08011201781a040000803f7a00a00601"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire message extension as type 1",
+    "valid": true,
+    "wire": "08011201781a040000803f7a00a1060100000000000000"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire message extension as type 3",
+    "valid": true,
+    "wire": "08011201781a040000803f7a00a306980601a406"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire message extension as type 5",
+    "valid": true,
+    "wire": "08011201781a040000803f7a00a50601000000"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "16": 1.0,
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire fixed64 as type 0",
+    "valid": true,
+    "wire": "08011201781a040000803f7a008101000000000000f03f800101"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "16": 1.0,
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire fixed64 as type 2",
+    "valid": true,
+    "wire": "08011201781a040000803f7a008101000000000000f03f8201020801"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "16": 1.0,
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire fixed64 as type 3",
+    "valid": true,
+    "wire": "08011201781a040000803f7a008101000000000000f03f83019806018401"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "16": 1.0,
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire fixed64 as type 5",
+    "valid": true,
+    "wire": "08011201781a040000803f7a008101000000000000f03f850101000000"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ],
+      "4": 1
+    },
+    "name": "wrong wire oneof preserves member type 1",
+    "valid": true,
+    "wire": "08011201781a040000803f7a002001290100000000000000"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ],
+      "4": 1
+    },
+    "name": "wrong wire oneof preserves member type 2",
+    "valid": true,
+    "wire": "08011201781a040000803f7a0020012a020801"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ],
+      "4": 1
+    },
+    "name": "wrong wire oneof preserves member type 3",
+    "valid": true,
+    "wire": "08011201781a040000803f7a0020012b9806012c"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ],
+      "4": 1
+    },
+    "name": "wrong wire oneof preserves member type 5",
+    "valid": true,
+    "wire": "08011201781a040000803f7a0020012d01000000"
+  },
+  {
+    "name": "wrong wire required bytes absent type 0",
+    "valid": false,
+    "wire": "08011201781a040000803f7801"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "11": {
+        "1": 1,
+        "2": 4
+      },
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire nested scalar preserves value type 0",
+    "valid": true,
+    "wire": "08011201781a040000803f7a005a06080310040801"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "11": {
+        "1": 1,
+        "2": 4
+      },
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire nested required scalar absent type 0",
+    "valid": true,
+    "wire": "08011201781a040000803f7a005a0410040801"
+  },
+  {
+    "name": "wrong wire required bytes absent type 1",
+    "valid": false,
+    "wire": "08011201781a040000803f790100000000000000"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "11": {
+        "1": 3,
+        "2": 4
+      },
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire nested scalar preserves value type 1",
+    "valid": true,
+    "wire": "08011201781a040000803f7a005a0d08031004090100000000000000"
+  },
+  {
+    "name": "wrong wire nested required scalar absent type 1",
+    "valid": false,
+    "wire": "08011201781a040000803f7a005a0b1004090100000000000000"
+  },
+  {
+    "name": "wrong wire required bytes absent type 3",
+    "valid": false,
+    "wire": "08011201781a040000803f7b9806017c"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "11": {
+        "1": 3,
+        "2": 4
+      },
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire nested scalar preserves value type 3",
+    "valid": true,
+    "wire": "08011201781a040000803f7a005a09080310040b9806010c"
+  },
+  {
+    "name": "wrong wire nested required scalar absent type 3",
+    "valid": false,
+    "wire": "08011201781a040000803f7a005a0710040b9806010c"
+  },
+  {
+    "name": "wrong wire required bytes absent type 5",
+    "valid": false,
+    "wire": "08011201781a040000803f7d01000000"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "11": {
+        "1": 3,
+        "2": 4
+      },
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "wrong wire nested scalar preserves value type 5",
+    "valid": true,
+    "wire": "08011201781a040000803f7a005a09080310040d01000000"
+  },
+  {
+    "name": "wrong wire nested required scalar absent type 5",
+    "valid": false,
+    "wire": "08011201781a040000803f7a005a0710040d01000000"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ],
+      "9": {
+        "": 1
+      }
+    },
+    "name": "closed enum map entry key wire type 0",
+    "observations": {
+      "cpp_25_1_text": "id: 1\nbody: \"x\"\nembedding: 1\nstates_by_key {\n  key: \"\"\n  value: READY\n  1: 1\n}\nrequired_token: \"\"\n",
+      "upb_6_33_5_binary": {
+        "fields": {
+          "1": 1,
+          "15": "",
+          "2": "x",
+          "3": [
+            1.0
+          ]
+        },
+        "valid": true
+      }
+    },
+    "reference": "cpp_25_1_text_parse",
+    "valid": true,
+    "wire": "08011201781a040000803f7a004a0408011001"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ],
+      "9": {
+        "": 1
+      }
+    },
+    "name": "closed enum map entry key wire type 1",
+    "observations": {
+      "cpp_25_1_text": "id: 1\nbody: \"x\"\nembedding: 1\nstates_by_key {\n  key: \"\"\n  value: READY\n  1: 0x0000000000000001\n}\nrequired_token: \"\"\n",
+      "upb_6_33_5_binary": {
+        "fields": {
+          "1": 1,
+          "15": "",
+          "2": "x",
+          "3": [
+            1.0
+          ]
+        },
+        "valid": true
+      }
+    },
+    "reference": "cpp_25_1_text_parse",
+    "valid": true,
+    "wire": "08011201781a040000803f7a004a0b0901000000000000001001"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ],
+      "9": {
+        "": 1
+      }
+    },
+    "name": "closed enum map entry key wire type 3",
+    "observations": {
+      "cpp_25_1_text": "id: 1\nbody: \"x\"\nembedding: 1\nstates_by_key {\n  key: \"\"\n  value: READY\n  1 {\n    99: 1\n  }\n}\nrequired_token: \"\"\n",
+      "upb_6_33_5_binary": {
+        "fields": {
+          "1": 1,
+          "15": "",
+          "2": "x",
+          "3": [
+            1.0
+          ]
+        },
+        "valid": true
+      }
+    },
+    "reference": "cpp_25_1_text_parse",
+    "valid": true,
+    "wire": "08011201781a040000803f7a004a070b9806010c1001"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ],
+      "9": {
+        "": 1
+      }
+    },
+    "name": "closed enum map entry key wire type 5",
+    "observations": {
+      "cpp_25_1_text": "id: 1\nbody: \"x\"\nembedding: 1\nstates_by_key {\n  key: \"\"\n  value: READY\n  1: 0x00000001\n}\nrequired_token: \"\"\n",
+      "upb_6_33_5_binary": {
+        "fields": {
+          "1": 1,
+          "15": "",
+          "2": "x",
+          "3": [
+            1.0
+          ]
+        },
+        "valid": true
+      }
+    },
+    "reference": "cpp_25_1_text_parse",
+    "valid": true,
+    "wire": "08011201781a040000803f7a004a070d010000001001"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ],
+      "9": {
+        "a": 0
+      }
+    },
+    "name": "closed enum map entry value wire type 1",
+    "observations": {
+      "cpp_25_1_text": "id: 1\nbody: \"x\"\nembedding: 1\nstates_by_key {\n  key: \"a\"\n  value: UNKNOWN\n  2: 0x0000000000000001\n}\nrequired_token: \"\"\n",
+      "upb_6_33_5_binary": {
+        "fields": {
+          "1": 1,
+          "15": "",
+          "2": "x",
+          "3": [
+            1.0
+          ]
+        },
+        "valid": true
+      }
+    },
+    "reference": "cpp_25_1_text_parse",
+    "valid": true,
+    "wire": "08011201781a040000803f7a004a0c0a0161110100000000000000"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ],
+      "9": {
+        "a": 0
+      }
+    },
+    "name": "closed enum map entry value wire type 2",
+    "observations": {
+      "cpp_25_1_text": "id: 1\nbody: \"x\"\nembedding: 1\nstates_by_key {\n  key: \"a\"\n  value: UNKNOWN\n  2 {\n    1: 1\n  }\n}\nrequired_token: \"\"\n",
+      "upb_6_33_5_binary": {
+        "fields": {
+          "1": 1,
+          "15": "",
+          "2": "x",
+          "3": [
+            1.0
+          ]
+        },
+        "valid": true
+      }
+    },
+    "reference": "cpp_25_1_text_parse",
+    "valid": true,
+    "wire": "08011201781a040000803f7a004a070a016112020801"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ],
+      "9": {
+        "a": 0
+      }
+    },
+    "name": "closed enum map entry value wire type 3",
+    "observations": {
+      "cpp_25_1_text": "id: 1\nbody: \"x\"\nembedding: 1\nstates_by_key {\n  key: \"a\"\n  value: UNKNOWN\n  2 {\n    99: 1\n  }\n}\nrequired_token: \"\"\n",
+      "upb_6_33_5_binary": {
+        "fields": {
+          "1": 1,
+          "15": "",
+          "2": "x",
+          "3": [
+            1.0
+          ]
+        },
+        "valid": true
+      }
+    },
+    "reference": "cpp_25_1_text_parse",
+    "valid": true,
+    "wire": "08011201781a040000803f7a004a080a01611398060114"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ],
+      "9": {
+        "a": 0
+      }
+    },
+    "name": "closed enum map entry value wire type 5",
+    "observations": {
+      "cpp_25_1_text": "id: 1\nbody: \"x\"\nembedding: 1\nstates_by_key {\n  key: \"a\"\n  value: UNKNOWN\n  2: 0x00000001\n}\nrequired_token: \"\"\n",
+      "upb_6_33_5_binary": {
+        "fields": {
+          "1": 1,
+          "15": "",
+          "2": "x",
+          "3": [
+            1.0
+          ]
+        },
+        "valid": true
+      }
+    },
+    "reference": "cpp_25_1_text_parse",
+    "valid": true,
+    "wire": "08011201781a040000803f7a004a080a01611501000000"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ],
+      "9": {
+        "": 0,
+        "a": 1
+      }
+    },
+    "name": "closed enum map valid prior then key wire type 1",
+    "observations": {
+      "cpp_25_1_text": "id: 1\nbody: \"x\"\nembedding: 1\nstates_by_key {\n  key: \"\"\n  value: UNKNOWN\n  1: 0x0000000000000001\n}\nstates_by_key {\n  key: \"a\"\n  value: READY\n}\nrequired_token: \"\"\n",
+      "upb_6_33_5_binary": {
+        "fields": {
+          "1": 1,
+          "15": "",
+          "2": "x",
+          "3": [
+            1.0
+          ],
+          "9": {
+            "a": 1
+          }
+        },
+        "valid": true
+      }
+    },
+    "reference": "cpp_25_1_text_parse",
+    "valid": true,
+    "wire": "08011201781a040000803f7a004a050a016110014a0b0901000000000000001000"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ],
+      "9": {
+        "a": 0
+      }
+    },
+    "name": "closed enum map valid prior then value wire type 1",
+    "observations": {
+      "cpp_25_1_text": "id: 1\nbody: \"x\"\nembedding: 1\nstates_by_key {\n  key: \"a\"\n  value: READY\n}\nstates_by_key {\n  key: \"a\"\n  value: UNKNOWN\n  2: 0x0000000000000001\n}\nrequired_token: \"\"\n",
+      "upb_6_33_5_binary": {
+        "fields": {
+          "1": 1,
+          "15": "",
+          "2": "x",
+          "3": [
+            1.0
+          ],
+          "9": {
+            "a": 1
+          }
+        },
+        "valid": true
+      }
+    },
+    "reference": "cpp_25_1_text_parse",
+    "valid": true,
+    "wire": "08011201781a040000803f7a004a050a016110014a0c0a0161110100000000000000"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ],
+      "9": {
+        "a": 1
+      }
+    },
+    "name": "closed enum map entry synthetic field 3",
+    "observations": {
+      "cpp_25_1_text": "id: 1\nbody: \"x\"\nembedding: 1\nstates_by_key {\n  key: \"a\"\n  value: READY\n  3: 7\n}\nrequired_token: \"\"\n",
+      "upb_6_33_5_binary": {
+        "fields": {
+          "1": 1,
+          "15": "",
+          "2": "x",
+          "3": [
+            1.0
+          ]
+        },
+        "valid": true
+      }
+    },
+    "reference": "cpp_25_1_text_parse",
+    "valid": true,
+    "wire": "08011201781a040000803f7a004a070a016110011807"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ],
+      "9": {
+        "a": 0
+      }
+    },
+    "name": "closed enum map valid prior then synthetic field 3",
+    "observations": {
+      "cpp_25_1_text": "id: 1\nbody: \"x\"\nembedding: 1\nstates_by_key {\n  key: \"a\"\n  value: READY\n}\nstates_by_key {\n  key: \"a\"\n  value: UNKNOWN\n  3: 7\n}\nrequired_token: \"\"\n",
+      "upb_6_33_5_binary": {
+        "fields": {
+          "1": 1,
+          "15": "",
+          "2": "x",
+          "3": [
+            1.0
+          ],
+          "9": {
+            "a": 1
+          }
+        },
+        "valid": true
+      }
+    },
+    "reference": "cpp_25_1_text_parse",
+    "valid": true,
+    "wire": "08011201781a040000803f7a004a050a016110014a070a016110001807"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "12": {
+        "": {
+          "1": 3,
+          "2": 4
+        },
+        "a": {
+          "1": 3,
+          "2": 4
+        }
+      },
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "message map valid prior then key wire type 1",
+    "observations": {
+      "cpp_25_1_text": "id: 1\nbody: \"x\"\nembedding: 1\ndetail_by_key {\n  key: \"\"\n  value {\n    left: 3\n    right: 4\n  }\n  1: 0x0000000000000001\n}\ndetail_by_key {\n  key: \"a\"\n  value {\n    left: 3\n    right: 4\n  }\n}\nrequired_token: \"\"\n",
+      "upb_6_33_5_binary": {
+        "fields": {
+          "1": 1,
+          "12": {
+            "a": {
+              "1": 3,
+              "2": 4
+            }
+          },
+          "15": "",
+          "2": "x",
+          "3": [
+            1.0
+          ]
+        },
+        "valid": true
+      }
+    },
+    "reference": "cpp_25_1_text_parse",
+    "valid": true,
+    "wire": "08011201781a040000803f7a0062090a0161120408031004620f090100000000000000120408031004"
+  },
+  {
+    "name": "message map valid prior then value wire type 1",
+    "observations": {
+      "cpp_25_1_text": "id: 1\nbody: \"x\"\nembedding: 1\ndetail_by_key {\n  key: \"a\"\n  value {\n    left: 3\n    right: 4\n  }\n}\ndetail_by_key {\n  key: \"a\"\n  value {\n  }\n  2: 0x0000000000000001\n}\nrequired_token: \"\"\n",
+      "upb_6_33_5_binary": {
+        "fields": {
+          "1": 1,
+          "12": {
+            "a": {
+              "1": 3,
+              "2": 4
+            }
+          },
+          "15": "",
+          "2": "x",
+          "3": [
+            1.0
+          ]
+        },
+        "valid": true
+      }
+    },
+    "reference": "cpp_25_1_text_parse",
+    "valid": false,
+    "wire": "08011201781a040000803f7a0062090a0161120408031004620c0a0161110100000000000000"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "12": {
+        "a": {
+          "1": 3,
+          "2": 4
+        }
+      },
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "message map entry synthetic field 3",
+    "observations": {
+      "cpp_25_1_text": "id: 1\nbody: \"x\"\nembedding: 1\ndetail_by_key {\n  key: \"a\"\n  value {\n    left: 3\n    right: 4\n  }\n  3: 7\n}\nrequired_token: \"\"\n",
+      "upb_6_33_5_binary": {
+        "fields": {
+          "1": 1,
+          "15": "",
+          "2": "x",
+          "3": [
+            1.0
+          ]
+        },
+        "valid": true
+      }
+    },
+    "reference": "cpp_25_1_text_parse",
+    "valid": true,
+    "wire": "08011201781a040000803f7a00620b0a01611204080310041807"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "12": {
+        "a": {
+          "1": 8,
+          "2": 9
+        }
+      },
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "message map valid prior then synthetic field 3",
+    "observations": {
+      "cpp_25_1_text": "id: 1\nbody: \"x\"\nembedding: 1\ndetail_by_key {\n  key: \"a\"\n  value {\n    left: 3\n    right: 4\n  }\n}\ndetail_by_key {\n  key: \"a\"\n  value {\n    left: 8\n    right: 9\n  }\n  3: 7\n}\nrequired_token: \"\"\n",
+      "upb_6_33_5_binary": {
+        "fields": {
+          "1": 1,
+          "12": {
+            "a": {
+              "1": 3,
+              "2": 4
+            }
+          },
+          "15": "",
+          "2": "x",
+          "3": [
+            1.0
+          ]
+        },
+        "valid": true
+      }
+    },
+    "reference": "cpp_25_1_text_parse",
+    "valid": true,
+    "wire": "08011201781a040000803f7a0062090a0161120408031004620b0a01611204080810091807"
+  },
+  {
+    "fields": {
+      "1": 1,
+      "12": {
+        "a": {
+          "1": 3,
+          "2": 4
+        }
+      },
+      "15": "",
+      "2": "x",
+      "3": [
+        1.0
+      ]
+    },
+    "name": "message map complete value plus nested left wire type 1",
+    "observations": {
+      "cpp_25_1_text": "id: 1\nbody: \"x\"\nembedding: 1\ndetail_by_key {\n  key: \"a\"\n  value {\n    left: 3\n    right: 4\n    1: 0x0000000000000001\n  }\n}\nrequired_token: \"\"\n",
+      "upb_6_33_5_binary": {
+        "fields": {
+          "1": 1,
+          "12": {
+            "a": {
+              "1": 3,
+              "2": 4
+            }
+          },
+          "15": "",
+          "2": "x",
+          "3": [
+            1.0
+          ]
+        },
+        "valid": true
+      }
+    },
+    "reference": "cpp_25_1_text_parse",
+    "valid": true,
+    "wire": "08011201781a040000803f7a0062120a0161120d08031004090100000000000000"
+  },
+  {
+    "name": "malformed skipped fixed64",
+    "valid": false,
+    "wire": "08011201781a040000803f7a000900000000000000"
+  },
+  {
+    "name": "malformed skipped length",
+    "valid": false,
+    "wire": "08011201781a040000803f7a000a0200"
+  },
+  {
+    "name": "malformed skipped group missing end",
+    "valid": false,
+    "wire": "08011201781a040000803f7a0013980601"
+  },
+  {
+    "name": "malformed skipped group mismatched end",
+    "valid": false,
+    "wire": "08011201781a040000803f7a00139806011c"
+  },
+  {
+    "name": "malformed skipped nested group",
+    "valid": false,
+    "wire": "08011201781a040000803f7a00139b060801149c06"
   }
 ]

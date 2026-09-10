@@ -18,7 +18,7 @@ use std::time::Instant;
 use pipestream_search::analyzer::body_spec;
 use pipestream_search::pb::search_service_client::SearchServiceClient;
 use pipestream_search::pb::{
-    filter_query, search_query, selection_query, BooleanQuery, Bm25SearchRequest, DenseQuery,
+    filter_query, search_query, selection_query, Bm25SearchRequest, BooleanQuery, DenseQuery,
     FilterQuery, LexicalQuery, QueryRequest, QueryResponse, SearchQuery, SelectionQuery,
 };
 use pipestream_search::security::ToolClient;
@@ -130,7 +130,12 @@ async fn run_boolean(
             if !hits.is_empty() {
                 hits.push(',');
             }
-            hits.push_str(&format!("{}:{:08x}:{}", hit.doc_id, hit.score.to_bits(), hit.rank));
+            hits.push_str(&format!(
+                "{}:{:08x}:{}",
+                hit.doc_id,
+                hit.score.to_bits(),
+                hit.rank
+            ));
         }
         let (sel, tot, segs, shards) = match &response.profile {
             Some(p) => (
@@ -151,7 +156,10 @@ async fn run_boolean(
             response.executed
         );
     }
-    println!("digest shape={name} rounds={rounds} hits={total_hits} fnv={:016x}", digest.0);
+    println!(
+        "digest shape={name} rounds={rounds} hits={total_hits} fnv={:016x}",
+        digest.0
+    );
     Ok(())
 }
 
@@ -194,7 +202,10 @@ async fn run_allowlist(
         }
         println!("shape={name} round={round} wall_ms={wall:.1} hits={hits}");
     }
-    println!("digest shape={name} rounds={rounds} hits={total_hits} fnv={:016x}", digest.0);
+    println!(
+        "digest shape={name} rounds={rounds} hits={total_hits} fnv={:016x}",
+        digest.0
+    );
     Ok(())
 }
 
@@ -217,9 +228,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .filter(|s| !s.is_empty())
     .collect();
 
-    let (dim, mut reader) = pipestream_search::demo::court::EmbeddingReader::open(
-        std::path::Path::new(&embeddings),
-    )?;
+    let (dim, mut reader) =
+        pipestream_search::demo::court::EmbeddingReader::open(std::path::Path::new(&embeddings))?;
     let record = reader
         .nth(dense_row)
         .ok_or_else(|| format!("{embeddings}: no record {dense_row}"))??;
@@ -287,7 +297,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 run_boolean(
                     &mut client,
                     shape,
-                    boolean(vec![dense("v", vector.clone()), cel("f", "court == \"scotus\"")]),
+                    boolean(vec![
+                        dense("v", vector.clone()),
+                        cel("f", "court == \"scotus\""),
+                    ]),
                     k,
                     rounds,
                 )

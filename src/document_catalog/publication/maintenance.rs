@@ -55,7 +55,11 @@ pub(super) fn validate_maintenance(
         || intent.previous.as_ref().is_some_and(|p| {
             p.after_epoch == 0 || p.after_epoch > intent.before_epoch || p.intent_id.len() != 32
         })
-        || proof.format_version != 1
+        // Format 1 certified stored content and exact FP32 rows; format 2
+        // adds the provider's own encoded rows (docs/source-index-maintenance.md).
+        // Journals written under format 1 stay readable; only a format-2
+        // certificate says anything about the dense image.
+        || !matches!(proof.format_version, 1 | 2)
         || proof.owner.as_ref() != Some(owner)
         || proof.schema_sha256.len() != 32
         || proof.identity_content_sha256.len() != 32
@@ -255,7 +259,7 @@ impl DocumentCatalog {
                 .map(|t| t.name().to_owned())
                 .collect::<Vec<_>>();
             let mut meta = tx.open_table(META).map_err(storage)?;
-            let header: DocumentCatalogHeader = decode(
+            let header: DocumentCatalogHeader = decode_header(
                 meta.get("header")
                     .map_err(storage)?
                     .ok_or_else(|| Status::data_loss("catalog header missing"))?
@@ -523,7 +527,7 @@ impl DocumentCatalog {
         catalog.with_durable_snapshot(|snapshot| {
             let tx = self.database.begin_read().map_err(storage)?;
             let meta = tx.open_table(META).map_err(storage)?;
-            let header: DocumentCatalogHeader = decode(
+            let header: DocumentCatalogHeader = decode_header(
                 meta.get("header")
                     .map_err(storage)?
                     .ok_or_else(|| Status::data_loss("catalog header missing"))?
@@ -586,7 +590,7 @@ impl DocumentCatalog {
         };
         let intent: MaintenanceIntent = decode(bytes.value())?;
         let meta = tx.open_table(META).map_err(storage)?;
-        let header: DocumentCatalogHeader = decode(
+        let header: DocumentCatalogHeader = decode_header(
             meta.get("header")
                 .map_err(storage)?
                 .ok_or_else(|| Status::data_loss("catalog header missing"))?
@@ -649,7 +653,7 @@ impl DocumentCatalog {
             let result;
             {
                 let meta = tx.open_table(META).map_err(storage)?;
-                let header: DocumentCatalogHeader = decode(meta.get("header").map_err(storage)?.ok_or_else(|| Status::data_loss("catalog header missing"))?.value())?;
+                let header: DocumentCatalogHeader = decode_header(meta.get("header").map_err(storage)?.ok_or_else(|| Status::data_loss("catalog header missing"))?.value())?;
                 validate_current_header(&header)?;
                 let mut states = tx.open_table(STATES).map_err(storage)?;
                 let mut state: ProjectionJournalState = decode(states.get(key).map_err(storage)?.ok_or_else(|| Status::not_found("maintenance index is not registered"))?.value())?;

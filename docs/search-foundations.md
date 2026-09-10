@@ -1,7 +1,7 @@
 # Search foundations
 
 Foundation work began on `feat/search-foundations` from `PRE_ASTRA`. At
-`ab16d93`, the current source-authority increment includes durable retirement
+`ab16d93`, the preceding source-authority checkpoint includes durable retirement
 admission from `f85e345` and reconciles main `3cf7982`. It preserves original
 source and immutable retry history, journals local publication and maintenance,
 audits complete histories, writes coherent backups, verifies incoming bundles
@@ -15,6 +15,13 @@ backup](source-index-backup.md).
 This is a trusted local lifecycle only. Distributed authority activation,
 explicit server routing, remaining protobuf shape semantics and the remaining
 authorization scope are unfinished. The foundation goal is not complete.
+
+The newer checkpoint `7be8a3a` adds
+[access-controlled local source catalogs](source-access.md): format 7 persists
+resource scope, and policy pins serialize synchronous commits against
+revocation. It passed 1,546 tests, all five mobile checks and wire compatibility
+validation on unchanged source. It does not yet connect source writes to public
+server routing or exclusive distributed owner admission.
 
 ## Historical map-projection checkpoint
 

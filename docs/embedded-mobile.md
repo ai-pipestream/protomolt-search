@@ -41,11 +41,35 @@ is not implemented.
 with the public workspace/collection authority. The mobile package re-exports
 the principal and authority types. Keep the runtime's owner methods and raw
 `search_service()` handle private; they intentionally carry owner access.
-Policy format 2 can restrict `Bm25Search`, including prefix expansion, `Suggest`
-and `TermSuggest` to a mandatory document view. Other restricted routes refuse.
-Policy format 3 adds [field grants](field-grants.md) on those same private-shard
-routes. Collaborative network delegation remains unfinished. See
+Policy format 2 can restrict `Bm25Search`, including prefix expansion, `Suggest`,
+`TermSuggest`, `Aggregate`, `Query` and `QueryStream` to a mandatory document
+view. Other restricted routes refuse. Policy format 3 adds
+[field grants](field-grants.md) on those same private-shard routes. Collaborative
+network delegation remains unfinished. See
 [document grants](document-grants.md) for the exact supported boundary.
+
+One runtime serves one collection: every shard must declare the same name,
+even when no document catalog is configured. Nonempty names follow the public
+collection naming rules. Startup rejects mixed or invalid names before opening
+storage. For a named runtime, the authorized facade registers that name as its
+default; omitting `collection` resolves to it before checking permission. An
+unnamed-collection grant cannot reach a named runtime. The coordinator and
+facade use the same binding.
+
+The regression tests reproduce the previous cross-workspace read with real
+indexed hits, exercise both default and explicit named requests, and reject
+mixed and invalid startup configurations. All four failed before the fix and
+pass with it; this verifies the embedded binding, not completion of the remaining
+authorization or collaboration work.
+
+The follow-up gate passed 79 integration tests across catalog, projection,
+staging, wrapper mapping, authorization and collection routing; 71 catalog
+unit tests; and 13 embedded-package tests. Together with the eight-test embedded
+regression target, 171 tests passed. All five Android/iOS compilation checks,
+tests/examples compilation and formatting passed. The focused target peaked at
+4.28 GiB with zero swap or OOM events. The follow-up scope's journal records an
+8 GiB peak; its driver did not retain final swap/OOM counters, so those counters
+are not reported as zero. These are local checks, not device or fleet execution.
 
 ## Contract
 

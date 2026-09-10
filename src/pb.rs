@@ -68,13 +68,14 @@ pub mod wal {
     pub use v1::*;
 }
 
-/// Shim for the generated wal code: it references the search types it
+/// Shim for the generated storage, mobile and WAL code: it references the search types it
 /// reuses as `super::super::v1::X` (their package path), while this module
 /// includes them flat — re-export the referenced ones under that name.
 pub mod v1 {
     pub use super::{
-        AcceptDocumentRequest, AddDocumentsRequest, AddVectorsRequest, DerivedColumns,
-        DocumentWriteReceipt, FlushResponse, IngestMappedRequest, QueryStreamResponse,
-        ReplayStreamBinding, SnapshotArtifact, VectorBackendConfig,
+        AcceptDocumentRequest, AddDocumentsRequest, AddVectorsRequest, ClusterNodeState,
+        CollectionGrant, DerivedColumns, DocumentWriteReceipt, FlushResponse, IngestMappedRequest,
+        NodeCapacity, PlacementActionKind, PlacementTree, QueryStreamResponse, ReplayStreamBinding,
+        ShardReplicaRole, SnapshotArtifact, VectorBackendConfig,
     };
 }

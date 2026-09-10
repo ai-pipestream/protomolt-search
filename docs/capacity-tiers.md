@@ -20,6 +20,29 @@ number below is allocated; every one is marked DRAFT and becomes
 contract only when the number is reserved in
 `proto/ai/protomolt/search/v1/search.proto`.
 
+Implementation state, 2026-09-08: the bounded observation store and the
+deterministic dry-run planner are built as a pure library module
+(`src/capacity_tiers.rs`) on branch `feat/capacity-tiers`, with §10's
+literals as its golden tests and `scripts/verify_capacity_tier_fixtures.py`
+as the independent oracle. The module allocates no protocol fields,
+opens no routes, and executes nothing; the typed snapshot it plans
+from is the coordination seam with the control-plane track, which owns
+persistence, revision allocation, and Raft wiring.
+
+The snapshot boundary, agreed for Fable's integration: `TierSnapshot`
+is opaque, and `TierSnapshot::validated` is the only constructor. It
+enforces once, for the store-fed path and any hand-built input alike:
+resource binding of every observation and fragment to the context and
+the committed view; committed-identity equality in both directions;
+incarnation currency; duplicate rejection (nothing silently
+overwrites); Server residency and eligibility for every `complete`
+claim, with one coverage digest per fragment's complete copies;
+canonical ordering of fragments, pools, owners, and copies; and the
+admission caps. Fragment pools, owners, and copies are derived from the
+committed view, never accepted from the caller. Adapters must not
+compensate for invalid inputs; an input that fails validation is a
+refusal by name, not a fix-up.
+
 The documents this one extends: the measurement and the dry run in
 [bandwidth-budget.md](bandwidth-budget.md), the predicate tree and its
 codes in [placement.md](placement.md), the declared hash column and its
@@ -525,12 +548,20 @@ incarnation, destination node id). Two planners given the same
 snapshot emit the same moves because every choice above is a function
 of the snapshot; example E12 is the golden nonempty case.
 
-**plan_digest.** The plan's identity is
-`SHA-256("protomolt.capacity-plan-input.v1" ‖ 0x00 ‖ u32le(1) ‖ the context fields in the order above)`,
-each field in §5's canonical encoding. Because the context includes the resolved limits and
-the planning instant, two runs that differ only in a defaulted limit
-or in when they planned have different digests — a plan can always be
-checked against exactly what it planned from.
+**plan_digest.** The plan's identity, encoding version 2, is
+`SHA-256("protomolt.capacity-plan-input.v1" ‖ 0x00 ‖ u32le(2) ‖ the context fields in the order above ‖ u64le(cohort_length_ms) ‖ u64le(cohort_phase_unix_ms) ‖ nodes_digest ‖ fragments_digest)`,
+each field in §5's canonical encoding. `nodes_digest` is the SHA-256 of
+`"protomolt.capacity-plan-nodes.v1" ‖ 0x00 ‖ u32le(1) ‖ u32le(count) ‖ per node in id order: s(node_id) ‖ u8(residency: 0=Unspecified, 1=SERVER, 2=DEVICE) ‖ u8(eligible) ‖ s(failure_domain) ‖ u64le(total_bytes) ‖ u64le(resident_bytes)`.
+`fragments_digest` is the SHA-256 of
+`"protomolt.capacity-plan-fragments.v1" ‖ 0x00 ‖ u32le(1) ‖ u32le(count) ‖ per fragment in canonical order: partition ‖ u64le(topology_generation) ‖ s(leaf) ‖ pool in node-id order ‖ shard owners in shard order ‖ copies in (node, storage-incarnation) order, each as s(node) ‖ 16 bytes ‖ s(domain) ‖ u8(complete) ‖ 32-byte coverage digest`.
+Because the context includes the resolved limits, the planning instant,
+the cohort, the node registry, and the fragment records, two runs that
+differ in any effective input — a defaulted limit, a capacity figure, a
+failure domain, a residency, an eligibility, a pool, an owner, or a
+copy — have different digests: a plan can always be checked against
+exactly what it planned from. (Version 1 omitted the cohort, the node
+registry, and the fragment records; the third 2026-09-08 review found
+the gap, and version 2 is the deliberate correction.)
 
 ```proto
 // DRAFT. Not allocated. On ClusterControl, beside PlanBalance:
@@ -1031,11 +1062,11 @@ Canonical observation-set digest (domain
 ordered by the §3 stored-key tuple):
 `33d9878d3941dbc85ffddd22d4b739162bae935dd5476521a5f0a1439ab965e3`.
 
-Plan digest for the full frozen context (tree digest
+Plan digest (encoding version 2) for the full frozen context (tree digest
 `SHA-256("example placement tree: gen 9, leaf L4 = {krick-1, pi5v1, pi5v3}, leaf L7 = {krick-1, pi5v1}")`,
 provider-geometry digest
 `SHA-256("example provider geometry: turbovec 64-shard mapped image; committed free bytes: krick-1=26843545600, pi5v1=16106127360, pi5v3=0")`):
-`2a4ba9094445438e21bbf888a5e22569c5cfbbada571cfd856823edb20102a4f`.
+`363d0d80d42d9d9e1e3deb256792dab6c088d3aa82eada126e7a038c7460ce27`.
 
 ### E1. Cross-collection identical declarations
 
@@ -1199,7 +1230,7 @@ set by the §3 key tuple either way, so:
 
 - observation-set digest is `33d9878d…65e3` in both;
 - the plan bytes are identical in both, with plan digest
-  `2a4ba909…2a4f`.
+  `363d0d80…ce27`.
 
 Expected plan output for fixture A, stated literally:
 
@@ -1215,7 +1246,7 @@ PlanTiersResponse {
   topology_generation: 9
   workspace: "ws-court"  collection: "cases"
   derived_fingerprint: "34386b55…26d0"
-  plan_digest: "2a4ba909…2a4f"
+  plan_digest: "363d0d80…ce27"
   placements: [
     { fragment: (ws-court, cases, 34386b55…26d0, key_bucket, 7, gen 9, L4),
       classified_tier: "hot",
@@ -1267,7 +1298,7 @@ literal.)
 
 ### E9. Multi-step plans and revisions
 
-Suppose plan P (digest `2a4ba909…2a4f`, control revision 41, epoch
+Suppose plan P (digest `363d0d80…ce27`, control revision 41, epoch
 118) carries two moves, m1 then m2, for two fragments. Under strict
 per-step revision comparison, if an executor commits m1, the control
 revision advances to 42 — and m2, which carries 41, refuses:
@@ -1335,7 +1366,7 @@ two floor violations. Observation epoch 119; fixture M's
 observation-set digest is
 `236d6740a5d5eaec435bb2b6c4b85644ed437ff87b40fd6b9150579ead21f6e1`
 and its plan digest is
-`96f514b75b2c29dcf708ddcdb558d69628f01e1280191bae947aa9182e81d48e`
+`69725b5f19f17c5f42e5fbd45074c11ed941ac5ad1962a9de993dac6cb2400c1`
 (fixture M's frozen context is fixture A's with epoch 119 and the M
 observation set; note fixture M *replaces* fixture A's bucket-7
 reports for this example — its observation set is exactly the two
@@ -1358,7 +1389,7 @@ TierMove {
   destination: { node_id: "krick-1" }    # advisory; no incarnation minted
   from_tier: "archive"  to_tier: "archive"
   bytes: 21474836480
-  plan_digest: "96f514b7…d48e"  control_revision: 41
+  plan_digest: "69725b5f…00c1"  control_revision: 41
   observation_epoch: 119  policy_fingerprint: "5858b135…08eb"
 }
 ```
@@ -1431,11 +1462,44 @@ as follows; the section numbers are this revision's.
     context; reloading the local file never silently overrides
     committed policy (§5).
 
+The third 2026-09-08 review (of the first implementation) found five
+defects, all repaired on `feat/capacity-tiers` with counterexample
+regressions:
+
+1. **Resource/identity binding at the planning boundary** — the
+   planner had grouped reports by a shortened key. The planner now
+   keys on full identity, and the validated constructor re-verifies
+   every observation and fragment against the committed view's
+   resource, owner/history, and copy records; duplicates refuse rather
+   than overwrite.
+2. **Digest completeness** — plan-input encoding version 2 (§4) now
+   binds the cohort and canonical subdigests of the node registry and
+   the fragment records; the §10 digests were recomputed deliberately
+   and the Python oracle recomputes them.
+3. **Bounds and arithmetic as hard refusals** — cohort length
+   validated before any division, checked skew addition, epoch
+   increments preflight-checked before mutation, retained accounting
+   charged by allocation capacity for both key and value, a bounded
+   incarnation registry, replica floors capped at policy validation,
+   and admission caps on observations, fragments, and nodes.
+4. **Residency and eligibility** — the snapshot's node registry
+   carries self-declared residency, eligibility, failure domain, and
+   capacity; `complete` claims validate against it (Server, eligible,
+   one coverage digest per fragment), device-local and unspecified
+   sources are never candidates or verified copies, and pools, owners,
+   and copies are derived from the committed view rather than accepted
+   from the caller.
+5. **Permutation coverage** — the constructor canonicalizes every
+   unordered input and refuses duplicates, so reversed fragments,
+   copies, and pools yield byte-identical plans; two fragments
+   competing for one destination resolve in canonical partition order.
+   Policy tier order stays semantic and is never sorted.
+
 **Next bounded task (per the review's handoff).** With these semantics
-fixed and the fixtures verified by the committed script: implement
-bounded observation collection (cohort-aligned reports on
-`ReportShard`, the stored-set rules of §3) and a pure dry-run planner
-against committed input snapshots, with §10's literals as the golden
-tests. Move execution, ownership changes, transport tag allocation,
-and further fleet operations stay out of that task; source-authority
-activation remains on the foundations track.
+fixed, the fixtures verified by the committed script, and the
+implementation's golden tests green: wire the store and the validated
+snapshot into the control plane's persistence and revision allocation
+(Fable's track), then the cohort-aligned reporting path on
+`ReportShard`. Move execution, ownership changes, transport tag
+allocation, and further fleet operations stay out of that task;
+source-authority activation remains on the foundations track.

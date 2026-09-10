@@ -2,7 +2,9 @@
 
 The 2026-09-06 feature-branch increments add revisioned document grants to the
 public collection authority. Certified execution covers `Bm25Search`, `Suggest`,
-`TermSuggest` and [Aggregate](scoped-folds.md) over private in-process shards.
+`TermSuggest`, [Aggregate](scoped-folds.md), and
+[Query and QueryStream](document-query-authorization.md) over private in-process
+shards.
 BM25 includes prefix expansion, flat and fused fields, the internal streaming scorer, facets, supported
 projections, snippets and score explains. Other retrieval routes, network-node
 delegation and RAG disclosure remain required work. [Field grants](field-grants.md)
@@ -69,8 +71,11 @@ measurements, not a claim that no segments were consulted.
 
 ## Current boundaries
 
-A restricted search decision refuses `Search`, `PhraseSearch`, `HybridSearch`,
-`VariantSearch`, `Query` and `QueryStream` before execution.
+A restricted search decision refuses the legacy `Search`, `PhraseSearch`,
+`HybridSearch` and `VariantSearch` routes before execution. The supported
+`Query` and `QueryStream` executor carries the document view through its
+selection, scoring, fetch and disclosure boundaries; see
+[document-authorized queries](document-query-authorization.md).
 The supported dictionary routes and BM25 prefix expansion apply the document view
 before counting terms or documents. Configured synonym rules continue to expand
 query terms independently of the corpus dictionary.
@@ -95,9 +100,9 @@ Before enabling additional routes, carry visibility into every candidate and
 fetch boundary, source expansion, aggregations and RAG
 context. Field-use and field-disclosure grants apply on the supported
 private-shard routes; the additional routes still need their enforcement. Query
-cursors
-must bind the visibility identity without serializing the private predicate to
-callers; the current restricted Query refusal precedes cursor construction.
+cursors bind the complete authority decision without serializing the private
+predicate to callers. A changed decision invalidates the cursor and requires a
+fresh first page.
 
 ## Evidence
 

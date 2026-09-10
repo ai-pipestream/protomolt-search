@@ -7,9 +7,18 @@
 //! node-to-node WAL/snapshot paths; this module owns decisions, validated
 //! action completion, and complete topology publication.
 
+mod checkpoint;
+#[cfg(feature = "net")]
+pub(crate) mod retirement;
+mod storage;
+pub use checkpoint::LegacyControlCheckpoint;
+#[cfg(feature = "net")]
+pub use retirement::RetiredLegacyControl;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -60,6 +69,7 @@ enum StoredNodeState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct StoredCapacity {
     disk_bytes: u64,
     used_disk_bytes: u64,
@@ -115,6 +125,7 @@ impl From<&StoredCapacity> for NodeCapacity {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredNode {
     node_id: String,
     addr: String,
@@ -131,6 +142,7 @@ enum StoredRole {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredReplica {
     shard_id: String,
     node_id: String,
@@ -150,6 +162,7 @@ struct StoredReplica {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct StoredRoute {
     addr: String,
     replica: Option<String>,
@@ -158,12 +171,14 @@ struct StoredRoute {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredTopology {
     generation: u64,
     routes: Vec<StoredRoute>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredAction {
     action_id: u64,
     kind: i32,
@@ -190,6 +205,7 @@ struct ActionSpec<'a> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredState {
     format: u32,
     /// The collection this plane governs (docs/collections.md); empty in
@@ -202,10 +218,12 @@ struct StoredState {
     next_action: u64,
     topology: StoredTopology,
     history: Vec<StoredTopology>,
+    #[serde(deserialize_with = "checkpoint::unique_map")]
     nodes: BTreeMap<String, StoredNode>,
+    #[serde(deserialize_with = "checkpoint::unique_map")]
     replicas: BTreeMap<String, StoredReplica>,
     actions: Vec<StoredAction>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "checkpoint::unique_set")]
     completed_actions: BTreeSet<u64>,
 }
 
@@ -565,30 +583,120 @@ fn replica_key(shard_id: &str, node_id: &str) -> String {
     format!("{shard_id}\0{node_id}")
 }
 
-fn write_state(path: &Path, state: &StoredState) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)
-        .map_err(|error| format!("mkdir {}: {error}", parent.display()))?;
-    let mut temp = path.as_os_str().to_owned();
-    temp.push(format!(".tmp-{}", std::process::id()));
-    let temp = PathBuf::from(temp);
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StateWriteFault {
+    BeforeRename,
+    AfterRename,
+    AfterSync,
+    ExitBeforeRename,
+    ExitAfterRename,
+    ExitAfterSync,
+}
+
+#[cfg(test)]
+fn inject_state_write_fault(
+    fault: &Mutex<Option<StateWriteFault>>,
+    boundary: StateWriteFault,
+) -> Result<(), String> {
+    let mut selected = fault.lock().unwrap();
+    if matches!(
+        (*selected, boundary),
+        (
+            Some(StateWriteFault::ExitBeforeRename),
+            StateWriteFault::BeforeRename
+        ) | (
+            Some(StateWriteFault::ExitAfterRename),
+            StateWriteFault::AfterRename
+        ) | (
+            Some(StateWriteFault::ExitAfterSync),
+            StateWriteFault::AfterSync
+        )
+    ) {
+        std::process::exit(87);
+    }
+    if *selected == Some(boundary) {
+        *selected = None;
+        return Err(format!(
+            "injected control state write failure at {boundary:?}"
+        ));
+    }
+    Ok(())
+}
+
+struct StateWriteError {
+    message: String,
+    may_have_published: bool,
+}
+
+impl From<String> for StateWriteError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            may_have_published: false,
+        }
+    }
+}
+
+impl StateWriteError {
+    fn publication(message: String) -> Self {
+        Self {
+            message,
+            may_have_published: true,
+        }
+    }
+}
+
+const RETIRED_CONTROL_MAGIC: &[u8; 8] = b"PCTRLRET";
+const RETIRED_CONTROL_STATE: &str = "legacy control authority is durably retired for import; recover its retirement record, never restart it as a writer";
+
+const UNCERTAIN_CONTROL_STATE: &str =
+    "control state persistence outcome is uncertain; close every clone and reopen existing durable state before continuing";
+
+fn write_state(
+    path: &Path,
+    state: &StoredState,
+    #[cfg(test)] fault: &Mutex<Option<StateWriteFault>>,
+) -> Result<(), StateWriteError> {
     let bytes = serde_json::to_vec_pretty(state)
         .map_err(|error| format!("encode control state: {error}"))?;
-    {
-        use std::io::Write;
-        let mut file = std::fs::File::create(&temp)
-            .map_err(|error| format!("create {}: {error}", temp.display()))?;
-        file.write_all(&bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|error| format!("write {}: {error}", temp.display()))?;
-    }
-    std::fs::rename(&temp, path).map_err(|error| format!("replace {}: {error}", path.display()))?;
+    write_bytes(
+        path,
+        &bytes,
+        #[cfg(test)]
+        fault,
+    )
+}
+
+fn write_bytes(
+    path: &Path,
+    bytes: &[u8],
+    #[cfg(test)] fault: &Mutex<Option<StateWriteFault>>,
+) -> Result<(), StateWriteError> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let candidate = storage::Candidate::write(path, bytes)?;
+    #[cfg(test)]
+    inject_state_write_fault(fault, StateWriteFault::BeforeRename)?;
+    // Once publication has been attempted, a failed syscall must not be
+    // interpreted as proof that the old state is still authoritative.
+    candidate.publish(path).map_err(|error| {
+        StateWriteError::publication(format!("replace {}: {error}", path.display()))
+    })?;
+    #[cfg(test)]
+    inject_state_write_fault(fault, StateWriteFault::AfterRename)
+        .map_err(StateWriteError::publication)?;
     std::fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
-        .map_err(|error| format!("sync {}: {error}", parent.display()))
+        .map_err(|error| {
+            StateWriteError::publication(format!("sync {}: {error}", parent.display()))
+        })?;
+    #[cfg(test)]
+    inject_state_write_fault(fault, StateWriteFault::AfterSync)
+        .map_err(StateWriteError::publication)?;
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -596,31 +704,76 @@ pub struct DurableControlPlane {
     state: Arc<Mutex<StoredState>>,
     path: Option<PathBuf>,
     policy: ControlPolicy,
+    // Shared by every clone. Set while holding `state`; checked only after
+    // acquiring that same lock, so a queued operation cannot miss the failure.
+    persistence_uncertain: Arc<AtomicBool>,
+    #[cfg(test)]
+    write_fault: Arc<Mutex<Option<StateWriteFault>>>,
+    // Every clone retains the same open lock file through its lifetime.
+    _ownership_lock: Option<Arc<std::fs::File>>,
+    #[cfg(feature = "net")]
+    retirement: Arc<std::sync::OnceLock<Arc<crate::pb::storage::LegacyControlRetirement>>>,
 }
 
 impl DurableControlPlane {
+    #[cfg(test)]
+    pub(crate) fn arm_state_write_fault(&self, fault: StateWriteFault) {
+        *self.write_fault.lock().unwrap() = Some(fault);
+    }
+
     pub fn open(path: impl Into<PathBuf>, policy: ControlPolicy) -> Result<Self, String> {
-        let path = path.into();
-        let state = if path.exists() {
-            let bytes = std::fs::read(&path)
-                .map_err(|error| format!("read control state {}: {error}", path.display()))?;
-            let state: StoredState = serde_json::from_slice(&bytes)
-                .map_err(|error| format!("parse control state {}: {error}", path.display()))?;
-            if state.format != 1 {
-                return Err(format!(
-                    "control state {} has format {}, expected 1",
-                    path.display(),
-                    state.format
-                ));
+        Self::open_state(path.into(), policy, true)
+    }
+
+    /// Recover an existing control store without bootstrapping missing history.
+    /// A successful reopen reads and syncs the stored decision again. All prior
+    /// instances and clones must be dropped to release exclusive file ownership.
+    pub fn open_existing(path: impl Into<PathBuf>, policy: ControlPolicy) -> Result<Self, String> {
+        Self::open_state(path.into(), policy, false)
+    }
+
+    fn open_state(
+        path: PathBuf,
+        policy: ControlPolicy,
+        allow_create: bool,
+    ) -> Result<Self, String> {
+        let (path, ownership_lock) = storage::acquire(&path, allow_create)?;
+        let state = match storage::read(&path) {
+            Ok(bytes) => {
+                if bytes.starts_with(RETIRED_CONTROL_MAGIC) {
+                    return Err(RETIRED_CONTROL_STATE.to_string());
+                }
+                let state: StoredState = serde_json::from_slice(&bytes)
+                    .map_err(|error| format!("parse control state {}: {error}", path.display()))?;
+                if state.format != 1 {
+                    return Err(format!(
+                        "control state {} has format {}, expected 1",
+                        path.display(),
+                        state.format
+                    ));
+                }
+                state
             }
-            state
-        } else {
-            StoredState::default()
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && allow_create => {
+                StoredState::default()
+            }
+            Err(error) => {
+                return Err(format!(
+                    "read existing control state {}: {error}",
+                    path.display()
+                ))
+            }
         };
         let this = Self {
             state: Arc::new(Mutex::new(state)),
             path: Some(path),
             policy,
+            persistence_uncertain: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            write_fault: Arc::new(Mutex::new(None)),
+            _ownership_lock: Some(ownership_lock),
+            #[cfg(feature = "net")]
+            retirement: Arc::new(std::sync::OnceLock::new()),
         };
         this.persist()?;
         Ok(this)
@@ -631,6 +784,12 @@ impl DurableControlPlane {
             state: Arc::new(Mutex::new(StoredState::default())),
             path: None,
             policy,
+            persistence_uncertain: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            write_fault: Arc::new(Mutex::new(None)),
+            _ownership_lock: None,
+            #[cfg(feature = "net")]
+            retirement: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -640,24 +799,29 @@ impl DurableControlPlane {
     /// dataset's.
     pub fn with_collection(self, name: &str) -> Result<Self, String> {
         {
-            let mut state = self.state.lock().expect("control state lock poisoned");
-            if state.collection.is_empty() {
-                state.collection = name.to_string();
-            } else if state.collection != name {
+            let mut state = self
+                .lock_state()
+                .map_err(|error| error.message().to_string())?;
+            let mut candidate = state.clone();
+            if candidate.collection.is_empty() {
+                candidate.collection = name.to_string();
+            } else if candidate.collection != name {
                 return Err(format!(
                     "control state {} governs collection {:?}, not {name:?}",
                     self.path
                         .as_ref()
                         .map_or_else(|| "(in memory)".to_string(), |p| p.display().to_string()),
-                    state.collection
+                    candidate.collection
                 ));
             }
-            self.persist_locked(&state)?;
+            self.persist_locked(&candidate)?;
+            *state = candidate;
         }
         Ok(self)
     }
 
-    /// The collection this plane governs; empty for an unnamed dataset.
+    /// Configuration label only; empty for an unnamed dataset. Authority
+    /// operations separately check the persistence failure latch under the lock.
     pub fn collection(&self) -> String {
         self.state
             .lock()
@@ -690,9 +854,8 @@ impl DurableControlPlane {
             })
             .collect::<Result<Vec<_>, String>>()?;
         let mut state = self
-            .state
-            .lock()
-            .map_err(|_| "control state lock poisoned".to_string())?;
+            .lock_state()
+            .map_err(|error| error.message().to_string())?;
         let pristine = state.topology.generation == 0
             && state.topology.routes.is_empty()
             && state.history.is_empty()
@@ -712,18 +875,55 @@ impl DurableControlPlane {
         Ok(())
     }
 
+    fn lock_state(&self) -> Result<MutexGuard<'_, StoredState>, Status> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Status::internal("control state lock poisoned"))?;
+        if self.persistence_uncertain.load(Ordering::Acquire) {
+            return Err(Status::failed_precondition(UNCERTAIN_CONTROL_STATE));
+        }
+        #[cfg(feature = "net")]
+        if self.retirement.get().is_some() {
+            return Err(Status::failed_precondition(RETIRED_CONTROL_STATE));
+        }
+        Ok(state)
+    }
+
+    // Every caller retains the state lock through this write and the failure
+    // latch update. A failure before publication leaves the prior authority
+    // usable; an ambiguous publication permanently closes this instance.
     fn persist_locked(&self, state: &StoredState) -> Result<(), String> {
+        if self.persistence_uncertain.load(Ordering::Acquire) {
+            return Err(UNCERTAIN_CONTROL_STATE.to_string());
+        }
+        #[cfg(feature = "net")]
+        if self.retirement.get().is_some() {
+            return Err(RETIRED_CONTROL_STATE.to_string());
+        }
         match &self.path {
-            Some(path) => write_state(path, state),
+            Some(path) => write_state(
+                path,
+                state,
+                #[cfg(test)]
+                &self.write_fault,
+            )
+            .map_err(|error| {
+                if error.may_have_published {
+                    self.persistence_uncertain.store(true, Ordering::Release);
+                    format!("{UNCERTAIN_CONTROL_STATE}: {}", error.message)
+                } else {
+                    error.message
+                }
+            }),
             None => Ok(()),
         }
     }
 
     fn persist(&self) -> Result<(), String> {
         let state = self
-            .state
-            .lock()
-            .map_err(|_| "control state lock poisoned".to_string())?;
+            .lock_state()
+            .map_err(|error| error.message().to_string())?;
         self.persist_locked(&state)
     }
 
@@ -772,10 +972,7 @@ impl DurableControlPlane {
             ));
         }
         let duration = self.lease_duration(request.lease_ms)?;
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| Status::internal("control state lock poisoned"))?;
+        let mut state = self.lock_state()?;
         if let Some(held) = state.nodes.get(&request.node_id) {
             if held.state != StoredNodeState::Expired && held.addr != request.addr {
                 return Err(Status::already_exists(format!(
@@ -823,10 +1020,7 @@ impl DurableControlPlane {
 
     fn renew(&self, request: RenewNodeLeaseRequest, now: u64) -> Result<NodeLease, Status> {
         let duration = self.lease_duration(request.lease_ms)?;
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| Status::internal("control state lock poisoned"))?;
+        let mut state = self.lock_state()?;
         let revision = state
             .revision
             .checked_add(1)
@@ -854,10 +1048,7 @@ impl DurableControlPlane {
     }
 
     fn drain(&self, request: DrainNodeRequest, now: u64) -> Result<(), Status> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| Status::internal("control state lock poisoned"))?;
+        let mut state = self.lock_state()?;
         let revision = state
             .revision
             .checked_add(1)
@@ -899,10 +1090,7 @@ impl DurableControlPlane {
                 "shard tombstone count exceeds physical rows",
             ));
         }
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| Status::internal("control state lock poisoned"))?;
+        let mut state = self.lock_state()?;
         let revision = state
             .revision
             .checked_add(1)
@@ -1081,10 +1269,7 @@ impl DurableControlPlane {
         request: CompletePlacementActionRequest,
         now: u64,
     ) -> Result<(), Status> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| Status::internal("control state lock poisoned"))?;
+        let mut state = self.lock_state()?;
         Self::validate_lease(&mut state, &request.node_id, request.lease_token, now)?;
         if state.completed_actions.contains(&request.action_id) {
             return Ok(());
@@ -1777,29 +1962,19 @@ impl DurableControlPlane {
     }
 
     fn reconcile(&self, dry_run: bool, now: u64) -> Result<(ClusterPlan, bool), Status> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| Status::internal("control state lock poisoned"))?;
-        if dry_run {
-            let mut candidate = state.clone();
-            let changed = self.reconcile_locked(&mut candidate, now)?;
-            return Ok((Self::plan_of(&candidate), changed));
+        let mut state = self.lock_state()?;
+        let mut candidate = state.clone();
+        let changed = self.reconcile_locked(&mut candidate, now)?;
+        let plan = Self::plan_of(&candidate);
+        if !dry_run {
+            self.persist_locked(&candidate).map_err(Status::internal)?;
+            *state = candidate;
         }
-        let before = state.clone();
-        let changed = self.reconcile_locked(&mut state, now)?;
-        if let Err(error) = self.persist_locked(&state) {
-            *state = before;
-            return Err(Status::internal(error));
-        }
-        Ok((Self::plan_of(&state), changed))
+        Ok((plan, changed))
     }
 
     fn rollback(&self, requested: u64) -> Result<(ClusterPlan, bool), Status> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| Status::internal("control state lock poisoned"))?;
+        let mut state = self.lock_state()?;
         let position = if requested == 0 {
             state.history.len().checked_sub(1)
         } else {
@@ -1835,10 +2010,7 @@ impl DurableControlPlane {
     }
 
     fn plan(&self) -> Result<ClusterPlan, Status> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| Status::internal("control state lock poisoned"))?;
+        let state = self.lock_state()?;
         Ok(Self::plan_of(&state))
     }
 
@@ -1850,19 +2022,18 @@ impl DurableControlPlane {
         pool_of: &dyn Fn(&str) -> BalancePool,
         now: u64,
     ) -> Result<PlanBalanceResponse, Status> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| Status::internal("control state lock poisoned"))?;
+        let state = self.lock_state()?;
         plan_balance(&state, request, row_bytes, pool_of, now)
     }
 
+    #[cfg(test)]
     fn topology_routes(&self) -> Result<(u64, Vec<TopologyRoute>), Status> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| Status::internal("control state lock poisoned"))?;
-        Ok((
+        let state = self.lock_state()?;
+        Ok(Self::topology_routes_of(&state))
+    }
+
+    fn topology_routes_of(state: &StoredState) -> (u64, Vec<TopologyRoute>) {
+        (
             state.topology.generation,
             state
                 .topology
@@ -1875,7 +2046,7 @@ impl DurableControlPlane {
                     placement: None,
                 })
                 .collect(),
-        ))
+        )
     }
 
     fn plan_of(state: &StoredState) -> ClusterPlan {
@@ -2021,7 +2192,7 @@ impl ClusterControlService {
     /// Admit a request only for this plane's collection (the same rule
     /// as `CoordinatorServiceImpl::admit`).
     fn admit(&self, requested: &str) -> Result<(), Status> {
-        let own = self.plane.collection();
+        let own = self.plane.lock_state()?.collection.clone();
         if requested.is_empty() || requested == own {
             return Ok(());
         }
@@ -2043,10 +2214,13 @@ impl ClusterControlService {
     }
 
     pub fn publish_current_topology(&self) -> Result<(), Status> {
+        // Keep publication serialized with persistence failures. A route
+        // snapshot read before an ambiguous write must not be published after it.
+        let state = self.plane.lock_state()?;
         let Some(coordinator) = &self.coordinator else {
             return Ok(());
         };
-        let (generation, routes) = self.plane.topology_routes()?;
+        let (generation, routes) = DurableControlPlane::topology_routes_of(&state);
         // The durable control state holds hash ranges and addresses, not
         // placement codes: publishing over a placed generation would
         // strip the tree, so it is refused until the plane carries it.
@@ -2130,11 +2304,7 @@ impl ClusterControlService {
         let mut pools = BTreeMap::new();
         if let Some(placement) = coordinator.current_placement() {
             let node_ids_by_addr: BTreeMap<String, String> = {
-                let state = self
-                    .plane
-                    .state
-                    .lock()
-                    .map_err(|_| Status::internal("control state lock poisoned"))?;
+                let state = self.plane.lock_state()?;
                 state
                     .nodes
                     .values()
@@ -2324,6 +2494,31 @@ impl ClusterControl for ClusterControlService {
         .await
     }
 }
+
+#[cfg(test)]
+mod checkpoint_tests;
+#[cfg(test)]
+pub(crate) mod test_fixtures {
+    //! Legacy state files for tests in other modules.
+    /// A populated legacy state file body under `collection`, with `routes`
+    /// current routes (at least 2).
+    pub(crate) fn populated_state_json(collection: &str, routes: usize) -> String {
+        serde_json::to_string(&super::checkpoint_tests::complete_state_with(
+            collection, routes,
+        ))
+        .unwrap()
+    }
+    /// The policy that state was captured under.
+    pub(crate) fn populated_policy() -> super::ControlPolicy {
+        super::checkpoint_tests::complete_policy()
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests;
+
+#[cfg(test)]
+mod persistence_tests;
 
 #[cfg(test)]
 mod tests {

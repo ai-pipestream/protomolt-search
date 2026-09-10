@@ -1,3 +1,4 @@
+use pipestream_search::test_support::ForkGuarded;
 use pipestream_search::{
     pb,
     replay_journal::{binding_digest, seal_frame, ReplayJournal},
@@ -322,7 +323,7 @@ fn accepted_receipt_survives_process_exit_without_drop() {
             "--nocapture",
         ])
         .env(ENV, dir.path())
-        .status()
+        .status_guarded()
         .unwrap();
     assert!(status.success());
     let journal = ReplayJournal::open(&dir.path(), binding()).unwrap();

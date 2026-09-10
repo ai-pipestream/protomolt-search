@@ -2,6 +2,7 @@ syntax = "proto3";
 package ai.protomolt.search.storage.v1;
 import "ai/protomolt/search/v1/document_write.proto";
 import "ai/protomolt/search/v1/search.proto";
+import "ai/protomolt/search/storage/v1/source_authority.proto";
 
 message DocumentCatalogHeader {
   uint32 format_version = 1;
@@ -18,6 +19,70 @@ message DocumentCatalogHeader {
   // retains this decision together with the final seal. Older readers refuse
   // both formats; neither reopen nor backup can discard the admission fence.
   SourceRetirementIntent retirement_intent = 7;
+  // Format 7 requires the access-controlled API on open and every mutation.
+  // Retirement and seal markers retain their meaning without changing format.
+  SourceResourceBinding resource_binding = 8;
+  // Format 8: actor-scoped retries. Required even when no legacy records exist.
+  SourceActorNamespace actor_namespace = 9;
+  // Format 9 binds this exact local history to a prepared logical owner.
+  // Reopen starts closed; persisted metadata never grants write admission.
+  SourceManagedBinding managed_binding = 10;
+  // Format 10 records the committed ownership fence. Writes are admitted only
+  // through the activated adapter, under an authority admission that finds
+  // the owner ACTIVE with this exact epoch at every commit.
+  SourceManagedActivation managed_activation = 11;
+}
+
+// The fence the owner persisted from its committed activation.
+message SourceManagedActivation {
+  uint32 format_version = 1; // 1
+  SourceAuthorityIdentity authority = 2;
+  uint64 ownership_generation = 3;
+  uint64 write_epoch = 4;
+  uint64 activated_control_revision = 5;
+  uint64 activated_at_sequence = 6;
+}
+
+// The source-side completion of a committed preparation, not activation or
+// permission to export a phone's bytes. All original history and retries stay.
+message SourceManagedBinding {
+  uint32 format_version = 1; // 1
+  SourceAuthorityIdentity authority = 2;
+  PreparedSourceOwner preparation = 3;
+  uint64 bound_at_sequence = 4;
+}
+
+// Canonical lookup key in the separate actor_operations table. Principals are
+// authenticated stable subjects, never display names or caller-supplied aliases.
+message ActorOperationKey {
+  uint32 format_version = 1; // 1
+  string principal = 2; // 1..16384 UTF-8 bytes, never reassigned to another actor.
+  bytes operation_id = 3; // 1..1024 bytes.
+}
+
+// Migration watermark. All acceptance is fenced until assignment is complete.
+message SourceActorNamespace {
+  uint32 format_version = 1; // 1
+  uint64 legacy_operations = 2;
+  uint64 assigned_operations = 3;
+}
+
+// Explicit Admin attribution of one actorless decision. Preserves the exact
+// stored operation value, history, versions, watermark and lifecycle fences.
+// It grants no permission to the named actor and no replacement ownership.
+message SourceActorAssignment {
+  uint32 format_version = 1; // 1
+  bytes history_id = 2;
+  bytes operation_id = 3;
+  string principal = 4;
+  bytes request_sha256 = 5;
+}
+
+// Immutable local resource scope, not a replacement-owner or residency grant.
+message SourceResourceBinding {
+  uint32 format_version = 1; // 1
+  string workspace = 2;
+  string collection = 3;
 }
 
 // Trusted local admission closure. The database writer chooses the accepted
@@ -116,6 +181,10 @@ message SourceIndexOwner {
 
 // Local artifact comparison, not an authorization grant or a write receipt.
 // The maintenance publisher must compute this from its held before/after views.
+// Format 1 certified stored content and exact FP32 rows only; format 2 also
+// certifies the vector provider's stored encoding of every live row. A journal
+// keeps format-1 records readable; only format 2 says anything about the
+// dense image (docs/source-index-maintenance.md).
 message SourceRewriteCertificate {
   uint32 format_version = 1;
   SourceIndexOwner owner = 2;

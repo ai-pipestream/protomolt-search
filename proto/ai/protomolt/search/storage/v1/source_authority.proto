@@ -1,0 +1,199 @@
+syntax = "proto3";
+package ai.protomolt.search.storage.v1;
+
+import "ai/protomolt/search/v1/authorization.proto";
+
+// Internal durable control contract. These are not public RPCs, source write
+// credentials, document receipts, or permission to copy a device's data.
+message SourceAuthorityIdentity {
+  uint32 format_version = 1; // 1
+  bytes group_id = 2; // nonzero 16 bytes, immutable on recovery
+  bytes authority_incarnation = 3; // nonzero 16 bytes, never inferred on open
+}
+
+// An owner belongs to a resource. Independent phone owners may share a
+// collection and local document keys. Replacement retains this logical key.
+message LogicalSourceOwner {
+  string workspace = 1;
+  string collection = 2;
+  bytes owner_id = 3; // 1..1024 bytes; empty only for collection-policy commands
+}
+
+enum SourceResidency {
+  SOURCE_RESIDENCY_UNSPECIFIED = 0;
+  SOURCE_RESIDENCY_SERVER = 1;
+  SOURCE_RESIDENCY_DEVICE_LOCAL = 2;
+}
+
+// Intended physical storage, distinct from logical owner, process incarnation,
+// node lease, and authority incarnation. No paths or source bytes enter control.
+message SourceStorageTarget {
+  string node_id = 1; // stable authenticated host identity, 1..1024 bytes
+  bytes storage_incarnation = 2; // nonzero 16 bytes
+  bytes history_id = 3; // nonzero 16 bytes; must later be verified at the owner
+  SourceResidency residency = 4;
+  // Required and equal to node_id for DEVICE_LOCAL; absent for SERVER.
+  string resident_device_id = 5;
+}
+
+enum PreparedSourceOwnerPhase {
+  PREPARED_SOURCE_OWNER_PHASE_UNSPECIFIED = 0;
+  PREPARED_SOURCE_OWNER_PHASE_PREPARED = 1;
+  PREPARED_SOURCE_OWNER_PHASE_CANCELLED = 2;
+  // The owner persisted its managed binding and the hosting adapter verified
+  // that completion. Still not a published map or a live writer.
+  PREPARED_SOURCE_OWNER_PHASE_READY = 3;
+  // Activation committed the ownership fence (write epoch). Installation is
+  // authorized; the owner admits writes only under this exact epoch.
+  PREPARED_SOURCE_OWNER_PHASE_ACTIVE = 4;
+}
+
+// PREPARED and CANCELLED admit no writes and authorize no installation.
+// Cancellation retains the generation allocator and the workflow; a later
+// preparation advances it. READY is terminal for this generation: it cannot be
+// cancelled, and replacement needs a complete ownership transition.
+message PreparedSourceOwner {
+  uint32 format_version = 1; // 1
+  LogicalSourceOwner key = 2;
+  SourceStorageTarget target = 3;
+  bytes workflow_id = 4; // 1..1024 bytes, separate from each command's retry ID
+  uint64 ownership_generation = 5;
+  PreparedSourceOwnerPhase phase = 6;
+  uint64 control_revision = 7;
+  SourceAuthorityOperationKey last_command = 8;
+  SourceOwnerReadiness readiness = 9; // present from READY on
+  SourceOwnerActivation activation = 10; // present exactly when phase is ACTIVE
+}
+
+// The committed ownership fence. write_epoch is the ownership generation of
+// the activated owner; every source write validates it at its commit
+// boundary through the authority's admission. Lease expiry never allocates
+// one: only a committed activation does.
+message SourceOwnerActivation {
+  uint32 format_version = 1; // 1
+  uint64 write_epoch = 2;
+  uint64 activated_control_revision = 3;
+}
+
+// The verified completion fact recorded at readiness.
+message SourceOwnerReadiness {
+  uint32 format_version = 1; // 1
+  SourceOwnerCompletion completion = 2;
+}
+
+// What the owner's durable managed binding states, as verified by the hosting
+// adapter that holds that binding. Never accepted from caller bytes alone.
+message SourceOwnerCompletion {
+  uint32 format_version = 1; // 1
+  bytes binding_sha256 = 2; // SHA-256 over the canonical SourceManagedBinding
+  uint64 bound_at_sequence = 3;
+  bytes history_id = 4; // must equal the prepared target
+  string node_id = 5; // must equal the prepared target
+  bytes storage_incarnation = 6; // must equal the prepared target
+}
+
+message PrepareSourceOwner {
+  bytes workflow_id = 1;
+  SourceStorageTarget target = 2;
+}
+
+message CancelPreparedSourceOwner {
+  bytes workflow_id = 1;
+}
+
+// PREPARED -> READY. Admitted only through the hosting adapter that holds the
+// owner's managed binding; the general command path refuses it.
+message ConfirmSourceOwnerReady {
+  bytes workflow_id = 1;
+  SourceOwnerCompletion completion = 2;
+}
+
+// READY -> ACTIVE by a current Admin: commits the write epoch. It does not
+// claim the owner is serving; the owner records the fence before it writes.
+message ActivateSourceOwner {
+  bytes workflow_id = 1;
+}
+
+// Replace grants for this command's one immutable resource only. No action
+// implies another; existing document/field restrictions retain their meaning.
+// The state machine increments the policy revision. Empty grants deny all.
+message ReplaceSourceCollectionGrants {
+  repeated ai.protomolt.search.v1.CollectionGrant grants = 1;
+}
+
+message SourceAuthorityCommand {
+  uint32 format_version = 1; // 1
+  SourceAuthorityIdentity authority = 2;
+  LogicalSourceOwner key = 3;
+  bytes command_id = 4; // 1..1024 bytes, scoped by actor and the complete key
+  uint64 expected_control_revision = 5;
+  uint64 expected_policy_revision = 6;
+  // Zero means no owner has ever been prepared under this key.
+  uint64 expected_ownership_generation = 7;
+  oneof action {
+    PrepareSourceOwner prepare = 10;
+    CancelPreparedSourceOwner cancel = 11;
+    ReplaceSourceCollectionGrants replace_grants = 12;
+    ConfirmSourceOwnerReady confirm_ready = 13;
+    ActivateSourceOwner activate = 14;
+  }
+}
+
+message SourceAuthorityOperationKey {
+  uint32 format_version = 1; // 1
+  LogicalSourceOwner key = 2;
+  string principal = 3; // authenticated stable subject, 1..16384 bytes
+  bytes command_id = 4;
+}
+
+// A control decision only. No accepted/searchable/durable document receipt is
+// synthesized here. Rejections are durable retry results too. code uses the
+// canonical gRPC numeric status; zero is a successful control transition.
+message SourceAuthorityDecision {
+  uint32 format_version = 1; // 1
+  uint32 code = 2;
+  string message = 3;
+  uint64 control_revision = 4;
+  uint64 policy_revision = 5;
+  PreparedSourceOwner owner = 6;
+}
+
+message SourceAuthorityOperation {
+  uint32 format_version = 1; // 1
+  bytes request_sha256 = 2;
+  // Server-resolved actor is in the table key, never accepted from this command.
+  SourceAuthorityCommand command = 3;
+  SourceAuthorityDecision decision = 4;
+}
+
+message SourceAuthorityWorkflowKey {
+  LogicalSourceOwner key = 1;
+  bytes workflow_id = 2;
+}
+
+// A permanent workflow reservation; cancellation never permits reuse.
+message SourceAuthorityWorkflow {
+  SourceAuthorityOperationKey preparation_command = 1;
+  uint64 ownership_generation = 2;
+}
+
+// Logical payload accounting, not a bound on filesystem pages or process RSS.
+// No retry eviction. Full capacity refuses new commands without reserving IDs.
+message SourceAuthorityLimits {
+  uint64 max_owners = 1; // 1..1000000
+  uint64 max_decisions = 2; // 1..1000000
+  uint64 max_payload_bytes = 3; // 1..1 TiB
+  uint32 max_command_bytes = 4; // 1..1 MiB, <= max_payload_bytes
+}
+
+message SourceAuthorityHeader {
+  uint32 format_version = 1; // 1
+  SourceAuthorityIdentity identity = 2;
+  SourceAuthorityLimits limits = 3;
+  uint64 control_revision = 4; // begins at 1; advances only on accepted changes
+  uint64 owner_count = 5;
+  uint64 decision_count = 6;
+  // Policy bytes and every owner/decision/workflow key and value, header excluded.
+  uint64 payload_bytes = 7;
+  uint64 workflow_count = 8;
+}

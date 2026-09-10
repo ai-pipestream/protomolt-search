@@ -172,6 +172,7 @@ impl From<Status> for EmbeddedError {
 /// owns a network listener.
 pub struct EmbeddedSearch {
     coordinator: CoordinatorServiceImpl,
+    collections: crate::collections::CollectionSet,
     /// The shards, reached in-process through [`NodeLink::Local`]: the
     /// same handlers the network serves, with no HTTP/2 between.
     nodes: Vec<Arc<NodeServiceImpl>>,
@@ -237,7 +238,9 @@ impl EmbeddedSearch {
             nodes.push(Arc::new(node));
         }
 
+        let collection = config.shards[0].node.collection.clone();
         let mut coordinator = CoordinatorServiceImpl::with_local_nodes(nodes.clone())
+            .with_collection(&collection)
             .with_bm25(
                 Some(NATIVE_ANALYSIS_BACKEND.to_string()),
                 config.bm25_params,
@@ -253,8 +256,18 @@ impl EmbeddedSearch {
             coordinator = coordinator.with_dense_quality_profile(profile);
         }
 
+        let collections = if collection.is_empty() {
+            crate::collections::CollectionSet::single(coordinator.clone())
+        } else {
+            crate::collections::CollectionSet::named(
+                vec![(collection.clone(), coordinator.clone())],
+                Some(collection),
+            )
+            .map_err(EmbeddedError::InvalidConfig)?
+        };
         Ok(Self {
             coordinator,
+            collections,
             nodes,
             document_catalog,
         })
@@ -426,8 +439,7 @@ impl EmbeddedSearch {
         &self,
         principals: Arc<crate::security::Principals>,
     ) -> crate::collections::CollectionSet {
-        crate::collections::CollectionSet::single(self.coordinator.clone())
-            .with_principals(principals)
+        self.collections.clone().with_principals(principals)
     }
 
     /// Embedded construction hard-disables TCP fallback, DNS resolution, and
@@ -691,6 +703,18 @@ fn validate_config(config: &mut EmbeddedSearchConfig) -> Result<(), EmbeddedErro
         return Err(EmbeddedError::InvalidConfig(
             "embedded max_rerank_bytes must be positive".to_string(),
         ));
+    }
+
+    let collection = &config.shards[0].node.collection;
+    if !collection.is_empty() {
+        crate::collections::validate_name(collection).map_err(EmbeddedError::InvalidConfig)?;
+    }
+    for (shard, shard_config) in config.shards.iter().enumerate() {
+        if &shard_config.node.collection != collection {
+            return Err(EmbeddedError::InvalidConfig(format!(
+                "embedded shard {shard} collection differs; one runtime serves one collection"
+            )));
+        }
     }
 
     let catalog_path = config

@@ -13,6 +13,10 @@ resolver = "2"
 [dependencies]
 turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "turbovec-pipestream-s21" }
 turbovec-grpc = { git = "https://github.com/ai-pipestream/turbovec-grpc.git", rev = "ce2f9de", optional = true }
+# Control consensus (docs/raft-control-design.md). Pinned exactly: the
+# storage-v2 contracts are what the log store and state machine implement,
+# and the typed envelopes map to this version's types explicitly.
+openraft = { version = "=0.9.25", default-features = false, features = ["storage-v2"], optional = true }
 # tonic's core (Status, Request, codegen, the prost codec) is all the
 # embedded runtime needs; the HTTP/2 transport rides the `net` feature.
 tonic = { version = "0.12", default-features = false, features = ["codegen", "prost"] }
@@ -61,6 +65,21 @@ redb = "=4.1.0"
 getrandom = "=0.2.17"
 
 [features]
+# Raft hosting of the source authority (docs/raft-control-design.md): the
+# redb log store, the state machine over the committed-replay paths and the
+# in-process host. Transport needs `net` as well.
+raft = ["dep:openraft"]
+# Process-exit fault injection at store and source transaction boundaries,
+# for out-of-crate crash-recovery harnesses (tests/*.rs). Never on in a
+# serving binary.
+fault-injection = []
+# The fork guard of `test_support` (docs/control-authority-test-harness.md,
+# "the fork window"): the exclusive lock takes call its handoff and the
+# module is public, so a test binary that spawns this same executable can
+# spawn under the guard and with the pre-exec descriptor sweep. On in every
+# test build of this crate through the dev-dependency on itself below;
+# never on in a serving binary.
+fork-guard = []
 # The network stack (docs/embedded-mobile.md): tonic's HTTP/2 transport,
 # Tokio's sockets and signals, the clustered TurboVec gRPC client, and
 # everything that listens or dials — the serving binary, the harness,
@@ -115,6 +134,10 @@ tonic-build = "0.12"
 # and the embedded runtime compose; dev-only so the product gains no
 # dependency on the provider while the ownership question stands.
 protomolt-embedder = { path = "crates/protomolt-embedder" }
+# Turns `fork-guard` on for the test targets of this crate and for no other
+# build: cargo unifies a self dev-dependency's features into the library
+# the tests link, and `cargo build` of the binaries does not see it.
+pipestream-search = { path = ".", features = ["fork-guard"] }
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
 bzip2 = "0.6"
 csv = "1"

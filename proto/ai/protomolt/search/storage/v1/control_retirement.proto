@@ -1,0 +1,27 @@
+syntax = "proto3";
+package ai.protomolt.search.storage.v1;
+
+import "ai/protomolt/search/storage/v1/source_authority.proto";
+
+// Administrative local preparation, not a Raft import or a source-write RPC.
+// The server resolves the actor and destination authority outside this request.
+message LegacyControlRetirementRequest {
+  uint32 format_version = 1; // 1
+  LogicalSourceOwner key = 2; // explicit resource, owner_id must be empty
+  bytes command_id = 3; // stable retirement retry ID, scoped by actor and resource
+  bytes expected_checkpoint_sha256 = 4; // SHA-256 of canonical LegacyControlImport
+  uint64 expected_control_revision = 5; // destination authority at first retirement
+  uint64 expected_policy_revision = 6; // destination policy at first retirement
+}
+
+// Replaces the legacy JSON authority before a new authority can consume its
+// checkpoint. Retains credentials and every legacy field inside checkpoint;
+// never disclose this record through public diagnostics or map subscriptions.
+// It does not assert that the destination imported anything or an owner is ready.
+message LegacyControlRetirement {
+  uint32 format_version = 1; // 1
+  SourceAuthorityIdentity authority = 2;
+  SourceAuthorityOperationKey operation = 3; // resolved actor, exact resource and ID
+  LegacyControlRetirementRequest request = 4;
+  bytes checkpoint = 5; // canonical LegacyControlImport, <=16 MiB
+}

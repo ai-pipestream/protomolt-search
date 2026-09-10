@@ -10,24 +10,29 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use common::{fit_calibration, start_empty_node, unit_vectors};
 use pipestream_search::analyzer::body_spec;
+use pipestream_search::authorization::PolicyAuthority;
 use pipestream_search::bm25::Bm25Params;
 use pipestream_search::coordinator::CoordinatorServiceImpl;
 use pipestream_search::embedded::{
-    EmbeddedError, EmbeddedSearch, EmbeddedSearchConfig, EmbeddedShardConfig,
+    EmbeddedDocumentCatalogConfig, EmbeddedError, EmbeddedSearch, EmbeddedSearchConfig,
+    EmbeddedShardConfig,
 };
 use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
-    ingest_mapped_request, query_stream_response, search_query, selection_query,
-    AddDocumentsRequest, AddVectorsRequest, BroadcastCalibrationRequest, CommitReplacementsRequest,
-    DeleteDocumentsRequest, DenseQuery, IngestMappedRequest, IntegerValue, LexicalQuery,
-    MappedBind, PlanIndexRequest, QueryRequest, QueryStreamRequest, Replacement, SearchQuery,
-    SelectionQuery, SetCalibrationRequest,
+    ingest_mapped_request, query_stream_response, search_query, selection_query, AccessAction,
+    AccessPolicy, AddDocumentsRequest, AddVectorsRequest, BroadcastCalibrationRequest,
+    CollectionGrant, CollectionResource, CommitReplacementsRequest, DeleteDocumentsRequest,
+    DenseQuery, IngestMappedRequest, IntegerValue, LexicalQuery, MappedBind, PlanIndexRequest,
+    QueryRequest, QueryStreamRequest, Replacement, SearchQuery, SelectionQuery,
+    SetCalibrationRequest,
 };
+use pipestream_search::security::{PrincipalConfig, Principals};
 use prost::Message;
 use prost_types::field_descriptor_proto::{Label, Type};
 use prost_types::{DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet};
+use std::sync::Arc;
 use tokio_stream::StreamExt;
 use tonic::Request;
 
@@ -80,6 +85,157 @@ fn local_shards() -> Vec<EmbeddedShardConfig> {
             shard
         })
         .collect()
+}
+
+fn named_shards(names: &[&str]) -> Vec<EmbeddedShardConfig> {
+    names
+        .iter()
+        .enumerate()
+        .map(|(slot, name)| {
+            let mut shard = EmbeddedShardConfig::in_memory((slot * 100) as u64);
+            shard.node.collection = (*name).into();
+            shard
+        })
+        .collect()
+}
+
+fn named_principals() -> Arc<Principals> {
+    let policy = AccessPolicy {
+        format_version: 1,
+        revision: 1,
+        resources: vec![
+            CollectionResource {
+                workspace: "workspace-a".into(),
+                collection: "books".into(),
+            },
+            CollectionResource {
+                workspace: "workspace-b".into(),
+                collection: String::new(),
+            },
+        ],
+        grants: vec![
+            CollectionGrant {
+                principal: "books-reader".into(),
+                workspace: "workspace-a".into(),
+                collection: "books".into(),
+                actions: vec![AccessAction::Search as i32],
+                ..Default::default()
+            },
+            CollectionGrant {
+                principal: "unnamed-reader".into(),
+                workspace: "workspace-b".into(),
+                collection: String::new(),
+                actions: vec![AccessAction::Search as i32],
+                ..Default::default()
+            },
+        ],
+    };
+    let authority = Arc::new(PolicyAuthority::new(policy).unwrap());
+    Arc::new(
+        Principals::from_configs(&[
+            PrincipalConfig {
+                name: "books-reader".into(),
+                token: "books-reader-token-0123456789".into(),
+                ..Default::default()
+            },
+            PrincipalConfig {
+                name: "unnamed-reader".into(),
+                token: "unnamed-reader-token-0123456789".into(),
+                ..Default::default()
+            },
+        ])
+        .unwrap()
+        .with_authorizer(authority),
+    )
+}
+
+async fn populated_named_embedded() -> EmbeddedSearch {
+    let mut config = EmbeddedSearchConfig::new(named_shards(&["books", "books"]));
+    config.document_catalog = Some(EmbeddedDocumentCatalogConfig {
+        collection: "books".into(),
+        path: None,
+    });
+    let embedded = EmbeddedSearch::open(config).await.unwrap();
+    for shard in 0..2 {
+        embedded
+            .add_documents(
+                shard,
+                vec![AddDocumentsRequest {
+                    text: format!("named zebra {shard}"),
+                    analysis: Some(body_spec()),
+                    ..Default::default()
+                }],
+            )
+            .await
+            .unwrap();
+    }
+    embedded
+}
+
+#[tokio::test]
+async fn authorized_named_embedded_service_defaults_and_routes_to_its_collection() {
+    let embedded = populated_named_embedded().await;
+    let service = embedded.authorized_service(named_principals());
+
+    let default =
+        SearchService::query(&service, authorized(lexical_query("zebra"), "books-reader"))
+            .await
+            .unwrap()
+            .into_inner();
+    assert_eq!(default.hits.len(), 2);
+
+    let mut explicit = lexical_query("zebra");
+    explicit.collection = "books".into();
+    let explicit = SearchService::query(&service, authorized(explicit, "books-reader"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(explicit.hits, default.hits);
+    assert_eq!(explicit.executed, default.executed);
+}
+
+#[tokio::test]
+async fn unnamed_grant_in_another_workspace_cannot_reach_named_embedded_data() {
+    let embedded = populated_named_embedded().await;
+    let service = embedded.authorized_service(named_principals());
+    let error = SearchService::query(
+        &service,
+        authorized(lexical_query("zebra"), "unnamed-reader"),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn embedded_startup_rejects_mixed_collection_names_without_a_catalog() {
+    let mixed = EmbeddedSearch::open(EmbeddedSearchConfig::new(named_shards(&["books", "other"])))
+        .await
+        .err()
+        .expect("mixed embedded collections must be rejected");
+    assert!(matches!(mixed, EmbeddedError::InvalidConfig(_)));
+    assert!(mixed.to_string().contains("collection"));
+}
+
+#[tokio::test]
+async fn embedded_startup_rejects_invalid_collection_name_without_a_catalog() {
+    let invalid = EmbeddedSearch::open(EmbeddedSearchConfig::new(named_shards(&["bad name"])))
+        .await
+        .err()
+        .expect("invalid embedded collection must be rejected");
+    assert!(matches!(invalid, EmbeddedError::InvalidConfig(_)));
+    assert!(invalid.to_string().contains("collection"));
+}
+
+fn authorized<T>(message: T, principal: &str) -> Request<T> {
+    let mut request = Request::new(message);
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {principal}-token-0123456789")
+            .parse()
+            .unwrap(),
+    );
+    request
 }
 
 async fn populate_embedded(runtime: &EmbeddedSearch, corpus: &[f32]) {

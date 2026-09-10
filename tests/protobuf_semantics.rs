@@ -104,6 +104,57 @@ fn closed_enum_oneof_does_not_replace_a_known_member() {
 }
 
 #[test]
+fn wrong_wire_oneof_fields_do_not_replace_the_selected_member() {
+    let extractor = Extractor::new(SEMANTICS_DESCRIPTOR, "semantics.Doc", "body").unwrap();
+    for wrong_wire in [
+        vec![41, 0, 0, 0, 0, 0, 0, 0, 0],
+        vec![42, 1, 0],
+        vec![43, 8, 1, 44],
+        vec![45, 0, 0, 0, 0],
+    ] {
+        let mut suffix = vec![32, 1];
+        suffix.extend(wrong_wire);
+        let rows = extractor.extract(&semantics_wire(&suffix)).unwrap();
+        assert!(rows[0]
+            .request
+            .facets
+            .iter()
+            .any(|value| value.field == "state" && value.value == "READY"));
+        assert!(!rows[0]
+            .request
+            .integers
+            .iter()
+            .any(|value| value.field == "other"));
+    }
+}
+
+#[test]
+fn wrong_wire_required_field_does_not_satisfy_presence() {
+    let extractor = Extractor::new(SEMANTICS_DESCRIPTOR, "semantics.Doc", "body").unwrap();
+    for wrong_wire in [
+        vec![120, 1],
+        vec![121, 0, 0, 0, 0, 0, 0, 0, 0],
+        vec![123, 8, 1, 124],
+        vec![125, 0, 0, 0, 0],
+    ] {
+        let mut wire = base_wire();
+        wire.extend(wrong_wire);
+        let error = extractor
+            .extract(&wire)
+            .err()
+            .expect("wrong wire type cannot satisfy the required field");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(
+            error
+                .message()
+                .contains("required protobuf field is absent"),
+            "{error}"
+        );
+        assert!(error.message().contains("required_token"), "{error}");
+    }
+}
+
+#[test]
 fn open_enum_unknown_values_project_as_decimal_facets() {
     let extractor = Extractor::new(SEMANTICS_DESCRIPTOR, "semantics.Doc", "body").unwrap();
     let rows = extractor.extract(&semantics_wire(&[112, 99])).unwrap();

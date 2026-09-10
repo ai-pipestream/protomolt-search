@@ -3,7 +3,8 @@
 use crate::pb::{AccessAction, AccessDecision, AccessPolicy};
 use std::collections::{BTreeMap, BTreeSet};
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::task::{Context, Poll};
 use tokio::sync::watch;
 use tokio_stream::{wrappers::WatchStream, Stream};
@@ -20,6 +21,33 @@ pub trait Authorizer: std::fmt::Debug + Send + Sync {
         action: AccessAction,
     ) -> Result<AccessDecision, Status>;
     fn subscribe(&self) -> watch::Receiver<u64>;
+
+    /// Serialize policy replacement against a synchronous operation. The guard
+    /// must keep this exact decision valid until dropped. Remote adapters need
+    /// an equivalent enforcement protocol; snapshot checks are insufficient.
+    fn pin(&self, _expected: &AccessDecision) -> Result<Box<dyn AuthorizationGuard + '_>, Status> {
+        Err(Status::unimplemented(
+            "authorization provider does not support pinned authorization",
+        ))
+    }
+}
+
+/// Provider-owned admission guard. Dropping it releases the policy fence.
+pub trait AuthorizationGuard {
+    fn decision(&self) -> &AccessDecision;
+}
+
+/// Permission held through synchronous work and its commit. Acquire before
+/// node/catalog locks and the database writer. Never hold across an await or
+/// reenter authorization or policy replacement while a pin is held.
+#[must_use = "dropping the pin releases authorization admission"]
+pub struct PinnedAccess<'a> {
+    guard: Box<dyn AuthorizationGuard + 'a>,
+}
+impl PinnedAccess<'_> {
+    pub fn decision(&self) -> &AccessDecision {
+        self.guard.decision()
+    }
 }
 
 #[derive(Debug)]
@@ -122,47 +150,33 @@ impl Policy {
     }
 }
 
-/// In-process snapshot authority. Loading and validating a replacement happens
-/// before publication; readers never observe a partially replaced policy.
-#[derive(Debug)]
-pub struct PolicyAuthority {
-    policy: RwLock<Policy>,
-    revisions: watch::Sender<u64>,
+// Reuse the same policy semantics in deterministic control-state application.
+// The caller supplies committed state; this never reads a live policy or clock.
+#[cfg(feature = "net")]
+pub(crate) fn validate_policy_snapshot(input: &AccessPolicy) -> Result<(), String> {
+    Policy::validate(input.clone()).map(|_| ())
 }
-impl PolicyAuthority {
-    pub fn new(policy: AccessPolicy) -> Result<Self, String> {
-        let policy = Policy::validate(policy)?;
-        let (revisions, _) = watch::channel(policy.revision);
-        Ok(Self {
-            policy: RwLock::new(policy),
-            revisions,
-        })
-    }
-    pub fn replace(&self, policy: AccessPolicy) -> Result<(), String> {
-        let next = Policy::validate(policy)?;
-        let mut current = self
-            .policy
-            .write()
-            .map_err(|_| "access policy lock poisoned")?;
-        if next.revision <= current.revision {
-            return Err("access policy revision must increase".into());
-        }
-        *current = next;
-        self.revisions.send_replace(current.revision);
-        Ok(())
-    }
+
+#[cfg(feature = "net")]
+pub(crate) fn authorize_policy_snapshot(
+    input: &AccessPolicy,
+    principal: &str,
+    collection: &str,
+    action: AccessAction,
+) -> Result<AccessDecision, Status> {
+    Policy::validate(input.clone())
+        .map_err(|error| Status::data_loss(format!("committed control policy: {error}")))?
+        .authorize(principal, collection, action)
 }
-impl Authorizer for PolicyAuthority {
+
+impl Policy {
     fn authorize(
         &self,
         principal: &str,
         collection: &str,
         action: AccessAction,
     ) -> Result<AccessDecision, Status> {
-        let policy = self
-            .policy
-            .read()
-            .map_err(|_| Status::internal("access policy lock poisoned"))?;
+        let policy = self;
         let allowed = policy
             .grants
             .get(&(principal.to_owned(), collection.to_owned()))
@@ -196,6 +210,160 @@ impl Authorizer for PolicyAuthority {
             },
         })
     }
+}
+
+#[derive(Debug)]
+struct PolicyEpoch {
+    policy: Policy,
+    active: AtomicUsize,
+    notification: Mutex<()>,
+    drained: Condvar,
+}
+impl PolicyEpoch {
+    fn new(policy: Policy) -> Self {
+        Self {
+            policy,
+            active: AtomicUsize::new(0),
+            notification: Mutex::new(()),
+            drained: Condvar::new(),
+        }
+    }
+
+    // The caller must retain the publication read lock until admission returns.
+    fn admit(self: &Arc<Self>, decision: AccessDecision) -> Result<PolicyGuard, Status> {
+        self.active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                active.checked_add(1)
+            })
+            .map_err(|_| Status::resource_exhausted("authorization admission count exhausted"))?;
+        Ok(PolicyGuard {
+            epoch: Arc::clone(self),
+            decision,
+        })
+    }
+
+    fn wait_drained(&self) {
+        // This mutex protects only notification ordering. Recovering its poison
+        // does not accept a partially mutated policy or admission counter.
+        let mut notification = self
+            .notification
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while self.active.load(Ordering::Acquire) != 0 {
+            notification = self
+                .drained
+                .wait(notification)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+struct PolicyGuard {
+    epoch: Arc<PolicyEpoch>,
+    decision: AccessDecision,
+}
+impl AuthorizationGuard for PolicyGuard {
+    fn decision(&self) -> &AccessDecision {
+        &self.decision
+    }
+}
+impl Drop for PolicyGuard {
+    fn drop(&mut self) {
+        let previous = self
+            .epoch
+            .active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                active.checked_sub(1)
+            })
+            .expect("authorization admission count underflow");
+        if previous == 1 {
+            // Taking the same mutex as the waiter prevents a last-drop wakeup
+            // from passing between its nonzero check and Condvar::wait.
+            let _notification = self
+                .epoch
+                .notification
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.epoch.drained.notify_all();
+        }
+    }
+}
+
+/// In-process snapshot authority. Loading and validating a replacement happens
+/// before publication; readers never observe a partially replaced policy.
+#[derive(Debug)]
+pub struct PolicyAuthority {
+    policy: RwLock<Arc<PolicyEpoch>>,
+    replacements: Mutex<()>,
+    revisions: watch::Sender<u64>,
+}
+impl PolicyAuthority {
+    pub fn new(policy: AccessPolicy) -> Result<Self, String> {
+        let policy = Policy::validate(policy)?;
+        let (revisions, _) = watch::channel(policy.revision);
+        Ok(Self {
+            policy: RwLock::new(Arc::new(PolicyEpoch::new(policy))),
+            replacements: Mutex::new(()),
+            revisions,
+        })
+    }
+
+    /// Publish a policy, then drain synchronous operations admitted under the
+    /// previous revision. New checks and admissions use the published policy
+    /// during the drain. Success means the previous admissions have finished;
+    /// observing the watched revision alone does not establish that barrier.
+    pub fn replace(&self, policy: AccessPolicy) -> Result<(), String> {
+        let next = Arc::new(PolicyEpoch::new(Policy::validate(policy)?));
+        // Serialize through completed drain. After an unwind, fail closed:
+        // a later replacement must not skip a previously published old epoch.
+        let _replacement = self.replacements.lock().map_err(|_| {
+            "access policy replacement lock poisoned; prior drain may be incomplete"
+        })?;
+        let mut current = self
+            .policy
+            .write()
+            .map_err(|_| "access policy lock poisoned")?;
+        if next.policy.revision <= current.policy.revision {
+            return Err("access policy revision must increase".into());
+        }
+        let previous = std::mem::replace(&mut *current, next);
+        self.revisions.send_replace(current.policy.revision);
+        drop(current);
+        previous.wait_drained();
+        Ok(())
+    }
+}
+impl Authorizer for PolicyAuthority {
+    fn authorize(
+        &self,
+        principal: &str,
+        collection: &str,
+        action: AccessAction,
+    ) -> Result<AccessDecision, Status> {
+        let epoch = Arc::clone(
+            &*self
+                .policy
+                .read()
+                .map_err(|_| Status::internal("access policy lock poisoned"))?,
+        );
+        epoch.policy.authorize(principal, collection, action)
+    }
+    fn pin(&self, expected: &AccessDecision) -> Result<Box<dyn AuthorizationGuard + '_>, Status> {
+        let epoch = self
+            .policy
+            .read()
+            .map_err(|_| Status::internal("access policy lock poisoned"))?;
+        let action = AccessAction::try_from(expected.action)
+            .map_err(|_| Status::permission_denied("invalid authorization action"))?;
+        let decision = epoch
+            .policy
+            .authorize(&expected.principal, &expected.collection, action)?;
+        if &decision != expected {
+            return Err(crate::error_disclosure::policy_changed());
+        }
+        Ok(Box::new(epoch.admit(decision)?))
+    }
+
     fn subscribe(&self) -> watch::Receiver<u64> {
         self.revisions.subscribe()
     }
@@ -255,6 +423,24 @@ impl AccessPermit {
     }
     pub fn decision(&self) -> &AccessDecision {
         &self.decision
+    }
+    /// Pin the admitted revision through a synchronous commit. Do not call
+    /// `check` under this guard: providers may retain locks that make recursive
+    /// authorization deadlock a queued policy replacement.
+    pub fn pin(&self) -> Result<PinnedAccess<'_>, Status> {
+        if *self.revisions.borrow() != self.decision.policy_revision {
+            return Err(crate::error_disclosure::policy_changed());
+        }
+        let guard = self.authority.pin(&self.decision)?;
+        if guard.decision() != &self.decision {
+            return Err(Status::permission_denied(
+                "invalid pinned authorization decision",
+            ));
+        }
+        if *self.revisions.borrow() != self.decision.policy_revision {
+            return Err(crate::error_disclosure::policy_changed());
+        }
+        Ok(PinnedAccess { guard })
     }
     pub fn check(&self) -> Result<(), Status> {
         if *self.revisions.borrow() != self.decision.policy_revision {
@@ -331,5 +517,208 @@ where
             self.inner = None;
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+    use crate::pb::{CollectionGrant, CollectionResource};
+    use std::sync::{mpsc, TryLockError};
+    use std::time::Duration;
+
+    fn policy() -> AccessPolicy {
+        AccessPolicy {
+            format_version: 1,
+            revision: 1,
+            resources: vec![CollectionResource {
+                workspace: "workspace".into(),
+                collection: "books".into(),
+            }],
+            grants: vec![CollectionGrant {
+                principal: "reader".into(),
+                workspace: "workspace".into(),
+                collection: "books".into(),
+                actions: vec![AccessAction::Search as i32],
+                ..Default::default()
+            }],
+        }
+    }
+
+    fn policy_revision(revision: u64) -> AccessPolicy {
+        let mut policy = policy();
+        policy.revision = revision;
+        policy
+    }
+
+    #[test]
+    fn admitted_operation_delays_replacement_completion_until_drop() {
+        let authority = Arc::new(PolicyAuthority::new(policy()).unwrap());
+        let permit =
+            AccessPermit::acquire(authority.clone(), "reader", "books", AccessAction::Search)
+                .unwrap();
+        let pin = permit.pin().unwrap();
+        let (result_tx, result_rx) = mpsc::channel();
+        let replacing = {
+            let authority = authority.clone();
+            std::thread::spawn(move || {
+                result_tx
+                    .send(authority.replace(policy_revision(2)))
+                    .unwrap();
+            })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while *authority.revisions.borrow() != 2 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let published = *authority.revisions.borrow() == 2;
+        let serializer_held_through_drain = matches!(
+            authority.replacements.try_lock(),
+            Err(TryLockError::WouldBlock)
+        );
+        let before_drop = result_rx.try_recv();
+        let pending = matches!(&before_drop, Err(mpsc::TryRecvError::Empty));
+        drop(pin);
+        let replacement = match before_drop {
+            Ok(result) => Ok(result),
+            Err(mpsc::TryRecvError::Empty) => result_rx.recv_timeout(Duration::from_secs(5)),
+            Err(mpsc::TryRecvError::Disconnected) => Err(mpsc::RecvTimeoutError::Disconnected),
+        };
+        if replacement.is_ok() {
+            replacing.join().unwrap();
+        }
+        assert!(
+            published,
+            "replacement did not publish within the observation bound"
+        );
+        assert!(
+            serializer_held_through_drain,
+            "replacement serializer was released before the admitted epoch drained"
+        );
+        assert!(
+            pending,
+            "replacement completed while an operation remained admitted"
+        );
+        replacement.unwrap().unwrap();
+    }
+
+    #[test]
+    fn admission_counter_exhaustion_refuses_without_wrapping() {
+        let epoch = Arc::new(PolicyEpoch::new(Policy::validate(policy()).unwrap()));
+        let decision = epoch
+            .policy
+            .authorize("reader", "books", AccessAction::Search)
+            .unwrap();
+        epoch.active.store(usize::MAX, Ordering::Release);
+        let error = epoch
+            .admit(decision)
+            .err()
+            .expect("counter must refuse overflow");
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert!(error.message().contains("admission count"));
+        assert_eq!(epoch.active.load(Ordering::Acquire), usize::MAX);
+    }
+
+    #[test]
+    fn drain_eventually_completes_after_last_guard_drop() {
+        let epoch = Arc::new(PolicyEpoch::new(Policy::validate(policy()).unwrap()));
+        let decision = epoch
+            .policy
+            .authorize("reader", "books", AccessAction::Search)
+            .unwrap();
+        let guard = epoch.admit(decision).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (drained_tx, drained_rx) = mpsc::channel();
+        let waiter = {
+            let epoch = epoch.clone();
+            std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                epoch.wait_drained();
+                drained_tx.send(()).unwrap();
+            })
+        };
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            drained_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        drop(guard);
+        drained_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("last guard drop did not wake the drain");
+        waiter.join().unwrap();
+        assert_eq!(epoch.active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn post_publication_replacement_poison_fails_later_replacements_closed() {
+        let authority = Arc::new(PolicyAuthority::new(policy()).unwrap());
+        let permit =
+            AccessPermit::acquire(authority.clone(), "reader", "books", AccessAction::Search)
+                .unwrap();
+        let pin = permit.pin().unwrap();
+        let publishing = {
+            let authority = authority.clone();
+            std::thread::spawn(move || {
+                let _replacement = authority.replacements.lock().unwrap();
+                let next = Arc::new(PolicyEpoch::new(
+                    Policy::validate(policy_revision(2)).unwrap(),
+                ));
+                let mut current = authority.policy.write().unwrap();
+                let _undrained = std::mem::replace(&mut *current, next);
+                authority.revisions.send_replace(2);
+                drop(current);
+                panic!("inject failure after publication before drain");
+            })
+        };
+        assert!(publishing.join().is_err());
+        assert_eq!(*authority.revisions.borrow(), 2);
+        let error = authority
+            .replace(policy_revision(3))
+            .expect_err("a poisoned replacement serializer must fail closed");
+        assert!(error.contains("replacement lock poisoned"), "{error}");
+        drop(pin);
+    }
+
+    #[test]
+    fn notification_poison_recovers_without_skipping_the_admission_count() {
+        let epoch = Arc::new(PolicyEpoch::new(Policy::validate(policy()).unwrap()));
+        let decision = epoch
+            .policy
+            .authorize("reader", "books", AccessAction::Search)
+            .unwrap();
+        let guard = epoch.admit(decision).unwrap();
+        let poisoning = {
+            let epoch = epoch.clone();
+            std::thread::spawn(move || {
+                let _notification = epoch.notification.lock().unwrap();
+                panic!("inject notification-only mutex poison");
+            })
+        };
+        assert!(poisoning.join().is_err());
+        assert_eq!(epoch.active.load(Ordering::Acquire), 1);
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (drained_tx, drained_rx) = mpsc::channel();
+        let waiter = {
+            let epoch = epoch.clone();
+            std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                epoch.wait_drained();
+                drained_tx.send(()).unwrap();
+            })
+        };
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            drained_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        drop(guard);
+        drained_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("notification poison prevented the real zero-count drain");
+        waiter.join().unwrap();
+        assert_eq!(epoch.active.load(Ordering::Acquire), 0);
     }
 }

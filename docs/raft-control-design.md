@@ -310,6 +310,64 @@ Map subscriptions authenticate the relay's cluster certificate and authorize
 its collection scope. Trusting that certificate does not enroll it as a learner;
 learner membership remains an explicit operator action.
 
+## Single-authority convergence boundary (2026-09-08)
+
+The [typed legacy checkpoint](control-checkpoint.md) now preserves the complete
+legacy state and captured runtime policy under explicit bounds. It is an import
+input, not a new authority or an activated source owner.
+
+The implemented source-owner store and the legacy topology adapter are still
+separate authorities. `SourceAuthorityStore::execute_locked` commits policy,
+owner/workflow state, revision and retry decisions in one redb transaction;
+`DurableControlPlane::persist_locked` independently replaces JSON and
+`ClusterControlService::publish_current_topology` publishes under its own mutex.
+Closed managed-source binding joins neither transaction. The JSON adapter now
+holds exclusive file ownership across rename, which prevents another compliant
+local opener from overwriting its decisions; it is not distributed fencing.
+
+The next runtime integration must put policy, owner phases, full published map
+and control allocators in the same applied control state, with one revision and
+failure domain. Keep source catalogs as separate databases with durable intents
+and completion facts. Do not attach a second writable topology cache to the
+source store, copy revision numbers between stores, or publish a map before its
+owning decision commits. The legacy JSON service becomes an explicit import
+source, not a concurrent managed authority. Automatic replacement on lease
+expiry remains unavailable in the initial managed release.
+
+A lossless import cannot use `ClusterPlan`: it omits lease credentials,
+next-token/action allocators, complete historical maps and completed-action IDs.
+Private protobuf import records must retain those fields, every pending action,
+the node/replica map keys and validated enum values. Preserve ordered route and
+action sequences and optional replica presence. Validate map keys against their
+values and preserve the specific legacy serde defaults; a missing unrelated
+field must not silently become a protobuf scalar default.
+
+The JSON file also omits placement trees/codes, derived declarations, provider
+geometry and runtime control policy. Capture these separately from the quiesced
+configuration and full map, and validate them as explicit import inputs. In the
+new state they become committed collection configuration; dry runs must consume
+that snapshot instead of calling live coordinator health or reading mutable
+placement pools. An import may preserve existing decisions, but cannot invent
+source-owner readiness or authenticated process/storage identity from addresses.
+
+Unifying authorization requires an admission adapter, not an independent
+`PolicyAuthority` mirror. The current managed binding takes a local policy pin
+before entering the source-authority mutex. An adapter that held that same
+source-authority mutex inside `Authorizer::pin` and then reentered
+`with_prepared_owner` would deadlock. Resolve current policy and ownership in one
+admission acquisition, retain its guard through the source commit, and avoid
+reentrant authority acquisition. Revision notification means publication;
+revocation enforcement additionally requires draining previously admitted work
+or obtaining the required remote enforcement acknowledgments. Neither a watch
+update nor a successful control commit alone proves remote admission closure.
+
+The implementation gates remain: faithful bounded import; deterministic unified
+state application and recovery; same-revision/different-map refusal; initial
+owner activation/readiness with crash recovery; current-policy admission through
+commit; then existing server/relay wiring to the committed map feed. Test every
+cross-database boundary before enabling writable managed hosting. No source,
+index, WAL or snapshot bytes from a phone enter this control state or its log.
+
 ## Migration and recovery rules
 
 1. After the budget merge, audit the final state/config schema and capture the
@@ -323,15 +381,24 @@ learner membership remains an explicit operator action.
    collection binding and full map. Preserve allocated IDs and generations.
    Missing placement state is an import error until supplied and verified from
    the quiesced map. Do not silently discard it.
-3. Explicitly bootstrap the agreed voter set and commit the import once.
+3. Durably retire the legacy authority **before** committing the new import.
+   The [legacy retirement adapter](control-retirement.md) replaces its JSON
+   with a checksummed record containing the complete validated checkpoint,
+   authenticated actor/resource/operation and destination authority identity.
+   Every legacy clone is fenced; reopening that path as a writer refuses.
+   Recovery must finish the same migration forward. A marker written after
+   the new import would leave a crash window with two restartable authorities.
+4. Explicitly bootstrap the agreed voter set and commit the import once.
    Compare all replicas' applied state/digests and exercise restart/catch-up.
    Adopt existing data owners only after their epoch enforcement is verified.
-4. Switch consumers to the applied map feed. Persist a consumed/import marker
-   so the old JSON authority cannot restart and compete with the Raft group.
-   Retain the original file and import record as recovery evidence.
-5. Before Raft accepts new operations, migration can be rolled back under a
-   deliberate shutdown. Afterwards, restarting the old authority from that
-   file would lose acknowledged decisions and is forbidden.
+5. Switch consumers to the applied map feed. Retain the retirement checkpoint
+   and new import decision as recovery evidence. Retirement itself does not
+   prove that the destination imported the checkpoint or fenced old data-plane
+   work; those are separate acceptance obligations.
+6. There is no automatic rollback from a retired record to the legacy writer.
+   An operator recovery from backup requires deliberate shutdown, proof of
+   fencing and a declared recovery point. Once new operations are acknowledged,
+   restoring the old JSON would lose those decisions and is forbidden.
 
 Ordinary restart reopens the same group and store, restores applied state and
 membership, replays committed unapplied entries, and catches up before serving
