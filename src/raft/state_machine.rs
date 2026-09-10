@@ -261,6 +261,7 @@ impl SnapshotGate {
 pub(crate) struct SnapshotGates {
     build: Mutex<Option<Arc<SnapshotGate>>>,
     serve: Mutex<Option<Arc<SnapshotGate>>>,
+    install: Mutex<Option<Arc<SnapshotGate>>>,
 }
 
 #[cfg(any(test, feature = "fault-injection"))]
@@ -273,12 +274,20 @@ impl SnapshotGates {
         Self::arm(&self.serve)
     }
 
+    pub(crate) fn arm_install(&self) -> Arc<SnapshotGate> {
+        Self::arm(&self.install)
+    }
+
     fn pause_build(&self) {
         Self::pause(&self.build)
     }
 
     fn pause_serve(&self) {
         Self::pause(&self.serve)
+    }
+
+    fn pause_install(&self) {
+        Self::pause(&self.install)
     }
 
     fn arm(slot: &Mutex<Option<Arc<SnapshotGate>>>) -> Arc<SnapshotGate> {
@@ -331,7 +340,13 @@ pub struct ControlStateMachine {
     pointer_lock: Arc<Mutex<()>>,
     #[cfg(any(test, feature = "fault-injection"))]
     gates: Arc<SnapshotGates>,
+    // A process-exit fault armed for the next install's store replacement.
+    #[cfg(any(test, feature = "fault-injection"))]
+    install_fault: InstallFault,
 }
+
+#[cfg(any(test, feature = "fault-injection"))]
+pub(crate) type InstallFault = Arc<Mutex<Option<crate::source_authority::ExitFault>>>;
 
 impl ControlStateMachine {
     /// Wrap an opened store. The store is marked Raft-hosted: its direct
@@ -371,6 +386,8 @@ impl ControlStateMachine {
             pointer_lock: Arc::new(Mutex::new(())),
             #[cfg(any(test, feature = "fault-injection"))]
             gates: Arc::new(SnapshotGates::default()),
+            #[cfg(any(test, feature = "fault-injection"))]
+            install_fault: Arc::new(Mutex::new(None)),
         };
         machine.sweep()?;
         Ok(machine)
@@ -396,10 +413,28 @@ impl ControlStateMachine {
         })
     }
 
-    /// The pause hooks on the snapshot build and serve paths.
+    /// The pause hooks on the snapshot build, serve and install paths.
     #[cfg(any(test, feature = "fault-injection"))]
     pub(crate) fn gates(&self) -> Arc<SnapshotGates> {
         Arc::clone(&self.gates)
+    }
+
+    /// The exit fault slot on the install path, shared with the host.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub(crate) fn install_fault(&self) -> InstallFault {
+        Arc::clone(&self.install_fault)
+    }
+
+    #[cfg(any(test, feature = "fault-injection"))]
+    fn inject_install(&self, after: bool) {
+        use crate::source_authority::ExitFault;
+        let fault = self.install_fault.lock().unwrap();
+        match (*fault, after) {
+            (Some(ExitFault::BeforeCommit), false) | (Some(ExitFault::AfterCommit), true) => {
+                std::process::exit(87)
+            }
+            _ => {}
+        }
     }
 
     pub(crate) fn shared_store(&self) -> SharedStore {
@@ -683,6 +718,8 @@ impl ControlStateMachine {
         meta: &SnapshotMeta<NodeId, BasicNode>,
         receive: &Receive,
     ) -> Result<(), Status> {
+        #[cfg(any(test, feature = "fault-injection"))]
+        self.gates.pause_install();
         let _serial = self.snapshot_lock.lock().unwrap();
         // The transport validates the complete image before the library's
         // install runs; a receive that arrived another way is validated
@@ -710,11 +747,19 @@ impl ControlStateMachine {
             .and_then(|f| f.sync_all())
             .map_err(io)?;
         let store = self.store()?;
+        // The install's commit is the store's replacement: from here the
+        // store is at the image's position. The generation's publication
+        // is a second step; a node that stops between the two starts with
+        // the store at the position and no generation published.
+        #[cfg(any(test, feature = "fault-injection"))]
+        self.inject_install(false);
         if let Err(status) = store.replace_from(&staged) {
             let _ = std::fs::remove_file(&staged);
             let _ = std::fs::remove_dir_all(&target);
             return Err(status);
         }
+        #[cfg(any(test, feature = "fault-injection"))]
+        self.inject_install(true);
         drop(store);
         publish(&self.pointer_lock, &self.snapshots, generation)?;
         *self.membership.lock().unwrap() = meta.last_membership.clone();

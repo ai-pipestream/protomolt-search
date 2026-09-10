@@ -1271,6 +1271,15 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   advanced without an apply keeps running and applies the leader's next
   entry; before, that append opened a gap and stopped the member's core.
   See [raft hosting](docs/raft-hosting.md).
+- **Foundation branch: the raft log and the snapshot install under crash
+  faults.** `tests/control_raft_crash_faults.rs` kills a worker process
+  before and after the log's purge transactions (the library's purge, the
+  record of a purge the store bounds, its completion at an append) and the
+  store's replacement by a received image, with the order between the two
+  commits fixed by an install gate, then reads both nodes' on-disk state,
+  restarts them and drives an append through the seeded member. Eight
+  windows, each checked. See [the harness
+  document](docs/control-authority-test-harness.md).
 - **Foundation branch: the snapshot bound is the receiver's.** A store
   image over `max_snapshot_bytes` no longer stops the building node: the
   bound applies where an image arrives, so a peer configured below the

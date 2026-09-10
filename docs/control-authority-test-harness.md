@@ -1450,3 +1450,73 @@ deferred purge is rejected by name (the reader's unstated invariant under
 its question 2).
 
 Gates, in the 8 GiB scope with two build jobs and four test threads: `cargo check --tests` with raft, tls and fault-injection, with raft only and with the default features (`review2-check-{raft,raft-only,default}.log`); the focused lib tests 4 (`review2-lib-focused.log`); the snapshot target 22 pass, with the new dropped-trigger test (`review2-control_raft_snapshots.log`); the three timing-sensitive tests of that target (the dropped trigger, the changed bytes, the backoff) five runs in five (`review2-repeat-{1..5}.log`); crash faults 7, regressions 10, admission 10 and the adversarial worker 11 (`review2-raft-targets.log`); the lib with the default features 815 pass (`review2-lib-default.log`) and with raft, tls and fault-injection 836 pass (`review2-lib-raft.log`); clippy with the raft features, the pre-existing deny at `src/vector.rs:1092` and pre-existing warnings, none in `src/raft` (`review2-clippy.log`); the combined release gate 165 targets, 1822 pass, 0 fail, 1 ignored, the pre-existing `native_matches_opennlp_contract` (`review2-combined-gate.log`); rustfmt on the changed files.
+
+## The raft log store crash target (finding 8 of the checkpoint review, Fable)
+
+The second reader of 5b48a0b and fa8dfc5 found that the crash matrix
+(`tests/control_crash_faults.rs`) kills the process at
+`SourceAuthorityStore` transaction boundaries only: no case ran a
+`RaftHost`, so the raft log's purge transactions and the snapshot install
+had no crash coverage, and the purge record 5b48a0b introduced was
+read from the code, not killed. `tests/control_raft_crash_faults.rs` adds
+that coverage on the same pattern: a worker process bootstraps a one-voter
+group with a prepared member in one process, sets one exit fault (code
+87) at one commit and drives the seed into it; the parent reads both
+nodes' on-disk state with the hosts down, asserts the window the fault
+names, starts both nodes again on their recorded ports and drives an
+append through the seeded member.
+
+Two library hooks are behind it, both under `fault-injection`.
+`RaftHost::arm_purge_exit_fault` exits before or after the next purge
+transaction of the node's log, which is the library's purge, the record of
+a purge the store bounds, or the completion of a recorded purge at an
+append or at start; `RaftHost::arm_install_exit_fault` exits before the
+store is replaced by a received image or right after, before the
+generation is published. `RaftHost::arm_snapshot_install_gate` pauses an
+install once the image is received and before it is verified, which fixes
+the order between the two commits: the library issues the purge and the
+install from one engine step, the purge runs on the core and the install
+on the state machine's worker, and without the gate either may commit
+first. `pipestream_search::raft::inspect_node` opens a stopped node's log
+and store on their own and reports the purge point, the recorded purge,
+the first and last entry, the store's applied position and whether it
+still awaits its first image; `RaftHost::log_inspection` reads the same
+through a running host.
+
+Four families, each before and after the commit:
+
+- `member-purge`: the member's record of the library's purge, with the
+  store at no position. Before, the log is empty with no record; after, the record
+  names the seed position and no entry is purged. The store is the prepared
+  one in both.
+- `member-install`: the member's store replaced by the image, once the
+  record is in the log. Before, the store still awaits its image; after,
+  it is at the seed position with no generation published, and the record
+  is still in the log.
+- `member-settle`: the completion of the recorded purge at the member's
+  next append, the leader's membership entry after the seed. Before, the
+  record is still in the log and the entry is not in the log; after, the log is purged
+  to the seed position, the record is cleared and the entry is not in the
+  log.
+- `leader-purge`: the leader's own purge to its seed snapshot in
+  `add_learner`, before the membership changes. Before, the log has
+  every entry from the bootstrap under a published generation; after, it
+  is purged to the snapshot. The member is as prepared either way.
+
+After the restart every case converges the same way: the member's applied
+position catches up to the leader's, a grant proposed at the leader applies at
+the member, both cores run, the member's record is cleared, its purge
+point is at or before its store and its entries are contiguous from the
+purge point. The `leader-purge` cases issue a fresh `add_learner` first,
+since the membership did not change.
+
+Gates, in the 8 GiB scope with two build jobs and four test threads, on
+the branch rebased onto 1a9125c (the settle rule above): the target 5
+pass, the four families and the worker stub, in about four seconds
+(`raft-crash-rebased-run-1.log`), eight runs in eight
+(`raft-crash-rebased-loop-{1..8}.log`); the same on 63b6116 before the
+rebase (`raft-crash-run-{1,2}.log`, `raft-crash-loop-{1..8}.log`); clippy
+on the target with no warning in the new file
+(`raft-crash-rebased-clippy.log`); the lib's raft unit tests with raft,
+tls and fault-injection 21 pass (`raft-crash-rebased-lib-raft.log`);
+rustfmt on the changed files.

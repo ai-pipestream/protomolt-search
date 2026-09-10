@@ -46,6 +46,23 @@ struct Inner {
     /// an earlier run completes at start or when it is asked again).
     requested_purge: Mutex<Option<u64>>,
     _file_lock: File,
+    // A process-exit fault armed for the next purge transaction (the
+    // crash target, `tests/control_raft_crash_faults.rs`).
+    #[cfg(any(test, feature = "fault-injection"))]
+    fault: Mutex<Option<crate::source_authority::ExitFault>>,
+}
+
+/// The purge state of a raft log on disk, for crash-recovery harnesses.
+#[cfg(any(test, feature = "fault-injection"))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RaftLogInspection {
+    /// The index the log records as purged.
+    pub purged: Option<u64>,
+    /// The library's purge position recorded as deferred.
+    pub deferred: Option<u64>,
+    /// The first and last entry the log holds.
+    pub first: Option<u64>,
+    pub last: Option<u64>,
 }
 
 /// Where a settle runs: at start, before the library reads the log state,
@@ -183,8 +200,59 @@ impl RaftLogStore {
                 write: Mutex::new(()),
                 requested_purge: Mutex::new(None),
                 _file_lock: file,
+                #[cfg(any(test, feature = "fault-injection"))]
+                fault: Mutex::new(None),
             }),
         })
+    }
+
+    /// Arm one process-exit fault for the next purge transaction of this
+    /// log: the process exits with code 87 either before that transaction
+    /// commits or right after it. A purge transaction is the library's
+    /// purge, the record of a purge the store bounds, or the completion of
+    /// a recorded purge at an append or at start.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn arm_purge_exit_fault(&self, fault: crate::source_authority::ExitFault) {
+        *self.inner.fault.lock().unwrap() = Some(fault);
+    }
+
+    #[cfg(any(test, feature = "fault-injection"))]
+    fn inject(&self, after: bool) {
+        use crate::source_authority::ExitFault;
+        let fault = self.inner.fault.lock().unwrap();
+        match (*fault, after) {
+            (Some(ExitFault::BeforeCommit), false) | (Some(ExitFault::AfterCommit), true) => {
+                std::process::exit(87)
+            }
+            _ => {}
+        }
+    }
+
+    /// The purge state of this log.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inspection(&self) -> Result<RaftLogInspection, Status> {
+        let _order = self.inner.write.lock().unwrap();
+        let header = self.header()?;
+        let deferred = self.deferred_purge().map_err(storage_status)?;
+        let first = self.first_log_index().map_err(storage_status)?;
+        let last = self.last_log_id().map_err(storage_status)?;
+        Ok(RaftLogInspection {
+            purged: header.last_purged.map(|p| p.index),
+            deferred: deferred.map(|d| d.index),
+            first,
+            last: last.map(|l| l.index),
+        })
+    }
+
+    /// Open the log at `path` on its own, read its purge state and close
+    /// it: the on-disk state of a node that is not running.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inspect(
+        path: &Path,
+        group: &SourceAuthorityIdentity,
+        node_id: NodeId,
+    ) -> Result<RaftLogInspection, Status> {
+        Self::open(path, group, node_id)?.inspection()
     }
 
     pub fn node_id(&self) -> NodeId {
@@ -613,8 +681,13 @@ impl RaftLogStore {
                 .map_err(|e| io(ErrorSubject::Logs, ErrorVerb::Write, e))?;
             Self::write_deferred(&mut meta, deferred, ErrorVerb::Write)?;
         }
+        #[cfg(any(test, feature = "fault-injection"))]
+        self.inject(false);
         tx.commit()
-            .map_err(|e| io(ErrorSubject::Logs, ErrorVerb::Write, e))
+            .map_err(|e| io(ErrorSubject::Logs, ErrorVerb::Write, e))?;
+        #[cfg(any(test, feature = "fault-injection"))]
+        self.inject(true);
+        Ok(())
     }
 
     fn write_deferred(
@@ -797,8 +870,12 @@ impl RaftLogStore {
                     .map_err(|e| io(ErrorSubject::Logs, ErrorVerb::Delete, e))?;
                 Self::write_deferred(&mut meta, deferred, ErrorVerb::Delete)?;
             }
+            #[cfg(any(test, feature = "fault-injection"))]
+            self.inject(false);
             tx.commit()
                 .map_err(|e| io(ErrorSubject::Logs, ErrorVerb::Delete, e))?;
+            #[cfg(any(test, feature = "fault-injection"))]
+            self.inject(true);
         }
         Ok(())
     }

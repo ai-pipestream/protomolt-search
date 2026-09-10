@@ -375,6 +375,42 @@ pub struct RaftHost {
     grant_gate: std::sync::Mutex<Option<Arc<GrantGate>>>,
     #[cfg(any(test, feature = "fault-injection"))]
     snapshot_gates: Arc<super::state_machine::SnapshotGates>,
+    #[cfg(any(test, feature = "fault-injection"))]
+    install_fault: super::state_machine::InstallFault,
+}
+
+/// The on-disk state of a node that is not running: its log's purge state
+/// and its store's position. For crash-recovery harnesses.
+#[cfg(any(test, feature = "fault-injection"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeInspection {
+    pub log: super::log_store::RaftLogInspection,
+    /// The applied index the store recorded with its last entry.
+    pub applied: Option<u64>,
+    /// Whether the store is a prepared member's, awaiting its first image.
+    pub awaiting_snapshot: bool,
+}
+
+/// Open the log and the store in `dir` on their own, read their state and
+/// close them. Refuses while a host holds either.
+#[cfg(any(test, feature = "fault-injection"))]
+pub fn inspect_node(
+    dir: &Path,
+    identity: &SourceAuthorityIdentity,
+    node_id: NodeId,
+) -> Result<NodeInspection, Status> {
+    let log = RaftLogStore::inspect(&dir.join(LOG_FILE), identity, node_id)?;
+    let store = SourceAuthorityStore::open(&dir.join(STORE_FILE), identity)?;
+    let applied = store
+        .raft_applied()?
+        .and_then(|a| a.last_applied)
+        .map(|id| id.index);
+    let awaiting_snapshot = store.awaiting_snapshot()?;
+    Ok(NodeInspection {
+        log,
+        applied,
+        awaiting_snapshot,
+    })
 }
 
 impl RaftHost {
@@ -577,6 +613,8 @@ impl RaftHost {
         let published = machine.published_image();
         #[cfg(any(test, feature = "fault-injection"))]
         let snapshot_gates = machine.gates();
+        #[cfg(any(test, feature = "fault-injection"))]
+        let install_fault = machine.install_fault();
         let mut log_store = log_store;
         log_store
             .bind_applied_floor(Arc::clone(&shared))
@@ -617,6 +655,8 @@ impl RaftHost {
             grant_gate: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "fault-injection"))]
             snapshot_gates,
+            #[cfg(any(test, feature = "fault-injection"))]
+            install_fault,
         })
     }
 
@@ -781,6 +821,35 @@ impl RaftHost {
     #[cfg(any(test, feature = "fault-injection"))]
     pub fn arm_snapshot_serve_gate(&self) -> Arc<super::state_machine::SnapshotGate> {
         self.snapshot_gates.arm_serve()
+    }
+
+    /// Arm a pause in the next snapshot install, once the image is
+    /// received and before it is verified and the store replaced. The
+    /// library's purge for the same snapshot runs on the core meanwhile.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn arm_snapshot_install_gate(&self) -> Arc<super::state_machine::SnapshotGate> {
+        self.snapshot_gates.arm_install()
+    }
+
+    /// Arm one process-exit fault (code 87) for the next purge transaction
+    /// of this node's log: before it commits or right after.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn arm_purge_exit_fault(&self, fault: crate::source_authority::ExitFault) {
+        self.log_store.arm_purge_exit_fault(fault);
+    }
+
+    /// Arm one process-exit fault (code 87) for the next snapshot install:
+    /// before the store is replaced by the image, or right after, before
+    /// the generation is published.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn arm_install_exit_fault(&self, fault: crate::source_authority::ExitFault) {
+        *self.install_fault.lock().unwrap() = Some(fault);
+    }
+
+    /// The purge state of this node's log, read through the running host.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn log_inspection(&self) -> Result<super::log_store::RaftLogInspection, Status> {
+        self.log_store.inspection()
     }
 
     /// The snapshot the state machine serves to a peer right now, read in

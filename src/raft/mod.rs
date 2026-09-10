@@ -104,7 +104,11 @@ pub mod types;
 
 #[cfg(feature = "tls")]
 pub use host::ClusterTransport;
+#[cfg(any(test, feature = "fault-injection"))]
+pub use host::{inspect_node, NodeInspection};
 pub use host::{HostConfig, NoNetwork, RaftHost};
+#[cfg(any(test, feature = "fault-injection"))]
+pub use log_store::RaftLogInspection;
 pub use log_store::RaftLogStore;
 pub use state_machine::{ControlStateMachine, SnapshotBuildReport};
 #[cfg(feature = "tls")]
