@@ -73,6 +73,13 @@ raft = ["dep:openraft"]
 # for out-of-crate crash-recovery harnesses (tests/*.rs). Never on in a
 # serving binary.
 fault-injection = []
+# The fork guard of `test_support` (docs/control-authority-test-harness.md,
+# "the fork window"): the exclusive lock takes call its handoff and the
+# module is public, so a test binary that spawns this same executable can
+# spawn under the guard and with the pre-exec descriptor sweep. On in every
+# test build of this crate through the dev-dependency on itself below;
+# never on in a serving binary.
+fork-guard = []
 # The network stack (docs/embedded-mobile.md): tonic's HTTP/2 transport,
 # Tokio's sockets and signals, the clustered TurboVec gRPC client, and
 # everything that listens or dials — the serving binary, the harness,
@@ -123,6 +130,10 @@ required-features = ["net"]
 tonic-build = "0.12"
 
 [dev-dependencies]
+# Turns `fork-guard` on for the test targets of this crate and for no other
+# build: cargo unifies a self dev-dependency's features into the library
+# the tests link, and `cargo build` of the binaries does not see it.
+pipestream-search = { path = ".", features = ["fork-guard"] }
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
 bzip2 = "0.6"
 csv = "1"

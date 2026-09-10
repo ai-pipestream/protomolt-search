@@ -136,7 +136,7 @@ impl RaftLogStore {
             }
             _ => storage_status(error),
         })?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "fork-guard"))]
         let _handoff = crate::test_support::lock_handoff();
         file.try_lock().map_err(|error| {
             Status::failed_precondition(format!("raft log store exclusive lock: {error}"))

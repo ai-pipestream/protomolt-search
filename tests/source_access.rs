@@ -1,3 +1,4 @@
+use pipestream_search::test_support::ForkGuarded;
 use pipestream_search::{
     authorization::{AccessPermit, Authorizer, PolicyAuthority},
     document_catalog::{AccessControlledCatalog, DocumentCatalog},
@@ -449,7 +450,7 @@ fn source_catalog_creation_is_private_under_a_permissive_umask() {
             "--nocapture",
         ])
         .env("PSEARCH_SOURCE_MODE_DIR", &dir.0)
-        .status()
+        .status_guarded()
         .unwrap();
     assert!(status.success(), "creation-mode worker failed: {status}");
 }

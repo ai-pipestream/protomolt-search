@@ -116,8 +116,8 @@ pub mod stats_cache;
 pub mod stats_identity;
 mod stream_signal;
 pub mod synonyms;
-#[cfg(test)]
-pub(crate) mod test_support;
+#[cfg(any(test, feature = "fork-guard"))]
+pub mod test_support;
 pub mod values;
 pub mod vector;
 pub mod visibility;

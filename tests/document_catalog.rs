@@ -12,6 +12,7 @@ use pipestream_search::pb::{
     accept_document_request::Mutation, AcceptDocumentRequest, ProtobufSource,
 };
 use pipestream_search::pb::{accepted_document_version, ReadAcceptedDocumentsRequest};
+use pipestream_search::test_support::ForkGuarded;
 use prost::Message;
 use redb::{ReadableDatabase, ReadableTable};
 use tonic::Code;
@@ -245,7 +246,7 @@ fn committed_receipt_survives_process_exit_without_dropping_database() {
         .env("PSEARCH_CATALOG_CRASH_PATH", dir.catalog())
         .env_remove("PSEARCH_CATALOG_CRASH_SEAL")
         .env_remove("PSEARCH_CATALOG_CRASH_RETIRE")
-        .status()
+        .status_guarded()
         .unwrap();
     assert_eq!(status.code(), Some(73));
     let catalog = DocumentCatalog::open(&dir.catalog(), "books").unwrap();
@@ -266,7 +267,7 @@ fn committed_seal_survives_process_exit_without_dropping_database() {
         .env("PSEARCH_CATALOG_CRASH_PATH", dir.catalog())
         .env("PSEARCH_CATALOG_CRASH_SEAL", "1")
         .env_remove("PSEARCH_CATALOG_CRASH_RETIRE")
-        .status()
+        .status_guarded()
         .unwrap();
     assert_eq!(status.code(), Some(73));
     let catalog = DocumentCatalog::open(&dir.catalog(), "books").unwrap();
@@ -303,7 +304,7 @@ fn committed_retirement_intent_survives_process_exit_and_closes_admission() {
         .env("PSEARCH_CATALOG_CRASH_PATH", dir.catalog())
         .env_remove("PSEARCH_CATALOG_CRASH_SEAL")
         .env("PSEARCH_CATALOG_CRASH_RETIRE", "1")
-        .status()
+        .status_guarded()
         .unwrap();
     assert_eq!(status.code(), Some(73));
     assert_eq!(stored_header(&dir.catalog()).format_version, 5);

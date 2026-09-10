@@ -31,21 +31,32 @@
 //! tokio hold must survive (std reports an exec failure over one). The
 //! hook runs in the child of a multithreaded process, so it makes raw
 //! system calls and makes no allocation.
+//!
+//! The lib test binary gets both layers under `cfg(test)`. An integration
+//! test binary links the library without `cfg(test)`, so the `fork-guard`
+//! feature compiles the handoff into the lock takes and makes this module
+//! public; the crate's dev-dependency on itself turns the feature on for
+//! every test build and for no serving binary. A test binary that spawns
+//! this same executable (the crash harnesses under `tests/`) spawns through
+//! [`ForkGuarded`]; `tests/fork_window.rs` pins the window through the
+//! document catalog's lock.
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::{RwLock, RwLockReadGuard};
 
 static FORK_GUARD: RwLock<()> = RwLock::new(());
 
 /// Held by every lock acquisition while it takes the lock.
-pub(crate) fn lock_handoff() -> RwLockReadGuard<'static, ()> {
+pub fn lock_handoff() -> RwLockReadGuard<'static, ()> {
     FORK_GUARD
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// `Command::status` / `Command::output` with the fork-to-exec window under
-/// the write guard and the inherited regular files closed before exec.
-pub(crate) trait ForkGuarded {
+/// `Command::spawn` / `Command::status` / `Command::output` with the
+/// fork-to-exec window under the write guard and the inherited regular
+/// files closed before exec.
+pub trait ForkGuarded {
+    fn spawn_guarded(&mut self) -> std::io::Result<Child>;
     fn status_guarded(&mut self) -> std::io::Result<ExitStatus>;
     fn output_guarded(&mut self) -> std::io::Result<Output>;
 }
@@ -70,6 +81,10 @@ fn spawn_guarded(command: &mut Command) -> std::io::Result<Child> {
 }
 
 impl ForkGuarded for Command {
+    fn spawn_guarded(&mut self) -> std::io::Result<Child> {
+        spawn_guarded(self)
+    }
+
     fn status_guarded(&mut self) -> std::io::Result<ExitStatus> {
         spawn_guarded(self)?.wait()
     }

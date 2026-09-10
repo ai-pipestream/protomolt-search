@@ -49,6 +49,7 @@ use pipestream_search::sha256;
 use pipestream_search::source_authority::{
     chunk_digest, payload_digest, retirement_digest, PlanningContext, SourceAuthorityStore,
 };
+use pipestream_search::test_support::ForkGuarded;
 use prost::Message;
 use tonic::Request;
 
@@ -515,6 +516,8 @@ pub fn confirm_ready_action(workflow: &[u8]) -> Action {
 // ---- worker/parent process injection --------------------------------------
 
 /// Spawn this same test binary running only `test_name` with `envs` set.
+/// The spawn is guarded (`ForkGuarded`): a lock a sibling test drops while
+/// the child is between fork and exec is not held by the child.
 pub fn spawn_worker(test_name: &str, envs: &[(&str, &str)]) -> Child {
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
@@ -525,7 +528,7 @@ pub fn spawn_worker(test_name: &str, envs: &[(&str, &str)]) -> Child {
     for (name, value) in envs {
         command.env(name, value);
     }
-    command.spawn().expect("spawn adversarial worker")
+    command.spawn_guarded().expect("spawn adversarial worker")
 }
 
 /// Kill-on-drop guard so a failed assertion never leaks a worker process.
@@ -550,7 +553,7 @@ pub fn kill9(child: &mut Child) {
     let pid = child.id().to_string();
     let status = Command::new("/bin/kill")
         .args(["-9", &pid])
-        .status()
+        .status_guarded()
         .unwrap();
     assert!(status.success(), "kill -9 {pid} failed");
     let waited = child.wait().unwrap();

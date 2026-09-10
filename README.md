@@ -1285,6 +1285,15 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   spawn helper now closes the child's inherited regular files before exec,
   inside the existing fork guard. See [the harness
   document](docs/control-authority-test-harness.md).
+- **Foundation branch: the fork window at the integration binaries closed.**
+  The `fork-guard` feature, on for every test build through the crate's
+  dev-dependency on itself and on for no serving binary, compiles the lock
+  handoff into the library and makes the spawn helper public; the seven
+  spawn sites in the four integration binaries that fork this same
+  executable go through it, and a new target pins the window through the
+  control ownership lock: with the guard removed the reopen is rejected on
+  every run, with it on none. See [the harness
+  document](docs/control-authority-test-harness.md).
 - **Foundation branch: snapshot serve under the pointer lock.** Serving
   the published generation to a lagging peer is one step under the pointer
   lock, from reading the pointer to opening the image, so a build

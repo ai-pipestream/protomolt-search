@@ -128,7 +128,7 @@ pub(super) fn acquire(path: &Path, allow_create: bool) -> Result<(PathBuf, Arc<F
             lock_path.display()
         ));
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fork-guard"))]
     let _handoff = crate::test_support::lock_handoff();
     lock.try_lock().map_err(|e| {
         error(

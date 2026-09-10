@@ -879,6 +879,8 @@ handoff is not in their lock code, and `test_support` is crate-private.
 Giving them the same protection means compiling the handoff into the
 library under a feature and exposing the module; that is a design choice
 for the owner of the storage contracts and is left open here, named.
+(Closed on 2026-09-09 that way: see "The fork window at the integration
+binaries is closed" at the end of this document.)
 
 ## Slice 4b (port): admission timing target on the 945b484 kit
 
@@ -1099,7 +1101,9 @@ suite alongside it, taking and dropping locks while this target forks. The
 second run of the combined gate passed in full. Closing it means either
 exposing the library hook behind a feature or a harness-local copy of it
 in `kit.rs`, with its own sensitivity probe; that is a slice of its own
-and is left named here.
+and is left named here. (Closed on 2026-09-09 the first way: see "The fork
+window at the integration binaries is closed" at the end of this
+document.)
 
 ### Found after slice 4c: the purge the store bounds is now recorded (Fable)
 
@@ -1270,3 +1274,70 @@ the test passed eight runs in eight
 (`review-response-changed-bytes-fixed-{1..8}.log`).
 
 Gates, in the 8 GiB scope with two build jobs and four test threads: the snapshot target 21 pass (`review-response-control_raft_snapshots.log`); the changed-bytes test eight runs in eight after the fixes (`review-response-changed-bytes-fixed-{1..8}.log`); regressions 10, admission 10, crash faults 7 and the worker 1 (`review-response-raft-targets.log`); the lib with raft, tls and fault-injection 833 pass (`review-response-lib-raft.log`); `cargo check --tests` with raft only and with the default features (`review-response-check-{raft,default}.log`); clippy with the raft features, the pre-existing deny at `src/vector.rs:1092` and pre-existing warnings, none in `src/raft` (`review-response-clippy.log`); the combined release gate 164 targets, 1817 pass, 0 fail, 1 ignored, the pre-existing `native_matches_opennlp_contract` (`review-response-combined-gate.log`); rustfmt on the changed files.
+
+## The fork window at the integration binaries is closed (Fable, 2026-09-09)
+
+The two sections above that named the six spawn sites as open ("Found in
+the default gate of the serve checkpoint" and "Gates after slice 4c") are
+closed here. The design choice went the way the first of them sketched:
+the handoff is compiled into the library under a feature and the module is
+public.
+
+**The feature.** `fork-guard` (Cargo.toml) gates `pub mod test_support` and
+the four lock takes that call `lock_handoff` (`document_catalog.rs`,
+`source_authority.rs`, `control_plane/storage.rs`, `raft/log_store.rs`) as
+`cfg(any(test, feature = "fork-guard"))`. The crate lists itself as a
+dev-dependency with that feature on, so cargo unifies it into the library
+every test target links and into no other build: `cargo tree -e normal,build
+--depth 0` shows `default,net,tls` and `cargo tree -e normal,build,dev
+--depth 0` shows `default,fork-guard,net,tls`. The serving binary and the
+embedded crate are built without it, and the gate commands are unchanged.
+`ForkGuarded` has a new method, `spawn_guarded`, for a caller that keeps
+the `Child`.
+
+**The spawn sites.** Seven, in four binaries, go through the guard: the
+three `current_exe` workers in `tests/document_catalog.rs`, the one in
+`tests/replay_journal.rs`, the `/bin/sh` wrapper in `tests/source_access.rs`,
+and in `tests/control_adversarial/kit.rs` both `spawn_worker` and the
+`kill -9` of `kill9` (a fork is a fork). `tests/multiprocess.rs` and
+`tests/security.rs` spawn the server binary and cargo and take no library
+lock in their own process, so they are not routed.
+
+**The pin.** `tests/fork_window.rs` is a new target that links the library
+the way every integration target does, without `cfg(test)`, and proves
+both layers reach it through a production lock path. Its shape took three
+tries, and the failures say where the window is. A standalone probe
+(`fork-guard-probe.rs`, output `fork-guard-probe.txt`) put numbers on it:
+with a holder thread sweeping its drop-and-retake by microseconds against a
+spawner's announcement, the re-take is rejected from about 4 µs after
+`Command::status` is entered (the fork) to about 40 µs after (the child's
+close-on-exec sweep), 2,916 hits in 4,000 rounds with a 50 µs sweep and 375
+in 4,000 with a 400 µs one. The first two shapes of the test, a continuous
+spawner next to 400 reopens and a swept delay after the spawner's
+announcement, saw no rejection in 8,000 and 8,000 rounds without the
+guard: the holder's drop and reopen outlast the window. The third shape
+puts the re-take inside it by arrangement, with two pipes: the child
+writes one byte from a pre-exec hook, after the fork and before the exec,
+and blocks there on a read; the holder drops its lock holder on that byte,
+releases the child with a byte of its own, and reopens at once. The
+fork-path probe of that shape (`fork-guard-probe-fork-path.rs`) is rejected
+500 rounds in 500.
+
+The lock the pin takes is the control ownership lock
+(`DurableControlPlane::open_existing`), the one the crash target saw
+rejected. The document catalog, the first lock tried, is not subject to the
+window at all: redb unlocks its file explicitly when the database is
+dropped, which releases the flock for every duplicate of the description,
+the child's included; 4,000 rounds of the catalog in the third shape,
+without the guard, saw no rejection. The source authority and the raft log
+store take their locks as the control plane does, and are subject.
+
+Sensitivity, with the guard removed from the test's spawn (`status()` for
+`status_guarded()`): 20 runs, 0 pass, each rejected on its first round with
+`exclusive control ownership lock unavailable ... lock acquisition failed
+because the operation would block` (`fork-guard-window-without-guard.log`).
+With the guard: 20 runs, 20 pass (`fork-guard-window-guarded.log`). The
+guarded reopen blocks on the handoff until the spawn returns, by which time
+the child has closed the inherited file.
+
+Gates, in the 8 GiB scope with two build jobs and four test threads: `cargo check --tests` with raft, tls and fault-injection and with raft only (`fork-guard-check-raft-all.log`, `fork-guard-check-raft-only.log`) and with the default features (`fork-guard-check-default.log`); the four default-feature targets, catalog 21, journal 9, source access 11, the new target 1 (`fork-guard-default-targets.log`); the `test_support` tests 2 (`fork-guard-lib-test-support.log`); with the raft features, crash faults 7, regressions 10, admission 10 and the adversarial worker 11 (`fork-guard-raft-targets.log`); the lib with the default features 815 pass and with raft, tls and fault-injection 833 pass (`fork-guard-lib-default.log`, `fork-guard-lib-raft.log`); clippy with the raft features, the pre-existing deny at `src/vector.rs:1092` and pre-existing warnings, none in the changed files (`fork-guard-clippy.log`); the combined release gate 165 targets, 1818 pass, 0 fail, 1 ignored, the pre-existing `native_matches_opennlp_contract` (`fork-guard-combined-gate.log`); rustfmt on the changed files.
