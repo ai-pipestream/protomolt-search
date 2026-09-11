@@ -581,6 +581,11 @@ mod adapter {
             &self.binding
         }
 
+        /// The collection this activated source serves, from its binding.
+        pub fn collection(&self) -> &str {
+            &self.key().collection
+        }
+
         fn key(&self) -> &crate::pb::storage::LogicalSourceOwner {
             self.binding
                 .preparation

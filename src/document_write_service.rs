@@ -18,35 +18,25 @@ use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response, Status};
 
-struct Inner {
-    principals: Principals,
-    catalogs: BTreeMap<String, Arc<AccessControlledCatalog>>,
+#[cfg(feature = "raft")]
+pub mod hosted;
+
+/// The admission limits every write service enforces, shared by the
+/// single-authority service and the hosted one: one validation, one pair
+/// of semaphores, no copied block.
+struct WriteBudget {
     limits: DocumentWriteServiceLimits,
     pending: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
 }
 
-struct WorkPermit {
-    _principal: Permit,
+struct BudgetPermit {
     _pending: OwnedSemaphorePermit,
     _bytes: OwnedSemaphorePermit,
 }
 
-/// Host adapter over catalogs that the embedding application has explicitly
-/// opened under Admin permission. Clones share every receiver capacity limit.
-/// Source/history bytes remain in those local catalogs. Exposing this service
-/// does not turn their resource binding into distributed ownership authority.
-#[derive(Clone)]
-pub struct DocumentWriteServiceImpl {
-    inner: Arc<Inner>,
-}
-
-impl DocumentWriteServiceImpl {
-    pub fn new(
-        principals: Principals,
-        catalogs: Vec<Arc<AccessControlledCatalog>>,
-        limits: DocumentWriteServiceLimits,
-    ) -> Result<Self, Status> {
+impl WriteBudget {
+    fn new(limits: DocumentWriteServiceLimits) -> Result<Self, Status> {
         if limits.max_request_bytes == 0 || limits.max_request_bytes > 64 * 1024 * 1024 {
             return Err(Status::invalid_argument(
                 "source max_request_bytes must be 1..64 MiB",
@@ -64,6 +54,57 @@ impl DocumentWriteServiceImpl {
                 "source max_in_flight must be 1..1024",
             ));
         }
+        Ok(Self {
+            pending: Arc::new(Semaphore::new(limits.max_in_flight as usize)),
+            bytes: Arc::new(Semaphore::new(limits.max_pending_bytes as usize)),
+            limits,
+        })
+    }
+
+    fn max_request_bytes(&self) -> usize {
+        self.limits.max_request_bytes as usize
+    }
+
+    fn admit(&self, length: usize) -> Result<BudgetPermit, Status> {
+        let pending = Arc::clone(&self.pending)
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("source execution capacity is full"))?;
+        let bytes = Arc::clone(&self.bytes)
+            .try_acquire_many_owned(length as u32)
+            .map_err(|_| Status::resource_exhausted("source pending byte budget is full"))?;
+        Ok(BudgetPermit {
+            _pending: pending,
+            _bytes: bytes,
+        })
+    }
+}
+
+struct Inner {
+    principals: Principals,
+    catalogs: BTreeMap<String, Arc<AccessControlledCatalog>>,
+    budget: WriteBudget,
+}
+
+struct WorkPermit {
+    _principal: Permit,
+    _budget: BudgetPermit,
+}
+
+/// Host adapter over catalogs that the embedding application has explicitly
+/// opened under Admin permission. Clones share every receiver capacity limit.
+/// Source/history bytes remain in those local catalogs. Exposing this service
+/// does not turn their resource binding into distributed ownership authority.
+#[derive(Clone)]
+pub struct DocumentWriteServiceImpl {
+    inner: Arc<Inner>,
+}
+
+impl DocumentWriteServiceImpl {
+    pub fn new(
+        principals: Principals,
+        catalogs: Vec<Arc<AccessControlledCatalog>>,
+        limits: DocumentWriteServiceLimits,
+    ) -> Result<Self, Status> {
         if catalogs.is_empty() {
             return Err(Status::invalid_argument(
                 "source write service requires an explicitly provisioned catalog",
@@ -82,9 +123,7 @@ impl DocumentWriteServiceImpl {
             inner: Arc::new(Inner {
                 principals,
                 catalogs: members,
-                pending: Arc::new(Semaphore::new(limits.max_in_flight as usize)),
-                bytes: Arc::new(Semaphore::new(limits.max_pending_bytes as usize)),
-                limits,
+                budget: WriteBudget::new(limits)?,
             }),
         })
     }
@@ -92,7 +131,7 @@ impl DocumentWriteServiceImpl {
     /// Use this builder when registering the adapter so tonic enforces the
     /// request byte limit during decoding as well as at execution admission.
     pub fn into_server(self) -> DocumentWriteServiceServer<Self> {
-        let max_bytes = self.inner.limits.max_request_bytes as usize;
+        let max_bytes = self.inner.budget.max_request_bytes();
         DocumentWriteServiceServer::new(self).max_decoding_message_size(max_bytes)
     }
 
@@ -114,18 +153,13 @@ impl DocumentWriteServiceImpl {
             .cloned()
             .ok_or_else(|| Status::not_found("source collection is not configured"))?;
         let length = request.get_ref().encoded_len();
-        if length > self.inner.limits.max_request_bytes as usize {
+        if length > self.inner.budget.max_request_bytes() {
             return Err(Status::resource_exhausted(
                 "source request exceeds max_request_bytes",
             ));
         }
         let principal_permit = principal.admit_request()?;
-        let pending = Arc::clone(&self.inner.pending)
-            .try_acquire_owned()
-            .map_err(|_| Status::resource_exhausted("source execution capacity is full"))?;
-        let bytes = Arc::clone(&self.inner.bytes)
-            .try_acquire_many_owned(length as u32)
-            .map_err(|_| Status::resource_exhausted("source pending byte budget is full"))?;
+        let budget = self.inner.budget.admit(length)?;
         if write {
             principal.admit_ingest(1)?;
         }
@@ -134,8 +168,7 @@ impl DocumentWriteServiceImpl {
             access,
             WorkPermit {
                 _principal: principal_permit,
-                _pending: pending,
-                _bytes: bytes,
+                _budget: budget,
             },
         ))
     }
