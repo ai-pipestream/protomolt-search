@@ -99,6 +99,8 @@ pub mod log_store;
 pub mod operator;
 #[cfg(all(feature = "raft", feature = "tls"))]
 pub mod operator_service;
+#[cfg(feature = "tls")]
+pub mod rejection_log;
 pub mod state_machine;
 #[cfg(feature = "tls")]
 pub mod transport;

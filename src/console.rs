@@ -30,7 +30,9 @@ use std::time::{Duration, Instant};
 
 use bytes::{Buf, BufMut, Bytes};
 use prost::Message as _;
-use prost_reflect::{DescriptorPool, DynamicMessage, MethodDescriptor, SerializeOptions};
+use prost_reflect::{
+    DescriptorPool, DynamicMessage, MessageDescriptor, MethodDescriptor, SerializeOptions,
+};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -434,46 +436,52 @@ fn raw_grpc(ctx: &Ctx, addr: &str) -> Result<RawGrpc, Reply> {
     )
 }
 
-/// proto3 JSON -> message bytes for `method`'s input. An empty body is
-/// the empty message.
-fn encode_request(method: &MethodDescriptor, json: &[u8]) -> Result<Bytes, Reply> {
+/// proto3 JSON -> message bytes for `message`. An empty document is
+/// the empty message. Shared with the `raft-bootstrap` CLI's `--policy`
+/// and `--limits` files, so the console and the CLI reject the same
+/// documents the same way.
+pub fn json_to_message_bytes(message: &MessageDescriptor, json: &[u8]) -> Result<Vec<u8>, String> {
     let body: &[u8] = if json.iter().all(u8::is_ascii_whitespace) {
         b"{}"
     } else {
         json
     };
     let mut deserializer = serde_json::Deserializer::from_slice(body);
-    let message = DynamicMessage::deserialize(method.input(), &mut deserializer).map_err(|e| {
-        Reply::error(
-            400,
-            "INVALID_ARGUMENT",
-            format!("request JSON for {}: {e}", method.input().full_name()),
-        )
-    })?;
-    Ok(Bytes::from(message.encode_to_vec()))
+    let decoded = DynamicMessage::deserialize(message.clone(), &mut deserializer)
+        .map_err(|e| format!("request JSON for {}: {e}", message.full_name()))?;
+    Ok(decoded.encode_to_vec())
 }
 
-/// Message bytes -> proto3 JSON for `method`'s output.
-fn decode_response(method: &MethodDescriptor, bytes: Bytes) -> Result<Vec<u8>, Reply> {
-    let message = DynamicMessage::decode(method.output(), bytes).map_err(|e| {
-        Reply::error(
-            502,
-            "INTERNAL",
-            format!("response bytes for {}: {e}", method.output().full_name()),
-        )
-    })?;
+/// Message bytes -> proto3 JSON for `message`. Every field is rendered,
+/// defaults included (what grpcurl calls `-emit-defaults`): a document
+/// id of 0 or a score of 0 is a value a reader needs to see, not an
+/// omission. Shared with the `raft-*` CLI's status printing, which is
+/// the console's rendering of the same bytes.
+pub fn message_bytes_to_json(message: &MessageDescriptor, bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let decoded = DynamicMessage::decode(message.clone(), bytes)
+        .map_err(|e| format!("response bytes for {}: {e}", message.full_name()))?;
     let mut out = Vec::new();
     let mut serializer = serde_json::Serializer::new(&mut out);
-    // Every field is rendered, defaults included (what grpcurl calls
-    // `-emit-defaults`): a document id of 0 or a score of 0 is a value a
-    // reader needs to see, not an omission.
-    message
+    decoded
         .serialize_with_options(
             &mut serializer,
             &SerializeOptions::new().skip_default_fields(false),
         )
-        .map_err(|e| Reply::error(502, "INTERNAL", format!("response JSON: {e}")))?;
+        .map_err(|e| format!("response JSON: {e}"))?;
     Ok(out)
+}
+
+/// proto3 JSON -> message bytes for `method`'s input. An empty body is
+/// the empty message.
+fn encode_request(method: &MethodDescriptor, json: &[u8]) -> Result<Bytes, Reply> {
+    json_to_message_bytes(&method.input(), json)
+        .map(Bytes::from)
+        .map_err(|e| Reply::error(400, "INVALID_ARGUMENT", e))
+}
+
+/// Message bytes -> proto3 JSON for `method`'s output.
+fn decode_response(method: &MethodDescriptor, bytes: Bytes) -> Result<Vec<u8>, Reply> {
+    message_bytes_to_json(&method.output(), &bytes).map_err(|e| Reply::error(502, "INTERNAL", e))
 }
 
 /// The doc's status-to-HTTP table.

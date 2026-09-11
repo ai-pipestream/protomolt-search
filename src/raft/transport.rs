@@ -327,6 +327,10 @@ impl RaftTransportService {
         if announced > self.staging.max_image_bytes() {
             let bound = self.staging.max_image_bytes();
             self.rejections.record(from, announced, bound);
+            super::rejection_log::record(format!(
+                "raft member {} : snapshot from {from} announced {announced} over bound {bound}",
+                self.node_id
+            ));
             return Err(Status::resource_exhausted(format!(
                 "snapshot announces {announced} bytes, beyond the {bound} byte image bound of node {}",
                 self.node_id

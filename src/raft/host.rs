@@ -311,13 +311,14 @@ struct Listener {
 /// serve cycles and the cycle ends.
 #[cfg(feature = "tls")]
 async fn rebuild_on_digest_rejection(
+    node_id: NodeId,
     mut rejections: watch::Receiver<BTreeMap<NodeId, PeerRejection>>,
     published: Arc<super::state_machine::PublishedImage>,
     raft: Raft<ControlRaft>,
 ) {
     let mut seen: BTreeMap<NodeId, u64> = BTreeMap::new();
     loop {
-        let fresh: Vec<(NodeId, u64)> = rejections
+        let fresh: Vec<(NodeId, PeerRejection)> = rejections
             .borrow_and_update()
             .iter()
             .filter(|(node, rejection)| {
@@ -325,10 +326,15 @@ async fn rebuild_on_digest_rejection(
                     && rejection.code == tonic::Code::DataLoss
                     && seen.get(node).is_none_or(|count| rejection.count > *count)
             })
-            .map(|(node, rejection)| (*node, rejection.count))
+            .map(|(node, rejection)| (*node, rejection.clone()))
             .collect();
-        for (node, count) in fresh {
-            seen.insert(node, count);
+        for (node, rejection) in fresh {
+            seen.insert(node, rejection.count);
+            // One line per peer per change of count, not per poll.
+            super::rejection_log::record(format!(
+                "raft member {node_id} : peer {node} rejected {} ({:?}): {}",
+                rejection.action, rejection.code, rejection.message
+            ));
             let checked = {
                 let published = Arc::clone(&published);
                 tokio::task::spawn_blocking(move || published.verify()).await
@@ -566,6 +572,7 @@ impl RaftHost {
             Self::start_with(dir, store, log_store, node_id, config, factory, None).await?;
         host.forwarder = Some(forwarder);
         host.digest_watch = Some(tokio::spawn(rebuild_on_digest_rejection(
+            host.node_id,
             peer_rejections.subscribe(),
             Arc::clone(&host.published),
             host.raft.clone(),
@@ -761,6 +768,45 @@ impl RaftHost {
     /// view, never an admission.
     pub fn believed_leader(&self) -> Option<NodeId> {
         self.raft.metrics().borrow().current_leader
+    }
+
+    /// This member's gauges, sampled live for the metrics page: the
+    /// same reads `member_status` serves, as values. The store reads
+    /// fall back to the not-ready zero (not the leader, nothing
+    /// applied, awaiting snapshot unknown as false) rather than fail
+    /// a scrape.
+    pub fn member_gauges(&self) -> crate::metrics::MemberGauges {
+        let metrics = self.raft.metrics().borrow().clone();
+        let build = self.last_snapshot_build();
+        crate::metrics::MemberGauges {
+            is_leader: metrics.state == openraft::ServerState::Leader,
+            applied_index: metrics.last_applied.map(|id| id.index).unwrap_or(0),
+            last_log_index: metrics.last_log_index.unwrap_or(0),
+            awaiting_snapshot: self.awaiting_snapshot().unwrap_or(false),
+            #[cfg(feature = "tls")]
+            peer_rejections: self
+                .peer_rejections()
+                .iter()
+                .map(|(node, rejection)| (*node, rejection.count))
+                .collect(),
+            #[cfg(not(feature = "tls"))]
+            peer_rejections: Vec::new(),
+            #[cfg(feature = "tls")]
+            snapshot_rejections: self.snapshot_rejections().count(),
+            #[cfg(not(feature = "tls"))]
+            snapshot_rejections: 0,
+            last_snapshot_build_bytes: build.as_ref().map(|build| build.bytes).unwrap_or(0),
+            last_snapshot_receiver_bound_bytes: build
+                .as_ref()
+                .map(|build| build.receiver_bound)
+                .unwrap_or(0),
+        }
+    }
+
+    /// A scrape-time sampler of [`RaftHost::member_gauges`] for the
+    /// metrics page.
+    pub fn member_gauge_provider(host: Arc<Self>) -> crate::metrics::MemberGaugeProvider {
+        Box::new(move || host.member_gauges())
     }
 
     /// An owned admission lease (docs/raft-admission.md) for work that

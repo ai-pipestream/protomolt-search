@@ -40,7 +40,7 @@ fn hex(bytes: &[u8]) -> String {
 
 /// One member's status from the host's read accessors, for the route and
 /// for the `raft-bootstrap` and `raft-status` CLIs.
-pub(crate) fn member_status(host: &RaftHost) -> Result<MemberStatus, Status> {
+pub fn member_status(host: &RaftHost) -> Result<MemberStatus, Status> {
     let store = host.store()?;
     let identity = store.identity();
     let readings = host.metrics();

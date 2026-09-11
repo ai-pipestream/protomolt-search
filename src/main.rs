@@ -473,12 +473,20 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .map(|node| node.metrics_provider())
             .collect();
+        #[cfg(all(feature = "raft", feature = "tls"))]
+        let member_gauges: Vec<pipestream_search::metrics::MemberGaugeProvider> = raft_host
+            .clone()
+            .map(|host| pipestream_search::raft::RaftHost::member_gauge_provider(host))
+            .into_iter()
+            .collect();
+        #[cfg(not(all(feature = "raft", feature = "tls")))]
+        let member_gauges: Vec<pipestream_search::metrics::MemberGaugeProvider> = Vec::new();
         eprintln!(
             "metrics on http://{bound}/metrics ({} shard gauges)",
             gauges.len()
         );
         handles.push(tokio::spawn(async move {
-            pipestream_search::metrics::serve(listener, gauges).await;
+            pipestream_search::metrics::serve_with_member(listener, gauges, member_gauges).await;
             Ok(())
         }));
     }
@@ -558,9 +566,18 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .map(|node| node.metrics_provider())
             .collect();
+        #[cfg(all(feature = "raft", feature = "tls"))]
+        let member_gauges: Vec<pipestream_search::metrics::MemberGaugeProvider> = raft_host
+            .clone()
+            .map(|host| pipestream_search::raft::RaftHost::member_gauge_provider(host))
+            .into_iter()
+            .collect();
+        #[cfg(not(all(feature = "raft", feature = "tls")))]
+        let member_gauges: Vec<pipestream_search::metrics::MemberGaugeProvider> = Vec::new();
         let diagnostics = search_set
             .diagnostics()
             .with_gauges(gauges)
+            .with_member_gauges(member_gauges)
             .into_server(max);
         let coord_base = secured_server(cfg.tls.as_ref(), false)?
             .initial_stream_window_size(pipestream_search::H2_STREAM_WINDOW)
@@ -868,6 +885,319 @@ fn raft_prepare(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     {
         let _ = member;
         Err("this build has no Raft support (features `raft` and `tls` are needed)".into())
+    }
+}
+
+/// The `raft-*` operator subcommands (docs/raft-hosting.md, "Operator
+/// surface"): thin clients of the operator RPCs next to `raft-prepare`,
+/// plus the local `raft-bootstrap`. Exit codes: 0 on success, 2 on a
+/// usage error (the invocation names no valid call, so nothing is
+/// attempted), 1 on a rejected call with the status code and message on
+/// stderr.
+fn cli_usage(command: &str, detail: &str) -> ! {
+    eprintln!("{command}: usage error: {detail}");
+    std::process::exit(2);
+}
+
+/// The value of `--{key}=...` among a subcommand's args.
+fn cli_flag(args: &[String], key: &str) -> Option<String> {
+    let prefix = format!("--{key}=");
+    args.iter()
+        .find_map(|a| a.strip_prefix(&prefix).map(str::to_string))
+}
+
+/// `raft-status --addr=<host:port>`: the member's address.
+fn parse_raft_status(args: &[String]) -> Result<String, String> {
+    cli_flag(args, "addr").ok_or_else(|| "raft-status --addr=<host:port>".to_string())
+}
+
+/// `raft-add-learner --addr=<leader> --node-id=<n> --node-addr=<host:port>`:
+/// the leader to ask, the learner's id, the address peers dial for it.
+fn parse_raft_add_learner(args: &[String]) -> Result<(String, u64, String), String> {
+    const USAGE: &str = "raft-add-learner --addr=<leader> --node-id=<n> --node-addr=<host:port>";
+    let addr = cli_flag(args, "addr").ok_or(USAGE)?;
+    let raw = cli_flag(args, "node-id").ok_or(USAGE)?;
+    let node_id = raw
+        .parse::<u64>()
+        .map_err(|_| format!("{USAGE}: --node-id={raw:?} is not a node id"))?;
+    let node_addr = cli_flag(args, "node-addr").ok_or(USAGE)?;
+    Ok((addr, node_id, node_addr))
+}
+
+/// `raft-promote --addr=<leader> --node-id=<n>[,<n>...]`: the leader to
+/// ask and the learners to promote.
+fn parse_raft_promote(args: &[String]) -> Result<(String, Vec<u64>), String> {
+    const USAGE: &str = "raft-promote --addr=<leader> --node-id=<n>[,<n>...]";
+    let addr = cli_flag(args, "addr").ok_or(USAGE)?;
+    let raw = cli_flag(args, "node-id").ok_or(USAGE)?;
+    let mut ids = Vec::new();
+    for part in raw.split(',') {
+        ids.push(
+            part.trim()
+                .parse::<u64>()
+                .map_err(|_| format!("{USAGE}: --node-id={raw:?} is not a learner list"))?,
+        );
+    }
+    Ok((addr, ids))
+}
+
+/// `raft-remove-member --addr=<leader> --node-id=<n>`: the leader to ask
+/// and the member to remove.
+fn parse_raft_remove_member(args: &[String]) -> Result<(String, u64), String> {
+    const USAGE: &str = "raft-remove-member --addr=<leader> --node-id=<n>";
+    let addr = cli_flag(args, "addr").ok_or(USAGE)?;
+    let raw = cli_flag(args, "node-id").ok_or(USAGE)?;
+    let node_id = raw
+        .parse::<u64>()
+        .map_err(|_| format!("{USAGE}: --node-id={raw:?} is not a node id"))?;
+    Ok((addr, node_id))
+}
+
+/// `raft-verify-image --addr=<member>`: the member to ask.
+fn parse_raft_verify_image(args: &[String]) -> Result<String, String> {
+    cli_flag(args, "addr").ok_or_else(|| "raft-verify-image --addr=<member>".to_string())
+}
+
+/// `raft-bootstrap`'s two JSON files: the policy and the limits the
+/// first member is created with.
+fn parse_raft_bootstrap_files(args: &[String]) -> Result<(String, String), String> {
+    const USAGE: &str = "raft-bootstrap --raft-dir=... --raft-node-id=... --raft-group-id=... \
+        --raft-authority-incarnation=... --raft-listen=... --raft-peers=... \
+        --policy=<file> --limits=<file>";
+    let policy = cli_flag(args, "policy").ok_or(USAGE)?;
+    let limits = cli_flag(args, "limits").ok_or(USAGE)?;
+    Ok((policy, limits))
+}
+
+/// The operator RPC client over the member's listener, with the
+/// process-wide client material, the way the console dials.
+#[cfg(all(feature = "raft", feature = "tls"))]
+async fn operator_client(
+    addr: &str,
+) -> Result<
+    pipestream_search::pb::raft_operator_service_client::RaftOperatorServiceClient<
+        tonic::transport::Channel,
+    >,
+    Box<dyn std::error::Error>,
+> {
+    let channel = secure_channel(addr).await?;
+    Ok(
+        pipestream_search::pb::raft_operator_service_client::RaftOperatorServiceClient::new(
+            channel,
+        )
+        .max_decoding_message_size(pipestream_search::MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(pipestream_search::MAX_MESSAGE_BYTES),
+    )
+}
+
+/// Print one proto message as proto3 JSON: the console's rendering
+/// (every field, defaults included), one document, no other output on
+/// stdout.
+#[cfg(all(feature = "raft", feature = "tls"))]
+fn print_message_json<M: prost::Message>(
+    message_name: &str,
+    message: &M,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pool = pipestream_search::console::descriptor_pool();
+    let descriptor = pool
+        .get_message_by_name(message_name)
+        .ok_or_else(|| format!("{message_name} is not in the compiled descriptor set"))?;
+    let json =
+        pipestream_search::console::message_bytes_to_json(&descriptor, &message.encode_to_vec())?;
+    println!(
+        "{}",
+        String::from_utf8(json).map_err(|e| format!("response JSON is not UTF-8: {e}"))?
+    );
+    Ok(())
+}
+
+#[cfg(all(feature = "raft", feature = "tls"))]
+async fn raft_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use pipestream_search::pb::GetMemberStatusRequest;
+    let addr = parse_raft_status(args).unwrap_or_else(|e| cli_usage("raft-status", &e));
+    let status = operator_client(&addr)
+        .await?
+        .get_member_status(tonic::Request::new(GetMemberStatusRequest {}))
+        .await
+        .map_err(|status| format!("raft-status: {}: {}", status.code(), status.message()))?
+        .into_inner();
+    print_message_json("ai.protomolt.search.v1.MemberStatus", &status)
+}
+
+#[cfg(all(feature = "raft", feature = "tls"))]
+async fn raft_add_learner(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use pipestream_search::pb::AddLearnerRequest;
+    let (addr, node_id, node_addr) =
+        parse_raft_add_learner(args).unwrap_or_else(|e| cli_usage("raft-add-learner", &e));
+    let change = operator_client(&addr)
+        .await?
+        .add_learner(tonic::Request::new(AddLearnerRequest {
+            node_id,
+            addr: node_addr,
+        }))
+        .await
+        .map_err(|status| format!("raft-add-learner: {}: {}", status.code(), status.message()))?
+        .into_inner();
+    print_message_json("ai.protomolt.search.v1.MembershipChange", &change)
+}
+
+#[cfg(all(feature = "raft", feature = "tls"))]
+async fn raft_promote(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use pipestream_search::pb::PromoteLearnersRequest;
+    let (addr, learner_ids) =
+        parse_raft_promote(args).unwrap_or_else(|e| cli_usage("raft-promote", &e));
+    let change = operator_client(&addr)
+        .await?
+        .promote_learners(tonic::Request::new(PromoteLearnersRequest { learner_ids }))
+        .await
+        .map_err(|status| format!("raft-promote: {}: {}", status.code(), status.message()))?
+        .into_inner();
+    print_message_json("ai.protomolt.search.v1.MembershipChange", &change)
+}
+
+#[cfg(all(feature = "raft", feature = "tls"))]
+async fn raft_remove_member(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use pipestream_search::pb::RemoveMemberRequest;
+    let (addr, node_id) =
+        parse_raft_remove_member(args).unwrap_or_else(|e| cli_usage("raft-remove-member", &e));
+    let change = operator_client(&addr)
+        .await?
+        .remove_member(tonic::Request::new(RemoveMemberRequest { node_id }))
+        .await
+        .map_err(|status| {
+            format!(
+                "raft-remove-member: {}: {}",
+                status.code(),
+                status.message()
+            )
+        })?
+        .into_inner();
+    print_message_json("ai.protomolt.search.v1.MembershipChange", &change)
+}
+
+#[cfg(all(feature = "raft", feature = "tls"))]
+async fn raft_verify_image(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use pipestream_search::pb::VerifyPublishedImageRequest;
+    let addr = parse_raft_verify_image(args).unwrap_or_else(|e| cli_usage("raft-verify-image", &e));
+    let verification = operator_client(&addr)
+        .await?
+        .verify_published_image(tonic::Request::new(VerifyPublishedImageRequest {}))
+        .await
+        .map_err(|status| format!("raft-verify-image: {}: {}", status.code(), status.message()))?
+        .into_inner();
+    print_message_json(
+        "ai.protomolt.search.v1.PublishedImageVerification",
+        &verification,
+    )
+}
+
+/// Read one proto3 JSON file into its typed message through the shared
+/// decoder, so the CLI rejects what the console rejects. A file that
+/// does not decode is rejected naming the file and the decoder's
+/// message.
+#[cfg(all(feature = "raft", feature = "tls"))]
+fn read_message_json<M: prost::Message + Default>(
+    path: &str,
+    message_name: &str,
+) -> Result<M, Box<dyn std::error::Error>> {
+    let pool = pipestream_search::console::descriptor_pool();
+    let descriptor = pool
+        .get_message_by_name(message_name)
+        .ok_or_else(|| format!("{message_name} is not in the compiled descriptor set"))?;
+    let json = std::fs::read(path).map_err(|e| format!("raft-bootstrap: {path}: {e}"))?;
+    let bytes = pipestream_search::console::json_to_message_bytes(&descriptor, &json)
+        .map_err(|e| format!("raft-bootstrap: {path}: {e}"))?;
+    let message = M::decode(bytes.as_slice())
+        .map_err(|e| format!("raft-bootstrap: {path}: response bytes for {message_name}: {e}"))?;
+    Ok(message)
+}
+
+/// `raft-bootstrap ... --policy=<file> --limits=<file>`: the one-time
+/// creation of the first member. Local, not an RPC: it decodes the
+/// policy and limits, refuses a directory that already has a store or a
+/// log (each named with its own create's wording), bootstraps the
+/// group, waits until the member leads, prints the status JSON, and
+/// shuts the host down cleanly.
+#[cfg(all(feature = "raft", feature = "tls"))]
+async fn raft_bootstrap(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use pipestream_search::raft::host::{LOG_FILE, STORE_FILE};
+    use pipestream_search::raft::{operator, RaftHost};
+    let cfg = parse(args).unwrap_or_else(|e| cli_usage("raft-bootstrap", &e));
+    let Some(member) = &cfg.raft else {
+        cli_usage(
+            "raft-bootstrap",
+            "raft-bootstrap needs --raft-dir and the other --raft-* options",
+        );
+    };
+    let (policy_path, limits_path) =
+        parse_raft_bootstrap_files(args).unwrap_or_else(|e| cli_usage("raft-bootstrap", &e));
+    if member.dir.join(STORE_FILE).exists() {
+        return Err("raft-bootstrap: source authority already exists".into());
+    }
+    if member.dir.join(LOG_FILE).exists() {
+        return Err("raft-bootstrap: raft log store already exists".into());
+    }
+    let policy = read_message_json::<pipestream_search::pb::AccessPolicy>(
+        &policy_path,
+        "ai.protomolt.search.v1.AccessPolicy",
+    )?;
+    let limits = read_message_json::<pipestream_search::pb::storage::SourceAuthorityLimits>(
+        &limits_path,
+        "ai.protomolt.search.storage.v1.SourceAuthorityLimits",
+    )?;
+    let identity = operator::identity(member);
+    let host_config = operator::host_config(member).map_err(|e| format!("raft-bootstrap: {e}"))?;
+    let transport = operator::cluster_transport(member, cfg.tls.as_ref(), cfg.client_tls.as_ref())
+        .map_err(|e| format!("raft-bootstrap: {e}"))?;
+    let host = RaftHost::bootstrap_cluster(
+        &member.dir,
+        &identity,
+        member.node_id,
+        &policy,
+        &limits,
+        &host_config,
+        transport,
+    )
+    .await
+    .map_err(|status| format!("raft-bootstrap: {}: {}", status.code(), status.message()))?;
+    host.wait(Some(std::time::Duration::from_secs(30)))
+        .state(openraft::ServerState::Leader, "raft-bootstrap leader")
+        .await
+        .map_err(|e| format!("raft-bootstrap: the member never led: {e}"))?;
+    let status = pipestream_search::raft::operator_service::member_status(&host)
+        .map_err(|status| format!("raft-bootstrap: {}: {}", status.code(), status.message()))?;
+    print_message_json("ai.protomolt.search.v1.MemberStatus", &status)?;
+    host.shutdown()
+        .await
+        .map_err(|status| format!("raft-bootstrap: {}: {}", status.code(), status.message()))?;
+    Ok(())
+}
+
+/// The `raft-*` operator subcommands on a build without Raft: parsed
+/// nowhere, attempted nowhere.
+#[cfg(not(all(feature = "raft", feature = "tls")))]
+async fn raft_operator_cli(
+    command: &str,
+    _args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    Err(format!("{command} needs Raft support (features `raft` and `tls` are needed)").into())
+}
+
+/// The `raft-*` operator subcommands: status and membership over the
+/// member's listener, bootstrap local.
+#[cfg(all(feature = "raft", feature = "tls"))]
+async fn raft_operator_cli(
+    command: &str,
+    args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        "raft-status" => raft_status(args).await,
+        "raft-add-learner" => raft_add_learner(args).await,
+        "raft-promote" => raft_promote(args).await,
+        "raft-remove-member" => raft_remove_member(args).await,
+        "raft-verify-image" => raft_verify_image(args).await,
+        "raft-bootstrap" => raft_bootstrap(args).await,
+        _ => cli_usage(command, "unknown raft subcommand"),
     }
 }
 
@@ -1414,6 +1744,105 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if argv.first().map(String::as_str) == Some("raft-prepare") {
         return raft_prepare(&argv[1..]);
     }
+    if matches!(
+        argv.first().map(String::as_str),
+        Some(
+            "raft-status"
+                | "raft-add-learner"
+                | "raft-promote"
+                | "raft-remove-member"
+                | "raft-verify-image"
+                | "raft-bootstrap"
+        )
+    ) {
+        let command = argv[0].clone();
+        return raft_operator_cli(&command, &argv[1..]).await;
+    }
     let cfg = parse(&argv)?;
     run(cfg).await
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn args(words: &[&str]) -> Vec<String> {
+        words.iter().map(|w| (*w).to_string()).collect()
+    }
+
+    #[test]
+    fn status_parses_its_addr() {
+        assert_eq!(
+            parse_raft_status(&args(&["--addr=127.0.0.1:50051"])),
+            Ok("127.0.0.1:50051".to_string())
+        );
+        assert!(parse_raft_status(&args(&[])).is_err());
+    }
+
+    #[test]
+    fn add_learner_parses_its_target() {
+        assert_eq!(
+            parse_raft_add_learner(&args(&[
+                "--addr=127.0.0.1:50051",
+                "--node-id=4",
+                "--node-addr=127.0.0.1:50151"
+            ])),
+            Ok((
+                "127.0.0.1:50051".to_string(),
+                4,
+                "127.0.0.1:50151".to_string()
+            ))
+        );
+        assert!(parse_raft_add_learner(&args(&["--addr=127.0.0.1:50051", "--node-id=4"])).is_err());
+        assert!(parse_raft_add_learner(&args(&[
+            "--addr=127.0.0.1:50051",
+            "--node-id=four",
+            "--node-addr=127.0.0.1:50151"
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn promote_parses_a_learner_list() {
+        assert_eq!(
+            parse_raft_promote(&args(&["--addr=127.0.0.1:50051", "--node-id=4,5"])),
+            Ok(("127.0.0.1:50051".to_string(), vec![4, 5]))
+        );
+        assert!(parse_raft_promote(&args(&["--addr=127.0.0.1:50051"])).is_err());
+        assert!(parse_raft_promote(&args(&["--addr=127.0.0.1:50051", "--node-id=4,x"])).is_err());
+    }
+
+    #[test]
+    fn remove_member_parses_its_target() {
+        assert_eq!(
+            parse_raft_remove_member(&args(&["--addr=127.0.0.1:50051", "--node-id=4"])),
+            Ok(("127.0.0.1:50051".to_string(), 4))
+        );
+        assert!(parse_raft_remove_member(&args(&["--addr=127.0.0.1:50051"])).is_err());
+    }
+
+    #[test]
+    fn verify_image_parses_its_member() {
+        assert_eq!(
+            parse_raft_verify_image(&args(&["--addr=127.0.0.1:50051"])),
+            Ok("127.0.0.1:50051".to_string())
+        );
+        assert!(parse_raft_verify_image(&args(&[])).is_err());
+    }
+
+    #[test]
+    fn bootstrap_parses_its_two_files() {
+        assert_eq!(
+            parse_raft_bootstrap_files(&args(&[
+                "--raft-dir=/tmp/raft0",
+                "--policy=/tmp/policy.json",
+                "--limits=/tmp/limits.json"
+            ])),
+            Ok((
+                "/tmp/policy.json".to_string(),
+                "/tmp/limits.json".to_string()
+            ))
+        );
+        assert!(parse_raft_bootstrap_files(&args(&["--policy=/tmp/policy.json"])).is_err());
+    }
 }
