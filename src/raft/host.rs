@@ -371,6 +371,10 @@ pub struct RaftHost {
     snapshot_rejections: Arc<SnapshotRejections>,
     #[cfg(feature = "tls")]
     isolation: Isolation,
+    /// The caller side of a forwarded lease (docs/raft-admission.md, "A
+    /// lease forwarded from the leader"); `None` without a transport.
+    #[cfg(feature = "tls")]
+    forwarder: Option<super::transport::LeaseForwarder>,
     #[cfg(any(test, feature = "fault-injection"))]
     grant_gate: std::sync::Mutex<Option<Arc<GrantGate>>>,
     #[cfg(any(test, feature = "fault-injection"))]
@@ -557,8 +561,10 @@ impl RaftHost {
             timing.clone(),
         );
         let peer_rejections = factory.rejections();
+        let forwarder = factory.forwarder();
         let mut host =
             Self::start_with(dir, store, log_store, node_id, config, factory, None).await?;
+        host.forwarder = Some(forwarder);
         host.digest_watch = Some(tokio::spawn(rebuild_on_digest_rejection(
             peer_rejections.subscribe(),
             Arc::clone(&host.published),
@@ -575,6 +581,7 @@ impl RaftHost {
             Arc::clone(&host.staging),
             Arc::clone(&host.snapshot_rejections),
             &transport.limits,
+            host.read_timeout,
         );
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let server = tonic::transport::Server::builder()
@@ -651,6 +658,8 @@ impl RaftHost {
             snapshot_rejections: Arc::new(SnapshotRejections::default()),
             #[cfg(feature = "tls")]
             isolation: Isolation::default(),
+            #[cfg(feature = "tls")]
+            forwarder: None,
             #[cfg(any(test, feature = "fault-injection"))]
             grant_gate: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "fault-injection"))]
@@ -779,10 +788,7 @@ impl RaftHost {
         match tokio::time::timeout(self.read_timeout, self.raft.ensure_linearizable()).await {
             Ok(Ok(_)) => {}
             Ok(Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(forward)))) => {
-                return Err(Status::unavailable(format!(
-                    "not the leader; leader is {:?}",
-                    forward.leader_id
-                )))
+                return self.forwarded_lease(principal, lease, forward).await;
             }
             Ok(Err(e)) => {
                 return Err(Status::unavailable(format!(
@@ -797,6 +803,71 @@ impl RaftHost {
             }
         }
         self.hold.extend(lease.anchor);
+        self.pass_grant_gate().await;
+        let store = self.store()?;
+        Ok(LeasedAdmission::new(store, principal, lease))
+    }
+
+    /// A lease for a member that does not lead (docs/raft-admission.md, "A
+    /// lease forwarded from the leader"): the leader the library names is
+    /// asked to run its barrier, and the interval is the one anchored here
+    /// before it was asked, so every hop, wait and delay consumes it. The
+    /// grant waits until this member has applied the position the leader's
+    /// barrier read, bounded by the remaining interval, so the applied view
+    /// it grants on is at least as fresh as the leader's was; a member that
+    /// cannot get there inside the interval is rejected by name. Without a
+    /// transport, or with no leader known, the rejection names what is
+    /// missing.
+    async fn forwarded_lease(
+        &self,
+        principal: &str,
+        lease: AdmissionLease,
+        forward: openraft::error::ForwardToLeader<NodeId, BasicNode>,
+    ) -> Result<LeasedAdmission, Status> {
+        let (Some(leader), Some(node)) = (forward.leader_id, forward.leader_node.as_ref()) else {
+            return Err(Status::unavailable(
+                "not the leader, and no leader is known to forward the lease to",
+            ));
+        };
+        #[cfg(not(feature = "tls"))]
+        {
+            let _ = (principal, lease, node);
+            return Err(Status::unavailable(format!(
+                "not the leader; leader is Some({leader}), and this build has no transport to forward the lease"
+            )));
+        }
+        #[cfg(feature = "tls")]
+        {
+            let Some(forwarder) = &self.forwarder else {
+                return Err(Status::unavailable(format!(
+                    "not the leader; leader is Some({leader}), and this host has no transport to forward the lease"
+                )));
+            };
+            let read = forwarder
+                .grant_lease(leader, &node.addr, self.read_timeout)
+                .await?;
+            if let Some(read) = read {
+                let remaining =
+                    (lease.anchor + lease.ttl).saturating_duration_since(std::time::Instant::now());
+                self.raft
+                    .wait(Some(remaining))
+                    .applied_index_at_least(Some(read.index), "forwarded lease")
+                    .await
+                    .map_err(|e| {
+                        Status::unavailable(format!(
+                            "forwarded lease: this member had not applied the leader's read position {} inside the interval: {e}",
+                            read.index
+                        ))
+                    })?;
+            }
+            self.hold.extend(lease.anchor);
+            self.pass_grant_gate().await;
+            let store = self.store()?;
+            Ok(LeasedAdmission::new(store, principal, lease))
+        }
+    }
+
+    async fn pass_grant_gate(&self) {
         #[cfg(any(test, feature = "fault-injection"))]
         {
             let gate = self.grant_gate.lock().unwrap().take();
@@ -805,8 +876,6 @@ impl RaftHost {
                 gate.release.notified().await;
             }
         }
-        let store = self.store()?;
-        Ok(LeasedAdmission::new(store, principal, lease))
     }
 
     /// Run owner-side work under a leased admission on the calling thread:
@@ -1322,6 +1391,13 @@ impl RaftHost {
     #[cfg(all(feature = "tls", any(test, feature = "fault-injection")))]
     pub fn isolate(&self, peers: impl IntoIterator<Item = NodeId>) {
         self.isolation.isolate(peers);
+    }
+
+    /// Refuse what these peers send this node while still calling them:
+    /// the node falls behind and can still ask the leader for a lease.
+    #[cfg(all(feature = "tls", any(test, feature = "fault-injection")))]
+    pub fn isolate_inbound(&self, peers: impl IntoIterator<Item = NodeId>) {
+        self.isolation.isolate_inbound(peers);
     }
 
     #[cfg(all(feature = "tls", any(test, feature = "fault-injection")))]

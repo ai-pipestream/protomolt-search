@@ -614,6 +614,8 @@ async fn an_isolated_leader_admits_nothing_and_the_surviving_quorum_revokes() {
         2
     );
     drop(healed);
+    // The healed old leader forwards its lease to the successor and grants
+    // on the revocation it has applied: alice is denied on the merits.
     let error = cluster
         .host(leader)
         .with_admission("alice", |admission| {
@@ -621,7 +623,7 @@ async fn an_isolated_leader_admits_nothing_and_the_surviving_quorum_revokes() {
         })
         .await
         .unwrap_err();
-    assert_eq!(error.code(), Code::Unavailable, "{error}");
+    assert_eq!(error.code(), Code::PermissionDenied, "{error}");
     // On the current leader the revocation is what a fresh admission sees.
     let error = cluster
         .host(successor)

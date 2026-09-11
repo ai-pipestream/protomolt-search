@@ -411,7 +411,7 @@ async fn a_write_through_the_hosted_service_is_admitted_by_the_leader_and_durabl
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_write_through_a_follower_is_rejected_naming_the_leader() {
+async fn a_write_through_a_follower_is_admitted_under_a_lease_forwarded_from_the_leader() {
     let _serial = serial();
     let mut cluster = raft_kit::three_voters("hosted-follower", &hosted_policy()).await;
     let leader = cluster.leader().await;
@@ -421,21 +421,26 @@ async fn a_write_through_a_follower_is_rejected_naming_the_leader() {
         .find(|n| **n != leader)
         .expect("three voters");
     let dir = kit::TestDir::new("hosted-follower-catalog");
-    let active = bridge_active(&mut cluster, leader, &dir, "hosted-prepare").await;
+    let catalog = Arc::new(bridge_active(&mut cluster, leader, &dir, "hosted-prepare").await);
 
-    // The target comes from the leader's service: on a follower even the
-    // target read takes a lease and refuses.
-    let catalog = Arc::new(active);
-    let leader_host = take_host(&mut cluster, leader);
-    let leader_service = HostedDocumentWriteService::new(
+    // The follower serves the catalog: its target read and its write each
+    // take a lease forwarded from the leader and are admitted on the
+    // follower's own applied view.
+    let host = take_host(&mut cluster, follower);
+    let service = HostedDocumentWriteService::new(
         principals(),
-        Arc::clone(&leader_host),
+        Arc::clone(&host),
         vec![Arc::clone(&catalog)],
         limits(),
     )
     .unwrap();
-    let (mut leader_client, leader_server) = serve(leader_service).await;
-    let target = leader_client
+    let (mut client, server) = serve(service).await;
+    assert_ne!(
+        host.metrics().borrow().state,
+        openraft::ServerState::Leader,
+        "the serving member must not lead"
+    );
+    let target = client
         .get_write_target(auth(
             GetDocumentWriteTargetRequest {
                 collection: kit::COLLECTION.into(),
@@ -445,29 +450,162 @@ async fn a_write_through_a_follower_is_rejected_naming_the_leader() {
         .await
         .unwrap()
         .into_inner();
-    drop(leader_client);
-    leader_server.shutdown().await;
-    return_host(&mut cluster, leader, leader_host);
+    let request = network_write(
+        target.history_id.clone(),
+        b"hosted-one",
+        b"hosted-op-one",
+        0,
+    );
+    let receipt = client
+        .accept_document(auth(request.clone(), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        receipt.accepted && receipt.durable && !receipt.replayed,
+        "{receipt:?}"
+    );
+    assert_eq!(receipt.version, 1);
+    assert_eq!(receipt.write_epoch, catalog.activation().write_epoch);
+    let replay = client
+        .accept_document(auth(request, "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(replay.replayed);
+    assert_eq!(replay.accepted_sequence, receipt.accepted_sequence);
+    assert_ne!(
+        host.metrics().borrow().state,
+        openraft::ServerState::Leader,
+        "the write did not make the member lead"
+    );
 
-    let host = take_host(&mut cluster, follower);
-    let service =
-        HostedDocumentWriteService::new(principals(), Arc::clone(&host), vec![catalog], limits())
-            .unwrap();
-    let (mut client, server) = serve(service).await;
+    // Cut from the leader, the follower cannot forward and rejects by
+    // name; nothing is admitted on a stale view.
+    host.isolate([leader]);
     let error = client
         .accept_document(auth(
-            network_write(target.history_id, b"hosted-one", b"hosted-op-one", 0),
+            network_write(target.history_id, b"hosted-two", b"hosted-op-two", 0),
             "alice",
         ))
         .await
         .unwrap_err();
     assert_eq!(error.code(), Code::Unavailable, "{error}");
     assert!(
-        error
-            .message()
-            .contains(&format!("not the leader; leader is Some({leader})")),
-        "the follower must name the leader it refuses for: {error}"
+        error.message().contains("forwarded lease"),
+        "the rejection must name the forwarded lease: {error}"
     );
+    host.heal();
+
+    drop(client);
+    server.shutdown().await;
+    return_host(&mut cluster, follower, host);
+    cluster.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// A forwarded lease grants only once the member has applied the position
+// the leader's barrier read: a member that has fallen behind rejects
+// inside its interval, and once it catches up it sees the revocation.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forwarded_lease_grants_only_once_the_member_applied_the_leaders_read_position() {
+    let _serial = serial();
+    let config = slow_lease_config();
+    let lease = Duration::from_millis(config.admission_lease_ms);
+    let mut cluster =
+        raft_kit::three_voters_with("hosted-read-position", &hosted_policy(), &config).await;
+    let leader = cluster.leader().await;
+    let follower = *cluster
+        .nodes()
+        .iter()
+        .find(|n| **n != leader)
+        .expect("three voters");
+    let dir = kit::TestDir::new("hosted-read-position-catalog");
+    let catalog = Arc::new(bridge_active(&mut cluster, leader, &dir, "hosted-prepare").await);
+    let host = take_host(&mut cluster, follower);
+    let service = HostedDocumentWriteService::new(
+        principals(),
+        Arc::clone(&host),
+        vec![Arc::clone(&catalog)],
+        limits(),
+    )
+    .unwrap();
+    let (mut client, server) = serve(service).await;
+    let target = client
+        .get_write_target(auth(
+            GetDocumentWriteTargetRequest {
+                collection: kit::COLLECTION.into(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    // The follower stops hearing the leader but can still ask it. The
+    // leader and the third voter commit the revocation of alice; the
+    // follower has not applied it.
+    host.isolate_inbound([leader]);
+    let behind = host.applied_position().unwrap().unwrap().index;
+    cluster
+        .propose(
+            leader,
+            "bob",
+            "revoke-alice",
+            &kit::key(),
+            revoke_alice_action(),
+        )
+        .await;
+    let revoked_at = cluster
+        .host(leader)
+        .applied_position()
+        .unwrap()
+        .unwrap()
+        .index;
+    assert!(revoked_at > behind);
+    let started = Instant::now();
+    let error = client
+        .accept_document(auth(
+            network_write(target.history_id.clone(), b"hosted-behind", b"behind-op", 0),
+            "alice",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::Unavailable, "{error}");
+    assert!(
+        error.message().contains(&format!(
+            "had not applied the leader's read position {revoked_at}"
+        )),
+        "the rejection must name the position the member is behind: {error}"
+    );
+    assert!(
+        started.elapsed() <= lease + Duration::from_millis(200),
+        "the wait is bounded by the interval: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        host.applied_position().unwrap().unwrap().index,
+        behind,
+        "nothing was applied while the member was deaf"
+    );
+
+    // Healed, the member applies the revocation and the same write is
+    // denied on the merits, not on the position.
+    host.heal();
+    host.wait(Some(Duration::from_secs(30)))
+        .applied_index_at_least(Some(revoked_at), "applied")
+        .await
+        .unwrap();
+    let error = client
+        .accept_document(auth(
+            network_write(target.history_id, b"hosted-behind", b"behind-op", 0),
+            "alice",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::PermissionDenied, "{error}");
 
     drop(client);
     server.shutdown().await;
@@ -562,7 +700,8 @@ async fn a_write_kept_past_its_lease_leaves_no_durable_change() {
 
 // ---------------------------------------------------------------------------
 // An isolated leader refuses through the service within the election
-// ceiling; after healing it still refuses as a follower.
+// ceiling; after healing it forwards its lease to the successor and
+// denies the revoked principal on the merits.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -649,8 +788,9 @@ async fn an_isolated_leader_rejects_hosted_writes_within_election_timeout_max() 
         .unwrap()
         .index;
 
-    // Heal: the old leader catches up to the revoked policy and still
-    // refuses as a follower, naming the successor.
+    // Heal: the old leader catches up to the revoked policy; its lease is
+    // forwarded to the successor and granted on the applied revocation,
+    // so alice is denied on the merits.
     host.heal();
     for other in &others {
         cluster.host(*other).heal();
@@ -666,13 +806,12 @@ async fn an_isolated_leader_rejects_hosted_writes_within_election_timeout_max() 
         ))
         .await
         .unwrap_err();
-    assert_eq!(error.code(), Code::Unavailable, "{error}");
-    assert!(
-        error
-            .message()
-            .contains(&format!("not the leader; leader is Some({successor})")),
-        "the healed old leader must refuse as a follower naming the successor: {error}"
+    assert_eq!(
+        error.code(),
+        Code::PermissionDenied,
+        "the healed old leader must deny the revoked principal under a forwarded lease: {error}"
     );
+    let _ = successor;
 
     drop(client);
     server.shutdown().await;

@@ -79,8 +79,27 @@ message RaftInstallSnapshotResponse {
   }
 }
 
+// A member that does not lead asks the leader for an admission lease
+// (docs/raft-admission.md, "A lease forwarded from the leader"): the leader
+// runs its read barrier, extends its vote hold, and answers with the log
+// position the barrier read. The member grants on its own applied view
+// once that position is applied, inside the interval it anchored before
+// it asked. The request names no principal: the lease is the leader's
+// statement about the group, and the actor is the member's own business.
+message RaftGrantLeaseRequest {
+  RaftRpcHeader header = 1;
+}
+
+message RaftGrantLeaseResponse {
+  RaftRpcHeader header = 1;
+  // The position the leader's barrier read; absent when the leader has
+  // applied nothing.
+  RaftLogId read_log_id = 2;
+}
+
 service RaftTransport {
   rpc AppendEntries(RaftAppendEntriesRequest) returns (RaftAppendEntriesResponse);
   rpc Vote(RaftVoteRequest) returns (RaftVoteResponse);
   rpc InstallSnapshot(RaftInstallSnapshotRequest) returns (RaftInstallSnapshotResponse);
+  rpc GrantLease(RaftGrantLeaseRequest) returns (RaftGrantLeaseResponse);
 }

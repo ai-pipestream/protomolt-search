@@ -20,14 +20,15 @@ use crate::pb::storage::{
     raft_install_snapshot_response::Outcome as InstallOutcome,
     raft_transport_client::RaftTransportClient,
     raft_transport_server::{RaftTransport, RaftTransportServer},
-    RaftAppendEntriesRequest, RaftAppendEntriesResponse, RaftInstallSnapshotRequest,
-    RaftInstallSnapshotResponse, RaftPartialSuccess, RaftRpcHeader, RaftSnapshotMeta,
-    RaftSnapshotMismatch, RaftVoteRequest, RaftVoteResponse, SourceAuthorityIdentity,
+    RaftAppendEntriesRequest, RaftAppendEntriesResponse, RaftGrantLeaseRequest,
+    RaftGrantLeaseResponse, RaftInstallSnapshotRequest, RaftInstallSnapshotResponse,
+    RaftPartialSuccess, RaftRpcHeader, RaftSnapshotMeta, RaftSnapshotMismatch, RaftVoteRequest,
+    RaftVoteResponse, SourceAuthorityIdentity,
 };
 use crate::security::{apply_client_tls, secure_url, ClientTls};
 use openraft::error::{
-    InstallSnapshotError, NetworkError, PayloadTooLarge, RPCError, RaftError, RemoteError,
-    SnapshotMismatch, Timeout, Unreachable,
+    CheckIsLeaderError, InstallSnapshotError, NetworkError, PayloadTooLarge, RPCError, RaftError,
+    RemoteError, SnapshotMismatch, Timeout, Unreachable,
 };
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
@@ -35,7 +36,7 @@ use openraft::raft::{
     VoteRequest, VoteResponse,
 };
 use openraft::storage::{Snapshot, SnapshotMeta};
-use openraft::{BasicNode, RPCTypes, Raft, SnapshotSegmentId};
+use openraft::{BasicNode, LogId, RPCTypes, Raft, SnapshotSegmentId};
 use prost::Message;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -182,10 +183,12 @@ pub use super::host::LeaseHold;
 pub const TIMING_METADATA: &str = "protomolt-raft-timing";
 
 /// A fault-injection switch: peers this node refuses to speak to or hear
-/// from. Empty outside tests and the `fault-injection` feature.
+/// from, and peers it refuses to hear from while still speaking to them.
+/// Empty outside tests and the `fault-injection` feature.
 #[derive(Clone, Default)]
 pub struct Isolation {
     blocked: Arc<RwLock<BTreeSet<NodeId>>>,
+    deaf: Arc<RwLock<BTreeSet<NodeId>>>,
 }
 
 impl Isolation {
@@ -196,15 +199,31 @@ impl Isolation {
             .unwrap_or(true)
     }
 
+    /// Whether this node refuses what `peer` sends it, at the listener.
+    fn deaf_to(&self, peer: NodeId) -> bool {
+        self.deaf
+            .read()
+            .map(|deaf| deaf.contains(&peer))
+            .unwrap_or(true)
+    }
+
     /// Refuse every RPC to and from these peers until `heal`.
     #[cfg(any(test, feature = "fault-injection"))]
     pub fn isolate(&self, peers: impl IntoIterator<Item = NodeId>) {
         self.blocked.write().unwrap().extend(peers);
     }
 
+    /// Refuse every RPC from these peers at the listener while this node
+    /// still calls them: the node falls behind and can still ask.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn isolate_inbound(&self, peers: impl IntoIterator<Item = NodeId>) {
+        self.deaf.write().unwrap().extend(peers);
+    }
+
     #[cfg(any(test, feature = "fault-injection"))]
     pub fn heal(&self) {
         self.blocked.write().unwrap().clear();
+        self.deaf.write().unwrap().clear();
     }
 }
 
@@ -224,6 +243,8 @@ pub struct RaftTransportService {
     rejections: Arc<SnapshotRejections>,
     transfer: Mutex<Option<Transfer>>,
     idle: Duration,
+    /// The bound on the read barrier a forwarded lease runs here.
+    read_timeout: Duration,
 }
 
 /// One snapshot transfer in progress: bound to the authenticated peer that
@@ -268,6 +289,7 @@ impl RaftTransportService {
         staging: Arc<SnapshotStaging>,
         rejections: Arc<SnapshotRejections>,
         limits: &TransportLimits,
+        read_timeout: Duration,
     ) -> Self {
         Self {
             raft,
@@ -280,6 +302,7 @@ impl RaftTransportService {
             rejections,
             transfer: Mutex::new(None),
             idle: Duration::from_millis(limits.snapshot_idle_timeout_ms),
+            read_timeout,
         }
     }
 
@@ -502,6 +525,11 @@ impl RaftTransportService {
                 "node {registered} is isolated from this node (fault injection)"
             )));
         }
+        if self.isolation.deaf_to(registered) {
+            return Err(Status::unavailable(format!(
+                "node {registered} is not heard at this node (fault injection)"
+            )));
+        }
         let timing = request.metadata().get(TIMING_METADATA).ok_or_else(|| {
             Status::failed_precondition(
                 "raft rpc carries no timing agreement; the peer runs another build",
@@ -638,6 +666,48 @@ impl RaftTransportService {
     }
 }
 
+impl RaftTransportService {
+    /// A member that does not lead asks this node for a lease
+    /// (docs/raft-admission.md, "A lease forwarded from the leader"): the
+    /// read barrier bounded as for a local lease, the vote hold extended
+    /// from the instant the request was received, and the position the
+    /// barrier read returned for the asker to apply before it grants. A
+    /// node that does not lead answers by naming the leader, and the
+    /// asker retries where the library points it.
+    async fn answer_grant_lease(
+        &self,
+        request: Request<RaftGrantLeaseRequest>,
+    ) -> Result<Response<RaftGrantLeaseResponse>, Status> {
+        let from = self.authenticate(&request, request.get_ref().header.as_ref())?;
+        let anchor = std::time::Instant::now();
+        let read = match tokio::time::timeout(self.read_timeout, self.raft.ensure_linearizable())
+            .await
+        {
+            Ok(Ok(read)) => read,
+            Ok(Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(forward)))) => {
+                return Err(Status::unavailable(format!(
+                    "not the leader; leader is {:?}",
+                    forward.leader_id
+                )))
+            }
+            Ok(Err(e)) => {
+                return Err(Status::unavailable(format!(
+                    "a forwarded lease needs a linearizable read: {e}"
+                )))
+            }
+            Err(_) => return Err(Status::unavailable(format!(
+                "a forwarded lease needs a linearizable read: no quorum acknowledged within {} ms",
+                self.read_timeout.as_millis()
+            ))),
+        };
+        self.hold.extend(anchor);
+        Ok(Response::new(RaftGrantLeaseResponse {
+            header: Some(self.header(from)),
+            read_log_id: read.as_ref().map(log_id_to_proto),
+        }))
+    }
+}
+
 /// Metadata key on every status this service answers with. The client
 /// records a rejection only for a status that carries it: a status
 /// without it was made by the transport (a connection closed, a frame
@@ -675,6 +745,13 @@ impl RaftTransport for RaftTransportService {
         self.answer_install_snapshot(request)
             .await
             .map_err(answered)
+    }
+
+    async fn grant_lease(
+        &self,
+        request: Request<RaftGrantLeaseRequest>,
+    ) -> Result<Response<RaftGrantLeaseResponse>, Status> {
+        self.answer_grant_lease(request).await.map_err(answered)
     }
 }
 
@@ -1039,6 +1116,79 @@ impl TonicNetworkFactory {
     /// The rejections peers answer to this node's RPCs.
     pub(crate) fn rejections(&self) -> PeerRejections {
         self.shared.rejections.clone()
+    }
+}
+
+/// The caller side of a forwarded lease: one channel per ask, to the
+/// leader the library named, under the same identity, timing and
+/// isolation rules as the library's own calls.
+#[derive(Clone)]
+pub(crate) struct LeaseForwarder {
+    shared: Arc<Shared>,
+}
+
+impl LeaseForwarder {
+    /// Ask `leader` at `addr` for a lease: the leader's barrier position,
+    /// or the failure by name. A transport failure or an unreachable
+    /// leader is `Unavailable`; a rejection the leader's service answered
+    /// keeps its code and names the leader.
+    pub(crate) async fn grant_lease(
+        &self,
+        leader: NodeId,
+        addr: &str,
+        timeout: Duration,
+    ) -> Result<Option<LogId<NodeId>>, Status> {
+        let mut network = TonicNetwork {
+            shared: Arc::clone(&self.shared),
+            target: leader,
+            addr: addr.to_string(),
+            client: None,
+        };
+        let header = network.header();
+        let client = network
+            .client::<RaftError<NodeId>>()
+            .map_err(|e| Status::unavailable(format!("forwarded lease: {e}")))?;
+        let mut request = Request::new(RaftGrantLeaseRequest {
+            header: Some(header),
+        });
+        request.set_timeout(timeout);
+        request
+            .metadata_mut()
+            .insert(TIMING_METADATA, self.shared.timing.clone());
+        let response = match client.grant_lease(request).await {
+            Ok(response) => response.into_inner(),
+            Err(status) => {
+                return Err(match classify(&status) {
+                    Answer::Rejection => Status::new(
+                        status.code(),
+                        format!(
+                            "forwarded lease: leader {leader} rejected it: {}",
+                            status.message()
+                        ),
+                    ),
+                    Answer::Timeout => Status::unavailable(format!(
+                        "forwarded lease: leader {leader} at {addr} did not answer within {} ms",
+                        timeout.as_millis()
+                    )),
+                    Answer::Unreachable | Answer::Transport => Status::unavailable(format!(
+                        "forwarded lease: leader {leader} at {addr}: {}",
+                        status.message()
+                    )),
+                })
+            }
+        };
+        network
+            .check_reply(response.header.as_ref())
+            .map_err(|e| Status::unavailable(format!("forwarded lease: {}", e.message())))?;
+        Ok(response.read_log_id.as_ref().map(log_id_from_proto))
+    }
+}
+
+impl TonicNetworkFactory {
+    pub(crate) fn forwarder(&self) -> LeaseForwarder {
+        LeaseForwarder {
+            shared: Arc::clone(&self.shared),
+        }
     }
 }
 

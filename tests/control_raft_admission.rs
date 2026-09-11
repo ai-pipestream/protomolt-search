@@ -362,8 +362,8 @@ async fn paused_grant_after_barrier_survives_no_revocation_race() {
         .unwrap_err();
     assert_eq!(
         error.code(),
-        Code::Unavailable,
-        "a follower has no barrier to grant through: {error}"
+        Code::PermissionDenied,
+        "the old leader forwards its lease to the successor and grants on the applied revocation, which denies alice: {error}"
     );
     let error = cluster
         .host(successor)
@@ -775,7 +775,8 @@ async fn write_paused_during_revocation_is_refused_and_epoch_fenced() {
     );
 
     // Heal: the old leader applies the revocation; alice is denied on the
-    // current leader, and the old leader grants nothing as a follower.
+    // current leader, and on the old leader, whose lease is now forwarded
+    // from the successor and granted on the applied revocation.
     host.heal();
     for other in &others {
         cluster.host(*other).heal();
@@ -804,8 +805,8 @@ async fn write_paused_during_revocation_is_refused_and_epoch_fenced() {
         .unwrap_err();
     assert_eq!(
         error.code(),
-        Code::Unavailable,
-        "the old leader grants nothing after catch-up: {error}"
+        Code::PermissionDenied,
+        "the old leader forwards its lease and denies the revoked principal: {error}"
     );
 
     cluster.shutdown().await;
