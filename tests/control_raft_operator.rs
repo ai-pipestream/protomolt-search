@@ -236,6 +236,24 @@ async fn a_member_rotated_to_a_new_certificate_serves_again() {
         .await
         .unwrap();
 
+    // Every listener, the re-added member's included, still rejects the
+    // old certificate by name: no directory binds it to any member.
+    let mut listeners: Vec<std::net::SocketAddr> = survivors
+        .iter()
+        .map(|node| cluster.host(*node).listen_addr().unwrap())
+        .collect();
+    listeners.push(host.listen_addr().unwrap());
+    for addr in listeners {
+        let mut client = raw_client(addr, &format!("node-{rotated}")).await;
+        let error = client.vote(RaftVoteRequest::default()).await.unwrap_err();
+        assert_eq!(error.code(), Code::Unauthenticated, "{error}");
+        assert_eq!(
+            reasons::reason_of(&error),
+            Some(reasons::TRANSPORT_UNREGISTERED_CERTIFICATE),
+            "{error}"
+        );
+    }
+
     host.shutdown().await.unwrap();
     cluster.shutdown().await;
 }

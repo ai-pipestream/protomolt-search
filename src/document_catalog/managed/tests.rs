@@ -1798,7 +1798,11 @@ fn a_write_durable_after_its_lease_lapsed_is_unconfirmed_until_settled() {
         .settle(&admission, "alice", b"accept-two")
         .unwrap_err();
     assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
-    assert!(error.message().contains("lease expired"), "{error}");
+    assert_eq!(
+        crate::raft::reasons::reason_of(&error),
+        Some(crate::raft::reasons::LEASE_INTERVAL_ELAPSED),
+        "{error}"
+    );
     assert_eq!(
         recorded(&active, b"accept-two"),
         (WriteOutcome::Unconfirmed, 0)
@@ -1950,6 +1954,11 @@ fn a_write_settled_after_its_right_was_revoked_is_fenced_by_name() {
     let retry = active.accept(&fresh, &second_write()).unwrap_err();
     assert_eq!(retry.code(), Code::FailedPrecondition, "{retry}");
     assert_eq!(retry.message(), rejection.message());
+    assert_eq!(
+        crate::raft::reasons::reason_of(&retry),
+        Some(crate::raft::reasons::OUTCOME_FENCED),
+        "{retry}"
+    );
     match active.settle(&fresh, "alice", b"accept-two").unwrap() {
         Settlement::Fenced(again) => assert_eq!(again.message(), rejection.message()),
         Settlement::Accepted(receipt) => panic!("{receipt:?}"),
@@ -1960,6 +1969,21 @@ fn a_write_settled_after_its_right_was_revoked_is_fenced_by_name() {
     other.document_key = b"document-other".to_vec();
     let error = active.accept(&fresh, &other).unwrap_err();
     assert_eq!(error.code(), Code::AlreadyExists, "{error}");
+    assert_eq!(
+        crate::raft::reasons::reason_of(&error),
+        Some(crate::raft::reasons::OUTCOME_OPERATION_REUSED),
+        "{error}"
+    );
+    // An operation the actor never wrote has nothing to settle.
+    let error = active
+        .settle(&fresh, "alice", b"never-written")
+        .unwrap_err();
+    assert_eq!(error.code(), Code::NotFound, "{error}");
+    assert_eq!(
+        crate::raft::reasons::reason_of(&error),
+        Some(crate::raft::reasons::OUTCOME_NO_OPERATION),
+        "{error}"
+    );
     drop(fresh);
 
     // The row stays in the history, marked, at the sequence it took; it

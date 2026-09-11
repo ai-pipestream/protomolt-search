@@ -362,8 +362,46 @@ async fn peer_identity_binds_certificate_group_and_node() {
     stale.protocol_version = 2;
     let error = refused(vote_request(Some(stale))).await;
     assert_eq!(error.code(), Code::InvalidArgument, "{error}");
+    assert_eq!(
+        super::reasons::reason_of(&error),
+        Some(super::reasons::TRANSPORT_BAD_HEADER),
+        "{error}"
+    );
     let error = refused(vote_request(None)).await;
     assert_eq!(error.code(), Code::InvalidArgument, "{error}");
+    assert_eq!(
+        super::reasons::reason_of(&error),
+        Some(super::reasons::TRANSPORT_BAD_HEADER),
+        "{error}"
+    );
+    // Fault injection answers in front of the library too: a peer this
+    // node isolates, and one it is deaf to, are refused by name, and heal
+    // restores the answer.
+    host.isolate([2]);
+    let error = refused(vote_request(Some(header(&group, 2, 1)))).await;
+    assert_eq!(error.code(), Code::Unavailable, "{error}");
+    assert_eq!(
+        super::reasons::reason_of(&error),
+        Some(super::reasons::TRANSPORT_ISOLATED),
+        "{error}"
+    );
+    host.heal();
+    host.isolate_inbound([2]);
+    let error = refused(vote_request(Some(header(&group, 2, 1)))).await;
+    assert_eq!(error.code(), Code::Unavailable, "{error}");
+    assert_eq!(
+        super::reasons::reason_of(&error),
+        Some(super::reasons::TRANSPORT_NOT_HEARD),
+        "{error}"
+    );
+    host.heal();
+    let mut healed = node2.clone();
+    let reply = healed
+        .vote(timed(vote_request(Some(header(&group, 2, 1)))))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(reply.header.unwrap().to_node_id, 2);
 
     // A peer whose election or lease values differ, or that presents none,
     // is refused: the lease argument depends on every member holding the
@@ -431,6 +469,30 @@ async fn peer_identity_binds_certificate_group_and_node() {
     // directory refuses to rebind a certificate or a node.
     let error = host.add_learner(4, "127.0.0.1:1").await.unwrap_err();
     assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
+    assert_eq!(
+        super::reasons::reason_of(&error),
+        Some(super::reasons::MEMBERSHIP_UNREGISTERED_CERTIFICATE),
+        "{error}"
+    );
+    // A registered node with no dial address, and a promotion naming no
+    // learner, are refused by name before the library sees them.
+    let error = host.add_learner(2, "").await.unwrap_err();
+    assert_eq!(error.code(), Code::InvalidArgument, "{error}");
+    assert_eq!(
+        super::reasons::reason_of(&error),
+        Some(super::reasons::MEMBERSHIP_BAD_ADDRESS),
+        "{error}"
+    );
+    let error = host
+        .promote(std::collections::BTreeSet::new())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::InvalidArgument, "{error}");
+    assert_eq!(
+        super::reasons::reason_of(&error),
+        Some(super::reasons::MEMBERSHIP_NO_LEARNERS),
+        "{error}"
+    );
     let error = directory
         .register(5, certificate_sha256(&pem("node-2.pem")).unwrap())
         .unwrap_err();
@@ -877,6 +939,65 @@ async fn a_leader_withholds_its_vote_while_an_admission_interval_may_be_open() {
     .await;
     let reply = client.vote(timed(request)).await.unwrap().into_inner();
     assert!(reply.vote.is_some());
+    cluster.shutdown().await;
+}
+
+/// A lease the leader forwarded counts toward its hold (I2): the asking
+/// member took no lease on the leader itself, and the leader still
+/// withholds its vote from a candidate while the forwarded interval may
+/// be open, extended from the request's receipt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leader_withholds_its_vote_for_a_lease_it_forwarded() {
+    let cluster = three_voters("vote-hold-forwarded").await;
+    let leader = cluster.leader().await;
+    let member = if leader == 1 { 2 } else { 1 };
+    let candidate = [1, 2, 3]
+        .into_iter()
+        .find(|n| *n != leader && *n != member)
+        .unwrap();
+    // The member that does not lead takes its lease through the leader's
+    // barrier over GrantLease; the leader's own hold moves with it.
+    cluster
+        .host(member)
+        .with_admission("alice", |admission| {
+            admission.authorize("books", AccessAction::Ingest)
+        })
+        .await
+        .unwrap();
+    assert_ne!(
+        cluster.host(member).metrics().borrow().state,
+        openraft::ServerState::Leader,
+        "the lease was forwarded, not local"
+    );
+    let mut client = raw_client(
+        cluster.host(leader).listen_addr().unwrap(),
+        &format!("node-{candidate}"),
+    )
+    .await
+    .unwrap();
+    let metrics = cluster.host(leader).metrics().borrow().clone();
+    let request = RaftVoteRequest {
+        header: Some(header(&cluster.group, candidate, leader)),
+        vote: Some(RaftVote {
+            term: metrics.current_term + 1,
+            node_id: candidate,
+            committed: false,
+        }),
+        last_log_id: metrics
+            .last_applied
+            .as_ref()
+            .map(super::types::log_id_to_proto),
+    };
+    let reply = client.vote(timed(request)).await.unwrap().into_inner();
+    assert!(
+        !reply.vote_granted,
+        "the vote is withheld for the forwarded lease"
+    );
+    assert_eq!(reply.vote.unwrap().term, metrics.current_term);
+    assert_eq!(
+        cluster.host(leader).metrics().borrow().state,
+        openraft::ServerState::Leader
+    );
     cluster.shutdown().await;
 }
 
