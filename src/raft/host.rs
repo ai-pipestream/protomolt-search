@@ -787,7 +787,12 @@ impl RaftHost {
             peer_rejections: self
                 .peer_rejections()
                 .iter()
-                .map(|(node, rejection)| (*node, rejection.count))
+                .map(|(node, rejection)| crate::metrics::PeerRejectionGauges {
+                    peer: *node,
+                    action: rejection.action.to_string(),
+                    code: format!("{:?}", rejection.code),
+                    count: rejection.count,
+                })
                 .collect(),
             #[cfg(not(feature = "tls"))]
             peer_rejections: Vec::new(),

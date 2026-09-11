@@ -1122,8 +1122,9 @@ fn read_message_json<M: prost::Message + Default>(
 async fn raft_bootstrap(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use pipestream_search::raft::host::{LOG_FILE, STORE_FILE};
     use pipestream_search::raft::{operator, RaftHost};
-    let cfg = parse(args).unwrap_or_else(|e| cli_usage("raft-bootstrap", &e));
-    let Some(member) = &cfg.raft else {
+    let (member, tls, client_tls) = pipestream_search::config::parse_raft_local(args)
+        .unwrap_or_else(|e| cli_usage("raft-bootstrap", &e));
+    let Some(member) = &member else {
         cli_usage(
             "raft-bootstrap",
             "raft-bootstrap needs --raft-dir and the other --raft-* options",
@@ -1137,6 +1138,8 @@ async fn raft_bootstrap(args: &[String]) -> Result<(), Box<dyn std::error::Error
     if member.dir.join(LOG_FILE).exists() {
         return Err("raft-bootstrap: raft log store already exists".into());
     }
+    std::fs::create_dir_all(&member.dir)
+        .map_err(|e| format!("raft-bootstrap: member directory: {e}"))?;
     let policy = read_message_json::<pipestream_search::pb::AccessPolicy>(
         &policy_path,
         "ai.protomolt.search.v1.AccessPolicy",
@@ -1147,7 +1150,7 @@ async fn raft_bootstrap(args: &[String]) -> Result<(), Box<dyn std::error::Error
     )?;
     let identity = operator::identity(member);
     let host_config = operator::host_config(member).map_err(|e| format!("raft-bootstrap: {e}"))?;
-    let transport = operator::cluster_transport(member, cfg.tls.as_ref(), cfg.client_tls.as_ref())
+    let transport = operator::cluster_transport(member, tls.as_ref(), client_tls.as_ref())
         .map_err(|e| format!("raft-bootstrap: {e}"))?;
     let host = RaftHost::bootstrap_cluster(
         &member.dir,

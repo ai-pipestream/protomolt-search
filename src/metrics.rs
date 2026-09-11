@@ -731,10 +731,26 @@ pub struct ShardGauges {
 /// format requires.
 pub type GaugeProvider = Box<dyn Fn() -> ShardGauges + Send + Sync>;
 
+/// One peer's rejections, sampled at SCRAPE time: the `count` this
+/// peer has answered since the member started, labeled by the RPC and
+/// the status code so the page and the snapshot carry what the status
+/// route serves.
+#[derive(Debug, Clone, Default)]
+pub struct PeerRejectionGauges {
+    /// The peer that answered the rejections.
+    pub peer: u64,
+    /// The RPC rejected: "append", "vote" or "snapshot".
+    pub action: String,
+    /// The status code, Debug name ("DataLoss").
+    pub code: String,
+    /// Rejections answered by this peer since the member started.
+    pub count: u64,
+}
+
 /// One Raft member's gauges, sampled at SCRAPE time from the live host,
 /// so a gauge can never go stale and never needs an update site. A
 /// process serves at most one member, so the scalars carry no labels;
-/// peer rejections are labeled by peer.
+/// peer rejections are labeled by peer, RPC and code.
 #[derive(Debug, Clone, Default)]
 pub struct MemberGauges {
     /// Whether the member leads.
@@ -745,9 +761,8 @@ pub struct MemberGauges {
     pub last_log_index: u64,
     /// Whether the store awaits its first snapshot.
     pub awaiting_snapshot: bool,
-    /// Peer rejections answered, by peer node id: the `count` of each
-    /// entry.
-    pub peer_rejections: Vec<(u64, u64)>,
+    /// Peer rejections answered, one entry per peer.
+    pub peer_rejections: Vec<PeerRejectionGauges>,
     /// Snapshot installs rejected at the announce.
     pub snapshot_rejections: u64,
     /// Bytes of the last snapshot build.
@@ -1062,14 +1077,17 @@ fn write_member_gauges(out: &mut String, members: &[MemberGauges]) {
         out,
         "raft_peer_rejections_total",
         "counter",
-        "Peer messages rejected, by peer node id.",
+        "Peer messages rejected, by peer node id, RPC and status code.",
     );
-    for (peer, count) in &sample.peer_rejections {
+    for rejection in &sample.peer_rejections {
         write_metric(
             out,
             "raft_peer_rejections_total",
-            &format!("peer=\"{peer}\""),
-            *count,
+            &format!(
+                "peer=\"{}\",action=\"{}\",code=\"{}\"",
+                rejection.peer, rejection.action, rejection.code
+            ),
+            rejection.count,
         );
     }
     if sample.peer_rejections.is_empty() {
@@ -1253,11 +1271,15 @@ pub fn snapshot_reading(process: &str, reading: &Reading) -> crate::pb::MetricsS
         if member.peer_rejections.is_empty() {
             samples.push(counter("raft_peer_rejections_total", Vec::new(), 0));
         }
-        for (peer, count) in &member.peer_rejections {
+        for rejection in &member.peer_rejections {
             samples.push(counter(
                 "raft_peer_rejections_total",
-                vec![label("peer", &peer.to_string())],
-                *count,
+                vec![
+                    label("peer", &rejection.peer.to_string()),
+                    label("action", &rejection.action),
+                    label("code", &rejection.code),
+                ],
+                rejection.count,
             ));
         }
     }
