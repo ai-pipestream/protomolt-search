@@ -98,24 +98,17 @@ pub fn recover_catalogs(
     let mut catalogs = Vec::with_capacity(entries.len());
     for entry in entries {
         let context = |error: Status| {
-            let reason = crate::raft::reasons::reason_of(&error).map(str::to_string);
-            let mut wrapped = Status::new(
-                error.code(),
-                format!(
-                    "managed catalog for collection {:?}: {}",
-                    entry.collection,
-                    error.message()
+            crate::raft::reasons::carry(
+                &error,
+                Status::new(
+                    error.code(),
+                    format!(
+                        "managed catalog for collection {:?}: {}",
+                        entry.collection,
+                        error.message()
+                    ),
                 ),
-            );
-            if let Some(reason) = reason {
-                wrapped.metadata_mut().insert(
-                    crate::raft::reasons::REASON,
-                    reason
-                        .parse()
-                        .expect("reason identifiers are metadata values"),
-                );
-            }
-            wrapped
+            )
         };
         let (_, binding, file_activation) =
             crate::document_catalog::header_binding(&entry.path).map_err(context)?;

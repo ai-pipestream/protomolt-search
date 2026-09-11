@@ -730,8 +730,11 @@ mod adapter {
             {
                 let request_sha = crate::sha256::digest(&request.encode_to_vec());
                 if operation.request_sha256.as_slice() != request_sha {
-                    return Err(Status::already_exists(
-                        "operation_id was used for a different document write",
+                    return Err(crate::raft::reasons::reason(
+                        Status::already_exists(
+                            "operation_id was used for a different document write",
+                        ),
+                        crate::raft::reasons::OUTCOME_OPERATION_REUSED,
                     ));
                 }
                 match outcome::outcome_of(operation.outcome)? {
@@ -827,8 +830,9 @@ mod adapter {
                 .inner
                 .recorded_operation(Some(principal), operation_id)?
             else {
-                return Err(Status::not_found(
-                    "the actor has no operation with this id to settle",
+                return Err(crate::raft::reasons::reason(
+                    Status::not_found("the actor has no operation with this id to settle"),
+                    crate::raft::reasons::OUTCOME_NO_OPERATION,
                 ));
             };
             let receipt = operation

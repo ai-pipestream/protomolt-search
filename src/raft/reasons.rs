@@ -82,6 +82,16 @@ pub fn reason_of(status: &tonic::Status) -> Option<&str> {
     status.metadata().get(REASON)?.to_str().ok()
 }
 
+/// Carry the identifier of `from`, if it has one, onto `to`: a wrapper
+/// that rewords a rejection keeps the code and the identifier the site
+/// set, so a reason attached deep in a call survives the reworded answer.
+pub fn carry(from: &tonic::Status, mut to: tonic::Status) -> tonic::Status {
+    if let Some(value) = from.metadata().get(REASON) {
+        to.metadata_mut().insert(REASON, value.clone());
+    }
+    to
+}
+
 /// Every identifier constant in this module, for the registry equality
 /// test: the document's identifier column and this list cannot drift.
 pub const ALL: &[&str] = &[
@@ -143,6 +153,45 @@ mod tests {
         assert_eq!(status.message(), "some words");
         assert_eq!(reason_of(&status), Some(LEASE_NOT_LEADER));
         assert_eq!(reason_of(&tonic::Status::unavailable("bare")), None,);
+        // A reworded wrapper carries the identifier and its own code and
+        // message; a source without one adds nothing.
+        let carried = carry(&status, tonic::Status::aborted("reworded"));
+        assert_eq!(carried.code(), tonic::Code::Aborted);
+        assert_eq!(carried.message(), "reworded");
+        assert_eq!(reason_of(&carried), Some(LEASE_NOT_LEADER));
+        let bare = carry(
+            &tonic::Status::unavailable("bare"),
+            tonic::Status::aborted("reworded"),
+        );
+        assert_eq!(reason_of(&bare), None);
+    }
+
+    /// `ALL` names every identifier constant declared in this file, so a
+    /// constant added without its entry fails here and the registry test
+    /// below sees every one. The declarations are read from the source.
+    #[test]
+    fn every_identifier_constant_is_listed() {
+        let mut declared = Vec::new();
+        for line in include_str!("reasons.rs").lines() {
+            let Some(rest) = line.trim().strip_prefix("pub const ") else {
+                continue;
+            };
+            let Some((name, value)) = rest.split_once(": &str = \"") else {
+                continue;
+            };
+            if name == "REASON" {
+                continue;
+            }
+            let Some((literal, _)) = value.split_once('"') else {
+                continue;
+            };
+            declared.push(literal.to_string());
+        }
+        declared.sort();
+        let mut listed: Vec<String> = ALL.iter().map(|s| s.to_string()).collect();
+        listed.sort();
+        assert!(declared.len() > 40, "the declarations were read");
+        assert_eq!(declared, listed, "every identifier constant is in ALL");
     }
 
     /// The registry document's identifier column and `ALL` are equal, in

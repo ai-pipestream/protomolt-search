@@ -1227,21 +1227,18 @@ impl LeaseForwarder {
             Ok(response) => response.into_inner(),
             Err(status) => {
                 return Err(match classify(&status) {
-                    Answer::Rejection => {
-                        // The leader's answer keeps its code and its
-                        // reason; only the message names the forward.
-                        let mut wrapped = Status::new(
+                    // The leader's answer keeps its code and its reason;
+                    // only the message names the forward.
+                    Answer::Rejection => reasons::carry(
+                        &status,
+                        Status::new(
                             status.code(),
                             format!(
                                 "forwarded lease: leader {leader} rejected it: {}",
                                 status.message()
                             ),
-                        );
-                        if let Some(reason) = status.metadata().get(reasons::REASON) {
-                            wrapped.metadata_mut().insert(reasons::REASON, reason.clone());
-                        }
-                        wrapped
-                    }
+                        ),
+                    ),
                     Answer::Timeout => reasons::reason(
                         Status::unavailable(format!(
                             "forwarded lease: leader {leader} at {addr} did not answer within {} ms",
