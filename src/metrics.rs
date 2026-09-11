@@ -118,12 +118,23 @@ pub enum Route {
     EvaluateBoolean,
     GetDocumentWriteTarget,
     AcceptSourceDocument,
+    /// `RaftOperatorService.GetMemberStatus` (docs/raft-hosting.md,
+    /// "Operator surface").
+    GetMemberStatus,
+    /// `RaftOperatorService.AddLearner`.
+    AddLearner,
+    /// `RaftOperatorService.PromoteLearners`.
+    PromoteLearners,
+    /// `RaftOperatorService.RemoveMember`.
+    RemoveMember,
+    /// `RaftOperatorService.VerifyPublishedImage`.
+    VerifyPublishedImage,
 }
 
 /// Route names as they appear in the `rpc` label, parallel to the
 /// counter tables, with whether the route answers with a response
 /// stream (and so reports two latency phases).
-const REQUEST_ROUTES: [(Route, &str, bool); 68] = [
+const REQUEST_ROUTES: [(Route, &str, bool); 73] = [
     (Route::SearchShard, "search_shard", true),
     (Route::StreamSearch, "stream_search", true),
     (Route::BrowseShard, "browse_shard", false),
@@ -204,6 +215,11 @@ const REQUEST_ROUTES: [(Route, &str, bool); 68] = [
         false,
     ),
     (Route::AcceptSourceDocument, "accept_source_document", false),
+    (Route::GetMemberStatus, "get_member_status", false),
+    (Route::AddLearner, "add_learner", false),
+    (Route::PromoteLearners, "promote_learners", false),
+    (Route::RemoveMember, "remove_member", false),
+    (Route::VerifyPublishedImage, "verify_published_image", false),
 ];
 
 const N_ROUTES: usize = REQUEST_ROUTES.len();
@@ -328,6 +344,7 @@ pub struct Reading {
     batches: u64,
     batched_jobs: u64,
     shards: Vec<ShardGauges>,
+    members: Vec<MemberGauges>,
 }
 
 /// The process-wide scan and ingest counters, in page order: name,
@@ -385,6 +402,12 @@ const SCAN_COUNTERS: [(&str, &str, &AtomicU64); 9] = [
 /// is not a transaction across values, but it is the one set of values
 /// both [`render`] and [`snapshot`] see when they are given it.
 pub fn read(gauges: &[GaugeProvider]) -> Reading {
+    read_with_member(gauges, &[])
+}
+
+/// Read the registry once, with the member gauges sampled alongside
+/// the shard gauges.
+pub fn read_with_member(gauges: &[GaugeProvider], members: &[MemberGaugeProvider]) -> Reading {
     let mut requests = [0u64; N_ROUTES];
     let mut in_flight = [0u64; N_ROUTES];
     let mut errors = [[0u64; N_CODES]; N_ROUTES];
@@ -418,6 +441,7 @@ pub fn read(gauges: &[GaugeProvider]) -> Reading {
         batches,
         batched_jobs,
         shards: gauges.iter().map(|g| g()).collect(),
+        members: members.iter().map(|g| g()).collect(),
     }
 }
 
@@ -707,6 +731,50 @@ pub struct ShardGauges {
 /// format requires.
 pub type GaugeProvider = Box<dyn Fn() -> ShardGauges + Send + Sync>;
 
+/// One peer's rejections, sampled at SCRAPE time: the `count` this
+/// peer has answered since the member started, labeled by the RPC and
+/// the status code so the page and the snapshot carry what the status
+/// route serves.
+#[derive(Debug, Clone, Default)]
+pub struct PeerRejectionGauges {
+    /// The peer that answered the rejections.
+    pub peer: u64,
+    /// The RPC rejected: "append", "vote" or "snapshot".
+    pub action: String,
+    /// The status code, Debug name ("DataLoss").
+    pub code: String,
+    /// Rejections answered by this peer since the member started.
+    pub count: u64,
+}
+
+/// One Raft member's gauges, sampled at SCRAPE time from the live host,
+/// so a gauge can never go stale and never needs an update site. A
+/// process serves at most one member, so the scalars carry no labels;
+/// peer rejections are labeled by peer, RPC and code.
+#[derive(Debug, Clone, Default)]
+pub struct MemberGauges {
+    /// Whether the member leads.
+    pub is_leader: bool,
+    /// Last log index applied to the state machine.
+    pub applied_index: u64,
+    /// Last log index appended to the log.
+    pub last_log_index: u64,
+    /// Whether the store awaits its first snapshot.
+    pub awaiting_snapshot: bool,
+    /// Peer rejections answered, one entry per peer.
+    pub peer_rejections: Vec<PeerRejectionGauges>,
+    /// Snapshot installs rejected at the announce.
+    pub snapshot_rejections: u64,
+    /// Bytes of the last snapshot build.
+    pub last_snapshot_build_bytes: u64,
+    /// Receiver bound of the last snapshot build.
+    pub last_snapshot_receiver_bound_bytes: u64,
+}
+
+/// A live-state gauge sampler for the Raft member. Returns VALUES
+/// rather than rendering text, as [`GaugeProvider`] does.
+pub type MemberGaugeProvider = Box<dyn Fn() -> MemberGauges + Send + Sync>;
+
 fn write_sample_head(out: &mut String, name: &str, labels: &str) {
     out.push_str(name);
     if !labels.is_empty() {
@@ -785,6 +853,11 @@ fn write_histogram(out: &mut String, labels: &str, histogram: &HistogramReading)
 /// every gauge provider in order. One [`read`], then [`render_reading`].
 pub fn render(gauges: &[GaugeProvider]) -> String {
     render_reading(&read(gauges))
+}
+
+/// Render the whole exposition page with member gauges sampled too.
+pub fn render_with_member(gauges: &[GaugeProvider], members: &[MemberGaugeProvider]) -> String {
+    render_reading(&read_with_member(gauges, members))
 }
 
 /// The exposition page for one [`Reading`].
@@ -918,7 +991,108 @@ pub fn render_reading(reading: &Reading) -> String {
             }
         }
     }
+    write_member_gauges(&mut out, &reading.members);
     out
+}
+
+/// The member gauge rows for one reading: at most one member sample,
+/// because a process serves at most one member.
+fn write_member_gauges(out: &mut String, members: &[MemberGauges]) {
+    if members.is_empty() {
+        return;
+    }
+    let Some(sample) = members.first() else {
+        return;
+    };
+    header(
+        out,
+        "raft_is_leader",
+        "gauge",
+        "Whether this process's Raft member leads (1) or follows (0).",
+    );
+    write_metric(out, "raft_is_leader", "", u64::from(sample.is_leader));
+    header(
+        out,
+        "raft_applied_index",
+        "gauge",
+        "Last Raft log index applied to the state machine.",
+    );
+    write_metric(out, "raft_applied_index", "", sample.applied_index);
+    header(
+        out,
+        "raft_last_log_index",
+        "gauge",
+        "Last Raft log index appended to the log.",
+    );
+    write_metric(out, "raft_last_log_index", "", sample.last_log_index);
+    header(
+        out,
+        "raft_awaiting_snapshot",
+        "gauge",
+        "Whether the store awaits its first snapshot (1) or not (0).",
+    );
+    write_metric(
+        out,
+        "raft_awaiting_snapshot",
+        "",
+        u64::from(sample.awaiting_snapshot),
+    );
+    header(
+        out,
+        "raft_snapshot_rejections_total",
+        "counter",
+        "Snapshot installs rejected at the announce.",
+    );
+    write_metric(
+        out,
+        "raft_snapshot_rejections_total",
+        "",
+        sample.snapshot_rejections,
+    );
+    header(
+        out,
+        "raft_last_snapshot_build_bytes",
+        "gauge",
+        "Bytes of the last snapshot build.",
+    );
+    write_metric(
+        out,
+        "raft_last_snapshot_build_bytes",
+        "",
+        sample.last_snapshot_build_bytes,
+    );
+    header(
+        out,
+        "raft_last_snapshot_receiver_bound_bytes",
+        "gauge",
+        "Receiver bound of the last snapshot build.",
+    );
+    write_metric(
+        out,
+        "raft_last_snapshot_receiver_bound_bytes",
+        "",
+        sample.last_snapshot_receiver_bound_bytes,
+    );
+    header(
+        out,
+        "raft_peer_rejections_total",
+        "counter",
+        "Peer messages rejected, by peer node id, RPC and status code.",
+    );
+    for rejection in &sample.peer_rejections {
+        write_metric(
+            out,
+            "raft_peer_rejections_total",
+            &format!(
+                "peer=\"{}\",action=\"{}\",code=\"{}\"",
+                rejection.peer, rejection.action, rejection.code
+            ),
+            rejection.count,
+        );
+    }
+    if sample.peer_rejections.is_empty() {
+        write_metric(out, "raft_peer_rejections_total", "", 0);
+    }
 }
 
 /// The registry as values (`docs/diagnostics.md`): the same counters,
@@ -926,6 +1100,15 @@ pub fn render_reading(reading: &Reading) -> String {
 /// same names and labels, so a dashboard and a scraper never disagree.
 pub fn snapshot(process: &str, gauges: &[GaugeProvider]) -> crate::pb::MetricsSnapshot {
     snapshot_reading(process, &read(gauges))
+}
+
+/// The registry as values with member gauges sampled too.
+pub fn snapshot_with_member(
+    process: &str,
+    gauges: &[GaugeProvider],
+    members: &[MemberGaugeProvider],
+) -> crate::pb::MetricsSnapshot {
+    snapshot_reading(process, &read_with_member(gauges, members))
 }
 
 /// The snapshot for one [`Reading`].
@@ -1049,6 +1232,57 @@ pub fn snapshot_reading(process: &str, reading: &Reading) -> crate::pb::MetricsS
             }
         }
     }
+    if let Some(member) = reading.members.first() {
+        samples.push(gauge(
+            "raft_is_leader",
+            Vec::new(),
+            u64::from(member.is_leader),
+        ));
+        samples.push(gauge(
+            "raft_applied_index",
+            Vec::new(),
+            member.applied_index,
+        ));
+        samples.push(gauge(
+            "raft_last_log_index",
+            Vec::new(),
+            member.last_log_index,
+        ));
+        samples.push(gauge(
+            "raft_awaiting_snapshot",
+            Vec::new(),
+            u64::from(member.awaiting_snapshot),
+        ));
+        samples.push(counter(
+            "raft_snapshot_rejections_total",
+            Vec::new(),
+            member.snapshot_rejections,
+        ));
+        samples.push(gauge(
+            "raft_last_snapshot_build_bytes",
+            Vec::new(),
+            member.last_snapshot_build_bytes,
+        ));
+        samples.push(gauge(
+            "raft_last_snapshot_receiver_bound_bytes",
+            Vec::new(),
+            member.last_snapshot_receiver_bound_bytes,
+        ));
+        if member.peer_rejections.is_empty() {
+            samples.push(counter("raft_peer_rejections_total", Vec::new(), 0));
+        }
+        for rejection in &member.peer_rejections {
+            samples.push(counter(
+                "raft_peer_rejections_total",
+                vec![
+                    label("peer", &rejection.peer.to_string()),
+                    label("action", &rejection.action),
+                    label("code", &rejection.code),
+                ],
+                rejection.count,
+            ));
+        }
+    }
     crate::pb::MetricsSnapshot {
         unix_ms: crate::diagnostics::unix_ms(),
         process: process.to_string(),
@@ -1066,13 +1300,25 @@ pub fn snapshot_reading(process: &str, reading: &Reading) -> crate::pb::MetricsS
 /// a trusted interface.
 #[cfg(feature = "net")]
 pub async fn serve(listener: tokio::net::TcpListener, gauges: Vec<GaugeProvider>) {
+    serve_with_member(listener, gauges, Vec::new()).await
+}
+
+/// Serve [`render_with_member`] over HTTP; see [`serve`].
+#[cfg(feature = "net")]
+pub async fn serve_with_member(
+    listener: tokio::net::TcpListener,
+    gauges: Vec<GaugeProvider>,
+    members: Vec<MemberGaugeProvider>,
+) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let gauges = std::sync::Arc::new(gauges);
+    let members = std::sync::Arc::new(members);
     loop {
         let Ok((mut socket, _)) = listener.accept().await else {
             continue;
         };
         let gauges = gauges.clone();
+        let members = members.clone();
         tokio::spawn(async move {
             // Drain the request head (up to a bound; a scraper's GET is
             // tiny) so the peer never sees a reset before our response.
@@ -1089,7 +1335,7 @@ pub async fn serve(listener: tokio::net::TcpListener, gauges: Vec<GaugeProvider>
                     }
                 }
             }
-            let body = render(&gauges);
+            let body = render_with_member(&gauges, &members);
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; \
                  charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",

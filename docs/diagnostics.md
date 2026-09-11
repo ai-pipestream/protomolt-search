@@ -89,9 +89,9 @@ grpcurl -plaintext -d '{"name":"segment_pruning","value":"false"}' 127.0.0.1:193
 
 `GetMetricsSnapshot` returns the metrics registry as values: the same
 request counters, in-flight gauges, latency histograms, error counters,
-scan-work and ingest counters, and per-shard gauges the Prometheus page
-renders (`docs/metrics.md`), with the same names and labels, in the
-same order. A histogram sample lists cumulative bucket counts with
+scan-work and ingest counters, per-shard gauges, and per-member Raft
+gauges the Prometheus page renders (`docs/metrics.md`), with the same
+names and labels, in the same order. A histogram sample lists cumulative bucket counts with
 their upper bounds in seconds, the sum in seconds, and the count. Both
 are views of one registry reading (`metrics::read`): the page and the
 snapshot built from the same reading are equal by construction, and a

@@ -100,6 +100,11 @@ Cluster control routes (`docs/cluster-control.md`):
     complete_placement_action  reconcile_cluster  get_cluster_plan
     rollback_cluster
 
+Operator routes (`docs/raft-hosting.md`, "Operator surface"):
+
+    get_member_status  add_learner  promote_learners  remove_member
+    verify_published_image
+
 (`bm25_query` counts both the unary and the streaming transport of the
 same query. `suggest_terms` is the node's dictionary scan and `suggest`
 the coordinator's public route, `docs/suggest.md`; a coordinator process
@@ -221,13 +226,37 @@ Labeled by `slot_offset` (the shard's name in the global id space):
 A process serving several shards (one `[[shards]]` entry each) exports
 one labeled sample per shard on one page.
 
+### Per-member gauges
+
+Sampled live from the Raft member at scrape time (`MemberGauges`, a
+second provider list beside the shard one, so no gauge ever goes
+stale). The scalars carry no labels — a process serves at most one
+member:
+
+    raft_is_leader
+    raft_applied_index
+    raft_last_log_index
+    raft_awaiting_snapshot
+    raft_snapshot_rejections_total
+    raft_last_snapshot_build_bytes
+    raft_last_snapshot_receiver_bound_bytes
+
+Peer rejections are labeled by peer, RPC and status code:
+
+    raft_peer_rejections_total{peer="...",action="...",code="..."}
+
+A process that is no member exports none of these rows; a member with
+no rejections exports `raft_peer_rejections_total 0` so the series
+exists from the first scrape. The snapshot carries the same rows in
+the same order (`docs/diagnostics.md`).
+
 ## Page size
 
-49 routes × (14 buckets + `_sum` + `_count`), twice for the five
-streaming routes, plus 49 × 10 error rows and the request and in-flight
-rows: 1,499 lines and 111 KB of text per scrape (measured by the
-page-shape unit test's render, no gauges), rendered on demand into one
-string. Nothing is retained between scrapes.
+73 routes × (14 buckets + `_sum` + `_count`), twice for the seven
+streaming routes, plus 73 × 10 error rows and the request and in-flight
+rows: 2,197 lines and 161 KB of text per scrape (a gaugeless render),
+rendered on demand into one string. Nothing is retained between
+scrapes.
 
 ## What is deliberately NOT here
 

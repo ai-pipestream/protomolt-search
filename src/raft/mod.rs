@@ -97,7 +97,11 @@ pub mod host;
 pub mod log_store;
 #[cfg(feature = "tls")]
 pub mod operator;
+#[cfg(all(feature = "raft", feature = "tls"))]
+pub mod operator_service;
 pub mod reasons;
+#[cfg(feature = "tls")]
+pub mod rejection_log;
 pub mod state_machine;
 #[cfg(feature = "tls")]
 pub mod transport;

@@ -747,6 +747,7 @@ pub struct CoordinatorDiagnostics {
     principals: Option<Arc<Principals>>,
     ring: Arc<RecentRing>,
     gauges: Arc<Vec<crate::metrics::GaugeProvider>>,
+    member_gauges: Arc<Vec<crate::metrics::MemberGaugeProvider>>,
 }
 
 impl CoordinatorDiagnostics {
@@ -790,6 +791,7 @@ impl CoordinatorDiagnostics {
             principals,
             ring,
             gauges: Arc::new(Vec::new()),
+            member_gauges: Arc::new(Vec::new()),
         }
     }
 
@@ -798,6 +800,13 @@ impl CoordinatorDiagnostics {
     /// does.
     pub fn with_gauges(mut self, gauges: Vec<crate::metrics::GaugeProvider>) -> Self {
         self.gauges = Arc::new(gauges);
+        self
+    }
+
+    /// The Raft member gauges of this process, so the coordinator's
+    /// snapshot carries the same member rows the exporter does.
+    pub fn with_member_gauges(mut self, members: Vec<crate::metrics::MemberGaugeProvider>) -> Self {
+        self.member_gauges = Arc::new(members);
         self
     }
 
@@ -822,7 +831,7 @@ impl CoordinatorDiagnostics {
             .primary()
             .map(|m| m.knobs().process().to_string())
             .unwrap_or_default();
-        crate::metrics::snapshot(&process, &self.gauges)
+        crate::metrics::snapshot_with_member(&process, &self.gauges, &self.member_gauges)
     }
 }
 

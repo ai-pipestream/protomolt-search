@@ -137,11 +137,11 @@ library a validated image only (`RaftTransportService::stage`,
   transport between two nodes makes statuses in the same code space (a
   connection closed is `Internal`, an end of stream and a message past
   the client's own decode bound are `OutOfRange`), and those are retried
-  with the library's backoff, not recorded, and do not end a join. These
-  accessors are in-process: no code in the serving binary reads them, no
-  `/metrics` row and no log line carries them, so outside an `add_learner`
-  call a peer's rejection is visible to a caller of the host and to no
-  operator; the operator route for them is open ("Not yet"). A rejected
+  with the library's backoff, not recorded, and do not end a join. The
+  rejection accessors are served as well as stored: the operator status
+  carries every peer's latest rejection and the snapshot rejections, the
+  `/metrics` page carries their counts, and a log line names each one
+  ("Operator surface"). A rejected
   snapshot is returned to the library as unreachable, so the leader backs
   off between attempts: the library's sender retries the chunk five times
   with 500 ms between, returns to the replication core, backs off 500 ms
@@ -507,10 +507,79 @@ Serving opens existing state only. `pipestream-search raft-prepare
 --raft-dir=... --raft-node-id=... --raft-group-id=... --raft-authority-incarnation=...
 --raft-listen=... --raft-peers=...` creates a member's durable state with a
 placeholder genesis the group's snapshot replaces; the leader then adds it
-with `add_learner` and promotes it. Bootstrapping the first member of a
-group stays a programmatic step (`RaftHost::bootstrap_cluster` with the
-group's policy and limits); an operator surface for authoring those is not
-part of this checkpoint.
+with `add_learner` and promotes it.
+
+The first member of a group is created once, locally, by
+`pipestream-search raft-bootstrap --raft-dir=... --raft-node-id=...
+--raft-group-id=... --raft-authority-incarnation=... --raft-listen=...
+--raft-peers=... --policy=<file> --limits=<file>`: the `AccessPolicy`
+and `SourceAuthorityLimits` are decoded from the two files as proto3
+JSON (the transcoding the console shares, `console::json_to_message_bytes`),
+a directory that already holds a store or a log is refused by name
+before anything is created, and the command then bootstraps the group,
+waits until the member leads, prints its status as proto3 JSON, and
+shuts the host down. Every later member joins by snapshot through the
+operator's add (below), never through a second bootstrap.
+
+## Operator surface
+
+`RaftOperatorService` (`proto/ai/protomolt/search/v1/raft_operator.proto`,
+`src/raft/operator_service.rs`) is the membership surface of a member:
+`GetMemberStatus` reads the member's state (node id, group and authority
+incarnation as hex, advertised address, believed leader, whether it
+leads, vote, applied position, last log index, voters and learners with
+their addresses, whether the store awaits its first snapshot, the last
+snapshot build, every peer's latest rejection, and the snapshot
+rejections; every optional field is a proto3 `optional` or a message),
+`AddLearner` adds a learner by node id and dial address, `PromoteLearners`
+promotes learners to voters, `RemoveMember` removes a voter or a learner,
+and `VerifyPublishedImage` checks the published image by digest. No
+request takes a policy or limits: bootstrap is the local subcommand
+above, not an RPC.
+
+Trust is cluster trust, the way `ClusterControlService::membership`
+does it: every call requires a client certificate the listener verified
+against the cluster CA (`control_plane::cluster_membership`, one
+function for both services), refused as `Unauthenticated` naming the
+certificate. The operator's certificate does not have to be bound in
+the `PeerDirectory`: that directory binds Raft peers, and the operator
+is not one. The service rides every listener the process opens (node,
+coordinator, relay) when the process is a Raft member; a node-only
+process is a valid member for it. Every mutation passes its error
+through unchanged: an add on a non-leader is `Unavailable` naming the
+leader, a learner with an unregistered certificate is the host's own
+refusal, an unknown learner's promotion is the library's membership
+error as the host maps it. The service does not retry, forward, or
+reword.
+
+The CLI (`src/main.rs`, next to `raft-prepare`) is a thin client of
+these RPCs over the member's listener with the client material its
+`--tls-ca`, `--tls-client-cert`, `--tls-client-key` and `--tls-domain`
+flags name (installed process-wide before the dial, as a serving process
+installs its own): `raft-status --addr=<host:port>` prints the status as proto3
+JSON (the console's rendering, defaults included), `raft-add-learner
+--addr=<leader> --node-id=<n> --node-addr=<host:port>`,
+`raft-promote --addr=<leader> --node-id=<n>[,<n>...]`,
+`raft-remove-member --addr=<leader> --node-id=<n>`, and
+`raft-verify-image --addr=<member>`. Exit codes are 0 on success, 2 on
+a usage error, 1 on a rejected call with the status code and message on
+stderr.
+
+The member's numbers are on the `/metrics` page (`docs/metrics.md`,
+"Per-member gauges"), sampled live at scrape time, and in the metrics
+snapshot. A peer's rejection count rising writes one log line per peer
+per change of count, whatever the RPC and the code (`raft member {id} :
+peer {peer} rejected {action} #{count} ({code}): {message}`); the digest
+rejection's rebuild follows the same watch. A snapshot install rejected
+at the announce writes one line where it is recorded.
+
+Evidence (`tests/control_raft_operator.rs`, the `Voters` kit, the
+service on each member over mTLS): status on leader and follower, a
+learner added, promoted and removed with a write after each step, a
+follower's change refused naming the leader, a call without a client
+certificate refused by name, a cluster-CA certificate outside the peer
+directory accepted, the digest rejection in the status, the snapshot
+and the log line, and `raft-bootstrap` as a child process.
 
 ## Security considerations
 
@@ -562,7 +631,7 @@ After step 3 a call under the old certificate MUST be rejected by name
 at every listener (`Unauthenticated`,
 `transport.unregistered_certificate`): the directory binds no member to
 it. After step 4 the member MUST serve again under the new certificate.
-(`tests/control_raft_operator.rs`,
+(`tests/control_raft_rotation.rs`,
 `a_member_rotated_to_a_new_certificate_serves_again`, fails if the old
 certificate reaches any listener or the re-added member does not catch
 up and vote.) The missing runtime rebind is a "Not yet" bullet, not a
@@ -797,13 +866,6 @@ mTLS with the fixtures under `tests/certs/raft`, regenerated by
 ## Not yet
 
 - The map feed of a learner's applied state.
-- An operator surface for authoring the first member's policy and limits
-  (`bootstrap_cluster`), and for `add_learner`, `promote` and
-  `remove_member` from the command line.
-- An operator route for the rejection and build numbers
-  (`peer_rejections`, `snapshot_rejections`, `last_snapshot_build`,
-  `verify_published_image`): a `/metrics` row and a log line. Until then
-  they are in-process accessors.
 - Cross-process fault injection (a member killed at a transaction boundary
   while the others continue) is Kimi's harness, on `fault-injection` and the
   transport's `Isolation`.

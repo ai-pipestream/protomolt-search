@@ -34,7 +34,7 @@ targets:
   under `raft` + `tls`;
 - `tests/control_raft_hosted_writes.rs`, under `raft` + `tls` +
   `fault-injection`;
-- `tests/control_raft_operator.rs`, under `raft` + `tls`;
+- `tests/control_raft_rotation.rs`, under `raft` + `tls`;
 - `tests/control_raft_migration.rs` (the migration and
   disaster-recovery exercise), under its own gates;
 - `tests/control_raft_snapshots.rs`, `tests/control_raft_regressions.rs`,

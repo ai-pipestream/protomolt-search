@@ -359,3 +359,82 @@ async fn coordinator_routes_and_streaming_phases_move() {
         );
     }
 }
+
+/// The member gauges appear on the page and in the snapshot in the same
+/// order: one provider's values, every row, the page's row order
+/// matching the snapshot's sample order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn member_gauges_appear_on_the_page_and_in_the_snapshot_in_the_same_order() {
+    let members: Vec<metrics::MemberGaugeProvider> = vec![Box::new(|| metrics::MemberGauges {
+        is_leader: true,
+        applied_index: 7,
+        last_log_index: 9,
+        awaiting_snapshot: false,
+        peer_rejections: vec![metrics::PeerRejectionGauges {
+            peer: 2,
+            action: "snapshot".to_string(),
+            code: "DataLoss".to_string(),
+            count: 3,
+        }],
+        snapshot_rejections: 1,
+        last_snapshot_build_bytes: 1024,
+        last_snapshot_receiver_bound_bytes: 2048,
+    })];
+    let page = metrics::render_with_member(&[], &members);
+    let rows = [
+        "raft_is_leader 1",
+        "raft_applied_index 7",
+        "raft_last_log_index 9",
+        "raft_awaiting_snapshot 0",
+        "raft_snapshot_rejections_total 1",
+        "raft_last_snapshot_build_bytes 1024",
+        "raft_last_snapshot_receiver_bound_bytes 2048",
+        "raft_peer_rejections_total{peer=\"2\",action=\"snapshot\",code=\"DataLoss\"} 3",
+    ];
+    let mut at = 0;
+    for row in rows {
+        let found = page[at..]
+            .find(row)
+            .unwrap_or_else(|| panic!("no page row {row:?}"));
+        at += found + row.len();
+    }
+
+    let snapshot = metrics::snapshot_with_member("test", &[], &members);
+    let member: Vec<(&str, f64)> = snapshot
+        .samples
+        .iter()
+        .filter(|sample| sample.name.starts_with("raft_"))
+        .map(|sample| (sample.name.as_str(), sample.value))
+        .collect();
+    assert_eq!(
+        member.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+        [
+            "raft_is_leader",
+            "raft_applied_index",
+            "raft_last_log_index",
+            "raft_awaiting_snapshot",
+            "raft_snapshot_rejections_total",
+            "raft_last_snapshot_build_bytes",
+            "raft_last_snapshot_receiver_bound_bytes",
+            "raft_peer_rejections_total",
+        ]
+    );
+    assert_eq!(
+        member.iter().map(|(_, value)| *value).collect::<Vec<_>>(),
+        [1.0, 7.0, 9.0, 0.0, 1.0, 1024.0, 2048.0, 3.0]
+    );
+    let peer = snapshot
+        .samples
+        .iter()
+        .find(|sample| sample.name == "raft_peer_rejections_total")
+        .unwrap();
+    let labels: Vec<(&str, &str)> = peer
+        .labels
+        .iter()
+        .map(|label| (label.name.as_str(), label.value.as_str()))
+        .collect();
+    assert_eq!(
+        labels,
+        [("peer", "2"), ("action", "snapshot"), ("code", "DataLoss")]
+    );
+}

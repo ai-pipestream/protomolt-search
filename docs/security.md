@@ -247,6 +247,13 @@ reconcile, plan, rollback) require a client certificate when the
 listener runs TLS with a client CA: `ClusterControlService::membership`
 refuses a call without one as `UNAUTHENTICATED` — "a bearer token is
 not membership". The collection set applies the same rule per member.
+The Raft operator routes (`GetMemberStatus`, `AddLearner`,
+`PromoteLearners`, `RemoveMember`, `VerifyPublishedImage`,
+`docs/raft-hosting.md`, "Operator surface") share the one check
+(`control_plane::cluster_membership`) and the same refusal: the
+operator's certificate must chain to the cluster CA, but it is not
+required to be bound in the Raft peer directory, which binds peers,
+not operators.
 A node's own control channel (`--node-id` with `--control-addr`,
 `docs/cluster-control.md`) is opened under the same process-wide client
 material, so a registering node presents `--tls-client-cert`; the

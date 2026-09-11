@@ -864,16 +864,127 @@ fn normalize_analysis_backend(value: String) -> String {
 }
 
 /// Parse configuration from process args (excluding argv[0]).
-pub fn parse(args: &[String]) -> Result<Config, String> {
-    // The config file sits at the bottom of the precedence stack.
-    let file: FileConfig = match opt(args, "config", "TURBOVEC_CONFIG", None) {
+/// The config file at the bottom of the precedence stack, shared by
+/// the serving parse and the local directory commands.
+fn read_file_config(args: &[String]) -> Result<FileConfig, String> {
+    match opt(args, "config", "TURBOVEC_CONFIG", None) {
         Some(path) => {
             let text =
                 std::fs::read_to_string(&path).map_err(|e| format!("read config {path}: {e}"))?;
-            toml::from_str(&text).map_err(|e| format!("parse config {path}: {e}"))?
+            toml::from_str(&text).map_err(|e| format!("parse config {path}: {e}"))
         }
-        None => FileConfig::default(),
+        None => Ok(FileConfig::default()),
+    }
+}
+
+/// The member and TLS material for the local directory commands
+/// (`raft-bootstrap`): the raft flags and the listener and client TLS,
+/// without the serving roles' shard and collection requirements, which
+/// a command that creates a directory but serves nothing does not have.
+pub struct RaftLocal {
+    pub member: Option<RaftMemberConfig>,
+    pub tls: Option<crate::security::ServerTls>,
+    pub client_tls: Option<crate::security::ClientTls>,
+}
+
+pub fn parse_raft_local(args: &[String]) -> Result<RaftLocal, String> {
+    let file = read_file_config(args)?;
+    let relay = flag_present(args, "relay");
+    let member = parse_raft(args, &file, relay)?;
+    let (tls, client_tls) = parse_tls(args, &file)?;
+    Ok(RaftLocal {
+        member,
+        tls,
+        client_tls,
+    })
+}
+
+/// The security surface (`docs/security.md`): the listener TLS and the
+/// client material. Files are read here so a missing certificate
+/// refuses at startup, not at the first connection.
+fn parse_tls(
+    args: &[String],
+    file: &FileConfig,
+) -> Result<
+    (
+        Option<crate::security::ServerTls>,
+        Option<crate::security::ClientTls>,
+    ),
+    String,
+> {
+    // The security surface (docs/security.md). Files are read here so a
+    // missing certificate refuses at startup, not at the first connection.
+    let path_opt = |key: &str, env: &str, file_value: Option<&str>| {
+        opt(args, key, env, file_value).map(PathBuf::from)
     };
+    let tls_cert = path_opt(
+        "tls-cert",
+        "PIPESTREAM_SEARCH_TLS_CERT",
+        file.tls_cert.as_deref(),
+    );
+    let tls_key = path_opt(
+        "tls-key",
+        "PIPESTREAM_SEARCH_TLS_KEY",
+        file.tls_key.as_deref(),
+    );
+    let tls_client_ca = path_opt(
+        "tls-client-ca",
+        "PIPESTREAM_SEARCH_TLS_CLIENT_CA",
+        file.tls_client_ca.as_deref(),
+    );
+    let tls = match (tls_cert, tls_key) {
+        (Some(cert), Some(key)) => Some(crate::security::ServerTls::load(
+            &cert,
+            &key,
+            tls_client_ca.as_deref(),
+        )?),
+        (None, None) => {
+            if tls_client_ca.is_some() {
+                return Err("--tls-client-ca needs --tls-cert and --tls-key".to_string());
+            }
+            None
+        }
+        _ => return Err("TLS needs both --tls-cert and --tls-key".to_string()),
+    };
+    let tls_ca = path_opt("tls-ca", "PIPESTREAM_SEARCH_TLS_CA", file.tls_ca.as_deref());
+    let tls_client_cert = path_opt(
+        "tls-client-cert",
+        "PIPESTREAM_SEARCH_TLS_CLIENT_CERT",
+        file.tls_client_cert.as_deref(),
+    );
+    let tls_client_key = path_opt(
+        "tls-client-key",
+        "PIPESTREAM_SEARCH_TLS_CLIENT_KEY",
+        file.tls_client_key.as_deref(),
+    );
+    let tls_domain = opt(
+        args,
+        "tls-domain",
+        "PIPESTREAM_SEARCH_TLS_DOMAIN",
+        file.tls_domain.as_deref(),
+    );
+    let client_tls = match tls_ca {
+        Some(ca) => Some(crate::security::ClientTls::load(
+            &ca,
+            tls_client_cert.as_deref(),
+            tls_client_key.as_deref(),
+            tls_domain,
+        )?),
+        None => {
+            if tls_client_cert.is_some() || tls_client_key.is_some() || tls_domain.is_some() {
+                return Err(
+                    "--tls-client-cert / --tls-client-key / --tls-domain need --tls-ca".to_string(),
+                );
+            }
+            None
+        }
+    };
+    Ok((tls, client_tls))
+}
+
+pub fn parse(args: &[String]) -> Result<Config, String> {
+    // The config file sits at the bottom of the precedence stack.
+    let file: FileConfig = read_file_config(args)?;
 
     let role = match opt(args, "role", "TURBOVEC_ROLE", file.role.as_deref())
         .unwrap_or_else(|| "node".to_string())
@@ -2382,72 +2493,9 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             });
         }
     }
-    // The security surface (docs/security.md). Files are read here so a
-    // missing certificate refuses at startup, not at the first connection.
+    let (tls, client_tls) = parse_tls(args, &file)?;
     let path_opt = |key: &str, env: &str, file_value: Option<&str>| {
         opt(args, key, env, file_value).map(PathBuf::from)
-    };
-    let tls_cert = path_opt(
-        "tls-cert",
-        "PIPESTREAM_SEARCH_TLS_CERT",
-        file.tls_cert.as_deref(),
-    );
-    let tls_key = path_opt(
-        "tls-key",
-        "PIPESTREAM_SEARCH_TLS_KEY",
-        file.tls_key.as_deref(),
-    );
-    let tls_client_ca = path_opt(
-        "tls-client-ca",
-        "PIPESTREAM_SEARCH_TLS_CLIENT_CA",
-        file.tls_client_ca.as_deref(),
-    );
-    let tls = match (tls_cert, tls_key) {
-        (Some(cert), Some(key)) => Some(crate::security::ServerTls::load(
-            &cert,
-            &key,
-            tls_client_ca.as_deref(),
-        )?),
-        (None, None) => {
-            if tls_client_ca.is_some() {
-                return Err("--tls-client-ca needs --tls-cert and --tls-key".to_string());
-            }
-            None
-        }
-        _ => return Err("TLS needs both --tls-cert and --tls-key".to_string()),
-    };
-    let tls_ca = path_opt("tls-ca", "PIPESTREAM_SEARCH_TLS_CA", file.tls_ca.as_deref());
-    let tls_client_cert = path_opt(
-        "tls-client-cert",
-        "PIPESTREAM_SEARCH_TLS_CLIENT_CERT",
-        file.tls_client_cert.as_deref(),
-    );
-    let tls_client_key = path_opt(
-        "tls-client-key",
-        "PIPESTREAM_SEARCH_TLS_CLIENT_KEY",
-        file.tls_client_key.as_deref(),
-    );
-    let tls_domain = opt(
-        args,
-        "tls-domain",
-        "PIPESTREAM_SEARCH_TLS_DOMAIN",
-        file.tls_domain.as_deref(),
-    );
-    let client_tls = match tls_ca {
-        Some(ca) => Some(crate::security::ClientTls::load(
-            &ca,
-            tls_client_cert.as_deref(),
-            tls_client_key.as_deref(),
-            tls_domain,
-        )?),
-        None => {
-            if tls_client_cert.is_some() || tls_client_key.is_some() || tls_domain.is_some() {
-                return Err(
-                    "--tls-client-cert / --tls-client-key / --tls-domain need --tls-ca".to_string(),
-                );
-            }
-            None
-        }
     };
     let allow_plaintext = flag_present(args, "allow-plaintext")
         || std::env::var("PIPESTREAM_SEARCH_ALLOW_PLAINTEXT")
@@ -2791,6 +2839,39 @@ mod tests {
             ),
             ("relay", "workspace-a", "books")
         );
+    }
+
+    #[test]
+    fn raft_local_parse_serves_the_directory_commands_without_shards() {
+        // The local commands create a directory but serve nothing: raft
+        // flags alone are a member, with no shard or collection flags.
+        let local = parse_raft_local(&args_raw(&[
+            "--raft-dir=/tmp/member-1",
+            "--raft-node-id=1",
+            "--raft-group-id=0102030405060708090a0b0c0d0e0f10",
+            "--raft-authority-incarnation=ffffffffffffffffffffffffffffffff",
+            "--raft-listen=127.0.0.1:19500",
+            "--raft-peers=/tmp/peers.toml",
+        ]))
+        .unwrap();
+        assert_eq!(
+            local
+                .member
+                .as_ref()
+                .expect("raft flags alone are a member")
+                .node_id,
+            1
+        );
+        assert!(local.tls.is_none());
+        assert!(local.client_tls.is_none());
+        // No raft flags is no member, not an error.
+        let local = parse_raft_local(&args_raw(&[])).unwrap();
+        assert!(local.member.is_none());
+        // A partial member is refused by name.
+        let error = parse_raft_local(&args_raw(&["--raft-node-id=1"]))
+            .err()
+            .expect("a member without its directory refuses");
+        assert!(error.contains("needs --raft-dir"), "{error}");
     }
 
     #[test]
