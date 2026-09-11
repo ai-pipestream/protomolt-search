@@ -603,6 +603,20 @@ async fn a_peer_rejection_is_reported_over_the_route_and_on_the_metrics_page() {
     let operator = serve_operator(Arc::clone(&leader), "node-1").await;
     let diagnostics = serve_diagnostics(Arc::clone(&leader), "node-1").await;
     let mut client = operator_client(&operator.addr, Some("node-1"));
+    // The ring may carry lines of an earlier test in this process; what
+    // follows counts only the lines this scenario writes.
+    let _ = pipestream_search::raft::rejection_log::take();
+
+    // A member that awaits its seed answers its status: no applied
+    // position, awaiting, no leader believed in yet or the leader.
+    let member = Arc::new(member);
+    let member_operator = serve_operator(Arc::clone(&member), "node-2").await;
+    let pending = get_status(&mut operator_client(&member_operator.addr, Some("node-2"))).await;
+    assert_eq!(pending.node_id, 2);
+    assert!(pending.awaiting_snapshot, "{pending:?}");
+    assert!(pending.applied.is_none(), "{pending:?}");
+    assert!(!pending.leads);
+    member_operator.stop().await;
 
     let rejected = client
         .add_learner(AddLearnerRequest { node_id: 2, addr })
@@ -652,23 +666,77 @@ async fn a_peer_rejection_is_reported_over_the_route_and_on_the_metrics_page() {
         rejection.count
     );
 
+    // One line per rise of the count, the count in the line, and no
+    // line while the count stands: the lines of this scenario name
+    // distinct, increasing counts, and a quiet interval adds none.
     let deadline = Instant::now() + Duration::from_secs(30);
-    let line = loop {
-        let lines = pipestream_search::raft::rejection_log::take();
-        if let Some(line) = lines
-            .iter()
-            .find(|line| line.contains("peer 2") && line.contains("snapshot"))
-        {
-            break line.clone();
+    let mut lines: Vec<String> = Vec::new();
+    loop {
+        lines.extend(
+            pipestream_search::raft::rejection_log::take()
+                .into_iter()
+                .filter(|line| line.contains("peer 2 rejected snapshot")),
+        );
+        if !lines.is_empty() {
+            break;
         }
         assert!(Instant::now() < deadline, "no rejection line was written");
         tokio::time::sleep(Duration::from_millis(20)).await;
-    };
-    assert!(line.contains("raft member 1"), "{line}");
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    lines.extend(
+        pipestream_search::raft::rejection_log::take()
+            .into_iter()
+            .filter(|line| line.contains("peer 2 rejected snapshot")),
+    );
+    // The peer's count at the end bounds every line: no line without a
+    // rise of the count.
+    let settled = get_status(&mut client)
+        .await
+        .peer_rejections
+        .iter()
+        .find(|rejection| rejection.node_id == 2)
+        .map(|rejection| rejection.count)
+        .unwrap();
+    let counts: Vec<u64> = lines
+        .iter()
+        .map(|line| {
+            let after = line.split(" #").nth(1).expect("the line names the count");
+            after
+                .split(' ')
+                .next()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap_or_else(|_| panic!("the count is a number: {line}"))
+        })
+        .collect();
+    assert!(
+        counts.windows(2).all(|pair| pair[0] < pair[1]),
+        "one line per rise of the count, in order: {counts:?}"
+    );
+    assert!(
+        counts.iter().all(|count| *count <= settled),
+        "no line without a rise of the count: {counts:?} vs {settled}"
+    );
+    // The digest rejection is among the lines; the continuation of the
+    // dropped transfer the sender retries is a rejection too, and is
+    // logged as one, by its own code.
+    assert!(
+        lines.iter().any(|line| line.contains("(DataLoss)")),
+        "the digest rejection is logged: {lines:?}"
+    );
+    for line in &lines {
+        assert!(line.contains("raft member 1"), "{line}");
+    }
 
     operator.stop().await;
     diagnostics.stop().await;
-    member.shutdown().await.unwrap();
+    Arc::try_unwrap(member)
+        .ok()
+        .expect("no server still holds the member")
+        .shutdown()
+        .await
+        .unwrap();
     Arc::try_unwrap(leader)
         .ok()
         .expect("no server still holds the host")
@@ -807,6 +875,60 @@ async fn raft_bootstrap_creates_one_leading_member_and_rejects_a_used_directory(
         "the refusal names the store: {stderr}"
     );
 
+    // The directory the bootstrap left is one a member starts from: it
+    // opens, leads on its own, and serves its status.
+    {
+        let group = kit::identity(kit::SEED);
+        let directory = raft_kit::directory(&group);
+        let host = RaftHost::start_member(
+            &work.path().join("member"),
+            &group,
+            1,
+            &raft_kit::host_config(),
+            raft_kit::transport(1, &directory, "127.0.0.1:0".parse().unwrap()),
+        )
+        .await
+        .expect("a bootstrapped directory starts as a member");
+        host.wait(Some(Duration::from_secs(30)))
+            .state(
+                openraft::ServerState::Leader,
+                "the bootstrapped member leads",
+            )
+            .await
+            .unwrap();
+        let status = pipestream_search::raft::operator_service::member_status(&host).unwrap();
+        assert!(status.leads);
+        assert_eq!(status.node_id, 1);
+        assert_eq!(voter_ids(&status), vec![1]);
+        host.shutdown().await.unwrap();
+    }
+
+    // A directory with a log and no store is a partial state, refused by
+    // its own name before any file is created.
+    {
+        let partial = work.path().join("partial");
+        std::fs::create_dir_all(partial.join("member")).unwrap();
+        std::fs::copy(work.path().join("peers.toml"), partial.join("peers.toml")).unwrap();
+        std::fs::copy(fixtures().join("node-1.pem"), partial.join("node-1.pem")).unwrap();
+        std::fs::write(
+            partial
+                .join("member")
+                .join(pipestream_search::raft::host::LOG_FILE),
+            b"",
+        )
+        .unwrap();
+        let partial_args = bootstrap_args(&partial, &policy_path, &limits_path);
+        let out = tokio::task::spawn_blocking(move || run_child(partial_args))
+            .await
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("raft log store already exists"),
+            "the refusal names the log: {stderr}"
+        );
+    }
+
     let bad_policy = work.path().join("bad-policy.json");
     std::fs::write(&bad_policy, b"{not json").unwrap();
     // A fresh directory, so the run reaches the decoder rather than the
@@ -833,4 +955,76 @@ async fn raft_bootstrap_creates_one_leading_member_and_rejects_a_used_directory(
         stderr.contains(&bad_policy.display().to_string()),
         "the refusal names the file: {stderr}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The RPC subcommands as child processes against a live member's mTLS
+// listener: `raft-status` with the client material its flags name prints
+// the status; with the CA alone the call is refused by name and the
+// command exits 1 naming the refusal.
+// ---------------------------------------------------------------------------
+
+fn status_args(addr: &str, identity: bool) -> Vec<String> {
+    let mut args = vec![
+        "raft-status".to_string(),
+        format!("--addr={}", addr.trim_start_matches("https://")),
+        format!("--tls-ca={}", fixtures().join("ca.pem").display()),
+        "--tls-domain=localhost".to_string(),
+    ];
+    if identity {
+        args.push(format!(
+            "--tls-client-cert={}",
+            fixtures().join("node-1.pem").display()
+        ));
+        args.push(format!(
+            "--tls-client-key={}",
+            fixtures().join("node-1.key.pem").display()
+        ));
+    }
+    args
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raft_status_dials_a_member_with_the_client_material_its_flags_name() {
+    let _serial = serial();
+    let mut voters = raft_kit::three_voters("operator-cli", &kit::policy()).await;
+    let leader = voters.leader().await;
+    let leader_host = take_host(&mut voters, leader);
+    let served = serve_operator(Arc::clone(&leader_host), &format!("node-{leader}")).await;
+
+    let with_identity = status_args(&served.addr, true);
+    let out = tokio::task::spawn_blocking(move || run_child(with_identity))
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "raft-status with the client material: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        status["nodeId"],
+        serde_json::Value::from(leader.to_string())
+    );
+    assert_eq!(status["leads"], serde_json::Value::Bool(true));
+
+    let ca_only = status_args(&served.addr, false);
+    let out = tokio::task::spawn_blocking(move || run_child(ca_only))
+        .await
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Unauthenticated") && stderr.contains("client certificate"),
+        "the command names the refusal: {stderr}"
+    );
+
+    served.stop().await;
+    return_host(&mut voters, leader, leader_host);
+    voters.shutdown().await;
 }

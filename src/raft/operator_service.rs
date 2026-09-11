@@ -146,7 +146,7 @@ impl RaftOperatorServiceImpl {
             return Ok(());
         }
         Err(Status::unauthenticated(
-            "raft operator routes require a client certificate from the cluster CA; a Bearer [REDACTED] is not membership",
+            "raft operator routes require a client certificate from the cluster CA; a bearer token is not membership",
         ))
     }
 

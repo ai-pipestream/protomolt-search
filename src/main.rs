@@ -1027,7 +1027,7 @@ async fn raft_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
         .await?
         .get_member_status(tonic::Request::new(GetMemberStatusRequest {}))
         .await
-        .map_err(|status| format!("raft-status: {}: {}", status.code(), status.message()))?
+        .map_err(|status| format!("raft-status: {:?}: {}", status.code(), status.message()))?
         .into_inner();
     print_message_json("ai.protomolt.search.v1.MemberStatus", &status)
 }
@@ -1044,7 +1044,13 @@ async fn raft_add_learner(args: &[String]) -> Result<(), Box<dyn std::error::Err
             addr: node_addr,
         }))
         .await
-        .map_err(|status| format!("raft-add-learner: {}: {}", status.code(), status.message()))?
+        .map_err(|status| {
+            format!(
+                "raft-add-learner: {:?}: {}",
+                status.code(),
+                status.message()
+            )
+        })?
         .into_inner();
     print_message_json("ai.protomolt.search.v1.MembershipChange", &change)
 }
@@ -1058,7 +1064,7 @@ async fn raft_promote(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
         .await?
         .promote_learners(tonic::Request::new(PromoteLearnersRequest { learner_ids }))
         .await
-        .map_err(|status| format!("raft-promote: {}: {}", status.code(), status.message()))?
+        .map_err(|status| format!("raft-promote: {:?}: {}", status.code(), status.message()))?
         .into_inner();
     print_message_json("ai.protomolt.search.v1.MembershipChange", &change)
 }
@@ -1074,7 +1080,7 @@ async fn raft_remove_member(args: &[String]) -> Result<(), Box<dyn std::error::E
         .await
         .map_err(|status| {
             format!(
-                "raft-remove-member: {}: {}",
+                "raft-remove-member: {:?}: {}",
                 status.code(),
                 status.message()
             )
@@ -1091,7 +1097,13 @@ async fn raft_verify_image(args: &[String]) -> Result<(), Box<dyn std::error::Er
         .await?
         .verify_published_image(tonic::Request::new(VerifyPublishedImageRequest {}))
         .await
-        .map_err(|status| format!("raft-verify-image: {}: {}", status.code(), status.message()))?
+        .map_err(|status| {
+            format!(
+                "raft-verify-image: {:?}: {}",
+                status.code(),
+                status.message()
+            )
+        })?
         .into_inner();
     print_message_json(
         "ai.protomolt.search.v1.PublishedImageVerification",
@@ -1171,17 +1183,17 @@ async fn raft_bootstrap(args: &[String]) -> Result<(), Box<dyn std::error::Error
         transport,
     )
     .await
-    .map_err(|status| format!("raft-bootstrap: {}: {}", status.code(), status.message()))?;
+    .map_err(|status| format!("raft-bootstrap: {:?}: {}", status.code(), status.message()))?;
     host.wait(Some(std::time::Duration::from_secs(30)))
         .state(openraft::ServerState::Leader, "raft-bootstrap leader")
         .await
         .map_err(|e| format!("raft-bootstrap: the member never led: {e}"))?;
     let status = pipestream_search::raft::operator_service::member_status(&host)
-        .map_err(|status| format!("raft-bootstrap: {}: {}", status.code(), status.message()))?;
+        .map_err(|status| format!("raft-bootstrap: {:?}: {}", status.code(), status.message()))?;
     print_message_json("ai.protomolt.search.v1.MemberStatus", &status)?;
     host.shutdown()
         .await
-        .map_err(|status| format!("raft-bootstrap: {}: {}", status.code(), status.message()))?;
+        .map_err(|status| format!("raft-bootstrap: {:?}: {}", status.code(), status.message()))?;
     Ok(())
 }
 
@@ -1196,12 +1208,21 @@ async fn raft_operator_cli(
 }
 
 /// The `raft-*` operator subcommands: status and membership over the
-/// member's listener, bootstrap local.
+/// member's listener, bootstrap local. The RPC subcommands install the
+/// client material their `--tls-*` flags name before they dial, so a
+/// member's mTLS listener is reached the way the console reaches it; a
+/// call without `--tls-ca` dials in plaintext and a TLS listener
+/// rejects the handshake, which is the transport's own refusal.
 #[cfg(all(feature = "raft", feature = "tls"))]
 async fn raft_operator_cli(
     command: &str,
     args: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if command != "raft-bootstrap" {
+        let local = pipestream_search::config::parse_raft_local(args)
+            .unwrap_or_else(|e| cli_usage(command, &e));
+        pipestream_search::security::install_client_tls(local.client_tls);
+    }
     match command {
         "raft-status" => raft_status(args).await,
         "raft-add-learner" => raft_add_learner(args).await,

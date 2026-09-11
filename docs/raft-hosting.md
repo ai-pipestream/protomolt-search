@@ -484,8 +484,10 @@ error as the host maps it. The service does not retry, forward, or
 reword.
 
 The CLI (`src/main.rs`, next to `raft-prepare`) is a thin client of
-these RPCs over the member's listener with the process-wide client
-material: `raft-status --addr=<host:port>` prints the status as proto3
+these RPCs over the member's listener with the client material its
+`--tls-ca`, `--tls-client-cert`, `--tls-client-key` and `--tls-domain`
+flags name (installed process-wide before the dial, as a serving process
+installs its own): `raft-status --addr=<host:port>` prints the status as proto3
 JSON (the console's rendering, defaults included), `raft-add-learner
 --addr=<leader> --node-id=<n> --node-addr=<host:port>`,
 `raft-promote --addr=<leader> --node-id=<n>[,<n>...]`,
@@ -497,9 +499,10 @@ stderr.
 The member's numbers are on the `/metrics` page (`docs/metrics.md`,
 "Per-member gauges"), sampled live at scrape time, and in the metrics
 snapshot. A peer's rejection count rising writes one log line per peer
-per change of count (`raft member {id} : peer {peer} rejected {action}
-({code}): {message}`); a snapshot install rejected at the announce
-writes one line where it is recorded.
+per change of count, whatever the RPC and the code (`raft member {id} :
+peer {peer} rejected {action} #{count} ({code}): {message}`); the digest
+rejection's rebuild follows the same watch. A snapshot install rejected
+at the announce writes one line where it is recorded.
 
 Evidence (`tests/control_raft_operator.rs`, the `Voters` kit, the
 service on each member over mTLS): status on leader and follower, a

@@ -298,6 +298,11 @@ struct Listener {
     task: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
 }
 
+/// Every rise of a peer's rejection count writes one log line naming the
+/// peer, the RPC, the code, the count and the message: one line per peer
+/// per change of count, never per poll (docs/raft-hosting.md, "Operator
+/// surface").
+///
 /// A peer that rejects this node's image by digest names bytes that
 /// differ from what the meta announces. The image was served by length,
 /// so the difference is on this node's disk or on the way: this reads the
@@ -321,20 +326,18 @@ async fn rebuild_on_digest_rejection(
         let fresh: Vec<(NodeId, PeerRejection)> = rejections
             .borrow_and_update()
             .iter()
-            .filter(|(node, rejection)| {
-                rejection.action == "snapshot"
-                    && rejection.code == tonic::Code::DataLoss
-                    && seen.get(node).is_none_or(|count| rejection.count > *count)
-            })
+            .filter(|(node, rejection)| seen.get(node).is_none_or(|count| rejection.count > *count))
             .map(|(node, rejection)| (*node, rejection.clone()))
             .collect();
         for (node, rejection) in fresh {
             seen.insert(node, rejection.count);
-            // One line per peer per change of count, not per poll.
             super::rejection_log::record(format!(
-                "raft member {node_id} : peer {node} rejected {} ({:?}): {}",
-                rejection.action, rejection.code, rejection.message
+                "raft member {node_id} : peer {node} rejected {} #{} ({:?}): {}",
+                rejection.action, rejection.count, rejection.code, rejection.message
             ));
+            if rejection.action != "snapshot" || rejection.code != tonic::Code::DataLoss {
+                continue;
+            }
             let checked = {
                 let published = Arc::clone(&published);
                 tokio::task::spawn_blocking(move || published.verify()).await
