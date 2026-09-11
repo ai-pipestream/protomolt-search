@@ -12,7 +12,7 @@
 //! authority name actors by that same string, and the decision the source
 //! commit records carries it, so the two gates judge the same actor. This
 //! equivalence is a contract of the deployment: a principal name must mean
-//! the same actor in the Bearer [REDACTED] and in the authority policy.
+//! the same actor in the bearer principal table and in the authority policy.
 //!
 //! One `AcceptDocument` call, in order: transport gate, request size with
 //! pending and byte permits plus ingest admission on the principal,
