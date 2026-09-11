@@ -127,6 +127,26 @@ the UI thread.
 The source store adds no networking. The Rust `accepted_document` lookup is for
 the trusted local application. No network source-fetch service is exposed.
 
+## Hosted owner writes
+
+A Raft member serves the `DocumentWriteService` proto
+(`GetDocumentWriteTarget`, `AcceptDocument`) over its activated managed
+catalogs through `HostedDocumentWriteService`
+(`src/document_write_service/hosted.rs`), instead of the
+single-authority `DocumentWriteServiceImpl` over explicitly provisioned
+local catalogs. Clients do not change; a process serves one variant or
+the other, never both, and the two share the `Route` rows.
+
+Every admission on the hosted path comes from the member's Raft host:
+the transport gate (`Principals::authenticate` and
+`authorize(.., Ingest)`) stays first and the authority admission is
+authoritative, with the lease actor equal to the transport principal
+name. The grant runs on a blocking worker and the commit carries the
+admission's final check; no lease check follows the commit. The lease,
+recovery and failure mapping are in [hosted owner
+writes](raft-hosting.md#hosted-owner-writes) and the lease argument in
+[admission under Raft](raft-admission.md).
+
 ## Ordered source history
 
 `ReadAcceptedDocumentsRequest` and `ReadAcceptedDocumentsResponse` let a local

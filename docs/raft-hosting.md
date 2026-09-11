@@ -5,9 +5,10 @@ Status: implemented 2026-09-08 from the accepted
 cargo feature `raft` (`openraft = "=0.9.25"`, `storage-v2`), the tonic
 transport and membership operations behind `raft` + `tls`. Tests in
 `src/raft/tests.rs` (single node) and `src/raft/transport_tests.rs` (three
-voters over loopback mTLS). Distributed owner writes stay disabled until the
-relay and the owner-side callers are wired to `with_admission`; the
-multi-node evidence below is what they hold to.
+voters over loopback mTLS). Member processes serve distributed owner
+writes through the hosted write service below; the multi-node evidence
+it holds to is in that section and in
+[admission under Raft](raft-admission.md).
 
 ## Envelopes
 
@@ -286,8 +287,12 @@ command and every local `admission()`. `store()` hands out the current
 store for reads (maps, snapshots, decisions); `with_admission` grants the
 leased admission owner-side work needs, with the linearizable read bounded
 by the longest election so an isolated leader refuses instead of waiting
-([admission under Raft](raft-admission.md)). A proposal on a non-leader is
-`Unavailable` naming the leader.
+([admission under Raft](raft-admission.md)). `lease` performs the same
+anchor, barrier, vote-hold extension and grant gate and returns them as
+an owned `LeasedAdmission` for work that runs on a blocking worker; the
+grant on that thread measures the interval from the anchor.
+`with_admission` is that path with an immediate grant. A proposal on a
+non-leader is `Unavailable` naming the leader.
 
 ## Transport
 
@@ -405,6 +410,20 @@ Every member is listed, this node included; paths are relative to the file;
 a node listed twice or a certificate bound to two nodes refuses
 (`src/raft/operator.rs`).
 
+A member serves owner writes for `--raft-managed-catalog=<collection>=<path>`
+(repeatable; `PIPESTREAM_SEARCH_RAFT_MANAGED_CATALOG` comma-separated,
+`raft_managed_catalog` in the file): an access-controlled source catalog
+bound and activated for that collection of the member's authority.
+`--raft-managed-principal` names the actor holding the Admin that
+recovers the handles at start (`PIPESTREAM_SEARCH_RAFT_MANAGED_PRINCIPAL`,
+`raft_managed_principal`). Both need `--raft-dir`; a catalog without its
+actor is refused at parse. At start the binary recovers every catalog
+through `hosted::recover_catalogs` and registers the hosted service on
+the coordinator or relay listener; a node-only process naming catalogs
+is refused. The service runs under compiled limits (1 MiB per write,
+16 MiB admitted, 64 operations); the transport principals come from
+`--bearer-tokens` as on the other surfaces.
+
 Serving opens existing state only. `pipestream-search raft-prepare
 --raft-dir=... --raft-node-id=... --raft-group-id=... --raft-authority-incarnation=...
 --raft-listen=... --raft-peers=...` creates a member's durable state with a
@@ -431,6 +450,53 @@ as a named fault and the relay keeps routing on the last accepted map. A
 resource with no applied control state refuses at attach. The map source
 grants no admission and carries no lease; the relay routes on it and admits
 nothing by it.
+
+## Hosted owner writes
+
+`HostedDocumentWriteService` (`src/document_write_service/hosted.rs`,
+behind `raft`) serves the `DocumentWriteService` proto
+(`GetDocumentWriteTarget`, `AcceptDocument`) over activated managed
+catalogs, so clients do not change. A process serves the
+single-authority service or this one, never both; the two share the
+`Route` rows.
+
+One `AcceptDocument` call, in order: the transport gate
+(`Principals::authenticate` and `authorize(.., Ingest)`), the request
+size with pending and byte permits plus ingest admission on the
+principal (the shared `WriteBudget`), `host.lease` on the RPC future,
+then a blocking worker holding the lease, the permits and the request,
+where the grant runs and `ActiveManagedCatalog::accept` commits. The
+lease and the permits are pinned in the worker, never in the RPC
+future. `GetDocumentWriteTarget` follows the same shape with
+`catalog.write_target` under the grant.
+
+Two gates judge every write: the transport gate first, the authority
+admission second and authoritative. The lease actor is the transport
+principal's name, which the authority policy rows name by the same
+string; a deployment must keep that equivalence. Every error from
+`lease` passes through unchanged — `Unavailable` naming the leader
+off-leader, `Unavailable` when no quorum acknowledged the barrier, and
+`FailedPrecondition` when the interval elapsed before the grant — and
+the service never retries, never forwards, and never falls back to the
+local `admission()`. No lease check runs after the commit: a write
+past its final check is durable under its epoch fence, and the pause
+between the final check and durability is the residual named in
+[admission under Raft](raft-admission.md).
+
+Recovery at start (`hosted::recover_catalogs`, the function the binary
+calls and tests call the same way) opens each configured path, takes
+the file's binding bytes as they stand, and recovers the managed
+handle under a fresh leased admission. A catalog that is prepared
+rather than active, one with an authority identity that is not the
+member's, or one with an activation the store does not record stops
+the whole recovery by name; no partial service starts.
+
+The evidence is `tests/control_raft_hosted_writes.rs` (eight tests:
+admitted-and-durable on the leader, follower naming the leader, lease
+kept past the interval with no durable change, isolation inside the
+read bound with the healed leader refusing as a follower, restart
+serving again, and the three start rejections) with the single-node
+lease evidence in `src/raft/tests.rs`.
 
 ## Evidence
 
@@ -511,9 +577,7 @@ mTLS with the fixtures under `tests/certs/raft`, regenerated by
 
 ## Not yet
 
-- Wiring the relay and the owner-side callers to `with_admission` and the
-  map feed of a learner's applied state; distributed owner writes stay
-  disabled until then.
+- The map feed of a learner's applied state.
 - An operator surface for authoring the first member's policy and limits
   (`bootstrap_cluster`), and for `add_learner`, `promote` and
   `remove_member` from the command line.

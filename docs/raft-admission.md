@@ -1,12 +1,14 @@
 # Admission under Raft: leases, isolation and revocation
 
 Status: contract, 2026-09-08, revised the same day after Astra's review of
-240be9f (A1, A2). The mechanism is implemented
-(`RaftHost::with_admission`, `AdmissionLease`, `LeaseHold`,
-`HostConfig::validate`, the timing agreement on every transport RPC, the
-pre-commit fence in `DocumentCatalog::accept_as`) with three-voter evidence
-over the tonic transport. Distributed owner writes stay disabled until the
-relay and the owner-side callers obtain their admission through the host.
+240be9f (A1, A2); the hosted write path landed 2026-09-11. The mechanism is
+implemented (`RaftHost::with_admission`, `RaftHost::lease`,
+`LeasedAdmission`, `AdmissionLease`, `LeaseHold`, `HostConfig::validate`,
+the timing agreement on every transport RPC, the pre-commit fence in
+`DocumentCatalog::accept_as`) with three-voter evidence over the tonic
+transport. Member processes serve owner writes through the hosted write
+service, whose every admission comes from the host's lease
+([hosted owner writes](raft-hosting.md#hosted-owner-writes)).
 
 It answers one question before any owner write is admitted through a
 replicated authority: what makes an admission authoritative when the node
@@ -70,6 +72,15 @@ and only the host grants it:
    `anchor + ttl` has already passed: a continuation paused after the
    barrier, delayed acknowledgements, a slow catch-up to the read index or
    any scheduling delay consume the interval; none of them extends it.
+   `RaftHost::lease` performs the same anchor, barrier, vote-hold
+   extension and grant gate and returns them as an owned
+   `LeasedAdmission` for work that runs on a blocking worker; the grant
+   on another thread (`LeasedAdmission::admission`) measures the interval
+   from the anchor, which is exactly the paused case above — the move
+   between threads consumes the interval and never extends it.
+   `with_admission` is that path with an immediate grant. The owned value
+   itself takes no shared guard; only the granted `SourceAdmission`
+   holds control commands off the store, from the grant to its drop.
 3. Every admission method (`authorize`, `prepared_owner`,
    `activated_owner`, `admit_write`, `check_fresh`) checks the interval
    first; past it the admission admits nothing, by name.
@@ -125,7 +136,7 @@ for another:
 
 | Read | Guarantee |
 |---|---|
-| Admission (`with_admission`) | linearizable, leased from an anchor taken before the barrier, refuses off-leader and refuses when the interval elapsed before the grant |
+| Admission (`with_admission`, or `lease` with the grant on a worker) | linearizable, leased from an anchor taken before the barrier, refuses off-leader and refuses when the interval elapsed before the grant |
 | Owner, policy and decision reads on `host.store()` | the applied view of this replica, which a snapshot install moves forward under the same handle; correct for audit and retry lookup, never for admitting a write |
 | Map distribution (`published_map`, `subscribe_applied`) | revisioned and monotonic per consumer; may lag; a consumer refuses same-revision/different-content and generation conflicts |
 
@@ -151,6 +162,14 @@ commit (`DocumentCatalog::accept_as`, the `fence` argument;
   check and durability is not bounded by anything in this process; a write
   that passed its final check may therefore become durable after the lease
   has lapsed. That is the residual, and it is named rather than hidden.
+  The network path runs no lease check after the commit for the same
+  reason: a write past its final check is durable under its epoch fence,
+  and hiding its receipt would not make it less durable.
+- The network path's entry check is `ActiveManagedCatalog::accept`'s
+  `admit_write` under the worker's grant, after the transport gate
+  (`Principals::authenticate` and `authorize(.., Ingest)`) and the
+  request admission. The transport gate stays first; the authority
+  admission is authoritative.
 
 Contract for in-flight work, brought here for review: **an operation that
 passed its final check may finish**; revocation takes effect for every
@@ -217,9 +236,24 @@ admitted at entry and paused inside its transaction past the lease is
 refused at the final check, nothing is durable, no retry record exists, and
 a pause that ends within the lease commits.
 
-Remaining: the relay and owner-side callers must obtain their admission
-through `with_admission`; the residual between the final check and
-durability stays open until a storage-side fencing token exists; Kimi's
-harness adds deterministic scheduling around the pause hooks
-(`RaftHost::arm_grant_gate`, `ActiveManagedCatalog::arm_precommit_pause`,
-both on `fault-injection`) with crash and recovery variants.
+Hosted evidence (`src/raft/tests.rs`, `tests/control_raft_hosted_writes.rs`):
+a lease taken on one thread grants on a blocking worker inside its
+interval and admits an owner-side call; a lease kept past its interval
+is refused at the grant with the interval elapsed before it and the
+applied position unchanged. Over three voters through the hosted
+service: a leader-served write commits with a receipt and its exact
+retry replays; a follower names the leader in its refusal; a write
+kept past its lease is denied at the grant and its retry commits as
+new work, with no row and no retry record from the refused grant; an
+isolated leader refuses inside the read bound and, healed, refuses as
+a follower naming the successor. A restarted group recovers its
+managed catalogs through the binary's recovery function and serves a
+write on the leader; recovery names a prepared source, a foreign
+authority and an unrecorded activation.
+
+Remaining: the residual between the final check and durability stays
+open until a storage-side fencing token exists; Kimi's harness adds
+deterministic scheduling around the pause hooks
+(`RaftHost::arm_grant_gate`, `HostedDocumentWriteService::arm_grant_delay`,
+`ActiveManagedCatalog::arm_precommit_pause`, all on `fault-injection`)
+with crash and recovery variants.

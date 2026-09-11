@@ -1237,6 +1237,18 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **2026-09-11 — Hosted owner writes through the leased admission.** Member
+  processes serve the `DocumentWriteService` proto over activated managed
+  catalogs, with every admission drawn from the host's owned lease
+  (`RaftHost::lease`, `LeasedAdmission`) and the grant running on a
+  blocking worker. Operator options `--raft-managed-catalog` (repeatable)
+  and `--raft-managed-principal` recover the handles at start; a restarted
+  group serves writes again. Eight three-voter tests plus two single-node
+  lease tests pin the path, including the named rejections. The final-check
+  to durability residual stays open pending a storage-side fencing token.
+  See [hosted owner writes](docs/raft-hosting.md#hosted-owner-writes) and
+  [admission under Raft](docs/raft-admission.md).
+
 - **Foundation branch: bounded dense-proof reconciliation.** The embedded row
   reader uses TurboVec s21 without materializing mapped images; the product and
   gRPC facade pin the same engine source. Proofs compare actual encoded rows and
