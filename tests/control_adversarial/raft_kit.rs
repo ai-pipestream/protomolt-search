@@ -751,6 +751,9 @@ pub struct Voters {
     hosts: BTreeMap<u64, RaftHost>,
     /// The control revision the next command must expect.
     pub revision: u64,
+    /// The timing every member of this group runs under; a member started
+    /// again on its directory takes the same one.
+    pub config: HostConfig,
 }
 
 impl Voters {
@@ -863,7 +866,7 @@ impl Voters {
             dir.path(),
             &self.group,
             node,
-            &host_config(),
+            &self.config,
             transport(node, &self.directory, ephemeral()),
         )
         .await
@@ -888,8 +891,17 @@ impl Voters {
 }
 
 /// Bootstrap node 1 with a throwaway prepared owner, seed 2 and 3 from its
-/// snapshot and promote them: a group of three voters on `policy`.
+/// snapshot and promote them: a group of three voters on `policy` under
+/// the kit's fast timing.
 pub async fn three_voters(name: &str, policy: &AccessPolicy) -> Voters {
+    three_voters_with(name, policy, &host_config()).await
+}
+
+/// `three_voters` under an explicit timing, for scenarios that park a
+/// write inside its transaction for longer than the kit's 100 ms lease
+/// allows (the lease plus the skew must stay under the election floor,
+/// `HostConfig::validate`).
+pub async fn three_voters_with(name: &str, policy: &AccessPolicy, config: &HostConfig) -> Voters {
     let group = identity(SEED);
     let directory = directory(&group);
     let dir = TestDir::new(&format!("{name}-1"));
@@ -899,7 +911,7 @@ pub async fn three_voters(name: &str, policy: &AccessPolicy) -> Voters {
         NODE_ID,
         policy,
         &limits(),
-        &host_config(),
+        config,
         transport(NODE_ID, &directory, ephemeral()),
     )
     .await
@@ -910,6 +922,7 @@ pub async fn three_voters(name: &str, policy: &AccessPolicy) -> Voters {
         dirs: BTreeMap::from([(1, dir)]),
         hosts: BTreeMap::from([(1, leader)]),
         revision: 1,
+        config: config.clone(),
     };
     let target = pipestream_search::pb::storage::SourceStorageTarget {
         node_id: "server-a".into(),

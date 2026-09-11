@@ -18,9 +18,14 @@
 //! pending and byte permits plus ingest admission on the principal,
 //! `host.lease` on the RPC future, then a blocking worker holding the
 //! lease, the permits and the request, where the grant runs and the
-//! catalog commits. The lease and the permits are pinned in the worker,
-//! never in the RPC future, so dropping that future cannot release either
-//! before the commit. `GetDocumentWriteTarget` follows the same shape.
+//! catalog commits. A client that drops its call before the worker exists
+//! drops the lease ungranted and the permits unused, and no row is
+//! written. Once the worker exists it finishes on its own terms: the
+//! library does not cancel a blocking task when its handle is dropped, the
+//! permits are released only when the worker returns, and the grant and
+//! the commit run there whether or not a client is still listening
+//! (`a_client_that_drops_its_call_leaves_the_worker_to_finish_under_its_permits`).
+//! `GetDocumentWriteTarget` follows the same shape.
 //!
 //! Every error from `lease` passes through unchanged: `Unavailable`
 //! naming the leader off-leader, `Unavailable` when no quorum
@@ -67,26 +72,24 @@ struct WorkPermit {
     _budget: BudgetPermit,
 }
 
-/// The operator limits the hosted service serves under. No operator option
-/// sets them in this step; a later step can add one. One megabyte bounds a
-/// single write, sixteen bound admitted work, sixty-four bound operations.
-pub fn default_limits() -> DocumentWriteServiceLimits {
-    DocumentWriteServiceLimits {
-        max_request_bytes: 1024 * 1024,
-        max_pending_bytes: 16 * 1024 * 1024,
-        max_in_flight: 64,
-    }
-}
-
 /// Recover every managed catalog the operator configured, for the serving
 /// binary and for tests alike: open each path, recover the managed handle
-/// under a fresh leased admission, and reject by name a catalog that is
+/// under the store's applied view, and reject by name a catalog that is
 /// prepared rather than active, one with an authority identity that is not
 /// the member's, or one with an activation the store does not record. The
 /// binding comes from the catalog file's own header, presented byte-exact
-/// to the committed fence; nothing is reconstructed. A rejection stops the
-/// whole recovery with its cause: no partial service starts on the rest.
-pub async fn recover_catalogs(
+/// to the committed owner row; nothing is reconstructed, and the row is
+/// what admits the handle. A rejection stops the whole recovery with its
+/// cause: no partial service starts on the rest.
+///
+/// Recovery takes no lease. A lease needs a leader, and a member restarts
+/// before any leader exists and serves as a follower most of its life; a
+/// recovery admission (`SourceAuthorityStore::recovery_admission`) opens
+/// the handle on what this replica has applied and admits no write. Every
+/// write on the handle takes its own lease, so a handle opened on a view
+/// the quorum has since moved past is rejected at its first write, by
+/// name, and nothing this function admits reaches a source transaction.
+pub fn recover_catalogs(
     host: &RaftHost,
     principal: &str,
     entries: &[crate::config::RaftManagedCatalog],
@@ -129,8 +132,7 @@ pub async fn recover_catalogs(
                 entry.collection
             )));
         }
-        let leased = host.lease(principal).await.map_err(context)?;
-        let admission = leased.admission().map_err(context)?;
+        let admission = store.recovery_admission(principal).map_err(context)?;
         let catalog = ActiveManagedCatalog::recover(&entry.path, &store, &admission, &binding)
             .map_err(context)?;
         catalogs.push(Arc::new(catalog));
@@ -238,9 +240,10 @@ impl HostedDocumentWriteService {
         ))
     }
 
-    /// The lease handoff: the grant runs on the blocking worker, never on
-    /// the RPC future, so a dropped future cannot age or release the lease
-    /// before the worker takes the grant.
+    /// The window between the lease and the worker, on the RPC future. A
+    /// client that drops its call here drops the lease ungranted; the
+    /// fault-injection delay ages a lease on purpose so a test can see the
+    /// worker reject the grant by name.
     async fn handoff(&self) -> Result<(), Status> {
         #[cfg(any(test, feature = "fault-injection"))]
         let delay = self.inner.grant_delay.lock().unwrap().take();
@@ -261,8 +264,8 @@ impl HostedDocumentWriteService {
         self.handoff().await?;
         let result = tokio::task::spawn_blocking(move || {
             // Pin the lease and the permits in the receiving worker, not
-            // in the RPC future. Dropping that future cannot release
-            // permission, capacity or the lease before the grant runs.
+            // in the RPC future: from here a dropped future releases
+            // nothing until the worker returns.
             let _permit = permit;
             let admission = lease.admission()?;
             catalog.write_target(&admission)
@@ -294,8 +297,9 @@ impl HostedDocumentWriteService {
         self.handoff().await?;
         let result = tokio::task::spawn_blocking(move || {
             // Pin the lease and the permits in the receiving worker, not
-            // in the RPC future. Dropping that future cannot release
-            // permission, capacity or the lease before the commit.
+            // in the RPC future: from here a dropped future releases
+            // nothing until the worker returns, and the commit happens
+            // whether or not a client is still listening.
             let _permit = permit;
             let admission = lease.admission()?;
             catalog.accept(&admission, &document)

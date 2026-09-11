@@ -245,6 +245,9 @@ mod tests {
             map: None,
             managed_catalogs: Vec::new(),
             managed_principal: None,
+            managed_max_request_bytes: 1024 * 1024,
+            managed_max_pending_bytes: 16 * 1024 * 1024,
+            managed_max_in_flight: 64,
         };
         let server = ServerTls {
             cert_pem: pem("node-1.pem"),

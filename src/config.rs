@@ -270,6 +270,13 @@ pub struct RaftMemberConfig {
     /// (`--raft-managed-principal`).
     pub managed_catalogs: Vec<RaftManagedCatalog>,
     pub managed_principal: Option<String>,
+    /// The hosted write service's limits (`--raft-managed-max-request-bytes`,
+    /// `--raft-managed-max-pending-bytes`, `--raft-managed-max-in-flight`):
+    /// one write's bound, the admitted bytes in flight, the operations in
+    /// flight. Validated where the service is built, by name.
+    pub managed_max_request_bytes: u64,
+    pub managed_max_pending_bytes: u64,
+    pub managed_max_in_flight: u64,
 }
 
 /// Full process configuration.
@@ -624,6 +631,9 @@ struct FileConfig {
     raft_map_collection: Option<String>,
     raft_managed_catalog: Option<Vec<String>>,
     raft_managed_principal: Option<String>,
+    raft_managed_max_request_bytes: Option<u64>,
+    raft_managed_max_pending_bytes: Option<u64>,
+    raft_managed_max_in_flight: Option<u64>,
     tls_client_cert: Option<String>,
     tls_client_key: Option<String>,
     tls_domain: Option<String>,
@@ -2819,6 +2829,36 @@ mod tests {
         );
         assert_eq!(raft.managed_catalogs[1].collection, "papers");
         assert_eq!(raft.managed_principal.as_deref(), Some("alice"));
+        // The service limits default to one MiB per write, sixteen MiB
+        // admitted and sixty-four operations; each is an option.
+        assert_eq!(
+            (
+                raft.managed_max_request_bytes,
+                raft.managed_max_pending_bytes,
+                raft.managed_max_in_flight
+            ),
+            (1024 * 1024, 16 * 1024 * 1024, 64)
+        );
+        let cfg = member(&[
+            "--raft-managed-catalog=books=/tmp/books.redb",
+            "--raft-managed-principal=alice",
+            "--raft-managed-max-request-bytes=4096",
+            "--raft-managed-max-pending-bytes=65536",
+            "--raft-managed-max-in-flight=1",
+        ])
+        .unwrap()
+        .raft
+        .unwrap();
+        assert_eq!(
+            (
+                cfg.managed_max_request_bytes,
+                cfg.managed_max_pending_bytes,
+                cfg.managed_max_in_flight
+            ),
+            (4096, 65536, 1)
+        );
+        let error = member(&["--raft-managed-max-in-flight=many"]).unwrap_err();
+        assert!(error.contains("--raft-managed-max-in-flight"), "{error}");
         // A catalog without its recovery actor refuses.
         let error = member(&["--raft-managed-catalog=books=/tmp/books.redb"]).unwrap_err();
         assert!(error.contains("--raft-managed-principal"), "{error}");
@@ -3780,6 +3820,24 @@ fn parse_raft(
     if !managed_catalogs.is_empty() && managed_principal.is_none() {
         return Err("--raft-managed-catalog needs --raft-managed-principal, the actor holding the Admin that recovers the catalogs at start".to_string());
     }
+    let managed_max_request_bytes = number(
+        "raft-managed-max-request-bytes",
+        "RAFT_MANAGED_MAX_REQUEST_BYTES",
+        file.raft_managed_max_request_bytes,
+        1024 * 1024,
+    )?;
+    let managed_max_pending_bytes = number(
+        "raft-managed-max-pending-bytes",
+        "RAFT_MANAGED_MAX_PENDING_BYTES",
+        file.raft_managed_max_pending_bytes,
+        16 * 1024 * 1024,
+    )?;
+    let managed_max_in_flight = number(
+        "raft-managed-max-in-flight",
+        "RAFT_MANAGED_MAX_IN_FLIGHT",
+        file.raft_managed_max_in_flight,
+        64,
+    )?;
     #[cfg(not(all(feature = "raft", feature = "tls")))]
     if !managed_catalogs.is_empty() || managed_principal.is_some() {
         return Err(
@@ -3803,5 +3861,8 @@ fn parse_raft(
         map,
         managed_catalogs,
         managed_principal,
+        managed_max_request_bytes,
+        managed_max_pending_bytes,
+        managed_max_in_flight,
     }))
 }

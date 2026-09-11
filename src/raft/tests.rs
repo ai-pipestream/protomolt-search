@@ -1447,3 +1447,62 @@ async fn a_lease_kept_past_its_interval_is_rejected_at_the_grant() {
     assert_eq!(host.applied_position().unwrap().map(|id| id.index), applied);
     host.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recovery_admission_opens_a_handle_and_admits_no_write() {
+    let dir = Directory::new("recovery-admission");
+    let group = identity(7);
+    let host = RaftHost::bootstrap_single(
+        &dir.0,
+        &group,
+        1,
+        "https://node-1:19291",
+        &policy(),
+        &limits(),
+        &config(),
+    )
+    .await
+    .unwrap();
+    let store = host.store().unwrap();
+    // The applied view opens a handle: the actor and identity resolve, and
+    // the guard is taken, without a leader or a lease.
+    let admission = store.recovery_admission("alice").unwrap();
+    assert_eq!(admission.principal(), "alice");
+    assert_eq!(admission.identity(), &group);
+    assert!(admission.lease().is_none());
+    // Every write-side check on it is rejected by name.
+    for (what, result) in [
+        ("check_fresh", admission.check_fresh()),
+        (
+            "authorize",
+            admission
+                .authorize("books", AccessAction::Ingest)
+                .map(|_| ()),
+        ),
+        (
+            "admit_write",
+            admission
+                .admit_write(
+                    &crate::pb::storage::LogicalSourceOwner {
+                        workspace: "workspace-a".into(),
+                        collection: "books".into(),
+                        owner_id: vec![1; 16],
+                    },
+                    1,
+                    AccessAction::Ingest,
+                )
+                .map(|_| ()),
+        ),
+    ] {
+        let error = result.err().unwrap_or_else(|| panic!("{what} admitted"));
+        assert_eq!(error.code(), Code::FailedPrecondition, "{what}: {error}");
+        assert!(
+            error
+                .message()
+                .contains("a recovery admission opens a managed handle and admits no write"),
+            "{what}: {error}"
+        );
+    }
+    drop(admission);
+    host.shutdown().await.unwrap();
+}

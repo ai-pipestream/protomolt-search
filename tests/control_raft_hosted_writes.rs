@@ -61,8 +61,14 @@ fn hosted_policy() -> AccessPolicy {
 }
 
 fn principals() -> pipestream_search::security::Principals {
+    principals_with(Arc::new(PolicyAuthority::new(hosted_policy()).unwrap()))
+}
+
+/// Transport principals over an authority the test keeps a handle on, so
+/// it can replace the policy under a call.
+fn principals_with(authority: Arc<PolicyAuthority>) -> pipestream_search::security::Principals {
     use pipestream_search::security::{PrincipalConfig, Principals};
-    let authority: Arc<dyn Authorizer> = Arc::new(PolicyAuthority::new(hosted_policy()).unwrap());
+    let authority: Arc<dyn Authorizer> = authority;
     Principals::from_configs(&["alice", "bob"].map(|name| PrincipalConfig {
         name: name.into(),
         token: format!("{name}-token-0123456789"),
@@ -329,11 +335,12 @@ async fn a_write_through_the_hosted_service_is_admitted_by_the_leader_and_durabl
     let dir = kit::TestDir::new("hosted-write-catalog");
     let active = bridge_active(&mut cluster, leader, &dir, "hosted-prepare").await;
 
+    let catalog = Arc::new(active);
     let host = take_host(&mut cluster, leader);
     let service = HostedDocumentWriteService::new(
         principals(),
         Arc::clone(&host),
-        vec![Arc::new(active)],
+        vec![Arc::clone(&catalog)],
         limits(),
     )
     .unwrap();
@@ -366,8 +373,7 @@ async fn a_write_through_the_hosted_service_is_admitted_by_the_leader_and_durabl
     assert_eq!(first.version, 1);
     assert!(!first.replayed);
 
-    // The exact retry answers from the stored decision: the row is
-    // readable in the catalog after the network write.
+    // The exact retry answers from the stored decision.
     let replay = client
         .accept_document(auth(request, "alice"))
         .await
@@ -377,6 +383,21 @@ async fn a_write_through_the_hosted_service_is_admitted_by_the_leader_and_durabl
     assert_eq!(
         (replay.version, replay.accepted_sequence),
         (first.version, first.accepted_sequence)
+    );
+
+    // The row is in the catalog itself: the fixture's write was the first
+    // accepted row, the network write is the second.
+    let inspected = host
+        .with_admission("alice", |admission| catalog.inspect(admission, 1 << 20))
+        .await
+        .unwrap();
+    assert_eq!(
+        inspected
+            .header
+            .as_ref()
+            .map(|header| header.accepted_sequence),
+        Some(2),
+        "the network write must be the catalog's second accepted row"
     );
 
     drop(client);
@@ -442,7 +463,9 @@ async fn a_write_through_a_follower_is_rejected_naming_the_leader() {
         .unwrap_err();
     assert_eq!(error.code(), Code::Unavailable, "{error}");
     assert!(
-        error.message().contains(&leader.to_string()),
+        error
+            .message()
+            .contains(&format!("not the leader; leader is Some({leader})")),
         "the follower must name the leader it refuses for: {error}"
     );
 
@@ -645,7 +668,9 @@ async fn an_isolated_leader_rejects_hosted_writes_within_election_timeout_max() 
         .unwrap_err();
     assert_eq!(error.code(), Code::Unavailable, "{error}");
     assert!(
-        error.message().contains(&successor.to_string()),
+        error
+            .message()
+            .contains(&format!("not the leader; leader is Some({successor})")),
         "the healed old leader must refuse as a follower naming the successor: {error}"
     );
 
@@ -690,13 +715,16 @@ async fn a_member_restarted_with_its_managed_catalogs_serves_writes_again() {
         host.shutdown().await.unwrap();
     }
 
-    // Start every member again on its own directory and address.
+    // Start every member again on its own directory and address. The first
+    // one up recovers the catalogs at once: one member of three is running,
+    // so no leader can exist, and recovery reads the applied view.
+    let mut recovered_without_a_leader = None;
     for (node, dir, addr) in &states {
         let host = RaftHost::start_member(
             dir,
             &cluster.group,
             *node,
-            &raft_kit::host_config(),
+            &cluster.config,
             raft_kit::transport(*node, &cluster.directory, *addr),
         )
         .await
@@ -705,14 +733,25 @@ async fn a_member_restarted_with_its_managed_catalogs_serves_writes_again() {
             !host.awaiting_snapshot().unwrap(),
             "a restarted member must hold its seeded state"
         );
+        if recovered_without_a_leader.is_none() {
+            // One member of three: the library may resume the old leader's
+            // role from its committed vote, but no quorum is in reach, so
+            // no lease can be granted here and a leased recovery could not
+            // have run.
+            let no_lease = host.lease("alice").await.err().expect("no quorum");
+            assert_eq!(no_lease.code(), Code::Unavailable, "{no_lease}");
+            let recovered = recover_catalogs(&host, "alice", &[entry.clone()]).unwrap();
+            recovered_without_a_leader = Some(recovered.len());
+        }
         cluster.insert(*node, host);
     }
+    assert_eq!(recovered_without_a_leader, Some(1));
     let leader = cluster.leader().await;
 
     // Recover through the same function the binary calls at start, then
     // serve one write on the leader.
     let host = take_host(&mut cluster, leader);
-    let recovered = recover_catalogs(&host, "alice", &[entry]).await.unwrap();
+    let recovered = recover_catalogs(&host, "alice", &[entry]).unwrap();
     assert_eq!(recovered.len(), 1);
     let service =
         HostedDocumentWriteService::new(principals(), Arc::clone(&host), recovered, limits())
@@ -784,7 +823,6 @@ async fn a_restart_with_a_prepared_but_inactive_catalog_is_rejected_by_name() {
 
     let host = take_host(&mut cluster, leader);
     let error = recover_catalogs(&host, "alice", &[managed_entry(kit::COLLECTION, &dir)])
-        .await
         .err()
         .expect("a prepared catalog must not recover");
     assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
@@ -823,7 +861,6 @@ async fn a_restart_with_a_foreign_authority_catalog_is_rejected_by_name() {
     .await
     .unwrap();
     let error = recover_catalogs(&foreign, "alice", &[managed_entry(kit::COLLECTION, &dir)])
-        .await
         .err()
         .expect("a foreign catalog must not recover");
     assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
@@ -853,7 +890,6 @@ async fn a_restart_with_an_unrecorded_activation_is_rejected_by_name() {
     let fresh_dir = kit::TestDir::new("hosted-unrecorded-member");
     let fresh = raft_kit::bootstrap_host_with(&fresh_dir, &hosted_policy()).await;
     let error = recover_catalogs(&fresh, "alice", &[managed_entry(kit::COLLECTION, &dir)])
-        .await
         .err()
         .expect("an unrecorded activation must not recover");
     assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
@@ -863,5 +899,366 @@ async fn a_restart_with_an_unrecorded_activation_is_rejected_by_name() {
     );
     fresh.shutdown().await.unwrap();
 
+    cluster.shutdown().await;
+}
+
+/// Timing under which a write can be parked inside its transaction for a
+/// few hundred milliseconds without the lease lapsing: the default
+/// production values on the kit's snapshot and chunk settings.
+fn slow_lease_config() -> pipestream_search::raft::HostConfig {
+    pipestream_search::raft::HostConfig {
+        heartbeat_interval_ms: 250,
+        election_timeout_min_ms: 1_000,
+        election_timeout_max_ms: 2_000,
+        admission_lease_ms: 500,
+        clock_skew_ms: 250,
+        ..raft_kit::host_config()
+    }
+}
+
+fn one_in_flight() -> DocumentWriteServiceLimits {
+    DocumentWriteServiceLimits {
+        max_request_bytes: 64 * 1024,
+        max_pending_bytes: 256 * 1024,
+        max_in_flight: 1,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// One member restarted while the other two keep running: it recovers its
+// catalogs at start, before it has any leader, and serves writes again
+// once it leads.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_single_member_restarted_recovers_at_start_and_serves_once_it_leads() {
+    let _serial = serial();
+    let mut cluster = raft_kit::three_voters("hosted-single-restart", &hosted_policy()).await;
+    let leader = cluster.leader().await;
+    let others: Vec<u64> = cluster
+        .nodes()
+        .into_iter()
+        .filter(|n| *n != leader)
+        .collect();
+    let dir = kit::TestDir::new("hosted-single-restart-catalog");
+    let active = bridge_active(&mut cluster, leader, &dir, "hosted-prepare").await;
+    drop(active);
+    let entry = managed_entry(kit::COLLECTION, &dir);
+    let addr = cluster.host(leader).listen_addr().expect("listening");
+    let member_dir = cluster.member_dir(leader);
+
+    // Cut every link, then leave one entry in the leader's log that no peer
+    // holds: a command the state machine refuses (a stale expected
+    // revision), appended locally while its commit waits for a quorum that
+    // cannot answer. With the longer log, the restarted member is the only
+    // one its peers can elect, whichever of them asks first.
+    cluster.host(leader).isolate(others.iter().copied());
+    for other in &others {
+        let rest: Vec<u64> = cluster.nodes().into_iter().filter(|n| n != other).collect();
+        cluster.host(*other).isolate(rest);
+    }
+    let before = cluster.host(leader).log_entries().unwrap().len();
+    let host = Arc::new(cluster.take(leader));
+    let pending = {
+        let host = Arc::clone(&host);
+        let stale = kit::source_command(
+            &cluster.group,
+            &kit::owner_key(),
+            "stale-revision",
+            1,
+            1,
+            0,
+            kit::prepare_action_history(WORKFLOW, vec![7; 16]),
+        );
+        tokio::spawn(async move { host.propose_command("alice", &stale).await })
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while host.log_entries().unwrap().len() == before {
+        assert!(
+            Instant::now() < deadline,
+            "the entry never reached the leader's log"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    pending.abort();
+    let _ = pending.await;
+    let host = Arc::try_unwrap(host)
+        .ok()
+        .expect("the proposal task released the host");
+    host.shutdown().await.unwrap();
+
+    // Start the member again on its directory. It has no leader, and the
+    // catalogs recover all the same, through the function the binary calls.
+    let host = RaftHost::start_member(
+        &member_dir,
+        &cluster.group,
+        leader,
+        &cluster.config,
+        raft_kit::transport(leader, &cluster.directory, addr),
+    )
+    .await
+    .unwrap();
+    // The library may resume the old leader's role from the committed
+    // vote, but both peers still cut this member off: no quorum is in
+    // reach, no lease can be granted, and recovery runs all the same.
+    let no_lease = host.lease("alice").await.err().expect("no quorum");
+    assert_eq!(no_lease.code(), Code::Unavailable, "{no_lease}");
+    let recovered = recover_catalogs(&host, "alice", &[entry]).unwrap();
+    assert_eq!(recovered.len(), 1);
+
+    // Open the peers to the restarted member while they stay cut from each
+    // other, and serve on it.
+    for other in &others {
+        cluster.host(*other).heal();
+        let rest: Vec<u64> = others.iter().copied().filter(|n| n != other).collect();
+        cluster.host(*other).isolate(rest);
+    }
+    let host = Arc::new(host);
+    let service =
+        HostedDocumentWriteService::new(principals(), Arc::clone(&host), recovered, limits())
+            .unwrap();
+    let (mut client, server) = serve(service).await;
+
+    // Until it leads the barrier finds no quorum for it and the service
+    // rejects; the library elects it once a peer grants the vote.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while host.metrics().borrow().state != openraft::ServerState::Leader {
+        assert!(
+            Instant::now() < deadline,
+            "the restarted member never led with the longest log"
+        );
+        host.trigger_election().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    for other in &others {
+        cluster.host(*other).heal();
+    }
+
+    let target = client
+        .get_write_target(auth(
+            GetDocumentWriteTargetRequest {
+                collection: kit::COLLECTION.into(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let receipt = client
+        .accept_document(auth(
+            network_write(
+                target.history_id,
+                b"hosted-after-single-restart",
+                b"single-restart-op",
+                0,
+            ),
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(receipt.accepted && receipt.durable && !receipt.replayed);
+    assert_eq!(receipt.version, 1);
+
+    drop(client);
+    server.shutdown().await;
+    return_host(&mut cluster, leader, host);
+    cluster.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// A client that drops its call: the worker finishes on its own terms, the
+// permits are released only when it returns, and the write is durable.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_that_drops_its_call_leaves_the_worker_to_finish_under_its_permits() {
+    let _serial = serial();
+    let mut cluster = raft_kit::three_voters_with(
+        "hosted-dropped-call",
+        &hosted_policy(),
+        &slow_lease_config(),
+    )
+    .await;
+    let leader = cluster.leader().await;
+    let dir = kit::TestDir::new("hosted-dropped-call-catalog");
+    let catalog = Arc::new(bridge_active(&mut cluster, leader, &dir, "hosted-prepare").await);
+    let host = take_host(&mut cluster, leader);
+    let service = HostedDocumentWriteService::new(
+        principals(),
+        Arc::clone(&host),
+        vec![Arc::clone(&catalog)],
+        one_in_flight(),
+    )
+    .unwrap();
+    let (mut client, server) = serve(service).await;
+    let target = client
+        .get_write_target(auth(
+            GetDocumentWriteTargetRequest {
+                collection: kit::COLLECTION.into(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    // Park the next write inside its transaction, after the staging and
+    // before the final check, for less than the lease; drop the call while
+    // it is parked.
+    let pause = Duration::from_millis(300);
+    catalog.arm_precommit_pause(pause);
+    let request = network_write(
+        target.history_id.clone(),
+        b"hosted-dropped",
+        b"dropped-op",
+        0,
+    );
+    let started = Instant::now();
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(60),
+        client.accept_document(auth(request.clone(), "alice")),
+    )
+    .await;
+    assert!(
+        dropped.is_err(),
+        "the call must still be parked when the client drops it"
+    );
+
+    // The worker holds the only in-flight permit until it returns.
+    let refused = client
+        .accept_document(auth(
+            network_write(target.history_id.clone(), b"hosted-second", b"second-op", 0),
+            "alice",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::ResourceExhausted, "{refused}");
+    assert!(
+        refused
+            .message()
+            .contains("source execution capacity is full"),
+        "{refused}"
+    );
+    assert!(
+        started.elapsed() < pause,
+        "the second call must arrive while the first is parked"
+    );
+
+    // The worker commits with no client listening: once its permit is
+    // free, the exact retry replays the durable row.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let replay = loop {
+        match client.accept_document(auth(request.clone(), "alice")).await {
+            Ok(receipt) => break receipt.into_inner(),
+            Err(status) if status.code() == Code::ResourceExhausted => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the permit was never released: {status}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(status) => panic!("the retry failed for another reason: {status}"),
+        }
+    };
+    assert!(
+        replay.replayed && replay.durable,
+        "the dropped call's write must be durable and replay"
+    );
+    assert_eq!(replay.version, 1);
+    assert!(
+        started.elapsed() >= pause,
+        "the retry can only answer after the worker's pause"
+    );
+
+    drop(client);
+    server.shutdown().await;
+    return_host(&mut cluster, leader, host);
+    cluster.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// The transport policy changes under a committed write: the row is durable
+// and the receipt is withheld by the transport gate, by name.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_receipt_is_withheld_when_transport_access_changes_under_a_committed_write() {
+    let _serial = serial();
+    let mut cluster = raft_kit::three_voters_with(
+        "hosted-receipt-race",
+        &hosted_policy(),
+        &slow_lease_config(),
+    )
+    .await;
+    let leader = cluster.leader().await;
+    let dir = kit::TestDir::new("hosted-receipt-race-catalog");
+    let catalog = Arc::new(bridge_active(&mut cluster, leader, &dir, "hosted-prepare").await);
+    let host = take_host(&mut cluster, leader);
+    let transport_policy = Arc::new(PolicyAuthority::new(hosted_policy()).unwrap());
+    let service = HostedDocumentWriteService::new(
+        principals_with(Arc::clone(&transport_policy)),
+        Arc::clone(&host),
+        vec![Arc::clone(&catalog)],
+        limits(),
+    )
+    .unwrap();
+    let (mut client, server) = serve(service).await;
+    let target = client
+        .get_write_target(auth(
+            GetDocumentWriteTargetRequest {
+                collection: kit::COLLECTION.into(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    // Park the write inside its transaction and replace the transport
+    // policy without alice while it is parked. The authority policy, which
+    // admits the write, is unchanged: the commit goes through, and the
+    // transport gate withholds the receipt after the worker returns.
+    catalog.arm_precommit_pause(Duration::from_millis(300));
+    let request = network_write(
+        target.history_id.clone(),
+        b"hosted-withheld",
+        b"withheld-op",
+        0,
+    );
+    let call = {
+        let mut client = client.clone();
+        let request = request.clone();
+        tokio::spawn(async move { client.accept_document(auth(request, "alice")).await })
+    };
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let mut without_alice = hosted_policy();
+    without_alice.revision = 2;
+    without_alice
+        .grants
+        .retain(|grant| grant.principal != "alice");
+    transport_policy.replace(without_alice).unwrap();
+    let withheld = call.await.unwrap().unwrap_err();
+    assert_eq!(withheld.code(), Code::PermissionDenied, "{withheld}");
+    assert!(
+        withheld.message().contains("access policy changed"),
+        "the withheld receipt must name the policy change: {withheld}"
+    );
+
+    // Durable regardless: with alice granted again, the exact retry replays.
+    let mut restored = hosted_policy();
+    restored.revision = 3;
+    transport_policy.replace(restored).unwrap();
+    let replay = client
+        .accept_document(auth(request, "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(replay.replayed && replay.durable);
+    assert_eq!(replay.version, 1);
+
+    drop(client);
+    server.shutdown().await;
+    return_host(&mut cluster, leader, host);
     cluster.shutdown().await;
 }

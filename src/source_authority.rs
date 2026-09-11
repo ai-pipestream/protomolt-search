@@ -232,6 +232,13 @@ pub struct SourceAdmission<'a> {
     // linearizable read anchored before the barrier, and it admits nothing
     // past the anchor plus the lease.
     lease: Option<AdmissionLease>,
+    // A recovery admission on a hosted store: the applied view, taken at
+    // start to open a managed handle. It proves the actor's Admin and the
+    // owner ACTIVE as this replica has applied them, which opens a handle
+    // and admits no write; every write on the handle takes its own leased
+    // admission, and a handle opened on a stale view is rejected there
+    // ("the fence has moved").
+    recovery: bool,
     _shared: RwLockReadGuard<'a, ()>,
 }
 
@@ -242,12 +249,28 @@ impl SourceAdmission<'_> {
 
     /// A leased admission past its interval admits nothing; the lease is
     /// what keeps admission authoritative under leader isolation
-    /// (docs/raft-admission.md).
+    /// (docs/raft-admission.md). A recovery admission is not fresh for a
+    /// write at all: it opens a handle and admits nothing.
     fn fresh(&self) -> Result<(), Status> {
+        if self.recovery {
+            return Err(Status::failed_precondition(
+                "a recovery admission opens a managed handle and admits no write; obtain a leased admission through the host",
+            ));
+        }
         match &self.lease {
             Some(lease) => lease.fresh(),
             None => Ok(()),
         }
+    }
+
+    /// The check a recovery admission passes: the applied view of this
+    /// replica, enough to open a handle whose every write is admitted
+    /// again under a lease.
+    fn applied(&self) -> Result<(), Status> {
+        if self.recovery {
+            return Ok(());
+        }
+        self.fresh()
     }
 
     /// The final check a source write performs inside its own transaction,
@@ -315,7 +338,7 @@ impl SourceAdmission<'_> {
         &self,
         binding: &SourceManagedBinding,
     ) -> Result<PreparedSourceOwner, Status> {
-        self.fresh()?;
+        self.applied()?;
         let verified = VerifiedOwnerCompletion::from_binding(binding)?;
         if binding.authority.as_ref() != Some(&self.store.inner.identity) {
             return Err(Status::failed_precondition(
@@ -562,8 +585,28 @@ impl SourceAuthorityStore {
             store: self,
             principal: principal.to_string(),
             lease,
+            recovery: false,
             _shared: shared,
         })
+    }
+
+    /// The applied-view admission that opens a managed handle at start on a
+    /// hosted store (docs/raft-hosting.md, "Hosted owner writes"). It
+    /// proves the actor's current Admin and the owner ACTIVE as this
+    /// replica has applied them, which is enough to open the handle and,
+    /// by name, not enough to admit a write: every write on the handle
+    /// takes its own leased admission, so a handle opened on a view the
+    /// quorum has since moved past is rejected at its first write. A
+    /// member therefore recovers its catalogs whether or not it leads, and
+    /// before any leader exists.
+    #[cfg(feature = "raft")]
+    pub(crate) fn recovery_admission(
+        &self,
+        principal: &str,
+    ) -> Result<SourceAdmission<'_>, Status> {
+        let mut admission = self.admission_with(principal, None)?;
+        admission.recovery = true;
+        Ok(admission)
     }
 
     pub fn identity(&self) -> &SourceAuthorityIdentity {

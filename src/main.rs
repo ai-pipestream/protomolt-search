@@ -186,20 +186,25 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     // A Raft member starts from its existing durable state before any
     // listener that routes on its committed map (docs/raft-hosting.md).
     let raft_host = start_raft_member(&cfg).await?.map(std::sync::Arc::new);
-    // Managed catalogs recover here, before any listener serves them: a
-    // rejection stops the process with its cause, no partial service.
+    // Managed catalogs are served on the coordinator or relay listener; a
+    // node-only process has neither, so it is rejected before any catalog
+    // is opened. Then the catalogs recover, before any listener serves
+    // them: a rejection stops the process with its cause, no partial
+    // service.
     #[cfg(all(feature = "raft", feature = "tls"))]
-    let hosted_writes = hosted_write_service(&cfg, raft_host.clone()).await?;
-    // Managed catalogs are served on the coordinator or relay listener;
-    // a node-only process has neither, so it must not start half-wired.
-    #[cfg(all(feature = "raft", feature = "tls"))]
-    if hosted_writes.is_some() && !cfg.relay && !matches!(cfg.role, Role::Coordinator | Role::Both)
-    {
-        return Err(
-            "raft managed catalogs need the coordinator or relay listener; a node-only process serves no write surface"
-                .into(),
-        );
-    }
+    let hosted_writes = {
+        let names_catalogs = cfg
+            .raft
+            .as_ref()
+            .is_some_and(|member| !member.managed_catalogs.is_empty());
+        if names_catalogs && !cfg.relay && !matches!(cfg.role, Role::Coordinator | Role::Both) {
+            return Err(
+                "raft managed catalogs need the coordinator or relay listener; a node-only process serves no write surface"
+                    .into(),
+            );
+        }
+        hosted_write_service(&cfg, raft_host.clone())?
+    };
     let mut node_services = Vec::new();
     // Membership (docs/cluster-control.md): one agent per collection the
     // configured shards name, each reporting its shards under their own
@@ -738,11 +743,12 @@ fn relay_service(
 }
 
 /// The hosted owner-write service of a member whose operator configuration
-/// names managed catalogs, recovered at start under the configured actor.
-/// `None` when no catalog is named. Recovery runs on the member's host, so
-/// every admission the service later grants comes from its lease.
+/// names managed catalogs, recovered at start under the configured actor
+/// on the store's applied view (no leader is needed to start). `None` when
+/// no catalog is named. Every admission the service later grants comes
+/// from the host's lease.
 #[cfg(all(feature = "raft", feature = "tls"))]
-async fn hosted_write_service(
+fn hosted_write_service(
     cfg: &Config,
     host: Option<std::sync::Arc<pipestream_search::raft::RaftHost>>,
 ) -> Result<
@@ -750,8 +756,9 @@ async fn hosted_write_service(
     Box<dyn std::error::Error>,
 > {
     use pipestream_search::document_write_service::hosted::{
-        default_limits, recover_catalogs, HostedDocumentWriteService,
+        recover_catalogs, HostedDocumentWriteService,
     };
+    use pipestream_search::pb::DocumentWriteServiceLimits;
     let Some(member) = &cfg.raft else {
         return Ok(None);
     };
@@ -771,12 +778,16 @@ async fn hosted_write_service(
         );
     };
     let catalogs = recover_catalogs(&host, actor, &member.managed_catalogs)
-        .await
         .map_err(|status| format!("raft managed catalogs: {}", status.message()))?;
     let count = catalogs.len();
-    let service =
-        HostedDocumentWriteService::new((**principals).clone(), host, catalogs, default_limits())
-            .map_err(|status| format!("hosted write service: {}", status.message()))?;
+    let limits = DocumentWriteServiceLimits {
+        max_request_bytes: member.managed_max_request_bytes,
+        max_pending_bytes: member.managed_max_pending_bytes,
+        max_in_flight: u32::try_from(member.managed_max_in_flight)
+            .map_err(|_| "--raft-managed-max-in-flight must be 1..1024")?,
+    };
+    let service = HostedDocumentWriteService::new((**principals).clone(), host, catalogs, limits)
+        .map_err(|status| format!("hosted write service: {}", status.message()))?;
     let collections: Vec<&str> = member
         .managed_catalogs
         .iter()

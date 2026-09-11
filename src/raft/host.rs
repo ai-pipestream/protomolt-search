@@ -14,7 +14,7 @@ use crate::pb::storage::{
 use crate::pb::AccessPolicy;
 use crate::source_authority::{AdmissionLease, LeasedAdmission, SourceAdmission};
 use crate::source_authority::{SourceAuthorityStore, VerifiedOwnerCompletion};
-use openraft::error::{ClientWriteError, RaftError, Unreachable};
+use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
@@ -754,20 +754,20 @@ impl RaftHost {
         self.raft.metrics().borrow().current_leader
     }
 
-    /// Run owner-side work under a leased admission (docs/raft-admission.md).
-    /// The lease is anchored before the read barrier is invoked: the
-    /// barrier's heartbeats are sent after that instant, every follower
-    /// that acknowledges them refreshes its own leader lease later still,
-    /// and none of them grants a vote before that plus the election
-    /// ceiling. The interval therefore includes every response, catch-up
-    /// and scheduling delay between the barrier and the grant, and a grant
-    /// whose interval has already elapsed is refused. The read itself is
-    /// bounded: an isolated leader collects no quorum and refuses.
-    /// An owned admission lease for work that cannot run on the calling
-    /// thread: this does what `with_admission` does up to and including the
-    /// vote-hold extension and the grant gate, then returns the store, the
-    /// actor and the anchored interval instead of running a closure. The
-    /// grant (`LeasedAdmission::admission`) measures the interval from the
+    /// An owned admission lease (docs/raft-admission.md) for work that
+    /// cannot run on the calling thread. The lease is anchored before the
+    /// read barrier is invoked: the barrier's heartbeats are sent after
+    /// that instant, every follower that acknowledges them refreshes its
+    /// own leader lease later still, and none of them grants a vote before
+    /// that plus the election ceiling. The interval therefore includes
+    /// every response, catch-up and scheduling delay between the barrier
+    /// and the grant, and a grant whose interval has already elapsed is
+    /// refused. The read itself is bounded: an isolated leader collects no
+    /// quorum and refuses, and a member that does not lead refuses naming
+    /// the leader. After the barrier this extends the vote hold and passes
+    /// the grant gate, then returns the store, the actor and the anchored
+    /// interval instead of running a closure. The grant
+    /// (`LeasedAdmission::admission`) measures the interval from the
     /// anchor, so moving the value to a blocking worker consumes the
     /// interval without extending it.
     pub async fn lease(&self, principal: &str) -> Result<LeasedAdmission, Status> {
@@ -778,6 +778,12 @@ impl RaftHost {
         };
         match tokio::time::timeout(self.read_timeout, self.raft.ensure_linearizable()).await {
             Ok(Ok(_)) => {}
+            Ok(Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(forward)))) => {
+                return Err(Status::unavailable(format!(
+                    "not the leader; leader is {:?}",
+                    forward.leader_id
+                )))
+            }
             Ok(Err(e)) => {
                 return Err(Status::unavailable(format!(
                     "admission needs a linearizable read: {e}"
@@ -803,6 +809,10 @@ impl RaftHost {
         Ok(LeasedAdmission::new(store, principal, lease))
     }
 
+    /// Run owner-side work under a leased admission on the calling thread:
+    /// `lease` followed by an immediate grant. The closure borrows the
+    /// admission, so the shared guard it takes at the grant is dropped
+    /// when the closure returns.
     pub async fn with_admission<T>(
         &self,
         principal: &str,
@@ -811,6 +821,18 @@ impl RaftHost {
         let leased = self.lease(principal).await?;
         let admission = leased.admission()?;
         run(&admission)
+    }
+
+    /// Ask the library to start an election on this member, for tests that
+    /// need a named member to lead after a restart. The library elects only
+    /// a member whose log is current and whose peers grant the vote.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub async fn trigger_election(&self) -> Result<(), Status> {
+        self.raft
+            .trigger()
+            .elect()
+            .await
+            .map_err(|e| Status::internal(format!("raft election trigger: {e}")))
     }
 
     /// Arm a pause between the next admission's read barrier and its grant.
