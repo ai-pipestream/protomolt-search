@@ -13,6 +13,7 @@ use tonic::Status;
 use crate::pb::storage::{
     DocumentCatalogHeader, DocumentOperation, DocumentVersion, DocumentVersionKey,
     SourceManagedActivation, SourceManagedBinding, SourceRecord, SourceResourceBinding,
+    WriteOutcome,
 };
 use crate::pb::{
     accept_document_request::Mutation, AcceptDocumentRequest, AcceptedDocumentVersion,
@@ -26,6 +27,7 @@ mod actors;
 mod backup;
 mod checkpoint;
 mod managed;
+mod outcome;
 mod projection;
 mod publication;
 mod restore;
@@ -37,7 +39,7 @@ pub use checkpoint::CatalogCheckpoint;
 #[cfg(all(feature = "net", feature = "raft"))]
 pub(crate) use managed::header_binding;
 #[cfg(feature = "net")]
-pub use managed::{ActiveManagedCatalog, PreparedManagedCatalog};
+pub use managed::{Acceptance, ActiveManagedCatalog, PreparedManagedCatalog, Settlement};
 pub use publication::{MaintenanceRecovery, ProjectionRecovery};
 pub use restore::VerifiedSourceRestore;
 
@@ -55,7 +57,11 @@ const RETIRED_FORMAT_VERSION: u32 = 6;
 const LEGACY_ACCESS_CONTROLLED_FORMAT: u32 = 7;
 const ACCESS_CONTROLLED_FORMAT: u32 = 8;
 const MANAGED_FORMAT: u32 = 9;
-const ACTIVE_MANAGED_FORMAT: u32 = 10;
+// Format 10 was the activated managed source before write outcomes
+// existed; format 11 records an outcome and the write epoch on every
+// version and operation (docs/document-writes.md, "Write outcomes").
+const ACTIVE_MANAGED_FORMAT_BEFORE_OUTCOMES: u32 = 10;
+const ACTIVE_MANAGED_FORMAT: u32 = 11;
 const CACHE_BYTES: usize = 8 << 20;
 
 fn storage(error: impl std::fmt::Display) -> Status {
@@ -63,6 +69,14 @@ fn storage(error: impl std::fmt::Display) -> Status {
 }
 fn decode<T: Message + Default>(bytes: &[u8]) -> Result<T, Status> {
     T::decode(bytes).map_err(|e| Status::data_loss(format!("document catalog record: {e}")))
+}
+
+/// One accepted write as the catalog recorded it: the receipt and the
+/// outcome the record holds (docs/document-writes.md, "Write outcomes").
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Written {
+    pub(crate) receipt: DocumentWriteReceipt,
+    pub(crate) outcome: WriteOutcome,
 }
 
 fn decode_header(bytes: &[u8]) -> Result<DocumentCatalogHeader, Status> {
@@ -98,6 +112,11 @@ fn new_history_id() -> Result<Vec<u8>, Status> {
 }
 
 fn validate_current_header(header: &DocumentCatalogHeader) -> Result<(), Status> {
+    if header.format_version == ACTIVE_MANAGED_FORMAT_BEFORE_OUTCOMES {
+        return Err(Status::failed_precondition(
+            "document catalog format 10 (an activated managed source from before write outcomes) is not served; format 11 records an outcome on every write, and the source is rebuilt from its authority rather than migrated",
+        ));
+    }
     if !matches!(
         header.format_version,
         FORMAT_VERSION
@@ -137,6 +156,10 @@ pub struct DocumentCatalog {
     // wait and before the write's final admission check.
     #[cfg(any(test, feature = "fault-injection"))]
     precommit_pause: std::sync::Mutex<Option<std::time::Duration>>,
+    // Fault injection: a pause after the write's commit returned durable
+    // and before its outcome is judged against the lease.
+    #[cfg(any(test, feature = "fault-injection"))]
+    postcommit_pause: std::sync::Mutex<Option<std::time::Duration>>,
 }
 
 impl DocumentCatalog {
@@ -274,6 +297,8 @@ impl DocumentCatalog {
             _file_lock: Some(file),
             #[cfg(any(test, feature = "fault-injection"))]
             precommit_pause: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "fault-injection"))]
+            postcommit_pause: std::sync::Mutex::new(None),
         };
         catalog.initialize(collection, new)?;
         catalog.validate_projection_journal()?;
@@ -296,6 +321,8 @@ impl DocumentCatalog {
             _file_lock: None,
             #[cfg(any(test, feature = "fault-injection"))]
             precommit_pause: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "fault-injection"))]
+            postcommit_pause: std::sync::Mutex::new(None),
         };
         catalog.initialize(collection, true)?;
         Ok(catalog)
@@ -461,7 +488,8 @@ impl DocumentCatalog {
     /// before the version precondition or retirement fence, including after
     /// later writes, deletion or sealing. A replay does not mutate the catalog.
     pub fn accept(&self, request: &AcceptDocumentRequest) -> Result<DocumentWriteReceipt, Status> {
-        self.accept_as(request, None, None)
+        self.accept_as(request, None, None, 0)
+            .map(|written| written.receipt)
     }
 
     /// Pause the next write inside its transaction, after the writer lock
@@ -471,17 +499,31 @@ impl DocumentCatalog {
         *self.precommit_pause.lock().unwrap() = Some(pause);
     }
 
+    /// Pause the next write after its commit returned durable and before
+    /// its outcome is judged against the lease: the window in which a
+    /// write becomes durable after its admission lapsed.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn arm_postcommit_pause(&self, pause: std::time::Duration) {
+        *self.postcommit_pause.lock().unwrap() = Some(pause);
+    }
+
     /// `fence` is the write's final admission check, run inside the
     /// transaction after every wait and write and immediately before the
     /// commit: the boundary at which the write becomes authorized
     /// (docs/raft-admission.md, "Source write boundary"). A fence that
-    /// refuses leaves no durable change and no retry record.
-    fn accept_as(
+    /// refuses leaves no durable change and no retry record. `write_epoch`
+    /// is the owner's epoch the write commits under, recorded on the
+    /// version and the operation; zero when the catalog is not an
+    /// activated managed source. The returned outcome is the recorded one:
+    /// ACCEPTED for new work, and for a replay whatever the record settled
+    /// to (a FENCED record replays as a rejection, in `retry`).
+    pub(crate) fn accept_as(
         &self,
         request: &AcceptDocumentRequest,
         principal: Option<&str>,
         fence: Option<&dyn Fn() -> Result<(), Status>>,
-    ) -> Result<DocumentWriteReceipt, Status> {
+        write_epoch: u64,
+    ) -> Result<Written, Status> {
         let operation_key = actors::OperationKey::new(principal, &request.operation_id)?;
         match request.contract_version {
             1 if request.history_id.is_empty() => {}
@@ -600,6 +642,9 @@ impl DocumentCatalog {
             accepted_sequence: header.accepted_sequence,
             source_sha256,
             deleted: matches!(request.mutation, Some(Mutation::Delete(_))),
+            write_epoch,
+            outcome: WriteOutcome::Accepted as i32,
+            fenced_at_revision: 0,
         };
         let receipt = DocumentWriteReceipt {
             document_key: request.document_key.clone(),
@@ -610,6 +655,7 @@ impl DocumentCatalog {
             durable: self.durable,
             replayed: false,
             history_id: header.history_id.clone(),
+            write_epoch,
         };
         let document_bytes = document.encode_to_vec();
         let version_key = DocumentVersionKey {
@@ -639,6 +685,9 @@ impl DocumentCatalog {
         let operation = DocumentOperation {
             request_sha256: request_sha.to_vec(),
             receipt: Some(receipt.clone()),
+            write_epoch,
+            outcome: WriteOutcome::Accepted as i32,
+            fenced_at_revision: 0,
         }
         .encode_to_vec();
         transaction
@@ -659,7 +708,14 @@ impl DocumentCatalog {
             fence()?;
         }
         transaction.commit().map_err(storage)?;
-        Ok(receipt)
+        #[cfg(any(test, feature = "fault-injection"))]
+        if let Some(pause) = self.postcommit_pause.lock().unwrap().take() {
+            std::thread::sleep(pause);
+        }
+        Ok(Written {
+            receipt,
+            outcome: WriteOutcome::Accepted,
+        })
     }
 
     /// Trusted local source lookup. No network or search-result disclosure API.
@@ -834,6 +890,9 @@ impl DocumentCatalog {
                     Some(source) => crate::pb::accepted_document_version::Mutation::Source(source),
                     None => crate::pb::accepted_document_version::Mutation::Deleted(true),
                 }),
+                write_epoch: version.write_epoch,
+                fenced: version.outcome == WriteOutcome::Fenced as i32,
+                fenced_at_revision: version.fenced_at_revision,
             };
             let size = document.encoded_len() as u64;
             if size > remaining {

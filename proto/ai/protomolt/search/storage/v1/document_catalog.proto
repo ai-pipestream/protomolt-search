@@ -124,16 +124,40 @@ message DocumentVersionKey {
   bytes document_key = 1;
   uint64 version = 2;
 }
+// The outcome of one durable write under a leased admission
+// (docs/raft-admission.md, "Source write boundary"). A write that became
+// durable while its lease was still open is ACCEPTED in the transaction
+// that committed it. One that became durable after its lease lapsed is
+// UNCONFIRMED until it is settled under a fresh lease: ACCEPTED when the
+// actor's right is still current, FENCED with the control revision at
+// which the right was found gone. Every record written before outcomes
+// existed decodes as ACCEPTED, which is what it was.
+enum WriteOutcome {
+  WRITE_OUTCOME_ACCEPTED = 0;
+  WRITE_OUTCOME_UNCONFIRMED = 1;
+  WRITE_OUTCOME_FENCED = 2;
+}
 message DocumentVersion {
   bytes document_key = 1;
   uint64 version = 2;
   uint64 accepted_sequence = 3;
   bytes source_sha256 = 4;
   bool deleted = 5;
+  // Catalog format 11: the owner's write epoch the version committed
+  // under (zero on a catalog that is not an activated managed source) and
+  // the write's outcome.
+  uint64 write_epoch = 6;
+  WriteOutcome outcome = 7;
+  uint64 fenced_at_revision = 8;
 }
 message DocumentOperation {
   bytes request_sha256 = 1;
   ai.protomolt.search.v1.DocumentWriteReceipt receipt = 2;
+  // Catalog format 11: the same outcome as the version the operation
+  // wrote, so a retry replays the settled decision.
+  uint64 write_epoch = 3;
+  WriteOutcome outcome = 4;
+  uint64 fenced_at_revision = 5;
 }
 
 // Optional source-catalog extension. Decisions describe durable index artifacts,

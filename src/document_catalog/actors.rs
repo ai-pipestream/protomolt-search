@@ -193,7 +193,7 @@ fn attributed_receipt(
             "legacy attribution requires an immutable stored receipt",
         ));
     }
-    let receipt = retry::receipt(header, bytes, sha)?;
+    let receipt = retry::receipt(header, bytes, sha)?.receipt;
     if !receipt.accepted
         || !receipt.durable
         || receipt.searchable

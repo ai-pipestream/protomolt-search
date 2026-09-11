@@ -630,7 +630,9 @@ async fn write_paused_past_lease_leaves_no_durable_change() {
     active.arm_precommit_pause(lease + Duration::from_millis(200));
     let error = cluster
         .host(leader)
-        .with_admission("alice", |admission| active.accept(admission, &request))
+        .with_admission("alice", |admission| {
+            active.accept(admission, &request).map(|a| a.into_receipt())
+        })
         .await
         .unwrap_err();
     assert_eq!(
@@ -647,7 +649,9 @@ async fn write_paused_past_lease_leaves_no_durable_change() {
     // fresh admission is accepted as new work at the next sequence.
     let receipt = cluster
         .host(leader)
-        .with_admission("alice", |admission| active.accept(admission, &request))
+        .with_admission("alice", |admission| {
+            active.accept(admission, &request).map(|a| a.into_receipt())
+        })
         .await
         .unwrap();
     assert!(
@@ -665,7 +669,9 @@ async fn write_paused_past_lease_leaves_no_durable_change() {
     active.arm_precommit_pause(lease / 2);
     let receipt = cluster
         .host(leader)
-        .with_admission("alice", |admission| active.accept(admission, &third))
+        .with_admission("alice", |admission| {
+            active.accept(admission, &third).map(|a| a.into_receipt())
+        })
         .await
         .unwrap();
     assert_eq!(receipt.accepted_sequence, 3, "the in-lease write commits");
@@ -720,8 +726,10 @@ async fn write_paused_during_revocation_is_refused_and_epoch_fenced() {
     let task = {
         let host = Arc::clone(&host);
         tokio::spawn(async move {
-            host.with_admission("alice", |admission| active.accept(admission, &request))
-                .await
+            host.with_admission("alice", |admission| {
+                active.accept(admission, &request).map(|a| a.into_receipt())
+            })
+            .await
         })
     };
     // The write is inside its pause before the lease expires; give the
@@ -819,12 +827,15 @@ async fn receipt_discloses_nothing_about_the_lease() {
 
     let receipt = cluster
         .host(leader)
-        .with_admission("alice", |admission| active.accept(admission, &request))
+        .with_admission("alice", |admission| {
+            active.accept(admission, &request).map(|a| a.into_receipt())
+        })
         .await
         .unwrap();
 
-    // The complete public field set of `DocumentWriteReceipt` at 0fe7081.
-    // A lease field added to this struct is a contract change and must fail
+    // The complete public field set of `DocumentWriteReceipt`: at 0fe7081
+    // the eight fields, and since the commit fence the write epoch. A
+    // lease field added to this struct is a contract change and must fail
     // this exhaustive destructure at compile time.
     let DocumentWriteReceipt {
         document_key,
@@ -835,7 +846,13 @@ async fn receipt_discloses_nothing_about_the_lease() {
         durable,
         replayed,
         history_id,
+        write_epoch,
     } = receipt.clone();
+    assert_eq!(
+        write_epoch,
+        active.activation().write_epoch,
+        "the receipt names the epoch the write committed under"
+    );
 
     assert_eq!(document_key, request.document_key);
     assert_eq!(version, 1, "the first accept of this document is version 1");
@@ -954,7 +971,9 @@ async fn crash_admission_write_worker() {
     };
     let request = catalog_write(b"document-two", b"accept-two");
     let receipt = guard
-        .with_admission("alice", |admission| active.accept(admission, &request))
+        .with_admission("alice", |admission| {
+            active.accept(admission, &request).map(|a| a.into_receipt())
+        })
         .await
         .unwrap();
     std::fs::write(
@@ -1020,7 +1039,9 @@ async fn crash_admission_verify_worker() {
 
     let request = catalog_write(b"document-two", b"accept-two");
     let receipt = guard
-        .with_admission("alice", |admission| active.accept(admission, &request))
+        .with_admission("alice", |admission| {
+            active.accept(admission, &request).map(|a| a.into_receipt())
+        })
         .await
         .unwrap();
     assert!(

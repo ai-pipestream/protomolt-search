@@ -130,7 +130,7 @@ pub(super) fn validate_header(header: &DocumentCatalogHeader) -> Result<(), Stat
         }
         _ => {
             return Err(Status::data_loss(
-                "managed source binding requires catalog format 9 without activation or format 10 with it",
+                "managed source binding requires catalog format 9 without activation or format 11 with it",
             ))
         }
     }
@@ -157,6 +157,7 @@ pub(super) fn validate_header(header: &DocumentCatalogHeader) -> Result<(), Stat
 #[cfg(feature = "net")]
 mod adapter {
     use super::*;
+    use crate::pb::storage::WriteOutcome;
     use crate::pb::storage::{
         DocumentCatalogCheckpoint, PreparedSourceOwner, SourceAuthorityCommand,
         SourceAuthorityDecision,
@@ -179,6 +180,41 @@ mod adapter {
     /// admitted through a `SourceAdmission` that finds the owner ACTIVE under
     /// exactly this epoch and the actor permitted, and the admission is held
     /// through the source commit.
+    /// What [`ActiveManagedCatalog::accept`] returns: the receipt of a
+    /// write whose lease was still open when its commit returned, or the
+    /// receipt of one whose lease had lapsed by then, recorded UNCONFIRMED
+    /// and awaiting [`ActiveManagedCatalog::settle`].
+    #[derive(Clone, Debug, PartialEq)]
+    pub enum Acceptance {
+        Accepted(crate::pb::DocumentWriteReceipt),
+        Unconfirmed(crate::pb::DocumentWriteReceipt),
+    }
+
+    impl Acceptance {
+        pub fn receipt(&self) -> &crate::pb::DocumentWriteReceipt {
+            match self {
+                Acceptance::Accepted(receipt) | Acceptance::Unconfirmed(receipt) => receipt,
+            }
+        }
+
+        /// The receipt whatever the judgement; a caller that uses this
+        /// answers for an unconfirmed write itself.
+        pub fn into_receipt(self) -> crate::pb::DocumentWriteReceipt {
+            match self {
+                Acceptance::Accepted(receipt) | Acceptance::Unconfirmed(receipt) => receipt,
+            }
+        }
+    }
+
+    /// What [`ActiveManagedCatalog::settle`] decided: the write is accepted
+    /// with its receipt, or fenced with the rejection every retry replays.
+    /// An error from `settle` means no decision was made.
+    #[derive(Debug)]
+    pub enum Settlement {
+        Accepted(crate::pb::DocumentWriteReceipt),
+        Fenced(Status),
+    }
+
     pub struct ActiveManagedCatalog {
         pub(super) inner: DocumentCatalog,
         binding: SourceManagedBinding,
@@ -610,6 +646,13 @@ mod adapter {
             self.inner.arm_precommit_pause(pause);
         }
 
+        /// Fault injection: pause the next write after its commit returned
+        /// durable and before its outcome is judged against the lease.
+        #[cfg(any(test, feature = "fault-injection"))]
+        pub fn arm_postcommit_pause(&self, pause: std::time::Duration) {
+            self.inner.arm_postcommit_pause(pause);
+        }
+
         pub fn binding(&self) -> &SourceManagedBinding {
             &self.binding
         }
@@ -650,15 +693,178 @@ mod adapter {
         /// from changing on this store; only time passes, and the final check
         /// is where it is measured. Retries resolve from the actor-scoped
         /// record.
+        ///
+        /// The commit's return is judged against the lease once more
+        /// (docs/document-writes.md, "Write outcomes"): a write whose lease
+        /// is still open is `Accepted`; one whose lease lapsed while the
+        /// commit was becoming durable is recorded UNCONFIRMED and returned
+        /// as `Unconfirmed`, for the caller to settle under a fresh lease
+        /// with [`settle`](Self::settle). A retry that finds an UNCONFIRMED
+        /// record settles it under its own admission, which is fresh at
+        /// entry, so the retry answers with the decision.
         pub fn accept(
             &self,
             admission: &SourceAdmission<'_>,
             request: &crate::pb::AcceptDocumentRequest,
-        ) -> Result<crate::pb::DocumentWriteReceipt, Status> {
+        ) -> Result<Acceptance, Status> {
+            // A retry of an operation awaiting its decision, or already
+            // fenced, is answered from the record before the entry check:
+            // the decision is what the retry asks for, and for an actor
+            // whose right is gone the decision is the fence, not a
+            // permission error that would hide it.
+            if let Some(operation) = self
+                .inner
+                .recorded_operation(Some(admission.principal()), &request.operation_id)?
+            {
+                let request_sha = crate::sha256::digest(&request.encode_to_vec());
+                if operation.request_sha256.as_slice() != request_sha {
+                    return Err(Status::already_exists(
+                        "operation_id was used for a different document write",
+                    ));
+                }
+                match outcome::outcome_of(operation.outcome)? {
+                    WriteOutcome::Accepted => {}
+                    WriteOutcome::Unconfirmed => {
+                        return match self.settle_under(
+                            admission,
+                            admission.principal(),
+                            &request.operation_id,
+                        )? {
+                            Settlement::Accepted(receipt) => {
+                                Ok(Acceptance::Accepted(crate::pb::DocumentWriteReceipt {
+                                    replayed: true,
+                                    ..receipt
+                                }))
+                            }
+                            Settlement::Fenced(rejection) => Err(rejection),
+                        };
+                    }
+                    WriteOutcome::Fenced => {
+                        let receipt = operation
+                            .receipt
+                            .ok_or_else(|| Status::data_loss("operation receipt missing"))?;
+                        return Err(outcome::fenced(&receipt, operation.fenced_at_revision));
+                    }
+                }
+            }
             let decision = self.admit(admission, AccessAction::Ingest)?;
             let fence = || admission.check_fresh();
-            self.inner
-                .accept_as(request, Some(&decision.principal), Some(&fence))
+            let written = self.inner.accept_as(
+                request,
+                Some(&decision.principal),
+                Some(&fence),
+                self.activation.write_epoch,
+            )?;
+            match written.outcome {
+                WriteOutcome::Unconfirmed | WriteOutcome::Fenced => Err(Status::internal(
+                    "an unsettled or fenced record was returned as a receipt",
+                )),
+                WriteOutcome::Accepted if written.receipt.replayed => {
+                    Ok(Acceptance::Accepted(written.receipt))
+                }
+                WriteOutcome::Accepted => match admission.check_fresh() {
+                    Ok(()) => Ok(Acceptance::Accepted(written.receipt)),
+                    Err(_) => {
+                        self.inner
+                            .mark_unconfirmed(Some(&decision.principal), &request.operation_id)?;
+                        Ok(Acceptance::Unconfirmed(written.receipt))
+                    }
+                },
+            }
+        }
+
+        /// Settle a write returned `Unconfirmed` by [`accept`](Self::accept),
+        /// under a fresh leased admission for the same actor: the entry
+        /// check run again. Current right: the record becomes ACCEPTED and
+        /// the receipt is returned. Right gone (the grant revoked, the owner
+        /// no longer ACTIVE under this epoch): the record becomes FENCED at
+        /// the store's applied control revision and the settlement names
+        /// the durable version; every retry replays that rejection. An
+        /// admission that is itself no longer fresh settles nothing and is
+        /// an error by name, so the record stays UNCONFIRMED for the next
+        /// attempt.
+        pub fn settle(
+            &self,
+            admission: &SourceAdmission<'_>,
+            principal: &str,
+            operation_id: &[u8],
+        ) -> Result<Settlement, Status> {
+            if admission.identity() != self.authority.identity() {
+                return Err(Status::failed_precondition(
+                    "admission was acquired from another source authority",
+                ));
+            }
+            if admission.principal() != principal {
+                return Err(Status::permission_denied(
+                    "a write is settled under an admission for the actor that wrote it",
+                ));
+            }
+            self.settle_under(admission, principal, operation_id)
+        }
+
+        fn settle_under(
+            &self,
+            admission: &SourceAdmission<'_>,
+            principal: &str,
+            operation_id: &[u8],
+        ) -> Result<Settlement, Status> {
+            let Some(operation) = self
+                .inner
+                .recorded_operation(Some(principal), operation_id)?
+            else {
+                return Err(Status::not_found(
+                    "the actor has no operation with this id to settle",
+                ));
+            };
+            let receipt = operation
+                .receipt
+                .ok_or_else(|| Status::data_loss("operation receipt missing"))?;
+            match outcome::outcome_of(operation.outcome)? {
+                WriteOutcome::Accepted => return Ok(Settlement::Accepted(receipt)),
+                WriteOutcome::Fenced => {
+                    return Ok(Settlement::Fenced(outcome::fenced(
+                        &receipt,
+                        operation.fenced_at_revision,
+                    )))
+                }
+                WriteOutcome::Unconfirmed => {}
+            }
+            // A lease that lapsed again decides nothing.
+            admission.check_fresh()?;
+            let settled = match self.admit(admission, AccessAction::Ingest) {
+                Ok(_) => outcome::Settled::Accepted,
+                Err(_) => outcome::Settled::Fenced {
+                    at_revision: admission.applied_control_revision(),
+                },
+            };
+            match self
+                .inner
+                .settle_outcome(Some(principal), operation_id, settled)?
+            {
+                WriteOutcome::Accepted => Ok(Settlement::Accepted(receipt)),
+                WriteOutcome::Fenced => {
+                    let at_revision = match settled {
+                        outcome::Settled::Fenced { at_revision } => at_revision,
+                        outcome::Settled::Accepted => 0,
+                    };
+                    Ok(Settlement::Fenced(outcome::fenced(&receipt, at_revision)))
+                }
+                WriteOutcome::Unconfirmed => {
+                    Err(Status::internal("an unconfirmed record was not settled"))
+                }
+            }
+        }
+
+        /// Accepted history in commit order under Ingest admission
+        /// (docs/document-writes.md, "Ordered source history"), with each
+        /// version's write epoch and fence mark.
+        pub fn read_accepted(
+            &self,
+            admission: &SourceAdmission<'_>,
+            request: &crate::pb::ReadAcceptedDocumentsRequest,
+        ) -> Result<crate::pb::ReadAcceptedDocumentsResponse, Status> {
+            self.admit(admission, AccessAction::Ingest)?;
+            self.inner.read_accepted(request)
         }
 
         /// The pinned local history for pinned writes, under Ingest admission.
@@ -706,7 +912,7 @@ mod adapter {
 }
 
 #[cfg(feature = "net")]
-pub use adapter::{ActiveManagedCatalog, PreparedManagedCatalog};
+pub use adapter::{Acceptance, ActiveManagedCatalog, PreparedManagedCatalog, Settlement};
 
 #[cfg(all(test, feature = "net"))]
 mod tests;

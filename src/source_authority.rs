@@ -292,6 +292,12 @@ impl SourceAdmission<'_> {
         &self.principal
     }
 
+    /// The control revision this replica has applied, as the admission
+    /// sees it: the revision a fenced write is marked with.
+    pub fn applied_control_revision(&self) -> u64 {
+        *self.store.inner.applied.borrow()
+    }
+
     /// The current committed decision for this actor on one collection.
     pub fn authorize(
         &self,

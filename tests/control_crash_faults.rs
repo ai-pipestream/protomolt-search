@@ -884,7 +884,8 @@ fn crash_managed_bind_and_activate_boundaries() {
                     .accept(&admission, &managed_write(b"document-two", b"accept-two"))
                     .unwrap();
                 assert_eq!(
-                    receipt.accepted_sequence, 2,
+                    receipt.receipt().accepted_sequence,
+                    2,
                     "{family}:{fault} serves the next write"
                 );
             }

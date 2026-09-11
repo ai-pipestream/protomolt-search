@@ -17,16 +17,21 @@ pub(super) fn receipt(
     header: &DocumentCatalogHeader,
     bytes: &[u8],
     request_sha: &[u8; 32],
-) -> Result<DocumentWriteReceipt, Status> {
+) -> Result<Written, Status> {
     let previous: DocumentOperation = decode(bytes)?;
     if previous.request_sha256.as_slice() != request_sha {
         return Err(Status::already_exists(
             "operation_id was used for a different document write",
         ));
     }
+    let outcome = outcome::outcome_of(previous.outcome)?;
     let mut receipt = previous
         .receipt
         .ok_or_else(|| Status::data_loss("operation receipt missing"))?;
+    if outcome == WriteOutcome::Fenced {
+        // The settled decision: durable, named, never admitted.
+        return Err(outcome::fenced(&receipt, previous.fenced_at_revision));
+    }
     if receipt.history_id.is_empty()
         && receipt.accepted_sequence > 0
         && receipt.accepted_sequence <= header.legacy_receipts_through_sequence
@@ -39,7 +44,7 @@ pub(super) fn receipt(
         ));
     }
     receipt.replayed = true;
-    Ok(receipt)
+    Ok(Written { receipt, outcome })
 }
 
 impl DocumentCatalog {
@@ -48,7 +53,7 @@ impl DocumentCatalog {
         request: &AcceptDocumentRequest,
         request_sha: &[u8; 32],
         operation_key: &actors::OperationKey,
-    ) -> Result<Option<DocumentWriteReceipt>, Status> {
+    ) -> Result<Option<Written>, Status> {
         let read = self.database.begin_read().map_err(storage)?;
         let meta = read.open_table(META).map_err(storage)?;
         let header: DocumentCatalogHeader = decode_header(

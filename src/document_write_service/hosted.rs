@@ -42,7 +42,7 @@
 //! storage-side fencing token the catalog does not have yet.
 
 use super::{BudgetPermit, WriteBudget};
-use crate::document_catalog::ActiveManagedCatalog;
+use crate::document_catalog::{Acceptance, ActiveManagedCatalog, Settlement};
 use crate::metrics::{self, Route};
 use crate::pb::document_write_service_server::{DocumentWriteService, DocumentWriteServiceServer};
 use crate::pb::{
@@ -295,21 +295,75 @@ impl HostedDocumentWriteService {
         }
         let lease = self.inner.host.lease(&actor).await?;
         self.handoff().await?;
-        let result = tokio::task::spawn_blocking(move || {
+        let settling = Arc::clone(&catalog);
+        let operation_id = document.operation_id.clone();
+        let (result, permit) = tokio::task::spawn_blocking(move || {
             // Pin the lease and the permits in the receiving worker, not
             // in the RPC future: from here a dropped future releases
             // nothing until the worker returns, and the commit happens
-            // whether or not a client is still listening.
-            let _permit = permit;
-            let admission = lease.admission()?;
-            catalog.accept(&admission, &document)
+            // whether or not a client is still listening. The permits come
+            // back so a settlement runs under the same ones.
+            let result = lease
+                .admission()
+                .and_then(|admission| catalog.accept(&admission, &document));
+            (result, permit)
         })
         .await
         .map_err(|_| Status::internal("source acceptance worker failed"))?;
+        let result = match result {
+            Ok(Acceptance::Accepted(receipt)) => Ok(receipt),
+            Ok(Acceptance::Unconfirmed(receipt)) => {
+                self.settle(&actor, settling, operation_id, receipt, permit)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
         // Acceptance may have committed under its admitted decision while a
         // replacement published. Current access still gates receipt disclosure.
         access.check()?;
         result.map(Response::new)
+    }
+
+    /// A write whose commit returned durable after its lease lapsed is
+    /// settled under a fresh lease, on a worker holding the call's permits
+    /// (docs/document-writes.md, "Write outcomes"). A settlement that
+    /// cannot be made now, because no lease can be had or the fresh lease
+    /// lapsed before the grant, is `Unavailable` naming the durable
+    /// version: the record stays UNCONFIRMED and the exact retry settles
+    /// it. A fenced settlement is the rejection every retry replays.
+    async fn settle(
+        &self,
+        actor: &str,
+        catalog: Arc<ActiveManagedCatalog>,
+        operation_id: Vec<u8>,
+        receipt: DocumentWriteReceipt,
+        permit: WorkPermit,
+    ) -> Result<DocumentWriteReceipt, Status> {
+        let unsettled = |cause: &Status| {
+            Status::unavailable(format!(
+                "write of version {} at sequence {} is durable but unconfirmed: its lease lapsed before the commit returned, and no fresh lease settles it now ({}); retry the operation to settle it",
+                receipt.version,
+                receipt.accepted_sequence,
+                cause.message()
+            ))
+        };
+        let lease = match self.inner.host.lease(actor).await {
+            Ok(lease) => lease,
+            Err(error) => return Err(unsettled(&error)),
+        };
+        let actor = actor.to_string();
+        let settled = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let admission = lease.admission()?;
+            catalog.settle(&admission, &actor, &operation_id)
+        })
+        .await
+        .map_err(|_| Status::internal("source settlement worker failed"))?;
+        match settled {
+            Ok(Settlement::Accepted(receipt)) => Ok(receipt),
+            Ok(Settlement::Fenced(rejection)) => Err(rejection),
+            Err(error) => Err(unsettled(&error)),
+        }
     }
 }
 

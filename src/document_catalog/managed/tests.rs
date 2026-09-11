@@ -479,7 +479,7 @@ fn binding_preserves_history_actor_retry_and_closes_every_source_writer() {
     };
     let error = managed
         .inner
-        .accept_as(&fresh_write, Some("alice"), None)
+        .accept_as(&fresh_write, Some("alice"), None, 0)
         .unwrap_err();
     assert_eq!(error.code(), Code::FailedPrecondition);
     assert!(error.message().contains("managed"), "{error}");
@@ -583,7 +583,7 @@ fn binding_preserves_history_actor_retry_and_closes_every_source_writer() {
     assert_managed_records(&reopened, 1);
     let error = reopened
         .inner
-        .accept_as(&fresh_write, Some("alice"), None)
+        .accept_as(&fresh_write, Some("alice"), None, 0)
         .unwrap_err();
     assert_eq!(error.code(), Code::FailedPrecondition);
     assert!(error.message().contains("managed"), "{error}");
@@ -1222,7 +1222,7 @@ fn active_records(active: &ActiveManagedCatalog, sequence: u64) {
     let read = active.inner.database.begin_read().unwrap();
     let meta = read.open_table(META).unwrap();
     let header = decode_header(meta.get("header").unwrap().unwrap().value()).unwrap();
-    assert_eq!(header.format_version, 10);
+    assert_eq!(header.format_version, 11);
     assert_eq!(header.accepted_sequence, sequence);
     assert!(header.managed_binding.is_some());
     assert_eq!(header.managed_activation.as_ref().unwrap().write_epoch, 1);
@@ -1299,14 +1299,21 @@ fn activation_admits_writes_only_under_the_committed_fence() {
     active_records(&active, 1);
     let receipt = {
         let admission = fixture.authority.admission("alice").unwrap();
-        active.accept(&admission, &second_write()).unwrap()
+        active
+            .accept(&admission, &second_write())
+            .unwrap()
+            .into_receipt()
     };
     assert_eq!(receipt.accepted_sequence, 2);
     assert_eq!(receipt.history_id, fixture.receipt.history_id);
+    assert_eq!(receipt.write_epoch, active.activation().write_epoch);
     {
         let admission = fixture.authority.admission("alice").unwrap();
         assert_eq!(
-            active.accept(&admission, &second_write()).unwrap(),
+            active
+                .accept(&admission, &second_write())
+                .unwrap()
+                .into_receipt(),
             replayed(&receipt)
         );
         assert_eq!(
@@ -1446,7 +1453,10 @@ fn activation_admits_writes_only_under_the_committed_fence() {
     )
     .unwrap();
     assert_eq!(
-        recovered.accept(&admission, &second_write()).unwrap(),
+        recovered
+            .accept(&admission, &second_write())
+            .unwrap()
+            .into_receipt(),
         replayed(&receipt)
     );
     let mut third = second_write();
@@ -1456,6 +1466,7 @@ fn activation_admits_writes_only_under_the_committed_fence() {
         recovered
             .accept(&admission, &third)
             .unwrap()
+            .into_receipt()
             .accepted_sequence,
         3
     );
@@ -1603,6 +1614,7 @@ fn abrupt_activation_exit_recovers_format_nine_or_the_activated_source() {
             active
                 .accept(&admission, &second_write())
                 .unwrap()
+                .into_receipt()
                 .accepted_sequence,
             2
         );
@@ -1646,7 +1658,10 @@ fn a_write_paused_before_commit_past_its_lease_leaves_no_durable_change() {
     // Nothing became durable and no retry record exists: a fresh admission
     // accepts the same request as new work at the next sequence.
     let admission = fixture.authority.admission("alice").unwrap();
-    let receipt = active.accept(&admission, &second_write()).unwrap();
+    let receipt = active
+        .accept(&admission, &second_write())
+        .unwrap()
+        .into_receipt();
     assert!(!receipt.replayed);
     assert_eq!(receipt.accepted_sequence, 2);
     // A pause that ends within the lease commits; the final check is where
@@ -1661,5 +1676,343 @@ fn a_write_paused_before_commit_past_its_lease_leaves_no_durable_change() {
     let mut third = second_write();
     third.document_key = b"document-three".to_vec();
     third.operation_id = b"accept-three".to_vec();
-    assert_eq!(active.accept(&leased, &third).unwrap().accepted_sequence, 3);
+    assert_eq!(
+        active
+            .accept(&leased, &third)
+            .unwrap()
+            .into_receipt()
+            .accepted_sequence,
+        3
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Write outcomes (docs/document-writes.md, "Write outcomes"): a write whose
+// commit returns after its lease lapsed is unconfirmed until a fresh lease
+// settles it; the decision is accepted while the actor's right is current
+// and fenced, by name, once it is gone.
+// ---------------------------------------------------------------------------
+
+fn short_lease(ttl_ms: u64) -> crate::source_authority::AdmissionLease {
+    crate::source_authority::AdmissionLease {
+        anchor: std::time::Instant::now(),
+        anchor_wall: std::time::SystemTime::now(),
+        ttl: std::time::Duration::from_millis(ttl_ms),
+    }
+}
+
+fn grants_command(
+    identity: &SourceAuthorityIdentity,
+    id: &str,
+    control_revision: u64,
+    policy_revision: u64,
+    grants: Vec<CollectionGrant>,
+) -> SourceAuthorityCommand {
+    SourceAuthorityCommand {
+        format_version: 1,
+        authority: Some(identity.clone()),
+        key: Some(LogicalSourceOwner {
+            workspace: "workspace-a".into(),
+            collection: "books".into(),
+            owner_id: Vec::new(),
+        }),
+        command_id: id.as_bytes().to_vec(),
+        expected_control_revision: control_revision,
+        expected_policy_revision: policy_revision,
+        expected_ownership_generation: 0,
+        action: Some(Action::ReplaceGrants(ReplaceSourceCollectionGrants {
+            grants,
+        })),
+    }
+}
+
+fn history(active: &ActiveManagedCatalog) -> Vec<crate::pb::AcceptedDocumentVersion> {
+    active
+        .inner
+        .read_accepted(&crate::pb::ReadAcceptedDocumentsRequest {
+            after_sequence: 0,
+            limit: 100,
+            through_sequence: None,
+            max_bytes: 1 << 20,
+            history_id: Vec::new(),
+        })
+        .unwrap()
+        .documents
+}
+
+fn recorded(active: &ActiveManagedCatalog, operation_id: &[u8]) -> (WriteOutcome, u64) {
+    let operation = active
+        .inner
+        .recorded_operation(Some("alice"), operation_id)
+        .unwrap()
+        .unwrap();
+    (
+        WriteOutcome::try_from(operation.outcome).unwrap(),
+        operation.fenced_at_revision,
+    )
+}
+
+fn activated(name: &str) -> (Fixture, ActiveManagedCatalog) {
+    let fixture = fixture(name, false);
+    let identity = authority_identity(7);
+    let (fixture, managed) = ready(fixture);
+    assert_eq!(
+        fixture
+            .authority
+            .execute("alice", &activate_command(&identity, 3))
+            .unwrap()
+            .code,
+        0
+    );
+    let active = {
+        let admission = fixture.authority.admission("alice").unwrap();
+        managed.activate(&admission).unwrap()
+    };
+    (fixture, active)
+}
+
+#[test]
+fn a_write_durable_after_its_lease_lapsed_is_unconfirmed_until_settled() {
+    let (fixture, active) = activated("lapsed-write");
+
+    // The commit returns after the lease lapsed: durable, unconfirmed.
+    let admission = fixture
+        .authority
+        .leased_admission("alice", short_lease(40))
+        .unwrap();
+    active.arm_postcommit_pause(std::time::Duration::from_millis(80));
+    let receipt = match active.accept(&admission, &second_write()).unwrap() {
+        Acceptance::Unconfirmed(receipt) => receipt,
+        Acceptance::Accepted(receipt) => panic!("accepted past its lease: {receipt:?}"),
+    };
+    assert_eq!(receipt.accepted_sequence, 2);
+    assert_eq!(receipt.write_epoch, 1);
+    assert!(receipt.accepted && receipt.durable && !receipt.replayed);
+    assert_eq!(
+        recorded(&active, b"accept-two"),
+        (WriteOutcome::Unconfirmed, 0)
+    );
+
+    // The lapsed admission decides nothing, by name, and the record stays.
+    let error = active
+        .settle(&admission, "alice", b"accept-two")
+        .unwrap_err();
+    assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
+    assert!(error.message().contains("lease expired"), "{error}");
+    assert_eq!(
+        recorded(&active, b"accept-two"),
+        (WriteOutcome::Unconfirmed, 0)
+    );
+    drop(admission);
+
+    // Another actor cannot settle it.
+    let bob = fixture
+        .authority
+        .leased_admission("bob", short_lease(500))
+        .unwrap();
+    let error = active.settle(&bob, "alice", b"accept-two").unwrap_err();
+    assert_eq!(error.code(), Code::PermissionDenied, "{error}");
+    drop(bob);
+
+    // A fresh lease settles it: the right is current, the write is accepted
+    // and the record moves with it.
+    let fresh = fixture
+        .authority
+        .leased_admission("alice", short_lease(500))
+        .unwrap();
+    match active.settle(&fresh, "alice", b"accept-two").unwrap() {
+        Settlement::Accepted(settled) => assert_eq!(settled, receipt),
+        Settlement::Fenced(rejection) => panic!("fenced with a current right: {rejection}"),
+    }
+    assert_eq!(
+        recorded(&active, b"accept-two"),
+        (WriteOutcome::Accepted, 0)
+    );
+    // Settling again is the same answer, and the retry replays it.
+    match active.settle(&fresh, "alice", b"accept-two").unwrap() {
+        Settlement::Accepted(settled) => assert_eq!(settled, receipt),
+        Settlement::Fenced(rejection) => panic!("{rejection}"),
+    }
+    assert_eq!(
+        active.accept(&fresh, &second_write()).unwrap(),
+        Acceptance::Accepted(replayed(&receipt))
+    );
+    drop(fresh);
+
+    // A retry that finds the record unconfirmed settles it under its own
+    // admission, which is fresh at entry.
+    let mut third = second_write();
+    third.document_key = b"document-three".to_vec();
+    third.operation_id = b"accept-three".to_vec();
+    let lapsed = fixture
+        .authority
+        .leased_admission("alice", short_lease(40))
+        .unwrap();
+    active.arm_postcommit_pause(std::time::Duration::from_millis(80));
+    let third_receipt = active.accept(&lapsed, &third).unwrap().into_receipt();
+    assert_eq!(
+        recorded(&active, b"accept-three"),
+        (WriteOutcome::Unconfirmed, 0)
+    );
+    drop(lapsed);
+    let retry = fixture
+        .authority
+        .leased_admission("alice", short_lease(500))
+        .unwrap();
+    assert_eq!(
+        active.accept(&retry, &third).unwrap(),
+        Acceptance::Accepted(replayed(&third_receipt))
+    );
+    assert_eq!(
+        recorded(&active, b"accept-three"),
+        (WriteOutcome::Accepted, 0)
+    );
+
+    // The history carries the epoch on every version and no fence.
+    let versions = history(&active);
+    assert_eq!(versions.len(), 3);
+    assert_eq!(
+        versions[0].write_epoch, 0,
+        "the fixture write predates activation"
+    );
+    assert!(versions[1..]
+        .iter()
+        .all(|v| v.write_epoch == 1 && !v.fenced));
+    active_records(&active, 3);
+}
+
+#[test]
+fn a_write_settled_after_its_right_was_revoked_is_fenced_by_name() {
+    let (fixture, active) = activated("fenced-write");
+    let identity = authority_identity(7);
+
+    let admission = fixture
+        .authority
+        .leased_admission("alice", short_lease(40))
+        .unwrap();
+    active.arm_postcommit_pause(std::time::Duration::from_millis(80));
+    let receipt = match active.accept(&admission, &second_write()).unwrap() {
+        Acceptance::Unconfirmed(receipt) => receipt,
+        Acceptance::Accepted(receipt) => panic!("accepted past its lease: {receipt:?}"),
+    };
+    drop(admission);
+
+    // alice loses Ingest before the write is settled: the command expects
+    // control revision 4 and policy revision 1, and its commit is control
+    // revision 5, the one the fence is marked with.
+    assert_eq!(
+        fixture
+            .authority
+            .execute(
+                "alice",
+                &grants_command(
+                    &identity,
+                    "admin-only",
+                    4,
+                    1,
+                    vec![grant("alice", AccessAction::Admin)]
+                )
+            )
+            .unwrap()
+            .code,
+        0
+    );
+
+    // Settling finds the right gone: the record is fenced at the revision
+    // that took it, and the rejection names the durable version.
+    let fresh = fixture
+        .authority
+        .leased_admission("alice", short_lease(500))
+        .unwrap();
+    let rejection = match active.settle(&fresh, "alice", b"accept-two").unwrap() {
+        Settlement::Fenced(rejection) => rejection,
+        Settlement::Accepted(receipt) => panic!("accepted with the right gone: {receipt:?}"),
+    };
+    assert_eq!(rejection.code(), Code::FailedPrecondition, "{rejection}");
+    assert!(
+        rejection
+            .message()
+            .contains("version 1 at sequence 2 became durable after its admission lapsed"),
+        "{rejection}"
+    );
+    assert!(
+        rejection.message().contains("control revision 5"),
+        "{rejection}"
+    );
+    assert!(
+        rejection.message().contains("fenced under write epoch 1"),
+        "{rejection}"
+    );
+    assert_eq!(recorded(&active, b"accept-two"), (WriteOutcome::Fenced, 5));
+
+    // A fence is final: the retry replays the rejection, before any entry
+    // check, and a settlement returns it again.
+    let retry = active.accept(&fresh, &second_write()).unwrap_err();
+    assert_eq!(retry.code(), Code::FailedPrecondition, "{retry}");
+    assert_eq!(retry.message(), rejection.message());
+    match active.settle(&fresh, "alice", b"accept-two").unwrap() {
+        Settlement::Fenced(again) => assert_eq!(again.message(), rejection.message()),
+        Settlement::Accepted(receipt) => panic!("{receipt:?}"),
+    }
+    // The same operation id with another request is still a different
+    // write.
+    let mut other = second_write();
+    other.document_key = b"document-other".to_vec();
+    let error = active.accept(&fresh, &other).unwrap_err();
+    assert_eq!(error.code(), Code::AlreadyExists, "{error}");
+    drop(fresh);
+
+    // The row stays in the history, marked, at the sequence it took; it
+    // remains the head of its key, so the next version of that key counts
+    // on from it.
+    let versions = history(&active);
+    assert_eq!(versions.len(), 2);
+    assert_eq!(versions[1].accepted_sequence, receipt.accepted_sequence);
+    assert!(versions[1].fenced);
+    assert_eq!(versions[1].fenced_at_revision, 5);
+    assert_eq!(versions[1].write_epoch, 1);
+    assert!(!versions[0].fenced);
+
+    // Granted again (the command at control revision 5, policy revision
+    // 2), alice's next write of the key is
+    // version 2 at sequence 3, accepted within its lease.
+    assert_eq!(
+        fixture
+            .authority
+            .execute(
+                "alice",
+                &grants_command(
+                    &identity,
+                    "granted-again",
+                    5,
+                    2,
+                    vec![{
+                        let mut alice = grant("alice", AccessAction::Admin);
+                        alice.actions.push(AccessAction::Ingest as i32);
+                        alice
+                    }]
+                )
+            )
+            .unwrap()
+            .code,
+        0
+    );
+    let again = fixture
+        .authority
+        .leased_admission("alice", short_lease(500))
+        .unwrap();
+    let mut next = second_write();
+    next.operation_id = b"accept-two-again".to_vec();
+    next.expected_version = Some(1);
+    let next_receipt = active.accept(&again, &next).unwrap().into_receipt();
+    assert_eq!(
+        (next_receipt.version, next_receipt.accepted_sequence),
+        (2, 3)
+    );
+    assert_eq!(
+        recorded(&active, b"accept-two-again"),
+        (WriteOutcome::Accepted, 0)
+    );
+    let versions = history(&active);
+    assert!(versions[1].fenced && !versions[2].fenced);
 }

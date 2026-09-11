@@ -80,6 +80,10 @@ message DocumentWriteReceipt {
   bool replayed = 7;
   // Persistent catalog lineage, independent of its path and shard geometry.
   bytes history_id = 8;
+  // The owner's write epoch this write committed under: the fence a
+  // replacement owner's activation moves. Zero when the catalog is not an
+  // activated managed source.
+  uint64 write_epoch = 9;
 }
 
 // Trusted local consumption of accepted versions in commit order. This is
@@ -109,6 +113,15 @@ message AcceptedDocumentVersion {
     ProtobufSource source = 4;
     bool deleted = 5;
   }
+  // The write epoch the version committed under (zero on a catalog that
+  // is not an activated managed source).
+  uint64 write_epoch = 6;
+  // True when the version became durable after its admission lapsed and
+  // was then found to have no current right: it stays in the history,
+  // marked, with the control revision at which it was fenced. A reader
+  // that applies history treats a fenced version as never admitted.
+  bool fenced = 7;
+  uint64 fenced_at_revision = 8;
 }
 
 message ReadAcceptedDocumentsResponse {
