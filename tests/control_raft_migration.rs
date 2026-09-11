@@ -482,6 +482,22 @@ async fn the_fleet_map_migrates_into_a_group_that_survives_the_exercise() {
         .applied_index_at_least(Some(position), "healed")
         .await
         .unwrap();
+    // Applied catch-up alone does not mean the healed member knows the
+    // leader yet; the replay below forwards to the successor, so wait
+    // for that awareness instead of racing the successor's heartbeat.
+    // Waiting for the successor specifically (not any leader) keeps the
+    // forwarded-lease property the replay asserts.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if old_leader.believed_leader() == Some(successor) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the healed old leader never learned the successor"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let replay = old_leader
         .with_admission("alice", |admission| catalog.accept(admission, &inflight))
         .await
