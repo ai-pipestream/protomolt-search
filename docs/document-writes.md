@@ -145,6 +145,17 @@ answers with the settlement; when no lease can be had, the call is
 retry settles it. What this closes, and the residual it leaves, are in
 [admission under Raft](raft-admission.md), "Source write boundary".
 
+The version precondition (`expected_version`, "Identity and retry rules")
+is decided inside the same write transaction, before the final admission
+check and the commit: a mismatch is `ABORTED`, consumes no version and no
+operation id, and has no outcome to record, so the corrected request is
+new work. On a hosted source the check runs on the serving member's own
+applied view under its lease, forwarded from the leader when the member
+does not lead. Evidence: two writers on one key through the leader's
+service, one wins at version 1 and the other is `ABORTED` by name with no
+record; the same key through a member that does not lead
+(`tests/control_raft_hosted_writes.rs`).
+
 Fault injection (`fault-injection`): `arm_postcommit_pause` holds a write
 after its commit returned and before its outcome is judged, the window
 the outcomes exist for.

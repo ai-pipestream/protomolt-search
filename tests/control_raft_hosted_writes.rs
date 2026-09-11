@@ -1781,3 +1781,137 @@ async fn an_unconfirmed_write_whose_actor_was_revoked_meanwhile_is_fenced() {
     return_host(&mut cluster, leader, host);
     cluster.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// The conditional write over the hosted service (docs/document-writes.md,
+// "Identity and retry rules"): two writers name the same expected version
+// of one key, one wins, the other is ABORTED by name inside the write
+// transaction and leaves no version and no operation record, so its
+// corrected request is new work. The rule holds through a member that
+// does not lead as well.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_version_precondition_is_decided_in_the_write_transaction_and_a_loser_leaves_no_record() {
+    let _serial = serial();
+    let mut cluster = raft_kit::three_voters("hosted-version-race", &hosted_policy()).await;
+    let leader = cluster.leader().await;
+    let follower = *cluster
+        .nodes()
+        .iter()
+        .find(|n| **n != leader)
+        .expect("three voters");
+    let dir = kit::TestDir::new("hosted-version-race-catalog");
+    let catalog = Arc::new(bridge_active(&mut cluster, leader, &dir, "hosted-prepare").await);
+    let host = take_host(&mut cluster, leader);
+    let service = HostedDocumentWriteService::new(
+        principals(),
+        Arc::clone(&host),
+        vec![Arc::clone(&catalog)],
+        limits(),
+    )
+    .unwrap();
+    let (mut client, server) = serve(service).await;
+    let target = client
+        .get_write_target(auth(
+            GetDocumentWriteTargetRequest {
+                collection: kit::COLLECTION.into(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    // Two writers, one key, both expecting no prior version: the catalog's
+    // writer lock orders them, the first commits version 1, the second is
+    // ABORTED by name.
+    let first = network_write(target.history_id.clone(), b"raced", b"race-op-one", 0);
+    let second = network_write(target.history_id.clone(), b"raced", b"race-op-two", 0);
+    let (won, lost) = {
+        let mut one = client.clone();
+        let mut two = client.clone();
+        let (a, b) = tokio::join!(
+            one.accept_document(auth(first.clone(), "alice")),
+            two.accept_document(auth(second.clone(), "alice"))
+        );
+        match (a, b) {
+            (Ok(receipt), Err(status)) => (receipt.into_inner(), (status, second.clone())),
+            (Err(status), Ok(receipt)) => (receipt.into_inner(), (status, first.clone())),
+            (Ok(a), Ok(b)) => panic!("both writers won: {a:?} {b:?}"),
+            (Err(a), Err(b)) => panic!("neither writer won: {a} {b}"),
+        }
+    };
+    assert_eq!(won.version, 1);
+    assert!(won.accepted && won.durable && !won.replayed);
+    let (status, loser) = lost;
+    assert_eq!(status.code(), Code::Aborted, "{status}");
+    assert!(
+        status
+            .message()
+            .contains("document version precondition failed"),
+        "{status}"
+    );
+
+    // The loser left no record: its exact retry is not a replay of the
+    // rejection but the same precondition failing again, and the corrected
+    // request (expecting version 1) is new work at version 2.
+    let again = client
+        .accept_document(auth(loser.clone(), "alice"))
+        .await
+        .unwrap_err();
+    assert_eq!(again.code(), Code::Aborted, "{again}");
+    let mut corrected = loser;
+    corrected.document.as_mut().unwrap().expected_version = Some(1);
+    let receipt = client
+        .accept_document(auth(corrected.clone(), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(receipt.version, 2);
+    assert!(!receipt.replayed);
+    assert_eq!(receipt.accepted_sequence, won.accepted_sequence + 1);
+    // Sending the corrected request under the loser's operation id is a
+    // different request under a used id: ALREADY_EXISTS, no third version.
+    let mut reused = corrected;
+    reused.document.as_mut().unwrap().expected_version = Some(2);
+    let error = client
+        .accept_document(auth(reused, "alice"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::AlreadyExists, "{error}");
+
+    // The precondition is checked on the follower's own view under a
+    // forwarded lease too: version 2 is what it sees.
+    drop(client);
+    server.shutdown().await;
+    return_host(&mut cluster, leader, host);
+    let host = take_host(&mut cluster, follower);
+    let service = HostedDocumentWriteService::new(
+        principals(),
+        Arc::clone(&host),
+        vec![Arc::clone(&catalog)],
+        limits(),
+    )
+    .unwrap();
+    let (mut client, server) = serve(service).await;
+    let stale = network_write(target.history_id.clone(), b"raced", b"race-op-three", 1);
+    let error = client
+        .accept_document(auth(stale, "alice"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::Aborted, "{error}");
+    let current = network_write(target.history_id, b"raced", b"race-op-three", 2);
+    let receipt = client
+        .accept_document(auth(current, "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(receipt.version, 3);
+    assert!(!receipt.replayed);
+
+    drop(client);
+    server.shutdown().await;
+    return_host(&mut cluster, follower, host);
+    cluster.shutdown().await;
+}
