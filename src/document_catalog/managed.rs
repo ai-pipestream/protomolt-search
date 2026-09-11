@@ -220,6 +220,8 @@ mod adapter {
         binding: SourceManagedBinding,
         activation: SourceManagedActivation,
         authority: SourceAuthorityStore,
+        #[cfg(any(test, feature = "fault-injection"))]
+        settle_pause: std::sync::Mutex<Option<std::time::Duration>>,
     }
 
     impl AccessControlledCatalog {
@@ -502,6 +504,8 @@ mod adapter {
                 binding: self.binding,
                 activation,
                 authority: self.authority,
+                #[cfg(any(test, feature = "fault-injection"))]
+                settle_pause: std::sync::Mutex::new(None),
             })
         }
 
@@ -632,6 +636,8 @@ mod adapter {
                 binding: binding.clone(),
                 activation,
                 authority: authority.clone(),
+                #[cfg(any(test, feature = "fault-injection"))]
+                settle_pause: std::sync::Mutex::new(None),
             })
         }
 
@@ -651,6 +657,13 @@ mod adapter {
         #[cfg(any(test, feature = "fault-injection"))]
         pub fn arm_postcommit_pause(&self, pause: std::time::Duration) {
             self.inner.arm_postcommit_pause(pause);
+        }
+
+        /// Fault injection: pause the next settlement between its freshness
+        /// check and its entry check, the gap in which a lease can lapse.
+        #[cfg(any(test, feature = "fault-injection"))]
+        pub fn arm_settle_pause(&self, pause: std::time::Duration) {
+            *self.settle_pause.lock().unwrap() = Some(pause);
         }
 
         pub fn binding(&self) -> &SourceManagedBinding {
@@ -756,8 +769,26 @@ mod adapter {
                 self.activation.write_epoch,
             )?;
             match written.outcome {
-                WriteOutcome::Unconfirmed | WriteOutcome::Fenced => Err(Status::internal(
-                    "an unsettled or fenced record was returned as a receipt",
+                WriteOutcome::Unconfirmed => {
+                    // The record was marked between this call's first look
+                    // and the write's own retry lookup, by the call that wrote
+                    // it: settle it here, as the first look would have.
+                    match self.settle_under(
+                        admission,
+                        &decision.principal,
+                        &request.operation_id,
+                    )? {
+                        Settlement::Accepted(receipt) => {
+                            Ok(Acceptance::Accepted(crate::pb::DocumentWriteReceipt {
+                                replayed: true,
+                                ..receipt
+                            }))
+                        }
+                        Settlement::Fenced(rejection) => Err(rejection),
+                    }
+                }
+                WriteOutcome::Fenced => Err(Status::internal(
+                    "a fenced record was returned as a receipt",
                 )),
                 WriteOutcome::Accepted if written.receipt.replayed => {
                     Ok(Acceptance::Accepted(written.receipt))
@@ -831,11 +862,23 @@ mod adapter {
             }
             // A lease that lapsed again decides nothing.
             admission.check_fresh()?;
+            #[cfg(any(test, feature = "fault-injection"))]
+            if let Some(pause) = self.settle_pause.lock().unwrap().take() {
+                std::thread::sleep(pause);
+            }
             let settled = match self.admit(admission, AccessAction::Ingest) {
                 Ok(_) => outcome::Settled::Accepted,
-                Err(_) => outcome::Settled::Fenced {
-                    at_revision: admission.applied_control_revision(),
-                },
+                Err(_) => {
+                    // The entry check fails for a lapsed lease as well as for
+                    // a right that is gone; only the second is a fence. A
+                    // lease that lapsed between the check above and the entry
+                    // check decides nothing, and the record stays
+                    // unconfirmed for the next attempt.
+                    admission.check_fresh()?;
+                    outcome::Settled::Fenced {
+                        at_revision: admission.applied_control_revision(),
+                    }
+                }
             };
             match self
                 .inner
@@ -843,9 +886,15 @@ mod adapter {
             {
                 WriteOutcome::Accepted => Ok(Settlement::Accepted(receipt)),
                 WriteOutcome::Fenced => {
+                    // Fenced here, or fenced by a concurrent settlement whose
+                    // revision the record now names.
                     let at_revision = match settled {
                         outcome::Settled::Fenced { at_revision } => at_revision,
-                        outcome::Settled::Accepted => 0,
+                        outcome::Settled::Accepted => self
+                            .inner
+                            .recorded_operation(Some(principal), operation_id)?
+                            .map(|operation| operation.fenced_at_revision)
+                            .unwrap_or(0),
                     };
                     Ok(Settlement::Fenced(outcome::fenced(&receipt, at_revision)))
                 }
