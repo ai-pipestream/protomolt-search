@@ -989,34 +989,10 @@ async fn a_restart_with_a_foreign_collection_catalog_is_rejected_by_name() {
     let mut cluster = raft_kit::three_voters("hosted-collection", &hosted_policy()).await;
     let leader = cluster.leader().await;
     let dir = kit::TestDir::new("hosted-collection-catalog");
-    let authority = cluster.group.clone();
-    let (catalog, history_id) = catalog_fixture(&dir);
-    let prepare = kit::source_command(
-        &authority,
-        &kit::owner_key(),
-        "hosted-prepare",
-        cluster.revision,
-        1,
-        0,
-        kit::prepare_action_history(WORKFLOW, history_id),
-    );
-    let decision = cluster
-        .host(leader)
-        .propose_command("alice", &prepare)
-        .await
-        .unwrap();
-    assert_eq!(decision.code, 0, "{}", decision.message);
-    let preparation = decision.owner.clone().unwrap();
-    let store = cluster.host(leader).store().unwrap();
-    let prepared = cluster
-        .host(leader)
-        .with_admission("alice", |admission| {
-            catalog.bind_prepared_owner(admission, &store, &preparation, 1 << 20)
-        })
-        .await
-        .unwrap();
-    drop(prepared);
-    drop(store);
+    // Activated, so recovery passes the prepared state and reaches the
+    // collection binding: the file is bound to the prepared collection.
+    let active = bridge_active(&mut cluster, leader, &dir, "hosted-prepare").await;
+    drop(active);
 
     let host = take_host(&mut cluster, leader);
     let error = recover_catalogs(&host, "alice", &[managed_entry("another-collection", &dir)])
