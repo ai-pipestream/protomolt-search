@@ -498,6 +498,27 @@ async fn the_fleet_map_migrates_into_a_group_that_survives_the_exercise() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // The forwarded lease answers with the successor's committed position
+    // and gives the healed member the rest of the lease interval (500 ms
+    // here) to apply it. `position` was read once, right after the heal;
+    // the successor can commit past it while its replication to the
+    // healed member is still on the library's retry cadence for a member
+    // that was unreachable, a fixed 500 ms. The replay must not race that
+    // cadence: wait until the healed member holds everything in the
+    // successor's log, reading the target again until it stands still.
+    let mut target = cluster.host(successor).metrics().borrow().last_log_index;
+    loop {
+        old_leader
+            .wait(Some(Duration::from_secs(30)))
+            .applied_index_at_least(target, "healed to the successor's last log")
+            .await
+            .unwrap();
+        let again = cluster.host(successor).metrics().borrow().last_log_index;
+        if again == target {
+            break;
+        }
+        target = again;
+    }
     let replay = old_leader
         .with_admission("alice", |admission| catalog.accept(admission, &inflight))
         .await
