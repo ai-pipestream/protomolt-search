@@ -510,16 +510,16 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         );
         let max = cfg.max_message_bytes;
         let mut shutdown = shutdown_rx.clone();
-        let mut relay_server = secured_server(cfg.tls.as_ref(), true)?
+        let relay_base = secured_server(cfg.tls.as_ref(), true)?
             .initial_stream_window_size(pipestream_search::H2_STREAM_WINDOW)
             .initial_connection_window_size(pipestream_search::H2_CONN_WINDOW)
             .add_service(relay.clone().into_server(max))
             .add_service(relay.diagnostics_server(max));
         #[cfg(all(feature = "raft", feature = "tls"))]
-        {
-            relay_server = relay_server
-                .add_optional_service(hosted_writes.clone().map(|service| service.into_server()));
-        }
+        let relay_server = relay_base
+            .add_optional_service(hosted_writes.clone().map(|service| service.into_server()));
+        #[cfg(not(all(feature = "raft", feature = "tls")))]
+        let relay_server = relay_base;
         handles.push(tokio::spawn(relay_server.serve_with_incoming_shutdown(
             harness::nodelay_incoming(listener),
             async move {
@@ -541,17 +541,17 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             .diagnostics()
             .with_gauges(gauges)
             .into_server(max);
-        let mut coord_server = secured_server(cfg.tls.as_ref(), false)?
+        let coord_base = secured_server(cfg.tls.as_ref(), false)?
             .initial_stream_window_size(pipestream_search::H2_STREAM_WINDOW)
             .initial_connection_window_size(pipestream_search::H2_CONN_WINDOW)
             .add_optional_service(control_set.map(|set| set.into_server(max)))
             .add_service(search_set.into_server(max))
             .add_service(diagnostics);
         #[cfg(all(feature = "raft", feature = "tls"))]
-        {
-            coord_server = coord_server
-                .add_optional_service(hosted_writes.clone().map(|service| service.into_server()));
-        }
+        let coord_server = coord_base
+            .add_optional_service(hosted_writes.clone().map(|service| service.into_server()));
+        #[cfg(not(all(feature = "raft", feature = "tls")))]
+        let coord_server = coord_base;
         handles.push(tokio::spawn(coord_server.serve_with_incoming_shutdown(
             harness::nodelay_incoming(listener),
             async move {

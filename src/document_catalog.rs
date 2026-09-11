@@ -34,7 +34,7 @@ mod seal;
 pub use access::AccessControlledCatalog;
 pub use backup::CapturedBackup;
 pub use checkpoint::CatalogCheckpoint;
-#[cfg(feature = "net")]
+#[cfg(all(feature = "net", feature = "raft"))]
 pub(crate) use managed::header_binding;
 #[cfg(feature = "net")]
 pub use managed::{ActiveManagedCatalog, PreparedManagedCatalog};

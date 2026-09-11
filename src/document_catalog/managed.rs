@@ -32,6 +32,7 @@ fn inject(fault: Option<BindFault>, after: bool) -> Result<(), Status> {
 /// with the persisted binding and activation. Recovery presents these
 /// exact binding bytes to the committed fence; nothing is reconstructed.
 /// A file with no managed binding is not a managed source.
+#[cfg(all(feature = "net", feature = "raft"))]
 pub(crate) fn header_binding(
     path: &Path,
 ) -> Result<(u32, SourceManagedBinding, Option<SourceManagedActivation>), Status> {

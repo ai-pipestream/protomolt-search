@@ -179,6 +179,7 @@ pub struct LeasedAdmission {
 }
 
 impl LeasedAdmission {
+    #[cfg(feature = "raft")]
     pub(crate) fn new(store: SourceAuthorityStore, principal: &str, lease: AdmissionLease) -> Self {
         Self {
             store,

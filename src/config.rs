@@ -2784,6 +2784,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "raft", feature = "tls"))]
     fn raft_managed_catalog_options_parse_repeatable_and_refuse_without_member() {
         let base = || {
             vec![
@@ -2844,6 +2845,25 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(error.contains("needs --raft-dir"), "{error}");
+    }
+
+    #[test]
+    #[cfg(not(all(feature = "raft", feature = "tls")))]
+    fn raft_managed_catalog_options_refuse_without_raft_support() {
+        let error = parse(&args(&[
+            "--role=coordinator",
+            "--nodes=127.0.0.1:1",
+            "--raft-dir=/tmp/member-1",
+            "--raft-node-id=1",
+            "--raft-group-id=0102030405060708090a0b0c0d0e0f10",
+            "--raft-authority-incarnation=ffffffffffffffffffffffffffffffff",
+            "--raft-listen=127.0.0.1:19500",
+            "--raft-peers=/tmp/peers.toml",
+            "--raft-managed-catalog=books=/tmp/books.redb",
+            "--raft-managed-principal=alice",
+        ]))
+        .unwrap_err();
+        assert!(error.contains("has no Raft support"), "{error}");
     }
 
     #[test]
