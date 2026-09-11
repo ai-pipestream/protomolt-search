@@ -99,7 +99,10 @@ impl DocumentCatalog {
                 .get(operation_key.bytes.as_slice())
                 .map_err(storage)?
                 .ok_or_else(|| {
-                    Status::not_found("the actor has no operation with this id to settle")
+                    crate::raft::reasons::reason(
+                        Status::not_found("the actor has no operation with this id to settle"),
+                        crate::raft::reasons::OUTCOME_NO_OPERATION,
+                    )
                 })?;
             decode(bytes.value())?
         };
@@ -122,7 +125,10 @@ impl DocumentCatalog {
                 .get(version_key.as_slice())
                 .map_err(storage)?
                 .ok_or_else(|| {
-                    Status::data_loss("operation names a version the catalog does not hold")
+                    crate::raft::reasons::reason(
+                        Status::data_loss("operation names a version the catalog does not hold"),
+                        crate::raft::reasons::OUTCOME_VERSION_UNKNOWN,
+                    )
                 })?;
             decode(bytes.value())?
         };
@@ -171,15 +177,22 @@ impl DocumentCatalog {
 }
 
 pub(super) fn outcome_of(value: i32) -> Result<WriteOutcome, Status> {
-    WriteOutcome::try_from(value)
-        .map_err(|_| Status::data_loss("operation record carries an unknown write outcome"))
+    WriteOutcome::try_from(value).map_err(|_| {
+        crate::raft::reasons::reason(
+            Status::data_loss("operation record carries an unknown write outcome"),
+            crate::raft::reasons::OUTCOME_UNKNOWN_OUTCOME,
+        )
+    })
 }
 
 /// The rejection a fenced write replays: the row is durable and named,
 /// and it was never admitted.
 pub(super) fn fenced(receipt: &DocumentWriteReceipt, at_revision: u64) -> Status {
-    Status::failed_precondition(format!(
-        "write of version {} at sequence {} became durable after its admission lapsed and its right was gone at control revision {}: the version is fenced under write epoch {} and was never admitted; a retry replays this decision",
-        receipt.version, receipt.accepted_sequence, at_revision, receipt.write_epoch
-    ))
+    crate::raft::reasons::reason(
+        Status::failed_precondition(format!(
+            "write of version {} at sequence {} became durable after its admission lapsed and its right was gone at control revision {}: the version is fenced under write epoch {} and was never admitted; a retry replays this decision",
+            receipt.version, receipt.accepted_sequence, at_revision, receipt.write_epoch
+        )),
+        crate::raft::reasons::OUTCOME_FENCED,
+    )
 }

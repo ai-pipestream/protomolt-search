@@ -97,6 +97,7 @@ pub mod host;
 pub mod log_store;
 #[cfg(feature = "tls")]
 pub mod operator;
+pub mod reasons;
 pub mod state_machine;
 #[cfg(feature = "tls")]
 pub mod transport;

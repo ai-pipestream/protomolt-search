@@ -9,6 +9,7 @@
 //! `to_node_id` must be this node. A caller names the target in every
 //! request and checks the responder named in every reply. An address is
 //! where a node is dialed, never who it is.
+use super::reasons;
 use super::state_machine::SnapshotStaging;
 use super::types::{
     entry_from_proto, entry_to_proto, log_id_from_proto, log_id_to_proto,
@@ -327,10 +328,13 @@ impl RaftTransportService {
         if announced > self.staging.max_image_bytes() {
             let bound = self.staging.max_image_bytes();
             self.rejections.record(from, announced, bound);
-            return Err(Status::resource_exhausted(format!(
-                "snapshot announces {announced} bytes, beyond the {bound} byte image bound of node {}",
-                self.node_id
-            )));
+            return Err(reasons::reason(
+                Status::resource_exhausted(format!(
+                    "snapshot announces {announced} bytes, beyond the {bound} byte image bound of node {}",
+                    self.node_id
+                )),
+                reasons::TRANSPORT_SNAPSHOT_OVER_BOUND,
+            ));
         }
         let now = std::time::Instant::now();
         let mut guard = self
@@ -370,10 +374,13 @@ impl RaftTransportService {
                 // without end and without a fresh serve; a definite refusal
                 // spends the sender's retry budget, so it returns to the
                 // library's core, backs off and serves its snapshot afresh.
-                return Err(Status::failed_precondition(format!(
-                    "snapshot chunk at offset {} of {} continues no transfer at node {}: the transfer was dropped, and a transfer begins at offset zero",
-                    rpc.offset, rpc.meta.snapshot_id, self.node_id
-                )));
+                return Err(reasons::reason(
+                    Status::failed_precondition(format!(
+                        "snapshot chunk at offset {} of {} continues no transfer at node {}: the transfer was dropped, and a transfer begins at offset zero",
+                        rpc.offset, rpc.meta.snapshot_id, self.node_id
+                    )),
+                    reasons::TRANSPORT_SNAPSHOT_STALE_CONTINUATION,
+                ));
             }
             let (dir, file) = self.staging.begin()?;
             *guard = Some(Transfer {
@@ -389,10 +396,13 @@ impl RaftTransportService {
         }
         let active = guard.as_mut().expect("a transfer is in progress");
         if active.peer != from {
-            return Err(Status::failed_precondition(format!(
-                "snapshot transfer {} is bound to node {}",
-                active.meta.snapshot_id, active.peer
-            )));
+            return Err(reasons::reason(
+                Status::failed_precondition(format!(
+                    "snapshot transfer {} is bound to node {}",
+                    active.meta.snapshot_id, active.peer
+                )),
+                reasons::TRANSPORT_SNAPSHOT_TRANSFER_BOUND,
+            ));
         }
         if active.meta != rpc.meta || active.vote != rpc.vote {
             let broken = guard.take().expect("checked");
@@ -425,9 +435,12 @@ impl RaftTransportService {
             let announced = active.announced;
             let broken = guard.take().expect("checked");
             self.staging.discard(&broken.dir);
-            return Err(Status::invalid_argument(format!(
-                "snapshot chunk ends at byte {end}, beyond the announced length {announced}; the transfer is dropped"
-            )));
+            return Err(reasons::reason(
+                Status::invalid_argument(format!(
+                    "snapshot chunk ends at byte {end}, beyond the announced length {announced}; the transfer is dropped"
+                )),
+                reasons::TRANSPORT_SNAPSHOT_OVER_ANNOUNCED,
+            ));
         }
         {
             use std::io::Write;
@@ -446,10 +459,13 @@ impl RaftTransportService {
         drop(guard);
         if complete.received != complete.announced {
             self.staging.discard(&complete.dir);
-            return Err(Status::invalid_argument(format!(
-                "snapshot transfer ended at {} bytes of the announced length {}",
-                complete.received, complete.announced
-            )));
+            return Err(reasons::reason(
+                Status::invalid_argument(format!(
+                    "snapshot transfer ended at {} bytes of the announced length {}",
+                    complete.received, complete.announced
+                )),
+                reasons::TRANSPORT_SNAPSHOT_OVER_ANNOUNCED,
+            ));
         }
         if let Err(error) = complete.file.sync_all() {
             self.staging.discard(&complete.dir);
@@ -482,64 +498,101 @@ impl RaftTransportService {
         header: Option<&RaftRpcHeader>,
     ) -> Result<NodeId, Status> {
         let certificates = request.peer_certs().ok_or_else(|| {
-            Status::unauthenticated(
-                "raft transport requires a client certificate from the cluster CA",
+            reasons::reason(
+                Status::unauthenticated(
+                    "raft transport requires a client certificate from the cluster CA",
+                ),
+                reasons::TRANSPORT_NO_CLIENT_CERTIFICATE,
             )
         })?;
         let leaf = certificates.first().ok_or_else(|| {
-            Status::unauthenticated(
-                "raft transport requires a client certificate from the cluster CA",
+            reasons::reason(
+                Status::unauthenticated(
+                    "raft transport requires a client certificate from the cluster CA",
+                ),
+                reasons::TRANSPORT_NO_CLIENT_CERTIFICATE,
             )
         })?;
         let fingerprint = crate::sha256::digest(leaf.as_ref());
         let registered = self.directory.node_of(&fingerprint).ok_or_else(|| {
-            Status::unauthenticated(
-                "client certificate is not registered to any member of this group",
+            reasons::reason(
+                Status::unauthenticated(
+                    "client certificate is not registered to any member of this group",
+                ),
+                reasons::TRANSPORT_UNREGISTERED_CERTIFICATE,
             )
         })?;
-        let header =
-            header.ok_or_else(|| Status::invalid_argument("raft rpc carries no header"))?;
+        let header = header.ok_or_else(|| {
+            reasons::reason(
+                Status::invalid_argument("raft rpc carries no header"),
+                reasons::TRANSPORT_BAD_HEADER,
+            )
+        })?;
         if header.protocol_version != PROTOCOL_VERSION {
-            return Err(Status::invalid_argument(format!(
-                "raft rpc protocol version {} is not {PROTOCOL_VERSION}",
-                header.protocol_version
-            )));
+            return Err(reasons::reason(
+                Status::invalid_argument(format!(
+                    "raft rpc protocol version {} is not {PROTOCOL_VERSION}",
+                    header.protocol_version
+                )),
+                reasons::TRANSPORT_BAD_HEADER,
+            ));
         }
         if header.group.as_ref() != Some(self.directory.group()) {
-            return Err(Status::permission_denied("raft rpc names another group"));
+            return Err(reasons::reason(
+                Status::permission_denied("raft rpc names another group"),
+                reasons::TRANSPORT_WRONG_GROUP,
+            ));
         }
         if header.to_node_id != self.node_id {
-            return Err(Status::permission_denied(format!(
-                "raft rpc addressed to node {} reached node {}",
-                header.to_node_id, self.node_id
-            )));
+            return Err(reasons::reason(
+                Status::permission_denied(format!(
+                    "raft rpc addressed to node {} reached node {}",
+                    header.to_node_id, self.node_id
+                )),
+                reasons::TRANSPORT_MISADDRESSED,
+            ));
         }
         if header.from_node_id != registered {
-            return Err(Status::permission_denied(format!(
-                "raft rpc claims node {} but the certificate is registered to node {registered}",
-                header.from_node_id
-            )));
+            return Err(reasons::reason(
+                Status::permission_denied(format!(
+                    "raft rpc claims node {} but the certificate is registered to node {registered}",
+                    header.from_node_id
+                )),
+                reasons::TRANSPORT_IDENTITY_MISMATCH,
+            ));
         }
         if self.isolation.blocks(registered) {
-            return Err(Status::unavailable(format!(
-                "node {registered} is isolated from this node (fault injection)"
-            )));
+            return Err(reasons::reason(
+                Status::unavailable(format!(
+                    "node {registered} is isolated from this node (fault injection)"
+                )),
+                reasons::TRANSPORT_ISOLATED,
+            ));
         }
         if self.isolation.deaf_to(registered) {
-            return Err(Status::unavailable(format!(
-                "node {registered} is not heard at this node (fault injection)"
-            )));
+            return Err(reasons::reason(
+                Status::unavailable(format!(
+                    "node {registered} is not heard at this node (fault injection)"
+                )),
+                reasons::TRANSPORT_NOT_HEARD,
+            ));
         }
         let timing = request.metadata().get(TIMING_METADATA).ok_or_else(|| {
-            Status::failed_precondition(
-                "raft rpc carries no timing agreement; the peer runs another build",
+            reasons::reason(
+                Status::failed_precondition(
+                    "raft rpc carries no timing agreement; the peer runs another build",
+                ),
+                reasons::TRANSPORT_TIMING_MISMATCH,
             )
         })?;
         if timing.as_bytes() != self.timing.as_bytes() {
-            return Err(Status::failed_precondition(format!(
-                "peer timing configuration {:?} differs from this node's {}; election and lease values must agree across the group",
-                timing, self.timing
-            )));
+            return Err(reasons::reason(
+                Status::failed_precondition(format!(
+                    "peer timing configuration {:?} differs from this node's {}; election and lease values must agree across the group",
+                    timing, self.timing
+                )),
+                reasons::TRANSPORT_TIMING_MISMATCH,
+            ));
         }
         Ok(registered)
     }
@@ -685,20 +738,31 @@ impl RaftTransportService {
         {
             Ok(Ok(read)) => read,
             Ok(Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(forward)))) => {
-                return Err(Status::unavailable(format!(
-                    "not the leader; leader is {:?}",
-                    forward.leader_id
-                )))
+                return Err(reasons::reason(
+                    Status::unavailable(format!(
+                        "not the leader; leader is {:?}",
+                        forward.leader_id
+                    )),
+                    reasons::LEASE_NOT_LEADER,
+                ))
             }
             Ok(Err(e)) => {
-                return Err(Status::unavailable(format!(
-                    "a forwarded lease needs a linearizable read: {e}"
-                )))
+                return Err(reasons::reason(
+                    Status::unavailable(format!(
+                        "a forwarded lease needs a linearizable read: {e}"
+                    )),
+                    reasons::TRANSPORT_NO_LINEARIZABLE_READ,
+                ))
             }
-            Err(_) => return Err(Status::unavailable(format!(
-                "a forwarded lease needs a linearizable read: no quorum acknowledged within {} ms",
-                self.read_timeout.as_millis()
-            ))),
+            Err(_) => {
+                return Err(reasons::reason(
+                    Status::unavailable(format!(
+                        "a forwarded lease needs a linearizable read: no quorum acknowledged within {} ms",
+                        self.read_timeout.as_millis()
+                    )),
+                    reasons::TRANSPORT_NO_LINEARIZABLE_READ,
+                ))
+            }
         };
         self.hold.extend(anchor);
         Ok(Response::new(RaftGrantLeaseResponse {
@@ -914,8 +978,9 @@ fn snapshot_meta_from_proto(
         return Err(Status::invalid_argument("snapshot meta requires format 1"));
     }
     if value.group.as_ref() != Some(group) {
-        return Err(Status::permission_denied(
-            "snapshot meta names another group",
+        return Err(reasons::reason(
+            Status::permission_denied("snapshot meta names another group"),
+            reasons::TRANSPORT_WRONG_GROUP,
         ));
     }
     let signature = super::state_machine::parse_snapshot_id(&value.snapshot_id).map_err(wire)?;
@@ -1145,9 +1210,12 @@ impl LeaseForwarder {
             client: None,
         };
         let header = network.header();
-        let client = network
-            .client::<RaftError<NodeId>>()
-            .map_err(|e| Status::unavailable(format!("forwarded lease: {e}")))?;
+        let client = network.client::<RaftError<NodeId>>().map_err(|e| {
+            reasons::reason(
+                Status::unavailable(format!("forwarded lease: {e}")),
+                reasons::LEASE_LEADER_UNREACHABLE,
+            )
+        })?;
         let mut request = Request::new(RaftGrantLeaseRequest {
             header: Some(header),
         });
@@ -1159,22 +1227,36 @@ impl LeaseForwarder {
             Ok(response) => response.into_inner(),
             Err(status) => {
                 return Err(match classify(&status) {
-                    Answer::Rejection => Status::new(
-                        status.code(),
-                        format!(
-                            "forwarded lease: leader {leader} rejected it: {}",
-                            status.message()
-                        ),
+                    Answer::Rejection => {
+                        // The leader's answer keeps its code and its
+                        // reason; only the message names the forward.
+                        let mut wrapped = Status::new(
+                            status.code(),
+                            format!(
+                                "forwarded lease: leader {leader} rejected it: {}",
+                                status.message()
+                            ),
+                        );
+                        if let Some(reason) = status.metadata().get(reasons::REASON) {
+                            wrapped.metadata_mut().insert(reasons::REASON, reason.clone());
+                        }
+                        wrapped
+                    }
+                    Answer::Timeout => reasons::reason(
+                        Status::unavailable(format!(
+                            "forwarded lease: leader {leader} at {addr} did not answer within {} ms",
+                            timeout.as_millis()
+                        )),
+                        reasons::LEASE_LEADER_UNREACHABLE,
                     ),
-                    Answer::Timeout => Status::unavailable(format!(
-                        "forwarded lease: leader {leader} at {addr} did not answer within {} ms",
-                        timeout.as_millis()
-                    )),
-                    Answer::Unreachable | Answer::Transport => Status::unavailable(format!(
-                        "forwarded lease: leader {leader} at {addr}: {}",
-                        status.message()
-                    )),
-                })
+                    Answer::Unreachable | Answer::Transport => reasons::reason(
+                        Status::unavailable(format!(
+                            "forwarded lease: leader {leader} at {addr}: {}",
+                            status.message()
+                        )),
+                        reasons::LEASE_LEADER_UNREACHABLE,
+                    ),
+                });
             }
         };
         network

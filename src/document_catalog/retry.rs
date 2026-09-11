@@ -20,8 +20,9 @@ pub(super) fn receipt(
 ) -> Result<Written, Status> {
     let previous: DocumentOperation = decode(bytes)?;
     if previous.request_sha256.as_slice() != request_sha {
-        return Err(Status::already_exists(
-            "operation_id was used for a different document write",
+        return Err(crate::raft::reasons::reason(
+            Status::already_exists("operation_id was used for a different document write"),
+            crate::raft::reasons::OUTCOME_OPERATION_REUSED,
         ));
     }
     let outcome = outcome::outcome_of(previous.outcome)?;

@@ -208,17 +208,26 @@ impl AdmissionLease {
     /// each is a named refusal, never an extension.
     pub fn fresh(&self) -> Result<(), Status> {
         if std::time::Instant::now() >= self.deadline() {
-            return Err(Status::failed_precondition(
-                "admission lease expired; obtain a fresh admission through the host",
+            return Err(crate::raft::reasons::reason(
+                Status::failed_precondition(
+                    "admission lease expired; obtain a fresh admission through the host",
+                ),
+                crate::raft::reasons::LEASE_INTERVAL_ELAPSED,
             ));
         }
         match std::time::SystemTime::now().duration_since(self.anchor_wall) {
             Ok(elapsed) if elapsed < self.ttl => Ok(()),
-            Ok(_) => Err(Status::failed_precondition(
-                "admission lease expired on the wall clock (the process or machine was suspended); obtain a fresh admission through the host",
+            Ok(_) => Err(crate::raft::reasons::reason(
+                Status::failed_precondition(
+                    "admission lease expired on the wall clock (the process or machine was suspended); obtain a fresh admission through the host",
+                ),
+                crate::raft::reasons::LEASE_INTERVAL_ELAPSED,
             )),
-            Err(_) => Err(Status::failed_precondition(
-                "wall clock moved backwards under an admission lease; obtain a fresh admission through the host",
+            Err(_) => Err(crate::raft::reasons::reason(
+                Status::failed_precondition(
+                    "wall clock moved backwards under an admission lease; obtain a fresh admission through the host",
+                ),
+                crate::raft::reasons::LEASE_INTERVAL_ELAPSED,
             )),
         }
     }
@@ -326,7 +335,12 @@ impl SourceAdmission<'_> {
                     .get(bytes.as_slice())
                     .map_err(storage)?
                     .ok_or_else(|| {
-                        Status::failed_precondition("source owner has no committed preparation")
+                        crate::raft::reasons::reason(
+                            Status::failed_precondition(
+                                "source owner has no committed preparation",
+                            ),
+                            crate::raft::reasons::ADMISSION_UNRECORDED_ACTIVATION,
+                        )
                     })?
                     .value(),
             )?;
@@ -390,8 +404,11 @@ impl SourceAdmission<'_> {
         if held.phase != PreparedSourceOwnerPhase::Active as i32
             || held.activation.as_ref().map(|a| a.write_epoch) != Some(write_epoch)
         {
-            return Err(Status::failed_precondition(
-                "source owner is not ACTIVE under this write epoch; the fence has moved",
+            return Err(crate::raft::reasons::reason(
+                Status::failed_precondition(
+                    "source owner is not ACTIVE under this write epoch; the fence has moved",
+                ),
+                crate::raft::reasons::ADMISSION_EPOCH_MOVED,
             ));
         }
         Ok(decision)
@@ -417,7 +434,12 @@ impl SourceAdmission<'_> {
                     .get(bytes.as_slice())
                     .map_err(storage)?
                     .ok_or_else(|| {
-                        Status::failed_precondition("source owner has no committed preparation")
+                        crate::raft::reasons::reason(
+                            Status::failed_precondition(
+                                "source owner has no committed preparation",
+                            ),
+                            crate::raft::reasons::ADMISSION_UNRECORDED_ACTIVATION,
+                        )
                     })?
                     .value(),
             )?;
@@ -568,10 +590,13 @@ impl SourceAuthorityStore {
         lease: AdmissionLease,
     ) -> Result<SourceAdmission<'_>, Status> {
         lease.fresh().map_err(|e| {
-            Status::failed_precondition(format!(
-                "admission interval elapsed before the grant: {}",
-                e.message()
-            ))
+            crate::raft::reasons::reason(
+                Status::failed_precondition(format!(
+                    "admission interval elapsed before the grant: {}",
+                    e.message()
+                )),
+                crate::raft::reasons::LEASE_INTERVAL_ELAPSED,
+            )
         })?;
         self.admission_with(principal, Some(lease))
     }
@@ -1298,8 +1323,11 @@ impl SourceAuthorityStore {
     /// from the group silently.
     fn refuse_unseeded(meta: &redb::Table<&'static str, &'static [u8]>) -> Result<(), Status> {
         if meta.get(MEMBER_META).map_err(storage)?.is_some() {
-            return Err(Status::failed_precondition(
-                "prepared member store awaits the group's first snapshot; log entries do not apply to its genesis image",
+            return Err(crate::raft::reasons::reason(
+                Status::failed_precondition(
+                    "prepared member store awaits the group's first snapshot; log entries do not apply to its genesis image",
+                ),
+                crate::raft::reasons::MEMBERSHIP_AWAITING_SNAPSHOT,
             ));
         }
         Ok(())

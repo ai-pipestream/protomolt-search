@@ -98,22 +98,35 @@ pub fn recover_catalogs(
     let mut catalogs = Vec::with_capacity(entries.len());
     for entry in entries {
         let context = |error: Status| {
-            Status::new(
+            let reason = crate::raft::reasons::reason_of(&error).map(str::to_string);
+            let mut wrapped = Status::new(
                 error.code(),
                 format!(
                     "managed catalog for collection {:?}: {}",
                     entry.collection,
                     error.message()
                 ),
-            )
+            );
+            if let Some(reason) = reason {
+                wrapped.metadata_mut().insert(
+                    crate::raft::reasons::REASON,
+                    reason
+                        .parse()
+                        .expect("reason identifiers are metadata values"),
+                );
+            }
+            wrapped
         };
         let (_, binding, file_activation) =
             crate::document_catalog::header_binding(&entry.path).map_err(context)?;
         if file_activation.is_none() {
-            return Err(Status::failed_precondition(format!(
-                "managed catalog for collection {:?} is prepared, not active; only an activated source serves writes",
-                entry.collection
-            )));
+            return Err(crate::raft::reasons::reason(
+                Status::failed_precondition(format!(
+                    "managed catalog for collection {:?} is prepared, not active; only an activated source serves writes",
+                    entry.collection
+                )),
+                crate::raft::reasons::ADMISSION_NOT_ACTIVE,
+            ));
         }
         let bound_collection = binding
             .preparation
@@ -121,16 +134,22 @@ pub fn recover_catalogs(
             .and_then(|preparation| preparation.key.as_ref())
             .map(|key| key.collection.as_str());
         if bound_collection != Some(entry.collection.as_str()) {
-            return Err(Status::failed_precondition(format!(
-                "managed catalog for collection {:?} names another collection in its binding",
-                entry.collection
-            )));
+            return Err(crate::raft::reasons::reason(
+                Status::failed_precondition(format!(
+                    "managed catalog for collection {:?} names another collection in its binding",
+                    entry.collection
+                )),
+                crate::raft::reasons::ADMISSION_FOREIGN_COLLECTION,
+            ));
         }
         if binding.authority.as_ref() != Some(store.identity()) {
-            return Err(Status::failed_precondition(format!(
-                "managed catalog for collection {:?} names another source authority",
-                entry.collection
-            )));
+            return Err(crate::raft::reasons::reason(
+                Status::failed_precondition(format!(
+                    "managed catalog for collection {:?} names another source authority",
+                    entry.collection
+                )),
+                crate::raft::reasons::ADMISSION_FOREIGN_AUTHORITY,
+            ));
         }
         let admission = store.recovery_admission(principal).map_err(context)?;
         let catalog = ActiveManagedCatalog::recover(&entry.path, &store, &admission, &binding)
@@ -320,7 +339,16 @@ impl HostedDocumentWriteService {
         };
         // Acceptance may have committed under its admitted decision while a
         // replacement published. Current access still gates receipt disclosure.
-        access.check()?;
+        access.check().map_err(|error| {
+            if crate::error_disclosure::status_detail(&error).is_some_and(|detail| {
+                detail.reason == crate::pb::SearchErrorReason::AccessPolicyChanged as i32
+                    && error.code() == tonic::Code::PermissionDenied
+            }) {
+                crate::raft::reasons::reason(error, crate::raft::reasons::RECEIPT_POLICY_CHANGED)
+            } else {
+                error
+            }
+        })?;
         result.map(Response::new)
     }
 
@@ -340,12 +368,15 @@ impl HostedDocumentWriteService {
         permit: WorkPermit,
     ) -> Result<DocumentWriteReceipt, Status> {
         let unsettled = |cause: &Status| {
-            Status::unavailable(format!(
-                "write of version {} at sequence {} is durable but unconfirmed: its lease lapsed before the commit returned, and no fresh lease settles it now ({}); retry the operation to settle it",
-                receipt.version,
-                receipt.accepted_sequence,
-                cause.message()
-            ))
+            crate::raft::reasons::reason(
+                Status::unavailable(format!(
+                    "write of version {} at sequence {} is durable but unconfirmed: its lease lapsed before the commit returned, and no fresh lease settles it now ({}); retry the operation to settle it",
+                    receipt.version,
+                    receipt.accepted_sequence,
+                    cause.message()
+                )),
+                crate::raft::reasons::OUTCOME_UNCONFIRMED,
+            )
         };
         let lease = match self.inner.host.lease(actor).await {
             Ok(lease) => lease,

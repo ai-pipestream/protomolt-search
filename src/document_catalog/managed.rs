@@ -248,8 +248,11 @@ mod adapter {
             max_metadata_bytes: usize,
         ) -> Result<PreparedManagedCatalog, Status> {
             if admission.identity() != authority.identity() {
-                return Err(Status::failed_precondition(
-                    "admission was acquired from another source authority",
+                return Err(crate::raft::reasons::reason(
+                    Status::failed_precondition(
+                        "admission was acquired from another source authority",
+                    ),
+                    crate::raft::reasons::ADMISSION_FOREIGN_AUTHORITY,
                 ));
             }
             admission.prepared_owner(preparation)?;
@@ -443,8 +446,11 @@ mod adapter {
             admission: &SourceAdmission<'_>,
         ) -> Result<ActiveManagedCatalog, Status> {
             if admission.identity() != self.authority.identity() {
-                return Err(Status::failed_precondition(
-                    "admission was acquired from another source authority",
+                return Err(crate::raft::reasons::reason(
+                    Status::failed_precondition(
+                        "admission was acquired from another source authority",
+                    ),
+                    crate::raft::reasons::ADMISSION_FOREIGN_AUTHORITY,
                 ));
             }
             let held = admission.activated_owner(&self.binding)?;
@@ -572,8 +578,11 @@ mod adapter {
         ) -> Result<Self, Status> {
             validate_binding(binding)?;
             if admission.identity() != authority.identity() {
-                return Err(Status::failed_precondition(
-                    "admission was acquired from another source authority",
+                return Err(crate::raft::reasons::reason(
+                    Status::failed_precondition(
+                        "admission was acquired from another source authority",
+                    ),
+                    crate::raft::reasons::ADMISSION_FOREIGN_AUTHORITY,
                 ));
             }
             let held = admission.activated_owner(binding)?;
@@ -678,8 +687,11 @@ mod adapter {
             action: AccessAction,
         ) -> Result<crate::pb::AccessDecision, Status> {
             if admission.identity() != self.authority.identity() {
-                return Err(Status::failed_precondition(
-                    "admission was acquired from another source authority",
+                return Err(crate::raft::reasons::reason(
+                    Status::failed_precondition(
+                        "admission was acquired from another source authority",
+                    ),
+                    crate::raft::reasons::ADMISSION_FOREIGN_AUTHORITY,
                 ));
             }
             admission.admit_write(self.key(), self.activation.write_epoch, action)
@@ -790,8 +802,11 @@ mod adapter {
             operation_id: &[u8],
         ) -> Result<Settlement, Status> {
             if admission.identity() != self.authority.identity() {
-                return Err(Status::failed_precondition(
-                    "admission was acquired from another source authority",
+                return Err(crate::raft::reasons::reason(
+                    Status::failed_precondition(
+                        "admission was acquired from another source authority",
+                    ),
+                    crate::raft::reasons::ADMISSION_FOREIGN_AUTHORITY,
                 ));
             }
             if admission.principal() != principal {

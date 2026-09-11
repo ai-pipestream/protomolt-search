@@ -3,6 +3,7 @@
 //! way the direct paths did and turns the committed reply back into the
 //! caller's decision.
 use super::log_store::RaftLogStore;
+use super::reasons;
 use super::state_machine::{ControlStateMachine, SharedStore};
 use super::types::{validate_proposal, ControlRaft, NodeId};
 use crate::control_plane::RetiredLegacyControl;
@@ -791,15 +792,19 @@ impl RaftHost {
                 return self.forwarded_lease(principal, lease, forward).await;
             }
             Ok(Err(e)) => {
-                return Err(Status::unavailable(format!(
-                    "admission needs a linearizable read: {e}"
-                )))
+                return Err(reasons::reason(
+                    Status::unavailable(format!("admission needs a linearizable read: {e}")),
+                    reasons::LEASE_NO_LINEARIZABLE_READ,
+                ))
             }
             Err(_) => {
-                return Err(Status::unavailable(format!(
-                    "admission needs a linearizable read: no quorum acknowledged within {} ms",
-                    self.read_timeout.as_millis()
-                )))
+                return Err(reasons::reason(
+                    Status::unavailable(format!(
+                        "admission needs a linearizable read: no quorum acknowledged within {} ms",
+                        self.read_timeout.as_millis()
+                    )),
+                    reasons::LEASE_NO_LINEARIZABLE_READ,
+                ))
             }
         }
         self.hold.extend(lease.anchor);
@@ -825,23 +830,32 @@ impl RaftHost {
         forward: openraft::error::ForwardToLeader<NodeId, BasicNode>,
     ) -> Result<LeasedAdmission, Status> {
         let (Some(leader), Some(node)) = (forward.leader_id, forward.leader_node.as_ref()) else {
-            return Err(Status::unavailable(
-                "not the leader, and no leader is known to forward the lease to",
+            return Err(reasons::reason(
+                Status::unavailable(
+                    "not the leader, and no leader is known to forward the lease to",
+                ),
+                reasons::LEASE_NO_KNOWN_LEADER,
             ));
         };
         #[cfg(not(feature = "tls"))]
         {
             let _ = (principal, lease, node);
-            return Err(Status::unavailable(format!(
-                "not the leader; leader is Some({leader}), and this build has no transport to forward the lease"
-            )));
+            return Err(reasons::reason(
+                Status::unavailable(format!(
+                    "not the leader; leader is Some({leader}), and this build has no transport to forward the lease"
+                )),
+                reasons::LEASE_NO_TRANSPORT,
+            ));
         }
         #[cfg(feature = "tls")]
         {
             let Some(forwarder) = &self.forwarder else {
-                return Err(Status::unavailable(format!(
-                    "not the leader; leader is Some({leader}), and this host has no transport to forward the lease"
-                )));
+                return Err(reasons::reason(
+                    Status::unavailable(format!(
+                        "not the leader; leader is Some({leader}), and this host has no transport to forward the lease"
+                    )),
+                    reasons::LEASE_NO_TRANSPORT,
+                ));
             };
             let read = forwarder
                 .grant_lease(leader, &node.addr, self.read_timeout)
@@ -854,10 +868,13 @@ impl RaftHost {
                     .applied_index_at_least(Some(read.index), "forwarded lease")
                     .await
                     .map_err(|e| {
-                        Status::unavailable(format!(
-                            "forwarded lease: this member had not applied the leader's read position {} inside the interval: {e}",
-                            read.index
-                        ))
+                        reasons::reason(
+                            Status::unavailable(format!(
+                                "forwarded lease: this member had not applied the leader's read position {} inside the interval: {e}",
+                                read.index
+                            )),
+                            reasons::LEASE_READ_POSITION_BEHIND,
+                        )
                     })?;
             }
             self.hold.extend(lease.anchor);
@@ -1011,11 +1028,15 @@ impl RaftHost {
         what: E,
     ) -> Status {
         match error {
-            RaftError::APIError(ClientWriteError::ForwardToLeader(forward)) => {
-                Status::unavailable(format!("not the leader; leader is {:?}", forward.leader_id))
-            }
+            RaftError::APIError(ClientWriteError::ForwardToLeader(forward)) => reasons::reason(
+                Status::unavailable(format!("not the leader; leader is {:?}", forward.leader_id)),
+                reasons::LEASE_NOT_LEADER,
+            ),
             RaftError::APIError(ClientWriteError::ChangeMembershipError(change)) => {
-                Status::failed_precondition(format!("{what}: {change}"))
+                reasons::reason(
+                    Status::failed_precondition(format!("{what}: {change}")),
+                    reasons::MEMBERSHIP_CHANGE_REJECTED,
+                )
             }
             other => Status::unavailable(format!("{what}: {other}")),
         }
@@ -1182,16 +1203,23 @@ impl RaftHost {
     #[cfg(feature = "tls")]
     pub async fn add_learner(&self, node_id: NodeId, addr: &str) -> Result<(), Status> {
         let directory = self.directory.as_ref().ok_or_else(|| {
-            Status::failed_precondition("membership changes need a networked member")
+            reasons::reason(
+                Status::failed_precondition("membership changes need a networked member"),
+                reasons::MEMBERSHIP_NOT_NETWORKED,
+            )
         })?;
         if !directory.knows(node_id) {
-            return Err(Status::failed_precondition(format!(
-                "node {node_id} has no registered certificate; bind it before it joins"
-            )));
+            return Err(reasons::reason(
+                Status::failed_precondition(format!(
+                    "node {node_id} has no registered certificate; bind it before it joins"
+                )),
+                reasons::MEMBERSHIP_UNREGISTERED_CERTIFICATE,
+            ));
         }
         if addr.is_empty() || addr.len() > 1024 {
-            return Err(Status::invalid_argument(
-                "member address must be 1..1024 bytes",
+            return Err(reasons::reason(
+                Status::invalid_argument("member address must be 1..1024 bytes"),
+                reasons::MEMBERSHIP_BAD_ADDRESS,
             ));
         }
         self.seed_boundary().await?;
@@ -1354,7 +1382,10 @@ impl RaftHost {
     #[cfg(feature = "tls")]
     pub async fn promote(&self, learners: BTreeSet<NodeId>) -> Result<(), Status> {
         if learners.is_empty() {
-            return Err(Status::invalid_argument("no learners to promote"));
+            return Err(reasons::reason(
+                Status::invalid_argument("no learners to promote"),
+                reasons::MEMBERSHIP_NO_LEARNERS,
+            ));
         }
         self.raft
             .change_membership(ChangeMembers::AddVoterIds(learners), false)

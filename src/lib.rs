@@ -89,6 +89,11 @@ mod query_disclosure;
 mod query_identity;
 #[cfg(feature = "raft")]
 pub mod raft;
+#[cfg(not(feature = "raft"))]
+pub mod raft {
+    #[path = "reasons.rs"]
+    pub mod reasons;
+}
 mod rangefacet;
 pub mod rankdiff;
 pub mod reconcile;

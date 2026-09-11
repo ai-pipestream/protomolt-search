@@ -36,6 +36,9 @@ which is not on this base yet; no site attaches them here.
 | snapshot.digest | DataLoss | image bytes differ from the announced digest | stable |
 | snapshot.stale_continuation | FailedPrecondition | chunk continues a transfer the receiver dropped | stable |
 | snapshot.transfer_bound | FailedPrecondition | another peer's chunk on a bound transfer; names the bound node | stable |
+| snapshot.over_announced | InvalidArgument | chunk or transfer past the announced length; the transfer is dropped | stable |
+| snapshot.membership_mismatch | DataLoss | image membership differs from the snapshot meta | stable |
+| snapshot.position_mismatch | DataLoss | image applied position differs from the snapshot meta | stable |
 
 ## Leases (`src/raft/host.rs`, `src/raft/transport.rs`, `src/source_authority.rs`)
 

@@ -61,7 +61,7 @@ const MANAGED_FORMAT: u32 = 9;
 // existed; format 11 records an outcome and the write epoch on every
 // version and operation (docs/document-writes.md, "Write outcomes").
 const ACTIVE_MANAGED_FORMAT_BEFORE_OUTCOMES: u32 = 10;
-const ACTIVE_MANAGED_FORMAT: u32 = 11;
+pub(crate) const ACTIVE_MANAGED_FORMAT: u32 = 11;
 const CACHE_BYTES: usize = 8 << 20;
 
 fn storage(error: impl std::fmt::Display) -> Status {
@@ -592,7 +592,10 @@ impl DocumentCatalog {
             .expected_version
             .is_some_and(|v| v != current_version)
         {
-            return Err(Status::aborted("document version precondition failed"));
+            return Err(crate::raft::reasons::reason(
+                Status::aborted("document version precondition failed"),
+                crate::raft::reasons::OUTCOME_VERSION_MISMATCH,
+            ));
         }
         let version = current_version
             .checked_add(1)

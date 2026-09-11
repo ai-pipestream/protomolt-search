@@ -163,29 +163,34 @@ impl SnapshotStaging {
         // the received bytes must stay identical to their checksum.
         let probe = dir.join(PROBE);
         std::fs::copy(&image, &probe).map_err(io)?;
-        let checked =
-            (|| -> Result<(), Status> {
-                let opened = SourceAuthorityStore::open(&probe, &self.identity)
-                    .map_err(|e| Status::data_loss(format!("snapshot image: {}", e.message())))?;
-                let applied = opened.raft_applied()?.ok_or_else(|| {
-                    Status::data_loss("snapshot image carries no applied position")
-                })?;
-                if applied.last_applied.as_ref().map(log_id_from_proto) != meta.last_log_id {
-                    return Err(Status::data_loss(
+        let checked = (|| -> Result<(), Status> {
+            let opened = SourceAuthorityStore::open(&probe, &self.identity)
+                .map_err(|e| Status::data_loss(format!("snapshot image: {}", e.message())))?;
+            let applied = opened
+                .raft_applied()?
+                .ok_or_else(|| Status::data_loss("snapshot image carries no applied position"))?;
+            if applied.last_applied.as_ref().map(log_id_from_proto) != meta.last_log_id {
+                return Err(super::reasons::reason(
+                    Status::data_loss(
                         "snapshot image applied position differs from the snapshot meta",
-                    ));
-                }
-                let membership =
-                    stored_membership_from_proto(applied.membership.as_ref().ok_or_else(
-                        || Status::data_loss("snapshot image carries no membership"),
-                    )?)?;
-                if membership != meta.last_membership {
-                    return Err(Status::data_loss(
-                        "snapshot image membership differs from the snapshot meta",
-                    ));
-                }
-                Ok(())
-            })();
+                    ),
+                    super::reasons::TRANSPORT_SNAPSHOT_POSITION_MISMATCH,
+                ));
+            }
+            let membership = stored_membership_from_proto(
+                applied
+                    .membership
+                    .as_ref()
+                    .ok_or_else(|| Status::data_loss("snapshot image carries no membership"))?,
+            )?;
+            if membership != meta.last_membership {
+                return Err(super::reasons::reason(
+                    Status::data_loss("snapshot image membership differs from the snapshot meta"),
+                    super::reasons::TRANSPORT_SNAPSHOT_MEMBERSHIP_MISMATCH,
+                ));
+            }
+            Ok(())
+        })();
         let _ = std::fs::remove_file(&probe);
         checked?;
         if let Some(receive) = self.receiving.lock().unwrap().as_mut() {
@@ -940,8 +945,9 @@ fn verify_image(path: &Path, expected: &ImageSignature, max_bytes: u64) -> Resul
     }
     let actual = image_signature(path, max_bytes)?;
     if actual != *expected {
-        return Err(Status::data_loss(
-            "snapshot image digest differs from the announced digest",
+        return Err(super::reasons::reason(
+            Status::data_loss("snapshot image digest differs from the announced digest"),
+            super::reasons::TRANSPORT_SNAPSHOT_DIGEST,
         ));
     }
     Ok(())
