@@ -58,10 +58,10 @@ message PeerRejectionSample {
 message SnapshotRejectionSummary {
   // Installs rejected at the announce since this node started.
   uint64 count = 1;
-  SnapshotRejection last = 2;
+  SnapshotRejectionSample last = 2;
 }
 
-message SnapshotRejection {
+message SnapshotRejectionSample {
   uint64 from = 1;
   uint64 announced = 2;
   uint64 bound = 3;

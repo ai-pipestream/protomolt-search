@@ -2136,6 +2136,22 @@ impl DurableControlPlane {
     }
 }
 
+/// Whether a call carries cluster membership: a client certificate the
+/// listener verified against the cluster CA. One function for the
+/// control and operator services; each names its own refusal.
+pub(crate) fn cluster_membership<T>(request: &Request<T>, required: bool) -> bool {
+    if !required {
+        return true;
+    }
+    #[cfg(feature = "tls")]
+    if request.peer_certs().is_some_and(|certs| !certs.is_empty()) {
+        return true;
+    }
+    #[cfg(not(feature = "tls"))]
+    let _ = request;
+    false
+}
+
 #[derive(Clone)]
 pub struct ClusterControlService {
     plane: DurableControlPlane,
@@ -2164,15 +2180,9 @@ impl ClusterControlService {
     /// Cluster membership: a client certificate the listener verified
     /// against the cluster CA. A missing one refuses by name.
     fn membership<T>(&self, request: &Request<T>) -> Result<(), Status> {
-        if !self.require_client_cert {
+        if cluster_membership(request, self.require_client_cert) {
             return Ok(());
         }
-        #[cfg(feature = "tls")]
-        if request.peer_certs().is_some_and(|certs| !certs.is_empty()) {
-            return Ok(());
-        }
-        #[cfg(not(feature = "tls"))]
-        let _ = request;
         Err(Status::unauthenticated(
             "cluster control requires a client certificate from the cluster CA; a bearer \
              token is not membership",

@@ -205,6 +205,18 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
         hosted_write_service(&cfg, raft_host.clone())?
     };
+    // The operator service rides every listener this process opens when
+    // it is a Raft member, node listeners included: unlike the hosted
+    // writes, it needs no catalog and no coordinator surface.
+    #[cfg(all(feature = "raft", feature = "tls"))]
+    let raft_operator = raft_host.clone().map(|host| {
+        pipestream_search::raft::operator_service::RaftOperatorServiceImpl::new(host)
+            .with_client_cert_required(
+                cfg.tls
+                    .as_ref()
+                    .is_some_and(|tls| tls.client_ca_pem.is_some()),
+            )
+    });
     let mut node_services = Vec::new();
     // Membership (docs/cluster-control.md): one agent per collection the
     // configured shards name, each reporting its shards under their own
@@ -317,19 +329,22 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             let max = cfg.max_message_bytes;
             let mut shutdown = shutdown_rx.clone();
             let diagnostics = node.diagnostics_server(max);
-            handles.push(tokio::spawn(
-                secured_server(cfg.tls.as_ref(), true)?
-                    .initial_stream_window_size(pipestream_search::H2_STREAM_WINDOW)
-                    .initial_connection_window_size(pipestream_search::H2_CONN_WINDOW)
-                    .add_service(NodeServiceImpl::into_server(node, max))
-                    .add_service(diagnostics)
-                    .serve_with_incoming_shutdown(
-                        harness::nodelay_incoming(listener),
-                        async move {
-                            let _ = shutdown.wait_for(|v| *v).await;
-                        },
-                    ),
-            ));
+            let node_base = secured_server(cfg.tls.as_ref(), true)?
+                .initial_stream_window_size(pipestream_search::H2_STREAM_WINDOW)
+                .initial_connection_window_size(pipestream_search::H2_CONN_WINDOW)
+                .add_service(NodeServiceImpl::into_server(node, max))
+                .add_service(diagnostics);
+            #[cfg(all(feature = "raft", feature = "tls"))]
+            let node_server = node_base
+                .add_optional_service(raft_operator.clone().map(|service| service.into_server()));
+            #[cfg(not(all(feature = "raft", feature = "tls")))]
+            let node_server = node_base;
+            handles.push(tokio::spawn(node_server.serve_with_incoming_shutdown(
+                harness::nodelay_incoming(listener),
+                async move {
+                    let _ = shutdown.wait_for(|v| *v).await;
+                },
+            )));
         }
     }
 
@@ -522,7 +537,8 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             .add_service(relay.diagnostics_server(max));
         #[cfg(all(feature = "raft", feature = "tls"))]
         let relay_server = relay_base
-            .add_optional_service(hosted_writes.clone().map(|service| service.into_server()));
+            .add_optional_service(hosted_writes.clone().map(|service| service.into_server()))
+            .add_optional_service(raft_operator.clone().map(|service| service.into_server()));
         #[cfg(not(all(feature = "raft", feature = "tls")))]
         let relay_server = relay_base;
         handles.push(tokio::spawn(relay_server.serve_with_incoming_shutdown(
@@ -554,7 +570,8 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             .add_service(diagnostics);
         #[cfg(all(feature = "raft", feature = "tls"))]
         let coord_server = coord_base
-            .add_optional_service(hosted_writes.clone().map(|service| service.into_server()));
+            .add_optional_service(hosted_writes.clone().map(|service| service.into_server()))
+            .add_optional_service(raft_operator.clone().map(|service| service.into_server()));
         #[cfg(not(all(feature = "raft", feature = "tls")))]
         let coord_server = coord_base;
         handles.push(tokio::spawn(coord_server.serve_with_incoming_shutdown(
@@ -564,10 +581,12 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             },
         )));
     }
-    // The listeners own their copies now; releasing this one lets the
+    // The listeners own their copies now; releasing these lets the
     // member shut down on its last handle once they drain.
     #[cfg(all(feature = "raft", feature = "tls"))]
     drop(hosted_writes);
+    #[cfg(all(feature = "raft", feature = "tls"))]
+    drop(raft_operator);
 
     if cfg.demo_query {
         let query = harness::unit_vectors(1, cfg.query_dim, 0x0E0E_0001);

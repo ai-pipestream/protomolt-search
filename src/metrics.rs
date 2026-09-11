@@ -118,12 +118,23 @@ pub enum Route {
     EvaluateBoolean,
     GetDocumentWriteTarget,
     AcceptSourceDocument,
+    /// `RaftOperatorService.GetMemberStatus` (docs/raft-hosting.md,
+    /// "Operator surface").
+    GetMemberStatus,
+    /// `RaftOperatorService.AddLearner`.
+    AddLearner,
+    /// `RaftOperatorService.PromoteLearners`.
+    PromoteLearners,
+    /// `RaftOperatorService.RemoveMember`.
+    RemoveMember,
+    /// `RaftOperatorService.VerifyPublishedImage`.
+    VerifyPublishedImage,
 }
 
 /// Route names as they appear in the `rpc` label, parallel to the
 /// counter tables, with whether the route answers with a response
 /// stream (and so reports two latency phases).
-const REQUEST_ROUTES: [(Route, &str, bool); 68] = [
+const REQUEST_ROUTES: [(Route, &str, bool); 73] = [
     (Route::SearchShard, "search_shard", true),
     (Route::StreamSearch, "stream_search", true),
     (Route::BrowseShard, "browse_shard", false),
@@ -204,6 +215,11 @@ const REQUEST_ROUTES: [(Route, &str, bool); 68] = [
         false,
     ),
     (Route::AcceptSourceDocument, "accept_source_document", false),
+    (Route::GetMemberStatus, "get_member_status", false),
+    (Route::AddLearner, "add_learner", false),
+    (Route::PromoteLearners, "promote_learners", false),
+    (Route::RemoveMember, "remove_member", false),
+    (Route::VerifyPublishedImage, "verify_published_image", false),
 ];
 
 const N_ROUTES: usize = REQUEST_ROUTES.len();
