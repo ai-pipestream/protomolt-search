@@ -182,11 +182,11 @@ single-authority `DocumentWriteServiceImpl` over explicitly provisioned
 local catalogs. Clients do not change; a process serves one variant or
 the other, never both, and the two share the `Route` rows.
 
-Every admission on the hosted path comes from the member's Raft host:
-the transport gate (`Principals::authenticate` and
-`authorize(.., Ingest)`) stays first and the authority admission is
-authoritative, with the lease actor equal to the transport principal
-name. The grant runs on a blocking worker and the commit carries the
+Every admission on the hosted path comes from the member's Raft host,
+which asks the leader for it when the member does not lead: the
+transport gate (`Principals::authenticate` and `authorize(.., Ingest)`)
+stays first and the authority admission is authoritative, with the lease
+actor equal to the transport principal name. The grant runs on a blocking worker and the commit carries the
 admission's final check; the commit's return is judged against the lease
 once more and recorded as the write's outcome ("Write outcomes" above),
 settled on the same call under a fresh lease when the first lapsed. The

@@ -71,11 +71,15 @@ and only the host grants it:
    a managed handle at start on the applied view; it admits no write, by
    name, and every write on the handle takes its own lease
    ([hosted owner writes](raft-hosting.md#hosted-owner-writes)).
-2. `RaftHost::with_admission(principal, run)` takes the lease anchor —
-   `AdmissionLease { anchor, anchor_wall, ttl }` — **before** it invokes
-   the read barrier, then performs the barrier bounded by
-   `election_timeout_max` (an isolated leader collects no quorum and
-   refuses), then grants. The grant itself is refused when
+2. `RaftHost::lease(principal)` (and `with_admission` over it) takes the
+   lease anchor — `AdmissionLease { anchor, anchor_wall, ttl }` —
+   **before** it invokes the read barrier, then performs the barrier
+   bounded by `election_timeout_max` (an isolated leader collects no
+   quorum and refuses), then grants. On a member that does not lead the
+   barrier is the leader's, asked for over the transport
+   (`RaftTransport.GrantLease`), and the grant waits until this member
+   has applied the position that barrier read; "A lease forwarded from
+   the leader" below. The grant itself is refused when
    `anchor + ttl` has already passed: a continuation paused after the
    barrier, delayed acknowledgements, a slow catch-up to the read index or
    any scheduling delay consume the interval; none of them extends it.
@@ -135,6 +139,40 @@ moved backwards under a lease refuses; election and lease values are equal
 across the group (rule 4 enforces it on every RPC); membership is the
 library's applied membership on each node (the barrier counts a quorum of
 the effective configuration, joint configurations included).
+
+## A lease forwarded from the leader
+
+A member that does not lead cannot run the barrier: the library answers
+its `ensure_linearizable` with the leader it believes in. `RaftHost::lease`
+then asks that leader (`RaftTransport.GrantLease`, under the same
+certificate, group and timing checks as every other RPC) and the leader
+runs exactly the barrier it runs for its own lease, extends its own vote
+hold from the instant it received the request, and answers with the
+position the barrier read. The asking member grants once it has applied
+that position, bounded by what remains of its interval, so the applied
+view it grants on is at least as fresh as the leader's was at the
+barrier; a member that has fallen behind and cannot get there inside the
+interval is rejected by name, and no admission is granted on a stale
+view.
+
+The interval is the one anchored on the asking member **before** it
+asked, on its own monotonic clock. Let `t0'` be that anchor, `t0` the
+leader's anchor at receipt and `S` the send of the barrier's heartbeats:
+`t0' ≤ t0 ≤ S`, so every bound in "Why the interval is defensible" holds
+with `t0'` in place of `t0`, and the extra hop only shortens the useful
+interval; no clock of the leader's enters the member's arithmetic, and
+the skew budget is the one the group already agreed. The leader's hold
+covers `t0 + election_timeout_max ≥ t0' + admission_lease`, so a lease
+it forwarded is inside the interval its vote is withheld for. The asking
+member extends its own hold too, which is inert while it does not lead
+and correct the moment it does.
+
+A leader that stopped leading between the library's answer and the
+request rejects naming the leader it now believes in, and the member's
+caller retries; a leader that cannot be reached, or does not answer
+inside the read bound, is `Unavailable` naming the forwarded lease. No
+member forwards a proposal: writes to the authority still go to the
+leader, and a member that does not lead names it.
 
 ## Read consistency
 
@@ -230,7 +268,12 @@ the next durable transaction, and it is stated here rather than closed.
   leader could have been elected.
 - Vote request at a leader with an interval open: not granted, the leader
   stays leader, the request does not reach the library until the interval's
-  ceiling has passed.
+  ceiling has passed. A lease the leader forwarded counts: its hold is
+  extended from the request's receipt.
+- A member that does not lead, cut from the leader: the forwarded lease
+  cannot be asked for, `Unavailable` naming it. Behind the leader's read
+  position past its interval: rejected by name, no grant on the stale
+  view.
 
 ## Evidence and remaining gaps
 
@@ -297,6 +340,17 @@ itself; settled after the actor's grant was revoked it is fenced at the
 applied control revision, the retry replays the rejection before any
 entry check, the row stays in the history marked and remains the head of
 its key, and the actor granted again writes the next version on from it.
+A lease forwarded from the leader (`tests/control_raft_hosted_writes.rs`):
+a write through a member that does not lead is admitted under a lease
+forwarded from the leader and its retry replays, the member still not
+leading; cut from the leader, the same member rejects naming the
+forwarded lease; a member that stopped hearing the leader while the
+leader and the third voter committed a revocation is rejected inside its
+interval naming the position it has not applied, and once healed and
+caught up denies the revoked actor on the merits; the healed old leader
+of the isolation scenario denies the revoked actor under a lease
+forwarded from its successor.
+
 Over three voters through the hosted service: a write durable after its
 lease lapsed is settled on the same call under a fresh lease; one the
 leader cannot settle, every link cut, is named durable and unconfirmed

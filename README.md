@@ -1237,6 +1237,14 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: a managed catalog is served wherever its member
+  is.** A member that does not lead asks the leader for its admission
+  lease over a fourth transport RPC; the leader runs its barrier and
+  extends its vote hold, and the member grants on its own applied view
+  once it has applied the position the barrier read, inside the interval
+  it anchored before asking. Cut from the leader or too far behind, it
+  rejects by name. See [a lease forwarded from the
+  leader](docs/raft-admission.md#a-lease-forwarded-from-the-leader).
 - **Foundation branch: a write's outcome is recorded at durability.** On an
   activated managed source the lease is judged once more when the commit
   returns: still open, the write is accepted; lapsed, the row is marked
