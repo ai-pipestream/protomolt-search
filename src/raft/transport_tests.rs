@@ -955,8 +955,17 @@ async fn a_leader_withholds_its_vote_for_a_lease_it_forwarded() {
         .into_iter()
         .find(|n| *n != leader && *n != member)
         .unwrap();
-    // The member that does not lead takes its lease through the leader's
-    // barrier over GrantLease; the leader's own hold moves with it.
+    // The member has applied everything the leader has, so the forwarded
+    // grant needs no catch-up inside its interval; the lease then goes
+    // through the leader's barrier over GrantLease, and the leader's own
+    // hold moves with it.
+    let applied = cluster
+        .host(leader)
+        .applied_position()
+        .unwrap()
+        .unwrap()
+        .index;
+    cluster.wait_applied(member, applied).await;
     cluster
         .host(member)
         .with_admission("alice", |admission| {
