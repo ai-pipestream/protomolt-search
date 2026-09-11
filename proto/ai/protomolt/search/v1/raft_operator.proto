@@ -1,0 +1,104 @@
+// The Raft operator surface (docs/raft-hosting.md, "Operator surface"):
+// member status, membership changes and image verification over the
+// member's listener, under cluster trust. Bootstrap is a local
+// subcommand, not an RPC: no request takes a policy or limits.
+syntax = "proto3";
+package ai.protomolt.search.v1;
+
+import "ai/protomolt/search/storage/v1/raft_control.proto";
+
+// One member's state, from the accessors that exist. Every optional
+// field is a proto3 `optional` or a message, never a zero that means
+// "none".
+message MemberStatus {
+  uint64 node_id = 1;
+  // Hex, as the --raft-group-id and --raft-authority-incarnation flags
+  // spell them.
+  string group_id = 2;
+  string authority_incarnation = 3;
+  optional string advertised_addr = 4;
+  optional uint64 believed_leader = 5;
+  bool leads = 6;
+  // The current vote (term and node).
+  ai.protomolt.search.storage.v1.RaftVote vote = 7;
+  // The applied position; absent before anything applies.
+  ai.protomolt.search.storage.v1.RaftLogId applied = 8;
+  optional uint64 last_log_index = 9;
+  // Voters and learners with their addresses, from
+  // metrics().membership_config.
+  ai.protomolt.search.storage.v1.RaftMembership membership = 10;
+  bool awaiting_snapshot = 11;
+  // The last snapshot build; absent before the first build.
+  SnapshotBuild last_snapshot_build = 12;
+  repeated PeerRejectionSample peer_rejections = 13;
+  SnapshotRejectionSummary snapshot_rejections = 14;
+}
+
+message SnapshotBuild {
+  uint64 generation = 1;
+  uint64 bytes = 2;
+  uint64 receiver_bound = 3;
+  ai.protomolt.search.storage.v1.RaftLogId last_log_id = 4;
+  bool over_receiver_bound = 5;
+}
+
+message PeerRejectionSample {
+  uint64 node_id = 1;
+  // The RPC rejected: "append", "vote" or "snapshot".
+  string action = 2;
+  // The tonic status code, Debug name ("DataLoss").
+  string code = 3;
+  string message = 4;
+  // Rejections answered by this peer since this node started.
+  uint64 count = 5;
+  // Milliseconds since the rejection was recorded.
+  uint64 age_ms = 6;
+}
+
+message SnapshotRejectionSummary {
+  // Installs rejected at the announce since this node started.
+  uint64 count = 1;
+  SnapshotRejection last = 2;
+}
+
+message SnapshotRejection {
+  uint64 from = 1;
+  uint64 announced = 2;
+  uint64 bound = 3;
+}
+
+message GetMemberStatusRequest {}
+
+message AddLearnerRequest {
+  uint64 node_id = 1;
+  string addr = 2;
+}
+
+message PromoteLearnersRequest {
+  repeated uint64 learner_ids = 1;
+}
+
+message RemoveMemberRequest {
+  uint64 node_id = 1;
+}
+
+message VerifyPublishedImageRequest {}
+
+// The membership after the change and the applied position.
+message MembershipChange {
+  ai.protomolt.search.storage.v1.RaftMembership membership = 1;
+  ai.protomolt.search.storage.v1.RaftLogId applied = 2;
+}
+
+message PublishedImageVerification {
+  // The verified generation; absent on a clean "no image".
+  optional uint64 generation = 1;
+}
+
+service RaftOperatorService {
+  rpc GetMemberStatus(GetMemberStatusRequest) returns (MemberStatus);
+  rpc AddLearner(AddLearnerRequest) returns (MembershipChange);
+  rpc PromoteLearners(PromoteLearnersRequest) returns (MembershipChange);
+  rpc RemoveMember(RemoveMemberRequest) returns (MembershipChange);
+  rpc VerifyPublishedImage(VerifyPublishedImageRequest) returns (PublishedImageVerification);
+}

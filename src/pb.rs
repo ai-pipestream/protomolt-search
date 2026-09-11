@@ -4,7 +4,16 @@
 // lint bar.
 #![allow(clippy::all, clippy::pedantic, clippy::nursery, missing_docs)]
 
-tonic::include_proto!("ai.protomolt.search.v1");
+/// The v1 API surface, in its own module so a v1 message naming a
+/// storage message resolves to the storage module by the generated
+/// `super::storage::v1::X` path. Everything is re-exported, so
+/// `crate::pb::X` keeps working; the storage, mobile and WAL code keeps
+/// resolving `super::super::v1::X` here, which now names the defined
+/// types directly instead of a re-export shim.
+pub mod v1 {
+    tonic::include_proto!("ai.protomolt.search.v1");
+}
+pub use v1::*;
 
 /// Standard rich gRPC error envelope, vendored from googleapis.
 pub mod google_rpc {
@@ -66,16 +75,4 @@ pub mod wal {
         tonic::include_proto!("ai.protomolt.search.wal.v1");
     }
     pub use v1::*;
-}
-
-/// Shim for the generated storage, mobile and WAL code: it references the search types it
-/// reuses as `super::super::v1::X` (their package path), while this module
-/// includes them flat — re-export the referenced ones under that name.
-pub mod v1 {
-    pub use super::{
-        AcceptDocumentRequest, AddDocumentsRequest, AddVectorsRequest, ClusterNodeState,
-        CollectionGrant, DerivedColumns, DocumentWriteReceipt, FlushResponse, IngestMappedRequest,
-        NodeCapacity, PlacementActionKind, PlacementTree, QueryStreamResponse, ReplayStreamBinding,
-        ShardReplicaRole, SnapshotArtifact, VectorBackendConfig,
-    };
 }
