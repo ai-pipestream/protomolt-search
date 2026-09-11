@@ -1183,7 +1183,7 @@ async fn a_client_that_drops_its_call_leaves_the_worker_to_finish_under_its_perm
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_receipt_is_withheld_when_transport_access_changes_under_a_committed_write() {
+async fn a_receipt_is_kept_back_when_transport_access_changes_under_a_committed_write() {
     let _serial = serial();
     let mut cluster = raft_kit::three_voters_with(
         "hosted-receipt-race",
