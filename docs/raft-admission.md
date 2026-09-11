@@ -8,7 +8,10 @@ the timing agreement on every transport RPC, the pre-commit fence in
 `DocumentCatalog::accept_as`) with three-voter evidence over the tonic
 transport. Member processes serve owner writes through the hosted write
 service, whose every admission comes from the host's lease
-([hosted owner writes](raft-hosting.md#hosted-owner-writes)).
+([hosted owner writes](raft-hosting.md#hosted-owner-writes)). Since the
+commit fence (2026-09-11) the storage records every write's outcome at
+durability: accepted, unconfirmed, or fenced by name
+(`docs/document-writes.md`, "Write outcomes").
 
 It answers one question before any owner write is admitted through a
 replicated authority: what makes an admission authoritative when the node
@@ -163,29 +166,51 @@ commit (`DocumentCatalog::accept_as`, the `fence` argument;
   no durable change and no retry record, so a retry after a fresh admission
   is new work, not a replay.
 - After the final check only the commit remains. A pause between the final
-  check and durability is not bounded by anything in this process; a write
-  that passed its final check may therefore become durable after the lease
-  has lapsed. That is the residual, and it is named rather than hidden.
-  The network path runs no lease check after the commit for the same
-  reason: a write past its final check is durable under its epoch fence,
-  and hiding its receipt would not make it less durable.
+  check and durability is not bounded by anything in this process (a
+  stalled sync is the ordinary case), so a write that passed its final
+  check may become durable after the lease has lapsed. Nothing inside one
+  process can prevent that: the process that would check is the process
+  that is stalled. What the storage can do is judge the write once more
+  when the commit returns, and record the judgement with the row. That is
+  the outcome: still inside the lease, the write is ACCEPTED, and the
+  lease argument above makes its right current at durability; past it,
+  the row is marked UNCONFIRMED in a transaction of its own, before the
+  caller learns of it, and is settled under a fresh lease, whose grant is
+  a linearizable read of the current policy and ownership. Settled with
+  the actor's right current, the write is ACCEPTED. Settled with the right
+  gone, the write is FENCED at the control revision this replica has
+  applied: the row stays in the history, marked, and every retry replays
+  the rejection by name. The receipt of an accepted write names the epoch
+  it committed under.
 - The network path's entry check is `ActiveManagedCatalog::accept`'s
   `admit_write` under the worker's grant, after the transport gate
   (`Principals::authenticate` and `authorize(.., Ingest)`) and the
   request admission. The transport gate stays first; the authority
   admission is authoritative.
 
-Contract for in-flight work, brought here for review: **an operation that
-passed its final check may finish**; revocation takes effect for every
-write whose final check happens after the interval has lapsed, and for
-every new admission. The receipt discloses nothing about the lease; the
-write is fenced against replacement by the owner's write epoch — a new
-activation allocates a new epoch, and a former owner's writes are refused
-by the epoch at every replica. Until replacement exists, expiry-only
-replacement stays unavailable, and no path activates a second writer.
-Closing the residual entirely needs a fencing token checked by the storage
-at commit; the source catalog has none today, and adding one is a storage
-contract change outside this checkpoint.
+Contract for in-flight work: **an operation that passed its final check
+may become durable, and it is accepted only if its right is current when
+its acceptance is declared.** Revocation takes effect for every write
+whose final check happens after the interval has lapsed, for every new
+admission, and for every write that became durable after its interval
+lapsed and is settled after the revocation: such a write is fenced, its
+receipt is a rejection, and its row is marked. The receipt discloses
+nothing about the lease beyond the epoch; the write is fenced against
+replacement by the owner's write epoch, which a new activation moves, and
+by the outcome at every replica that reads the history. Until replacement
+exists, expiry-only replacement stays unavailable, and no path activates a
+second writer; the fence therefore bites on a revoked grant today and on
+a moved epoch when replacement exists.
+
+The residual that remains, named: a crash between the commit's return and
+the UNCONFIRMED mark leaves a row recorded ACCEPTED whose lease may have
+lapsed before durability. On restart the catalog recovers only if its
+owner is still ACTIVE under the same epoch, in which case the row's right
+was never lost; if the owner was replaced, recovery rejects the catalog
+as a whole and no reader serves it. What is not decided in that window is
+a late row under a grant revoked in it, on a catalog whose owner is
+unchanged; that window is the instruction between the sync's return and
+the next durable transaction, and it is stated here rather than closed.
 
 ## Failure behaviour
 
@@ -262,9 +287,28 @@ durable; recovery names a prepared source, a foreign authority and an
 unrecorded activation, and a recovery admission admits no write, by
 name.
 
-Remaining: the residual between the final check and durability stays
-open until a storage-side fencing token exists; Kimi's harness adds
-deterministic scheduling around the pause hooks
+Write outcomes (`src/document_catalog/managed/tests.rs`,
+`tests/control_raft_hosted_writes.rs`): a write whose commit returns after
+its lease lapsed is unconfirmed, its record marked, until a fresh lease
+settles it; a lapsed admission and another actor's admission settle
+nothing, by name; settled with the right current it is accepted and the
+retry replays it; a retry that finds the record unconfirmed settles it
+itself; settled after the actor's grant was revoked it is fenced at the
+applied control revision, the retry replays the rejection before any
+entry check, the row stays in the history marked and remains the head of
+its key, and the actor granted again writes the next version on from it.
+Over three voters through the hosted service: a write durable after its
+lease lapsed is settled on the same call under a fresh lease; one the
+leader cannot settle, every link cut, is named durable and unconfirmed
+and the exact retry settles it once the member leads again; one whose
+actor the surviving quorum revoked meanwhile is fenced at the revision
+the healed leader applied, stays fenced after the actor is granted again,
+and is marked in the history.
+
+Remaining: the crash window between the commit's return and the
+UNCONFIRMED mark, named under "Source write boundary"; Kimi's harness
+adds deterministic scheduling around the pause hooks
 (`RaftHost::arm_grant_gate`, `HostedDocumentWriteService::arm_grant_delay`,
-`ActiveManagedCatalog::arm_precommit_pause`, all on `fault-injection`)
+`ActiveManagedCatalog::arm_precommit_pause`,
+`ActiveManagedCatalog::arm_postcommit_pause`, all on `fault-injection`)
 with crash and recovery variants.

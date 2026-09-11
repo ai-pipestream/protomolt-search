@@ -1237,6 +1237,18 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: a write's outcome is recorded at durability.** On an
+  activated managed source the lease is judged once more when the commit
+  returns: still open, the write is accepted; lapsed, the row is marked
+  unconfirmed in storage and settled under a fresh lease, accepted while
+  the actor's right is current and fenced by name, at the applied control
+  revision, when it is gone. The hosted service settles on the same call
+  and names an unsettled row as unconfirmed for the exact retry. Every
+  version and receipt carries the write epoch; a fenced version stays in
+  the history, marked. Catalog format 11. See [write
+  outcomes](docs/document-writes.md#write-outcomes) and the residual as it
+  now stands in [admission under Raft](docs/raft-admission.md).
+
 - **2026-09-11 — Hosted owner writes through the leased admission.** Member
   processes serve the `DocumentWriteService` proto over activated managed
   catalogs, with every admission drawn from the host's owned lease

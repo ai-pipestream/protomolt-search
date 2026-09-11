@@ -492,10 +492,19 @@ string; a deployment must keep that equivalence. Every error from
 is Some(n)" off-leader, `Unavailable` when no quorum acknowledged the
 barrier, and `FailedPrecondition` when the interval elapsed before the
 grant. The service never retries, never forwards, and never falls back
-to the local `admission()`. No lease check runs after the commit: a
-write past its final check is durable under its epoch fence, and the
-pause between the final check and durability is the residual named in
-[admission under Raft](raft-admission.md).
+to the local `admission()`.
+
+The commit's return is judged against the lease once more and recorded
+as the write's outcome (`docs/document-writes.md`, "Write outcomes"). A
+lease still open: the receipt. A lease that lapsed while the commit was
+becoming durable: the record is marked UNCONFIRMED, the call takes a
+fresh lease under the same permits and settles it on a worker of its
+own, answering with the receipt when the actor's right is still current
+and with the fence, by name, when it is gone; when no fresh lease can be
+had (no leader, no quorum, the fresh interval elapsed before its grant)
+the call is `Unavailable` naming the durable version as unconfirmed, and
+the exact retry settles it. What remains open after this is in
+[admission under Raft](raft-admission.md), "Source write boundary".
 
 A managed catalog's writes are therefore served only while the member
 that holds it leads. On a follower every write is rejected naming the

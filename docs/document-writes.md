@@ -85,6 +85,7 @@ retry history. No automatic history expiration or garbage collection exists.
 | `durable=true` | The persistent local transaction completed its sync boundary |
 | `durable=false` | The caller explicitly selected volatile storage |
 | `searchable=false` | No index projection was published by this operation |
+| `write_epoch` | The owner's write epoch the write committed under on an activated managed source; zero elsewhere ("Write outcomes" below) |
 
 Errors return an error status, not a successful receipt with guessed flags. If a
 commit or its acknowledgment is interrupted, retry the same operation ID and
@@ -103,6 +104,50 @@ mount or moved catalog from resetting versions and idempotency history.
 Existing empty files, missing tables,
 unknown catalog formats and collection mismatches fail instead of creating fresh
 retry history. Content hashes are checked during source reads.
+
+## Write outcomes
+
+On an activated managed source every write is admitted under a lease
+([admission under Raft](raft-admission.md)), and the lease is judged
+twice: at the final check immediately before the commit, and again when
+the commit returns durable. The second judgement is what the storage
+records, on the operation record and on the version, as the write's
+outcome (`WriteOutcome` in the storage proto, catalog format 11):
+
+| Outcome | Meaning |
+|---|---|
+| `ACCEPTED` | The lease was still open when the commit returned; the write was admitted under a right current at durability. Every record written before outcomes existed decodes as this, which is what it was. |
+| `UNCONFIRMED` | The commit returned after the lease lapsed. The row is durable; whether it was admitted is not yet decided. Marked in a durable transaction of its own, before the caller learns of it. |
+| `FENCED` | Settled under a fresh lease and the actor's right was gone: the grant revoked, or the owner no longer ACTIVE under the write's epoch. Marked with the control revision this replica had applied. Final. |
+
+An unconfirmed write is settled by `ActiveManagedCatalog::settle` under a
+fresh leased admission for the same actor: the entry check run again.
+Right current, the record becomes ACCEPTED and the receipt is returned;
+right gone, the record becomes FENCED and the settlement is a
+`FAILED_PRECONDITION` naming the version, the sequence, the epoch and the
+revision. An admission that lapsed again settles nothing, by name, and
+the record stays unconfirmed for the next attempt. A retry of an
+operation whose record is unconfirmed is answered from the record before
+the entry check, and settled under the retry's own admission, which is
+fresh at entry; a retry of a fenced operation replays the rejection. A
+fenced version stays in the history at the sequence it took, marked
+(`AcceptedDocumentVersion.fenced`, `fenced_at_revision`), and remains the
+head of its key, so the next version of that key counts on from it; a
+reader that applies history treats a fenced version as never admitted.
+Every version carries the epoch it committed under (`write_epoch`, zero
+on a catalog that is not an activated managed source).
+
+The hosted write service settles on the same call
+([hosted owner writes](raft-hosting.md#hosted-owner-writes)): a write
+returned unconfirmed takes a fresh lease under the call's permits and
+answers with the settlement; when no lease can be had, the call is
+`UNAVAILABLE` naming the durable version as unconfirmed, and the exact
+retry settles it. What this closes, and the residual it leaves, are in
+[admission under Raft](raft-admission.md), "Source write boundary".
+
+Fault injection (`fault-injection`): `arm_postcommit_pause` holds a write
+after its commit returned and before its outcome is judged, the window
+the outcomes exist for.
 
 ## Embedded and mobile use
 
@@ -142,8 +187,10 @@ the transport gate (`Principals::authenticate` and
 `authorize(.., Ingest)`) stays first and the authority admission is
 authoritative, with the lease actor equal to the transport principal
 name. The grant runs on a blocking worker and the commit carries the
-admission's final check; no lease check follows the commit. The lease,
-recovery and failure mapping are in [hosted owner
+admission's final check; the commit's return is judged against the lease
+once more and recorded as the write's outcome ("Write outcomes" above),
+settled on the same call under a fresh lease when the first lapsed. The
+lease, recovery and failure mapping are in [hosted owner
 writes](raft-hosting.md#hosted-owner-writes) and the lease argument in
 [admission under Raft](raft-admission.md).
 
@@ -153,7 +200,9 @@ writes](raft-hosting.md#hosted-owner-writes) and the lease argument in
 projection worker consume original versions in acceptance order. The same
 transaction that accepts the source, version and retry decision also appends its
 sequence-to-version entry. Reading history does not mark a version searchable.
-It includes replaced versions and tombstones, independently of the current head.
+It includes replaced versions and tombstones, independently of the current head,
+and fenced versions marked as such ("Write outcomes"), with every version's
+write epoch.
 
 Start with `after_sequence=0`, omit `through_sequence`, and supply `limit` and
 `max_bytes`. The response pins the current upper sequence. For subsequent pages,
