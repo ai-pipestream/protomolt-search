@@ -1507,12 +1507,68 @@ async fn a_recovery_admission_opens_a_handle_and_admits_no_write() {
     host.shutdown().await.unwrap();
 }
 
+/// I2's floor (docs/raft-admission.md, "The rule", 4): a lease plus the
+/// skew budget that reaches past the election floor is refused at
+/// validation, before any host is built; the in-crate recipe validates.
+#[test]
+fn a_lease_beyond_the_election_floor_is_rejected_at_validation() {
+    let sound = config();
+    sound.validate().unwrap();
+    let beyond = HostConfig {
+        admission_lease_ms: sound.election_timeout_min_ms - sound.clock_skew_ms + 1,
+        ..config()
+    };
+    let error = beyond.validate().unwrap_err();
+    assert_eq!(error.code(), Code::InvalidArgument, "{error}");
+    assert!(
+        error.message().contains("election_timeout_min_ms"),
+        "the refusal names the floor: {error}"
+    );
+    let zero = HostConfig {
+        admission_lease_ms: 0,
+        ..config()
+    };
+    let error = zero.validate().unwrap_err();
+    assert_eq!(error.code(), Code::InvalidArgument, "{error}");
+}
+
+/// A member with no transport has no directory to change: a membership
+/// operation refuses by name before the library sees it.
+#[cfg(feature = "tls")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_member_without_a_transport_refuses_membership_changes_by_name() {
+    let dir = Directory::new("not-networked");
+    let group = identity(7);
+    let host = RaftHost::bootstrap_single(
+        &dir.0,
+        &group,
+        1,
+        "https://node-1:19291",
+        &policy(),
+        &limits(),
+        &config(),
+    )
+    .await
+    .unwrap();
+    let error = host.add_learner(2, "127.0.0.1:1").await.unwrap_err();
+    assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
+    assert_eq!(
+        super::reasons::reason_of(&error),
+        Some(super::reasons::MEMBERSHIP_NOT_NETWORKED),
+        "{error}"
+    );
+    host.shutdown().await.unwrap();
+}
+
 /// The specification's document versions and its version map stay equal
 /// to the code's numbers (`docs/raft-specification.md`): a bumped
 /// format or protocol fails here until the documents move with it.
 #[test]
 fn specification_versions_match_the_code() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // Each document's own version line, as written under its title; the
+    // map's version column is checked against it, not against a literal.
+    let mut versions = BTreeMap::new();
     for doc in [
         "docs/raft-admission.md",
         "docs/raft-hosting.md",
@@ -1520,11 +1576,17 @@ fn specification_versions_match_the_code() {
         "docs/raft-error-registry.md",
     ] {
         let text = std::fs::read_to_string(root.join(doc)).unwrap();
+        let version = text
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("Specification version: "))
+            .unwrap_or_else(|| panic!("{doc} carries a specification version line"))
+            .trim()
+            .to_string();
         assert!(
-            text.lines()
-                .any(|line| line.trim() == "Specification version: 1"),
-            "{doc} carries specification version 1"
+            !version.is_empty() && version.chars().all(|c| c.is_ascii_digit()),
+            "{doc}: specification version {version:?} is a number"
         );
+        versions.insert(doc, version);
     }
     let spec = std::fs::read_to_string(root.join("docs/raft-specification.md")).unwrap();
     let protocol = super::transport::PROTOCOL_VERSION;
@@ -1542,7 +1604,11 @@ fn specification_versions_match_the_code() {
             .map(str::trim)
             .collect();
         assert_eq!(cells.len(), 3, "version-map row: {line}");
-        assert_eq!(cells[1], "1", "document version: {line}");
+        let doc = cells[0].trim_matches('`');
+        let version = versions
+            .get(doc)
+            .unwrap_or_else(|| panic!("version-map row names an unlisted document: {line}"));
+        assert_eq!(cells[1], version, "document version: {line}");
         if cells[2].contains("transport protocol version") {
             assert!(
                 cells[2].contains(&format!("transport protocol version {protocol}")),
