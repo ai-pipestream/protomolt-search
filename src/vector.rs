@@ -1065,6 +1065,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::reversed_empty_ranges)]
     fn checked_transcripts_require_each_requested_row_once_in_order() {
         let (result, forwarded) = scripted_transcripts(3..6, &[3, 4, 5]);
         result.unwrap();
