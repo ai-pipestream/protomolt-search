@@ -185,7 +185,21 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     let mut handles = Vec::new();
     // A Raft member starts from its existing durable state before any
     // listener that routes on its committed map (docs/raft-hosting.md).
-    let raft_host = start_raft_member(&cfg).await?;
+    let raft_host = start_raft_member(&cfg).await?.map(std::sync::Arc::new);
+    // Managed catalogs recover here, before any listener serves them: a
+    // rejection stops the process with its cause, no partial service.
+    #[cfg(all(feature = "raft", feature = "tls"))]
+    let hosted_writes = hosted_write_service(&cfg, raft_host.clone()).await?;
+    // Managed catalogs are served on the coordinator or relay listener;
+    // a node-only process has neither, so it must not start half-wired.
+    #[cfg(all(feature = "raft", feature = "tls"))]
+    if hosted_writes.is_some() && !cfg.relay && !matches!(cfg.role, Role::Coordinator | Role::Both)
+    {
+        return Err(
+            "raft managed catalogs need the coordinator or relay listener; a node-only process serves no write surface"
+                .into(),
+        );
+    }
     let mut node_services = Vec::new();
     // Membership (docs/cluster-control.md): one agent per collection the
     // configured shards name, each reporting its shards under their own
@@ -479,7 +493,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             &mut handles,
         )
         .await?;
-        let relay = relay_service(&cfg, raft_host.as_ref(), coordinator)?;
+        let relay = relay_service(&cfg, raft_host.as_deref(), coordinator)?;
         let health = relay
             .check_children()
             .await
@@ -496,16 +510,22 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         );
         let max = cfg.max_message_bytes;
         let mut shutdown = shutdown_rx.clone();
-        handles.push(tokio::spawn(
-            secured_server(cfg.tls.as_ref(), true)?
-                .initial_stream_window_size(pipestream_search::H2_STREAM_WINDOW)
-                .initial_connection_window_size(pipestream_search::H2_CONN_WINDOW)
-                .add_service(relay.clone().into_server(max))
-                .add_service(relay.diagnostics_server(max))
-                .serve_with_incoming_shutdown(harness::nodelay_incoming(listener), async move {
-                    let _ = shutdown.wait_for(|v| *v).await;
-                }),
-        ));
+        let mut relay_server = secured_server(cfg.tls.as_ref(), true)?
+            .initial_stream_window_size(pipestream_search::H2_STREAM_WINDOW)
+            .initial_connection_window_size(pipestream_search::H2_CONN_WINDOW)
+            .add_service(relay.clone().into_server(max))
+            .add_service(relay.diagnostics_server(max));
+        #[cfg(all(feature = "raft", feature = "tls"))]
+        {
+            relay_server = relay_server
+                .add_optional_service(hosted_writes.clone().map(|service| service.into_server()));
+        }
+        handles.push(tokio::spawn(relay_server.serve_with_incoming_shutdown(
+            harness::nodelay_incoming(listener),
+            async move {
+                let _ = shutdown.wait_for(|v| *v).await;
+            },
+        )));
     } else if matches!(cfg.role, Role::Coordinator | Role::Both) {
         let listener = TcpListener::bind(cfg.coord_listen).await?;
         let addr: SocketAddr = listener.local_addr()?;
@@ -521,18 +541,28 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             .diagnostics()
             .with_gauges(gauges)
             .into_server(max);
-        handles.push(tokio::spawn(
-            secured_server(cfg.tls.as_ref(), false)?
-                .initial_stream_window_size(pipestream_search::H2_STREAM_WINDOW)
-                .initial_connection_window_size(pipestream_search::H2_CONN_WINDOW)
-                .add_optional_service(control_set.map(|set| set.into_server(max)))
-                .add_service(search_set.into_server(max))
-                .add_service(diagnostics)
-                .serve_with_incoming_shutdown(harness::nodelay_incoming(listener), async move {
-                    let _ = shutdown.wait_for(|v| *v).await;
-                }),
-        ));
+        let mut coord_server = secured_server(cfg.tls.as_ref(), false)?
+            .initial_stream_window_size(pipestream_search::H2_STREAM_WINDOW)
+            .initial_connection_window_size(pipestream_search::H2_CONN_WINDOW)
+            .add_optional_service(control_set.map(|set| set.into_server(max)))
+            .add_service(search_set.into_server(max))
+            .add_service(diagnostics);
+        #[cfg(all(feature = "raft", feature = "tls"))]
+        {
+            coord_server = coord_server
+                .add_optional_service(hosted_writes.clone().map(|service| service.into_server()));
+        }
+        handles.push(tokio::spawn(coord_server.serve_with_incoming_shutdown(
+            harness::nodelay_incoming(listener),
+            async move {
+                let _ = shutdown.wait_for(|v| *v).await;
+            },
+        )));
     }
+    // The listeners own their copies now; releasing this one lets the
+    // member shut down on its last handle once they drain.
+    #[cfg(all(feature = "raft", feature = "tls"))]
+    drop(hosted_writes);
 
     if cfg.demo_query {
         let query = harness::unit_vectors(1, cfg.query_dim, 0x0E0E_0001);
@@ -569,7 +599,20 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         let mut shutdown = shutdown_rx.clone();
         handles.push(tokio::spawn(async move {
             let _ = shutdown.wait_for(|v| *v).await;
-            if let Err(error) = host.shutdown().await {
+            // The hosted write service holds the member's other handle
+            // while its listener drains; the member shuts down on the
+            // last one, once every listener below has released it.
+            let mut shared = host;
+            let owned = loop {
+                match std::sync::Arc::try_unwrap(shared) {
+                    Ok(host) => break host,
+                    Err(back) => {
+                        shared = back;
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                }
+            };
+            if let Err(error) = owned.shutdown().await {
                 eprintln!("raft member shutdown: {}", error.message());
             }
             Ok(())
@@ -692,6 +735,58 @@ fn relay_service(
     Ok(pipestream_search::relay::RelayService::new(
         std::sync::Arc::new(coordinator),
     ))
+}
+
+/// The hosted owner-write service of a member whose operator configuration
+/// names managed catalogs, recovered at start under the configured actor.
+/// `None` when no catalog is named. Recovery runs on the member's host, so
+/// every admission the service later grants comes from its lease.
+#[cfg(all(feature = "raft", feature = "tls"))]
+async fn hosted_write_service(
+    cfg: &Config,
+    host: Option<std::sync::Arc<pipestream_search::raft::RaftHost>>,
+) -> Result<
+    Option<pipestream_search::document_write_service::hosted::HostedDocumentWriteService>,
+    Box<dyn std::error::Error>,
+> {
+    use pipestream_search::document_write_service::hosted::{
+        default_limits, recover_catalogs, HostedDocumentWriteService,
+    };
+    let Some(member) = &cfg.raft else {
+        return Ok(None);
+    };
+    if member.managed_catalogs.is_empty() {
+        return Ok(None);
+    }
+    let Some(host) = host else {
+        return Err("raft managed catalogs need the member's host".into());
+    };
+    let actor = member
+        .managed_principal
+        .as_deref()
+        .ok_or("--raft-managed-catalog needs --raft-managed-principal")?;
+    let Some(principals) = &cfg.principals else {
+        return Err(
+            "--raft-managed-catalog needs --bearer-tokens, the transport principals".into(),
+        );
+    };
+    let catalogs = recover_catalogs(&host, actor, &member.managed_catalogs)
+        .await
+        .map_err(|status| format!("raft managed catalogs: {}", status.message()))?;
+    let count = catalogs.len();
+    let service =
+        HostedDocumentWriteService::new((**principals).clone(), host, catalogs, default_limits())
+            .map_err(|status| format!("hosted write service: {}", status.message()))?;
+    let collections: Vec<&str> = member
+        .managed_catalogs
+        .iter()
+        .map(|entry| entry.collection.as_str())
+        .collect();
+    eprintln!(
+        "hosted owner writes for collections [{collections}] as actor {actor} ({count} catalogs)",
+        collections = collections.join(", "),
+    );
+    Ok(Some(service))
 }
 
 fn hex(bytes: &[u8]) -> String {

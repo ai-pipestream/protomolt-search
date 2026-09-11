@@ -243,6 +243,8 @@ mod tests {
             skew_ms: 250,
             max_snapshot_bytes: 4 << 30,
             map: None,
+            managed_catalogs: Vec::new(),
+            managed_principal: None,
         };
         let server = ServerTls {
             cert_pem: pem("node-1.pem"),

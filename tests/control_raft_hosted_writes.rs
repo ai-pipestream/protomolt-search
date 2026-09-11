@@ -452,6 +452,16 @@ async fn a_write_through_a_follower_is_rejected_naming_the_leader() {
     cluster.shutdown().await;
 }
 
+use pipestream_search::config::RaftManagedCatalog;
+use pipestream_search::document_write_service::hosted::recover_catalogs;
+
+fn managed_entry(collection: &str, dir: &kit::TestDir) -> RaftManagedCatalog {
+    RaftManagedCatalog {
+        collection: collection.into(),
+        path: dir.path().join("catalog.redb"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // A lease kept past its interval leaves no durable change.
 // ---------------------------------------------------------------------------
@@ -642,5 +652,216 @@ async fn an_isolated_leader_rejects_hosted_writes_within_election_timeout_max() 
     drop(client);
     server.shutdown().await;
     return_host(&mut cluster, leader, host);
+    cluster.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Restart: every member restarts on its directory, the catalogs recover
+// through the same library function the binary uses, and the leader's
+// service serves writes again.
+//
+// Leadership after a restart is not deterministic, so the restart covers
+// the whole group (as a fleet rollout would) and the write goes to
+// whichever member leads: recovery itself is member-agnostic, running on
+// the host's store under a leased admission.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_restarted_with_its_managed_catalogs_serves_writes_again() {
+    let _serial = serial();
+    let mut cluster = raft_kit::three_voters("hosted-restart", &hosted_policy()).await;
+    let leader = cluster.leader().await;
+    let dir = kit::TestDir::new("hosted-restart-catalog");
+    let active = bridge_active(&mut cluster, leader, &dir, "hosted-prepare").await;
+    drop(active);
+    let entry = managed_entry(kit::COLLECTION, &dir);
+
+    // Record every member's bound address, then stop the whole group.
+    let mut states = Vec::new();
+    for node in cluster.nodes() {
+        let addr = cluster.host(node).listen_addr().expect("listening");
+        states.push((node, cluster.member_dir(node), addr));
+    }
+    let mut hosts = Vec::new();
+    for node in cluster.nodes() {
+        hosts.push(cluster.take(node));
+    }
+    for host in hosts {
+        host.shutdown().await.unwrap();
+    }
+
+    // Start every member again on its own directory and address.
+    for (node, dir, addr) in &states {
+        let host = RaftHost::start_member(
+            dir,
+            &cluster.group,
+            *node,
+            &raft_kit::host_config(),
+            raft_kit::transport(*node, &cluster.directory, *addr),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !host.awaiting_snapshot().unwrap(),
+            "a restarted member must hold its seeded state"
+        );
+        cluster.insert(*node, host);
+    }
+    let leader = cluster.leader().await;
+
+    // Recover through the same function the binary calls at start, then
+    // serve one write on the leader.
+    let host = take_host(&mut cluster, leader);
+    let recovered = recover_catalogs(&host, "alice", &[entry]).await.unwrap();
+    assert_eq!(recovered.len(), 1);
+    let service =
+        HostedDocumentWriteService::new(principals(), Arc::clone(&host), recovered, limits())
+            .unwrap();
+    let (mut client, server) = serve(service).await;
+    let target = client
+        .get_write_target(auth(
+            GetDocumentWriteTargetRequest {
+                collection: kit::COLLECTION.into(),
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let receipt = client
+        .accept_document(auth(
+            network_write(target.history_id, b"hosted-after-restart", b"restart-op", 0),
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(receipt.accepted && receipt.durable && !receipt.replayed);
+    assert_eq!(receipt.version, 1);
+
+    drop(client);
+    server.shutdown().await;
+    return_host(&mut cluster, leader, host);
+    cluster.shutdown().await;
+}
+
+/// A catalog file bound under a preparation but never activated: recovery
+/// names the prepared state and serves nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_with_a_prepared_but_inactive_catalog_is_rejected_by_name() {
+    let _serial = serial();
+    let mut cluster = raft_kit::three_voters("hosted-prepared", &hosted_policy()).await;
+    let leader = cluster.leader().await;
+    let dir = kit::TestDir::new("hosted-prepared-catalog");
+    let authority = cluster.group.clone();
+    let (catalog, history_id) = catalog_fixture(&dir);
+    let prepare = kit::source_command(
+        &authority,
+        &kit::owner_key(),
+        "hosted-prepare",
+        cluster.revision,
+        1,
+        0,
+        kit::prepare_action_history(WORKFLOW, history_id),
+    );
+    let decision = cluster
+        .host(leader)
+        .propose_command("alice", &prepare)
+        .await
+        .unwrap();
+    assert_eq!(decision.code, 0, "{}", decision.message);
+    let preparation = decision.owner.clone().unwrap();
+    let store = cluster.host(leader).store().unwrap();
+    let prepared = cluster
+        .host(leader)
+        .with_admission("alice", |admission| {
+            catalog.bind_prepared_owner(admission, &store, &preparation, 1 << 20)
+        })
+        .await
+        .unwrap();
+    drop(prepared);
+    drop(store);
+
+    let host = take_host(&mut cluster, leader);
+    let error = recover_catalogs(&host, "alice", &[managed_entry(kit::COLLECTION, &dir)])
+        .await
+        .err()
+        .expect("a prepared catalog must not recover");
+    assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
+    assert!(
+        error.message().contains("prepared, not active"),
+        "the rejection must name the prepared state: {error}"
+    );
+
+    return_host(&mut cluster, leader, host);
+    cluster.shutdown().await;
+}
+
+/// A catalog file bound under another authority: recovery names the
+/// foreign identity and serves nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_with_a_foreign_authority_catalog_is_rejected_by_name() {
+    let _serial = serial();
+    let mut cluster = raft_kit::three_voters("hosted-foreign", &hosted_policy()).await;
+    let leader = cluster.leader().await;
+    let dir = kit::TestDir::new("hosted-foreign-catalog");
+    let active = bridge_active(&mut cluster, leader, &dir, "hosted-prepare").await;
+    drop(active);
+
+    // A member of another group: its store carries another identity, so
+    // the file's binding names an authority it never served.
+    let foreign_dir = kit::TestDir::new("hosted-foreign-member");
+    let foreign = RaftHost::bootstrap_single(
+        foreign_dir.path(),
+        &kit::identity(9),
+        1,
+        "https://node-1:19291",
+        &hosted_policy(),
+        &kit::limits(),
+        &raft_kit::host_config(),
+    )
+    .await
+    .unwrap();
+    let error = recover_catalogs(&foreign, "alice", &[managed_entry(kit::COLLECTION, &dir)])
+        .await
+        .err()
+        .expect("a foreign catalog must not recover");
+    assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
+    assert!(
+        error.message().contains("another source authority"),
+        "the rejection must name the foreign authority: {error}"
+    );
+    foreign.shutdown().await.unwrap();
+
+    cluster.shutdown().await;
+}
+
+/// A catalog file whose activation the store does not record: recovery
+/// names the fence mismatch and serves nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_with_an_unrecorded_activation_is_rejected_by_name() {
+    let _serial = serial();
+    let mut cluster = raft_kit::three_voters("hosted-unrecorded", &hosted_policy()).await;
+    let leader = cluster.leader().await;
+    let dir = kit::TestDir::new("hosted-unrecorded-catalog");
+    let active = bridge_active(&mut cluster, leader, &dir, "hosted-prepare").await;
+    drop(active);
+
+    // A fresh store of the same identity holds no owner row at all, so the
+    // file's activation is recorded nowhere in it: the fence lookup finds
+    // no committed preparation to compare against.
+    let fresh_dir = kit::TestDir::new("hosted-unrecorded-member");
+    let fresh = raft_kit::bootstrap_host_with(&fresh_dir, &hosted_policy()).await;
+    let error = recover_catalogs(&fresh, "alice", &[managed_entry(kit::COLLECTION, &dir)])
+        .await
+        .err()
+        .expect("an unrecorded activation must not recover");
+    assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
+    assert!(
+        error.message().contains("has no committed preparation"),
+        "the rejection must name the unrecorded activation: {error}"
+    );
+    fresh.shutdown().await.unwrap();
+
     cluster.shutdown().await;
 }

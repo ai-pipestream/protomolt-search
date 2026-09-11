@@ -231,6 +231,16 @@ pub struct RaftMapConfig {
     pub collection: String,
 }
 
+/// One access-controlled source catalog this member serves owner writes
+/// for (`--raft-managed-catalog=<collection>=<path>`, repeatable): a file
+/// bound and activated for the named collection of the member's
+/// authority, recovered at start before the service listens.
+#[derive(Debug, Clone)]
+pub struct RaftManagedCatalog {
+    pub collection: String,
+    pub path: PathBuf,
+}
+
 /// A Raft member of the source authority group (`--raft-*`,
 /// docs/raft-hosting.md "Operator configuration"). Serving opens existing
 /// state; `raft-prepare` creates it.
@@ -255,6 +265,11 @@ pub struct RaftMemberConfig {
     pub skew_ms: u64,
     pub max_snapshot_bytes: u64,
     pub map: Option<RaftMapConfig>,
+    /// Managed catalogs served through the hosted write service, with the
+    /// actor holding the Admin that recovers them at start
+    /// (`--raft-managed-principal`).
+    pub managed_catalogs: Vec<RaftManagedCatalog>,
+    pub managed_principal: Option<String>,
 }
 
 /// Full process configuration.
@@ -607,6 +622,8 @@ struct FileConfig {
     raft_map_principal: Option<String>,
     raft_map_workspace: Option<String>,
     raft_map_collection: Option<String>,
+    raft_managed_catalog: Option<Vec<String>>,
+    raft_managed_principal: Option<String>,
     tls_client_cert: Option<String>,
     tls_client_key: Option<String>,
     tls_domain: Option<String>,
@@ -775,6 +792,25 @@ fn parse_hash_range(
 
 fn flag_present(args: &[String], key: &str) -> bool {
     args.iter().any(|a| a == &format!("--{key}"))
+}
+
+/// Every value of a repeatable `--key=value` option, in both the `=` and
+/// the space-separated form. Hand-rolled exact matching, no patterns.
+fn arg_values(args: &[String], key: &str) -> Vec<String> {
+    let prefix = format!("--{key}=");
+    let mut out: Vec<String> = args
+        .iter()
+        .filter_map(|a| a.strip_prefix(&prefix).map(str::to_string))
+        .collect();
+    let flag = format!("--{key}");
+    let mut i = 0;
+    while i + 1 < args.len() {
+        if args[i] == flag && !args[i + 1].starts_with("--") {
+            out.push(args[i + 1].clone());
+        }
+        i += 1;
+    }
+    out
 }
 
 /// CLI > env > file, for string-valued options.
@@ -2748,6 +2784,69 @@ mod tests {
     }
 
     #[test]
+    fn raft_managed_catalog_options_parse_repeatable_and_refuse_without_member() {
+        let base = || {
+            vec![
+                "--role=coordinator",
+                "--nodes=127.0.0.1:1",
+                "--raft-dir=/tmp/member-1",
+                "--raft-node-id=1",
+                "--raft-group-id=0102030405060708090a0b0c0d0e0f10",
+                "--raft-authority-incarnation=ffffffffffffffffffffffffffffffff",
+                "--raft-listen=127.0.0.1:19500",
+                "--raft-peers=/tmp/peers.toml",
+            ]
+        };
+        let member = |extra: &[&str]| {
+            let mut pairs: Vec<&str> = base();
+            pairs.extend_from_slice(extra);
+            parse(&args(&pairs))
+        };
+        // Repeatable: two catalogs and their recovery actor parse together.
+        let cfg = member(&[
+            "--raft-managed-catalog=books=/tmp/books.redb",
+            "--raft-managed-catalog=papers=/tmp/papers.redb",
+            "--raft-managed-principal=alice",
+        ])
+        .unwrap();
+        let raft = cfg.raft.unwrap();
+        assert_eq!(raft.managed_catalogs.len(), 2);
+        assert_eq!(raft.managed_catalogs[0].collection, "books");
+        assert_eq!(
+            raft.managed_catalogs[0].path,
+            PathBuf::from("/tmp/books.redb")
+        );
+        assert_eq!(raft.managed_catalogs[1].collection, "papers");
+        assert_eq!(raft.managed_principal.as_deref(), Some("alice"));
+        // A catalog without its recovery actor refuses.
+        let error = member(&["--raft-managed-catalog=books=/tmp/books.redb"]).unwrap_err();
+        assert!(error.contains("--raft-managed-principal"), "{error}");
+        // A malformed entry refuses by name.
+        let error = member(&[
+            "--raft-managed-catalog=books",
+            "--raft-managed-principal=alice",
+        ])
+        .unwrap_err();
+        assert!(error.contains("--raft-managed-catalog"), "{error}");
+        // Managed options on a non-member refuse by name.
+        let error = parse(&args(&[
+            "--role=node",
+            "--index=/tmp/x.tv",
+            "--raft-managed-catalog=books=/tmp/books.redb",
+            "--raft-managed-principal=alice",
+        ]))
+        .unwrap_err();
+        assert!(error.contains("needs --raft-dir"), "{error}");
+        let error = parse(&args(&[
+            "--role=node",
+            "--index=/tmp/x.tv",
+            "--raft-managed-principal=alice",
+        ]))
+        .unwrap_err();
+        assert!(error.contains("needs --raft-dir"), "{error}");
+    }
+
+    #[test]
     fn unsigned_columns_keep_their_own_configured_type() {
         let config = parse(&args(&[
             "--role=node",
@@ -3475,6 +3574,18 @@ fn parse_raft(
                 None => Ok(default),
             }
         };
+    let managed_catalog_present = !arg_values(args, "raft-managed-catalog").is_empty()
+        || text("raft-managed-catalog", "RAFT_MANAGED_CATALOG", None).is_some()
+        || file
+            .raft_managed_catalog
+            .as_ref()
+            .is_some_and(|v| !v.is_empty());
+    let managed_principal_present = text(
+        "raft-managed-principal",
+        "RAFT_MANAGED_PRINCIPAL",
+        file.raft_managed_principal.as_deref(),
+    )
+    .is_some();
     let Some(dir) = text("raft-dir", "RAFT_DIR", file.raft_dir.as_deref()) else {
         for (key, present) in [
             (
@@ -3489,6 +3600,8 @@ fn parse_raft(
                 "raft-listen",
                 text("raft-listen", "RAFT_LISTEN", file.raft_listen.as_deref()).is_some(),
             ),
+            ("raft-managed-catalog", managed_catalog_present),
+            ("raft-managed-principal", managed_principal_present),
         ] {
             if present {
                 return Err(format!(
@@ -3610,6 +3723,49 @@ fn parse_raft(
             ),
         }
     };
+    // Managed catalogs: repeatable on the CLI, comma-separated in the
+    // environment, a list in the file. CLI wins over environment over file.
+    let managed_entries = {
+        let cli = arg_values(args, "raft-managed-catalog");
+        if !cli.is_empty() {
+            cli
+        } else if let Some(env) = text("raft-managed-catalog", "RAFT_MANAGED_CATALOG", None) {
+            env.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        } else {
+            file.raft_managed_catalog.clone().unwrap_or_default()
+        }
+    };
+    let mut managed_catalogs = Vec::with_capacity(managed_entries.len());
+    for entry in &managed_entries {
+        let (collection, path) = entry.split_once('=').ok_or_else(|| {
+            "--raft-managed-catalog takes <collection>=<path>, repeatable".to_string()
+        })?;
+        if collection.trim().is_empty() || path.trim().is_empty() {
+            return Err("--raft-managed-catalog takes <collection>=<path>, repeatable".to_string());
+        }
+        managed_catalogs.push(RaftManagedCatalog {
+            collection: collection.trim().to_string(),
+            path: PathBuf::from(path.trim()),
+        });
+    }
+    let managed_principal = text(
+        "raft-managed-principal",
+        "RAFT_MANAGED_PRINCIPAL",
+        file.raft_managed_principal.as_deref(),
+    );
+    if !managed_catalogs.is_empty() && managed_principal.is_none() {
+        return Err("--raft-managed-catalog needs --raft-managed-principal, the actor holding the Admin that recovers the catalogs at start".to_string());
+    }
+    #[cfg(not(all(feature = "raft", feature = "tls")))]
+    if !managed_catalogs.is_empty() || managed_principal.is_some() {
+        return Err(
+            "this build has no Raft support (features `raft` and `tls` are needed)".to_string(),
+        );
+    }
     Ok(Some(RaftMemberConfig {
         dir: PathBuf::from(dir),
         node_id,
@@ -3625,5 +3781,7 @@ fn parse_raft(
         skew_ms,
         max_snapshot_bytes,
         map,
+        managed_catalogs,
+        managed_principal,
     }))
 }

@@ -28,6 +28,38 @@ fn inject(fault: Option<BindFault>, after: bool) -> Result<(), Status> {
     }
 }
 
+/// Read a catalog file's header without opening the catalog: its format
+/// with the persisted binding and activation. Recovery presents these
+/// exact binding bytes to the committed fence; nothing is reconstructed.
+/// A file with no managed binding is not a managed source.
+pub(crate) fn header_binding(
+    path: &Path,
+) -> Result<(u32, SourceManagedBinding, Option<SourceManagedActivation>), Status> {
+    if !path.is_file() {
+        return Err(Status::not_found(format!(
+            "managed catalog {} is missing; restore it rather than creating a fresh authority",
+            path.display()
+        )));
+    }
+    let database = Database::open(path).map_err(storage)?;
+    let transaction = database.begin_read().map_err(storage)?;
+    let metadata = transaction.open_table(META).map_err(storage)?;
+    let bytes = metadata
+        .get("header")
+        .map_err(storage)?
+        .ok_or_else(|| Status::data_loss("existing document catalog header missing"))?
+        .value()
+        .to_vec();
+    let header = decode_header(&bytes)?;
+    let binding = header.managed_binding.ok_or_else(|| {
+        Status::failed_precondition(format!(
+            "catalog {} has no managed binding; bind it under a committed preparation first",
+            path.display()
+        ))
+    })?;
+    Ok((header.format_version, binding, header.managed_activation))
+}
+
 pub(super) fn validate_binding(binding: &SourceManagedBinding) -> Result<(), Status> {
     if binding.format_version != 1 {
         return Err(Status::invalid_argument(

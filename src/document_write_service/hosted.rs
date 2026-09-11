@@ -67,6 +67,77 @@ struct WorkPermit {
     _budget: BudgetPermit,
 }
 
+/// The operator limits the hosted service serves under. No operator option
+/// sets them in this step; a later step can add one. One megabyte bounds a
+/// single write, sixteen bound admitted work, sixty-four bound operations.
+pub fn default_limits() -> DocumentWriteServiceLimits {
+    DocumentWriteServiceLimits {
+        max_request_bytes: 1024 * 1024,
+        max_pending_bytes: 16 * 1024 * 1024,
+        max_in_flight: 64,
+    }
+}
+
+/// Recover every managed catalog the operator configured, for the serving
+/// binary and for tests alike: open each path, recover the managed handle
+/// under a fresh leased admission, and reject by name a catalog that is
+/// prepared rather than active, one with an authority identity that is not
+/// the member's, or one with an activation the store does not record. The
+/// binding comes from the catalog file's own header, presented byte-exact
+/// to the committed fence; nothing is reconstructed. A rejection stops the
+/// whole recovery with its cause: no partial service starts on the rest.
+pub async fn recover_catalogs(
+    host: &RaftHost,
+    principal: &str,
+    entries: &[crate::config::RaftManagedCatalog],
+) -> Result<Vec<Arc<ActiveManagedCatalog>>, Status> {
+    let store = host.store()?;
+    let mut catalogs = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let context = |error: Status| {
+            Status::new(
+                error.code(),
+                format!(
+                    "managed catalog for collection {:?}: {}",
+                    entry.collection,
+                    error.message()
+                ),
+            )
+        };
+        let (_, binding, file_activation) =
+            crate::document_catalog::header_binding(&entry.path).map_err(context)?;
+        if file_activation.is_none() {
+            return Err(Status::failed_precondition(format!(
+                "managed catalog for collection {:?} is prepared, not active; only an activated source serves writes",
+                entry.collection
+            )));
+        }
+        let bound_collection = binding
+            .preparation
+            .as_ref()
+            .and_then(|preparation| preparation.key.as_ref())
+            .map(|key| key.collection.as_str());
+        if bound_collection != Some(entry.collection.as_str()) {
+            return Err(Status::failed_precondition(format!(
+                "managed catalog for collection {:?} names another collection in its binding",
+                entry.collection
+            )));
+        }
+        if binding.authority.as_ref() != Some(store.identity()) {
+            return Err(Status::failed_precondition(format!(
+                "managed catalog for collection {:?} names another source authority",
+                entry.collection
+            )));
+        }
+        let leased = host.lease(principal).await.map_err(context)?;
+        let admission = leased.admission().map_err(context)?;
+        let catalog = ActiveManagedCatalog::recover(&entry.path, &store, &admission, &binding)
+            .map_err(context)?;
+        catalogs.push(Arc::new(catalog));
+    }
+    Ok(catalogs)
+}
+
 /// The hosted write service: the network adapter over activated managed
 /// catalogs whose admissions all come from the member's Raft host.
 #[derive(Clone)]

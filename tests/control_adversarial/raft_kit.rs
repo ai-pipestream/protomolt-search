@@ -772,6 +772,12 @@ impl Voters {
         self.hosts.keys().copied().collect()
     }
 
+    /// The on-disk directory of `node`'s member state, for a restart on
+    /// the same directory the member served from.
+    pub fn member_dir(&self, node: u64) -> PathBuf {
+        self.dirs[&node].path().to_path_buf()
+    }
+
     /// Poll until some host leads; bounded and loud.
     pub async fn leader(&self) -> u64 {
         let deadline = Instant::now() + Duration::from_secs(10);

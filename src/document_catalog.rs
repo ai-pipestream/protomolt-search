@@ -35,6 +35,8 @@ pub use access::AccessControlledCatalog;
 pub use backup::CapturedBackup;
 pub use checkpoint::CatalogCheckpoint;
 #[cfg(feature = "net")]
+pub(crate) use managed::header_binding;
+#[cfg(feature = "net")]
 pub use managed::{ActiveManagedCatalog, PreparedManagedCatalog};
 pub use publication::{MaintenanceRecovery, ProjectionRecovery};
 pub use restore::VerifiedSourceRestore;
