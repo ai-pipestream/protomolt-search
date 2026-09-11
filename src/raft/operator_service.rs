@@ -56,7 +56,7 @@ pub fn member_status(host: &RaftHost) -> Result<MemberStatus, Status> {
         vote: Some(vote_to_proto(&metrics.vote)),
         applied: host.applied_position()?,
         last_log_index: metrics.last_log_index,
-        membership: Some(membership_to_proto(&metrics.membership_config.membership())),
+        membership: Some(membership_to_proto(metrics.membership_config.membership())),
         awaiting_snapshot: host.awaiting_snapshot()?,
         last_snapshot_build: host.last_snapshot_build().map(|build| SnapshotBuild {
             generation: build.generation,
@@ -97,7 +97,7 @@ pub fn member_status(host: &RaftHost) -> Result<MemberStatus, Status> {
 fn membership_change(host: &RaftHost) -> Result<MembershipChange, Status> {
     Ok(MembershipChange {
         membership: Some(membership_to_proto(
-            &host.metrics().borrow().membership_config.membership(),
+            host.metrics().borrow().membership_config.membership(),
         )),
         applied: host.applied_position()?,
     })

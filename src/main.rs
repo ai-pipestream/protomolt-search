@@ -1130,9 +1130,9 @@ fn read_message_json<M: prost::Message + Default>(
 async fn raft_bootstrap(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use pipestream_search::raft::host::{LOG_FILE, STORE_FILE};
     use pipestream_search::raft::{operator, RaftHost};
-    let (member, tls, client_tls) = pipestream_search::config::parse_raft_local(args)
+    let local = pipestream_search::config::parse_raft_local(args)
         .unwrap_or_else(|e| cli_usage("raft-bootstrap", &e));
-    let Some(member) = &member else {
+    let Some(member) = &local.member else {
         cli_usage(
             "raft-bootstrap",
             "raft-bootstrap needs --raft-dir and the other --raft-* options",
@@ -1158,8 +1158,9 @@ async fn raft_bootstrap(args: &[String]) -> Result<(), Box<dyn std::error::Error
     )?;
     let identity = operator::identity(member);
     let host_config = operator::host_config(member).map_err(|e| format!("raft-bootstrap: {e}"))?;
-    let transport = operator::cluster_transport(member, tls.as_ref(), client_tls.as_ref())
-        .map_err(|e| format!("raft-bootstrap: {e}"))?;
+    let transport =
+        operator::cluster_transport(member, local.tls.as_ref(), local.client_tls.as_ref())
+            .map_err(|e| format!("raft-bootstrap: {e}"))?;
     let host = RaftHost::bootstrap_cluster(
         &member.dir,
         &identity,

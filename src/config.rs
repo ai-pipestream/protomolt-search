@@ -881,21 +881,22 @@ fn read_file_config(args: &[String]) -> Result<FileConfig, String> {
 /// (`raft-bootstrap`): the raft flags and the listener and client TLS,
 /// without the serving roles' shard and collection requirements, which
 /// a command that creates a directory but serves nothing does not have.
-pub fn parse_raft_local(
-    args: &[String],
-) -> Result<
-    (
-        Option<RaftMemberConfig>,
-        Option<crate::security::ServerTls>,
-        Option<crate::security::ClientTls>,
-    ),
-    String,
-> {
+pub struct RaftLocal {
+    pub member: Option<RaftMemberConfig>,
+    pub tls: Option<crate::security::ServerTls>,
+    pub client_tls: Option<crate::security::ClientTls>,
+}
+
+pub fn parse_raft_local(args: &[String]) -> Result<RaftLocal, String> {
     let file = read_file_config(args)?;
     let relay = flag_present(args, "relay");
     let member = parse_raft(args, &file, relay)?;
     let (tls, client_tls) = parse_tls(args, &file)?;
-    Ok((member, tls, client_tls))
+    Ok(RaftLocal {
+        member,
+        tls,
+        client_tls,
+    })
 }
 
 /// The security surface (`docs/security.md`): the listener TLS and the
@@ -2844,7 +2845,7 @@ mod tests {
     fn raft_local_parse_serves_the_directory_commands_without_shards() {
         // The local commands create a directory but serve nothing: raft
         // flags alone are a member, with no shard or collection flags.
-        let (member, tls, client_tls) = parse_raft_local(&args_raw(&[
+        let local = parse_raft_local(&args_raw(&[
             "--raft-dir=/tmp/member-1",
             "--raft-node-id=1",
             "--raft-group-id=0102030405060708090a0b0c0d0e0f10",
@@ -2853,15 +2854,23 @@ mod tests {
             "--raft-peers=/tmp/peers.toml",
         ]))
         .unwrap();
-        let member = member.expect("raft flags alone are a member");
-        assert_eq!(member.node_id, 1);
-        assert!(tls.is_none());
-        assert!(client_tls.is_none());
+        assert_eq!(
+            local
+                .member
+                .as_ref()
+                .expect("raft flags alone are a member")
+                .node_id,
+            1
+        );
+        assert!(local.tls.is_none());
+        assert!(local.client_tls.is_none());
         // No raft flags is no member, not an error.
-        let (member, _, _) = parse_raft_local(&args_raw(&[])).unwrap();
-        assert!(member.is_none());
+        let local = parse_raft_local(&args_raw(&[])).unwrap();
+        assert!(local.member.is_none());
         // A partial member is refused by name.
-        let error = parse_raft_local(&args_raw(&["--raft-node-id=1"])).unwrap_err();
+        let error = parse_raft_local(&args_raw(&["--raft-node-id=1"]))
+            .err()
+            .expect("a member without its directory refuses");
         assert!(error.contains("needs --raft-dir"), "{error}");
     }
 
