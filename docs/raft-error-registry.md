@@ -22,7 +22,7 @@ which is not on this base yet; no site attaches them here.
 
 | reason | code | refusal | stability |
 | ------ | ---- | ------- | --------- |
-| transport.no_client_certificate | Unauthenticated | no client certificate from the cluster CA | stable |
+| transport.no_client_certificate | Unauthenticated | no client certificate from the cluster CA; the listener's TLS requires one, so this is a second check behind the handshake and no client reaches it | stable |
 | transport.unregistered_certificate | Unauthenticated | certificate bound to no member | stable |
 | transport.bad_header | InvalidArgument | no header, or a protocol version this node does not speak | stable |
 | transport.wrong_group | PermissionDenied | another group named | stable |
@@ -36,7 +36,7 @@ which is not on this base yet; no site attaches them here.
 | snapshot.digest | DataLoss | image bytes differ from the announced digest | stable |
 | snapshot.stale_continuation | FailedPrecondition | chunk continues a transfer the receiver dropped | stable |
 | snapshot.transfer_bound | FailedPrecondition | another peer's chunk on a bound transfer; names the bound node | stable |
-| snapshot.over_announced | InvalidArgument | chunk or transfer past the announced length; the transfer is dropped | stable |
+| snapshot.over_announced | InvalidArgument | a chunk past the announced length, or a transfer that ended short of it; the transfer is dropped | stable |
 | snapshot.membership_mismatch | DataLoss | image membership differs from the snapshot meta | stable |
 | snapshot.position_mismatch | DataLoss | image applied position differs from the snapshot meta | stable |
 

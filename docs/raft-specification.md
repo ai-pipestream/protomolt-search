@@ -71,8 +71,5 @@ receipt destructure pins the receipt's field set.
    mark: named under "Source write boundary" in
    [admission under Raft](raft-admission.md); no target in the
    conformance list above parks a crash inside it.
-4. Receipt disclosure minimality (an accepted receipt says nothing
-   about the lease beyond the epoch): no negative test asserts the
-   absence.
-5. The lease actor equals the transport principal name by deployment
+4. The lease actor equals the transport principal name by deployment
    convention: a deployment obligation, not a sentence a test can fail.

@@ -112,7 +112,9 @@ retry history. Content hashes are checked during source reads.
 On an activated managed source every write MUST be admitted under a lease
 ([admission under Raft](raft-admission.md)), and the lease MUST be judged
 twice: at the final check immediately before the commit, and again when
-the commit returns durable. The second judgement is what the storage
+the commit returns durable. (`src/document_catalog/managed/tests.rs`,
+`a_write_durable_after_its_lease_lapsed_is_unconfirmed_until_settled`,
+fails if the commit's return is not judged.) The second judgement is what the storage
 records, on the operation record and on the version, as the write's
 outcome (`WriteOutcome` in the storage proto, catalog format 11):
 
@@ -132,26 +134,38 @@ The outcome moves forward only (I5):
 | `UNCONFIRMED` | `FENCED` | `ActiveManagedCatalog::settle` under a fresh leased admission for the same actor | the right gone (grant revoked, or owner not ACTIVE under the epoch); the settlement is `FAILED_PRECONDITION` (`outcome.fenced`) naming the version, the sequence, the epoch and the revision | `tests/control_raft_hosted_writes.rs`, `an_unconfirmed_write_whose_actor_was_revoked_meanwhile_is_fenced` |
 
 An admission that lapsed again MUST settle nothing, by name
-(`outcome.unconfirmed`), and the record MUST stay unconfirmed for the
+(`lease.interval_elapsed` at the catalog; the hosted service answers
+`outcome.unconfirmed`), and the record MUST stay unconfirmed for the
 next attempt. A retry of an operation whose record is unconfirmed MUST
 be answered from the record before the entry check, and settled under
-the retry's own admission, which is fresh at entry; a retry of a fenced
-operation MUST replay the rejection. A fenced version MUST stay in the
+the retry's own admission, which is fresh at entry.
+(`src/document_catalog/managed/tests.rs`,
+`a_write_durable_after_its_lease_lapsed_is_unconfirmed_until_settled`,
+fails if a lapsed admission settles, the record moves, or a retry
+re-enters the entry check.) A retry of a fenced operation MUST replay
+the rejection (`outcome.fenced`). A fenced version MUST stay in the
 history at the sequence it took, marked
 (`AcceptedDocumentVersion.fenced`, `fenced_at_revision`), and remain the
-head of its key, so the next version of that key counts on from it; a
-reader that applies history MUST treat a fenced version as never
-admitted. Every version MUST carry the epoch it committed under
-(`write_epoch`, zero on a catalog that is not an activated managed
-source).
+head of its key, so the next version of that key counts on from it.
+(`src/document_catalog/managed/tests.rs`,
+`a_write_settled_after_its_right_was_revoked_is_fenced_by_name`, fails
+if the replay differs or the row leaves the history.) A reader that
+applies history treats a fenced version as never admitted. Every
+version MUST carry the epoch it committed under (`write_epoch`, zero on
+a catalog that is not an activated managed source); the two tests
+above read it back on every version.
 
 The hosted write service MUST settle on the same call
 ([hosted owner writes](raft-hosting.md#hosted-owner-writes)): a write
 returned unconfirmed MUST take a fresh lease under the call's permits
 and answer with the settlement; when no lease can be had, the call MUST
 be `UNAVAILABLE` naming the durable version as unconfirmed
-(`outcome.unconfirmed`), and the exact retry settles it. What this
-closes, and the residual it leaves, are in
+(`outcome.unconfirmed`), and the exact retry settles it.
+(`tests/control_raft_hosted_writes.rs`,
+`a_write_durable_after_its_lease_lapsed_is_settled_under_a_fresh_lease`
+and `an_unconfirmed_write_the_leader_cannot_settle_is_settled_by_the_retry`,
+fail if the call answers without settling or the retry does not settle.)
+What this closes, and the residual it leaves, are in
 [admission under Raft](raft-admission.md), "Source write boundary".
 
 The version precondition (`expected_version`, "Identity and retry rules")

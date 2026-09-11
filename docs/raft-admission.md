@@ -37,7 +37,7 @@ the test that pins it:
 - I1: No admission interval is ever extended; remaining time is
   computed only from the anchor on the anchoring member's monotonic
   clock, and a suspend detected by the wall clock, or a backwards step
-  of the wall clock, refuses instead of extending. (`SourceAdmission::fresh`
+  of the wall clock, refuses instead of extending. (`AdmissionLease::fresh`
   checks the monotonic deadline and the wall clock together in
   `src/source_authority.rs`; `src/raft/transport_tests.rs`, "a grant
   paused after the barrier is refused once its interval elapsed", and
@@ -171,18 +171,21 @@ and only the host grants it:
    transport RPC MUST carry the group's timing agreement (heartbeat, election
    floor and ceiling, lease, skew); a peer presenting different values, or
    none, MUST be refused (`transport.timing_mismatch`) before the library
-   sees the call (I2). (`src/raft/tests.rs`, the lease-beyond-the-election-floor refusal,
-   and `src/raft/transport_tests.rs`,
+   sees the call (I2). (`src/raft/tests.rs`,
+   `a_lease_beyond_the_election_floor_is_rejected_at_validation`, and
+   `src/raft/transport_tests.rs`,
    `peer_identity_binds_certificate_group_and_node`, fail if an
    unvalidated configuration or an untimed peer is admitted.)
 5. While an interval anchored at this node's latest barrier may still be
    open (`anchor + election_timeout_max` on this node's clock), the
    transport MUST withhold this node's vote from every candidate
    (`LeaseHold`, I2): the reply names the leader's current vote and grants
-   nothing, and the request never reaches the library.
-   (`src/raft/transport_tests.rs`,
-   `a_leader_withholds_its_vote_while_an_admission_interval_may_be_open`,
-   fails if the vote is granted.)
+   nothing, and the request never reaches the library. A lease the
+   leader forwarded counts: its hold is extended from the request's
+   receipt. (`src/raft/transport_tests.rs`,
+   `a_leader_withholds_its_vote_while_an_admission_interval_may_be_open`
+   and `a_leader_withholds_its_vote_for_a_lease_it_forwarded`, fail if
+   the vote is granted under a local or a forwarded interval.)
 
 ## Why the interval is defensible
 
@@ -318,8 +321,12 @@ write whose final check happens after the interval has lapsed, for every
 new admission, and for every write that became durable after its interval
 lapsed and is settled after the revocation: such a write MUST be fenced
 (`outcome.fenced`), its receipt MUST be a rejection, and its row MUST be
-marked. The receipt discloses nothing about the lease beyond the epoch;
-the write is fenced against replacement by the owner's write epoch,
+marked. The receipt MUST disclose nothing about the lease beyond the
+epoch (`tests/control_raft_admission.rs`,
+`receipt_discloses_nothing_about_the_lease`: its exhaustive destructure
+of the receipt stops compiling when a field is added, and its encoded
+bytes are checked for the anchor); the write is fenced against
+replacement by the owner's write epoch,
 which a new activation moves, and by the outcome at every replica that
 reads the history. Until replacement exists, expiry-only replacement
 stays unavailable, and no path activates a second writer; the fence
@@ -340,42 +347,64 @@ the next durable transaction, and it is stated here rather than closed.
 
 ## Failure behaviour
 
-Every bullet is a MUST the evidence below pins; the lease lifecycle
-table follows the last one.
+Each bullet names the test that fails it; the lease lifecycle table
+follows the last one.
 
 - Leader isolated: the barrier MUST fail or time out → admission refused
   (`Unavailable`, `lease.no_linearizable_read`). Leases granted before
   isolation MUST expire within `admission_lease_ms` of their anchor (I1);
   work admitted under them either passed its final check before expiry
   (and is fenced by the epoch on any later activation, I4) or is refused
-  at that check.
+  at that check. (`src/raft/transport_tests.rs`,
+  `an_isolated_leader_admits_nothing_and_the_surviving_quorum_revokes`,
+  and `tests/control_raft_admission.rs`,
+  `isolated_leader_barrier_fails_within_election_max`, fail if the
+  isolated leader admits or a lease outlives the election floor.)
 - Paused between barrier and grant: the grant MUST be refused
   (`FailedPrecondition`, `lease.interval_elapsed`, I1).
+  (`src/raft/transport_tests.rs`,
+  `a_grant_paused_after_the_barrier_is_refused_once_its_interval_elapsed`,
+  fails if the paused grant is given.)
 - Revocation on the surviving quorum: applied on the new leader; the old
-  leader MUST NOT admit anything after its leases lapse; a retry of an old
-  decision on any replica MUST return the recorded decision but disclose it
-  only under the current grant (`read_policy` at each read).
+  leader MUST NOT admit anything after its leases lapse
+  (`src/raft/transport_tests.rs`,
+  `an_isolated_leader_admits_nothing_and_the_surviving_quorum_revokes`,
+  fails if the old leader admits after the quorum revoked); a retry of
+  an old decision on any replica returns the recorded decision but
+  discloses it only under the current grant (`read_policy` at each
+  read).
 - Attempted writes through the old side after a new leader exists: MUST be
   refused at admission (no barrier), and any in-flight lease MUST expire
   before the new leader could have been elected (I2).
+  (`tests/control_raft_hosted_writes.rs`,
+  `an_isolated_leader_rejects_hosted_writes_within_election_timeout_max`,
+  fails if the old side admits a write inside or past the read bound.)
 - Vote request at a leader with an interval open: MUST NOT be granted, the
   leader stays leader, the request MUST NOT reach the library until the
   interval's ceiling has passed (I2). A lease the leader forwarded counts:
   its hold is extended from the request's receipt.
+  (`src/raft/transport_tests.rs`,
+  `a_leader_withholds_its_vote_while_an_admission_interval_may_be_open`
+  and `a_leader_withholds_its_vote_for_a_lease_it_forwarded`, fail if the
+  vote is granted inside the ceiling.)
 - A member that does not lead, cut from the leader: the forwarded lease
   cannot be asked for, `Unavailable` naming it
   (`lease.leader_unreachable`). Behind the leader's read position past its
   interval: MUST be rejected by name (`lease.read_position_behind`, I3),
-  no grant on the stale view.
+  no grant on the stale view. (`tests/control_raft_hosted_writes.rs`,
+  `a_write_through_a_follower_is_admitted_under_a_lease_forwarded_from_the_leader`
+  and
+  `a_forwarded_lease_grants_only_once_the_member_applied_the_leaders_read_position`,
+  fail if a cut member or a member behind the read position grants.)
 
 ### Lease lifecycle
 
 | State | How it is entered | How it is left | Test |
 | ----- | ----------------- | -------------- | ---- |
-| anchored | `RaftHost::lease` takes the anchor before the barrier | the barrier answers, or the interval elapses first | `src/raft/transport_tests.rs`, the paused grant |
-| barrier passed | a quorum acknowledged inside `election_timeout_max`; on a member that does not lead, the leader's barrier answered over `GrantLease` | the grant runs, or the interval elapses first | `tests/control_raft_hosted_writes.rs`, the forwarded lease |
-| granted | the grant gate found `anchor + ttl` still open and, off-leader, the read position applied | the interval elapses, or the admission is dropped | `src/raft/tests.rs`, the worker grant |
-| lapsed | the monotonic deadline, the wall clock, or a backwards wall-clock step passed the anchor | terminal: no grant, no admission, no settlement moves it back (I1, I5) | `src/raft/tests.rs`, expired admission admits nothing |
+| anchored | `RaftHost::lease` takes the anchor before the barrier | the barrier answers, or the interval elapses first | `src/raft/transport_tests.rs`, `a_grant_paused_after_the_barrier_is_refused_once_its_interval_elapsed` |
+| barrier passed | a quorum acknowledged inside `election_timeout_max`; on a member that does not lead, the leader's barrier answered over `GrantLease` | the grant runs, or the interval elapses first | `tests/control_raft_hosted_writes.rs`, `a_write_through_a_follower_is_admitted_under_a_lease_forwarded_from_the_leader` |
+| granted | the grant gate found `anchor + ttl` still open and, off-leader, the read position applied | the interval elapses, or the admission is dropped | `src/raft/tests.rs`, `a_lease_taken_on_one_thread_grants_on_another_within_its_interval` |
+| lapsed | the monotonic deadline, the wall clock, or a backwards wall-clock step passed the anchor | terminal: no grant, no admission, no settlement moves it back (I1, I5) | `src/raft/tests.rs`, `a_lease_kept_past_its_interval_is_rejected_at_the_grant` |
 
 A local admission and a forwarded admission share the lifecycle; only
 the barrier differs (own vs. the leader's). The grant gate in both is

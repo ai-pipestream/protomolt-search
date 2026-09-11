@@ -288,7 +288,9 @@ Raw submission and committed application MUST NOT be reachable by product
 callers: the submit path is private, the replay paths, the log store's
 constructors and writes and the state machine's constructor are
 crate-private, and a hosted store MUST refuse every direct command and
-every local `admission()`. `store()` hands out the current
+every local `admission()`. (`src/raft/tests.rs`,
+`a_hosted_store_refuses_direct_mutation_and_local_admission`, fails if
+a direct command or a local admission is taken.) `store()` hands out the current
 store for reads (maps, snapshots, decisions); `with_admission` grants the
 leased admission owner-side work needs, with the linearizable read bounded
 by the longest election so an isolated leader refuses instead of waiting
@@ -353,6 +355,11 @@ interval may still be open MUST answer a vote request with its current
 vote and grant nothing, without the library seeing the request
 (`LeaseHold`, I2; the reasons are in
 [admission under Raft](raft-admission.md)).
+(`src/raft/transport_tests.rs`,
+`peer_identity_binds_certificate_group_and_node` for the timing refusal
+and `a_leader_withholds_its_vote_while_an_admission_interval_may_be_open`
+for the withheld vote, fail if an untimed peer is answered or the vote
+is granted.)
 
 A fourth RPC, `GrantLease`, carries a forwarded lease: a member that
 does not lead MUST ask the leader to run its read barrier and answer
@@ -360,6 +367,12 @@ with the position it read; the leader MUST extend its vote hold from
 the request's receipt (I2, I3;
 [admission under Raft](raft-admission.md), "A lease forwarded from the
 leader"). The request names no principal.
+(`tests/control_raft_hosted_writes.rs`,
+`a_forwarded_lease_grants_only_once_the_member_applied_the_leaders_read_position`,
+fails if the member grants before it applied the position the leader
+read; `src/raft/transport_tests.rs`,
+`a_leader_withholds_its_vote_for_a_lease_it_forwarded`, fails if the
+leader's hold does not move with the forwarded lease.)
 
 Bounds: `TransportLimits { max_message_bytes, connect_timeout_ms }` is
 enforced by both sides' codecs and validated to hold one snapshot chunk
@@ -388,7 +401,11 @@ never through files. The member lifecycle table follows the procedure.
    `three_voters_replicate_and_learners_are_seeded_by_snapshot`, fails if
    the marked store applies.)
 2. `add_learner(node_id, addr)` on the leader MUST require the node's
-   certificate to be registered (`membership.unregistered_certificate`),
+   certificate to be registered (`membership.unregistered_certificate`;
+   `src/raft/transport_tests.rs`,
+   `peer_identity_binds_certificate_group_and_node`, fails if an unbound
+   node is added, a node with no dial address is added, or a promotion
+   naming no learner is taken),
    build a snapshot at or past the applied position it read (the store
    may be one entry ahead of the metric, and a build images the store
    where it is), purge the log to the snapshot's position, add the
@@ -407,8 +424,10 @@ never through files. The member lifecycle table follows the procedure.
    the marker is gone with it. (`src/raft/transport_tests.rs`,
    `three_voters_replicate_and_learners_are_seeded_by_snapshot`, fails if
    the seed installs an unverified image.)
-3. `promote(learners)` MUST upgrade only caught-up learners to voters
-   (`AddVoterIds`); `remove_member(node_id)` MUST remove a voter
+3. `promote(learners)` MUST upgrade the named learners to voters
+   (`AddVoterIds`; the operator promotes once they are caught up, and the
+   host checks nothing about catch-up itself); `remove_member(node_id)`
+   MUST remove a voter
    (`RemoveVoters`, not retained as a learner) or a learner
    (`RemoveNodes`). A removed member MUST propose nothing and admit
    nothing. (`src/raft/transport_tests.rs`,
@@ -658,7 +677,10 @@ completion, and the file's activation MUST equal the committed fence.
 A forged or stale header can therefore open nothing the store does not
 record. Recovery MUST take no lease on purpose: a lease needs a leader,
 and a member restarts before any leader exists and serves as a follower
-most of its life. The recovery admission MUST admit no write, by name;
+most of its life. (`tests/control_raft_hosted_writes.rs`,
+`a_single_member_restarted_recovers_at_start_and_serves_once_it_leads`,
+fails if recovery waits on a leader.) The recovery admission MUST admit
+no write, by name;
 every write on the handle MUST take its own lease, so a handle opened on
 a view the quorum has since moved past MUST be rejected at its first
 write (`admission.epoch_moved`, "the fence has moved").
