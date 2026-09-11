@@ -555,6 +555,15 @@ in `src/raft/tests.rs`.
 
 ## Evidence
 
+The migration and disaster-recovery exercise of the design's step 5 runs
+against the fleet's own root map on disposable state
+(`tests/control_raft_migration.rs`; [the exercise](raft-migration-exercise.md)):
+the map becomes a legacy control plane, is retired and imported into a
+bootstrapped group whose every voter then publishes it for the relay; the
+group loses its leader with a write in flight, replaces a lost member
+while the leader's image has changed bytes, restarts from cold, serves a
+write on every path, and recovers its retirement record.
+
 Single node (`src/raft/tests.rs`):
 
 - Envelope round trips and malformed refusals.

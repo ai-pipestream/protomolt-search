@@ -1,0 +1,52 @@
+# Root shard map, generation 10, 2026-09-05: six "archive" shards on krick-1
+# and the "recent" group behind the relay on pi5v1. Codes: recent = 0,
+# archive = 1 << 54 (level_bits 9, chain order recent, archive).
+generation = 10
+
+[[shards]]
+addr = "192.168.1.195:19400"
+slot_offset = 0
+placement = 18014398509481984
+
+[[shards]]
+addr = "192.168.1.195:19401"
+slot_offset = 22151168
+placement = 18014398509481984
+
+[[shards]]
+addr = "192.168.1.195:19402"
+slot_offset = 44302336
+placement = 18014398509481984
+
+[[shards]]
+addr = "192.168.1.195:19403"
+slot_offset = 66453504
+placement = 18014398509481984
+
+[[shards]]
+addr = "192.168.1.195:19404"
+slot_offset = 88604672
+placement = 18014398509481984
+
+[[shards]]
+addr = "192.168.1.195:19405"
+slot_offset = 110755840
+placement = 18014398509481984
+
+[[shards]]
+addr = "192.168.1.216:19390"
+slot_offset = 132907008
+placement = 0
+
+[placement]
+column = "placement"
+level_bits = 9
+
+[[placement.nodes]]
+name = "recent"
+cel = "year >= 2015"
+shards = 1
+
+[[placement.nodes]]
+name = "archive"
+shards = 6

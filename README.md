@@ -1237,6 +1237,15 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **Foundation branch: the migration and disaster-recovery exercise, on
+  the fleet's own map.** The design's step 5 run on disposable state:
+  the fleet's root map as a legacy control plane, retired and imported
+  into a bootstrapped three-voter group; every voter publishes the map
+  the relay would route on; the leader is lost with a write in flight
+  and the write replays; a member is lost and replaced while the image
+  has changed bytes; a cold restart; a write on every path; the
+  retirement record recovered. Under five seconds, one test in the
+  release gate. See [the exercise](docs/raft-migration-exercise.md).
 - **Foundation branch: a managed catalog is served wherever its member
   is.** A member that does not lead asks the leader for its admission
   lease over a fourth transport RPC; the leader runs its barrier and
