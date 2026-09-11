@@ -31,6 +31,7 @@ use pipestream_search::pb::{
     DocumentWriteRequest, DocumentWriteServiceLimits, GetDocumentWriteTargetRequest,
     ProtobufSource, ReadAcceptedDocumentsRequest,
 };
+use pipestream_search::raft::reasons;
 use pipestream_search::raft::RaftHost;
 use tonic::Code;
 
@@ -491,8 +492,9 @@ async fn a_write_through_a_follower_is_admitted_under_a_lease_forwarded_from_the
         .await
         .unwrap_err();
     assert_eq!(error.code(), Code::Unavailable, "{error}");
-    assert!(
-        error.message().contains("forwarded lease"),
+    assert_eq!(
+        reasons::reason_of(&error),
+        Some(reasons::LEASE_LEADER_UNREACHABLE),
         "the rejection must name the forwarded lease: {error}"
     );
     host.heal();
@@ -579,6 +581,11 @@ async fn a_forwarded_lease_grants_only_once_the_member_applied_the_leaders_read_
             "had not applied the leader's read position {revoked_at}"
         )),
         "the rejection must name the position the member is behind: {error}"
+    );
+    assert_eq!(
+        reasons::reason_of(&error),
+        Some(reasons::LEASE_READ_POSITION_BEHIND),
+        "{error}"
     );
     assert!(
         started.elapsed() <= lease + Duration::from_millis(200),
@@ -674,10 +681,9 @@ async fn a_write_kept_past_its_lease_leaves_no_durable_change() {
         .await
         .unwrap_err();
     assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
-    assert!(
-        error
-            .message()
-            .contains("admission interval elapsed before the grant"),
+    assert_eq!(
+        reasons::reason_of(&error),
+        Some(reasons::LEASE_INTERVAL_ELAPSED),
         "the refusal must name the grant-time check: {error}"
     );
 
@@ -965,9 +971,62 @@ async fn a_restart_with_a_prepared_but_inactive_catalog_is_rejected_by_name() {
         .err()
         .expect("a prepared catalog must not recover");
     assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
-    assert!(
-        error.message().contains("prepared, not active"),
+    assert_eq!(
+        reasons::reason_of(&error),
+        Some(reasons::ADMISSION_NOT_ACTIVE),
         "the rejection must name the prepared state: {error}"
+    );
+
+    return_host(&mut cluster, leader, host);
+    cluster.shutdown().await;
+}
+
+/// A catalog file bound under one collection but configured for another:
+/// recovery names the foreign collection and serves nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_with_a_foreign_collection_catalog_is_rejected_by_name() {
+    let _serial = serial();
+    let mut cluster = raft_kit::three_voters("hosted-collection", &hosted_policy()).await;
+    let leader = cluster.leader().await;
+    let dir = kit::TestDir::new("hosted-collection-catalog");
+    let authority = cluster.group.clone();
+    let (catalog, history_id) = catalog_fixture(&dir);
+    let prepare = kit::source_command(
+        &authority,
+        &kit::owner_key(),
+        "hosted-prepare",
+        cluster.revision,
+        1,
+        0,
+        kit::prepare_action_history(WORKFLOW, history_id),
+    );
+    let decision = cluster
+        .host(leader)
+        .propose_command("alice", &prepare)
+        .await
+        .unwrap();
+    assert_eq!(decision.code, 0, "{}", decision.message);
+    let preparation = decision.owner.clone().unwrap();
+    let store = cluster.host(leader).store().unwrap();
+    let prepared = cluster
+        .host(leader)
+        .with_admission("alice", |admission| {
+            catalog.bind_prepared_owner(admission, &store, &preparation, 1 << 20)
+        })
+        .await
+        .unwrap();
+    drop(prepared);
+    drop(store);
+
+    let host = take_host(&mut cluster, leader);
+    let error = recover_catalogs(&host, "alice", &[managed_entry("another-collection", &dir)])
+        .err()
+        .expect("a foreign-collection catalog must not recover");
+    assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
+    assert_eq!(
+        reasons::reason_of(&error),
+        Some(reasons::ADMISSION_FOREIGN_COLLECTION),
+        "the rejection must name the foreign collection: {error}"
     );
 
     return_host(&mut cluster, leader, host);
@@ -1003,8 +1062,9 @@ async fn a_restart_with_a_foreign_authority_catalog_is_rejected_by_name() {
         .err()
         .expect("a foreign catalog must not recover");
     assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
-    assert!(
-        error.message().contains("another source authority"),
+    assert_eq!(
+        reasons::reason_of(&error),
+        Some(reasons::ADMISSION_FOREIGN_AUTHORITY),
         "the rejection must name the foreign authority: {error}"
     );
     foreign.shutdown().await.unwrap();
@@ -1032,8 +1092,9 @@ async fn a_restart_with_an_unrecorded_activation_is_rejected_by_name() {
         .err()
         .expect("an unrecorded activation must not recover");
     assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
-    assert!(
-        error.message().contains("has no committed preparation"),
+    assert_eq!(
+        reasons::reason_of(&error),
+        Some(reasons::ADMISSION_UNRECORDED_ACTIVATION),
         "the rejection must name the unrecorded activation: {error}"
     );
     fresh.shutdown().await.unwrap();
@@ -1379,8 +1440,9 @@ async fn a_receipt_is_kept_back_when_transport_access_changes_under_a_committed_
     transport_policy.replace(without_alice).unwrap();
     let withheld = call.await.unwrap().unwrap_err();
     assert_eq!(withheld.code(), Code::PermissionDenied, "{withheld}");
-    assert!(
-        withheld.message().contains("access policy changed"),
+    assert_eq!(
+        reasons::reason_of(&withheld),
+        Some(reasons::RECEIPT_POLICY_CHANGED),
         "the withheld receipt must name the policy change: {withheld}"
     );
 
@@ -1579,13 +1641,10 @@ async fn an_unconfirmed_write_the_leader_cannot_settle_is_settled_by_the_retry()
     let started = Instant::now();
     let error = call.await.unwrap().unwrap_err();
     assert_eq!(error.code(), Code::Unavailable, "{error}");
-    assert!(
-        error.message().contains("is durable but unconfirmed"),
+    assert_eq!(
+        reasons::reason_of(&error),
+        Some(reasons::OUTCOME_UNCONFIRMED),
         "the call must name the row as durable and unconfirmed: {error}"
-    );
-    assert!(
-        error.message().contains("retry the operation to settle it"),
-        "{error}"
     );
     assert!(
         started.elapsed() < lease * 3 + election_max + lease,
@@ -1689,8 +1748,9 @@ async fn an_unconfirmed_write_whose_actor_was_revoked_meanwhile_is_fenced() {
         .index;
     let error = call.await.unwrap().unwrap_err();
     assert_eq!(error.code(), Code::Unavailable, "{error}");
-    assert!(
-        error.message().contains("is durable but unconfirmed"),
+    assert_eq!(
+        reasons::reason_of(&error),
+        Some(reasons::OUTCOME_UNCONFIRMED),
         "{error}"
     );
 
@@ -1716,6 +1776,11 @@ async fn an_unconfirmed_write_whose_actor_was_revoked_meanwhile_is_fenced() {
         fenced.message().contains(&format!(
             "version 1 at sequence 2 became durable after its admission lapsed and its right was gone at control revision {revision}"
         )),
+        "{fenced}"
+    );
+    assert_eq!(
+        reasons::reason_of(&fenced),
+        Some(reasons::OUTCOME_FENCED),
         "{fenced}"
     );
     assert!(
@@ -1846,10 +1911,9 @@ async fn a_version_precondition_is_decided_in_the_write_transaction_and_a_loser_
     assert!(won.accepted && won.durable && !won.replayed);
     let (status, loser) = lost;
     assert_eq!(status.code(), Code::Aborted, "{status}");
-    assert!(
-        status
-            .message()
-            .contains("document version precondition failed"),
+    assert_eq!(
+        reasons::reason_of(&status),
+        Some(reasons::OUTCOME_VERSION_MISMATCH),
         "{status}"
     );
 

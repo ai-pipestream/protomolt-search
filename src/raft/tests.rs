@@ -1506,3 +1506,56 @@ async fn a_recovery_admission_opens_a_handle_and_admits_no_write() {
     drop(admission);
     host.shutdown().await.unwrap();
 }
+
+/// The specification's document versions and its version map stay equal
+/// to the code's numbers (`docs/raft-specification.md`): a bumped
+/// format or protocol fails here until the documents move with it.
+#[test]
+fn specification_versions_match_the_code() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for doc in [
+        "docs/raft-admission.md",
+        "docs/raft-hosting.md",
+        "docs/document-writes.md",
+        "docs/raft-error-registry.md",
+    ] {
+        let text = std::fs::read_to_string(root.join(doc)).unwrap();
+        assert!(
+            text.lines()
+                .any(|line| line.trim() == "Specification version: 1"),
+            "{doc} carries specification version 1"
+        );
+    }
+    let spec = std::fs::read_to_string(root.join("docs/raft-specification.md")).unwrap();
+    let protocol = super::transport::PROTOCOL_VERSION;
+    let format = crate::document_catalog::ACTIVE_MANAGED_FORMAT;
+    let mut rows = 0;
+    for line in spec.lines() {
+        let line = line.trim();
+        if !line.starts_with("| `docs/") {
+            continue;
+        }
+        let cells: Vec<&str> = line
+            .trim_start_matches('|')
+            .trim_end_matches('|')
+            .split('|')
+            .map(str::trim)
+            .collect();
+        assert_eq!(cells.len(), 3, "version-map row: {line}");
+        assert_eq!(cells[1], "1", "document version: {line}");
+        if cells[2].contains("transport protocol version") {
+            assert!(
+                cells[2].contains(&format!("transport protocol version {protocol}")),
+                "protocol number: {line}"
+            );
+        }
+        if cells[2].contains("catalog format") {
+            assert!(
+                cells[2].contains(&format!("catalog format {format}")),
+                "catalog format: {line}"
+            );
+        }
+        rows += 1;
+    }
+    assert_eq!(rows, 4, "one version-map row per behavioral document");
+}

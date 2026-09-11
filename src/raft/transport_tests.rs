@@ -338,12 +338,26 @@ async fn peer_identity_binds_certificate_group_and_node() {
     let error = refused(vote_request(Some(header(&group, 3, 1)))).await;
     assert_eq!(error.code(), Code::PermissionDenied, "{error}");
     assert!(error.message().contains("registered to node 2"), "{error}");
+    assert_eq!(
+        super::reasons::reason_of(&error),
+        Some(super::reasons::TRANSPORT_IDENTITY_MISMATCH),
+        "{error}"
+    );
     let error = refused(vote_request(Some(header(&group, 2, 9)))).await;
     assert_eq!(error.code(), Code::PermissionDenied, "{error}");
     assert!(error.message().contains("addressed to node 9"), "{error}");
+    assert_eq!(
+        super::reasons::reason_of(&error),
+        Some(super::reasons::TRANSPORT_MISADDRESSED),
+        "{error}"
+    );
     let error = refused(vote_request(Some(header(&identity(8), 2, 1)))).await;
     assert_eq!(error.code(), Code::PermissionDenied, "{error}");
-    assert!(error.message().contains("another group"), "{error}");
+    assert_eq!(
+        super::reasons::reason_of(&error),
+        Some(super::reasons::TRANSPORT_WRONG_GROUP),
+        "{error}"
+    );
     let mut stale = header(&group, 2, 1);
     stale.protocol_version = 2;
     let error = refused(vote_request(Some(stale))).await;
@@ -359,7 +373,11 @@ async fn peer_identity_binds_certificate_group_and_node() {
         .await
         .unwrap_err();
     assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
-    assert!(error.message().contains("timing agreement"), "{error}");
+    assert_eq!(
+        super::reasons::reason_of(&error),
+        Some(super::reasons::TRANSPORT_TIMING_MISMATCH),
+        "{error}"
+    );
     let mut other_timing = tonic::Request::new(vote_request(Some(header(&group, 2, 1))));
     other_timing.metadata_mut().insert(
         super::transport::TIMING_METADATA,
@@ -369,7 +387,11 @@ async fn peer_identity_binds_certificate_group_and_node() {
     );
     let error = node2.vote(other_timing).await.unwrap_err();
     assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
-    assert!(error.message().contains("differs"), "{error}");
+    assert_eq!(
+        super::reasons::reason_of(&error),
+        Some(super::reasons::TRANSPORT_TIMING_MISMATCH),
+        "{error}"
+    );
 
     // A certificate the cluster CA issued but nobody registered is not a
     // member, whatever node id it claims.
@@ -475,6 +497,11 @@ async fn three_voters_replicate_and_learners_are_seeded_by_snapshot() {
         .unwrap_err();
     assert_eq!(error.code(), Code::Unavailable, "{error}");
     assert!(error.message().contains("not the leader"), "{error}");
+    assert_eq!(
+        super::reasons::reason_of(&error),
+        Some(super::reasons::LEASE_NOT_LEADER),
+        "{error}"
+    );
     // A prepared member store refuses to apply anything before its seed.
     let pending = Directory::new("pending");
     RaftHost::prepare_member(&pending.0, &cluster.group, 4, &policy(), &limits()).unwrap();
@@ -499,7 +526,11 @@ async fn three_voters_replicate_and_learners_are_seeded_by_snapshot() {
         })
         .unwrap_err();
     assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
-    assert!(error.message().contains("awaits"), "{error}");
+    assert_eq!(
+        super::reasons::reason_of(&error),
+        Some(super::reasons::MEMBERSHIP_AWAITING_SNAPSHOT),
+        "{error}"
+    );
     cluster.shutdown().await;
 }
 
@@ -561,7 +592,11 @@ async fn an_isolated_leader_admits_nothing_and_the_surviving_quorum_revokes() {
         .await
         .unwrap_err();
     assert_eq!(error.code(), Code::Unavailable, "{error}");
-    assert!(error.message().contains("linearizable"), "{error}");
+    assert_eq!(
+        super::reasons::reason_of(&error),
+        Some(super::reasons::LEASE_NO_LINEARIZABLE_READ),
+        "{error}"
+    );
     // The surviving quorum revokes alice.
     let decision = cluster
         .host(successor)
@@ -770,8 +805,9 @@ async fn a_grant_paused_after_the_barrier_is_refused_once_its_interval_elapsed()
     gate.release();
     let error = task.await.unwrap().unwrap_err();
     assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
-    assert!(
-        error.message().contains("elapsed before the grant"),
+    assert_eq!(
+        super::reasons::reason_of(&error),
+        Some(super::reasons::LEASE_INTERVAL_ELAPSED),
         "{error}"
     );
     host.heal();
@@ -936,6 +972,11 @@ async fn an_idle_snapshot_transfer_is_dropped_and_its_place_freed() {
         .unwrap_err();
     assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
     assert!(error.message().contains("bound to node 4"), "{error}");
+    assert_eq!(
+        super::reasons::reason_of(&error),
+        Some(super::reasons::TRANSPORT_SNAPSHOT_TRANSFER_BOUND),
+        "{error}"
+    );
     // Past the idle timeout the quiet transfer is dropped and node 1's
     // transfer takes its place and completes; the core ran throughout.
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -963,6 +1004,11 @@ async fn an_idle_snapshot_transfer_is_dropped_and_its_place_freed() {
     assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
     assert!(
         error.message().contains("continues no transfer at node"),
+        "{error}"
+    );
+    assert_eq!(
+        super::reasons::reason_of(&error),
+        Some(super::reasons::TRANSPORT_SNAPSHOT_STALE_CONTINUATION),
         "{error}"
     );
     let incoming = std::fs::read_dir(member_dir.0.join(super::host::SNAPSHOT_DIR))
