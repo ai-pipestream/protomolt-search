@@ -9,8 +9,8 @@
 //! Compiled only with `raft`, `tls` and `fault-injection` together (the
 //! `control_raft_admission` convention: the lease scenarios need the pause
 //! hook `arm_grant_delay`, and the group needs the mTLS transport). The
-//! write service itself serves plain loopback HTTP here with Bearer [REDACTED]
-//! in production it registers on the process's secured listener.
+//! write service itself serves plain loopback HTTP here with a bearer
+//! principal; in production it registers on the process's secured listener.
 #![cfg(all(feature = "raft", feature = "tls", feature = "fault-injection"))]
 
 mod control_adversarial;

@@ -2040,3 +2040,51 @@ fn a_write_settled_after_its_right_was_revoked_is_fenced_by_name() {
     let versions = history(&active);
     assert!(versions[1].fenced && !versions[2].fenced);
 }
+
+#[test]
+fn a_lease_that_lapses_inside_the_settlement_decides_nothing() {
+    let (fixture, active) = activated("settle-lapse");
+
+    let admission = fixture
+        .authority
+        .leased_admission("alice", short_lease(40))
+        .unwrap();
+    active.arm_postcommit_pause(std::time::Duration::from_millis(80));
+    let receipt = match active.accept(&admission, &second_write()).unwrap() {
+        Acceptance::Unconfirmed(receipt) => receipt,
+        Acceptance::Accepted(receipt) => panic!("accepted past its lease: {receipt:?}"),
+    };
+    drop(admission);
+
+    // The settlement's freshness check passes, then the lease lapses in the
+    // gap before the entry check: the entry check fails for the lapse, not
+    // for the right, and the settlement decides nothing. The record stays
+    // unconfirmed; the right was never judged gone.
+    let short = fixture
+        .authority
+        .leased_admission("alice", short_lease(60))
+        .unwrap();
+    active.arm_settle_pause(std::time::Duration::from_millis(100));
+    let error = active.settle(&short, "alice", b"accept-two").unwrap_err();
+    assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
+    assert!(error.message().contains("lease expired"), "{error}");
+    assert_eq!(
+        recorded(&active, b"accept-two"),
+        (WriteOutcome::Unconfirmed, 0)
+    );
+    drop(short);
+
+    // A fresh lease that stays open through the settlement accepts it.
+    let fresh = fixture
+        .authority
+        .leased_admission("alice", short_lease(500))
+        .unwrap();
+    match active.settle(&fresh, "alice", b"accept-two").unwrap() {
+        Settlement::Accepted(settled) => assert_eq!(settled, receipt),
+        Settlement::Fenced(rejection) => panic!("fenced with a current right: {rejection}"),
+    }
+    assert_eq!(
+        recorded(&active, b"accept-two"),
+        (WriteOutcome::Accepted, 0)
+    );
+}
