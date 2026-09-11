@@ -1241,11 +1241,14 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   processes serve the `DocumentWriteService` proto over activated managed
   catalogs, with every admission drawn from the host's owned lease
   (`RaftHost::lease`, `LeasedAdmission`) and the grant running on a
-  blocking worker. Operator options `--raft-managed-catalog` (repeatable)
-  and `--raft-managed-principal` recover the handles at start; a restarted
-  group serves writes again. Eight three-voter tests plus two single-node
-  lease tests pin the path, including the named rejections. The final-check
-  to durability residual stays open pending a storage-side fencing token.
+  blocking worker. Operator options `--raft-managed-catalog` (repeatable),
+  `--raft-managed-principal` and the three `--raft-managed-max-*` limits
+  recover the handles at start on the applied view, before any leader
+  exists, and serve them; a restarted member serves writes again once it
+  leads. Eleven three-voter tests plus three single-node tests pin the
+  path, including the named rejections, a client that drops its call and
+  a transport policy changed under a committed write. The final-check to
+  durability residual stays open pending a storage-side fencing token.
   See [hosted owner writes](docs/raft-hosting.md#hosted-owner-writes) and
   [admission under Raft](docs/raft-admission.md).
 

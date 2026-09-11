@@ -291,8 +291,9 @@ by the longest election so an isolated leader refuses instead of waiting
 anchor, barrier, vote-hold extension and grant gate and returns them as
 an owned `LeasedAdmission` for work that runs on a blocking worker; the
 grant on that thread measures the interval from the anchor.
-`with_admission` is that path with an immediate grant. A proposal on a
-non-leader is `Unavailable` naming the leader.
+`with_admission` is that path with an immediate grant. A proposal or a
+lease on a non-leader is `Unavailable` naming the leader ("not the
+leader; leader is Some(n)").
 
 ## Transport
 
@@ -420,8 +421,11 @@ recovers the handles at start (`PIPESTREAM_SEARCH_RAFT_MANAGED_PRINCIPAL`,
 actor is refused at parse. At start the binary recovers every catalog
 through `hosted::recover_catalogs` and registers the hosted service on
 the coordinator or relay listener; a node-only process naming catalogs
-is refused. The service runs under compiled limits (1 MiB per write,
-16 MiB admitted, 64 operations); the transport principals come from
+is refused before any catalog is opened. `--raft-managed-max-request-bytes`
+(default 1 MiB), `--raft-managed-max-pending-bytes` (16 MiB) and
+`--raft-managed-max-in-flight` (64) set the service's limits, validated
+where the service is built (1..64 MiB, at least the request bound and at
+most 256 MiB, 1..1024); the transport principals come from
 `--bearer-tokens` as on the other surfaces.
 
 Serving opens existing state only. `pipestream-search raft-prepare
@@ -465,38 +469,71 @@ One `AcceptDocument` call, in order: the transport gate
 size with pending and byte permits plus ingest admission on the
 principal (the shared `WriteBudget`), `host.lease` on the RPC future,
 then a blocking worker holding the lease, the permits and the request,
-where the grant runs and `ActiveManagedCatalog::accept` commits. The
-lease and the permits are pinned in the worker, never in the RPC
-future. `GetDocumentWriteTarget` follows the same shape with
+where the grant runs and `ActiveManagedCatalog::accept` commits.
+`GetDocumentWriteTarget` follows the same shape with
 `catalog.write_target` under the grant.
+
+A client that drops its call before the worker exists drops the lease
+ungranted and the permits unused; no row is written. Once the worker
+exists it finishes on its own terms: a blocking task is not cancelled
+when its handle is dropped, the permits are released only when the
+worker returns, and the grant and the commit run there whether or not
+a client is still listening. The transport permit is checked again
+after the worker returns, as the single-authority service checks it:
+a transport policy that changed under a committed write withholds the
+receipt by name ("access policy changed") and the row stays durable,
+readable by the exact retry once the actor is granted again.
 
 Two gates judge every write: the transport gate first, the authority
 admission second and authoritative. The lease actor is the transport
 principal's name, which the authority policy rows name by the same
 string; a deployment must keep that equivalence. Every error from
-`lease` passes through unchanged — `Unavailable` naming the leader
-off-leader, `Unavailable` when no quorum acknowledged the barrier, and
-`FailedPrecondition` when the interval elapsed before the grant — and
-the service never retries, never forwards, and never falls back to the
-local `admission()`. No lease check runs after the commit: a write
-past its final check is durable under its epoch fence, and the pause
-between the final check and durability is the residual named in
+`lease` passes through unchanged: `Unavailable` "not the leader; leader
+is Some(n)" off-leader, `Unavailable` when no quorum acknowledged the
+barrier, and `FailedPrecondition` when the interval elapsed before the
+grant. The service never retries, never forwards, and never falls back
+to the local `admission()`. No lease check runs after the commit: a
+write past its final check is durable under its epoch fence, and the
+pause between the final check and durability is the residual named in
 [admission under Raft](raft-admission.md).
+
+A managed catalog's writes are therefore served only while the member
+that holds it leads. On a follower every write is rejected naming the
+leader, and the client retries when leadership returns; a lease a
+non-leading member could obtain from the leader is listed under "Not
+yet".
 
 Recovery at start (`hosted::recover_catalogs`, the function the binary
 calls and tests call the same way) opens each configured path, takes
 the file's binding bytes as they stand, and recovers the managed
-handle under a fresh leased admission. A catalog that is prepared
-rather than active, one with an authority identity that is not the
-member's, or one with an activation the store does not record stops
-the whole recovery by name; no partial service starts.
+handle on the store's applied view under a recovery admission
+(`SourceAuthorityStore::recovery_admission`, crate-private). The
+header's binding is a claim, not an authority: `activated_owner`
+resolves the committed owner row by the binding's key and requires the
+row ACTIVE with the same target, workflow, ownership generation and
+completion, and the file's activation must equal the committed fence.
+A forged or stale header can therefore open nothing the store does not
+record. Recovery takes no lease on purpose: a lease needs a leader, and
+a member restarts before any leader exists and serves as a follower
+most of its life. The recovery admission admits no write, by name;
+every write on the handle takes its own lease, so a handle opened on a
+view the quorum has since moved past is rejected at its first write
+("the fence has moved"). A catalog that is prepared rather than
+active, one with an authority identity that is not the member's, or
+one with an activation the store does not record stops the whole
+recovery by name; no partial service starts.
 
-The evidence is `tests/control_raft_hosted_writes.rs` (eight tests:
-admitted-and-durable on the leader, follower naming the leader, lease
-kept past the interval with no durable change, isolation inside the
-read bound with the healed leader refusing as a follower, restart
-serving again, and the three start rejections) with the single-node
-lease evidence in `src/raft/tests.rs`.
+The evidence is `tests/control_raft_hosted_writes.rs` (eleven tests:
+admitted-and-durable on the leader with the row counted in the
+catalog, follower naming the leader, lease kept past the interval with
+no durable change, isolation inside the read bound with the healed
+leader refusing as a follower, a whole group restarted with the first
+member up recovering before any leader exists, one member restarted
+while the others keep running recovering at start and serving once it
+leads, a client that drops its call while the worker is parked, a
+transport policy changed under a committed write, and the three start
+rejections) with the single-node lease and recovery-admission evidence
+in `src/raft/tests.rs`.
 
 ## Evidence
 
@@ -577,6 +614,9 @@ mTLS with the fixtures under `tests/certs/raft`, regenerated by
 
 ## Not yet
 
+- A lease a member that does not lead can obtain from the leader, so a
+  managed catalog serves writes wherever its member is; today its writes
+  are served only while that member leads.
 - The map feed of a learner's applied state.
 - An operator surface for authoring the first member's policy and limits
   (`bootstrap_cluster`), and for `add_learner`, `promote` and

@@ -64,6 +64,10 @@ and only the host grants it:
 1. `SourceAuthorityStore::admission` refuses on a hosted store
    (`FailedPrecondition`, "obtain a leased admission through the host").
    The direct command paths refuse too; only committed entries apply.
+   The one crate-private exception is the recovery admission that opens
+   a managed handle at start on the applied view; it admits no write, by
+   name, and every write on the handle takes its own lease
+   ([hosted owner writes](raft-hosting.md#hosted-owner-writes)).
 2. `RaftHost::with_admission(principal, run)` takes the lease anchor —
    `AdmissionLease { anchor, anchor_wall, ttl }` — **before** it invokes
    the read barrier, then performs the barrier bounded by
@@ -247,9 +251,16 @@ kept past its lease is denied at the grant and its retry commits as
 new work, with no row and no retry record from the refused grant; an
 isolated leader refuses inside the read bound and, healed, refuses as
 a follower naming the successor. A restarted group recovers its
-managed catalogs through the binary's recovery function and serves a
-write on the leader; recovery names a prepared source, a foreign
-authority and an unrecorded activation.
+managed catalogs through the binary's recovery function with the first
+member up, before any leader exists, and serves a write on the leader;
+one member restarted while the others keep running recovers at start
+and serves once it leads; a client that drops its call while the
+worker is parked leaves the worker to commit under its permits, and
+the exact retry replays the row; a transport policy changed under a
+committed write withholds the receipt by name and the row stays
+durable; recovery names a prepared source, a foreign authority and an
+unrecorded activation, and a recovery admission admits no write, by
+name.
 
 Remaining: the residual between the final check and durability stays
 open until a storage-side fencing token exists; Kimi's harness adds
