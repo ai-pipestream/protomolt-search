@@ -1237,6 +1237,15 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **2026-09-11 — Raft operator surface (Phase A).** `RaftOperatorService`
+  serves member status, add-learner, promote, remove and image
+  verification on every listener of a Raft member under cluster trust,
+  with member gauges on the metrics page, a log line on rejections, and
+  `raft-status`, `raft-add-learner`, `raft-promote`,
+  `raft-remove-member`, `raft-verify-image` plus a local
+  `raft-bootstrap` taking the policy and limits as proto3 JSON files.
+  Seven operator tests, the member gauge test and CLI parse tests pin
+  the surface. See [operator surface](docs/raft-hosting.md#operator-surface).
 - **Foundation branch: the migration and disaster-recovery exercise, on
   the fleet's own map.** The design's step 5 run on disposable state:
   the fleet's root map as a legacy control plane, retired and imported
@@ -1265,7 +1274,6 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   the history, marked. Catalog format 11. See [write
   outcomes](docs/document-writes.md#write-outcomes) and the residual as it
   now stands in [admission under Raft](docs/raft-admission.md).
-
 - **2026-09-11 — Hosted owner writes through the leased admission.** Member
   processes serve the `DocumentWriteService` proto over activated managed
   catalogs, with every admission drawn from the host's owned lease
