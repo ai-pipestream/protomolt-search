@@ -164,6 +164,39 @@ pub struct AdmissionLease {
     pub ttl: std::time::Duration,
 }
 
+/// An owned admission lease granted by the Raft host: the store handle, the
+/// actor and the interval anchored before the host's read barrier. Turning
+/// it into a `SourceAdmission` takes the shared guard at the grant, so a
+/// value that is never turned into an admission blocks no control command.
+/// The grant measures the interval from the anchor: a grant taken later on
+/// another thread is the "paused between barrier and grant" case, and the
+/// delay consumes the interval without extending it. `Send + 'static`, so
+/// the grant and the source transaction can run on a blocking worker.
+pub struct LeasedAdmission {
+    store: SourceAuthorityStore,
+    principal: String,
+    lease: AdmissionLease,
+}
+
+impl LeasedAdmission {
+    pub(crate) fn new(store: SourceAuthorityStore, principal: &str, lease: AdmissionLease) -> Self {
+        Self {
+            store,
+            principal: principal.to_string(),
+            lease,
+        }
+    }
+
+    /// The grant. Rejected by name when the interval elapsed before it.
+    pub fn admission(&self) -> Result<SourceAdmission<'_>, Status> {
+        self.store.leased_admission(&self.principal, self.lease)
+    }
+
+    pub fn principal(&self) -> &str {
+        &self.principal
+    }
+}
+
 impl AdmissionLease {
     pub fn deadline(&self) -> std::time::Instant {
         self.anchor + self.ttl

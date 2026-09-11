@@ -102,6 +102,7 @@ pub mod state_machine;
 pub mod transport;
 pub mod types;
 
+pub use crate::source_authority::LeasedAdmission;
 #[cfg(feature = "tls")]
 pub use host::ClusterTransport;
 #[cfg(any(test, feature = "fault-injection"))]

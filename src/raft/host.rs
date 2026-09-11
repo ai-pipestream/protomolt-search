@@ -12,7 +12,7 @@ use crate::pb::storage::{
     SourceAuthorityLimits,
 };
 use crate::pb::AccessPolicy;
-use crate::source_authority::{AdmissionLease, SourceAdmission};
+use crate::source_authority::{AdmissionLease, LeasedAdmission, SourceAdmission};
 use crate::source_authority::{SourceAuthorityStore, VerifiedOwnerCompletion};
 use openraft::error::{ClientWriteError, RaftError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
@@ -763,11 +763,14 @@ impl RaftHost {
     /// and scheduling delay between the barrier and the grant, and a grant
     /// whose interval has already elapsed is refused. The read itself is
     /// bounded: an isolated leader collects no quorum and refuses.
-    pub async fn with_admission<T>(
-        &self,
-        principal: &str,
-        run: impl FnOnce(&SourceAdmission<'_>) -> Result<T, Status>,
-    ) -> Result<T, Status> {
+    /// An owned admission lease for work that cannot run on the calling
+    /// thread: this does what `with_admission` does up to and including the
+    /// vote-hold extension and the grant gate, then returns the store, the
+    /// actor and the anchored interval instead of running a closure. The
+    /// grant (`LeasedAdmission::admission`) measures the interval from the
+    /// anchor, so moving the value to a blocking worker consumes the
+    /// interval without extending it.
+    pub async fn lease(&self, principal: &str) -> Result<LeasedAdmission, Status> {
         let lease = AdmissionLease {
             anchor: std::time::Instant::now(),
             anchor_wall: std::time::SystemTime::now(),
@@ -797,7 +800,16 @@ impl RaftHost {
             }
         }
         let store = self.store()?;
-        let admission = store.leased_admission(principal, lease)?;
+        Ok(LeasedAdmission::new(store, principal, lease))
+    }
+
+    pub async fn with_admission<T>(
+        &self,
+        principal: &str,
+        run: impl FnOnce(&SourceAdmission<'_>) -> Result<T, Status>,
+    ) -> Result<T, Status> {
+        let leased = self.lease(principal).await?;
+        let admission = leased.admission()?;
         run(&admission)
     }
 

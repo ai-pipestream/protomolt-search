@@ -1382,3 +1382,68 @@ async fn a_hosted_store_refuses_direct_mutation_and_local_admission() {
     drop(store);
     host.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lease_taken_on_one_thread_grants_on_another_within_its_interval() {
+    let dir = Directory::new("owned-lease-grant");
+    let group = identity(7);
+    let host = RaftHost::bootstrap_single(
+        &dir.0,
+        &group,
+        1,
+        "https://node-1:19291",
+        &policy(),
+        &limits(),
+        &config(),
+    )
+    .await
+    .unwrap();
+    let leased = host.lease("alice").await.unwrap();
+    assert_eq!(leased.principal(), "alice");
+    let granted = tokio::task::spawn_blocking(move || {
+        let admission = leased.admission().unwrap();
+        assert!(admission.expires_at().is_some());
+        admission
+            .authorize("books", AccessAction::Admin)
+            .map(|d| assert_eq!(d.principal, "alice"))
+    })
+    .await
+    .unwrap();
+    granted.unwrap();
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lease_kept_past_its_interval_is_rejected_at_the_grant() {
+    let dir = Directory::new("owned-lease-expiry");
+    let group = identity(7);
+    let short = HostConfig {
+        admission_lease_ms: 40,
+        ..config()
+    };
+    let host = RaftHost::bootstrap_single(
+        &dir.0,
+        &group,
+        1,
+        "https://node-1:19291",
+        &policy(),
+        &limits(),
+        &short,
+    )
+    .await
+    .unwrap();
+    let leased = host.lease("alice").await.unwrap();
+    let applied = host.applied_position().unwrap().map(|id| id.index);
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let error = leased.admission().err().unwrap();
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert!(
+        error
+            .message()
+            .contains("admission interval elapsed before the grant"),
+        "{error}"
+    );
+    drop(leased);
+    assert_eq!(host.applied_position().unwrap().map(|id| id.index), applied);
+    host.shutdown().await.unwrap();
+}
