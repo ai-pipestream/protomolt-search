@@ -888,6 +888,7 @@ fn raft_prepare(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+#[cfg(all(feature = "raft", feature = "tls"))]
 /// The `raft-*` operator subcommands (docs/raft-hosting.md, "Operator
 /// surface"): thin clients of the operator RPCs next to `raft-prepare`,
 /// plus the local `raft-bootstrap`. Exit codes: 0 on success, 2 on a
@@ -899,6 +900,7 @@ fn cli_usage(command: &str, detail: &str) -> ! {
     std::process::exit(2);
 }
 
+#[cfg(all(feature = "raft", feature = "tls"))]
 /// The value of `--{key}=...` among a subcommand's args.
 fn cli_flag(args: &[String], key: &str) -> Option<String> {
     let prefix = format!("--{key}=");
@@ -906,11 +908,13 @@ fn cli_flag(args: &[String], key: &str) -> Option<String> {
         .find_map(|a| a.strip_prefix(&prefix).map(str::to_string))
 }
 
+#[cfg(all(feature = "raft", feature = "tls"))]
 /// `raft-status --addr=<host:port>`: the member's address.
 fn parse_raft_status(args: &[String]) -> Result<String, String> {
     cli_flag(args, "addr").ok_or_else(|| "raft-status --addr=<host:port>".to_string())
 }
 
+#[cfg(all(feature = "raft", feature = "tls"))]
 /// `raft-add-learner --addr=<leader> --node-id=<n> --node-addr=<host:port>`:
 /// the leader to ask, the learner's id, the address peers dial for it.
 fn parse_raft_add_learner(args: &[String]) -> Result<(String, u64, String), String> {
@@ -924,6 +928,7 @@ fn parse_raft_add_learner(args: &[String]) -> Result<(String, u64, String), Stri
     Ok((addr, node_id, node_addr))
 }
 
+#[cfg(all(feature = "raft", feature = "tls"))]
 /// `raft-promote --addr=<leader> --node-id=<n>[,<n>...]`: the leader to
 /// ask and the learners to promote.
 fn parse_raft_promote(args: &[String]) -> Result<(String, Vec<u64>), String> {
@@ -941,6 +946,7 @@ fn parse_raft_promote(args: &[String]) -> Result<(String, Vec<u64>), String> {
     Ok((addr, ids))
 }
 
+#[cfg(all(feature = "raft", feature = "tls"))]
 /// `raft-remove-member --addr=<leader> --node-id=<n>`: the leader to ask
 /// and the member to remove.
 fn parse_raft_remove_member(args: &[String]) -> Result<(String, u64), String> {
@@ -953,11 +959,13 @@ fn parse_raft_remove_member(args: &[String]) -> Result<(String, u64), String> {
     Ok((addr, node_id))
 }
 
+#[cfg(all(feature = "raft", feature = "tls"))]
 /// `raft-verify-image --addr=<member>`: the member to ask.
 fn parse_raft_verify_image(args: &[String]) -> Result<String, String> {
     cli_flag(args, "addr").ok_or_else(|| "raft-verify-image --addr=<member>".to_string())
 }
 
+#[cfg(all(feature = "raft", feature = "tls"))]
 /// `raft-bootstrap`'s two JSON files: the policy and the limits the
 /// first member is created with.
 fn parse_raft_bootstrap_files(args: &[String]) -> Result<(String, String), String> {
@@ -1765,7 +1773,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     run(cfg).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "raft", feature = "tls"))]
 mod cli_tests {
     use super::*;
 
