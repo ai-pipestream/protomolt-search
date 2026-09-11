@@ -1,5 +1,7 @@
 # Raft hosting of the source authority
 
+Specification version: 1
+
 Status: implemented 2026-09-08 from the accepted
 [control-authority design](raft-control-design.md): `src/raft/` behind the
 cargo feature `raft` (`openraft = "=0.9.25"`, `storage-v2`), the tonic
@@ -275,25 +277,33 @@ one voter with no transport; `RaftHost::start` opens existing state and
 never creates. The networked forms are `bootstrap_cluster` (the first
 member, listening), `prepare_member` (the durable state of a member that
 will join, see below) and `start_member` (a prepared member, or any member
-restarting, listening on its recorded address). The host admits proposals
+restarting, listening on its recorded address). The host MUST admit proposals
 the way the direct paths did — a `ConfirmReady` needs the managed binding
 (`propose_confirm_ready`), a `Begin` needs the retirement holder
-(`propose_import`) — then writes them through `Raft::client_write` and
-returns the committed reply. Raw submission and committed application are
-not reachable by product callers: the submit path is private, the replay
-paths, the log store's constructors and writes and the state machine's
-constructor are crate-private, and a hosted store refuses every direct
-command and every local `admission()`. `store()` hands out the current
+(`propose_import`) — then write them through `Raft::client_write` and
+return the committed reply. (`src/raft/tests.rs`, "the general proposal
+path refuses a readiness confirmation" and "stale and unauthorized
+proposals are recorded outcomes", fail if an unbound proposal applies.)
+Raw submission and committed application MUST NOT be reachable by product
+callers: the submit path is private, the replay paths, the log store's
+constructors and writes and the state machine's constructor are
+crate-private, and a hosted store MUST refuse every direct command and
+every local `admission()`. `store()` hands out the current
 store for reads (maps, snapshots, decisions); `with_admission` grants the
 leased admission owner-side work needs, with the linearizable read bounded
 by the longest election so an isolated leader refuses instead of waiting
 ([admission under Raft](raft-admission.md)). `lease` performs the same
 anchor, barrier, vote-hold extension and grant gate and returns them as
 an owned `LeasedAdmission` for work that runs on a blocking worker; the
-grant on that thread measures the interval from the anchor.
+grant on that thread measures the interval from the anchor (I1).
 `with_admission` is that path with an immediate grant. A proposal or a
-lease on a non-leader is `Unavailable` naming the leader ("not the
-leader; leader is Some(n)").
+lease on a non-leader MUST be `Unavailable` naming the leader
+(`lease.not_leader`, "not the leader; leader is Some(n)").
+(`tests/control_raft_hosted_writes.rs`,
+   `a_write_through_a_follower_is_admitted_under_a_lease_forwarded_from_the_leader`,
+   and `src/raft/transport_tests.rs`,
+   `three_voters_replicate_and_learners_are_seeded_by_snapshot`, fail if
+   an off-leader grant or apply happens.)
 
 ## Transport
 
@@ -306,37 +316,50 @@ sender's and the receiver's node id.
 
 Identity is bound on both sides (`src/raft/transport.rs`):
 
-- A `PeerDirectory` binds each node id of one group to the SHA-256 of its
-  certificate's DER (`certificate_sha256` over a PEM with exactly one
-  leaf). A certificate binds to one node and a node to one certificate;
-  rebinding refuses.
-- The listener requires a client certificate from the cluster CA (mTLS), looks
-  the leaf up in the directory, and refuses before the library sees the
-  call when the certificate is unregistered (`Unauthenticated`), when the
-  header claims another node than the certificate is registered to, names
-  another group or is addressed to another node (`PermissionDenied`), or
-  when the header is missing or of another protocol version
-  (`InvalidArgument`). A certificate of another CA does not complete the
-  handshake.
-- The caller dials the address the membership records, presents its own
-  certificate, names the target in every request and checks the responder
-  named in every reply; a reply from another node or group is a network
-  error, never a result.
+- A `PeerDirectory` MUST bind each node id of one group to the SHA-256
+  of its certificate's DER (`certificate_sha256` over a PEM with exactly
+  one leaf). A certificate MUST bind to one node and a node to one
+  certificate; rebinding MUST refuse.
+  (`src/raft/transport_tests.rs`,
+  `peer_identity_binds_certificate_group_and_node`, which also covers
+  the directory refusing to rebind, and `src/raft/operator.rs` tests,
+  the peers file refusing duplicates, fail if a rebinding takes.)
+- The listener MUST require a client certificate from the cluster CA
+  (mTLS), look the leaf up in the directory, and refuse before the
+  library sees the call when the certificate is unregistered
+  (`Unauthenticated`, `transport.unregistered_certificate`), when the
+  header claims another node than the certificate is registered to
+  (`transport.identity_mismatch`), names another group
+  (`transport.wrong_group`) or is addressed to another node
+  (`transport.misaddressed`, all `PermissionDenied`), or when the header
+  is missing or of another protocol version (`InvalidArgument`,
+  `transport.bad_header`). A certificate of another CA MUST NOT
+  complete the handshake. (`src/raft/transport_tests.rs`,
+  `peer_identity_binds_certificate_group_and_node`, fails if an unbound
+  caller reaches the library.)
+- The caller MUST dial the address the membership records, present its
+  own certificate, name the target in every request and check the
+  responder named in every reply; a reply from another node or group is
+  a network error, never a result. (`src/raft/transport_tests.rs`,
+  `peer_identity_binds_certificate_group_and_node`, fails if a
+  misdirected reply is accepted.)
 
-Two more checks sit in front of the library. Every RPC presents the
+Two more checks sit in front of the library. Every RPC MUST present the
 group's timing agreement (`HostConfig::timing_agreement`: heartbeat,
 election floor and ceiling, lease, skew) in metadata; a peer presenting
-different values, or none, is refused (`FailedPrecondition`). And a
-leader whose latest admission interval may still be open answers a vote
-request with its current vote and grants nothing, without the library
-seeing the request (`LeaseHold`; the reasons are in
+different values, or none, MUST be refused (`FailedPrecondition`,
+`transport.timing_mismatch`, I2). And a leader whose latest admission
+interval may still be open MUST answer a vote request with its current
+vote and grant nothing, without the library seeing the request
+(`LeaseHold`, I2; the reasons are in
 [admission under Raft](raft-admission.md)).
 
 A fourth RPC, `GrantLease`, carries a forwarded lease: a member that
-does not lead asks the leader to run its read barrier and answers with
-the position it read; the leader extends its vote hold from the
-request's receipt ([admission under Raft](raft-admission.md), "A lease
-forwarded from the leader"). The request names no principal.
+does not lead MUST ask the leader to run its read barrier and answer
+with the position it read; the leader MUST extend its vote hold from
+the request's receipt (I2, I3;
+[admission under Raft](raft-admission.md), "A lease forwarded from the
+leader"). The request names no principal.
 
 Bounds: `TransportLimits { max_message_bytes, connect_timeout_ms }` is
 enforced by both sides' codecs and validated to hold one snapshot chunk
@@ -351,36 +374,56 @@ refuse every RPC to and from chosen peers in both directions.
 ## Membership
 
 Membership changes go through the library's joint-consensus procedure,
-never through files:
+never through files. The member lifecycle table follows the procedure.
 
 1. `RaftHost::prepare_member(dir, identity, node_id, policy, limits)`
-   creates the member's store and empty log. The store carries the meta key
-   `member` ("awaiting-snapshot"): while it is present, no log entry applies
-   to it (`FailedPrecondition`, "awaits the group's first snapshot"), and
-   recovery refuses a store that carries both the marker and an applied
-   position. A member therefore never replays the group's log onto its own
-   genesis image, which could differ from the group's silently.
-2. `add_learner(node_id, addr)` on the leader requires the node's
-   certificate to be registered, builds a snapshot at or past the applied
-   position it read (the store may be one entry ahead of the metric, and
-   a build images the store where it is), purges the log to the
-   snapshot's position, adds the learner and waits until the learner holds
-   the membership entry that added it, or until the learner's service
-   rejects the seed, which is returned at once with the learner's code (a
-   failure of the transport between the nodes is retried inside the
-   window, not returned). The seed repeats its build trigger every 2 s
-   while a build is in flight: the library drops a trigger during a build
-   and reports it taken, and a build begun before the position moved ends
-   below it. A repeated `add_learner` for the same node writes one more
+   MUST create the member's store and empty log. The store MUST carry
+   the meta key `member` ("awaiting-snapshot"): while it is present, no
+   log entry MUST apply to it (`FailedPrecondition`,
+   `membership.awaiting_snapshot`), and recovery MUST refuse a store
+   that carries both the marker and an applied position. A member
+   therefore never replays the group's log onto its own genesis image,
+   which could differ from the group's silently.
+   (`src/raft/transport_tests.rs`,
+   `three_voters_replicate_and_learners_are_seeded_by_snapshot`, fails if
+   the marked store applies.)
+2. `add_learner(node_id, addr)` on the leader MUST require the node's
+   certificate to be registered (`membership.unregistered_certificate`),
+   build a snapshot at or past the applied position it read (the store
+   may be one entry ahead of the metric, and a build images the store
+   where it is), purge the log to the snapshot's position, add the
+   learner and wait until the learner holds the membership entry that
+   added it, or until the learner's service rejects the seed, which MUST
+   be returned at once with the learner's code (a failure of the
+   transport between the nodes is retried inside the window, not
+   returned). The seed repeats its build trigger every 2 s while a build
+   is in flight: the library drops a trigger during a build and reports
+   it taken, and a build begun before the position moved ends below it.
+   A repeated `add_learner` for the same node writes one more
    membership entry (the library writes the entry whether or not the
    membership changes) and seeds again from the position after it. The
-   learner is seeded by the verified image (group, position, membership
-   checked on a probe copy), which replaces the marked store; the marker
-   is gone with it.
-3. `promote(learners)` upgrades caught-up learners to voters
-   (`AddVoterIds`); `remove_member(node_id)` removes a voter
-   (`RemoveVoters`, not retained as a learner) or a learner (`RemoveNodes`).
-   A removed member proposes nothing and admits nothing.
+   learner MUST be seeded by the verified image (group, position,
+   membership checked on a probe copy), which replaces the marked store;
+   the marker is gone with it. (`src/raft/transport_tests.rs`,
+   `three_voters_replicate_and_learners_are_seeded_by_snapshot`, fails if
+   the seed installs an unverified image.)
+3. `promote(learners)` MUST upgrade only caught-up learners to voters
+   (`AddVoterIds`); `remove_member(node_id)` MUST remove a voter
+   (`RemoveVoters`, not retained as a learner) or a learner
+   (`RemoveNodes`). A removed member MUST propose nothing and admit
+   nothing. (`src/raft/transport_tests.rs`,
+   `a_voter_is_replaced_through_membership`, fails if the removed member
+   proposes.)
+
+### Member lifecycle
+
+| State | Operation that moves it | Check on entry | Test |
+| ----- | ----------------------- | -------------- | ---- |
+| prepared | `prepare_member` creates store and log | the `member` marker is present; nothing applies (`membership.awaiting_snapshot`) | `src/raft/transport_tests.rs`, `three_voters_replicate_and_learners_are_seeded_by_snapshot` |
+| awaiting snapshot | `add_learner` seeds the verified image | group, position and membership equal the meta on a probe copy | `src/raft/transport_tests.rs`, `three_voters_replicate_and_learners_are_seeded_by_snapshot` |
+| learner | the seed installs; the marker is gone with the store | the learner holds the membership entry that added it | `src/raft/transport_tests.rs`, `three_voters_replicate_and_learners_are_seeded_by_snapshot` |
+| voter | `promote` (`AddVoterIds`) once caught up | the voter replicates every later proposal at the same position | `src/raft/transport_tests.rs`, `three_voters_replicate_and_learners_are_seeded_by_snapshot` |
+| removed | `remove_member` (`RemoveVoters` / `RemoveNodes`) | terminal: proposes nothing, admits nothing | `src/raft/transport_tests.rs`, `a_voter_is_replaced_through_membership` |
 
 A member restarts with `start_member` on the address the membership
 records for it; the address is where it is dialed, its certificate is who
@@ -424,10 +467,17 @@ bound and activated for that collection of the member's authority.
 `--raft-managed-principal` names the actor holding the Admin that
 recovers the handles at start (`PIPESTREAM_SEARCH_RAFT_MANAGED_PRINCIPAL`,
 `raft_managed_principal`). Both need `--raft-dir`; a catalog without its
-actor is refused at parse. At start the binary recovers every catalog
-through `hosted::recover_catalogs` and registers the hosted service on
-the coordinator or relay listener; a node-only process naming catalogs
-is refused before any catalog is opened. `--raft-managed-max-request-bytes`
+actor MUST be refused at parse. (`src/config.rs`,
+`raft_managed_catalog_options_parse_repeatable_and_refuse_without_member`,
+fails if a catalog parses without its recovery actor.) At start the
+binary MUST recover every catalog through `hosted::recover_catalogs`
+and register the hosted service on the coordinator or relay listener
+(`tests/control_raft_hosted_writes.rs`,
+`a_member_restarted_with_its_managed_catalogs_serves_writes_again`,
+fails if start serves an unrecovered catalog); a node-only process
+naming catalogs is refused before any catalog is opened (Open: no test
+pins the refusal order at startup; see
+`docs/raft-specification.md`). `--raft-managed-max-request-bytes`
 (default 1 MiB), `--raft-managed-max-pending-bytes` (16 MiB) and
 `--raft-managed-max-in-flight` (64) set the service's limits, validated
 where the service is built (1..64 MiB, at least the request bound and at
@@ -442,6 +492,62 @@ with `add_learner` and promotes it. Bootstrapping the first member of a
 group stays a programmatic step (`RaftHost::bootstrap_cluster` with the
 group's policy and limits); an operator surface for authoring those is not
 part of this checkpoint.
+
+## Security considerations
+
+Each layer trusts exactly one thing. The transport trusts the cluster
+CA: only a certificate it issued completes the handshake, and the mTLS
+requirement is enforced by the TLS stack, not by application code. The
+group trusts the peer directory's fingerprint binding: a certificate is
+a member only while its SHA-256 is bound to a node id, and one
+certificate speaks for exactly one node. The admission argument trusts
+the timing agreement: every RPC carries it and a peer with different
+values, or none, is refused before the library sees the call
+(`transport.timing_mismatch`, I2). The operator routes trust cluster
+membership: until the Phase A service lands there is no operator route,
+and membership changes go only through the library's joint-consensus
+procedure, never through files. Owner writes trust the Bearer token at
+the transport gate and the authority policy at the admission: the gate
+stays first and the admission is authoritative.
+
+A compromised member certificate is that member and nothing more. It
+can vote as that node, append as a follower, and ask the leader for
+leases; the group counts its vote and the leader extends its hold for
+its asks like any member's. It cannot propose as another actor: every
+proposal carries its principal and the admission checks it. It cannot
+serve a snapshot the receiver rejects: the receiver verifies length and
+digest streaming against the announced meta and opens the image on a
+probe copy before the library ever sees it. It cannot read what the
+current grant withholds: decisions disclose only under the current
+grant at each read. What it can do while it remains a voter is vote and
+be counted toward quorum, so a compromised certificate is removed first
+and asked questions later.
+
+Rotation procedure, as steps, for a compromised or expiring member
+certificate:
+
+1. Remove the member (`remove_member` on the leader) so the group no
+   longer counts its vote, seeds from it, or forwards to it.
+2. Issue the new certificate from the cluster CA.
+3. Rebind the node id to the new certificate's fingerprint in every
+   member's peers file. There is no runtime rebind operation on this
+   base (`PeerDirectory::register` refuses a second certificate for a
+   known node): running members pick the edited file up by restart, and
+   every member MUST be restarted before the re-added member serves, or
+   the survivors still bind the node id to the old certificate.
+4. Re-prepare the member's state and re-add it (`prepare_member`,
+   `add_learner` with the node's certificate registered, seed by the
+   verified snapshot, `promote`).
+
+After step 3 a call under the old certificate MUST be rejected by name
+at every listener (`Unauthenticated`,
+`transport.unregistered_certificate`): the directory binds no member to
+it. After step 4 the member MUST serve again under the new certificate.
+(`tests/control_raft_operator.rs`,
+`a_member_rotated_to_a_new_certificate_serves_again`, fails if the old
+certificate reaches any listener or the re-added member does not catch
+up and vote.) The missing runtime rebind is a "Not yet" bullet, not a
+step built here: until it exists, rotation restarts every member.
 
 ## Relay on the committed map
 
@@ -494,32 +600,51 @@ Two gates judge every write: the transport gate first, the authority
 admission second and authoritative. The lease actor is the transport
 principal's name, which the authority policy rows name by the same
 string; a deployment must keep that equivalence. Every error from
-`lease` passes through unchanged: `Unavailable` "not the leader; leader
-is Some(n)" off-leader, `Unavailable` when no quorum acknowledged the
-barrier, and `FailedPrecondition` when the interval elapsed before the
-grant. The service never retries, never forwards, and never falls back
-to the local `admission()`.
+`lease` MUST pass through unchanged: `Unavailable`
+`lease.not_leader` off-leader, `Unavailable`
+`lease.no_linearizable_read` when no quorum acknowledged the barrier,
+and `FailedPrecondition` `lease.interval_elapsed` when the interval
+elapsed before the grant. The service MUST never retry, never forward,
+and never fall back to the local `admission()`.
+(`tests/control_raft_hosted_writes.rs`,
+   `a_write_through_a_follower_is_admitted_under_a_lease_forwarded_from_the_leader`,
+   `an_isolated_leader_rejects_hosted_writes_within_election_timeout_max`,
+   and `a_forwarded_lease_grants_only_once_the_member_applied_the_leaders_read_position`,
+   fail if a lease error is rewritten, retried, or forwarded.)
 
-The commit's return is judged against the lease once more and recorded
-as the write's outcome (`docs/document-writes.md`, "Write outcomes"). A
-lease still open: the receipt. A lease that lapsed while the commit was
-becoming durable: the record is marked UNCONFIRMED, the call takes a
-fresh lease under the same permits and settles it on a worker of its
-own, answering with the receipt when the actor's right is still current
-and with the fence, by name, when it is gone; when no fresh lease can be
-had (no leader, no quorum, the fresh interval elapsed before its grant)
-the call is `Unavailable` naming the durable version as unconfirmed, and
-the exact retry settles it. What remains open after this is in
+The commit's return MUST be judged against the lease once more and
+recorded as the write's outcome (`docs/document-writes.md`, "Write
+outcomes", I4, I5). A lease still open: the receipt. A lease that
+lapsed while the commit was becoming durable: the record MUST be marked
+UNCONFIRMED (`outcome.unconfirmed`), the call MUST take a fresh lease
+under the same permits and settle it on a worker of its own, answering
+with the receipt when the actor's right is still current and with the
+fence, by name (`outcome.fenced`), when it is gone; when no fresh lease
+can be had (no leader, no quorum, the fresh interval elapsed before its
+grant) the call MUST be `Unavailable` naming the durable version as
+unconfirmed, and the exact retry settles it.
+(`tests/control_raft_hosted_writes.rs`,
+   `a_write_durable_after_its_lease_lapsed_is_settled_under_a_fresh_lease`,
+   `an_unconfirmed_write_the_leader_cannot_settle_is_settled_by_the_retry`,
+   and `an_unconfirmed_write_whose_actor_was_revoked_meanwhile_is_fenced`,
+   fail if the judgement or the settlement differs.) What remains open after this is in
 [admission under Raft](raft-admission.md), "Source write boundary".
 
 A managed catalog is served wherever its member is. On a member that
-does not lead, `RaftHost::lease` asks the leader the library names to run
-its barrier (`RaftTransport.GrantLease`) and grants once this member has
-applied the position that barrier read, inside the interval it anchored
-before asking; a member cut from the leader, or too far behind to catch
-up inside its interval, rejects by name and admits nothing on a stale
-view ([admission under Raft](raft-admission.md), "A lease forwarded from
-the leader"). Proposals still go to the leader.
+does not lead, `RaftHost::lease` MUST ask the leader the library names
+to run its barrier (`RaftTransport.GrantLease`) and MUST grant only once
+this member has applied the position that barrier read, inside the
+interval it anchored before asking (I3); a member cut from the leader,
+or too far behind to catch up inside its interval, MUST reject by name
+(`lease.leader_unreachable`, `lease.read_position_behind`) and admit
+nothing on a stale view ([admission under Raft](raft-admission.md), "A
+lease forwarded from the leader"). Proposals still go to the leader: a
+member that does not lead MUST name it (`lease.not_leader`).
+(`tests/control_raft_hosted_writes.rs`,
+   `a_write_through_a_follower_is_admitted_under_a_lease_forwarded_from_the_leader`
+   and
+   `a_forwarded_lease_grants_only_once_the_member_applied_the_leaders_read_position`,
+   fail if a stale view admits or a proposal is taken off-leader.)
 
 Recovery at start (`hosted::recover_catalogs`, the function the binary
 calls and tests call the same way) opens each configured path, takes
@@ -527,21 +652,29 @@ the file's binding bytes as they stand, and recovers the managed
 handle on the store's applied view under a recovery admission
 (`SourceAuthorityStore::recovery_admission`, crate-private). The
 header's binding is a claim, not an authority: `activated_owner`
-resolves the committed owner row by the binding's key and requires the
-row ACTIVE with the same target, workflow, ownership generation and
-completion, and the file's activation must equal the committed fence.
+MUST resolve the committed owner row by the binding's key and require
+the row ACTIVE with the same target, workflow, ownership generation and
+completion, and the file's activation MUST equal the committed fence.
 A forged or stale header can therefore open nothing the store does not
-record. Recovery takes no lease on purpose: a lease needs a leader, and
-a member restarts before any leader exists and serves as a follower
-most of its life. The recovery admission admits no write, by name;
-every write on the handle takes its own lease, so a handle opened on a
-view the quorum has since moved past is rejected at its first write
-("the fence has moved"). A catalog that is prepared rather than
-active, one with an authority identity that is not the member's, or
-one with an activation the store does not record stops the whole
-recovery by name; no partial service starts.
+record. Recovery MUST take no lease on purpose: a lease needs a leader,
+and a member restarts before any leader exists and serves as a follower
+most of its life. The recovery admission MUST admit no write, by name;
+every write on the handle MUST take its own lease, so a handle opened on
+a view the quorum has since moved past MUST be rejected at its first
+write (`admission.epoch_moved`, "the fence has moved").
+(`tests/control_raft_admission.rs`,
+`write_paused_during_revocation_is_refused_and_epoch_fenced`, fails if a
+moved-past handle writes.) A catalog that is prepared rather than
+active (`admission.not_active`), one with an authority identity that is
+not the member's (`admission.foreign_authority`), one with a collection
+that is not the entry's (`admission.foreign_collection`), or one with
+an activation the store does not record
+(`admission.unrecorded_activation`) MUST stop the whole recovery by
+name; no partial service MUST start.
+(`tests/control_raft_hosted_writes.rs`, the four start rejections,
+fail if a bad catalog serves.)
 
-The evidence is `tests/control_raft_hosted_writes.rs` (eleven tests:
+The evidence is `tests/control_raft_hosted_writes.rs` (twelve tests:
 admitted-and-durable on the leader with the row counted in the
 catalog, follower naming the leader, lease kept past the interval with
 no durable change, isolation inside the read bound with the healed
@@ -549,7 +682,7 @@ leader refusing as a follower, a whole group restarted with the first
 member up recovering before any leader exists, one member restarted
 while the others keep running recovering at start and serving once it
 leads, a client that drops its call while the worker is parked, a
-transport policy changed under a committed write, and the three start
+transport policy changed under a committed write, and the four start
 rejections) with the single-node lease and recovery-admission evidence
 in `src/raft/tests.rs`.
 
@@ -652,3 +785,13 @@ mTLS with the fixtures under `tests/certs/raft`, regenerated by
 - Cross-process fault injection (a member killed at a transaction boundary
   while the others continue) is Kimi's harness, on `fault-injection` and the
   transport's `Isolation`.
+- A runtime rebind of a node id to a new certificate fingerprint
+  (`PeerDirectory` replacement without restart): certificate rotation
+  restarts every member until it exists.
+
+## Changelog
+
+- v1: the specification pass — requirement words on the contract
+  sentences, the member lifecycle table, the error registry, the
+  "Security considerations" section with the rotation procedure, and
+  the conformance declaration.

@@ -1,5 +1,7 @@
 # Logical document acceptance
 
+Specification version: 1
+
 `document_write.proto` defines the source/version transaction independently of
 physical index rows. `src/document_catalog.rs` implements the local authority;
 `EmbeddedSearch::accept_document` and the C/JNI mobile bridge use it directly.
@@ -107,8 +109,8 @@ retry history. Content hashes are checked during source reads.
 
 ## Write outcomes
 
-On an activated managed source every write is admitted under a lease
-([admission under Raft](raft-admission.md)), and the lease is judged
+On an activated managed source every write MUST be admitted under a lease
+([admission under Raft](raft-admission.md)), and the lease MUST be judged
 twice: at the final check immediately before the commit, and again when
 the commit returns durable. The second judgement is what the storage
 records, on the operation record and on the version, as the write's
@@ -116,45 +118,55 @@ outcome (`WriteOutcome` in the storage proto, catalog format 11):
 
 | Outcome | Meaning |
 |---|---|
-| `ACCEPTED` | The lease was still open when the commit returned; the write was admitted under a right current at durability. Every record written before outcomes existed decodes as this, which is what it was. |
-| `UNCONFIRMED` | The commit returned after the lease lapsed. The row is durable; whether it was admitted is not yet decided. Marked in a durable transaction of its own, before the caller learns of it. |
+| `ACCEPTED` | The lease was still open when the commit returned; the write was admitted under a right current at durability (I4). Every record written before outcomes existed decodes as this, which is what it was. |
+| `UNCONFIRMED` | The commit returned after the lease lapsed. The row is durable; whether it was admitted is not yet decided. MUST be marked in a durable transaction of its own, before the caller learns of it. |
 | `FENCED` | Settled under a fresh lease and the actor's right was gone: the grant revoked, or the owner no longer ACTIVE under the write's epoch. Marked with the control revision this replica had applied. Final. |
 
-An unconfirmed write is settled by `ActiveManagedCatalog::settle` under a
-fresh leased admission for the same actor: the entry check run again.
-Right current, the record becomes ACCEPTED and the receipt is returned;
-right gone, the record becomes FENCED and the settlement is a
-`FAILED_PRECONDITION` naming the version, the sequence, the epoch and the
-revision. An admission that lapsed again settles nothing, by name, and
-the record stays unconfirmed for the next attempt. A retry of an
-operation whose record is unconfirmed is answered from the record before
-the entry check, and settled under the retry's own admission, which is
-fresh at entry; a retry of a fenced operation replays the rejection. A
-fenced version stays in the history at the sequence it took, marked
-(`AcceptedDocumentVersion.fenced`, `fenced_at_revision`), and remains the
-head of its key, so the next version of that key counts on from it; a
-reader that applies history treats a fenced version as never admitted.
-Every version carries the epoch it committed under (`write_epoch`, zero
-on a catalog that is not an activated managed source).
+The outcome moves forward only (I5):
 
-The hosted write service settles on the same call
+| From | To | Who moves it | Under what check | Test |
+| ---- | -- | ------------ | ---------------- | ---- |
+| none | `ACCEPTED` | the commit path's post-commit judgement | the lease still open at the commit's return; the right current at durability (I4) | `tests/control_raft_hosted_writes.rs`, `a_write_through_the_hosted_service_is_admitted_by_the_leader_and_durable` |
+| none | `UNCONFIRMED` | the commit path's post-commit judgement | the commit returned after the lease lapsed; marked before the caller learns of it | `tests/control_raft_hosted_writes.rs`, `a_write_durable_after_its_lease_lapsed_is_settled_under_a_fresh_lease` |
+| `UNCONFIRMED` | `ACCEPTED` | `ActiveManagedCatalog::settle` under a fresh leased admission for the same actor | the entry check run again with the right current | `tests/control_raft_hosted_writes.rs`, `an_unconfirmed_write_the_leader_cannot_settle_is_settled_by_the_retry` |
+| `UNCONFIRMED` | `FENCED` | `ActiveManagedCatalog::settle` under a fresh leased admission for the same actor | the right gone (grant revoked, or owner not ACTIVE under the epoch); the settlement is `FAILED_PRECONDITION` (`outcome.fenced`) naming the version, the sequence, the epoch and the revision | `tests/control_raft_hosted_writes.rs`, `an_unconfirmed_write_whose_actor_was_revoked_meanwhile_is_fenced` |
+
+An admission that lapsed again MUST settle nothing, by name
+(`outcome.unconfirmed`), and the record MUST stay unconfirmed for the
+next attempt. A retry of an operation whose record is unconfirmed MUST
+be answered from the record before the entry check, and settled under
+the retry's own admission, which is fresh at entry; a retry of a fenced
+operation MUST replay the rejection. A fenced version MUST stay in the
+history at the sequence it took, marked
+(`AcceptedDocumentVersion.fenced`, `fenced_at_revision`), and remain the
+head of its key, so the next version of that key counts on from it; a
+reader that applies history MUST treat a fenced version as never
+admitted. Every version MUST carry the epoch it committed under
+(`write_epoch`, zero on a catalog that is not an activated managed
+source).
+
+The hosted write service MUST settle on the same call
 ([hosted owner writes](raft-hosting.md#hosted-owner-writes)): a write
-returned unconfirmed takes a fresh lease under the call's permits and
-answers with the settlement; when no lease can be had, the call is
-`UNAVAILABLE` naming the durable version as unconfirmed, and the exact
-retry settles it. What this closes, and the residual it leaves, are in
+returned unconfirmed MUST take a fresh lease under the call's permits
+and answer with the settlement; when no lease can be had, the call MUST
+be `UNAVAILABLE` naming the durable version as unconfirmed
+(`outcome.unconfirmed`), and the exact retry settles it. What this
+closes, and the residual it leaves, are in
 [admission under Raft](raft-admission.md), "Source write boundary".
 
 The version precondition (`expected_version`, "Identity and retry rules")
-is decided inside the same write transaction, before the final admission
-check and the commit: a mismatch is `ABORTED`, consumes no version and no
-operation id, and has no outcome to record, so the corrected request is
-new work. On a hosted source the check runs on the serving member's own
-applied view under its lease, forwarded from the leader when the member
-does not lead. Evidence: two writers on one key through the leader's
-service, one wins at version 1 and the other is `ABORTED` by name with no
-record; the same key through a member that does not lead
-(`tests/control_raft_hosted_writes.rs`).
+MUST be decided inside the same write transaction, before the final
+admission check and the commit: a mismatch MUST be `ABORTED`
+(`outcome.version_mismatch`), consume no version and no operation id,
+and have no outcome to record, so the corrected request is new work. On
+a hosted source the check MUST run on the serving member's own applied
+view under its lease, forwarded from the leader when the member does
+not lead. (`tests/control_raft_hosted_writes.rs`,
+`a_version_precondition_is_decided_in_the_write_transaction_and_a_loser_leaves_no_record`,
+fails if a loser consumes a version or a record: two writers on one key
+through the leader's service, one wins at version 1 and the other is
+`ABORTED` by name with no record; the same key through a member that
+does not lead.)
 
 Fault injection (`fault-injection`): `arm_postcommit_pause` holds a write
 after its commit returned and before its outcome is judged, the window
@@ -606,3 +618,8 @@ regressions failed before the fix and passed afterwards. These were the shared
 unit suite and affected integration targets, not a rerun of every integration
 target. All builds/tests ran under an 8 GiB memory cap with swap disabled and
 two Cargo build jobs. No fleet rollout or hosted-CI result is claimed.
+
+## Changelog
+
+- v1: the specification pass — requirement words and the forward-only
+  transition table on "Write outcomes", and the conformance declaration.
