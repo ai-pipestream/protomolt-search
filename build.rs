@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The console's JSON facade transcodes from this descriptor set at
     // run time (src/console.rs), so a new RPC needs no facade change.
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
         .build_transport(net)

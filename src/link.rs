@@ -17,8 +17,9 @@ use std::task::{Context, Poll};
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
-use tonic::codec::{Codec, ProstCodec, Streaming};
+use tonic::codec::{Codec, Streaming};
 use tonic::{IntoRequest, IntoStreamingRequest, Request, Response, Status};
+use tonic_prost::ProstCodec;
 
 use crate::node::NodeServiceImpl;
 #[cfg(feature = "net")]

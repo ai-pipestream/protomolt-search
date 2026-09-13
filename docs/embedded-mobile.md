@@ -294,9 +294,9 @@ wrapper checksum, AGP 9.2.0, API 37, and protobuf 4.36.1.
 
 Some apparent older versions are compatibility pins, not forgotten updates:
 
-- tonic 0.12, prost/prost-types 0.13, and tonic-build 0.12 must move together
-  with `turbovec-grpc`; mixing their generated message/trait versions breaks
-  the in-process clustered backend contract;
+- tonic, tonic-prost and tonic-prost-build 0.14 and prost/prost-types 0.14
+  must move together with `turbovec-grpc`; mixing their generated
+  message/trait versions breaks the in-process clustered backend contract;
 - ICU4X and aho-corasick are exact analyzer pins because their output affects
   persisted term identity. ICU4X 2.3 is linked through `protomolt-unicode16`,
   which gives back the Unicode 16 answers the identities were built with,

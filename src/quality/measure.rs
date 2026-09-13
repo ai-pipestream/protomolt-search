@@ -63,7 +63,7 @@ impl ProfileRoute for crate::coordinator::CoordinatorServiceImpl {
 #[cfg(feature = "net")]
 impl<T> ProfileRoute for crate::pb::search_service_client::SearchServiceClient<T>
 where
-    T: tonic::client::GrpcService<tonic::body::BoxBody> + Send,
+    T: tonic::client::GrpcService<tonic::body::Body> + Send,
     T::Future: Send,
     T::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     T::ResponseBody: http_body::Body<Data = bytes::Bytes> + Send + 'static,

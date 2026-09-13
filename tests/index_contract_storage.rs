@@ -349,7 +349,7 @@ where
     B: http_body::Body + Send + 'static,
     B::Error: Into<tonic::codegen::StdError> + Send + 'static,
 {
-    type Response = tonic::codegen::http::Response<tonic::body::BoxBody>;
+    type Response = tonic::codegen::http::Response<tonic::body::Body>;
     type Error = std::convert::Infallible;
     type Future = std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
@@ -390,11 +390,9 @@ where
                     })
                 }
             }
-            Ok(
-                tonic::server::Grpc::new(tonic::codec::ProstCodec::default())
-                    .unary(Unary(node), request)
-                    .await,
-            )
+            Ok(tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
+                .unary(Unary(node), request)
+                .await)
         })
     }
 }

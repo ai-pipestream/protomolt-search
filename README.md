@@ -1237,6 +1237,11 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **2026-09-13 — tonic 0.14 and prost 0.14.** The gRPC stack moves as
+  one: tonic 0.14 here and in `turbovec-grpc` (with tonic-health and
+  tonic-reflection, its main at 4c8827b), prost and prost-types 0.14,
+  prost-reflect 0.16, the prost codec from its new crate `tonic-prost`,
+  and code generation through `tonic-prost-build`. No wire change.
 - **2026-09-13 — ICU4X 2.3 behind a Unicode 16 freeze.** The analyzer
   and the embedder use ICU4X only through `protomolt-unicode16`, which
   links 2.3.0 on exact pins and gives back the Unicode 16 answer where

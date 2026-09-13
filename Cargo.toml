@@ -12,22 +12,24 @@ resolver = "2"
 
 [dependencies]
 turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "turbovec-pipestream-s21" }
-turbovec-grpc = { git = "https://github.com/ai-pipestream/turbovec-grpc.git", rev = "ce2f9de", optional = true }
+turbovec-grpc = { git = "https://github.com/ai-pipestream/turbovec-grpc.git", rev = "4c8827b", optional = true }
 # Control consensus (docs/raft-control-design.md). Pinned exactly: the
 # storage-v2 contracts are what the log store and state machine implement,
 # and the typed envelopes map to this version's types explicitly.
 openraft = { version = "=0.9.25", default-features = false, features = ["storage-v2"], optional = true }
 # tonic's core (Status, Request, codegen, the prost codec) is all the
 # embedded runtime needs; the HTTP/2 transport rides the `net` feature.
-tonic = { version = "0.12", default-features = false, features = ["codegen", "prost"] }
-prost = "0.13"
-prost-reflect = { version = "0.14.7", default-features = false }
+tonic = { version = "0.14", default-features = false, features = ["codegen"] }
+# The prost codec the generated code names; it left tonic in 0.14.
+tonic-prost = "0.14"
+prost = "0.14"
+prost-reflect = { version = "0.16.5", default-features = false }
 # google.protobuf.Timestamp on the ingest wire compiles to this crate's
 # type; tonic-build emits the reference, the runtime needs the crate.
-# Locked to prost's minor version: prost-types 0.14 implements prost
-# 0.14's Message trait, which tonic 0.12's prost 0.13 codec refuses.
+# Locked to prost's minor version: prost-types implements one prost
+# minor's Message trait, and tonic-prost's codec takes that minor only.
 # It moves when tonic and prost move, never on its own.
-prost-types = "0.13"
+prost-types = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.1"
@@ -90,6 +92,7 @@ fork-guard = []
 # Tokio `net` because of it.
 net = [
     "tonic/transport",
+    "tonic/router",
     "tokio/net",
     "tokio/signal",
     "tokio-stream/net",
@@ -109,7 +112,7 @@ net = [
 default = ["net", "tls"]
 tls = [
     "net",
-    "tonic/tls",
+    "tonic/tls-ring",
     "dep:hyper-rustls",
     "dep:webpki-roots",
     "dep:rustls",
@@ -127,7 +130,7 @@ path = "src/bin/console.rs"
 required-features = ["net"]
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-prost-build = "0.14"
 
 [dev-dependencies]
 # The embedder loop test (tests/embedder_loop.rs) proves the provider crate

@@ -92,7 +92,7 @@ async fn stats(addr: &str, visibility: Option<WireVisibility>) -> TermStatsRespo
             tonic::codegen::http::uri::PathAndQuery::from_static(
                 "/ai.protomolt.search.v1.NodeService/TermStats",
             ),
-            tonic::codec::ProstCodec::default(),
+            tonic_prost::ProstCodec::default(),
         )
         .await
         .unwrap()
