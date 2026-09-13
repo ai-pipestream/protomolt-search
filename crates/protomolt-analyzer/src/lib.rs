@@ -1310,3 +1310,73 @@ mod sentence_tests {
         }
     }
 }
+
+/// Term identity is persisted, so every Unicode scalar value, through each
+/// analysis step that reads ICU4X data, must analyze as it did under ICU4X
+/// 2.0.0 (Unicode 16 properties and normalization, with the Unicode 17 case
+/// folds OpenNLP bundles). The digest was computed on that release; a data
+/// or code change that moves any answer moves the digest. The shapes also
+/// run through `char::is_alphanumeric` and unicode-segmentation, which is
+/// intended: a change there moves term identity the same way.
+#[cfg(test)]
+mod unicode_identity {
+    use super::*;
+
+    const DIGEST_UNDER_ICU4X_2_0: u64 = 0xfc31_a718_6426_ce5e;
+
+    fn eat(hash: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    #[test]
+    fn every_scalar_analyzes_as_it_did_under_icu4x_2_0() {
+        let steps = [
+            NormalizerStep::StripInvisible,
+            NormalizerStep::Whitespace,
+            NormalizerStep::AccentFold,
+            NormalizerStep::FullCaseFold,
+        ];
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        let mut text = String::new();
+        for scalar in (0u32..=0x10FFFF).filter_map(char::from_u32) {
+            // The scalar alone, after a Latin base, as a base for two marks
+            // in noncanonical order (U+0301 is class 230, U+0323 class 220),
+            // and between marks: category, script, combining class and
+            // composition all reach the output.
+            for shape in [
+                format!("{scalar}"),
+                format!("a{scalar}\u{0301}"),
+                format!("{scalar}\u{0301}\u{0323}"),
+                format!("A\u{0301}{scalar}\u{0323}"),
+            ] {
+                eat(&mut hash, full_case_fold(&shape).as_bytes());
+                eat(&mut hash, &[0xFF]);
+                eat(&mut hash, accent_fold(&shape).as_bytes());
+                eat(&mut hash, &[0xFF]);
+                eat(&mut hash, normalize(&shape, &steps).as_bytes());
+                eat(&mut hash, &[0xFE]);
+            }
+            // Word segmentation keeps a segment only when it holds a letter,
+            // a digit, a pictograph or a regional indicator: the scalar as
+            // its own segment and inside a word.
+            text.clear();
+            text.push(' ');
+            text.push(scalar);
+            text.push_str(" x");
+            text.push(scalar);
+            text.push('y');
+            for token in tokenize_uax29(&text, OffsetUnit::Utf8Bytes) {
+                eat(&mut hash, token.surface.as_bytes());
+                eat(&mut hash, &[0xFD]);
+            }
+            eat(&mut hash, &[0xFC]);
+        }
+        assert_eq!(
+            hash, DIGEST_UNDER_ICU4X_2_0,
+            "analysis digest over every scalar is {hash:#018x}"
+        );
+    }
+}

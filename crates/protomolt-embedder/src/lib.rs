@@ -789,3 +789,53 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+/// Vector identity is persisted, so every Unicode scalar value must
+/// normalize and pre-tokenize as it did under ICU4X 2.0.0 (Unicode 16
+/// general categories and normalization). The digest was computed on that
+/// release; a data or code change that moves any answer moves the digest.
+/// The shapes also run through `char::to_lowercase`, which is intended: a
+/// change there moves vector identity the same way.
+#[cfg(test)]
+mod unicode_identity {
+    use super::*;
+
+    const DIGEST_UNDER_ICU4X_2_0: u64 = 0x96b5_005a_5b3c_6621;
+
+    fn eat(hash: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    #[test]
+    fn every_scalar_normalizes_as_it_did_under_icu4x_2_0() {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for scalar in (0u32..=0x10FFFF).filter_map(char::from_u32) {
+            // The scalar alone, after a Latin base, as a base for two marks
+            // in noncanonical order, and inside words beside punctuation:
+            // the control, space, punctuation and nonspacing-mark checks
+            // and the decomposition all reach the output.
+            for shape in [
+                format!("{scalar}"),
+                format!("a{scalar}\u{0301}"),
+                format!("{scalar}\u{0301}\u{0323}"),
+                format!("x {scalar}y, z{scalar}"),
+            ] {
+                let normalized = normalize(&shape);
+                eat(&mut hash, normalized.as_bytes());
+                eat(&mut hash, &[0xFF]);
+                for word in pre_tokenize(&normalized) {
+                    eat(&mut hash, word.as_bytes());
+                    eat(&mut hash, &[0xFE]);
+                }
+                eat(&mut hash, &[0xFD]);
+            }
+        }
+        assert_eq!(
+            hash, DIGEST_UNDER_ICU4X_2_0,
+            "embedding normalization digest over every scalar is {hash:#018x}"
+        );
+    }
+}
