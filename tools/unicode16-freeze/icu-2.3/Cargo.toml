@@ -1,0 +1,24 @@
+[package]
+name = "unicode16-freeze-dump-icu-2-3"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# A tool, not part of the product workspace. The pins match
+# crates/protomolt-unicode16/Cargo.toml; the tables are only valid for the
+# release that crate links.
+[workspace]
+
+[[bin]]
+name = "dump"
+path = "../dump.rs"
+
+[dependencies]
+icu_casemap = "=2.3.0"
+icu_normalizer = "=2.3.0"
+icu_properties = "=2.3.0"
+icu_casemap_data = "=2.3.0"
+icu_normalizer_data = "=2.3.0"
+icu_properties_data = "=2.3.0"
+icu_locale_core = "=2.3.0"
+icu_provider = "=2.3.0"

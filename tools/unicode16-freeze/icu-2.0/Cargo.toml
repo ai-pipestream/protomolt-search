@@ -1,0 +1,23 @@
+[package]
+name = "unicode16-freeze-dump-icu-2-0"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# A tool, not part of the product workspace: it links ICU4X 2.0.0, which
+# the product no longer does.
+[workspace]
+
+[[bin]]
+name = "dump"
+path = "../dump.rs"
+
+[dependencies]
+icu_casemap = "=2.0.0"
+icu_normalizer = "=2.0.0"
+icu_properties = "=2.0.0"
+icu_casemap_data = "=2.0.0"
+icu_normalizer_data = "=2.0.0"
+icu_properties_data = "=2.0.0"
+icu_locale_core = "=2.0.0"
+icu_provider = "=2.0.0"

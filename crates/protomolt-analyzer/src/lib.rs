@@ -11,10 +11,7 @@ use std::error::Error;
 use std::fmt;
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
-use icu_casemap::CaseMapper;
-use icu_normalizer::{ComposingNormalizerBorrowed, DecomposingNormalizerBorrowed};
-use icu_properties::props::{ExtendedPictographic, GeneralCategory, Script};
-use icu_properties::{CodePointMapData, CodePointSetData};
+use protomolt_unicode16::{GeneralCategory, Script};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Maximum accepted UTF-8 input size, matching the OpenNLP analysis service.
@@ -617,21 +614,9 @@ fn normalize(token: &str, steps: &[NormalizerStep]) -> String {
 
 fn full_case_fold(text: &str) -> String {
     // JDK 25's normalization and character-property tables are Unicode 16,
-    // while OpenNLP deliberately bundles Unicode 17's CaseFolding.txt. ICU4X
-    // 2.0 supplies the former. These are the latter table's new common folds.
-    CaseMapper::new()
-        .fold_string(text)
-        .chars()
-        .map(|ch| match ch {
-            '\u{A7CE}' => '\u{A7CF}',
-            '\u{A7D2}' => '\u{A7D3}',
-            '\u{A7D4}' => '\u{A7D5}',
-            '\u{16EA0}'..='\u{16EB8}' => {
-                char::from_u32(ch as u32 + 0x1B).expect("Unicode 17 Beria Erfe fold is a scalar")
-            }
-            _ => ch,
-        })
-        .collect()
+    // while OpenNLP deliberately bundles Unicode 17's CaseFolding.txt;
+    // protomolt-unicode16 supplies the Unicode 17 folds.
+    protomolt_unicode16::case_fold(text)
 }
 
 /// Unicode full, non-Turkic case folding used by persisted product identities.
@@ -720,7 +705,6 @@ fn tokenize_whitespace(text: &str, offset_unit: OffsetUnit) -> Vec<Token<'_>> {
 
 fn tokenize_uax29(text: &str, offset_unit: OffsetUnit) -> Vec<Token<'_>> {
     const MAX_TOKEN_UTF16: u32 = 255;
-    let pictographic = CodePointSetData::new::<ExtendedPictographic>();
     let mut tokens = Vec::new();
     let mut utf16 = 0u32;
     let mut last_byte = 0usize;
@@ -730,7 +714,7 @@ fn tokenize_uax29(text: &str, offset_unit: OffsetUnit) -> Vec<Token<'_>> {
         let segment_utf16 = segment.encode_utf16().count() as u32;
         if segment.chars().any(|ch| {
             ch.is_alphanumeric()
-                || pictographic.contains(ch)
+                || protomolt_unicode16::is_extended_pictographic(ch)
                 || matches!(ch as u32, 0x1F1E6..=0x1F1FF)
         }) {
             let mut chunk_byte = byte;
@@ -903,14 +887,12 @@ fn normalize_whitespace(text: &str) -> String {
 }
 
 fn accent_fold(text: &str) -> String {
-    let decomposed = DecomposingNormalizerBorrowed::new_nfd().normalize(text);
-    let categories = CodePointMapData::<GeneralCategory>::new();
-    let scripts = CodePointMapData::<Script>::new();
+    let decomposed = protomolt_unicode16::nfd(text);
     let mut out = String::with_capacity(decomposed.len());
     let mut base_script = None;
 
     for ch in decomposed.chars() {
-        if categories.get(ch) == GeneralCategory::NonspacingMark {
+        if protomolt_unicode16::general_category(ch) == GeneralCategory::NonspacingMark {
             if !base_script.is_some_and(is_folded_script) {
                 out.push(ch);
             }
@@ -921,12 +903,10 @@ fn accent_fold(text: &str) -> String {
             base_script = Some(Script::Latin);
         } else {
             out.push(ch);
-            base_script = Some(scripts.get(ch));
+            base_script = Some(protomolt_unicode16::script(ch));
         }
     }
-    ComposingNormalizerBorrowed::new_nfc()
-        .normalize(&out)
-        .into_owned()
+    protomolt_unicode16::nfc(&out)
 }
 
 fn is_folded_script(script: Script) -> bool {

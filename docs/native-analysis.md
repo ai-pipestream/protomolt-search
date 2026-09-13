@@ -106,8 +106,18 @@ missing embedding provider.
 The native implementation is checked against the real OpenNLP service for the
 two product analyzers, a generated Porter suffix corpus, and every Unicode
 scalar. JDK 25 uses Unicode 16 normalization, category, and script behavior;
-OpenNLP additionally bundles Unicode 17 full-case-fold mappings. The crate pins
-the matching ICU4X data and carries the small case-fold delta explicitly.
+OpenNLP additionally bundles Unicode 17 full-case-fold mappings. The analyzer
+uses ICU4X only through `protomolt-unicode16`, which links ICU4X 2.3
+(Unicode 17) on exact pins and gives back the Unicode 16 answer for every
+scalar where the general category, script, Extended_Pictographic flag or
+normalization differs, while keeping Unicode 17 case folding. Those
+differences are 4,803 scalars new in Unicode 17, 689 scalars that lost
+Extended_Pictographic (U+2605 BLACK STAR among them, which the tokenizer
+keeps as a term), and U+0295, a lowercase letter in 16 and an other letter
+in 17. `tools/unicode16-freeze/run.sh` regenerates the tables by comparing
+every scalar under ICU4X 2.0 and 2.3, and stops on a difference the freeze
+does not handle. A digest test in `protomolt-analyzer` and one in
+`protomolt-embedder` compare every scalar's output with ICU4X 2.0.
 
 Run the differential oracle against a live sidecar:
 

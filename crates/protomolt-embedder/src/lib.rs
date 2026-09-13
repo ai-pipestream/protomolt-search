@@ -48,9 +48,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 
-use icu_normalizer::DecomposingNormalizerBorrowed;
-use icu_properties::props::GeneralCategory;
-use icu_properties::CodePointMapData;
+use protomolt_unicode16::{general_category, nfd, GeneralCategory};
 
 /// Everything that can go wrong loading a model directory. String payloads
 /// name the file and reason; a load error is a packaging problem, never a
@@ -77,7 +75,7 @@ fn is_control(c: char) -> bool {
         return false;
     }
     matches!(
-        CodePointMapData::<GeneralCategory>::new().get(c),
+        general_category(c),
         GeneralCategory::Control
             | GeneralCategory::Format
             | GeneralCategory::PrivateUse
@@ -91,13 +89,13 @@ fn is_ws(c: char) -> bool {
         || c == '\t'
         || c == '\n'
         || c == '\r'
-        || CodePointMapData::<GeneralCategory>::new().get(c) == GeneralCategory::SpaceSeparator
+        || general_category(c) == GeneralCategory::SpaceSeparator
 }
 
 fn is_punct(c: char) -> bool {
     c.is_ascii_punctuation()
         || matches!(
-            CodePointMapData::<GeneralCategory>::new().get(c),
+            general_category(c),
             GeneralCategory::ConnectorPunctuation
                 | GeneralCategory::DashPunctuation
                 | GeneralCategory::OpenPunctuation
@@ -139,11 +137,10 @@ pub fn normalize(text: &str) -> String {
     }
     // Strip accents: NFD, then drop nonspacing marks — the same shape as
     // protomolt-analyzer's accent fold, against the same pinned ICU data.
-    let decomposed = DecomposingNormalizerBorrowed::new_nfd().normalize(&cleaned);
-    let categories = CodePointMapData::<GeneralCategory>::new();
+    let decomposed = nfd(&cleaned);
     decomposed
         .chars()
-        .filter(|c| categories.get(*c) != GeneralCategory::NonspacingMark)
+        .filter(|c| general_category(*c) != GeneralCategory::NonspacingMark)
         .flat_map(char::to_lowercase)
         .collect()
 }

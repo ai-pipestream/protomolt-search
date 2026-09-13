@@ -1237,6 +1237,14 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
 
+- **2026-09-13 — ICU4X 2.3 behind a Unicode 16 freeze.** The analyzer
+  and the embedder use ICU4X only through `protomolt-unicode16`, which
+  links 2.3.0 on exact pins and gives back the Unicode 16 answer where
+  the Unicode 17 data differs (4,803 new scalars, 689 pictographic
+  flags, U+0295), keeping the Unicode 17 case folding OpenNLP bundles. A
+  digest test in each crate compares every scalar value's output with
+  ICU4X 2.0.0; `tools/unicode16-freeze/run.sh` regenerates the tables.
+  See [compatibility and index safety](docs/native-analysis.md#compatibility-and-index-safety).
 - **2026-09-11 — Raft operator surface (Phase A).** `RaftOperatorService`
   serves member status, add-learner, promote, remove and image
   verification on every listener of a Raft member under cluster trust,

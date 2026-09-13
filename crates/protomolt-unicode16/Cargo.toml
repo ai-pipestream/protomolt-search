@@ -1,0 +1,23 @@
+[package]
+name = "protomolt-unicode16"
+version = "0.1.0"
+edition = "2021"
+license = "MIT AND Unicode-3.0"
+description = "Unicode 16 character answers over ICU4X 2.3 for persisted term and vector identity"
+
+[dependencies]
+# Term identity and vector identity are persisted. Exact pins make a Unicode
+# update an explicit compatibility event: tools/unicode16-freeze/run.sh
+# regenerates src/tables.rs for a new release, and the digest tests in
+# protomolt-analyzer and protomolt-embedder decide whether it is taken.
+icu_casemap = "=2.3.0"
+icu_normalizer = "=2.3.0"
+icu_properties = "=2.3.0"
+# ICU crates declare their generated data with patch-compatible ranges.
+# Constrain every baked artifact so Unicode changes cannot enter via a patch.
+icu_casemap_data = "=2.3.0"
+icu_normalizer_data = "=2.3.0"
+icu_properties_data = "=2.3.0"
+# Keep the internally generated data and provider ABI on the same release.
+icu_locale_core = "=2.3.0"
+icu_provider = "=2.3.0"

@@ -297,9 +297,12 @@ Some apparent older versions are compatibility pins, not forgotten updates:
 - tonic 0.12, prost/prost-types 0.13, and tonic-build 0.12 must move together
   with `turbovec-grpc`; mixing their generated message/trait versions breaks
   the in-process clustered backend contract;
-- ICU4X 2.0 and aho-corasick 1.1.4 are exact analyzer pins because their output
-  affects persisted term identity; changing them is an analyzer-fingerprint
-  and corpus-rebuild decision;
+- ICU4X and aho-corasick are exact analyzer pins because their output affects
+  persisted term identity. ICU4X 2.3 is linked through `protomolt-unicode16`,
+  which gives back the Unicode 16 answers the identities were built with,
+  checked for every scalar by the analyzer and embedder digest tests; a
+  change that moves any answer is an analyzer-fingerprint and
+  corpus-rebuild decision;
 - TurboVec's random/statistical dependencies remain engine-owned exact pins
   because they affect persisted encoded bytes.
 
