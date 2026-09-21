@@ -36,7 +36,7 @@ through its C/Swift wrapper.
 | Surface | Verified implementation | Remaining work |
 |---|---|---|
 | Local engine | `src/embedded.rs`, JNI/C ABI in `crates/protomolt-search-embedded/src/mobile.rs` | App integration and physical-device validation |
-| Protobuf ingest | Descriptor-derived `PlanIndex`, fingerprint-bound `IngestMapped` | Expose planning through the mobile byte ABI; it currently exposes mapped ingest but not PlanIndex |
+| Protobuf ingest | Descriptor-derived `PlanIndex`, fingerprint-bound `IngestMapped`, both exposed through the mobile byte ABI (`protomolt_search_plan_index`) | None for the private shard |
 | Local search | `Query`, pull-based `QueryStream`, flush and close | A separate shard execution bridge for collaborative collectors |
 | Vector collaboration | `NodeService.StreamSearch`: start, floor updates, stop, candidates, completion | Route these operations over a device-initiated session to the local shard |
 | Lexical collaboration | Global BM25 statistics and `Bm25QueryStream` certificates | Session routing for both statistics and candidate phases |
