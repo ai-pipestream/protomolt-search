@@ -28,8 +28,9 @@ fi
 
 case "$(uname -s)-$(uname -m)" in
   Linux-x86_64) host_tag="linux-x86_64" ;;
-  Darwin-x86_64) host_tag="darwin-x86_64" ;;
-  Darwin-arm64) host_tag="darwin-arm64" ;;
+  # The NDK ships one macOS toolchain, universal binaries under darwin-x86_64,
+  # on Apple Silicon as well: there is no darwin-arm64 directory.
+  Darwin-x86_64 | Darwin-arm64) host_tag="darwin-x86_64" ;;
   *) echo "unsupported Android build host: $(uname -s)-$(uname -m)" >&2; exit 2 ;;
 esac
 
@@ -62,8 +63,8 @@ for entry in "${targets[@]}"; do
     echo "Android linker is missing: $linker" >&2
     exit 2
   fi
-  linker_var="CARGO_TARGET_${rust_target^^}_LINKER"
-  linker_var="${linker_var//-/_}"
+  # tr rather than ${rust_target^^}: that expansion is bash 4, and macOS ships 3.2.
+  linker_var="CARGO_TARGET_$(printf '%s' "$rust_target" | tr 'a-z-' 'A-Z_')_LINKER"
   export "$linker_var=$linker"
   cargo build --manifest-path "$repo_dir/Cargo.toml" --locked --release \
     -p protomolt-search-embedded --target "$rust_target"
