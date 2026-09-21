@@ -202,8 +202,9 @@ emits all three forms needed by its consumers: `rlib` for Rust applications,
 protomolt-search-embedded = { path = "crates/protomolt-search-embedded" }
 ```
 
-The stable mobile ABI exposes create/open, mapped ingest, `Query`, pull-based
-`QueryStream`, flush, and close. Inputs and outputs are protobuf bytes.
+The stable mobile ABI exposes create/open, `PlanIndex`, mapped ingest, `Query`,
+pull-based `QueryStream`, `DescribeSchema`, document acceptance and its history
+read, flush, and close. Inputs and outputs are protobuf bytes.
 `mobile.proto` owns only lifecycle envelopes and imports the ordinary
 `search.proto` request and response types, so neither host wrapper contains a
 second query or schema model. The Rust library owns its Tokio runtime; Android
@@ -274,6 +275,59 @@ cargo check --locked -p protomolt-search-embedded --target x86_64-apple-ios
 
 These remain fast Rust compile gates. The package workflow performs the native
 link and archive steps with the real NDK and Xcode toolchains.
+
+## Calling it from an app
+
+The shortest working sequence through the byte ABI is five calls: create or open,
+`PlanIndex`, `IngestMapped`, flush, `Query`. The device suites exercise them with a
+hardcoded schema; an app with its own schema meets the rules below, each of which
+the engine enforces and none of which is otherwise written down for this path.
+They were found by building one: `ai-pipestream/protomolt-mobile-samples` is a
+SwiftUI and a Compose app over this package, with a host-side Rust program that
+makes the same calls against the C symbols.
+
+**The field table.** `MobileShardConfig.bm25_fields` replaces `NodeConfig`'s
+default of `["body"]`; it does not add to it. List the body column, list it first,
+and then every other text field the plan lands. A text field the plan lands and
+the table omits refuses `IngestMapped` with `FAILED_PRECONDITION` ("the plan lands
+columns this shard does not declare"). Entry 0 is what an unqualified
+`LexicalQuery` searches. A table whose first entry is not the body column is
+accepted, and such a query then searches that column without a refusal: `["title",
+"body"]` indexes both and answers a body term with no hits.
+
+**Analysis.** The native analyzer has no default spec. `MappedBind.field_analysis`
+must name every projected text path, the body included, and is mutually exclusive
+with the legacy `analysis` field; a path it names that the table lacks refuses
+("bound analysis field ... is absent from the shard"). Queries carry the same spec.
+A host without the Rust `body_spec()` helper builds it from the enum values:
+tokenizer 1 (whitespace), stemmer 2 (Porter), term-vector mode 1 (full),
+term-vector source 3 (normalized stems), char filters 1, 2, 15, 6 (strip invisible,
+whitespace, accent fold, full case fold).
+
+**The fingerprint.** `MappedBind.expected_fingerprint` comes from `PlanIndex` on
+the same descriptor set. Derivation is deterministic and cheap enough to repeat on
+every open, which also gives an app the fingerprint to show.
+
+**Snippets.** `QueryRequest.highlight` is served for a single lexical selection.
+On any other shape, a dense query included, the whole request is refused, so the
+field is left off rather than ignored. `profile` and the response's `executed` work
+on every shape. Snippet and highlight offsets are UTF-16 code units of the original
+stored text.
+
+**Type-ahead.** `LexicalQuery.prefixes` expands a prefix in a dictionary of stems,
+so a finished word sent only as a prefix (`sentencing`) misses its own stem
+(`sentenc`). Send the text and the last word as a prefix together; the engine
+scores the union.
+
+**Files.** `index_path` names an image with sidecars beside it (`.live`,
+`.segments/`, `.wal/`), and create refuses to overwrite any of them. An app asking
+whether its index exists looks for any file with that prefix, not for the path
+itself.
+
+**Java hosts.** Full `protobuf-java` does not compile these contracts: fields
+named `descriptor` (`GetVectorBackendResponse`, `SchemaEnum`, `SchemaField`, the
+WAL's `SourceReference`) generate a `getDescriptor()` that collides with the
+runtime's static one. The lite runtime has no descriptors and compiles.
 
 ## Dependency audit
 
