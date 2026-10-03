@@ -102,7 +102,7 @@ fn valid_history_id(id: &[u8]) -> bool {
 
 fn new_history_id() -> Result<Vec<u8>, Status> {
     let mut id = vec![0; 16];
-    getrandom::getrandom(&mut id).map_err(storage)?;
+    getrandom::fill(&mut id).map_err(storage)?;
     if !valid_history_id(&id) {
         return Err(Status::internal(
             "catalog history entropy returned an invalid identity",

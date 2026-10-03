@@ -172,7 +172,7 @@ impl Candidate {
     pub(super) fn write(path: &Path, bytes: &[u8]) -> Result<Self, String> {
         for _ in 0..8 {
             let mut nonce = [0u8; 16];
-            getrandom::getrandom(&mut nonce)
+            getrandom::fill(&mut nonce)
                 .map_err(|e| format!("control state candidate entropy: {e}"))?;
             let nonce = nonce
                 .iter()

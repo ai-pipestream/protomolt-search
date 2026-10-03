@@ -50,7 +50,7 @@ impl StatsIncarnation {
     pub(crate) fn bytes(&self) -> Result<Vec<u8>, Status> {
         match self.0.get_or_init(|| {
             let mut bytes = [0; 32];
-            getrandom::getrandom(&mut bytes).map_err(|e| e.to_string())?;
+            getrandom::fill(&mut bytes).map_err(|e| e.to_string())?;
             Ok(bytes)
         }) {
             Ok(bytes) => Ok(bytes.to_vec()),

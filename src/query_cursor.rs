@@ -31,7 +31,7 @@ impl CursorSigner {
         self.key
             .get_or_init(|| {
                 let mut key = [0; 32];
-                getrandom::getrandom(&mut key)
+                getrandom::fill(&mut key)
                     .map_err(|error| format!("cursor entropy unavailable: {error}"))?;
                 Ok(key)
             })
