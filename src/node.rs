@@ -6443,8 +6443,23 @@ impl NodeServiceImpl {
     /// layout, not the log's history. Returns whether a segment was
     /// written.
     pub(crate) fn seal_tail(&self) -> Result<bool, Status> {
+        self.seal_tail_with(false)
+    }
+
+    /// [`Self::seal_tail`] for a sealer that runs beside live ingest
+    /// (compaction): with a vector provider configured it refuses, under
+    /// the same write lock that would freeze the tail, a tail whose
+    /// documents outnumber their vectors. Such a tail is a two-call
+    /// append between its calls; freezing it would seal the documents
+    /// alone and the vectors that follow would be refused. The refusal
+    /// carries the misaligned-tail message, which the caller retries.
+    pub(crate) fn seal_tail_paired(&self) -> Result<bool, Status> {
+        self.seal_tail_with(true)
+    }
+
+    fn seal_tail_with(&self, paired: bool) -> Result<bool, Status> {
         let _one_at_a_time = self.seal_lock.lock().expect("seal lock poisoned");
-        let Some(plan) = self.freeze_tail()? else {
+        let Some(plan) = self.freeze_tail(paired)? else {
             return Ok(false);
         };
         let outcome = self.write_segment(&plan);
@@ -6484,8 +6499,10 @@ impl NodeServiceImpl {
 
     /// Step one of a seal, under the write lock: freeze the tail (or
     /// pick up the frozen part a failed seal left) and gather what the
-    /// writer needs. `None` when there is nothing to seal.
-    fn freeze_tail(&self) -> Result<Option<SealPlan>, Status> {
+    /// writer needs. `None` when there is nothing to seal. `paired`
+    /// refuses a document-only tail when a vector provider is configured
+    /// (see [`Self::seal_tail_paired`]).
+    fn freeze_tail(&self, paired: bool) -> Result<Option<SealPlan>, Status> {
         let mut guard = write_shard(&self.state);
         guard.check_catalog_publication()?;
         if let Some(binding) = guard.mapped_binding.clone() {
@@ -6515,7 +6532,8 @@ impl NodeServiceImpl {
                 if docs == 0 && vectors == 0 {
                     return Ok(None);
                 }
-                if docs != 0 && vectors != 0 && docs != vectors {
+                let awaits_vectors = paired && provider.is_some() && vectors == 0;
+                if docs != 0 && (vectors != 0 || awaits_vectors) && docs != vectors {
                     return Err(Status::failed_precondition(format!(
                         "the tail has {docs} documents and {vectors} vectors; a segment's \
                          artifacts cover the same rows, so ingest through the mapped path, \
