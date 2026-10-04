@@ -174,7 +174,13 @@ pub fn pre_tokenize(normalized: &str) -> Vec<String> {
 /// `max_word_chars`, or any position with no vocabulary match, collapses the
 /// WHOLE word to a single `[UNK]` — partial matches are discarded, per the
 /// reference algorithm.
-pub fn wordpiece(vocab: &HashMap<String, u32>, unk_id: u32, max_word_chars: usize, word: &str, out: &mut Vec<u32>) {
+pub fn wordpiece(
+    vocab: &HashMap<String, u32>,
+    unk_id: u32,
+    max_word_chars: usize,
+    word: &str,
+    out: &mut Vec<u32>,
+) {
     let chars: Vec<char> = word.chars().collect();
     if chars.len() > max_word_chars {
         out.push(unk_id);
@@ -187,7 +193,11 @@ pub fn wordpiece(vocab: &HashMap<String, u32>, unk_id: u32, max_word_chars: usiz
         let mut found = None;
         while end > start {
             let piece: String = chars[start..end].iter().collect();
-            let key = if start > 0 { format!("##{piece}") } else { piece };
+            let key = if start > 0 {
+                format!("##{piece}")
+            } else {
+                piece
+            };
             if let Some(&id) = vocab.get(&key) {
                 found = Some(id);
                 break;
@@ -256,10 +266,15 @@ impl StaticEmbedder {
         // would produce silently different vectors, so it must not load.
         let model = &tok["model"];
         if model["type"] != "WordPiece" {
-            return Err(LoadError::Format(format!("tokenizer model {} is not WordPiece", model["type"])));
+            return Err(LoadError::Format(format!(
+                "tokenizer model {} is not WordPiece",
+                model["type"]
+            )));
         }
         if model["continuing_subword_prefix"] != "##" {
-            return Err(LoadError::Format("continuing_subword_prefix is not ##".into()));
+            return Err(LoadError::Format(
+                "continuing_subword_prefix is not ##".into(),
+            ));
         }
         let norm = &tok["normalizer"];
         if norm["type"] != "BertNormalizer"
@@ -271,7 +286,9 @@ impl StaticEmbedder {
             return Err(LoadError::Format(format!("unsupported normalizer {norm}")));
         }
         if tok["pre_tokenizer"]["type"] != "BertPreTokenizer" {
-            return Err(LoadError::Format("pre_tokenizer is not BertPreTokenizer".into()));
+            return Err(LoadError::Format(
+                "pre_tokenizer is not BertPreTokenizer".into(),
+            ));
         }
 
         let vocab_json = model["vocab"]
@@ -282,9 +299,8 @@ impl StaticEmbedder {
             let id = id
                 .as_u64()
                 .filter(|&v| v <= u64::from(u32::MAX))
-                .ok_or_else(|| {
-                    LoadError::Format(format!("vocab id for {piece:?} is not a u32"))
-                })? as u32;
+                .ok_or_else(|| LoadError::Format(format!("vocab id for {piece:?} is not a u32")))?
+                as u32;
             vocab.insert(piece.clone(), id);
         }
         // The piece-to-row map must be a bijection: two pieces naming one row
@@ -338,7 +354,9 @@ impl StaticEmbedder {
         let table = unsafe { memmap2::Mmap::map(&file) }
             .map_err(|e| LoadError::Io(format!("{}: {e}", st_path.display())))?;
         if table.len() < 8 {
-            return Err(LoadError::Format("safetensors shorter than its length header".into()));
+            return Err(LoadError::Format(
+                "safetensors shorter than its length header".into(),
+            ));
         }
         let header_len = u64::from_le_bytes(table[0..8].try_into().unwrap()) as usize;
         if header_len > MAX_SAFETENSORS_HEADER_BYTES {
@@ -358,7 +376,9 @@ impl StaticEmbedder {
         let rows = shape[0];
         let dim = shape[1];
         if rows == 0 || dim == 0 {
-            return Err(LoadError::Format("embeddings shape has a zero dimension".into()));
+            return Err(LoadError::Format(
+                "embeddings shape has a zero dimension".into(),
+            ));
         }
         if rows != vocab.len() {
             return Err(LoadError::Format(format!(
@@ -379,8 +399,8 @@ impl StaticEmbedder {
         // A non-finite row would silently poison every pooled vector, so the
         // table is scanned once at load. This touches every page once; the
         // pages stay clean and evictable, so the resident cost is transient.
-        for chunk in table[emb_offset..emb_offset + emb_bytes].chunks_exact(4) {
-            if !f32::from_le_bytes(chunk.try_into().unwrap()).is_finite() {
+        for chunk in table[emb_offset..emb_offset + emb_bytes].as_chunks::<4>().0 {
+            if !f32::from_le_bytes(*chunk).is_finite() {
                 return Err(LoadError::Format(
                     "embeddings table holds a non-finite value".into(),
                 ));
@@ -397,8 +417,8 @@ impl StaticEmbedder {
                     )));
                 }
                 let mut values = Vec::with_capacity(wshape[0]);
-                for chunk in table[woffset..woffset + wbytes].chunks_exact(4) {
-                    let w = f32::from_le_bytes(chunk.try_into().unwrap());
+                for chunk in table[woffset..woffset + wbytes].as_chunks::<4>().0 {
+                    let w = f32::from_le_bytes(*chunk);
                     if !w.is_finite() || w < 0.0 {
                         return Err(LoadError::Format(
                             "weights must be finite and non-negative".into(),
@@ -410,7 +430,17 @@ impl StaticEmbedder {
             }
             _ => None,
         };
-        Ok(Self { vocab, unk_id, special, max_word_chars, table, weights, data_offset: emb_offset, dim, rows })
+        Ok(Self {
+            vocab,
+            unk_id,
+            special,
+            max_word_chars,
+            table,
+            weights,
+            data_offset: emb_offset,
+            dim,
+            rows,
+        })
     }
 
     pub fn dim(&self) -> usize {
@@ -426,7 +456,13 @@ impl StaticEmbedder {
     pub fn tokenize(&self, text: &str) -> Vec<u32> {
         let mut ids = Vec::new();
         for word in pre_tokenize(&normalize(text)) {
-            wordpiece(&self.vocab, self.unk_id, self.max_word_chars, &word, &mut ids);
+            wordpiece(
+                &self.vocab,
+                self.unk_id,
+                self.max_word_chars,
+                &word,
+                &mut ids,
+            );
         }
         ids
     }
@@ -457,8 +493,8 @@ impl StaticEmbedder {
                 .map_or(1.0, |ws| f64::from(ws[id as usize]));
             let at = self.data_offset + id as usize * stride;
             let row = &self.table[at..at + stride];
-            for (a, chunk) in acc.iter_mut().zip(row.chunks_exact(4)) {
-                *a += w * f64::from(f32::from_le_bytes(chunk.try_into().unwrap()));
+            for (a, chunk) in acc.iter_mut().zip(row.as_chunks::<4>().0) {
+                *a += w * f64::from(f32::from_le_bytes(*chunk));
             }
         }
         let n = ids.len() as f64;
@@ -483,10 +519,15 @@ fn tensor_region(
 ) -> Result<(Vec<usize>, usize, usize), LoadError> {
     let tensor = &header[name];
     if tensor.is_null() {
-        return Err(LoadError::Format(format!("safetensors has no {name} tensor")));
+        return Err(LoadError::Format(format!(
+            "safetensors has no {name} tensor"
+        )));
     }
     if tensor["dtype"] != "F32" {
-        return Err(LoadError::Format(format!("{name} dtype {} is not F32", tensor["dtype"])));
+        return Err(LoadError::Format(format!(
+            "{name} dtype {} is not F32",
+            tensor["dtype"]
+        )));
     }
     let shape: Vec<usize> = tensor["shape"]
         .as_array()
@@ -508,14 +549,16 @@ fn tensor_region(
         .iter()
         .try_fold(1usize, |acc, &d| acc.checked_mul(d))
         .ok_or_else(|| LoadError::Format(format!("{name} shape overflows addressable memory")))?;
-    let bytes = elements
-        .checked_mul(4)
-        .ok_or_else(|| LoadError::Format(format!("{name} byte size overflows addressable memory")))?;
+    let bytes = elements.checked_mul(4).ok_or_else(|| {
+        LoadError::Format(format!("{name} byte size overflows addressable memory"))
+    })?;
     let offsets = tensor["data_offsets"]
         .as_array()
         .ok_or_else(|| LoadError::Format(format!("{name} data_offsets missing")))?;
     if offsets.len() != 2 {
-        return Err(LoadError::Format(format!("{name} data_offsets is not [start, end]")));
+        return Err(LoadError::Format(format!(
+            "{name} data_offsets is not [start, end]"
+        )));
     }
     let start = offsets[0]
         .as_u64()
@@ -538,7 +581,9 @@ fn tensor_region(
         .checked_add(bytes)
         .ok_or_else(|| LoadError::Format(format!("{name} data end overflows")))?;
     if data_end > table_len {
-        return Err(LoadError::Format(format!("{name} data extends past end of file")));
+        return Err(LoadError::Format(format!(
+            "{name} data extends past end of file"
+        )));
     }
     Ok((shape, data_offset, bytes))
 }
@@ -672,7 +717,10 @@ mod tests {
         // mean([3,0],[0,4]) = [1.5,2] -> normalized [0.6,0.8]; the zzz word
         // becomes [UNK] and must not move the result.
         let v = e.embed("LEFT zzz right").unwrap();
-        assert!((v[0] - 0.6).abs() < 1e-7 && (v[1] - 0.8).abs() < 1e-7, "{v:?}");
+        assert!(
+            (v[0] - 0.6).abs() < 1e-7 && (v[1] - 0.8).abs() < 1e-7,
+            "{v:?}"
+        );
         assert_eq!(e.embed("zzz qqq"), None);
         assert_eq!(e.embed("   "), None);
         std::fs::remove_dir_all(&dir).ok();
