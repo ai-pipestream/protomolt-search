@@ -2301,21 +2301,17 @@ mod tests {
         let bad_band = TierPolicy {
             tiers: vec![tier("warm", 2, 100, 100, 0)],
         };
-        assert!(
-            bad_band
-                .validate()
-                .unwrap_err()
-                .contains("empty or inverted")
-        );
+        assert!(bad_band
+            .validate()
+            .unwrap_err()
+            .contains("empty or inverted"));
         let bad_floor = TierPolicy {
             tiers: vec![tier("warm", 0, 1, 100, 0)],
         };
-        assert!(
-            bad_floor
-                .validate()
-                .unwrap_err()
-                .contains("outside [1, 1024]")
-        );
+        assert!(bad_floor
+            .validate()
+            .unwrap_err()
+            .contains("outside [1, 1024]"));
         // A giant floor is a policy error, not a work order.
         let giant_floor = TierPolicy {
             tiers: vec![tier("hot", 1_000_000, 100, 1_000, 0)],
@@ -2330,12 +2326,10 @@ mod tests {
                 ..tier("cold", 1, 0, 1, 0)
             }],
         };
-        assert!(
-            device_tier
-                .validate()
-                .unwrap_err()
-                .contains("non-SERVER residency")
-        );
+        assert!(device_tier
+            .validate()
+            .unwrap_err()
+            .contains("non-SERVER residency"));
     }
 
     #[test]
@@ -2509,46 +2503,36 @@ mod tests {
         let mut alien = forged.observations[0].clone();
         alien.partition.collection = "briefs".to_string();
         forged.observations.push(alien.clone());
-        assert!(
-            TierSnapshot::validated(forged)
-                .unwrap_err()
-                .contains("outside the snapshot's resource")
-        );
+        assert!(TierSnapshot::validated(forged)
+            .unwrap_err()
+            .contains("outside the snapshot's resource"));
         let mut reversed = input_a(&store, 118);
         reversed.observations.insert(0, alien);
-        assert!(
-            TierSnapshot::validated(reversed)
-                .unwrap_err()
-                .contains("outside the snapshot's resource")
-        );
+        assert!(TierSnapshot::validated(reversed)
+            .unwrap_err()
+            .contains("outside the snapshot's resource"));
 
         // A committed view of another resource refuses.
         let mut wrong = input_a(&store, 118);
         wrong.committed.collection = "briefs".to_string();
-        assert!(
-            TierSnapshot::validated(wrong)
-                .unwrap_err()
-                .contains("is not the snapshot's")
-        );
+        assert!(TierSnapshot::validated(wrong)
+            .unwrap_err()
+            .contains("is not the snapshot's"));
 
         // Duplicate full-identity observations refuse; nothing overwrites.
         let mut dup = input_a(&store, 118);
         let copy = dup.observations[0].clone();
         dup.observations.push(copy);
-        assert!(
-            TierSnapshot::validated(dup)
-                .unwrap_err()
-                .contains("duplicate observation")
-        );
+        assert!(TierSnapshot::validated(dup)
+            .unwrap_err()
+            .contains("duplicate observation"));
 
         // A duplicate fragment request refuses.
         let mut dup_req = input_a(&store, 118);
         dup_req.fragment_requests.push(req(7, "L4"));
-        assert!(
-            TierSnapshot::validated(dup_req)
-                .unwrap_err()
-                .contains("duplicate fragment request")
-        );
+        assert!(TierSnapshot::validated(dup_req)
+            .unwrap_err()
+            .contains("duplicate fragment request"));
 
         // A report from a superseded incarnation refuses even when the
         // store's own ingest was bypassed.
@@ -2556,11 +2540,9 @@ mod tests {
         stale
             .current_incarnations
             .insert("krick-1".to_string(), inc(0x1a));
-        assert!(
-            TierSnapshot::validated(stale)
-                .unwrap_err()
-                .contains("is superseded by")
-        );
+        assert!(TierSnapshot::validated(stale)
+            .unwrap_err()
+            .contains("is superseded by"));
 
         // Store ingest binds the resource too.
         let mut store = ObservationStore::new(COHORT, 0, 1000, 1 << 20, 64, committed_view_a())
@@ -2568,12 +2550,10 @@ mod tests {
         store.register_incarnation("krick-1", inc(0x0a)).unwrap();
         let mut alien = obs(7, &K1_S6, "L4", "s6", 3, 5, 1_000_000, 268_435_456, 0, 0);
         alien.partition.collection = "briefs".to_string();
-        assert!(
-            store
-                .ingest(alien)
-                .unwrap_err()
-                .contains("is not this resource")
-        );
+        assert!(store
+            .ingest(alien)
+            .unwrap_err()
+            .contains("is not this resource"));
     }
 
     #[test]
@@ -2629,18 +2609,14 @@ mod tests {
         // windows, which the constructor refuses by name.
         let mut cohort = input_a(&store, 118);
         cohort.cohort_length_ms = 700_000;
-        assert!(
-            TierSnapshot::validated(cohort)
-                .unwrap_err()
-                .contains("not a cohort window")
-        );
+        assert!(TierSnapshot::validated(cohort)
+            .unwrap_err()
+            .contains("not a cohort window"));
         let mut zero = input_a(&store, 118);
         zero.cohort_length_ms = 0;
-        assert!(
-            TierSnapshot::validated(zero)
-                .unwrap_err()
-                .contains("outside (0, 2^40]")
-        );
+        assert!(TierSnapshot::validated(zero)
+            .unwrap_err()
+            .contains("outside (0, 2^40]"));
     }
 
     #[test]
@@ -2650,29 +2626,23 @@ mod tests {
         // A complete copy on a device-local source refuses validation.
         let mut device = input_a(&store, 118);
         device.nodes.get_mut("pi5v3").unwrap().residency = NodeResidency::Device;
-        assert!(
-            TierSnapshot::validated(device)
-                .unwrap_err()
-                .contains("not server-resident")
-        );
+        assert!(TierSnapshot::validated(device)
+            .unwrap_err()
+            .contains("not server-resident"));
 
         // Unspecified residency refuses the same way.
         let mut unknown = input_a(&store, 118);
         unknown.nodes.get_mut("pi5v3").unwrap().residency = NodeResidency::Unspecified;
-        assert!(
-            TierSnapshot::validated(unknown)
-                .unwrap_err()
-                .contains("not server-resident")
-        );
+        assert!(TierSnapshot::validated(unknown)
+            .unwrap_err()
+            .contains("not server-resident"));
 
         // An ineligible node cannot hold a verified copy.
         let mut ineligible = input_a(&store, 118);
         ineligible.nodes.get_mut("pi5v3").unwrap().eligible = false;
-        assert!(
-            TierSnapshot::validated(ineligible)
-                .unwrap_err()
-                .contains("ineligible node")
-        );
+        assert!(TierSnapshot::validated(ineligible)
+            .unwrap_err()
+            .contains("ineligible node"));
 
         // Complete copies under different coverage digests cannot be one
         // source version.
@@ -2687,11 +2657,9 @@ mod tests {
             .unwrap()
             .copies[2]
             .coverage_digest = cov_l7();
-        assert!(
-            TierSnapshot::validated(forged)
-                .unwrap_err()
-                .contains("different coverage digests")
-        );
+        assert!(TierSnapshot::validated(forged)
+            .unwrap_err()
+            .contains("different coverage digests"));
 
         // A device node inside a server pool is never a destination.
         let mut store = ObservationStore::new(COHORT, 0, 1000, 1 << 20, 64, committed_view_m())
@@ -2807,23 +2775,21 @@ mod tests {
         tight_bytes
             .register_incarnation("krick-1", inc(0x0a))
             .unwrap();
-        assert!(
-            tight_bytes
-                .ingest(obs(
-                    7,
-                    &K1_S6,
-                    "L4",
-                    "s6",
-                    3,
-                    5,
-                    1_000_000,
-                    268_435_456,
-                    0,
-                    0
-                ))
-                .unwrap_err()
-                .contains("bound of 100 retained bytes")
-        );
+        assert!(tight_bytes
+            .ingest(obs(
+                7,
+                &K1_S6,
+                "L4",
+                "s6",
+                3,
+                5,
+                1_000_000,
+                268_435_456,
+                0,
+                0
+            ))
+            .unwrap_err()
+            .contains("bound of 100 retained bytes"));
     }
 
     #[test]
@@ -3024,53 +2990,41 @@ mod tests {
         );
         let mut behind_epoch = base();
         behind_epoch.shard.ownership_epoch = 4;
-        assert!(
-            store
-                .ingest(behind_epoch)
-                .unwrap_err()
-                .contains("ownership epoch 4 is not the committed 5")
-        );
+        assert!(store
+            .ingest(behind_epoch)
+            .unwrap_err()
+            .contains("ownership epoch 4 is not the committed 5"));
         let mut replaced = base();
         replaced.shard.storage_incarnation = inc(0xaa);
-        assert!(
-            store
-                .ingest(replaced)
-                .unwrap_err()
-                .contains("is not the committed")
-        );
+        assert!(store
+            .ingest(replaced)
+            .unwrap_err()
+            .contains("is not the committed"));
         let mut wrong_leaf = base();
         wrong_leaf.leaf = "L7".to_string();
-        assert!(
-            store
-                .ingest(wrong_leaf)
-                .unwrap_err()
-                .contains("covers no rows in leaf L7")
-        );
+        assert!(store
+            .ingest(wrong_leaf)
+            .unwrap_err()
+            .contains("covers no rows in leaf L7"));
         let mut wrong_shard = base();
         wrong_shard.shard.shard = "s9".to_string();
-        assert!(
-            store
-                .ingest(wrong_shard)
-                .unwrap_err()
-                .contains("not in the committed topology")
-        );
+        assert!(store
+            .ingest(wrong_shard)
+            .unwrap_err()
+            .contains("not in the committed topology"));
         let mut wrong_gen = base();
         wrong_gen.topology_generation = 10;
-        assert!(
-            store
-                .ingest(wrong_gen)
-                .unwrap_err()
-                .contains("topology_generation 10 is not the committed 9")
-        );
+        assert!(store
+            .ingest(wrong_gen)
+            .unwrap_err()
+            .contains("topology_generation 10 is not the committed 9"));
 
         let mut store2 = ObservationStore::new(COHORT, 0, 1000, 1 << 20, 64, committed_view_a())
             .expect("valid cohort config");
-        assert!(
-            store2
-                .ingest(base())
-                .unwrap_err()
-                .contains("has not registered an incarnation")
-        );
+        assert!(store2
+            .ingest(base())
+            .unwrap_err()
+            .contains("has not registered an incarnation"));
     }
 
     #[test]
@@ -3079,20 +3033,16 @@ mod tests {
             .expect("valid cohort config");
         store.register_incarnation("krick-1", inc(0x0a)).unwrap();
         let mut no_bytes = obs(7, &K1_S6, "L4", "s6", 3, 5, 1_000_000, 0, 0, 0);
-        assert!(
-            store
-                .ingest(no_bytes.clone())
-                .unwrap_err()
-                .contains("0 resident bytes")
-        );
+        assert!(store
+            .ingest(no_bytes.clone())
+            .unwrap_err()
+            .contains("0 resident bytes"));
         no_bytes.rows = 0;
         no_bytes.scans_observed = 5;
-        assert!(
-            store
-                .ingest(no_bytes)
-                .unwrap_err()
-                .contains("scans of 0 resident bytes")
-        );
+        assert!(store
+            .ingest(no_bytes)
+            .unwrap_err()
+            .contains("scans of 0 resident bytes"));
 
         let mut tight = ObservationStore::new(COHORT, 0, 1, 1 << 20, 64, committed_view_a())
             .expect("valid cohort config");
@@ -3277,10 +3227,8 @@ mod tests {
         let mut snapshot = snapshot_a(&store, 118);
         snapshot.policy.tiers[0].max_seconds_since_scan = u64::MAX;
         snapshot.policy.tiers[0].scans_per_byte_nanos_lo = 0;
-        assert!(
-            plan_tiers(&snapshot)
-                .unwrap_err()
-                .contains("warmth bound 18446744073709551615 s overflows milliseconds")
-        );
+        assert!(plan_tiers(&snapshot)
+            .unwrap_err()
+            .contains("warmth bound 18446744073709551615 s overflows milliseconds"));
     }
 }

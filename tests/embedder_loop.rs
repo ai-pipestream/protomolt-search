@@ -19,7 +19,8 @@ use common::fit_calibration;
 use pipestream_search::analyzer::body_spec;
 use pipestream_search::embedded::{EmbeddedSearch, EmbeddedSearchConfig, EmbeddedShardConfig};
 use pipestream_search::pb::{
-    AddDocumentsRequest, AddVectorsRequest, BroadcastCalibrationRequest, FusionMode, HybridLegOptions, HybridSearchRequest,
+    AddDocumentsRequest, AddVectorsRequest, BroadcastCalibrationRequest, FusionMode,
+    HybridLegOptions, HybridSearchRequest,
 };
 use protomolt_embedder::StaticEmbedder;
 
@@ -187,7 +188,10 @@ async fn embed_ingest_hybrid_loop() {
         .await
         .unwrap();
     assert_eq!(semantic.hits.len(), 2);
-    assert_eq!(semantic.hits[0].doc_id, 0, "mortgage doc must win on meaning");
+    assert_eq!(
+        semantic.hits[0].doc_id, 0,
+        "mortgage doc must win on meaning"
+    );
     assert_eq!(semantic.hits[0].vector_rank, Some(1));
     assert_eq!(
         semantic.hits[0].bm25_rank, None,

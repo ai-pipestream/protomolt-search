@@ -37,13 +37,13 @@ android {
 
 protobuf {
     protoc {
-        artifact = "com.google.protobuf:protoc:4.36.1"
+        artifact = "com.google.protobuf:protoc:4.36.2"
     }
 }
 
 dependencies {
     implementation(files(sdkAar))
-    implementation("com.google.protobuf:protobuf-java:4.36.1")
+    implementation("com.google.protobuf:protobuf-java:4.36.2")
 
     androidTestImplementation("androidx.test:core:1.7.0")
     androidTestImplementation("androidx.test:runner:1.7.0")
