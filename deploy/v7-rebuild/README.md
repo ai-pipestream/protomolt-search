@@ -13,7 +13,7 @@ configuration and mTLS client identity. Run `plan` with the actual host's disk
 headroom before `up`; the historical size measurements below are estimates,
 not a current capacity guarantee.
 
-The current `turbovec-pipestream-s22` lockfile pins `0ae3bd2b` (the s21 patch
+The current `turbovec-pipestream-s22` lockfile pins `28e5a111` (the s21 patch
 stack rebased onto upstream `c6cf0ba`, which adds upstream's faster 2-bit
 search), whose reader and writer use the v7 container. The normal loader refuses v5/v6 vector images.
 This v7 container is different from the abandoned per-block calibration branch
