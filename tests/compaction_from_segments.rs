@@ -668,7 +668,18 @@ async fn walless_catalog_compacts_into_partitions_while_writes_continue() {
     assert_eq!(response.layout, "segments");
     assert_eq!(response.partition_column, "num");
     assert_eq!(response.wal_generation, 0, "no log is rewritten");
-    assert_eq!(response.rows_before, N as u64);
+    // The writer starts before the compaction request, so a loaded host
+    // can land some of its rows before the cutoff seal; those are in the
+    // cutoff set. Every append is counted once, on one side or the other.
+    let before_cutoff = response
+        .rows_before
+        .checked_sub(N as u64)
+        .expect("the cutoff set holds every seeded row");
+    assert_eq!(
+        before_cutoff + response.tail_records_applied,
+        appends as u64,
+        "each append lands in the cutoff set or in a carried segment, once"
+    );
     assert_eq!(response.tombstones_reclaimed, doomed.len() as u64);
     assert!(
         response.tail_records_applied > 0,
@@ -676,7 +687,7 @@ async fn walless_catalog_compacts_into_partitions_while_writes_continue() {
     );
     assert_eq!(
         response.rows_after,
-        (N - doomed.len()) as u64 + response.tail_records_applied,
+        (N - doomed.len()) as u64 + before_cutoff + response.tail_records_applied,
     );
 
     // The layout: partition ranges, then the carried tail segments.
