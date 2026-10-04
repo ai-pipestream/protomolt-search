@@ -36,7 +36,7 @@ struct StageDirectory(PathBuf);
 impl StageDirectory {
     fn create(parent: &Path) -> Result<Arc<Self>, Status> {
         let mut random = [0u8; 16];
-        getrandom::getrandom(&mut random).map_err(|e| Status::internal(e.to_string()))?;
+        getrandom::fill(&mut random).map_err(|e| Status::internal(e.to_string()))?;
         let suffix: String = random.iter().map(|b| format!("{b:02x}")).collect();
         let path = parent.join(format!(".document-projection-{suffix}"));
         let mut builder = std::fs::DirBuilder::new();

@@ -50,7 +50,7 @@ struct Directory(PathBuf);
 impl Directory {
     fn create(parent: &Path) -> Result<Self, Status> {
         let mut random = [0u8; 16];
-        getrandom::getrandom(&mut random).map_err(failure)?;
+        getrandom::fill(&mut random).map_err(failure)?;
         let suffix: String = random.iter().map(|b| format!("{b:02x}")).collect();
         let path = parent.join(format!(".document-rewrite-{suffix}"));
         let mut builder = std::fs::DirBuilder::new();
