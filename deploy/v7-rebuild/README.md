@@ -13,9 +13,9 @@ configuration and mTLS client identity. Run `plan` with the actual host's disk
 headroom before `up`; the historical size measurements below are estimates,
 not a current capacity guarantee.
 
-The current `turbovec-pipestream-s21` lockfile pins `3cce294e` (s20 `0c6cf820` plus
-bounded stored-row reads for the rewrite proof), whose reader and
-writer use the v7 container. The normal loader refuses v5/v6 vector images.
+The current `turbovec-pipestream-s22` lockfile pins `0ae3bd2b` (the s21 patch
+stack rebased onto upstream `c6cf0ba`, which adds upstream's faster 2-bit
+search), whose reader and writer use the v7 container. The normal loader refuses v5/v6 vector images.
 This v7 container is different from the abandoned per-block calibration branch
 that originally gave this directory its name. Calibration is one explicit
 shared shift/scale pair: fit once and seed every shard from the same
