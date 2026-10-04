@@ -63,6 +63,13 @@ const CUTOVER_RETRIES: usize = 16;
 /// makes no progress and no later pass will: the refusal names it at
 /// once instead of after the pass cap.
 const STALLED_TAIL_PASSES: u64 = 8;
+/// How long a segment seal waits for a two-call append (AddDocuments,
+/// then AddVectors for the same rows) caught between its calls to land
+/// its vectors before the misaligned tail is refused by name. A loaded
+/// host can stretch the gap between the two calls well past a second.
+const PAIRED_APPEND_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// The pause between those checks.
+const PAIRED_APPEND_PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
 /// Concurrent analysis streams the build and tail open per spec.
 const ANALYSIS_STREAMS: usize = 2;
 /// The commit marker's format, for a reader that finds a newer one.
@@ -2046,9 +2053,8 @@ impl NodeServiceImpl {
     /// mid-row the way the closing flush waits it out. Returns the rows
     /// the seal covered, 0 when there was nothing to seal.
     fn seal_tail_wait(&self) -> Result<u64, Status> {
-        const ATTEMPTS: usize = 200;
-        const PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
-        for attempt in 1..=ATTEMPTS {
+        let deadline = Instant::now() + PAIRED_APPEND_WAIT;
+        loop {
             let (pending, frozen) = {
                 let guard = crate::node::read_shard(&self.state);
                 let (documents, vectors) = match guard.bm25.as_ref() {
@@ -2070,21 +2076,36 @@ impl NodeServiceImpl {
             if pending == 0 && !frozen {
                 return Ok(0);
             }
-            match self.seal_tail() {
+            // Paired: a fresh tail holding a document whose vectors have
+            // not arrived yet is that same mid-row append; sealing it
+            // would strand the document without its vectors.
+            match self.seal_tail_paired() {
                 Ok(_) => return Ok(pending),
                 Err(status)
-                    if attempt < ATTEMPTS
+                    if Instant::now() < deadline
                         && status.code() == tonic::Code::FailedPrecondition
                         && status
                             .message()
                             .contains("a segment's artifacts cover the same rows") =>
                 {
-                    std::thread::sleep(PAUSE);
+                    std::thread::sleep(PAIRED_APPEND_PAUSE);
                 }
                 Err(status) => return Err(status),
             }
         }
-        unreachable!("the last attempt returns")
+    }
+
+    /// The tail holds documents whose vectors have not arrived: a
+    /// two-call append between its calls, which only the writer can
+    /// finish (see `ShardService::seal_tail_paired`).
+    fn tail_awaits_vectors(guard: &ShardState) -> bool {
+        let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
+            return false;
+        };
+        let Some(provider) = guard.index.as_ref().and_then(VectorIndex::as_segmented) else {
+            return false;
+        };
+        shard.frozen().is_none() && shard.tail().next_doc_id() as usize > provider.tail().len()
     }
 
     /// The tail is empty on both legs and no seal is in flight.
@@ -2152,17 +2173,29 @@ impl NodeServiceImpl {
     ) -> Result<CompactShardResponse, Status> {
         // The cutoff seal: the current tail joins the sealed set, so the
         // cutoff is the sealed catalog and only later writes are caught
-        // up. Writes continue; nothing here locks them out.
+        // up. Writes continue; nothing here locks them out, so the tail
+        // may already hold rows again when the set is read: those are
+        // later writes, which the catch-up seals and the cutover carries
+        // as segments past the cutoff set. The seal lock keeps a seal
+        // from publishing between the set and the overlay read.
         self.seal_tail_wait()?;
         {
+            let _seal = self.seal_lock.lock().expect("seal lock poisoned");
             let guard = crate::node::read_shard(&self.state);
             let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
                 return Err(Status::internal(
                     "the shard changed layout while a compaction was starting",
                 ));
             };
-            if !Self::segment_tail_is_clear(&guard) {
-                return Err(Status::internal("the cutoff seal left an unsealed tail"));
+            let vectors_frozen = guard
+                .index
+                .as_ref()
+                .and_then(VectorIndex::as_segmented)
+                .is_some_and(|p| p.frozen().is_some());
+            if shard.frozen().is_some() || vectors_frozen {
+                return Err(Status::internal(
+                    "a frozen tail part is unpublished at the cutoff",
+                ));
             }
             pre.set = shard.snapshot().clone();
             pre.overlay = guard.live_docs.clone();
@@ -2250,10 +2283,26 @@ impl NodeServiceImpl {
         // The cutover. Reserve commits first: with the gate held, no
         // write but a gate-bypassing one can land, and the fence below
         // catches those. The seal lock keeps a seal from racing the
-        // manifest read.
-        let _mutation = self.mutation_gate.blocking_write();
+        // manifest read. The gate is taken per attempt: a two-call append
+        // caught between its calls cannot land its vectors while the gate
+        // is held, so the attempt releases the gate until it has.
         let mut attempt = 0usize;
-        let (write_lock_ms, carried_rows) = loop {
+        let pair_deadline = Instant::now() + PAIRED_APPEND_WAIT;
+        let (write_lock_ms, carried_rows, _mutation) = loop {
+            let mutation = self.mutation_gate.blocking_write();
+            if Self::tail_awaits_vectors(&crate::node::read_shard(&self.state)) {
+                drop(mutation);
+                if Instant::now() >= pair_deadline {
+                    crate::segments::remove_segment_dirs(&root, &staged);
+                    return Err(Status::failed_precondition(format!(
+                        "the tail holds documents whose vectors did not arrive within {}s; \
+                         send AddVectors for each AddDocuments batch, then retry the compaction",
+                        PAIRED_APPEND_WAIT.as_secs()
+                    )));
+                }
+                std::thread::sleep(PAIRED_APPEND_PAUSE);
+                continue;
+            }
             attempt += 1;
             self.seal_tail_wait()?;
             let _seal = self.seal_lock.lock().expect("seal lock poisoned");
@@ -2292,7 +2341,7 @@ impl NodeServiceImpl {
             }
             let carried_rows = prepared.carried_rows;
             match self.install_segments(pre, prepared, &mut guard) {
-                Ok(()) => break (started.elapsed().as_millis() as u64, carried_rows),
+                Ok(()) => break (started.elapsed().as_millis() as u64, carried_rows, mutation),
                 Err(status) => return Err(status),
             }
         };
