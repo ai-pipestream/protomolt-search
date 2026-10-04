@@ -2233,7 +2233,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -2646,7 +2646,7 @@ dependencies = [
 [[package]]
 name = "turbovec-grpc"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turbovec-grpc.git?rev=58dd535#58dd535353d818fd44d1895ef2653d8af8cebf84"
+source = "git+https://github.com/ai-pipestream/turbovec-grpc.git?rev=e2d59de#e2d59debcf25a4ca25f7e2c12eadc798a4476aae"
 dependencies = [
  "crc32fast",
  "prost",
