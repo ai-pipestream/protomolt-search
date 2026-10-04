@@ -11,8 +11,8 @@ exclude = ["sidecars/route-cost"]
 resolver = "2"
 
 [dependencies]
-turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "turbovec-pipestream-s21" }
-turbovec-grpc = { git = "https://github.com/ai-pipestream/turbovec-grpc.git", rev = "4c8827b", optional = true }
+turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "turbovec-pipestream-s22" }
+turbovec-grpc = { git = "https://github.com/ai-pipestream/turbovec-grpc.git", rev = "e2d59de", optional = true }
 # Control consensus (docs/raft-control-design.md). Pinned exactly: the
 # storage-v2 contracts are what the log store and state machine implement,
 # and the typed envelopes map to this version's types explicitly.
