@@ -121,7 +121,9 @@ async fn ready(inbound: &mut tonic::Streaming<StreamSearchResponse>) {
                 assert_eq!(batch.hits.len() % 12, 0);
                 assert!(batch
                     .hits
-                    .chunks_exact(12)
+                    .as_chunks::<12>()
+                    .0
+                    .iter()
                     .all(|row| u64::from_le_bytes(row[..8].try_into().unwrap()) != 101));
             }
             response::Payload::IdentityReady(ready) => {

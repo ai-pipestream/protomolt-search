@@ -4869,6 +4869,9 @@ fn open_vocab(config: &NodeConfig) -> Option<Arc<crate::vocab::VocabularyListene
 
 /// Raise a floor cell (f32 bits) to `floor` if that is higher. Monotone
 /// under any interleaving of the gRPC and UDP lanes; NaN is ignored.
+// fetch_update is deprecated in favor of try_update from Rust 1.99, but the
+// Pi binaries are built on 1.97, which lacks try_update.
+#[allow(deprecated)]
 fn raise_floor_cell(cell: &std::sync::atomic::AtomicU32, floor: f32) {
     if floor.is_nan() {
         return;
