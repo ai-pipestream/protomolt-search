@@ -601,8 +601,7 @@ async fn the_fleet_map_migrates_into_a_group_that_survives_the_exercise() {
     )
     .await
     .expect("the leader answers inside 20 s")
-    .err()
-    .expect("an image with changed bytes was installed");
+    .expect_err("an image with changed bytes was installed");
     assert_eq!(rejected.code(), Code::DataLoss, "{rejected}");
     mark("the changed image is rejected at the replacement by name");
     tokio::time::timeout(Duration::from_secs(20), async {

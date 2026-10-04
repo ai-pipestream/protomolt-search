@@ -10,6 +10,9 @@
 //! convention: the group needs the mTLS transport, and the log-line
 //! assertion needs the rejection ring).
 #![cfg(all(feature = "raft", feature = "tls", feature = "fault-injection"))]
+// Every test holds the target-wide `serial()` guard for its whole body,
+// across awaits, on purpose.
+#![allow(clippy::await_holding_lock)]
 
 mod control_adversarial;
 
@@ -480,8 +483,7 @@ async fn a_membership_change_on_a_follower_is_rejected_naming_the_leader() {
             addr: "127.0.0.1:50151".to_string(),
         })
         .await
-        .err()
-        .expect("a follower takes no membership change");
+        .expect_err("a follower takes no membership change");
     assert_eq!(rejected.code(), Code::Unavailable, "{rejected}");
     assert!(
         rejected.message().contains(&leader.to_string()),
@@ -510,8 +512,7 @@ async fn an_operator_call_without_a_client_certificate_is_rejected_by_name() {
     let rejected = operator_client(&leader_server.addr, None)
         .get_member_status(GetMemberStatusRequest {})
         .await
-        .err()
-        .expect("a call without a client certificate is refused");
+        .expect_err("a call without a client certificate is refused");
     assert_eq!(rejected.code(), Code::Unauthenticated, "{rejected}");
     assert!(
         rejected.message().contains("client certificate"),
@@ -621,8 +622,7 @@ async fn a_peer_rejection_is_reported_over_the_route_and_on_the_metrics_page() {
     let rejected = client
         .add_learner(AddLearnerRequest { node_id: 2, addr })
         .await
-        .err()
-        .expect("an image whose bytes changed installs nowhere");
+        .expect_err("an image whose bytes changed installs nowhere");
     assert_eq!(rejected.code(), Code::DataLoss, "{rejected}");
     assert!(rejected.message().contains("digest"), "{rejected}");
 

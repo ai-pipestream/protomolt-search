@@ -51,6 +51,7 @@ pub(crate) const RAFT_META: &str = "raft";
 /// first snapshot: log entries refuse to apply until the leader's image
 /// replaces the file, so a member never replays onto its own genesis.
 pub(crate) const MEMBER_META: &str = "member";
+#[cfg_attr(not(feature = "raft"), allow(dead_code))]
 const MEMBER_PENDING: &[u8] = b"awaiting-snapshot";
 const OWNERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("source_authority_owners");
 const DECISIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("source_authority_decisions");
@@ -60,6 +61,7 @@ const CLOSED: &str = "source authority storage failed; close every clone and reo
 #[cfg(any(test, feature = "fault-injection"))]
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 enum Fault {
     BeforeCommit,
     AfterCommit,
@@ -113,6 +115,7 @@ struct Inner {
     // The boolean permanently closes the instance after a storage failure.
     closed: Mutex<bool>,
     identity: SourceAuthorityIdentity,
+    #[cfg_attr(not(feature = "raft"), allow(dead_code))]
     path: PathBuf,
     // Raft hosting: while hosted, the direct command paths refuse and only
     // the committed-replay paths apply, each writing the pending applied
@@ -504,6 +507,7 @@ enum OwnerAdmission<'a> {
     /// The hosting adapter's held binding, checked before the transition.
     Holder(&'a VerifiedOwnerCompletion),
     /// A command from the committed log, replayed as committed evidence.
+    #[cfg_attr(not(feature = "raft"), allow(dead_code))]
     Committed,
 }
 
@@ -706,6 +710,7 @@ impl SourceAuthorityStore {
     /// Apply a command that a trusted proposal already admitted: the
     /// committed-log path. A ConfirmReady replays without the managed
     /// binding; every other check runs against the committed rows.
+    #[cfg_attr(not(feature = "raft"), allow(dead_code))]
     pub(crate) fn replay_command(
         &self,
         principal: &str,
@@ -754,7 +759,7 @@ impl SourceAuthorityStore {
         let header = SourceAuthorityHeader {
             format_version: 1,
             identity: Some(identity.clone()),
-            limits: Some(limits.clone()),
+            limits: Some(*limits),
             control_revision: 1,
             payload_bytes: policy.encoded_len() as u64,
             ..Default::default()
@@ -783,6 +788,7 @@ impl SourceAuthorityStore {
     /// The store of a member that will be seeded by the group's snapshot:
     /// a bootstrap image marked pending, on which no log entry applies
     /// until the leader's image replaces it (docs/raft-hosting.md).
+    #[cfg_attr(not(feature = "raft"), allow(dead_code))]
     pub(crate) fn create_member(
         path: &Path,
         identity: &SourceAuthorityIdentity,
@@ -802,6 +808,7 @@ impl SourceAuthorityStore {
 
     /// Whether this store is a prepared member still waiting for the
     /// group's first snapshot.
+    #[cfg_attr(not(feature = "raft"), allow(dead_code))]
     pub(crate) fn awaiting_snapshot(&self) -> Result<bool, Status> {
         self.guarded(|| {
             let tx = self.inner.database().begin_read().map_err(storage)?;
@@ -915,6 +922,7 @@ impl SourceAuthorityStore {
     }
 
     /// The committed policy revision and control revision of a database.
+    #[cfg_attr(not(feature = "raft"), allow(dead_code))]
     fn revisions_of(database: &Database) -> Result<(u64, u64), Status> {
         let tx = database.begin_read().map_err(storage)?;
         let meta = tx.open_table(META).map_err(storage)?;
@@ -1017,7 +1025,7 @@ impl SourceAuthorityStore {
             )?;
             contract::policy(&policy).map_err(corrupt)?;
             recovery::header(&header, &self.inner.identity)?;
-            let limits = header.limits.clone().ok_or_else(|| missing("limits"))?;
+            let limits = header.limits.ok_or_else(|| missing("limits"))?;
             contract::command(command, &self.inner.identity, &limits)?;
             let key = command.key.as_ref().ok_or_else(|| missing("command key"))?;
             contract::authorize(&policy, principal, key)?;
@@ -1242,6 +1250,7 @@ impl SourceAuthorityStore {
 
     /// Proposal admission of a readiness confirmation, the same checks the
     /// direct path performs before its transition, as a read.
+    #[cfg_attr(not(feature = "raft"), allow(dead_code))]
     pub(crate) fn proposal_admits_readiness(
         &self,
         principal: &str,
@@ -1345,6 +1354,7 @@ impl SourceAuthorityStore {
 
     /// Mark the store as Raft-hosted; the direct command paths refuse from
     /// here on. The host owns proposal admission.
+    #[cfg_attr(not(feature = "raft"), allow(dead_code))]
     pub(crate) fn set_raft_hosted(&self) {
         self.inner.hosted.store(true, Ordering::Release);
     }
@@ -1355,6 +1365,7 @@ impl SourceAuthorityStore {
 
     /// Run one committed-replay application with `applied` recorded in the
     /// same transaction. The state machine applies entries one at a time.
+    #[cfg_attr(not(feature = "raft"), allow(dead_code))]
     pub(crate) fn raft_apply<T>(
         &self,
         applied: RaftApplied,
@@ -1368,6 +1379,7 @@ impl SourceAuthorityStore {
 
     /// Record an applied position with no application change: blank and
     /// membership entries, and entries refused at their envelope.
+    #[cfg_attr(not(feature = "raft"), allow(dead_code))]
     pub(crate) fn apply_raft_position(&self, applied: &RaftApplied) -> Result<(), Status> {
         let _exclusive = self.exclusive()?;
         self.guarded(|| {
@@ -1384,6 +1396,7 @@ impl SourceAuthorityStore {
     }
 
     /// The applied Raft position recorded with the last applied entry.
+    #[cfg_attr(not(feature = "raft"), allow(dead_code))]
     pub(crate) fn raft_applied(&self) -> Result<Option<RaftApplied>, Status> {
         self.guarded(|| {
             let tx = self.inner.database().begin_read().map_err(storage)?;
@@ -1398,6 +1411,7 @@ impl SourceAuthorityStore {
     /// Hold every store transaction off while `run` reads the file: the
     /// snapshot builder copies a consistent image. The applied position is
     /// read under the same hold, so image and position agree.
+    #[cfg_attr(not(feature = "raft"), allow(dead_code))]
     pub(crate) fn quiesced<T>(
         &self,
         run: impl FnOnce(&Path, Option<RaftApplied>) -> Result<T, Status>,
@@ -1424,6 +1438,7 @@ impl SourceAuthorityStore {
     /// held or not, observes the installed state on its next operation, and
     /// the policy and applied watches publish the installed revisions. On
     /// any refusal nothing changed and the handle serves as before.
+    #[cfg_attr(not(feature = "raft"), allow(dead_code))]
     pub(crate) fn replace_from(&self, staged: &Path) -> Result<(), Status> {
         let _exclusive = self.exclusive()?;
         let mut closed = self

@@ -942,6 +942,7 @@ async fn run_online_compaction(layout: Layout) {
     let final_rows: Vec<Row> = tracked.lock().unwrap().live.values().cloned().collect();
     let verify_sources = |reader: &pipestream_search::postings::Bm25Reader| {
         use pipestream_search::postings::Bm25Index;
+        #[allow(clippy::type_complexity)]
         let mut keyed: BTreeMap<Vec<u8>, Vec<(u32, u64, Option<u32>)>> = BTreeMap::new();
         for local in 0..reader.next_doc_id() {
             let text = reader.text(local).unwrap();

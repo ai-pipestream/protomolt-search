@@ -2647,6 +2647,7 @@ impl Drop for ShardLegs {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum ShardEvent {
     Child(usize, Result<Option<SearchShardResponse>, Status>),
     Parent(Option<Result<SearchShardRequest, Status>>),

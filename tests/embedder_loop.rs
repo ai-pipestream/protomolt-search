@@ -73,9 +73,7 @@ fn synthetic_model_dir() -> PathBuf {
     let mut rows = Vec::with_capacity(WORDS.len() * DIM);
     for (_, base, private) in WORDS {
         let mut row = [0.0f32; DIM];
-        for d in base..base + 4 {
-            row[d] = 1.0;
-        }
+        row[base..base + 4].fill(1.0);
         row[private] = 0.5;
         rows.extend_from_slice(&row);
     }
@@ -182,7 +180,7 @@ async fn embed_ingest_hybrid_loop() {
             vector: embedder.embed("home loan").unwrap(),
             k: 2,
             analysis: Some(body_spec()),
-            legs: legs.clone(),
+            legs,
             ..Default::default()
         })
         .await

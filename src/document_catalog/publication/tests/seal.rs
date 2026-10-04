@@ -425,7 +425,6 @@ async fn accept_racing_seal_has_one_serialized_winner() {
                 operation_id: b"race-accept".to_vec(),
                 expected_version: Some(0),
                 mutation: Some(Mutation::Delete(true)),
-                ..Default::default()
             })
         })
     };

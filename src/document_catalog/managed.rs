@@ -5,6 +5,7 @@ use crate::pb::storage::{PreparedSourceOwnerPhase, SourceManagedActivation, Sour
 #[cfg(all(any(test, feature = "fault-injection"), feature = "net"))]
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy)]
+#[allow(clippy::enum_variant_names)]
 pub(super) enum BindFault {
     BeforeCommit,
     AfterCommit,

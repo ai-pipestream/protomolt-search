@@ -411,9 +411,8 @@ fn incompatible_wrapper_descriptors_refuse_projection_but_remain_describable() {
         }
         let bytes = set.encode_to_vec();
         pipestream_search::mapping::describe_schema(&bytes, "wrapper_fixture.Record").unwrap();
-        let error = derive_plan(&bytes, "wrapper_fixture.Record")
-            .err()
-            .expect("invalid wrapper shape");
+        let error =
+            derive_plan(&bytes, "wrapper_fixture.Record").expect_err("invalid wrapper shape");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
         assert!(
             error.message().contains("signed") && error.message().contains("wrapper"),
@@ -876,8 +875,7 @@ async fn wrapper_lifecycle(explicit: bool) {
 fn identity_roles_require_an_exact_value_projection_during_planning() {
     for name in ["BadId", "BadTextId", "BadChunked"] {
         let error = derive_plan(DESCRIPTOR, &format!("wrapper_fixture.{name}"))
-            .err()
-            .expect("unusable identity plan");
+            .expect_err("unusable identity plan");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
         assert!(
             error.message().contains("id") || error.message().contains("ID"),

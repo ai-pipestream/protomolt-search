@@ -108,33 +108,27 @@ fn failure_after_rename_latches_every_clone_until_an_explicit_reopen() {
         .recv_timeout(Duration::from_secs(5))
         .expect("cross-thread clone read remained blocked after the persistence failure");
     checking.join().unwrap();
-    let original_read = plane.plan().err().expect("original must be latched");
+    let original_read = plane.plan().expect_err("original must be latched");
     let clone_topology = clone
         .topology_routes()
-        .err()
-        .expect("clone topology read must be latched");
+        .expect_err("clone topology read must be latched");
     let clone_mutation = clone
         .register(registration("b"), 100)
-        .err()
-        .expect("clone mutation must be latched");
+        .expect_err("clone mutation must be latched");
     let service = ClusterControlService::new(clone.clone());
     let service_admission = service
         .admit("")
-        .err()
-        .expect("service admission must observe the latch");
+        .expect_err("service admission must observe the latch");
     let service_publication = service
         .publish_current_topology()
-        .err()
-        .expect("topology publication must observe the latch without a coordinator");
+        .expect_err("topology publication must observe the latch without a coordinator");
 
     assert_eq!(disk.revision, 2);
     assert!(disk.nodes.contains_key("a"));
     for error in [
         original_read,
         clone_topology,
-        cross_thread_result
-            .err()
-            .expect("cross-thread clone must be latched"),
+        cross_thread_result.expect_err("cross-thread clone must be latched"),
         clone_mutation,
         service_admission,
         service_publication,
@@ -164,8 +158,7 @@ fn failure_after_rename_latches_every_clone_until_an_explicit_reopen() {
     );
     let still_latched = latched
         .plan()
-        .err()
-        .expect("old clone must remain latched before recovery");
+        .expect_err("old clone must remain latched before recovery");
     assert_eq!(still_latched.code(), tonic::Code::FailedPrecondition);
     drop(service);
     drop(latched);
@@ -214,8 +207,7 @@ fn collection_binding_after_rename_requires_an_explicit_reopen() {
     let disk_collection = dir.stored().collection;
     let refused = observer
         .plan()
-        .err()
-        .expect("shared instance must be latched");
+        .expect_err("shared instance must be latched");
 
     assert_eq!(disk_collection, "books");
     assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
@@ -334,8 +326,10 @@ fn open_existing_refuses_missing_corrupt_and_wrong_format_without_side_effects()
     assert_eq!(std::fs::read(&corrupt).unwrap(), corrupt_bytes);
 
     let wrong_format = dir.0.join("wrong-format.json");
-    let mut invalid = StoredState::default();
-    invalid.format = 99;
+    let invalid = StoredState {
+        format: 99,
+        ..StoredState::default()
+    };
     let wrong_format_bytes = serde_json::to_vec_pretty(&invalid).unwrap();
     std::fs::write(&wrong_format, &wrong_format_bytes).unwrap();
     let format_error = DurableControlPlane::open_existing(&wrong_format, ControlPolicy::default())

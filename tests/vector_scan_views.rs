@@ -621,7 +621,6 @@ async fn relay_read_routes_preserve_scoped_receipts_through_two_levels() {
                 prefix: "wo".into(),
                 visibility: visibility.clone(),
                 max_scan: 100,
-                ..Default::default()
             })
             .await
             .unwrap()

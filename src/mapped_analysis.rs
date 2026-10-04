@@ -145,6 +145,62 @@ pub(crate) fn valid_digest(digest: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn contract_digest(bytes: &[u8]) -> String {
+    let mut hasher = crate::sha256::Sha256::new();
+    hasher.update(b"protomolt.search.mapped-analysis.v1\0");
+    hasher.update(bytes);
+    crate::sha256::to_hex(&hasher.finalize())
+}
+
+pub(crate) fn decode_contract(
+    digest: &str,
+    bytes: &[u8],
+    body_path: &str,
+) -> Result<crate::pb::MappedAnalysisContract, String> {
+    if digest.is_empty() && bytes.is_empty() {
+        return Ok(crate::pb::MappedAnalysisContract::default());
+    }
+    if !valid_digest(digest) || digest != contract_digest(bytes) {
+        return Err("invalid mapped analysis digest or contract".into());
+    }
+    let contract = crate::pb::MappedAnalysisContract::decode(bytes)
+        .map_err(|e| format!("invalid mapped analysis contract: {e}"))?;
+    if contract.encode_to_vec() != bytes {
+        return Err("noncanonical mapped analysis contract".into());
+    }
+    let mut names = std::collections::BTreeSet::new();
+    let mut previous = None;
+    let mut body = false;
+    for field in &contract.fields {
+        if field.path.is_empty()
+            || field.name.is_empty()
+            || previous.is_some_and(|p| p >= field.path.as_str())
+            || !names.insert(&field.name)
+        {
+            return Err(
+                "mapped analysis paths must be sorted and unique, and column names unique".into(),
+            );
+        }
+        previous = Some(field.path.as_str());
+        if field.name == "body" {
+            body = field.path == body_path;
+        } else if field.path == body_path {
+            return Err("mapped analysis body path names another column".into());
+        }
+        validate_spec(
+            field
+                .analysis
+                .as_ref()
+                .ok_or("mapped analysis column lacks a spec")?,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    if !body {
+        return Err("mapped analysis contract lacks its bound body".into());
+    }
+    Ok(contract)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,60 +333,4 @@ mod tests {
         let resolved = resolve(&bind).unwrap(); // Valid sidecar SIMPLE tokenizer.
         assert!(resolved.validate_native().is_err());
     }
-}
-
-fn contract_digest(bytes: &[u8]) -> String {
-    let mut hasher = crate::sha256::Sha256::new();
-    hasher.update(b"protomolt.search.mapped-analysis.v1\0");
-    hasher.update(bytes);
-    crate::sha256::to_hex(&hasher.finalize())
-}
-
-pub(crate) fn decode_contract(
-    digest: &str,
-    bytes: &[u8],
-    body_path: &str,
-) -> Result<crate::pb::MappedAnalysisContract, String> {
-    if digest.is_empty() && bytes.is_empty() {
-        return Ok(crate::pb::MappedAnalysisContract::default());
-    }
-    if !valid_digest(digest) || digest != contract_digest(bytes) {
-        return Err("invalid mapped analysis digest or contract".into());
-    }
-    let contract = crate::pb::MappedAnalysisContract::decode(bytes)
-        .map_err(|e| format!("invalid mapped analysis contract: {e}"))?;
-    if contract.encode_to_vec() != bytes {
-        return Err("noncanonical mapped analysis contract".into());
-    }
-    let mut names = std::collections::BTreeSet::new();
-    let mut previous = None;
-    let mut body = false;
-    for field in &contract.fields {
-        if field.path.is_empty()
-            || field.name.is_empty()
-            || previous.is_some_and(|p| p >= field.path.as_str())
-            || !names.insert(&field.name)
-        {
-            return Err(
-                "mapped analysis paths must be sorted and unique, and column names unique".into(),
-            );
-        }
-        previous = Some(field.path.as_str());
-        if field.name == "body" {
-            body = field.path == body_path;
-        } else if field.path == body_path {
-            return Err("mapped analysis body path names another column".into());
-        }
-        validate_spec(
-            field
-                .analysis
-                .as_ref()
-                .ok_or("mapped analysis column lacks a spec")?,
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    if !body {
-        return Err("mapped analysis contract lacks its bound body".into());
-    }
-    Ok(contract)
 }

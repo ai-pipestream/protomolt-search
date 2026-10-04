@@ -780,6 +780,7 @@ struct LegResults {
 /// ingest, and the disk-resident mmap reader used after Flush and on
 /// startup. Once resident, a shard holds no postings or document texts
 /// in heap — only the small per-doc tables.
+#[allow(clippy::large_enum_variant)]
 pub enum Bm25Shard {
     /// Heap builder (small or append ingests; searchable mid-build).
     Building(Bm25Store),
@@ -1834,6 +1835,7 @@ impl Bm25Shard {
     /// must not pay for it twice. Range edges are validated by
     /// [`validate_range_facet_fields`] before this runs.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::type_complexity)]
     fn count_facets(
         &self,
         views: &[(&dyn Bm25Index, &[String])],
@@ -5236,22 +5238,19 @@ fn run_scan_batch(
                 continue;
             }
         };
-        match receipt {
-            Some(receipt) => {
-                if job
-                    .ready_tx
-                    .blocking_send(Ok(SearchShardResponse {
-                        payload: Some(search_shard_response::Payload::ReadReady(receipt)),
-                    }))
-                    .is_err()
-                {
-                    let _ = job
-                        .done
-                        .send(Err(Status::cancelled("scoped scan response closed")));
-                    continue;
-                }
+        if let Some(receipt) = receipt {
+            if job
+                .ready_tx
+                .blocking_send(Ok(SearchShardResponse {
+                    payload: Some(search_shard_response::Payload::ReadReady(receipt)),
+                }))
+                .is_err()
+            {
+                let _ = job
+                    .done
+                    .send(Err(Status::cancelled("scoped scan response closed")));
+                continue;
             }
-            None => {}
         }
         prunes.push(prune);
         knowns.push(filter_known_flags(
@@ -6915,7 +6914,7 @@ impl NodeServiceImpl {
                 .index
                 .as_ref()
                 .and_then(VectorIndex::as_segmented)
-                .is_some_and(|provider| provider.tail().len() != 0 || provider.frozen().is_some());
+                .is_some_and(|provider| !provider.tail().is_empty() || provider.frozen().is_some());
         Ok(FlushResponse {
             path: vector_path.display().to_string(),
             num_vectors,
@@ -13390,7 +13389,7 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                         .await;
                     return;
                 }
-                let identity_limits = start.identity_limits.clone();
+                let identity_limits = start.identity_limits;
                 let identity_timeout = match identity_limits.as_ref()
                     .map(crate::query_identity::validate_limits).transpose() {
                     Ok(timeout) => timeout,
@@ -13671,7 +13670,7 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                                 .map_err(|e| Status::internal(format!("identity request task failed: {e}")))??;
                             match selection {
                                 Some(selection) => {
-                                    let limits = limits.clone();
+                                    let limits = *limits;
                                     let cancelled = Arc::clone(&signals);
                                     let response = tokio::task::spawn_blocking(move || {
                                         identities.resolve_until(selection, &limits,
@@ -16344,6 +16343,7 @@ fn filter_leaf_domains(
 pub static BOOLEAN_MUST_SHORT_CIRCUIT_SKIPS: AtomicU64 = AtomicU64::new(0);
 
 /// One leaf's slot in a resolving evaluation.
+#[allow(clippy::large_enum_variant)]
 enum LeafSlot {
     Todo,
     Done(EvaluatedLeaf),
@@ -18367,7 +18367,7 @@ mod vector_scan_view_tests {
         }
         let mut index =
             crate::vector::VectorIndex::create(crate::vector::EMBEDDED_TURBOVEC, 16, 4).unwrap();
-        index.add(&vec![0.25; 48], 16).unwrap(); // final row has no document metadata
+        index.add(&[0.25; 48], 16).unwrap(); // final row has no document metadata
         let node = NodeServiceImpl::new(Some(index), Default::default())
             .with_bm25(Some(Bm25Shard::Building(store)));
         let mut jobs = Vec::new();
@@ -18694,7 +18694,7 @@ mod filter_domain_tests {
             stats: crate::segment_prune::PruneStats::default(),
             mask: None,
         };
-        let passes = |slot: u32| slot % 3 == 0;
+        let passes = |slot: u32| slot.is_multiple_of(3);
         let full = fill_allowlist(n, &prune, passes);
         let mut domain = Bits::empty(n as usize);
         for slot in (0..n as usize).step_by(7) {

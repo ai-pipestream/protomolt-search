@@ -186,6 +186,7 @@ pub(super) enum Admission {
     /// The hosting adapter's retirement holder, checked before the transition.
     Holder(AdmittedRetirement),
     /// A command from the committed log, replayed as committed evidence.
+    #[cfg_attr(not(feature = "raft"), allow(dead_code))]
     Committed,
 }
 
@@ -396,6 +397,7 @@ impl SourceAuthorityStore {
 
     /// Proposal admission of an import step: a Begin needs the retirement
     /// holder and its digests must match; every other step needs no holder.
+    #[cfg_attr(not(feature = "raft"), allow(dead_code))]
     pub(crate) fn proposal_admits_import(
         &self,
         principal: &str,
@@ -448,6 +450,7 @@ impl SourceAuthorityStore {
     /// committed-log path. It needs no holder and touches no file beyond the
     /// store; every digest and identity check runs against the committed
     /// evidence the command and the workflow row carry.
+    #[cfg_attr(not(feature = "raft"), allow(dead_code))]
     pub(crate) fn replay_control_import(
         &self,
         principal: &str,

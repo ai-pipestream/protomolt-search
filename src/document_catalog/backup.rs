@@ -124,7 +124,7 @@ impl DocumentCatalog {
         }
         let mut capture = CapturedBackup {
             source,
-            limits: limits.clone(),
+            limits: *limits,
             indexes: Vec::new(),
             files: Vec::new(),
             paths: BTreeSet::new(),

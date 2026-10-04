@@ -61,7 +61,7 @@ struct Policy {
 
 impl Policy {
     fn validate(input: AccessPolicy) -> Result<Self, String> {
-        if !matches!(input.format_version, 1 | 2 | 3) {
+        if !matches!(input.format_version, 1..=3) {
             return Err(format!(
                 "unsupported access policy format_version {}; expected 1, 2 or 3",
                 input.format_version

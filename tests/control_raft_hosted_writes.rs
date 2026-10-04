@@ -12,6 +12,9 @@
 //! write service itself serves plain loopback HTTP here with a bearer
 //! principal; in production it registers on the process's secured listener.
 #![cfg(all(feature = "raft", feature = "tls", feature = "fault-injection"))]
+// Every test holds the target-wide `serial()` guard for its whole body,
+// across awaits, on purpose.
+#![allow(clippy::await_holding_lock)]
 
 mod control_adversarial;
 
@@ -885,7 +888,7 @@ async fn a_member_restarted_with_its_managed_catalogs_serves_writes_again() {
             // have run.
             let no_lease = host.lease("alice").await.err().expect("no quorum");
             assert_eq!(no_lease.code(), Code::Unavailable, "{no_lease}");
-            let recovered = recover_catalogs(&host, "alice", &[entry.clone()]).unwrap();
+            let recovered = recover_catalogs(&host, "alice", std::slice::from_ref(&entry)).unwrap();
             recovered_without_a_leader = Some(recovered.len());
         }
         cluster.insert(*node, host);

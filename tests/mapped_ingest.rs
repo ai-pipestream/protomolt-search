@@ -1995,9 +1995,7 @@ fn timestamp_projection_rejects_incompatible_named_descriptors() {
         // These are valid user-defined protobuf schemas. They can be retained
         // and described, but their name must not confer Timestamp projection.
         describe_schema(&bytes, "law.v1.Case").unwrap();
-        let error = derive_plan(&bytes, "law.v1.Case")
-            .err()
-            .expect("invalid Timestamp shape");
+        let error = derive_plan(&bytes, "law.v1.Case").expect_err("invalid Timestamp shape");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
         assert!(error.message().contains("created_at"), "{change}: {error}");
         assert!(error.message().contains("Timestamp"), "{change}: {error}");

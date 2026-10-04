@@ -181,7 +181,7 @@ fn validate_transition(
     }
     let retired = before
         .document_retirements(&info.document_key, 65536)
-        .map_err(|e| Status::failed_precondition(e))?;
+        .map_err(Status::failed_precondition)?;
     for i in 0..before.len() {
         let mut expected = before.metadata(i).clone();
         let actual = after.metadata(i);

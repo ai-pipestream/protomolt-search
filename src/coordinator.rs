@@ -3423,6 +3423,7 @@ impl CoordinatorServiceImpl {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn query_stream_attempt(
         &self,
         query: crate::pb::QueryRequest,
@@ -7952,7 +7953,7 @@ impl CoordinatorServiceImpl {
                         collapse_parents,
                         geo_filters: filters.geo.clone(),
                         filter: Self::shard_filter_tree(filters, mask.as_ref(), shard),
-                        identity_limits: identity_limits.clone(),
+                        identity_limits,
                     })),
                 })
                 .expect("fresh channel accepts the Start message");
@@ -8120,7 +8121,7 @@ impl CoordinatorServiceImpl {
             initial_floor,
             false,
             filters,
-            Some(identity_limits.clone()),
+            Some(identity_limits),
         )?;
 
         // The global top-k: a max-heap whose top is the WORST survivor
@@ -14629,6 +14630,7 @@ fn variant_text(variant: &crate::pb::SearchVariant) -> &str {
 mod stream_cancel_tests {
     use super::*;
 
+    #[allow(clippy::type_complexity)]
     fn identity_fanout() -> (
         StreamFanout,
         mpsc::Sender<(usize, Result<Option<StreamSearchResponse>, Status>)>,

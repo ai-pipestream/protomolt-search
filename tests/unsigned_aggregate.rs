@@ -83,10 +83,7 @@ fn expected(rows: &[Option<u64>]) -> Vec<(u64, Option<A>)> {
     ]
 }
 fn check_results(actual: &[pb::AggregateResult], rows: &[Option<u64>]) {
-    let actual: Vec<_> = actual
-        .iter()
-        .map(|r| (r.present, r.value.clone()))
-        .collect();
+    let actual: Vec<_> = actual.iter().map(|r| (r.present, r.value)).collect();
     assert_eq!(actual, expected(rows));
 }
 fn check_response(response: &pb::AggregateResponse, rows: &[Option<u64>]) {

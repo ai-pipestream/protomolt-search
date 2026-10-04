@@ -17,6 +17,9 @@
 //! raft,fault-injection -- --test-threads=1` (the target holds a
 //! target-wide serial lock, so any `--test-threads` value is safe).
 #![cfg(all(feature = "raft", feature = "tls"))]
+// Every test holds the target-wide `serial()` guard for its whole body,
+// across awaits, on purpose.
+#![allow(clippy::await_holding_lock)]
 
 mod control_adversarial;
 
@@ -488,8 +491,7 @@ async fn r2_exact_retry_advances_durable_applied_position() {
     let refusal = guard
         .propose_command("alice", &changed)
         .await
-        .err()
-        .expect("a changed-content retry must refuse");
+        .expect_err("a changed-content retry must refuse");
     assert_eq!(refusal.code(), Code::FailedPrecondition);
     raft_kit::wait_applied(&guard, 3).await;
 

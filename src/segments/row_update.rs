@@ -74,6 +74,7 @@ impl SegmentCatalog {
 
     /// Source versions may produce zero rows. Still commit their epoch and
     /// reviewed binding, with the source journal prepared under this fence.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_projection_prepared<T>(
         &self,
         expected_epoch: u64,
@@ -185,6 +186,7 @@ impl SegmentCatalog {
         Ok((published, context))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn commit_row_transaction<T>(
         &self,
         expected_epoch: u64,

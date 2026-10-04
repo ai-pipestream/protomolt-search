@@ -61,7 +61,7 @@ fn service(principals: Principals) -> (CoordinatorDiagnostics, Vec<CoordinatorSe
             (
                 name.to_string(),
                 CoordinatorServiceImpl::new(Vec::new())
-                    .with_collection(name.into())
+                    .with_collection(name)
                     .with_max_k(50),
             )
         })

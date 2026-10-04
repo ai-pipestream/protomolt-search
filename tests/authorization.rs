@@ -162,6 +162,8 @@ async fn each_public_unary_route_enforces_its_declared_action() {
     let set = set(Arc::new(PolicyAuthority::new(policy()).unwrap()));
     macro_rules! refuses {
         ($principal:expr; $($method:ident : $request:ident),+ $(,)?) => { $(
+            // Some requests carry only `collection`; the update is for the rest.
+            #[allow(clippy::needless_update)]
             let error = SearchService::$method(&set, request($request { collection: "a".into(), ..Default::default() }, $principal)).await.err().unwrap();
             assert_eq!(error.code(), Code::PermissionDenied, "{}: {}", stringify!($method), error);
         )+ };

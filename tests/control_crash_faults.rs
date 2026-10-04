@@ -777,6 +777,7 @@ fn expected_binding(
 ///   ACTIVE on the control side), recovered and activatable;
 /// - activate after -> format 10, recovered directly through
 ///   `ActiveManagedCatalog::recover`.
+///
 /// All four recovered catalogs serve the next write at sequence 2.
 #[test]
 fn crash_managed_bind_and_activate_boundaries() {

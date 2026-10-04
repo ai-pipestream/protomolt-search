@@ -222,7 +222,6 @@ mod tests {
                 documented.push(first);
             }
         }
-        let mut documented = documented;
         documented.sort();
         documented.dedup();
         let mut constants: Vec<String> = ALL
