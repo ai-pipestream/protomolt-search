@@ -83,7 +83,6 @@ fn record(clock: u64, text: &str) -> Vec<u8> {
                 ..Default::default()
             },
         )),
-        ..Default::default()
     }
     .encode_to_vec()
 }
@@ -257,7 +256,7 @@ fn pages_are_byte_bounded_and_pin_their_prefix_across_later_appends() {
     let mut request = page(0);
     request.max_bytes = a.encoded_len() as u64;
     let initial = journal.read(&request).unwrap();
-    assert_eq!(initial.frames, [a.clone()]);
+    assert_eq!(initial.frames, std::slice::from_ref(&a));
     assert!(!initial.complete);
     journal.accept(&c).unwrap();
     request.after_sequence = initial.next_sequence;

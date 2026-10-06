@@ -238,7 +238,7 @@ fn cluster_columns(
         }],
         vec![TimestampValue {
             field: "decided".to_string(),
-            value: Some(m.decided.clone()),
+            value: Some(m.decided),
         }],
     )
 }

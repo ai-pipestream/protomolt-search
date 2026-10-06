@@ -359,7 +359,7 @@ fn unsigned_keys_and_reported_values_round_trip_without_narrowing() {
         let decoded = pb::SortKey::decode(wire.encode_to_vec().as_slice()).unwrap();
         assert_eq!(Key::from_pb(&decoded), Some(key.clone()));
         assert_eq!(
-            sortkeys::decode_keys(&sortkeys::encode_keys(&[key.clone()])),
+            sortkeys::decode_keys(&sortkeys::encode_keys(std::slice::from_ref(&key))),
             Some(vec![key])
         );
         let wire = Value::UnsignedInteger(n).to_pb();

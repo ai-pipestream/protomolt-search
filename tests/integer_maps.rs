@@ -234,8 +234,8 @@ fn integer_maps_translate_keys_across_sealed_frozen_and_mutable_parts() {
                     values.iter().map(|e| e.2).max().unwrap()
                 ))
             );
-            for other in 0..count {
-                if rows[other].0 != key {
+            for (other, entry) in rows.iter().enumerate().take(count) {
+                if entry.0 != key {
                     assert_eq!(shard.map_integer_value(0, sk, other as u32), None);
                     assert_eq!(shard.map_unsigned_integer_value(0, uk, other as u32), None);
                 }

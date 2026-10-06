@@ -195,8 +195,7 @@ fn retirement_preserves_exact_checkpoint_and_retries_after_authority_revision_ch
     for plane in [&legacy, &clone] {
         let error = plane
             .checkpoint_for_import()
-            .err()
-            .expect("retirement must close every clone");
+            .expect_err("retirement must close every clone");
         assert_eq!(error.code(), Code::FailedPrecondition);
         assert!(error.message().contains("retired"), "{error}");
     }

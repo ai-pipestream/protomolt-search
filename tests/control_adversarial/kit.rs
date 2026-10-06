@@ -275,7 +275,7 @@ pub fn supplement(checkpoint: &LegacyControlCheckpoint) -> LegacyControlImportSu
         policy: Some(ControlPlannerPolicy {
             format_version: 1,
             planner_version: 1,
-            control: Some(checkpoint.policy().clone()),
+            control: Some(*checkpoint.policy()),
         }),
         history_placement_unavailable: true,
     }
@@ -935,6 +935,7 @@ pub fn expire_transition(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn observation(
     node: &str,
     incarnation: u8,

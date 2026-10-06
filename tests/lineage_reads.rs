@@ -393,7 +393,7 @@ async fn lineage_collector_refuses_legacy_metadata_unrequested_keys_and_rows() {
             4 => bad.fields.clear(),
             5 => bad.parents[0].group_id = 99,
             6 => bad.parents[0].doc_id = 1,
-            _ => bad.parents.push(bad.parents[0].clone()),
+            _ => bad.parents.push(bad.parents[0]),
         }
         *reply.lock().unwrap() = bad;
         assert_eq!(

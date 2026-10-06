@@ -583,6 +583,7 @@ pub fn current_vote(host: &RaftHost) -> RaftVote {
 }
 
 /// One chunk of `image` at `offset` under `meta`.
+#[allow(clippy::too_many_arguments)]
 pub fn chunk_request(
     group: &SourceAuthorityIdentity,
     from: u64,
@@ -595,7 +596,7 @@ pub fn chunk_request(
 ) -> RaftInstallSnapshotRequest {
     RaftInstallSnapshotRequest {
         header: Some(header(group, from, to)),
-        vote: Some(vote.clone()),
+        vote: Some(*vote),
         meta: Some(meta.clone()),
         offset: offset as u64,
         data: data.to_vec(),
@@ -705,9 +706,9 @@ impl Deref for HostGuard {
 impl Drop for HostGuard {
     fn drop(&mut self) {
         if let (Some(host), Ok(handle)) = (self.0.take(), tokio::runtime::Handle::try_current()) {
-            let _ = handle.spawn(async move {
+            drop(handle.spawn(async move {
                 let _ = host.shutdown().await;
-            });
+            }));
         }
     }
 }

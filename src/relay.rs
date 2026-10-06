@@ -162,6 +162,9 @@ impl RelaySignals {
         self.cancel.notify_one();
     }
 
+    // fetch_update is deprecated in favor of try_update from Rust 1.99, but the
+    // Pi binaries are built on 1.97, which lacks try_update.
+    #[allow(deprecated)]
     fn accept_seq(&self, seq: u32) -> bool {
         self.last_seq
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |last| {
@@ -2647,6 +2650,7 @@ impl Drop for ShardLegs {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum ShardEvent {
     Child(usize, Result<Option<SearchShardResponse>, Status>),
     Parent(Option<Result<SearchShardRequest, Status>>),

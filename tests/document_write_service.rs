@@ -435,8 +435,7 @@ async fn authorization_history_contract_and_transport_limits_refuse_before_write
     );
     let handler = DocumentWriteService::accept_document(&direct, auth(oversized, "writer-a"))
         .await
-        .err()
-        .expect("handler must enforce its own request byte limit");
+        .expect_err("handler must enforce its own request byte limit");
     assert_eq!(handler.code(), Code::ResourceExhausted);
     assert!(handler.message().contains("max_request_bytes"), "{handler}");
     let accepted = client
@@ -812,7 +811,7 @@ async fn revoked_after_admission_suppresses_receipt_but_exact_retry_replays_comm
         "revocation was not published during the admitted commit"
     );
     assert!(replacement_was_pending);
-    let suppressed = response.err().expect("revoked receipt was disclosed");
+    let suppressed = response.expect_err("revoked receipt was disclosed");
     assert_eq!(suppressed.code(), Code::PermissionDenied);
     assert!(!gated.timed_out.load(Ordering::Acquire));
     replacement.unwrap().unwrap();

@@ -688,10 +688,12 @@ async fn public_query_collapse_refuses_lineage_from_a_replacement_lifetime() {
         )
         .await
         .unwrap();
-        service.before_reads.lock().unwrap().insert(
-            "ResolveParents".into(),
-            [Some(node(&["rust", "rust"]).await)].into(),
-        );
+        let replacement = node(&["rust", "rust"]).await;
+        service
+            .before_reads
+            .lock()
+            .unwrap()
+            .insert("ResolveParents".into(), [Some(replacement)].into());
         let error = SearchService::query(&coordinator(address), tonic::Request::new(query))
             .await
             .unwrap_err();

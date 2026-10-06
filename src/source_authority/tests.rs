@@ -97,6 +97,7 @@ fn target(node: &str, seed: u8, residency: SourceResidency) -> SourceStorageTarg
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare(
     authority: &SourceAuthorityIdentity,
     owner: LogicalSourceOwner,

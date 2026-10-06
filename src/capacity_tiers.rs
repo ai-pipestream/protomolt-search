@@ -2015,6 +2015,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn obs(
         bucket: u64,
         spec: &CopySpec,
@@ -2562,6 +2563,7 @@ mod tests {
         let base = snapshot_a(&store, 118).plan_digest();
         assert_eq!(hex32(&base), PLAN_A_HEX);
 
+        #[allow(clippy::type_complexity)]
         let mutators: Vec<(&str, fn(&mut TierSnapshotInput))> = vec![
             ("capacity", |i| {
                 i.nodes.get_mut("krick-1").unwrap().capacity.total_bytes = 1;

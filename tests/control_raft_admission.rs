@@ -17,6 +17,9 @@
 //! `raft_kit::host_config` (lease 100 ms, skew 50 ms, election
 //! 150/300 ms); every sleep is computed from those values.
 #![cfg(all(feature = "raft", feature = "tls", feature = "fault-injection"))]
+// Every test holds the target-wide `serial()` guard for its whole body,
+// across awaits, on purpose.
+#![allow(clippy::await_holding_lock)]
 
 mod control_adversarial;
 
@@ -446,7 +449,7 @@ async fn paused_grant_resumed_within_interval_is_granted() {
             .authorize(kit::COLLECTION, AccessAction::Ingest)
             .expect("the granted admission authorizes");
         std::thread::sleep(lease.ttl + Duration::from_millis(50));
-        let error = admission.check_fresh().err().expect("past the deadline");
+        let error = admission.check_fresh().expect_err("past the deadline");
         assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
         assert!(
             error.message().contains("lease expired"),
@@ -706,8 +709,7 @@ async fn write_paused_during_revocation_is_refused_and_epoch_fenced() {
                 .expect("the committed epoch admits");
             let error = admission
                 .admit_write(&kit::owner_key(), 2, AccessAction::Ingest)
-                .err()
-                .expect("a stale epoch must refuse");
+                .expect_err("a stale epoch must refuse");
             assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
             assert!(
                 error.message().contains("the fence has moved"),

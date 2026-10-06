@@ -410,7 +410,6 @@ fn acceptance_racing_retirement_is_serialized_at_one_captured_watermark() {
                 operation_id: b"racing-accept".to_vec(),
                 expected_version: Some(0),
                 mutation: Some(Mutation::Delete(true)),
-                ..Default::default()
             })
         })
     };

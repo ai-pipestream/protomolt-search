@@ -26,7 +26,7 @@ fn request(sequence: u64) -> AcceptDocumentRequest {
         document_key: b"key\0one".to_vec(),
         operation_id: sequence.to_be_bytes().to_vec(),
         expected_version: Some(sequence - 1),
-        mutation: Some(if sequence % 3 == 0 {
+        mutation: Some(if sequence.is_multiple_of(3) {
             Mutation::Delete(true)
         } else {
             Mutation::Source(ProtobufSource {

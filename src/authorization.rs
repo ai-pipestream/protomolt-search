@@ -61,7 +61,7 @@ struct Policy {
 
 impl Policy {
     fn validate(input: AccessPolicy) -> Result<Self, String> {
-        if !matches!(input.format_version, 1 | 2 | 3) {
+        if !matches!(input.format_version, 1..=3) {
             return Err(format!(
                 "unsupported access policy format_version {}; expected 1, 2 or 3",
                 input.format_version
@@ -230,6 +230,9 @@ impl PolicyEpoch {
     }
 
     // The caller must retain the publication read lock until admission returns.
+    // fetch_update is deprecated in favor of try_update from Rust 1.99, but the
+    // Pi binaries are built on 1.97, which lacks try_update.
+    #[allow(deprecated)]
     fn admit(self: &Arc<Self>, decision: AccessDecision) -> Result<PolicyGuard, Status> {
         self.active
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
@@ -268,6 +271,9 @@ impl AuthorizationGuard for PolicyGuard {
     }
 }
 impl Drop for PolicyGuard {
+    // fetch_update is deprecated in favor of try_update from Rust 1.99, but the
+    // Pi binaries are built on 1.97, which lacks try_update.
+    #[allow(deprecated)]
     fn drop(&mut self) {
         let previous = self
             .epoch

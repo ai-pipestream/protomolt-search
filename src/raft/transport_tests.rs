@@ -1080,7 +1080,7 @@ async fn an_idle_snapshot_transfer_is_dropped_and_its_place_freed() {
     let chunk = |from: NodeId, offset: usize, data: &[u8], done: bool| {
         timed(RaftInstallSnapshotRequest {
             header: Some(header(&group, from, 2)),
-            vote: Some(vote.clone()),
+            vote: Some(vote),
             meta: Some(meta.clone()),
             offset: offset as u64,
             data: data.to_vec(),

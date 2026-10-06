@@ -667,10 +667,10 @@ mod tests {
             dim,
             table_bytes
         );
-        if weights.is_some() {
+        if let Some(w) = weights {
             header.push_str(&format!(
                 r#","weights":{{"dtype":"F32","shape":[{}],"data_offsets":[{},{}]}}"#,
-                weights.unwrap().len(),
+                w.len(),
                 table_bytes,
                 table_bytes + weights_bytes
             ));

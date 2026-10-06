@@ -836,6 +836,7 @@ fn hosted_write_service(
     Ok(Some(service))
 }
 
+#[cfg_attr(not(feature = "raft"), allow(dead_code))]
 fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {

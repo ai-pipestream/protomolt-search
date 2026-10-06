@@ -27,6 +27,9 @@
 //! raft,fault-injection -- --test-threads=1` (the target holds a
 //! target-wide serial lock, so any `--test-threads` value is safe).
 #![cfg(all(feature = "raft", feature = "tls"))]
+// Every test holds the target-wide `serial()` guard for its whole body,
+// across awaits, on purpose.
+#![allow(clippy::await_holding_lock)]
 
 mod control_adversarial;
 
@@ -844,8 +847,7 @@ async fn r5_announced_length_is_enforced_while_receiving() {
             true,
         )))
         .await
-        .err()
-        .expect("R5 REQUIRED the announced length to be enforced while receiving");
+        .expect_err("R5 REQUIRED the announced length to be enforced while receiving");
     assert_eq!(error.code(), Code::InvalidArgument, "{error}");
     assert!(error.message().contains("announced length"), "{error}");
     assert!(
@@ -1024,8 +1026,7 @@ async fn snapshot_admission_refuses_invalid_transfers_without_stopping_the_core(
     let error = peer
         .install_snapshot(chunk(&huge, 0, &image[..1024], false))
         .await
-        .err()
-        .expect("an oversized announcement must refuse");
+        .expect_err("an oversized announcement must refuse");
     assert_eq!(error.code(), Code::ResourceExhausted, "{error}");
     assert!(error.message().contains("image bound"), "{error}");
     intact("oversized");
@@ -1036,8 +1037,7 @@ async fn snapshot_admission_refuses_invalid_transfers_without_stopping_the_core(
     let error = cluster
         .push(&forged, &image_b)
         .await
-        .err()
-        .expect("foreign image refused");
+        .expect_err("foreign image refused");
     assert!(
         error.message().contains("group") || error.message().contains("incarnation"),
         "{error}"
@@ -1048,8 +1048,7 @@ async fn snapshot_admission_refuses_invalid_transfers_without_stopping_the_core(
     let error = cluster
         .push(&newer, &image[..image.len() / 2])
         .await
-        .err()
-        .expect("a truncated transfer must refuse");
+        .expect_err("a truncated transfer must refuse");
     assert!(error.message().contains("announced"), "{error}");
     intact("truncated");
 
@@ -1058,8 +1057,7 @@ async fn snapshot_admission_refuses_invalid_transfers_without_stopping_the_core(
     let error = cluster
         .push(&wrong, &image)
         .await
-        .err()
-        .expect("wrong membership refused");
+        .expect_err("wrong membership refused");
     assert!(error.message().contains("membership"), "{error}");
     intact("membership");
 
@@ -1071,8 +1069,7 @@ async fn snapshot_admission_refuses_invalid_transfers_without_stopping_the_core(
     let error = peer
         .install_snapshot(chunk(&newer, 4096, &image[4096..8192], false))
         .await
-        .err()
-        .expect("a first chunk at a nonzero offset refused");
+        .expect_err("a first chunk at a nonzero offset refused");
     assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
     assert!(
         error.message().contains("continues no transfer at node"),
@@ -1095,8 +1092,7 @@ async fn snapshot_admission_refuses_invalid_transfers_without_stopping_the_core(
     let error = cluster
         .push(&other_id, &image)
         .await
-        .err()
-        .expect("a renamed image fails its position check");
+        .expect_err("a renamed image fails its position check");
     assert!(error.message().contains("applied position"), "{error}");
     intact("superseded");
 
@@ -1107,8 +1103,7 @@ async fn snapshot_admission_refuses_invalid_transfers_without_stopping_the_core(
     let error = peer
         .install_snapshot(chunk(&wrong, 4096, &image[4096..8192], false))
         .await
-        .err()
-        .expect("a changed meta must refuse");
+        .expect_err("a changed meta must refuse");
     assert_eq!(error.code(), Code::InvalidArgument, "{error}");
     assert!(error.message().contains("changed"), "{error}");
     intact("meta changed");
@@ -1133,8 +1128,7 @@ async fn snapshot_admission_refuses_invalid_transfers_without_stopping_the_core(
             false,
         )))
         .await
-        .err()
-        .expect("another peer cannot continue a bound transfer");
+        .expect_err("another peer cannot continue a bound transfer");
     assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
     assert!(error.message().contains("bound to node 3"), "{error}");
     let error = other
@@ -1149,8 +1143,7 @@ async fn snapshot_admission_refuses_invalid_transfers_without_stopping_the_core(
             false,
         )))
         .await
-        .err()
-        .expect("another peer cannot start a transfer under the same vote");
+        .expect_err("another peer cannot start a transfer under the same vote");
     assert_eq!(error.code(), Code::Unavailable, "{error}");
     assert!(error.message().contains("in progress"), "{error}");
     assert!(raft_kit::core_running(cluster.member()));
@@ -1316,8 +1309,7 @@ async fn the_leader_keeps_serving_a_peer_that_rejects_its_seed_with_backoff() {
     )
     .await
     .expect("the leader answers inside 10 s")
-    .err()
-    .expect("the learner was seeded past its bound");
+    .expect_err("the learner was seeded past its bound");
     assert_eq!(rejected.code(), Code::ResourceExhausted, "{rejected}");
 
     let mut crossings = Vec::new();
@@ -1385,8 +1377,7 @@ async fn a_peer_rejected_at_its_bound_is_seeded_after_a_restart_under_a_larger_b
     )
     .await
     .expect("the leader answers inside 10 s")
-    .err()
-    .expect("the learner was seeded past its bound");
+    .expect_err("the learner was seeded past its bound");
     assert_eq!(rejected.code(), Code::ResourceExhausted, "{rejected}");
     assert_eq!(cluster.member().metrics().borrow().last_log_index, None);
     assert!(cluster.member().awaiting_snapshot().unwrap());
@@ -1462,8 +1453,7 @@ async fn a_chunk_past_the_announced_length_drops_the_transfer_and_the_next_one_i
             true,
         )))
         .await
-        .err()
-        .expect("a chunk past the announced length is rejected");
+        .expect_err("a chunk past the announced length is rejected");
     assert_eq!(rejected.code(), Code::InvalidArgument, "{rejected}");
     assert!(
         rejected.message().contains(&format!(
@@ -1521,8 +1511,7 @@ async fn a_served_image_with_changed_bytes_is_rejected_at_the_receiver_and_named
     )
     .await
     .expect("the leader answers inside 20 s")
-    .err()
-    .expect("an image whose bytes changed was installed");
+    .expect_err("an image whose bytes changed was installed");
     assert_eq!(rejected.code(), Code::DataLoss, "{rejected}");
     assert!(rejected.message().contains("digest"), "{rejected}");
     assert!(
@@ -1677,8 +1666,7 @@ async fn a_store_image_over_a_peers_bound_is_rejected_at_that_peer_with_both_cor
     let rejected = cluster
         .push(&meta, &image)
         .await
-        .err()
-        .expect("the peer rejects an image over its bound");
+        .expect_err("the peer rejects an image over its bound");
     assert_eq!(rejected.code(), Code::ResourceExhausted, "{rejected}");
     assert!(
         rejected
@@ -1702,8 +1690,7 @@ async fn a_store_image_over_a_peers_bound_is_rejected_at_that_peer_with_both_cor
     .await;
     let rejected = outcome
         .expect("the leader answers inside 10 s")
-        .err()
-        .expect("the learner was seeded past its bound");
+        .expect_err("the learner was seeded past its bound");
     assert_eq!(rejected.code(), Code::ResourceExhausted, "{rejected}");
     assert!(
         rejected

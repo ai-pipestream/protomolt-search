@@ -193,7 +193,7 @@ async fn ambiguous_and_invalid_map_score_operations_refuse_before_reading() {
 }
 
 fn value(id: u64) -> Option<f64> {
-    (id % 5 != 0).then_some((id % 101) as f64 - 50.0)
+    (!id.is_multiple_of(5)).then_some((id % 101) as f64 - 50.0)
 }
 fn effect(stage: &pb::ScoreStage, x: f64) -> (bool, f64) {
     let Some(pb::score_stage::Operation::MapOp(map)) = &stage.operation else {

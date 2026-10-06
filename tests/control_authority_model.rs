@@ -529,14 +529,8 @@ fn gen_retry(rng: &mut XorShift64, issued: &[Generated]) -> Generated {
     if rng.chance(45) {
         // Exact retry: same actor, same bytes.
         let (cmd, op) = match &base.cmd {
-            IssuedCmd::Source(c) => (
-                IssuedCmd::Source(c.clone()),
-                model_op_for_source(&actor, &c),
-            ),
-            IssuedCmd::Import(c) => (
-                IssuedCmd::Import(c.clone()),
-                model_op_for_import(&actor, &c),
-            ),
+            IssuedCmd::Source(c) => (IssuedCmd::Source(c.clone()), model_op_for_source(&actor, c)),
+            IssuedCmd::Import(c) => (IssuedCmd::Import(c.clone()), model_op_for_import(&actor, c)),
         };
         return Generated {
             actor,
