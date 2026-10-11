@@ -223,6 +223,213 @@ pub fn wordpiece(
 const MAX_TOKENIZER_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SAFETENSORS_HEADER_BYTES: usize = 64 * 1024 * 1024;
 
+fn io_error(path: &Path, error: impl fmt::Display) -> LoadError {
+    LoadError::Io(format!("{}: {error}", path.display()))
+}
+
+/// Reads and size-bounds `tokenizer.json`; the file is parsed fully in
+/// memory, so its size is bounded before allocation.
+fn read_tokenizer_json(dir: &Path) -> Result<serde_json::Value, LoadError> {
+    let tok_path = dir.join("tokenizer.json");
+    let tok_len = std::fs::metadata(&tok_path)
+        .map_err(|e| io_error(&tok_path, e))?
+        .len();
+    if tok_len > MAX_TOKENIZER_BYTES {
+        return Err(LoadError::Format(format!(
+            "{}: {tok_len} bytes exceeds the {MAX_TOKENIZER_BYTES}-byte tokenizer limit",
+            tok_path.display()
+        )));
+    }
+    let tok: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&tok_path).map_err(|e| io_error(&tok_path, e))?,
+    )
+    .map_err(|e| LoadError::Format(format!("{}: {e}", tok_path.display())))?;
+    Ok(tok)
+}
+
+/// Refuses anything but the exact tokenizer family this implementation
+/// reproduces. A different normalizer or prefix would not fail — it would
+/// produce silently different vectors, so it must not load.
+fn validate_tokenizer_family(tok: &serde_json::Value) -> Result<(), LoadError> {
+    let model = &tok["model"];
+    if model["type"] != "WordPiece" {
+        return Err(LoadError::Format(format!(
+            "tokenizer model {} is not WordPiece",
+            model["type"]
+        )));
+    }
+    if model["continuing_subword_prefix"] != "##" {
+        return Err(LoadError::Format(
+            "continuing_subword_prefix is not ##".into(),
+        ));
+    }
+    let norm = &tok["normalizer"];
+    if norm["type"] != "BertNormalizer"
+        || norm["clean_text"] != true
+        || norm["handle_chinese_chars"] != true
+        || !norm["strip_accents"].is_null()
+        || norm["lowercase"] != true
+    {
+        return Err(LoadError::Format(format!("unsupported normalizer {norm}")));
+    }
+    if tok["pre_tokenizer"]["type"] != "BertPreTokenizer" {
+        return Err(LoadError::Format(
+            "pre_tokenizer is not BertPreTokenizer".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Parses the vocab object into the piece-to-row map. The map must be a
+/// bijection: two pieces naming one row would make added-token and unk
+/// resolution ambiguous.
+fn parse_vocab(model: &serde_json::Value) -> Result<HashMap<String, u32>, LoadError> {
+    let vocab_json = model["vocab"]
+        .as_object()
+        .ok_or_else(|| LoadError::Format("vocab is not an object".into()))?;
+    let mut vocab: HashMap<String, u32> = HashMap::with_capacity(vocab_json.len());
+    for (piece, id) in vocab_json {
+        let id = id
+            .as_u64()
+            .filter(|&v| v <= u64::from(u32::MAX))
+            .ok_or_else(|| LoadError::Format(format!("vocab id for {piece:?} is not a u32")))?
+            as u32;
+        vocab.insert(piece.clone(), id);
+    }
+    let mut seen_ids = std::collections::HashSet::with_capacity(vocab.len());
+    for (piece, &id) in &vocab {
+        if !seen_ids.insert(id) {
+            return Err(LoadError::Format(format!(
+                "vocab id {id} is claimed by more than one piece ({piece:?})"
+            )));
+        }
+    }
+    Ok(vocab)
+}
+
+/// Resolves `[UNK]` through the vocabulary map by content, never by trusting
+/// a numeric id space, and collects the special-token ids. The added-token
+/// overlay may alias a vocab piece, but it must not contradict it: an id
+/// that disagrees with the vocabulary is a packaging bug, not a variant to
+/// tolerate.
+fn resolve_special_tokens(
+    model: &serde_json::Value,
+    tok: &serde_json::Value,
+    vocab: &HashMap<String, u32>,
+) -> Result<(u32, Vec<u32>), LoadError> {
+    let unk = model["unk_token"]
+        .as_str()
+        .ok_or_else(|| LoadError::Format("missing unk_token".into()))?;
+    let unk_id = *vocab
+        .get(unk)
+        .ok_or_else(|| LoadError::Format(format!("unk token {unk:?} not in vocab")))?;
+    let mut special = Vec::new();
+    if let Some(added) = tok["added_tokens"].as_array() {
+        for entry in added {
+            let id = entry["id"]
+                .as_u64()
+                .filter(|&v| v <= u64::from(u32::MAX))
+                .ok_or_else(|| {
+                    LoadError::Format("added_tokens entry with a missing or invalid id".into())
+                })? as u32;
+            let content = entry["content"]
+                .as_str()
+                .ok_or_else(|| LoadError::Format("added_tokens entry without content".into()))?;
+            if let Some(&vocab_id) = vocab.get(content) {
+                if vocab_id != id {
+                    return Err(LoadError::Format(format!(
+                        "added_tokens id {id} for {content:?} disagrees with vocab id {vocab_id}"
+                    )));
+                }
+            }
+            if entry["special"].as_bool().unwrap_or(false) {
+                special.push(id);
+            }
+        }
+    }
+    Ok((unk_id, special))
+}
+
+/// Mmaps `model.safetensors`. The table never fully loads; pages are clean
+/// and evictable, which is what a mobile host wants from a 100 MB-class
+/// asset.
+fn open_safetensors(dir: &Path) -> Result<memmap2::Mmap, LoadError> {
+    let st_path = dir.join("model.safetensors");
+    let file = std::fs::File::open(&st_path).map_err(|e| io_error(&st_path, e))?;
+    // SAFETY: the file is only read after this, and every read range is
+    // bounds-checked against the mapping before it is used.
+    let table = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| io_error(&st_path, e))?;
+    if table.len() < 8 {
+        return Err(LoadError::Format(
+            "safetensors shorter than its length header".into(),
+        ));
+    }
+    Ok(table)
+}
+
+/// Parses the safetensors JSON header and returns it with the absolute file
+/// offset where tensor data begins. The header length is bounded before the
+/// slice is taken.
+fn parse_safetensors_header(table: &[u8]) -> Result<(serde_json::Value, usize), LoadError> {
+    let header_len = u64::from_le_bytes(table[0..8].try_into().unwrap()) as usize;
+    if header_len > MAX_SAFETENSORS_HEADER_BYTES {
+        return Err(LoadError::Format(format!(
+            "safetensors header of {header_len} bytes exceeds the {MAX_SAFETENSORS_HEADER_BYTES}-byte limit"
+        )));
+    }
+    let header: serde_json::Value = serde_json::from_slice(
+        table
+            .get(8..8 + header_len)
+            .ok_or_else(|| LoadError::Format("safetensors header exceeds file".into()))?,
+    )
+    .map_err(|e| LoadError::Format(format!("safetensors header: {e}")))?;
+    Ok((header, 8 + header_len))
+}
+
+/// Iterates the little-endian f32 values of a tensor byte range that
+/// `tensor_region` has already bounds-checked.
+fn read_f32_chunks(table: &[u8], offset: usize, bytes: usize) -> impl Iterator<Item = f32> + '_ {
+    table[offset..offset + bytes]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
+}
+
+/// Loads the optional per-token `weights` tensor. Weights must be finite
+/// and non-negative; anything else would poison every pooled vector.
+fn load_weights(
+    header: &serde_json::Value,
+    table: &[u8],
+    header_end: usize,
+    table_len: usize,
+    rows: usize,
+) -> Result<Option<Vec<f32>>, LoadError> {
+    match header.get("weights") {
+        Some(tensor) if !tensor.is_null() => {
+            let (wshape, woffset, wbytes) =
+                tensor_region(header, "weights", 1, header_end, table_len)?;
+            if wshape[0] != rows {
+                return Err(LoadError::Format(format!(
+                    "weights length {} != table rows {rows}",
+                    wshape[0]
+                )));
+            }
+            let mut values = Vec::with_capacity(wshape[0]);
+            for w in read_f32_chunks(table, woffset, wbytes) {
+                if !w.is_finite() || w < 0.0 {
+                    return Err(LoadError::Format(
+                        "weights must be finite and non-negative".into(),
+                    ));
+                }
+                values.push(w);
+            }
+            Ok(Some(values))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// A loaded Model2Vec model: WordPiece vocabulary plus the mmapped f32
 /// table. The table never fully loads; pages are clean and evictable, which
 /// is what a mobile host wants from a 100 MB-class asset.
@@ -245,132 +452,15 @@ pub struct StaticEmbedder {
 
 impl StaticEmbedder {
     pub fn load(dir: &Path) -> Result<Self, LoadError> {
-        let tok_path = dir.join("tokenizer.json");
-        let tok_len = std::fs::metadata(&tok_path)
-            .map_err(|e| LoadError::Io(format!("{}: {e}", tok_path.display())))?
-            .len();
-        if tok_len > MAX_TOKENIZER_BYTES {
-            return Err(LoadError::Format(format!(
-                "{}: {tok_len} bytes exceeds the {MAX_TOKENIZER_BYTES}-byte tokenizer limit",
-                tok_path.display()
-            )));
-        }
-        let tok: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(&tok_path)
-                .map_err(|e| LoadError::Io(format!("{}: {e}", tok_path.display())))?,
-        )
-        .map_err(|e| LoadError::Format(format!("{}: {e}", tok_path.display())))?;
-
-        // Refuse anything but the exact tokenizer family this implementation
-        // reproduces. A different normalizer or prefix would not fail — it
-        // would produce silently different vectors, so it must not load.
+        let tok = read_tokenizer_json(dir)?;
+        validate_tokenizer_family(&tok)?;
         let model = &tok["model"];
-        if model["type"] != "WordPiece" {
-            return Err(LoadError::Format(format!(
-                "tokenizer model {} is not WordPiece",
-                model["type"]
-            )));
-        }
-        if model["continuing_subword_prefix"] != "##" {
-            return Err(LoadError::Format(
-                "continuing_subword_prefix is not ##".into(),
-            ));
-        }
-        let norm = &tok["normalizer"];
-        if norm["type"] != "BertNormalizer"
-            || norm["clean_text"] != true
-            || norm["handle_chinese_chars"] != true
-            || !norm["strip_accents"].is_null()
-            || norm["lowercase"] != true
-        {
-            return Err(LoadError::Format(format!("unsupported normalizer {norm}")));
-        }
-        if tok["pre_tokenizer"]["type"] != "BertPreTokenizer" {
-            return Err(LoadError::Format(
-                "pre_tokenizer is not BertPreTokenizer".into(),
-            ));
-        }
-
-        let vocab_json = model["vocab"]
-            .as_object()
-            .ok_or_else(|| LoadError::Format("vocab is not an object".into()))?;
-        let mut vocab: HashMap<String, u32> = HashMap::with_capacity(vocab_json.len());
-        for (piece, id) in vocab_json {
-            let id = id
-                .as_u64()
-                .filter(|&v| v <= u64::from(u32::MAX))
-                .ok_or_else(|| LoadError::Format(format!("vocab id for {piece:?} is not a u32")))?
-                as u32;
-            vocab.insert(piece.clone(), id);
-        }
-        // The piece-to-row map must be a bijection: two pieces naming one row
-        // would make added-token and unk resolution ambiguous.
-        let mut seen_ids = std::collections::HashSet::with_capacity(vocab.len());
-        for (piece, &id) in &vocab {
-            if !seen_ids.insert(id) {
-                return Err(LoadError::Format(format!(
-                    "vocab id {id} is claimed by more than one piece ({piece:?})"
-                )));
-            }
-        }
-        let unk = model["unk_token"]
-            .as_str()
-            .ok_or_else(|| LoadError::Format("missing unk_token".into()))?;
-        let unk_id = *vocab
-            .get(unk)
-            .ok_or_else(|| LoadError::Format(format!("unk token {unk:?} not in vocab")))?;
-        let mut special = Vec::new();
-        if let Some(added) = tok["added_tokens"].as_array() {
-            for entry in added {
-                let id = entry["id"]
-                    .as_u64()
-                    .filter(|&v| v <= u64::from(u32::MAX))
-                    .ok_or_else(|| {
-                        LoadError::Format("added_tokens entry with a missing or invalid id".into())
-                    })? as u32;
-                let content = entry["content"].as_str().ok_or_else(|| {
-                    LoadError::Format("added_tokens entry without content".into())
-                })?;
-                // The overlay may alias a vocab piece, but it must not
-                // contradict it: an id that disagrees with the vocabulary is
-                // a packaging bug, not a variant to tolerate.
-                if let Some(&vocab_id) = vocab.get(content) {
-                    if vocab_id != id {
-                        return Err(LoadError::Format(format!(
-                            "added_tokens id {id} for {content:?} disagrees with vocab id {vocab_id}"
-                        )));
-                    }
-                }
-                if entry["special"].as_bool().unwrap_or(false) {
-                    special.push(id);
-                }
-            }
-        }
+        let vocab = parse_vocab(model)?;
+        let (unk_id, special) = resolve_special_tokens(model, &tok, &vocab)?;
         let max_word_chars = model["max_input_chars_per_word"].as_u64().unwrap_or(100) as usize;
 
-        let st_path = dir.join("model.safetensors");
-        let file = std::fs::File::open(&st_path)
-            .map_err(|e| LoadError::Io(format!("{}: {e}", st_path.display())))?;
-        let table = unsafe { memmap2::Mmap::map(&file) }
-            .map_err(|e| LoadError::Io(format!("{}: {e}", st_path.display())))?;
-        if table.len() < 8 {
-            return Err(LoadError::Format(
-                "safetensors shorter than its length header".into(),
-            ));
-        }
-        let header_len = u64::from_le_bytes(table[0..8].try_into().unwrap()) as usize;
-        if header_len > MAX_SAFETENSORS_HEADER_BYTES {
-            return Err(LoadError::Format(format!(
-                "safetensors header of {header_len} bytes exceeds the {MAX_SAFETENSORS_HEADER_BYTES}-byte limit"
-            )));
-        }
-        let header: serde_json::Value = serde_json::from_slice(
-            table
-                .get(8..8 + header_len)
-                .ok_or_else(|| LoadError::Format("safetensors header exceeds file".into()))?,
-        )
-        .map_err(|e| LoadError::Format(format!("safetensors header: {e}")))?;
-        let header_end = 8 + header_len;
+        let table = open_safetensors(dir)?;
+        let (header, header_end) = parse_safetensors_header(&table)?;
         let (shape, emb_offset, emb_bytes) =
             tensor_region(&header, "embeddings", 2, header_end, table.len())?;
         let rows = shape[0];
@@ -399,37 +489,14 @@ impl StaticEmbedder {
         // A non-finite row would silently poison every pooled vector, so the
         // table is scanned once at load. This touches every page once; the
         // pages stay clean and evictable, so the resident cost is transient.
-        for chunk in table[emb_offset..emb_offset + emb_bytes].as_chunks::<4>().0 {
-            if !f32::from_le_bytes(*chunk).is_finite() {
+        for value in read_f32_chunks(&table, emb_offset, emb_bytes) {
+            if !value.is_finite() {
                 return Err(LoadError::Format(
                     "embeddings table holds a non-finite value".into(),
                 ));
             }
         }
-        let weights = match header.get("weights") {
-            Some(tensor) if !tensor.is_null() => {
-                let (wshape, woffset, wbytes) =
-                    tensor_region(&header, "weights", 1, header_end, table.len())?;
-                if wshape[0] != rows {
-                    return Err(LoadError::Format(format!(
-                        "weights length {} != table rows {rows}",
-                        wshape[0]
-                    )));
-                }
-                let mut values = Vec::with_capacity(wshape[0]);
-                for chunk in table[woffset..woffset + wbytes].as_chunks::<4>().0 {
-                    let w = f32::from_le_bytes(*chunk);
-                    if !w.is_finite() || w < 0.0 {
-                        return Err(LoadError::Format(
-                            "weights must be finite and non-negative".into(),
-                        ));
-                    }
-                    values.push(w);
-                }
-                Some(values)
-            }
-            _ => None,
-        };
+        let weights = load_weights(&header, &table, header_end, table.len(), rows)?;
         Ok(Self {
             vocab,
             unk_id,
