@@ -41,7 +41,8 @@ rejected at open as corruption. Coordinates must be finite, latitude in
 ## Quality columns
 
 `AddDocumentsRequest.quality` tells the node to derive columns from the analysis
-sidecar's noise and artifact layers in the same pass that produces the terms:
+sidecar's noise and artifact detection in the same pass that produces the
+terms:
 
 - `noise_column` (f64): the lowest finding's score in [0, 1], or 0.0
   when there were no findings.

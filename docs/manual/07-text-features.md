@@ -19,8 +19,9 @@ Two providers serve it:
   not something the native provider can know. Any option outside that table
   fails by name instead of being approximated.
 - **The OpenNLP analysis sidecar** (`--analysis-addr=host:port`). The wider
-  surface: static embeddings, sentence detection, quality and geography layers,
-  model NER, and model- or dictionary-backed tokenizers and stemmers.
+  surface: static embeddings, sentence detection, quality and geography
+  annotations, model NER, and model- or dictionary-backed tokenizers and
+  stemmers.
 
 Offsets are stored as UTF-16 code units of the original text, one unit for the
 entire index. A provider that answers in another unit when UTF-16 was requested

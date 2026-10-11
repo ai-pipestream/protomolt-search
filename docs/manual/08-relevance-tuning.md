@@ -1,6 +1,6 @@
 # Relevance tuning
 
-Four layers, applied in this order: score functions inside selection, boosts
+Four stages, applied in this order: score functions inside selection, boosts
 over the candidate pool, the composite scorer over named signals, and A/B
 comparison across entire requests.
 

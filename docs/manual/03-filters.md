@@ -127,7 +127,8 @@ Reference: docs/segment-pruning.md
 ## Whole shards are skipped from their placement leaf
 
 This is constraint exclusion, the rule a partitioned database applies to
-its partitions, one level above the segment rule. Under a placement tree
+its partitions, applied one step up: the node drops whole segments, the
+coordinator drops whole shards. Under a placement tree
 (chapter 10, `docs/placement.md`) each shard serves one
 leaf, and the leaf's predicates bound what its rows can hold. Before the
 coordinator sends a filtered request anywhere, it drops the shards no row of

@@ -5,7 +5,8 @@
 `QueryRequest.sort` orders the result by stored values instead of by relevance.
 Keys are listed most significant first; ties break on the next key, then on doc
 id. Each key names an i64 column, an f64 column, a facet column (compared by the
-term's bytes), or one of the lineage keys `parent_id` and `group_id`.
+term's bytes), or one of the **lineage** keys — the document relationships
+recorded at ingest — `parent_id` and `group_id`.
 `descending` reverses one key.
 
 A document with no value for any of the keys is dropped. Absence has no

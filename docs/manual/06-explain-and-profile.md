@@ -41,7 +41,7 @@ What each shape reports:
   (rrf_k + rank)` for RRF, `weight * normalized` for the blend with the
   normalization named, `weight * raw` for decomposed, and for cascade the rerank
   score as the top node with the gate score next to it and not added. Each
-  branch is reported at branch level, since the composite protocols include
+  branch is reported as one unit, since the composite protocols include
   scores and ranks and not per-term inputs.
 - **A boolean tree.** The top node is the sum of the positive scoring clauses,
   one leaf node per clause id. Filter clauses appear in `matched` and not in the
