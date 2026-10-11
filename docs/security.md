@@ -1,7 +1,12 @@
 # Security: transport, principals, capabilities and quotas
 
-Implemented on branch 2026-09-02 (the rest of roadmap item 12). Three rules shape it,
-stated once:
+This document describes how pipestream-search authenticates callers,
+authorizes actions, and enforces quotas. It covers TLS on every listener,
+bearer-token principals on the public API, workspace and collection
+grants (including per-document and per-field grants), signed UDP
+datagrams, and cluster membership rules.
+
+Three rules shape the whole design, stated once:
 
 - **Refuse, do not clamp.** A request over its principal's quota is a
   named `RESOURCE_EXHAUSTED`; it is not trimmed to fit.
@@ -11,7 +16,8 @@ stated once:
   public client and buys it nothing inside the cluster.
 - **The UDP key is not the bearer.** Floor and cancel datagrams carry a
   tag under their own key, so a leaked client token cannot forge a
-  floor.
+  floor. (The *floor* is the live score cutoff of a streaming query; a
+  forged floor could silently cut good candidates.)
 
 ## TLS on the listeners
 
@@ -109,13 +115,23 @@ The product-owned `authorization.proto` defines `AccessPolicy`, workspace-bound
 `CollectionResource`s, exact `CollectionGrant`s and `AccessDecision`. The TOML
 above is a configuration adapter for that protobuf contract. Credentials supply
 identity; they grant no capability by themselves. Empty grants deny access.
-`format_version` is 1 for collection capabilities, or 2 for mandatory document
-visibility, or 3 for [field permissions](field-grants.md). Format 1 refuses a
-document predicate; formats 1/2 refuse field permissions. Future restrictions
-require a new version so older readers reject rather than drop them. The document-grant
-execution and deployment boundaries are in [document grants](document-grants.md).
-Unknown actions, duplicate resources or grants, and grants whose workspace does
-not own the collection are configuration errors. Configuration typos refuse.
+
+`format_version` selects how much the policy can say:
+
+- **1** — collection capabilities only.
+- **2** — adds the mandatory document view: a grant may carry a
+  `document_visibility` predicate that restricts which documents the
+  grant covers (`docs/document-grants.md`). A format 1 file carrying a
+  document predicate is refused.
+- **3** — adds [field permissions](field-grants.md): a grant may carry
+  an exact field allowlist on top of the collection and document
+  scopes. Formats 1 and 2 carrying field permissions are refused.
+
+Future restrictions require a new version so older readers reject rather
+than drop them. The document-grant execution and deployment boundaries
+are in [document grants](document-grants.md). Unknown actions, duplicate
+resources or grants, and grants whose workspace does not own the
+collection are configuration errors. Configuration typos refuse.
 
 Every public route in `CollectionSet` declares one capability:
 
@@ -134,15 +150,16 @@ same denial for an unknown collection and an unauthorized one; naming errors
 cannot disclose the served collection list. Unnamed `ClusterHealth` on a named
 set lists only collections with an admin grant, and denies when none are allowed.
 
-`authorization::Authorizer` is the integration seam for a workspace authority.
-`PolicyAuthority` supplies validated snapshots and atomic replacement. Revision
-must be nonzero and strictly increase on replacement. Decisions are pinned to
-one revision; a replacement invalidates outstanding decisions even if their
-capabilities would remain unchanged. Unary results are checked again before
-return. Query streams check before disclosing each item and wake on policy
-replacement even while their producer is pending. Routed ingest checks the bind
-before schema/fan-out work and checks each subsequent stream item. Already
-admitted mutations are not rolled back by revocation or a later stream error.
+`authorization::Authorizer` is the integration interface for a workspace
+authority. `PolicyAuthority` supplies validated snapshots and atomic replacement.
+Revision must be nonzero and strictly increase on replacement. Decisions are
+pinned to one revision; a replacement invalidates outstanding decisions even if
+their capabilities would remain unchanged. Unary results are checked again
+before return. Query streams check before disclosing each item and wake on
+policy replacement even while their producer is pending. Routed ingest checks
+the bind before schema/fan-out work and checks each subsequent stream item.
+Already admitted mutations are not rolled back by revocation or a later stream
+error.
 
 Authorization precedes coordinator cache lookup. Revoked callers cannot retrieve
 a previous cached response through the public service. Mandatory document views
@@ -161,29 +178,41 @@ accepted revision in the ecosystem authority across restarts. `AccessDecision`
 is diagnostic context, not a credential for untrusted clients or node calls.
 
 **Migration:** add `[policy]` to existing bearer files before upgrading. Grant
-only the exact datasets/actions required. `mkcerts.sh` generates a policy for the
-fleet tools' unnamed dataset when creating a new file; it does not overwrite an
-existing file. This increment does not alter the separate node mTLS or cluster
-control membership rules. Document authorization is currently limited to the
-private-shard BM25 and dictionary paths, where field permissions also apply.
-Applying delegated policy on direct node calls remains unfinished; restricted
-network-backed collections refuse.
+only the exact datasets/actions required. `mkcerts.sh` generates a policy for
+the fleet tools' unnamed dataset when creating a new file; it does not
+overwrite an existing file. This increment does not alter the separate node
+mTLS or cluster control membership rules.
+
+Where document and field grants apply today, in one place:
+
+- **Enforced (private in-process shards):** `Bm25Search`, `Suggest`,
+  `TermSuggest`, [Private Aggregate](scoped-folds.md), and `Query` /
+  `QueryStream` all enforce the authority's document view and field
+  grants before shard reads and before any result is disclosed. See
+  [document grants](document-grants.md) and
+  [field grants](field-grants.md) for the exact route coverage.
+- **Not enforced yet:** network-backed collections (a restricted
+  collection on the network public surface refuses by name until
+  delegation lands), and direct node or cluster-control calls, which
+  still trust cluster membership. A public bearer is not that
+  membership.
+
 The console (`docs/console-facade.md`) is the one client that holds the
 cluster credentials on a browser's behalf: it binds to loopback unless
 told otherwise, and whoever reaches it acts as its principal.
 
 ## Query cursor context
 
-`Query` and `QueryStream` retain the server-issued `AccessDecision` when entering
-the coordinator, instead of losing it when unwrapping the request. The opaque
-cursor envelope in `query_cursor.proto` binds that decision, the resolved
+`Query` and `QueryStream` retain the server-issued `AccessDecision` when
+entering the coordinator, instead of losing it when unwrapping the request. The
+opaque cursor envelope in `query_cursor.proto` binds that decision, the resolved
 collection, normalized query and frozen routing map. A different principal,
 workspace, policy revision, query or map cannot resume a token just because a
 boundary score matches. The check precedes execution and stream creation.
-Current authorization still runs for every page and every disclosed stream item;
-possessing a cursor grants no access. Client metadata cannot supply a trusted
-`AccessDecision` extension. A streamed query's nested collection must also agree
-with its authorized outer resource.
+Current authorization still runs for every page and every disclosed stream
+item; possessing a cursor grants no access. Client metadata cannot supply a
+trusted `AccessDecision` extension. A streamed query's nested collection must
+also agree with its authorized outer resource.
 
 Envelope format 2 separately hashes the request's physical read versions.
 These are checked after shard admission, before selection on a continuation.
@@ -197,17 +226,17 @@ are compared with the existing constant-time comparison. Parsing is bounded and
 refuses noncanonical payloads and unknown versions. Keys are shared by clones
 of a coordinator, are redacted in debug output, and default to ephemeral
 32-byte secrets obtained through
-[getrandom 0.2.17](https://docs.rs/getrandom/0.2.17/getrandom/). Entropy failure
+[getrandom 0.4.3](https://docs.rs/getrandom/0.4.3/getrandom/). Entropy failure
 refuses token issuance instead of using a predictable fallback. A library host
 can supply a retained key through `with_cursor_signing_key`; it must also retain
 the authority's revision history. The command-line server has no key-file or
 live key-rotation option. An ephemeral-key restart or a host key change requires
 fresh pagination. Tokens are not encrypted and are not durable index snapshots.
 
-This closes the cursor context gap; it does not implement document/field
-selection, scope term statistics or partition result caches for those policies.
-Those restrictions remain required across every disclosure route before granular
-grants can be advertised. See [paging](query-api.md#paging) for the live-data
+This closes the cursor context gap; it does not by itself implement document
+or field selection, scoped term statistics, or partitioned result caches for
+those policies on every remaining route — see the coverage list above for what
+is enforced where. See [paging](query-api.md#paging) for the live-data
 boundary and old-token migration.
 
 ## Quotas, per principal
@@ -220,9 +249,9 @@ boundary and old-token migration.
 
 ## Signed UDP datagrams
 
-The streaming-search fast lane (`docs/streaming-query.md`) duplicates
+The streaming-search fast path (`docs/streaming-query.md`) duplicates
 floor raises and cancels on UDP. A forged floor could cut candidates,
-so off loopback the lane is authenticated: `--udp-hmac-key=<file>` (raw
+so off loopback the path is authenticated: `--udp-hmac-key=<file>` (raw
 bytes or hex, at least 16 bytes) on the coordinator and its nodes.
 
 A signed datagram is the 20-byte typed frame, a 4-byte sequence, and a
@@ -235,8 +264,8 @@ datagrams change nothing, and the gRPC twin of every signal still
 governs. The packet grew by 20 bytes and gained no new parser: the frame
 is the frame it was.
 
-Without a key a node opens its UDP lane on a loopback listener only;
-off loopback the lane stays closed and every signal rides the gRPC
+Without a key a node opens its UDP channel on a loopback listener only;
+off loopback the channel stays closed and every signal rides the gRPC
 stream. A coordinator without a key sends plain frames, which a keyed
 node ignores.
 
@@ -305,17 +334,23 @@ key, and one principal with its token file.
 - No per-principal metrics labels yet (`docs/metrics.md` counts routes).
 - No TLS to the analysis sidecar or the clustered TurboVec backend:
   those are separate services with their own transports.
-- No document/field policy enforcement yet. A collection search grant currently
-  includes that entire collection's public search results and projections.
-- No public-policy enforcement on direct node or cluster-control operations;
-  those still trust cluster membership. A public bearer is not that membership.
-- No automatic access-policy file reload or persisted revision high watermark
-  in the command-line process; dynamic authority providers own that lifecycle.
+- Document and field grants cover the private-shard routes only
+  (`Bm25Search`, `Suggest`, `TermSuggest`, private `Aggregate`,
+  `Query`, `QueryStream`). On every other route a collection search
+  grant still includes that entire collection's search results and
+  projections.
+- No public-policy enforcement on direct node or cluster-control
+  operations; those still trust cluster membership. A public bearer is
+  not that membership.
+- No automatic access-policy file reload or persisted revision high
+  watermark in the command-line process; dynamic authority providers
+  own that lifecycle.
 
 ## Tests
 
-`tests/security.rs`: a tool built from its flags reaches a TLS node with the
-identity and a TLS coordinator with the bearer, and the flag refusals; a TLS node accepts a client certificate from the
+`tests/security.rs`: a tool built from its flags reaches a TLS node with
+the identity and a TLS coordinator with the bearer, and the flag
+refusals; a TLS node accepts a client certificate from the
 cluster CA and rejects plaintext, a certificate-less client, and a
 foreign CA's certificate; a coordinator with its identity reaches TLS
 nodes and serves bearer clients over TLS; the bearer table (missing,
@@ -324,12 +359,13 @@ coordinator default and served under one above it; concurrency held by an
 in-flight request (a delayed analysis sidecar keeps one open); the
 ingest meter; cluster control with and without membership; the metrics
 listener alongside TLS; the embedded crate's dependency gate; the
-configuration refusals. `src/node.rs` unit-tests the signed floor lane
-(forged, wrong-key, replayed, and stale sequences leave the floor
-untouched); `src/stream_signal.rs` and `src/security.rs` unit-test the
-frames, HMAC vectors, principals, and buckets.
+configuration refusals. `src/node.rs` unit-tests the signed floor
+channel (forged, wrong-key, replayed, and stale sequences leave the
+floor untouched); `src/stream_signal.rs` and `src/security.rs` unit-test
+the frames, HMAC vectors, principals, and buckets.
 
-`tests/authorization.rs` checks the public route capability table, workspace
-bindings, resolved defaults, hidden collection names, scoped health listing,
-malformed policies, monotonic revisions, cache-entry revocation, routed-ingest
-admission, and cancellation of pending/disclosing streams on policy replacement.
+`tests/authorization.rs` checks the public route capability table,
+workspace bindings, resolved defaults, hidden collection names, scoped
+health listing, malformed policies, monotonic revisions, cache-entry
+revocation, routed-ingest admission, and cancellation of
+pending/disclosing streams on policy replacement.
