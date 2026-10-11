@@ -44,22 +44,21 @@ deliberate exception described later (a UDP fast path for typed
 stream signals).
 
 ```
-                        gRPC (SearchService)
-        client --------------------------------------+
-                                                    |
-        +----------------------v--------------------|-----------------+
-        |           pipestream-search cluster        |                 |
-        |                                            |                 |
-        |     coordinator ---- NodeService + UDP ----+-- search node 0 |
-        |        |    |------------------------------+-- search node 1 |
-        |        |    |------------------------------+-- search node N |
-        |        |                                 |                 |
-        |        +-> native Rust analyzer           |                 |
-        +--------------------------------------------                 |
-                 |                          |                          |
-     gRPC stream |                gRPC (planned)                       |
-                 |                          |                          |
-     OpenNLP analysis sidecar      repo service (future)               |
+   client
+     |  gRPC (SearchService)
+     v
++------------------------- pipestream-search cluster ------------------------+
+|                                                                            |
+|  coordinator -- NodeService + UDP --> search node 0 (shard 0)              |
+|     |      \------------------------> search node 1 (shard 1)              |
+|     |      \------------------------> search node N (shard N)              |
+|     |                                                                      |
+|     +--> native Rust analyzer (in-process)                                 |
+|                                                                            |
++----------------------------------------------------------------------------+
+     | gRPC stream (optional)              | gRPC (planned)
+     v                                     v
+ OpenNLP analysis sidecar           repo service
 ```
 
 *Figure 1 — the parts and the lines between them: a client talks to
