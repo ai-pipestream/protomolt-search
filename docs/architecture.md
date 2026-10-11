@@ -431,8 +431,8 @@ Node and coordinator to sidecar is the analysis stream. The UDP
 signal channel shares the node's listen address and carries typed
 monotonic floor hints or advisory cancellation. The same signal also
 travels over gRPC, and correctness never depends on a datagram
-arriving. This section intentionally stops here; message-level
-detail belongs to the proto files and the appendix.
+arriving. This section intentionally stops here; the details of
+individual messages belong to the proto files and the appendix.
 
 ## Appendix
 

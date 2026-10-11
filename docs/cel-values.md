@@ -1,7 +1,7 @@
 # First-class CEL values: projections and materialized columns
 
 Status: implemented; uint values added on the unsigned feature branch
-(2026-09-05); the index-level declaration, the calendar and hash
+(2026-09-05); the index's own declaration, the calendar and hash
 functions, timestamp and facet inputs, and the stable key are in
 `docs/derived-columns.md` (2026-09-07).
 

@@ -280,9 +280,9 @@ and provenance but no score; a member no positive scoring clause
 matches has a zero score, no signal, and follows the scored members
 in id order. Dense and lexical clauses in the same boolean group
 are the recursive hybrid form; the older `CompositeSearchStrategy`
-remains a top-level compatibility route for RRF, score blend,
-decomposed, and cascade. ANN cannot certify recursive membership
-and is refused.
+remains an outermost-position compatibility route for RRF, score
+blend, decomposed, and cascade. ANN cannot certify recursive
+membership and is refused.
 
 An optional `BooleanQuery.aggregate` folds on each shard over that
 shard's match set, in the same call, and merges at the coordinator
