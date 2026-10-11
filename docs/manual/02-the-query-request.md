@@ -9,6 +9,33 @@ to confuse, so the contract keeps them separate:
    cannot add or remove a document.
 3. **The scorer** combines named signals into the final order.
 
+```text
+QueryRequest
+    |
+    v
++------------+   fixed pool: the top selection_k candidates
+| selection  | --------------------------------------------+
+| (a tree:   |                                             |
+|  lexical / |   +------------+   +------------------+    |
+|  dense /   |   | boosts     |   | the scorer       |    |
+|  filter /  |   | (optional, |   | (optional: named |    |
+|  composite |   |  signal    |   |  signals -> one  |    |
+|  / boolean)|   |  only)     |   |  final order)    |    |
++------------+   +------------+   +------------------+    |
+    |                |                  |                   |
+    v                v                  v                   v
++-----------------------------------------------------------+
+| coordinator: fan-out to every shard, merge, page          |
++-----------------------------------------------------------+
+    |
+    v
+QueryResponse: hits + scores (+ explain / profile / aggregate on request)
+```
+
+*How a query request is put together: selection fixes the candidate pool,
+boosts and the scorer only reorder what the pool already holds, and the
+coordinator merges shard answers into one global result.*
+
 ## Selection shapes
 
 `QueryRequest.selection` is a tree of four node kinds.

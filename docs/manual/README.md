@@ -27,7 +27,8 @@ and not from a rule of thumb.
 
 **Shards share score cutoffs.** As soon as any shard has k candidates, its
 k-th best is a lower bound on the global k-th best. The coordinator collects
-those bounds, takes the highest, and pushes it back to every shard. A lexical
+those bounds, takes the highest — the **floor** — and pushes it back to every
+shard. A lexical
 shard then skips index blocks whose best possible score is under the cutoff,
 and a vector shard drops candidates under it before they cost heap work or a
 trip to the coordinator. The vector scan still visits its rows in full, which

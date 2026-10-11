@@ -8,6 +8,25 @@ index, a BM25 postings index, a document store, and typed columns.
 A **coordinator** takes client requests, fans them out to the nodes, merges what
 comes back, and replies. Clients talk only to the coordinator.
 
+```text
+                 your client
+                     |  gRPC (SearchService)
+                     v
+        +------------------------+
+        |  coordinator           |  one HTTP/2 channel per node,
+        |  (--role=coordinator)  |  merges shard answers into one
+        +------------------------+  exact global answer
+           |          |          |
+           v          v          v
+        +------+  +------+  +------+
+        | node |  | node |  | node |   (--role=node, one listener
+        |shard0|  |shard1|  |shardN|    per shard)
+        +------+  +------+  +------+
+```
+
+*One binary, two jobs: the coordinator is the only address clients need; each
+node serves the shards that hold a slice of the corpus.*
+
 One binary serves both. `--role=node`, `--role=coordinator`, or `--role=both`.
 
 A **collection** is a dataset. One cluster can serve several: each collection has
@@ -15,6 +34,26 @@ its own shard set, topology, statistics, vector configuration, and analysis
 backend, and a node serves one collection (`--collection=NAME`). Every public
 request has a `collection` field. An empty name selects the unnamed dataset, or
 the configured default. An unknown name gives an error.
+
+## Words used everywhere
+
+These terms appear in every chapter:
+
+- **floor** — a proven lower bound on the global k-th score. Shards publish
+  their k-th best; the coordinator broadcasts the highest. Candidates below
+  the floor cannot make the top-k and are skipped.
+- **calibration** — the shared vector encoding parameters, fitted once and
+  configured on every shard, which is what makes scores comparable across
+  shards.
+- **tombstone** — the delete marker for a row; deletes set a bit instead of
+  rewriting files, and compaction reclaims the space.
+- **seal** — to freeze the writable tail of a shard into a new immutable
+  on-disk segment.
+- **segment** — one immutable, checksummed piece of a persisted shard.
+- **manifest** — the small file naming a generation's pieces and geometry
+  (WAL `manifest.toml`, `snapshot-manifest.json`, a segment's `segment.json`).
+- **lineage** — a document's relationships: `parent_id`, `group_id`, and its
+  span inside its parent document.
 
 ## Run a node and a coordinator
 
@@ -38,7 +77,8 @@ with its `listen`, `index`, and `slot_offset`.
 
 Text analysis is required. `--analysis-addr=native` uses the in-process
 analyzer; an address points at the OpenNLP analysis sidecar, which adds
-embeddings and model-backed layers. With no analysis backend, ingest returns
+embeddings and model-backed analysis such as sentence detection and
+named-entity recognition. With no analysis backend, ingest returns
 UNAVAILABLE.
 
 ## Declare your columns first
