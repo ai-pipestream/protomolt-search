@@ -1,3 +1,6 @@
+//! The v4-to-v5 transcode: rewrite one legacy file through the v5 three-run
+//! layout (`docs/block-max.md`), validating structure before and after.
+
 use super::*;
 
 use std::io::{self, Write};

@@ -1,3 +1,8 @@
+//! Heap column stores and their section writers: dictionary-encoded facet
+//! columns, f64/i64/u64 numerics, geo points, and the map columns (`docs/map-
+//! columns.md`), collected per document at ingest and written as the v7 column
+//! table. Also the shared dictionary helpers and the reserved-name validation.
+
 use super::*;
 
 use std::collections::HashMap;

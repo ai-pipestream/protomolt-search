@@ -1,3 +1,8 @@
+//! Ingest-side document types: what an analyzed document is — terms with
+//! original-text offsets, token positions, sentence spans, lineage, quality,
+//! geography — before it becomes postings. Shared by the heap builder, the
+//! spill builder, and every ingest adapter.
+
 /// One posting: a term occurrence set within one document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Posting {

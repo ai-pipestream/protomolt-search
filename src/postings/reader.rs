@@ -1,3 +1,9 @@
+//! The disk-resident `Bm25Reader`: the file is memory mapped, and the per-field
+//! section slices plus the shared tables are validated at open — walking
+//! message boundaries before allocating decoded records. v3 through v8 open
+//! here; the v8 envelope's eager CRCs run during open, the lazy blobs during
+//! `verify_integrity`.
+
 use super::*;
 
 use std::io::{self};

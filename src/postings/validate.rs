@@ -1,3 +1,8 @@
+//! Structural validators for every format version. They walk section boundaries
+//! and cross-check offsets before any decoded record is allocated; the open-
+//! time corruption refusals and the malformed-file test matrices exercise
+//! exactly these walks.
+
 use super::*;
 
 use std::io::{self};

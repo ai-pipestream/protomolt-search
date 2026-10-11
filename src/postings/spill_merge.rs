@@ -1,3 +1,7 @@
+//! The merge-side readers of the spill builder: `RunHead` walks one spilled
+//! run's postings, and `PositionsStage` carries token ordinals across the merge
+//! so kind-7 sections survive the external sort.
+
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 

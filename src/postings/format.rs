@@ -1,3 +1,10 @@
+//! BM25 on-disk format constants and the v8 integrity envelope: magics, column-
+//! kind numbers, section layouts, the `IntegrityTable` parser, and
+//! `finalize_v8`. The values documented here are the frozen format contract:
+//! writers emit them, readers accept them, and the corruption tests pin every
+//! byte. Also the little byte primitives (`write_u16`, `take`, `read_u32`,
+//! ...).
+
 use super::*;
 
 use std::io::{self, Write};

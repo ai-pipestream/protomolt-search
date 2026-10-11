@@ -1,3 +1,7 @@
+//! Block-max impact cursors (`docs/block-max.md`): `FileImpacts` walks one
+//! term's v5 skip run and doc run, and `ImpactCursor` chains the per-part
+//! cursors of a segmented shard into one logical term.
+
 use super::*;
 
 /// Zero-copy cursor over one term's v5 doc run and skip run — the

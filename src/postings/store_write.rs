@@ -1,3 +1,8 @@
+//! The store's byte writers: shared text/text_index/lineage sections, the v6/v7
+//! ordered writer, the legacy v4 writer, and `read_from`, the in-memory decode
+//! entry point that checks the v8 envelope before reading the payload as its
+//! base version.
+
 use super::*;
 
 use std::io::{self, Write};

@@ -1,3 +1,8 @@
+//! v5 skip-run encoding (`docs/block-max.md`): per-block `(tf, dl)` Pareto
+//! frontiers, collapsed never dropped, and the two-level `SkipRunBuilder` (one
+//! level-0 record per 128 postings, one level-1 record per 32 blocks). Stage 1
+//! writes skip runs no scorer consumes yet.
+
 use super::*;
 
 use std::io::{self, Write};

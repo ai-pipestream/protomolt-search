@@ -1,3 +1,7 @@
+//! The heap store's v3-v7 decode paths: `read_v3_from`, `read_v5_from`, and
+//! `read_v6v7_from`, each rebuilding a `Bm25Store` from already-validated
+//! bytes, plus `from_single_field`, the shape every pre-v6 path produces.
+
 use super::*;
 
 use std::collections::HashMap;

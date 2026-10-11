@@ -1,3 +1,7 @@
+//! The disk-backed external sort for corpus-scale ingests: pending postings
+//! buffer per field, spilled runs, and `finish_v6`/`finish_v4`, whose output is
+//! byte-identical to `Bm25Store::save` — pinned by the byte-identity tests.
+
 use super::*;
 
 use std::io::{self, Write};

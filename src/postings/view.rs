@@ -1,3 +1,7 @@
+//! Per-field read surfaces over an open file: `FieldView` presents one field as
+//! a `Bm25Index`, and `FieldTranspose` iterates a field's postings column-wise
+//! for facet and aggregation passes.
+
 use super::*;
 
 /// One field of an open `.bm25` file as its own [`Bm25Index`]

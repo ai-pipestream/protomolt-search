@@ -1,3 +1,8 @@
+//! The postings format suites: writer/reader round-trips across v3-v8, byte-
+//! identity between the store and spill builders, and the v8 corruption-
+//! robustness matrices (bit-flip at every byte, truncation at every length,
+//! malformed headers and directories). `malformed_tests` sits at the bottom.
+
 use super::*;
 
 use std::io::{self, Write};

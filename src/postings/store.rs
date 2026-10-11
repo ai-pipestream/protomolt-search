@@ -1,3 +1,8 @@
+//! The heap builder `Bm25Store`: ingest appends here, and `save` writes the
+//! current format (v8) next to the shard's `.tv`. Also `StoreFieldView`, the
+//! per-field read view over a heap store, and the `Bm25Index` impl forwarding
+//! the single-field surface to field 0.
+
 use super::*;
 
 use std::io::{self, Write};

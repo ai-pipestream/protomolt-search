@@ -1,3 +1,8 @@
+//! The shard-level descriptor bindings: `StoredBinding` (the mapped plan a
+//! shard's columns were written under, kinds 6/12/13/14) and `StoredDerived`
+//! (the derived-column declaration, kind 17). Both ride the v7 column table so
+//! they live inside the v8 integrity envelope.
+
 use super::*;
 
 use std::io::{self, Write};
