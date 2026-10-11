@@ -1,12 +1,42 @@
 # pipestream-search
 
-Provider-neutral distributed lexical, vector, and hybrid search. The product
-owns BM25, CEL selection, document semantics, fusion, generations, and public
-quality claims. Vector engines plug in behind one descriptor/configuration
-contract. The shipped `embedded-turbovec` adapter provides exhaustive
-TurboQuant scoring and collaborative live-floor streaming.
+Pipestream Search is a distributed search engine for text and vectors. You
+give it documents, their embeddings, and their typed values, spread across as
+many machines as you like, and it answers keyword (BM25), vector, and hybrid
+queries over the whole set. Clients speak gRPC to a coordinator; the
+coordinator fans each request out to shard nodes and merges what comes back.
+The product owns BM25, CEL selection, document semantics, fusion,
+generations, and public quality claims. Vector engines plug in behind one
+descriptor/configuration contract. The shipped `embedded-turbovec` adapter
+provides exhaustive TurboQuant scoring and collaborative live-floor
+streaming.
 
-New here? The user manual is [docs/manual/README.md](docs/manual/README.md).
+New here? Start with [docs/manual/README.md](docs/manual/README.md) — a
+chaptered manual written for a first-time reader. This README is the deeper
+tour: architecture, invariants, formats, and the record of what landed.
+
+## Words used everywhere
+
+- **shard** — one slice of the corpus on one node: a vector index, a BM25
+  postings index, a document store, and typed columns.
+- **floor** — a proven lower bound on the global k-th score, published by a
+  shard and broadcast by the coordinator. Candidates below the floor cannot
+  make the top-k, so shards skip them. Floors only ever rise.
+- **seal** — to freeze the writable in-memory tail of a shard into a new
+  immutable on-disk segment.
+- **tombstone** — the delete marker for a row. Deletes never rewrite files;
+  they set a bit in a live-row overlay that every read path consults, and
+  compaction reclaims the space later.
+- **manifest** — the small file that names a generation's pieces: the WAL
+  manifest (`manifest.toml`), a snapshot manifest (`snapshot-manifest.json`),
+  or a segment's `segment.json`.
+- **lineage** — a document's relationships: its `parent_id`, `group_id`, and
+  the span of text it occupies inside its parent document.
+- **calibration** — the provider-owned vector encoding parameters (the TQ+
+  fit), fitted once on a sample and shared by every shard so scores are
+  comparable across the fleet.
+- **segment** — one immutable, checksummed piece of a persisted shard,
+  created when a tail is sealed.
 
 ## Repository map
 
@@ -132,16 +162,37 @@ docker run --rm --network court-e2e_default -v court-e2e_corpus-data:/corpus \
 
 ## Design
 
-```mermaid
-flowchart TB
-    client([client]) -->|Search| coord["coordinator (SearchService)<br/>FloorTracker: max over shard floors"]
-    coord -->|"StartShardSearch + FloorUpdate"| n0["node 0 (NodeService)<br/>shard index · chunked scan"]
-    coord -->|"StartShardSearch + FloorUpdate"| n1["node 1 (NodeService)<br/>shard index · chunked scan"]
-    coord -->|"StartShardSearch + FloorUpdate"| nn["node N (NodeService)<br/>shard index · chunked scan"]
-    n0 -->|"FloorUpdate: k-th best (once heap fills)"| coord
-    n1 -->|"FloorUpdate: k-th best"| coord
-    nn -->|"FloorUpdate: k-th best"| coord
+Cluster topology: clients talk only to the coordinator; each node serves one
+or more shards, and a shard-map entry may also name a replica of the same
+data.
+
+```text
+                        client
+                          |  Search / Bm25Search / HybridSearch / Query
+                          v
+              +------------------------+       FloorTracker:
+              |     coordinator        |       max over shard floors
+              | (SearchService, :50050)|
+              +------------------------+
+                   |             |             |
+        StartShardSearch  StartShardSearch  StartShardSearch
+        + FloorUpdate     + FloorUpdate     + FloorUpdate
+                   v             v             v
+            +-------------+ +-------------+ +-------------+
+            |  node 0     | |  node 1     | |  node N     |
+            | NodeService | | NodeService | | NodeService |
+            | shard index | | shard index | | shard index |
+            | chunked scan| | chunked scan| | chunked scan|
+            +-------------+ +-------------+ +-------------+
+                   |             |             |
+                   +------+------+------+------+
+        FloorUpdate: k-th best (once a shard's heap fills)
 ```
+
+*How one query flows between the coordinator and the shard nodes: each node
+scans its shard in chunks seeded with the best floor it knows, publishes its
+k-th best as a `FloorUpdate` once its heap fills, and the coordinator
+broadcasts the highest floor back to everyone.*
 
 Floor flow for one query:
 
@@ -381,7 +432,8 @@ interchangeable providers. The in-process Rust provider implements the
 production `ingest`/`folded` and `cased` analyzer specs. The
 [grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis)
 sidecar supplies the wider OpenNLP surface, including embeddings and
-model-backed layers. Its proto is vendored at
+model-backed analysis such as sentence detection and named-entity
+recognition. Its proto is vendored at
 `proto/ai/pipestream/opennlp/analysis/v1/analysis.proto`; see the file header.
 Both providers support original-text UTF-16 coordinates. The portable Rust
 analyzer and sidecar can also return UTF-8 byte offsets to direct callers.
@@ -401,7 +453,7 @@ Phrase and proximity queries (`PhraseMatch` on `Bm25Search` and on the
 single lexical leaf of `Query`) are served by two opt-in per-field
 payloads: a derived bigram column (`--bigram-fields=body`) answers
 two-term exact phrases as one term, and token positions
-(`--position-fields=body`) answer longer phrases and slop exactly at the
+(`--position-fields=body`) answer longer phrases and any `slop` exactly at the
 shared heap gate. Positions are token ordinals from the ingest analysis,
 never character offsets, and a field that declared neither refuses the
 query by name. See [`docs/phrase-proximity.md`](docs/phrase-proximity.md)
@@ -445,6 +497,31 @@ with global statistics, chained block-max cursors, and union
 dictionaries. `--layout=single-image` keeps the one-file layout, existing
 single-image shards keep theirs, and nothing converts on open.
 
+```text
+ingest appends to the tail, in memory
+     |
+     v
++---------------------------+     seal (flush or --seal-tail-docs)
+| writable tail             | ----------------------------+
++---------------------------+                             |
+     ^                                                    v
+     |                                            +--------------+
+     |  compaction rebuilds dense,                | segment 1    |  immutable
+     |  partitioned if a column is named          +--------------+  checksummed
+     |                                            | segment 2    |  artifacts
+     |                                            +--------------+
+     +------------ new tail <-------------------- | segment 3    |
+                                                  +--------------+
+queries read segment 1 + segment 2 + segment 3 + tail as ONE shard
+(global statistics, chained block-max cursors, union dictionaries)
+```
+
+*The segment lifecycle of a persisted shard: writes land in a writable
+tail, a seal freezes a full tail into one more immutable segment, and
+queries always see every segment plus the tail as a single shard; online
+compaction rewrites the live rows into a fresh dense layout and a new
+tail.*
+
 Security (`docs/security.md`): `--tls-cert`/`--tls-key` put every
 listener on TLS (rustls; plaintext is then refused, and off loopback it
 needs `--allow-plaintext`), node listeners require a client certificate
@@ -467,29 +544,43 @@ stream RPC is refused rather than silently downgraded. Either provider builds
 the same postings and stores the raw text. Doc
 ids share the shard's positional id space with vectors (next id =
 max(vectors, docs)). Analysis options pass through (`AnalysisSpec`:
-tokenizer/stemmer/term-vector mode+source/normalizer rungs, as the
-sidecar's enum numbers). Unsupported native options fail explicitly. Per-shard
+tokenizer/stemmer/term-vector mode+source/normalizer steps, numbered as
+the sidecar's enums). Unsupported native options fail explicitly. Per-shard
 `analysis_addr` in the config; unset means UNAVAILABLE.
 
 **Query** (`SearchService.Bm25Search`) — distributed correctness via global
 statistics followed by an exact candidate stream:
 
-```mermaid
-sequenceDiagram
-    participant C as coordinator
-    participant A as analyzer
-    participant S as shards
-    C->>A: 1. Analyze(query text, same options)
-    A-->>C: query terms
-    C->>S: 2. TermStats{terms}
-    S-->>C: per-shard df, N, Σlen
-    C->>S: 3. Bm25QueryStream{terms, globals, k1, b}
-    Note over S: every shard scores with IDENTICAL idf/avgdl
-    S-->>C: 4. candidate batches
-    C->>S: monotone global k-th floor raises
-    S-->>C: 5. completion + fingerprint + local details
-    Note over C: only global heap selects winners
+```text
+coordinator                 analyzer                shards (one per node)
+     |  1. Analyze(query text, same options)          |
+     |----------------------------------------------->|
+     |<-----------------------------------------------|
+     |     query terms                                |
+     |                                                |
+     |  2. TermStats{terms}                           |
+     |----------------------------------------------->|
+     |<-----------------------------------------------|
+     |     per-shard df, N, sum(doc length)           |
+     |                                                |
+     |  3. Bm25QueryStream{terms, globals, k1, b}     |
+     |----------------------------------------------->|
+     |     every shard scores with IDENTICAL          |
+     |     idf and average length                     |
+     |<-----------------------------------------------|
+     |  4. candidate batches                          |
+     |----------------------------------------------->|
+     |     monotone global k-th floor raises          |
+     |<-----------------------------------------------|
+     |  5. completion + fingerprint + local details   |
+     |                                                |
+     |  only the coordinator's global heap            |
+     |  selects the winners                           |
 ```
+
+*The two-phase BM25 query path: one analysis, one statistics fan-out so every
+shard scores with identical global numbers, then a candidate stream in which
+only the coordinator's global heap picks the final hits.*
 
 Shard-local BM25 stats would make scores incomparable across shards; the
 global-stats fan-out is what keeps distributed ranking identical to a
@@ -503,9 +594,11 @@ per-term occurrence offsets; fetch raw text with
 (`bm25_k1`/`bm25_b`, defaults 1.2/0.75) and sent to every shard with the
 query so scoring is uniform.
 
-**Block-max pruning** (see `docs/block-max.md`): the v5 `.bm25` format
+**Block-max pruning** (see `docs/block-max.md`): the `.bm25` disk format
 stores per-term doc/occurrence/skip runs with two-level impact blocks
-(Lucene-style block-max), and scoring skips postings that provably
+(Lucene-style block-max, introduced at format v5; the current writer emits
+v8, a v6/v7 payload with a per-section CRC integrity table, and readers
+accept v3 through v8), and scoring skips postings that provably
 cannot reach the running floor — bit-identical results, measured up to
 ~70x on high-df terms at k=10. `Bm25SearchRequest.min_score` seeds the
 whole fleet with a floor the client already holds (e.g. a previous
@@ -711,8 +804,8 @@ shared:
    cross-shard comparable. Rerank: BM25 desc, vector desc, doc id asc;
    return the top k of the pool. Hits carry `vector_score` and
    `bm25_score` as separate fields plus the final rank — no fused score.
-   The rescore is one stage behind a small seam; more rankers plug in
-   later.
+   The rescore runs as its own stage behind the `Bm25Rescore` interface;
+   more rankers plug in later.
 
 **Honest trade-off**: cascade makes vector recall a GATE for the BM25
 leg — a keyword-strong but vector-weak document never enters the pool
@@ -825,7 +918,7 @@ adds a second-pass lexical boost after fusion: the top `window` hits
 bm25(boost text)` and reordered; hits beyond the window keep their
 relative order after it. `base` is the mode's ordering score (fused
 score, or phase-2 BM25 for cascade). The boost runs candidate-scoped
-through the existing `Bm25Rescore` seam with global stats fetched for
+through the existing `Bm25Rescore` interface with global stats fetched for
 the BOOST terms — one TermStats fan-out plus one Bm25Rescore per
 owning shard, never a full postings walk. Hits carry `boost_score`
 separately so clients see both parts; the debug block reports
@@ -836,6 +929,27 @@ separately so clients see both parts; the debug block reports
 Shards ingest over gRPC; prebuilt provider images are not required.
 Deployment order for a from-scratch cluster is **fit → configure → ingest →
 search**:
+
+```text
+fit                  configure                ingest                   search
+  |                    |                        |                        |
+  v                    v                        v                        v
+sample the       push the identical      AddDocuments /          the lossless
+corpus vectors   payload to EVERY        AddVectors client       floor flow,
+-> provider      empty shard (one        stream per shard,       unchanged by
+   state          config call; any       batches applied         ingested data
+   (one payload    retry must be         under the shard's
+   for all)        identical, or it      write lock; the WAL
+                   is rejected)          logs each batch after
+                                         it applies; Flush
+                                         fsyncs the log and
+                                         writes the index
+                                         images
+```
+
+*The write path in four steps: fit the vector encoding parameters once,
+configure every shard with the identical payload so scores stay mergeable,
+ingest documents and vectors over client streams, then serve.*
 
 1. **Fit** provider state on a representative sample. The provider owns the
    fitting algorithm and returned payload.
@@ -1172,8 +1286,10 @@ losslessness at k=1000 over a 24k corpus.
 - `src/fusion.rs` — reciprocal rank fusion (used at both fusion levels)
   and score-blend fusion (normalize + weighted-combine) over scored
   legs, with per-leg provenance.
-- `src/analyzer.rs` — the analysis-sidecar client (text in, term vectors
-  out). No local analysis by design.
+- `src/analyzer.rs` — the lexical analysis providers and the OpenNLP
+  sidecar client (text in, term vectors out). The `native` provider runs
+  the same term contract in-process through `protomolt-analyzer`; an
+  address selects the sidecar instead.
 - `src/vocab.rs` — the vocabulary index: streaming corpus statistics
   (HLL + count-min + space-saving, two channels) accumulated inline in
   the AddDocuments AnalyzeStream path, snapshot per window to
@@ -1205,24 +1321,30 @@ Shard storage has two shapes behind one read surface
 (`postings::Bm25Index`):
 
 - **Heap builder** (`Bm25Store`) — ingest appends here. `Flush` writes
-  the v5 `.bm25` format and immediately reopens the shard disk-resident.
-- **Disk-resident** (`Bm25Reader`) — the v5 file is memory-mapped;
+  the current `.bm25` format, v8, and immediately reopens the shard
+  disk-resident.
+- **Disk-resident** (`Bm25Reader`) — the file is memory-mapped;
   postings slices and document texts are read from the map on demand.
   The OS page cache is the buffer pool (the Lucene model): after
-  `Flush` or on startup with a v5 file, a shard holds NO postings or
+  `Flush` or on startup with a persisted file, a shard holds NO postings or
   document texts in heap — only the per-doc length table (4 B/doc) and
   small lookup structures. Measured: opening a 164 MiB file and
   serving queries grows RSS by ~11 MiB, versus ~159 MiB for the heap
   load (`tests/mmap_store.rs`).
 
-v5 layout (single file, atomic write): header with absolute section
-offsets, per-doc lengths, document texts, an on-disk text index
+The on-disk layout (single file, atomic write): header with absolute
+section offsets, per-doc lengths, document texts, an on-disk text index
 (fixed-stride entries, so text reads never walk the file), lineage,
 then per sorted term a fixed-stride doc run, an occurrence run, and a
 skip run of two-level impact blocks (see `docs/block-max.md`), and a
 fixed-stride term directory (binary search per term to its run offsets
-+ df). v3/v4 files still load and serve — into the heap builder on the
-append path, upgraded to v5 on the next flush.
++ df). v6 added the multi-field section table (`docs/multi-field.md`)
+and v7 the typed per-document column table (`docs/facets.md`); v8 wraps
+the v6/v7 payload in a per-section CRC32 integrity table plus a trailer,
+so a damaged section is named on open, and `examples/bm25_verify` runs
+the expensive full-integrity pass over every section. v3 through v7
+files still load and serve — into the heap builder on the append path,
+upgraded to v8 on the next flush.
 A disk-resident shard that receives more documents first reloads into
 the heap builder (bulk-load discipline: build in memory, flush back).
 
@@ -1230,12 +1352,16 @@ This is what makes a corpus larger than machine memory work: the
 postings (~130 GB at full CourtListener scale) and doc text (~40 GB)
 live in page cache shared across all consumers, not per-process heap.
 The product-owned original-FP32 rerank sidecar is mmap-backed after flush or
-load and faults only the candidate rows used by reranking. Sealed TurboVec v7
-segment images are mmap-backed by default and populate a bounded blocked-layout
-cache as searches touch them; writable tails and explicit single-image shards
-remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
+load and faults only the candidate rows used by reranking. Sealed TurboVec
+segment images (the `.tv` format; the current writer emits v6 and the loader
+accepts v5 and v6) are mmap-backed by default and populate a bounded
+blocked-layout cache as searches touch them; writable tails and explicit
+single-image shards remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
 
 ## TODO
+
+This section is a dated log of landed and in-progress work, newest first;
+the maintained documentation is the manual in [docs/manual/](docs/manual/README.md).
 
 - **2026-09-13 — tonic 0.14 and prost 0.14.** The gRPC stack moves as
   one: tonic 0.14 here and in `turbovec-grpc` (with tonic-health and
