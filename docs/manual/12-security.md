@@ -96,9 +96,9 @@ HMAC-SHA256 tag. A node with the key ignores a datagram with a tag that does not
 verify, a malformed frame, or a sequence at or behind the newest it applied for
 that stream. Forged, damaged, and replayed datagrams have no effect.
 
-Without a key, a node opens its UDP lane on loopback only; off loopback the lane
-remains closed and every signal goes over the gRPC stream. A coordinator with no
-key sends unsigned frames, which a keyed node ignores.
+Without a key, a node opens its UDP channel on loopback only; off loopback the
+channel remains closed and every signal goes over the gRPC stream. A coordinator
+with no key sends unsigned frames, which a keyed node ignores.
 
 ## Cluster control membership
 

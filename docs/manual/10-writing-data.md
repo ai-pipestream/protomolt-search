@@ -16,6 +16,24 @@ document has:
 - `quality`, `geography`, `materialize`: the derive-at-ingest specs.
 - `cased_field`: the field receiving the body's cased identity.
 
+```text
+client stream                 node (one shard, under the write lock)
+  |  AddDocuments              |
+  |  document                  v
+  |  document          analyze (native in-process, or the sidecar)
+  |  document                |
+  v                          v
+batch applies        check every column value BEFORE anything mutates
+  |                          |
+  v                          v
+AddDocumentsResponse  applied to the postings, doc store, and columns,
+                      then logged to the WAL after it applies
+```
+
+*The document write path: one client stream, one analyzer pass per document,
+all validation before any mutation, and the write-ahead log record written
+after the mutation applies, under one lock.*
+
 Every column value is checked before anything mutates. An unknown name is
 rejected naming the column and the flag that declares it; a field valued twice
 in one document is rejected; empty facet values, empty map keys, non-finite
@@ -76,7 +94,8 @@ is rejected, so an automatic retry cannot cross a reshard cutover.
 ## Deletes and replacements
 
 No value mutates in place. `NodeService.DeleteDocuments` records idempotent
-tombstones for global ids in one live-row overlay that every read path consults.
+tombstones — delete markers kept in one live-row overlay that every read path
+consults — for global ids.
 Term statistics subtract deleted postings and lengths, so distributed BM25 uses
 statistics for the live corpus.
 
@@ -131,8 +150,10 @@ rejected by name on resumption.
 
 ## The write-ahead log
 
-Each persisted shard keeps `<index>.wal/gen-NNNNNN/`: a manifest, a set of
-bucket files, and a marker file. Records route to buckets by
+Each persisted shard keeps `<index>.wal/gen-NNNNNN/`: a manifest (the small
+`manifest.toml` naming the generation's dimension, provider state, slot
+offset, bucket geometry, and format version), a set of bucket files, and a
+marker file. Records route to buckets by
 `fnv1a64(id) >> (64 - bucket_bits)`, the same partition function a split uses,
 so a split into at most `--wal-buckets` children hands each child a contiguous
 set of bucket files with no re-hashing. `--wal-buckets` defaults to 64, must be
@@ -189,10 +210,38 @@ counts, fingerprints, and the SHA-256 of every artifact. Opening a set verifies
 every hash and count before it can serve.
 
 Queries read every segment and the tail as one shard, with global statistics and
-chained block-max cursors. `--seal-tail-docs` (default 500,000) seals a full
-tail into a new immutable segment between documents; 0 seals on flush only.
-Sealed vector images are memory-mapped by default (`--vector-mmap=false` loads
-them into memory instead).
+chained block-max cursors. `--seal-tail-docs` (default 500,000) seals — freezes
+— a full tail into a new immutable segment between documents; 0 seals on flush
+only. Sealed vector images are memory-mapped by default (`--vector-mmap=false`
+loads them into memory instead).
+
+```text
+                 writes append here
+                       |
+                       v
+              +----------------+      seal: a full tail becomes one
+              | writable tail  |      more immutable segment
+              +----------------+            |
+                       ^                    v
+                       |     +----------+ +----------+ +----------+
+                       +-----| segment  |-| segment  |-| segment  |
+                             | 1        | | 2        | | 3        |
+                             +----------+ +----------+ +----------+
+                             four row-aligned artifacts each:
+                             vector image, exact FP32 rows,
+                             BM25 image, live-doc bitmap,
+                             plus a checksummed segment.json
+
+one shard = segment 1 + segment 2 + segment 3 + the writable tail,
+read with one global statistic set and chained block-max cursors
+
+compaction: reads every segment + tail, rebuilds the live rows dense,
+publishes a fresh set of segments and a fresh tail (chapter: Deletes)
+```
+
+*A persisted shard is an ordered catalog of immutable segments plus one
+writable tail; sealing promotes the tail to a segment, and compaction rewrites
+the live rows into a new, denser catalog while writes continue.*
 
 A shard has the layout its files have. No file converts on open, and a path
 holding both a single image and a catalog is rejected by name.

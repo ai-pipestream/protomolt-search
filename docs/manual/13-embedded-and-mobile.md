@@ -33,7 +33,7 @@ It has by construction, not by policy:
 1. The configuration takes shard configurations, not node addresses.
 2. Every coordinator link is an in-process link to a shard it opened itself.
 3. A missing link is rejected instead of falling back to TCP, and both DNS
-   resolution and the UDP signal lane are disabled.
+   resolution and the UDP signal channel are disabled.
 4. Every shard and the coordinator are forced to the in-process native analyzer.
    A sidecar URL is rejected before any service task starts.
 5. Embeddings enter as client-supplied vectors or as fields in mapped protobuf
@@ -41,7 +41,7 @@ It has by construction, not by policy:
 
 The package depends on the search crate with its network feature off and on the
 core of the gRPC crate only, so the linked binary has no HTTP/2, hyper,
-axum, tower, rustls, or socket layer, and no Tokio networking or signals. A
+axum, tower, rustls, or socket code, and no Tokio networking or signals. A
 dependency check in its test suite fails the build the moment one of them comes
 back.
 

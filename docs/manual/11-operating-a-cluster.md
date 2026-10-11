@@ -78,7 +78,7 @@ and do not reopen the old generation and losing a tail.
 
 `--relay` on a coordinator makes it serve the node-facing surface over
 its shard set and present itself to a parent coordinator as one shard,
-which is how a root stands over thousands of shards with a level in
+which is how a root stands over thousands of shards with a relay in
 between. A relay serves `StreamSearch`, `TermStats`, and `Health` and
 refuses every other node route by name; it takes one unnamed collection
 on a dedicated endpoint, needs children with contiguous slot ranges, and
@@ -206,8 +206,9 @@ on streaming routes, `{phase}`, `turbovec_request_errors_total{rpc,code}`, the
 scan counters, the ingest counters, and per-shard gauges labeled by slot offset.
 
 Requests count at arrival, so a shard erroring under load shows as traffic
-and not as silence. One arrival is one count however many layers it passes
-through. Histogram buckets are fixed and identical for every route, from 1 ms to
+and not as silence. One arrival is one count however many coordinators and
+relays it passes through. Histogram buckets are fixed and identical for every
+route, from 1 ms to
 10 s plus an infinity bucket, compared in integer nanoseconds.
 
 Streaming routes include a `phase` label: `first_response` is arrival to the first
