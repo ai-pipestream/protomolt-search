@@ -203,13 +203,29 @@ fn node_config(config: MobileShardConfig) -> Result<EmbeddedShardConfig, BridgeE
     };
     shard.allow_missing_bm25 = config.allow_missing_bm25;
 
+    // The optional overrides are uniform `if let Some` copies; listing the
+    // fields keeps the whole override surface auditable at a glance. The
+    // second arm narrows u64 wire values to usize node fields.
+    macro_rules! copy_present {
+        ($from:ident -> $to:ident; $($field:ident),* $(,)?) => {
+            $(if let Some(value) = $from.$field {
+                $to.$field = value;
+            })*
+        };
+        ($from:ident -> $to:ident as usize; $($field:ident),* $(,)?) => {
+            $(if let Some(value) = $from.$field {
+                $to.$field = value as usize;
+            })*
+        };
+    }
     let node = &mut shard.node;
-    if let Some(value) = config.vector_backend {
-        node.vector_backend = value;
-    }
-    if let Some(value) = config.bit_width {
-        node.bit_width = value as usize;
-    }
+    copy_present!(config -> node;
+        vector_backend, wal, wal_buckets, vocab, vocab_window_docs, share_floors, block_max,
+        floor_delta, floor_warmup_chunks, floor_min_interval_ms, coalesce,
+    );
+    copy_present!(config -> node as usize;
+        bit_width, vocab_top_k, chunk_blocks, scan_parallel, rerank_parallel,
+    );
     if !config.bm25_fields.is_empty() {
         node.bm25_fields = config.bm25_fields;
     }
@@ -222,48 +238,6 @@ fn node_config(config: MobileShardConfig) -> Result<EmbeddedShardConfig, BridgeE
     node.integer_fields = config.integer_fields;
     node.unsigned_integer_fields = config.unsigned_integer_fields;
     node.geo_fields = config.geo_fields;
-    if let Some(value) = config.wal {
-        node.wal = value;
-    }
-    if let Some(value) = config.wal_buckets {
-        node.wal_buckets = value;
-    }
-    if let Some(value) = config.vocab {
-        node.vocab = value;
-    }
-    if let Some(value) = config.vocab_window_docs {
-        node.vocab_window_docs = value;
-    }
-    if let Some(value) = config.vocab_top_k {
-        node.vocab_top_k = value as usize;
-    }
-    if let Some(value) = config.chunk_blocks {
-        node.chunk_blocks = value as usize;
-    }
-    if let Some(value) = config.share_floors {
-        node.share_floors = value;
-    }
-    if let Some(value) = config.block_max {
-        node.block_max = value;
-    }
-    if let Some(value) = config.floor_delta {
-        node.floor_delta = value;
-    }
-    if let Some(value) = config.floor_warmup_chunks {
-        node.floor_warmup_chunks = value;
-    }
-    if let Some(value) = config.floor_min_interval_ms {
-        node.floor_min_interval_ms = value;
-    }
-    if let Some(value) = config.coalesce {
-        node.coalesce = value;
-    }
-    if let Some(value) = config.scan_parallel {
-        node.scan_parallel = value as usize;
-    }
-    if let Some(value) = config.rerank_parallel {
-        node.rerank_parallel = value as usize;
-    }
     Ok(shard)
 }
 
