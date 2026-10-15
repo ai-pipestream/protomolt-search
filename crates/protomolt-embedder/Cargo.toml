@@ -6,12 +6,8 @@ license = "MIT"
 description = "Model2Vec static-embedding provider spike: WordPiece + table lookup, no runtime, no network"
 
 [dependencies]
-# Embedding output is persisted vector identity, exactly as analyzer output is
-# persisted term identity. Unicode answers come only through
-# protomolt-unicode16, the same exact ICU4X pins and Unicode 16 answers the
-# analyzer uses; this crate adds no Unicode data source of its own. The
-# unicode_identity digest test in src/lib.rs compares every scalar value.
-protomolt-unicode16 = { path = "../protomolt-unicode16" }
+icu_normalizer = "2.3"
+icu_properties = "2.3"
 # Table access and file parsing reuse the root product's existing versions.
 memmap2 = "0.9"
 serde_json = "1"

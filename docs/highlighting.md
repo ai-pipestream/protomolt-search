@@ -17,7 +17,7 @@ sentence layer:
 
 - The sidecar: `sentence_detection` is requested on the ingest session
   (`SessionLayers.sentences`), one traversal of text the sidecar already
-  holds. The spans come back in **original-text UTF-16 units**, the one
+  holds. The spans come back in **original-text UTF-8 bytes**, the one
   coordinate system every persisted span uses — before any char filter
   (accent folding, invisible stripping, case folding) touched the text.
   This is the same layer the sidecar's `SOURCE_SENTENCES` embeddings are
@@ -84,14 +84,14 @@ and on `QueryRequest` for the single lexical selection:
 |---|---|---|
 | `fields` | fields to cut from; only the body qualifies | `["body"]` |
 | `max_snippets` | per hit per field | 3, at most 64 |
-| `max_chars` | snippet width in UTF-16 units | 300, 16 to 4096 |
+| `max_chars` | snippet width in UTF-8 bytes | 300, 16 to 4096 |
 | `mode` | `SENTENCE` (default) or `WINDOW` | |
 
 Each returned `Bm25Hit` (and `QueryHit`) then carries `snippets`, in
 text order, each with:
 
 - `text`: the UTF-8 slice of the stored text at `[start, end)`;
-- `start`, `end`: UTF-16 units of the **original** text;
+- `start`, `end`: UTF-8 byte offsets of the **original** text;
 - `highlights`: the hit's occurrence spans inside the snippet, merged
   (no two overlap or touch), ascending, in the same units — subtract
   `start` for snippet-relative positions;

@@ -24,10 +24,11 @@ Terms retain first-occurrence order. Full vectors retain every occurrence;
 scoring-only vectors retain frequencies without offsets. Input is capped at
 1 MiB, matching the sidecar.
 
-`analyze()` preserves the original UTF-16 behavior. Direct callers select a
-different ruler with `analyze_with_offset_unit(..., OffsetUnit::Utf8Bytes)`.
-The selected unit is recorded on `AnalyzedDocument`; it changes only numeric
-span coordinates, not tokens, normalization, term identity, or frequencies.
+`analyze()` defaults to UTF-8 byte offsets (`OffsetUnit::Utf8Bytes`). Direct
+callers can select a different ruler with
+`analyze_with_offset_unit(..., OffsetUnit::Utf16CodeUnits)`. The selected unit
+is recorded on `AnalyzedDocument`; it changes only numeric span coordinates,
+not tokens, normalization, term identity, or frequencies.
 
 An absent `AnalysisSpec` is not accepted by the native provider because the
 named `server` analyzer means "use the sidecar's configured defaults". Any
@@ -39,16 +40,16 @@ substitute a similar algorithm.
 same punctuation-only filtering used by OpenNLP's word tokenizer. It retains
 letters, numbers, ideographs, kana, Hangul, Southeast Asian words, emoji, and
 regional-indicator flags; drops punctuation-only segments; and caps one token
-at 255 UTF-16 units without splitting a surrogate pair. The convenience
+at 255 units without splitting a character boundary. The convenience
 `uax29_body_spec()` selects it. `body_spec()` remains whitespace-tokenized
 because silently changing the default would change every persisted term.
 
 The crate also owns the portable glossary matcher described in
-[`phrase-search.md`](phrase-search.md): pinned Aho-Corasick matching, Unicode
-full case folding, word boundaries, selectable original-text UTF-16 or UTF-8
-spans, stable vocabulary fingerprints, and canonical concept posting
-identities. Existing `matches()` and `index_matches()` callers retain UTF-16;
-the corresponding `*_with_offset_unit` methods select UTF-8 when needed.
+[`phrase-search.md`](phrase-search.md): Aho-Corasick matching, Unicode full
+case folding, word boundaries, selectable original-text UTF-8 or UTF-16 spans,
+stable vocabulary fingerprints, and canonical concept posting identities.
+`matches()` and `index_matches()` default to UTF-8 byte offsets; the
+corresponding `*_with_offset_unit` methods select UTF-16 when needed.
 
 ## Server configuration
 
@@ -79,10 +80,10 @@ The same backend dispatch is used by unary query analysis, streamed ingest,
 mapped ingest, replay, and resharding. There is no local network service and no
 loopback hop.
 
-Protomolt Search deliberately requests UTF-16 from either provider and stores
+Protomolt Search requests UTF-8 byte offsets from either provider and stores
 that canonical unit in BM25 postings, WAL replay, and resharded generations.
-It accepts an unspecified response from an older sidecar as legacy UTF-16, but
-refuses a UTF-8 or unknown response when UTF-16 was requested. Offset selection
+It accepts an unspecified response from a legacy sidecar as UTF-8, and refuses
+a UTF-16 or unknown response when UTF-8 was requested. Offset selection
 therefore stays outside the term-identity fingerprint and cannot create a
 mixed-unit index generation.
 
@@ -103,21 +104,9 @@ missing embedding provider.
 
 ## Compatibility and index safety
 
-The native implementation is checked against the real OpenNLP service for the
-two product analyzers, a generated Porter suffix corpus, and every Unicode
-scalar. JDK 25 uses Unicode 16 normalization, category, and script behavior;
-OpenNLP additionally bundles Unicode 17 full-case-fold mappings. The analyzer
-uses ICU4X only through `protomolt-unicode16`, which links ICU4X 2.3
-(Unicode 17) on exact pins and gives back the Unicode 16 answer for every
-scalar where the general category, script, Extended_Pictographic flag or
-normalization differs, while keeping Unicode 17 case folding. Those
-differences are 4,803 scalars new in Unicode 17, 689 scalars that lost
-Extended_Pictographic (U+2605 BLACK STAR among them, which the tokenizer
-keeps as a term), and U+0295, a lowercase letter in 16 and an other letter
-in 17. `tools/unicode16-freeze/run.sh` regenerates the tables by comparing
-every scalar under ICU4X 2.0 and 2.3, and stops on a difference the freeze
-does not handle. A digest test in `protomolt-analyzer` and one in
-`protomolt-embedder` compare every scalar's output with ICU4X 2.0.
+The native implementation uses ICU4X 2.3 (Unicode 17) directly for
+normalization, general category, script, Extended_Pictographic properties, and
+full case folding, and `unicode-segmentation` for UAX #29 word boundaries.
 
 Run the differential oracle against a live sidecar:
 
@@ -126,11 +115,9 @@ OPENNLP_ANALYSIS_ADDR=http://127.0.0.1:59222 \
   cargo test --test native_opennlp_conformance -- --ignored --nocapture
 ```
 
-Analysis output is persisted term identity. Keep the ICU dependencies exact,
-and treat any tokenizer, normalizer, or stemmer change as an index
-compatibility event. Switching an existing generation between providers is
-safe only after the differential test and corpus canaries pass for its exact
-spec. A changed spec or changed term output requires a rebuild.
+Analysis output is persisted term identity. Treat any tokenizer, normalizer, or
+stemmer change as an index compatibility event. A changed spec or changed term
+output requires a rebuild.
 
 ## Android and iOS
 

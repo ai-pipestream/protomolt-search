@@ -305,7 +305,7 @@ mod tests {
             .iter()
             .find(|value| value.concept_id == "nyc")
             .unwrap();
-        assert_eq!(nyc.offsets, [OffsetSpan { start: 3, end: 16 }]);
+        assert_eq!(nyc.offsets, [OffsetSpan { start: 5, end: 18 }]);
     }
 
     #[test]

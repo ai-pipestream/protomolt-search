@@ -3,8 +3,8 @@
 //!
 //! `native` runs the same product term contract in-process through the
 //! cross-platform `protomolt-analyzer` crate. HTTP(S) values use the OpenNLP
-//! sidecar. Search configures both to produce original-text UTF-16 offsets;
-//! direct users of either analyzer can select UTF-8 instead. Embeddings and optional
+//! sidecar. Search configures both to produce original-text UTF-8 byte offsets;
+//! direct users of either analyzer can select UTF-16 if needed. Embeddings and optional
 //! model-backed/structural layers remain sidecar capabilities.
 
 #[cfg(feature = "net")]
@@ -759,10 +759,9 @@ fn analysis_options(spec: Option<&AnalysisSpec>, layers: SessionLayers) -> Analy
         // Sentence spans for snippets (docs/highlighting.md) ride the
         // same pass; the term identity is unchanged by the layer.
         sentence_detection: layers.sentences,
-        // Search persistence remains one unambiguous legacy coordinate system.
-        // Offset output selection is separate from term identity and is exposed
-        // by the portable analyzer API rather than AnalysisSpec.
-        offset_unit: crate::pb::analysis::OffsetUnit::Utf16CodeUnits as i32,
+        // Search persists native UTF-8 byte offsets across postings, entities,
+        // and sentence tables.
+        offset_unit: crate::pb::analysis::OffsetUnit::Utf8Bytes as i32,
         ..Default::default()
     }
 }
@@ -862,10 +861,10 @@ fn analyzed_from(
 ) -> Result<AnalyzedDoc, Status> {
     match crate::pb::analysis::OffsetUnit::try_from(response.offset_unit) {
         Ok(crate::pb::analysis::OffsetUnit::Unspecified)
-        | Ok(crate::pb::analysis::OffsetUnit::Utf16CodeUnits) => {}
-        Ok(crate::pb::analysis::OffsetUnit::Utf8Bytes) => {
+        | Ok(crate::pb::analysis::OffsetUnit::Utf8Bytes) => {}
+        Ok(crate::pb::analysis::OffsetUnit::Utf16CodeUnits) => {
             return Err(Status::failed_precondition(
-                "analysis sidecar returned UTF-8 byte offsets after search requested UTF-16; refusing ambiguous persisted spans",
+                "analysis sidecar returned UTF-16 offsets after search requested UTF-8; refusing ambiguous persisted spans",
             ));
         }
         Err(value) => {
@@ -1962,9 +1961,9 @@ mod tests {
     }
 
     #[test]
-    fn search_refuses_a_sidecar_that_violates_its_utf16_storage_request() {
+    fn search_refuses_a_sidecar_that_violates_its_utf8_storage_request() {
         let response = AnalyzeResponse {
-            offset_unit: crate::pb::analysis::OffsetUnit::Utf8Bytes as i32,
+            offset_unit: crate::pb::analysis::OffsetUnit::Utf16CodeUnits as i32,
             ..Default::default()
         };
         let error = analyzed_from(response, SessionLayers::default()).unwrap_err();
@@ -1973,7 +1972,7 @@ mod tests {
     }
 
     #[test]
-    fn native_provider_runs_the_product_specs_with_utf16_offsets() {
+    fn native_provider_runs_the_product_specs_with_utf8_offsets() {
         let folded =
             analyze_document_native("😀 Running Rodríguez running", Some(&body_spec())).unwrap();
         let body = &folded.fields[0];
@@ -1981,9 +1980,9 @@ mod tests {
         assert_eq!(
             body.terms,
             vec![
-                ("😀".to_string(), 1, vec![(0, 2)]),
-                ("run".to_string(), 2, vec![(3, 10), (21, 28)]),
-                ("rodriguez".to_string(), 1, vec![(11, 20)]),
+                ("😀".to_string(), 1, vec![(0, 4)]),
+                ("run".to_string(), 2, vec![(5, 12), (24, 31)]),
+                ("rodriguez".to_string(), 1, vec![(13, 23)]),
             ]
         );
 

@@ -1,7 +1,7 @@
 //! Per-shard BM25 postings index and doc store, with persistence.
 //!
 //! The shard owns: term → postings (doc id, tf, occurrence offsets in
-//! original-text UTF-16 code units), per-document lengths and corpus totals, and
+//! original-text UTF-8 bytes), per-document lengths and corpus totals, and
 //! the raw document texts (the highlight source). Append-only: no deletes,
 //! no updates, so postings for a term stay doc-id-ordered by construction.
 //!
@@ -203,7 +203,7 @@ fn positions_section_size(n_terms: u64, total: u64) -> u64 {
 /// [`SENTENCES_ENTRY_PREFIX`], then `u64 off | u64 total`. Section:
 /// `u32 n_slots | (n_slots + 1) x u32 base | total x (u32 start, u32 end)`
 /// — `base[d]..base[d + 1]` are document `d`'s sentences in text order,
-/// UTF-16 units of the stored text, sorted and non-overlapping. Costs
+/// UTF-8 byte offsets of the stored text, sorted and non-overlapping. Costs
 /// 4 B per slot plus 8 B per sentence, read only for returned hits.
 const COLUMN_KIND_SENTENCES: u8 = 8;
 /// Column-table name prefix of a kind-8 entry: `sentences:<field>`.
@@ -737,7 +737,7 @@ pub trait Bm25Index {
     fn has_sentences(&self) -> bool {
         false
     }
-    /// The sentence spans of `doc_id` in UTF-16 units of the stored
+    /// The sentence spans of `doc_id` in UTF-8 bytes of the stored
     /// text, sorted; `None` when the field stores none, an empty table
     /// for a slot without a document.
     fn doc_sentences(&self, doc_id: u32) -> Option<Vec<(u32, u32)>> {
@@ -805,7 +805,7 @@ pub struct Posting {
     pub doc_id: u32,
     /// Term frequency within the document.
     pub tf: u32,
-    /// Occurrence spans `(start, end)` in original-text UTF-16 code units.
+    /// Occurrence spans `(start, end)` in original-text UTF-8 bytes
     /// (half-open). Empty when ingested with SCORING_ONLY term vectors.
     pub offsets: Vec<(u32, u32)>,
     /// Token ordinal per occurrence, parallel to `offsets`
@@ -856,7 +856,7 @@ pub struct AnalyzedField {
     /// than indexing it without positions, because half a column with
     /// positions is a phrase index that lies about the other half.
     pub positions: Option<DocPositions>,
-    /// Sentence spans of the field's text in UTF-16 units, sorted and
+    /// Sentence spans of the field's text in UTF-8 bytes, sorted and
     /// non-overlapping, or `None` when the analysis carried no sentence
     /// layer. A sentence field refuses a `None` document by name
     /// (`docs/highlighting.md`); every occurrence must lie inside one

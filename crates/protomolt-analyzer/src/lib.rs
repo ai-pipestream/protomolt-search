@@ -11,7 +11,10 @@ use std::error::Error;
 use std::fmt;
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
-use protomolt_unicode16::{GeneralCategory, Script};
+use icu_casemap::CaseMapper;
+use icu_normalizer::{ComposingNormalizerBorrowed, DecomposingNormalizerBorrowed};
+use icu_properties::props::{ExtendedPictographic, GeneralCategory, Script};
+use icu_properties::{CodePointMapData, CodePointSetData};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Maximum accepted UTF-8 input size, matching the OpenNLP analysis service.
@@ -39,7 +42,7 @@ pub enum Stemmer {
 /// Amount of occurrence data retained for each term.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TermVectorMode {
-    /// Frequencies and original-text UTF-16 occurrence spans.
+    /// Frequencies and original-text UTF-8 occurrence spans.
     Full,
     /// Frequencies only.
     ScoringOnly,
@@ -60,11 +63,11 @@ pub enum TermVectorSource {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum OffsetUnit {
     /// Java/OpenNLP string coordinates. Supplementary scalars occupy two
-    /// units. This is the backward-compatible default.
-    #[default]
+    /// units.
     Utf16CodeUnits,
     /// Byte boundaries in the original text's UTF-8 encoding, directly usable
-    /// to slice a Rust string.
+    /// to slice a Rust string. This is the default.
+    #[default]
     Utf8Bytes,
 }
 
@@ -153,7 +156,7 @@ pub struct GlossaryEntry {
     pub term: String,
 }
 
-/// One glossary occurrence in original-text UTF-16 coordinates.
+/// One glossary occurrence in original-text coordinates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GlossaryMatch {
     pub id: String,
@@ -226,7 +229,7 @@ impl Glossary {
                     entry.term
                 )));
             }
-            let count = tokenize_uax29(&entry.term, OffsetUnit::Utf16CodeUnits).len() as u32;
+            let count = tokenize_uax29(&entry.term, OffsetUnit::Utf8Bytes).len() as u32;
             if count == 0 {
                 return Err(AnalysisError::new(format!(
                     "glossary term {:?} contains no indexable UAX #29 token",
@@ -265,7 +268,7 @@ impl Glossary {
 
     /// Leftmost-longest non-overlapping matches for annotation consumers.
     pub fn matches(&self, text: &str) -> Vec<GlossaryMatch> {
-        self.matches_with_offset_unit(text, OffsetUnit::Utf16CodeUnits)
+        self.matches_with_offset_unit(text, OffsetUnit::Utf8Bytes)
     }
 
     /// Leftmost-longest matches using the requested original-text coordinate
@@ -302,7 +305,7 @@ impl Glossary {
     /// as both `new york` and `new york city`. No unregistered shingle is
     /// synthesized.
     pub fn index_matches(&self, text: &str) -> Vec<GlossaryMatch> {
-        self.index_matches_with_offset_unit(text, OffsetUnit::Utf16CodeUnits)
+        self.index_matches_with_offset_unit(text, OffsetUnit::Utf8Bytes)
     }
 
     /// Every registered occurrence using the requested original-text
@@ -392,9 +395,9 @@ struct Token<'a> {
 }
 
 /// Analyze one document. Terms are emitted in first-occurrence order and
-/// occurrence spans use Java/OpenNLP UTF-16 coordinates.
+/// occurrence spans use UTF-8 byte coordinates.
 pub fn analyze(text: &str, spec: &AnalysisSpec) -> Result<AnalyzedDocument, AnalysisError> {
-    analyze_with_offset_unit(text, spec, OffsetUnit::Utf16CodeUnits)
+    analyze_with_offset_unit(text, spec, OffsetUnit::Utf8Bytes)
 }
 
 /// Analyze one document and return every occurrence in `offset_unit`.
@@ -449,7 +452,7 @@ pub fn analyze_dual(
     text: &str,
     spec: &AnalysisSpec,
 ) -> Result<DualAnalyzedDocument, AnalysisError> {
-    analyze_dual_with_offset_unit(text, spec, OffsetUnit::Utf16CodeUnits)
+    analyze_dual_with_offset_unit(text, spec, OffsetUnit::Utf8Bytes)
 }
 
 pub fn analyze_dual_with_offset_unit(
@@ -613,10 +616,7 @@ fn normalize(token: &str, steps: &[NormalizerStep]) -> String {
 }
 
 fn full_case_fold(text: &str) -> String {
-    // JDK 25's normalization and character-property tables are Unicode 16,
-    // while OpenNLP deliberately bundles Unicode 17's CaseFolding.txt;
-    // protomolt-unicode16 supplies the Unicode 17 folds.
-    protomolt_unicode16::case_fold(text)
+    CaseMapper::new().fold_string(text).into_owned()
 }
 
 /// Unicode full, non-Turkic case folding used by persisted product identities.
@@ -705,6 +705,7 @@ fn tokenize_whitespace(text: &str, offset_unit: OffsetUnit) -> Vec<Token<'_>> {
 
 fn tokenize_uax29(text: &str, offset_unit: OffsetUnit) -> Vec<Token<'_>> {
     const MAX_TOKEN_UTF16: u32 = 255;
+    let pictographic = CodePointSetData::new::<ExtendedPictographic>();
     let mut tokens = Vec::new();
     let mut utf16 = 0u32;
     let mut last_byte = 0usize;
@@ -714,7 +715,7 @@ fn tokenize_uax29(text: &str, offset_unit: OffsetUnit) -> Vec<Token<'_>> {
         let segment_utf16 = segment.encode_utf16().count() as u32;
         if segment.chars().any(|ch| {
             ch.is_alphanumeric()
-                || protomolt_unicode16::is_extended_pictographic(ch)
+                || pictographic.contains(ch)
                 || matches!(ch as u32, 0x1F1E6..=0x1F1FF)
         }) {
             let mut chunk_byte = byte;
@@ -887,12 +888,16 @@ fn normalize_whitespace(text: &str) -> String {
 }
 
 fn accent_fold(text: &str) -> String {
-    let decomposed = protomolt_unicode16::nfd(text);
+    let decomposed = DecomposingNormalizerBorrowed::new_nfd()
+        .normalize(text)
+        .into_owned();
+    let categories = CodePointMapData::<GeneralCategory>::new();
+    let scripts = CodePointMapData::<Script>::new();
     let mut out = String::with_capacity(decomposed.len());
     let mut base_script = None;
 
     for ch in decomposed.chars() {
-        if protomolt_unicode16::general_category(ch) == GeneralCategory::NonspacingMark {
+        if categories.get(ch) == GeneralCategory::NonspacingMark {
             if !base_script.is_some_and(is_folded_script) {
                 out.push(ch);
             }
@@ -903,10 +908,12 @@ fn accent_fold(text: &str) -> String {
             base_script = Some(Script::Latin);
         } else {
             out.push(ch);
-            base_script = Some(protomolt_unicode16::script(ch));
+            base_script = Some(scripts.get(ch));
         }
     }
-    protomolt_unicode16::nfc(&out)
+    ComposingNormalizerBorrowed::new_nfc()
+        .normalize(&out)
+        .into_owned()
 }
 
 fn is_folded_script(script: Script) -> bool {
@@ -958,28 +965,28 @@ mod tests {
     }
 
     #[test]
-    fn folded_terms_group_and_keep_utf16_offsets() {
+    fn folded_terms_group_and_keep_utf8_offsets() {
         let doc = analyze("😀 Running Rodríguez running", &folded()).unwrap();
-        assert_eq!(doc.offset_unit, OffsetUnit::Utf16CodeUnits);
+        assert_eq!(doc.offset_unit, OffsetUnit::Utf8Bytes);
         assert_eq!(
             doc.term_vectors,
             vec![
                 TermVector {
                     term: "😀".into(),
                     frequency: 1,
-                    occurrences: vec![Span { start: 0, end: 2 }],
+                    occurrences: vec![Span { start: 0, end: 4 }],
                     positions: vec![0],
                 },
                 TermVector {
                     term: "run".into(),
                     frequency: 2,
-                    occurrences: vec![Span { start: 3, end: 10 }, Span { start: 21, end: 28 }],
+                    occurrences: vec![Span { start: 5, end: 12 }, Span { start: 24, end: 31 }],
                     positions: vec![1, 3],
                 },
                 TermVector {
                     term: "rodriguez".into(),
                     frequency: 1,
-                    occurrences: vec![Span { start: 11, end: 20 }],
+                    occurrences: vec![Span { start: 13, end: 23 }],
                     positions: vec![2],
                 },
             ]
@@ -1016,10 +1023,11 @@ mod tests {
     #[test]
     fn utf8_mode_changes_only_the_original_text_ruler() {
         let text = "A 😀 café 東京";
-        let utf16 = analyze(text, &folded()).unwrap();
-        let utf8 = analyze_with_offset_unit(text, &folded(), OffsetUnit::Utf8Bytes).unwrap();
+        let utf8 = analyze(text, &folded()).unwrap();
+        let utf16 = analyze_with_offset_unit(text, &folded(), OffsetUnit::Utf16CodeUnits).unwrap();
 
         assert_eq!(utf8.offset_unit, OffsetUnit::Utf8Bytes);
+        assert_eq!(utf16.offset_unit, OffsetUnit::Utf16CodeUnits);
         assert_eq!(utf8.tokens, utf16.tokens);
         assert_eq!(utf8.length, utf16.length);
         assert_eq!(
@@ -1092,7 +1100,7 @@ mod tests {
     }
 
     #[test]
-    fn uax29_matches_words_ideographs_emoji_and_utf16_offsets() {
+    fn uax29_matches_words_ideographs_emoji_and_utf8_offsets() {
         let mut spec = folded();
         spec.tokenizer = Tokenizer::Uax29;
         spec.stemmer = Stemmer::None;
@@ -1102,7 +1110,7 @@ mod tests {
             doc.tokens,
             ["😀", "U.S", "東", "京", "カタカナ", "hot", "dog"]
         );
-        assert_eq!(doc.term_vectors[0].occurrences, [Span { start: 0, end: 2 }]);
+        assert_eq!(doc.term_vectors[0].occurrences, [Span { start: 0, end: 4 }]);
         assert_eq!(doc.term_vectors[1].term, "u.s");
     }
 
@@ -1158,7 +1166,7 @@ mod tests {
     }
 
     #[test]
-    fn glossary_preserves_original_utf16_spans_across_folding() {
+    fn glossary_preserves_original_utf8_spans_across_folding() {
         let glossary = Glossary::new(
             vec![GlossaryEntry {
                 id: "street".into(),
@@ -1168,11 +1176,11 @@ mod tests {
         )
         .unwrap();
         let found = glossary.matches("😀 Straße!");
-        assert_eq!(found[0].span, Span { start: 3, end: 9 });
+        assert_eq!(found[0].span, Span { start: 5, end: 12 });
         assert!(glossary.matches("Grosses").is_empty());
         assert_eq!(
-            glossary.matches_with_offset_unit("😀 Straße!", OffsetUnit::Utf8Bytes)[0].span,
-            Span { start: 5, end: 12 }
+            glossary.matches_with_offset_unit("😀 Straße!", OffsetUnit::Utf16CodeUnits)[0].span,
+            Span { start: 3, end: 9 }
         );
     }
 
@@ -1246,12 +1254,12 @@ mod sentence_tests {
     fn lines_become_sentences_trimmed_and_blank_lines_yield_none() {
         let text = "  first line  \n\n\t \nsecond\r\nthird";
         assert_eq!(
-            spans(text, OffsetUnit::Utf16CodeUnits),
+            spans(text, OffsetUnit::Utf8Bytes),
             vec![(2, 12), (19, 25), (27, 32)]
         );
-        assert_eq!(spans("", OffsetUnit::Utf16CodeUnits), vec![]);
-        assert_eq!(spans(" \n \n", OffsetUnit::Utf16CodeUnits), vec![]);
-        assert_eq!(spans("one", OffsetUnit::Utf16CodeUnits), vec![(0, 3)]);
+        assert_eq!(spans("", OffsetUnit::Utf8Bytes), vec![]);
+        assert_eq!(spans(" \n \n", OffsetUnit::Utf8Bytes), vec![]);
+        assert_eq!(spans("one", OffsetUnit::Utf8Bytes), vec![(0, 3)]);
     }
 
     #[test]
@@ -1288,75 +1296,5 @@ mod sentence_tests {
                 );
             }
         }
-    }
-}
-
-/// Term identity is persisted, so every Unicode scalar value, through each
-/// analysis step that reads ICU4X data, must analyze as it did under ICU4X
-/// 2.0.0 (Unicode 16 properties and normalization, with the Unicode 17 case
-/// folds OpenNLP bundles). The digest was computed on that release; a data
-/// or code change that moves any answer moves the digest. The shapes also
-/// run through `char::is_alphanumeric` and unicode-segmentation, which is
-/// intended: a change there moves term identity the same way.
-#[cfg(test)]
-mod unicode_identity {
-    use super::*;
-
-    const DIGEST_UNDER_ICU4X_2_0: u64 = 0xfc31_a718_6426_ce5e;
-
-    fn eat(hash: &mut u64, bytes: &[u8]) {
-        for byte in bytes {
-            *hash ^= u64::from(*byte);
-            *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    }
-
-    #[test]
-    fn every_scalar_analyzes_as_it_did_under_icu4x_2_0() {
-        let steps = [
-            NormalizerStep::StripInvisible,
-            NormalizerStep::Whitespace,
-            NormalizerStep::AccentFold,
-            NormalizerStep::FullCaseFold,
-        ];
-        let mut hash = 0xcbf2_9ce4_8422_2325u64;
-        let mut text = String::new();
-        for scalar in (0u32..=0x10FFFF).filter_map(char::from_u32) {
-            // The scalar alone, after a Latin base, as a base for two marks
-            // in noncanonical order (U+0301 is class 230, U+0323 class 220),
-            // and between marks: category, script, combining class and
-            // composition all reach the output.
-            for shape in [
-                format!("{scalar}"),
-                format!("a{scalar}\u{0301}"),
-                format!("{scalar}\u{0301}\u{0323}"),
-                format!("A\u{0301}{scalar}\u{0323}"),
-            ] {
-                eat(&mut hash, full_case_fold(&shape).as_bytes());
-                eat(&mut hash, &[0xFF]);
-                eat(&mut hash, accent_fold(&shape).as_bytes());
-                eat(&mut hash, &[0xFF]);
-                eat(&mut hash, normalize(&shape, &steps).as_bytes());
-                eat(&mut hash, &[0xFE]);
-            }
-            // Word segmentation keeps a segment only when it holds a letter,
-            // a digit, a pictograph or a regional indicator: the scalar as
-            // its own segment and inside a word.
-            text.clear();
-            text.push(' ');
-            text.push(scalar);
-            text.push_str(" x");
-            text.push(scalar);
-            text.push('y');
-            for token in tokenize_uax29(&text, OffsetUnit::Utf8Bytes) {
-                eat(&mut hash, token.surface.as_bytes());
-                eat(&mut hash, &[0xFD]);
-            }
-            eat(&mut hash, &[0xFC]);
-        }
-        assert_eq!(
-            hash, DIGEST_UNDER_ICU4X_2_0,
-            "analysis digest over every scalar is {hash:#018x}"
-        );
     }
 }

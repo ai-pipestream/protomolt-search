@@ -2,7 +2,7 @@
 //! snippets with merged occurrence spans, cut by the shard from text and
 //! sentence spans it stored at ingest, with no analyzer on the query
 //! path. Pins the happy path over the wire, the whitespace-only cuts,
-//! UTF-16 offsets, multi-field behaviour, the refusal table, the
+//! UTF-8 byte offsets, multi-field behaviour, the refusal table, the
 //! flush/reopen/WAL-replay round trip, distributed == monolithic, the
 //! heap/spill dual-writer identity, the no-analysis meter, and the
 //! bytes-per-document price of the kind-8 column.
@@ -114,20 +114,14 @@ async fn refused(c: &CoordinatorServiceImpl, req: Bm25SearchRequest) -> tonic::S
         .unwrap_err()
 }
 
-fn utf16_slice(text: &str, start: u32, end: u32) -> String {
-    let units: Vec<u16> = text
-        .encode_utf16()
-        .skip(start as usize)
-        .take((end - start) as usize)
-        .collect();
-    String::from_utf16(&units).unwrap()
+fn utf8_slice(text: &str, start: u32, end: u32) -> &str {
+    &text[start as usize..end as usize]
 }
 
-/// UTF-16 span of the `n`th occurrence of `word` in `text`.
+/// UTF-8 byte span of the `n`th occurrence of `word` in `text`.
 fn at(text: &str, word: &str, n: usize) -> (u32, u32) {
-    let byte = text.match_indices(word).nth(n).expect("occurrence").0;
-    let start = text[..byte].encode_utf16().count() as u32;
-    (start, start + word.encode_utf16().count() as u32)
+    let byte = text.match_indices(word).nth(n).expect("occurrence").0 as u32;
+    (byte, byte + word.len() as u32)
 }
 
 fn hit(resp: &Bm25SearchResponse, doc_id: u64) -> &Bm25Hit {
@@ -138,7 +132,7 @@ fn hit(resp: &Bm25SearchResponse, doc_id: u64) -> &Bm25Hit {
 }
 
 /// The contract every snippet keeps, whatever cut it got: text is the
-/// UTF-16 slice at its bounds, highlights are sorted, disjoint, inside
+/// UTF-8 byte slice at its bounds, highlights are sorted, disjoint, inside
 /// the bounds, and each is an occurrence the hit reported.
 fn check_contract(text: &str, h: &Bm25Hit) {
     let occurrences: Vec<(u32, u32)> = h
@@ -155,7 +149,7 @@ fn check_contract(text: &str, h: &Bm25Hit) {
             h.snippets
         );
         prev_end = s.end;
-        assert_eq!(s.text, utf16_slice(text, s.start, s.end), "{s:?}");
+        assert_eq!(s.text, utf8_slice(text, s.start, s.end), "{s:?}");
         let mut last = s.start;
         for (i, hl) in s.highlights.iter().enumerate() {
             assert!(s.start <= hl.start && hl.end <= s.end, "{s:?}");
@@ -281,8 +275,8 @@ async fn wide_sentences_truncate_at_whitespace_and_window_mode_never_cuts_a_toke
     assert_eq!(s.cut, SnippetCut::TruncatedSentence as i32);
     assert!(s.end - s.start <= 64, "{}", s.end - s.start);
     assert!(s.text.contains("court"));
-    let before = utf16_slice(text, 0, s.start);
-    let after = utf16_slice(text, s.end, text.encode_utf16().count() as u32);
+    let before = utf8_slice(text, 0, s.start);
+    let after = utf8_slice(text, s.end, text.len() as u32);
     assert!(
         before.is_empty() || before.ends_with(' '),
         "start on a token edge: {before:?}"
@@ -308,8 +302,8 @@ async fn wide_sentences_truncate_at_whitespace_and_window_mode_never_cuts_a_toke
     for s in &d4.snippets {
         assert_eq!(s.cut, SnippetCut::Window as i32);
         assert!(s.end - s.start <= 40);
-        let before = utf16_slice(text, 0, s.start);
-        let after = utf16_slice(text, s.end, text.encode_utf16().count() as u32);
+        let before = utf8_slice(text, 0, s.start);
+        let after = utf8_slice(text, s.end, text.len() as u32);
         assert!(before.is_empty() || before.ends_with(' '));
         assert!(after.is_empty() || after.starts_with(' '));
     }
@@ -327,7 +321,7 @@ async fn wide_sentences_truncate_at_whitespace_and_window_mode_never_cuts_a_toke
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn utf16_offsets_stay_in_the_original_text() {
+async fn utf8_offsets_stay_in_the_original_text() {
     let (c, handles) = fleet(true).await;
     let text = CORPUS[2];
     let resp = bm25(
@@ -338,25 +332,25 @@ async fn utf16_offsets_stay_in_the_original_text() {
     let d2 = hit(&resp, 2);
     check_contract(text, d2);
     assert_eq!(d2.snippets.len(), 2);
-    // 😀 is two UTF-16 units and four UTF-8 bytes; é one unit, two
-    // bytes; 𝔘 two units, four bytes. The offsets are units.
+    // 😀 is 4 UTF-8 bytes, é is 2 bytes, 𝔘 is 4 bytes. The offsets are
+    // UTF-8 byte offsets in the original text.
     assert_eq!(d2.snippets[0].text, "😀 café court");
-    assert_eq!((d2.snippets[0].start, d2.snippets[0].end), (0, 13));
+    assert_eq!((d2.snippets[0].start, d2.snippets[0].end), (0, 16));
     assert_eq!(
         d2.snippets[0]
             .highlights
             .iter()
             .map(|o| (o.start, o.end))
             .collect::<Vec<_>>(),
-        vec![(8, 13)]
+        vec![(11, 16)]
     );
     assert_eq!(d2.snippets[1].text, "naïve 𝔘nicode court appeal");
-    assert_eq!((d2.snippets[1].start, d2.snippets[1].end), (14, 41));
+    assert_eq!((d2.snippets[1].start, d2.snippets[1].end), (17, 47));
     // Snippet-relative positions are the subtraction the contract
-    // promises: they index the snippet's own UTF-16 units.
+    // promises: they index the snippet's own UTF-8 bytes.
     for s in &d2.snippets {
         for hl in &s.highlights {
-            let rel = utf16_slice(&s.text, hl.start - s.start, hl.end - s.start);
+            let rel = utf8_slice(&s.text, hl.start - s.start, hl.end - s.start);
             assert!(rel == "court" || rel == "appeal", "{rel:?}");
         }
     }
@@ -766,12 +760,10 @@ async fn highlighting_adds_no_analysis_call_and_a_layerless_sidecar_refuses_inge
 async fn offsets_predate_normalization_and_compose_with_lineage() {
     let (addr, handle) = start_empty_node(config(0, true)).await;
     let parent = "Preamble of the opinion\nRodríguez\u{200B} argued the appeal\nThe court agreed with Rodríguez\n😀 closing line";
-    // The chunk is a UTF-16 slice of the parent, as a Java chunker cuts.
-    let parent_units: Vec<u16> = parent.encode_utf16().collect();
+    // The chunk is a UTF-8 byte slice of the parent.
     let chunk_start = at(parent, "Rodríguez", 0).0;
     let chunk_end = at(parent, "😀", 0).0 - 1;
-    let chunk =
-        String::from_utf16(&parent_units[chunk_start as usize..chunk_end as usize]).unwrap();
+    let chunk = utf8_slice(parent, chunk_start, chunk_end).to_string();
     {
         let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
         let (tx, rx) = mpsc::channel(1);
@@ -802,9 +794,9 @@ async fn offsets_predate_normalization_and_compose_with_lineage() {
     check_contract(&chunk, h);
     assert_eq!(h.snippets.len(), 2);
     // The first occurrence's span covers the original surface form,
-    // zero-width space included: 9 letters plus the invisible.
+    // zero-width space included: 10 UTF-8 bytes for Rodríguez plus 3 for U+200B.
     let first = at(&chunk, "Rodríguez\u{200B}", 0);
-    assert_eq!(first.1 - first.0, 10);
+    assert_eq!(first.1 - first.0, 13);
     assert_eq!(
         (
             h.snippets[0].highlights[0].start,
@@ -817,7 +809,7 @@ async fn offsets_predate_normalization_and_compose_with_lineage() {
     assert_eq!(h.snippets[1].sentence_index, Some(1));
     assert_eq!(h.snippets[1].text, "The court agreed with Rodríguez");
     // Composition: lineage span + snippet offset locates the snippet in
-    // the parent, in the parent's UTF-16 units.
+    // the parent, in the parent's UTF-8 bytes.
     let mut client = NodeServiceClient::connect(addr).await.unwrap();
     let stored = client
         .get_documents(pipestream_search::pb::GetDocumentsRequest { doc_ids: vec![0] })
@@ -831,7 +823,7 @@ async fn offsets_predate_normalization_and_compose_with_lineage() {
     );
     for s in &h.snippets {
         assert_eq!(
-            utf16_slice(
+            utf8_slice(
                 parent,
                 lineage.span_start + s.start,
                 lineage.span_start + s.end
@@ -839,7 +831,7 @@ async fn offsets_predate_normalization_and_compose_with_lineage() {
             s.text
         );
         for hl in &s.highlights {
-            let in_parent = utf16_slice(
+            let in_parent = utf8_slice(
                 parent,
                 lineage.span_start + hl.start,
                 lineage.span_start + hl.end,

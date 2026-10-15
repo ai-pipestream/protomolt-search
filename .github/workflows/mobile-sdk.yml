@@ -28,7 +28,7 @@ jobs:
       - name: Build Android AAR
         run: scripts/build-android-aar.sh target/mobile/ProtomoltSearch.aar
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ProtomoltSearch-android
           path: target/mobile/ProtomoltSearch.aar
@@ -59,7 +59,7 @@ jobs:
           cp proto/ai/pipestream/search/v1/search.proto target/mobile/apple-sdk/proto/ai/pipestream/search/v1/
           ditto -c -k --sequesterRsrc --keepParent target/mobile/apple-sdk target/mobile/ProtomoltSearch-apple-sdk.zip
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ProtomoltSearch-apple
           path: target/mobile/ProtomoltSearch-apple-sdk.zip

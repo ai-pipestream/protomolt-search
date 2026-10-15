@@ -6,9 +6,7 @@
 
 /// Classic, case-sensitive Porter stemming over one token.
 pub(crate) fn stem(input: &str) -> String {
-    // OpenNLP's Java implementation operates on `char[]`, so supplementary
-    // scalars occupy two consonant code units inside the state machine.
-    let mut word: Vec<u16> = input.encode_utf16().collect();
+    let mut word: Vec<char> = input.chars().collect();
     if word.len() <= 2 {
         return input.to_string();
     }
@@ -18,18 +16,18 @@ pub(crate) fn stem(input: &str) -> String {
     step4(&mut word);
     step5(&mut word);
     step6(&mut word);
-    String::from_utf16(&word).expect("Porter suffix edits preserve valid UTF-16")
+    word.into_iter().collect()
 }
 
-fn consonant(word: &[u16], index: usize) -> bool {
+fn consonant(word: &[char], index: usize) -> bool {
     match word[index] {
-        0x0061 | 0x0065 | 0x0069 | 0x006F | 0x0075 => false,
-        0x0079 => index == 0 || !consonant(word, index - 1),
+        'a' | 'e' | 'i' | 'o' | 'u' => false,
+        'y' => index == 0 || !consonant(word, index - 1),
         _ => true,
     }
 }
 
-fn measure(word: &[u16]) -> usize {
+fn measure(word: &[char]) -> usize {
     let mut count = 0;
     let mut index = 0;
     while index < word.len() && consonant(word, index) {
@@ -50,17 +48,17 @@ fn measure(word: &[u16]) -> usize {
     count
 }
 
-fn contains_vowel(word: &[u16]) -> bool {
+fn contains_vowel(word: &[char]) -> bool {
     (0..word.len()).any(|index| !consonant(word, index))
 }
 
-fn double_consonant(word: &[u16]) -> bool {
+fn double_consonant(word: &[char]) -> bool {
     word.len() >= 2
         && word[word.len() - 1] == word[word.len() - 2]
         && consonant(word, word.len() - 1)
 }
 
-fn cvc(word: &[u16]) -> bool {
+fn cvc(word: &[char]) -> bool {
     if word.len() < 3 {
         return false;
     }
@@ -68,21 +66,29 @@ fn cvc(word: &[u16]) -> bool {
     consonant(word, end)
         && !consonant(word, end - 1)
         && consonant(word, end - 2)
-        && !matches!(word[end], 0x0077..=0x0079)
+        && !matches!(word[end], 'w'..='y')
 }
 
-fn suffix_start(word: &[u16], suffix: &str) -> Option<usize> {
-    let suffix: Vec<u16> = suffix.encode_utf16().collect();
-    word.ends_with(&suffix).then(|| word.len() - suffix.len())
+fn suffix_start(word: &[char], suffix: &str) -> Option<usize> {
+    let suffix_len = suffix.chars().count();
+    if word.len() < suffix_len {
+        return None;
+    }
+    let start = word.len() - suffix_len;
+    word[start..]
+        .iter()
+        .copied()
+        .eq(suffix.chars())
+        .then_some(start)
 }
 
-fn replace_suffix(word: &mut Vec<u16>, start: usize, replacement: &str) {
+fn replace_suffix(word: &mut Vec<char>, start: usize, replacement: &str) {
     word.truncate(start);
-    word.extend(replacement.encode_utf16());
+    word.extend(replacement.chars());
 }
 
 fn replace_if_measure(
-    word: &mut Vec<u16>,
+    word: &mut Vec<char>,
     suffix: &str,
     replacement: &str,
     minimum: usize,
@@ -96,12 +102,12 @@ fn replace_if_measure(
     true
 }
 
-fn step1(word: &mut Vec<u16>) {
+fn step1(word: &mut Vec<char>) {
     if let Some(start) = suffix_start(word, "sses") {
         replace_suffix(word, start, "ss");
     } else if let Some(start) = suffix_start(word, "ies") {
         replace_suffix(word, start, "i");
-    } else if word.ends_with(&[b's' as u16]) && word.get(word.len() - 2) != Some(&(b's' as u16)) {
+    } else if word.ends_with(&['s']) && word.get(word.len() - 2) != Some(&'s') {
         word.pop();
     }
 
@@ -118,28 +124,25 @@ fn step1(word: &mut Vec<u16>) {
         return;
     }
     word.truncate(start);
-    if word.ends_with(&[b'a' as u16, b't' as u16])
-        || word.ends_with(&[b'b' as u16, b'l' as u16])
-        || word.ends_with(&[b'i' as u16, b'z' as u16])
-    {
-        word.push(b'e' as u16);
+    if word.ends_with(&['a', 't']) || word.ends_with(&['b', 'l']) || word.ends_with(&['i', 'z']) {
+        word.push('e');
     } else if double_consonant(word) {
-        if !matches!(word.last(), Some(0x006C | 0x0073 | 0x007A)) {
+        if !matches!(word.last(), Some('l' | 's' | 'z')) {
             word.pop();
         }
     } else if measure(word) == 1 && cvc(word) {
-        word.push(b'e' as u16);
+        word.push('e');
     }
 }
 
-fn step2(word: &mut [u16]) {
-    if word.last() == Some(&(b'y' as u16)) && contains_vowel(&word[..word.len() - 1]) {
+fn step2(word: &mut [char]) {
+    if word.last() == Some(&'y') && contains_vowel(&word[..word.len() - 1]) {
         let end = word.len() - 1;
-        word[end] = b'i' as u16;
+        word[end] = 'i';
     }
 }
 
-fn step3(word: &mut Vec<u16>) {
+fn step3(word: &mut Vec<char>) {
     const RULES: &[(&str, &str)] = &[
         ("ational", "ate"),
         ("tional", "tion"),
@@ -170,7 +173,7 @@ fn step3(word: &mut Vec<u16>) {
     }
 }
 
-fn step4(word: &mut Vec<u16>) {
+fn step4(word: &mut Vec<char>) {
     const RULES: &[(&str, &str)] = &[
         ("icate", "ic"),
         ("ative", ""),
@@ -187,7 +190,7 @@ fn step4(word: &mut Vec<u16>) {
     }
 }
 
-fn step5(word: &mut Vec<u16>) {
+fn step5(word: &mut Vec<char>) {
     const SUFFIXES: &[&str] = &[
         "al", "ance", "ence", "er", "ic", "able", "ible", "ant", "ement", "ment", "ent", "ou",
         "ism", "ate", "iti", "ous", "ive", "ize",
@@ -202,22 +205,22 @@ fn step5(word: &mut Vec<u16>) {
         return;
     }
     if let Some(start) = suffix_start(word, "ion") {
-        if start > 0 && matches!(word[start - 1], 0x0073 | 0x0074) && measure(&word[..start]) > 1 {
+        if start > 0 && matches!(word[start - 1], 's' | 't') && measure(&word[..start]) > 1 {
             word.truncate(start);
         }
     }
 }
 
-fn step6(word: &mut Vec<u16>) {
+fn step6(word: &mut Vec<char>) {
     let before_final_e = word.clone();
-    if word.last() == Some(&(b'e' as u16)) {
+    if word.last() == Some(&'e') {
         let stem = &word[..word.len() - 1];
         let m = measure(stem);
         if m > 1 || (m == 1 && !cvc(stem)) {
             word.pop();
         }
     }
-    if word.last() == Some(&(b'l' as u16)) && double_consonant(word) {
+    if word.last() == Some(&'l') && double_consonant(word) {
         // OpenNLP's Release 3 implementation leaves its measure cursor at
         // the pre-e word. Preserve that edge case when an e was removed.
         let measured = if before_final_e.len() != word.len() {
@@ -281,7 +284,8 @@ mod tests {
     }
 
     #[test]
-    fn supplementary_scalars_match_java_char_array_behavior() {
-        assert_eq!(stem("ba😀ing"), "ba😀");
+    fn supplementary_scalars_are_single_consonants() {
+        assert_eq!(stem("ba😀ing"), "ba😀e");
+        assert_eq!(stem("foo😀ing"), "foo😀");
     }
 }

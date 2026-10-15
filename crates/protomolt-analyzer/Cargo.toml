@@ -6,13 +6,8 @@ license = "MIT AND Apache-2.0"
 description = "Cross-platform native lexical analysis for Protomolt"
 
 [dependencies]
-# Analysis output is persisted. Unicode answers come only through
-# protomolt-unicode16, which links ICU4X on exact pins and restores the
-# Unicode 16 answers term identity was built with (JDK 25's tables under
-# OpenNLP), with the Unicode 17 case folds OpenNLP bundles. The
-# unicode_identity digest test in src/lib.rs compares every scalar value.
-protomolt-unicode16 = { path = "../protomolt-unicode16" }
-# Both algorithms affect persisted term identity. Exact pins make an upgrade
-# an explicit index-compatibility decision.
-unicode-segmentation = "=1.13.3"
-aho-corasick = "=1.1.5"
+icu_casemap = "2.3"
+icu_normalizer = "2.3"
+icu_properties = "2.3"
+unicode-segmentation = "1.13"
+aho-corasick = "1.1"

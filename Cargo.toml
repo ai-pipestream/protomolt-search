@@ -6,13 +6,13 @@ license = "MIT"
 description = "Provider-neutral distributed lexical, vector, and hybrid search"
 
 [workspace]
-members = ["crates/protomolt-analyzer", "crates/protomolt-embedder", "crates/protomolt-search-embedded", "crates/protomolt-unicode16"]
+members = ["crates/protomolt-analyzer", "crates/protomolt-embedder", "crates/protomolt-search-embedded"]
 exclude = ["sidecars/route-cost"]
 resolver = "2"
 
 [dependencies]
-turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "turbovec-pipestream-s22" }
-turbovec-grpc = { git = "https://github.com/ai-pipestream/turbovec-grpc.git", rev = "e2d59de", optional = true }
+turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "main" }
+turbovec-grpc = { git = "https://github.com/ai-pipestream/turbovec-grpc.git", rev = "c1a973e84047653ba9a3be77f2e9049cc1ca193b", optional = true }
 # Control consensus (docs/raft-control-design.md). Pinned exactly: the
 # storage-v2 contracts are what the log store and state machine implement,
 # and the typed envelopes map to this version's types explicitly.
@@ -39,7 +39,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 memmap2 = "0.9"
 protomolt-analyzer = { path = "crates/protomolt-analyzer" }
 # The in-process node link (src/link.rs) frames request streams into the
-# handler's body itself: the body trait and the byte buffers, no socket.
+# handler's byte buffers itself: the body trait and the byte buffers, no socket.
 http-body = "1"
 bytes = "1"
 tower = { version = "0.5", features = ["util"], optional = true }
@@ -62,9 +62,9 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 webpki-roots = { version = "1", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 rustls-pki-types = { version = "1", features = ["std"], optional = true }
-redb = "=4.1.0"
+redb = "4"
 # OS entropy for cursor signing; already present through the transport tree.
-getrandom = "=0.4.3"
+getrandom = "0.4"
 
 [features]
 # Raft hosting of the source authority (docs/raft-control-design.md): the

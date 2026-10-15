@@ -1,7 +1,7 @@
 //! Server-side snippets (`docs/highlighting.md`): the shard cuts each hit's
 //! stored text into sentence-bounded windows around the query's
 //! occurrence spans, merges overlapping spans, and returns the pieces in
-//! original-text UTF-16 coordinates. Everything here is arithmetic over
+//! original-text UTF-8 byte coordinates. Everything here is arithmetic over
 //! data the shard already holds — the text, the sentence spans stored
 //! at ingest, and the occurrence spans the scorer collected — so the
 //! query path touches no analyzer.
@@ -18,15 +18,15 @@
 //! A window edge lands on whitespace or the text's edge, never inside a
 //! token; if honoring that would push the anchoring highlight out, the
 //! window is the anchor's own whitespace-delimited run, and may then
-//! exceed `max_chars`. Offsets are UTF-16 code units of the original
+//! exceed `max_chars`. Offsets are UTF-8 byte offsets of the original
 //! text, the unit every persisted span uses; a snippet's `text` is the
-//! UTF-8 slice at those units.
+//! UTF-8 slice at those offsets.
 
 use tonic::Status;
 
 /// Snippets per hit when the request leaves `max_snippets` at 0.
 pub const DEFAULT_MAX_SNIPPETS: u32 = 3;
-/// Snippet width in UTF-16 units when the request leaves `max_chars` at 0.
+/// Snippet width in UTF-8 bytes when the request leaves `max_chars` at 0.
 pub const DEFAULT_MAX_CHARS: u32 = 300;
 /// Smallest `max_chars` accepted: below this a window cannot hold a
 /// highlight and its neighbours.
@@ -139,13 +139,13 @@ impl Plan {
 /// One snippet of one hit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snippet {
-    /// UTF-16 bounds in the original text.
+    /// UTF-8 byte bounds in the original text.
     pub start: u32,
     pub end: u32,
     /// The UTF-8 text at those bounds.
     pub text: String,
     /// Merged occurrence spans inside the bounds, ascending, in
-    /// original-text UTF-16 units.
+    /// original-text UTF-8 bytes.
     pub highlights: Vec<(u32, u32)>,
     pub cut: Cut,
     /// The sentence's ordinal in the stored table for a sentence cut;
@@ -166,59 +166,75 @@ pub fn merge_spans(spans: &mut Vec<(u32, u32)>) {
     *spans = out;
 }
 
-/// UTF-16 unit → byte offset map for one text: the boundaries of every
-/// character, so a persisted UTF-16 offset resolves to a byte offset by
-/// binary search, and an offset inside a surrogate pair is caught.
-struct Utf16Map {
-    /// `(utf16, byte)` at every character start, plus the end.
+/// UTF-8 character-boundary map for one text: the boundaries of every
+/// scalar, so a persisted UTF-8 byte offset is validated on a character
+/// boundary and window edges snap cleanly across characters.
+struct CharBoundaryMap {
+    /// `(byte_u32, byte)` at every character start, plus the end.
     boundaries: Vec<(u32, usize)>,
 }
 
-impl Utf16Map {
-    fn new(text: &str) -> Utf16Map {
+impl CharBoundaryMap {
+    fn new(text: &str) -> CharBoundaryMap {
         let mut boundaries = Vec::with_capacity(text.len() + 1);
-        let mut utf16 = 0u32;
-        for (byte, ch) in text.char_indices() {
-            boundaries.push((utf16, byte));
-            utf16 += ch.len_utf16() as u32;
+        for (byte, _) in text.char_indices() {
+            boundaries.push((byte as u32, byte));
         }
-        boundaries.push((utf16, text.len()));
-        Utf16Map { boundaries }
+        boundaries.push((text.len() as u32, text.len()));
+        CharBoundaryMap { boundaries }
     }
 
-    fn len_utf16(&self) -> u32 {
+    fn len_bytes(&self) -> u32 {
         self.boundaries.last().map_or(0, |b| b.0)
     }
 
-    fn byte_at(&self, utf16: u32) -> Result<usize, Status> {
-        match self.boundaries.binary_search_by_key(&utf16, |b| b.0) {
+    fn byte_at(&self, offset: u32) -> Result<usize, Status> {
+        match self.boundaries.binary_search_by_key(&offset, |b| b.0) {
             Ok(i) => Ok(self.boundaries[i].1),
             Err(_) => Err(Status::internal(format!(
-                "highlight: UTF-16 offset {utf16} is not a character boundary of the stored \
-                 text (a surrogate pair is split, or the span outruns the text)"
+                "highlight: UTF-8 byte offset {offset} is not a character boundary of the stored \
+                 text (a multi-byte scalar is split, or the span outruns the text)"
             ))),
         }
     }
 
-    /// The character-boundary index of `utf16`, when it is one.
-    fn index_of(&self, utf16: u32) -> Option<usize> {
-        self.boundaries.binary_search_by_key(&utf16, |b| b.0).ok()
+    /// The character-boundary index of `offset`, when it is one.
+    fn index_of(&self, offset: u32) -> Option<usize> {
+        self.boundaries.binary_search_by_key(&offset, |b| b.0).ok()
+    }
+
+    /// The first character-boundary index at or after `offset`.
+    fn ceil_index_of(&self, offset: u32) -> Option<usize> {
+        match self.boundaries.binary_search_by_key(&offset, |b| b.0) {
+            Ok(i) => Some(i),
+            Err(i) if i < self.boundaries.len() => Some(i),
+            Err(_) => None,
+        }
+    }
+
+    /// The last character-boundary index at or before `offset`.
+    fn floor_index_of(&self, offset: u32) -> Option<usize> {
+        match self.boundaries.binary_search_by_key(&offset, |b| b.0) {
+            Ok(i) => Some(i),
+            Err(i) if i > 0 => Some(i - 1),
+            Err(_) => None,
+        }
     }
 }
 
 /// Whether the character starting at boundary `i` is whitespace.
-fn is_space_at(text: &str, map: &Utf16Map, i: usize) -> bool {
+fn is_space_at(text: &str, map: &CharBoundaryMap, i: usize) -> bool {
     let byte = map.boundaries[i].1;
     text[byte..].chars().next().is_some_and(char::is_whitespace)
 }
 
-/// A window of at most `max_chars` UTF-16 units inside `bounds` around
+/// A window of at most `max_chars` UTF-8 bytes inside `bounds` around
 /// `anchor` (the first highlight), edges snapped outward-to-inward onto
 /// whitespace so no token is cut. When the snap would exclude the
 /// anchor, the window becomes the anchor's whitespace-delimited run.
 fn window(
     text: &str,
-    map: &Utf16Map,
+    map: &CharBoundaryMap,
     bounds: (u32, u32),
     anchor: (u32, u32),
     max_chars: u32,
@@ -235,7 +251,7 @@ fn window(
     // a whitespace (or stays at the bound); the end moves back to the
     // last whitespace (or stays at the bound).
     let mut si = map
-        .index_of(start)
+        .ceil_index_of(start)
         .ok_or_else(|| Status::internal("highlight: window start off a character boundary"))?;
     if start != lo {
         while si + 1 < map.boundaries.len()
@@ -253,7 +269,7 @@ fn window(
         }
     }
     let mut ei = map
-        .index_of(end)
+        .floor_index_of(end)
         .ok_or_else(|| Status::internal("highlight: window end off a character boundary"))?;
     if end != hi {
         // If the end lands mid-token (the character before it and the
@@ -316,7 +332,7 @@ impl Unit {
 }
 
 /// Cut `max_snippets` snippets of `text` around `occurrences`
-/// (`(term index, UTF-16 span)` pairs). `sentences` is the stored
+/// (`(term index, UTF-8 byte span)` pairs). `sentences` is the stored
 /// sentence table, required in sentence mode and unread in window mode;
 /// an occurrence outside every sentence is a contract break and refuses.
 pub fn snippets(
@@ -330,17 +346,17 @@ pub fn snippets(
     if occurrences.is_empty() || max_snippets == 0 {
         return Ok(Vec::new());
     }
-    let map = Utf16Map::new(text);
-    let text_end = map.len_utf16();
+    let map = CharBoundaryMap::new(text);
+    let text_end = map.len_bytes();
     for &(_, (start, end)) in occurrences {
         if start > end || end > text_end {
             return Err(Status::internal(format!(
                 "highlight: occurrence [{start}, {end}) outruns the stored text of {text_end} \
-                 UTF-16 units"
+                 UTF-8 bytes"
             )));
         }
         // Both edges must be character boundaries: an offset inside a
-        // surrogate pair cannot be sliced, and cannot have come from an
+        // multi-byte scalar cannot be sliced, and cannot have come from an
         // analyzer that reported code-point-aligned spans.
         map.byte_at(start)?;
         map.byte_at(end)?;
@@ -502,15 +518,14 @@ pub fn check_sentence_table(sentences: &[(u32, u32)]) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    fn u16len(s: &str) -> u32 {
-        s.encode_utf16().count() as u32
+    fn u8len(s: &str) -> u32 {
+        s.len() as u32
     }
 
-    /// UTF-16 span of the `n`th occurrence of `word` in `text`.
+    /// UTF-8 byte span of the `n`th occurrence of `word` in `text`.
     fn at(text: &str, word: &str, n: usize) -> (u32, u32) {
-        let byte = text.match_indices(word).nth(n).expect("occurrence").0;
-        let start = u16len(&text[..byte]);
-        (start, start + u16len(word))
+        let byte = text.match_indices(word).nth(n).expect("occurrence").0 as u32;
+        (byte, byte + u8len(word))
     }
 
     fn sentences_of(text: &str) -> Vec<(u32, u32)> {
@@ -519,10 +534,10 @@ mod tests {
         for line in text.split('\n') {
             let trimmed = line.trim();
             if !trimmed.is_empty() {
-                let lead = u16len(&line[..line.find(trimmed).unwrap()]);
-                out.push((cursor + lead, cursor + lead + u16len(trimmed)));
+                let lead = u8len(&line[..line.find(trimmed).unwrap()]);
+                out.push((cursor + lead, cursor + lead + u8len(trimmed)));
             }
-            cursor += u16len(line) + 1;
+            cursor += u8len(line) + 1;
         }
         out
     }
@@ -580,7 +595,7 @@ mod tests {
         for i in 0..40 {
             text.push_str(&format!(" x{i:02}abcdef"));
         }
-        let sents = vec![(0, u16len(&text))];
+        let sents = vec![(0, u8len(&text))];
         let occ = vec![(0, at(&text, "court", 0))];
         let got = snippets(&text, Some(&sents), &occ, Mode::Sentence, 3, 64).unwrap();
         assert_eq!(got.len(), 1);
@@ -608,7 +623,7 @@ mod tests {
         let got = snippets(text, None, &occ, Mode::Window, 3, 40).unwrap();
         assert!(got.iter().all(|s| s.cut == Cut::Window));
         assert!(got.iter().all(|s| s.sentence_index.is_none()));
-        // The two courts sit within 40 units of each other: one window;
+        // The two courts sit within 40 bytes of each other: one window;
         // the appeal is far away: another.
         assert_eq!(got.len(), 2, "{got:?}");
         assert!(got[0].text.contains("alpha court beta"));
@@ -621,35 +636,30 @@ mod tests {
     }
 
     #[test]
-    fn offsets_stay_utf16_and_slices_stay_on_character_boundaries() {
+    fn offsets_stay_utf8_and_slices_stay_on_character_boundaries() {
         let text = "😀 café court\nnaïve 𝔘nicode court";
         let sents = sentences_of(text);
         let occ = vec![(0, at(text, "court", 0)), (0, at(text, "court", 1))];
         let got = snippets(text, Some(&sents), &occ, Mode::Sentence, 3, 300).unwrap();
         assert_eq!(got.len(), 2);
-        // 😀 is two units, é one, 𝔘 two: the offsets count UTF-16 units of
-        // the original text, never bytes or characters.
+        // 😀 is 4 UTF-8 bytes, é is 2, 𝔘 is 4: the offsets count UTF-8 bytes
+        // of the original text.
         assert_eq!(got[0].text, "😀 café court");
-        assert_eq!((got[0].start, got[0].end), (0, 13));
-        assert_eq!(got[0].highlights, vec![(8, 13)]);
+        assert_eq!((got[0].start, got[0].end), (0, 16));
+        assert_eq!(got[0].highlights, vec![(11, 16)]);
         assert_eq!(got[1].text, "naïve 𝔘nicode court");
-        assert_eq!((got[1].start, got[1].end), (14, 34));
-        assert_eq!(got[1].highlights, vec![(29, 34)]);
-        // A span that splits the surrogate pair is refused, not sliced.
+        assert_eq!((got[1].start, got[1].end), (17, 40));
+        assert_eq!(got[1].highlights, vec![(35, 40)]);
+        // A span that splits a multi-byte UTF-8 scalar is refused, not sliced.
         let bad = vec![(0, (1, 2))];
         let error = snippets(text, None, &bad, Mode::Window, 3, 300).unwrap_err();
         assert!(error.message().contains("not a character boundary"));
-        // A window cut near the emoji still lands on a boundary, and the
-        // text is exactly the UTF-16 slice at the reported offsets.
+        // A window cut near multi-byte characters still lands on a boundary,
+        // and the text is the UTF-8 byte slice at the reported offsets.
         let win = snippets(text, None, &occ, Mode::Window, 3, 16).unwrap();
         assert!(!win.is_empty());
         for s in &win {
-            let units: Vec<u16> = text
-                .encode_utf16()
-                .skip(s.start as usize)
-                .take((s.end - s.start) as usize)
-                .collect();
-            assert_eq!(s.text, String::from_utf16(&units).unwrap());
+            assert_eq!(s.text, &text[s.start as usize..s.end as usize]);
         }
     }
 
