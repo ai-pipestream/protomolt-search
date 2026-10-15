@@ -13,5 +13,5 @@ pipestream-search = { path = "../.." }
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-turbovec-ivf = { package = "turbovec", git = "https://github.com/RyanCodrai/turbovec.git", rev = "1452b6e8f1eee9d071c22bd8f850cd9ada2acf7a" }
+turbovec-ivf = { package = "turbovec", git = "https://github.com/RyanCodrai/turbovec.git", branch = "feat/ivf-residual" }
 

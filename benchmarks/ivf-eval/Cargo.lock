@@ -1819,7 +1819,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "turbovec"
 version = "1.0.0"
-source = "git+https://github.com/RyanCodrai/turbovec.git?rev=1452b6e8f1eee9d071c22bd8f850cd9ada2acf7a#1452b6e8f1eee9d071c22bd8f850cd9ada2acf7a"
+source = "git+https://github.com/RyanCodrai/turbovec.git?branch=feat%2Fivf-residual#1452b6e8f1eee9d071c22bd8f850cd9ada2acf7a"
 dependencies = [
  "ordered-float 4.6.0",
  "rand",
