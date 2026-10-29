@@ -713,7 +713,9 @@ pub struct GraphStats {
     pub edges: usize,
     pub hubs: usize,
     pub max_degree: usize,
-    /// Rows whose FP32 embedding the image holds.
+    /// Rows whose FP32 embedding the provider holds in memory. Under
+    /// recompute storage this includes indexed rows kept until the first
+    /// `prepare` or source attachment drops them.
     pub stored_rows: usize,
     /// Whether a background rebuild is running.
     pub building: bool,
@@ -882,7 +884,7 @@ impl LeannGraph {
                 .map(Vec::len)
                 .max()
                 .unwrap_or(0),
-            stored_rows: self.rows - self.held_from(&index),
+            stored_rows: self.dim.map_or(0, |dim| self.stored.len() / dim),
             building: self.build.lock().unwrap().is_some(),
         }
     }
@@ -1631,25 +1633,31 @@ impl VectorProvider for LeannGraph {
 
     /// Fold the unindexed tail into the graph. Under recompute storage this
     /// is also where the build's embeddings are dropped.
+    ///
+    /// The rebuild is decided and run while every row is still held, and
+    /// rows are dropped only once the index covers them, so a refusal
+    /// leaves the provider exactly as searchable as it was.
     fn prepare(&mut self) -> Result<(), VectorError> {
         self.wait_for_build()?;
+        if self.index().indexed < self.rows {
+            if !self.can_rebuild() {
+                return Err(VectorError::new(format!(
+                    "{LEANN_GRAPH} cannot rebuild a recompute-mode image without a recompute source"
+                )));
+            }
+            if let Some(job) = self.build_job() {
+                let built = job.run()?;
+                *self.index.get_mut().unwrap() = Arc::new(built);
+            }
+        }
         self.trim_indexed_rows();
-        if self.index().indexed == self.rows {
-            return Ok(());
-        }
-        if !self.can_rebuild() {
-            return Err(VectorError::new(format!(
-                "{LEANN_GRAPH} cannot rebuild a recompute-mode image without a recompute source"
-            )));
-        }
-        if let Some(job) = self.build_job() {
-            let built = job.run()?;
-            *self.index.get_mut().unwrap() = Arc::new(built);
-            self.trim_indexed_rows();
-        }
         Ok(())
     }
 
+    /// Under recompute storage the image keeps only the unindexed tail as
+    /// FP32, even while this provider still holds indexed rows (before its
+    /// first `prepare` or source attachment): an image written then is not
+    /// searchable until a source is attached to the loaded copy.
     fn write(&self, path: &Path) -> Result<(), VectorError> {
         let image = self.encode_image();
         let mut file = fs::File::create(path)
@@ -2305,6 +2313,37 @@ mod tests {
     /// Recompute storage with no source refuses the append that would need a
     /// rebuild instead of letting the tail grow unindexed, and nodes refuse
     /// recompute storage outright until they can bind a source.
+    /// A sourceless recompute-mode `prepare` whose tail is under the build
+    /// threshold rebuilds from the rows it still holds; once those are
+    /// dropped, a refused `prepare` leaves what is held untouched.
+    #[test]
+    fn prepare_rebuilds_from_held_rows_and_refuses_without_dropping_any() {
+        let dim = 8;
+        let vectors = corpus(1400, dim, 51);
+        let mut graph = LeannGraph::new(
+            Some(dim),
+            LeannGraphConfig {
+                storage: EmbeddingStorage::Recomputed,
+                ..LeannGraphConfig::default()
+            },
+        )
+        .unwrap();
+        graph.add(&vectors[..1200 * dim], dim).unwrap();
+        graph.wait_for_build().unwrap();
+        graph.add(&vectors[1200 * dim..1300 * dim], dim).unwrap();
+        assert_eq!(graph.graph_stats().stored_rows, 1300);
+        graph.prepare().unwrap();
+        let stats = graph.graph_stats();
+        assert_eq!((stats.indexed_rows, stats.stored_rows), (1300, 0));
+
+        graph.add(&vectors[1300 * dim..], dim).unwrap();
+        assert_eq!(graph.graph_stats().stored_rows, 100);
+        let error = graph.prepare().unwrap_err().to_string();
+        assert!(error.contains("without a recompute source"), "{error}");
+        assert_eq!(graph.graph_stats().stored_rows, 100);
+        assert_eq!(graph.graph_stats().indexed_rows, 1300);
+    }
+
     #[test]
     fn recompute_storage_refuses_what_it_cannot_rebuild() {
         let dim = 8;

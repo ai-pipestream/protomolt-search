@@ -122,8 +122,13 @@ source is attached only after a determinism gate recomputes up to 32 evenly
 spaced indexed rows and reproduces each fingerprint bit for bit, and every
 later recompute is checked the same way: a recompute that disagrees with
 the indexed vector (another model, a nondeterministic kernel) is an error
-naming the row, never a silently different score. A recompute-mode image
-with no source attached refuses searches and rebuilds by name.
+naming the row, never a silently different score. Until the first
+`prepare()` or source attachment, a recompute-mode provider keeps the rows
+it was given, so it serves searches and rebuilds across batches from them;
+after that, a provider or loaded image with no source refuses searches of
+dropped rows and rebuilds by name. A refused `prepare()` drops nothing. An
+image written before then keeps only the unindexed tail, so the loaded copy
+needs a source before it can be searched.
 
 What recompute mode costs:
 
