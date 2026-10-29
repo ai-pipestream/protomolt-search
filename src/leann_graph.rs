@@ -70,6 +70,8 @@ const REBUILD_MIN_TAIL: usize = 1024;
 const GATE_SAMPLE_ROWS: usize = 32;
 /// Rows materialized per recompute call during a rebuild.
 const REBUILD_CHUNK_ROWS: usize = 4096;
+/// Unindexed tail rows scored between stream-control polls.
+const TAIL_POLL_ROWS: usize = 64;
 
 /// Where the exact embeddings of indexed rows come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -976,6 +978,7 @@ impl LeannGraph {
             verify(&self.fingerprints, &rows, &out, dim)?;
         }
         self.source = Some(source);
+        self.trim_indexed_rows();
         Ok(())
     }
 
@@ -1082,19 +1085,34 @@ impl LeannGraph {
         let mut floor = options.minimum_score.unwrap_or(f32::NEG_INFINITY);
         let mut stats = TraversalStats::default();
         let index = self.index();
-        let (best, evaluated, stopped) = self.traverse(
+        let mut polled = false;
+        let mut poll = || {
+            polled = true;
+            control()
+        };
+        let (best, evaluated, mut stopped) = self.traverse(
             &index,
             query,
             beam,
             options.allow,
             &mut floor,
             &mut stats,
-            control,
+            &mut poll,
         )?;
         let mut hits = if every_evaluated { evaluated } else { best };
-        if !stopped {
+        if !stopped && index.indexed < self.rows {
             let allowed = |row: usize| options.allow.is_none_or(|mask| mask[row]);
-            for row in index.indexed..self.rows {
+            for (offset, row) in (index.indexed..self.rows).enumerate() {
+                if offset.is_multiple_of(TAIL_POLL_ROWS) {
+                    match poll() {
+                        VectorStreamControl::Stop => {
+                            stopped = true;
+                            break;
+                        }
+                        VectorStreamControl::RaiseFloor(raised) => floor = floor.max(raised),
+                        VectorStreamControl::Continue => {}
+                    }
+                }
                 if !allowed(row) {
                     continue;
                 }
@@ -1104,6 +1122,13 @@ impl LeannGraph {
                     row: row as u32,
                 });
                 stats.tail_scanned += 1;
+            }
+        }
+        if !polled {
+            match control() {
+                VectorStreamControl::Stop => stopped = true,
+                VectorStreamControl::RaiseFloor(raised) => floor = floor.max(raised),
+                VectorStreamControl::Continue => {}
             }
         }
         hits.retain(|hit| hit.score >= floor);
@@ -1217,8 +1242,14 @@ impl LeannGraph {
                 }
             }
             // The frontier is exhausted or behind the beam: evaluate the
-            // pending rows that could still enter it, best first.
+            // pending rows that could still enter it, best first. If an
+            // expanded candidate had no unvisited neighbors (`batch` stays
+            // empty), keep walking remaining competitive frontier entries
+            // before draining `pending` or stopping.
             if batch.is_empty() {
+                if frontier.peek().is_some_and(|c| competitive(c.score)) {
+                    continue;
+                }
                 while batch.len() < PENDING_BATCH_ROWS {
                     match pending.peek() {
                         Some(next) if competitive(next.score + bound) => {
@@ -1336,9 +1367,9 @@ impl LeannGraph {
         // anything is allocated for it, with overflow-checked sizes.
         let fingerprints = reader
             .array(rows, ROW_FINGERPRINT_BYTES)?
-            .chunks_exact(ROW_FINGERPRINT_BYTES)
-            .map(|chunk| chunk.try_into().unwrap())
-            .collect();
+            .as_chunks::<ROW_FINGERPRINT_BYTES>()
+            .0
+            .to_vec();
         let mut codes = Codes {
             bits: config.bits_per_dimension,
             dim,
@@ -1362,8 +1393,10 @@ impl LeannGraph {
         let hubs = reader.u32s(hub_count)?;
         let offsets = reader
             .array(indexed + 1, 8)?
-            .chunks_exact(8)
-            .map(|chunk| usize::try_from(u64::from_le_bytes(chunk.try_into().unwrap())))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|&chunk| usize::try_from(u64::from_le_bytes(chunk)))
             .collect::<Result<Vec<usize>, _>>()
             .map_err(|_| VectorError::new("image field exceeds usize"))?;
         if offsets[0] != 0 || offsets.windows(2).any(|w| w[1] < w[0]) {
@@ -1453,8 +1486,10 @@ impl<'a> Reader<'a> {
     fn u32s(&mut self, count: usize) -> Result<Vec<u32>, VectorError> {
         Ok(self
             .array(count, 4)?
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&chunk| u32::from_le_bytes(chunk))
             .collect())
     }
 
@@ -1558,7 +1593,9 @@ impl VectorProvider for LeannGraph {
         if let Some(error) = self.build_error.lock().unwrap().take() {
             return Err(error);
         }
-        self.trim_indexed_rows();
+        if self.source.is_some() {
+            self.trim_indexed_rows();
+        }
         let indexed = self.index().indexed;
         let threshold = REBUILD_MIN_TAIL.max(indexed);
         if !self.can_rebuild() && self.rows + added - indexed >= threshold {
@@ -1720,7 +1757,13 @@ impl VectorProvider for LeannGraph {
                     scores: &scores,
                     slots: &slots,
                 });
-                stop |= matches!(decision, VectorStreamControl::Stop);
+                match decision {
+                    VectorStreamControl::Stop => stop = true,
+                    VectorStreamControl::RaiseFloor(raised) => {
+                        floor = Some(floor.map_or(raised, |f| f.max(raised)));
+                    }
+                    VectorStreamControl::Continue => {}
+                }
             }
             if stop {
                 return Ok(VectorStreamSummary {
@@ -2478,5 +2521,140 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn frontier_survives_a_hop_with_no_new_neighbors() {
+        // Row 0 (entry) connects to rows 1 and 2. Row 1 connects only back to
+        // row 0 (no unvisited neighbors when expanded), while row 2 connects
+        // to row 3, the best match for the query.
+        let dim = 4;
+        let vectors = vec![
+            1.0, 0.0, 0.0, 0.0, // row 0 (entry)
+            0.9, 0.2, 0.0, 0.0, // row 1 (higher than row 2, dead-end neighbor 0)
+            0.8, 0.0, 0.2, 0.0, // row 2 (leads to row 3)
+            1.0, 0.5, 0.5, 0.0, // row 3 (best match)
+        ];
+        let config = LeannGraphConfig {
+            search_beam: 4,
+            prune_ratio_ppm: 0,
+            ..LeannGraphConfig::default()
+        };
+        let graph = LeannGraph {
+            config: config.clone(),
+            dim: Some(dim),
+            rows: 4,
+            stored_base: 0,
+            stored: vectors.clone(),
+            fingerprints: vectors.chunks_exact(dim).map(row_fingerprint).collect(),
+            index: RwLock::new(Arc::new(Index {
+                indexed: 4,
+                codes: Codes::fit(config.bits_per_dimension, dim, &vectors),
+                graph: Graph {
+                    adjacency: vec![vec![1, 2], vec![0], vec![3], vec![2]],
+                    hubs: vec![0],
+                    entry: 0,
+                },
+            })),
+            build: Mutex::new(None),
+            build_error: Mutex::new(None),
+            source: None,
+        };
+        let query = [1.0, 0.3, 0.3, 0.0];
+        let (hits, _) = graph
+            .search_with_stats(&query, 4, VectorSearchOptions::new())
+            .unwrap();
+        assert_eq!(hits.len(), 4);
+        assert_eq!(hits[0].1, 3);
+    }
+
+    #[test]
+    fn generated_graph_with_full_beam_visits_every_reachable_row() {
+        let dim = 8;
+        let vectors = corpus(200, dim, 19);
+        let mut graph = LeannGraph::new(Some(dim), LeannGraphConfig::default()).unwrap();
+        graph.add(&vectors, dim).unwrap();
+        graph.prepare().unwrap();
+        let (hits, _) = graph
+            .search_with_stats(&vectors[..dim], 200, VectorSearchOptions::new())
+            .unwrap();
+        assert_eq!(hits.len(), 200);
+    }
+
+    #[test]
+    fn recompute_ingest_serves_until_prepared_and_supports_multi_batch_build() {
+        let dim = 8;
+        let vectors = corpus(2500, dim, 29);
+        let config = LeannGraphConfig {
+            storage: EmbeddingStorage::Recomputed,
+            ..LeannGraphConfig::default()
+        };
+        let mut graph = LeannGraph::new(Some(dim), config).unwrap();
+        graph.add(&vectors[..1200 * dim], dim).unwrap();
+        graph.wait_for_build().unwrap();
+        assert_eq!(graph.graph_stats().indexed_rows, 1200);
+        // Before `prepare` is called, stored vectors remain available even
+        // without a RecomputeSource attached, so searches and subsequent
+        // rebuilds across batches succeed.
+        let (hits, _) = graph
+            .search_with_stats(&vectors[..dim], 5, VectorSearchOptions::new())
+            .unwrap();
+        assert_eq!(hits[0].1, 0);
+        graph.add(&vectors[1200 * dim..], dim).unwrap();
+        graph.wait_for_build().unwrap();
+        assert_eq!(graph.graph_stats().indexed_rows, 2500);
+        graph.prepare().unwrap();
+        assert_eq!(graph.graph_stats().stored_rows, 0);
+    }
+
+    #[test]
+    fn tail_only_stream_honors_stop_and_sink_floor_carries_across_queries() {
+        let dim = 8;
+        let vectors = corpus(200, dim, 31);
+        let mut graph = LeannGraph::new(Some(dim), LeannGraphConfig::default()).unwrap();
+        graph.add(&vectors, dim).unwrap();
+        assert_eq!(graph.graph_stats().indexed_rows, 0);
+        let mut polls = 0usize;
+        let summary = graph
+            .search_streaming_controlled(
+                &vectors[..dim],
+                VectorSearchOptions::new(),
+                &mut |_| VectorStreamControl::Continue,
+                &mut || {
+                    polls += 1;
+                    if polls == 2 {
+                        VectorStreamControl::Stop
+                    } else {
+                        VectorStreamControl::Continue
+                    }
+                },
+            )
+            .unwrap();
+        assert!(!summary.completed);
+        assert_eq!(polls, 2);
+        assert_eq!(summary.units_scanned, TAIL_POLL_ROWS);
+
+        let queries = [&vectors[..dim], &vectors[dim..2 * dim]].concat();
+        let mut second_query_min = f32::INFINITY;
+        let raised_floor = 0.5f32;
+        let summary = graph
+            .search_streaming_controlled(
+                &queries,
+                VectorSearchOptions::new(),
+                &mut |batch| {
+                    if batch.query_index == 0 {
+                        VectorStreamControl::RaiseFloor(raised_floor)
+                    } else {
+                        for &score in batch.scores {
+                            second_query_min = second_query_min.min(score);
+                        }
+                        VectorStreamControl::Continue
+                    }
+                },
+                &mut || VectorStreamControl::Continue,
+            )
+            .unwrap();
+        assert!(summary.completed);
+        assert!(second_query_min >= raised_floor);
     }
 }

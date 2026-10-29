@@ -100,9 +100,10 @@ rows above it.
 
 Streaming (`search_streaming_controlled`) traverses at `search_beam` and
 emits every allowed row whose exact score was computed, not only the
-beam's best, plus the tail. It polls the control callback after every hop:
-`Stop` ends the stream uncompleted, and a raised floor gates the rest of
-that query and every later one.
+beam's best, plus the tail. It polls the control callback after every hop
+and every 64 unindexed tail rows: `Stop` ends the stream uncompleted, and
+a floor raised by either `control` or `sink` gates the rest of that query
+and every later one.
 
 Exact embeddings come from one of two places:
 

@@ -162,7 +162,9 @@ async fn query(
 /// The FP32 inner-product top `k` as `(doc id, score)`.
 fn fp32_top(corpus: &[f32], query: &[f32], k: usize) -> Vec<(u64, f32)> {
     let mut all: Vec<(u64, f32)> = corpus
-        .chunks_exact(DIM)
+        .as_chunks::<DIM>()
+        .0
+        .iter()
         .enumerate()
         .map(|(id, row)| (id as u64, row.iter().zip(query).map(|(a, b)| a * b).sum()))
         .collect();
@@ -177,7 +179,7 @@ async fn explicit_ann_returns_the_fp32_top_k_and_reports_the_graph() {
     let queries = unit_vectors(8, DIM, 0x1EA4_0003);
     let mut found = 0;
     let mut response = None;
-    for query_vector in queries.chunks_exact(DIM) {
+    for query_vector in queries.as_chunks::<DIM>().0 {
         let answer = query(
             &fixture.coordinator,
             dense_request(query_vector, 5, DenseExecutionMode::Ann),
@@ -310,7 +312,7 @@ async fn auto_qualifies_the_graph_only_through_its_own_fingerprint() {
 async fn a_seeded_floor_filters_the_walk_without_cutting_it_short() {
     let fixture = start_fixture().await;
     let queries = unit_vectors(4, DIM, 0x1EA4_0004);
-    for (q, query_vector) in queries.chunks_exact(DIM).enumerate() {
+    for (q, query_vector) in queries.as_chunks::<DIM>().0.iter().enumerate() {
         let unfloored = fixture
             .coordinator
             .fanout_stream_search(
