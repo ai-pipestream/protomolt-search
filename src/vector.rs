@@ -329,6 +329,14 @@ pub trait VectorProvider: Send + Sync {
         None
     }
 
+    /// Rows covered by a search structure the provider builds after the
+    /// fact (in the background); later rows are scanned exhaustively until
+    /// the next build lands. `None` when every row is searchable through
+    /// the provider's main structure as soon as it is added.
+    fn indexed_len(&self) -> Option<usize> {
+        None
+    }
+
     /// Attach the source a recompute-storage provider reads exact embeddings
     /// from. Providers that keep their rows refuse.
     fn attach_recompute_source(
@@ -540,6 +548,11 @@ impl VectorIndex {
     /// See [`VectorProvider::representation_materialized`].
     pub fn representation_materialized(&self) -> Option<bool> {
         self.engine.representation_materialized()
+    }
+
+    /// See [`VectorProvider::indexed_len`].
+    pub fn indexed_len(&self) -> Option<usize> {
+        self.engine.indexed_len()
     }
 
     pub fn descriptor(&self) -> VectorBackendDescriptor {

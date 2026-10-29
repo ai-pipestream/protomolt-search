@@ -39,7 +39,8 @@ use std::fs;
 use std::io::Write;
 use std::ops::Range;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
+use std::thread::JoinHandle;
 
 use crate::vector::{
     first_invalid_coordinate, QualityContract, RecomputeSource, ScoreDirection,
@@ -712,24 +713,108 @@ pub struct GraphStats {
     pub max_degree: usize,
     /// Rows whose FP32 embedding the image holds.
     pub stored_rows: usize,
+    /// Whether a background rebuild is running.
+    pub building: bool,
+}
+
+/// The graph over rows `0..indexed` and the codes that steer its walk:
+/// the part a rebuild replaces, swapped in whole.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Index {
+    indexed: usize,
+    codes: Codes,
+    graph: Graph,
+}
+
+/// Everything a rebuild needs, copied out so it runs with no lock held.
+struct BuildJob {
+    config: LeannGraphConfig,
+    dim: usize,
+    /// Rows `stored_base..rows` as held.
+    held: Vec<f32>,
+    stored_base: usize,
+    /// Fingerprints of rows `0..stored_base`, which the source recomputes.
+    fingerprints: Vec<[u8; ROW_FINGERPRINT_BYTES]>,
+    source: Option<Arc<dyn RecomputeSource>>,
+}
+
+impl BuildJob {
+    /// The rows' embeddings in order (recomputing those not held, in chunks,
+    /// each checked against its fingerprint), then the pruned graph and the
+    /// codes over all of them.
+    fn run(self) -> Result<Index, VectorError> {
+        let dim = self.dim;
+        let rows = self.stored_base + self.held.len() / dim;
+        let mut vectors = Vec::with_capacity(rows * dim);
+        let mut start = 0usize;
+        while start < self.stored_base {
+            let source = self.source.as_ref().ok_or_else(|| {
+                VectorError::new(format!(
+                    "{LEANN_GRAPH} cannot rebuild a recompute-mode image without a recompute source"
+                ))
+            })?;
+            let end = self.stored_base.min(start + REBUILD_CHUNK_ROWS);
+            let ids: Vec<u32> = (start as u32..end as u32).collect();
+            let mut chunk = vec![0f32; ids.len() * dim];
+            source.embed_rows(&ids, dim, &mut chunk)?;
+            verify(&self.fingerprints, &ids, &chunk, dim)?;
+            vectors.extend_from_slice(&chunk);
+            start = end;
+        }
+        vectors.extend_from_slice(&self.held);
+        Ok(Index {
+            indexed: rows,
+            graph: build_graph(&vectors, dim, &self.config),
+            codes: Codes::fit(self.config.bits_per_dimension, dim, &vectors),
+        })
+    }
+}
+
+fn verify(
+    fingerprints: &[[u8; ROW_FINGERPRINT_BYTES]],
+    rows: &[u32],
+    vectors: &[f32],
+    dim: usize,
+) -> Result<(), VectorError> {
+    for (row, vector) in rows.iter().zip(vectors.chunks_exact(dim)) {
+        let expected = fingerprints[*row as usize];
+        let actual = row_fingerprint(vector);
+        if actual != expected {
+            return Err(VectorError::new(format!(
+                "recomputed embedding of row {row} does not reproduce the indexed vector \
+                 (fingerprint {}, indexed {}); the recompute source \
+                 is not the model the image was built with, or is not deterministic",
+                hex(&actual),
+                hex(&expected)
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The `leann-graph` provider.
 ///
 /// Rows `0..indexed` are in the graph; later rows form an unindexed tail
-/// scored exhaustively until the next rebuild. The image holds the FP32
-/// rows `stored_base..rows`: all of them under [`EmbeddingStorage::Stored`],
-/// only the tail under [`EmbeddingStorage::Recomputed`].
+/// scored exhaustively until the next rebuild. The provider holds the FP32
+/// rows `stored_base..rows`: all of them under [`EmbeddingStorage::Stored`];
+/// under [`EmbeddingStorage::Recomputed`] the tail, plus rows a background
+/// build indexed since the last append (dropped at the next `add` or
+/// `prepare`, and never written to an image).
+///
+/// Rebuilds run on a background thread over a copy of their inputs, so
+/// neither the caller of `add` nor any reader waits for one. A finished
+/// build is swapped in whole the next time any method looks at the index;
+/// until then its rows are scored exactly as tail.
 pub struct LeannGraph {
     config: LeannGraphConfig,
     dim: Option<usize>,
     rows: usize,
-    indexed: usize,
     stored_base: usize,
     stored: Vec<f32>,
     fingerprints: Vec<[u8; ROW_FINGERPRINT_BYTES]>,
-    codes: Codes,
-    graph: Graph,
+    index: RwLock<Arc<Index>>,
+    build: Mutex<Option<JoinHandle<Result<Index, VectorError>>>>,
+    build_error: Mutex<Option<VectorError>>,
     source: Option<Arc<dyn RecomputeSource>>,
 }
 
@@ -753,19 +838,22 @@ impl LeannGraph {
             )));
         }
         Ok(Self {
-            codes: Codes {
-                bits: config.bits_per_dimension,
-                dim: dimension.unwrap_or(0),
-                ..Codes::default()
-            },
+            index: RwLock::new(Arc::new(Index {
+                codes: Codes {
+                    bits: config.bits_per_dimension,
+                    dim: dimension.unwrap_or(0),
+                    ..Codes::default()
+                },
+                ..Index::default()
+            })),
             config,
             dim: dimension,
             rows: 0,
-            indexed: 0,
             stored_base: 0,
             stored: Vec::new(),
             fingerprints: Vec::new(),
-            graph: Graph::default(),
+            build: Mutex::new(None),
+            build_error: Mutex::new(None),
             source: None,
         })
     }
@@ -779,14 +867,95 @@ impl LeannGraph {
     }
 
     pub fn graph_stats(&self) -> GraphStats {
+        let index = self.index();
         GraphStats {
             rows: self.rows,
-            indexed_rows: self.indexed,
-            edges: self.graph.adjacency.iter().map(Vec::len).sum(),
-            hubs: self.graph.hubs.len(),
-            max_degree: self.graph.adjacency.iter().map(Vec::len).max().unwrap_or(0),
-            stored_rows: self.rows - self.stored_base,
+            indexed_rows: index.indexed,
+            edges: index.graph.adjacency.iter().map(Vec::len).sum(),
+            hubs: index.graph.hubs.len(),
+            max_degree: index
+                .graph
+                .adjacency
+                .iter()
+                .map(Vec::len)
+                .max()
+                .unwrap_or(0),
+            stored_rows: self.rows - self.held_from(&index),
+            building: self.build.lock().unwrap().is_some(),
         }
+    }
+
+    /// The current index, after swapping in a finished background build.
+    fn index(&self) -> Arc<Index> {
+        let finished = {
+            let mut build = self.build.lock().unwrap();
+            match build.as_ref() {
+                Some(handle) if handle.is_finished() => build.take(),
+                _ => None,
+            }
+        };
+        if let Some(handle) = finished {
+            self.install(handle);
+        }
+        self.index.read().unwrap().clone()
+    }
+
+    fn install(&self, handle: JoinHandle<Result<Index, VectorError>>) {
+        let outcome = handle.join().unwrap_or_else(|_| {
+            Err(VectorError::new(format!(
+                "{LEANN_GRAPH} background build panicked"
+            )))
+        });
+        match outcome {
+            Ok(built) => {
+                let mut index = self.index.write().unwrap();
+                if built.indexed > index.indexed {
+                    *index = Arc::new(built);
+                }
+            }
+            Err(error) => *self.build_error.lock().unwrap() = Some(error),
+        }
+    }
+
+    /// Wait for a background build, swap it in, and report its failure if
+    /// it failed (once; the next append schedules a fresh build).
+    pub fn wait_for_build(&self) -> Result<(), VectorError> {
+        let pending = self.build.lock().unwrap().take();
+        if let Some(handle) = pending {
+            self.install(handle);
+        }
+        match self.build_error.lock().unwrap().take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// The first row an image of `index` holds as FP32.
+    fn held_from(&self, index: &Index) -> usize {
+        match self.config.storage {
+            EmbeddingStorage::Stored => 0,
+            EmbeddingStorage::Recomputed => index.indexed.max(self.stored_base),
+        }
+    }
+
+    /// Under recompute storage, drop the held rows a build has indexed.
+    fn trim_indexed_rows(&mut self) {
+        let held_from = self.held_from(&self.index());
+        if let (Some(dim), true) = (self.dim, held_from > self.stored_base) {
+            self.stored.drain(..(held_from - self.stored_base) * dim);
+            self.stored_base = held_from;
+        }
+    }
+
+    fn build_job(&self) -> Option<BuildJob> {
+        Some(BuildJob {
+            config: self.config.clone(),
+            dim: self.dim?,
+            held: self.stored.clone(),
+            stored_base: self.stored_base,
+            fingerprints: self.fingerprints[..self.stored_base].to_vec(),
+            source: self.source.clone(),
+        })
     }
 
     /// Attach the product-side embedding source, after the determinism gate:
@@ -798,33 +967,15 @@ impl LeannGraph {
         source: Arc<dyn RecomputeSource>,
     ) -> Result<(), VectorError> {
         let dim = self.dim.unwrap_or(0);
-        if self.indexed > 0 && dim > 0 {
-            let sample = GATE_SAMPLE_ROWS.min(self.indexed);
-            let rows: Vec<u32> = (0..sample)
-                .map(|i| (i * self.indexed / sample) as u32)
-                .collect();
+        let indexed = self.index().indexed;
+        if indexed > 0 && dim > 0 {
+            let sample = GATE_SAMPLE_ROWS.min(indexed);
+            let rows: Vec<u32> = (0..sample).map(|i| (i * indexed / sample) as u32).collect();
             let mut out = vec![0f32; rows.len() * dim];
             source.embed_rows(&rows, dim, &mut out)?;
-            self.verify(&rows, &out, dim)?;
+            verify(&self.fingerprints, &rows, &out, dim)?;
         }
         self.source = Some(source);
-        Ok(())
-    }
-
-    fn verify(&self, rows: &[u32], vectors: &[f32], dim: usize) -> Result<(), VectorError> {
-        for (row, vector) in rows.iter().zip(vectors.chunks_exact(dim)) {
-            let expected = self.fingerprints[*row as usize];
-            let actual = row_fingerprint(vector);
-            if actual != expected {
-                return Err(VectorError::new(format!(
-                    "recomputed embedding of row {row} does not reproduce the indexed vector \
-                     (fingerprint {}, indexed {}); the recompute source \
-                     is not the model the image was built with, or is not deterministic",
-                    hex(&actual),
-                    hex(&expected)
-                )));
-            }
-        }
         Ok(())
     }
 
@@ -862,7 +1013,7 @@ impl LeannGraph {
         let ids: Vec<u32> = missing.iter().map(|&i| rows[i]).collect();
         let mut buffer = vec![0f32; ids.len() * dim];
         source.embed_rows(&ids, dim, &mut buffer)?;
-        self.verify(&ids, &buffer, dim)?;
+        verify(&self.fingerprints, &ids, &buffer, dim)?;
         for (j, &i) in missing.iter().enumerate() {
             out[i * dim..(i + 1) * dim].copy_from_slice(&buffer[j * dim..(j + 1) * dim]);
         }
@@ -873,39 +1024,6 @@ impl LeannGraph {
     /// Whether every indexed row's embedding can be produced for a rebuild.
     fn can_rebuild(&self) -> bool {
         self.stored_base == 0 || self.source.is_some()
-    }
-
-    /// Rebuild the graph over every row, folding in the tail.
-    fn rebuild(&mut self) -> Result<(), VectorError> {
-        let Some(dim) = self.dim else {
-            return Ok(());
-        };
-        let mut vectors = Vec::with_capacity(self.rows * dim);
-        let mut stats = TraversalStats::default();
-        let mut chunk = Vec::new();
-        let mut start = 0usize;
-        while start < self.stored_base {
-            let end = self.stored_base.min(start + REBUILD_CHUNK_ROWS);
-            let rows: Vec<u32> = (start as u32..end as u32).collect();
-            self.exact_rows(&rows, &mut chunk, &mut stats)?;
-            vectors.extend_from_slice(&chunk);
-            start = end;
-        }
-        vectors.extend_from_slice(&self.stored);
-        self.graph = build_graph(&vectors, dim, &self.config);
-        self.codes = Codes::fit(self.config.bits_per_dimension, dim, &vectors);
-        self.indexed = self.rows;
-        match self.config.storage {
-            EmbeddingStorage::Stored => {
-                self.stored = vectors;
-                self.stored_base = 0;
-            }
-            EmbeddingStorage::Recomputed => {
-                self.stored = Vec::new();
-                self.stored_base = self.rows;
-            }
-        }
-        Ok(())
     }
 
     fn check_allow(&self, allow: Option<&[bool]>) -> Result<(), VectorError> {
@@ -963,12 +1081,20 @@ impl LeannGraph {
         self.check_allow(options.allow)?;
         let mut floor = options.minimum_score.unwrap_or(f32::NEG_INFINITY);
         let mut stats = TraversalStats::default();
-        let (best, evaluated, stopped) =
-            self.traverse(query, beam, options.allow, &mut floor, &mut stats, control)?;
+        let index = self.index();
+        let (best, evaluated, stopped) = self.traverse(
+            &index,
+            query,
+            beam,
+            options.allow,
+            &mut floor,
+            &mut stats,
+            control,
+        )?;
         let mut hits = if every_evaluated { evaluated } else { best };
         if !stopped {
             let allowed = |row: usize| options.allow.is_none_or(|mask| mask[row]);
-            for row in self.indexed..self.rows {
+            for row in index.indexed..self.rows {
                 if !allowed(row) {
                     continue;
                 }
@@ -997,8 +1123,10 @@ impl LeannGraph {
     /// is passed over only when its approximate score plus the codes' proven
     /// error bound cannot reach the beam's worst exact score. The floor only
     /// filters results; a node below it can still lead to rows above it.
+    #[allow(clippy::too_many_arguments)]
     fn traverse(
         &self,
+        index: &Index,
         query: &[f32],
         beam: usize,
         allow: Option<&[bool]>,
@@ -1006,13 +1134,13 @@ impl LeannGraph {
         stats: &mut TraversalStats,
         control: &mut dyn FnMut() -> VectorStreamControl,
     ) -> Result<(Vec<Scored>, Vec<Scored>, bool), VectorError> {
-        if self.indexed == 0 || beam == 0 {
+        if index.indexed == 0 || beam == 0 {
             return Ok((Vec::new(), Vec::new(), false));
         }
         let allowed = |row: u32| allow.is_none_or(|mask| mask[row as usize]);
-        let (base, weights) = self.codes.query(query);
-        let bound = self.codes.error_bound(&weights);
-        let mut visited = vec![0u64; self.indexed.div_ceil(64)];
+        let (base, weights) = index.codes.query(query);
+        let bound = index.codes.error_bound(&weights);
+        let mut visited = vec![0u64; index.indexed.div_ceil(64)];
         let mut visit = |row: u32| {
             let (word, bit) = (row as usize / 64, 1u64 << (row % 64));
             let fresh = visited[word] & bit == 0;
@@ -1024,8 +1152,8 @@ impl LeannGraph {
         let mut frontier: BinaryHeap<Scored> = BinaryHeap::new();
         let mut pending: BinaryHeap<Scored> = BinaryHeap::new();
         let mut exact = Vec::new();
-        let mut batch: Vec<u32> = vec![self.graph.entry];
-        visit(self.graph.entry);
+        let mut batch: Vec<u32> = vec![index.graph.entry];
+        visit(index.graph.entry);
         stats.visited += 1;
         let keep = |discovered: usize| -> usize {
             if discovered == 0 {
@@ -1071,10 +1199,10 @@ impl LeannGraph {
                 frontier.pop();
                 stats.hops += 1;
                 let mut discovered = 0;
-                for &neighbor in &self.graph.adjacency[candidate.row as usize] {
+                for &neighbor in &index.graph.adjacency[candidate.row as usize] {
                     if visit(neighbor) {
                         pending.push(Scored {
-                            score: self.codes.approx(base, &weights, neighbor),
+                            score: index.codes.approx(base, &weights, neighbor),
                             row: neighbor,
                         });
                         discovered += 1;
@@ -1111,40 +1239,42 @@ impl LeannGraph {
 
     fn encode_image(&self) -> Vec<u8> {
         let dim = self.dim.unwrap_or(0);
+        let index = self.index();
+        let held_from = self.held_from(&index);
         let mut out = Vec::new();
         out.extend_from_slice(IMAGE_MAGIC);
         out.extend_from_slice(&IMAGE_FORMAT.to_le_bytes());
         out.extend_from_slice(&self.config.encode());
-        for value in [dim, self.rows, self.indexed, self.stored_base] {
+        for value in [dim, self.rows, index.indexed, held_from] {
             out.extend_from_slice(&(value as u64).to_le_bytes());
         }
-        out.extend_from_slice(&self.graph.entry.to_le_bytes());
+        out.extend_from_slice(&index.graph.entry.to_le_bytes());
         for fingerprint in &self.fingerprints {
             out.extend_from_slice(fingerprint);
         }
-        if self.indexed > 0 {
-            for value in self.codes.min.iter().chain(&self.codes.step) {
+        if index.indexed > 0 {
+            for value in index.codes.min.iter().chain(&index.codes.step) {
                 out.extend_from_slice(&value.to_bits().to_le_bytes());
             }
-            out.extend_from_slice(&self.codes.bytes);
+            out.extend_from_slice(&index.codes.bytes);
         }
-        out.extend_from_slice(&(self.graph.hubs.len() as u64).to_le_bytes());
-        for hub in &self.graph.hubs {
+        out.extend_from_slice(&(index.graph.hubs.len() as u64).to_le_bytes());
+        for hub in &index.graph.hubs {
             out.extend_from_slice(&hub.to_le_bytes());
         }
         // CSR: offsets, then the concatenated neighbor lists.
         let mut offset = 0u64;
         out.extend_from_slice(&offset.to_le_bytes());
-        for list in &self.graph.adjacency {
+        for list in &index.graph.adjacency {
             offset += list.len() as u64;
             out.extend_from_slice(&offset.to_le_bytes());
         }
-        for list in &self.graph.adjacency {
+        for list in &index.graph.adjacency {
             for neighbor in list {
                 out.extend_from_slice(&neighbor.to_le_bytes());
             }
         }
-        for value in &self.stored {
+        for value in &self.stored[(held_from - self.stored_base) * dim..] {
             out.extend_from_slice(&value.to_bits().to_le_bytes());
         }
         let digest = crate::sha256::digest(&out);
@@ -1275,16 +1405,20 @@ impl LeannGraph {
             config,
             dim: (dim > 0).then_some(dim),
             rows,
-            indexed,
             stored_base,
             stored,
             fingerprints,
-            codes,
-            graph: Graph {
-                adjacency,
-                hubs,
-                entry,
-            },
+            index: RwLock::new(Arc::new(Index {
+                indexed,
+                codes,
+                graph: Graph {
+                    adjacency,
+                    hubs,
+                    entry,
+                },
+            })),
+            build: Mutex::new(None),
+            build_error: Mutex::new(None),
             source: None,
         })
     }
@@ -1419,15 +1553,41 @@ impl VectorProvider for LeannGraph {
                 u32::MAX
             )));
         }
+        // A failed background build is reported here, before anything is
+        // appended, so the caller sees it; the next append builds afresh.
+        if let Some(error) = self.build_error.lock().unwrap().take() {
+            return Err(error);
+        }
+        self.trim_indexed_rows();
+        let indexed = self.index().indexed;
+        let threshold = REBUILD_MIN_TAIL.max(indexed);
+        if !self.can_rebuild() && self.rows + added - indexed >= threshold {
+            return Err(VectorError::new(format!(
+                "{LEANN_GRAPH} recompute-mode image has {} unindexed rows and no recompute \
+                 source to rebuild with; attach one before appending more",
+                self.rows - indexed
+            )));
+        }
+        if self.dim.is_none() {
+            let mut index = self.index.write().unwrap();
+            Arc::make_mut(&mut index).codes.dim = dimension;
+        }
         self.dim = Some(dimension);
-        self.codes.dim = dimension;
         self.fingerprints
             .extend(vectors.chunks_exact(dimension).map(row_fingerprint));
         self.stored.extend_from_slice(vectors);
         self.rows += added;
-        let tail = self.rows - self.indexed;
-        if tail >= REBUILD_MIN_TAIL.max(self.indexed) && self.can_rebuild() {
-            self.rebuild()?;
+        let mut build = self.build.lock().unwrap();
+        if build.is_none() && self.rows - indexed >= threshold {
+            if let Some(job) = self.build_job() {
+                let handle = std::thread::Builder::new()
+                    .name("leann-graph-build".into())
+                    .spawn(move || job.run())
+                    .map_err(|e| {
+                        VectorError::new(format!("{LEANN_GRAPH} cannot start a build: {e}"))
+                    })?;
+                *build = Some(handle);
+            }
         }
         Ok(())
     }
@@ -1435,7 +1595,9 @@ impl VectorProvider for LeannGraph {
     /// Fold the unindexed tail into the graph. Under recompute storage this
     /// is also where the build's embeddings are dropped.
     fn prepare(&mut self) -> Result<(), VectorError> {
-        if self.indexed == self.rows {
+        self.wait_for_build()?;
+        self.trim_indexed_rows();
+        if self.index().indexed == self.rows {
             return Ok(());
         }
         if !self.can_rebuild() {
@@ -1443,7 +1605,12 @@ impl VectorProvider for LeannGraph {
                 "{LEANN_GRAPH} cannot rebuild a recompute-mode image without a recompute source"
             )));
         }
-        self.rebuild()
+        if let Some(job) = self.build_job() {
+            let built = job.run()?;
+            *self.index.get_mut().unwrap() = Arc::new(built);
+            self.trim_indexed_rows();
+        }
+        Ok(())
     }
 
     fn write(&self, path: &Path) -> Result<(), VectorError> {
@@ -1606,6 +1773,10 @@ impl VectorProvider for LeannGraph {
     ) -> Result<(), VectorError> {
         LeannGraph::attach_recompute_source(self, source)
     }
+
+    fn indexed_len(&self) -> Option<usize> {
+        Some(self.index().indexed)
+    }
 }
 
 pub(crate) fn create(
@@ -1619,19 +1790,34 @@ pub(crate) fn create(
     .map(LeannGraph::into_index)
 }
 
+/// Nodes cannot yet bind a vector field to the model that embedded it, so
+/// nothing could attach a recompute source after compaction replays a
+/// segment and `prepare` rebuilds it. Until that binding exists the node
+/// paths refuse recompute storage; library callers that own a source use
+/// [`LeannGraph`] directly.
+fn refuse_recompute_on_nodes(config: &LeannGraphConfig) -> Result<(), VectorError> {
+    match config.storage {
+        EmbeddingStorage::Stored => Ok(()),
+        EmbeddingStorage::Recomputed => Err(VectorError::new(format!(
+            "{LEANN_GRAPH} recompute storage needs a recompute source, which nodes cannot \
+             bind to a vector field yet; configure stored embeddings"
+        ))),
+    }
+}
+
 pub(crate) fn from_config(
     dimension: usize,
     config: &VectorBackendConfig,
 ) -> Result<VectorIndex, VectorError> {
-    LeannGraph::new(
-        Some(dimension),
-        LeannGraphConfig::from_backend_config(config)?,
-    )
-    .map(LeannGraph::into_index)
+    let config = LeannGraphConfig::from_backend_config(config)?;
+    refuse_recompute_on_nodes(&config)?;
+    LeannGraph::new(Some(dimension), config).map(LeannGraph::into_index)
 }
 
 pub(crate) fn load(path: &Path) -> Result<VectorIndex, VectorError> {
-    LeannGraph::load(path).map(LeannGraph::into_index)
+    let graph = LeannGraph::load(path)?;
+    refuse_recompute_on_nodes(&graph.config)?;
+    Ok(graph.into_index())
 }
 
 #[cfg(test)]
@@ -1953,8 +2139,8 @@ mod tests {
             graph.add(&vectors[600 * dim..], dim).unwrap();
             let image = graph.encode_image();
             let mut loaded = LeannGraph::decode_image(&image).unwrap();
-            assert_eq!(loaded.graph, graph.graph);
-            assert_eq!(loaded.codes, graph.codes);
+            assert_eq!(loaded.index().graph, graph.index().graph);
+            assert_eq!(loaded.index().codes, graph.index().codes);
             assert_eq!(loaded.fingerprints, graph.fingerprints);
             assert_eq!(loaded.graph_stats(), graph.graph_stats());
             let source = Arc::new(FromCopy {
@@ -2055,13 +2241,99 @@ mod tests {
         graph
             .add(&vectors[(REBUILD_MIN_TAIL - 1) * dim..], dim)
             .unwrap();
-        assert_eq!(graph.graph_stats().indexed_rows, REBUILD_MIN_TAIL + 10);
+        // The append returned without building; until the build lands every
+        // row is still answered, from the tail.
+        let (hits, _) = graph
+            .search_with_stats(&vectors[..dim], 5, VectorSearchOptions::new())
+            .unwrap();
+        assert_eq!(hits[0].1, 0);
+        graph.wait_for_build().unwrap();
+        let stats = graph.graph_stats();
+        assert_eq!(stats.indexed_rows, REBUILD_MIN_TAIL + 10);
+        assert!(!stats.building);
         let (hits, stats) = graph
             .search_with_stats(&vectors[..dim], 5, VectorSearchOptions::new())
             .unwrap();
         assert_eq!(stats.tail_scanned, 0);
         assert!(stats.hops > 0);
         assert_eq!(hits[0].1, 0);
+    }
+
+    /// Recompute storage with no source refuses the append that would need a
+    /// rebuild instead of letting the tail grow unindexed, and nodes refuse
+    /// recompute storage outright until they can bind a source.
+    #[test]
+    fn recompute_storage_refuses_what_it_cannot_rebuild() {
+        let dim = 8;
+        let config = LeannGraphConfig {
+            storage: EmbeddingStorage::Recomputed,
+            ..LeannGraphConfig::default()
+        };
+        let vectors = corpus(3 * REBUILD_MIN_TAIL, dim, 31);
+        let mut graph = LeannGraph::new(Some(dim), config.clone()).unwrap();
+        graph.add(&vectors[..REBUILD_MIN_TAIL * dim], dim).unwrap();
+        graph.prepare().unwrap();
+        assert_eq!(graph.graph_stats().stored_rows, 0);
+        let more = &vectors[REBUILD_MIN_TAIL * dim..];
+        let error = graph.add(more, dim).unwrap_err().to_string();
+        assert!(error.contains("no recompute source"), "{error}");
+        assert_eq!(graph.graph_stats().rows, REBUILD_MIN_TAIL);
+        graph
+            .attach_recompute_source(Arc::new(FromCopy {
+                vectors: vectors.clone(),
+                calls: Default::default(),
+            }))
+            .unwrap();
+        graph.add(more, dim).unwrap();
+        graph.prepare().unwrap();
+        assert_eq!(graph.graph_stats().indexed_rows, 3 * REBUILD_MIN_TAIL);
+        assert_eq!(graph.graph_stats().stored_rows, 0);
+
+        let error = from_config(dim, &config.backend_config().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("recompute storage"), "{error}");
+        assert!(from_config(dim, &LeannGraphConfig::default().backend_config().unwrap()).is_ok());
+    }
+
+    /// 4-bit codes bound the approximate score loosely, so most pruned rows
+    /// still clear the bound and are scored exactly: recall holds, and the
+    /// saving `prune_ratio` buys is real at 8 bits, not at 4.
+    #[test]
+    fn four_bit_codes_keep_recall_under_pruning() {
+        let dim = 32;
+        let vectors = corpus(3000, dim, 41);
+        let build = |bits_per_dimension| {
+            let mut graph = LeannGraph::new(
+                Some(dim),
+                LeannGraphConfig {
+                    bits_per_dimension,
+                    prune_ratio_ppm: 800_000,
+                    ..LeannGraphConfig::default()
+                },
+            )
+            .unwrap();
+            graph.add(&vectors, dim).unwrap();
+            graph.prepare().unwrap();
+            graph
+        };
+        let exact_rows = |graph: &LeannGraph| {
+            (0..40)
+                .map(|q| {
+                    let query = &vectors[q * 7 * dim..(q * 7 + 1) * dim];
+                    graph
+                        .search_with_stats(query, 10, VectorSearchOptions::new())
+                        .unwrap()
+                        .1
+                        .exact_evaluations
+                })
+                .sum::<u64>()
+        };
+        let four = build(4);
+        let eight = build(8);
+        assert!(recall(&four, &vectors, dim, 40, 10) >= 0.9);
+        assert!(recall(&eight, &vectors, dim, 40, 10) >= 0.9);
+        assert!(exact_rows(&eight) < exact_rows(&four));
     }
 
     /// A floor above the entry hub's own score must not stop the walk
@@ -2078,7 +2350,7 @@ mod tests {
         let mut graph = LeannGraph::new(Some(dim), config).unwrap();
         graph.add(&vectors, dim).unwrap();
         graph.prepare().unwrap();
-        let entry = graph.graph.entry as usize;
+        let entry = graph.index().graph.entry as usize;
         let mut checked = 0;
         for q in 0..40 {
             let query = &vectors[q * 11 * dim..(q * 11 + 1) * dim];

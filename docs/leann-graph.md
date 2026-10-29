@@ -85,7 +85,16 @@ node falls below the beam's worst result, the queue is drained of every
 row whose approximate score plus the codes' proven error bound (half a
 quantization step times the query weight, summed over dimensions) could
 still enter the beam; the walk stops only when none can. Approximate scores
-never end the search on their own. A floor (`minimum_score` or a shared
+never end the search on their own.
+
+That bound is what decides whether `prune_ratio` saves anything. At 8 bits
+the step is small, so most pruned rows stay below the beam's worst exact
+score and are never scored exactly. At 4 bits the step is 17 times wider:
+most pruned rows still clear the bound and are drained, so recall holds
+but the exact work saved is small. Pair `prune_ratio` with 8-bit codes;
+at 4 bits treat it as a storage choice, not a speed one.
+
+A floor (`minimum_score` or a shared
 cross-shard floor) only filters results: a node below it can still lead to
 rows above it.
 
@@ -115,13 +124,39 @@ the indexed vector (another model, a nondeterministic kernel) is an error
 naming the row, never a silently different score. A recompute-mode image
 with no source attached refuses searches and rebuilds by name.
 
+What recompute mode costs:
+
+- Every rebuild re-embeds the whole indexed corpus through the source, in
+  chunks of 4,096 rows checked against their fingerprints, because the
+  graph is rebuilt from all rows. With the geometric schedule below that is
+  O(log n) full re-embeds over a shard's life, each one a full pass of the
+  embedding model. Size the rebuild threshold, or batch appends and call
+  `prepare()` once, with that in mind.
+- Searches call the source on the query path, while the shard's read guard
+  is held: a slow model holds the guard for the length of its batch.
+- With no source attached, an append that would bring the unindexed tail
+  to the build threshold is refused by name rather than leaving the tail
+  to grow without bound.
+- Nodes refuse recompute storage at configure and load time (see below).
+
 ## Appends and images
 
 Rows added after a build form an unindexed tail that is scored exactly
 and kept as FP32 in both modes. `prepare()` folds the tail into a full
 rebuild; `add()` also rebuilds once the tail reaches the larger of 1,024
-rows and the indexed row count, so appends rebuild O(log n) times. The
-rebuild runs synchronously inside `add`, on the writer's path. A shard
+rows and the indexed row count, so appends rebuild O(log n) times.
+
+Rebuilds triggered by `add()` run on a background thread over a copy of
+their inputs, so neither the writer holding the shard's write lock nor any
+reader waits for one, and at most one runs at a time. Until a build lands
+its rows are answered by the exact tail scan; the finished graph is swapped
+in whole the next time anything looks at the index. A failed build is
+reported by the next `add()`, which appends nothing and returns the error;
+the append after it schedules a fresh build. `prepare()` waits for a build
+in flight and then folds whatever tail remains synchronously, since its
+callers (load, compaction, snapshots) want a fully indexed image. A node
+reports the rows its graph covers as `indexed_vectors` in
+`GetVectorBackendResponse`. A shard
 below 1,024 rows that is never `prepare`d stays an exact scan, which at
 that size is cheaper than a graph.
 
@@ -138,9 +173,12 @@ its FP32 fingerprint, the identity the reported score is computed from.
 ## What this does not do yet
 
 - The product does not yet bind a vector field to its embedding model, so
-  nodes have no source text to recompute from. Recompute mode is usable
-  through the library API (`RecomputeSource`); serving it from a node needs
-  the model-identity step of the LEANN assessment first.
+  nodes have no source to recompute from. Nodes therefore refuse recompute
+  storage when it is configured or loaded, since compaction replays a
+  segment and `prepare()` would have to rebuild it. Recompute mode is
+  usable through the library API (`LeannGraph` with a `RecomputeSource`);
+  serving it from a node needs the model-identity step of the LEANN
+  assessment first.
 - No measured dense execution policy ships for it; AUTO stays refused
   until one is measured on a real corpus.
 - Per the assessment it targets small k. At k = 10,000 the exhaustive SIMD

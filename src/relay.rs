@@ -842,6 +842,7 @@ pub fn merge_vector_backend(
         descriptor: first.descriptor.clone(),
         config: first.config.clone(),
         num_vectors,
+        indexed_vectors: reports.iter().map(|report| report.indexed_vectors).sum(),
     })
 }
 

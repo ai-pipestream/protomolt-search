@@ -13724,6 +13724,7 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                 descriptor: None,
                 config: None,
                 num_vectors: 0,
+                indexed_vectors: None,
             }));
         };
         let config = index
@@ -13733,6 +13734,7 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
             descriptor: Some(wire_backend_descriptor(index)),
             config: Some(wire_backend_config(&config)),
             num_vectors: index.len() as u64,
+            indexed_vectors: index.indexed_len().map(|rows| rows as u64),
         }))
     }
 
