@@ -72,7 +72,10 @@ provisional replacement revisions and an explicit terminal certificate.
 generation-bound policy in
 [docs/dense-execution-policy.md](docs/dense-execution-policy.md): exhaustive
 providers resolve to `EXACT`, a configured ANN provider only at a measured
-point, and the response reports which.
+point, and the response reports which. The optional `leann-graph` provider
+(`vector_backend = "leann-graph"`) is such a configured ANN engine: a native
+port of LEANN's hub-preserving graph pruning and selective embedding
+recomputation, for small-k searches; see [docs/leann-graph.md](docs/leann-graph.md).
 A cased A/B column costs no second analysis:
 [docs/dual-cased.md](docs/dual-cased.md) — `AddDocumentsRequest.cased_field`
 takes the body's cased identity from the same pass, sidecar or native.

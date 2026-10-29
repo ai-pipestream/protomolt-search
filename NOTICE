@@ -4,3 +4,11 @@ licensed under the Apache License, Version 2.0.
 
 Apache OpenNLP includes a Java adaptation of Martin Porter's Release 3
 stemming algorithm.
+
+The `leann-graph` vector provider (src/leann_graph.rs) is an independent
+Rust implementation of the high-degree preserving graph pruning and
+two-level selective-recomputation search described in "LEANN: A
+Low-Storage Vector Index" (Wang et al., arXiv:2506.08276). No LEANN source
+code is included. The LEANN reference implementation
+(https://github.com/StarTrail-org/LEANN) is distributed under the MIT
+License, Copyright (c) 2025 LEANN Contributors.
