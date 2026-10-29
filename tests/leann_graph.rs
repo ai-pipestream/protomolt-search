@@ -1,10 +1,11 @@
 //! The LEANN-style graph provider (`docs/leann-graph.md`) served by real
 //! nodes behind a coordinator: it is selected by `vector_backend`, it is
 //! never treated as exact (EXACT, the legacy unspecified mode and AUTO
-//! without a policy refuse naming it), explicit ANN returns the FP32 top-k
-//! with exact FP32 scores on a corpus small enough for the traversal to
-//! reach it, and AUTO qualifies it only through a policy bound to its
-//! scoring fingerprint.
+//! without a policy refuse naming it), explicit ANN finds the FP32 top-k
+//! through a graph each node really built (every shard holds more rows than
+//! the build threshold, so nothing is answered by the exact tail scan) and
+//! reports exact FP32 scores, and AUTO qualifies it only through a policy
+//! bound to its scoring fingerprint.
 
 mod common;
 
@@ -29,7 +30,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 
 const DIM: usize = 32;
-const N_DOCS: usize = 64;
+/// 1,100 rows per shard: past the 1,024-row threshold at which `add`
+/// builds the graph, so every query traverses one.
+const N_DOCS: usize = 2200;
 const SHARDS: usize = 2;
 const GENERATION: u64 = 3;
 
@@ -152,22 +155,32 @@ fn fp32_top(corpus: &[f32], query: &[f32], k: usize) -> Vec<(u64, f32)> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn explicit_ann_returns_the_fp32_top_k_and_reports_the_graph() {
     let fixture = start_fixture().await;
-    let response = query(
-        &fixture.coordinator,
-        dense_request(&fixture.query_vector, 5, DenseExecutionMode::Ann),
-    )
-    .await
-    .unwrap();
-    let truth = fp32_top(&fixture.corpus, &fixture.query_vector, 5);
-    let ids: Vec<u64> = response.hits.iter().map(|h| h.doc_id).collect();
-    assert_eq!(ids, truth.iter().map(|t| t.0).collect::<Vec<_>>());
-    for (hit, (_, score)) in response.hits.iter().zip(&truth) {
-        assert!(
-            (hit.score - score).abs() < 1.0e-5,
-            "{} vs {score}",
-            hit.score
-        );
+    let queries = unit_vectors(8, DIM, 0x1EA4_0003);
+    let mut found = 0;
+    let mut response = None;
+    for query_vector in queries.chunks_exact(DIM) {
+        let answer = query(
+            &fixture.coordinator,
+            dense_request(query_vector, 5, DenseExecutionMode::Ann),
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer.hits.len(), 5);
+        let truth = fp32_top(&fixture.corpus, query_vector, 5);
+        for hit in &answer.hits {
+            let row = &fixture.corpus[hit.doc_id as usize * DIM..][..DIM];
+            let exact: f32 = row.iter().zip(query_vector).map(|(a, b)| a * b).sum();
+            assert!(
+                (hit.score - exact).abs() < 1.0e-5,
+                "{} vs {exact}",
+                hit.score
+            );
+            found += truth.iter().any(|t| t.0 == hit.doc_id) as usize;
+        }
+        response = Some(answer);
     }
+    assert!(found >= 36, "recall@5 {found}/40");
+    let response = response.unwrap();
     let outcome = response.dense_execution.unwrap();
     assert_eq!(outcome.provider_backend, LEANN_GRAPH);
     assert_eq!(outcome.resolved_mode, DenseExecutionMode::Ann as i32);

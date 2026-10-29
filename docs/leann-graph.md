@@ -62,10 +62,11 @@ steer traversal), so shards that share a config produce comparable scores.
 ## High-degree preserving pruning
 
 Paper Algorithm 3. A full insertion graph at degree M is built only to
-measure node degrees (out plus in). The top `hub_ratio_ppm` of nodes become
+measure node degrees (distinct neighbors over out- and in-links). The top `hub_ratio_ppm` of nodes become
 hubs. The serving graph is then rebuilt by inserting the same nodes in the
 same order: a hub selects up to M neighbors and every other node up to m,
-using the HNSW neighbor heuristic; edges are added in both directions and a
+using the HNSW neighbor heuristic on directions (cosine), so vectors of
+different lengths do not crowd each other out; edges are added in both directions and a
 list that grows past M is shrunk back with the same heuristic. Traversal
 enters through the best-connected hub. At the defaults the serving graph
 keeps well under half of the full graph's edges while hubs stay dense (the
@@ -79,9 +80,20 @@ codes (4 or 8 bits; the paper uses PQ, scalar codes need no training and
 keep builds deterministic) into one global approximate queue, and computes
 exact scores for the best `1 - prune_ratio` of the newly discovered
 neighbors (at least one). Nodes left in the approximate queue are evaluated
-on later hops when they become the best remaining. The search stops when
-the best frontier node falls below the k-th result, or, under a shared
-floor, when neither the frontier nor the approximate queue clears it.
+on later hops when they become the best remaining. When the best frontier
+node falls below the beam's worst result, the queue is drained of every
+row whose approximate score plus the codes' proven error bound (half a
+quantization step times the query weight, summed over dimensions) could
+still enter the beam; the walk stops only when none can. Approximate scores
+never end the search on their own. A floor (`minimum_score` or a shared
+cross-shard floor) only filters results: a node below it can still lead to
+rows above it.
+
+Streaming (`search_streaming_controlled`) traverses at `search_beam` and
+emits every allowed row whose exact score was computed, not only the
+beam's best, plus the tail. It polls the control callback after every hop:
+`Stop` ends the stream uncompleted, and a raised floor gates the rest of
+that query and every later one.
 
 Exact embeddings come from one of two places:
 
@@ -94,7 +106,8 @@ Exact embeddings come from one of two places:
   256 B of 8-bit codes (128 B at 4 bits) plus roughly 4 B per edge per row
   instead of 1,024 B of FP32.
 
-Every row's FP32 fingerprint (FNV-1a 64 over its bit patterns) is kept. A
+Every row's FP32 fingerprint (the first 128 bits of the SHA-256 of its bit
+patterns) is kept. A
 source is attached only after a determinism gate recomputes up to 32 evenly
 spaced indexed rows and reproduces each fingerprint bit for bit, and every
 later recompute is checked the same way: a recompute that disagrees with
@@ -107,13 +120,19 @@ with no source attached refuses searches and rebuilds by name.
 Rows added after a build form an unindexed tail that is scored exactly
 and kept as FP32 in both modes. `prepare()` folds the tail into a full
 rebuild; `add()` also rebuilds once the tail reaches the larger of 1,024
-rows and the indexed row count, so appends rebuild O(log n) times.
+rows and the indexed row count, so appends rebuild O(log n) times. The
+rebuild runs synchronously inside `add`, on the writer's path. A shard
+below 1,024 rows that is never `prepare`d stays an exact scan, which at
+that size is cheaper than a graph.
 
 The image (`PMLEANN1`, format 1) holds the config, row counts, row
 fingerprints, approximate codes, hub list, CSR adjacency, the held FP32
 rows, and a SHA-256 trailer. Loading checks the trailer and every
 structural field (row layout, offsets, neighbor and hub ranges, trailing
-bytes). `load_mapped` reads the image onto the heap. A row's transcript is
+bytes); every array length is checked against the bytes that remain, with
+overflow-checked sizes, before anything is allocated for it. `load_mapped`
+reads the image onto the heap and reports `is_mapped() == false`, which is
+the truth about where it serves from. A row's transcript is
 its FP32 fingerprint, the identity the reported score is computed from.
 
 ## What this does not do yet
