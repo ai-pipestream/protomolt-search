@@ -915,6 +915,9 @@ impl LeannGraph {
                 let mut index = self.index.write().unwrap();
                 if built.indexed > index.indexed {
                     *index = Arc::new(built);
+                    // A newer build covers what an earlier failed one did,
+                    // so that failure no longer describes this index.
+                    *self.build_error.lock().unwrap() = None;
                 }
             }
             Err(error) => *self.build_error.lock().unwrap() = Some(error),
@@ -970,6 +973,12 @@ impl LeannGraph {
         &mut self,
         source: Arc<dyn RecomputeSource>,
     ) -> Result<(), VectorError> {
+        if self.config.storage == EmbeddingStorage::Stored {
+            return Err(VectorError::new(format!(
+                "{LEANN_GRAPH} keeps every embedding under stored storage and \
+                 does not recompute them"
+            )));
+        }
         let dim = self.dim.unwrap_or(0);
         let indexed = self.index().indexed;
         if indexed > 0 && dim > 0 {
@@ -1147,8 +1156,10 @@ impl LeannGraph {
     /// exactly, and whether `control` stopped the traversal.
     ///
     /// Approximate scores never decide a stop on their own: a pending row
-    /// is passed over only when its approximate score plus the codes' proven
-    /// error bound cannot reach the beam's worst exact score. The floor only
+    /// is passed over only when its approximate score plus the codes' rounding
+    /// bound (with a small relative slack for f32 summation; data with huge
+    /// values and near-constant dimensions can exceed it, costing recall
+    /// only) cannot reach the beam's worst exact score. The floor only
     /// filters results; a node below it can still lead to rows above it.
     #[allow(clippy::too_many_arguments)]
     fn traverse(
@@ -1590,15 +1601,16 @@ impl VectorProvider for LeannGraph {
                 u32::MAX
             )));
         }
-        // A failed background build is reported here, before anything is
-        // appended, so the caller sees it; the next append builds afresh.
+        // Install a build that finished meanwhile, then report a failed one
+        // here, before anything is appended, so the caller sees it; the next
+        // append builds afresh.
+        let indexed = self.index().indexed;
         if let Some(error) = self.build_error.lock().unwrap().take() {
             return Err(error);
         }
         if self.source.is_some() {
             self.trim_indexed_rows();
         }
-        let indexed = self.index().indexed;
         let threshold = REBUILD_MIN_TAIL.max(indexed);
         if !self.can_rebuild() && self.rows + added - indexed >= threshold {
             return Err(VectorError::new(format!(
@@ -2342,6 +2354,94 @@ mod tests {
         assert!(error.contains("without a recompute source"), "{error}");
         assert_eq!(graph.graph_stats().stored_rows, 100);
         assert_eq!(graph.graph_stats().indexed_rows, 1300);
+    }
+
+    /// A source that turns wrong after the determinism gate.
+    struct TurnsWrong {
+        vectors: Vec<f32>,
+        calls: std::sync::atomic::AtomicUsize,
+        wrong: std::sync::atomic::AtomicBool,
+    }
+
+    impl RecomputeSource for TurnsWrong {
+        fn embed_rows(&self, rows: &[u32], dim: usize, out: &mut [f32]) -> Result<(), VectorError> {
+            let call = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            for (i, &row) in rows.iter().enumerate() {
+                let start = row as usize * dim;
+                out[i * dim..(i + 1) * dim].copy_from_slice(&self.vectors[start..start + dim]);
+            }
+            if call > 0 && self.wrong.load(std::sync::atomic::Ordering::Relaxed) {
+                out[0] += 1.0;
+            }
+            Ok(())
+        }
+    }
+
+    /// A background build that fails is reported by the next `add`, even
+    /// when nothing looked at the index between the failure and that call,
+    /// and it does not resurface once a later build has succeeded.
+    #[test]
+    fn a_failed_background_build_is_reported_once_and_then_superseded() {
+        let dim = 8;
+        let vectors = corpus(3500, dim, 61);
+        let mut graph = LeannGraph::new(
+            Some(dim),
+            LeannGraphConfig {
+                storage: EmbeddingStorage::Recomputed,
+                ..LeannGraphConfig::default()
+            },
+        )
+        .unwrap();
+        graph.add(&vectors[..1100 * dim], dim).unwrap();
+        graph.prepare().unwrap();
+        let source = Arc::new(TurnsWrong {
+            vectors: vectors.clone(),
+            calls: Default::default(),
+            wrong: std::sync::atomic::AtomicBool::new(true),
+        });
+        graph.attach_recompute_source(source.clone()).unwrap();
+        graph.add(&vectors[1100 * dim..2300 * dim], dim).unwrap();
+        while !graph
+            .build
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|handle| handle.is_finished())
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let error = graph
+            .add(&vectors[2300 * dim..2400 * dim], dim)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not reproduce"), "{error}");
+        assert_eq!(graph.graph_stats().rows, 2300);
+
+        source
+            .wrong
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        graph.add(&vectors[2300 * dim..], dim).unwrap();
+        graph.prepare().unwrap();
+        let stats = graph.graph_stats();
+        assert_eq!((stats.indexed_rows, stats.stored_rows), (3500, 0));
+    }
+
+    #[test]
+    fn stored_storage_refuses_a_recompute_source() {
+        let dim = 8;
+        let vectors = corpus(10, dim, 71);
+        let mut graph = LeannGraph::new(Some(dim), LeannGraphConfig::default()).unwrap();
+        graph.add(&vectors, dim).unwrap();
+        let error = graph
+            .attach_recompute_source(Arc::new(FromCopy {
+                vectors,
+                calls: Default::default(),
+            }))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("stored storage"), "{error}");
     }
 
     #[test]

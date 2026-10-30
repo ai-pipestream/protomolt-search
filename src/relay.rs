@@ -807,6 +807,7 @@ pub fn merge_vector_backend(
     };
     let name = |shard: usize| children.get(shard).map_or("", String::as_str);
     let mut num_vectors: u64 = 0;
+    let mut indexed_vectors: Option<u64> = Some(0);
     for (shard, report) in reports.iter().enumerate() {
         if report.descriptor.is_none() {
             return Err(Status::failed_precondition(format!(
@@ -837,12 +838,25 @@ pub fn merge_vector_backend(
                 name(shard)
             ))
         })?;
+        if report
+            .indexed_vectors
+            .is_some_and(|indexed| indexed > report.num_vectors)
+        {
+            return Err(Status::failed_precondition(format!(
+                "relay: child {shard} ({}) reports more indexed vectors than vectors",
+                name(shard)
+            )));
+        }
+        // Bounded by the checked `num_vectors` sum, so this cannot overflow.
+        indexed_vectors = indexed_vectors
+            .zip(report.indexed_vectors)
+            .map(|(sum, indexed)| sum + indexed);
     }
     Ok(crate::pb::GetVectorBackendResponse {
         descriptor: first.descriptor.clone(),
         config: first.config.clone(),
         num_vectors,
-        indexed_vectors: reports.iter().map(|report| report.indexed_vectors).sum(),
+        indexed_vectors,
     })
 }
 

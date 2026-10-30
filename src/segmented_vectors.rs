@@ -482,6 +482,27 @@ impl VectorProvider for SegmentedProvider {
             .reduce(|a, b| a || b)
     }
 
+    /// When any image builds its search structure after the fact: every
+    /// row but those an image still holds outside its structure, so a fully
+    /// built shard reports its whole length. `None` when no image reports.
+    fn indexed_len(&self) -> Option<usize> {
+        let images = self.images();
+        images
+            .iter()
+            .any(|(_, _, image)| image.indexed_len().is_some())
+            .then(|| {
+                let unindexed: usize = images
+                    .iter()
+                    .map(|(_, count, image)| {
+                        image
+                            .indexed_len()
+                            .map_or(0, |indexed| count.saturating_sub(indexed))
+                    })
+                    .sum();
+                self.len().saturating_sub(unindexed)
+            })
+    }
+
     fn as_segmented(&self) -> Option<&SegmentedProvider> {
         Some(self)
     }

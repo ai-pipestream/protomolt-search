@@ -16988,6 +16988,20 @@ fn dense_pass(
             "query coordinate {coord} is invalid: {value}"
         )));
     }
+    // A pass must score every masked slot. A provider that cannot certify
+    // exhaustive completion (a graph walk reaches only part of the mask
+    // and still completes) would silently drop members or their scores.
+    let descriptor = index.descriptor();
+    if !descriptor
+        .capabilities
+        .contains(&crate::vector::VectorCapability::ExhaustiveCompletion)
+    {
+        return Err(Status::failed_precondition(format!(
+            "vector backend {:?} does not score every member exhaustively; Boolean \
+             evaluation needs an exhaustive dense provider",
+            descriptor.backend_kind
+        )));
+    }
     let options = VectorSearchOptions::new().with_mask(mask);
     let summary = index
         .try_search_streaming_controlled(

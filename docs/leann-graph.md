@@ -82,9 +82,9 @@ exact scores for the best `1 - prune_ratio` of the newly discovered
 neighbors (at least one). Nodes left in the approximate queue are evaluated
 on later hops when they become the best remaining. When the best frontier
 node falls below the beam's worst result, the queue is drained of every
-row whose approximate score plus the codes' proven error bound (half a
-quantization step times the query weight, summed over dimensions) could
-still enter the beam; the walk stops only when none can. Approximate scores
+row whose approximate score plus the codes' rounding bound (half a
+quantization step times the query weight, summed over dimensions, with a
+small relative slack for f32 summation) could still enter the beam; the walk stops only when none can. Approximate scores
 never end the search on their own.
 
 That bound is what decides whether `prune_ratio` saves anything. At 8 bits

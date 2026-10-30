@@ -21,9 +21,9 @@ use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
-    search_query, selection_query, AddDocumentsRequest, AddVectorsRequest, DenseExecutionMode,
-    DenseQuery, DenseScoreMode, GetVectorBackendRequest, QueryRequest, QueryResponse, SearchQuery,
-    SelectionQuery, VectorQualityContract,
+    search_query, selection_query, AddDocumentsRequest, AddVectorsRequest, BooleanQuery,
+    DenseExecutionMode, DenseQuery, DenseScoreMode, GetVectorBackendRequest, QueryRequest,
+    QueryResponse, SearchQuery, SelectionQuery, VectorQualityContract,
 };
 use pipestream_search::vector::VectorIndex;
 use tokio::sync::mpsc;
@@ -343,5 +343,36 @@ async fn a_seeded_floor_filters_the_walk_without_cutting_it_short() {
                 .collect::<Vec<_>>()
         };
         assert_eq!(ids(&floored.hits), ids(&unfloored.hits), "query {q}");
+    }
+}
+
+/// Recursive Boolean evaluation needs every member's dense score. The graph
+/// walk reaches only part of a mask, so a Boolean dense leaf on these shards
+/// is refused by name rather than answered from the walk as if it were
+/// exhaustive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn boolean_dense_leaves_refuse_the_graph() {
+    let fixture = start_fixture().await;
+    for mode in [DenseExecutionMode::Exact, DenseExecutionMode::Unspecified] {
+        let dense = dense_request(&fixture.query_vector, 5, mode)
+            .selection
+            .unwrap();
+        let request = QueryRequest {
+            k: 5,
+            selection: Some(SelectionQuery {
+                node: Some(selection_query::Node::Boolean(BooleanQuery {
+                    must: vec![dense],
+                    ..Default::default()
+                })),
+            }),
+            ..Default::default()
+        };
+        let error = query(&fixture.coordinator, request).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{mode:?}");
+        assert!(
+            error.message().contains("exhaustive"),
+            "{mode:?}: {}",
+            error.message()
+        );
     }
 }
