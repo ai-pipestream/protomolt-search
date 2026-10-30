@@ -1849,6 +1849,13 @@ message GetVectorBackendResponse {
   VectorBackendDescriptor descriptor = 1;
   VectorBackendConfig config = 2;
   uint64 num_vectors = 3;
+  // Rows the provider's search structure covers, for a provider that
+  // builds it in the background (leann-graph): rows past this count are
+  // still answered, by an exhaustive tail scan, until the next build
+  // lands. Absent when every row is in the search structure as soon as
+  // it is added. A relay sums its children's counts only when every
+  // child reports one.
+  optional uint64 indexed_vectors = 4;
 }
 
 message ConfigureVectorBackendRequest {

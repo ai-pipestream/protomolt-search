@@ -13724,6 +13724,7 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                 descriptor: None,
                 config: None,
                 num_vectors: 0,
+                indexed_vectors: None,
             }));
         };
         let config = index
@@ -13733,6 +13734,7 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
             descriptor: Some(wire_backend_descriptor(index)),
             config: Some(wire_backend_config(&config)),
             num_vectors: index.len() as u64,
+            indexed_vectors: index.indexed_len().map(|rows| rows as u64),
         }))
     }
 
@@ -16984,6 +16986,20 @@ fn dense_pass(
     if let Some((_, coord, value)) = first_invalid_coordinate(vector, dim) {
         return Err(Status::invalid_argument(format!(
             "query coordinate {coord} is invalid: {value}"
+        )));
+    }
+    // A pass must score every masked slot. A provider that cannot certify
+    // exhaustive completion (a graph walk reaches only part of the mask
+    // and still completes) would silently drop members or their scores.
+    let descriptor = index.descriptor();
+    if !descriptor
+        .capabilities
+        .contains(&crate::vector::VectorCapability::ExhaustiveCompletion)
+    {
+        return Err(Status::failed_precondition(format!(
+            "vector backend {:?} does not score every member exhaustively; Boolean \
+             evaluation needs an exhaustive dense provider",
+            descriptor.backend_kind
         )));
     }
     let options = VectorSearchOptions::new().with_mask(mask);
