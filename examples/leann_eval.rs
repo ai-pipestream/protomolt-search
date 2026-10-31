@@ -31,6 +31,10 @@ use pipestream_search::vector::{VectorIndex, VectorSearchOptions, VectorSearchRe
 use serde_json::{json, Value};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
+/// Per-query ranked `(row, score)` hits, best first.
+type Hits = Vec<Vec<(usize, f32)>>;
+/// `(allow percent, row mask, FP32 truth)` for one filter.
+type Filter = (usize, Option<Vec<bool>>, Vec<Vec<usize>>);
 
 fn arg(key: &str, default: &str) -> String {
     let prefix = format!("--{key}=");
@@ -222,7 +226,7 @@ fn timed(
     depth: usize,
     iterations: usize,
     allow: Option<&[bool]>,
-) -> Result<(Vec<Vec<(usize, f32)>>, Vec<f64>), Error> {
+) -> Result<(Hits, Vec<f64>), Error> {
     let mut samples = Vec::new();
     let mut hits = Vec::new();
     for iteration in 0..iterations + 1 {
@@ -324,7 +328,7 @@ fn main() -> Result<(), Error> {
 
     let started = Instant::now();
     // (percent, mask, truth) per filter; the unfiltered search has no mask.
-    let filtered: Vec<(usize, Option<Vec<bool>>, Vec<Vec<usize>>)> = filters
+    let filtered: Vec<Filter> = filters
         .iter()
         .rev()
         .map(|&percent| {
