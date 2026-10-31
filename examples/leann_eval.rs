@@ -136,13 +136,14 @@ fn by_score_desc(left: &(usize, f32), right: &(usize, f32)) -> Ordering {
     right.1.total_cmp(&left.1).then(left.0.cmp(&right.0))
 }
 
-/// Exact FP32 top-`k` ids per query, one query per thread at a time.
-fn truth(corpus: &Corpus, k: usize) -> Vec<Vec<usize>> {
+/// Exact FP32 top-`k` allowed ids per query, one query per thread at a time.
+fn truth(corpus: &Corpus, k: usize, allow: Option<&[bool]>) -> Vec<Vec<usize>> {
     let one = |query: &[f32]| {
         let mut scored: Vec<(usize, f32)> = corpus
             .values
             .chunks(corpus.dim)
             .enumerate()
+            .filter(|(id, _)| allow.is_none_or(|mask| mask[*id]))
             .map(|(id, row)| (id, dot(query, row)))
             .collect();
         let k = k.min(scored.len());
@@ -164,6 +165,20 @@ fn truth(corpus: &Corpus, k: usize) -> Vec<Vec<usize>> {
             .flat_map(|h| h.join().expect("truth thread"))
             .collect()
     })
+}
+
+/// A row mask keeping `percent`% of rows, chosen by a fixed hash of the row
+/// id so it is uncorrelated with the embeddings (the friendly case for a
+/// graph; a filter correlated with topic, such as court or year, is harder).
+fn mask(rows: usize, percent: usize) -> Vec<bool> {
+    (0..rows as u64)
+        .map(|row| {
+            let mut h = row.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            h = (h ^ (h >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            (h ^ (h >> 31)) % 100 < percent as u64
+        })
+        .collect()
 }
 
 /// Per-query result ids, best first.
@@ -206,6 +221,7 @@ fn timed(
     corpus: &Corpus,
     depth: usize,
     iterations: usize,
+    allow: Option<&[bool]>,
 ) -> Result<(Vec<Vec<(usize, f32)>>, Vec<f64>), Error> {
     let mut samples = Vec::new();
     let mut hits = Vec::new();
@@ -213,7 +229,11 @@ fn timed(
         hits.clear();
         for query in corpus.queries.chunks_exact(corpus.dim) {
             let started = Instant::now();
-            let result = index.try_search(query, depth, VectorSearchOptions::new())?;
+            let options = match allow {
+                Some(mask) => VectorSearchOptions::new().with_mask(mask),
+                None => VectorSearchOptions::new(),
+            };
+            let result = index.try_search(query, depth, options)?;
             let elapsed = started.elapsed().as_secs_f64() * 1e3;
             // Iteration 0 is warmup.
             if iteration > 0 {
@@ -273,6 +293,11 @@ fn main() -> Result<(), Error> {
     let flat_bits: usize = arg("flat-bits", "4").parse()?;
     let ks = list("k", "10,100")?;
     let beams = list("beams", "10,32,64,128,256,512")?;
+    // Percent of rows a filter allows; 100 is the unfiltered search.
+    let filters = list("filters", "100,50,10,1")?;
+    if filters.iter().any(|p| *p > 100) {
+        return Err("--filters are percents in 1..=100".into());
+    }
     let out = PathBuf::from(arg("out", "leann-eval.json"));
     let configs = arg("configs", "32:8:64,64:16:128")
         .split(',')
@@ -298,14 +323,23 @@ fn main() -> Result<(), Error> {
     eprintln!("leann-eval: {} ({} queries)", corpus.provenance, queries);
 
     let started = Instant::now();
-    let truth = truth(&corpus, max_k);
+    // (percent, mask, truth) per filter; the unfiltered search has no mask.
+    let filtered: Vec<(usize, Option<Vec<bool>>, Vec<Vec<usize>>)> = filters
+        .iter()
+        .rev()
+        .map(|&percent| {
+            let allow = (percent < 100).then(|| mask(rows, percent));
+            let wanted = truth(&corpus, max_k, allow.as_deref());
+            (percent, allow, wanted)
+        })
+        .collect();
     eprintln!(
         "leann-eval: FP32 truth in {:.1}s",
         started.elapsed().as_secs_f64()
     );
 
     let mut report = json!({
-        "format": "protomolt-leann-eval-v1",
+        "format": "protomolt-leann-eval-v2",
         "corpus": corpus.provenance,
         "rows": rows,
         "dimension": corpus.dim,
@@ -313,6 +347,7 @@ fn main() -> Result<(), Error> {
         "iterations": iterations,
         "ks": ks,
         "beams": beams,
+        "filter_percents": filters,
         "host_threads": std::thread::available_parallelism().map_or(0, |n| n.get()),
         "turbovec_4bit_planes": std::env::var("TURBOVEC_4BIT_PLANES").ok(),
         "flat": Value::Null,
@@ -331,39 +366,44 @@ fn main() -> Result<(), Error> {
     let flat_rss = rss_bytes().saturating_sub(rss_before);
     eprintln!("leann-eval: flat built in {flat_build_s:.1}s");
     let mut flat_cells = Vec::new();
-    for &k in &ks {
-        let (hits, samples) = timed(&flat, &corpus, k, iterations)?;
-        let ids: Vec<Vec<usize>> = hits
-            .iter()
-            .map(|h| h.iter().map(|x| x.0).collect())
-            .collect();
-        flat_cells.push(json!({
-            "k": k, "rerank": 0, "recall": recall(&ids, &truth, k), "latency": percentiles(samples),
-        }));
-        let depth = rerank_depth.max(k).min(rows);
-        let (hits, samples) = timed(&flat, &corpus, depth, iterations)?;
-        let reranked: Vec<Vec<usize>> = hits
-            .iter()
-            .zip(corpus.queries.chunks_exact(corpus.dim))
-            .map(|(hits, query)| {
-                let mut scored: Vec<(usize, f32)> = hits
-                    .iter()
-                    .map(|(id, _)| {
-                        (
-                            *id,
-                            dot(query, &corpus.values[id * corpus.dim..][..corpus.dim]),
-                        )
-                    })
-                    .collect();
-                scored.sort_unstable_by(by_score_desc);
-                scored.into_iter().map(|(id, _)| id).collect()
-            })
-            .collect();
-        flat_cells.push(json!({
-            "k": k, "rerank": depth, "recall": recall(&reranked, &truth, k),
-            "latency_scan_only": percentiles(samples),
-        }));
-        eprintln!("leann-eval: flat k={k} done");
+    for (percent, allow, truth) in &filtered {
+        let allow = allow.as_deref();
+        for &k in &ks {
+            let (hits, samples) = timed(&flat, &corpus, k, iterations, allow)?;
+            let ids: Vec<Vec<usize>> = hits
+                .iter()
+                .map(|h| h.iter().map(|x| x.0).collect())
+                .collect();
+            flat_cells.push(json!({
+                "allow_percent": percent, "k": k, "rerank": 0,
+                "recall": recall(&ids, truth, k), "latency": percentiles(samples),
+            }));
+            let depth = rerank_depth.max(k).min(rows);
+            let (hits, samples) = timed(&flat, &corpus, depth, iterations, allow)?;
+            let reranked: Vec<Vec<usize>> = hits
+                .iter()
+                .zip(corpus.queries.chunks_exact(corpus.dim))
+                .map(|(hits, query)| {
+                    let mut scored: Vec<(usize, f32)> = hits
+                        .iter()
+                        .map(|(id, _)| {
+                            (
+                                *id,
+                                dot(query, &corpus.values[id * corpus.dim..][..corpus.dim]),
+                            )
+                        })
+                        .collect();
+                    scored.sort_unstable_by(by_score_desc);
+                    scored.into_iter().map(|(id, _)| id).collect()
+                })
+                .collect();
+            flat_cells.push(json!({
+                "allow_percent": percent, "k": k, "rerank": depth,
+                "recall": recall(&reranked, truth, k),
+                "latency_scan_only": percentiles(samples),
+            }));
+            eprintln!("leann-eval: flat {percent}% k={k} done");
+        }
     }
     report["flat"] = json!({
         "bits": flat_bits, "build_s": flat_build_s, "retained_rss_bytes": flat_rss, "cells": flat_cells,
@@ -381,18 +421,22 @@ fn main() -> Result<(), Error> {
         let retained = rss_bytes().saturating_sub(rss_before);
         eprintln!("leann-eval: graph {spec} built in {build_s:.1}s");
         let mut cells = Vec::new();
-        for &k in &ks {
-            for &beam in beams.iter().filter(|b| **b >= k) {
-                let (hits, samples) = timed(&graph, &corpus, beam.max(k), iterations)?;
-                let ids: Vec<Vec<usize>> = hits
-                    .iter()
-                    .map(|h| h.iter().map(|x| x.0).collect())
-                    .collect();
-                cells.push(json!({
-                    "k": k, "beam": beam, "recall": recall(&ids, &truth, k), "latency": percentiles(samples),
-                }));
+        for (percent, allow, truth) in &filtered {
+            let allow = allow.as_deref();
+            for &k in &ks {
+                for &beam in beams.iter().filter(|b| **b >= k) {
+                    let (hits, samples) = timed(&graph, &corpus, beam, iterations, allow)?;
+                    let ids: Vec<Vec<usize>> = hits
+                        .iter()
+                        .map(|h| h.iter().map(|x| x.0).collect())
+                        .collect();
+                    cells.push(json!({
+                        "allow_percent": percent, "k": k, "beam": beam,
+                        "recall": recall(&ids, truth, k), "latency": percentiles(samples),
+                    }));
+                }
+                eprintln!("leann-eval: graph {spec} {percent}% k={k} done");
             }
-            eprintln!("leann-eval: graph {spec} k={k} done");
         }
         report["graphs"]
             .as_array_mut()
