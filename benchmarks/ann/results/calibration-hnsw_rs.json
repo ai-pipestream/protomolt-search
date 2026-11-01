@@ -1,0 +1,36 @@
+{
+  "build_s": 25.714851563,
+  "dataset": "fashion-mnist-784-euclidean (rebuilt from the Fashion-MNIST IDX files; exact L2 truth)",
+  "dim": 784,
+  "engine": "hnsw_rs",
+  "format": "protomolt-ann-calibration-v1",
+  "host": {
+    "arch": "x86_64",
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "cpu_features": [
+      "sse4.2",
+      "avx2",
+      "fma",
+      "avx512f"
+    ],
+    "name": "vm",
+    "threads": 4
+  },
+  "params": {
+    "ef_construction": 400,
+    "ef_search": 24,
+    "extend_candidates": false,
+    "k": 10,
+    "max_nb_connection": 24,
+    "nb_layer": 11
+  },
+  "published_recall": 0.977,
+  "qps_all_cores_parallel_search": 14403.25007379073,
+  "queries": 10000,
+  "recall_hnsw_rs_definition": 0.99091,
+  "recall_id_overlap": 0.9909,
+  "rows": 60000,
+  "tolerance": 0.01,
+  "verdict": "FAIL",
+  "version": "0.3.5"
+}

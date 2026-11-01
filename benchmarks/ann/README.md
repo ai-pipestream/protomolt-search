@@ -103,6 +103,10 @@ exhaustive path). Per point:
 - Hops and exact scores per query where the engine reports them
   (`leann-graph`, `enumerate`, `exhaustive-tq`).
 - Build time, retained memory (RSS delta) and serialized bytes per row.
+  Read the byte columns with care: `corenn-hnswlib` and `enumerate` read the
+  fixture's shared rows, so their RSS delta excludes the vectors;
+  `exhaustive-tq`'s image holds the codes only, not the FP32 copy its rerank
+  reads (the product's `.exact` sidecar, 4 x dim bytes per row).
 
 A breadth sweep stops once mean recall reaches `--recall-stop` (0.99, the
 highest target): a larger breadth is only slower and the gate never picks
