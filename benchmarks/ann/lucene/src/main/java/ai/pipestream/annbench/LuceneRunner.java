@@ -313,6 +313,12 @@ public final class LuceneRunner {
                   if ((double) p.get("recall_mean") >= recallStop) {
                     break;
                   }
+                  // Plateau: three more breadths added < 0.005 recall.
+                  int np = points.size();
+                  if (np >= 4 && (double) p.get("recall_mean")
+                      - (double) ((Map<?, ?>) points.get(np - 4)).get("recall_mean") < 0.005) {
+                    break;
+                  }
                 }
                 System.err.printf("lucene: M=%d efc=%d %s k=%d: %d points%n", m, efc, f.name(), k, points.size());
                 cells.add(Map.of("filter", f.name(), "k", k, "points", points));

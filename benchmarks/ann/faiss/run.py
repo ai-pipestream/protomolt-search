@@ -325,6 +325,9 @@ def main():
                         points.append(p)
                         if p["recall_mean"] >= a.recall_stop:
                             break
+                        # Plateau: three more breadths added < 0.005 recall.
+                        if len(points) >= 4 and p["recall_mean"] - points[-4]["recall_mean"] < 0.005:
+                            break
                     cells.append({"filter": filt[0], "k": k, "points": points})
                     print(f"faiss: M={mm} efc={efc} {filt[0]} k={k}: {len(points)} points", file=sys.stderr)
             engine["builds"].append({

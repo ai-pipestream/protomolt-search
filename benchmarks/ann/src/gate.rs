@@ -54,7 +54,7 @@ pub fn command() -> Result<(), Error> {
     let mut builds: BTreeMap<String, BTreeMap<String, Vec<Value>>> = BTreeMap::new();
     let mut engines_meta: BTreeMap<String, Value> = BTreeMap::new();
     let mut hosts = BTreeSet::new();
-    let mut selectivity: BTreeMap<String, f64> = BTreeMap::new();
+    let mut selectivity: BTreeMap<(String, String), f64> = BTreeMap::new();
     for input in &inputs {
         let report = read_json(&PathBuf::from(input))?;
         let group = format!(
@@ -76,7 +76,7 @@ pub fn command() -> Result<(), Error> {
         {
             if let (Some(name), Some(pct)) = (f["name"].as_str(), f["actual_mean_percent"].as_f64())
             {
-                selectivity.insert(name.to_string(), pct);
+                selectivity.insert((group.clone(), name.to_string()), pct);
             }
         }
         for engine in report["engines"].as_array().into_iter().flatten() {
@@ -113,6 +113,9 @@ pub fn command() -> Result<(), Error> {
                         .entry(key)
                         .or_insert_with(|| vec![None; TARGETS.len() * MODES.len()]);
                     for point in cell["points"].as_array().into_iter().flatten() {
+                        if point["below_qps_floor"].as_bool().unwrap_or(false) {
+                            continue;
+                        }
                         let recall = point["recall_mean"].as_f64().unwrap_or(0.0);
                         for (t, target) in TARGETS.iter().enumerate() {
                             if recall + 1e-9 < *target {
@@ -265,7 +268,7 @@ pub fn command() -> Result<(), Error> {
                         "100%".to_string()
                     } else {
                         selectivity
-                            .get(filter)
+                            .get(&(group.clone(), filter.clone()))
                             .map_or("?".to_string(), |p| format!("{p:.1}%"))
                     };
                     writeln!(
@@ -309,7 +312,10 @@ pub fn command() -> Result<(), Error> {
                                 .and_then(|b| b[slot(t, 0)].clone())
                         };
                         if let (Some(c), Some(e)) = (get(&candidate), get(ENUMERATE)) {
-                            let actual = selectivity.get(&f).copied().unwrap_or(pct as f64);
+                            let actual = selectivity
+                                .get(&(group.clone(), f.clone()))
+                                .copied()
+                                .unwrap_or(pct as f64);
                             series.push((actual, c.qps / e.qps));
                         }
                     }

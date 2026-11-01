@@ -562,10 +562,12 @@ mod rust_cv {
             32 => build_m::<32, 64>(rows, p.ef_construction),
             48 => build_m::<48, 96>(rows, p.ef_construction),
             64 => build_m::<64, 128>(rows, p.ef_construction),
-            m => return Err(format!(
+            m => {
+                return Err(format!(
                 "rust-cv-hnsw: M is a const generic; {m} is not compiled in (12,16,24,32,48,64)"
             )
-            .into()),
+                .into())
+            }
         })
     }
 }

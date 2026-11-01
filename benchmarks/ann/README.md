@@ -106,7 +106,12 @@ exhaustive path). Per point:
 
 A breadth sweep stops once mean recall reaches `--recall-stop` (0.99, the
 highest target): a larger breadth is only slower and the gate never picks
-it.
+it. It also stops on a plateau, when three more breadths added less than
+0.005 recall. When the recall pass over every query already takes longer
+than `--min-time-ms` (slow filtered points), it is also the one-core timing
+pass. With `--min-qps=N`, a point slower than N queries per second on one
+core is abandoned after 50 queries (recorded as `below_qps_floor`, ignored by
+the gate) and the sweep moves on; the committed cloud run used 20 for the Rust baselines, below every leann-graph point it measured, so no verdict can depend on a skipped point.
 
 The Rust harness compiles for the default target, as the product does; the
 C++ and Java engines dispatch SIMD at run time. Record any `RUSTFLAGS` you
