@@ -1308,7 +1308,12 @@ mod embedded_turbovec {
             options: VectorSearchOptions<'_>,
             allow: Option<&'a [bool]>,
         ) -> SearchOptions<'a> {
-            let mut native = SearchOptions::new();
+            // This provider advertises `ExhaustiveQuantized`: every top-k
+            // is the whole-index scan's, bit for bit. On a bit-plane cache
+            // (32,768+ rows on aarch64 or AVX-512 VBMI + VNNI hosts) turbovec
+            // would otherwise search in stages, with an approximate id set
+            // that also depends on the caller's thread count.
+            let mut native = SearchOptions::new().with_exhaustive(true);
             if let Some(allow) = allow {
                 native = native.with_mask(allow);
             }
