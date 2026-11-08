@@ -72,18 +72,19 @@ finalizes it in place (one header write, one rename), so an ingest of any
 length holds none of its FP32 rows in heap. An in-memory shard keeps a
 heap builder.
 
-**Exactness since turbovec 1.1.** An image served from memory (the tail,
-a single-image shard, or any sealed image under `--vector-mmap=false`) that
-holds 32,768 rows or more on those hosts searches top-k with upstream's
-staged search: the sign plane picks a shortlist, the lower planes rank it,
-and the best are rescored exactly. Scores are exact for the ids returned,
-but the id set is approximate: 99.9 to 100% of queries return exactly the
-whole-index scan's ids on real embedding corpora, and fewer on structureless
-random vectors. Mapped images and the streaming collector stay exhaustive.
-`TURBOVEC_4BIT_PLANES=0` and `TURBOVEC_2BIT_PLANES=0` in the process
-environment keep the whole-index scan everywhere. The provider still
-advertises `ExhaustiveQuantized`; reconciling that with the staged path is
-tracked in #68.
+**Exactness since turbovec 1.1.** Upstream searches an image whose cache is
+in the bit-plane layout (32,768 rows or more on those hosts, served from
+memory: the tail, a single-image shard, or any sealed image under
+`--vector-mmap=false`) in stages: a sign-plane shortlist, a ranking on the
+lower planes, and an exact rescore of the best. Scores are exact for the ids
+returned, but the id set is approximate, and a single query's shortlist
+differs between one thread and a pool. The embedded provider advertises
+`ExhaustiveQuantized`, so every top-k it runs sets the fork's
+`SearchOptions::exhaustive` (ai-pipestream/turbovec#8): such an image is
+scanned chunk by chunk with every row exactly rescored, bit for bit the
+whole-index scan on any thread count. Mapped images and the streaming
+collector were exhaustive already. Using the staged search for an
+approximate (`ConfiguredAnn`) route is tracked in #68.
 
 `tests/segment_layout.rs` pins a segmented shard served mapped against the
 same shard served from memory (Search and Query hits and scores, bit for
