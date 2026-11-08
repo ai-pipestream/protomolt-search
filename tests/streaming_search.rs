@@ -286,3 +286,47 @@ async fn grpc_stop_returns_an_incomplete_node_certificate() {
         "Stop arrived only after the whole scan completed: {summary:?}"
     );
 }
+
+/// A shard at or above 32,768 rows takes turbovec's bit-planes layout. The
+/// streaming scan over one must neither panic (the fork once sized the
+/// planes regions for 2-bit codes only) nor lose a row: its emissions,
+/// re-sorted, are the exhaustive monolithic top-k bit for bit.
+#[test]
+fn streaming_a_planes_layout_shard_is_exhaustive() {
+    use pipestream_search::vector::{VectorSearchOptions, VectorStreamControl};
+    let rows = 40_000;
+    let corpus = unit_vectors(rows, DIM, 0x5EED_B1A5);
+    let mut index = VectorIndex::create(EMBEDDED_TURBOVEC, DIM, BIT_WIDTH).unwrap();
+    index.add(&corpus, DIM).unwrap();
+    index.prepare().unwrap();
+    for qi in 0..3u64 {
+        let query = unit_vectors(1, DIM, 0x57AE_B1A5 + qi);
+        let mut emitted: Vec<(u64, u32)> = Vec::new();
+        let summary = index
+            .try_search_streaming_controlled(
+                &query,
+                VectorSearchOptions::new(),
+                |batch| {
+                    emitted.extend(
+                        batch
+                            .slots
+                            .iter()
+                            .zip(batch.scores)
+                            .map(|(&slot, &score)| (slot as u64, score.to_bits())),
+                    );
+                    VectorStreamControl::Continue
+                },
+                || VectorStreamControl::Continue,
+            )
+            .unwrap();
+        assert!(summary.completed, "query {qi}");
+        assert_eq!(emitted.len(), rows, "query {qi}: every row emitted");
+        emitted.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        emitted.truncate(K as usize);
+        assert_eq!(
+            emitted,
+            monolithic_topk(&index, &query, K as usize),
+            "query {qi}"
+        );
+    }
+}
