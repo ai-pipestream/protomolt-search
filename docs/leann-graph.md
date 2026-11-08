@@ -36,7 +36,7 @@ payload of eight little-endian `u32` fields in this order:
 | `base_degree` (m) | 8 | Neighbors a non-hub node selects on insertion |
 | `hub_ratio_ppm` | 20,000 | Share of nodes kept as hubs (2%) |
 | `build_beam` | 64 | Insertion search beam (`ef_construction`) |
-| `search_beam` | 64 | Minimum query beam (`ef`); a query uses `max(k, ef)` |
+| `search_beam` | 64 | Query beam (`ef`): unary search uses `max(k, ef)`, streaming uses `ef` |
 | `prune_ratio_ppm` | 0 | Share of each hop's new neighbors left approximate |
 | `storage` | 0 | 0 = stored embeddings, 1 = recomputed embeddings |
 
@@ -55,6 +55,20 @@ so nothing about the exact path changes:
   its `provider_backend` and `scoring_fingerprint`
   ([Dense execution policy](dense-execution-policy.md)); without one it
   refuses.
+- Depth is bounded by `search_beam`. A served query reaches each shard
+  through the streaming scan, which walks at `search_beam` whatever the
+  request's k, and the coordinator then truncates what the shards emit.
+  So the coordinator reads `search_beam` from every shard's backend config
+  in the dense execution preflight and refuses, naming both values:
+  - an `ANN` request whose depth `max(k, selection_k)` is greater than
+    `search_beam`, rather than walking deeper than the fingerprint binds or
+    returning fewer rows than asked for;
+  - an `AUTO` policy any point of which has `candidates` greater than
+    `search_beam`, when it is bound to the live shards (before any key is
+    matched), so a measured point the walk can never fill is not served.
+
+  To serve deeper requests, build the graph with a larger `search_beam`
+  (up to `MAX_BEAM`) and re-measure the policy against its fingerprint.
 
 Reported scores are exact FP32 inner products (the approximate codes only
 steer traversal), so shards that share a config produce comparable scores.

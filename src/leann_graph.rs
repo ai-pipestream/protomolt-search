@@ -260,6 +260,13 @@ impl LeannGraphConfig {
     }
 }
 
+/// The `search_beam` a `leann-graph` backend config binds: the depth its
+/// streaming walk runs at, which the coordinator checks request and policy
+/// depths against.
+pub fn search_beam_of(config: &VectorBackendConfig) -> Result<u32, VectorError> {
+    LeannGraphConfig::from_backend_config(config).map(|c| c.search_beam)
+}
+
 /// Bytes kept per row as its FP32 identity.
 pub const ROW_FINGERPRINT_BYTES: usize = 16;
 
@@ -2557,6 +2564,89 @@ mod tests {
         }
         assert!(checked > 10);
         assert!(recall(&graph, &vectors, dim, 40, 10) >= 0.8);
+    }
+
+    /// Recall@10 at `bits_per_dimension = 4`, the realistic storage
+    /// setting, against exact FP32 truth over held-out queries (not corpus
+    /// rows): on unit vectors and on vectors of varied length, without
+    /// pruning and at `prune_ratio = 0.5`. Every reported score is exact
+    /// FP32, so only membership can be lost. Under pruning the walk's exact
+    /// evaluations are pinned against the nodes it visited: a looser 4-bit
+    /// error bound scores more pruned rows anyway and a tighter one fewer,
+    /// so a regression in the bound moves the ratio out of its band.
+    #[test]
+    fn four_bit_recall_holds_against_exact_truth() {
+        // Measured at this seed: recall@10 1.00 on both shapes, with or
+        // without pruning.
+        const RECALL_FLOOR: f64 = 0.95;
+        let dim = 32;
+        let rows = 2000;
+        let queries = 40;
+        let k = 10;
+        // Held out: the last `queries` rows of one draw, from the same
+        // clusters as the corpus but never indexed.
+        let drawn = corpus(rows + queries, dim, 0x4B17_0001);
+        let (unit, held_out) = drawn.split_at(rows * dim);
+        let unit = unit.to_vec();
+        let mut varied = unit.clone();
+        for (r, row) in varied.chunks_exact_mut(dim).enumerate() {
+            let scale = 0.25 + (r * 7919 % 1000) as f32 / 250.0;
+            row.iter_mut().for_each(|v| *v *= scale);
+        }
+        let measure = |vectors: &[f32], prune_ratio_ppm: u32| {
+            let mut graph = LeannGraph::new(
+                Some(dim),
+                LeannGraphConfig {
+                    bits_per_dimension: 4,
+                    prune_ratio_ppm,
+                    ..LeannGraphConfig::default()
+                },
+            )
+            .unwrap();
+            graph.add(vectors, dim).unwrap();
+            graph.prepare().unwrap();
+            let (mut found, mut exact, mut visited) = (0usize, 0u64, 0u64);
+            for query in held_out.chunks_exact(dim) {
+                let truth = exact_top(vectors, dim, query, k);
+                let (hits, stats) = graph
+                    .search_with_stats(query, k, VectorSearchOptions::new())
+                    .unwrap();
+                assert_eq!(hits.len(), k);
+                assert_eq!(stats.tail_scanned, 0);
+                for (score, row) in &hits {
+                    let fp32 = dot(query, &vectors[*row as usize * dim..][..dim]);
+                    assert_eq!(score.to_bits(), fp32.to_bits(), "row {row}");
+                }
+                found += hits.iter().filter(|(_, row)| truth.contains(row)).count();
+                exact += stats.exact_evaluations;
+                visited += stats.visited;
+            }
+            (found as f64 / (queries * k) as f64, exact, visited)
+        };
+        // Exact evaluations over visits at prune_ratio = 0.5, measured at
+        // this seed: 0.80 (unit) and 0.54 (varied length). 8-bit codes
+        // spend about 0.53 on corpora like these, and the unpruned walk spends
+        // 1.0, so the band shows how much of the saving the 4-bit bound
+        // gives back.
+        for (shape, vectors, spent_band) in [
+            ("unit", &unit, 0.70..=0.90),
+            ("varied length", &varied, 0.50..=0.64),
+        ] {
+            let (recall, exact, visited) = measure(vectors, 0);
+            assert!(recall >= RECALL_FLOOR, "{shape}: 4-bit recall@10 {recall}");
+            assert_eq!(exact, visited, "{shape}: unpruned walk scores every visit");
+
+            let (recall, exact, visited) = measure(vectors, 500_000);
+            assert!(
+                recall >= RECALL_FLOOR,
+                "{shape}: 4-bit pruned recall@10 {recall}"
+            );
+            let spent = exact as f64 / visited as f64;
+            assert!(
+                spent_band.contains(&spent),
+                "{shape}: {exact} exact evaluations over {visited} visited ({spent:.3})"
+            );
+        }
     }
 
     #[test]

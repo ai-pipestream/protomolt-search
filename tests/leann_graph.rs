@@ -376,3 +376,80 @@ async fn boolean_dense_leaves_refuse_the_graph() {
         );
     }
 }
+
+/// Each shard's streaming walk stops at the configured `search_beam` (64 by
+/// default) whatever the request asks for, and the coordinator truncates
+/// what the shards emit. A policy point or an explicit ANN request deeper
+/// than the beam would come back short without saying so; both are refused
+/// naming the depth and the beam, and a depth at the beam still serves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn depths_beyond_the_search_beam_are_refused() {
+    let fixture = start_fixture().await;
+    let beam = pipestream_search::leann_graph::LeannGraphConfig::default().search_beam;
+
+    let text = format!(
+        "format_version = 1\npolicy_id = \"leann-deep\"\nembedding_model = \"test-embed\"\n\
+         corpus_generation = {GENERATION}\ncorpus_rows = {N_DOCS}\ndimensions = {DIM}\n\
+         provider_backend = \"{LEANN_GRAPH}\"\nscoring_fingerprint = \"{}\"\n\
+         measured_queries = 16\n\n[[points]]\nk = 5\n\
+         filter_selectivity_ppm_min = 1000000\nfilter_selectivity_ppm_max = 1000000\n\
+         candidates = {}\nmeasured_recall_ppm = 990000\n",
+        fixture.fingerprint,
+        beam + 1
+    );
+    let policy = DenseExecutionPolicy::parse(&text).unwrap();
+    let coordinator = fixture
+        .coordinator
+        .clone()
+        .with_dense_execution_policy(policy);
+    let error = query(
+        &coordinator,
+        dense_request(&fixture.query_vector, 5, DenseExecutionMode::Auto),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        error
+            .message()
+            .contains(&format!("candidates {}", beam + 1))
+            && error
+                .message()
+                .contains(&format!("{LEANN_GRAPH} search_beam {beam}")),
+        "{}",
+        error.message()
+    );
+
+    let error = query(
+        &fixture.coordinator,
+        dense_request(&fixture.query_vector, beam + 1, DenseExecutionMode::Ann),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        error.message().contains(&format!("depth {}", beam + 1))
+            && error.message().contains(&format!("search_beam {beam}")),
+        "{}",
+        error.message()
+    );
+
+    let mut deep = dense_request(&fixture.query_vector, 5, DenseExecutionMode::Ann);
+    deep.selection_k = beam + 1;
+    let error = query(&fixture.coordinator, deep).await.unwrap_err();
+    assert!(
+        error
+            .message()
+            .contains(&format!("selection_k {}", beam + 1)),
+        "{}",
+        error.message()
+    );
+
+    let response = query(
+        &fixture.coordinator,
+        dense_request(&fixture.query_vector, beam, DenseExecutionMode::Ann),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.hits.len(), beam as usize);
+}

@@ -334,6 +334,22 @@ impl DenseExecutionPolicy {
         Ok(())
     }
 
+    /// Refuse a policy any point of which is deeper than the traversal the
+    /// bound provider performs. A `leann-graph` shard's streaming walk stops
+    /// at its configured `search_beam` whatever the request asks for, so a
+    /// point measured at `candidates > search_beam` could only ever return
+    /// short; the first such point is named with both values.
+    pub fn verify_traversal_depth(&self, provider: &str, search_beam: u32) -> Result<(), String> {
+        match self.points.iter().find(|p| p.candidates > search_beam) {
+            Some(p) => Err(format!(
+                "dense execution policy {:?} point k={} selectivity {}..={} ppm has candidates \
+                 {}, deeper than provider {provider} search_beam {search_beam}",
+                self.policy_id, p.k, p.selectivity_min_ppm, p.selectivity_max_ppm, p.candidates
+            )),
+            None => Ok(()),
+        }
+    }
+
     /// The point a request key matches exactly, or a refusal naming the
     /// key and what the policy measured for that `k`.
     pub fn qualify(&self, key: RequestKey) -> Result<Qualified, String> {
@@ -631,6 +647,23 @@ measured_recall_ppm = 995000
             .verify_identity(&dims)
             .unwrap_err()
             .contains("dimensions"));
+    }
+
+    #[test]
+    fn points_deeper_than_the_search_beam_are_refused_by_name() {
+        let policy = DenseExecutionPolicy::parse(TEXT).unwrap();
+        // The deepest point is candidates = 400.
+        policy.verify_traversal_depth("leann-graph", 400).unwrap();
+        let error = policy
+            .verify_traversal_depth("leann-graph", 399)
+            .unwrap_err();
+        assert!(error.contains("candidates 400"), "{error}");
+        assert!(error.contains("leann-graph search_beam 399"), "{error}");
+        let error = policy
+            .verify_traversal_depth("leann-graph", 64)
+            .unwrap_err();
+        assert!(error.contains("candidates 100"), "{error}");
+        assert!(error.contains("search_beam 64"), "{error}");
     }
 
     #[test]

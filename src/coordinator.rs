@@ -3625,6 +3625,9 @@ impl CoordinatorServiceImpl {
         query_dim: usize,
         key: DenseRequestKey<'_>,
     ) -> Result<crate::pb::DenseExecutionOutcome, Status> {
+        // The leann-graph shards' configured search_beam, when the live
+        // provider is one; the depth checks below need it.
+        let mut search_beam: Option<u32> = None;
         let (provider, scoring_fingerprint, quality, exhaustive, dimensions, rows, generation) =
             if let Some(identity) = self.clustered_quality_identity().await? {
                 (
@@ -3670,6 +3673,36 @@ impl CoordinatorServiceImpl {
                         return Err(Status::failed_precondition(
                             "dense execution preflight found an unnamed vector provider",
                         ));
+                    }
+                    // A graph shard walks its streaming scan at the beam its
+                    // config binds, whatever the request's depth; the depth
+                    // checks below need it (docs/leann-graph.md).
+                    if let Some(config) = backend
+                        .config
+                        .as_ref()
+                        .filter(|c| c.backend_kind == crate::leann_graph::LEANN_GRAPH)
+                    {
+                        let beam = crate::leann_graph::search_beam_of(
+                            &crate::vector::VectorBackendConfig {
+                                backend_kind: config.backend_kind.clone(),
+                                config_format: config.config_format.clone(),
+                                payload: config.payload.clone(),
+                            },
+                        )
+                        .map_err(|e| {
+                            Status::failed_precondition(format!(
+                                "dense execution preflight could not read the {} config: {e}",
+                                crate::leann_graph::LEANN_GRAPH
+                            ))
+                        })?;
+                        match search_beam {
+                            Some(held) if held != beam => {
+                                return Err(Status::failed_precondition(
+                                    "dense execution preflight found mixed search_beam settings",
+                                ))
+                            }
+                            _ => search_beam = Some(beam),
+                        }
                     }
                     if descriptor.scoring_fingerprint.is_empty() {
                         return Err(Status::failed_precondition(
@@ -3829,6 +3862,17 @@ impl CoordinatorServiceImpl {
                         "provider {provider} does not expose a configured ANN traversal"
                     )));
                 }
+                // The streaming walk stops at the configured beam, so a
+                // deeper request would come back short without saying so.
+                let depth = key.k.max(key.candidate_depth);
+                if let Some(beam) = search_beam.filter(|&beam| depth > beam) {
+                    return Err(Status::failed_precondition(format!(
+                        "ANN dense execution asks for depth {depth} (k {} selection_k {}), but \
+                         provider {provider} walks at search_beam {beam} and would return \
+                         fewer rows; lower k or rebuild with search_beam >= {depth}",
+                        key.k, key.candidate_depth
+                    )));
+                }
                 (
                     crate::pb::DenseExecutionMode::Ann,
                     "caller accepted the provider's configured approximate traversal".to_string(),
@@ -3869,6 +3913,11 @@ impl CoordinatorServiceImpl {
                         dimensions,
                     })
                     .map_err(Status::failed_precondition)?;
+                if let Some(beam) = search_beam {
+                    policy
+                        .verify_traversal_depth(&provider, beam)
+                        .map_err(Status::failed_precondition)?;
+                }
                 let selectivity = self.dense_filter_selectivity(key.filters, rows).await?;
                 let hit = policy
                     .qualify(crate::dense_policy::RequestKey {
