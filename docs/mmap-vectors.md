@@ -37,6 +37,18 @@ A mapped index is read-only:
 file is refused with the conversion advice `load` gives: converting a file
 forward is a file operation, not a corpus rebuild.
 
+Since upstream 1.1 the fork's `main` is one patch commit on upstream
+`main`, and an index of 32,768 vectors or more whose host kernels read the
+bit-plane layout (aarch64, or x86 with AVX-512 VBMI + VNNI) is written as a
+v8 image with bit-plane units. `load_mapped` serves those too: the chunk
+assembler converts each unit's canonical, host-independent planes back to
+sequential-blocked bytes (the converter's route) before the shared
+transform, and the mapped scan keeps the classic kernels
+(ai-pipestream/turbovec#8). Before that change such an image was refused,
+so a large sealed segment written on those hosts could not open mapped.
+`vector::tests::a_sealed_image_past_the_planes_threshold_serves_mapped`
+pins it here at 2 and 4 bits.
+
 The fork's `tests/mapped_image.rs` pins mapped against loaded results bit
 for bit (top-k, oversized k, batched queries, masks, seeded floors, streaming), a synced
 file with pending removal ops and a partial tail block, the read-only
@@ -59,6 +71,19 @@ serve rows by offset, the payload digest runs as rows arrive, and a flush
 finalizes it in place (one header write, one rename), so an ingest of any
 length holds none of its FP32 rows in heap. An in-memory shard keeps a
 heap builder.
+
+**Exactness since turbovec 1.1.** An image served from memory (the tail,
+a single-image shard, or any sealed image under `--vector-mmap=false`) that
+holds 32,768 rows or more on those hosts searches top-k with upstream's
+staged search: the sign plane picks a shortlist, the lower planes rank it,
+and the best are rescored exactly. Scores are exact for the ids returned,
+but the id set is approximate: 99.9 to 100% of queries return exactly the
+whole-index scan's ids on real embedding corpora, and fewer on structureless
+random vectors. Mapped images and the streaming collector stay exhaustive.
+`TURBOVEC_4BIT_PLANES=0` and `TURBOVEC_2BIT_PLANES=0` in the process
+environment keep the whole-index scan everywhere. The provider still
+advertises `ExhaustiveQuantized`; reconciling that with the staged path is
+tracked in #68.
 
 `tests/segment_layout.rs` pins a segmented shard served mapped against the
 same shard served from memory (Search and Query hits and scores, bit for
