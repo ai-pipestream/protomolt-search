@@ -306,6 +306,17 @@ pub struct SegmentSource<'a> {
     pub partition_column: Option<&'a str>,
 }
 
+/// The scoring contracts a sealed segment's provider may carry: the
+/// exhaustive quantized scan, or a configured approximate traversal
+/// (`docs/hnsw.md`), whose results the planner admits only under ANN or a
+/// measured AUTO policy. A probabilistic bound has no provider yet.
+pub fn admitted_quality_contract(contract: QualityContract) -> bool {
+    matches!(
+        contract,
+        QualityContract::ExhaustiveQuantized | QualityContract::ConfiguredAnn
+    )
+}
+
 /// The artifact record of an artifact a segment does not have.
 pub fn absent_artifact() -> SegmentArtifact {
     SegmentArtifact {
@@ -591,10 +602,10 @@ impl OpenedSegmentSet {
                 let descriptor = vector.descriptor();
                 if descriptor.scoring_fingerprint != metadata.scoring_fingerprint
                     || descriptor.score_direction != ScoreDirection::HigherIsBetter
-                    || descriptor.quality_contract != QualityContract::ExhaustiveQuantized
+                    || !admitted_quality_contract(descriptor.quality_contract)
                 {
                     return Err(format!(
-                        "segment {:?} vector scoring contract differs from its aligned manifest or is not exhaustive",
+                        "segment {:?} vector scoring contract differs from its aligned manifest or is neither exhaustive nor a configured ANN traversal",
                         metadata.segment_id
                     ));
                 }
@@ -1909,10 +1920,11 @@ fn stage_segment(root: &Path, source: SegmentSource<'_>) -> Result<SegmentMetada
             Some(vector) => {
                 let descriptor = vector.descriptor();
                 if descriptor.score_direction != ScoreDirection::HigherIsBetter
-                    || descriptor.quality_contract != QualityContract::ExhaustiveQuantized
+                    || !admitted_quality_contract(descriptor.quality_contract)
                 {
                     return Err(
-                        "aligned segments currently require an exhaustive higher-is-better provider"
+                        "aligned segments require a higher-is-better provider that is exhaustive \
+                         or a configured ANN traversal"
                             .into(),
                     );
                 }
