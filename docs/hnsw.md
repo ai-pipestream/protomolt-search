@@ -7,10 +7,21 @@ by inner product. It is written from scratch for this product; nothing is
 linked, vendored or ported from another implementation. The attribution is
 in `NOTICE`.
 
-Code: `src/hnsw/` (`config.rs`, `distance.rs`, `graph.rs`, `image.rs`).
-Tests: the module's unit tests and `tests/hnsw.rs` (real nodes behind a
-coordinator). Harness engine: `hnsw` in `benchmarks/ann/` (the gate's
-default `--candidate`).
+**This is a milestone, not a replacement.** The provider is complete as a
+backend: it builds, serves from a memory map, streams, honors masks and
+floors, lives through the segment lifecycle and reports exact scores. It is
+not the gate of #54, and this document makes no product-level performance
+claim for it: the harness in `benchmarks/ann/` measures it beside the
+reference libraries on a fixture, and whether it serves a product query
+path is decided by the measured dense execution policy of #58, not here.
+Sharing its rows with the `.exact` sidecar is #71.
+
+Code: `src/hnsw/` (`config.rs`, `distance.rs`, `graph.rs`, `image.rs`,
+`rows.rs`). Tests: the module's unit tests, `tests/hnsw.rs` (real nodes
+behind a coordinator: planner refusals, corruption, streaming control,
+masks and floors, the candidate depth, multi-node fan-out) and
+`tests/hnsw_lifecycle.rs` (ingest, seal, reopen, deletes, replacement,
+snapshot, compaction). Harness engine: `hnsw` in `benchmarks/ann/`.
 
 ## Selecting it
 
@@ -42,26 +53,12 @@ so a dense execution policy measured at one setting does not qualify
 another. The fingerprint hashes the canonical re-encoding of the decoded
 message, so field order or unknown fields on the wire do not change it.
 
-## The beam
+A shard with a write-ahead log locks its provider configuration in the
+log's manifest up to its first record, so configure the backend before the
+first row (as the TurboVec shards do with their calibration); a compaction
+replays from that manifest and refuses one without a usable configuration.
 
-The query beam (`ef`) is deliberately not configuration: it is the request's
-candidate depth, the number of candidates the planner asked the shard to
-consider.
-
-- `search(queries, k, options)` walks at `max(k, candidate_depth, 16)`:
-  `options.candidate_depth` when the request names one, else `k`, never below
-  16. Sixteen is the smallest breadth in the harness's sweep, so a product
-  query never runs a beam narrower than one the gate measured; below it the
-  walk degenerates toward a greedy descent.
-- Streaming (`search_streaming_controlled`) has no `k`, so the depth must
-  arrive in `VectorSearchOptions::candidate_depth`. The coordinator sends
-  the request's `k` in `StartStreamSearch.candidate_depth`, the node copies
-  it into the options, and a relay forwards it. Without a depth the
-  provider refuses the stream by name rather than guessing.
-
-Exhaustive providers ignore the depth.
-
-## Contract with the planner
+## What it may serve
 
 The descriptor advertises `CONFIGURED_ANN` without `exhaustive_completion`,
 so nothing about the exact path changes:
@@ -71,13 +68,71 @@ so nothing about the exact path changes:
 - `AUTO` admits it only through a measured dense execution policy bound to
   its `provider_backend` and `scoring_fingerprint`
   ([Dense execution policy](dense-execution-policy.md)); without one it
-  refuses.
+  refuses. No such policy ships with this milestone.
 - Recursive Boolean evaluation needs every member's score and refuses a
   provider without exhaustive completion.
 
-Reported scores are exact FP32 inner products of the stored rows, so shards
-that share a config produce comparable scores. `completed` on a stream means
-every walk finished, never that every row was evaluated.
+`completed` on a stream means every walk finished, never that every row was
+evaluated.
+
+## The beam
+
+The query beam (`ef`) is deliberately not configuration: it is the request's
+candidate depth, the number of candidates the planner asked the shard to
+consider.
+
+- `search(queries, k, options)` walks at `max(k, candidate_depth, 16)`:
+  `options.candidate_depth` when the request names one, else `k`, never below
+  16. Sixteen is the smallest breadth in the harness's sweep, so a product
+  query never runs a beam narrower than one the harness measured; below it
+  the walk degenerates toward a greedy descent.
+- Streaming (`search_streaming_controlled`) has no `k`, so the depth must
+  arrive in `VectorSearchOptions::candidate_depth`. The coordinator sends
+  the request's depth in `StartStreamSearch.candidate_depth`, the node
+  copies it into the options, the segmented wrapper copies it into each
+  part's options, and a relay forwards it. Without a depth the provider
+  refuses the stream by name rather than guessing.
+- The depth a dense request executed at is reported:
+  `DenseExecutionOutcome.candidate_depth` is set whenever the resolved mode
+  is ANN (the request's `k` or `selection_k`, or the policy point's
+  `candidates` when AUTO qualified through one). `tests/hnsw.rs` drives two
+  depths through a real node's streaming path and checks that they change
+  the walk and that the reported depth is the executed one.
+
+Exhaustive providers ignore the depth.
+
+## Scores
+
+Every score the provider reports is the product's exact score.
+
+- **Kernels steer, the scalar scorer reports.** The SIMD kernels of
+  `src/hnsw/distance.rs` score rows during the walk and decide which rows
+  enter the beam. Every row that enters the reported result, and every row
+  a stream emits, is rescored with `crate::exact_vectors::dot`, the scalar
+  row-order accumulation, before it leaves the provider. Reported scores are
+  therefore bit for bit the exact FP32 inner products of the stored rows on
+  every kernel and every host, and comparable across shards that share a
+  configuration. `reported_scores_are_bit_identical_to_the_scalar_scorer_and_ties_order_by_row`
+  pins this for the unary and the streamed path.
+- **Tie order.** Results order by score descending, then row ascending, on
+  the unary path and within every streamed batch. Across batches a stream
+  is best effort in discovery order (the walk emits as it proceeds).
+- **Determinism.** Which rows a walk discovers depends on the graph. A
+  `FIXED_ORDER` build is reproducible bit for bit per kernel (same machine,
+  same binary): the kernels differ from one another in the last bits of a
+  traversal score, so a different kernel may walk a different path. A
+  `PARALLEL` build depends on thread scheduling and differs from run to
+  run. Neither changes a reported score, only which rows are found.
+- **Kernel bound.** Each kernel computes a floating-point sum of the exact
+  products `qᵢxᵢ` in some association order, so against the scalar scorer a
+  traversal score differs by at most `2·γ(d)·Σ|qᵢxᵢ|`, with
+  `γ(d) = d·u / (1 − d·u)` and `u = 2⁻²⁴` (Higham, *Accuracy and Stability
+  of Numerical Algorithms*, §3.1: each of the two sums is within
+  `γ(d)·Σ|qᵢxᵢ|` of the exact value). The bound is checked against the
+  scalar scorer on every available kernel at dimensions 1, 2, 3, 4, 7, 8,
+  15, 16, 17, 31, 32, 33, 63, 64, 65, 127 and 1023 with negative scores,
+  cancellation and near ties
+  (`kernels_stay_within_the_bound_of_the_scalar_scorer_on_adversarial_rows`).
 
 ## The graph
 
@@ -114,23 +169,26 @@ epoch-stamped `u32` array reset in O(1); a walk uses one candidate heap and
 one result heap, both over 8-byte `(score, node)` entries ordered totally
 (score, then node), so heaps behave the same on every run.
 
-**One distance per visited node.** Every scored row is scored once, exactly,
-from its FP32 row, with the provider's own single-row kernels
+**One traversal distance per visited node.** Every row the walk visits is
+scored once from its FP32 row with the provider's own single-row kernels
 (`src/hnsw/distance.rs`): AVX-512F and AVX2+FMA on x86-64 chosen at run time
 with `is_x86_feature_detected!` (the crate still compiles for the
 x86-64-v2 baseline), NEON on aarch64, a four-accumulator scalar loop
 elsewhere. The walk prefetches the first line of each unvisited neighbor's
-row while collecting them and the next row in full while scoring. Kernels
-differ from one another in the last bits of a sum, so a fixed-order build is
-reproducible per kernel (same machine, same binary), not across machines.
+row while collecting them and the next row in full while scoring.
 
 **Parallel build.** `build_mode = PARALLEL` inserts a batch of at least 256
 rows from every thread of the rayon pool. Link cells are `AtomicU32`, written
 under striped per-node locks (16,384 stripes; one node lock held at a time,
 so striping cannot deadlock); reads during a build take the node's lock too.
-A node that raises the top level holds the entry lock through its insertion
-so no other insertion starts from an entry whose upper lists are not yet
-written. `FIXED_ORDER` runs the same insertion on one thread in row order.
+A node publishes its own lists by merging them with the back-links other
+insertions wrote to it meanwhile (shrinking with the heuristic when the
+merge exceeds the cap), so no concurrent link is lost; the test
+`a_full_beam_visits_every_reachable_row` walks a parallel graph at a beam
+of the row count and requires every row to be reached. A node that raises
+the top level holds the entry lock through its insertion so no other
+insertion starts from an entry whose upper lists are not yet written.
+`FIXED_ORDER` runs the same insertion on one thread in row order.
 
 ## Appends
 
@@ -152,13 +210,34 @@ walk short. Filter regimes and floor pruning are later tickets (#55, #60).
 ## Streaming
 
 One walk per query at the request's depth. Every allowed row the walk
-scores exactly at layer 0 (the entry point included; the rows the descent
-scores are not) and that is at or above the floor is emitted, in batches of
-up to 64 as the walk proceeds, best effort in discovery order. The control
-callback is polled after every expansion. `Stop` from either callback ends
-the stream uncompleted; a floor raised by either gates the rest of that
-query and every later one, and a buffered row that fell below a floor raised
-since it was scored is dropped before the sink sees it.
+scores at layer 0 (the entry point included; the rows the descent scores
+are not) and whose exact score is at or above the floor is emitted, in
+batches of up to 64 as the walk proceeds, each batch ordered score
+descending then row ascending. The control callback is polled after every
+expansion. `Stop` from either callback ends the stream uncompleted; a floor
+raised by either gates the rest of that query and every later one, and a
+buffered row that fell below a floor raised since it was scored is dropped
+before the sink sees it.
+
+## Rows and their identity
+
+The graph traverses and scores FP32 rows behind the `RowSource` trait
+(`src/hnsw/rows.rs`): the dimension, the row count, the row-major values
+and a row accessor. In this milestone the provider owns them: `OwnedRows`
+on the heap, `MappedRows` over the image's row section when the index is
+served from a memory map. The trait exists so that #71 can bind the graph
+to the product's `.exact` sidecar, which holds the same rows, and the trait
+carries the identity that binding must match, `RowSourceIdentity`: the
+dimension, the row count and the SHA-256 over every row's little-endian
+`f32` bytes in row order. That digest is the one `ExactVectorStore` keeps
+over its payload, so an image's rows and a sidecar's rows compare by one
+number; `row_source_identity_is_stable_and_matches_the_exact_sidecar` pins
+that the heap, loaded and mapped identities agree and equal the sidecar's.
+
+A row's transcript (`row_transcripts`) is the bytes its score is computed
+from: `HNSW`, the dimension, then the stored FP32 row little-endian. Nothing
+else in the image reaches a reported score, so rewrite proofs compare rows
+by content.
 
 ## Image and serving
 
@@ -178,22 +257,73 @@ the map: the section alignment makes the typed views aligned, nothing is
 copied to the heap, and `is_mapped()` is true. Scores are bit for bit those
 of `load`. A mapped index is sealed: `add` and `write` refuse.
 
-Bytes per row: `4 × dim` for the row, 4 for the inverse norm, 1 for the
-level, 4 for the upper slot, `4 × (2M + 1)` for layer 0, plus `4 × (M + 1)`
-per upper layer the node has (about `4 × (M + 1) / (M - 1)` per row on
-average) and 4 per upper node for its base. At `dim = 64`, `M = 16` the
-challenge fixture's image measures 402 bytes per row, 256 of them the FP32
-row; at `M = 32`, 529.
+## Storage and memory
 
-A row's transcript (`row_transcripts`) is the bytes its score is computed
-from: `HNSW`, the dimension, then the stored FP32 row little-endian. Nothing
-else in the image reaches a reported score, so rewrite proofs compare rows
-by content.
+**Image bytes per row:** `4 × dim` for the row, 4 for the inverse norm, 1
+for the level, 4 for the upper slot, `4 × (2M + 1)` for layer 0, plus `4 ×
+(M + 1)` per upper layer the node has (about `4 × (M + 1) / (M − 1)` per row
+on average) and 4 per upper node for its base. At `dim = 64`, `M = 16` the
+challenge fixture's image (100,000 rows) measures 402 bytes per row, 256 of
+them the FP32 row; at `M = 32`, 529.
+
+**Whole shard.** A shard stores its FP32 rows twice in this milestone: in
+the image and in the `.exact` sidecar every provider shares (`4 × dim` per
+row behind an 80-byte header, so 256 bytes per row at `dim = 64`). The
+dense storage of a shard is then about 658 bytes per row at `M = 16` and
+785 at `M = 32` for `dim = 64`, before the BM25 store, the live-document
+overlay and the WAL. #71 removes the duplicate by binding the graph to the
+sidecar's rows.
+
+**Peak build memory.** Measured as the peak resident set of the harness
+process building the challenge fixture (100,000 × 64, `ef_construction =
+200`) minus the same process with an engine that builds nothing
+(`enumerate`, which only holds the fixture): 44.3 MB at `M = 16` against a
+40.2 MB image, 57.2 MB at `M = 32` against 52.9 MB; a single-thread build
+peaks at 43.3 MB at `M = 16`. The flat arrays grow once per batch to their
+final size (every array is reserved for the batch before it is filled), so
+the peak is the image plus the per-thread scratch (one `u32` visited stamp
+per row per thread, two heaps bounded by `ef_construction`, the lock
+stripes) and allocator slack: 8 to 10 percent over the image at this shape.
+Writing the image streams the arrays and allocates nothing of that size;
+loading it mapped allocates nothing.
+
+## Lifecycle on a node
+
+A node runs the provider through every path the exhaustive providers take;
+`tests/hnsw_lifecycle.rs` drives each through real nodes.
+
+- **Sealed segments.** Staging a segment and opening a catalog admit a
+  provider whose contract is the exhaustive quantized scan or a configured
+  ANN traversal (`segments::admitted_quality_contract`), with the artifact,
+  row-alignment and fingerprint checks unchanged. A flush seals the tail
+  into an hnsw image; a reopen serves the images through the map
+  (`VectorLoad::Mapped`) or from the heap, and both give the sealed catalog's
+  answers bit for bit. An unsealed tail is volatile until a flush seals it,
+  as on every provider; a shard with a write-ahead log rebuilds it from the
+  log on open.
+- **Deletes.** Deleted rows reach the provider as the allow mask and are
+  excluded from unary results and from streams, in sealed segments and in
+  the tail alike.
+- **Replacement.** `CommitReplacements` retires the old row from every dense
+  answer and serves the revision, in the tail and after the seal that
+  follows.
+- **Snapshot.** An hnsw image installs with its `.exact` sidecar and BM25
+  store, answers at the slot offset, and survives a restart.
+- **Compaction.** A compaction replays the live rows into new segments and
+  builds their graphs again; the rebuilt graphs answer exactly scored live
+  rows at the recall the graph gives, not the old graph's misses, so a
+  by-text comparison across a compaction is a recall check, not a bit
+  comparison. A publication interrupted between the write of its outputs
+  and the publish of its manifest rolls back at open: the staged segment
+  and the marker are removed and the old generation serves.
 
 ## What this does not do yet
 
-- The FP32 rows are the provider's own copy, as FAISS `HNSWFlat` keeps
-  one. Sharing them with the `.exact` sidecar is #71.
+- No performance claim. The harness numbers in `benchmarks/ann/` describe a
+  fixture on one host; the product decides what the provider serves through
+  the measured dense execution policy of #58.
+- The FP32 rows are the provider's own copy, as FAISS `HNSWFlat` keeps one.
+  Sharing them with the `.exact` sidecar through `RowSource` is #71.
 - Filter-aware traversal (#55), the shared floor pruning the walk, collapse
   and seeded entries (#54 follow-ups, #60) are later tickets.
 - No measured dense execution policy ships for it; AUTO stays refused until

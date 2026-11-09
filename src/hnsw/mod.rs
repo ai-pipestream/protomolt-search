@@ -13,7 +13,6 @@
 //! - [`graph`]: the flat layered graph, insertion and the walk.
 //! - [`image`]: the persisted format, loaded onto the heap or served from
 //!   a memory map.
-//!
 //! - [`rows`]: the FP32 rows behind the [`RowSource`] trait, with the
 //!   identity a shared row store must match (#71).
 //!

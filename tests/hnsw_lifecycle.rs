@@ -258,8 +258,8 @@ async fn health(addr: &str) -> pipestream_search::pb::HealthResponse {
 /// Ingest, seal, delete, reopen mapped: two sealed hnsw segments plus a
 /// tail answer explicit ANN and the streaming scan with exact scores over
 /// live rows only. Sealed, the catalog answers identically after a reopen
-/// through the map and through the heap (the images are the graphs; only
-/// a live tail is rebuilt on open).
+/// through the map and through the heap (the images are the graphs; an
+/// unsealed tail is volatile without a log, as on every provider).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sealed_segments_serve_mapped_and_exclude_deleted_rows() {
     let dir = tempdir("sealed");
