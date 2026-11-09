@@ -292,6 +292,16 @@ impl ExactVectorStore {
         matches!(self.storage, Storage::Mapped { .. } | Storage::Segmented(_))
     }
 
+    /// The SHA-256 the persisted store keeps over its payload: every row's
+    /// little-endian `f32` bytes in row order. `None` while the store is
+    /// still being built or is a view over several files.
+    pub fn payload_sha256(&self) -> Option<[u8; 32]> {
+        match &self.storage {
+            Storage::Mapped { payload_sha256, .. } => Some(*payload_sha256),
+            _ => None,
+        }
+    }
+
     pub fn path(&self) -> Option<&Path> {
         match &self.storage {
             Storage::Mapped { path, .. } => Some(path),

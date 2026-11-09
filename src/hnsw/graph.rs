@@ -36,6 +36,7 @@ use std::sync::{Mutex, MutexGuard};
 use crate::vector::VectorError;
 
 use super::distance::{prefetch, Kernel};
+use super::rows::{OwnedRows, RowSource};
 use super::HNSW;
 
 /// The absent node: an empty graph's entry, a level-0 node's upper slot.
@@ -181,7 +182,10 @@ pub fn with_scratch<R>(f: impl FnOnce(&mut Scratch) -> R) -> R {
 /// What a walk reports as it goes: every exactly scored allowed node at
 /// layer 0 and each expansion. A plain search uses [`NoHook`].
 pub trait Hook {
-    fn scored(&mut self, node: u32, score: f32);
+    /// An allowed node was scored at layer 0: its id, the traversal
+    /// kernel's score, and its row (for the scalar rescoring of anything
+    /// that leaves the provider).
+    fn scored(&mut self, node: u32, score: f32, row: &[f32]);
     /// After each expansion; `false` stops the walk.
     fn hop(&mut self) -> bool;
 }
@@ -190,7 +194,7 @@ pub struct NoHook;
 
 impl Hook for NoHook {
     #[inline]
-    fn scored(&mut self, _node: u32, _score: f32) {}
+    fn scored(&mut self, _node: u32, _score: f32, _row: &[f32]) {}
     #[inline]
     fn hop(&mut self) -> bool {
         true
@@ -338,7 +342,7 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
             if scratch.visit(e.node) {
                 scratch.cand.push(e);
                 if allowed(e.node) {
-                    hook.scored(e.node, e.score);
+                    hook.scored(e.node, e.score, self.row(e.node));
                     scratch.res.push(Reverse(e));
                 }
             }
@@ -371,7 +375,7 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
                 stats.scored += 1;
                 let ok = allowed(v);
                 if ok {
-                    hook.scored(v, s);
+                    hook.scored(v, s, self.row(v));
                 }
                 let full = scratch.res.len() >= ef;
                 let worst = scratch.res.peek().map_or(f32::NEG_INFINITY, |r| r.0.score);
@@ -460,7 +464,7 @@ pub struct Store {
     pub ef_construction: usize,
     pub kernel: Kernel,
     level_mult: f64,
-    pub rows: Vec<f32>,
+    pub rows: OwnedRows,
     pub inv_norm: Vec<f32>,
     pub level: Vec<u8>,
     pub upper_slot: Vec<u32>,
@@ -503,7 +507,7 @@ impl Store {
             ef_construction,
             kernel,
             level_mult: 1.0 / (m as f64).ln(),
-            rows: Vec::new(),
+            rows: OwnedRows::new(dim),
             inv_norm: Vec::new(),
             level: Vec::new(),
             upper_slot: Vec::new(),
@@ -535,7 +539,7 @@ impl Store {
         top: u8,
     ) -> Self {
         let mut store = Self::new(dim, m, ef_construction, seed, kernel);
-        store.rows = rows;
+        store.rows = OwnedRows::from_values(dim, rows);
         store.inv_norm = inv_norm;
         store.level = level;
         store.upper_slot = upper_slot;
@@ -560,7 +564,7 @@ impl Store {
             dim: self.dim,
             m: self.m,
             m0: self.m0,
-            rows: &self.rows,
+            rows: self.rows.values(),
             inv_norm: &self.inv_norm,
             level: &self.level,
             upper_slot: &self.upper_slot,
@@ -593,7 +597,7 @@ impl Store {
         for (i, row) in vectors.chunks_exact(self.dim).enumerate() {
             let node = (first + i) as u32;
             let norm = self.kernel.dot(row, row).sqrt();
-            self.rows.extend_from_slice(row);
+            self.rows.push(row);
             self.inv_norm.push(if norm > 0.0 && norm.is_finite() {
                 1.0 / norm
             } else {
@@ -664,6 +668,62 @@ impl Store {
         }
     }
 
+    /// Write the inserting node's own list at `layer`. Under a parallel
+    /// build other insertions may already have linked back into this list
+    /// (the node's row was visible to their searches); those links are kept,
+    /// and when the union exceeds the cap the heuristic chooses among all of
+    /// them, so no concurrent back-link is lost to an overwrite.
+    #[allow(clippy::too_many_arguments)]
+    fn publish_links(
+        &self,
+        node: u32,
+        layer: usize,
+        cap: usize,
+        locks: Option<&Locks>,
+        sel: &[u32],
+        pool: &mut Vec<Scored>,
+        scratch: &mut Scratch,
+    ) {
+        let Some(locks) = locks else {
+            self.write_links(node, layer, sel, None);
+            return;
+        };
+        let view = self.view();
+        let start = view.list_start(node, layer);
+        let cells = if layer == 0 {
+            &self.links0
+        } else {
+            &self.upper
+        };
+        let _guard = locks.lock(node);
+        let count = (cells[start].load(Atomic::Relaxed) as usize).min(cap);
+        let mut merged = std::mem::take(&mut scratch.nbrs);
+        merged.clear();
+        merged.extend_from_slice(sel);
+        for i in 0..count {
+            let v = cells[start + 1 + i].load(Atomic::Relaxed);
+            if !merged.contains(&v) {
+                merged.push(v);
+            }
+        }
+        if merged.len() > cap {
+            let row = view.row(node);
+            pool.clear();
+            pool.extend(merged.iter().map(|&v| Scored {
+                score: view.kernel.dot(row, view.row(v)),
+                node: v,
+            }));
+            pool.sort_unstable_by(|a, b| b.cmp(a));
+            merged.clear();
+            view.select(view.inv_norm[node as usize], pool, cap, &mut merged);
+        }
+        cells[start].store(merged.len() as u32, Atomic::Relaxed);
+        for (i, &v) in merged.iter().enumerate() {
+            cells[start + 1 + i].store(v, Atomic::Relaxed);
+        }
+        scratch.nbrs = merged;
+    }
+
     /// Paper Algorithm 1 for one node.
     pub fn insert(&self, node: u32, locks: Option<&Locks>, scratch: &mut Scratch) {
         let level = self.level[node as usize];
@@ -719,7 +779,7 @@ impl Store {
             }
             let mut sel = std::mem::take(&mut scratch.sel);
             view.select(node_inv_norm, &pool, cap, &mut sel);
-            self.write_links(node, layer, &sel, locks);
+            self.publish_links(node, layer, cap, locks, &sel, &mut pool, scratch);
             for &e in &sel {
                 self.connect_back(e, node, layer, cap, locks, &mut pool, scratch);
             }
@@ -754,6 +814,10 @@ impl Store {
         let _guard = locks.map(|l| l.lock(e));
         let count = (cells[start].load(Atomic::Relaxed) as usize).min(cap);
         if count < cap {
+            // Already linked by this pair's other insertion: nothing to add.
+            if (0..count).any(|i| cells[start + 1 + i].load(Atomic::Relaxed) == node) {
+                return;
+            }
             cells[start + 1 + count].store(node, Atomic::Relaxed);
             cells[start].store((count + 1) as u32, Atomic::Relaxed);
             return;

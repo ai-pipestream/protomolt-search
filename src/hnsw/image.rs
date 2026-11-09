@@ -22,6 +22,7 @@ use std::sync::atomic::AtomicU32;
 use super::config::{BuildMode, HnswConfig};
 use super::distance::Kernel;
 use super::graph::{LinkCells, Store, View, MAX_LEVEL, MAX_ROWS, NO_NODE};
+use super::rows::{MappedRows, RowSource};
 use super::{HNSW, MAX_DIM};
 use crate::vector::VectorError;
 
@@ -320,7 +321,7 @@ pub fn write(store: &Store, config: &HnswConfig, path: &Path) -> Result<(), Vect
         Ok(())
     };
     pad_to(&mut out, layout.rows_off)?;
-    write_f32s(&mut out, &store.rows).map_err(io)?;
+    write_f32s(&mut out, store.rows.values()).map_err(io)?;
     pad_to(&mut out, layout.inv_norm_off)?;
     write_f32s(&mut out, &store.inv_norm).map_err(io)?;
     pad_to(&mut out, layout.level_off)?;
@@ -504,6 +505,15 @@ impl Mapped {
         &self.map[at..at + stride]
     }
 
+    /// The rows, read in place from the map.
+    pub fn rows(&self) -> MappedRows<'_> {
+        let h = &self.header;
+        MappedRows::new(
+            h.dim,
+            f32s_view(section(&self.map, h.layout.rows_off, h.n * h.dim * 4)),
+        )
+    }
+
     pub fn view(&self) -> View<'_, [u32]> {
         let h = &self.header;
         let l = &h.layout;
@@ -513,7 +523,7 @@ impl Mapped {
             dim: h.dim,
             m,
             m0: 2 * m,
-            rows: f32s_view(section(&self.map, l.rows_off, n * h.dim * 4)),
+            rows: self.rows().into_values(),
             inv_norm: f32s_view(section(&self.map, l.inv_norm_off, n * 4)),
             level: section(&self.map, l.level_off, n),
             upper_slot: u32s_view(section(&self.map, l.upper_slot_off, n * 4)),

@@ -14,16 +14,26 @@
 //! - [`image`]: the persisted format, loaded onto the heap or served from
 //!   a memory map.
 //!
+//! - [`rows`]: the FP32 rows behind the [`RowSource`] trait, with the
+//!   identity a shared row store must match (#71).
+//!
 //! The provider advertises [`QualityContract::ConfiguredAnn`] without
 //! exhaustive completion: `EXACT` refuses it, `ANN` runs it, and `AUTO`
 //! admits it only through a measured dense execution policy bound to its
-//! scoring fingerprint. Scores are exact FP32 inner products of the stored
-//! rows, so shards that share a config produce comparable scores.
+//! scoring fingerprint.
+//!
+//! Numerical contract (`docs/hnsw.md`, "Scores"): the SIMD kernels steer the
+//! traversal only. Every row the provider reports, in a unary result or a
+//! streamed batch, is rescored with [`crate::exact_vectors::dot`], the
+//! scalar row-order accumulation, before it leaves the provider, so reported
+//! scores are bit for bit the product's exact scores on every kernel and
+//! host. Ties order by score descending, then row ascending.
 
 pub mod config;
 pub mod distance;
 pub mod graph;
 pub mod image;
+pub mod rows;
 #[cfg(test)]
 mod tests;
 
@@ -33,6 +43,7 @@ use std::path::Path;
 pub use config::{BuildMode, HnswConfig, CONFIG_FORMAT};
 pub use distance::Kernel;
 pub use graph::SearchStats;
+pub use rows::{RowSource, RowSourceIdentity};
 
 use crate::vector::{
     first_invalid_coordinate, QualityContract, ScoreDirection, VectorBackendConfig,
@@ -168,13 +179,47 @@ impl HnswIndex {
         }
         let bytes = match &self.backing {
             Backing::Heap(store) => {
-                (store.rows.len() + store.inv_norm.len() + store.upper_slot.len()) * 4
+                (store.rows.values().len() + store.inv_norm.len() + store.upper_slot.len()) * 4
                     + store.level.len()
                     + (store.upper_base.len() + store.links0.len() + store.upper.len()) * 4
             }
             Backing::Mapped(mapped) => mapped.byte_len(),
         };
         Some(bytes as f64 / n as f64)
+    }
+
+    /// Run `f` over the rows the graph was built over.
+    pub fn with_row_source<R>(&self, f: impl FnOnce(&dyn RowSource) -> R) -> R {
+        match &self.backing {
+            Backing::Heap(store) => f(&store.rows),
+            Backing::Mapped(mapped) => f(&mapped.rows()),
+        }
+    }
+
+    /// The identity a shared row store must match to replace the
+    /// provider's own rows (#71): dimension, row count, content digest.
+    pub fn row_identity(&self) -> RowSourceIdentity {
+        self.with_row_source(|rows| rows.identity())
+    }
+
+    /// Rescore the walk's results with the scalar scorer, drop those below
+    /// the floor, and order them score descending then row ascending. This
+    /// is the only path a unary result takes out of the provider.
+    fn report(
+        hits: Vec<Scored>,
+        query: &[f32],
+        rows: &dyn RowSource,
+        floor: f32,
+        k: usize,
+    ) -> Vec<(u32, f32)> {
+        let mut exact: Vec<(u32, f32)> = hits
+            .into_iter()
+            .map(|h| (h.node, crate::exact_vectors::dot(rows.row(h.node), query)))
+            .filter(|(_, score)| *score >= floor)
+            .collect();
+        exact.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        exact.truncate(k);
+        exact
     }
 
     fn check_queries(&self, queries: &[f32]) -> Result<usize, VectorError> {
@@ -233,19 +278,14 @@ impl HnswIndex {
                 &mut NoHook
             ))
         });
-        let hits = hits
-            .into_iter()
-            .filter(|h| h.score >= floor)
-            .take(k)
-            .map(|h| (h.node, h.score))
-            .collect();
+        let hits = self.with_row_source(|rows| Self::report(hits, query, rows, floor, k));
         Ok((hits, stats))
     }
 
     fn row_bytes_into(&self, row: usize, out: &mut Vec<u8>) {
         match &self.backing {
             Backing::Heap(store) => {
-                for v in &store.rows[row * self.dim..(row + 1) * self.dim] {
+                for v in store.rows.row(row as u32) {
                     out.extend_from_slice(&v.to_le_bytes());
                 }
             }
@@ -254,11 +294,14 @@ impl HnswIndex {
     }
 }
 
-/// The streaming walk's hook: buffers every allowed exactly scored row at
-/// or above the floor, hands batches to the sink, polls the control after
-/// each expansion, and lets either raise the floor or stop.
+/// The streaming walk's hook: rescores every allowed row the walk scores
+/// with the scalar scorer, buffers those at or above the floor, hands
+/// batches to the sink ordered score descending then row ascending, polls
+/// the control after each expansion, and lets either raise the floor or
+/// stop.
 struct StreamHook<'a> {
     query_index: usize,
+    query: &'a [f32],
     floor: &'a mut f32,
     scores: Vec<f32>,
     slots: Vec<i64>,
@@ -303,6 +346,17 @@ impl StreamHook<'_> {
         if kept == 0 {
             return;
         }
+        // Score descending, then row ascending, within the batch.
+        let mut order: Vec<usize> = (0..kept).collect();
+        order.sort_by(|&a, &b| {
+            self.scores[b]
+                .total_cmp(&self.scores[a])
+                .then(self.slots[a].cmp(&self.slots[b]))
+        });
+        let scores: Vec<f32> = order.iter().map(|&i| self.scores[i]).collect();
+        let slots: Vec<i64> = order.iter().map(|&i| self.slots[i]).collect();
+        self.scores = scores;
+        self.slots = slots;
         self.emitted += kept;
         let decision = (self.sink)(&VectorStreamBatch {
             query_index: self.query_index,
@@ -318,7 +372,8 @@ impl StreamHook<'_> {
 
 impl Hook for StreamHook<'_> {
     #[inline]
-    fn scored(&mut self, node: u32, score: f32) {
+    fn scored(&mut self, node: u32, _traversal_score: f32, row: &[f32]) {
+        let score = crate::exact_vectors::dot(row, self.query);
         if score >= *self.floor {
             self.scores.push(score);
             self.slots.push(i64::from(node));
@@ -474,13 +529,12 @@ impl VectorProvider for HnswIndex {
                     scratch,
                     &mut NoHook
                 ));
-                let mut written = 0;
-                for hit in hits.iter().filter(|h| h.score >= floor).take(k) {
-                    scores.push(hit.score);
-                    slots.push(i64::from(hit.node));
-                    written += 1;
+                let hits = self.with_row_source(|rows| Self::report(hits, query, rows, floor, k));
+                for (node, score) in &hits {
+                    scores.push(*score);
+                    slots.push(i64::from(*node));
                 }
-                for _ in written..k {
+                for _ in hits.len()..k {
                     scores.push(f32::NEG_INFINITY);
                     slots.push(-1);
                 }
@@ -531,6 +585,7 @@ impl VectorProvider for HnswIndex {
             for (query_index, query) in queries.chunks_exact(self.dim).enumerate() {
                 let mut hook = StreamHook {
                     query_index,
+                    query,
                     floor: &mut floor,
                     scores: Vec::with_capacity(STREAM_BATCH_ROWS),
                     slots: Vec::with_capacity(STREAM_BATCH_ROWS),

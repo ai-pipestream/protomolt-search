@@ -10,7 +10,17 @@
 //! Each kernel is deterministic for a given dimension, so two builds on the
 //! same machine score identically; kernels differ from one another in the
 //! last bits of a sum (different accumulation order), which is why a
-//! fixed-order build is reproducible per kernel, not across machines.
+//! fixed-order build is reproducible per kernel, not across machines. The
+//! kernels steer the traversal only: every score the provider reports is
+//! recomputed by the scalar row-order sum (`crate::exact_vectors::dot`).
+//!
+//! Error against that scalar sum: every kernel accumulates the same `d`
+//! products in some order with FMA or separate rounding, so both it and the
+//! scalar sum are within the classic bound `γ(d) · Σ|qᵢxᵢ|` of the real
+//! inner product, where `γ(d) = d·u / (1 − d·u)` and `u = 2⁻²⁴` (Higham,
+//! Accuracy and Stability of Numerical Algorithms, §3.1). The difference
+//! between a kernel and the scalar sum is therefore at most
+//! `2·γ(d)·Σ|qᵢxᵢ|`; the tests check each kernel against that bound.
 
 /// The dot-product kernel an index runs, fixed when the index is created.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +52,23 @@ impl Kernel {
         }
         #[allow(unreachable_code)]
         Self::Scalar
+    }
+
+    /// Every kernel this machine can run, the scalar one first.
+    pub fn available() -> Vec<Self> {
+        let mut kernels = vec![Self::Scalar];
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                kernels.push(Self::Avx2Fma);
+            }
+            if is_x86_feature_detected!("avx512f") {
+                kernels.push(Self::Avx512f);
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        kernels.push(Self::Neon);
+        kernels
     }
 
     /// The kernel's name, for diagnostics.
@@ -271,18 +298,7 @@ mod tests {
     /// 32-, 16-, 8- and 4-wide blocks and every tail length are covered).
     #[test]
     fn kernels_agree_with_scalar_at_every_length() {
-        let mut kernels = vec![Kernel::Scalar];
-        #[cfg(target_arch = "x86_64")]
-        {
-            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-                kernels.push(Kernel::Avx2Fma);
-            }
-            if is_x86_feature_detected!("avx512f") {
-                kernels.push(Kernel::Avx512f);
-            }
-        }
-        #[cfg(target_arch = "aarch64")]
-        kernels.push(Kernel::Neon);
+        let kernels = Kernel::available();
         assert!(kernels.contains(&Kernel::detect()));
         for n in 0..=70 {
             let (a, b) = rows(0x5EED_0000 + n as u64, n);
@@ -298,6 +314,75 @@ mod tests {
                     "{} at n={n}: {got} vs {exact}",
                     kernel.name()
                 );
+            }
+        }
+    }
+
+    /// `2·γ(d)·Σ|qᵢxᵢ|`, the documented bound on a kernel's distance from
+    /// the scalar row-order sum.
+    fn bound(q: &[f32], x: &[f32]) -> f64 {
+        let d = q.len() as f64;
+        let u = 2f64.powi(-24);
+        let gamma = d * u / (1.0 - d * u);
+        let mass: f64 = q
+            .iter()
+            .zip(x)
+            .map(|(a, b)| (f64::from(*a) * f64::from(*b)).abs())
+            .sum();
+        2.0 * gamma * mass
+    }
+
+    /// Every kernel stays within the documented bound of the scalar sum on
+    /// inputs built to expose accumulation order: negative products,
+    /// cancellation between large terms of opposite sign, lengths that are
+    /// odd or straddle every lane width, and near ties. The scalar sum here
+    /// is `exact_vectors::dot`, the scorer every reported score comes from.
+    #[test]
+    fn kernels_stay_within_the_bound_of_the_scalar_scorer_on_adversarial_rows() {
+        let kernels = Kernel::available();
+        let dims = [
+            1usize, 2, 3, 4, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 1023,
+        ];
+        for &d in &dims {
+            let (a, b) = rows(0xADD_0000 + d as u64, d);
+            // Plain random signs: negative scores and mixed products.
+            let negative: Vec<f32> = a.iter().map(|v| -v.abs()).collect();
+            // Cancellation: large terms of opposite sign around the
+            // small rest of the row.
+            let mut cancel_q = a.clone();
+            let mut cancel_x = b.clone();
+            cancel_q[0] = 1.0e6;
+            cancel_x[0] = 1.0;
+            if d > 1 {
+                cancel_q[d - 1] = -1.0e6;
+                cancel_x[d - 1] = 1.0;
+            }
+            if d > 2 {
+                cancel_q[d / 2] = 3.0e5;
+                cancel_x[d / 2] = -3.3333333;
+            }
+            // Near ties: two rows differing in one last-place bit.
+            let mut tie = b.clone();
+            tie[d / 2] = f32::from_bits(tie[d / 2].to_bits() ^ 1);
+            let cases: [(&str, &[f32], &[f32]); 5] = [
+                ("random", &a, &b),
+                ("negative", &negative, &b),
+                ("negative-both", &negative, &a),
+                ("cancellation", &cancel_q, &cancel_x),
+                ("near-tie", &a, &tie),
+            ];
+            for (name, q, x) in cases {
+                let scalar = crate::exact_vectors::dot(x, q);
+                let limit = bound(q, x);
+                for kernel in &kernels {
+                    let got = kernel.dot(q, x);
+                    let delta = (f64::from(got) - f64::from(scalar)).abs();
+                    assert!(
+                        delta <= limit,
+                        "{} d={d} {name}: |{got} - {scalar}| = {delta} exceeds {limit}",
+                        kernel.name()
+                    );
+                }
             }
         }
     }
