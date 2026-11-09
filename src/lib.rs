@@ -64,7 +64,6 @@ pub mod hnsw;
 pub mod index_contract;
 mod integer_map;
 pub mod interleave;
-pub mod leann_graph;
 mod lineage;
 pub mod link;
 pub mod live_docs;

@@ -9,7 +9,6 @@
 use std::fmt;
 use std::ops::Range;
 use std::path::Path;
-use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -120,22 +119,6 @@ pub fn legacy_calibration_config(
         return Ok(None);
     }
     embedded_turbovec::decode_config(config).map(Some)
-}
-
-/// A product-side source of the exact embedding of a stored row, for a
-/// provider that drops its FP32 rows and recomputes them on demand
-/// (`src/leann_graph.rs`, `docs/leann-graph.md`). The product owns how a
-/// row's source becomes its embedding; the provider owns checking that the
-/// result reproduces the vector it indexed.
-pub trait RecomputeSource: Send + Sync {
-    /// Write the embedding of each of `rows` (provider row positions) into
-    /// `out`, `dimension` values per row, in request order.
-    fn embed_rows(
-        &self,
-        rows: &[u32],
-        dimension: usize,
-        out: &mut [f32],
-    ) -> Result<(), VectorError>;
 }
 
 /// A backend-independent operation failure.
@@ -338,26 +321,6 @@ pub trait VectorProvider: Send + Sync {
     fn representation_materialized(&self) -> Option<bool> {
         None
     }
-
-    /// Rows covered by a search structure the provider builds after the
-    /// fact (in the background); later rows are scanned exhaustively until
-    /// the next build lands. `None` when every row is searchable through
-    /// the provider's main structure as soon as it is added.
-    fn indexed_len(&self) -> Option<usize> {
-        None
-    }
-
-    /// Attach the source a recompute-storage provider reads exact embeddings
-    /// from. Providers that keep their rows refuse.
-    fn attach_recompute_source(
-        &mut self,
-        _source: Arc<dyn RecomputeSource>,
-    ) -> Result<(), VectorError> {
-        Err(VectorError::new(format!(
-            "vector backend {:?} does not recompute embeddings",
-            self.descriptor().backend_kind
-        )))
-    }
 }
 
 /// Rows a provider is asked for at once by the rewrite proof: bounds the
@@ -429,9 +392,8 @@ impl VectorIndex {
     }
 
     /// Create the configured backend: the exhaustive embedded adapter (the
-    /// default), the optional LEANN-style graph (`docs/leann-graph.md`) or
-    /// the HNSW graph (`docs/hnsw.md`). Unknown kinds refuse instead of
-    /// silently selecting one.
+    /// default) or the HNSW graph (`docs/hnsw.md`). Unknown kinds refuse
+    /// instead of silently selecting either.
     pub fn create(
         backend_kind: &str,
         dimension: usize,
@@ -439,13 +401,9 @@ impl VectorIndex {
     ) -> Result<Self, VectorError> {
         match backend_kind {
             EMBEDDED_TURBOVEC => embedded_turbovec::create(dimension, bits_per_dimension),
-            crate::leann_graph::LEANN_GRAPH => {
-                crate::leann_graph::create(dimension, bits_per_dimension)
-            }
             crate::hnsw::HNSW => crate::hnsw::create(dimension),
             other => Err(VectorError::new(format!(
-                "unknown vector backend {other:?}; available: {EMBEDDED_TURBOVEC}, {}, {}",
-                crate::leann_graph::LEANN_GRAPH,
+                "unknown vector backend {other:?}; available: {EMBEDDED_TURBOVEC}, {}",
                 crate::hnsw::HNSW
             ))),
         }
@@ -463,11 +421,6 @@ impl VectorIndex {
             EMBEDDED_TURBOVEC => {
                 embedded_turbovec::fit_config(dimension, bits_per_dimension, sample)
             }
-            // The graph's approximate codes are fit per image at build and
-            // never reach a score, so its shared config is parameters only.
-            crate::leann_graph::LEANN_GRAPH => {
-                crate::leann_graph::LeannGraphConfig::with_bits(bits_per_dimension).backend_config()
-            }
             // The graph scores FP32 rows and fits nothing: its shared config
             // is the default build parameters.
             crate::hnsw::HNSW => crate::hnsw::HnswConfig::default().backend_config(),
@@ -484,7 +437,6 @@ impl VectorIndex {
     ) -> Result<Self, VectorError> {
         match config.backend_kind.as_str() {
             EMBEDDED_TURBOVEC => embedded_turbovec::from_config(dimension, config),
-            crate::leann_graph::LEANN_GRAPH => crate::leann_graph::from_config(dimension, config),
             crate::hnsw::HNSW => crate::hnsw::from_config(dimension, config),
             other => Err(VectorError::new(format!(
                 "cannot construct unavailable vector backend {other:?}"
@@ -497,7 +449,6 @@ impl VectorIndex {
     pub fn load(backend_kind: &str, path: &Path) -> Result<Self, VectorError> {
         match backend_kind {
             EMBEDDED_TURBOVEC => embedded_turbovec::load(path),
-            crate::leann_graph::LEANN_GRAPH => crate::leann_graph::load(path),
             crate::hnsw::HNSW => crate::hnsw::load(path),
             other => Err(VectorError::new(format!(
                 "cannot load unavailable vector backend {other:?}"
@@ -513,22 +464,11 @@ impl VectorIndex {
     pub fn load_mapped(backend_kind: &str, path: &Path) -> Result<Self, VectorError> {
         match backend_kind {
             EMBEDDED_TURBOVEC => embedded_turbovec::load_mapped(path),
-            // The graph image is read onto the heap: traversal touches it
-            // at random, and the checksum is verified over the whole file.
-            crate::leann_graph::LEANN_GRAPH => crate::leann_graph::load(path),
             crate::hnsw::HNSW => crate::hnsw::load_mapped(path),
             other => Err(VectorError::new(format!(
                 "cannot load unavailable vector backend {other:?}"
             ))),
         }
-    }
-
-    /// See [`VectorProvider::attach_recompute_source`].
-    pub fn attach_recompute_source(
-        &mut self,
-        source: Arc<dyn RecomputeSource>,
-    ) -> Result<(), VectorError> {
-        self.engine.attach_recompute_source(source)
     }
 
     /// Whether this index serves from a mapped file ([`Self::load_mapped`]).
@@ -567,11 +507,6 @@ impl VectorIndex {
     /// See [`VectorProvider::representation_materialized`].
     pub fn representation_materialized(&self) -> Option<bool> {
         self.engine.representation_materialized()
-    }
-
-    /// See [`VectorProvider::indexed_len`].
-    pub fn indexed_len(&self) -> Option<usize> {
-        self.engine.indexed_len()
     }
 
     pub fn descriptor(&self) -> VectorBackendDescriptor {
