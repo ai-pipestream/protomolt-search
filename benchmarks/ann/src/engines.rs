@@ -30,7 +30,7 @@ pub struct QueryStats {
 pub struct BuildParams {
     pub m: usize,
     pub ef_construction: usize,
-    /// Code bits for the exhaustive and leann engines; 0 otherwise.
+    /// Code bits for the exhaustive engine; 0 otherwise.
     pub bits: usize,
 }
 
@@ -97,7 +97,7 @@ pub struct EngineInfo {
 pub const ENGINES: &[&str] = &[
     "enumerate",
     "exhaustive-tq",
-    "leann-graph",
+    "hnsw",
     "hnsw_rs",
     "rust-cv-hnsw",
     "corenn-hnswlib",
@@ -126,9 +126,9 @@ pub fn info(name: &str) -> Result<EngineInfo, Error> {
             supports_filter: true,
             sweeps_ef: true,
         },
-        "leann-graph" => EngineInfo {
-            name: "leann-graph",
-            library: "ours: src/leann_graph.rs (to be replaced by #54)",
+        "hnsw" => EngineInfo {
+            name: "hnsw",
+            library: "ours: src/hnsw/ (HNSW over FP32 rows, parallel build)",
             version: env!("CARGO_PKG_VERSION"),
             license: "ours",
             filter: "Vec<bool> mask (VectorSearchOptions::with_mask)",
@@ -203,7 +203,7 @@ pub fn build_sweep(name: &str, ms: &[usize], efcs: &[usize], bits: &[usize]) -> 
                     out.push(BuildParams {
                         m,
                         ef_construction: efc,
-                        bits: if name == "leann-graph" { 8 } else { 0 },
+                        bits: 0,
                     });
                 }
             }
@@ -221,7 +221,7 @@ pub fn build(
     Ok(match name {
         "enumerate" => Box::new(Enumerate { rows }),
         "exhaustive-tq" => Box::new(ExhaustiveTq::build(rows, p.bits)?),
-        "leann-graph" => Box::new(Leann::build(rows, p)?),
+        "hnsw" => Box::new(Hnsw::build(rows, p)?),
         "hnsw_rs" => Box::new(HnswRs::build(rows, p)),
         "rust-cv-hnsw" => rust_cv::build(rows, p)?,
         "corenn-hnswlib" => Box::new(CoreNn::build(rows, p, threads)?),
@@ -374,40 +374,36 @@ fn dir_size(dir: &std::path::Path) -> Option<u64> {
     Some(total)
 }
 
-// -------------------------------------------------------------- leann-graph
+// --------------------------------------------------------------------- hnsw
 
-/// The existing graph provider. Built with `search_beam = 1` so the query
-/// beam is the requested depth: asking for `ef` rows and keeping the top
-/// `k` is a beam-`ef` search. Scores are exact FP32.
-pub struct Leann {
+/// The product's graph provider (`src/hnsw/`), built in parallel mode. The
+/// query beam is the requested depth, so asking for `k` at beam `ef` is an
+/// HNSW search at `ef`. Scores are exact FP32 inner products.
+pub struct Hnsw {
     rows: Rows,
-    graph: pipestream_search::leann_graph::LeannGraph,
+    index: pipestream_search::hnsw::HnswIndex,
     disk: Option<u64>,
 }
 
-impl Leann {
+impl Hnsw {
     fn build(rows: Rows, p: &BuildParams) -> Result<Self, Error> {
-        use pipestream_search::leann_graph::{LeannGraph, LeannGraphConfig};
+        use pipestream_search::hnsw::{BuildMode, HnswConfig, HnswIndex};
         use pipestream_search::vector::VectorProvider;
-        let degree = (p.m as u32).min(64);
-        let config = LeannGraphConfig {
-            hub_degree: degree,
-            // Uniform degree: the hub-pruned shape (m = 8) is a storage
-            // trick #54 makes opt-in; the gate compares the uniform graph.
-            base_degree: degree,
-            build_beam: p.ef_construction as u32,
-            search_beam: 1,
-            ..LeannGraphConfig::with_bits(p.bits)
+        let config = HnswConfig {
+            m: p.m as u32,
+            ef_construction: p.ef_construction as u32,
+            build_mode: BuildMode::Parallel,
+            seed: 0x5EED_0A11,
         };
-        let mut graph = LeannGraph::new(Some(rows.dim), config)?;
-        graph.add(rows.slice(), rows.dim)?;
-        graph.prepare()?;
-        let disk = disk_size(|path| graph.write(path).map_err(Into::into));
-        Ok(Self { rows, graph, disk })
+        let mut index = HnswIndex::new(rows.dim, config)?;
+        index.add(rows.slice(), rows.dim)?;
+        index.prepare()?;
+        let disk = disk_size(|path| index.write(path).map_err(Into::into));
+        Ok(Self { rows, index, disk })
     }
 }
 
-impl Index for Leann {
+impl Index for Hnsw {
     fn search(
         &self,
         q: &[f32],
@@ -423,15 +419,12 @@ impl Index for Leann {
             None => VectorSearchOptions::new(),
         };
         let (hits, s) = self
-            .graph
-            .search_with_stats(q, ef.max(k), options)
-            .expect("leann search");
+            .index
+            .search_with_stats(q, k, ef, options)
+            .expect("hnsw search");
         stats.hops += s.hops;
-        stats.exact += s.exact_evaluations;
-        hits.into_iter()
-            .take(k)
-            .map(|(score, row)| (row, score))
-            .collect()
+        stats.exact += s.scored;
+        hits
     }
 
     fn disk_bytes(&self) -> Option<u64> {

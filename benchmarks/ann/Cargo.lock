@@ -1338,6 +1338,7 @@ dependencies = [
  "prost-reflect",
  "prost-types",
  "protomolt-analyzer",
+ "rayon",
  "redb",
  "serde",
  "serde_json",

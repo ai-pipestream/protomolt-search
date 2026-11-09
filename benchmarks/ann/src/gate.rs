@@ -45,7 +45,7 @@ pub fn command() -> Result<(), Error> {
     if inputs.is_empty() {
         return Err("--results=a.json,b.json is required".into());
     }
-    let candidate = arg("candidate", "leann-graph");
+    let candidate = arg("candidate", "hnsw");
     let margin: f64 = arg("unfiltered-margin", "0.20").parse()?;
     let out_md = PathBuf::from(arg("out", "gate.md"));
     let out_json = out_md.with_extension("json");

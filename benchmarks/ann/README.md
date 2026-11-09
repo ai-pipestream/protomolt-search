@@ -1,7 +1,7 @@
 # Graph ANN benchmark harness and gate (#53)
 
 The bar every graph provider must clear before it replaces the exhaustive
-path or `leann-graph`. One fixture directory, three runners (Rust in-process,
+path. One fixture directory, three runners (Rust in-process,
 FAISS in Python, Lucene in Java) that all read it and write the same results
 schema, and a gate that merges the results and judges a candidate against
 the best baseline in every cell.
@@ -29,7 +29,7 @@ mvn -q -f lucene/pom.xml package && java --add-modules jdk.incubator.vector \
   ai.pipestream.annbench.LuceneRunner --fixture=/tmp/fx --out=lucene.json
 ./fetch-fashion-mnist.sh /tmp/fmnist && $B calibrate --dir=/tmp/fmnist --out=calibration.json
 $B gate --results=rust.json,faiss.json,lucene.json --calibration=calibration.json \
-  --candidate=leann-graph --unfiltered-margin=0.20 --out=gate.md
+  --candidate=hnsw --unfiltered-margin=0.20 --out=gate.md
 ```
 
 `RUSTC_BOOTSTRAP=corenn_kernels` is needed because CoreNN's kernel crate uses
@@ -68,7 +68,7 @@ Files: `manifest.json`, `base.f32`, `queries.f32`, `parents.u64`, `bucket.u8`,
 | --- | --- | --- |
 | `enumerate` | ours | Exact FP32 scan over the allow bitset's set bits (#55's Enumerate regime). Unfiltered it is the flat scan. |
 | `exhaustive-tq` | ours | Embedded TurboVec over every row, FP32 rerank of the top `ef` (the product's default path); `Vec<bool>` mask. |
-| `leann-graph` | ours | `src/leann_graph.rs`, uniform degree (`m = M`), beam = `ef`; `Vec<bool>` mask. The starting candidate until #54 replaces it. |
+| `hnsw` | ours | `src/hnsw/` (`docs/hnsw.md`), parallel build, beam = `ef`; `Vec<bool>` mask. The candidate (#70), and the gate's default `--candidate`. |
 | `hnsw_rs` 0.3.5 | Rust | `FilterT` closure over the allow bitset. `DistL2` with `simdeez_f`. |
 | `rust-cv-hnsw` 0.11 | Rust | No predicate filter in the library: filtered cells are skipped and reported as such. |
 | `corenn-hnswlib` 0.10 | Rust | `Fn(&key)` closure. Vectors served from a borrowed-slice `VectorStore`, so it does not pay the default store's per-read `Arc`. |
@@ -101,7 +101,7 @@ exhaustive path). Per point:
   (FAISS: batch search for unfiltered and shared masks, forked one-thread
   workers for per-query masks; Lucene: one searcher shared by all threads).
 - Hops and exact scores per query where the engine reports them
-  (`leann-graph`, `enumerate`, `exhaustive-tq`).
+  (`hnsw`, `enumerate`, `exhaustive-tq`).
 - Build time, retained memory (RSS delta) and serialized bytes per row.
   Read the byte columns with care: `corenn-hnswlib` and `enumerate` read the
   fixture's shared rows, so their RSS delta excludes the vectors;
@@ -115,7 +115,7 @@ it. It also stops on a plateau, when three more breadths added less than
 than `--min-time-ms` (slow filtered points), it is also the one-core timing
 pass. With `--min-qps=N`, a point slower than N queries per second on one
 core is abandoned after 50 queries (recorded as `below_qps_floor`, ignored by
-the gate) and the sweep moves on; the committed cloud run used 20 for the Rust baselines, below every leann-graph point it measured, so no verdict can depend on a skipped point.
+the gate) and the sweep moves on; the committed cloud run used 20 for the Rust baselines, below every candidate point it measured, so no verdict can depend on a skipped point.
 
 The Rust harness compiles for the default target, as the product does; the
 C++ and Java engines dispatch SIMD at run time. Record any `RUSTFLAGS` you
