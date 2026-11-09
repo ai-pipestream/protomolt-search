@@ -309,6 +309,9 @@ impl VectorProvider for SegmentedProvider {
             if let Some(floor) = options.minimum_score {
                 part_options = part_options.with_minimum_score(floor);
             }
+            if let Some(depth) = options.candidate_depth {
+                part_options = part_options.with_candidate_depth(depth);
+            }
             let results = image.try_search(queries, k.min(rows), part_options)?;
             for (q, hits) in per_query.iter_mut().enumerate() {
                 for (&slot, &score) in results
@@ -379,6 +382,9 @@ impl VectorProvider for SegmentedProvider {
             }
             if let Some(f) = floor.get() {
                 part_options = part_options.with_minimum_score(f);
+            }
+            if let Some(depth) = options.candidate_depth {
+                part_options = part_options.with_candidate_depth(depth);
             }
             let note = |verdict: VectorStreamControl| match verdict {
                 VectorStreamControl::RaiseFloor(f) => {

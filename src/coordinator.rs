@@ -7263,8 +7263,14 @@ impl CoordinatorServiceImpl {
                 )));
             }
         } else {
-            let mut fanout =
-                self.open_stream_fanout(request_id, vector, initial_floor, false, filters)?;
+            let mut fanout = self.open_stream_fanout(
+                request_id,
+                vector,
+                initial_floor,
+                Some(k),
+                false,
+                filters,
+            )?;
             let mut remaining = n_nodes;
             for (shard, summary) in summaries.iter_mut().enumerate() {
                 if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
@@ -7895,6 +7901,7 @@ impl CoordinatorServiceImpl {
         request_id: &str,
         vector: &[f32],
         initial_floor: Option<f32>,
+        candidate_depth: Option<u32>,
         collapse_parents: bool,
         filters: &RequestFilters,
     ) -> Result<StreamFanout, Status> {
@@ -7902,17 +7909,23 @@ impl CoordinatorServiceImpl {
             request_id,
             vector,
             initial_floor,
+            candidate_depth,
             collapse_parents,
             filters,
             None,
         )
     }
 
+    /// `candidate_depth` is how many candidates the shard should consider
+    /// for the query (the request's `k`): a configured-ANN provider walks
+    /// its graph to it and refuses the scan without it (`docs/hnsw.md`).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_stream_fanout_with_identities(
         &self,
         request_id: &str,
         vector: &[f32],
         initial_floor: Option<f32>,
+        candidate_depth: Option<u32>,
         collapse_parents: bool,
         filters: &RequestFilters,
         identity_limits: Option<crate::pb::StreamIdentityLimits>,
@@ -7949,6 +7962,7 @@ impl CoordinatorServiceImpl {
                         request_id: request_id.to_string(),
                         vector: vector.to_vec(),
                         initial_floor,
+                        candidate_depth,
                         floor_token: lane.map_or(0, |(token, _)| token),
                         collapse_parents,
                         geo_filters: filters.geo.clone(),
@@ -8119,6 +8133,7 @@ impl CoordinatorServiceImpl {
             request_id,
             vector,
             initial_floor,
+            Some(k),
             false,
             filters,
             Some(identity_limits),
@@ -8358,7 +8373,8 @@ impl CoordinatorServiceImpl {
         }
         let mask = self.vector_scan_mask(filters.tree.as_ref());
         let mut known = Self::filter_known(filters, mask.as_ref());
-        let mut fanout = self.open_stream_fanout(request_id, vector, None, true, filters)?;
+        let mut fanout =
+            self.open_stream_fanout(request_id, vector, None, Some(k), true, filters)?;
         let mut parents: HashMap<u64, ParentAgg> = HashMap::new();
         let mut summaries: Vec<Option<StreamSearchSummary>> = vec![None; n_nodes];
         let mut remaining = n_nodes;

@@ -13560,6 +13560,9 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                         if let Some(a) = allow.as_deref() {
                             options = options.with_mask(a);
                         }
+                        if let Some(depth) = start.candidate_depth {
+                            options = options.with_candidate_depth(depth as usize);
+                        }
                         let mut floor_now = f32::NEG_INFINITY;
                         if let Some(f) = start.initial_floor {
                             options = options.with_initial_threshold(f);

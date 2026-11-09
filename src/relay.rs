@@ -19,7 +19,8 @@
 //!   sessions plus the gRPC twin; the relay's completion frame is issued
 //!   only after every child's; a child error or a missing terminal
 //!   certificate fails the attempt. The relay keeps no heap
-//!   (`StartStreamSearch` carries no k) and raises no floor of its own.
+//!   (`StartStreamSearch` carries a candidate depth, not a k; the relay
+//!   forwards it unchanged) and raises no floor of its own.
 //! - `TermStats`: children's shares summed with checked arithmetic (a
 //!   `u32` document frequency that would overflow refuses by name),
 //!   homogeneous field capabilities required, and the epoch reported as
@@ -1180,6 +1181,7 @@ async fn relay_stream(
         &start.request_id,
         &start.vector,
         start.initial_floor,
+        start.candidate_depth,
         start.collapse_parents,
         &filters,
         identity_limits,

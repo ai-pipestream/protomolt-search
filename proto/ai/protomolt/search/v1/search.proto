@@ -1683,6 +1683,11 @@ message StartStreamSearch {
   StreamIdentityLimits identity_limits = 8;
   // Opt-in field, authority-view and generation handshake before scan output.
   VectorReadContext read_context = 9;
+  // How many candidates the planner asked the shard to consider for this
+  // query: the request's k. A configured-ANN provider (hnsw) walks its
+  // graph to this depth and refuses the scan without it, since the beam is
+  // not part of its config; exhaustive providers ignore it.
+  optional uint32 candidate_depth = 10;
 }
 
 // Bounds for the post-scan identity exchange. All fields must be positive.

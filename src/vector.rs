@@ -165,6 +165,11 @@ impl std::error::Error for VectorError {}
 pub struct VectorSearchOptions<'a> {
     pub allow: Option<&'a [bool]>,
     pub minimum_score: Option<f32>,
+    /// How many candidates the request asked the provider to consider: the
+    /// beam a configured-ANN provider walks to (`docs/hnsw.md`, "The
+    /// beam"). A streaming search on such a provider refuses without it;
+    /// exhaustive providers ignore it.
+    pub candidate_depth: Option<usize>,
 }
 
 impl<'a> VectorSearchOptions<'a> {
@@ -188,6 +193,11 @@ impl<'a> VectorSearchOptions<'a> {
 
     pub fn with_initial_threshold(self, score: f32) -> Self {
         self.with_minimum_score(score)
+    }
+
+    pub fn with_candidate_depth(mut self, depth: usize) -> Self {
+        self.candidate_depth = Some(depth);
+        self
     }
 }
 
