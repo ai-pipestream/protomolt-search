@@ -429,8 +429,9 @@ impl VectorIndex {
     }
 
     /// Create the configured backend: the exhaustive embedded adapter (the
-    /// default) or the optional LEANN-style graph (`docs/leann-graph.md`).
-    /// Unknown kinds refuse instead of silently selecting either.
+    /// default), the optional LEANN-style graph (`docs/leann-graph.md`) or
+    /// the HNSW graph (`docs/hnsw.md`). Unknown kinds refuse instead of
+    /// silently selecting one.
     pub fn create(
         backend_kind: &str,
         dimension: usize,
@@ -441,9 +442,11 @@ impl VectorIndex {
             crate::leann_graph::LEANN_GRAPH => {
                 crate::leann_graph::create(dimension, bits_per_dimension)
             }
+            crate::hnsw::HNSW => crate::hnsw::create(dimension),
             other => Err(VectorError::new(format!(
-                "unknown vector backend {other:?}; available: {EMBEDDED_TURBOVEC}, {}",
-                crate::leann_graph::LEANN_GRAPH
+                "unknown vector backend {other:?}; available: {EMBEDDED_TURBOVEC}, {}, {}",
+                crate::leann_graph::LEANN_GRAPH,
+                crate::hnsw::HNSW
             ))),
         }
     }
@@ -465,6 +468,9 @@ impl VectorIndex {
             crate::leann_graph::LEANN_GRAPH => {
                 crate::leann_graph::LeannGraphConfig::with_bits(bits_per_dimension).backend_config()
             }
+            // The graph scores FP32 rows and fits nothing: its shared config
+            // is the default build parameters.
+            crate::hnsw::HNSW => crate::hnsw::HnswConfig::default().backend_config(),
             other => Err(VectorError::new(format!(
                 "cannot fit unavailable vector backend {other:?}"
             ))),
@@ -479,6 +485,7 @@ impl VectorIndex {
         match config.backend_kind.as_str() {
             EMBEDDED_TURBOVEC => embedded_turbovec::from_config(dimension, config),
             crate::leann_graph::LEANN_GRAPH => crate::leann_graph::from_config(dimension, config),
+            crate::hnsw::HNSW => crate::hnsw::from_config(dimension, config),
             other => Err(VectorError::new(format!(
                 "cannot construct unavailable vector backend {other:?}"
             ))),
@@ -491,6 +498,7 @@ impl VectorIndex {
         match backend_kind {
             EMBEDDED_TURBOVEC => embedded_turbovec::load(path),
             crate::leann_graph::LEANN_GRAPH => crate::leann_graph::load(path),
+            crate::hnsw::HNSW => crate::hnsw::load(path),
             other => Err(VectorError::new(format!(
                 "cannot load unavailable vector backend {other:?}"
             ))),
@@ -508,6 +516,7 @@ impl VectorIndex {
             // The graph image is read onto the heap: traversal touches it
             // at random, and the checksum is verified over the whole file.
             crate::leann_graph::LEANN_GRAPH => crate::leann_graph::load(path),
+            crate::hnsw::HNSW => crate::hnsw::load_mapped(path),
             other => Err(VectorError::new(format!(
                 "cannot load unavailable vector backend {other:?}"
             ))),

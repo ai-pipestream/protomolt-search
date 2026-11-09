@@ -76,6 +76,10 @@ point, and the response reports which. The optional `leann-graph` provider
 (`vector_backend = "leann-graph"`) is such a configured ANN engine: a native
 port of LEANN's hub-preserving graph pruning and selective embedding
 recomputation, for small-k searches; see [docs/leann-graph.md](docs/leann-graph.md).
+The optional `hnsw` provider (`vector_backend = "hnsw"`) is another: a
+from-scratch HNSW graph over FP32 rows with a parallel build, mmap serving and
+a query beam taken from the request's candidate depth; see
+[docs/hnsw.md](docs/hnsw.md).
 A cased A/B column costs no second analysis:
 [docs/dual-cased.md](docs/dual-cased.md) — `AddDocumentsRequest.cased_field`
 takes the body's cased identity from the same pass, sidecar or native.

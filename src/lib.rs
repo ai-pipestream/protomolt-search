@@ -60,6 +60,7 @@ pub mod geo;
 #[cfg(feature = "net")]
 pub mod harness;
 pub mod highlight;
+pub mod hnsw;
 pub mod index_contract;
 mod integer_map;
 pub mod interleave;

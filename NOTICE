@@ -12,3 +12,11 @@ Low-Storage Vector Index" (Wang et al., arXiv:2506.08276). No LEANN source
 code is included. The LEANN reference implementation
 (https://github.com/StarTrail-org/LEANN) is distributed under the MIT
 License, Copyright (c) 2025 LEANN Contributors.
+
+The `hnsw` vector provider (src/hnsw/) is an independent Rust
+implementation of the Hierarchical Navigable Small World graph described in
+"Efficient and robust approximate nearest neighbor search using Hierarchical
+Navigable Small World graphs" (Yu. A. Malkov and D. A. Yashunin,
+arXiv:1603.09320): the layered insertion, the layer search, the neighbor
+selection heuristic (applied to directions, see docs/hnsw.md) and the
+query. No code from any HNSW implementation is included.

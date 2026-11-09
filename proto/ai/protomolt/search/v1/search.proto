@@ -1836,6 +1836,33 @@ message VectorBackendConfig {
   bytes payload = 3;
 }
 
+// Build parameters of the `hnsw` vector backend (docs/hnsw.md), carried as
+// `VectorBackendConfig.payload` under
+// `config_format = "application/vnd.ai-pipestream.hnsw-config+protobuf;version=1"`.
+// Every field is part of the backend's scoring fingerprint. The query beam
+// is deliberately not here: it is the request's candidate depth.
+message HnswConfig {
+  // Neighbors per node in the upper layers; layer 0 keeps 2M. 4 to 256.
+  uint32 m = 1;
+  // Insertion beam: candidates considered per layer before the neighbor
+  // heuristic selects. At least m, at most 65,536.
+  uint32 ef_construction = 2;
+  // UNSPECIFIED is refused.
+  HnswBuildMode build_mode = 3;
+  // Seeds every node's level draw.
+  uint64 seed = 4;
+}
+
+enum HnswBuildMode {
+  HNSW_BUILD_MODE_UNSPECIFIED = 0;
+  // One thread inserts rows in row order; the graph is reproducible bit
+  // for bit on one machine and kernel.
+  HNSW_BUILD_MODE_FIXED_ORDER = 1;
+  // Every thread inserts under per-node locks; the graph depends on
+  // scheduling.
+  HNSW_BUILD_MODE_PARALLEL = 2;
+}
+
 message VectorBackendDescriptor {
   string backend_kind = 1;
   string backend_version = 2;

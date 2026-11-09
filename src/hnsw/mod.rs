@@ -1,0 +1,618 @@
+//! The `hnsw` vector provider: a from-scratch Hierarchical Navigable Small
+//! World graph over FP32 rows, scored by inner product.
+//!
+//! The algorithms are those of Malkov & Yashunin, "Efficient and robust
+//! approximate nearest neighbor search using Hierarchical Navigable Small
+//! World graphs" (arXiv:1603.09320); see `NOTICE`. Nothing is ported from
+//! another implementation. `docs/hnsw.md` is the operator-facing
+//! description; this module's submodules are:
+//!
+//! - [`config`]: the protobuf-carried build parameters and the fingerprint
+//!   contract.
+//! - [`distance`]: single-row inner-product kernels with runtime dispatch.
+//! - [`graph`]: the flat layered graph, insertion and the walk.
+//! - [`image`]: the persisted format, loaded onto the heap or served from
+//!   a memory map.
+//!
+//! The provider advertises [`QualityContract::ConfiguredAnn`] without
+//! exhaustive completion: `EXACT` refuses it, `ANN` runs it, and `AUTO`
+//! admits it only through a measured dense execution policy bound to its
+//! scoring fingerprint. Scores are exact FP32 inner products of the stored
+//! rows, so shards that share a config produce comparable scores.
+
+pub mod config;
+pub mod distance;
+pub mod graph;
+pub mod image;
+#[cfg(test)]
+mod tests;
+
+use std::ops::Range;
+use std::path::Path;
+
+pub use config::{BuildMode, HnswConfig, CONFIG_FORMAT};
+pub use distance::Kernel;
+pub use graph::SearchStats;
+
+use crate::vector::{
+    first_invalid_coordinate, QualityContract, ScoreDirection, VectorBackendConfig,
+    VectorBackendDescriptor, VectorCapability, VectorError, VectorIndex, VectorProvider,
+    VectorSearchOptions, VectorSearchResults, VectorStreamBatch, VectorStreamControl,
+    VectorStreamSummary,
+};
+
+use graph::{with_scratch, Hook, NoHook, Scored, Store};
+
+/// Stable identifier of the backend, as `vector_backend` names it.
+pub const HNSW: &str = "hnsw";
+const BACKEND_VERSION: &str = "1.0.0";
+/// Largest dimension an image may declare.
+pub const MAX_DIM: usize = 1 << 16;
+/// The smallest beam a query walks with. The harness's breadth sweep
+/// starts here, so a product query never runs a beam narrower than one the
+/// gate measured; below it the walk degenerates toward a greedy descent.
+pub const EF_FLOOR: usize = 16;
+/// A parallel-mode batch at least this large is inserted from every
+/// thread; smaller batches are not worth the fork.
+const PARALLEL_MIN_BATCH: usize = 256;
+/// Streaming emission batch: rows scored before the sink is called.
+const STREAM_BATCH_ROWS: usize = 64;
+
+enum Backing {
+    Heap(Store),
+    Mapped(image::Mapped),
+}
+
+/// Dispatch over the two link storages: `$v` is a `graph::View`.
+macro_rules! with_view {
+    ($self:expr, |$v:ident| $body:expr) => {
+        match &$self.backing {
+            Backing::Heap(store) => {
+                let $v = store.view();
+                $body
+            }
+            Backing::Mapped(mapped) => {
+                let $v = mapped.view();
+                $body
+            }
+        }
+    };
+}
+
+/// The provider.
+pub struct HnswIndex {
+    dim: usize,
+    config: HnswConfig,
+    kernel: Kernel,
+    backing: Backing,
+}
+
+impl std::fmt::Debug for HnswIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HnswIndex")
+            .field("dim", &self.dim)
+            .field("config", &self.config)
+            .field("kernel", &self.kernel.name())
+            .field("rows", &self.len())
+            .field("mapped", &self.is_mapped())
+            .finish()
+    }
+}
+
+impl HnswIndex {
+    /// An empty graph for rows of `dim` values.
+    pub fn new(dim: usize, config: HnswConfig) -> Result<Self, VectorError> {
+        config.validate()?;
+        if dim == 0 || dim > MAX_DIM {
+            return Err(VectorError::new(format!(
+                "{HNSW} dimension {dim} is outside 1..={MAX_DIM}"
+            )));
+        }
+        let kernel = Kernel::detect();
+        Ok(Self {
+            dim,
+            config,
+            kernel,
+            backing: Backing::Heap(Store::new(
+                dim,
+                config.m as usize,
+                config.ef_construction as usize,
+                config.seed,
+                kernel,
+            )),
+        })
+    }
+
+    /// Read an image onto the heap.
+    pub fn load(path: &Path) -> Result<Self, VectorError> {
+        let kernel = Kernel::detect();
+        let (store, config) = image::load_heap(path, kernel)?;
+        Ok(Self {
+            dim: store.dim,
+            config,
+            kernel,
+            backing: Backing::Heap(store),
+        })
+    }
+
+    /// Serve an image from a memory map; the graph and its rows are read
+    /// in place. The index is read-only.
+    pub fn load_mapped(path: &Path) -> Result<Self, VectorError> {
+        let kernel = Kernel::detect();
+        let mapped = image::load_mapped(path, kernel)?;
+        Ok(Self {
+            dim: mapped.header().dim,
+            config: mapped.header().config,
+            kernel,
+            backing: Backing::Mapped(mapped),
+        })
+    }
+
+    pub fn into_index(self) -> VectorIndex {
+        VectorIndex::from_provider(self)
+    }
+
+    pub fn config(&self) -> &HnswConfig {
+        &self.config
+    }
+
+    pub fn kernel(&self) -> Kernel {
+        self.kernel
+    }
+
+    /// Bytes the image of this graph takes, per row; `None` while empty.
+    pub fn image_bytes_per_row(&self) -> Option<f64> {
+        let n = self.len();
+        if n == 0 {
+            return None;
+        }
+        let bytes = match &self.backing {
+            Backing::Heap(store) => {
+                (store.rows.len() + store.inv_norm.len() + store.upper_slot.len()) * 4
+                    + store.level.len()
+                    + (store.upper_base.len() + store.links0.len() + store.upper.len()) * 4
+            }
+            Backing::Mapped(mapped) => mapped.byte_len(),
+        };
+        Some(bytes as f64 / n as f64)
+    }
+
+    fn check_queries(&self, queries: &[f32]) -> Result<usize, VectorError> {
+        if !queries.len().is_multiple_of(self.dim) {
+            return Err(VectorError::new(format!(
+                "{} query values do not form rows of dimension {}",
+                queries.len(),
+                self.dim
+            )));
+        }
+        if let Some((row, coord, value)) = first_invalid_coordinate(queries, self.dim) {
+            return Err(VectorError::new(format!(
+                "query {row} coordinate {coord} is invalid: {value}"
+            )));
+        }
+        Ok(queries.len() / self.dim)
+    }
+
+    fn check_allow(&self, allow: Option<&[bool]>) -> Result<(), VectorError> {
+        if let Some(allow) = allow {
+            if allow.len() != self.len() {
+                return Err(VectorError::new(format!(
+                    "allow mask covers {} rows, the index holds {}",
+                    allow.len(),
+                    self.len()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// One query at an explicit beam: up to `k` `(row, score)` best first
+    /// among the allowed rows at or above the floor, and the walk's work.
+    /// The beam is `max(beam, k, EF_FLOOR)`.
+    pub fn search_with_stats(
+        &self,
+        query: &[f32],
+        k: usize,
+        beam: usize,
+        options: VectorSearchOptions<'_>,
+    ) -> Result<(Vec<(u32, f32)>, SearchStats), VectorError> {
+        if self.check_queries(query)? != 1 {
+            return Err(VectorError::new(
+                "search_with_stats takes exactly one query",
+            ));
+        }
+        self.check_allow(options.allow)?;
+        let ef = beam.max(k).max(EF_FLOOR);
+        let floor = options.minimum_score.unwrap_or(f32::NEG_INFINITY);
+        let (hits, stats, _) = with_scratch(|scratch| {
+            with_view!(self, |view| view.walk(
+                query,
+                ef,
+                options.allow,
+                scratch,
+                &mut NoHook
+            ))
+        });
+        let hits = hits
+            .into_iter()
+            .filter(|h| h.score >= floor)
+            .take(k)
+            .map(|h| (h.node, h.score))
+            .collect();
+        Ok((hits, stats))
+    }
+
+    fn row_bytes_into(&self, row: usize, out: &mut Vec<u8>) {
+        match &self.backing {
+            Backing::Heap(store) => {
+                for v in &store.rows[row * self.dim..(row + 1) * self.dim] {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            Backing::Mapped(mapped) => out.extend_from_slice(mapped.row_bytes(row)),
+        }
+    }
+}
+
+/// The streaming walk's hook: buffers every allowed exactly scored row at
+/// or above the floor, hands batches to the sink, polls the control after
+/// each expansion, and lets either raise the floor or stop.
+struct StreamHook<'a> {
+    query_index: usize,
+    floor: &'a mut f32,
+    scores: Vec<f32>,
+    slots: Vec<i64>,
+    sink: &'a mut dyn FnMut(&VectorStreamBatch<'_>) -> VectorStreamControl,
+    control: &'a mut dyn FnMut() -> VectorStreamControl,
+    stopped: bool,
+    emitted: usize,
+}
+
+impl StreamHook<'_> {
+    fn apply(&mut self, decision: VectorStreamControl) {
+        match decision {
+            VectorStreamControl::Continue => {}
+            VectorStreamControl::RaiseFloor(raised) => {
+                if raised > *self.floor {
+                    *self.floor = raised;
+                }
+            }
+            VectorStreamControl::Stop => self.stopped = true,
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.scores.is_empty() || self.stopped {
+            self.scores.clear();
+            self.slots.clear();
+            return;
+        }
+        let floor = *self.floor;
+        // Rows that were above the floor when scored may have fallen below
+        // a floor raised since; the sink only sees rows at or above it now.
+        let mut kept = 0;
+        for i in 0..self.scores.len() {
+            if self.scores[i] >= floor {
+                self.scores[kept] = self.scores[i];
+                self.slots[kept] = self.slots[i];
+                kept += 1;
+            }
+        }
+        self.scores.truncate(kept);
+        self.slots.truncate(kept);
+        if kept == 0 {
+            return;
+        }
+        self.emitted += kept;
+        let decision = (self.sink)(&VectorStreamBatch {
+            query_index: self.query_index,
+            block_base: 0,
+            scores: &self.scores,
+            slots: &self.slots,
+        });
+        self.scores.clear();
+        self.slots.clear();
+        self.apply(decision);
+    }
+}
+
+impl Hook for StreamHook<'_> {
+    #[inline]
+    fn scored(&mut self, node: u32, score: f32) {
+        if score >= *self.floor {
+            self.scores.push(score);
+            self.slots.push(i64::from(node));
+            if self.scores.len() >= STREAM_BATCH_ROWS {
+                self.flush();
+            }
+        }
+    }
+
+    fn hop(&mut self) -> bool {
+        if !self.stopped {
+            let decision = (self.control)();
+            self.apply(decision);
+        }
+        !self.stopped
+    }
+}
+
+impl VectorProvider for HnswIndex {
+    fn descriptor(&self) -> VectorBackendDescriptor {
+        let dimension = (self.dim as u64).to_le_bytes();
+        let payload = self.config.encode();
+        VectorBackendDescriptor {
+            backend_kind: HNSW.to_string(),
+            backend_version: BACKEND_VERSION.to_string(),
+            dimension: Some(self.dim),
+            bits_per_dimension: Some(32),
+            metric: "inner_product".to_string(),
+            score_direction: ScoreDirection::HigherIsBetter,
+            scoring_fingerprint: crate::sha256::hex_digest(
+                [
+                    HNSW.as_bytes(),
+                    BACKEND_VERSION.as_bytes(),
+                    dimension.as_slice(),
+                    CONFIG_FORMAT.as_bytes(),
+                    payload.as_slice(),
+                ]
+                .concat()
+                .as_slice(),
+            ),
+            quality_contract: QualityContract::ConfiguredAnn,
+            capabilities: vec![
+                VectorCapability::BatchQuery,
+                VectorCapability::CandidateStream,
+                VectorCapability::LiveBoundInput,
+                VectorCapability::DenseMask,
+                VectorCapability::Append,
+                VectorCapability::Flush,
+                VectorCapability::SnapshotInstall,
+                VectorCapability::RawVectorRebuild,
+            ],
+        }
+    }
+
+    fn backend_config(&self) -> Result<VectorBackendConfig, VectorError> {
+        self.config.backend_config()
+    }
+
+    fn len(&self) -> usize {
+        match &self.backing {
+            Backing::Heap(store) => store.n(),
+            Backing::Mapped(mapped) => mapped.n(),
+        }
+    }
+
+    fn dimension(&self) -> Option<usize> {
+        Some(self.dim)
+    }
+
+    fn is_mapped(&self) -> bool {
+        matches!(self.backing, Backing::Mapped(_))
+    }
+
+    /// Append rows and link every one of them into the graph before
+    /// returning: the first rows of an empty graph as a bulk build in the
+    /// configured mode, later rows one by one in row order (a parallel-mode
+    /// batch of at least [`PARALLEL_MIN_BATCH`] rows still inserts from
+    /// every thread). There is no unindexed tail and no rebuild.
+    fn add(&mut self, vectors: &[f32], dimension: usize) -> Result<(), VectorError> {
+        if dimension != self.dim {
+            return Err(VectorError::new(format!(
+                "vectors have dimension {dimension}, the {HNSW} index expects {}",
+                self.dim
+            )));
+        }
+        if !vectors.len().is_multiple_of(self.dim) {
+            return Err(VectorError::new(format!(
+                "{} values do not form rows of dimension {}",
+                vectors.len(),
+                self.dim
+            )));
+        }
+        if let Some((row, coord, value)) = first_invalid_coordinate(vectors, self.dim) {
+            return Err(VectorError::new(format!(
+                "vector {row} coordinate {coord} is invalid: {value}"
+            )));
+        }
+        let mode = self.config.build_mode;
+        let store = match &mut self.backing {
+            Backing::Heap(store) => store,
+            Backing::Mapped(_) => {
+                return Err(VectorError::new(format!(
+                    "{HNSW} image is served from a map and is sealed; rows cannot be added"
+                )))
+            }
+        };
+        let range = store.append_rows(vectors)?;
+        match mode {
+            BuildMode::Parallel if range.len() >= PARALLEL_MIN_BATCH => {
+                store.insert_parallel(range)
+            }
+            _ => store.insert_sequential(range),
+        }
+        Ok(())
+    }
+
+    /// Every row is linked when `add` returns, so there is nothing to fold.
+    fn prepare(&mut self) -> Result<(), VectorError> {
+        Ok(())
+    }
+
+    fn write(&self, path: &Path) -> Result<(), VectorError> {
+        match &self.backing {
+            Backing::Heap(store) => image::write(store, &self.config, path),
+            Backing::Mapped(_) => Err(VectorError::new(format!(
+                "{HNSW} image is served from a map; copy the file instead of rewriting it"
+            ))),
+        }
+    }
+
+    /// Top `k` per query at a beam of `max(k, candidate_depth, EF_FLOOR)`.
+    /// Disallowed rows route but are never returned; `minimum_score`
+    /// filters the results; short results are padded with `-1` and
+    /// negative infinity.
+    fn search(
+        &self,
+        queries: &[f32],
+        k: usize,
+        options: VectorSearchOptions<'_>,
+    ) -> Result<VectorSearchResults, VectorError> {
+        let query_count = self.check_queries(queries)?;
+        self.check_allow(options.allow)?;
+        let ef = k.max(EF_FLOOR).max(options.candidate_depth.unwrap_or(0));
+        let floor = options.minimum_score.unwrap_or(f32::NEG_INFINITY);
+        let mut scores = Vec::with_capacity(query_count * k);
+        let mut slots = Vec::with_capacity(query_count * k);
+        with_scratch(|scratch| {
+            for query in queries.chunks_exact(self.dim) {
+                let (hits, _, _) = with_view!(self, |view| view.walk(
+                    query,
+                    ef,
+                    options.allow,
+                    scratch,
+                    &mut NoHook
+                ));
+                let mut written = 0;
+                for hit in hits.iter().filter(|h| h.score >= floor).take(k) {
+                    scores.push(hit.score);
+                    slots.push(i64::from(hit.node));
+                    written += 1;
+                }
+                for _ in written..k {
+                    scores.push(f32::NEG_INFINITY);
+                    slots.push(-1);
+                }
+            }
+        });
+        Ok(VectorSearchResults {
+            scores,
+            slots,
+            query_count,
+            result_count: k,
+        })
+    }
+
+    /// One walk per query at the request's candidate depth, emitting every
+    /// allowed row the walk scores exactly at or above the floor, in
+    /// batches, as it proceeds. `control` is polled after every expansion;
+    /// `Stop` from either callback ends the stream uncompleted, and a floor
+    /// raised by either gates the rest of the query and every later one.
+    /// `completed` means every walk finished, never that every row was
+    /// evaluated. Without a depth the provider refuses: the beam is not
+    /// configuration, and a graph walk cannot guess how far to go.
+    fn search_streaming_controlled(
+        &self,
+        queries: &[f32],
+        options: VectorSearchOptions<'_>,
+        sink: &mut dyn FnMut(&VectorStreamBatch<'_>) -> VectorStreamControl,
+        control: &mut dyn FnMut() -> VectorStreamControl,
+    ) -> Result<VectorStreamSummary, VectorError> {
+        let query_count = self.check_queries(queries)?;
+        self.check_allow(options.allow)?;
+        let depth = options.candidate_depth.ok_or_else(|| {
+            VectorError::new(format!(
+                "{HNSW} streaming search needs the request's candidate depth; the beam is not \
+                 part of the backend config"
+            ))
+        })?;
+        if depth == 0 {
+            return Err(VectorError::new(format!(
+                "{HNSW} streaming search was given candidate depth 0"
+            )));
+        }
+        let ef = depth.max(EF_FLOOR);
+        let mut floor = options.minimum_score.unwrap_or(f32::NEG_INFINITY);
+        let mut emitted = 0usize;
+        let mut units = 0usize;
+        let mut stopped = false;
+        with_scratch(|scratch| {
+            for (query_index, query) in queries.chunks_exact(self.dim).enumerate() {
+                let mut hook = StreamHook {
+                    query_index,
+                    floor: &mut floor,
+                    scores: Vec::with_capacity(STREAM_BATCH_ROWS),
+                    slots: Vec::with_capacity(STREAM_BATCH_ROWS),
+                    sink,
+                    control,
+                    stopped: false,
+                    emitted: 0,
+                };
+                let (_, stats, completed) = with_view!(self, |view| view.walk(
+                    query,
+                    ef,
+                    options.allow,
+                    scratch,
+                    &mut hook
+                ));
+                hook.flush();
+                units += stats.scored as usize;
+                emitted += hook.emitted;
+                if !completed || hook.stopped {
+                    stopped = true;
+                    break;
+                }
+            }
+        });
+        Ok(VectorStreamSummary {
+            query_count,
+            emitted,
+            units_scanned: units,
+            completed: !stopped,
+        })
+    }
+
+    /// A row's transcript is the bytes its score is computed from: the
+    /// dimension, then the stored FP32 row little-endian. Nothing else in
+    /// the image (norms, links) reaches a reported score.
+    fn row_transcripts(
+        &self,
+        rows: Range<usize>,
+        sink: &mut dyn FnMut(usize, &[u8]),
+    ) -> Result<(), VectorError> {
+        if rows.start > rows.end || rows.end > self.len() {
+            return Err(VectorError::new(format!(
+                "rows {rows:?} are outside the {} stored vectors",
+                self.len()
+            )));
+        }
+        let mut out = Vec::with_capacity(12 + 4 * self.dim);
+        for row in rows {
+            out.clear();
+            out.extend_from_slice(b"HNSW");
+            out.extend_from_slice(&(self.dim as u64).to_le_bytes());
+            self.row_bytes_into(row, &mut out);
+            sink(row, &out);
+        }
+        Ok(())
+    }
+}
+
+/// `VectorIndex::create`: the default config at `dimension`. The FP32 rows
+/// have no code width, so `bits_per_dimension` plays no part; the
+/// descriptor reports 32.
+pub(crate) fn create(dimension: usize) -> Result<VectorIndex, VectorError> {
+    HnswIndex::new(dimension, HnswConfig::default()).map(HnswIndex::into_index)
+}
+
+pub(crate) fn from_config(
+    dimension: usize,
+    config: &VectorBackendConfig,
+) -> Result<VectorIndex, VectorError> {
+    let config = HnswConfig::from_backend_config(config)?;
+    HnswIndex::new(dimension, config).map(HnswIndex::into_index)
+}
+
+pub(crate) fn load(path: &Path) -> Result<VectorIndex, VectorError> {
+    HnswIndex::load(path).map(HnswIndex::into_index)
+}
+
+pub(crate) fn load_mapped(path: &Path) -> Result<VectorIndex, VectorError> {
+    HnswIndex::load_mapped(path).map(HnswIndex::into_index)
+}
+
+#[allow(dead_code)]
+fn _assert_scored_is_small() {
+    const _: () = assert!(std::mem::size_of::<Scored>() == 8);
+}

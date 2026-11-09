@@ -37,6 +37,8 @@ toml = "1.1"
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 memmap2 = "0.9"
+# The hnsw provider's parallel build (docs/hnsw.md) inserts from every thread.
+rayon = "1"
 protomolt-analyzer = { path = "crates/protomolt-analyzer" }
 # The in-process node link (src/link.rs) frames request streams into the
 # handler's byte buffers itself: the body trait and the byte buffers, no socket.

@@ -1492,6 +1492,7 @@ dependencies = [
  "prost-types",
  "protomolt-analyzer",
  "protomolt-embedder",
+ "rayon",
  "redb",
  "rustls",
  "rustls-pki-types",
