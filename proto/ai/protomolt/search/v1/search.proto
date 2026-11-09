@@ -5927,9 +5927,13 @@ message DenseExecutionOutcome {
   string policy_fingerprint = 9;
   DensePolicyPoint policy_point = 10;
   // The live request key AUTO was judged on: filter selectivity in parts per
-  // million of the corpus (1,000,000 when unfiltered) and the candidate depth
-  // the providers were asked for. Set whenever a policy was consulted.
+  // million of the corpus (1,000,000 when unfiltered), set whenever a policy
+  // was consulted.
   uint32 filter_selectivity_ppm = 11;
+  // The candidate depth the providers were asked for: the beam an
+  // approximate traversal executed at. Set whenever resolved_mode is ANN
+  // (a policy point's `candidates` when AUTO qualified through one, else the
+  // request's selection_k or k); 0 for an exact traversal.
   uint32 candidate_depth = 12;
   // NOT_APPLICABLE without a measured AUTO policy; otherwise the scope of the
   // benchmark behind policy_point. FP32 depth evidence is in dense_quality.

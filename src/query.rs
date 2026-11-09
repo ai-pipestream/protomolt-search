@@ -1259,6 +1259,14 @@ pub(crate) async fn execute(
         },
         (_, None) => policy_depth.unwrap_or(req.k),
     };
+    // The depth the shards are asked for is the depth an approximate
+    // traversal executes at; the outcome reports it (a policy point names
+    // the same number, since the pool is fixed at it).
+    if let Some(outcome) = dense_execution.as_mut() {
+        if outcome.resolved_mode == DenseExecutionMode::Ann as i32 {
+            outcome.candidate_depth = fetch_k;
+        }
+    }
 
     match &plan.shape {
         Shape::Browse => {
