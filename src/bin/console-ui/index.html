@@ -34,11 +34,13 @@
           <div class="row"><select id="blend-norm"><option value="min_max">min-max</option><option value="z_score">z-score</option><option value="none">none</option></select>
           <select id="blend-comb"><option value="arithmetic">arithmetic</option><option value="geometric">geometric</option><option value="harmonic">harmonic</option></select></div></div>
         <div class="field"><label>Weights</label>
-          <div class="row"><input id="w-dense" type="number" step="0.1" placeholder="dense (1)"><input id="w-lex" type="number" step="0.1" placeholder="lexical (1)"></div></div>
+          <div class="row"><input id="w-dense" type="number" step="0.1" placeholder="dense" title="dense leg weight, default 1"><input id="w-lex" type="number" step="0.1" placeholder="lexical" title="lexical leg weight, default 1"></div></div>
       </div>
       <div id="shape-dense-fields" class="hidden">
         <div class="field"><label for="score-mode">Score mode</label>
           <select id="score-mode"><option value="native">4-bit native</option><option value="fp32">FP32 rerank</option></select></div>
+        <div class="field"><label for="exec-mode">Execution</label>
+          <select id="exec-mode" title="DenseQuery.execution_mode: how the candidate set is selected"><option value="">default (exact)</option><option value="DENSE_EXECUTION_MODE_EXACT">exact, certified</option><option value="DENSE_EXECUTION_MODE_ANN">ANN</option><option value="DENSE_EXECUTION_MODE_AUTO">auto</option></select></div>
         <div class="field"><label for="vector">Vector</label><textarea id="vector" rows="2" placeholder="paste [f32,...] or leave empty to embed the query text"></textarea></div>
       </div>
       <div id="shape-boolean" class="hidden">
@@ -48,6 +50,45 @@
       </div>
     </div>
 
+    <details class="panel fold" id="lex-options">
+      <summary><h2>Lexical options</h2><span id="lex-options-count" class="muted small"></span></summary>
+      <div class="field"><label for="phrase">Phrase</label>
+        <div class="row"><input id="phrase" type="checkbox" title="the words in order, within the slop (LexicalQuery.phrase)"><input id="slop" type="number" min="0" value="0" title="slop: positions the words may be apart"></div></div>
+      <div class="field"><label for="prefix">Prefix</label>
+        <div class="row"><input id="prefix" type="checkbox" title="expand the last word as a prefix in the dictionary (LexicalQuery.prefixes)"><input id="prefix-max" type="number" min="1" value="50" title="max expansions"></div></div>
+      <div class="field"><label for="synonyms">Synonyms</label><textarea id="synonyms" rows="2" spellcheck="false" placeholder="ship, vessel&#10;car => automobile"></textarea></div>
+      <div class="row"><label class="fixed"><input id="synonyms-off" type="checkbox"> ignore the cluster's synonym table</label></div>
+      <div class="stage-list" id="stages"></div>
+      <div class="row"><button id="add-stage" class="fixed" title="a score function over a stored column (LexicalQuery.score_stages)">+ score stage</button></div>
+    </details>
+
+    <details class="panel fold" id="boost-options">
+      <summary><h2>Boost</h2><span id="boost-count" class="muted small"></span></summary>
+      <div class="note">A second lexical query scored over the selection's candidates (<code>QueryRequest.boosts</code>). Its relevance shows on each hit as the signal <code>boost</code>.</div>
+      <div class="field"><label for="boost-text">Text</label><input id="boost-text" placeholder="boost query text"></div>
+      <div class="field"><label for="boost-window">Window</label><input id="boost-window" type="number" min="0" placeholder="candidates rescored"></div>
+      <div class="field"><label for="boost-base">Weights</label>
+        <div class="row"><input id="boost-base" type="number" step="0.1" placeholder="base" title="base_weight"><input id="boost-weight" type="number" step="0.1" placeholder="boost" title="boost_weight"></div></div>
+      <div id="boost-signal-only" class="muted small hidden">With a scorer the boost is a signal only: the window and weights are not sent.</div>
+    </details>
+
+    <details class="panel fold" id="scorer-options">
+      <summary><h2>Scorer</h2><span id="scorer-count" class="muted small"></span></summary>
+      <div class="note">The composite scorer (<code>QueryRequest.scorer</code>) reorders the <code>selection_k</code> candidates by named dimensions. A dimension reads the <code>base</code> score or the relevance of a query by its id.</div>
+      <div class="field"><label for="scorer-op">Operation</label>
+        <select id="scorer-op">
+          <option value="COMPOSITE_SCORE_OPERATION_WEIGHTED_SUM">weighted sum</option>
+          <option value="COMPOSITE_SCORE_OPERATION_WEIGHTED_MEAN">weighted mean</option>
+          <option value="COMPOSITE_SCORE_OPERATION_MAXIMUM">maximum</option>
+          <option value="COMPOSITE_SCORE_OPERATION_PRODUCT">product</option>
+          <option value="COMPOSITE_SCORE_OPERATION_GEOMETRIC_MEAN">geometric mean</option>
+          <option value="COMPOSITE_SCORE_OPERATION_HARMONIC_MEAN">harmonic mean</option>
+        </select></div>
+      <div class="stage-list" id="dims"></div>
+      <button id="add-dim">+ dimension</button>
+      <datalist id="signal-ids"></datalist>
+    </details>
+
     <div class="panel">
       <h2>Filter and paging</h2>
       <div class="field"><label for="filter">CEL filter</label><input id="filter" class="mono" placeholder='year >= 2010 && court == "scotus"'></div>
@@ -55,7 +96,8 @@
       <div class="field"><label for="selection-k">selection_k</label><input id="selection-k" type="number" value="0" min="0" placeholder="0 = default"></div>
       <div class="field"><label for="sort">Sort</label><input id="sort" class="mono" placeholder="year desc, court"></div>
       <div class="field"><label for="collapse">Collapse</label>
-        <div class="row"><input id="collapse" class="mono" placeholder="column"><input id="inner-hits" type="number" value="2" min="0" style="width:60px" title="inner hits"></div></div>
+        <div class="row"><input id="collapse" class="mono" placeholder="column" list="known-columns"><input id="inner-hits" type="number" value="2" min="0" class="narrow" title="inner hits per group"></div></div>
+      <div class="field"><label for="columns">Columns</label><input id="columns" class="mono" placeholder="court, year, citations" title="Stored columns or CEL expressions shown on each hit (QueryRequest.projections)"></div>
       <div class="field"><label for="highlight">Highlight</label>
         <div class="row"><input id="highlight" type="checkbox" class="fixed" checked><select id="hl-mode"><option value="HIGHLIGHT_MODE_SENTENCE">sentence</option><option value="HIGHLIGHT_MODE_WINDOW">window</option></select></div></div>
       <div class="row"><label class="fixed"><input id="explain" type="checkbox" checked> explain</label>
@@ -65,14 +107,15 @@
 
     <div class="panel">
       <h2>Aggregations</h2>
-      <div class="field"><label for="group-by">Group by</label><input id="group-by" class="mono" placeholder="facet column"></div>
+      <div class="field"><label for="group-by">Group by</label><input id="group-by" class="mono" placeholder="facet column" list="known-columns"></div>
       <div class="agg-list" id="aggs"></div>
       <div class="row"><button id="add-agg" class="fixed">+ fold</button></div>
-      <div class="field"><label for="hist-expr">Histogram</label>
-        <div class="row"><input id="hist-expr" class="mono" placeholder="expression"><input id="hist-interval" type="number" placeholder="interval" style="width:80px">
+      <div class="field"><label for="hist-expr">Histogram</label><input id="hist-expr" class="mono" placeholder="double(year), or a timestamp column"></div>
+      <div class="field"><label for="hist-interval">Interval</label>
+        <div class="row"><input id="hist-interval" type="number" placeholder="1" class="narrow">
           <select id="hist-calendar"><option value="">fixed</option><option value="CALENDAR_INTERVAL_DAY">day</option><option value="CALENDAR_INTERVAL_WEEK">week</option><option value="CALENDAR_INTERVAL_MONTH">month</option><option value="CALENDAR_INTERVAL_QUARTER">quarter</option><option value="CALENDAR_INTERVAL_YEAR">year</option></select></div></div>
       <div class="field"><label for="pct-expr">Percentiles</label>
-        <div class="row"><input id="pct-expr" class="mono" placeholder="expression"><input id="pct-list" class="mono" placeholder="50, 90, 99" style="width:100px"></div></div>
+        <div class="row"><input id="pct-expr" class="mono" placeholder="expression"><input id="pct-list" class="mono narrow" placeholder="50, 90, 99"></div></div>
     </div>
 
     <div class="panel">
@@ -90,31 +133,60 @@
         <div class="typeahead"><input id="q" placeholder="query text" autocomplete="off"><ul id="suggest" class="hidden"></ul></div>
         <button id="run" class="primary fixed">Search</button>
         <button id="stream" class="fixed" title="QueryStream: revisions as they settle">Stream</button>
+        <button id="time" class="fixed" title="run this query 20 times in sequence and show the latency distribution">Time</button>
+        <button id="keys" class="fixed" title="Keyboard shortcuts" aria-expanded="false" aria-controls="keys-help">?</button>
       </div>
+      <dl id="keys-help" class="keys hidden">
+        <dt><kbd>/</kbd></dt><dd>focus the query box</dd>
+        <dt><kbd>Ctrl</kbd> or <kbd>⌘</kbd> + <kbd>Enter</kbd></dt><dd>run the query from any field</dd>
+        <dt><kbd>↑</kbd> <kbd>↓</kbd> <kbd>Enter</kbd></dt><dd>choose a typeahead suggestion</dd>
+        <dt><kbd>[</kbd> <kbd>]</kbd></dt><dd>previous and next page</dd>
+        <dt><kbd>Esc</kbd></dt><dd>close the typeahead or this list</dd>
+        <dt><kbd>?</kbd></dt><dd>show or hide this list</dd>
+      </dl>
+      <div id="filter-chips" class="chips hidden"></div>
       <div id="dym" class="dym hidden"></div>
       <div id="error" class="error hidden"></div>
       <div id="profile-line" class="profile"></div>
+      <div id="phases" class="phases hidden"></div>
+      <div id="timing" class="timing hidden"></div>
       <div id="stream-log" class="muted small hidden"></div>
     </div>
     <div class="panel" id="results-panel">
-      <div class="toolbar"><span id="result-count" class="muted"></span><span class="spacer"></span>
+      <div class="toolbar"><span id="result-count" class="muted"></span>
+        <button id="pin" class="hidden" title="keep this ranking and mark how later runs move against it">pin baseline</button>
+        <button id="export-csv" class="hidden" title="download this page of hits as CSV">csv</button>
+        <button id="export-json" class="hidden" title="download the response as JSON">json</button>
         <button id="prev" disabled>◂ previous</button><button id="next" disabled>next ▸</button></div>
-      <div id="results"></div>
+      <div id="baseline" class="baseline hidden"></div>
+      <div id="results">
+        <div class="empty">
+          <p>Type a query and press <kbd>Enter</kbd>. The form on the left shapes it: lexical, dense, a hybrid of both with a fusion strategy, a boolean tree, or a filter-only browse.</p>
+          <ul>
+            <li>A <b>group-by</b> or a <b>histogram</b> on the left fills the rail on the right; click a value or a bar there to narrow the results to it.</li>
+            <li><b>Columns</b> puts stored values on each hit; click a value to filter by it.</li>
+            <li>The address bar holds the whole query, so a link reproduces it, and <b>History</b> keeps the last thirty.</li>
+            <li>Press <kbd>?</kbd> for the keyboard shortcuts.</li>
+          </ul>
+        </div>
+      </div>
     </div>
     <div class="panel hidden" id="ab-panel"></div>
     <div class="panel">
       <div class="tabs"><button class="active" data-tab="response">Response JSON</button><button data-tab="request">Request JSON</button><button data-tab="grpcurl">grpcurl</button></div>
-      <div class="toolbar"><span class="spacer"></span><button id="copy-raw">Copy</button></div>
+      <div class="toolbar"><a id="open-explorer" class="small hidden" href="/explorer" title="edit this request field by field against the documented shape">open in API explorer</a><span class="spacer"></span><button id="copy-raw">Copy</button></div>
       <pre class="raw" id="raw"></pre>
     </div>
   </main>
 
   <aside>
     <div class="panel"><h2>Aggregations</h2><div id="agg-out" class="muted small">Add a group-by, a fold, a histogram, or percentiles.</div></div>
-    <div class="panel"><h2>Synonyms</h2><div id="synonyms" class="muted small">none reported</div></div>
-    <div class="panel"><h2>Dense execution</h2><div id="dense-out" class="muted small mono"></div></div>
+    <div class="panel"><div class="toolbar"><h2>History</h2><span class="spacer"></span><button id="clear-history" class="quiet hidden">clear</button></div><div id="history" class="muted small">Queries you run are listed here.</div></div>
+    <div class="panel"><h2>Synonyms</h2><div id="synonyms-out" class="muted small">none reported</div></div>
+    <div class="panel"><h2>Dense execution</h2><div id="dense-out" class="muted small"></div></div>
   </aside>
 </div>
+<datalist id="known-columns"></datalist>
 <script type="module" src="/search.js"></script>
 </body>
 </html>
