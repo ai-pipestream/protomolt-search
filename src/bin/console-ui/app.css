@@ -283,3 +283,35 @@ pre.raw.tall { max-height: calc(100vh - 220px); min-height: 120px; }
 .shape button.name:hover { color: var(--accent); }
 .shape .comment { color: var(--soft); margin: 1px 0 0 12px; overflow-wrap: anywhere; }
 .shape .pill { margin-left: 6px; font-size: 10px; }
+
+/* Scorer dimensions on a hit: wider than a leg, for raw, norm and contribution. */
+.legs.dims { max-width: 640px; }
+.legs.dims .leg { grid-template-columns: 64px 1fr 290px; }
+.legs.dims .leg > :last-child { white-space: nowrap; }
+.leg.skipped { opacity: 0.55; }
+
+/* A timed query: one strip of runs per clock, on a shared axis from zero. */
+.timing { margin-top: 8px; font-size: 12px; display: grid; gap: 3px; }
+.timing .head { margin-top: 4px; }
+.timing .row { display: grid; grid-template-columns: 48px 1fr 400px; gap: 8px; align-items: center; }
+.timing .row > :last-child { text-align: right; font-size: 11px; white-space: nowrap; }
+.timing .strip { position: relative; height: 14px; border-bottom: 1px solid var(--rule); }
+.timing .strip i { position: absolute; bottom: 2px; width: 6px; height: 6px; margin-left: -3px; border-radius: 50%; background: var(--s1); opacity: 0.55; }
+.timing .strip.before i { background: var(--s0); }
+.timing .strip b { position: absolute; bottom: 0; width: 2px; height: 14px; margin-left: -1px; background: var(--ink); }
+.timing .axis { display: flex; justify-content: space-between; margin: 0 408px 0 56px; font-size: 10px; }
+@media (max-width: 720px) {
+  .timing .row { grid-template-columns: 48px 1fr; }
+  .timing .row > :last-child { grid-column: 1 / -1; text-align: left; white-space: normal; }
+  .timing .axis { margin: 0 0 0 56px; }
+}
+
+/* A route's latency histogram under the routes table. */
+#routes tbody tr { cursor: pointer; }
+#routes tbody tr.open td:first-child { box-shadow: inset 2px 0 0 var(--accent); font-weight: 600; }
+.route-latency { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--rule); font-size: 12px; }
+.route-latency .columns { display: flex; gap: 2px; align-items: stretch; margin-top: 6px; }
+.route-latency .col { flex: 0 1 84px; min-width: 0; display: grid; grid-template-rows: 14px 90px 14px 14px; text-align: center; font-size: 10px; }
+.route-latency .col i { align-self: end; background: var(--s1); border-radius: 2px 2px 0 0; min-height: 0; }
+.route-latency .col .le, .route-latency .col .count { white-space: nowrap; overflow: visible; color: var(--soft); }
+.route-latency .col .mark { color: var(--ink); font-weight: 600; white-space: nowrap; }

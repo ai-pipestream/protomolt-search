@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import {
   splitTopLevel, splitConjuncts, toggleConjunct, isIdentifier, celString, rangeColumn,
   rangeClause, replaceRange, calendarUpper, encodeState, decodeState, parseSynonyms,
-  identifiersIn, compareRuns, toCsv, defaultValue, insertAt,
+  identifiersIn, compareRuns, toCsv, defaultValue, insertAt, distribution,
 } from '../src/bin/console-ui/query-state.js';
 
 // Separators inside quotes and brackets do not split.
@@ -93,4 +93,8 @@ assert.deepEqual(
 assert.deepEqual(insertAt({ k: 5 }, [{ name: 'k' }], 0), { k: 5 });
 assert.deepEqual(insertAt({}, [{ name: 'by_name', map: true }, { name: 'weight' }], 0), { by_name: { key: { weight: 0 } } });
 assert.deepEqual(insertAt({ by_name: { a: {} } }, [{ name: 'by_name', map: true }, { name: 'weight' }], 1), { by_name: { a: { weight: 1 } } });
+// Nearest-rank order statistics: each figure is one of the samples.
+const twenty = Array.from({ length: 20 }, (_, i) => 20 - i);
+assert.deepEqual(distribution(twenty), { min: 1, p50: 10, p95: 19, max: 20 });
+assert.deepEqual(distribution([7]), { min: 7, p50: 7, p95: 7, max: 7 });
 console.log('console_ui: ok');

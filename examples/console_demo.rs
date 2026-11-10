@@ -11,6 +11,7 @@
 //! something to run against; it says nothing about retrieval quality.
 
 use std::pin::Pin;
+use std::sync::Arc;
 
 use pipestream_search::collections::CollectionSet;
 use pipestream_search::console::{Console, ConsoleConfig};
@@ -23,7 +24,8 @@ use pipestream_search::pb::analysis::analysis_service_server::{
     AnalysisService, AnalysisServiceServer,
 };
 use pipestream_search::pb::analysis::{
-    AnalyzeRequest, AnalyzeResponse, AnalyzeStreamRequest, AnalyzeStreamResponse, ChunkEmbedding,
+    analyze_stream_request, analyze_stream_response, AnalyzeRequest, AnalyzeResponse,
+    AnalyzeStreamError, AnalyzeStreamRequest, AnalyzeStreamResponse, ChunkEmbedding,
     GetCapabilitiesRequest, GetCapabilitiesResponse, Span,
 };
 use pipestream_search::pb::node_service_client::NodeServiceClient;
@@ -241,17 +243,29 @@ fn embed(text: &str) -> Vec<f32> {
     v
 }
 
-/// The mock sidecar plus the demo embedding on the unary call, which is
-/// the call the console's `/api/embed` makes.
-struct DemoAnalysis(MockAnalysis);
+/// The mock sidecar with two additions: the demo embedding on the unary
+/// call (the call the console's `/api/embed` makes), and punctuation
+/// blanked before the mock sees the text. The mock splits on whitespace
+/// only, so the prose's "…a seaworthy ship." would index `ship.` and a
+/// query for `ship` would find nothing.
+struct DemoAnalysis(Arc<MockAnalysis>);
+
+/// `text` with each ASCII punctuation byte as a space: the same length,
+/// so every span the mock reports still addresses the original.
+fn unpunctuated(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_ascii_punctuation() { ' ' } else { c })
+        .collect()
+}
 
 #[tonic::async_trait]
 impl AnalysisService for DemoAnalysis {
     async fn analyze(
         &self,
-        request: Request<AnalyzeRequest>,
+        mut request: Request<AnalyzeRequest>,
     ) -> Result<Response<AnalyzeResponse>, Status> {
-        let text = request.get_ref().text.clone();
+        let text = std::mem::take(&mut request.get_mut().text);
+        request.get_mut().text = unpunctuated(&text);
         let wants_embedding = request
             .get_ref()
             .options
@@ -274,11 +288,48 @@ impl AnalysisService for DemoAnalysis {
     type AnalyzeStreamStream =
         Pin<Box<dyn Stream<Item = Result<AnalyzeStreamResponse, Status>> + Send>>;
 
+    /// Each document through the mock's unary call, answered in order.
     async fn analyze_stream(
         &self,
         request: Request<Streaming<AnalyzeStreamRequest>>,
     ) -> Result<Response<Self::AnalyzeStreamStream>, Status> {
-        self.0.analyze_stream(request).await
+        let mut inbound = request.into_inner();
+        let mock = self.0.clone();
+        let (tx, rx) = mpsc::channel(16);
+        tokio::spawn(async move {
+            let mut options = None;
+            while let Ok(Some(message)) = inbound.message().await {
+                let doc = match message.msg {
+                    Some(analyze_stream_request::Msg::Options(o)) => {
+                        options = Some(o);
+                        continue;
+                    }
+                    Some(analyze_stream_request::Msg::Doc(doc)) => doc,
+                    None => continue,
+                };
+                let analyzed = mock
+                    .analyze(Request::new(AnalyzeRequest {
+                        text: unpunctuated(&doc.text),
+                        options: options.clone(),
+                    }))
+                    .await;
+                let result = match analyzed {
+                    Ok(ok) => analyze_stream_response::Result::Ok(ok.into_inner()),
+                    Err(status) => analyze_stream_response::Result::Error(AnalyzeStreamError {
+                        code: status.code() as i32,
+                        message: status.message().to_string(),
+                    }),
+                };
+                let response = AnalyzeStreamResponse {
+                    sequence: doc.sequence,
+                    result: Some(result),
+                };
+                if tx.send(Ok(response)).await.is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
     async fn get_capabilities(
@@ -295,7 +346,7 @@ async fn serve_analysis() -> String {
     tokio::spawn(
         Server::builder()
             .add_service(
-                AnalysisServiceServer::new(DemoAnalysis(MockAnalysis::default()))
+                AnalysisServiceServer::new(DemoAnalysis(Arc::new(MockAnalysis::default())))
                     .max_decoding_message_size(MAX_MESSAGE_BYTES)
                     .max_encoding_message_size(MAX_MESSAGE_BYTES),
             )

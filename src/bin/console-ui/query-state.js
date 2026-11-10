@@ -165,6 +165,14 @@ export function identifiersIn(text) {
   return [...new Set(found.filter((w) => !CEL_WORDS.has(w)))];
 }
 
+// The order statistics of a sample by the nearest-rank rule, so every
+// figure is a value that was measured.
+export function distribution(values) {
+  const sorted = [...values].sort((a, b) => a - b);
+  const rank = (q) => sorted[Math.max(0, Math.ceil(q * sorted.length) - 1)];
+  return { min: sorted[0], p50: rank(0.5), p95: rank(0.95), max: sorted[sorted.length - 1] };
+}
+
 // How a run moved against a pinned baseline. Both are document ids in
 // rank order. `moves` has one entry per current hit: the ranks it rose
 // (positive), fell (negative), or null when the baseline did not have it.

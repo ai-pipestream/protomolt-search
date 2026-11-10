@@ -13,6 +13,8 @@ const state = {
   stream: null,
   snapshots: [],       // ring of parsed snapshots
   routeSparks: new Map(),
+  routeHists: new Map(), // rpc -> its latency histogram over the window
+  routeOpen: null,       // the route whose distribution is drawn
   activeRoutes: new Set(), // routes seen serving, or with errors
   allRoutes: false,        // whether idle routes are listed too
   routeSort: 'rate',
@@ -287,7 +289,7 @@ function renderRoutes(snap, prev, oldest, dt, windowDt) {
     let tr = tbody.querySelector(`tr[data-rpc="${r.rpc}"]`);
     if (!tr) {
       const canvas = el('canvas', { class: 'spark', style: 'height:18px;width:120px' });
-      tr = el('tr', { 'data-rpc': r.rpc }, [
+      tr = el('tr', { 'data-rpc': r.rpc, title: 'click for the latency distribution', onclick: () => { state.routeOpen = state.routeOpen === r.rpc ? null : r.rpc; renderRouteLatency(); } }, [
         el('td', { class: 'mono', text: r.rpc }), el('td', { class: 'num rate' }), el('td', { class: 'num p50' }), el('td', { class: 'num p99' }), el('td', { class: 'num err' }), el('td', {}, [canvas]),
       ]);
       tbody.append(tr);
@@ -298,6 +300,7 @@ function renderRoutes(snap, prev, oldest, dt, windowDt) {
     const h = mergeHistograms(snap, oldest, (labels) => labels.rpc === r.rpc && !labels.phase);
     const p50 = h ? histogramQuantile(h.buckets, 0.5) : null;
     const p99 = h ? histogramQuantile(h.buckets, 0.99) : null;
+    state.routeHists.set(r.rpc, h);
     tr.querySelector('.rate').textContent = rate.toFixed(2);
     tr.querySelector('.p50').textContent = p50 == null ? '–' : fmtMs(p50 * 1000);
     tr.querySelector('.p99').textContent = p99 == null ? '–' : fmtMs(p99 * 1000);
@@ -311,6 +314,47 @@ function renderRoutes(snap, prev, oldest, dt, windowDt) {
   }
   void windowDt;
   arrangeRoutes();
+  renderRouteLatency();
+}
+
+// The open route's latency histogram over the window: one column per
+// bucket between the first and the last that hold a request, with the
+// buckets p50 and p99 fall in named. Two humps are a cold and a warm path.
+function renderRouteLatency() {
+  const box = clear($('route-latency'));
+  const rpc = state.routeOpen;
+  for (const tr of $('routes').querySelectorAll('tbody tr')) tr.classList.toggle('open', tr.dataset.rpc === rpc);
+  box.classList.toggle('hidden', !rpc);
+  if (!rpc) return;
+  const h = state.routeHists.get(rpc);
+  const buckets = [...(h?.buckets || [])].map((b) => ({ le: Number(b.le), cumulative: Number(b.cumulativeCount) })).sort((a, b) => a.le - b.le);
+  const columns = buckets.map((b, i) => ({ le: b.le, from: i ? buckets[i - 1].le : 0, count: b.cumulative - (i ? buckets[i - 1].cumulative : 0) }));
+  const first = columns.findIndex((c) => c.count > 0);
+  const head = el('div', { class: 'head' }, [el('span', { class: 'mono', text: rpc }), ' ']);
+  box.append(head);
+  if (first < 0) {
+    head.append(el('span', { class: 'muted', text: 'no request in the window' }));
+    return;
+  }
+  const shown = columns.slice(first, columns.findLastIndex((c) => c.count > 0) + 1);
+  const total = shown.reduce((a, c) => a + c.count, 0);
+  const p50 = histogramQuantile(h.buckets, 0.5);
+  const p99 = histogramQuantile(h.buckets, 0.99);
+  head.append(el('span', { class: 'muted', text: `${fmtNum(total)} request(s) in the window · p50 ${fmtMs(p50 * 1000)} · p99 ${fmtMs(p99 * 1000)}` }));
+  const top = Math.max(...shown.map((c) => c.count));
+  const edge = (seconds) => (Number.isFinite(seconds) ? fmtMs(seconds * 1000) : 'over');
+  const holds = (c, q) => q > c.from && q <= c.le;
+  const chart = el('div', { class: 'columns', role: 'img', 'aria-label': `latency histogram of ${rpc}: ${shown.map((c) => `${c.count} up to ${edge(c.le)}`).join(', ')}` });
+  shown.forEach((c, i) => {
+    const mark = [holds(c, p50) && 'p50', holds(c, p99) && 'p99'].filter(Boolean).join(' · ');
+    chart.append(el('div', { class: 'col', title: `${fmtNum(c.count)} request(s) from ${edge(c.from)} to ${edge(c.le)}` }, [
+      el('span', { class: 'mono count', text: c.count ? fmtNum(c.count) : '' }),
+      el('i', { style: `height:${(100 * c.count) / top}%` }),
+      el('span', { class: 'mono le', text: i === 0 || i === shown.length - 1 || mark ? `≤ ${edge(c.le)}` : '' }),
+      el('span', { class: 'mono mark', text: mark }),
+    ]));
+  });
+  box.append(chart);
 }
 
 // Order the rows by the chosen column (ties by name) and hide the

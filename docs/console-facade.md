@@ -84,14 +84,20 @@ expansion cap, synonym rules for this query (one per line, `a, b` for
 an equivalence and `a => b, c` for a one-way rule) or the cluster's
 table switched off, score stages over a column (exponential decay with
 origin and scale, a log multiplier, a linear addend), and a boost query
-with its window and weights. A panel that holds a value opens by itself
-and says how many it holds.
+with its window and weights, and the composite scorer: its operation
+and a list of dimensions, each reading the `base` score or a query's
+relevance by id (`lex`, `dense`, `boost`, a clause id) with a weight, a
+normalization and a missing-value policy. With a scorer the boost is a
+signal only, so its window and weights are not sent. A dense leaf takes
+its execution mode (exact, ANN, auto) beside the score mode. A panel
+that holds a value opens by itself and says how many it holds.
 
 A hit shows its score with a bar against the top score on the page, the
 requested columns as labelled values (a projected value carries no name;
 the request's projection at the same index names it), snippets or the
 stored text clamped to a few lines, one bar per leg for a multi-leg
-shape (each against that leg's best on the page), scorer dimensions,
+shape (each against that leg's best on the page), one row per scorer
+dimension (raw value, normalized value as a bar, contribution),
 matched clauses, and a foldable explain tree. The profile line shows the
 wall and total times, the shards the coordinator skipped from their
 placement and the segments skipped, over a stacked bar of the phase
@@ -117,6 +123,12 @@ keeps the last thirty in `localStorage`. `/` focuses the query box,
 `Ctrl` or `⌘` with `Enter` runs from any field, `[` and `]` page, the
 arrow keys choose a typeahead suggestion, and `?` lists these.
 
+**Time** sends the request twenty times in sequence (first page, no
+explain) and draws each run's server total and browser wall time on one
+axis from zero, with min, p50, p95 and max by nearest rank and whether
+every run returned the same ranking; the timing before it stays
+underneath for comparison. It measures a query, not throughput.
+
 Typeahead comes from `Suggest` on the last word, did-you-mean from
 `TermSuggest` after each query. The Stream button runs the same request
 through `QueryStream` without `explain` (the unary route serves it),
@@ -133,9 +145,11 @@ baseline ranks. The **csv** and **json** buttons download the page of
 hits (rank, id, score, each signal, each column, text) and the response.
 The single-column inputs (collapse, group-by, an aggregation's
 expression, a stage's column) suggest the column names of earlier
-successful queries, since no RPC lists a cluster's columns. The raw view shows the request, the
-response, and a working `grpcurl` line (the token spelled as
-`$BEARER_TOKEN`). Dense shapes need an embedding: the sidecar's when
+successful queries, since no RPC lists a cluster's columns. The raw
+view shows the request, the response, and a working `grpcurl` line (the
+token spelled as `$BEARER_TOKEN`); its request tab links to the API
+page with the request as the body (through `localStorage` when it is
+too long for a URL). Dense shapes need an embedding: the sidecar's when
 `--analysis` is given, a pasted vector otherwise.
 
 **API** (`/explorer`) lists every exposed method with a filter. A
@@ -154,7 +168,8 @@ process into tiles with sparklines (requests per second, windowed p99,
 in flight, errors, scan candidates, floors published, scan bytes per
 second with the rate while scanning, and the kernel's active share) and
 a per-route table with p50 and p99 from the latency histograms over the
-stream's window; the table lists the routes that have served a request
+stream's window, and a click on a route draws that histogram (one
+column per occupied bucket, the buckets holding p50 and p99 named); the table lists the routes that have served a request
 since the page opened or carry errors, sorted by the column heading
 clicked, with the idle labels behind a toggle, so a new route appears on
 its own. A knobs panel from `GetRuntimeKnobs` has
@@ -211,8 +226,8 @@ parsing, the descriptor's method list, and the JSON round trip.
 `node tests/console_ui.mjs` covers the UI's pure module
 (`query-state.js`): the filter's split into conditions, the clauses a
 click adds, the calendar bucket bounds, the URL encoding, the synonym
-rules, the baseline comparison, the CSV writer, and the API page's
-field inserts.
+rules, the baseline comparison, the CSV writer, the API page's field
+inserts, and the timing's order statistics.
 
 ## A demo cluster
 
@@ -221,7 +236,9 @@ cluster that lives in the one process: four shards of 150 generated
 court-opinion paragraphs each (facets `court` and `topic`, integers
 `year` and `filed`, the numeric `citations`, three chunks per opinion),
 a coordinator with diagnostics and an in-memory control plane, and the
-mock analysis sidecar with a hashed bag-of-words embedding, so every
+mock analysis sidecar with a hashed bag-of-words embedding (and with
+punctuation blanked before it tokenizes, since the mock splits on
+whitespace only), so every
 panel of the pages has something to show. The embedding is a toy: two
 texts are close when they share stemmed words. Nothing is written to
 disk. `--listen=` moves it off `127.0.0.1:8600`.

@@ -10,6 +10,7 @@ const $ = (id) => document.getElementById(id);
 // A stream shows its newest messages first, as many as fit this many
 // characters, so a long stream of large messages costs the same to draw.
 const STREAM_CHARS = 200_000;
+const HANDOFF_KEY = 'pipestream.console.explorer-body';
 const state = {
   config: null,
   described: null, // the /api/describe answer for the chosen method
@@ -49,7 +50,12 @@ function restore() {
   const params = new URLSearchParams(location.hash.replace(/^#/, ''));
   const [service, method] = (params.get('m') || '').split('.');
   if (params.get('t')) $('target').value = params.get('t');
-  if (service && method) choose(service, method, params.get('b'), false);
+  // The search page hands over a request too long for a URL in storage.
+  let body = params.get('b');
+  if (params.get('from') === 'search') {
+    try { body = localStorage.getItem(HANDOFF_KEY) ?? body; } catch { /* an empty body */ }
+  }
+  if (service && method) choose(service, method, body, false);
 }
 
 function remember() {

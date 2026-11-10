@@ -10,7 +10,7 @@ import {
 import {
   splitTopLevel, splitConjuncts, toggleConjunct, replaceRange, isIdentifier, celString,
   rangeColumn, rangeClause, calendarUpper, encodeState, decodeState, parseSynonyms,
-  identifiersIn, compareRuns, toCsv,
+  identifiersIn, compareRuns, toCsv, distribution,
 } from '/query-state.js';
 
 const $ = (id) => document.getElementById(id);
@@ -28,13 +28,14 @@ const state = {
   suggestIndex: -1,
   suggestSeq: 0,    // bumped when the list closes, so a late answer does not reopen it
   baseline: null,   // the pinned run: { label, hash, ids, at }
+  timings: [],      // the last two timed queries, newest first
 };
 
 // The controls the URL carries. A pasted vector is left out: it does not
 // fit in a URL.
 const FORM_IDS = [
   'q', 'shape', 'phrase', 'slop', 'prefix', 'prefix-max', 'synonyms', 'synonyms-off',
-  'boost-text', 'boost-window', 'boost-base', 'boost-weight', 'fusion', 'rrf-k', 'blend-norm', 'blend-comb', 'w-dense', 'w-lex', 'score-mode',
+  'boost-text', 'boost-window', 'boost-base', 'boost-weight', 'fusion', 'rrf-k', 'blend-norm', 'blend-comb', 'w-dense', 'w-lex', 'score-mode', 'exec-mode', 'scorer-op',
   'msm', 'filter', 'k', 'selection-k', 'sort', 'collapse', 'inner-hits', 'columns', 'highlight',
   'hl-mode', 'explain', 'profile', 'fetch-text', 'group-by', 'hist-expr', 'hist-interval',
   'hist-calendar', 'pct-expr', 'pct-list', 'ab-a', 'ab-b',
@@ -51,6 +52,15 @@ const SCORE_OPS = [
   ['SCORE_OP_MULT_LOG', 'log boost', 'score × (1 + weight · ln(1 + x))', ['weight']],
   ['SCORE_OP_ADD_LINEAR', 'add', 'score + weight · x', ['weight']],
 ];
+const NORMALIZATIONS = [['', 'min-max (default)'], ['SCORE_NORMALIZATION_Z_SCORE', 'z-score'], ['SCORE_NORMALIZATION_NONE', 'raw']];
+const MISSING = [
+  ['', 'missing: zero', 'a candidate without the signal scores a normalized zero, its weight still counted'],
+  ['MISSING_SCORE_POLICY_SKIP', 'missing: skip', 'the dimension leaves the combination for that candidate'],
+  ['MISSING_SCORE_POLICY_ERROR', 'missing: refuse', 'a candidate without the signal refuses the request'],
+];
+const TIMED_RUNS = 20;
+// Where a request too long for a URL waits for the API explorer.
+const HANDOFF_KEY = 'pipestream.console.explorer-body';
 
 mountHeader('search');
 init();
@@ -69,6 +79,9 @@ async function init() {
   addClause('must', 'lexical', '');
   $('add-agg').addEventListener('click', () => addAgg());
   $('add-stage').addEventListener('click', () => addStage());
+  $('add-dim').addEventListener('click', () => { addDim(); syncFolds(); });
+  $('scorer-options').addEventListener('toggle', syncFolds);
+  $('time').addEventListener('click', timeQuery);
   $('pin').addEventListener('click', pinBaseline);
   $('export-csv').addEventListener('click', exportCsv);
   $('export-json').addEventListener('click', () => download('response.json', 'application/json', $('raw').textContent));
@@ -130,6 +143,13 @@ function readForm() {
     origin: row.querySelector('.origin').value,
     scale: row.querySelector('.scale').value,
   }));
+  form.dims = [...$('dims').querySelectorAll('.stage')].map((row) => ({
+    id: row.querySelector('.dim-id').value,
+    source: row.querySelector('.source').value,
+    weight: row.querySelector('.weight').value,
+    normalization: row.querySelector('.normalization').value,
+    missing: row.querySelector('.missing').value,
+  }));
   return form;
 }
 
@@ -145,6 +165,8 @@ function writeForm(form) {
   for (const a of form.aggs) addAgg(a.name, a.expression, a.op);
   clear($('stages'));
   for (const st of form.stages) addStage(st);
+  clear($('dims'));
+  for (const d of form.dims) addDim(d);
   syncShape();
   renderChips();
 }
@@ -230,6 +252,62 @@ function syncFolds() {
   const boost = $('boost-text').value.trim() ? 1 : 0;
   $('boost-count').textContent = boost ? 'set' : '';
   if (boost) $('boost-options').open = true;
+  const dims = scorerDimensions().length;
+  $('scorer-count').textContent = dims ? `${dims} dimension(s)` : '';
+  if (dims) $('scorer-options').open = true;
+  $('boost-signal-only').classList.toggle('hidden', !(dims && boost));
+  clear($('signal-ids')).append(...['base', ...signalIds()].map((value) => el('option', { value })));
+}
+
+// The query ids the current form produces: what a scorer dimension can
+// read by `query_relevance_id`. A filter has no relevance.
+function signalIds() {
+  const shape = $('shape').value;
+  const ids = [];
+  if (shape === 'lexical' || shape === 'hybrid') ids.push('lex');
+  if (shape === 'dense' || shape === 'hybrid') ids.push('dense');
+  if (shape === 'boolean') {
+    [...$('clauses').querySelectorAll('.leaf')].forEach((leaf, i) => { if (leaf.value !== 'filter') ids.push(`${leaf.value}${i}`); });
+  }
+  if ($('boost-text').value.trim()) ids.push('boost');
+  return ids;
+}
+
+function addDim(dim = {}) {
+  const select = (cls, options, chosen) => el('select', { class: cls }, options.map(([value, label, title]) => el('option', { value, text: label, title, selected: value === (chosen ?? '') })));
+  const row = el('div', { class: 'stage' }, [
+    el('input', { class: 'mono dim-id', value: dim.id ?? '', placeholder: 'name', title: 'names the dimension on each hit' }),
+    el('input', { class: 'mono source', value: dim.source ?? '', placeholder: 'base, or a query id', list: 'signal-ids', title: 'base is the selection\'s own score; anything else is a query id (lex, dense, boost, a clause id)' }),
+    el('button', { text: '×', title: 'remove this dimension', onclick: () => row.remove() }),
+    el('div', { class: 'params' }, [
+      el('input', { class: 'mono weight', type: 'number', step: 'any', value: dim.weight ?? '', placeholder: 'weight 1', title: 'weight; 0 reports the dimension without counting it' }),
+      select('normalization', NORMALIZATIONS, dim.normalization),
+      select('missing', MISSING, dim.missing),
+    ]),
+  ]);
+  $('dims').append(row);
+}
+
+// The scorer's dimensions as the request spells them. A row needs a
+// source; its name defaults to the source.
+function scorerDimensions() {
+  const dimensions = [];
+  for (const row of $('dims').querySelectorAll('.stage')) {
+    const source = row.querySelector('.source').value.trim();
+    if (!source) continue;
+    const dimension = {
+      id: row.querySelector('.dim-id').value.trim() || source,
+      source: source === 'base' ? { base: true } : { query_relevance_id: source },
+    };
+    const weight = row.querySelector('.weight').value;
+    if (weight !== '') dimension.weight = Number(weight);
+    const normalization = row.querySelector('.normalization').value;
+    if (normalization) dimension.normalization = normalization;
+    const missing = row.querySelector('.missing').value;
+    if (missing) dimension.missing = missing;
+    dimensions.push(dimension);
+  }
+  return dimensions;
 }
 
 function addStage(stage = {}) {
@@ -311,6 +389,7 @@ function lexicalLeafWithOptions(id, text) {
 function denseLeaf(id, vector) {
   const dense = { vector };
   if ($('score-mode').value === 'fp32') dense.score_mode = enums.fp32;
+  if ($('exec-mode').value) dense.execution_mode = $('exec-mode').value;
   return { search: { id, dense } };
 }
 
@@ -436,10 +515,14 @@ async function buildRequest() {
   if (collapse) request.collapse = { column: collapse, inner_hits: Number($('inner-hits').value || 0) };
   const columns = splitTopLevel($('columns').value, ',');
   if (columns.length) request.projections = columns.map((expression) => ({ name: expression, expression }));
+  const dimensions = scorerDimensions();
+  if (dimensions.length) request.scorer = { operation: $('scorer-op').value, dimensions };
   const boostText = $('boost-text').value.trim();
   if (boostText) {
     const boost = { query: { id: 'boost', lexical: { text: boostText } } };
-    for (const [id, field] of [['boost-window', 'window'], ['boost-base', 'base_weight'], ['boost-weight', 'boost_weight']]) {
+    // With a scorer the boost is a signal only, and the engine refuses
+    // the fields of the reorder it no longer does.
+    for (const [id, field] of dimensions.length ? [] : [['boost-window', 'window'], ['boost-base', 'base_weight'], ['boost-weight', 'boost_weight']]) {
       if ($(id).value !== '') boost[field] = Number($(id).value);
     }
     request.boosts = [boost];
@@ -497,6 +580,75 @@ async function run({ paging = false, push = true } = {}) {
   } finally {
     $('run').disabled = false;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Timing: the same request in sequence, for its latency distribution
+// ---------------------------------------------------------------------------
+
+async function timeQuery() {
+  stopStream();
+  hideSuggest();
+  hideError();
+  let request;
+  try {
+    request = await buildRequest();
+  } catch (e) {
+    return showError(e);
+  }
+  // The first page, with the server's own total and without the cost
+  // of an explain tree.
+  delete request.explain;
+  delete request.cursor;
+  request.profile = true;
+  const button = $('time');
+  button.disabled = true;
+  const timing = { label: `${$('shape').value} ${JSON.stringify($('q').value.trim())}`, server: [], wall: [], rankings: new Set() };
+  try {
+    for (let i = 0; i < TIMED_RUNS; i++) {
+      button.textContent = `${i + 1}/${TIMED_RUNS}`;
+      const started = performance.now();
+      const r = await api.rpc('SearchService', 'Query', request);
+      timing.wall.push(performance.now() - started);
+      timing.server.push(Number(r.profile?.totalMs ?? 0));
+      const hits = r.groups?.length ? r.groups.flatMap((g) => g.hits || []) : r.hits || [];
+      timing.rankings.add(hits.map((h) => h.docId).join(','));
+    }
+    state.timings = [timing, ...state.timings].slice(0, 2);
+    renderTiming();
+  } catch (e) {
+    showError(e);
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Time';
+  }
+}
+
+// The newest timing over the one before it, on one axis from zero so
+// the two can be compared by eye.
+function renderTiming() {
+  const box = clear($('timing'));
+  box.classList.toggle('hidden', !state.timings.length);
+  const max = Math.max(...state.timings.flatMap((t) => [...t.server, ...t.wall]));
+  state.timings.forEach((t, i) => {
+    box.append(el('div', { class: 'head' }, [
+      el('span', { class: 'muted', text: i ? 'before' : 'timed' }), ' ',
+      el('span', { class: 'mono', text: t.label }), ' ',
+      el('span', { class: 'muted', text: `${t.wall.length} runs in sequence, ${t.rankings.size === 1 ? 'the same ranking every run' : `${t.rankings.size} different rankings`}` }),
+    ]));
+    for (const [name, values, title] of [['server', t.server, 'QueryProfile.total_ms'], ['wall', t.wall, 'request to response in this browser']]) {
+      const d = distribution(values);
+      const strip = el('span', { class: `strip${i ? ' before' : ''}`, role: 'img', 'aria-label': `${name}: min ${fmtMs(d.min)}, p50 ${fmtMs(d.p50)}, p95 ${fmtMs(d.p95)}, max ${fmtMs(d.max)}` });
+      for (const v of values) strip.append(el('i', { style: `left:${share(v, max)}%`, title: fmtMs(v) }));
+      strip.append(el('b', { style: `left:${share(d.p50, max)}%`, title: `p50 ${fmtMs(d.p50)}` }));
+      box.append(el('div', { class: 'row', title }, [
+        el('span', { class: 'mono muted', text: name }),
+        strip,
+        el('span', { class: 'mono', text: `min ${fmtMs(d.min)} · p50 ${fmtMs(d.p50)} · p95 ${fmtMs(d.p95)} · max ${fmtMs(d.max)}` }),
+      ]));
+    }
+  });
+  if (state.timings.length) box.append(el('div', { class: 'axis mono muted' }, [el('span', { text: '0' }), el('span', { text: fmtMs(max) })]));
 }
 
 function page(direction) {
@@ -757,11 +909,12 @@ async function fetchTexts(ids) {
 // What the bars on a page of hits are drawn against: the top score, and
 // per signal id the largest value on the page.
 function pageScale(hits) {
-  const scale = { score: 0, signals: new Map(), legs: 0, moves: new Map() };
+  const scale = { score: 0, signals: new Map(), legs: 0, dimension: 0, moves: new Map() };
   for (const h of hits) {
     scale.score = Math.max(scale.score, Number(h.score ?? 0));
     scale.legs = Math.max(scale.legs, (h.signals || []).length);
     for (const s of h.signals || []) scale.signals.set(s.id, Math.max(scale.signals.get(s.id) ?? 0, Number(s.score)));
+    for (const d of h.dimensions || []) scale.dimension = Math.max(scale.dimension, Math.abs(Number(d.normalized)));
   }
   return scale;
 }
@@ -827,8 +980,21 @@ function hitNode(h, scale) {
     }
     node.append(legs);
   }
+  if (h.dimensions?.length) {
+    // One row per scorer dimension: the normalized value as a bar
+    // against the largest on the page, then what it added to the score.
+    const dims = el('div', { class: 'legs dims' });
+    for (const d of h.dimensions) {
+      const text = d.skipped ? 'skipped' : `${d.raw == null ? 'missing' : `raw ${fmtNum(d.raw)}`} · norm ${fmtNum(d.normalized)} → ${fmtNum(d.contribution)}`;
+      dims.append(el('div', { class: `leg${d.skipped ? ' skipped' : ''}`, title: `dimension ${d.id}: ${text}` }, [
+        el('span', { class: 'mono muted', text: d.id }),
+        el('span', { class: 'track' }, [el('span', { style: `width:${d.skipped ? 0 : share(Math.abs(Number(d.normalized)), scale.dimension)}%` })]),
+        el('span', { class: 'mono', text }),
+      ]));
+    }
+    node.append(dims);
+  }
   const meta = el('div', { class: 'meta signals' });
-  for (const d of h.dimensions || []) meta.append(el('span', { text: `${d.id}: ${d.skipped ? 'skipped' : `raw ${fmtNum(d.raw)} norm ${fmtNum(d.normalized)} → ${fmtNum(d.contribution)}`}` }));
   if (h.matched?.length) meta.append(el('span', { text: `matched ${h.matched.join(',')}` }));
   if (meta.firstChild) node.append(meta);
   if (h.explain) {
@@ -1025,6 +1191,16 @@ function renderDense(response) {
 function renderRaw() {
   const pre = $('raw');
   for (const b of document.querySelectorAll('.tabs button')) b.classList.toggle('active', b.dataset.tab === state.tab);
+  // The request tab links to the API explorer with this request as the
+  // body: in the fragment when it fits a URL, through storage otherwise.
+  const link = $('open-explorer');
+  link.classList.toggle('hidden', state.tab !== 'request' || !state.request);
+  if (state.request) {
+    const body = JSON.stringify(state.request);
+    const fits = body.length <= 4000;
+    link.href = `/explorer#${new URLSearchParams(fits ? { m: 'SearchService.Query', b: body } : { m: 'SearchService.Query', from: 'search' })}`;
+    link.onclick = fits ? null : () => { try { localStorage.setItem(HANDOFF_KEY, body); } catch { /* the explorer opens with an empty body */ } };
+  }
   if (state.tab === 'request') pre.textContent = JSON.stringify(state.request, null, 2);
   else if (state.tab === 'grpcurl') pre.textContent = state.request ? grpcurlFor(state.config, 'SearchService', 'Query', state.request) : '';
   else {
@@ -1114,11 +1290,7 @@ async function didYouMean() {
   if (!text || $('shape').value === 'browse') return;
   try {
     const r = await api.rpc('SearchService', 'TermSuggest', { field: 'body', text, mode: 'TERM_SUGGEST_MODE_MISSING', limit: 3, analysis: state.config.body_spec });
-    // A candidate that differs only in punctuation is the same word.
-    const word = (term) => term.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
-    const terms = (r.terms || [])
-      .map((t) => ({ ...t, candidates: (t.candidates || []).filter((c) => word(c.term) !== word(t.term)) }))
-      .filter((t) => t.candidates.length);
+    const terms = (r.terms || []).filter((t) => t.candidates?.length);
     if (!terms.length) return;
     clear(box).append('Did you mean: ');
     for (const t of terms) {
