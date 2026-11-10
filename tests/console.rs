@@ -496,11 +496,56 @@ async fn the_facade_transcodes_search_and_diagnostics_and_serves_the_ui() {
     let r = http(c, "GET", "/dashboard", None).await;
     assert_eq!(r.status, 200);
     assert!(r.body.contains("dashboard.js"));
+    let r = http(c, "GET", "/explorer", None).await;
+    assert_eq!(r.status, 200);
+    assert!(r.body.contains("explorer.js"));
+
+    // The describe route: an exposed method's message shapes from the
+    // descriptor set, nested messages and enums included once each, with
+    // the .proto comments; the unexposed surface answers as /api/rpc does.
+    let r = http(c, "GET", "/api/describe/SearchService/Query", None).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let d: Value = serde_json::from_str(&r.body).unwrap();
+    assert_eq!(d["request"], "ai.protomolt.search.v1.QueryRequest");
+    assert_eq!(d["response"], "ai.protomolt.search.v1.QueryResponse");
+    assert_eq!(d["server_streaming"], false);
+    let fields = d["messages"]["ai.protomolt.search.v1.QueryRequest"]["fields"]
+        .as_array()
+        .unwrap();
+    let k = fields.iter().find(|f| f["name"] == "k").unwrap();
+    assert_eq!(k["type"], "uint32");
+    assert_eq!(k["repeated"], false);
+    assert!(!k["comment"].as_str().unwrap().is_empty(), "{k}");
+    let sort = fields.iter().find(|f| f["name"] == "sort").unwrap();
+    assert_eq!(sort["type"], "ai.protomolt.search.v1.QuerySort");
+    assert_eq!(sort["repeated"], true);
+    // SelectionQuery reaches itself through its composite; it is listed once.
+    let selection = &d["messages"]["ai.protomolt.search.v1.SelectionQuery"]["fields"];
+    assert!(selection
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|f| f["oneof"].is_string()));
+    assert!(d["enums"]["ai.protomolt.search.v1.HighlightMode"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("HIGHLIGHT_MODE_SENTENCE")));
+    let r = http(c, "GET", "/api/describe/SearchService/QueryStream", None).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&r.body).unwrap()["server_streaming"],
+        true
+    );
+    let r = http(c, "GET", "/api/describe/NodeService/Health", None).await;
+    assert_eq!(r.status, 404);
+    let r = http(c, "GET", "/api/describe/SearchService/Nope", None).await;
+    assert_eq!(r.status, 404);
+
     for asset in [
         "/app.css",
         "/common.js",
         "/search.js",
         "/dashboard.js",
+        "/explorer.js",
         "/query-state.js",
         "/sparkline.js",
     ] {

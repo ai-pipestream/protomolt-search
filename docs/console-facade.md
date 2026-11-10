@@ -41,6 +41,9 @@ proto3 JSON object, then `event: end`; a status mid-stream arrives as
 comes from a POST body, from a `request=<url-encoded JSON>` query
 parameter, or from scalar query parameters mapped onto top-level fields
 (`GET /api/stream/DiagnosticsService/StreamMetrics?interval_ms=1000`).
+A client that takes more than ten seconds to accept one frame is
+dropped: its unread gRPC stream would otherwise hold flow-control
+window on the channel all calls share.
 
 ## Convenience routes
 
@@ -50,6 +53,10 @@ parameter, or from scalar query parameters mapped onto top-level fields
   nodes, whether TLS, a bearer token, and an analysis sidecar are
   configured), the exposed method list with streaming flags, and the
   corpus analysis spec the suggesters need.
+- `GET /api/describe/<Service>/<Method>`: the method's comment,
+  streaming flag, request and response type names, and every message
+  (fields with JSON name, number, type, repeated, oneof, map, comment)
+  and enum reachable from them, from the compiled descriptor set.
 - `POST /api/embed` `{"text"}`: the analysis sidecar's embedding, when
   `--analysis` is given; 501 otherwise.
 - `POST /api/documents` `{"doc_ids": [...]}`: stored text and lineage
@@ -59,9 +66,10 @@ parameter, or from scalar query parameters mapped onto top-level fields
 
 ## The UI
 
-Two pages, plain ES modules and CSS embedded in the binary, no build
-step and no external resources; light and dark follow the system, and
-reduced motion is respected.
+Three pages, plain ES modules and CSS embedded in the binary, no build
+step and no external resources. Light and dark follow the system until
+the header's theme control picks one (kept per browser), and reduced
+motion is respected.
 
 **Search** (`/`) builds the unified `Query` from a form: the selection
 shape (lexical, dense, hybrid composite with the fusion strategy and
@@ -70,7 +78,14 @@ filter-only browse), a CEL filter, `k` and `selection_k`, sort keys,
 collapse with inner hits, the columns to show on each hit (sent as
 `projections`), highlight snippets, an aggregation rail (group-by,
 folds, a fixed or calendar histogram, percentiles), the explain and
-profile flags, and cursor paging.
+profile flags, and cursor paging. Two folded panels carry the rest of
+the lexical leaf and the request: phrase with slop, prefix with its
+expansion cap, synonym rules for this query (one per line, `a, b` for
+an equivalence and `a => b, c` for a one-way rule) or the cluster's
+table switched off, score stages over a column (exponential decay with
+origin and scale, a log multiplier, a linear addend), and a boost query
+with its window and weights. A panel that holds a value opens by itself
+and says how many it holds.
 
 A hit shows its score with a bar against the top score on the page, the
 requested columns as labelled values (a projected value carries no name;
@@ -110,10 +125,29 @@ The A/B panel runs `VariantSearch` with two configurations and shows
 both rankings with movement markers, the rank-difference figures, and
 the interleaved list in place of the hit list. A failed query keeps the
 previous results on screen, dimmed and labelled, and outlines the field
-the engine's message names. The raw view shows the request, the
+the engine's message names. **Pin baseline** keeps the current ranking
+(for the tab's session); every later run then marks each hit with its
+movement against it (up, down, new), states the overlap and whether the
+top hit changed, and lists the hits that dropped out with their
+baseline ranks. The **csv** and **json** buttons download the page of
+hits (rank, id, score, each signal, each column, text) and the response.
+The single-column inputs (collapse, group-by, an aggregation's
+expression, a stage's column) suggest the column names of earlier
+successful queries, since no RPC lists a cluster's columns. The raw view shows the request, the
 response, and a working `grpcurl` line (the token spelled as
 `$BEARER_TOKEN`). Dense shapes need an embedding: the sidecar's when
 `--analysis` is given, a pasted vector otherwise.
+
+**API** (`/explorer`) lists every exposed method with a filter. A
+method shows its request and response shapes from `GET /api/describe`,
+each field with its type and the comment written over it in the
+`.proto`, nested messages unfolding in place and oneof members marked.
+A click on a request field adds it to the JSON body with a starting
+value (the first named value of an enum, an element for a repeated
+field), creating the messages above it. Run sends the body to the
+coordinator or a chosen node, a streaming method lists its messages
+newest first until stopped (as many as fit 200,000 characters), and the tabs show the response and
+the `grpcurl` line. The URL fragment holds the method, target and body.
 
 **Dashboard** (`/dashboard`) streams `StreamMetrics` from the chosen
 process into tiles with sparklines (requests per second, windowed p99,
@@ -167,14 +201,18 @@ out of range; the placement dry run (a tree with no default refused by
 name, a planned tree's rows per leaf) and the balance dry run against an
 in-memory control plane, with the other control methods answering 404;
 404 for internal services and unknown methods; document
-text routed by slot range; the 501 embedding route; the UI assets with
+text routed by slot range; the 501 embedding route; the describe route
+(fields, a oneof, an enum, the streaming flag, 404 for an internal
+service); the UI assets with
 their content types; the suggesters; the server-sent event stream for
 `QueryStream` with its end frame and the query-parameter form; and the
 loopback rule. `src/console.rs` unit-tests the URL decoding, the query
 parsing, the descriptor's method list, and the JSON round trip.
 `node tests/console_ui.mjs` covers the UI's pure module
 (`query-state.js`): the filter's split into conditions, the clauses a
-click adds, the calendar bucket bounds, and the URL encoding.
+click adds, the calendar bucket bounds, the URL encoding, the synonym
+rules, the baseline comparison, the CSV writer, and the API page's
+field inserts.
 
 ## A demo cluster
 
@@ -184,6 +222,6 @@ court-opinion paragraphs each (facets `court` and `topic`, integers
 `year` and `filed`, the numeric `citations`, three chunks per opinion),
 a coordinator with diagnostics and an in-memory control plane, and the
 mock analysis sidecar with a hashed bag-of-words embedding, so every
-panel of both pages has something to show. The embedding is a toy: two
+panel of the pages has something to show. The embedding is a toy: two
 texts are close when they share stemmed words. Nothing is written to
 disk. `--listen=` moves it off `127.0.0.1:8600`.

@@ -324,6 +324,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             facet_fields: vec!["court".into(), "topic".into()],
             numeric_fields: vec!["citations".into()],
             sentence_fields: vec!["body".into()],
+            position_fields: vec!["body".into()],
             ..Default::default()
         })
         .await;

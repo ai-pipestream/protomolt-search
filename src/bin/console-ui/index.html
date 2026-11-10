@@ -48,6 +48,27 @@
       </div>
     </div>
 
+    <details class="panel fold" id="lex-options">
+      <summary><h2>Lexical options</h2><span id="lex-options-count" class="muted small"></span></summary>
+      <div class="field"><label for="phrase">Phrase</label>
+        <div class="row"><input id="phrase" type="checkbox" title="the words in order, within the slop (LexicalQuery.phrase)"><input id="slop" type="number" min="0" value="0" title="slop: positions the words may be apart"></div></div>
+      <div class="field"><label for="prefix">Prefix</label>
+        <div class="row"><input id="prefix" type="checkbox" title="expand the last word as a prefix in the dictionary (LexicalQuery.prefixes)"><input id="prefix-max" type="number" min="1" value="50" title="max expansions"></div></div>
+      <div class="field"><label for="synonyms">Synonyms</label><textarea id="synonyms" rows="2" spellcheck="false" placeholder="ship, vessel&#10;car => automobile"></textarea></div>
+      <div class="row"><label class="fixed"><input id="synonyms-off" type="checkbox"> ignore the cluster's synonym table</label></div>
+      <div class="stage-list" id="stages"></div>
+      <div class="row"><button id="add-stage" class="fixed" title="a score function over a stored column (LexicalQuery.score_stages)">+ score stage</button></div>
+    </details>
+
+    <details class="panel fold" id="boost-options">
+      <summary><h2>Boost</h2><span id="boost-count" class="muted small"></span></summary>
+      <div class="note">A second lexical query scored over the selection's candidates (<code>QueryRequest.boosts</code>). Its relevance shows on each hit as the signal <code>boost</code>.</div>
+      <div class="field"><label for="boost-text">Text</label><input id="boost-text" placeholder="boost query text"></div>
+      <div class="field"><label for="boost-window">Window</label><input id="boost-window" type="number" min="0" placeholder="candidates rescored"></div>
+      <div class="field"><label for="boost-base">Weights</label>
+        <div class="row"><input id="boost-base" type="number" step="0.1" placeholder="base" title="base_weight"><input id="boost-weight" type="number" step="0.1" placeholder="boost" title="boost_weight"></div></div>
+    </details>
+
     <div class="panel">
       <h2>Filter and paging</h2>
       <div class="field"><label for="filter">CEL filter</label><input id="filter" class="mono" placeholder='year >= 2010 && court == "scotus"'></div>
@@ -55,7 +76,7 @@
       <div class="field"><label for="selection-k">selection_k</label><input id="selection-k" type="number" value="0" min="0" placeholder="0 = default"></div>
       <div class="field"><label for="sort">Sort</label><input id="sort" class="mono" placeholder="year desc, court"></div>
       <div class="field"><label for="collapse">Collapse</label>
-        <div class="row"><input id="collapse" class="mono" placeholder="column"><input id="inner-hits" type="number" value="2" min="0" class="narrow" title="inner hits per group"></div></div>
+        <div class="row"><input id="collapse" class="mono" placeholder="column" list="known-columns"><input id="inner-hits" type="number" value="2" min="0" class="narrow" title="inner hits per group"></div></div>
       <div class="field"><label for="columns">Columns</label><input id="columns" class="mono" placeholder="court, year, citations" title="Stored columns or CEL expressions shown on each hit (QueryRequest.projections)"></div>
       <div class="field"><label for="highlight">Highlight</label>
         <div class="row"><input id="highlight" type="checkbox" class="fixed" checked><select id="hl-mode"><option value="HIGHLIGHT_MODE_SENTENCE">sentence</option><option value="HIGHLIGHT_MODE_WINDOW">window</option></select></div></div>
@@ -66,7 +87,7 @@
 
     <div class="panel">
       <h2>Aggregations</h2>
-      <div class="field"><label for="group-by">Group by</label><input id="group-by" class="mono" placeholder="facet column"></div>
+      <div class="field"><label for="group-by">Group by</label><input id="group-by" class="mono" placeholder="facet column" list="known-columns"></div>
       <div class="agg-list" id="aggs"></div>
       <div class="row"><button id="add-agg" class="fixed">+ fold</button></div>
       <div class="field"><label for="hist-expr">Histogram</label><input id="hist-expr" class="mono" placeholder="double(year), or a timestamp column"></div>
@@ -110,8 +131,12 @@
       <div id="stream-log" class="muted small hidden"></div>
     </div>
     <div class="panel" id="results-panel">
-      <div class="toolbar"><span id="result-count" class="muted"></span><span class="spacer"></span>
+      <div class="toolbar"><span id="result-count" class="muted"></span>
+        <button id="pin" class="hidden" title="keep this ranking and mark how later runs move against it">pin baseline</button>
+        <button id="export-csv" class="hidden" title="download this page of hits as CSV">csv</button>
+        <button id="export-json" class="hidden" title="download the response as JSON">json</button>
         <button id="prev" disabled>◂ previous</button><button id="next" disabled>next ▸</button></div>
+      <div id="baseline" class="baseline hidden"></div>
       <div id="results">
         <div class="empty">
           <p>Type a query and press <kbd>Enter</kbd>. The form on the left shapes it: lexical, dense, a hybrid of both with a fusion strategy, a boolean tree, or a filter-only browse.</p>
@@ -135,10 +160,11 @@
   <aside>
     <div class="panel"><h2>Aggregations</h2><div id="agg-out" class="muted small">Add a group-by, a fold, a histogram, or percentiles.</div></div>
     <div class="panel"><div class="toolbar"><h2>History</h2><span class="spacer"></span><button id="clear-history" class="quiet hidden">clear</button></div><div id="history" class="muted small">Queries you run are listed here.</div></div>
-    <div class="panel"><h2>Synonyms</h2><div id="synonyms" class="muted small">none reported</div></div>
+    <div class="panel"><h2>Synonyms</h2><div id="synonyms-out" class="muted small">none reported</div></div>
     <div class="panel"><h2>Dense execution</h2><div id="dense-out" class="muted small"></div></div>
   </aside>
 </div>
+<datalist id="known-columns"></datalist>
 <script type="module" src="/search.js"></script>
 </body>
 </html>

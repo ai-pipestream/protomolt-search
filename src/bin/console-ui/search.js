@@ -9,7 +9,8 @@ import {
 } from '/common.js';
 import {
   splitTopLevel, splitConjuncts, toggleConjunct, replaceRange, isIdentifier, celString,
-  rangeColumn, rangeClause, calendarUpper, encodeState, decodeState,
+  rangeColumn, rangeClause, calendarUpper, encodeState, decodeState, parseSynonyms,
+  identifiersIn, compareRuns, toCsv,
 } from '/query-state.js';
 
 const $ = (id) => document.getElementById(id);
@@ -25,18 +26,31 @@ const state = {
   vector: null,     // last embedded vector, with the text it came from
   defaults: null,   // the form as the page loads it, for the URL state
   suggestIndex: -1,
+  suggestSeq: 0,    // bumped when the list closes, so a late answer does not reopen it
+  baseline: null,   // the pinned run: { label, hash, ids, at }
 };
 
 // The controls the URL carries. A pasted vector is left out: it does not
 // fit in a URL.
 const FORM_IDS = [
-  'q', 'shape', 'fusion', 'rrf-k', 'blend-norm', 'blend-comb', 'w-dense', 'w-lex', 'score-mode',
+  'q', 'shape', 'phrase', 'slop', 'prefix', 'prefix-max', 'synonyms', 'synonyms-off',
+  'boost-text', 'boost-window', 'boost-base', 'boost-weight', 'fusion', 'rrf-k', 'blend-norm', 'blend-comb', 'w-dense', 'w-lex', 'score-mode',
   'msm', 'filter', 'k', 'selection-k', 'sort', 'collapse', 'inner-hits', 'columns', 'highlight',
   'hl-mode', 'explain', 'profile', 'fetch-text', 'group-by', 'hist-expr', 'hist-interval',
   'hist-calendar', 'pct-expr', 'pct-list', 'ab-a', 'ab-b',
 ];
 const HISTORY_KEY = 'pipestream.console.history';
 const HISTORY_MAX = 30;
+const COLUMNS_KEY = 'pipestream.console.columns';
+const COLUMNS_MAX = 60;
+const BASELINE_KEY = 'pipestream.console.baseline';
+// The inputs whose text names columns, for the suggestions.
+const COLUMN_INPUTS = ['filter', 'sort', 'collapse', 'columns', 'group-by', 'hist-expr', 'pct-expr'];
+const SCORE_OPS = [
+  ['SCORE_OP_MULT_EXP_DECAY', 'decay', 'score × exp(−|x − origin| / scale)', ['origin', 'scale']],
+  ['SCORE_OP_MULT_LOG', 'log boost', 'score × (1 + weight · ln(1 + x))', ['weight']],
+  ['SCORE_OP_ADD_LINEAR', 'add', 'score + weight · x', ['weight']],
+];
 
 mountHeader('search');
 init();
@@ -54,6 +68,10 @@ async function init() {
   $('add-clause').addEventListener('click', () => addClause());
   addClause('must', 'lexical', '');
   $('add-agg').addEventListener('click', () => addAgg());
+  $('add-stage').addEventListener('click', () => addStage());
+  $('pin').addEventListener('click', pinBaseline);
+  $('export-csv').addEventListener('click', exportCsv);
+  $('export-json').addEventListener('click', () => download('response.json', 'application/json', $('raw').textContent));
   $('run').addEventListener('click', () => run());
   $('stream').addEventListener('click', () => (state.stream ? stopStream() : streamQuery()));
   $('prev').addEventListener('click', () => page(-1));
@@ -76,8 +94,11 @@ async function init() {
   $('run-ab').addEventListener('click', () => runAb());
   $('clear-history').addEventListener('click', () => { saveHistory([]); renderHistory(); });
   state.defaults = readForm();
+  try { state.baseline = JSON.parse(sessionStorage.getItem(BASELINE_KEY) || 'null'); } catch { state.baseline = null; }
   syncShape();
   renderHistory();
+  renderKnownColumns();
+  renderBaseline();
   window.addEventListener('popstate', () => restoreFromUrl());
   restoreFromUrl();
 }
@@ -102,6 +123,13 @@ function readForm() {
     expression: row.querySelector('.expr').value,
     op: row.querySelector('.op').value,
   }));
+  form.stages = [...$('stages').querySelectorAll('.stage')].map((row) => ({
+    op: row.querySelector('.op').value,
+    column: row.querySelector('.column').value,
+    weight: row.querySelector('.weight').value,
+    origin: row.querySelector('.origin').value,
+    scale: row.querySelector('.scale').value,
+  }));
   return form;
 }
 
@@ -115,6 +143,8 @@ function writeForm(form) {
   for (const c of form.clauses) addClause(c.kind, c.leaf, c.value);
   clear($('aggs'));
   for (const a of form.aggs) addAgg(a.name, a.expression, a.op);
+  clear($('stages'));
+  for (const st of form.stages) addStage(st);
   syncShape();
   renderChips();
 }
@@ -185,6 +215,41 @@ function syncShape() {
   const fusion = $('fusion').value;
   $('rrf-fields').classList.toggle('hidden', fusion !== 'rrf');
   $('blend-fields').classList.toggle('hidden', fusion !== 'blend');
+  // The engine serves these on the single lexical leaf only.
+  $('lex-options').classList.toggle('hidden', shape !== 'lexical');
+  syncFolds();
+}
+
+// A folded panel says how many of its options are set, and opens when
+// the form it was restored from set any.
+function syncFolds() {
+  const lex = [$('phrase').checked, $('prefix').checked, $('synonyms').value.trim(), $('synonyms-off').checked]
+    .filter(Boolean).length + $('stages').querySelectorAll('.stage').length;
+  $('lex-options-count').textContent = lex ? `${lex} set` : '';
+  if (lex) $('lex-options').open = true;
+  const boost = $('boost-text').value.trim() ? 1 : 0;
+  $('boost-count').textContent = boost ? 'set' : '';
+  if (boost) $('boost-options').open = true;
+}
+
+function addStage(stage = {}) {
+  const input = (cls, value) => el('input', { class: `mono ${cls}`, type: 'number', step: 'any', value: value ?? '', placeholder: cls, title: cls });
+  const op = el('select', { class: 'op' }, SCORE_OPS.map(([value, label, title]) => el('option', { value, text: label, title, selected: value === stage.op })));
+  const row = el('div', { class: 'stage' }, [
+    op,
+    el('input', { class: 'mono column', value: stage.column ?? '', placeholder: 'column', list: 'known-columns' }),
+    el('button', { text: '×', title: 'remove this stage', onclick: () => row.remove() }),
+    el('div', { class: 'params' }, [input('weight', stage.weight), input('origin', stage.origin), input('scale', stage.scale)]),
+  ]);
+  // Only the parameters the operation reads take a value.
+  const sync = () => {
+    const reads = SCORE_OPS.find(([value]) => value === op.value)[3];
+    for (const name of ['weight', 'origin', 'scale']) row.querySelector(`.${name}`).classList.toggle('hidden', !reads.includes(name));
+    op.title = SCORE_OPS.find(([value]) => value === op.value)[2];
+  };
+  op.addEventListener('change', sync);
+  sync();
+  $('stages').append(row);
 }
 
 function addClause(kind = 'should', leaf = 'lexical', value = '') {
@@ -200,7 +265,7 @@ function addClause(kind = 'should', leaf = 'lexical', value = '') {
 function addAgg(name = '', expression = '', op = 'AGGREGATE_OP_COUNT') {
   const row = el('div', { class: 'agg' }, [
     el('input', { class: 'mono name', value: name, placeholder: 'name' }),
-    el('input', { class: 'mono expr', value: expression, placeholder: 'expression, e.g. year' }),
+    el('input', { class: 'mono expr', value: expression, placeholder: 'expression, e.g. year', list: 'known-columns' }),
     el('select', { class: 'op' }, enums.aggregateOp.map((o) => el('option', { value: o, text: o.replace('AGGREGATE_OP_', '').toLowerCase(), selected: o === op }))),
     el('button', { text: '×', title: 'remove this fold', onclick: () => row.remove() }),
   ]);
@@ -209,6 +274,38 @@ function addAgg(name = '', expression = '', op = 'AGGREGATE_OP_COUNT') {
 
 function lexicalLeaf(id, text) {
   return { search: { id, lexical: { text } } };
+}
+
+// The single lexical leaf with the options the form sets on it.
+function lexicalLeafWithOptions(id, text) {
+  const lexical = { text };
+  if ($('phrase').checked) lexical.phrase = { slop: Number($('slop').value || 0) };
+  if ($('prefix').checked) {
+    // The last word becomes the prefix; the words before it stay terms.
+    // A prefix is normalized under the field's char filters, so the
+    // engine wants the analysis spec spelled out.
+    const words = text.split(/\s+/).filter(Boolean);
+    const prefix = words.pop() ?? '';
+    lexical.text = words.join(' ');
+    lexical.prefixes = [{ prefix, max_expansions: Number($('prefix-max').value || 50) }];
+    lexical.analysis = state.config.body_spec;
+  }
+  const synonyms = parseSynonyms($('synonyms').value);
+  if (synonyms.length) lexical.synonyms = synonyms;
+  if ($('synonyms-off').checked) lexical.synonyms_off = true;
+  const stages = [];
+  for (const row of $('stages').querySelectorAll('.stage')) {
+    const column = row.querySelector('.column').value.trim();
+    if (!column) continue;
+    const stage = { op: row.querySelector('.op').value, column };
+    for (const name of SCORE_OPS.find(([value]) => value === stage.op)[3]) {
+      const value = row.querySelector(`.${name}`).value;
+      if (value !== '') stage[name] = Number(value);
+    }
+    stages.push(stage);
+  }
+  if (stages.length) lexical.score_stages = stages;
+  return { search: { id, lexical } };
 }
 
 function denseLeaf(id, vector) {
@@ -286,7 +383,7 @@ async function buildRequest() {
   if (needsVector) vector = await queryVector(text || $('vector').value.trim());
   if (shape !== 'browse' && shape !== 'boolean' && !text && !vector) throw { error: 'query text is required' };
 
-  if (shape === 'lexical') selection = lexicalLeaf('lex', text);
+  if (shape === 'lexical') selection = lexicalLeafWithOptions('lex', text);
   else if (shape === 'dense') selection = denseLeaf('dense', vector);
   else if (shape === 'hybrid') {
     const scoring = {};
@@ -339,6 +436,14 @@ async function buildRequest() {
   if (collapse) request.collapse = { column: collapse, inner_hits: Number($('inner-hits').value || 0) };
   const columns = splitTopLevel($('columns').value, ',');
   if (columns.length) request.projections = columns.map((expression) => ({ name: expression, expression }));
+  const boostText = $('boost-text').value.trim();
+  if (boostText) {
+    const boost = { query: { id: 'boost', lexical: { text: boostText } } };
+    for (const [id, field] of [['boost-window', 'window'], ['boost-base', 'base_weight'], ['boost-weight', 'boost_weight']]) {
+      if ($(id).value !== '') boost[field] = Number($(id).value);
+    }
+    request.boosts = [boost];
+  }
   // Snippets are served for the single lexical selection only, and a
   // filter makes the selection a composite; the stored text shows then.
   if ($('highlight').checked && shape === 'lexical' && !filter) {
@@ -360,6 +465,8 @@ async function buildRequest() {
 // first page; `push` writes the form to the URL as a new history entry.
 async function run({ paging = false, push = true } = {}) {
   stopStream();
+  hideSuggest();
+  syncFolds();
   if (!paging) { state.cursor = ''; state.cursors = []; }
   $('ab-panel').classList.add('hidden');
   $('results-panel').classList.remove('hidden');
@@ -381,6 +488,7 @@ async function run({ paging = false, push = true } = {}) {
     state.response = response;
     await render(response);
     if (!paging) remember(hash, response);
+    learnColumns();
     didYouMean();
   } catch (e) {
     state.response = { error: e };
@@ -406,7 +514,7 @@ function page(direction) {
 // The field an engine message is about, by the word the message opens
 // with or names, so the red line has a place on the form.
 const ERROR_FIELDS = [
-  [/^histogram\b/, 'hist-expr'], [/^percentile/, 'pct-expr'], [/^projection\b/, 'columns'],
+  [/^histogram\b/, 'hist-expr'], [/^percentile/, 'pct-expr'], [/^projections?\b/, 'columns'],
   [/^sort\b/, 'sort'], [/^collapse\b/, 'collapse'], [/^filter\b|\bCEL\b/, 'filter'],
   [/^aggregat|group_by|group-by/, 'group-by'],
 ];
@@ -489,6 +597,10 @@ async function render(response) {
   const all = groups.length ? groups.flatMap((g) => g.hits || []) : hits;
   if ($('fetch-text').checked) await fetchTexts(all.map((h) => h.docId));
   const scale = pageScale(all);
+  for (const id of ['pin', 'export-csv', 'export-json']) $(id).classList.toggle('hidden', !all.length);
+  const comparison = state.baseline && !state.cursor ? compareRuns(state.baseline.ids, all.map((h) => String(h.docId))) : null;
+  if (comparison) all.forEach((h, i) => scale.moves.set(h, comparison.moves[i]));
+  renderBaseline(comparison);
   const results = clear($('results'));
   if (!all.length) {
     results.append(el('div', { class: 'empty', text: 'Nothing matched. Loosen the filter, or check the did-you-mean line above.' }));
@@ -506,6 +618,128 @@ async function render(response) {
   } else {
     for (const h of hits) results.append(hitNode(h, scale));
   }
+  if (comparison?.dropped.length) results.append(await droppedNode(comparison.dropped));
+}
+
+// ---------------------------------------------------------------------------
+// The pinned baseline
+// ---------------------------------------------------------------------------
+
+function currentHits() {
+  const r = state.response || {};
+  return r.groups?.length ? r.groups.flatMap((g) => g.hits || []) : r.hits || [];
+}
+
+function pinBaseline() {
+  const form = readForm();
+  const label = [form.shape, form.q ? `"${form.q}"` : '', form.filter].filter(Boolean).join(' ');
+  state.baseline = { label, hash: encodeState(form, state.defaults), ids: currentHits().map((h) => String(h.docId)), at: Date.now() };
+  try { sessionStorage.setItem(BASELINE_KEY, JSON.stringify(state.baseline)); } catch { /* the pin lasts for the page then */ }
+  if (state.response) render(state.response);
+}
+
+function unpinBaseline() {
+  state.baseline = null;
+  try { sessionStorage.removeItem(BASELINE_KEY); } catch { /* nothing was stored */ }
+  if (state.response?.hits) render(state.response);
+  else renderBaseline();
+}
+
+function renderBaseline(comparison) {
+  const box = clear($('baseline'));
+  const b = state.baseline;
+  box.classList.toggle('hidden', !b);
+  if (!b) return;
+  box.append(
+    el('span', { class: 'muted', text: 'baseline' }),
+    el('a', { class: 'mono', href: `#${b.hash}`, title: 'restore the form the baseline was run from', text: b.label }),
+    el('span', { class: 'muted mono', text: `${b.ids.length} hit(s)` }),
+  );
+  if (comparison) {
+    const depth = comparison.moves.length;
+    box.append(el('span', { class: 'mono' }, [
+      `overlap ${comparison.overlap}/${Math.max(depth, b.ids.length)} · ${comparison.added} new · ${comparison.dropped.length} dropped · `,
+      el('span', { class: comparison.topSame ? '' : 'move down', text: comparison.topSame ? 'top hit same' : 'top hit changed' }),
+    ]));
+  } else if (state.cursor) {
+    box.append(el('span', { class: 'muted', text: 'compared on the first page only' }));
+  }
+  box.append(el('span', { class: 'spacer' }), el('button', { class: 'quiet', text: 'unpin', onclick: unpinBaseline }));
+}
+
+function moveNode(move) {
+  if (move === undefined) return null;
+  if (move === null) return el('span', { class: 'move new', text: 'new', title: 'not in the baseline' });
+  if (move === 0) return el('span', { class: 'move', text: '=', title: 'same rank as in the baseline' });
+  return el('span', { class: `move ${move > 0 ? 'up' : 'down'}`, text: `${move > 0 ? '▲' : '▼'}${Math.abs(move)}`, title: `${move > 0 ? 'up' : 'down'} ${Math.abs(move)} against the baseline` });
+}
+
+// What the baseline had that this run does not, folded under the hits.
+async function droppedNode(dropped) {
+  if ($('fetch-text').checked) await fetchTexts(dropped.map((d) => d.id));
+  const list = el('div');
+  for (const d of dropped) {
+    const doc = state.texts.get(d.id);
+    list.append(el('div', { class: 'hit' }, [
+      el('div', { class: 'head' }, [el('span', { class: 'rank', text: `#${d.rank}` }), el('span', { class: 'id', text: `doc ${d.id}` }), el('span', { class: 'move down', text: 'dropped' })]),
+      doc?.text ? el('div', { class: 'text clamp', text: doc.text }) : null,
+    ]));
+  }
+  return el('details', { class: 'dropped' }, [el('summary', { class: 'muted', text: `${dropped.length} in the baseline, not in this run (baseline ranks)` }), list]);
+}
+
+// ---------------------------------------------------------------------------
+// Export, and the column names seen
+// ---------------------------------------------------------------------------
+
+function download(name, type, text) {
+  const url = URL.createObjectURL(new Blob([text], { type }));
+  const a = el('a', { href: url, download: name });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function exportCsv() {
+  const hits = currentHits();
+  const signals = [...new Set(hits.flatMap((h) => (h.signals || []).map((s) => s.id)))];
+  const projections = (state.request?.projections || []).map((p) => p.name);
+  const rows = [['rank', 'doc_id', 'score', ...signals.map((id) => `signal:${id}`), ...projections, 'text']];
+  for (const h of hits) {
+    const bySignal = new Map((h.signals || []).map((s) => [s.id, s.score]));
+    rows.push([
+      h.rank, h.docId, h.score, ...signals.map((id) => bySignal.get(id)),
+      ...projections.map((_, i) => (h.projected?.[i] ? projectedValue(h.projected[i]) : '')),
+      state.texts.get(String(h.docId))?.text ?? (h.snippets || []).map((s) => s.text).join(' … '),
+    ]);
+  }
+  download('hits.csv', 'text/csv', toCsv(rows));
+}
+
+function knownColumns() {
+  try {
+    const list = JSON.parse(localStorage.getItem(COLUMNS_KEY) || '[]');
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
+}
+
+// No RPC lists a cluster's columns, so the names a query that succeeded
+// used are remembered and offered on the single-column inputs.
+function learnColumns() {
+  const stages = [...$('stages').querySelectorAll('.column')].map((n) => n.value);
+  const aggs = [...$('aggs').querySelectorAll('.expr')].map((n) => n.value);
+  const used = identifiersIn([...COLUMN_INPUTS.map((id) => $(id).value), ...stages, ...aggs].join(' ; '));
+  const list = [...new Set([...used, ...knownColumns()])].slice(0, COLUMNS_MAX);
+  try { localStorage.setItem(COLUMNS_KEY, JSON.stringify(list)); } catch { /* suggestions are a convenience */ }
+  renderKnownColumns();
+}
+
+function renderKnownColumns() {
+  const list = clear($('known-columns'));
+  for (const name of knownColumns()) list.append(el('option', { value: name }));
 }
 
 async function fetchTexts(ids) {
@@ -523,7 +757,7 @@ async function fetchTexts(ids) {
 // What the bars on a page of hits are drawn against: the top score, and
 // per signal id the largest value on the page.
 function pageScale(hits) {
-  const scale = { score: 0, signals: new Map(), legs: 0 };
+  const scale = { score: 0, signals: new Map(), legs: 0, moves: new Map() };
   for (const h of hits) {
     scale.score = Math.max(scale.score, Number(h.score ?? 0));
     scale.legs = Math.max(scale.legs, (h.signals || []).length);
@@ -548,6 +782,7 @@ function hitNode(h, scale) {
     el('span', { class: 'score', text: Number(h.score ?? 0).toFixed(6) }),
     scale.score > 0 ? el('span', { class: 'scorebar', title: `${share(h.score, scale.score).toFixed(0)}% of the top score on this page` }, [el('span', { style: `width:${share(h.score, scale.score)}%` })]) : null,
     el('button', { class: 'id quiet', text: `doc ${h.docId}`, title: 'copy the document id', onclick: () => copyText(String(h.docId)) }),
+    moveNode(scale.moves.get(h)),
     doc?.lineage ? el('span', { class: 'muted', text: `parent ${doc.lineage.parent_id} group ${doc.lineage.group_id}` }) : null,
     h.sortValues?.length ? el('span', { class: 'muted', text: `sort ${h.sortValues.map((v) => v.text ?? v.integer ?? v.number).join(' | ')}` }) : null,
   ]));
@@ -762,9 +997,13 @@ function epochLabel(micros) {
 }
 
 function renderSynonyms(list) {
-  const out = clear($('synonyms'));
+  const out = clear($('synonyms-out'));
   if (!list?.length) { out.textContent = 'none reported'; return; }
-  for (const s of list) out.append(el('div', { class: 'small mono', text: JSON.stringify(s) }));
+  for (const s of list) {
+    out.append(el('div', { class: 'small mono' }, [
+      el('span', { class: 'muted', text: s.field ? `${s.field}: ` : '' }), `${s.term} → ${(s.terms || []).join(', ')}`,
+    ]));
+  }
 }
 
 // The dense outcome messages as name and value rows; unset strings are left out.
@@ -842,7 +1081,10 @@ async function typeahead() {
   if (!m || m[1].length < 2) return hideSuggest();
   const prefix = m[1].toLowerCase();
   try {
+    const asked = state.suggestSeq;
     const r = await api.rpc('SearchService', 'Suggest', { field: 'body', prefix, limit: 8, analysis: state.config.body_spec });
+    // A run, or a later keystroke's answer, closed the list meanwhile.
+    if (asked !== state.suggestSeq) return;
     const list = clear($('suggest'));
     state.suggestIndex = -1;
     const suggestions = r.suggestions || [];
@@ -862,6 +1104,7 @@ async function typeahead() {
 function hideSuggest() {
   $('suggest').classList.add('hidden');
   state.suggestIndex = -1;
+  state.suggestSeq++;
 }
 
 async function didYouMean() {
@@ -871,7 +1114,11 @@ async function didYouMean() {
   if (!text || $('shape').value === 'browse') return;
   try {
     const r = await api.rpc('SearchService', 'TermSuggest', { field: 'body', text, mode: 'TERM_SUGGEST_MODE_MISSING', limit: 3, analysis: state.config.body_spec });
-    const terms = (r.terms || []).filter((t) => t.candidates?.length);
+    // A candidate that differs only in punctuation is the same word.
+    const word = (term) => term.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+    const terms = (r.terms || [])
+      .map((t) => ({ ...t, candidates: (t.candidates || []).filter((c) => word(c.term) !== word(t.term)) }))
+      .filter((t) => t.candidates.length);
     if (!terms.length) return;
     clear(box).append('Did you mean: ');
     for (const t of terms) {
