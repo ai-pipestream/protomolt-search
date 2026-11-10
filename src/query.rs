@@ -979,6 +979,12 @@ pub(crate) async fn execute(
         .as_ref()
         .filter(|o| o.resolved_mode == DenseExecutionMode::Ann as i32 && o.policy_point.is_some())
         .map(|o| o.candidate_depth);
+    // And the enumerate threshold the shards answer the filter under
+    // (docs/dense-execution-policy.md, "Filter regimes").
+    let policy_enumerate_max_rows: Option<u32> = dense_execution
+        .as_ref()
+        .and_then(|o| o.policy_point.as_ref())
+        .and_then(|point| point.enumerate_max_rows);
     let fp32_rerank = match &plan.shape {
         Shape::Dense { query, .. } => {
             let mode = dense_score_mode(query)?;
@@ -1448,6 +1454,7 @@ pub(crate) async fn execute(
                     vector: query.vector.clone(),
                     geo_filters: plan.geo_filters.clone(),
                     filter,
+                    enumerate_max_rows: policy_enumerate_max_rows,
                     ..Default::default()
                 })))
                 .await?
@@ -1456,6 +1463,11 @@ pub(crate) async fn execute(
                 p.selection_ms = ms(t_sel);
                 p.segments_total = response.segments_total;
                 p.segments_skipped = response.segments_skipped;
+            }
+            // The regime the shards answered the filter in is theirs to
+            // report (docs/hnsw.md, "Filters").
+            if let Some(outcome) = dense_execution.as_mut() {
+                outcome.filter_regimes = response.filter_regimes;
             }
             let mut hits: Vec<QueryHit> = response
                 .hits
@@ -1624,6 +1636,7 @@ pub(crate) async fn execute(
                     boost: legacy.map(|(_, b)| b),
                     geo_filters: plan.geo_filters.clone(),
                     filter,
+                    enumerate_max_rows: policy_enumerate_max_rows,
                     ..Default::default()
                 })))
                 .await?

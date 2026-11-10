@@ -15,6 +15,11 @@
 //! provider is asked for. A request qualifies only at a point whose key
 //! it matches exactly: no interpolation between points, no candidate
 //! depth the file does not name, no default band.
+//!
+//! A point measured on a provider with filter regimes (`docs/hnsw.md`,
+//! "Filters") also carries the enumerate threshold it was measured under,
+//! and the shards answer the request under that threshold: the recall a
+//! point claims is served by the regimes that measured it.
 
 use std::path::Path;
 
@@ -48,6 +53,7 @@ struct PointFile {
     filter_selectivity_ppm_max: u32,
     candidates: u32,
     measured_recall_ppm: u32,
+    enumerate_max_rows: Option<u32>,
 }
 
 /// One measured point: the key AUTO matches exactly, and the recall
@@ -59,6 +65,11 @@ pub struct PolicyPoint {
     pub selectivity_max_ppm: u32,
     pub candidates: u32,
     pub measured_recall_ppm: u32,
+    /// The enumerate threshold the point was measured under: a segment
+    /// whose mask allows at most this many rows is scored row by row,
+    /// exactly, and a larger one is walked. `None` on a point for a
+    /// provider without filter regimes, and on an unfiltered point.
+    pub enumerate_max_rows: Option<u32>,
 }
 
 /// What the live cluster reports; the policy must match it field by field.
@@ -175,6 +186,9 @@ impl DenseExecutionPolicy {
                 "measured_recall_ppm = {}\n",
                 point.measured_recall_ppm
             ));
+            if let Some(rows) = point.enumerate_max_rows {
+                out.push_str(&format!("enumerate_max_rows = {rows}\n"));
+            }
         }
         out
     }
@@ -249,12 +263,29 @@ impl DenseExecutionPolicy {
                     p.k, p.candidates, file.corpus_rows
                 ));
             }
+            if let Some(rows) = p.enumerate_max_rows {
+                if p.filter_selectivity_ppm_min == UNFILTERED_PPM {
+                    return Err(format!(
+                        "policy point k={} is unfiltered and names enumerate_max_rows {rows}; \
+                         an unfiltered search has no mask to enumerate",
+                        p.k
+                    ));
+                }
+                if u64::from(rows) > file.corpus_rows {
+                    return Err(format!(
+                        "policy point k={} has enumerate_max_rows {rows} above the corpus's {} \
+                         rows",
+                        p.k, file.corpus_rows
+                    ));
+                }
+            }
             let point = PolicyPoint {
                 k: p.k,
                 selectivity_min_ppm: p.filter_selectivity_ppm_min,
                 selectivity_max_ppm: p.filter_selectivity_ppm_max,
                 candidates: p.candidates,
                 measured_recall_ppm: p.measured_recall_ppm,
+                enumerate_max_rows: p.enumerate_max_rows,
             };
             if let Some(prev) = points
                 .last()
@@ -653,6 +684,48 @@ measured_recall_ppm = 995000
         assert!(DenseExecutionPolicy::parse(&version)
             .unwrap_err()
             .contains("format_version 2"));
+    }
+
+    /// A filtered point carries the enumerate threshold it was measured
+    /// under through the document form; an unfiltered point has no mask to
+    /// apply one to, and a threshold above the corpus is not a measurement.
+    #[test]
+    fn a_filtered_point_carries_its_enumerate_threshold() {
+        let text = TEXT.replace(
+            "candidates = 200\nmeasured_recall_ppm = 970000\n",
+            "candidates = 200\nmeasured_recall_ppm = 970000\nenumerate_max_rows = 64\n",
+        );
+        assert_ne!(text, TEXT);
+        let policy = DenseExecutionPolicy::parse(&text).unwrap();
+        let thresholds: Vec<Option<u32>> = policy
+            .points()
+            .iter()
+            .map(|point| point.enumerate_max_rows)
+            .collect();
+        assert_eq!(thresholds, [None, Some(64), None]);
+        let again = DenseExecutionPolicy::parse(&policy.to_toml()).unwrap();
+        assert_eq!(again.points(), policy.points());
+        let hit = policy
+            .qualify(RequestKey {
+                k: 10,
+                candidate_depth: 200,
+                filter_selectivity_ppm: 250_000,
+            })
+            .unwrap();
+        assert_eq!(hit.point.enumerate_max_rows, Some(64));
+
+        let unfiltered = TEXT.replace(
+            "candidates = 100\nmeasured_recall_ppm = 990000\n",
+            "candidates = 100\nmeasured_recall_ppm = 990000\nenumerate_max_rows = 64\n",
+        );
+        let refused = DenseExecutionPolicy::parse(&unfiltered).unwrap_err();
+        assert!(refused.contains("no mask to enumerate"), "{refused}");
+        let above = text.replace("enumerate_max_rows = 64", "enumerate_max_rows = 1001");
+        let refused = DenseExecutionPolicy::parse(&above).unwrap_err();
+        assert!(
+            refused.contains("above the corpus's 1000 rows"),
+            "{refused}"
+        );
     }
 
     #[test]

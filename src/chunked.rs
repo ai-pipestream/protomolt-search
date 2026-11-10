@@ -17,7 +17,7 @@
 //! the floor, so boundary ties survive. The merged heap therefore ends with
 //! exactly the shard's unchunked top-k.
 
-use crate::vector::{VectorIndex, VectorSearchOptions};
+use crate::vector::{Mask, VectorCapability, VectorIndex, VectorSearchOptions};
 
 /// Vectors per block in the current embedded scan provider. Chunk ranges are
 /// block-aligned so a chunk is always a whole number of kernel blocks.
@@ -72,6 +72,9 @@ pub struct ScanStats {
     pub bytes_scanned: u64,
     /// Wall time inside the kernel calls this query rode, in nanoseconds.
     pub scan_nanos: u64,
+    /// How a provider that steers its search by the filter answered this
+    /// query (`docs/hnsw.md`, "Filters"); all zero on a scan provider.
+    pub regimes: crate::vector::FilterRegimeCounts,
 }
 
 /// One kernel call's cost: encoded bytes streamed and wall time inside
@@ -220,8 +223,14 @@ pub struct BatchQuery<'a> {
     /// every slot of the index. `None` is an unfiltered query, which
     /// is not the same thing as an all-true allowlist: `None` batches
     /// with every other unfiltered query, an allowlist batches only
-    /// with itself (see [`chunked_topk_batch`]).
-    pub allow: Option<&'a [bool]>,
+    /// with itself (see [`chunked_topk_batch`]). The chunk scan masks
+    /// with a byte per row and converts a bitmap once per query; a
+    /// provider searched whole takes the mask as it is.
+    pub allow: Option<Mask<'a>>,
+    /// The enumerate threshold for a provider that chooses a filter
+    /// regime (`VectorSearchOptions::enumerate_max_rows`); the chunk scan
+    /// has no regimes and ignores it.
+    pub enumerate_max_rows: Option<usize>,
 }
 
 /// Scan `index` for the top-`k` of `query` in chunks, adopting external
@@ -262,7 +271,8 @@ pub fn chunked_topk(
         vector: query,
         k,
         keep_ties,
-        allow,
+        allow: allow.map(Mask::Bools),
+        enumerate_max_rows: None,
     }];
     chunked_topk_batch(
         index,
@@ -347,6 +357,23 @@ pub fn chunked_topk_batch_observed(
             );
         }
     }
+    if !index
+        .descriptor()
+        .capabilities
+        .contains(&VectorCapability::ExhaustiveCompletion)
+    {
+        for (qi, q) in queries.iter().enumerate() {
+            out[qi] = searched_topk(index, q, external_floor(qi), observe);
+            let (hits, stats) = &mut out[qi];
+            if q.k > 0 && hits.len() >= q.k {
+                stats.floors_offered += 1;
+                if publish_floor(qi, hits[q.k - 1].score) {
+                    stats.floors_published += 1;
+                }
+            }
+        }
+        return out;
+    }
     let chunk_size = chunk_blocks.max(1) * BLOCK_VECTORS;
     let mut heaps: Vec<Vec<ChunkHit>> = queries.iter().map(|q| Vec::with_capacity(q.k)).collect();
     let mut mask = vec![false; n];
@@ -361,6 +388,10 @@ pub fn chunked_topk_batch_observed(
     // argument unchanged. Unfiltered queries all share the `None` group,
     // so a fleet that sends no filters batches exactly as before.
     let groups = group_by_allow(queries);
+    let bools: Vec<Option<std::borrow::Cow<'_, [bool]>>> = groups
+        .iter()
+        .map(|group| queries[group[0]].allow.map(|mask| mask.bools()))
+        .collect();
     let flats: Vec<Vec<f32>> = groups
         .iter()
         .map(|group| {
@@ -378,7 +409,7 @@ pub fn chunked_topk_batch_observed(
     while start < n {
         let end = (start + chunk_size).min(n);
 
-        for (group, flat) in groups.iter().zip(&flats) {
+        for ((group, flat), allow) in groups.iter().zip(&flats).zip(&bools) {
             // Per-query floor: the external (coordinator) floor and the
             // local heap floor are each valid lower bounds on that query's
             // final k-th best, so their max is too. The kernel floor is the
@@ -411,8 +442,7 @@ pub fn chunked_topk_batch_observed(
             // query widens the group.
             let chunk_k = if any_ties { usize::MAX } else { group_k };
 
-            let allow = queries[group[0]].allow;
-            let rows_streamed = match allow {
+            let rows_streamed = match allow.as_deref() {
                 None => {
                     for slot in mask.iter_mut().take(end).skip(start) {
                         *slot = true;
@@ -494,15 +524,73 @@ pub fn chunked_topk_batch_observed(
     out
 }
 
+/// One query on a provider that does not scan (a graph): a single search of
+/// the whole index at a candidate depth of `k`, under the query's own
+/// allowlist. Chunking is how a scan adopts floors midway; a graph search
+/// has no chunks to cut, and a mask naming one chunk's rows would turn every
+/// chunk into its own filtered search of the whole graph. The floor known
+/// when the search starts filters its results; the k-th best it finds is
+/// offered once, when it ends. The answer is the provider's (approximate
+/// unless it enumerated the allowlist) and `keep_ties` cannot widen it: a
+/// search that does not visit every row cannot vouch for a tie group.
+fn searched_topk(
+    index: &VectorIndex,
+    query: &BatchQuery<'_>,
+    floor: Option<f32>,
+    observe: &mut dyn FnMut(ScanPass),
+) -> (Vec<ChunkHit>, ScanStats) {
+    let mut stats = ScanStats::default();
+    if query.k == 0 {
+        return (Vec::new(), stats);
+    }
+    let mut options = VectorSearchOptions::new().with_candidate_depth(query.k);
+    options.allow = query.allow;
+    options.enumerate_max_rows = query.enumerate_max_rows;
+    if let Some(floor) = floor.filter(|f| !f.is_nan() && *f != f32::NEG_INFINITY) {
+        options = options.with_minimum_score(floor);
+        stats.floor_updates_applied = 1;
+    }
+    let started = std::time::Instant::now();
+    let results = index.search_with_options(query.vector, query.k, options);
+    // Nothing of the encoded image is streamed: the walk reads rows it
+    // visits, which the provider counts in its own terms.
+    let pass = ScanPass {
+        bytes: 0,
+        nanos: u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+    };
+    observe(pass);
+    stats.chunk_calls = 1;
+    stats.scan_nanos = pass.nanos;
+    stats.regimes = results.regimes;
+    let mut hits: Vec<ChunkHit> = results
+        .scores_for_query(0)
+        .iter()
+        .zip(results.indices_for_query(0))
+        .filter(|(_, &slot)| slot >= 0)
+        .map(|(&score, &slot)| ChunkHit {
+            slot: slot as u32,
+            score,
+        })
+        .collect();
+    stats.candidates_collected = hits.len() as u64;
+    hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.slot.cmp(&b.slot)));
+    (hits, stats)
+}
+
 /// Partition query positions into groups that may share a kernel call:
-/// same allowlist, compared by identity (address and length) rather than
+/// same allowlist in the same shape, compared by identity (address and length) rather than
 /// contents. Two callers holding equal-but-distinct allowlists land in
 /// separate groups, which costs a kernel pass and never costs
 /// correctness. Order is preserved so a single-group batch runs exactly
 /// the sequence it ran before allowlists existed.
 fn group_by_allow(queries: &[BatchQuery<'_>]) -> Vec<Vec<usize>> {
-    let key = |a: Option<&[bool]>| a.map(|s| (s.as_ptr() as usize, s.len()));
-    let mut keys: Vec<Option<(usize, usize)>> = Vec::new();
+    let key = |a: Option<Mask<'_>>| {
+        a.map(|mask| match mask {
+            Mask::Bools(s) => (false, s.as_ptr() as usize, s.len()),
+            Mask::Bits(bits) => (true, std::ptr::from_ref(bits) as usize, bits.len()),
+        })
+    };
+    let mut keys: Vec<Option<(bool, usize, usize)>> = Vec::new();
     let mut groups: Vec<Vec<usize>> = Vec::new();
     for (qi, q) in queries.iter().enumerate() {
         let k = key(q.allow);
@@ -772,6 +860,7 @@ mod tests {
                 k: 10,
                 keep_ties: false,
                 allow: None,
+                enumerate_max_rows: None,
             })
             .collect();
         let mut observed_bytes = 0u64;
@@ -1074,6 +1163,7 @@ mod tests {
                     k,
                     keep_ties: ties,
                     allow: None,
+                    enumerate_max_rows: None,
                 })
                 .collect();
             let mut published: Vec<Vec<f32>> = vec![Vec::new(); specs.len()];
@@ -1242,19 +1332,22 @@ mod tests {
                     vector: &q0,
                     k,
                     keep_ties: false,
-                    allow: Some(&even),
+                    allow: Some(Mask::Bools(&even)),
+                    enumerate_max_rows: None,
                 },
                 BatchQuery {
                     vector: &q1,
                     k,
                     keep_ties: false,
-                    allow: Some(&odd),
+                    allow: Some(Mask::Bools(&odd)),
+                    enumerate_max_rows: None,
                 },
                 BatchQuery {
                     vector: &q2,
                     k,
                     keep_ties: false,
                     allow: None,
+                    enumerate_max_rows: None,
                 },
             ];
             let batched =
@@ -1357,12 +1450,14 @@ mod tests {
                 k,
                 keep_ties: false,
                 allow: None,
+                enumerate_max_rows: None,
             },
             BatchQuery {
                 vector: &q1,
                 k,
                 keep_ties: false,
                 allow: None,
+                enumerate_max_rows: None,
             },
         ];
         // The true k-th best floors query 0 from the start; query 1 runs

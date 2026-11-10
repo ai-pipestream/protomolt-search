@@ -308,8 +308,10 @@ impl HnswIndex {
     /// the caller pinned, or the one the mask's cardinality calls for.
     ///
     /// - no mask, or a mask that allows every row: an unfiltered walk;
-    /// - at most `ENUMERATE_ROWS_PER_WALK_ROW · ef · m0` allowed rows:
-    ///   enumerate;
+    /// - at most the enumerate threshold of allowed rows: enumerate. The
+    ///   threshold is the request's (`enumerate_max_rows`, which a dense
+    ///   execution policy point carries from its measurement) or, without
+    ///   one, `ENUMERATE_ROWS_PER_WALK_ROW · ef · m0`;
     /// - otherwise the filter-aware walk, which hands a query whose
     ///   neighborhood the mask leaves empty to enumerate (`graph::Walk`).
     ///
@@ -331,14 +333,27 @@ impl HnswIndex {
             }
             return Ok(Plan::UNFILTERED);
         };
+        if let (Some(regime), Some(rows)) = (options.filter_regime, options.enumerate_max_rows) {
+            return Err(VectorError::new(format!(
+                "{HNSW} was asked for the {} filter regime and an enumerate threshold of \
+                 {rows} rows; a pinned regime has no threshold to apply",
+                regime.name()
+            )));
+        }
         let allowed = allow.count();
         let regime = match options.filter_regime {
             Some(regime) => regime,
             None if allowed == allow.len() => return Ok(Plan::UNFILTERED),
-            None if allowed <= ENUMERATE_ROWS_PER_WALK_ROW * ef * self.m0() => {
-                FilterRegime::Enumerate
+            None => {
+                let threshold = options
+                    .enumerate_max_rows
+                    .unwrap_or(ENUMERATE_ROWS_PER_WALK_ROW * ef * self.m0());
+                if allowed <= threshold {
+                    FilterRegime::Enumerate
+                } else {
+                    FilterRegime::FilterAware
+                }
             }
-            None => FilterRegime::FilterAware,
         };
         Ok(Plan {
             regime: Some(regime),
@@ -626,6 +641,7 @@ impl VectorProvider for HnswIndex {
                 VectorCapability::Flush,
                 VectorCapability::SnapshotInstall,
                 VectorCapability::RawVectorRebuild,
+                VectorCapability::MaskEnumeration,
             ],
         }
     }
@@ -722,9 +738,13 @@ impl VectorProvider for HnswIndex {
         let floor = options.minimum_score.unwrap_or(f32::NEG_INFINITY);
         let mut scores = Vec::with_capacity(query_count * k);
         let mut slots = Vec::with_capacity(query_count * k);
+        let mut regimes = crate::vector::FilterRegimeCounts::default();
         with_scratch(|scratch| {
             for query in queries.chunks_exact(self.dim) {
-                let (hits, _) = self.answer(query, k, ef, floor, &plan, scratch);
+                let (hits, answer) = self.answer(query, k, ef, floor, &plan, scratch);
+                if let Some(regime) = answer.regime {
+                    regimes.count(regime);
+                }
                 for (node, score) in &hits {
                     scores.push(*score);
                     slots.push(i64::from(*node));
@@ -740,6 +760,7 @@ impl VectorProvider for HnswIndex {
             slots,
             query_count,
             result_count: k,
+            regimes,
         })
     }
 
@@ -779,6 +800,7 @@ impl VectorProvider for HnswIndex {
         let mut emitted = 0usize;
         let mut units = 0usize;
         let mut stopped = false;
+        let mut regimes = crate::vector::FilterRegimeCounts::default();
         with_scratch(|scratch| {
             for (query_index, query) in queries.chunks_exact(self.dim).enumerate() {
                 let mut hook = StreamHook {
@@ -792,6 +814,7 @@ impl VectorProvider for HnswIndex {
                     stopped: false,
                     emitted: 0,
                 };
+                let mut answered = plan.regime;
                 let (scored, completed) = match (plan.regime, plan.allow) {
                     (Some(FilterRegime::Enumerate), Some(allow)) => {
                         self.stream_rows(allow, |_| false, &mut hook)
@@ -807,11 +830,13 @@ impl VectorProvider for HnswIndex {
                         let walked = stats.scored as usize;
                         match (walk, plan.allow) {
                             (Walk::Far, Some(allow)) => {
+                                answered = Some(FilterRegime::Enumerate);
                                 let (rows, done) = self.stream_rows(allow, |_| false, &mut hook);
                                 (walked + rows, done)
                             }
                             // The walk already emitted the rows it reached.
                             (Walk::Short, Some(allow)) => {
+                                answered = Some(FilterRegime::Enumerate);
                                 let (rows, done) =
                                     self.stream_rows(allow, |row| scratch.seen(row), &mut hook);
                                 (walked + rows, done)
@@ -821,6 +846,9 @@ impl VectorProvider for HnswIndex {
                     }
                 };
                 hook.flush();
+                if let Some(regime) = answered {
+                    regimes.count(regime);
+                }
                 units += scored;
                 emitted += hook.emitted;
                 if !completed || hook.stopped {
@@ -834,6 +862,7 @@ impl VectorProvider for HnswIndex {
             emitted,
             units_scanned: units,
             completed: !stopped,
+            regimes,
         })
     }
 

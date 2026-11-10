@@ -54,6 +54,10 @@ pub enum VectorCapability {
     SnapshotInstall,
     RawVectorRebuild,
     ExhaustiveCompletion,
+    /// Pinned to [`FilterRegime::Enumerate`], a masked search scores every
+    /// allowed row exactly. A provider whose own search cannot certify
+    /// completion can still serve a pass that needs every member's score.
+    MaskEnumeration,
 }
 
 impl VectorCapability {
@@ -69,6 +73,7 @@ impl VectorCapability {
             Self::SnapshotInstall => "snapshot_install",
             Self::RawVectorRebuild => "raw_vector_rebuild",
             Self::ExhaustiveCompletion => "exhaustive_completion",
+            Self::MaskEnumeration => "mask_enumeration",
         }
     }
 }
@@ -283,6 +288,11 @@ pub struct VectorSearchOptions<'a> {
     /// choose from the mask's cardinality; a measurement pins it so a
     /// measured point is served by the regime that measured it.
     pub filter_regime: Option<FilterRegime>,
+    /// The enumerate threshold of a provider that chooses the regime: a
+    /// mask allowing at most this many rows is scored row by row, exactly.
+    /// `None` is the provider's own threshold. A dense execution policy
+    /// point carries the one it was measured under.
+    pub enumerate_max_rows: Option<usize>,
 }
 
 impl<'a> VectorSearchOptions<'a> {
@@ -323,6 +333,11 @@ impl<'a> VectorSearchOptions<'a> {
         self.filter_regime = Some(regime);
         self
     }
+
+    pub fn with_enumerate_max_rows(mut self, rows: usize) -> Self {
+        self.enumerate_max_rows = Some(rows);
+        self
+    }
 }
 
 /// Row-major native search results. Negative slots and negative-infinity
@@ -333,6 +348,9 @@ pub struct VectorSearchResults {
     pub slots: Vec<i64>,
     pub query_count: usize,
     pub result_count: usize,
+    /// How the filtered queries were answered; all zero for a provider
+    /// with one way to filter.
+    pub regimes: FilterRegimeCounts,
 }
 
 impl VectorSearchResults {
@@ -375,6 +393,55 @@ pub struct VectorStreamSummary {
     pub emitted: usize,
     pub units_scanned: usize,
     pub completed: bool,
+    /// How the filtered queries of this stream were answered; all zero for
+    /// a provider with one way to filter.
+    pub regimes: FilterRegimeCounts,
+}
+
+/// Filtered searches by the regime that answered them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FilterRegimeCounts {
+    pub enumerate: u32,
+    pub filter_aware: u32,
+    pub plain: u32,
+}
+
+impl FilterRegimeCounts {
+    pub fn count(&mut self, regime: FilterRegime) {
+        let slot = match regime {
+            FilterRegime::Enumerate => &mut self.enumerate,
+            FilterRegime::FilterAware => &mut self.filter_aware,
+            FilterRegime::Plain => &mut self.plain,
+        };
+        *slot = slot.saturating_add(1);
+    }
+
+    pub fn add(&mut self, other: FilterRegimeCounts) {
+        self.enumerate = self.enumerate.saturating_add(other.enumerate);
+        self.filter_aware = self.filter_aware.saturating_add(other.filter_aware);
+        self.plain = self.plain.saturating_add(other.plain);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The wire form, `None` when nothing was counted.
+    pub fn to_proto(self) -> Option<crate::pb::DenseFilterRegimes> {
+        (!self.is_empty()).then_some(crate::pb::DenseFilterRegimes {
+            enumerate: self.enumerate,
+            filter_aware: self.filter_aware,
+            plain: self.plain,
+        })
+    }
+
+    pub fn from_proto(regimes: Option<&crate::pb::DenseFilterRegimes>) -> Self {
+        regimes.map_or_else(Self::default, |r| Self {
+            enumerate: r.enumerate,
+            filter_aware: r.filter_aware,
+            plain: r.plain,
+        })
+    }
 }
 
 /// Compile-time adapter contract for a vector implementation. Providers own
@@ -1098,6 +1165,7 @@ mod embedded_turbovec {
                 slots: result.indices,
                 query_count: result.nq,
                 result_count: result.k,
+                regimes: FilterRegimeCounts::default(),
             })
         }
 
@@ -1130,6 +1198,7 @@ mod embedded_turbovec {
                 emitted: summary.emitted,
                 units_scanned: summary.blocks_scanned,
                 completed: summary.completed,
+                regimes: FilterRegimeCounts::default(),
             })
         }
     }
@@ -1195,6 +1264,7 @@ mod tests {
                 slots: vec![0; k],
                 query_count: 1,
                 result_count: k,
+                regimes: FilterRegimeCounts::default(),
             })
         }
 
@@ -1210,6 +1280,7 @@ mod tests {
                 emitted: 0,
                 units_scanned: 0,
                 completed: true,
+                regimes: FilterRegimeCounts::default(),
             })
         }
     }

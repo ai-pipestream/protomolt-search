@@ -1118,6 +1118,7 @@ struct StreamTotals {
     floor_raises_applied: u64,
     segments_total: u32,
     segments_skipped: u32,
+    regimes: crate::vector::FilterRegimeCounts,
 }
 
 enum StreamEvent {
@@ -1241,6 +1242,7 @@ async fn relay_stream(
                     scoring_fingerprint: scoring_fingerprint.unwrap_or_default(),
                     segments_total: totals.segments_total,
                     segments_skipped: totals.segments_skipped,
+                    filter_regimes: totals.regimes.to_proto(),
                 };
                 let _ = tx
                     .send(Ok(StreamSearchResponse {
@@ -1400,6 +1402,11 @@ async fn relay_stream(
                         totals.segments_skipped = totals
                             .segments_skipped
                             .saturating_add(summary.segments_skipped);
+                        totals
+                            .regimes
+                            .add(crate::vector::FilterRegimeCounts::from_proto(
+                                summary.filter_regimes.as_ref(),
+                            ));
                         summaries[shard] = Some(summary.clone());
                         if identity_limits.is_none() {
                             terminal[shard] = Some(summary);
@@ -1429,6 +1436,7 @@ async fn relay_stream(
         scoring_fingerprint: scoring_fingerprint.unwrap_or_default(),
         segments_total: totals.segments_total,
         segments_skipped: totals.segments_skipped,
+        filter_regimes: totals.regimes.to_proto(),
     };
     if let Some(limits) = identity_limits {
         let range =
@@ -2721,6 +2729,7 @@ async fn relay_shard_search(
             collapse_parents: start.collapse_parents,
             geo_filters: filters.geo.clone(),
             filter: CoordinatorServiceImpl::shard_filter_tree(&filters, mask.as_ref(), child),
+            enumerate_max_rows: filters.enumerate_max_rows,
         };
         req_tx
             .try_send(SearchShardRequest {
@@ -3488,6 +3497,7 @@ impl NodeService for RelayService {
             let filters = RequestFilters {
                 geo: start.geo_filters.clone(),
                 tree: start.filter.clone(),
+                enumerate_max_rows: start.enumerate_max_rows,
             };
             let signals = Arc::new(RelaySignals::new(
                 start.initial_floor.unwrap_or(f32::NEG_INFINITY),
@@ -3693,6 +3703,7 @@ impl NodeService for RelayService {
             let filters = RequestFilters {
                 geo: start.geo_filters.clone(),
                 tree: start.filter.clone(),
+                enumerate_max_rows: start.enumerate_max_rows,
             };
             let (tx, rx) = mpsc::channel::<Result<SearchShardResponse, Status>>(64);
             let (pinned, frozen) = self.pin();
@@ -5041,6 +5052,7 @@ impl NodeService for RelayService {
             let filters = RequestFilters {
                 geo: req.geo_filters.clone(),
                 tree: req.filter.clone(),
+                enumerate_max_rows: None,
             };
             let (pinned, frozen) = self.pin();
             let children = frozen.node_addresses().to_vec();

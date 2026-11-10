@@ -396,6 +396,7 @@ async fn embedded_in_process_and_external_transports_are_bit_exact() {
             collapse_parents: false,
             geo_filters: Vec::new(),
             filter: r#"court == "scotus""#.to_string(),
+            enumerate_max_rows: None,
         }),
     )
     .await
@@ -412,6 +413,7 @@ async fn embedded_in_process_and_external_transports_are_bit_exact() {
             collapse_parents: false,
             geo_filters: Vec::new(),
             filter: r#"court == "scotus""#.to_string(),
+            enumerate_max_rows: None,
         }),
     )
     .await
@@ -438,6 +440,7 @@ async fn embedded_in_process_and_external_transports_are_bit_exact() {
             collapse_parents: false,
             geo_filters: Vec::new(),
             filter: r#"court == "scotus""#.to_string(),
+            enumerate_max_rows: None,
         }),
     )
     .await

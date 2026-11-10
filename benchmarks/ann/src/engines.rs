@@ -386,6 +386,10 @@ pub struct Hnsw {
     /// `--hnsw-regime=enumerate|filter_aware|plain` pins the filter regime
     /// for threshold measurements; unset, the provider chooses.
     regime: Option<pipestream_search::vector::FilterRegime>,
+    /// `--hnsw-enumerate-max-rows=N` is the enumerate threshold the
+    /// provider chooses under, as a dense execution policy point carries
+    /// it; unset, the provider's own.
+    enumerate_max_rows: Option<usize>,
 }
 
 impl Hnsw {
@@ -415,11 +419,24 @@ impl Hnsw {
                 .into())
             }
         };
+        let enumerate_max_rows = match crate::util::arg("hnsw-enumerate-max-rows", "").as_str() {
+            "" => None,
+            raw => Some(raw.parse::<usize>().map_err(|error| {
+                format!("--hnsw-enumerate-max-rows={raw:?} is not a row count: {error}")
+            })?),
+        };
+        if regime.is_some() && enumerate_max_rows.is_some() {
+            return Err(
+                "--hnsw-regime pins the regime and --hnsw-enumerate-max-rows chooses it; give one"
+                    .into(),
+            );
+        }
         Ok(Self {
             rows,
             index,
             disk,
             regime,
+            enumerate_max_rows,
         })
     }
 }
@@ -452,9 +469,10 @@ impl Index for Hnsw {
         let options = match bits.as_ref() {
             Some(bits) => {
                 let options = VectorSearchOptions::new().with_bits(bits);
-                match self.regime {
-                    Some(regime) => options.with_filter_regime(regime),
-                    None => options,
+                match (self.regime, self.enumerate_max_rows) {
+                    (Some(regime), _) => options.with_filter_regime(regime),
+                    (None, Some(rows)) => options.with_enumerate_max_rows(rows),
+                    (None, None) => options,
                 }
             }
             None => VectorSearchOptions::new(),

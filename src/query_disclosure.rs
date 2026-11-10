@@ -80,8 +80,11 @@ pub(crate) fn redact_execution(response: &mut QueryResponse) {
         filter_selectivity_ppm,
         candidate_depth: _,
         evidence_scope: _,
+        filter_regimes,
     }) = dense_execution
     {
+        // Counts per segment searched: the physical layout.
+        *filter_regimes = None;
         planner_reason.clear();
         policy_id.clear();
         *filter_selectivity_ppm = 0;
@@ -91,10 +94,13 @@ pub(crate) fn redact_execution(response: &mut QueryResponse) {
             filter_selectivity_ppm_max,
             candidates: _,
             measured_recall_ppm: _,
+            enumerate_max_rows,
         }) = policy_point
         {
             *filter_selectivity_ppm_min = 0;
             *filter_selectivity_ppm_max = 0;
+            // Rows a segment: the physical layout's scale.
+            *enumerate_max_rows = None;
         }
     }
 }
@@ -164,10 +170,16 @@ mod tests {
                     filter_selectivity_ppm_max: 600_000,
                     candidates: 100,
                     measured_recall_ppm: 980_000,
+                    enumerate_max_rows: Some(4096),
                 }),
                 filter_selectivity_ppm: 500_000,
                 candidate_depth: 100,
                 evidence_scope: DenseEvidenceScope::SelectivityBandBenchmark as i32,
+                filter_regimes: Some(DenseFilterRegimes {
+                    enumerate: 3,
+                    filter_aware: 5,
+                    plain: 0,
+                }),
             }),
             ..Default::default()
         };
@@ -216,6 +228,7 @@ mod tests {
         assert!(!execution.exhaustive_completion);
         assert_eq!(execution.resolved_mode, DenseExecutionMode::Ann as i32);
         assert_eq!(execution.candidate_depth, 100);
+        assert_eq!(execution.filter_regimes, None);
         assert_eq!(execution.policy_fingerprint, "b".repeat(64));
         assert_eq!(
             execution.policy_point,

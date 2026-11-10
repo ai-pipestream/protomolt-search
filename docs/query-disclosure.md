@@ -15,7 +15,8 @@ unavailable, not measured zero:
 - `DenseQualityOutcome`: physical corpus rows and generation, profile display
   name and embedding-model label.
 - `DenseExecutionOutcome`: free-form planner explanation, policy display name,
-  live filter selectivity, and both selectivity bounds in its policy point.
+  live filter selectivity, both selectivity bounds and the enumerate threshold
+  in its policy point, and the filter regime counts (searches per segment).
 
 The response retains authorized hits, ranks, scores, groups, aggregates,
 projections and other field-authorized content. It also retains request and

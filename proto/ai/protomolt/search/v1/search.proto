@@ -1521,6 +1521,14 @@ message StartShardSearch {
   FilterExpr filter = 7;
   // Opt-in field, authority-view and generation handshake before scan output.
   VectorReadContext read_context = 8;
+  // The enumerate threshold of a filtered search on a provider with filter
+  // regimes (docs/hnsw.md, "Filters"): a segment whose mask allows at most
+  // this many rows is scored row by row, exactly, and a larger one is
+  // walked. Absent = the provider's own threshold. Set by a dense execution
+  // policy point, so the regimes that serve its measured recall are the
+  // ones that measured it. A provider without the `mask_enumeration`
+  // capability refuses it by name.
+  optional uint32 enumerate_max_rows = 9;
 }
 
 // A score floor: a lower bound on the global k-th best score. Flows both
@@ -1594,6 +1602,10 @@ message ShardScanStats {
   // is the same with pruning off.
   uint32 segments_total = 6;
   uint32 segments_skipped = 7;
+  // How this shard's provider answered the request's filter
+  // (docs/hnsw.md, "Filters"). Unset for an unfiltered scan and for a
+  // provider with one way to filter.
+  DenseFilterRegimes filter_regimes = 8;
 }
 
 // One scored vector. Ids are global across the cluster (see
@@ -1688,6 +1700,8 @@ message StartStreamSearch {
   // graph to this depth and refuses the scan without it, since the beam is
   // not part of its config; exhaustive providers ignore it.
   optional uint32 candidate_depth = 10;
+  // As `StartShardSearch.enumerate_max_rows`.
+  optional uint32 enumerate_max_rows = 11;
 }
 
 // Bounds for the post-scan identity exchange. All fields must be positive.
@@ -1815,6 +1829,25 @@ message StreamSearchSummary {
   // (docs/segment-pruning.md). The answer is the same with pruning off.
   uint32 segments_total = 8;
   uint32 segments_skipped = 9;
+  // How this shard's provider answered the filtered searches of this scan
+  // (docs/hnsw.md, "Filters"). All zero for an unfiltered scan and for a
+  // provider with one way to filter.
+  DenseFilterRegimes filter_regimes = 10;
+}
+
+// How a provider that can steer its search by the filter answered: one
+// count per filtered search of one segment (a shard's tail and each of its
+// sealed segments are searched separately, each choosing from its own part
+// of the mask). A measured recall claim holds for the regime it was
+// measured in, so the regime that ran is reported, never implied.
+message DenseFilterRegimes {
+  // Every allowed row was scored: exact over the filter. Includes a search
+  // a graph walk handed over because the filter lay away from the query.
+  uint32 enumerate = 1;
+  // A graph walk that scored allowed rows only.
+  uint32 filter_aware = 2;
+  // A graph walk as if unfiltered, the filter gating results.
+  uint32 plain = 3;
 }
 
 enum VectorScoreDirection {
@@ -2147,6 +2180,9 @@ message SearchRequest {
   // and compatible read receipts from every product shard. Empty preserves
   // legacy unrestricted selection; it cannot satisfy a field-restricted grant.
   string field = 8;
+  // The enumerate threshold the shards answer the filter under, as
+  // `StartShardSearch.enumerate_max_rows`. Absent = each provider's own.
+  optional uint32 enumerate_max_rows = 9;
 }
 
 // Client-facing search response.
@@ -2175,6 +2211,9 @@ message SearchResponse {
   // (docs/segment-pruning.md); zero on shards without a segment catalog.
   uint32 segments_total = 5;
   uint32 segments_skipped = 6;
+  // How the shards' providers answered this request's filter, summed over
+  // every segment searched. Unset when no provider reported a regime.
+  DenseFilterRegimes filter_regimes = 7;
 }
 
 // One parent document's chunks in a document-mode search response.
@@ -4676,6 +4715,9 @@ message HybridSearchRequest {
   // default; an unknown name, or no name where named collections exist
   // and no default is configured, refuses by name.
   string collection = 11;
+  // The enumerate threshold the shards answer the vector leg's filter
+  // under, as `StartShardSearch.enumerate_max_rows`.
+  optional uint32 enumerate_max_rows = 12;
 }
 
 // Profile of one hybrid query; populated only when the request set
@@ -5938,6 +5980,11 @@ message DenseExecutionOutcome {
   // NOT_APPLICABLE without a measured AUTO policy; otherwise the scope of the
   // benchmark behind policy_point. FP32 depth evidence is in dense_quality.
   DenseEvidenceScope evidence_scope = 13;
+  // How the providers answered the request's filter, summed over every
+  // segment searched (docs/hnsw.md, "Filters"). Unset for an unfiltered
+  // request and for providers with one way to filter. A request reported
+  // as ANN whose every count is `enumerate` scored every allowed row.
+  DenseFilterRegimes filter_regimes = 14;
 }
 
 // One measured point of a dense execution policy
@@ -5949,6 +5996,10 @@ message DensePolicyPoint {
   uint32 filter_selectivity_ppm_max = 3;
   uint32 candidates = 4;
   uint32 measured_recall_ppm = 5;
+  // The enumerate threshold the point was measured under and is served
+  // under: a segment whose mask allows at most this many rows is scored
+  // exactly. Absent on a point for a provider without filter regimes.
+  optional uint32 enumerate_max_rows = 6;
 }
 
 // Public streaming query controls. The query itself is byte-for-byte the

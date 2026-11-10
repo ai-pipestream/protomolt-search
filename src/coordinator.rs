@@ -1660,6 +1660,10 @@ pub struct RequestFilters {
     pub geo: Vec<crate::pb::GeoFilter>,
     /// The compiled tree; `None` when the request sent no CEL.
     pub tree: Option<crate::pb::FilterExpr>,
+    /// The enumerate threshold the shards answer the mask under
+    /// (`StartShardSearch.enumerate_max_rows`); `None` leaves each
+    /// provider its own.
+    pub enumerate_max_rows: Option<u32>,
 }
 
 /// The provider-mismatch line of a cluster health report: empty when
@@ -1809,6 +1813,7 @@ impl RequestFilters {
         Ok(Self {
             geo: geo.to_vec(),
             tree,
+            enumerate_max_rows: None,
         })
     }
 }
@@ -3625,162 +3630,181 @@ impl CoordinatorServiceImpl {
         query_dim: usize,
         key: DenseRequestKey<'_>,
     ) -> Result<crate::pb::DenseExecutionOutcome, Status> {
-        let (provider, scoring_fingerprint, quality, exhaustive, dimensions, rows, generation) =
-            if let Some(identity) = self.clustered_quality_identity().await? {
-                (
-                    "clustered-turbovec".to_string(),
-                    identity.scoring_fingerprint,
-                    crate::pb::VectorQualityContract::ExhaustiveNativeScore,
-                    true,
-                    identity.dimensions,
-                    identity.rows,
-                    identity.topology_generation,
-                )
-            } else {
-                let mut tasks = Vec::with_capacity(self.node_addrs.len());
-                for addr in &self.node_addrs {
-                    let mut client = self.node_client(addr)?;
-                    tasks.push(tokio::spawn(async move {
-                        client
-                            .get_vector_backend(crate::pb::GetVectorBackendRequest {})
-                            .await
-                            .map(tonic::Response::into_inner)
-                    }));
-                }
+        let (
+            provider,
+            scoring_fingerprint,
+            quality,
+            exhaustive,
+            enumerates,
+            dimensions,
+            rows,
+            generation,
+        ) = if let Some(identity) = self.clustered_quality_identity().await? {
+            (
+                "clustered-turbovec".to_string(),
+                identity.scoring_fingerprint,
+                crate::pb::VectorQualityContract::ExhaustiveNativeScore,
+                true,
+                false,
+                identity.dimensions,
+                identity.rows,
+                identity.topology_generation,
+            )
+        } else {
+            let mut tasks = Vec::with_capacity(self.node_addrs.len());
+            for addr in &self.node_addrs {
+                let mut client = self.node_client(addr)?;
+                tasks.push(tokio::spawn(async move {
+                    client
+                        .get_vector_backend(crate::pb::GetVectorBackendRequest {})
+                        .await
+                        .map(tonic::Response::into_inner)
+                }));
+            }
 
-                let mut provider = None;
-                let mut fingerprint = None;
-                let mut quality = None;
-                let mut exhaustive = None;
-                let mut dimensions = None;
-                let mut rows: u64 = 0;
-                for task in tasks {
-                    let backend = task.await.map_err(|error| {
-                        Status::internal(format!("dense execution preflight failed: {error}"))
-                    })??;
-                    rows = rows.checked_add(backend.num_vectors).ok_or_else(|| {
-                        Status::internal("dense execution preflight row count overflow")
-                    })?;
-                    let descriptor = backend.descriptor.ok_or_else(|| {
-                        Status::failed_precondition(
-                            "dense execution preflight found an unconfigured vector shard",
-                        )
-                    })?;
-                    if descriptor.backend_kind.is_empty() {
-                        return Err(Status::failed_precondition(
-                            "dense execution preflight found an unnamed vector provider",
-                        ));
-                    }
-                    if descriptor.scoring_fingerprint.is_empty() {
-                        return Err(Status::failed_precondition(
-                            "dense execution preflight found an empty scoring fingerprint",
-                        ));
-                    }
-                    let shard_quality =
-                        crate::pb::VectorQualityContract::try_from(descriptor.quality_contract)
-                            .map_err(|_| {
-                                Status::failed_precondition(format!(
-                                    "vector provider {} advertises unknown quality contract {}",
-                                    descriptor.backend_kind, descriptor.quality_contract
-                                ))
-                            })?;
-                    if shard_quality == crate::pb::VectorQualityContract::Unspecified {
-                        return Err(Status::failed_precondition(format!(
-                            "vector provider {} does not declare a quality contract",
-                            descriptor.backend_kind
-                        )));
-                    }
-                    let direction =
-                        crate::pb::VectorScoreDirection::try_from(descriptor.score_direction)
-                            .map_err(|_| {
-                                Status::failed_precondition(format!(
-                                    "vector provider {} advertises unknown score direction {}",
-                                    descriptor.backend_kind, descriptor.score_direction
-                                ))
-                            })?;
-                    if direction != crate::pb::VectorScoreDirection::HigherIsBetter {
-                        return Err(Status::failed_precondition(format!(
+            let mut provider = None;
+            let mut fingerprint = None;
+            let mut quality = None;
+            let mut exhaustive = None;
+            // Every shard is one provider under one fingerprint, so
+            // one that lacks the regime means none can be relied on.
+            let mut enumerates = true;
+            let mut dimensions = None;
+            let mut rows: u64 = 0;
+            for task in tasks {
+                let backend = task.await.map_err(|error| {
+                    Status::internal(format!("dense execution preflight failed: {error}"))
+                })??;
+                rows = rows.checked_add(backend.num_vectors).ok_or_else(|| {
+                    Status::internal("dense execution preflight row count overflow")
+                })?;
+                let descriptor = backend.descriptor.ok_or_else(|| {
+                    Status::failed_precondition(
+                        "dense execution preflight found an unconfigured vector shard",
+                    )
+                })?;
+                if descriptor.backend_kind.is_empty() {
+                    return Err(Status::failed_precondition(
+                        "dense execution preflight found an unnamed vector provider",
+                    ));
+                }
+                if descriptor.scoring_fingerprint.is_empty() {
+                    return Err(Status::failed_precondition(
+                        "dense execution preflight found an empty scoring fingerprint",
+                    ));
+                }
+                let shard_quality =
+                    crate::pb::VectorQualityContract::try_from(descriptor.quality_contract)
+                        .map_err(|_| {
+                            Status::failed_precondition(format!(
+                                "vector provider {} advertises unknown quality contract {}",
+                                descriptor.backend_kind, descriptor.quality_contract
+                            ))
+                        })?;
+                if shard_quality == crate::pb::VectorQualityContract::Unspecified {
+                    return Err(Status::failed_precondition(format!(
+                        "vector provider {} does not declare a quality contract",
+                        descriptor.backend_kind
+                    )));
+                }
+                let direction = crate::pb::VectorScoreDirection::try_from(
+                    descriptor.score_direction,
+                )
+                .map_err(|_| {
+                    Status::failed_precondition(format!(
+                        "vector provider {} advertises unknown score direction {}",
+                        descriptor.backend_kind, descriptor.score_direction
+                    ))
+                })?;
+                if direction != crate::pb::VectorScoreDirection::HigherIsBetter {
+                    return Err(Status::failed_precondition(format!(
                             "vector provider {} is not compatible with the coordinator's higher-is-better heap",
                             descriptor.backend_kind
                         )));
-                    }
-                    if !descriptor
+                }
+                if !descriptor
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "batch_query")
+                {
+                    return Err(Status::failed_precondition(format!(
+                        "vector provider {} does not advertise batch_query",
+                        descriptor.backend_kind
+                    )));
+                }
+                let shard_exhaustive = shard_quality
+                    == crate::pb::VectorQualityContract::ExhaustiveNativeScore
+                    && descriptor
                         .capabilities
                         .iter()
-                        .any(|capability| capability == "batch_query")
-                    {
-                        return Err(Status::failed_precondition(format!(
-                            "vector provider {} does not advertise batch_query",
-                            descriptor.backend_kind
-                        )));
-                    }
-                    let shard_exhaustive = shard_quality
-                        == crate::pb::VectorQualityContract::ExhaustiveNativeScore
-                        && descriptor
-                            .capabilities
-                            .iter()
-                            .any(|capability| capability == "exhaustive_completion");
+                        .any(|capability| capability == "exhaustive_completion");
+                enumerates &= descriptor
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "mask_enumeration");
 
-                    for (held, actual, mismatch) in [
-                        (
-                            &mut provider,
-                            descriptor.backend_kind,
-                            "mixed vector providers",
-                        ),
-                        (
-                            &mut fingerprint,
-                            descriptor.scoring_fingerprint,
-                            "mixed scoring fingerprints",
-                        ),
-                    ] {
-                        match held {
-                            Some(value) if value != &actual => {
-                                return Err(Status::failed_precondition(format!(
-                                    "dense execution preflight found {mismatch}"
-                                )))
-                            }
-                            None => *held = Some(actual),
-                            _ => {}
+                for (held, actual, mismatch) in [
+                    (
+                        &mut provider,
+                        descriptor.backend_kind,
+                        "mixed vector providers",
+                    ),
+                    (
+                        &mut fingerprint,
+                        descriptor.scoring_fingerprint,
+                        "mixed scoring fingerprints",
+                    ),
+                ] {
+                    match held {
+                        Some(value) if value != &actual => {
+                            return Err(Status::failed_precondition(format!(
+                                "dense execution preflight found {mismatch}"
+                            )))
                         }
-                    }
-                    match quality {
-                        Some(value) if value != shard_quality => {
-                            return Err(Status::failed_precondition(
-                                "dense execution preflight found mixed quality contracts",
-                            ))
-                        }
-                        None => quality = Some(shard_quality),
-                        _ => {}
-                    }
-                    match exhaustive {
-                        Some(value) if value != shard_exhaustive => {
-                            return Err(Status::failed_precondition(
-                                "dense execution preflight found mixed completion capabilities",
-                            ))
-                        }
-                        None => exhaustive = Some(shard_exhaustive),
-                        _ => {}
-                    }
-                    match dimensions {
-                        Some(value) if value != descriptor.dim => {
-                            return Err(Status::failed_precondition(
-                                "dense execution preflight found mixed vector dimensions",
-                            ))
-                        }
-                        None => dimensions = Some(descriptor.dim),
+                        None => *held = Some(actual),
                         _ => {}
                     }
                 }
-                (
-                    provider.unwrap_or_default(),
-                    fingerprint.unwrap_or_default(),
-                    quality.unwrap_or(crate::pb::VectorQualityContract::Unspecified),
-                    exhaustive.unwrap_or(false),
-                    dimensions.unwrap_or_default(),
-                    rows,
-                    self.topology_generation,
-                )
-            };
+                match quality {
+                    Some(value) if value != shard_quality => {
+                        return Err(Status::failed_precondition(
+                            "dense execution preflight found mixed quality contracts",
+                        ))
+                    }
+                    None => quality = Some(shard_quality),
+                    _ => {}
+                }
+                match exhaustive {
+                    Some(value) if value != shard_exhaustive => {
+                        return Err(Status::failed_precondition(
+                            "dense execution preflight found mixed completion capabilities",
+                        ))
+                    }
+                    None => exhaustive = Some(shard_exhaustive),
+                    _ => {}
+                }
+                match dimensions {
+                    Some(value) if value != descriptor.dim => {
+                        return Err(Status::failed_precondition(
+                            "dense execution preflight found mixed vector dimensions",
+                        ))
+                    }
+                    None => dimensions = Some(descriptor.dim),
+                    _ => {}
+                }
+            }
+            let enumerates = enumerates && provider.is_some();
+            (
+                provider.unwrap_or_default(),
+                fingerprint.unwrap_or_default(),
+                quality.unwrap_or(crate::pb::VectorQualityContract::Unspecified),
+                exhaustive.unwrap_or(false),
+                enumerates,
+                dimensions.unwrap_or_default(),
+                rows,
+                self.topology_generation,
+            )
+        };
 
         if dimensions as usize != query_dim {
             return Err(Status::failed_precondition(format!(
@@ -3878,6 +3902,34 @@ impl CoordinatorServiceImpl {
                     })
                     .map_err(Status::failed_precondition)?;
                 let point = hit.point;
+                // The recall a point claims is served by the regimes that
+                // measured it: a provider that chooses a filter regime
+                // takes the point's enumerate threshold, and a point
+                // cannot name one for a provider that has none.
+                match point.enumerate_max_rows {
+                    Some(threshold) if !enumerates => {
+                        return Err(Status::failed_precondition(format!(
+                            "dense execution policy {:?} point k={} depth {} names \
+                             enumerate_max_rows {threshold}, but provider {provider} has no \
+                             enumerate regime (it does not advertise mask_enumeration)",
+                            hit.policy_id, point.k, point.candidates
+                        )));
+                    }
+                    None if enumerates && selectivity != crate::dense_policy::UNFILTERED_PPM => {
+                        return Err(Status::failed_precondition(format!(
+                            "dense execution policy {:?} point k={} depth {} selectivity \
+                             {}..={} ppm names no enumerate_max_rows; provider {provider} answers \
+                             a filter in a regime chosen by that threshold, and a measured point \
+                             is served only under the threshold it was measured with",
+                            hit.policy_id,
+                            point.k,
+                            point.candidates,
+                            point.selectivity_min_ppm,
+                            point.selectivity_max_ppm
+                        )));
+                    }
+                    _ => {}
+                }
                 let reason = format!(
                     "AUTO selected the provider's configured approximate traversal through \
                      policy {:?} point k={} selectivity {}..={} ppm depth {} (measured recall {} \
@@ -3890,6 +3942,12 @@ impl CoordinatorServiceImpl {
                     point.measured_recall_ppm,
                     policy.measured_queries()
                 );
+                let reason = match point.enumerate_max_rows {
+                    Some(threshold) => {
+                        format!("{reason}; enumerate threshold {threshold} rows a segment")
+                    }
+                    None => reason,
+                };
                 qualified = Some((hit, selectivity));
                 (crate::pb::DenseExecutionMode::Ann, reason)
             }
@@ -3909,6 +3967,7 @@ impl CoordinatorServiceImpl {
             filter_selectivity_ppm: 0,
             candidate_depth: 0,
             evidence_scope: crate::pb::DenseEvidenceScope::NotApplicable as i32,
+            filter_regimes: None,
         };
         if let Some((hit, selectivity)) = qualified {
             outcome.evidence_scope = crate::pb::DenseEvidenceScope::SelectivityBandBenchmark as i32;
@@ -3920,6 +3979,7 @@ impl CoordinatorServiceImpl {
                 filter_selectivity_ppm_max: hit.point.selectivity_max_ppm,
                 candidates: hit.point.candidates,
                 measured_recall_ppm: hit.point.measured_recall_ppm,
+                enumerate_max_rows: hit.point.enumerate_max_rows,
             });
             outcome.filter_selectivity_ppm = selectivity;
             outcome.candidate_depth = hit.point.candidates;
@@ -7963,6 +8023,7 @@ impl CoordinatorServiceImpl {
                         vector: vector.to_vec(),
                         initial_floor,
                         candidate_depth,
+                        enumerate_max_rows: filters.enumerate_max_rows,
                         floor_token: lane.map_or(0, |(token, _)| token),
                         collapse_parents,
                         geo_filters: filters.geo.clone(),
@@ -12182,6 +12243,7 @@ async fn run_shard_stream(
                 collapse_parents: ctx.collapse,
                 geo_filters: ctx.filters.geo.clone(),
                 filter: ctx.shard_filters.get(shard as usize).cloned().flatten(),
+                enumerate_max_rows: ctx.filters.enumerate_max_rows,
             })),
         })
         .await
@@ -12385,6 +12447,20 @@ fn leg_payloads(
         (terms.to_vec(), global.dfs.clone())
     };
     (vector, terms, dfs)
+}
+
+/// How the shards' providers answered a request's filter, summed over their
+/// terminal summaries; `None` when none reported a regime.
+fn summed_filter_regimes(
+    summaries: &[StreamSearchSummary],
+) -> Option<crate::pb::DenseFilterRegimes> {
+    let mut total = crate::vector::FilterRegimeCounts::default();
+    for summary in summaries {
+        total.add(crate::vector::FilterRegimeCounts::from_proto(
+            summary.filter_regimes.as_ref(),
+        ));
+    }
+    total.to_proto()
 }
 
 /// Outcome of one coordinator fan-out: the merged global top-k plus the
@@ -12740,6 +12816,7 @@ impl PlanCounter<'_> {
         let filters = RequestFilters {
             geo: Vec::new(),
             tree,
+            enumerate_max_rows: None,
         };
         let count = crate::pb::CompiledAggregation {
             expr: Some(crate::cel::compile_value("1")?),
@@ -12947,7 +13024,8 @@ impl SearchService for CoordinatorServiceImpl {
             };
             // CEL text compiles ONCE, here, into the predicate IR the
             // shards execute; no shard ever sees CEL text.
-            let filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
+            let mut filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
+            filters.enumerate_max_rows = req.enumerate_max_rows;
             self.check_vector_scan(&filters, req.collapse_parents)?;
             // The fleet scores in one space or not at all: mixed provider
             // kinds or fingerprints are refused before any shard is asked
@@ -12963,6 +13041,7 @@ impl SearchService for CoordinatorServiceImpl {
                         .clustered_parent_collapse(&request_id, &req.vector, k, &filters)
                         .await?;
                     return Ok(Response::new(SearchResponse {
+                        filter_regimes: None,
                         segments_total: 0,
                         segments_skipped: 0,
                         request_id,
@@ -12985,6 +13064,7 @@ impl SearchService for CoordinatorServiceImpl {
                     })
                     .collect();
                 return Ok(Response::new(SearchResponse {
+                    filter_regimes: None,
                     segments_total: 0,
                     segments_skipped: 0,
                     request_id,
@@ -13005,6 +13085,7 @@ impl SearchService for CoordinatorServiceImpl {
                         .fanout_stream_search_collapse(&request_id, &req.vector, k, &filters)
                         .await?;
                     return Ok(Response::new(SearchResponse {
+                        filter_regimes: summed_filter_regimes(&doc.summaries),
                         segments_total: 0,
                         segments_skipped: 0,
                         request_id,
@@ -13020,6 +13101,7 @@ impl SearchService for CoordinatorServiceImpl {
                     .fanout_stream_search(&request_id, &req.vector, k, None, &filters)
                     .await?;
                 return Ok(Response::new(SearchResponse {
+                    filter_regimes: summed_filter_regimes(&streamed.summaries),
                     segments_total: 0,
                     segments_skipped: 0,
                     request_id,
@@ -13040,7 +13122,14 @@ impl SearchService for CoordinatorServiceImpl {
                     )
                 },
             );
+            let mut regimes = crate::vector::FilterRegimeCounts::default();
+            for stats in result.shard_stats.iter().flatten() {
+                regimes.add(crate::vector::FilterRegimeCounts::from_proto(
+                    stats.filter_regimes.as_ref(),
+                ));
+            }
             Ok(Response::new(SearchResponse {
+                filter_regimes: regimes.to_proto(),
                 segments_total,
                 segments_skipped,
                 request_id,
@@ -13388,7 +13477,8 @@ impl SearchService for CoordinatorServiceImpl {
             // filters outright because the vector leg had no filter
             // machinery and filtering only the lexical half would have
             // misdescribed the result set (docs/vector-filters.md).
-            let filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
+            let mut filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
+            filters.enumerate_max_rows = req.enumerate_max_rows;
             // leg_k: default max(k, rrf_k) so the RRF constant never exceeds a
             // leg's depth; explicit values below k are clamped to k.
             let options = req.legs.unwrap_or_default();

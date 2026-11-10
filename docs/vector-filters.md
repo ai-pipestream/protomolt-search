@@ -94,6 +94,10 @@ set; under a union mask, a query's whole chunk quota could be filled
 by documents its own filter rejects while its real candidates sit
 below the cut.
 
+A provider that is searched whole instead of scanned in chunks (a graph,
+`docs/hnsw.md`) has no shared pass to protect: each query is one search
+under its own mask, taken as the bitmap the shard resolved.
+
 So queries are grouped by allowlist identity, and each group gets its
 own kernel call with a mask that is exactly the allowlist of every
 query in it. Unfiltered queries all share the `None` group, so a fleet

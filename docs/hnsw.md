@@ -19,7 +19,9 @@ Sharing its rows with the `.exact` sidecar is #71.
 Code: `src/hnsw/` (`config.rs`, `distance.rs`, `graph.rs`, `image.rs`,
 `rows.rs`). Tests: the module's unit tests, `tests/hnsw.rs` (real nodes
 behind a coordinator: planner refusals, corruption, streaming control,
-masks and floors, the candidate depth, multi-node fan-out) and
+masks and floors, the candidate depth, multi-node fan-out, filter regimes
+through the Query API, Boolean dense leaves, the policy's enumerate
+threshold) and
 `tests/hnsw_lifecycle.rs` (ingest, seal, reopen, deletes, replacement,
 snapshot, compaction). Harness engine: `hnsw` in `benchmarks/ann/`.
 
@@ -69,8 +71,12 @@ so nothing about the exact path changes:
   its `provider_backend` and `scoring_fingerprint`
   ([Dense execution policy](dense-execution-policy.md)); without one it
   refuses. No such policy ships with this milestone.
-- Recursive Boolean evaluation needs every member's score and refuses a
-  provider without exhaustive completion.
+- Recursive Boolean evaluation needs every member's score, which a walk
+  cannot give. The descriptor advertises `mask_enumeration`, and the shard
+  runs a Boolean dense pass pinned to the enumerate regime ("Filters"):
+  every member is scored exactly, so the leaf is exact without the graph
+  certifying anything. `ANN` inside a Boolean stays refused, as on every
+  provider.
 
 `completed` on a stream means every walk finished, never that every row was
 evaluated.
@@ -214,8 +220,10 @@ regime ran (`hnsw::Answer`).
   scalar scorer then settles every row the kernel cannot rule out (a row
   whose kernel score plus its error bound is below the k-th largest score
   minus its bound cannot be in the top `k`). Chosen when the mask allows at
-  most `ENUMERATE_ROWS_PER_WALK_ROW · ef · 2M` rows: fewer rows than a walk
-  would score, read in order instead of behind a cache miss each.
+  most the enumerate threshold: the request's `enumerate_max_rows` when a
+  dense execution policy point carries one ("Through the product"), else
+  `ENUMERATE_ROWS_PER_WALK_ROW · ef · 2M` rows, which is fewer rows than a
+  walk would score, read in order instead of behind a cache miss each.
 - **Filter-aware walk.** The layer-0 beam scores allowed rows only, and
   only they enter the candidate and result heaps. A disallowed neighbor is
   a bridge: it is not scored, its own allowed neighbors are scored in its
@@ -243,11 +251,23 @@ answer is exact instead of quietly short:
   enumerated. A stream has already emitted the rows the walk reached, so it
   emits the remaining allowed rows and no row twice.
 
-Neither applies to a pinned regime, which runs as pinned.
+Neither applies to a pinned regime, which runs as pinned. Both apply under
+a request's threshold: they only ever move a query to the exact answer.
 
 Enumerating a far mask costs its allowed rows, as a filtered flat scan
 does. That is the price of the exact answer where the graph has none; the
 regime in the answer lets a caller see it was paid.
+
+Seeding the walk instead was tried and is not in the provider. With the
+probe tripped, 64 allowed rows drawn from across the mask were scored and
+used as the walk's entries. On the challenge fixture's far masks (whole
+k-means cells away from the query) recall at k 10 was 0.16 to 0.59 for
+beams of 16 to 256 at a 50% mask and 0.30 to 0.50 for beams of 16 to 64 at
+10%: the allowed cells are islands joined only through rows the walk may
+not score, and a seed that lands in the right island but scores under the
+beam's worst is never expanded. Entries kept per facet value, or links
+kept per value, are what #55 names next for these masks; until one of them
+holds recall, a far mask is enumerated.
 
 What the regimes cost on the harness's challenge fixture (100,000 rows of
 64 dimensions, k 10, one core of a shared 4-vCPU cloud host, queries per
@@ -269,10 +289,43 @@ the rules above are what they are:
 `minimum_score` and a floor raised during a stream filter what is returned
 or emitted; neither cuts a walk short. Floor pruning is #72.
 
-The shard still hands the provider a byte mask built per query
-(`resolve_shard_filters`); building it as a bitmap from the column indexes,
-and carrying the thresholds in the measured dense execution policy, are the
-product half of #55.
+### Through the product
+
+- **The mask.** A shard resolves the request's filters into a bitmap from
+  its column indexes ([Vector filters](vector-filters.md), "The mask from
+  the columns") and hands the provider that bitmap on both scan routes.
+  Segmented vectors give each sealed image its own span of it, so the
+  regime is chosen per segment from that segment's allowed rows.
+- **One search per shard.** The unary scan (`SearchShard`) cuts an
+  exhaustive index into chunks and masks each. A graph has no chunks to
+  cut, and a mask naming one chunk's rows would make every chunk a filtered
+  search of the whole graph, so a provider without `exhaustive_completion`
+  is searched once per query at the request's depth
+  (`chunked::searched_topk`). The floor known at the start filters the
+  result and the k-th best found is offered once, at the end.
+- **The regime is reported.** Every filtered search is counted under the
+  regime that answered it, per segment, and the counts travel with the
+  scan's statistics through relays to
+  `QueryResponse.dense_execution.filter_regimes` (`enumerate`,
+  `filter_aware`, `plain`). A query the probe or a stranded walk handed
+  over counts as enumerate. Absent when no search was filtered; withheld,
+  like the rest of the physical layout, from a document-scoped response
+  ([Query execution disclosure](query-disclosure.md)).
+- **The threshold is the policy's.** `AUTO` serves a measured recall claim,
+  and a claim measured under one threshold must not be served under
+  another. A policy point for a filtered band names the
+  `enumerate_max_rows` it was measured with
+  ([Dense execution policy](dense-execution-policy.md), "Filter regimes");
+  the coordinator sends it with the scan and the provider chooses under it
+  instead of its own constant. Explicit `ANN` accepts the provider's
+  traversal and runs under the provider's threshold. The harness measures
+  a threshold the same way: `--hnsw-enumerate-max-rows=N`.
+- **Boolean dense leaves** run pinned to enumerate, as "What it may serve"
+  says.
+
+There is no second threshold. The issue that planned these regimes (#55)
+expected a plain walk above some selectivity; the table above is why it is
+never chosen, and a threshold nothing would cross is not stored.
 
 ## Streaming
 

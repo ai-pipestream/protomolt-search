@@ -291,6 +291,7 @@ impl VectorProvider for SegmentedProvider {
         // same way, so the result shape is bounded by the shard.
         let k = k.min(self.len());
         let mut per_query: Vec<Vec<(f32, i64)>> = vec![Vec::new(); nq];
+        let mut regimes = crate::vector::FilterRegimeCounts::default();
         for (base, rows, image) in self.images() {
             let allow = match options.allow {
                 Some(allow) => match allow.slice(base, base + rows) {
@@ -308,7 +309,9 @@ impl VectorProvider for SegmentedProvider {
                 part_options = part_options.with_candidate_depth(depth);
             }
             part_options.filter_regime = options.filter_regime;
+            part_options.enumerate_max_rows = options.enumerate_max_rows;
             let results = image.try_search(queries, k.min(rows), part_options)?;
+            regimes.add(results.regimes);
             for (q, hits) in per_query.iter_mut().enumerate() {
                 for (&slot, &score) in results
                     .slots_for_query(q)
@@ -340,6 +343,7 @@ impl VectorProvider for SegmentedProvider {
             slots,
             query_count: nq,
             result_count: k,
+            regimes,
         })
     }
 
@@ -358,6 +362,7 @@ impl VectorProvider for SegmentedProvider {
         let stopped = std::cell::Cell::new(false);
         let mut emitted = 0usize;
         let mut units = 0usize;
+        let mut regimes = crate::vector::FilterRegimeCounts::default();
         for (base, rows, image) in self.images() {
             if stopped.get() {
                 break;
@@ -378,6 +383,7 @@ impl VectorProvider for SegmentedProvider {
                 part_options = part_options.with_candidate_depth(depth);
             }
             part_options.filter_regime = options.filter_regime;
+            part_options.enumerate_max_rows = options.enumerate_max_rows;
             let note = |verdict: VectorStreamControl| match verdict {
                 VectorStreamControl::RaiseFloor(f) => {
                     floor.set(Some(floor.get().map_or(f, |cur| cur.max(f))));
@@ -417,6 +423,7 @@ impl VectorProvider for SegmentedProvider {
             )?;
             emitted += summary.emitted;
             units += summary.units_scanned;
+            regimes.add(summary.regimes);
             if !summary.completed {
                 stopped.set(true);
             }
@@ -426,6 +433,7 @@ impl VectorProvider for SegmentedProvider {
             emitted,
             units_scanned: units,
             completed: !stopped.get(),
+            regimes,
         })
     }
 

@@ -51,14 +51,16 @@ filter_selectivity_ppm_min = 100000    # filters admitting 10%..50% of rows
 filter_selectivity_ppm_max = 500000
 candidates = 800
 measured_recall_ppm = 985000
+enumerate_max_rows = 4096              # only for a provider with filter regimes
 ```
 
 Validation refuses by name: an unsupported `format_version`; an empty
 identity string, or one that needs escaping; zero rows, dimensions, or
 measured queries; no points; a point with `k = 0`, a selectivity band outside
 `1..=1000000` or inverted, a recall outside that range, a candidate depth
-below `k` or above the corpus; and two points for the same `k` and depth
-whose bands overlap.
+below `k` or above the corpus; two points for the same `k` and depth
+whose bands overlap; and an `enumerate_max_rows` on an unfiltered point or
+above the corpus.
 
 ## How AUTO resolves
 
@@ -90,7 +92,12 @@ whose bands overlap.
    qualifies only when the policy measured exactly one depth for that `k` and
    band; several depths refuse and list them. A miss refuses and lists what
    the policy measured for that `k`.
-7. The dense leg runs at the point's candidate depth; the response trims to
+7. A provider that answers a filter in a regime it chooses
+   (`mask_enumeration`, "Filter regimes" below) is served under the point's
+   `enumerate_max_rows`. A filtered request at a point that names none is
+   refused, and so is a point that names one for a provider without the
+   regime.
+8. The dense leg runs at the point's candidate depth; the response trims to
    `k`. `dense_execution` reports `resolved_mode = ANN`,
    `exhaustive_completion = false`, `policy_id`, `policy_fingerprint`, the
    `policy_point`, `filter_selectivity_ppm`, and `candidate_depth`.
@@ -105,6 +112,36 @@ band. Matching that band does not establish recall for every predicate with
 the same cardinality. [Document-restricted Query](document-query-authorization.md)
 retains that evidence scope and withholds physical metadata. The authority
 predicate must not be bypassed to select an unfiltered policy point.
+
+## Filter regimes
+
+Landed 2026-11-10 with the `hnsw` provider's filters (`docs/hnsw.md`,
+"Filters"). That provider answers a masked search one of two ways, per
+segment: it scores every allowed row (enumerate, exact) when the mask allows
+at most a threshold of rows, and walks the graph filter-aware above it. The
+two do not have the same recall, so the recall a point claims holds only
+under the threshold it was measured with. The threshold is therefore part
+of the point, not a constant of the build:
+
+- `enumerate_max_rows` on a point is the threshold the measurement ran
+  under, in allowed rows of one segment. The harness takes the same number
+  as `--hnsw-enumerate-max-rows`.
+- When AUTO qualifies the point, the coordinator sends the threshold with
+  every shard scan (`StartShardSearch.enumerate_max_rows`,
+  `StartStreamSearch.enumerate_max_rows`, through relays, and on the vector
+  leg of a hybrid query), and the provider chooses under it instead of its
+  own. A shard whose provider has no enumerate regime refuses the scan by
+  name.
+- The provider's two handoffs to enumerate (a mask far from the query, a
+  walk stranded on an island) still apply. They move a query to the exact
+  answer and cannot lower a measured recall.
+- The outcome reports the threshold in `policy_point.enumerate_max_rows`,
+  names it in `planner_reason`, and counts the regimes that actually
+  answered in `filter_regimes`.
+
+A request whose view and filters admit every row carries no mask, and an
+unfiltered point names no threshold. Explicit `ANN` never consults a policy
+and runs under the provider's own threshold.
 
 ## AUTO and FP32 rerank
 
@@ -132,6 +169,10 @@ generation or row count refuses naming the field; a qualified point runs
 two shards as over one; a filter keys the point on its measured selectivity
 band and an unmeasured band refuses naming the live ppm; a named candidate
 depth must be a measured one; explicit `ANN` is marked approximate and FP32
-rerank does not upgrade it. `src/dense_policy.rs` unit tests pin the file
+rerank does not upgrade it; a point naming an enumerate threshold is refused
+on a provider without the regime. `tests/hnsw.rs`: a filtered point serves
+the same mask filter-aware under a low threshold and enumerated, exactly,
+under a high one, on both scan routes, and a filtered point without a
+threshold is refused. `src/dense_policy.rs` unit tests pin the file
 round trip, the fingerprint, the exact-key rule, identity mismatches, and
 the malformed-document refusals.

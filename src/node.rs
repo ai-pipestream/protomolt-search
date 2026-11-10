@@ -5111,6 +5111,8 @@ struct ScanJob {
     geo_filters: Vec<crate::pb::GeoFilter>,
     geo_regions: Vec<crate::geo::GeoRegion>,
     filter: Option<crate::pb::FilterExpr>,
+    /// The request's enumerate threshold (`StartShardSearch`).
+    enumerate_max_rows: Option<u32>,
     /// Polled between chunks for the best coordinator-pushed floor
     /// (returns `None` when floor sharing is off or no floor arrived).
     external: Box<dyn FnMut() -> Option<f32> + Send>,
@@ -5187,8 +5189,8 @@ fn run_scan_batch(
     // batch winning a slot.
     let dim = index.dim_opt();
     let slots = index.len();
-    let mut specs: Vec<(Vec<f32>, usize, bool)> = Vec::with_capacity(batch.len());
-    let mut allows: Vec<Option<Vec<bool>>> = Vec::with_capacity(batch.len());
+    let mut specs: Vec<(Vec<f32>, usize, bool, Option<usize>)> = Vec::with_capacity(batch.len());
+    let mut allows: Vec<Option<crate::boolean_bits::Bits>> = Vec::with_capacity(batch.len());
     let mut prunes: Vec<crate::segment_prune::PruneStats> = Vec::with_capacity(batch.len());
     let mut knowns: Vec<(Vec<bool>, Vec<bool>)> = Vec::with_capacity(batch.len());
     let mut externals: Vec<Box<dyn FnMut() -> Option<f32> + Send>> = Vec::new();
@@ -5200,6 +5202,10 @@ fn run_scan_batch(
                 "query dim {} no longer matches the index",
                 job.vector.len()
             ))));
+            continue;
+        }
+        if let Err(refused) = check_enumerate_threshold(index, job.enumerate_max_rows) {
+            let _ = job.done.send(Err(refused));
             continue;
         }
         let resolved = guard.vector_scan_filters(
@@ -5237,9 +5243,13 @@ fn run_scan_batch(
             &job.geo_filters,
             job.filter.as_ref(),
         ));
-        // The scan kernel masks with a byte per row.
-        allows.push(allow.map(|bits| bits.to_bools()));
-        specs.push((job.vector, job.k, job.tie_complete));
+        allows.push(allow);
+        specs.push((
+            job.vector,
+            job.k,
+            job.tie_complete,
+            job.enumerate_max_rows.map(|rows| rows as usize),
+        ));
         externals.push(job.external);
         publishers.push(job.publish);
         dones.push(job.done);
@@ -5264,12 +5274,15 @@ fn run_scan_batch(
     let queries: Vec<BatchQuery> = specs
         .iter()
         .zip(&allows)
-        .map(|((vector, k, keep_ties), allow)| BatchQuery {
-            vector,
-            k: *k,
-            keep_ties: *keep_ties,
-            allow: allow.as_deref(),
-        })
+        .map(
+            |((vector, k, keep_ties, enumerate_max_rows), allow)| BatchQuery {
+                vector,
+                k: *k,
+                keep_ties: *keep_ties,
+                allow: allow.as_ref().map(crate::vector::Mask::Bits),
+                enumerate_max_rows: *enumerate_max_rows,
+            },
+        )
         .collect();
     let mut pass_bytes = 0u64;
     let mut pass_nanos = 0u64;
@@ -12067,6 +12080,7 @@ impl NodeService for NodeServiceImpl {
                                     floors_offered: stats.floors_offered,
                                     segments_total: stats.segments_total,
                                     segments_skipped: stats.segments_skipped,
+                                    filter_regimes: stats.regimes.to_proto(),
                                 }),
                                 geo_columns_known,
                                 filter_columns_known,
@@ -12111,6 +12125,7 @@ impl NodeService for NodeServiceImpl {
                                     geo_filters: start.geo_filters.clone(),
                                     geo_regions: geo_regions.clone(),
                                     filter: start.filter.clone(),
+                                    enumerate_max_rows: start.enumerate_max_rows,
                                     external: Box::new(external_floor),
                                     publish: Box::new(publish_floor),
                                     done: done_tx,
@@ -12232,6 +12247,7 @@ impl NodeService for NodeServiceImpl {
                                 floors_offered: stats.floors_offered,
                                 segments_total: stats.segments_total,
                                 segments_skipped: stats.segments_skipped,
+                                filter_regimes: stats.regimes.to_proto(),
                             }),
                             geo_columns_known,
                             filter_columns_known,
@@ -13536,6 +13552,10 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                         if let Some(depth) = start.candidate_depth {
                             options = options.with_candidate_depth(depth as usize);
                         }
+                        check_enumerate_threshold(index, start.enumerate_max_rows)?;
+                        if let Some(rows) = start.enumerate_max_rows {
+                            options = options.with_enumerate_max_rows(rows as usize);
+                        }
                         let mut floor_now = f32::NEG_INFINITY;
                         if let Some(f) = start.initial_floor {
                             options = options.with_initial_threshold(f);
@@ -13624,6 +13644,7 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                             scoring_fingerprint,
                             segments_total: prune.segments_total,
                             segments_skipped: prune.segments_skipped,
+                            filter_regimes: summary.regimes.to_proto(),
                         }, identities))
                     });
                 let outcome = scan.await;
@@ -16938,6 +16959,27 @@ impl TopSlots {
     }
 }
 
+/// An enumerate threshold names a filter regime, so only a provider that
+/// has one may be handed it: anything else would serve the request under a
+/// rule its policy point was not measured with.
+fn check_enumerate_threshold(index: &VectorIndex, rows: Option<u32>) -> Result<(), Status> {
+    let Some(rows) = rows else {
+        return Ok(());
+    };
+    let descriptor = index.descriptor();
+    if descriptor
+        .capabilities
+        .contains(&crate::vector::VectorCapability::MaskEnumeration)
+    {
+        return Ok(());
+    }
+    Err(Status::failed_precondition(format!(
+        "vector backend {:?} has no enumerate regime for the request's threshold of {rows} \
+         rows (it does not advertise mask_enumeration)",
+        descriptor.backend_kind
+    )))
+}
+
 /// Products of one dense pass over `mask` (an index-sized allowlist):
 /// every masked slot's calibrated score, or with `top` the best `depth`
 /// under a self-raised floor, ties at the floor included.
@@ -16962,21 +17004,29 @@ fn dense_pass(
             "query coordinate {coord} is invalid: {value}"
         )));
     }
-    // A pass must score every masked slot. A provider that cannot certify
-    // exhaustive completion (a graph walk reaches only part of the mask
-    // and still completes) would silently drop members or their scores.
+    // A pass must score every masked slot. A provider that certifies
+    // exhaustive completion does so on its own; a graph walk reaches only
+    // part of the mask and still completes, so a provider without the
+    // certificate is pinned to the enumerate regime, which scores every
+    // allowed row exactly by construction (docs/hnsw.md, "Filters"). A
+    // provider with neither would silently drop members or their scores.
     let descriptor = index.descriptor();
-    if !descriptor
-        .capabilities
-        .contains(&crate::vector::VectorCapability::ExhaustiveCompletion)
-    {
+    let has = |capability| descriptor.capabilities.contains(&capability);
+    let options = VectorSearchOptions::new().with_mask(mask);
+    let options = if has(crate::vector::VectorCapability::ExhaustiveCompletion) {
+        options
+    } else if has(crate::vector::VectorCapability::MaskEnumeration) {
+        // The depth sizes a walk; enumerate has none to size.
+        options
+            .with_filter_regime(crate::vector::FilterRegime::Enumerate)
+            .with_candidate_depth(1)
+    } else {
         return Err(Status::failed_precondition(format!(
-            "vector backend {:?} does not score every member exhaustively; Boolean \
-             evaluation needs an exhaustive dense provider",
+            "vector backend {:?} neither completes exhaustively nor enumerates a mask; \
+             Boolean evaluation needs every member's dense score",
             descriptor.backend_kind
         )));
-    }
-    let options = VectorSearchOptions::new().with_mask(mask);
+    };
     let summary = index
         .try_search_streaming_controlled(
             vector,
@@ -18391,6 +18441,7 @@ mod vector_scan_view_tests {
                 geo_filters: vec![],
                 geo_regions: vec![],
                 filter: None,
+                enumerate_max_rows: None,
                 external: Box::new(|| None),
                 publish: Box::new(|_| false),
                 done,

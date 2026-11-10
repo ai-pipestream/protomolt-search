@@ -244,6 +244,7 @@ fn qualified_point() -> DensePolicyPoint {
         filter_selectivity_ppm_max: 1_000_000,
         candidates: 5,
         measured_recall_ppm: 990_000,
+        enumerate_max_rows: None,
     }
 }
 
@@ -518,6 +519,29 @@ async fn a_filter_keys_the_point_on_its_live_selectivity() {
         .unwrap_err();
     assert!(
         error.message().contains("1000000 ppm"),
+        "{}",
+        error.message()
+    );
+    // A point that names an enumerate threshold was measured on a provider
+    // with filter regimes; this one has none, and the point is refused
+    // rather than served under a rule the provider does not run.
+    let text = policy_text(&fixture.fingerprint, GENERATION, N_DOCS);
+    // Appended to the last point: k = 2 on the filtered band.
+    let with_threshold = format!("{text}enumerate_max_rows = 2\n");
+    let coordinator = fixture
+        .coordinator
+        .clone()
+        .with_dense_execution_policy(load_policy("threshold", &with_threshold));
+    let error = query(
+        &coordinator,
+        request(2, 0, filtered("court == \"ca9\"", leaf())),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        error.message().contains("enumerate_max_rows 2")
+            && error.message().contains("mask_enumeration"),
         "{}",
         error.message()
     );
