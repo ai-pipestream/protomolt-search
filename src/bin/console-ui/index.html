@@ -34,7 +34,7 @@
           <div class="row"><select id="blend-norm"><option value="min_max">min-max</option><option value="z_score">z-score</option><option value="none">none</option></select>
           <select id="blend-comb"><option value="arithmetic">arithmetic</option><option value="geometric">geometric</option><option value="harmonic">harmonic</option></select></div></div>
         <div class="field"><label>Weights</label>
-          <div class="row"><input id="w-dense" type="number" step="0.1" placeholder="dense (1)"><input id="w-lex" type="number" step="0.1" placeholder="lexical (1)"></div></div>
+          <div class="row"><input id="w-dense" type="number" step="0.1" placeholder="dense" title="dense leg weight, default 1"><input id="w-lex" type="number" step="0.1" placeholder="lexical" title="lexical leg weight, default 1"></div></div>
       </div>
       <div id="shape-dense-fields" class="hidden">
         <div class="field"><label for="score-mode">Score mode</label>
@@ -55,7 +55,8 @@
       <div class="field"><label for="selection-k">selection_k</label><input id="selection-k" type="number" value="0" min="0" placeholder="0 = default"></div>
       <div class="field"><label for="sort">Sort</label><input id="sort" class="mono" placeholder="year desc, court"></div>
       <div class="field"><label for="collapse">Collapse</label>
-        <div class="row"><input id="collapse" class="mono" placeholder="column"><input id="inner-hits" type="number" value="2" min="0" style="width:60px" title="inner hits"></div></div>
+        <div class="row"><input id="collapse" class="mono" placeholder="column"><input id="inner-hits" type="number" value="2" min="0" class="narrow" title="inner hits per group"></div></div>
+      <div class="field"><label for="columns">Columns</label><input id="columns" class="mono" placeholder="court, year, citations" title="Stored columns or CEL expressions shown on each hit (QueryRequest.projections)"></div>
       <div class="field"><label for="highlight">Highlight</label>
         <div class="row"><input id="highlight" type="checkbox" class="fixed" checked><select id="hl-mode"><option value="HIGHLIGHT_MODE_SENTENCE">sentence</option><option value="HIGHLIGHT_MODE_WINDOW">window</option></select></div></div>
       <div class="row"><label class="fixed"><input id="explain" type="checkbox" checked> explain</label>
@@ -68,11 +69,12 @@
       <div class="field"><label for="group-by">Group by</label><input id="group-by" class="mono" placeholder="facet column"></div>
       <div class="agg-list" id="aggs"></div>
       <div class="row"><button id="add-agg" class="fixed">+ fold</button></div>
-      <div class="field"><label for="hist-expr">Histogram</label>
-        <div class="row"><input id="hist-expr" class="mono" placeholder="expression"><input id="hist-interval" type="number" placeholder="interval" style="width:80px">
+      <div class="field"><label for="hist-expr">Histogram</label><input id="hist-expr" class="mono" placeholder="double(year), or a timestamp column"></div>
+      <div class="field"><label for="hist-interval">Interval</label>
+        <div class="row"><input id="hist-interval" type="number" placeholder="1" class="narrow">
           <select id="hist-calendar"><option value="">fixed</option><option value="CALENDAR_INTERVAL_DAY">day</option><option value="CALENDAR_INTERVAL_WEEK">week</option><option value="CALENDAR_INTERVAL_MONTH">month</option><option value="CALENDAR_INTERVAL_QUARTER">quarter</option><option value="CALENDAR_INTERVAL_YEAR">year</option></select></div></div>
       <div class="field"><label for="pct-expr">Percentiles</label>
-        <div class="row"><input id="pct-expr" class="mono" placeholder="expression"><input id="pct-list" class="mono" placeholder="50, 90, 99" style="width:100px"></div></div>
+        <div class="row"><input id="pct-expr" class="mono" placeholder="expression"><input id="pct-list" class="mono narrow" placeholder="50, 90, 99"></div></div>
     </div>
 
     <div class="panel">
@@ -90,16 +92,37 @@
         <div class="typeahead"><input id="q" placeholder="query text" autocomplete="off"><ul id="suggest" class="hidden"></ul></div>
         <button id="run" class="primary fixed">Search</button>
         <button id="stream" class="fixed" title="QueryStream: revisions as they settle">Stream</button>
+        <button id="keys" class="fixed" title="Keyboard shortcuts" aria-expanded="false" aria-controls="keys-help">?</button>
       </div>
+      <dl id="keys-help" class="keys hidden">
+        <dt><kbd>/</kbd></dt><dd>focus the query box</dd>
+        <dt><kbd>Ctrl</kbd> or <kbd>⌘</kbd> + <kbd>Enter</kbd></dt><dd>run the query from any field</dd>
+        <dt><kbd>↑</kbd> <kbd>↓</kbd> <kbd>Enter</kbd></dt><dd>choose a typeahead suggestion</dd>
+        <dt><kbd>[</kbd> <kbd>]</kbd></dt><dd>previous and next page</dd>
+        <dt><kbd>Esc</kbd></dt><dd>close the typeahead or this list</dd>
+        <dt><kbd>?</kbd></dt><dd>show or hide this list</dd>
+      </dl>
+      <div id="filter-chips" class="chips hidden"></div>
       <div id="dym" class="dym hidden"></div>
       <div id="error" class="error hidden"></div>
       <div id="profile-line" class="profile"></div>
+      <div id="phases" class="phases hidden"></div>
       <div id="stream-log" class="muted small hidden"></div>
     </div>
     <div class="panel" id="results-panel">
       <div class="toolbar"><span id="result-count" class="muted"></span><span class="spacer"></span>
         <button id="prev" disabled>◂ previous</button><button id="next" disabled>next ▸</button></div>
-      <div id="results"></div>
+      <div id="results">
+        <div class="empty">
+          <p>Type a query and press <kbd>Enter</kbd>. The form on the left shapes it: lexical, dense, a hybrid of both with a fusion strategy, a boolean tree, or a filter-only browse.</p>
+          <ul>
+            <li>A <b>group-by</b> or a <b>histogram</b> on the left fills the rail on the right; click a value or a bar there to narrow the results to it.</li>
+            <li><b>Columns</b> puts stored values on each hit; click a value to filter by it.</li>
+            <li>The address bar holds the whole query, so a link reproduces it, and <b>History</b> keeps the last thirty.</li>
+            <li>Press <kbd>?</kbd> for the keyboard shortcuts.</li>
+          </ul>
+        </div>
+      </div>
     </div>
     <div class="panel hidden" id="ab-panel"></div>
     <div class="panel">
@@ -111,8 +134,9 @@
 
   <aside>
     <div class="panel"><h2>Aggregations</h2><div id="agg-out" class="muted small">Add a group-by, a fold, a histogram, or percentiles.</div></div>
+    <div class="panel"><div class="toolbar"><h2>History</h2><span class="spacer"></span><button id="clear-history" class="quiet hidden">clear</button></div><div id="history" class="muted small">Queries you run are listed here.</div></div>
     <div class="panel"><h2>Synonyms</h2><div id="synonyms" class="muted small">none reported</div></div>
-    <div class="panel"><h2>Dense execution</h2><div id="dense-out" class="muted small mono"></div></div>
+    <div class="panel"><h2>Dense execution</h2><div id="dense-out" class="muted small"></div></div>
   </aside>
 </div>
 <script type="module" src="/search.js"></script>

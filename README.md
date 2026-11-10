@@ -818,7 +818,10 @@ profile, cursor paging), with typeahead and did-you-mean, the streaming
 query, an A/B panel over `VariantSearch`, and a raw view that yields a
 working `grpcurl` line. The dashboard streams the metrics registry,
 edits runtime knobs, draws the shard map from segment summaries, and
-lists recent queries. Details: [The console](docs/console-facade.md).
+lists recent queries. The search page's rail and hit columns filter on
+a click, the URL holds the query, and `cargo run --release --example
+console_demo` serves it all over a small in-process cluster. Details:
+[The console](docs/console-facade.md).
 
 ### Boost rescore (any mode)
 

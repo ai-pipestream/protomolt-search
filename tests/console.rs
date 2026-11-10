@@ -501,6 +501,7 @@ async fn the_facade_transcodes_search_and_diagnostics_and_serves_the_ui() {
         "/common.js",
         "/search.js",
         "/dashboard.js",
+        "/query-state.js",
         "/sparkline.js",
     ] {
         let r = http(c, "GET", asset, None).await;

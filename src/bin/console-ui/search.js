@@ -1,11 +1,16 @@
 // The search page: builds a QueryRequest from the form, runs it through
 // the facade, and renders hits, explain trees, groups, aggregations, and
-// the profile line. Also typeahead (Suggest), did-you-mean (TermSuggest),
-// the streaming query, and the A/B comparison (VariantSearch).
+// the profile. Also typeahead (Suggest), did-you-mean (TermSuggest), the
+// streaming query, the A/B comparison (VariantSearch), the filter chips
+// and drill-down, the URL state, and the history.
 import {
   api, el, clear, fmtMs, fmtNum, debounce, loadConfig, grpcurlFor, mountHeader,
-  copyText, errorText, isUnimplemented, enums,
+  copyText, errorText, enums,
 } from '/common.js';
+import {
+  splitTopLevel, splitConjuncts, toggleConjunct, replaceRange, isIdentifier, celString,
+  rangeColumn, rangeClause, calendarUpper, encodeState, decodeState,
+} from '/query-state.js';
 
 const $ = (id) => document.getElementById(id);
 const state = {
@@ -18,7 +23,20 @@ const state = {
   tab: 'response',
   stream: null,
   vector: null,     // last embedded vector, with the text it came from
+  defaults: null,   // the form as the page loads it, for the URL state
+  suggestIndex: -1,
 };
+
+// The controls the URL carries. A pasted vector is left out: it does not
+// fit in a URL.
+const FORM_IDS = [
+  'q', 'shape', 'fusion', 'rrf-k', 'blend-norm', 'blend-comb', 'w-dense', 'w-lex', 'score-mode',
+  'msm', 'filter', 'k', 'selection-k', 'sort', 'collapse', 'inner-hits', 'columns', 'highlight',
+  'hl-mode', 'explain', 'profile', 'fetch-text', 'group-by', 'hist-expr', 'hist-interval',
+  'hist-calendar', 'pct-expr', 'pct-list', 'ab-a', 'ab-b',
+];
+const HISTORY_KEY = 'pipestream.console.history';
+const HISTORY_MAX = 30;
 
 mountHeader('search');
 init();
@@ -33,20 +51,19 @@ async function init() {
   if (!state.config.analysis) $('dense-note').classList.remove('hidden');
   $('shape').addEventListener('change', syncShape);
   $('fusion').addEventListener('change', syncShape);
-  syncShape();
   $('add-clause').addEventListener('click', () => addClause());
   addClause('must', 'lexical', '');
   $('add-agg').addEventListener('click', () => addAgg());
   $('run').addEventListener('click', () => run());
-  $('stream').addEventListener('click', () => streamQuery());
+  $('stream').addEventListener('click', () => (state.stream ? stopStream() : streamQuery()));
   $('prev').addEventListener('click', () => page(-1));
   $('next').addEventListener('click', () => page(1));
-  $('q').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') { hideSuggest(); run(); }
-    if (e.key === 'Escape') hideSuggest();
-  });
+  $('q').addEventListener('keydown', queryKey);
   $('q').addEventListener('input', debounce(typeahead, 150));
   $('q').addEventListener('blur', () => setTimeout(hideSuggest, 150));
+  $('filter').addEventListener('input', renderChips);
+  $('keys').addEventListener('click', toggleKeys);
+  document.addEventListener('keydown', pageKey);
   for (const b of document.querySelectorAll('.tabs button')) {
     b.addEventListener('click', () => { state.tab = b.dataset.tab; renderRaw(); });
   }
@@ -57,6 +74,103 @@ async function init() {
   }
   $('ab-b').value = presets[1]?.id ?? presets[0].id;
   $('run-ab').addEventListener('click', () => runAb());
+  $('clear-history').addEventListener('click', () => { saveHistory([]); renderHistory(); });
+  state.defaults = readForm();
+  syncShape();
+  renderHistory();
+  window.addEventListener('popstate', () => restoreFromUrl());
+  restoreFromUrl();
+}
+
+// ---------------------------------------------------------------------------
+// The form as a value: the URL state and the history restore from it
+// ---------------------------------------------------------------------------
+
+function readForm() {
+  const form = {};
+  for (const id of FORM_IDS) {
+    const node = $(id);
+    form[id] = node.type === 'checkbox' ? node.checked : node.value;
+  }
+  form.clauses = [...$('clauses').querySelectorAll('.clause')].map((row) => ({
+    kind: row.querySelector('.kind').value,
+    leaf: row.querySelector('.leaf').value,
+    value: row.querySelector('.value').value,
+  }));
+  form.aggs = [...$('aggs').querySelectorAll('.agg')].map((row) => ({
+    name: row.querySelector('.name').value,
+    expression: row.querySelector('.expr').value,
+    op: row.querySelector('.op').value,
+  }));
+  return form;
+}
+
+function writeForm(form) {
+  for (const id of FORM_IDS) {
+    const node = $(id);
+    if (node.type === 'checkbox') node.checked = !!form[id];
+    else node.value = form[id];
+  }
+  clear($('clauses'));
+  for (const c of form.clauses) addClause(c.kind, c.leaf, c.value);
+  clear($('aggs'));
+  for (const a of form.aggs) addAgg(a.name, a.expression, a.op);
+  syncShape();
+  renderChips();
+}
+
+function currentHash() { return location.hash.replace(/^#/, ''); }
+
+// The URL fragment is the form: restore it, and run when it names a query.
+function restoreFromUrl() {
+  const hash = currentHash();
+  writeForm(decodeState(hash, state.defaults));
+  if (hash) run({ push: false });
+}
+
+function loadHistory() {
+  try {
+    const list = JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]');
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveHistory(list) {
+  try { localStorage.setItem(HISTORY_KEY, JSON.stringify(list)); } catch { /* storage is a convenience */ }
+}
+
+function remember(hash, response) {
+  if (!hash) return;
+  const form = readForm();
+  const entry = {
+    hash,
+    text: form.q,
+    shape: form.shape,
+    filter: form.filter,
+    hits: (response.groups?.length ? response.groups.flatMap((g) => g.hits || []) : response.hits || []).length,
+    ms: response._wall_ms,
+    at: Date.now(),
+  };
+  saveHistory([entry, ...loadHistory().filter((h) => h.hash !== hash)].slice(0, HISTORY_MAX));
+  renderHistory();
+}
+
+function renderHistory() {
+  const list = loadHistory();
+  const box = clear($('history'));
+  $('clear-history').classList.toggle('hidden', !list.length);
+  if (!list.length) { box.textContent = 'Queries you run are listed here.'; return; }
+  for (const h of list) {
+    box.append(el('a', { class: 'past', href: `#${h.hash}`, title: new Date(h.at).toLocaleString() }, [
+      el('span', { class: 'what' }, [
+        el('span', { class: 'q', text: h.text || '(no text)' }),
+        h.filter ? el('span', { class: 'mono muted', text: ` ${h.filter}` }) : null,
+      ]),
+      el('span', { class: 'mono muted', text: `${h.shape} · ${fmtNum(h.hits)} · ${fmtMs(h.ms)}` }),
+    ]));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -78,7 +192,7 @@ function addClause(kind = 'should', leaf = 'lexical', value = '') {
     el('select', { class: 'kind' }, ['must', 'should', 'must_not'].map((k) => el('option', { value: k, text: k, selected: k === kind }))),
     el('select', { class: 'leaf' }, ['lexical', 'dense', 'filter'].map((k) => el('option', { value: k, text: k, selected: k === leaf }))),
     el('input', { class: 'mono value', value, placeholder: 'text, or a CEL predicate, or (dense) the query text' }),
-    el('button', { text: '×', onclick: () => row.remove() }),
+    el('button', { text: '×', title: 'remove this clause', onclick: () => row.remove() }),
   ]);
   $('clauses').append(row);
 }
@@ -88,7 +202,7 @@ function addAgg(name = '', expression = '', op = 'AGGREGATE_OP_COUNT') {
     el('input', { class: 'mono name', value: name, placeholder: 'name' }),
     el('input', { class: 'mono expr', value: expression, placeholder: 'expression, e.g. year' }),
     el('select', { class: 'op' }, enums.aggregateOp.map((o) => el('option', { value: o, text: o.replace('AGGREGATE_OP_', '').toLowerCase(), selected: o === op }))),
-    el('button', { text: '×', onclick: () => row.remove() }),
+    el('button', { text: '×', title: 'remove this fold', onclick: () => row.remove() }),
   ]);
   $('aggs').append(row);
 }
@@ -139,7 +253,6 @@ function aggregateSpec() {
     if (!name && !expression) continue;
     aggregations.push({ name: name || expression, expression: expression || '1', op: row.querySelector('.op').value });
   }
-  if (aggregations.length) out.aggregations = aggregations;
   const histExpr = $('hist-expr').value.trim();
   if (histExpr) {
     const h = { name: `hist:${histExpr}`, expression: histExpr, max_buckets: 200 };
@@ -153,6 +266,12 @@ function aggregateSpec() {
     const percentiles = ($('pct-list').value || '50, 90, 99').split(',').map((s) => Number(s.trim())).filter((n) => Number.isFinite(n));
     out.percentiles = [{ name: `pct:${pctExpr}`, expression: pctExpr, percentiles }];
   }
+  // A group-by alone is not a request the engine takes: it wants at
+  // least one fold, so the count the rail shows anyway is asked for.
+  if (groupBy && !aggregations.length && !out.histograms && !out.percentiles) {
+    aggregations.push({ name: 'count', expression: '1', op: 'AGGREGATE_OP_COUNT' });
+  }
+  if (aggregations.length) out.aggregations = aggregations;
   return Object.keys(out).length ? out : null;
 }
 
@@ -218,7 +337,11 @@ async function buildRequest() {
   if (sort.length) request.sort = sort;
   const collapse = $('collapse').value.trim();
   if (collapse) request.collapse = { column: collapse, inner_hits: Number($('inner-hits').value || 0) };
-  if ($('highlight').checked && shape === 'lexical') {
+  const columns = splitTopLevel($('columns').value, ',');
+  if (columns.length) request.projections = columns.map((expression) => ({ name: expression, expression }));
+  // Snippets are served for the single lexical selection only, and a
+  // filter makes the selection a composite; the stored text shows then.
+  if ($('highlight').checked && shape === 'lexical' && !filter) {
     request.highlight = { max_snippets: 2, max_chars: 240, mode: $('hl-mode').value };
   }
   if (shape !== 'boolean') {
@@ -233,10 +356,16 @@ async function buildRequest() {
 // Running
 // ---------------------------------------------------------------------------
 
-async function run() {
+// One run of the form. A run that is not a page turn starts from the
+// first page; `push` writes the form to the URL as a new history entry.
+async function run({ paging = false, push = true } = {}) {
   stopStream();
+  if (!paging) { state.cursor = ''; state.cursors = []; }
   $('ab-panel').classList.add('hidden');
+  $('results-panel').classList.remove('hidden');
   hideError();
+  const hash = encodeState(readForm(), state.defaults);
+  if (push && hash !== currentHash()) history.pushState(null, '', hash ? `#${hash}` : location.pathname);
   let request;
   try {
     request = await buildRequest();
@@ -251,6 +380,7 @@ async function run() {
     response._wall_ms = performance.now() - started;
     state.response = response;
     await render(response);
+    if (!paging) remember(hash, response);
     didYouMean();
   } catch (e) {
     state.response = { error: e };
@@ -270,33 +400,84 @@ function page(direction) {
     if (!state.cursors.length) return;
     state.cursor = state.cursors.pop();
   }
-  run();
+  run({ paging: true, push: false });
 }
 
-$('q').addEventListener('change', () => { state.cursor = ''; state.cursors = []; });
-for (const id of ['shape', 'filter', 'k', 'sort', 'collapse']) {
-  $(id).addEventListener('change', () => { state.cursor = ''; state.cursors = []; });
-}
+// The field an engine message is about, by the word the message opens
+// with or names, so the red line has a place on the form.
+const ERROR_FIELDS = [
+  [/^histogram\b/, 'hist-expr'], [/^percentile/, 'pct-expr'], [/^projection\b/, 'columns'],
+  [/^sort\b/, 'sort'], [/^collapse\b/, 'collapse'], [/^filter\b|\bCEL\b/, 'filter'],
+  [/^aggregat|group_by|group-by/, 'group-by'],
+];
 
 function showError(e) {
   const node = $('error');
   node.textContent = errorText(e);
   node.classList.remove('hidden');
+  const message = String(e?.error ?? '');
+  const field = ERROR_FIELDS.find(([pattern]) => pattern.test(message));
+  if (field) $(field[1]).classList.add('invalid');
+  if ($('results').querySelector('.hit')) {
+    $('results-panel').classList.add('stale');
+    $('result-count').textContent = 'the query failed; these are the previous results';
+  }
 }
 
-function hideError() { $('error').classList.add('hidden'); }
+function hideError() {
+  $('error').classList.add('hidden');
+  $('results-panel').classList.remove('stale');
+  for (const node of document.querySelectorAll('.invalid')) node.classList.remove('invalid');
+}
+
+// ---------------------------------------------------------------------------
+// The filter as chips, and drill-down into it
+// ---------------------------------------------------------------------------
+
+function renderChips() {
+  const box = clear($('filter-chips'));
+  const parts = splitConjuncts($('filter').value);
+  box.classList.toggle('hidden', !parts.length);
+  if (!parts.length) return;
+  box.append(el('span', { class: 'muted small', text: 'filter' }));
+  for (const part of parts) {
+    box.append(el('span', { class: 'chip mono' }, [
+      part,
+      el('button', { text: '×', title: 'remove this condition', onclick: () => setFilter(toggleConjunct($('filter').value, part)) }),
+    ]));
+  }
+}
+
+function setFilter(value) {
+  $('filter').value = value;
+  renderChips();
+  run();
+}
+
+// Narrow to (or, with `exclude`, away from) one value of a column.
+function drill(column, value, exclude) {
+  const is = `${column} == ${celString(value)}`;
+  const not = `${column} != ${celString(value)}`;
+  const [add, drop] = exclude ? [not, is] : [is, not];
+  const parts = splitConjuncts($('filter').value);
+  if (parts.includes(drop)) setFilter(toggleConjunct(toggleConjunct($('filter').value, drop), add));
+  else setFilter(toggleConjunct($('filter').value, add));
+}
+
+function drillTitle(column, value) {
+  return `click: only ${column} == ${value}; shift-click: exclude it; click again to undo`;
+}
 
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
 
 async function render(response) {
-  const results = clear($('results'));
   const hits = response.hits || [];
   const groups = response.groups || [];
-  $('result-count').textContent = groups.length
-    ? `${groups.length} group(s), executed ${response.executed || ''}`
-    : `${hits.length} hit(s), executed ${response.executed || ''}`;
+  const count = groups.length ? `${groups.length} group(s)` : `${hits.length} hit(s)`;
+  const unhighlighted = $('highlight').checked && !state.request.highlight && $('shape').value === 'lexical';
+  $('result-count').textContent = `${count}, executed ${response.executed || ''}${unhighlighted ? ' (no snippets: the engine cuts them for an unfiltered lexical query only)' : ''}`;
   $('next').disabled = !response.nextCursor;
   $('prev').disabled = !state.cursors.length;
   renderProfile(response);
@@ -307,19 +488,23 @@ async function render(response) {
 
   const all = groups.length ? groups.flatMap((g) => g.hits || []) : hits;
   if ($('fetch-text').checked) await fetchTexts(all.map((h) => h.docId));
-  if (groups.length) {
+  const scale = pageScale(all);
+  const results = clear($('results'));
+  if (!all.length) {
+    results.append(el('div', { class: 'empty', text: 'Nothing matched. Loosen the filter, or check the did-you-mean line above.' }));
+  } else if (groups.length) {
     for (const g of groups) {
       const key = g.key ? (g.key.text ?? g.key.integer ?? g.key.number) : '';
       const box = el('div', { class: 'group' }, [
         el('div', { class: 'key' }, [`${key}`, ' ', el('span', { class: 'muted small mono', text: `${g.complete ? 'complete' : 'partial'}, pool ${g.poolHits ?? 0}` })]),
       ]);
       const inner = el('div', { class: 'inner' });
-      for (const h of g.hits || []) inner.append(hitNode(h));
+      for (const h of g.hits || []) inner.append(hitNode(h, scale));
       box.append(inner);
       results.append(box);
     }
   } else {
-    for (const h of hits) results.append(hitNode(h));
+    for (const h of hits) results.append(hitNode(h, scale));
   }
 }
 
@@ -335,35 +520,97 @@ async function fetchTexts(ids) {
   }
 }
 
-function hitNode(h) {
+// What the bars on a page of hits are drawn against: the top score, and
+// per signal id the largest value on the page.
+function pageScale(hits) {
+  const scale = { score: 0, signals: new Map(), legs: 0 };
+  for (const h of hits) {
+    scale.score = Math.max(scale.score, Number(h.score ?? 0));
+    scale.legs = Math.max(scale.legs, (h.signals || []).length);
+    for (const s of h.signals || []) scale.signals.set(s.id, Math.max(scale.signals.get(s.id) ?? 0, Number(s.score)));
+  }
+  return scale;
+}
+
+function share(value, max) {
+  return max > 0 ? Math.max(0, Math.min(100, (100 * Number(value)) / max)) : 0;
+}
+
+function projectedValue(p) {
+  return p.stringValue ?? p.uintValue ?? p.intValue ?? p.doubleValue ?? p.boolValue;
+}
+
+function hitNode(h, scale) {
   const doc = state.texts.get(String(h.docId));
   const node = el('div', { class: 'hit' });
   node.append(el('div', { class: 'head' }, [
     el('span', { class: 'rank', text: `#${h.rank ?? ''}` }),
     el('span', { class: 'score', text: Number(h.score ?? 0).toFixed(6) }),
-    el('span', { class: 'id', text: `doc ${h.docId}` }),
+    scale.score > 0 ? el('span', { class: 'scorebar', title: `${share(h.score, scale.score).toFixed(0)}% of the top score on this page` }, [el('span', { style: `width:${share(h.score, scale.score)}%` })]) : null,
+    el('button', { class: 'id quiet', text: `doc ${h.docId}`, title: 'copy the document id', onclick: () => copyText(String(h.docId)) }),
     doc?.lineage ? el('span', { class: 'muted', text: `parent ${doc.lineage.parent_id} group ${doc.lineage.group_id}` }) : null,
     h.sortValues?.length ? el('span', { class: 'muted', text: `sort ${h.sortValues.map((v) => v.text ?? v.integer ?? v.number).join(' | ')}` }) : null,
   ]));
+
+  // The projected values carry no name: the request's projection at the
+  // same index names each.
+  const projections = state.request?.projections || [];
+  if (h.projected?.length) {
+    const columns = el('div', { class: 'columns' });
+    h.projected.forEach((p, i) => {
+      const name = projections[i]?.name ?? `#${i}`;
+      const value = projectedValue(p);
+      const shown = value == null ? '–' : p.intValue != null ? epochLabel(p.intValue) : String(value);
+      const facet = p.stringValue != null && isIdentifier(name);
+      columns.append(el(facet ? 'button' : 'span', {
+        class: 'chip',
+        title: facet ? drillTitle(name, value) : value == null ? 'no value' : String(value),
+        onclick: facet ? (e) => drill(name, value, e.shiftKey) : null,
+      }, [el('span', { class: 'muted', text: `${name} ` }), el('span', { class: 'mono', text: shown })]));
+    });
+    node.append(columns);
+  }
+
   if (h.snippets?.length) {
     for (const s of h.snippets) node.append(el('div', { class: 'text' }, snippetNodes(s)));
   } else if (doc?.text) {
-    node.append(el('div', { class: 'text', text: doc.text.length > 1200 ? `${doc.text.slice(0, 1200)} …` : doc.text }));
+    node.append(textNode(doc.text));
   } else if (doc?.error) {
     node.append(el('div', { class: 'muted small', text: `text unavailable: ${doc.error}` }));
   }
+
+  // One signal is the score again; two or more are the legs, each drawn
+  // against the largest value that leg has on this page.
+  if (scale.legs > 1 && h.signals?.length) {
+    const legs = el('div', { class: 'legs' });
+    for (const s of h.signals) {
+      legs.append(el('div', { class: 'leg', title: `${s.id} ${s.score}: ${share(s.score, scale.signals.get(s.id)).toFixed(0)}% of this leg's best on the page` }, [
+        el('span', { class: 'mono muted', text: s.id }),
+        el('span', { class: 'track' }, [el('span', { style: `width:${share(s.score, scale.signals.get(s.id))}%` })]),
+        el('span', { class: 'mono', text: Number(s.score).toFixed(4) }),
+      ]));
+    }
+    node.append(legs);
+  }
   const meta = el('div', { class: 'meta signals' });
-  for (const s of h.signals || []) meta.append(el('span', { text: `${s.id}=${Number(s.score).toFixed(4)}` }));
   for (const d of h.dimensions || []) meta.append(el('span', { text: `${d.id}: ${d.skipped ? 'skipped' : `raw ${fmtNum(d.raw)} norm ${fmtNum(d.normalized)} → ${fmtNum(d.contribution)}`}` }));
   if (h.matched?.length) meta.append(el('span', { text: `matched ${h.matched.join(',')}` }));
-  for (const p of h.projected || []) meta.append(el('span', { text: `${p.name ?? ''}=${p.stringValue ?? p.uintValue ?? p.intValue ?? p.doubleValue ?? p.boolValue}` }));
-  node.append(meta);
+  if (meta.firstChild) node.append(meta);
   if (h.explain) {
     const drawer = el('details', { class: 'tree' }, [el('summary', { class: 'muted small', text: 'explain' })]);
     drawer.append(el('ul', {}, [explainNode(h.explain)]));
     node.append(drawer);
   }
   return node;
+}
+
+// Stored text, clamped to a few lines with a toggle when it is long.
+function textNode(text) {
+  const long = text.length > 420 || text.split('\n').length > 5;
+  const body = el('div', { class: long ? 'text clamp' : 'text', text });
+  if (!long) return body;
+  const toggle = el('button', { class: 'quiet small', text: 'more', onclick: () => { toggle.textContent = body.classList.toggle('clamp') ? 'more' : 'less'; } });
+  return el('div', {}, [body, toggle]);
 }
 
 function snippetNodes(s) {
@@ -389,56 +636,128 @@ function explainNode(node) {
   return el('li', {}, [d]);
 }
 
+// The phases of QueryProfile in the order they run, each with its slot
+// in the categorical palette (app.css): the slot follows the phase.
+const PHASES = [
+  ['selection', 'selectionMs'], ['boost', 'boostMs'], ['values', 'valuesMs'], ['scorer', 'scorerMs'],
+  ['projection', 'projectionMs'], ['rerank', 'rerankMs'], ['collapse', 'collapseMs'],
+];
+
 function renderProfile(response) {
   const line = clear($('profile-line'));
+  const bar = clear($('phases'));
   const p = response.profile;
   line.append(el('span', { text: `wall ${fmtMs(response._wall_ms)}` }));
+  bar.classList.toggle('hidden', !p);
   if (!p) return;
-  const phases = [['selection', p.selectionMs], ['boost', p.boostMs], ['values', p.valuesMs], ['scorer', p.scorerMs], ['projection', p.projectionMs], ['rerank', p.rerankMs], ['collapse', p.collapseMs]];
-  for (const [name, ms] of phases) if (ms) line.append(el('span', { text: `${name} ${fmtMs(ms)}` }));
   line.append(el('span', { text: `total ${fmtMs(p.totalMs)}` }));
   if (p.shardsTotal) line.append(el('span', { text: `shards ${p.shardsSkipped ?? 0}/${p.shardsTotal} skipped` }));
   if (p.segmentsTotal) line.append(el('span', { text: `segments ${p.segmentsSkipped ?? 0}/${p.segmentsTotal} skipped` }));
-  if (p.rerankRows) line.append(el('span', { text: `rerank ${fmtNum(p.rerankRows)} rows, ${fmtNum(p.rerankPages)} pages` }));
+  if (Number(p.rerankRows)) line.append(el('span', { text: `rerank ${fmtNum(p.rerankRows)} rows, ${fmtNum(p.rerankPages)} pages` }));
   if (response.servedTopologyGeneration) line.append(el('span', { text: `topology ${response.servedTopologyGeneration}` }));
+
+  const parts = PHASES.map(([name, key], i) => ({ name, ms: Number(p[key] || 0), slot: i + 1 })).filter((x) => x.ms > 0);
+  const total = Number(p.totalMs || 0);
+  const rest = total - parts.reduce((a, x) => a + x.ms, 0);
+  if (rest > 0.0005) parts.push({ name: 'fan-out and merge', ms: rest, slot: 0 });
+  const sum = parts.reduce((a, x) => a + x.ms, 0);
+  if (!sum) { bar.classList.add('hidden'); return; }
+  const track = el('div', { class: 'stack', role: 'img', 'aria-label': `phase timings: ${parts.map((x) => `${x.name} ${fmtMs(x.ms)}`).join(', ')}` });
+  const legend = el('div', { class: 'legend' });
+  for (const x of parts) {
+    const title = `${x.name} ${fmtMs(x.ms)} (${((100 * x.ms) / sum).toFixed(0)}%)`;
+    track.append(el('span', { class: `seg s${x.slot}`, style: `flex-grow:${x.ms}`, title }));
+    legend.append(el('span', { title }, [el('i', { class: `swatch s${x.slot}` }), `${x.name} `, el('span', { class: 'mono', text: fmtMs(x.ms) })]));
+  }
+  bar.append(track, legend);
+}
+
+function foldValue(x) {
+  return x.uintValue ?? x.intValue ?? x.doubleValue ?? '–';
 }
 
 function renderAggregate(agg) {
   const out = clear($('agg-out'));
-  if (!agg) { out.textContent = 'none requested'; return; }
-  out.append(el('div', { class: 'small mono', text: `matched ${fmtNum(agg.matched)}${agg.ungrouped ? `, ungrouped ${fmtNum(agg.ungrouped)}` : ''}` }));
-  const results = (r) => (r || []).map((x) => `${x.name} = ${x.uintValue ?? x.intValue ?? x.doubleValue ?? '–'} (${fmtNum(x.present)} present)`);
-  for (const line of results(agg.results)) out.append(el('div', { class: 'small', text: line }));
+  if (!agg) { out.textContent = 'Add a group-by, a fold, a histogram, or percentiles.'; return; }
+  const spec = state.request?.aggregate ?? state.request?.selection?.boolean?.aggregate ?? {};
+  out.classList.remove('muted');
+  out.append(el('div', { class: 'small mono muted', text: `matched ${fmtNum(agg.matched)}${Number(agg.ungrouped) ? `, ungrouped ${fmtNum(agg.ungrouped)}` : ''}` }));
+  const folds = (r) => (r || []).filter((x) => x.name !== 'count').map((x) => `${x.name} = ${fmtNum(foldValue(x))} (${fmtNum(x.present)} present)`);
+  for (const line of folds(agg.results)) out.append(el('div', { class: 'small', text: line }));
+
   if (agg.groups?.length) {
-    const max = Math.max(...agg.groups.map((g) => Number(g.matched)));
-    const list = el('div');
+    const column = spec.group_by;
+    const drillable = isIdentifier(column);
+    const active = splitConjuncts($('filter').value);
+    const max = Math.max(1, ...agg.groups.map((g) => Number(g.matched)));
+    const list = el('div', { class: 'facets' });
     for (const g of agg.groups) {
-      list.append(el('div', { class: 'facet' }, [
-        el('span', {}, [g.value, results(g.results).length ? el('span', { class: 'muted small', text: ` ${results(g.results).join('; ')}` }) : null]),
+      const on = active.includes(`${column} == ${celString(g.value)}`);
+      list.append(el(drillable ? 'button' : 'div', {
+        class: `facet${on ? ' on' : ''}`,
+        title: drillable ? drillTitle(column, g.value) : null,
+        onclick: drillable ? (e) => drill(column, g.value, e.shiftKey) : null,
+      }, [
+        el('span', { class: 'name' }, [g.value, folds(g.results).length ? el('span', { class: 'muted small', text: ` ${folds(g.results).join('; ')}` }) : null]),
         el('span', { class: 'count', text: fmtNum(g.matched) }),
+        el('span', { class: 'bar', style: `width:${(100 * Number(g.matched)) / max}%` }),
       ]));
-      list.append(el('div', { class: 'bar', style: `width:${(100 * Number(g.matched)) / max}%` }));
     }
-    out.append(list);
+    out.append(el('h3', { text: column }), list);
   }
-  for (const h of agg.histograms || []) {
-    const box = el('div', {}, [el('div', { class: 'small muted', text: `${h.name}: ${fmtNum(h.present)} present, ${fmtNum(h.unbucketable)} unbucketable` })]);
-    const max = Math.max(1, ...(h.buckets || []).map((b) => Number(b.count)));
-    for (const b of h.buckets || []) {
-      const lower = b.lowerInt != null ? epochLabel(b.lowerInt) : fmtNum(b.lower);
-      box.append(el('div', { class: 'facet' }, [el('span', { class: 'mono', text: lower }), el('span', { class: 'count', text: fmtNum(b.count) })]));
-      box.append(el('div', { class: 'bar', style: `width:${(100 * Number(b.count)) / max}%` }));
-    }
-    out.append(box);
-  }
+  (agg.histograms || []).forEach((h, i) => out.append(histogramNode(h, spec.histograms?.[i])));
   for (const p of agg.percentiles || []) {
-    out.append(el('div', { class: 'small', text: `${p.name}: ${(p.values || []).map((v) => `p${v.percentile} = ${v.uintValue ?? v.intValue ?? v.doubleValue}`).join(', ')} (${fmtNum(p.present)} present)` }));
+    const table = el('table', {}, [el('tbody', {}, (p.values || []).map((v) => el('tr', {}, [
+      el('td', { text: `p${v.percentile}` }), el('td', { class: 'num', text: fmtNum(foldValue(v)) }),
+    ])))]);
+    out.append(el('h3', { text: p.name.replace(/^pct:/, '') }), el('div', { class: 'small muted', text: `${fmtNum(p.present)} present` }), table);
   }
+}
+
+// One histogram as a column chart. A fixed histogram's buckets are keyed
+// by `lower` and the gaps between them are empty buckets; a calendar
+// one's by `lowerInt`, epoch microseconds, drawn as returned.
+function histogramNode(h, spec) {
+  const expression = spec?.expression ?? h.name.replace(/^hist:/, '');
+  const calendar = spec?.calendar;
+  const interval = Number(spec?.interval || 0);
+  let buckets = (h.buckets || []).map((b) => ({ lower: calendar ? Number(b.lowerInt) : Number(b.lower), count: Number(b.count) }));
+  if (!calendar && interval > 0 && buckets.length > 1) {
+    const counts = new Map(buckets.map((b) => [b.lower, b.count]));
+    const first = buckets[0].lower, last = buckets[buckets.length - 1].lower;
+    const steps = Math.round((last - first) / interval);
+    if (steps < 400) buckets = Array.from({ length: steps + 1 }, (_, i) => ({ lower: first + i * interval, count: counts.get(first + i * interval) ?? 0 }));
+  }
+  // Bucket bounds print without digit grouping: 1990 is as likely a year as a count.
+  const label = (lower) => (calendar ? epochLabel(lower) : String(Number(lower.toPrecision(12))));
+  const upper = (lower) => (calendar ? calendarUpper(lower, calendar) : lower + interval);
+  const target = rangeColumn(expression, calendar);
+  const clause = (lower) => (target ? rangeClause(target, lower, upper(lower)) : null);
+  const active = splitConjuncts($('filter').value);
+  const max = Math.max(1, ...buckets.map((b) => b.count));
+  const idle = `${fmtNum(h.present)} present${Number(h.unbucketable) ? `, ${fmtNum(h.unbucketable)} unbucketable` : ''}`;
+  const readout = el('div', { class: 'small muted mono', text: idle });
+  const plot = el('div', { class: 'columns-chart' });
+  for (const b of buckets) {
+    const c = clause(b.lower);
+    const text = `${label(b.lower)} to ${label(upper(b.lower))}: ${fmtNum(b.count)}`;
+    plot.append(el(c ? 'button' : 'span', {
+      class: `col${c && active.includes(c) ? ' on' : ''}`,
+      'aria-label': text,
+      onmouseenter: () => { readout.textContent = text; },
+      onfocus: () => { readout.textContent = text; },
+      onmouseleave: () => { readout.textContent = idle; },
+      title: c ? 'click: only this range; click again to undo' : null,
+      onclick: c ? () => setFilter(replaceRange($('filter').value, target.column, c)) : null,
+    }, [el('span', { style: `height:${b.count ? Math.max(3, (100 * b.count) / max) : 0}%` })]));
+  }
+  const axis = buckets.length ? el('div', { class: 'axis small muted mono' }, [el('span', { text: label(buckets[0].lower) }), el('span', { text: label(upper(buckets[buckets.length - 1].lower)) })]) : null;
+  return el('div', { class: 'histogram' }, [el('h3', { text: expression }), plot, axis, readout]);
 }
 
 function epochLabel(micros) {
   const n = Number(micros);
-  if (!Number.isFinite(n) || Math.abs(n) < 1e12) return String(micros);
+  if (!Number.isFinite(n) || Math.abs(n) < 1e14) return String(micros);
   return new Date(n / 1000).toISOString().slice(0, 10);
 }
 
@@ -448,13 +767,20 @@ function renderSynonyms(list) {
   for (const s of list) out.append(el('div', { class: 'small mono', text: JSON.stringify(s) }));
 }
 
+// The dense outcome messages as name and value rows; unset strings are left out.
 function renderDense(response) {
   const out = clear($('dense-out'));
-  const d = response.denseExecution;
-  const q = response.denseQuality;
-  if (!d && !q) { out.textContent = 'no dense leaf'; return; }
-  if (d) out.append(el('div', { text: JSON.stringify(d) }));
-  if (q) out.append(el('div', { text: JSON.stringify(q) }));
+  const parts = [response.denseExecution, response.denseQuality].filter(Boolean);
+  if (!parts.length) { out.textContent = 'no dense leaf'; return; }
+  const list = el('dl', { class: 'kv' });
+  for (const part of parts) {
+    for (const [name, value] of Object.entries(part)) {
+      if (value === '' || value == null) continue;
+      const text = typeof value === 'object' ? JSON.stringify(value) : String(value);
+      list.append(el('dt', { text: name }), el('dd', { class: 'mono', text }));
+    }
+  }
+  out.append(list);
 }
 
 function renderRaw() {
@@ -470,6 +796,42 @@ function renderRaw() {
 }
 
 // ---------------------------------------------------------------------------
+// Keyboard
+// ---------------------------------------------------------------------------
+
+function toggleKeys() {
+  const hidden = $('keys-help').classList.toggle('hidden');
+  $('keys').setAttribute('aria-expanded', String(!hidden));
+}
+
+function queryKey(e) {
+  const items = [...$('suggest').querySelectorAll('li')];
+  const open = !$('suggest').classList.contains('hidden') && items.length;
+  if (open && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+    e.preventDefault();
+    if (state.suggestIndex < 0) state.suggestIndex = e.key === 'ArrowDown' ? 0 : items.length - 1;
+    else state.suggestIndex = (state.suggestIndex + (e.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
+    items.forEach((li, i) => li.classList.toggle('active', i === state.suggestIndex));
+  } else if (e.key === 'Enter' && !e.ctrlKey && !e.metaKey) {
+    if (open && state.suggestIndex >= 0) { e.preventDefault(); return items[state.suggestIndex].choose(); }
+    hideSuggest();
+    run();
+  } else if (e.key === 'Escape') {
+    hideSuggest();
+  }
+}
+
+function pageKey(e) {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); hideSuggest(); return run(); }
+  if (e.key === 'Escape') { $('keys-help').classList.add('hidden'); $('keys').setAttribute('aria-expanded', 'false'); return; }
+  if (e.ctrlKey || e.metaKey || e.altKey || e.target.closest('input, textarea, select')) return;
+  if (e.key === '/') { e.preventDefault(); $('q').focus(); $('q').select(); }
+  else if (e.key === '?') toggleKeys();
+  else if (e.key === '[') page(-1);
+  else if (e.key === ']') page(1);
+}
+
+// ---------------------------------------------------------------------------
 // Typeahead and did-you-mean
 // ---------------------------------------------------------------------------
 
@@ -482,12 +844,14 @@ async function typeahead() {
   try {
     const r = await api.rpc('SearchService', 'Suggest', { field: 'body', prefix, limit: 8, analysis: state.config.body_spec });
     const list = clear($('suggest'));
+    state.suggestIndex = -1;
     const suggestions = r.suggestions || [];
     if (!suggestions.length) return hideSuggest();
     for (const s of suggestions) {
-      list.append(el('li', {
-        onmousedown: () => { input.value = text.slice(0, m.index) + s.term + ' '; hideSuggest(); input.focus(); },
-      }, [el('span', { text: s.term }), el('span', { class: 'muted mono', text: `df ${fmtNum(s.df)}` })]));
+      const li = el('li', {}, [el('span', { text: s.term }), el('span', { class: 'muted mono', text: `df ${fmtNum(s.df)}` })]);
+      li.choose = () => { input.value = `${text.slice(0, m.index)}${s.term} `; hideSuggest(); input.focus(); };
+      li.addEventListener('mousedown', li.choose);
+      list.append(li);
     }
     list.classList.remove('hidden');
   } catch {
@@ -495,7 +859,10 @@ async function typeahead() {
   }
 }
 
-function hideSuggest() { $('suggest').classList.add('hidden'); }
+function hideSuggest() {
+  $('suggest').classList.add('hidden');
+  state.suggestIndex = -1;
+}
 
 async function didYouMean() {
   const box = $('dym');
@@ -526,15 +893,25 @@ async function didYouMean() {
 // The streaming query
 // ---------------------------------------------------------------------------
 
+function phaseName(phase) {
+  return String(phase || '').replace('QUERY_STREAM_PHASE_', '').toLowerCase();
+}
+
+// Each revision replaces the hit list as it arrives; the completion's
+// response then renders as a unary one does.
 async function streamQuery() {
-  stopStream();
   hideError();
+  state.cursor = ''; state.cursors = [];
+  $('ab-panel').classList.add('hidden');
+  $('results-panel').classList.remove('hidden');
   let request;
   try {
     request = await buildRequest();
   } catch (e) {
     return showError(e);
   }
+  // Explain is served on the unary route only: a revision's hits carry no tree.
+  delete request.explain;
   state.request = request;
   const log = clear($('stream-log'));
   log.classList.remove('hidden');
@@ -544,7 +921,15 @@ async function streamQuery() {
     onEvent: async (msg) => {
       if (msg.revision) {
         const r = msg.revision;
-        log.append(el('div', { text: `revision ${r.revision} ${String(r.phase || '').replace('QUERY_STREAM_PHASE_', '').toLowerCase()}: ${(r.hits || []).length} hit(s) at ${fmtMs(performance.now() - started)}` }));
+        const hits = r.hits || [];
+        log.append(el('div', { text: `revision ${r.revision} ${phaseName(r.phase)}: ${hits.length} hit(s) at ${fmtMs(performance.now() - started)}` }));
+        if (!hits.length) return;
+        if ($('fetch-text').checked) await fetchTexts(hits.map((h) => h.docId));
+        if (!state.stream) return;
+        $('result-count').textContent = `revision ${r.revision} (${phaseName(r.phase)}): ${hits.length} hit(s), still settling`;
+        const scale = pageScale(hits);
+        const results = clear($('results'));
+        for (const h of hits) results.append(hitNode(h, scale));
       } else if (msg.completion) {
         const c = msg.completion;
         log.append(el('div', { text: `completion: ${c.completed ? 'certified' : 'NOT completed'} at revision ${c.finalRevision}${c.errorMessage ? `, ${c.errorMessage}` : ''}` }));
@@ -585,6 +970,7 @@ function variantPresets() {
 }
 
 async function runAb() {
+  stopStream();
   hideError();
   const text = $('q').value.trim();
   if (!text) return showError({ error: 'query text is required' });
@@ -625,6 +1011,9 @@ async function runAb() {
 
 async function renderAb(response, a, b) {
   const panel = clear($('ab-panel'));
+  // The comparison stands in for the hit list, which belongs to the
+  // last Query and would read as part of it.
+  $('results-panel').classList.add('hidden');
   panel.classList.remove('hidden');
   const results = response.results || [];
   if ($('fetch-text').checked) {
@@ -653,7 +1042,7 @@ async function renderAb(response, a, b) {
       `overlap ${d.overlap} (${(Number(d.overlapFraction) * 100).toFixed(0)}%)`,
       `kendall τ ${fmtNum(d.kendallTau)}`, `rbo ${fmtNum(d.rbo)}`,
       `score regret ${fmtNum(d.scoreRegret)}`, d.top1Flipped ? 'top-1 flipped' : 'top-1 same',
-    ]));
+    ].map((text) => el('span', { text }))));
   }
   if (response.interleaving) {
     const il = response.interleaving;

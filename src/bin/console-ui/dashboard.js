@@ -13,6 +13,9 @@ const state = {
   stream: null,
   snapshots: [],       // ring of parsed snapshots
   routeSparks: new Map(),
+  activeRoutes: new Set(), // routes seen serving, or with errors
+  allRoutes: false,        // whether idle routes are listed too
+  routeSort: 'rate',
   tiles: new Map(),
   timers: [],
   unserved: new Set(), // diagnostics methods the cluster answered UNIMPLEMENTED
@@ -28,6 +31,10 @@ async function init() {
   target.addEventListener('change', () => { state.target = target.value; restart(); });
   $('interval').addEventListener('change', () => restart());
   buildTiles();
+  $('routes-all').addEventListener('click', () => { state.allRoutes = !state.allRoutes; arrangeRoutes(); });
+  for (const th of $('routes').querySelectorAll('th[data-sort]')) {
+    th.addEventListener('click', () => { state.routeSort = th.dataset.sort; arrangeRoutes(); });
+  }
   $('plan-run').addEventListener('click', runPlacementPlan);
   $('bal-run').addEventListener('click', runBalancePlan);
   restart();
@@ -39,6 +46,7 @@ function restart() {
   state.unserved.clear();
   for (const s of state.routeSparks.values()) s.reset();
   clear($('routes').querySelector('tbody'));
+  state.activeRoutes.clear();
   openStream();
   poll('GetRuntimeKnobs', renderKnobs, 5000);
   poll('GetShardDiagnostics', renderShards, 10000);
@@ -274,7 +282,7 @@ function renderRoutes(snap, prev, oldest, dt, windowDt) {
     if (c.name === 'turbovec_request_errors_total' && routes.has(c.labels.rpc)) routes.get(c.labels.rpc).errors += c.value;
   }
   const tbody = $('routes').querySelector('tbody');
-  const rows = [...routes.values()].sort((a, b) => b.total - a.total);
+  const rows = [...routes.values()];
   for (const r of rows) {
     let tr = tbody.querySelector(`tr[data-rpc="${r.rpc}"]`);
     if (!tr) {
@@ -296,8 +304,35 @@ function renderRoutes(snap, prev, oldest, dt, windowDt) {
     tr.querySelector('.err').textContent = fmtNum(r.errors);
     state.routeSparks.get(r.rpc).push(rate);
     tr.classList.toggle('dim', r.total === before && !rate);
+    // A route is active once it has served a request while the page
+    // watched, or carries an error; the rest are the registry's labels.
+    if (rate > 0 || r.errors > 0) state.activeRoutes.add(r.rpc);
+    Object.assign(tr.dataset, { rate, errors: r.errors, p50: p50 ?? -1, p99: p99 ?? -1 });
   }
   void windowDt;
+  arrangeRoutes();
+}
+
+// Order the rows by the chosen column (ties by name) and hide the
+// routes that have done nothing unless all are asked for.
+function arrangeRoutes() {
+  const tbody = $('routes').querySelector('tbody');
+  const rows = [...tbody.querySelectorAll('tr')];
+  const key = state.routeSort;
+  const value = (tr) => (key === 'rpc' ? 0 : Number(tr.dataset[key]));
+  rows.sort((a, b) => value(b) - value(a) || a.dataset.rpc.localeCompare(b.dataset.rpc));
+  let idle = 0;
+  for (const tr of rows) {
+    const active = state.activeRoutes.has(tr.dataset.rpc);
+    if (!active) idle++;
+    tr.classList.toggle('hidden', !active && !state.allRoutes);
+    tbody.append(tr);
+  }
+  for (const th of $('routes').querySelectorAll('th[data-sort]')) th.classList.toggle('sorted', th.dataset.sort === key);
+  const toggle = $('routes-all');
+  toggle.classList.toggle('hidden', !idle);
+  toggle.textContent = state.allRoutes ? `hide ${idle} idle` : `show ${idle} idle`;
+  $('routes-empty').classList.toggle('hidden', state.allRoutes || idle < rows.length);
 }
 
 // ---------------------------------------------------------------------------
@@ -442,6 +477,10 @@ function renderRecent(r, err) {
   if (!r) { box.textContent = isUnimplemented(err) ? 'not served by this cluster' : errorText(err); return; }
   box.classList.remove('muted');
   box.append(el('div', { class: 'muted small', text: `${fmtNum(r.totalSeen)} seen since start` }));
+  if (!r.queries?.length) {
+    box.append(el('div', { class: 'muted small', text: 'No public request has reached this coordinator yet. Run one from the search page.' }));
+    return;
+  }
   const table = el('table', {}, [el('thead', {}, [el('tr', {}, ['time', 'route', 'executed', 'k', 'ms', 'status', 'hits', 'segments', 'candidates'].map((h) => el('th', { text: h })))])]);
   const tbody = el('tbody');
   for (const q of r.queries || []) {

@@ -95,6 +95,7 @@ const DASHBOARD_HTML: &str = include_str!("bin/console-ui/dashboard.html");
 const APP_CSS: &str = include_str!("bin/console-ui/app.css");
 const COMMON_JS: &str = include_str!("bin/console-ui/common.js");
 const SEARCH_JS: &str = include_str!("bin/console-ui/search.js");
+const QUERY_STATE_JS: &str = include_str!("bin/console-ui/query-state.js");
 const DASHBOARD_JS: &str = include_str!("bin/console-ui/dashboard.js");
 const SPARKLINE_JS: &str = include_str!("bin/console-ui/sparkline.js");
 
@@ -748,6 +749,7 @@ fn asset(path: &str) -> Option<(&'static str, &'static str)> {
         "/common.js" => ("text/javascript; charset=utf-8", COMMON_JS),
         "/search.js" => ("text/javascript; charset=utf-8", SEARCH_JS),
         "/dashboard.js" => ("text/javascript; charset=utf-8", DASHBOARD_JS),
+        "/query-state.js" => ("text/javascript; charset=utf-8", QUERY_STATE_JS),
         "/sparkline.js" => ("text/javascript; charset=utf-8", SPARKLINE_JS),
         _ => return None,
     })

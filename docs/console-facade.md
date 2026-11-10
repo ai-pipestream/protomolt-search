@@ -67,28 +67,63 @@ reduced motion is respected.
 shape (lexical, dense, hybrid composite with the fusion strategy and
 weights, a boolean tree of lexical, dense, and CEL filter clauses, or a
 filter-only browse), a CEL filter, `k` and `selection_k`, sort keys,
-collapse with inner hits, highlight snippets, an aggregation rail
-(group-by, folds, a fixed or calendar histogram, percentiles), the
-explain and profile flags, and cursor paging. Hits show scores, signals,
-scorer dimensions, matched clauses, snippets or the stored text, and a
-foldable explain tree; the profile line shows phase timings, the shards
-the coordinator skipped from their placement, and the segments skipped. Typeahead comes from `Suggest` on the last word,
-did-you-mean from `TermSuggest` after each query. The Stream button
-runs the same request through `QueryStream` and logs each revision. The
-A/B panel runs `VariantSearch` with two configurations and shows both
-rankings with movement markers, the rank-difference figures, and the
-interleaved list. The raw view shows the request, the response, and a
-working `grpcurl` line (the token spelled as `$BEARER_TOKEN`). Dense
-shapes need an embedding: the sidecar's when `--analysis` is given, a
-pasted vector otherwise.
+collapse with inner hits, the columns to show on each hit (sent as
+`projections`), highlight snippets, an aggregation rail (group-by,
+folds, a fixed or calendar histogram, percentiles), the explain and
+profile flags, and cursor paging.
+
+A hit shows its score with a bar against the top score on the page, the
+requested columns as labelled values (a projected value carries no name;
+the request's projection at the same index names it), snippets or the
+stored text clamped to a few lines, one bar per leg for a multi-leg
+shape (each against that leg's best on the page), scorer dimensions,
+matched clauses, and a foldable explain tree. The profile line shows the
+wall and total times, the shards the coordinator skipped from their
+placement and the segments skipped, over a stacked bar of the phase
+timings with the remainder up to the total as fan-out and merge.
+Snippets are requested for an unfiltered lexical query only, the one
+shape the engine cuts them for, and the result line says so otherwise.
+
+The filter draws as one chip per top-level `&&` condition; the text
+input stays the source. A click on a group-by value in the rail adds
+`column == "value"` (shift-click `!=`), a click on a string column value
+of a hit does the same, and a click on a histogram column adds its
+half-open range; each undoes itself on a second click. A filter compares
+a column in its own type and does not compile `double()`, so the range
+of a `double(year)` histogram goes on `year` with integer literals, a
+bare column of a fixed histogram takes double literals, a calendar
+histogram's column takes integer microseconds, and any other expression
+is not clickable. A fixed histogram draws its empty buckets.
+
+The form is written to the URL fragment on every run (what differs from
+the defaults; a pasted vector is left out), so a link reproduces the
+query, back and forward step through queries, and the History panel
+keeps the last thirty in `localStorage`. `/` focuses the query box,
+`Ctrl` or `⌘` with `Enter` runs from any field, `[` and `]` page, the
+arrow keys choose a typeahead suggestion, and `?` lists these.
+
+Typeahead comes from `Suggest` on the last word, did-you-mean from
+`TermSuggest` after each query. The Stream button runs the same request
+through `QueryStream` without `explain` (the unary route serves it),
+replaces the hit list with each revision as it arrives, and logs each.
+The A/B panel runs `VariantSearch` with two configurations and shows
+both rankings with movement markers, the rank-difference figures, and
+the interleaved list in place of the hit list. A failed query keeps the
+previous results on screen, dimmed and labelled, and outlines the field
+the engine's message names. The raw view shows the request, the
+response, and a working `grpcurl` line (the token spelled as
+`$BEARER_TOKEN`). Dense shapes need an embedding: the sidecar's when
+`--analysis` is given, a pasted vector otherwise.
 
 **Dashboard** (`/dashboard`) streams `StreamMetrics` from the chosen
 process into tiles with sparklines (requests per second, windowed p99,
 in flight, errors, scan candidates, floors published, scan bytes per
 second with the rate while scanning, and the kernel's active share) and
 a per-route table with p50 and p99 from the latency histograms over the
-stream's window; the table's rows are the snapshot's route labels, so a
-new route appears on its own. A knobs panel from `GetRuntimeKnobs` has
+stream's window; the table lists the routes that have served a request
+since the page opened or carry errors, sorted by the column heading
+clicked, with the idle labels behind a toggle, so a new route appears on
+its own. A knobs panel from `GetRuntimeKnobs` has
 inputs that call `SetRuntimeKnob` and show the startup value. The shard
 map from `GetShardDiagnostics` opens with the placement groups (one line
 per code served, the path it decodes to, the shards in it, a warning
@@ -137,3 +172,18 @@ their content types; the suggesters; the server-sent event stream for
 `QueryStream` with its end frame and the query-parameter form; and the
 loopback rule. `src/console.rs` unit-tests the URL decoding, the query
 parsing, the descriptor's method list, and the JSON round trip.
+`node tests/console_ui.mjs` covers the UI's pure module
+(`query-state.js`): the filter's split into conditions, the clauses a
+click adds, the calendar bucket bounds, and the URL encoding.
+
+## A demo cluster
+
+`cargo run --release --example console_demo` starts the console over a
+cluster that lives in the one process: four shards of 150 generated
+court-opinion paragraphs each (facets `court` and `topic`, integers
+`year` and `filed`, the numeric `citations`, three chunks per opinion),
+a coordinator with diagnostics and an in-memory control plane, and the
+mock analysis sidecar with a hashed bag-of-words embedding, so every
+panel of both pages has something to show. The embedding is a toy: two
+texts are close when they share stemmed words. Nothing is written to
+disk. `--listen=` moves it off `127.0.0.1:8600`.
