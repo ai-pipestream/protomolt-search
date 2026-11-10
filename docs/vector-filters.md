@@ -152,11 +152,21 @@ before such a mask is built. So the mask is built a column at a time
   at most 32 popular values, and `rows / 8` for the rows that hold any
   value. Nothing is written to disk. The frozen part and the tail are
   read forward, a row at a time; they are bounded by the seal size.
-- **Every other predicate is asked slot by slot, but only about the
-  slots still in question.** Under an AND the inverted children go first,
-  so `court == "scotus" && year >= 2000` reads `year` for the scotus rows
-  only. Deleted rows, pruned segments and a Boolean planner's domain are
-  removed before any column is read.
+- **A number range is answered from the column sorted by value**
+  (`src/number_rows.rs`): the rows that hold a value, in value order, so
+  the rows of a range are one run found by two binary searches, and the
+  rows that hold a value outside it are the two runs around it. A sealed
+  segment sorts a column the first time a filter names it and keeps the
+  result: 4 bytes of row id and 8 of value per row that holds one, on
+  the heap, nothing on disk. Under an AND the facet children go first,
+  and when the rows they left are fewer than a quarter of the run, the
+  range reads the column for those rows instead, so
+  `court == "scotus" && year >= 2000` still reads `year` for the scotus
+  rows only. The frozen part and the tail are read forward.
+- **Every other predicate (map and geo columns) is asked slot by slot,
+  but only about the slots still in question.** Deleted rows, pruned
+  segments and a Boolean planner's domain are removed before any column
+  is read.
 - **AND, OR and NOT are word-wise.** The language is three-valued (a
   comparison against an absent value is unknown and is not admitted), so
   a node answers for one verdict at a time, the slots where it is true or
@@ -170,8 +180,8 @@ and the tail, each with its own dictionary, and again after a reopen.
 
 What it costs, on one million rows in eight sealed segments and a tail of
 40,000 (one core of a shared cloud host; the measurement is the ignored
-test in that file). Inverting the column in all eight segments took 6 ms,
-once.
+test in that file). Inverting the court column in all eight segments took
+6 ms and sorting the year column 41 ms, each once.
 
 | filter | rows admitted | slot by slot | from the columns |
 |---|---:|---:|---:|
@@ -179,12 +189,13 @@ once.
 | one court, 10% | 100,017 | 10.4 ms | 0.20 ms |
 | one court, 1% | 9,995 | 10.4 ms | 0.18 ms |
 | one court, 0.1% | 1,002 | 11.0 ms | 0.16 ms |
-| one court (1%) AND a year range | 1,472 | 15.6 ms | 0.59 ms |
+| one court (1%) AND a year range | 1,472 | 16.6 ms | 0.46 ms |
 | NOT one court (50%) | 499,795 | 13.5 ms | 0.53 ms |
-| a year range alone | 146,663 | 11.5 ms | 11.8 ms |
+| a year range alone | 146,663 | 12.5 ms | 0.50 ms |
+| NOT a year range | 853,337 | 21.8 ms | 2.17 ms |
 
-A predicate with no inverted column costs what it did. Number, map and
-geo columns have none yet.
+A predicate with no column turned around costs what it did. Map and geo
+columns have none yet.
 
 ## Routes
 

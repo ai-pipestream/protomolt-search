@@ -8781,9 +8781,72 @@ pub struct Bm25Reader {
     /// names it (`crate::facet_rows`). The file never changes, so neither
     /// do they.
     facet_rows: std::sync::OnceLock<Box<[std::sync::OnceLock<crate::facet_rows::FacetRows>]>>,
+    /// The number columns sorted by value, built and kept the same way
+    /// (`crate::number_rows`).
+    number_rows: SortedNumbers,
+}
+
+type SortedColumns<T> =
+    std::sync::OnceLock<Box<[std::sync::OnceLock<crate::number_rows::NumberRows<T>>]>>;
+
+#[derive(Default)]
+struct SortedNumbers {
+    numeric: SortedColumns<f64>,
+    integer: SortedColumns<i64>,
+    unsigned_integer: SortedColumns<u64>,
+}
+
+/// Column `column` of `columns` sorted, built on first use.
+fn sorted_column<T: Copy>(
+    cache: &SortedColumns<T>,
+    columns: usize,
+    column: usize,
+    build: impl FnOnce() -> crate::number_rows::NumberRows<T>,
+) -> &crate::number_rows::NumberRows<T> {
+    let cells = cache.get_or_init(|| (0..columns).map(|_| std::sync::OnceLock::new()).collect());
+    cells[column].get_or_init(build)
 }
 
 impl Bm25Reader {
+    /// Numeric column `ni` sorted by value. The first call reads the whole
+    /// column once; later calls are a pointer read.
+    pub fn numeric_rows(&self, ni: usize) -> &crate::number_rows::NumberRows<f64> {
+        sorted_column(&self.number_rows.numeric, self.numerics.len(), ni, || {
+            crate::number_rows::NumberRows::build(
+                self.n_slots(),
+                |slot| self.numeric_value(ni, slot as u32),
+                f64::total_cmp,
+            )
+        })
+    }
+
+    /// Integer column `ii` sorted by value.
+    pub fn integer_rows(&self, ii: usize) -> &crate::number_rows::NumberRows<i64> {
+        sorted_column(&self.number_rows.integer, self.integers.len(), ii, || {
+            crate::number_rows::NumberRows::build(
+                self.n_slots(),
+                |slot| self.integer_value(ii, slot as u32),
+                i64::cmp,
+            )
+        })
+    }
+
+    /// Unsigned integer column `column` sorted by value.
+    pub fn unsigned_integer_rows(&self, column: usize) -> &crate::number_rows::NumberRows<u64> {
+        sorted_column(
+            &self.number_rows.unsigned_integer,
+            self.unsigned_integers.len(),
+            column,
+            || {
+                crate::number_rows::NumberRows::build(
+                    self.n_slots(),
+                    |slot| self.unsigned_integer_value(column, slot as u32),
+                    u64::cmp,
+                )
+            },
+        )
+    }
+
     /// Facet column `fi` inverted: the rows that hold each value ordinal.
     /// The first call reads the whole ords section once; later calls are a
     /// pointer read.
@@ -9548,6 +9611,7 @@ impl Bm25Reader {
             lineage_index: std::sync::OnceLock::new(),
             integrity: None,
             facet_rows: std::sync::OnceLock::new(),
+            number_rows: SortedNumbers::default(),
         })
     }
 
@@ -9922,6 +9986,7 @@ impl Bm25Reader {
             lineage_index: std::sync::OnceLock::new(),
             integrity: None,
             facet_rows: std::sync::OnceLock::new(),
+            number_rows: SortedNumbers::default(),
         })
     }
 
@@ -13252,3 +13317,50 @@ mod malformed_tests {
 #[cfg(test)]
 #[path = "postings_derived_compat_tests.rs"]
 mod derived_compat_tests;
+
+/// A sealed part answers a range from its column sorted by value.
+impl crate::filter_bits::PartNumbers for Bm25Reader {
+    fn int_value(&self, column: usize, row: u32) -> Option<i64> {
+        (column < self.integer_count())
+            .then(|| self.integer_value(column, row))
+            .flatten()
+    }
+    fn uint_value(&self, column: usize, row: u32) -> Option<u64> {
+        (column < self.unsigned_integer_count())
+            .then(|| self.unsigned_integer_value(column, row))
+            .flatten()
+    }
+    fn f64_value(&self, column: usize, row: u32) -> Option<f64> {
+        (column < self.numeric_count())
+            .then(|| self.numeric_value(column, row))
+            .flatten()
+    }
+    fn int_sorted(&self, column: usize) -> Option<&crate::number_rows::NumberRows<i64>> {
+        (column < self.integer_count()).then(|| self.integer_rows(column))
+    }
+    fn uint_sorted(&self, column: usize) -> Option<&crate::number_rows::NumberRows<u64>> {
+        (column < self.unsigned_integer_count()).then(|| self.unsigned_integer_rows(column))
+    }
+    fn f64_sorted(&self, column: usize) -> Option<&crate::number_rows::NumberRows<f64>> {
+        (column < self.numeric_count()).then(|| self.numeric_rows(column))
+    }
+}
+
+/// A part still being written is read forward.
+impl crate::filter_bits::PartNumbers for Bm25Store {
+    fn int_value(&self, column: usize, row: u32) -> Option<i64> {
+        (column < self.integer_count())
+            .then(|| self.integer_value(column, row))
+            .flatten()
+    }
+    fn uint_value(&self, column: usize, row: u32) -> Option<u64> {
+        (column < self.unsigned_integer_count())
+            .then(|| self.unsigned_integer_value(column, row))
+            .flatten()
+    }
+    fn f64_value(&self, column: usize, row: u32) -> Option<f64> {
+        (column < self.numeric_count())
+            .then(|| self.numeric_value(column, row))
+            .flatten()
+    }
+}

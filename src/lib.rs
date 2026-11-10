@@ -78,6 +78,7 @@ pub mod metrics;
 pub mod node;
 #[cfg(feature = "net")]
 pub mod node_agent;
+pub mod number_rows;
 pub mod pb;
 pub mod phrases;
 pub mod placement;

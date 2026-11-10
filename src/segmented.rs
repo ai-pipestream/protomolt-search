@@ -325,7 +325,47 @@ pub struct SegmentedShard {
     map_unsigned_integer_key_reverse: Vec<KeyReverse>,
 }
 
-impl crate::filter_bits::FacetSets for SegmentedShard {
+impl crate::filter_bits::ColumnSets for SegmentedShard {
+    /// A sealed part answers from its sorted column or, when the rows
+    /// still in question there are the fewer, by reading them; the frozen
+    /// part and the tail are read forward.
+    fn number_rows(
+        &self,
+        range: &crate::filter_bits::NumberRange<'_>,
+        want: bool,
+        domain: &Bits,
+        out: &mut Bits,
+    ) {
+        for (index, part) in self.parts.iter().enumerate() {
+            let base = part.base as usize;
+            range.part(
+                self.reader(index),
+                base..base + part.rows as usize,
+                want,
+                domain,
+                out,
+            );
+        }
+        if let Some(frozen) = &self.frozen {
+            let base = frozen.base as usize;
+            range.part(
+                frozen.store.as_ref(),
+                base..base + frozen.rows as usize,
+                want,
+                domain,
+                out,
+            );
+        }
+        let base = self.tail_base as usize;
+        range.part(
+            &self.tail,
+            base..base + self.tail.next_doc_id() as usize,
+            want,
+            domain,
+            out,
+        );
+    }
+
     /// Set in `out` the shard-local slots whose value in facet column `fi`
     /// has a global ordinal `accept` admits. A sealed part answers from
     /// its inverted column, a union per accepted value; the frozen part

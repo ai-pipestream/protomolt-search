@@ -4,7 +4,7 @@
 //! its own facet dictionary.
 use pipestream_search::boolean_bits::Bits;
 use pipestream_search::filter::{ResolvedFilter, ResolvedLeaf, Tri};
-use pipestream_search::filter_bits::{members, FacetSets};
+use pipestream_search::filter_bits::{members, ColumnSets};
 use pipestream_search::postings::{AnalyzedDoc, Bm25Store};
 use pipestream_search::scorefn::NumericRead;
 use pipestream_search::segmented::SegmentedShard;
@@ -343,13 +343,23 @@ fn measure_the_mask_from_the_columns() {
             "NOT court = half",
             ResolvedFilter::Not(Box::new(facet("half"))),
         ),
-        ("year in 2000..=2010 (no inverted column)", years.clone()),
+        ("year in 2000..=2010", years.clone()),
+        (
+            "NOT year in 2000..=2010",
+            ResolvedFilter::Not(Box::new(years.clone())),
+        ),
     ];
     let started = std::time::Instant::now();
     let mut first = Bits::empty(n);
     shard.facet_present(0, &mut first);
     println!(
         "{n} rows; inverting the column in 8 segments, once: {:.1} ms",
+        started.elapsed().as_secs_f64() * 1e3
+    );
+    let started = std::time::Instant::now();
+    members(&years, true, &all, &forward, &shard);
+    println!(
+        "sorting the year column in 8 segments, once: {:.1} ms",
         started.elapsed().as_secs_f64() * 1e3
     );
     for (name, filter) in &cases {

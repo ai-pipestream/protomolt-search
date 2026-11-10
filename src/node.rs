@@ -2509,7 +2509,24 @@ struct ShardNumericRead<'a>(&'a Bm25Shard);
 /// The inverted facet columns of a searchable shard
 /// (`crate::filter_bits`). A heap store has no inverted columns and is
 /// read forward; a mapped file and a segmented shard answer from theirs.
-impl crate::filter_bits::FacetSets for Bm25Shard {
+impl crate::filter_bits::ColumnSets for Bm25Shard {
+    fn number_rows(
+        &self,
+        range: &crate::filter_bits::NumberRange<'_>,
+        want: bool,
+        domain: &crate::boolean_bits::Bits,
+        out: &mut crate::boolean_bits::Bits,
+    ) {
+        match self {
+            Bm25Shard::Building(store) => {
+                range.part(store, 0..store.next_doc_id() as usize, want, domain, out)
+            }
+            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
+            Bm25Shard::Resident(reader) => range.part(reader, 0..domain.len(), want, domain, out),
+            Bm25Shard::Segmented(shard) => shard.number_rows(range, want, domain, out),
+        }
+    }
+
     fn facet_rows(
         &self,
         fi: usize,

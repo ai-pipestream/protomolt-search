@@ -158,6 +158,27 @@ impl Bits {
         })
     }
 
+    /// Set bits in `[start, end)`.
+    pub fn count_range(&self, start: usize, end: usize) -> usize {
+        let end = end.min(self.len);
+        if start >= end {
+            return 0;
+        }
+        let (first, last) = (start / 64, (end - 1) / 64);
+        let mut count = 0usize;
+        for wi in first..=last {
+            let mut word = self.words[wi];
+            if wi == first {
+                word &= u64::MAX << (start % 64);
+            }
+            if wi == last && !end.is_multiple_of(64) {
+                word &= (1u64 << (end % 64)) - 1;
+            }
+            count += word.count_ones() as usize;
+        }
+        count
+    }
+
     /// The set slots in `[start, end)`, ascending, word-wise: a span
     /// covering no set bit costs its words, not its slots.
     pub fn iter_range(&self, start: usize, end: usize) -> impl Iterator<Item = usize> + '_ {
@@ -501,6 +522,32 @@ mod tests {
             Bits::at_least(&sets, 1, 130).iter().collect::<Vec<_>>(),
             vec![1, 2, 3, 5, 64, 100, 129]
         );
+    }
+
+    #[test]
+    fn count_range_is_the_count_of_iter_range() {
+        let bits = Bits::from_bools(
+            &(0..300)
+                .map(|i| i % 7 == 0 || i % 64 == 63)
+                .collect::<Vec<_>>(),
+        );
+        for (start, end) in [
+            (0, 0),
+            (0, 300),
+            (5, 5),
+            (63, 64),
+            (63, 129),
+            (64, 128),
+            (1, 299),
+            (290, 400),
+            (400, 500),
+        ] {
+            assert_eq!(
+                bits.count_range(start, end),
+                bits.iter_range(start, end).count(),
+                "{start}..{end}"
+            );
+        }
     }
 
     #[test]
