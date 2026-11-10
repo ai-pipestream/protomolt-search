@@ -16,10 +16,11 @@ ordinary engine path underneath it.
 
 A shard resolves the request's filters ONCE against its own tables,
 producing the same [`DocFilter`] the lexical heap gate uses, then
-evaluates it over every slot into a `Vec<bool>`: `allow[slot]` is
-whether that document survives. The vector scan takes it as
-turbovec's `SearchOptions::mask`, so the kernel never scores a removed
-slot.
+evaluates it into a slot bitmap (`boolean_bits::Bits`): a set bit is a
+document that survives. A provider takes the mask in the shape it reads
+(`vector::Mask`): the scan kernel as turbovec's `SearchOptions::mask`,
+one byte per slot, so it never scores a removed slot; the graph provider
+as the bitmap itself (`docs/hnsw.md`, "Filters").
 
 The slot-to-document identity that makes this legal is the one the
 engine already relies on everywhere: a shard's vector slot and its
@@ -105,9 +106,10 @@ deliberately different things.
 
 Two costs, both visible and neither hidden behind a heuristic:
 
-1. **Building the allowlist** is one filter evaluation per slot: array
-   reads and integer compares, the same per-document work the facet
-   walk already prices at a couple of nanoseconds.
+1. **Building the allowlist** is a pass over the filter tree, each node
+   answering for every slot at once ("The mask from the columns" below).
+   A facet predicate costs the rows it admits; a predicate on any other
+   column is still one evaluation per slot in question.
 2. **Masked scans take turbovec's serial path.** `serial_required`
    is true whenever a mask is present, so a mask forfeits the
    multi-query SIMD batch kernel. The chunked scan has ALWAYS passed a
@@ -127,6 +129,58 @@ before the allowlist is built, its slots are `false` without a per-row
 evaluation, and its vector image is never opened
 (`docs/segment-pruning.md`). `ShardScanStats.segments_total` and
 `segments_skipped` report it per shard.
+
+## The mask from the columns
+
+Asking the filter about each slot in turn walks the tree and makes a
+routed column read per slot, per query. A scan of every row hides that
+cost; a graph walk does not, since at a million rows it finishes long
+before such a mask is built. So the mask is built a column at a time
+(`src/filter_bits.rs`):
+
+- **A facet predicate is answered from the column inverted**
+  (`src/facet_rows.rs`): for each value, the rows that hold it. A value
+  held by few rows keeps a sorted row list; a value held by at least one
+  row in 32 keeps a bitmap. The predicate's rows are the union over the
+  values it accepts. A sealed segment inverts a column the first time a
+  filter names it and keeps the result, since the segment never changes:
+  at most 4 bytes per row for the lists, `rows / 8` bytes for each of the
+  at most 32 popular values, and `rows / 8` for the rows that hold any
+  value. Nothing is written to disk. The frozen part and the tail are
+  read forward, a row at a time; they are bounded by the seal size.
+- **Every other predicate is asked slot by slot, but only about the
+  slots still in question.** Under an AND the inverted children go first,
+  so `court == "scotus" && year >= 2000` reads `year` for the scotus rows
+  only. Deleted rows, pruned segments and a Boolean planner's domain are
+  removed before any column is read.
+- **AND, OR and NOT are word-wise.** The language is three-valued (a
+  comparison against an absent value is unknown and is not admitted), so
+  a node answers for one verdict at a time, the slots where it is true or
+  the slots where it is false; NOT asks its child for the other verdict,
+  and a slot where the child is unknown is in neither answer.
+
+The answer is the row-by-row answer: `filter_bits` checks 400 random trees
+against it for both verdicts, and `tests/filter_mask_columns.rs` does the
+same on a shard whose rows are spread over sealed segments, a frozen part
+and the tail, each with its own dictionary, and again after a reopen.
+
+What it costs, on one million rows in eight sealed segments and a tail of
+40,000 (one core of a shared cloud host; the measurement is the ignored
+test in that file). Inverting the column in all eight segments took 6 ms,
+once.
+
+| filter | rows admitted | slot by slot | from the columns |
+|---|---:|---:|---:|
+| one court, 50% of the rows | 500,205 | 11.2 ms | 0.33 ms |
+| one court, 10% | 100,017 | 10.4 ms | 0.20 ms |
+| one court, 1% | 9,995 | 10.4 ms | 0.18 ms |
+| one court, 0.1% | 1,002 | 11.0 ms | 0.16 ms |
+| one court (1%) AND a year range | 1,472 | 15.6 ms | 0.59 ms |
+| NOT one court (50%) | 499,795 | 13.5 ms | 0.53 ms |
+| a year range alone | 146,663 | 11.5 ms | 11.8 ms |
+
+A predicate with no inverted column costs what it did. Number, map and
+geo columns have none yet.
 
 ## Routes
 

@@ -53,8 +53,10 @@ pub mod embedded;
 pub mod error_disclosure;
 pub mod exact_vectors;
 pub mod explain;
+pub mod facet_rows;
 mod field_permissions;
 pub mod filter;
+pub mod filter_bits;
 pub mod fusion;
 pub mod geo;
 #[cfg(feature = "net")]

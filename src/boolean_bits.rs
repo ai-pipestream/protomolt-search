@@ -194,6 +194,64 @@ impl Bits {
         })
     }
 
+    /// OR in a bitmap of `rows` slots packed in `words`, its slot 0 landing
+    /// at `base`: a part's bitmap into the shard's. Slots landing at or
+    /// past the length are dropped.
+    pub fn or_words_at(&mut self, words: &[u64], rows: usize, base: usize) {
+        let rows = rows
+            .min(self.len.saturating_sub(base))
+            .min(words.len() * 64);
+        if rows == 0 {
+            return;
+        }
+        let (word, shift) = (base / 64, base % 64);
+        let whole = rows / 64;
+        let tail = rows % 64;
+        let piece = |i: usize| {
+            if i < whole {
+                words[i]
+            } else {
+                words[i] & ((1u64 << tail) - 1)
+            }
+        };
+        for i in 0..whole + usize::from(tail != 0) {
+            let bits = piece(i);
+            self.words[word + i] |= bits << shift;
+            if shift != 0 && bits >> (64 - shift) != 0 {
+                self.words[word + i + 1] |= bits >> (64 - shift);
+            }
+        }
+    }
+
+    /// Clear the slots of `[start, end)`.
+    pub fn clear_range(&mut self, start: usize, end: usize) {
+        let end = end.min(self.len);
+        let mut slot = start.min(end);
+        while slot < end {
+            if slot.is_multiple_of(64) && slot + 64 <= end {
+                self.words[slot / 64] = 0;
+                slot += 64;
+            } else {
+                self.clear(slot);
+                slot += 1;
+            }
+        }
+    }
+
+    /// Clear every set slot `keep` turns down.
+    pub fn retain(&mut self, mut keep: impl FnMut(usize) -> bool) {
+        for wi in 0..self.words.len() {
+            let mut held = self.words[wi];
+            while held != 0 {
+                let bit = held.trailing_zeros() as usize;
+                held &= held - 1;
+                if !keep(wi * 64 + bit) {
+                    self.words[wi] &= !(1u64 << bit);
+                }
+            }
+        }
+    }
+
     /// The slots of `[start, end)` as their own bitmap, slot `start` at 0.
     pub fn slice(&self, start: usize, end: usize) -> Bits {
         let end = end.min(self.len);
@@ -320,6 +378,54 @@ pub fn group_members(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_part_bitmap_lands_at_its_base_and_ranges_clear() {
+        let part: Vec<bool> = (0..150).map(|i| i % 3 == 0 || i == 149).collect();
+        let words = {
+            let mut words = Bits::from_bools(&part).words;
+            // Stray bits past the part's rows must not leak.
+            *words.last_mut().unwrap() |= u64::MAX << (150 % 64);
+            words
+        };
+        for (len, base) in [
+            (400, 0),
+            (400, 1),
+            (400, 64),
+            (400, 77),
+            (200, 77),
+            (100, 90),
+            (64, 64),
+        ] {
+            let mut bits = Bits::empty(len);
+            if len > 3 {
+                bits.set(3);
+            }
+            bits.or_words_at(&words, 150, base);
+            let want: Vec<usize> = (0..len)
+                .filter(|&s| s == 3 || (s >= base && s - base < 150 && part[s - base]))
+                .collect();
+            assert_eq!(
+                bits.iter().collect::<Vec<_>>(),
+                want,
+                "len {len} base {base}"
+            );
+        }
+        let mut bits = Bits::full(300);
+        bits.clear_range(5, 5);
+        bits.clear_range(60, 200);
+        bits.clear_range(290, 999);
+        let want: Vec<usize> = (0..300)
+            .filter(|s| !(60..200).contains(s) && *s < 290)
+            .collect();
+        assert_eq!(bits.iter().collect::<Vec<_>>(), want);
+        bits.retain(|slot| slot % 2 == 0);
+        assert!(bits.iter().all(|slot| slot % 2 == 0));
+        assert_eq!(
+            bits.count() as usize,
+            want.iter().filter(|s| *s % 2 == 0).count()
+        );
+    }
 
     #[test]
     fn slices_and_words_keep_the_slots() {

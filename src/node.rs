@@ -2506,6 +2506,51 @@ impl crate::values::ColumnLookup for EmptyColumns<'_> {
 
 struct ShardNumericRead<'a>(&'a Bm25Shard);
 
+/// The inverted facet columns of a searchable shard
+/// (`crate::filter_bits`). A heap store has no inverted columns and is
+/// read forward; a mapped file and a segmented shard answer from theirs.
+impl crate::filter_bits::FacetSets for Bm25Shard {
+    fn facet_rows(
+        &self,
+        fi: usize,
+        accept: &dyn Fn(u32) -> bool,
+        out: &mut crate::boolean_bits::Bits,
+    ) {
+        match self {
+            Bm25Shard::Building(store) => {
+                for slot in 0..(store.next_doc_id() as usize).min(out.len()) {
+                    if store.facet_ord(fi, slot as u32).is_some_and(accept) {
+                        out.set(slot);
+                    }
+                }
+            }
+            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
+            Bm25Shard::Resident(reader) => {
+                let inverted = reader.facet_rows(fi);
+                for ord in (0..inverted.values() as u32).filter(|&ord| accept(ord)) {
+                    inverted.union_into(ord, 0, out);
+                }
+            }
+            Bm25Shard::Segmented(shard) => shard.facet_rows(fi, accept, out),
+        }
+    }
+
+    fn facet_present(&self, fi: usize, out: &mut crate::boolean_bits::Bits) {
+        match self {
+            Bm25Shard::Building(store) => {
+                for slot in 0..(store.next_doc_id() as usize).min(out.len()) {
+                    if store.facet_ord(fi, slot as u32).is_some() {
+                        out.set(slot);
+                    }
+                }
+            }
+            Bm25Shard::Spilling(_) => unreachable!("spilling shards are not searchable"),
+            Bm25Shard::Resident(reader) => reader.facet_rows(fi).present_into(0, out),
+            Bm25Shard::Segmented(shard) => shard.facet_present(fi, out),
+        }
+    }
+}
+
 /// The value-expression resolution surface (`docs/cel-values.md`):
 /// the same name-to-index lookups filters use, packaged as the trait
 /// `values::resolve` consumes.
@@ -3335,19 +3380,6 @@ impl SegmentPrune {
         self.admitted_slots_from(0, n)
     }
 
-    /// How many of `0..n` fall outside the pruned ranges.
-    fn admitted_count(&self, n: u32) -> u64 {
-        let mut pruned = 0u64;
-        let mut covered = 0u32;
-        for &(base, rows) in &self.ranges {
-            let start = base.max(covered).min(n);
-            let end = base.saturating_add(rows).min(n).max(start);
-            pruned += u64::from(end - start);
-            covered = end;
-        }
-        u64::from(n) - pruned
-    }
-
     /// Local slots outside every pruned range, ascending, over `start..n`.
     fn admitted_slots_from(&self, start: u32, n: u32) -> impl Iterator<Item = u32> + '_ {
         let mut ranges = self.ranges.iter().copied().peekable();
@@ -3399,50 +3431,6 @@ fn prune_segments(
     }
 }
 
-/// Fill the slot allowlist for one shard: every slot of a pruned
-/// segment is `false` without a predicate evaluation; every other slot
-/// is the filter's verdict.
-fn fill_allowlist(n: u32, prune: &SegmentPrune, mut passes: impl FnMut(u32) -> bool) -> Vec<bool> {
-    let mut allow = vec![false; n as usize];
-    let mut slot = 0u32;
-    for &(base, rows) in &prune.ranges {
-        for s in slot..base.min(n) {
-            allow[s as usize] = passes(s);
-        }
-        slot = base.saturating_add(rows).min(n);
-    }
-    for s in slot..n {
-        allow[s as usize] = passes(s);
-    }
-    allow
-}
-
-/// `fill_allowlist` over `domain`'s slots only: a slot outside the
-/// domain is `false` without a predicate evaluation, and a pruned
-/// segment's slots are skipped by range, not one by one. The Boolean
-/// planner uses this for a filter leaf whose group admits a row only
-/// where an exact MUST sibling holds it: off that intersection the
-/// verdict cannot affect group membership. Returned candidates can still need
-/// a separate predicate check for complete filter provenance.
-fn fill_allowlist_domain(
-    n: u32,
-    prune: &SegmentPrune,
-    domain: &crate::boolean_bits::Bits,
-    mut passes: impl FnMut(u32) -> bool,
-) -> Vec<bool> {
-    let mut allow = vec![false; n as usize];
-    let mut slot = 0u32;
-    for &(base, rows) in prune.ranges.iter().chain([(n, 0)].iter()) {
-        for s in domain.iter_range(slot as usize, base.min(n) as usize) {
-            if passes(s as u32) {
-                allow[s] = true;
-            }
-        }
-        slot = base.saturating_add(rows).min(n);
-    }
-    allow
-}
-
 /// Resolve a request's filters for one shard into the predicate the
 /// scorers gate with and the slot allowlist the vector kernel scans
 /// under. With `prune` set and a segmented shard, sealed segments the
@@ -3456,7 +3444,7 @@ fn fill_allowlist_domain(
 /// the segment counts.
 type ResolvedShardFilters = (
     Option<crate::filter::DocFilter<'static>>,
-    Option<Vec<bool>>,
+    Option<crate::boolean_bits::Bits>,
     crate::segment_prune::PruneStats,
 );
 
@@ -3481,20 +3469,13 @@ fn resolve_shard_filters(
     if geo_filters.is_empty() && filter.is_none() && deleted.is_none() {
         return Ok((None, None, total(bm25)));
     }
+    use crate::boolean_bits::Bits;
+    let live = Bits::live(deleted.as_deref().map(Vec::as_slice), n);
     let Some(store) = bm25 else {
         if geo_filters.is_empty() && filter.is_none() {
-            let allow = (0..n)
-                .map(|slot| {
-                    !deleted.as_ref().is_some_and(|words| {
-                        words
-                            .get(slot / 64)
-                            .is_some_and(|word| word & (1u64 << (slot % 64)) != 0)
-                    })
-                })
-                .collect();
-            return Ok((None, Some(allow), total(bm25)));
+            return Ok((None, Some(live), total(bm25)));
         }
-        return Ok((None, Some(vec![false; n]), total(bm25)));
+        return Ok((None, Some(Bits::empty(n)), total(bm25)));
     };
     if store.as_index().is_none() {
         return Err(Status::failed_precondition(
@@ -3508,25 +3489,23 @@ fn resolve_shard_filters(
         phrase: Vec::new(),
     };
     let pruned = prune_segments(store, doc_filter.pred.as_ref(), prune);
-    let allow = {
-        let cols = ShardNumericRead(store);
-        match domain {
-            // The bitwise domain walk costs about two plain slot loops
-            // per admitted row; past half the admitted rows the plain
-            // fill is cheaper, and the caller's AND applies the domain.
-            Some(domain) => {
-                let admitted = pruned.admitted_count(n as u32);
-                if domain.count() * 2 <= admitted.max(1) {
-                    fill_allowlist_domain(n as u32, &pruned, domain, |slot| {
-                        doc_filter.passes(slot, &cols)
-                    })
-                } else {
-                    fill_allowlist(n as u32, &pruned, |slot| doc_filter.passes(slot, &cols))
-                }
-            }
-            None => fill_allowlist(n as u32, &pruned, |slot| doc_filter.passes(slot, &cols)),
-        }
+    // The rows still in question before any column is read: live, outside
+    // every pruned segment, and inside the caller's domain.
+    let mut open = live;
+    for &(base, rows) in &pruned.ranges {
+        open.clear_range(base as usize, base.saturating_add(rows) as usize);
+    }
+    if let Some(domain) = domain {
+        open.and_with(domain);
+    }
+    let cols = ShardNumericRead(store);
+    let mut allow = match &doc_filter.pred {
+        Some(pred) => crate::filter_bits::members(pred, true, &open, &cols, store),
+        None => open,
     };
+    if !doc_filter.geo.filters.is_empty() {
+        allow.retain(|slot| doc_filter.geo.passes(slot as u32, &cols));
+    }
     Ok((Some(doc_filter), Some(allow), pruned.stats))
 }
 
@@ -3559,12 +3538,11 @@ fn live_field_stats(
     terms: &[String],
     live_docs: &LiveDocs,
     slots: u32,
-    visibility: Option<&[bool]>,
+    visibility: Option<&crate::boolean_bits::Bits>,
 ) -> (u64, Vec<u32>) {
     if let Some(visibility) = visibility {
-        let admitted = |slot: u32| {
-            !live_docs.is_deleted(slot as usize) && visibility.get(slot as usize) == Some(&true)
-        };
+        let admitted =
+            |slot: u32| !live_docs.is_deleted(slot as usize) && visibility.test(slot as usize);
         let total_doc_length = (0..slots)
             .filter(|slot| admitted(*slot))
             .map(|slot| u64::from(index.doc_length(slot)))
@@ -3613,7 +3591,7 @@ fn live_field_stats(
 fn live_document_count(
     store: &Bm25Shard,
     live_docs: &LiveDocs,
-    visibility: Option<&[bool]>,
+    visibility: Option<&crate::boolean_bits::Bits>,
 ) -> u64 {
     if !live_docs.has_deletes() && visibility.is_none() {
         return store.doc_count();
@@ -3624,7 +3602,7 @@ fn live_document_count(
     (0..store.next_doc_id())
         .filter(|slot| {
             !live_docs.is_deleted(*slot as usize)
-                && visibility.is_none_or(|allow| allow.get(*slot as usize) == Some(&true))
+                && visibility.is_none_or(|allow| allow.test(*slot as usize))
                 && views.iter().any(|view| view.doc_length(*slot) > 0)
         })
         .count() as u64
@@ -4028,10 +4006,8 @@ impl ShardState {
                 .bm25
                 .as_ref()
                 .map_or(0, |store| store.next_doc_id() as usize);
-            let allow = allow.get_or_insert_with(|| vec![true; rows]);
-            for live in allow.iter_mut().skip(documents) {
-                *live = false;
-            }
+            let allow = allow.get_or_insert_with(|| crate::boolean_bits::Bits::full(rows));
+            allow.clear_range(documents, rows);
         }
         Ok(((filter, allow, stats), receipt))
     }
@@ -5261,7 +5237,8 @@ fn run_scan_batch(
             &job.geo_filters,
             job.filter.as_ref(),
         ));
-        allows.push(allow);
+        // The scan kernel masks with a byte per row.
+        allows.push(allow.map(|bits| bits.to_bools()));
         specs.push((job.vector, job.k, job.tie_complete));
         externals.push(job.external);
         publishers.push(job.publish);
@@ -5446,9 +5423,7 @@ impl NodeServiceImpl {
             )?;
             let admitted = |doc: u32| {
                 !guard.live_docs.is_deleted(doc as usize)
-                    && allow
-                        .as_ref()
-                        .is_some_and(|mask| mask.get(doc as usize) == Some(&true))
+                    && allow.as_ref().is_some_and(|mask| mask.test(doc as usize))
             };
             index.suggest_visible_prefix(prefix, cap, &admitted)
         } else {
@@ -8810,7 +8785,7 @@ impl NodeServiceImpl {
                     &mut || None,
                     &mut |_| false,
                     false,
-                    allow.as_deref(),
+                    allow.as_ref().map(|bits| bits.to_bools()).as_deref(),
                 );
                 observe_scan(scan_stats.bytes_scanned, scan_stats.scan_nanos);
                 vector_leg = hits
@@ -12048,7 +12023,7 @@ impl NodeService for NodeServiceImpl {
                             &parents.rows,
                             &mut external_floor,
                             &mut publish_floor,
-                            allow.as_deref(),
+                            allow.as_ref().map(|bits| bits.to_bools()).as_deref(),
                         );
                         stats.segments_total = prune.segments_total;
                         stats.segments_skipped = prune.segments_skipped;
@@ -12204,7 +12179,7 @@ impl NodeService for NodeServiceImpl {
                                 &mut external_floor,
                                 &mut publish_floor,
                                 start.tie_complete,
-                                allow.as_deref(),
+                                allow.as_ref().map(|bits| bits.to_bools()).as_deref(),
                             );
                             stats.segments_total = prune.segments_total;
                             stats.segments_skipped = prune.segments_skipped;
@@ -12706,12 +12681,10 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                 self.knobs.segment_pruning(),
                 None,
             )?;
-            let allow = allow.unwrap_or_else(|| vec![true; label_count]);
+            let allow = allow.unwrap_or_else(|| crate::boolean_bits::Bits::full(label_count));
             let mut bits = vec![0u8; label_count.div_ceil(8)];
-            for (position, admitted) in allow.into_iter().enumerate() {
-                if admitted {
-                    bits[position / 8] |= 1 << (position % 8);
-                }
+            for position in allow.iter() {
+                bits[position / 8] |= 1 << (position % 8);
             }
             Ok(Response::new(crate::pb::FilterBitmapResponse {
                 stats_epoch: guard.stats_epoch,
@@ -12813,7 +12786,7 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                     && !guard.live_docs.is_deleted(position)
                     && visible
                         .as_ref()
-                        .is_none_or(|allowed| allowed.get(position) == Some(&true))
+                        .is_none_or(|allowed| allowed.test(position))
                 {
                     bits[position / 8] |= 1 << (position % 8);
                 }
@@ -12878,7 +12851,7 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                     && (req.visibility.is_none() || position < documents)
                     && visible
                         .as_ref()
-                        .is_none_or(|allowed| allowed.get(position) == Some(&true))
+                        .is_none_or(|allowed| allowed.test(position))
                 {
                     bits[position / 8] |= 1 << (position % 8);
                 }
@@ -13557,8 +13530,8 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                             })).map_err(|_| Status::cancelled("scoped scan response closed"))?;
                         }
                         let mut options = VectorSearchOptions::new();
-                        if let Some(a) = allow.as_deref() {
-                            options = options.with_mask(a);
+                        if let Some(a) = allow.as_ref() {
+                            options = options.with_bits(a);
                         }
                         if let Some(depth) = start.candidate_depth {
                             options = options.with_candidate_depth(depth as usize);
@@ -14332,7 +14305,7 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                                         &ft.terms,
                                         &guard.live_docs,
                                         store.next_doc_id(),
-                                        visibility.as_deref(),
+                                        visibility.as_ref(),
                                     );
                                     crate::pb::FieldStats {
                                         sentences: store.field_has_sentences(fi),
@@ -14356,10 +14329,10 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                             &req.terms,
                             &guard.live_docs,
                             store.next_doc_id(),
-                            visibility.as_deref(),
+                            visibility.as_ref(),
                         );
                         (
-                            live_document_count(store, &guard.live_docs, visibility.as_deref()),
+                            live_document_count(store, &guard.live_docs, visibility.as_ref()),
                             total_doc_length,
                             doc_frequencies,
                             field_stats,
@@ -16437,7 +16410,7 @@ impl BooleanMembership<'_> {
                         self.n
                     )));
                 }
-                Bits::from_bools(&allow)
+                allow
             }
         };
         // The early shapes of resolve_shard_filters (no predicate, no
@@ -16762,7 +16735,7 @@ pub(crate) fn evaluate_boolean_membership(
             None,
         )?;
         if let Some(allowed) = allowed {
-            authority.and_with(&Bits::from_bools(&allowed));
+            authority.and_with(&allowed);
         }
         authority.and_with(&Bits::prefix(n, docs));
     }
@@ -18702,32 +18675,6 @@ mod filter_domain_tests {
         let leaves = vec![of(n, &[1, 2, 3]), LeafSlot::Todo];
         let assigned = domains(&req, &leaves).unwrap();
         assert_eq!(assigned, vec![None, None]);
-    }
-
-    /// The domain fill is the full fill masked by the domain, pruned
-    /// ranges included.
-    #[test]
-    fn the_domain_fill_is_the_full_fill_masked() {
-        let n = 1_000u32;
-        let prune = SegmentPrune {
-            ranges: vec![(100, 50), (600, 200)],
-            stats: crate::segment_prune::PruneStats::default(),
-            mask: None,
-        };
-        let passes = |slot: u32| slot.is_multiple_of(3);
-        let full = fill_allowlist(n, &prune, passes);
-        let mut domain = Bits::empty(n as usize);
-        for slot in (0..n as usize).step_by(7) {
-            domain.set(slot);
-        }
-        let narrowed = fill_allowlist_domain(n, &prune, &domain, passes);
-        for slot in 0..n as usize {
-            assert_eq!(
-                narrowed[slot],
-                full[slot] && domain.test(slot),
-                "slot {slot}"
-            );
-        }
     }
 
     /// The recursion limit is the planner's own.

@@ -52,7 +52,7 @@ pub(crate) struct ScanIdentities {
     base: u64,
     rows: usize,
     identities: IdentitySnapshot,
-    admitted: Option<Vec<bool>>,
+    admitted: Option<crate::boolean_bits::Bits>,
 }
 
 impl ScanIdentities {
@@ -68,7 +68,7 @@ impl ScanIdentities {
         base: u64,
         rows: usize,
         identities: IdentitySnapshot,
-        admitted: Option<Vec<bool>>,
+        admitted: Option<crate::boolean_bits::Bits>,
     ) -> Result<Self, Status> {
         if rows as u128 > u128::from(u32::MAX) + 1
             || (rows > 0 && base.checked_add((rows - 1) as u64).is_none())
@@ -134,7 +134,7 @@ impl ScanIdentities {
             if self
                 .admitted
                 .as_ref()
-                .is_some_and(|mask| !mask[local as usize])
+                .is_some_and(|mask| !mask.test(local as usize))
             {
                 return Err(Status::permission_denied(
                     "identity ID was not admitted by the scan",
@@ -211,7 +211,7 @@ mod tests {
             100,
             3,
             IdentitySnapshot::default(),
-            Some(vec![true, false, true]),
+            Some(crate::boolean_bits::Bits::from_bools(&[true, false, true])),
         )
         .unwrap();
         let limits = StreamIdentityLimits {
@@ -254,7 +254,13 @@ mod tests {
             tonic::Code::ResourceExhausted
         );
         assert!(ScanIdentities::new(u64::MAX, 2, IdentitySnapshot::default(), None).is_err());
-        assert!(ScanIdentities::new(0, 2, IdentitySnapshot::default(), Some(vec![true])).is_err());
+        assert!(ScanIdentities::new(
+            0,
+            2,
+            IdentitySnapshot::default(),
+            Some(crate::boolean_bits::Bits::from_bools(&[true]))
+        )
+        .is_err());
     }
 
     #[test]

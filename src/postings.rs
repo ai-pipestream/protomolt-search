@@ -8777,9 +8777,31 @@ pub struct Bm25Reader {
     /// and the eagerly-read sections; [`Self::verify_integrity`]
     /// checks everything.
     integrity: Option<IntegrityTable>,
+    /// The facet columns inverted, each built the first time a filter
+    /// names it (`crate::facet_rows`). The file never changes, so neither
+    /// do they.
+    facet_rows: std::sync::OnceLock<Box<[std::sync::OnceLock<crate::facet_rows::FacetRows>]>>,
 }
 
 impl Bm25Reader {
+    /// Facet column `fi` inverted: the rows that hold each value ordinal.
+    /// The first call reads the whole ords section once; later calls are a
+    /// pointer read.
+    pub fn facet_rows(&self, fi: usize) -> &crate::facet_rows::FacetRows {
+        let columns = self.facet_rows.get_or_init(|| {
+            (0..self.facets.len())
+                .map(|_| std::sync::OnceLock::new())
+                .collect()
+        });
+        columns[fi].get_or_init(|| {
+            crate::facet_rows::FacetRows::build(
+                self.n_slots(),
+                self.facets[fi].dict.len(),
+                |slot| self.facet_ord(fi, slot as u32),
+            )
+        })
+    }
+
     /// Visit stored rows for an exact key; does not apply visibility or grants.
     pub fn visit_document_rows(
         &self,
@@ -9525,6 +9547,7 @@ impl Bm25Reader {
             blob_relative,
             lineage_index: std::sync::OnceLock::new(),
             integrity: None,
+            facet_rows: std::sync::OnceLock::new(),
         })
     }
 
@@ -9898,6 +9921,7 @@ impl Bm25Reader {
             source_section,
             lineage_index: std::sync::OnceLock::new(),
             integrity: None,
+            facet_rows: std::sync::OnceLock::new(),
         })
     }
 

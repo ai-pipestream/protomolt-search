@@ -22,6 +22,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::boolean_bits::Bits;
+
 use crate::postings::{
     AnalyzedDoc, Bm25Index, Bm25Store, DocLineage, FileImpacts, ImpactCursor, PostingCallback,
     StoredBinding,
@@ -321,6 +323,44 @@ pub struct SegmentedShard {
     map_numeric_key_reverse: Vec<KeyReverse>,
     map_integer_key_reverse: Vec<KeyReverse>,
     map_unsigned_integer_key_reverse: Vec<KeyReverse>,
+}
+
+impl crate::filter_bits::FacetSets for SegmentedShard {
+    /// Set in `out` the shard-local slots whose value in facet column `fi`
+    /// has a global ordinal `accept` admits. A sealed part answers from
+    /// its inverted column, a union per accepted value; the frozen part
+    /// and the tail are read forward, a row at a time.
+    fn facet_rows(&self, fi: usize, accept: &dyn Fn(u32) -> bool, out: &mut Bits) {
+        let dict = &self.facets[fi];
+        for (index, part) in self.parts.iter().enumerate() {
+            let reader = self.reader(index);
+            if fi >= reader.facet_count() {
+                continue;
+            }
+            let inverted = reader.facet_rows(fi);
+            for local in 0..inverted.values() as u32 {
+                if dict
+                    .to_global(Source::Sealed(index), local)
+                    .is_some_and(accept)
+                {
+                    inverted.union_into(local, part.base as usize, out);
+                }
+            }
+        }
+        self.heap_rows(fi, out, &|global| global.is_some_and(accept));
+    }
+
+    /// Set in `out` the shard-local slots that hold a value in facet
+    /// column `fi`.
+    fn facet_present(&self, fi: usize, out: &mut Bits) {
+        for (index, part) in self.parts.iter().enumerate() {
+            let reader = self.reader(index);
+            if fi < reader.facet_count() {
+                reader.facet_rows(fi).present_into(part.base as usize, out);
+            }
+        }
+        self.heap_rows(fi, out, &|global| global.is_some());
+    }
 }
 
 impl std::fmt::Debug for SegmentedShard {
@@ -1024,6 +1064,36 @@ impl SegmentedShard {
 
     pub fn facet_dictionary_sorted(&self, fi: usize) -> bool {
         self.facets[fi].sorted()
+    }
+
+    /// The frozen part's and the tail's rows whose global ordinal in facet
+    /// column `fi` (`None` when the row holds no value) `keep` admits.
+    fn heap_rows(&self, fi: usize, out: &mut Bits, keep: &dyn Fn(Option<u32>) -> bool) {
+        let dict = &self.facets[fi];
+        let len = out.len();
+        let mut scan = |store: &Bm25Store, source: Source, base: u32, rows: u32| {
+            for local in 0..rows {
+                let slot = (base + local) as usize;
+                if slot >= len {
+                    break;
+                }
+                let global = store
+                    .facet_ord(fi, local)
+                    .and_then(|ord| dict.to_global(source, ord));
+                if keep(global) {
+                    out.set(slot);
+                }
+            }
+        };
+        if let Some(frozen) = &self.frozen {
+            scan(&frozen.store, Source::Frozen, frozen.base, frozen.rows);
+        }
+        scan(
+            &self.tail,
+            Source::Tail,
+            self.tail_base,
+            self.tail.next_doc_id(),
+        );
     }
 
     pub fn facet_ord(&self, fi: usize, doc: u32) -> Option<u32> {

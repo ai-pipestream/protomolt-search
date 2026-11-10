@@ -488,7 +488,7 @@ pub enum ResolvedLeaf {
 impl ResolvedLeaf {
     /// This leaf's verdict on `doc_id`. Comparisons answer
     /// [`Tri::Unknown`] on absence; the presence tests are total.
-    fn eval(&self, doc_id: u32, cols: &dyn NumericRead) -> Tri {
+    pub(crate) fn eval(&self, doc_id: u32, cols: &dyn NumericRead) -> Tri {
         match self {
             ResolvedLeaf::Facet { column, ords } => match column {
                 None => Tri::Unknown,
