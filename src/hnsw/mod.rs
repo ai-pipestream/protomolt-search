@@ -36,7 +36,7 @@ pub mod rows;
 #[cfg(test)]
 mod tests;
 
-use std::ops::Range;
+use std::ops::{ControlFlow, Range};
 use std::path::Path;
 
 pub use config::{BuildMode, HnswConfig, CONFIG_FORMAT};
@@ -45,13 +45,13 @@ pub use graph::SearchStats;
 pub use rows::{RowSource, RowSourceIdentity};
 
 use crate::vector::{
-    first_invalid_coordinate, QualityContract, ScoreDirection, VectorBackendConfig,
-    VectorBackendDescriptor, VectorCapability, VectorError, VectorIndex, VectorProvider,
-    VectorSearchOptions, VectorSearchResults, VectorStreamBatch, VectorStreamControl,
-    VectorStreamSummary,
+    first_invalid_coordinate, FilterRegime, Mask, QualityContract, ScoreDirection,
+    VectorBackendConfig, VectorBackendDescriptor, VectorCapability, VectorError, VectorIndex,
+    VectorProvider, VectorSearchOptions, VectorSearchResults, VectorStreamBatch,
+    VectorStreamControl, VectorStreamSummary,
 };
 
-use graph::{with_scratch, Hook, NoHook, Scored, Store};
+use graph::{with_scratch, Filter, Hook, NoHook, Scored, Store, Walk};
 
 /// Stable identifier of the backend, as `vector_backend` names it.
 pub const HNSW: &str = "hnsw";
@@ -67,6 +67,56 @@ pub const EF_FLOOR: usize = 16;
 const PARALLEL_MIN_BATCH: usize = 256;
 /// Streaming emission batch: rows scored before the sink is called.
 const STREAM_BATCH_ROWS: usize = 64;
+/// Rows the enumerate regime streams between polls of the control.
+const STREAM_POLL_ROWS: usize = 16;
+/// Enumerate wins while the allowed rows cost less to score in row order
+/// than a walk costs. A walk scores on the order of `ef · m0` rows, each
+/// behind a cache miss; a row scored in mask order costs a fraction of
+/// that. The factor is the measured ratio on the challenge fixture
+/// (`docs/hnsw.md`, "Filters"); a dense execution policy will carry the
+/// thresholds measured per host class (#55).
+const ENUMERATE_ROWS_PER_WALK_ROW: usize = 4;
+/// How one query was answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Answer {
+    /// The regime that answered; `None` for an unfiltered walk. A
+    /// filter-aware walk that gave the query up reports enumerate.
+    pub regime: Option<FilterRegime>,
+    pub stats: SearchStats,
+}
+
+/// The mask of one search with what the regimes need of it.
+#[derive(Clone, Copy)]
+struct Plan<'a> {
+    regime: Option<FilterRegime>,
+    allow: Option<Mask<'a>>,
+    /// Rows the mask allows.
+    allowed: usize,
+    /// The provider chose the regime, so a filter-aware walk may hand the
+    /// query to enumerate; a pinned regime runs as pinned.
+    adaptive: bool,
+}
+
+impl Plan<'_> {
+    const UNFILTERED: Plan<'static> = Plan {
+        regime: None,
+        allow: None,
+        allowed: 0,
+        adaptive: false,
+    };
+
+    fn filter(&self) -> Filter<'_> {
+        match (self.regime, self.allow) {
+            (Some(FilterRegime::FilterAware), Some(allow)) => Filter::Aware {
+                allow,
+                allowed: self.allowed,
+                adaptive: self.adaptive,
+            },
+            (Some(FilterRegime::Plain), Some(allow)) => Filter::Plain(allow),
+            _ => Filter::None,
+        }
+    }
+}
 
 enum Backing {
     Heap(Store),
@@ -237,7 +287,7 @@ impl HnswIndex {
         Ok(queries.len() / self.dim)
     }
 
-    fn check_allow(&self, allow: Option<&[bool]>) -> Result<(), VectorError> {
+    fn check_allow(&self, allow: Option<Mask<'_>>) -> Result<(), VectorError> {
         if let Some(allow) = allow {
             if allow.len() != self.len() {
                 return Err(VectorError::new(format!(
@@ -250,35 +300,188 @@ impl HnswIndex {
         Ok(())
     }
 
+    fn m0(&self) -> usize {
+        2 * self.config.m as usize
+    }
+
+    /// Choose how a search at beam `ef` answers under `options`: the regime
+    /// the caller pinned, or the one the mask's cardinality calls for.
+    ///
+    /// - no mask, or a mask that allows every row: an unfiltered walk;
+    /// - at most `ENUMERATE_ROWS_PER_WALK_ROW · ef · m0` allowed rows:
+    ///   enumerate;
+    /// - otherwise the filter-aware walk, which hands a query whose
+    ///   neighborhood the mask leaves empty to enumerate (`graph::Walk`).
+    ///
+    /// The plain walk is never chosen: at every measured selectivity the
+    /// filter-aware walk reaches the same recall for less work
+    /// (`docs/hnsw.md`, "Filters"). It stays pinnable for measurement.
+    fn plan<'a>(
+        &self,
+        ef: usize,
+        options: &VectorSearchOptions<'a>,
+    ) -> Result<Plan<'a>, VectorError> {
+        self.check_allow(options.allow)?;
+        let Some(allow) = options.allow else {
+            if let Some(regime) = options.filter_regime {
+                return Err(VectorError::new(format!(
+                    "{HNSW} was asked for the {} filter regime on a search with no mask",
+                    regime.name()
+                )));
+            }
+            return Ok(Plan::UNFILTERED);
+        };
+        let allowed = allow.count();
+        let regime = match options.filter_regime {
+            Some(regime) => regime,
+            None if allowed == allow.len() => return Ok(Plan::UNFILTERED),
+            None if allowed <= ENUMERATE_ROWS_PER_WALK_ROW * ef * self.m0() => {
+                FilterRegime::Enumerate
+            }
+            None => FilterRegime::FilterAware,
+        };
+        Ok(Plan {
+            regime: Some(regime),
+            allow: Some(allow),
+            allowed,
+            adaptive: options.filter_regime.is_none(),
+        })
+    }
+
+    /// The enumerate regime: the exact top `k` of the allowed rows at or
+    /// above the floor. Every allowed row is scored with the traversal
+    /// kernel, and the scalar scorer settles the rows the kernel cannot
+    /// rule out (`graph::View::enumerate`).
+    fn enumerate(
+        &self,
+        query: &[f32],
+        k: usize,
+        allow: Mask<'_>,
+        floor: f32,
+    ) -> (Vec<(u32, f32)>, SearchStats) {
+        let du = self.dim as f64 / (1u64 << 24) as f64;
+        let gamma = du / (1.0 - du);
+        let query_norm = query
+            .iter()
+            .map(|&v| f64::from(v) * f64::from(v))
+            .sum::<f64>()
+            .sqrt();
+        let mut survivors = Vec::new();
+        let scored = with_view!(self, |view| view.enumerate(
+            query,
+            allow,
+            k,
+            4.0 * gamma * query_norm,
+            &mut survivors
+        ));
+        let stats = SearchStats {
+            scored,
+            ..SearchStats::default()
+        };
+        let hits = self.with_row_source(|rows| Self::report(survivors, query, rows, floor, k));
+        (hits, stats)
+    }
+
+    /// One query under a plan: up to `k` `(row, score)` best first, and
+    /// how it was answered.
+    fn answer(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        floor: f32,
+        plan: &Plan<'_>,
+        scratch: &mut graph::Scratch,
+    ) -> (Vec<(u32, f32)>, Answer) {
+        if let (Some(FilterRegime::Enumerate), Some(allow)) = (plan.regime, plan.allow) {
+            let (hits, stats) = self.enumerate(query, k, allow, floor);
+            return (
+                hits,
+                Answer {
+                    regime: plan.regime,
+                    stats,
+                },
+            );
+        }
+        let (hits, mut stats, walk) = with_view!(self, |view| view.walk(
+            query,
+            ef,
+            plan.filter(),
+            scratch,
+            &mut NoHook
+        ));
+        if let (Walk::Far | Walk::Short, Some(allow)) = (walk, plan.allow) {
+            // The graph cannot serve this mask from where the query lands:
+            // the answer is the exact top k of the mask.
+            let (hits, exact) = self.enumerate(query, k, allow, floor);
+            stats.scored += exact.scored;
+            return (
+                hits,
+                Answer {
+                    regime: Some(FilterRegime::Enumerate),
+                    stats,
+                },
+            );
+        }
+        let hits = self.with_row_source(|rows| Self::report(hits, query, rows, floor, k));
+        (
+            hits,
+            Answer {
+                regime: plan.regime,
+                stats,
+            },
+        )
+    }
+
     /// One query at an explicit beam: up to `k` `(row, score)` best first
-    /// among the allowed rows at or above the floor, and the walk's work.
-    /// The beam is `max(beam, k, EF_FLOOR)`.
+    /// among the allowed rows at or above the floor, with the regime that
+    /// answered and its work. The beam is `max(beam, k, EF_FLOOR)`.
     pub fn search_with_stats(
         &self,
         query: &[f32],
         k: usize,
         beam: usize,
         options: VectorSearchOptions<'_>,
-    ) -> Result<(Vec<(u32, f32)>, SearchStats), VectorError> {
+    ) -> Result<(Vec<(u32, f32)>, Answer), VectorError> {
         if self.check_queries(query)? != 1 {
             return Err(VectorError::new(
                 "search_with_stats takes exactly one query",
             ));
         }
-        self.check_allow(options.allow)?;
         let ef = beam.max(k).max(EF_FLOOR);
+        let plan = self.plan(ef, &options)?;
         let floor = options.minimum_score.unwrap_or(f32::NEG_INFINITY);
-        let (hits, stats, _) = with_scratch(|scratch| {
-            with_view!(self, |view| view.walk(
-                query,
-                ef,
-                options.allow,
-                scratch,
-                &mut NoHook
-            ))
-        });
-        let hits = self.with_row_source(|rows| Self::report(hits, query, rows, floor, k));
-        Ok((hits, stats))
+        Ok(with_scratch(|scratch| {
+            self.answer(query, k, ef, floor, &plan, scratch)
+        }))
+    }
+
+    /// The enumerate regime of a stream: every allowed row `skip` does not
+    /// name, in row order, scored by the scalar scorer alone. The control
+    /// is polled every `STREAM_POLL_ROWS` rows. Returns the rows scored and
+    /// whether the pass finished.
+    fn stream_rows(
+        &self,
+        allow: Mask<'_>,
+        skip: impl Fn(u32) -> bool,
+        hook: &mut StreamHook<'_>,
+    ) -> (usize, bool) {
+        self.with_row_source(|rows| {
+            let mut scored = 0usize;
+            let flow = allow.try_for_each(|row| {
+                let row = row as u32;
+                if skip(row) {
+                    return ControlFlow::Continue(());
+                }
+                hook.scored(row, 0.0, rows.row(row));
+                scored += 1;
+                if scored.is_multiple_of(STREAM_POLL_ROWS) && !hook.hop() {
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
+            });
+            (scored, flow.is_continue())
+        })
     }
 
     fn row_bytes_into(&self, row: usize, out: &mut Vec<u8>) {
@@ -514,21 +717,14 @@ impl VectorProvider for HnswIndex {
         options: VectorSearchOptions<'_>,
     ) -> Result<VectorSearchResults, VectorError> {
         let query_count = self.check_queries(queries)?;
-        self.check_allow(options.allow)?;
         let ef = k.max(EF_FLOOR).max(options.candidate_depth.unwrap_or(0));
+        let plan = self.plan(ef, &options)?;
         let floor = options.minimum_score.unwrap_or(f32::NEG_INFINITY);
         let mut scores = Vec::with_capacity(query_count * k);
         let mut slots = Vec::with_capacity(query_count * k);
         with_scratch(|scratch| {
             for query in queries.chunks_exact(self.dim) {
-                let (hits, _, _) = with_view!(self, |view| view.walk(
-                    query,
-                    ef,
-                    options.allow,
-                    scratch,
-                    &mut NoHook
-                ));
-                let hits = self.with_row_source(|rows| Self::report(hits, query, rows, floor, k));
+                let (hits, _) = self.answer(query, k, ef, floor, &plan, scratch);
                 for (node, score) in &hits {
                     scores.push(*score);
                     slots.push(i64::from(*node));
@@ -552,7 +748,10 @@ impl VectorProvider for HnswIndex {
     /// batches, as it proceeds. `control` is polled after every expansion;
     /// `Stop` from either callback ends the stream uncompleted, and a floor
     /// raised by either gates the rest of the query and every later one.
-    /// `completed` means every walk finished, never that every row was
+    /// A filtered query follows the regimes of `plan`: enumerate emits
+    /// every allowed row, and a filter-aware walk that gives the query up
+    /// is finished by enumerating the allowed rows it did not reach.
+    /// `completed` means every query finished, never that every row was
     /// evaluated. Without a depth the provider refuses: the beam is not
     /// configuration, and a graph walk cannot guess how far to go.
     fn search_streaming_controlled(
@@ -563,7 +762,6 @@ impl VectorProvider for HnswIndex {
         control: &mut dyn FnMut() -> VectorStreamControl,
     ) -> Result<VectorStreamSummary, VectorError> {
         let query_count = self.check_queries(queries)?;
-        self.check_allow(options.allow)?;
         let depth = options.candidate_depth.ok_or_else(|| {
             VectorError::new(format!(
                 "{HNSW} streaming search needs the request's candidate depth; the beam is not \
@@ -576,6 +774,7 @@ impl VectorProvider for HnswIndex {
             )));
         }
         let ef = depth.max(EF_FLOOR);
+        let plan = self.plan(ef, &options)?;
         let mut floor = options.minimum_score.unwrap_or(f32::NEG_INFINITY);
         let mut emitted = 0usize;
         let mut units = 0usize;
@@ -593,15 +792,36 @@ impl VectorProvider for HnswIndex {
                     stopped: false,
                     emitted: 0,
                 };
-                let (_, stats, completed) = with_view!(self, |view| view.walk(
-                    query,
-                    ef,
-                    options.allow,
-                    scratch,
-                    &mut hook
-                ));
+                let (scored, completed) = match (plan.regime, plan.allow) {
+                    (Some(FilterRegime::Enumerate), Some(allow)) => {
+                        self.stream_rows(allow, |_| false, &mut hook)
+                    }
+                    _ => {
+                        let (_, stats, walk) = with_view!(self, |view| view.walk(
+                            query,
+                            ef,
+                            plan.filter(),
+                            scratch,
+                            &mut hook
+                        ));
+                        let walked = stats.scored as usize;
+                        match (walk, plan.allow) {
+                            (Walk::Far, Some(allow)) => {
+                                let (rows, done) = self.stream_rows(allow, |_| false, &mut hook);
+                                (walked + rows, done)
+                            }
+                            // The walk already emitted the rows it reached.
+                            (Walk::Short, Some(allow)) => {
+                                let (rows, done) =
+                                    self.stream_rows(allow, |row| scratch.seen(row), &mut hook);
+                                (walked + rows, done)
+                            }
+                            (walk, _) => (walked, walk != Walk::Stopped),
+                        }
+                    }
+                };
                 hook.flush();
-                units += stats.scored as usize;
+                units += scored;
                 emitted += hook.emitted;
                 if !completed || hook.stopped {
                     stopped = true;

@@ -131,8 +131,8 @@ pub fn info(name: &str) -> Result<EngineInfo, Error> {
             library: "ours: src/hnsw/ (HNSW over FP32 rows, parallel build)",
             version: env!("CARGO_PKG_VERSION"),
             license: "ours",
-            filter: "Vec<bool> mask (VectorSearchOptions::with_mask)",
-            wants_bools: true,
+            filter: "allow bitmap (VectorSearchOptions::with_bits); enumerate, filter-aware walk",
+            wants_bools: false,
             supports_filter: true,
             sweeps_ef: true,
         },
@@ -383,6 +383,9 @@ pub struct Hnsw {
     rows: Rows,
     index: pipestream_search::hnsw::HnswIndex,
     disk: Option<u64>,
+    /// `--hnsw-regime=enumerate|filter_aware|plain` pins the filter regime
+    /// for threshold measurements; unset, the provider chooses.
+    regime: Option<pipestream_search::vector::FilterRegime>,
 }
 
 impl Hnsw {
@@ -399,7 +402,25 @@ impl Hnsw {
         index.add(rows.slice(), rows.dim)?;
         index.prepare()?;
         let disk = disk_size(|path| index.write(path).map_err(Into::into));
-        Ok(Self { rows, index, disk })
+        use pipestream_search::vector::FilterRegime;
+        let regime = match crate::util::arg("hnsw-regime", "").as_str() {
+            "" => None,
+            "enumerate" => Some(FilterRegime::Enumerate),
+            "filter_aware" => Some(FilterRegime::FilterAware),
+            "plain" => Some(FilterRegime::Plain),
+            other => {
+                return Err(format!(
+                    "--hnsw-regime={other:?} must be enumerate, filter_aware or plain"
+                )
+                .into())
+            }
+        };
+        Ok(Self {
+            rows,
+            index,
+            disk,
+            regime,
+        })
     }
 }
 
@@ -412,18 +433,38 @@ impl Index for Hnsw {
         allow: Option<&Allow>,
         stats: &mut QueryStats,
     ) -> Vec<(u32, f32)> {
+        use pipestream_search::boolean_bits::Bits;
         use pipestream_search::vector::VectorSearchOptions;
-        let options = match allow.and_then(|a| a.bools.as_deref()) {
-            Some(mask) => VectorSearchOptions::new()
-                .with_mask(&mask[self.rows.offset..self.rows.offset + self.rows.len]),
+        // The provider takes the mask as a bitmap: the words as they are
+        // when the index covers every row, this segment's span otherwise.
+        let (start, end) = (self.rows.offset, self.rows.offset + self.rows.len);
+        let bits = allow.map(|a| {
+            if start == 0 && end == a.bits.len() {
+                Bits::from_words(a.bits.words().to_vec(), end)
+            } else {
+                let mut bits = Bits::empty(self.rows.len);
+                for row in a.bits.ones_in(start, end) {
+                    bits.set(row - start);
+                }
+                bits
+            }
+        });
+        let options = match bits.as_ref() {
+            Some(bits) => {
+                let options = VectorSearchOptions::new().with_bits(bits);
+                match self.regime {
+                    Some(regime) => options.with_filter_regime(regime),
+                    None => options,
+                }
+            }
             None => VectorSearchOptions::new(),
         };
-        let (hits, s) = self
+        let (hits, answer) = self
             .index
             .search_with_stats(q, k, ef, options)
             .expect("hnsw search");
-        stats.hops += s.hops;
-        stats.exact += s.scored;
+        stats.hops += answer.stats.hops;
+        stats.exact += answer.stats.scored;
         hits
     }
 

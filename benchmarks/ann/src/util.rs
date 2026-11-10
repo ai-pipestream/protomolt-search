@@ -67,6 +67,11 @@ impl Bitset {
         self.len
     }
 
+    /// The packed words, bit `i` of the set at bit `i & 63` of word `i >> 6`.
+    pub fn words(&self) -> &[u64] {
+        &self.words
+    }
+
     pub fn count(&self) -> usize {
         self.words.iter().map(|w| w.count_ones() as usize).sum()
     }

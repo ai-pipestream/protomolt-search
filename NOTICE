@@ -11,4 +11,9 @@ implementation of the Hierarchical Navigable Small World graph described in
 Navigable Small World graphs" (Yu. A. Malkov and D. A. Yashunin,
 arXiv:1603.09320): the layered insertion, the layer search, the neighbor
 selection heuristic (applied to directions, see docs/hnsw.md) and the
-query. No code from any HNSW implementation is included.
+
+Its filter-aware walk follows the predicate-subgraph traversal of ACORN-1
+("ACORN: Performant and Predicate-Agnostic Search Over Vector Embeddings
+and Structured Data", L. Patel, P. Kraft, C. Guestrin and M. Zaharia,
+arXiv:2403.04871), applied to an unmodified graph. No code from any ACORN
+implementation is included.

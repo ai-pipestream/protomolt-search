@@ -68,7 +68,7 @@ Files: `manifest.json`, `base.f32`, `queries.f32`, `parents.u64`, `bucket.u8`,
 | --- | --- | --- |
 | `enumerate` | ours | Exact FP32 scan over the allow bitset's set bits (#55's Enumerate regime). Unfiltered it is the flat scan. |
 | `exhaustive-tq` | ours | Embedded TurboVec over every row, FP32 rerank of the top `ef` (the product's default path); `Vec<bool>` mask. |
-| `hnsw` | ours | `src/hnsw/` (`docs/hnsw.md`), parallel build, beam = `ef`; `Vec<bool>` mask. The candidate (#70), and the gate's default `--candidate`. |
+| `hnsw` | ours | `src/hnsw/` (`docs/hnsw.md`), parallel build, beam = `ef`; bitmap mask, the provider's filter regimes (`--hnsw-regime=enumerate|filter_aware|plain` pins one). The candidate (#70), and the gate's default `--candidate`. |
 | `hnsw_rs` 0.3.5 | Rust | `FilterT` closure over the allow bitset. `DistL2` with `simdeez_f`. |
 | `rust-cv-hnsw` 0.11 | Rust | No predicate filter in the library: filtered cells are skipped and reported as such. |
 | `corenn-hnswlib` 0.10 | Rust | `Fn(&key)` closure. Vectors served from a borrowed-slice `VectorStore`, so it does not pay the default store's per-read `Arc`. |
@@ -78,8 +78,11 @@ Files: `manifest.json`, `base.f32`, `queries.f32`, `parents.u64`, `bucket.u8`,
 
 Masks for the Rust engines and FAISS are built from column postings (value to
 rows), which is what #55 makes the product do; the time is reported per point
-as `predicate_ms_mean`. Engines on the product's `VectorIndex` seam also pay
-the per-query `Vec<bool>` the product builds today.
+as `predicate_ms_mean`. `exhaustive-tq` also pays the per-query `Vec<bool>`
+its scan kernel masks with. `hnsw` takes the bitmap as it is
+(`VectorSearchOptions::with_bits`); the shard still builds a byte mask per
+query, so a filtered `hnsw` row describes the provider, and the product
+reaches it once its masks are bitmaps (the product half of #55).
 
 Not runnable yet, reserved in the gate output: the Lucene collaborative-floor
 row (apache/lucene#16958 sandbox build; `-Dlucene.version=` points the Lucene

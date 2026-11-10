@@ -30,10 +30,11 @@
 use std::cell::RefCell;
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
+use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as Atomic};
 use std::sync::{Mutex, MutexGuard};
 
-use crate::vector::VectorError;
+use crate::vector::{Mask, VectorError};
 
 use super::distance::{prefetch, Kernel};
 use super::rows::{OwnedRows, RowSource};
@@ -48,6 +49,9 @@ pub const MAX_LEVEL: u8 = 31;
 pub const MAX_ROWS: usize = (u32::MAX - 1) as usize;
 /// Cache lines of a row prefetched ahead of scoring it.
 const PREFETCH_LINES: usize = 4;
+/// How many rows ahead of the one being scored the enumerate pass
+/// prefetches.
+const ENUMERATE_PREFETCH_AHEAD: usize = 8;
 /// Striped per-node locks for the parallel build.
 const LOCK_STRIPES: usize = 1 << 14;
 
@@ -106,8 +110,12 @@ impl PartialOrd for Scored {
 pub struct SearchStats {
     /// Nodes expanded (neighbor lists read).
     pub hops: u64,
-    /// Rows scored exactly.
+    /// Rows scored by the traversal kernel.
     pub scored: u64,
+    /// Disallowed rows a filter-aware walk looked through without scoring.
+    pub bridges: u64,
+    /// Rows the far probe looked at (links and mask only, never scored).
+    pub probed: u64,
 }
 
 /// Per-thread working memory: the epoch-stamped visited set (reset in
@@ -122,6 +130,10 @@ pub struct Scratch {
     nbrs: Vec<u32>,
     pool: Vec<Scored>,
     sel: Vec<u32>,
+    /// Filter-aware walk: the disallowed neighbors of the node being
+    /// expanded, and the allowed rows about to be scored.
+    routes: Vec<u32>,
+    fresh: Vec<u32>,
 }
 
 impl Scratch {
@@ -148,6 +160,13 @@ impl Scratch {
             *slot = self.epoch;
             true
         }
+    }
+
+    /// Whether the last walk reached `node`. An allowed row a filter-aware
+    /// walk reached was scored and handed to its hook.
+    #[inline]
+    pub fn seen(&self, node: u32) -> bool {
+        self.visited[node as usize] == self.epoch
     }
 
     /// The results, best first.
@@ -200,6 +219,53 @@ impl Hook for NoHook {
         true
     }
 }
+
+/// How a mask steers the layer-0 walk (`docs/hnsw.md`, "Filters").
+#[derive(Clone, Copy)]
+pub enum Filter<'a> {
+    /// Every row may be returned.
+    None,
+    /// The mask gates results only: disallowed rows are scored and routed
+    /// through like any other.
+    Plain(Mask<'a>),
+    /// The walk moves through the allowed rows: a disallowed neighbor is
+    /// never scored, its own neighbors are looked through instead.
+    /// `allowed` is the mask's count. With `adaptive` the walk gives the
+    /// query up to the caller ([`Walk::Far`], [`Walk::Short`]) where the
+    /// graph cannot serve this mask; without it the walk runs regardless
+    /// (a pinned regime).
+    Aware {
+        allow: Mask<'a>,
+        allowed: usize,
+        adaptive: bool,
+    },
+}
+
+/// How a walk ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Walk {
+    Completed,
+    /// The hook stopped it.
+    Stopped,
+    /// Not started: the far probe found the query's neighborhood all but
+    /// empty of allowed rows. Nothing was scored at layer 0 or reported.
+    Far,
+    /// Ran dry with the beam unfilled although the mask allows more rows:
+    /// the allowed rows it reached are an island. `Scratch::seen` tells
+    /// which rows it scored.
+    Short,
+}
+
+/// The far probe trips when the mask's share of the rows predicts at least
+/// this many allowed rows in the sample, and fewer than one in
+/// `FAR_PROBE_RATIO` of them are there. Below the minimum the sample says
+/// nothing (a Poisson count of mean 8 is under 2 three times in a
+/// thousand).
+const FAR_PROBE_MIN_EXPECTED: f64 = 8.0;
+const FAR_PROBE_RATIO: f64 = 4.0;
+/// The probe stops reading neighbor lists once the sample predicts this
+/// many allowed rows: a wide mask is judged from a few lists.
+const FAR_PROBE_ENOUGH_EXPECTED: f64 = 32.0;
 
 /// Striped locks over node ids. Insertion holds at most one node lock at
 /// a time (and takes the entry lock only while holding none), so striping
@@ -329,7 +395,7 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
         entries: &[Scored],
         ef: usize,
         layer: usize,
-        allow: Option<&[bool]>,
+        allow: Option<Mask<'_>>,
         locks: Option<&Locks>,
         scratch: &mut Scratch,
         hook: &mut H,
@@ -337,7 +403,7 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
     ) -> bool {
         let ef = ef.max(1);
         scratch.begin(self.n());
-        let allowed = |v: u32| allow.is_none_or(|a| a[v as usize]);
+        let allowed = |v: u32| allow.is_none_or(|a| a.test(v as usize));
         for &e in entries {
             if scratch.visit(e.node) {
                 scratch.cand.push(e);
@@ -399,20 +465,242 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
         completed
     }
 
+    /// The filter-aware beam at layer 0 (the predicate-subgraph idea of
+    /// ACORN-1, Patel et al., arXiv:2403.04871). Only allowed rows are
+    /// scored and only they enter the candidate and result heaps, so the
+    /// walk's cost follows the rows it can return. Expanding a node scores
+    /// its unvisited allowed neighbors; each disallowed neighbor is a
+    /// bridge, and its own allowed neighbors are scored in its place, until
+    /// the expansion has scored one full neighbor list (`m0` rows). A
+    /// bridge is marked visited only when it is looked through, so one cut
+    /// off by the budget can still be used from another node.
+    ///
+    /// `entries` are already scored and may be disallowed (the descent's
+    /// landing point): they are expanded but not returned.
+    #[allow(clippy::too_many_arguments)]
+    fn search_layer_aware<H: Hook>(
+        &self,
+        q: &[f32],
+        entries: &[Scored],
+        ef: usize,
+        allow: Mask<'_>,
+        scratch: &mut Scratch,
+        hook: &mut H,
+        stats: &mut SearchStats,
+    ) -> bool {
+        let ef = ef.max(1);
+        scratch.begin(self.n());
+        for &e in entries {
+            if scratch.visit(e.node) {
+                scratch.cand.push(e);
+                if allow.test(e.node as usize) {
+                    hook.scored(e.node, e.score, self.row(e.node));
+                    scratch.res.push(Reverse(e));
+                }
+            }
+        }
+        while scratch.res.len() > ef {
+            scratch.res.pop();
+        }
+        let mut nbrs = std::mem::take(&mut scratch.nbrs);
+        let mut routes = std::mem::take(&mut scratch.routes);
+        let mut fresh = std::mem::take(&mut scratch.fresh);
+        let budget = self.m0;
+        let mut completed = true;
+        while let Some(c) = scratch.cand.pop() {
+            if scratch.res.len() >= ef {
+                let worst = scratch.res.peek().map_or(f32::NEG_INFINITY, |r| r.0.score);
+                if c.score < worst {
+                    break;
+                }
+            }
+            stats.hops += 1;
+            self.copy_links(c.node, 0, None, &mut nbrs);
+            routes.clear();
+            fresh.clear();
+            for &v in nbrs.iter() {
+                if allow.test(v as usize) {
+                    if scratch.visit(v) {
+                        prefetch(self.row(v), 1);
+                        fresh.push(v);
+                    }
+                } else if !scratch.seen(v) {
+                    routes.push(v);
+                }
+            }
+            for &bridge in routes.iter() {
+                if fresh.len() >= budget {
+                    break;
+                }
+                if !scratch.visit(bridge) {
+                    continue;
+                }
+                stats.bridges += 1;
+                self.copy_links(bridge, 0, None, &mut nbrs);
+                for &w in nbrs.iter() {
+                    if fresh.len() >= budget {
+                        break;
+                    }
+                    if allow.test(w as usize) && scratch.visit(w) {
+                        prefetch(self.row(w), 1);
+                        fresh.push(w);
+                    }
+                }
+            }
+            for (i, &v) in fresh.iter().enumerate() {
+                if let Some(&next) = fresh.get(i + 1) {
+                    prefetch(self.row(next), PREFETCH_LINES);
+                }
+                let s = self.kernel.dot(q, self.row(v));
+                stats.scored += 1;
+                hook.scored(v, s, self.row(v));
+                let full = scratch.res.len() >= ef;
+                let worst = scratch.res.peek().map_or(f32::NEG_INFINITY, |r| r.0.score);
+                if !full || s > worst {
+                    let scored = Scored { score: s, node: v };
+                    scratch.cand.push(scored);
+                    scratch.res.push(Reverse(scored));
+                    if scratch.res.len() > ef {
+                        scratch.res.pop();
+                    }
+                }
+            }
+            if !hook.hop() {
+                completed = false;
+                break;
+            }
+        }
+        scratch.nbrs = nbrs;
+        scratch.routes = routes;
+        scratch.fresh = fresh;
+        completed
+    }
+
+    /// The enumerate regime's pass over the mask: score every allowed row
+    /// with the traversal kernel, in row order, and leave in `out` the rows
+    /// that can still be among the exact top `k`, for the scalar scorer to
+    /// settle. Returns the rows scored.
+    ///
+    /// A kernel score differs from the scalar score by at most
+    /// `2·γ(d)·Σ|qᵢxᵢ| ≤ 2·γ(d)·|q|·|x|` (`distance.rs`). `slack_per_norm`
+    /// is `4·γ(d)·|q|` (the factor two covers the stored norm, itself a
+    /// kernel result), so `b = slack_per_norm·|x|` bounds the error of row
+    /// `x`, and `B`, the same with the longest allowed row, bounds every
+    /// row's. With `t` the k-th largest kernel score, k rows have an exact
+    /// score of at least `t − B`; a row whose kernel score is below
+    /// `t − 2B` has an exact score below that, so k rows beat it and it is
+    /// dropped. A row with no stored direction (a zero row, or one whose
+    /// norm overflowed) has no bound: it takes no part in `t` and is always
+    /// kept.
+    pub fn enumerate(
+        &self,
+        q: &[f32],
+        allow: Mask<'_>,
+        k: usize,
+        slack_per_norm: f64,
+        out: &mut Vec<Scored>,
+    ) -> u64 {
+        out.clear();
+        let mut top: BinaryHeap<Reverse<Scored>> = BinaryHeap::with_capacity(k + 1);
+        let mut shortest_inv = f32::INFINITY;
+        let _ = allow.try_for_each(|row| {
+            out.push(Scored {
+                score: 0.0,
+                node: row as u32,
+            });
+            ControlFlow::<()>::Continue(())
+        });
+        // The allowed rows lie apart, so the hardware prefetcher cannot
+        // follow them: each row is asked for a few rows ahead of its turn.
+        for at in 0..out.len() {
+            if let Some(ahead) = out.get(at + ENUMERATE_PREFETCH_AHEAD) {
+                prefetch(self.row(ahead.node), PREFETCH_LINES);
+            }
+            let node = out[at].node;
+            let scored = Scored {
+                score: self.kernel.dot(q, self.row(node)),
+                node,
+            };
+            out[at] = scored;
+            let inv = self.inv_norm[node as usize];
+            if inv > 0.0 {
+                shortest_inv = shortest_inv.min(inv);
+                if top.len() < k {
+                    top.push(Reverse(scored));
+                } else if top.peek().is_some_and(|worst| scored > worst.0) {
+                    top.pop();
+                    top.push(Reverse(scored));
+                }
+            }
+        }
+        let scored = out.len() as u64;
+        if let (true, Some(Reverse(kth))) = (top.len() == k, top.peek()) {
+            let bar = f64::from(kth.score) - 2.0 * slack_per_norm / f64::from(shortest_inv);
+            out.retain(|s| f64::from(s.score) >= bar || self.inv_norm[s.node as usize] <= 0.0);
+        }
+        scored
+    }
+
+    /// The far probe: is the neighborhood the descent landed in all but
+    /// empty of allowed rows? The sample is `entry`'s layer-0 neighbors and
+    /// theirs, read from the links alone (no row is touched), and no larger
+    /// than the mask's share needs to be judged
+    /// (`FAR_PROBE_ENOUGH_EXPECTED`). A mask spread
+    /// through the graph, or gathered around the query, holds its share of
+    /// the sample or more; a mask on a region away from the query (one
+    /// court, one tenant) holds almost none of it, and a walk from here
+    /// would have to cross rows it may not score to rows it cannot rank.
+    fn far(
+        &self,
+        entry: u32,
+        allow: Mask<'_>,
+        allowed: usize,
+        scratch: &mut Scratch,
+        stats: &mut SearchStats,
+    ) -> bool {
+        scratch.begin(self.n());
+        scratch.visit(entry);
+        let mut near = std::mem::take(&mut scratch.routes);
+        let mut nbrs = std::mem::take(&mut scratch.nbrs);
+        self.copy_links(entry, 0, None, &mut near);
+        near.retain(|&v| scratch.visit(v));
+        let mut sample = 1 + near.len();
+        let mut hits = usize::from(allow.test(entry as usize))
+            + near.iter().filter(|&&v| allow.test(v as usize)).count();
+        let share = allowed as f64 / self.n() as f64;
+        let enough = (FAR_PROBE_ENOUGH_EXPECTED / share).ceil();
+        for &v in near.iter() {
+            if sample as f64 >= enough {
+                break;
+            }
+            self.copy_links(v, 0, None, &mut nbrs);
+            for &w in nbrs.iter() {
+                if scratch.visit(w) {
+                    sample += 1;
+                    hits += usize::from(allow.test(w as usize));
+                }
+            }
+        }
+        scratch.routes = near;
+        scratch.nbrs = nbrs;
+        stats.probed += sample as u64;
+        let expected = sample as f64 * share;
+        expected >= FAR_PROBE_MIN_EXPECTED && (hits as f64) * FAR_PROBE_RATIO < expected
+    }
+
     /// Paper Algorithm 5: descend greedily from the entry to layer 1, then
-    /// a beam of `ef` at layer 0. Results best first; `completed` is false
-    /// when the hook stopped the walk.
+    /// a beam of `ef` at layer 0, steered by `filter`. Results best first.
     pub fn walk<H: Hook>(
         &self,
         q: &[f32],
         ef: usize,
-        allow: Option<&[bool]>,
+        filter: Filter<'_>,
         scratch: &mut Scratch,
         hook: &mut H,
-    ) -> (Vec<Scored>, SearchStats, bool) {
+    ) -> (Vec<Scored>, SearchStats, Walk) {
         let mut stats = SearchStats::default();
         if self.entry == NO_NODE {
-            return (Vec::new(), stats, true);
+            return (Vec::new(), stats, Walk::Completed);
         }
         let mut ep = Scored {
             score: self.kernel.dot(q, self.row(self.entry)),
@@ -424,8 +712,43 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
             ep = self.greedy(q, ep, layer, None, &mut nbrs, &mut stats);
         }
         scratch.nbrs = nbrs;
-        let completed = self.search_layer(q, &[ep], ef, 0, allow, None, scratch, hook, &mut stats);
-        (scratch.drain_results(), stats, completed)
+        let completed = match filter {
+            Filter::None => {
+                self.search_layer(q, &[ep], ef, 0, None, None, scratch, hook, &mut stats)
+            }
+            Filter::Plain(allow) => self.search_layer(
+                q,
+                &[ep],
+                ef,
+                0,
+                Some(allow),
+                None,
+                scratch,
+                hook,
+                &mut stats,
+            ),
+            Filter::Aware {
+                allow,
+                allowed,
+                adaptive,
+            } => {
+                if adaptive && self.far(ep.node, allow, allowed, scratch, &mut stats) {
+                    return (Vec::new(), stats, Walk::Far);
+                }
+                let completed =
+                    self.search_layer_aware(q, &[ep], ef, allow, scratch, hook, &mut stats);
+                if completed && adaptive && scratch.res.len() < ef.max(1).min(allowed) {
+                    return (scratch.drain_results(), stats, Walk::Short);
+                }
+                completed
+            }
+        };
+        let walk = if completed {
+            Walk::Completed
+        } else {
+            Walk::Stopped
+        };
+        (scratch.drain_results(), stats, walk)
     }
 
     /// Paper Algorithm 4 on directions. Candidates arrive best first by

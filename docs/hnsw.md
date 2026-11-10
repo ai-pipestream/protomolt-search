@@ -200,12 +200,79 @@ tail, no rebuild at a threshold and no background build thread; `prepare()`
 has nothing to fold. In fixed-order mode a graph is the same whether its
 rows arrived in one batch or many, which is what the determinism test pins.
 
-## Masks and floors
+## Filters
 
-An allow mask routes through disallowed rows (they enter the candidate heap
-and are expanded) but never returns them. `minimum_score` and a floor
-raised during a stream filter what is returned or emitted; neither cuts the
-walk short. Filter regimes and floor pruning are later tickets (#55, #60).
+A filtered search carries an allow mask, one flag per row, as a byte per
+row or as a bitmap (`vector::Mask`). The provider tests, counts and lists
+the mask a word at a time when it is a bitmap; the byte form costs a pass
+over every row to count. The mask's cardinality and the query's own
+neighborhood decide how the query is answered, and the answer says which
+regime ran (`hnsw::Answer`).
+
+- **Enumerate.** Every allowed row is scored in row order and the result is
+  the exact top `k` of the mask. The traversal kernel scores them all; the
+  scalar scorer then settles every row the kernel cannot rule out (a row
+  whose kernel score plus its error bound is below the k-th largest score
+  minus its bound cannot be in the top `k`). Chosen when the mask allows at
+  most `ENUMERATE_ROWS_PER_WALK_ROW · ef · 2M` rows: fewer rows than a walk
+  would score, read in order instead of behind a cache miss each.
+- **Filter-aware walk.** The layer-0 beam scores allowed rows only, and
+  only they enter the candidate and result heaps. A disallowed neighbor is
+  a bridge: it is not scored, its own allowed neighbors are scored in its
+  place, until the expansion has scored one neighbor list (`2M` rows). This
+  is the predicate-subgraph idea of ACORN-1 (Patel et al.,
+  arXiv:2403.04871) on an unmodified graph. Chosen for every larger mask.
+- **Plain walk.** The unfiltered walk with the mask gating results:
+  disallowed rows are scored and routed through. The provider never chooses
+  it, since the filter-aware walk reached the same recall for less work at
+  every selectivity measured; it can be pinned
+  (`VectorSearchOptions::filter_regime`) so a measurement can compare.
+
+A mask can sit where the graph cannot serve it: one court, one tenant, a
+region of the space away from the query. The descent lands among rows the
+walk may not score, and whatever allowed rows it reaches through them are
+not the nearest ones. Two checks hand such a query to enumerate, so the
+answer is exact instead of quietly short:
+
+- **The far probe**, before the walk. The sample is the landing row's
+  layer-0 neighbors and theirs, read from the links alone. When the mask's
+  share of the rows predicts at least 8 allowed rows in the sample and
+  fewer than a quarter of them are there, the query is enumerated.
+- **A stranded walk**, after it. A walk that runs dry with its beam
+  unfilled while the mask allows more rows reached an island; the query is
+  enumerated. A stream has already emitted the rows the walk reached, so it
+  emits the remaining allowed rows and no row twice.
+
+Neither applies to a pinned regime, which runs as pinned.
+
+Enumerating a far mask costs its allowed rows, as a filtered flat scan
+does. That is the price of the exact answer where the graph has none; the
+regime in the answer lets a caller see it was paid.
+
+What the regimes cost on the harness's challenge fixture (100,000 rows of
+64 dimensions, k 10, one core of a shared 4-vCPU cloud host, queries per
+second at the first beam reaching recall 0.95; `--hnsw-regime` pins a
+regime). The host is noisy and the numbers are not a claim; they are why
+the rules above are what they are:
+
+| filter (allowed share) | filter-aware | plain | enumerate | provider's choice |
+|---|---|---|---|---|
+| uncorrelated 50% | 6333 | 4920 | 833 | 6735 |
+| uncorrelated 10% | 7817 | 4512 | 2724 | 6843 |
+| uncorrelated 1% | 9523 | 777 | 50707 | 45172 (enumerate) |
+| near the query 10% | 7749 | 6255 | 2747 | 7215 |
+| near the query 1% | 8859 | 5672 | 16621 | 14775 (enumerate) |
+| far from the query 50% | recall 0.50 | recall 0.94 | 827 | 678 (probe, enumerate) |
+| far from the query 10% | recall 0.17 | 130 | 2704 | 2208 (probe, enumerate) |
+| far from the query 1% | recall 0.03 | 81 | 14549 | 13940 (enumerate) |
+
+`minimum_score` and a floor raised during a stream filter what is returned
+or emitted; neither cuts a walk short. Floor pruning is #72.
+
+The shard still hands the provider a byte mask built per query
+(`resolve_shard_filters`); building it as a bitmap from the column indexes,
+and carrying the thresholds in the measured dense execution policy, are the
+product half of #55.
 
 ## Streaming
 
@@ -324,7 +391,7 @@ A node runs the provider through every path the exhaustive providers take;
   the measured dense execution policy of #58.
 - The FP32 rows are the provider's own copy, as FAISS `HNSWFlat` keeps one.
   Sharing them with the `.exact` sidecar through `RowSource` is #71.
-- Filter-aware traversal (#55), the shared floor pruning the walk, collapse
-  and seeded entries (#54 follow-ups, #60) are later tickets.
+- The shared floor pruning the walk (#72), collapse (#73) and seeded
+  entries (#76) are later tickets.
 - No measured dense execution policy ships for it; AUTO stays refused until
   one is measured on a real corpus.

@@ -6,11 +6,14 @@
 //! outside this module talks only to [`VectorIndex`]; the concrete TurboVec
 //! dependency is contained in [`embedded_turbovec`].
 
+use std::borrow::Cow;
 use std::fmt;
-use std::ops::Range;
+use std::ops::{ControlFlow, Range};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+
+use crate::boolean_bits::Bits;
 
 /// Stable identifier for the currently shipped embedded backend.
 pub const EMBEDDED_TURBOVEC: &str = "embedded-turbovec";
@@ -143,16 +146,143 @@ impl fmt::Display for VectorError {
 
 impl std::error::Error for VectorError {}
 
+/// How a provider that can steer its search by the mask answers a filtered
+/// query (`docs/hnsw.md`, "Filters"). A provider with one way to filter
+/// ignores it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FilterRegime {
+    /// Score every allowed row: exact over the mask, linear in the allowed
+    /// rows.
+    Enumerate,
+    /// Walk the graph through the allowed rows only.
+    FilterAware,
+    /// Walk the graph as if unfiltered; the mask gates results.
+    Plain,
+}
+
+impl FilterRegime {
+    pub fn name(self) -> &'static str {
+        match self {
+            FilterRegime::Enumerate => "enumerate",
+            FilterRegime::FilterAware => "filter_aware",
+            FilterRegime::Plain => "plain",
+        }
+    }
+}
+
+/// The rows a search may return, one flag per row of the index, in the
+/// shape the caller holds. The scan kernel masks with one byte per row; a
+/// graph walk tests single rows and counts and lists the set ones, which
+/// a bitmap does a word at a time. A provider takes its own shape as it
+/// is and converts the other once per search.
+#[derive(Debug, Clone, Copy)]
+pub enum Mask<'a> {
+    Bools(&'a [bool]),
+    Bits(&'a Bits),
+}
+
+impl<'a> Mask<'a> {
+    /// Rows covered, allowed or not.
+    pub fn len(&self) -> usize {
+        match self {
+            Mask::Bools(allow) => allow.len(),
+            Mask::Bits(bits) => bits.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub fn test(&self, row: usize) -> bool {
+        match self {
+            Mask::Bools(allow) => allow[row],
+            Mask::Bits(bits) => bits.test(row),
+        }
+    }
+
+    /// Allowed rows.
+    pub fn count(&self) -> usize {
+        match self {
+            Mask::Bools(allow) => allow.iter().filter(|&&on| on).count(),
+            Mask::Bits(bits) => bits.count() as usize,
+        }
+    }
+
+    /// The allowed rows ascending, until `each` breaks.
+    pub fn try_for_each<B>(&self, mut each: impl FnMut(usize) -> ControlFlow<B>) -> ControlFlow<B> {
+        match self {
+            Mask::Bools(allow) => {
+                for (row, &on) in allow.iter().enumerate() {
+                    if on {
+                        each(row)?;
+                    }
+                }
+                ControlFlow::Continue(())
+            }
+            Mask::Bits(bits) => bits.iter().try_for_each(each),
+        }
+    }
+
+    /// The rows of `[start, end)` as their own mask, row `start` at 0, or
+    /// `None` when the span allows nothing.
+    pub fn slice(&self, start: usize, end: usize) -> Option<OwnedMask> {
+        let end = end.min(self.len());
+        let start = start.min(end);
+        match self {
+            Mask::Bools(allow) => {
+                let part = &allow[start..end];
+                part.iter()
+                    .any(|&on| on)
+                    .then(|| OwnedMask::Bools(part.to_vec()))
+            }
+            Mask::Bits(bits) => {
+                let part = bits.slice(start, end);
+                (part.count() > 0).then_some(OwnedMask::Bits(part))
+            }
+        }
+    }
+
+    /// One byte per row, the shape the scan kernel masks with.
+    pub fn bools(&self) -> Cow<'a, [bool]> {
+        match self {
+            Mask::Bools(allow) => Cow::Borrowed(allow),
+            Mask::Bits(bits) => Cow::Owned(bits.to_bools()),
+        }
+    }
+}
+
+/// A mask that owns its flags (one part of a segmented search).
+#[derive(Debug, Clone)]
+pub enum OwnedMask {
+    Bools(Vec<bool>),
+    Bits(Bits),
+}
+
+impl OwnedMask {
+    pub fn as_mask(&self) -> Mask<'_> {
+        match self {
+            OwnedMask::Bools(allow) => Mask::Bools(allow),
+            OwnedMask::Bits(bits) => Mask::Bits(bits),
+        }
+    }
+}
+
 /// Options common to every provider search used by this product.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct VectorSearchOptions<'a> {
-    pub allow: Option<&'a [bool]>,
+    pub allow: Option<Mask<'a>>,
     pub minimum_score: Option<f32>,
     /// How many candidates the request asked the provider to consider: the
     /// beam a configured-ANN provider walks to (`docs/hnsw.md`, "The
     /// beam"). A streaming search on such a provider refuses without it;
     /// exhaustive providers ignore it.
     pub candidate_depth: Option<usize>,
+    /// The regime a filtered search must run in. `None` lets the provider
+    /// choose from the mask's cardinality; a measurement pins it so a
+    /// measured point is served by the regime that measured it.
+    pub filter_regime: Option<FilterRegime>,
 }
 
 impl<'a> VectorSearchOptions<'a> {
@@ -161,7 +291,13 @@ impl<'a> VectorSearchOptions<'a> {
     }
 
     pub fn with_allowlist(mut self, allow: &'a [bool]) -> Self {
-        self.allow = Some(allow);
+        self.allow = Some(Mask::Bools(allow));
+        self
+    }
+
+    /// The mask as a bitmap (`Mask::Bits`).
+    pub fn with_bits(mut self, allow: &'a Bits) -> Self {
+        self.allow = Some(Mask::Bits(allow));
         self
     }
 
@@ -180,6 +316,11 @@ impl<'a> VectorSearchOptions<'a> {
 
     pub fn with_candidate_depth(mut self, depth: usize) -> Self {
         self.candidate_depth = Some(depth);
+        self
+    }
+
+    pub fn with_filter_regime(mut self, regime: FilterRegime) -> Self {
+        self.filter_regime = Some(regime);
         self
     }
 }
@@ -601,7 +742,7 @@ impl VectorIndex {
         allow: Option<&[bool]>,
     ) -> Result<VectorSearchResults, VectorError> {
         let mut options = VectorSearchOptions::new();
-        options.allow = allow;
+        options.allow = allow.map(Mask::Bools);
         self.try_search(queries, k, options)
     }
 
@@ -771,9 +912,14 @@ mod embedded_turbovec {
             }
         }
 
-        fn options<'a>(options: VectorSearchOptions<'a>) -> SearchOptions<'a> {
+        /// `allow` is the search's mask in the kernel's shape
+        /// ([`Mask::bools`]), held by the caller for the search.
+        fn options<'a>(
+            options: VectorSearchOptions<'_>,
+            allow: Option<&'a [bool]>,
+        ) -> SearchOptions<'a> {
             let mut native = SearchOptions::new();
-            if let Some(allow) = options.allow {
+            if let Some(allow) = allow {
                 native = native.with_mask(allow);
             }
             if let Some(score) = options.minimum_score {
@@ -942,9 +1088,10 @@ mod embedded_turbovec {
             k: usize,
             options: VectorSearchOptions<'_>,
         ) -> Result<VectorSearchResults, VectorError> {
+            let allow = options.allow.map(|mask| mask.bools());
             let result = self
                 .index
-                .try_search_with_options(queries, k, Self::options(options))
+                .try_search_with_options(queries, k, Self::options(options, allow.as_deref()))
                 .map_err(|e| VectorError::new(e.to_string()))?;
             Ok(VectorSearchResults {
                 scores: result.scores,
@@ -961,11 +1108,12 @@ mod embedded_turbovec {
             sink: &mut dyn FnMut(&VectorStreamBatch<'_>) -> VectorStreamControl,
             control: &mut dyn FnMut() -> VectorStreamControl,
         ) -> Result<VectorStreamSummary, VectorError> {
+            let allow = options.allow.map(|mask| mask.bools());
             let summary = self
                 .index
                 .try_search_streaming_controlled(
                     queries,
-                    Self::options(options),
+                    Self::options(options, allow.as_deref()),
                     |batch| {
                         Self::map_control(sink(&VectorStreamBatch {
                             query_index: batch.query_index,

@@ -5,9 +5,10 @@ use std::path::PathBuf;
 use super::config::{BuildMode, HnswConfig, CONFIG_FORMAT};
 use super::graph::{level_for, MAX_LEVEL};
 use super::{HnswIndex, HNSW};
+use crate::boolean_bits::Bits;
 use crate::vector::{
-    QualityContract, VectorBackendConfig, VectorCapability, VectorIndex, VectorProvider,
-    VectorSearchOptions, VectorStreamControl, EMBEDDED_TURBOVEC,
+    FilterRegime, QualityContract, VectorBackendConfig, VectorCapability, VectorIndex,
+    VectorProvider, VectorSearchOptions, VectorStreamControl, EMBEDDED_TURBOVEC,
 };
 
 struct Rng(u64);
@@ -237,7 +238,7 @@ fn recall_at_10_clears_0_95_in_both_build_modes() {
             .search_with_stats(&queries[..dim], 10, 64, VectorSearchOptions::new())
             .unwrap();
         assert_eq!(hits.len(), 10);
-        assert!(stats.hops > 0 && stats.scored >= 10);
+        assert!(stats.stats.hops > 0 && stats.stats.scored >= 10);
         for (row, score) in hits {
             let exact: f32 = vectors[row as usize * dim..][..dim]
                 .iter()
@@ -667,7 +668,7 @@ fn masks_and_floors_filter_results_only() {
     let (_, wide) = index
         .search_with_stats(&queries[..dim], 1, 200, VectorSearchOptions::new())
         .unwrap();
-    assert!(wide.scored > narrow.scored);
+    assert!(wide.stats.scored > narrow.stats.scored);
     let deep = index
         .search(
             &queries[..dim],
@@ -1103,7 +1104,7 @@ fn a_full_beam_visits_every_reachable_row() {
                 .unwrap();
             assert_eq!(hits.len(), n, "{mode:?}: not every row was reached");
             // Layer 0 scores every row once; the descent above it scores a few more.
-            assert!(stats.scored as usize >= n);
+            assert!(stats.stats.scored as usize >= n);
             let truth = exact_top(&vectors, dim, query, n);
             let got: Vec<u32> = hits.iter().map(|h| h.0).collect();
             assert_eq!(got, truth, "{mode:?}: full-beam order is the exact order");
@@ -1123,5 +1124,410 @@ fn a_full_beam_visits_every_reachable_row() {
             emitted.sort_unstable();
             assert_eq!(emitted, (0..n as i64).collect::<Vec<_>>(), "{mode:?}");
         }
+    }
+}
+
+/// The exact top `k` of the allowed rows, by the scalar scorer: row and
+/// score, best first, ties by row.
+fn exact_top_masked(
+    vectors: &[f32],
+    dim: usize,
+    query: &[f32],
+    allow: &[bool],
+    k: usize,
+) -> Vec<(u32, f32)> {
+    let mut all: Vec<(u32, f32)> = vectors
+        .chunks_exact(dim)
+        .enumerate()
+        .filter(|(i, _)| allow[*i])
+        .map(|(i, row)| (i as u32, crate::exact_vectors::dot(row, query)))
+        .collect();
+    all.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    all.truncate(k);
+    all
+}
+
+/// The `percent` of rows whose direction is closest to `anchor`: a filter
+/// correlated with a region of the space.
+fn region_mask(vectors: &[f32], dim: usize, anchor: &[f32], percent: usize) -> Vec<bool> {
+    let n = vectors.len() / dim;
+    let keep = exact_top(vectors, dim, anchor, n * percent / 100);
+    let mut allow = vec![false; n];
+    for row in keep {
+        allow[row as usize] = true;
+    }
+    allow
+}
+
+#[test]
+fn the_regime_follows_the_mask_cardinality_and_a_pinned_regime_is_honored() {
+    let dim = 16;
+    let n = 20_000;
+    let (vectors, queries) = corpus_with_queries(n, 1, dim, 0x55A1);
+    let index = built(&vectors, dim, BuildMode::Parallel);
+    let query = &queries[..dim];
+    let regime_at = |allowed_every: usize, invert: bool| {
+        let allow: Vec<bool> = (0..n).map(|i| (i % allowed_every == 0) != invert).collect();
+        index
+            .search_with_stats(query, 10, 16, VectorSearchOptions::new().with_mask(&allow))
+            .unwrap()
+            .1
+            .regime
+    };
+    // ef 16 at M 16: enumerate up to 4 * 16 * 32 = 2048 allowed rows.
+    assert_eq!(regime_at(100, false), Some(FilterRegime::Enumerate)); // 200 rows
+    assert_eq!(regime_at(4, false), Some(FilterRegime::FilterAware)); // 25%
+                                                                      // The plain walk is never chosen, however much the mask allows.
+    assert_eq!(regime_at(20, true), Some(FilterRegime::FilterAware)); // 95%
+                                                                      // A mask that allows everything is no filter at all.
+    assert_eq!(regime_at(1, false), None);
+    // A wider beam moves the enumerate threshold with it.
+    let allow: Vec<bool> = (0..n).map(|i| i % 4 == 0).collect();
+    let (_, answer) = index
+        .search_with_stats(query, 10, 64, VectorSearchOptions::new().with_mask(&allow))
+        .unwrap();
+    assert_eq!(answer.regime, Some(FilterRegime::Enumerate)); // 5000 <= 8192
+
+    for regime in [
+        FilterRegime::Enumerate,
+        FilterRegime::FilterAware,
+        FilterRegime::Plain,
+    ] {
+        let options = VectorSearchOptions::new()
+            .with_mask(&allow)
+            .with_filter_regime(regime);
+        let (hits, answer) = index.search_with_stats(query, 10, 16, options).unwrap();
+        assert_eq!(answer.regime, Some(regime));
+        assert_eq!(hits.len(), 10);
+        // The mask as a bitmap is the same search.
+        let bits = Bits::from_bools(&allow);
+        let options = VectorSearchOptions::new()
+            .with_bits(&bits)
+            .with_filter_regime(regime);
+        let (same, as_bits) = index.search_with_stats(query, 10, 16, options).unwrap();
+        assert_eq!(same, hits, "{regime:?}");
+        assert_eq!(as_bits, answer, "{regime:?}");
+        assert!(
+            hits.iter().all(|(row, _)| allow[*row as usize]),
+            "{regime:?}"
+        );
+        // No mask, no regime to pin.
+        let error = index
+            .search_with_stats(
+                query,
+                10,
+                16,
+                VectorSearchOptions::new().with_filter_regime(regime),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("no mask"), "{error}");
+        // An empty mask returns nothing in every regime.
+        let none = vec![false; n];
+        let options = VectorSearchOptions::new()
+            .with_mask(&none)
+            .with_filter_regime(regime);
+        let (hits, _) = index.search_with_stats(query, 10, 16, options).unwrap();
+        assert!(hits.is_empty(), "{regime:?}");
+    }
+}
+
+#[test]
+fn enumerate_is_the_exact_top_k_of_the_mask_on_every_shape() {
+    let dim = 17;
+    let n = 6000;
+    let (mut vectors, queries) = corpus_with_queries(n, 6, dim, 0xE0E0);
+    // Rows of very different lengths, negated rows, and a zero row: the
+    // kernel bound has to hold for all of them.
+    let mut rng = Rng(0xBEEF);
+    for (i, row) in vectors.chunks_exact_mut(dim).enumerate() {
+        let scale = match i % 5 {
+            0 => 1e-3,
+            1 => 1.0,
+            2 => -7.5,
+            3 => 250.0,
+            _ => 1.0 + rng.unit() as f32,
+        };
+        for x in row.iter_mut() {
+            *x *= scale;
+        }
+    }
+    vectors[dim * 40..dim * 41].fill(0.0);
+    // Exact duplicates: ties are settled by row.
+    let (head, tail) = vectors.split_at_mut(dim * 100);
+    tail[..dim].copy_from_slice(&head[dim * 7..dim * 8]);
+    for mode in [BuildMode::FixedOrder, BuildMode::Parallel] {
+        let index = built(&vectors, dim, mode);
+        for (every, k) in [(3usize, 10usize), (10, 1), (10, 100), (50, 200), (997, 10)] {
+            let allow: Vec<bool> = (0..n)
+                .map(|i| i % every == 0 || i == 7 || i == 100)
+                .collect();
+            let allowed = allow.iter().filter(|&&on| on).count();
+            for query in queries.chunks_exact(dim) {
+                let options = VectorSearchOptions::new()
+                    .with_mask(&allow)
+                    .with_filter_regime(FilterRegime::Enumerate);
+                let (hits, answer) = index.search_with_stats(query, k, 16, options).unwrap();
+                let truth = exact_top_masked(&vectors, dim, query, &allow, k);
+                assert_eq!(hits.len(), k.min(allowed));
+                assert_eq!(answer.stats.scored as usize, allowed);
+                for (got, want) in hits.iter().zip(&truth) {
+                    assert_eq!(got.0, want.0, "{mode:?} every {every} k {k}");
+                    assert_eq!(got.1.to_bits(), want.1.to_bits());
+                }
+                // A floor keeps exactly the rows at or above it.
+                if let Some(&(_, mid)) = truth.get(truth.len() / 2) {
+                    let (floored, _) = index
+                        .search_with_stats(query, k, 16, options.with_minimum_score(mid))
+                        .unwrap();
+                    let want: Vec<u32> = truth.iter().filter(|t| t.1 >= mid).map(|t| t.0).collect();
+                    let got: Vec<u32> = floored.iter().map(|h| h.0).collect();
+                    assert_eq!(got, want);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_filter_aware_walk_keeps_recall_and_scores_only_allowed_rows() {
+    let dim = 24;
+    let n = 30_000;
+    let (vectors, queries) = corpus_with_queries(n, 24, dim, 0xAC02);
+    let index = built(&vectors, dim, BuildMode::Parallel);
+    let k = 10;
+    let mut rng = Rng(0x5EED);
+    let uncorrelated: Vec<bool> = (0..n).map(|_| rng.next_u64() % 10 < 3).collect();
+    // Beam 64 at M 16: the provider enumerates a mask of up to this many
+    // rows and walks a larger one.
+    let enumerated = super::ENUMERATE_ROWS_PER_WALK_ROW * 64 * 32;
+    for (name, percent) in [("uncorrelated", 30), ("near", 30), ("far", 30), ("far", 60)] {
+        // The provider's own choice, then the two walks pinned.
+        let regimes = [
+            None,
+            Some(FilterRegime::FilterAware),
+            Some(FilterRegime::Plain),
+        ];
+        let mut found = [0usize; 3];
+        let mut scored = [0u64; 3];
+        let mut bridges = 0u64;
+        let mut total = 0usize;
+        for (qi, query) in queries.chunks_exact(dim).enumerate() {
+            // "near": the region around the query. "far": the region around
+            // the row least like the query, a desert away from where the
+            // unfiltered descent lands.
+            let allow = match name {
+                "uncorrelated" => uncorrelated.clone(),
+                "near" => region_mask(&vectors, dim, query, percent),
+                _ => {
+                    let opposite: Vec<f32> = query.iter().map(|x| -x).collect();
+                    let far = exact_top(&vectors, dim, &opposite, 1)[0] as usize;
+                    region_mask(&vectors, dim, &vectors[far * dim..][..dim], percent)
+                }
+            };
+            let truth = exact_top_masked(&vectors, dim, query, &allow, k);
+            total += truth.len();
+            for (slot, regime) in regimes.into_iter().enumerate() {
+                let mut options = VectorSearchOptions::new().with_mask(&allow);
+                options.filter_regime = regime;
+                let (hits, answer) = index.search_with_stats(query, k, 64, options).unwrap();
+                assert!(
+                    hits.iter().all(|(row, _)| allow[*row as usize]),
+                    "query {qi}"
+                );
+                for (row, score) in &hits {
+                    let exact =
+                        crate::exact_vectors::dot(&vectors[*row as usize * dim..][..dim], query);
+                    assert_eq!(score.to_bits(), exact.to_bits());
+                }
+                found[slot] += hits
+                    .iter()
+                    .filter(|h| truth.iter().any(|t| t.0 == h.0))
+                    .count();
+                scored[slot] += answer.stats.scored;
+                match regime {
+                    // A mask away from the query is handed to enumerate
+                    // before the walk starts: the probe reads links only.
+                    None if name == "far" => {
+                        assert!(allow.iter().filter(|&&on| on).count() > enumerated);
+                        assert_eq!(answer.regime, Some(FilterRegime::Enumerate), "query {qi}");
+                        assert!(answer.stats.probed > 0);
+                        assert_eq!(answer.stats.bridges, 0);
+                        assert_eq!(hits, truth, "query {qi}");
+                    }
+                    None => {
+                        let allowed = allow.iter().filter(|&&on| on).count();
+                        let want = if allowed <= enumerated {
+                            FilterRegime::Enumerate
+                        } else {
+                            FilterRegime::FilterAware
+                        };
+                        assert_eq!(answer.regime, Some(want), "query {qi}");
+                    }
+                    Some(FilterRegime::FilterAware) => {
+                        assert_eq!(answer.regime, regime);
+                        assert_eq!(answer.stats.probed, 0);
+                        bridges += answer.stats.bridges;
+                    }
+                    Some(_) => assert_eq!(answer.stats.bridges, 0),
+                }
+            }
+        }
+        let recall = found[0] as f64 / total as f64;
+        assert!(recall >= 0.95, "{name} {percent}%: recall {recall}");
+        if name == "uncorrelated" {
+            // The plain walk pays for every disallowed row it routes
+            // through; the filter-aware walk looks through them.
+            assert!(bridges > 0, "no bridge was looked through");
+            assert!(
+                scored[1] * 2 < scored[2],
+                "filter-aware scored {} rows, plain {}",
+                scored[1],
+                scored[2]
+            );
+        }
+    }
+}
+
+#[test]
+fn a_walk_stranded_on_an_island_is_finished_by_enumerate() {
+    // A narrow graph and a mask of two kinds of rows: the three nearest the
+    // query, and a region away from it too small a share of the rows for
+    // the probe to judge. The walk reaches the three and runs dry.
+    let dim = 16;
+    let n = 8000;
+    let (vectors, queries) = corpus_with_queries(n, 4, dim, 0x15A0);
+    let mut config = config(BuildMode::FixedOrder);
+    config.m = 4;
+    let mut index = HnswIndex::new(dim, config).unwrap();
+    index.add(&vectors, dim).unwrap();
+    index.prepare().unwrap();
+    let k = 10;
+    for query in queries.chunks_exact(dim) {
+        let opposite: Vec<f32> = query.iter().map(|x| -x).collect();
+        let far = exact_top(&vectors, dim, &opposite, 1)[0] as usize;
+        let mut allow = region_mask(&vectors, dim, &vectors[far * dim..][..dim], 10);
+        for row in exact_top(&vectors, dim, query, 3) {
+            allow[row as usize] = true;
+        }
+        let allowed = allow.iter().filter(|&&on| on).count();
+        let truth = exact_top_masked(&vectors, dim, query, &allow, k);
+        let options = VectorSearchOptions::new().with_mask(&allow);
+        let (hits, answer) = index.search_with_stats(query, k, 16, options).unwrap();
+        assert_eq!(answer.regime, Some(FilterRegime::Enumerate));
+        // The walk ran (the probe let it) before enumerate scored the mask.
+        assert!(answer.stats.bridges > 0);
+        assert!(answer.stats.scored as usize > allowed);
+        assert_eq!(hits, truth);
+        // Pinned, the walk keeps what it reached.
+        let pinned = options.with_filter_regime(FilterRegime::FilterAware);
+        let (short, answer) = index.search_with_stats(query, k, 16, pinned).unwrap();
+        assert_eq!(answer.regime, Some(FilterRegime::FilterAware));
+        assert!(short.len() < k);
+
+        // A stream emits what the walk reached, then every other allowed
+        // row: each once, each exactly scored.
+        let mut rows: Vec<(i64, f32)> = Vec::new();
+        let summary = index
+            .search_streaming_controlled(
+                query,
+                options.with_candidate_depth(16),
+                &mut |batch| {
+                    rows.extend(
+                        batch
+                            .slots
+                            .iter()
+                            .copied()
+                            .zip(batch.scores.iter().copied()),
+                    );
+                    VectorStreamControl::Continue
+                },
+                &mut || VectorStreamControl::Continue,
+            )
+            .unwrap();
+        assert!(summary.completed);
+        assert_eq!(summary.emitted, allowed);
+        let mut seen: Vec<i64> = rows.iter().map(|r| r.0).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), allowed);
+        for (slot, score) in &rows {
+            assert!(allow[*slot as usize]);
+            let exact = crate::exact_vectors::dot(&vectors[*slot as usize * dim..][..dim], query);
+            assert_eq!(score.to_bits(), exact.to_bits());
+        }
+    }
+}
+
+#[test]
+fn streaming_follows_the_regimes() {
+    let dim = 16;
+    let n = 8000;
+    let (vectors, queries) = corpus_with_queries(n, 1, dim, 0x57AE);
+    let index = built(&vectors, dim, BuildMode::Parallel);
+    let query = &queries[..dim];
+    let allow: Vec<bool> = (0..n).map(|i| i % 5 == 0).collect();
+    let stream = |regime: FilterRegime, stop_after: Option<usize>| {
+        let mut rows: Vec<(i64, f32)> = Vec::new();
+        let mut batches = 0usize;
+        let options = VectorSearchOptions::new()
+            .with_mask(&allow)
+            .with_candidate_depth(32)
+            .with_filter_regime(regime);
+        let summary = index
+            .search_streaming_controlled(
+                query,
+                options,
+                &mut |batch| {
+                    batches += 1;
+                    rows.extend(
+                        batch
+                            .slots
+                            .iter()
+                            .copied()
+                            .zip(batch.scores.iter().copied()),
+                    );
+                    match stop_after {
+                        Some(limit) if batches >= limit => VectorStreamControl::Stop,
+                        _ => VectorStreamControl::Continue,
+                    }
+                },
+                &mut || VectorStreamControl::Continue,
+            )
+            .unwrap();
+        (rows, summary)
+    };
+    // Enumerate streams every allowed row, each exactly scored, once.
+    let (rows, summary) = stream(FilterRegime::Enumerate, None);
+    assert!(summary.completed);
+    assert_eq!(rows.len(), n / 5);
+    assert_eq!(summary.emitted, n / 5);
+    let mut seen: Vec<i64> = rows.iter().map(|r| r.0).collect();
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(seen.len(), n / 5);
+    for (slot, score) in &rows {
+        assert!(allow[*slot as usize]);
+        let exact = crate::exact_vectors::dot(&vectors[*slot as usize * dim..][..dim], query);
+        assert_eq!(score.to_bits(), exact.to_bits());
+    }
+    // And stops when told to.
+    let (rows, summary) = stream(FilterRegime::Enumerate, Some(2));
+    assert!(!summary.completed);
+    assert!(rows.len() < n / 5);
+    // The walks emit allowed rows only, and the filter-aware one covers the
+    // exact top of the mask.
+    for regime in [FilterRegime::FilterAware, FilterRegime::Plain] {
+        let (rows, summary) = stream(regime, None);
+        assert!(summary.completed);
+        assert!(
+            rows.iter().all(|(slot, _)| allow[*slot as usize]),
+            "{regime:?}"
+        );
+        let truth = exact_top_masked(&vectors, dim, query, &allow, 5);
+        let hit = truth
+            .iter()
+            .filter(|t| rows.iter().any(|r| r.0 == i64::from(t.0)))
+            .count();
+        assert!(hit >= 4, "{regime:?}: stream covers {hit} of the top 5");
     }
 }

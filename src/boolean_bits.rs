@@ -56,6 +56,15 @@ impl Bits {
         bits
     }
 
+    /// From packed words: slot `i` is bit `i % 64` of word `i / 64`. Words
+    /// are added or dropped to cover `len`, and bits at or past it cleared.
+    pub fn from_words(mut words: Vec<u64>, len: usize) -> Self {
+        words.resize(len.div_ceil(64), 0);
+        let mut bits = Self { words, len };
+        bits.trim();
+        bits
+    }
+
     /// From a per-slot admission list.
     pub fn from_bools(allow: &[bool]) -> Self {
         let mut bits = Self::empty(allow.len());
@@ -185,6 +194,17 @@ impl Bits {
         })
     }
 
+    /// The slots of `[start, end)` as their own bitmap, slot `start` at 0.
+    pub fn slice(&self, start: usize, end: usize) -> Bits {
+        let end = end.min(self.len);
+        let start = start.min(end);
+        let mut out = Bits::empty(end - start);
+        for slot in self.iter_range(start, end) {
+            out.set(slot - start);
+        }
+        out
+    }
+
     /// A per-slot admission list, the shape the vector kernel masks with.
     pub fn to_bools(&self) -> Vec<bool> {
         (0..self.len).map(|slot| self.test(slot)).collect()
@@ -300,6 +320,41 @@ pub fn group_members(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slices_and_words_keep_the_slots() {
+        let bools: Vec<bool> = (0..300).map(|i| i % 7 == 0 || i == 63 || i == 64).collect();
+        let bits = Bits::from_bools(&bools);
+        for (start, end) in [
+            (0, 300),
+            (0, 0),
+            (1, 64),
+            (63, 65),
+            (64, 128),
+            (130, 299),
+            (290, 400),
+        ] {
+            let part = bits.slice(start, end);
+            let end = end.min(300);
+            assert_eq!(
+                part.to_bools(),
+                bools[start.min(end)..end],
+                "{start}..{end}"
+            );
+        }
+        // Stray bits past the length and a short or long word list.
+        let words = vec![u64::MAX; 2];
+        let made = Bits::from_words(words, 70);
+        assert_eq!(made, Bits::full(70));
+        assert_eq!(
+            Bits::from_words(vec![1], 130).iter().collect::<Vec<_>>(),
+            [0]
+        );
+        assert_eq!(
+            Bits::from_words(vec![1, 2, 4], 64),
+            Bits::from_words(vec![1], 64)
+        );
+    }
 
     fn of(len: usize, slots: &[usize]) -> Bits {
         let mut b = Bits::empty(len);
