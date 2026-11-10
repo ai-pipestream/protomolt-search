@@ -3,7 +3,7 @@
 //! ```text
 //! ann_bench fixture   --source=challenge|court|synthetic:ROWS:DIM --out=DIR [--queries=1000]
 //! ann_bench run       --fixture=DIR --out=results.json [--engines=...] [--segment-rows=N]
-//! ann_bench gate      --results=a.json,b.json --out=gate.md [--candidate=hnsw] [--unfiltered-margin=0.20]
+//! ann_bench gate      --results=a.json,b.json --matrix=gates/replacement.json --out=gate.md
 //! ann_bench calibrate --dir=fashion-mnist --out=calibration.json
 //! ```
 //!

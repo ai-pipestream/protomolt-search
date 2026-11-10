@@ -14,7 +14,8 @@
 #   M, EFC, EF     sweep lists (defaults: 16,32,48,64 / 100,200,400 / 16..512)
 #   ENGINES        in-process engines (default: all)
 #   SKIP_FAISS, SKIP_LUCENE   set to 1 to skip a runner
-#   MARGIN         unfiltered bound for the gate (default 0.20, a placeholder)
+#   MATRIX         expected-cell matrix the gate judges (default gates/replacement.json;
+#                  the unfiltered margin lives in the matrix)
 #   CALIBRATION    calibration JSON for the gate (default results/calibration-hnsw_rs.json)
 #   MAVEN_SETTINGS a settings.xml for Maven (mirrors), passed as -s
 set -euo pipefail
@@ -28,7 +29,7 @@ QUERIES=${QUERIES:-500}
 M=${M:-16,32,48,64}
 EFC=${EFC:-100,200,400}
 EF=${EF:-16,32,48,64,96,128,192,256,384,512}
-MARGIN=${MARGIN:-0.20}
+MATRIX=${MATRIX:-$here/gates/replacement.json}
 CALIBRATION=${CALIBRATION:-$here/results/calibration-hnsw_rs.json}
 FIXTURE=${FIXTURE:-$OUT/fixture}
 
@@ -84,6 +85,6 @@ done
 
 calibration_arg=()
 [[ -f $CALIBRATION ]] && calibration_arg=(--calibration="$CALIBRATION")
-"$bench" gate --results="$(IFS=,; echo "${results[*]}")" --unfiltered-margin="$MARGIN" \
+"$bench" gate --results="$(IFS=,; echo "${results[*]}")" --matrix="$MATRIX" \
   "${calibration_arg[@]}" --out="$OUT/gate.md"
 echo "run-matrix: done; gate table in $OUT/gate.md"

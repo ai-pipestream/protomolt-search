@@ -90,6 +90,7 @@ def host():
         "name": os.environ.get("ANN_BENCH_HOST", socket.gethostname()),
         "cpu": cpu,
         "arch": platform.machine(),
+        "kernel": platform.release(),
         "threads": os.cpu_count(),
         "cpu_features": [],
     }
@@ -290,7 +291,10 @@ def main():
         "shape": shape_name,
         "segments": [list(r) for r in ranges],
         "host": host(),
-        "harness": {"runner": "faiss/run.py", "python": sys.version.split()[0], "numpy": np.__version__},
+        "harness": {
+            "runner": "faiss/run.py", "python": sys.version.split()[0], "numpy": np.__version__,
+            "commit": os.environ.get("ANN_BENCH_COMMIT", ""), "started_at": int(time.time()),
+        },
         "settings": {
             "k": ints(a.k), "ef": ints(a.ef), "m": ints(a.m), "ef_construction": ints(a.ef_construction),
             "min_time_ms": a.min_time_ms, "threads": a.threads, "recall_stop": a.recall_stop,

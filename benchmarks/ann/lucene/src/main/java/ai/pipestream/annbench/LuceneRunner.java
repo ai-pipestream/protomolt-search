@@ -214,7 +214,9 @@ public final class LuceneRunner {
     report.put("shape", shapeName);
     report.put("segments", ranges);
     report.put("host", host());
-    report.put("harness", Map.of("runner", "lucene/LuceneRunner", "java", System.getProperty("java.version")));
+    report.put("harness", Map.of("runner", "lucene/LuceneRunner", "java", System.getProperty("java.version"),
+        "commit", System.getenv().getOrDefault("ANN_BENCH_COMMIT", ""),
+        "started_at", System.currentTimeMillis() / 1000L));
     report.put("settings", Map.of("k", ks, "ef", efs, "m", ms, "ef_construction", efcs,
         "min_time_ms", minTimeNs / 1_000_000L, "threads", threads, "recall_stop", recallStop));
     Map<String, Object> engine = new LinkedHashMap<>();
@@ -478,6 +480,7 @@ public final class LuceneRunner {
     h.put("name", name);
     h.put("cpu", cpu);
     h.put("arch", System.getProperty("os.arch"));
+    h.put("kernel", System.getProperty("os.version"));
     h.put("threads", Runtime.getRuntime().availableProcessors());
     h.put("cpu_features", List.of());
     h.put("jvm", ManagementFactory.getRuntimeMXBean().getVmName() + " " + System.getProperty("java.version"));

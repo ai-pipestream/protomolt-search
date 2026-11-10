@@ -29,7 +29,7 @@ mvn -q -f lucene/pom.xml package && java --add-modules jdk.incubator.vector \
   ai.pipestream.annbench.LuceneRunner --fixture=/tmp/fx --out=lucene.json
 ./fetch-fashion-mnist.sh /tmp/fmnist && $B calibrate --dir=/tmp/fmnist --out=calibration.json
 $B gate --results=rust.json,faiss.json,lucene.json --calibration=calibration.json \
-  --candidate=hnsw --unfiltered-margin=0.20 --out=gate.md
+  --matrix=gates/core-unfiltered.json --out=gate.md
 ```
 
 `RUSTC_BOOTSTRAP=corenn_kernels` is needed because CoreNN's kernel crate uses
@@ -123,27 +123,70 @@ add.
 
 ## The gate (`ann_bench gate`)
 
-For every fixture and shape, every cell (filter x k), each recall target
-(0.95, 0.99) and each mode (one core, all cores), every engine is taken at
-its best point: the highest QPS of any build and breadth that reaches the
-target.
+The gate judges an explicit **matrix of expected cells**, a checked-in file
+under `gates/` passed as `--matrix`. A matrix names the candidate, the
+unfiltered margin and whether it is still provisional, and blocks of cells:
+fixture, shape, filters, k, recall targets (0.95, 0.99), cores (`1`, `all`)
+and the baselines every cell of the block requires.
+
+| Matrix | For | Cells |
+| --- | --- | --- |
+| `gates/core-unfiltered.json` | #70, the core milestone | unfiltered, challenge fixture |
+| `gates/filtered.json` | #55 | three filter sets at 50%, 10%, 1%, both fixtures |
+| `gates/replacement.json` | #54 | everything the harness can measure today: both fixtures, single and segmented court shape. The floor, collapse, seeded-entry and tombstone cells join it with #60. |
+
+For each expected cell every engine is taken at its best point: the highest
+QPS of any build and breadth that reaches the recall target.
 
 - **Filtered cells gate**: the candidate's QPS must be at least the best
-  baseline's. The exhaustive TurboVec row counts as a baseline (it is the bar
-  a graph must clear to enter the planner at all).
-- **Unfiltered cells are a bound**: within `--unfiltered-margin` of the best
-  baseline (0.20 is a placeholder until Kristian sets it). The flat scan
-  (`enumerate`) counts as a baseline here.
+  required baseline's. The exhaustive TurboVec row is a required baseline (it
+  is the bar a graph must clear to enter the planner at all).
+- **Unfiltered cells are a bound**: within the matrix's `unfiltered_margin`
+  of the best required baseline. The flat scan (`enumerate`) is a required
+  baseline here.
 - **Enumerate** is a reported column in filtered cells, and the gate prints
   the crossover selectivity where the candidate overtakes it: T1 for #55.
 - **Calibration**: hnsw_rs must reproduce its published recall at a
-  published point within one recall point (`ann_bench calibrate`) before any
-  comparison counts. The published point is fashion-mnist-784-euclidean,
-  M = 24, ef_construction = 400, ef = 24, k = 10, recall 0.977. The dataset is
+  published point within one recall point (`ann_bench calibrate`). The
+  published point is fashion-mnist-784-euclidean, M = 24,
+  ef_construction = 400, ef = 24, k = 10, recall 0.977. The dataset is
   rebuilt from the Fashion-MNIST IDX files, as ann-benchmarks builds it.
 
-The gate writes `gate.md` (tables) and `gate.json` (every verdict with both
-points).
+### Verdicts
+
+A cell's verdict is one of:
+
+| Cell verdict | Meaning |
+| --- | --- |
+| `PASS` | The candidate reaches the target and meets the bar against the best required baseline, and every required baseline was measured. |
+| `FAIL` | The candidate was measured and misses the recall target, or its QPS misses the bar. A missing baseline cannot rescue a ratio that already fails. |
+| `INCOMPLETE` | The candidate, or a required baseline, has no measurement for the cell. Never skipped. |
+| `NO-BASELINE` | Every required baseline was measured and none reaches the target. Counts as incomplete unless the matrix block sets `no_baseline_expected`. |
+
+The overall result is the only thing to quote as acceptance:
+
+| Overall | When |
+| --- | --- |
+| `FAIL` | Any expected cell fails. |
+| `INCOMPLETE` | No cell fails, but a cell is incomplete or without a baseline, a result file lacks provenance, or calibration is missing or has not passed. Not a verdict on the candidate. |
+| `PROVISIONAL PASS` | Everything passes, but the matrix still marks the unfiltered margin provisional (#59). |
+| `PASS` | Every expected cell passes, calibration passes, provenance is complete and the margin is decided. |
+
+A row quoted from `gate.md` on its own is not acceptance; the overall line is.
+
+### Provenance
+
+Every result file records the host (name, CPU model, architecture, threads,
+kernel), the commit (`ANN_BENCH_COMMIT`; the bench crate and the product
+share one repository, so one commit names both), the start time, and the
+fixture's `base_sha256`. The gate **refuses** to combine files that disagree
+on the host or on the digest of a fixture name, and reports a file that
+lacks any of these as incomplete evidence. Files from different commits are
+combined and the difference is stated. The calibration is a recall
+measurement and may come from another host.
+
+The gate writes `gate.md` (tables) and `gate.json` (the overall result, the
+reasons the evidence is incomplete, and every verdict with both points).
 
 ## Results
 

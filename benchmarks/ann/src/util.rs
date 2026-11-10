@@ -311,6 +311,28 @@ pub fn read_u32(path: &Path) -> Result<Vec<u32>, Error> {
         .collect())
 }
 
+/// The commit the harness ran at and when the run started: provenance the
+/// gate requires of every result file. The commit comes from
+/// `ANN_BENCH_COMMIT` (run-matrix.sh sets it), read at run time and, failing
+/// that, as it was at build time; the bench crate and the product crate share
+/// one repository, so one commit names both.
+pub fn harness() -> serde_json::Value {
+    let commit = std::env::var("ANN_BENCH_COMMIT")
+        .ok()
+        .filter(|c| !c.is_empty())
+        .or_else(|| option_env!("ANN_BENCH_COMMIT").map(str::to_string))
+        .unwrap_or_default();
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    serde_json::json!({
+        "runner": "ann_bench",
+        "version": env!("CARGO_PKG_VERSION"),
+        "commit": commit,
+        "started_at": started_at,
+    })
+}
+
 /// Host facts recorded in every result file.
 pub fn host() -> serde_json::Value {
     let cpu = std::fs::read_to_string("/proc/cpuinfo")
@@ -348,6 +370,9 @@ pub fn host() -> serde_json::Value {
         "name": hostname,
         "cpu": cpu,
         "arch": std::env::consts::ARCH,
+        "kernel": std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default(),
         "threads": host_threads(),
         "cpu_features": features,
     })

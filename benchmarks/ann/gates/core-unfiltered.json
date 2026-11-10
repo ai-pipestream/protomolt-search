@@ -1,0 +1,40 @@
+{
+  "format": "protomolt-ann-gate-matrix-v1",
+  "name": "core-unfiltered",
+  "issue": "#70",
+  "note": "Core milestone: unfiltered cells on the challenge fixture. Not the #54 replacement gate.",
+  "candidate": "hnsw",
+  "unfiltered_margin": 0.2,
+  "unfiltered_margin_provisional": true,
+  "cells": [
+    {
+      "fixture": "challenge-100000x64",
+      "shape": "single",
+      "filters": [
+        "none"
+      ],
+      "k": [
+        10,
+        100
+      ],
+      "recall": [
+        0.95,
+        0.99
+      ],
+      "cores": [
+        "1",
+        "all"
+      ],
+      "baselines": [
+        "faiss-hnsw",
+        "lucene-hnsw",
+        "usearch",
+        "hnsw_rs",
+        "corenn-hnswlib",
+        "rust-cv-hnsw",
+        "exhaustive-tq",
+        "enumerate"
+      ]
+    }
+  ]
+}

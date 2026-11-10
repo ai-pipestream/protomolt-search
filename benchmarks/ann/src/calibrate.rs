@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use serde_json::json;
 
-use crate::util::{arg, host, host_threads, l2sq, par_map, write_json, Error, TopK};
+use crate::util::{arg, harness, host, host_threads, l2sq, par_map, write_json, Error, TopK};
 
 const PUBLISHED_RECALL: f64 = 0.977;
 const TOLERANCE: f64 = 0.01;
@@ -151,6 +151,7 @@ pub fn command() -> Result<(), Error> {
         "build_s": build_s,
         "qps_all_cores_parallel_search": qn as f64 / search_s,
         "host": host(),
+        "harness": harness(),
         "verdict": verdict,
     });
     write_json(&out, &report)?;

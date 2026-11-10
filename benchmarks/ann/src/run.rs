@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use crate::engines::{self, Allow, BuildParams, Index, QueryStats};
 use crate::fixture::{self, Fixture};
 use crate::util::{
-    arg, host, host_threads, list_str, list_usize, rss_bytes, write_json, Error, TopK,
+    arg, harness, host, host_threads, list_str, list_usize, rss_bytes, write_json, Error, TopK,
 };
 
 pub const FORMAT: &str = "protomolt-ann-bench-results-v1";
@@ -290,7 +290,7 @@ pub fn command() -> Result<(), Error> {
         "shape": shape_name,
         "segments": ranges.iter().map(|r| json!([r.0, r.1])).collect::<Vec<_>>(),
         "host": host(),
-        "harness": { "version": env!("CARGO_PKG_VERSION"), "commit": option_env!("ANN_BENCH_COMMIT").unwrap_or("") },
+        "harness": harness(),
         "settings": {
             "k": s.ks, "ef": s.efs, "rerank": s.rerank_depths, "m": ms, "ef_construction": efcs,
             "min_time_ms": s.min_time.as_millis() as u64, "threads": s.threads, "recall_stop": s.recall_stop, "min_qps": s.min_qps,

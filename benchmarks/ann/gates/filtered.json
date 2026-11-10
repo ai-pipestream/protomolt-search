@@ -1,0 +1,81 @@
+{
+  "format": "protomolt-ann-gate-matrix-v1",
+  "name": "filtered",
+  "issue": "#55",
+  "note": "Filter-aware traversal: three filter sets at 50%, 10% and 1% on both fixtures. rust-cv-hnsw has no predicate filter; enumerate is a reported column, not a baseline.",
+  "candidate": "hnsw",
+  "unfiltered_margin": 0.2,
+  "unfiltered_margin_provisional": true,
+  "cells": [
+    {
+      "fixture": "challenge-100000x64",
+      "shape": "single",
+      "filters": [
+        "uncorrelated-50",
+        "uncorrelated-10",
+        "uncorrelated-1",
+        "near-50",
+        "near-10",
+        "near-1",
+        "far-50",
+        "far-10",
+        "far-1"
+      ],
+      "k": [
+        10,
+        100
+      ],
+      "recall": [
+        0.95,
+        0.99
+      ],
+      "cores": [
+        "1",
+        "all"
+      ],
+      "baselines": [
+        "faiss-hnsw",
+        "lucene-hnsw",
+        "usearch",
+        "hnsw_rs",
+        "corenn-hnswlib",
+        "exhaustive-tq"
+      ]
+    },
+    {
+      "fixture": "court-1000000x1024",
+      "shape": "single",
+      "filters": [
+        "uncorrelated-50",
+        "uncorrelated-10",
+        "uncorrelated-1",
+        "near-50",
+        "near-10",
+        "near-1",
+        "far-50",
+        "far-10",
+        "far-1"
+      ],
+      "k": [
+        10,
+        100
+      ],
+      "recall": [
+        0.95,
+        0.99
+      ],
+      "cores": [
+        "1",
+        "all"
+      ],
+      "baselines": [
+        "faiss-hnsw",
+        "lucene-hnsw",
+        "usearch",
+        "hnsw_rs",
+        "corenn-hnswlib",
+        "exhaustive-tq"
+      ]
+    }
+  ]
+}
