@@ -1,0 +1,5 @@
+/target
+/lucene/target
+# Fixtures and Lucene indexes are regenerable and large.
+/results/*/fixture/
+/results/*/lucene-index/
