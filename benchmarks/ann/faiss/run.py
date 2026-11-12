@@ -77,6 +77,17 @@ def recall(got, truth_row, k):
     return len(np.intersect1d(got[:k], t)) / len(t)
 
 
+def available_threads():
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            n = len(os.sched_getaffinity(0))
+            if n > 0:
+                return n
+        except OSError:
+            pass
+    return os.cpu_count() or 1
+
+
 def host():
     cpu = ""
     try:
@@ -91,7 +102,7 @@ def host():
         "cpu": cpu,
         "arch": platform.machine(),
         "kernel": platform.release(),
-        "threads": os.cpu_count(),
+        "threads": available_threads(),
         "cpu_features": [],
     }
 
@@ -264,7 +275,7 @@ def main():
     ap.add_argument("--k", default="10,100")
     ap.add_argument("--segment-rows", type=int, default=0)
     ap.add_argument("--min-time-ms", type=int, default=300)
-    ap.add_argument("--threads", type=int, default=os.cpu_count())
+    ap.add_argument("--threads", type=int, default=available_threads())
     ap.add_argument("--recall-stop", type=float, default=0.99)
     ap.add_argument("--filters", default="")
     a = ap.parse_args()
