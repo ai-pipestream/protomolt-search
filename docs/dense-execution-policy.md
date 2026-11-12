@@ -144,6 +144,21 @@ A request whose view and filters admit every row carries no mask, and an
 unfiltered point names no threshold. Explicit `ANN` never consults a policy
 and runs under the provider's own threshold.
 
+## Patience early stop
+
+A policy point measured on a provider advertising `patience_early_stop`
+(`docs/hnsw.md`, "Patience") may also name `patience_saturation_ppm`
+(`1..=1,000,000`) and `patience_hops` (`>= 1`). Both fields must be set
+together or omitted together. When AUTO qualifies a point carrying patience
+parameters, the coordinator forwards them on `StartShardSearch` and
+`StartStreamSearch` (including through relays and hybrid vector legs), names
+them in `planner_reason` and `policy_point`, and sums the early-stopped walks
+across shards in `DenseExecutionOutcome.patience_stopped` (redacted when
+physical execution details are withheld). A point naming patience parameters is
+refused on any provider that does not advertise `patience_early_stop`; points
+where plain `ef` won the benchmark omit both fields and run to standard beam
+convergence.
+
 ## AUTO and FP32 rerank
 
 Landed 2026-09-04. Step 2 resolves the traversal, not the rerank depth. When

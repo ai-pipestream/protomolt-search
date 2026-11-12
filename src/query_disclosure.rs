@@ -82,11 +82,13 @@ pub(crate) fn redact_execution(response: &mut QueryResponse) {
         evidence_scope: _,
         filter_regimes,
         tail_enumerated_rows,
+        patience_stopped,
     }) = dense_execution
     {
         // Counts per segment searched: the physical layout.
         *filter_regimes = None;
         *tail_enumerated_rows = 0;
+        *patience_stopped = 0;
         planner_reason.clear();
         policy_id.clear();
         *filter_selectivity_ppm = 0;
@@ -97,6 +99,8 @@ pub(crate) fn redact_execution(response: &mut QueryResponse) {
             candidates: _,
             measured_recall_ppm: _,
             enumerate_max_rows,
+            patience_saturation_ppm: _,
+            patience_hops: _,
         }) = policy_point
         {
             *filter_selectivity_ppm_min = 0;
@@ -173,6 +177,8 @@ mod tests {
                     candidates: 100,
                     measured_recall_ppm: 980_000,
                     enumerate_max_rows: Some(4096),
+                    patience_saturation_ppm: Some(990_000),
+                    patience_hops: Some(15),
                 }),
                 filter_selectivity_ppm: 500_000,
                 candidate_depth: 100,
@@ -184,6 +190,7 @@ mod tests {
                     budget_handoffs: 1,
                 }),
                 tail_enumerated_rows: 42,
+                patience_stopped: 7,
             }),
             ..Default::default()
         };
@@ -234,6 +241,7 @@ mod tests {
         assert_eq!(execution.candidate_depth, 100);
         assert_eq!(execution.filter_regimes, None);
         assert_eq!(execution.tail_enumerated_rows, 0);
+        assert_eq!(execution.patience_stopped, 0);
         assert_eq!(execution.policy_fingerprint, "b".repeat(64));
         assert_eq!(
             execution.policy_point,
@@ -241,6 +249,8 @@ mod tests {
                 k: 10,
                 candidates: 100,
                 measured_recall_ppm: 980_000,
+                patience_saturation_ppm: Some(990_000),
+                patience_hops: Some(15),
                 ..Default::default()
             })
         );

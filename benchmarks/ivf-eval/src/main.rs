@@ -276,6 +276,7 @@ impl VectorProvider for ExperimentalIvf {
             result_count: k,
             regimes: Default::default(),
             tail_enumerated_rows: 0,
+            patience_stopped: 0,
         })
     }
 

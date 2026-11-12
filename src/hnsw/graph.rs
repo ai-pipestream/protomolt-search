@@ -134,6 +134,10 @@ pub struct Scratch {
     routes: Vec<u32>,
     fresh: Vec<u32>,
     scored_allowed: Vec<Scored>,
+    /// Patience early-stop scratch: nodes inserted into the tracked window
+    /// during the current hop, and the optional `top_k` (`< ef`) min-heap.
+    patience_added: Vec<u32>,
+    patience_top: BinaryHeap<Reverse<Scored>>,
 }
 
 impl Scratch {
@@ -149,6 +153,8 @@ impl Scratch {
         self.cand.clear();
         self.res.clear();
         self.scored_allowed.clear();
+        self.patience_added.clear();
+        self.patience_top.clear();
     }
 
     /// Mark `node` visited; true when it was not.
@@ -251,12 +257,71 @@ pub enum Filter<'a> {
     },
 }
 
+/// Hop-to-hop saturation early-stop policy for a layer-0 walk (`#95`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Patience {
+    /// Required fraction of the tracked window that survives an expansion.
+    pub saturation: f32,
+    /// Optional exact parts-per-million saturation threshold (`1..=1_000_000`).
+    pub saturation_ppm: Option<u32>,
+    /// Consecutive saturated expansions required before ending the walk
+    /// (`0` disables patience).
+    pub hops: u32,
+    /// Optional `top_k` window size (`0` tracks the full `ef` beam).
+    pub top_k: usize,
+    /// Minimum allowed rows scored at layer 0 before patience may count when
+    /// `floor_active` is true (`#72` ascent gate).
+    pub ascent_gate: usize,
+    /// True when a finite score floor is active on this search.
+    pub floor_active: bool,
+}
+
+impl Default for Patience {
+    fn default() -> Self {
+        Self::OFF
+    }
+}
+
+impl Patience {
+    pub const OFF: Self = Self {
+        saturation: 1.0,
+        saturation_ppm: None,
+        hops: 0,
+        top_k: 0,
+        ascent_gate: 0,
+        floor_active: false,
+    };
+
+    #[inline]
+    pub fn enabled(self) -> bool {
+        self.hops > 0
+    }
+
+    #[inline]
+    fn min_survived(self, window: usize) -> usize {
+        if !self.enabled() || window == 0 {
+            return usize::MAX;
+        }
+        if let Some(ppm) = self.saturation_ppm {
+            let need = (u64::from(ppm) * window as u64).div_ceil(1_000_000);
+            return usize::try_from(need).unwrap_or(window).clamp(1, window);
+        }
+        // Subtract one f32 ULP so binary-rounded thresholds such as `0.99f32`
+        // (`0.9900000095...`) do not round `0.99 * 100` up to `100`.
+        let raw = (f64::from(self.saturation) - f64::from(f32::EPSILON)) * (window as f64);
+        raw.ceil().clamp(1.0, window as f64) as usize
+    }
+}
+
 /// How a walk ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Walk {
     Completed,
     /// The hook stopped it.
     Stopped,
+    /// Ended early after `Patience::hops` consecutive saturated expansions
+    /// once the beam (and ascent gate when a floor is active) filled.
+    Patience,
     /// Not started: the far probe found the query's neighborhood all but
     /// empty of allowed rows. Nothing was scored at layer 0 or reported.
     Far,
@@ -439,8 +504,7 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
 
     /// Paper Algorithm 2 at one layer. Leaves up to `ef` results (allowed
     /// nodes only) in `scratch.res`. Disallowed nodes route: they enter the
-    /// candidate heap and are expanded, but never the results. Returns
-    /// false when the hook stopped the walk.
+    /// candidate heap and are expanded, but never the results.
     #[allow(clippy::too_many_arguments)]
     fn search_layer<H: Hook>(
         &self,
@@ -449,20 +513,38 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
         ef: usize,
         layer: usize,
         allow: Option<Mask<'_>>,
+        patience: Patience,
         locks: Option<&Locks>,
         scratch: &mut Scratch,
         hook: &mut H,
         stats: &mut SearchStats,
-    ) -> bool {
+    ) -> Walk {
         let ef = ef.max(1);
         scratch.begin(self.n());
+        let use_top_k = patience.enabled() && patience.top_k > 0 && patience.top_k < ef;
+        let window = if use_top_k { patience.top_k } else { ef };
+        let min_survived = patience.min_survived(window);
+        let mut patience_added = std::mem::take(&mut scratch.patience_added);
+        let mut patience_top = std::mem::take(&mut scratch.patience_top);
+        patience_added.clear();
+        patience_top.clear();
+        let mut allowed_scored = 0usize;
         let allowed = |v: u32| allow.is_none_or(|a| a.test(v as usize));
         for &e in entries {
             if scratch.visit(e.node) {
                 scratch.cand.push(e);
                 if allowed(e.node) {
+                    allowed_scored += 1;
                     hook.scored(e.node, e.score, self.row(e.node));
                     scratch.res.push(Reverse(e));
+                    if use_top_k {
+                        if patience_top.len() < window {
+                            patience_top.push(Reverse(e));
+                        } else if patience_top.peek().is_some_and(|worst| e > worst.0) {
+                            patience_top.pop();
+                            patience_top.push(Reverse(e));
+                        }
+                    }
                 }
             }
         }
@@ -470,7 +552,8 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
             scratch.res.pop();
         }
         let mut nbrs = std::mem::take(&mut scratch.nbrs);
-        let mut completed = true;
+        let mut consecutive_saturated = 0u32;
+        let mut outcome = Walk::Completed;
         while let Some(c) = scratch.cand.pop() {
             if scratch.res.len() >= ef {
                 let worst = scratch.res.peek().map_or(f32::NEG_INFINITY, |r| r.0.score);
@@ -478,6 +561,18 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
                     break;
                 }
             }
+            if patience.enabled() && consecutive_saturated >= patience.hops {
+                outcome = Walk::Patience;
+                break;
+            }
+            let gate_ok = patience.enabled()
+                && scratch.res.len() >= ef
+                && (!patience.floor_active || allowed_scored >= patience.ascent_gate)
+                && (!use_top_k || patience_top.len() >= window);
+            if gate_ok {
+                patience_added.clear();
+            }
+            let mut lost = 0usize;
             stats.hops += 1;
             self.copy_links(c.node, layer, locks, &mut nbrs);
             nbrs.retain(|&v| scratch.visit(v));
@@ -485,6 +580,7 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
             self.for_each_scored(q, &nbrs, |v, s| {
                 let ok = allowed(v);
                 if ok {
+                    allowed_scored += 1;
                     hook.scored(v, s, self.row(v));
                 }
                 let full = scratch.res.len() >= ef;
@@ -495,18 +591,50 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
                     if ok {
                         scratch.res.push(Reverse(scored));
                         if scratch.res.len() > ef {
-                            scratch.res.pop();
+                            if let Some(Reverse(evicted)) = scratch.res.pop() {
+                                if gate_ok && !use_top_k && !patience_added.contains(&evicted.node)
+                                {
+                                    lost += 1;
+                                }
+                            }
+                            if gate_ok && !use_top_k {
+                                patience_added.push(scored.node);
+                            }
+                        }
+                        if use_top_k {
+                            if patience_top.len() < window {
+                                patience_top.push(Reverse(scored));
+                            } else if patience_top.peek().is_some_and(|w| scored > w.0) {
+                                if let Some(Reverse(evicted)) = patience_top.pop() {
+                                    if gate_ok && !patience_added.contains(&evicted.node) {
+                                        lost += 1;
+                                    }
+                                }
+                                patience_top.push(Reverse(scored));
+                                if gate_ok {
+                                    patience_added.push(scored.node);
+                                }
+                            }
                         }
                     }
                 }
             });
+            if patience.enabled() {
+                if gate_ok && window.saturating_sub(lost) >= min_survived {
+                    consecutive_saturated += 1;
+                } else {
+                    consecutive_saturated = 0;
+                }
+            }
             if !hook.hop() {
-                completed = false;
+                outcome = Walk::Stopped;
                 break;
             }
         }
         scratch.nbrs = nbrs;
-        completed
+        scratch.patience_added = patience_added;
+        scratch.patience_top = patience_top;
+        outcome
     }
 
     /// The filter-aware beam at layer 0 (the predicate-subgraph idea of
@@ -529,19 +657,37 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
         ef: usize,
         allow: Mask<'_>,
         visit_budget: Option<u64>,
+        patience: Patience,
         scratch: &mut Scratch,
         hook: &mut H,
         stats: &mut SearchStats,
     ) -> Walk {
         let ef = ef.max(1);
         scratch.begin(self.n());
+        let use_top_k = patience.enabled() && patience.top_k > 0 && patience.top_k < ef;
+        let window = if use_top_k { patience.top_k } else { ef };
+        let min_survived = patience.min_survived(window);
+        let mut patience_added = std::mem::take(&mut scratch.patience_added);
+        let mut patience_top = std::mem::take(&mut scratch.patience_top);
+        patience_added.clear();
+        patience_top.clear();
+        let mut allowed_scored = 0usize;
         for &e in entries {
             if scratch.visit(e.node) {
                 scratch.cand.push(e);
                 if allow.test(e.node as usize) {
+                    allowed_scored += 1;
                     hook.scored(e.node, e.score, self.row(e.node));
                     scratch.scored_allowed.push(e);
                     scratch.res.push(Reverse(e));
+                    if use_top_k {
+                        if patience_top.len() < window {
+                            patience_top.push(Reverse(e));
+                        } else if patience_top.peek().is_some_and(|worst| e > worst.0) {
+                            patience_top.pop();
+                            patience_top.push(Reverse(e));
+                        }
+                    }
                 }
             }
         }
@@ -553,6 +699,7 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
         let mut fresh = std::mem::take(&mut scratch.fresh);
         let hop_budget = self.m0;
         let base_scored = stats.scored;
+        let mut consecutive_saturated = 0u32;
         let mut outcome = Walk::Completed;
         while let Some(c) = scratch.cand.pop() {
             if scratch.res.len() >= ef {
@@ -561,10 +708,22 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
                     break;
                 }
             }
+            if patience.enabled() && consecutive_saturated >= patience.hops {
+                outcome = Walk::Patience;
+                break;
+            }
             if visit_budget.is_some_and(|limit| walk_work_units(stats, base_scored) >= limit) {
                 outcome = Walk::Budget;
                 break;
             }
+            let gate_ok = patience.enabled()
+                && scratch.res.len() >= ef
+                && (!patience.floor_active || allowed_scored >= patience.ascent_gate)
+                && (!use_top_k || patience_top.len() >= window);
+            if gate_ok {
+                patience_added.clear();
+            }
+            let mut lost = 0usize;
             stats.hops += 1;
             self.copy_links(c.node, 0, None, &mut nbrs);
             routes.clear();
@@ -598,6 +757,7 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
             }
             stats.scored += fresh.len() as u64;
             self.for_each_scored(q, &fresh, |v, s| {
+                allowed_scored += 1;
                 hook.scored(v, s, self.row(v));
                 let scored = Scored { score: s, node: v };
                 scratch.scored_allowed.push(scored);
@@ -607,10 +767,39 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
                     scratch.cand.push(scored);
                     scratch.res.push(Reverse(scored));
                     if scratch.res.len() > ef {
-                        scratch.res.pop();
+                        if let Some(Reverse(evicted)) = scratch.res.pop() {
+                            if gate_ok && !use_top_k && !patience_added.contains(&evicted.node) {
+                                lost += 1;
+                            }
+                        }
+                        if gate_ok && !use_top_k {
+                            patience_added.push(scored.node);
+                        }
+                    }
+                    if use_top_k {
+                        if patience_top.len() < window {
+                            patience_top.push(Reverse(scored));
+                        } else if patience_top.peek().is_some_and(|w| scored > w.0) {
+                            if let Some(Reverse(evicted)) = patience_top.pop() {
+                                if gate_ok && !patience_added.contains(&evicted.node) {
+                                    lost += 1;
+                                }
+                            }
+                            patience_top.push(Reverse(scored));
+                            if gate_ok {
+                                patience_added.push(scored.node);
+                            }
+                        }
                     }
                 }
             });
+            if patience.enabled() {
+                if gate_ok && window.saturating_sub(lost) >= min_survived {
+                    consecutive_saturated += 1;
+                } else {
+                    consecutive_saturated = 0;
+                }
+            }
             if !hook.hop() {
                 outcome = Walk::Stopped;
                 break;
@@ -619,6 +808,8 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
         scratch.nbrs = nbrs;
         scratch.routes = routes;
         scratch.fresh = fresh;
+        scratch.patience_added = patience_added;
+        scratch.patience_top = patience_top;
         outcome
     }
 
@@ -847,12 +1038,14 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
     }
 
     /// Paper Algorithm 5: descend greedily from the entry to layer 1, then
-    /// a beam of `ef` at layer 0, steered by `filter`. Results best first.
+    /// a beam of `ef` at layer 0, steered by `filter` and `patience`.
+    /// Results best first.
     pub fn walk<H: Hook>(
         &self,
         q: &[f32],
         ef: usize,
         filter: Filter<'_>,
+        patience: Patience,
         scratch: &mut Scratch,
         hook: &mut H,
     ) -> (Vec<Scored>, SearchStats, Walk) {
@@ -870,16 +1063,26 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
             ep = self.greedy(q, ep, layer, None, &mut nbrs, &mut stats);
         }
         scratch.nbrs = nbrs;
-        let completed = match filter {
-            Filter::None => {
-                self.search_layer(q, &[ep], ef, 0, None, None, scratch, hook, &mut stats)
-            }
+        let walk = match filter {
+            Filter::None => self.search_layer(
+                q,
+                &[ep],
+                ef,
+                0,
+                None,
+                patience,
+                None,
+                scratch,
+                hook,
+                &mut stats,
+            ),
             Filter::Plain(allow) => self.search_layer(
                 q,
                 &[ep],
                 ef,
                 0,
                 Some(allow),
+                patience,
                 None,
                 scratch,
                 hook,
@@ -894,8 +1097,17 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
                 if adaptive && self.far(ep.node, allow, allowed, scratch, &mut stats) {
                     return (Vec::new(), stats, Walk::Far);
                 }
-                let outcome =
-                    self.search_layer_aware(q, &[ep], ef, allow, budget, scratch, hook, &mut stats);
+                let outcome = self.search_layer_aware(
+                    q,
+                    &[ep],
+                    ef,
+                    allow,
+                    budget,
+                    patience,
+                    scratch,
+                    hook,
+                    &mut stats,
+                );
                 if outcome == Walk::Completed
                     && adaptive
                     && scratch.res.len() < ef.max(1).min(allowed)
@@ -904,11 +1116,6 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
                 }
                 return (scratch.drain_results(), stats, outcome);
             }
-        };
-        let walk = if completed {
-            Walk::Completed
-        } else {
-            Walk::Stopped
         };
         (scratch.drain_results(), stats, walk)
     }
@@ -1447,6 +1654,7 @@ impl LinkBuilder<'_> {
                 self.ef_construction,
                 layer,
                 None,
+                Patience::OFF,
                 locks,
                 scratch,
                 &mut NoHook,

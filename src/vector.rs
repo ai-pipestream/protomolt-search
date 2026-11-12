@@ -58,6 +58,8 @@ pub enum VectorCapability {
     /// allowed row exactly. A provider whose own search cannot certify
     /// completion can still serve a pass that needs every member's score.
     MaskEnumeration,
+    /// Layer-0 graph walks support hop-to-hop saturation early stopping (`#95`).
+    PatienceEarlyStop,
 }
 
 impl VectorCapability {
@@ -74,6 +76,7 @@ impl VectorCapability {
             Self::RawVectorRebuild => "raw_vector_rebuild",
             Self::ExhaustiveCompletion => "exhaustive_completion",
             Self::MaskEnumeration => "mask_enumeration",
+            Self::PatienceEarlyStop => "patience_early_stop",
         }
     }
 }
@@ -292,6 +295,72 @@ impl OwnedMask {
     }
 }
 
+/// Result window over which hop-to-hop survival is measured for patience
+/// early stopping (`docs/hnsw.md`, "Patience").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PatienceWindow {
+    /// Measure hop-to-hop survival over the full `ef` result beam, avoiding
+    /// the small-`k` quantization cliff (`1 / ef` granularity).
+    #[default]
+    Beam,
+    /// Measure hop-to-hop survival over the top-`k` (`min(k, ef)`) result
+    /// window (`PatienceKnnVectorQuery` top-`k` variant).
+    TopK,
+}
+
+impl PatienceWindow {
+    pub fn name(self) -> &'static str {
+        match self {
+            PatienceWindow::Beam => "beam",
+            PatienceWindow::TopK => "top_k",
+        }
+    }
+}
+
+/// Hop-to-hop saturation early-stop parameters for a layer-0 graph walk.
+/// `patience == 0` disables early stopping and reproduces the standard walk
+/// bit for bit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PatienceSpec {
+    /// Required fraction of the window from the start of an expansion that
+    /// remains in the window at the end of the expansion (`(0.0, 1.0]`).
+    pub saturation: f32,
+    /// Optional exact parts-per-million saturation threshold (`1..=1_000_000`)
+    /// carried from a dense execution policy point or protobuf request so
+    /// survival counts use exact integer ceiling arithmetic.
+    pub saturation_ppm: Option<u32>,
+    /// Consecutive saturated expansions after the beam fills before ending
+    /// the layer-0 walk early (`0` disables patience).
+    pub patience: u32,
+    /// Minimum local allowed rows scored at layer 0 before patience may count
+    /// when a finite score floor is active (`#72` ascent gate).
+    pub ascent_gate: usize,
+    /// Result window over which survival is measured.
+    pub window: PatienceWindow,
+}
+
+impl PatienceSpec {
+    pub const OFF: Self = Self {
+        saturation: 1.0,
+        saturation_ppm: None,
+        patience: 0,
+        ascent_gate: 0,
+        window: PatienceWindow::Beam,
+    };
+
+    /// Construct a beam-window patience policy from exact parts-per-million
+    /// saturation (`1..=1_000_000`) and consecutive hop count.
+    pub fn from_ppm(saturation_ppm: u32, patience: u32) -> Self {
+        Self {
+            saturation: (saturation_ppm as f64 / 1_000_000.0) as f32,
+            saturation_ppm: Some(saturation_ppm),
+            patience,
+            ascent_gate: 0,
+            window: PatienceWindow::Beam,
+        }
+    }
+}
+
 /// Options common to every provider search used by this product.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct VectorSearchOptions<'a> {
@@ -311,6 +380,8 @@ pub struct VectorSearchOptions<'a> {
     /// `None` is the provider's own threshold. A dense execution policy
     /// point carries the one it was measured under.
     pub enumerate_max_rows: Option<usize>,
+    /// Optional hop-to-hop saturation early-stop policy for layer-0 walks.
+    pub patience: Option<PatienceSpec>,
 }
 
 impl<'a> VectorSearchOptions<'a> {
@@ -356,6 +427,11 @@ impl<'a> VectorSearchOptions<'a> {
         self.enumerate_max_rows = Some(rows);
         self
     }
+
+    pub fn with_patience(mut self, patience: PatienceSpec) -> Self {
+        self.patience = Some(patience);
+        self
+    }
 }
 
 /// Row-major native search results. Negative slots and negative-infinity
@@ -372,6 +448,8 @@ pub struct VectorSearchResults {
     /// Rows scored by enumeration across unlinked HNSW parts (tail, frozen
     /// tail, or sealed segments below `MIN_GRAPH_ROWS`).
     pub tail_enumerated_rows: u64,
+    /// Layer-0 graph walks that ended early via patience saturation (`#95`).
+    pub patience_stopped: u32,
 }
 
 impl VectorSearchResults {
@@ -420,6 +498,8 @@ pub struct VectorStreamSummary {
     /// Rows scored by enumeration across unlinked HNSW parts (tail, frozen
     /// tail, or sealed segments below `MIN_GRAPH_ROWS`).
     pub tail_enumerated_rows: u64,
+    /// Layer-0 graph walks that ended early via patience saturation (`#95`).
+    pub patience_stopped: u32,
 }
 
 /// Filtered searches by the regime that answered them.
@@ -1213,6 +1293,7 @@ mod embedded_turbovec {
                 result_count: result.k,
                 regimes: FilterRegimeCounts::default(),
                 tail_enumerated_rows: 0,
+                patience_stopped: 0,
             })
         }
 
@@ -1247,6 +1328,7 @@ mod embedded_turbovec {
                 completed: summary.completed,
                 regimes: FilterRegimeCounts::default(),
                 tail_enumerated_rows: 0,
+                patience_stopped: 0,
             })
         }
     }
@@ -1314,6 +1396,7 @@ mod tests {
                 result_count: k,
                 regimes: FilterRegimeCounts::default(),
                 tail_enumerated_rows: 0,
+                patience_stopped: 0,
             })
         }
 
@@ -1331,6 +1414,7 @@ mod tests {
                 completed: true,
                 regimes: FilterRegimeCounts::default(),
                 tail_enumerated_rows: 0,
+                patience_stopped: 0,
             })
         }
     }

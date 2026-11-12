@@ -330,6 +330,48 @@ the rules above are what they are:
 `minimum_score` and a floor raised during a stream filter what is returned
 or emitted; neither cuts a walk short. Floor pruning is #72.
 
+## Patience
+
+A layer-0 walk at a wide beam (`ef`) often finishes discovering new beam
+members well before the candidate heap's best drops below the beam's `ef`-th
+member, especially under ACORN-1 bridge expansions (`ef >= k = 100` on
+50% predicates) or when `EF_FLOOR = 16` forces more expansions than `k = 10`
+needs. When a search carries a `PatienceSpec` (`patience_saturation_ppm` in
+`1..=1,000,000` and `patience_hops >= 1`), `search_layer` and
+`search_layer_aware` track hop-to-hop beam saturation in `O(1)` time and zero
+per-hop heap allocations (#95):
+
+- **Beam-window survival (`PatienceWindow::Beam`).** Tracking survival over the
+  full `ef` result beam avoids the small-`k` quantization cliff (`k = 10` can
+  only express 90% or 100% survival, turning `s = 0.95` and `s = 0.99` into
+  identical 10/10 zero-insertion checks). At the start of each layer-0
+  expansion once `scratch.res.len() >= ef`, an element of the beam fails to
+  survive iff it is evicted from `scratch.res` during that expansion and was
+  not itself inserted during the same expansion (`patience_added` tracks at
+  most `2M` insertions in pre-allocated scratch). When
+  `ef - lost >= ceil(saturation_ppm · ef / 1,000,000)` holds for
+  `patience_hops` consecutive expansions, the walk ends early (`Walk::Patience`)
+  and increments `patience_stopped`.
+- **Ascent gate under a floor.** When a finite score floor is active, patience
+  never counts until at least `max(ef, ascent_gate)` allowed rows have been
+  scored locally at layer 0, so a cold entry point ascending toward the query
+  neighborhood cannot be cut short before reaching the target basin (#72).
+- **Determinism when off.** With `patience == 0` (the default on explicit `ANN`
+  and unparameterized policy points), zero extra heap operations run and a
+  `FIXED_ORDER` walk visits the exact same nodes bit for bit.
+- **Measured Pareto wins (`protomolt-ann-bench patience`).** Across zero-jitter
+  `pi500p` (`Neon`, 16 GB NVMe Pi 5) and `krick-1` (`Avx512f`), beam-window
+  patience (`s = 0.99, p ∈ {7, 15, 30}`) wins QPS at matched recall on 10/20
+  cells on `Neon` and 7/20 cells on `Avx512f`, led by `uncorrelated-50 k = 100`
+  (`2.14×` 1c / `2.08×` 4c on `Neon`; `3.18×` 1c / `3.14×` 4c on `Avx512f`,
+  `2.30×` faster even at `recall >= 0.99` because plain HNSW cannot set
+  `ef < k = 100`), `uncorrelated-10 k = 10` (`1.16×`–`1.18×`), and `court200k`
+  `none` / `near-10` / `uncorrelated-50` `k = 10` (`+7.7%`–`+22.9%` over
+  interpolated plain-`ef` QPS). Patience is optional per policy point (`AUTO`
+  enables it only where a point names `patience_saturation_ppm` and
+  `patience_hops`), so cells where plain `ef` already sits on the Pareto
+  frontier pay zero cost.
+
 ### Through the product
 
 - **The mask.** A shard resolves the request's filters into a bitmap from

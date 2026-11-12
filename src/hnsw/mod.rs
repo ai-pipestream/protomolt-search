@@ -46,14 +46,14 @@ pub use graph::SearchStats;
 pub use rows::{RowSource, RowSourceIdentity};
 
 use crate::vector::{
-    first_invalid_coordinate, FilterRegime, Mask, QualityContract, ScoreDirection,
-    VectorBackendConfig, VectorBackendDescriptor, VectorCapability, VectorError, VectorIndex,
-    VectorProvider, VectorSearchOptions, VectorSearchResults, VectorStreamBatch,
+    first_invalid_coordinate, FilterRegime, Mask, PatienceSpec, PatienceWindow, QualityContract,
+    ScoreDirection, VectorBackendConfig, VectorBackendDescriptor, VectorCapability, VectorError,
+    VectorIndex, VectorProvider, VectorSearchOptions, VectorSearchResults, VectorStreamBatch,
     VectorStreamControl, VectorStreamSummary,
 };
 
 use distance::prefetch;
-use graph::{with_scratch, Filter, Hook, NoHook, Scored, Store, Walk};
+use graph::{with_scratch, Filter, Hook, NoHook, Patience, Scored, Store, Walk};
 
 /// Stable identifier of the backend, as `vector_backend` names it.
 pub const HNSW: &str = "hnsw";
@@ -104,6 +104,9 @@ pub struct Answer {
     /// True when a filter-aware walk spent its visit budget and handed the
     /// remaining allowed rows to enumerate (`regime` is `Enumerate`).
     pub budget_handoff: bool,
+    /// True when the layer-0 walk stopped early after its tracked window
+    /// stayed saturated for the configured patience hops.
+    pub patience_stopped: bool,
     /// Rows scored by enumeration because this index was unlinked (heap tail,
     /// frozen tail, or sealed segment below [`MIN_GRAPH_ROWS`]).
     pub tail_enumerated_rows: u64,
@@ -122,6 +125,7 @@ struct Plan<'a> {
     /// Work-unit cap before a filter-aware walk hands the remaining allowed
     /// rows to enumerate (`None` when pinned).
     budget: Option<u64>,
+    patience: PatienceSpec,
 }
 
 impl Plan<'_> {
@@ -131,6 +135,7 @@ impl Plan<'_> {
         allowed: 0,
         adaptive: false,
         budget: None,
+        patience: PatienceSpec::OFF,
     };
 
     fn filter(&self) -> Filter<'_> {
@@ -143,6 +148,24 @@ impl Plan<'_> {
             },
             (Some(FilterRegime::Plain), Some(allow)) => Filter::Plain(allow),
             _ => Filter::None,
+        }
+    }
+
+    fn patience(&self, k: usize, floor: f32) -> Patience {
+        if self.patience.patience == 0 {
+            return Patience::OFF;
+        }
+        let top_k = match self.patience.window {
+            PatienceWindow::Beam => 0,
+            PatienceWindow::TopK => k.max(1),
+        };
+        Patience {
+            saturation: self.patience.saturation,
+            saturation_ppm: self.patience.saturation_ppm,
+            hops: self.patience.patience,
+            top_k,
+            ascent_gate: self.patience.ascent_gate,
+            floor_active: floor.is_finite(),
         }
     }
 }
@@ -343,12 +366,36 @@ impl HnswIndex {
     /// The plain walk is never chosen: at every measured selectivity the
     /// filter-aware walk reaches the same recall for less work
     /// (`docs/hnsw.md`, "Filters"). It stays pinnable for measurement.
+    fn check_patience(patience: Option<PatienceSpec>) -> Result<PatienceSpec, VectorError> {
+        let Some(spec) = patience else {
+            return Ok(PatienceSpec::OFF);
+        };
+        if spec.patience == 0 {
+            return Ok(PatienceSpec::OFF);
+        }
+        if let Some(ppm) = spec.saturation_ppm {
+            if !(1..=1_000_000).contains(&ppm) {
+                return Err(VectorError::new(format!(
+                    "{HNSW} patience saturation_ppm {ppm} must be in 1..=1000000"
+                )));
+            }
+        }
+        if !spec.saturation.is_finite() || spec.saturation <= 0.0 || spec.saturation > 1.0 {
+            return Err(VectorError::new(format!(
+                "{HNSW} patience saturation {} must be finite and in (0.0, 1.0]",
+                spec.saturation
+            )));
+        }
+        Ok(spec)
+    }
+
     fn plan<'a>(
         &self,
         ef: usize,
         options: &VectorSearchOptions<'a>,
     ) -> Result<Plan<'a>, VectorError> {
         self.check_allow(options.allow)?;
+        let patience = Self::check_patience(options.patience)?;
         let Some(allow) = options.allow else {
             if let Some(regime) = options.filter_regime {
                 return Err(VectorError::new(format!(
@@ -356,7 +403,10 @@ impl HnswIndex {
                     regime.name()
                 )));
             }
-            return Ok(Plan::UNFILTERED);
+            return Ok(Plan {
+                patience,
+                ..Plan::UNFILTERED
+            });
         };
         if let (Some(regime), Some(rows)) = (options.filter_regime, options.enumerate_max_rows) {
             return Err(VectorError::new(format!(
@@ -371,7 +421,12 @@ impl HnswIndex {
         let mut budget = None;
         let regime = match options.filter_regime {
             Some(regime) => regime,
-            None if allowed == allow.len() => return Ok(Plan::UNFILTERED),
+            None if allowed == allow.len() => {
+                return Ok(Plan {
+                    patience,
+                    ..Plan::UNFILTERED
+                })
+            }
             None => {
                 let threshold = options.enumerate_max_rows.unwrap_or(default_threshold);
                 if allowed <= threshold {
@@ -396,6 +451,7 @@ impl HnswIndex {
             allowed,
             adaptive: options.filter_regime.is_none(),
             budget,
+            patience,
         })
     }
 
@@ -474,6 +530,7 @@ impl HnswIndex {
                     regime: plan.regime.map(|_| FilterRegime::Enumerate),
                     stats,
                     budget_handoff: false,
+                    patience_stopped: false,
                     tail_enumerated_rows,
                 },
             );
@@ -486,14 +543,17 @@ impl HnswIndex {
                     regime: plan.regime,
                     stats,
                     budget_handoff: false,
+                    patience_stopped: false,
                     tail_enumerated_rows: 0,
                 },
             );
         }
+        let patience = plan.patience(k, floor);
         let (hits, mut stats, walk) = with_view!(self, |view| view.walk(
             query,
             ef,
             plan.filter(),
+            patience,
             scratch,
             &mut NoHook
         ));
@@ -509,6 +569,7 @@ impl HnswIndex {
                         regime: Some(FilterRegime::Enumerate),
                         stats,
                         budget_handoff: false,
+                        patience_stopped: false,
                         tail_enumerated_rows: 0,
                     },
                 );
@@ -531,6 +592,7 @@ impl HnswIndex {
                         regime: Some(FilterRegime::Enumerate),
                         stats,
                         budget_handoff: walk == Walk::Budget,
+                        patience_stopped: false,
                         tail_enumerated_rows: 0,
                     },
                 );
@@ -544,6 +606,7 @@ impl HnswIndex {
                 regime: plan.regime,
                 stats,
                 budget_handoff: false,
+                patience_stopped: walk == Walk::Patience,
                 tail_enumerated_rows: 0,
             },
         )
@@ -831,6 +894,7 @@ impl VectorProvider for HnswIndex {
                 VectorCapability::SnapshotInstall,
                 VectorCapability::RawVectorRebuild,
                 VectorCapability::MaskEnumeration,
+                VectorCapability::PatienceEarlyStop,
             ],
         }
     }
@@ -947,11 +1011,15 @@ impl VectorProvider for HnswIndex {
         let mut slots = Vec::with_capacity(query_count * k);
         let mut regimes = crate::vector::FilterRegimeCounts::default();
         let mut tail_enumerated_rows = 0u64;
+        let mut patience_stopped = 0u32;
         with_scratch(|scratch| {
             for query in queries.chunks_exact(self.dim) {
                 let (hits, answer) = self.answer(query, k, ef, floor, &plan, scratch);
                 tail_enumerated_rows =
                     tail_enumerated_rows.saturating_add(answer.tail_enumerated_rows);
+                if answer.patience_stopped {
+                    patience_stopped = patience_stopped.saturating_add(1);
+                }
                 if answer.budget_handoff {
                     regimes.count_budget_handoff();
                 } else if let Some(regime) = answer.regime {
@@ -974,6 +1042,7 @@ impl VectorProvider for HnswIndex {
             result_count: k,
             regimes,
             tail_enumerated_rows,
+            patience_stopped,
         })
     }
 
@@ -1016,6 +1085,7 @@ impl VectorProvider for HnswIndex {
         let mut stopped = false;
         let mut regimes = crate::vector::FilterRegimeCounts::default();
         let mut tail_enumerated_rows = 0u64;
+        let mut patience_stopped = 0u32;
         with_scratch(|scratch| {
             for (query_index, query) in queries.chunks_exact(self.dim).enumerate() {
                 let mut hook = StreamHook {
@@ -1043,10 +1113,12 @@ impl VectorProvider for HnswIndex {
                             self.stream_rows(allow, |_| false, &mut hook)
                         }
                         _ => {
+                            let patience = plan.patience(ef, *hook.floor);
                             let (_, stats, walk) = with_view!(self, |view| view.walk(
                                 query,
                                 ef,
                                 plan.filter(),
+                                patience,
                                 scratch,
                                 &mut hook
                             ));
@@ -1066,7 +1138,12 @@ impl VectorProvider for HnswIndex {
                                         self.stream_rows(allow, |row| scratch.seen(row), &mut hook);
                                     (walked + rows, done)
                                 }
-                                (walk, _) => (walked, walk != Walk::Stopped),
+                                (walk, _) => {
+                                    if walk == Walk::Patience {
+                                        patience_stopped = patience_stopped.saturating_add(1);
+                                    }
+                                    (walked, walk != Walk::Stopped)
+                                }
                             }
                         }
                     }
@@ -1092,6 +1169,7 @@ impl VectorProvider for HnswIndex {
             completed: !stopped,
             regimes,
             tail_enumerated_rows,
+            patience_stopped,
         })
     }
 

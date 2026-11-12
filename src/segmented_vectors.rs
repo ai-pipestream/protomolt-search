@@ -315,6 +315,7 @@ impl VectorProvider for SegmentedProvider {
         let mut per_query: Vec<Vec<(f32, i64)>> = vec![Vec::new(); nq];
         let mut regimes = crate::vector::FilterRegimeCounts::default();
         let mut tail_enumerated_rows = 0u64;
+        let mut patience_stopped = 0u32;
         let mut running_floor = options.minimum_score;
         for (base, rows, image) in self.search_images() {
             let allow = match options.allow {
@@ -334,10 +335,12 @@ impl VectorProvider for SegmentedProvider {
             }
             part_options.filter_regime = options.filter_regime;
             part_options.enumerate_max_rows = options.enumerate_max_rows;
+            part_options.patience = options.patience;
             let results = image.try_search(queries, k.min(rows), part_options)?;
             regimes.add(results.regimes);
             tail_enumerated_rows =
                 tail_enumerated_rows.saturating_add(results.tail_enumerated_rows);
+            patience_stopped = patience_stopped.saturating_add(results.patience_stopped);
             for (q, hits) in per_query.iter_mut().enumerate() {
                 for (&slot, &score) in results
                     .slots_for_query(q)
@@ -377,6 +380,7 @@ impl VectorProvider for SegmentedProvider {
             result_count: k,
             regimes,
             tail_enumerated_rows,
+            patience_stopped,
         })
     }
 
@@ -397,6 +401,7 @@ impl VectorProvider for SegmentedProvider {
         let mut units = 0usize;
         let mut regimes = crate::vector::FilterRegimeCounts::default();
         let mut tail_enumerated_rows = 0u64;
+        let mut patience_stopped = 0u32;
         for (base, rows, image) in self.search_images() {
             if stopped.get() {
                 break;
@@ -418,6 +423,7 @@ impl VectorProvider for SegmentedProvider {
             }
             part_options.filter_regime = options.filter_regime;
             part_options.enumerate_max_rows = options.enumerate_max_rows;
+            part_options.patience = options.patience;
             let note = |verdict: VectorStreamControl| match verdict {
                 VectorStreamControl::RaiseFloor(f) => {
                     floor.set(Some(floor.get().map_or(f, |cur| cur.max(f))));
@@ -460,6 +466,7 @@ impl VectorProvider for SegmentedProvider {
             regimes.add(summary.regimes);
             tail_enumerated_rows =
                 tail_enumerated_rows.saturating_add(summary.tail_enumerated_rows);
+            patience_stopped = patience_stopped.saturating_add(summary.patience_stopped);
             if !summary.completed {
                 stopped.set(true);
             }
@@ -471,6 +478,7 @@ impl VectorProvider for SegmentedProvider {
             completed: !stopped.get(),
             regimes,
             tail_enumerated_rows,
+            patience_stopped,
         })
     }
 

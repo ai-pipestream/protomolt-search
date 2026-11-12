@@ -623,6 +623,8 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 geo_filters: Vec::new(),
                 filter: String::new(),
                 enumerate_max_rows: None,
+                patience_saturation_ppm: None,
+                patience_hops: None,
             })
             .await?
             .into_inner();

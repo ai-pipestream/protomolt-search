@@ -1529,6 +1529,14 @@ message StartShardSearch {
   // ones that measured it. A provider without the `mask_enumeration`
   // capability refuses it by name.
   optional uint32 enumerate_max_rows = 9;
+  // Hop-to-hop beam saturation early-stop parameters (docs/hnsw.md,
+  // "Patience"): required survival fraction in parts per million
+  // (1..=1,000,000) and consecutive saturated expansions (>= 1). Set
+  // together by a dense execution policy point measured with patience; absent
+  // runs the walk to full convergence. A provider without the
+  // `patience_early_stop` capability refuses them by name.
+  optional uint32 patience_saturation_ppm = 10;
+  optional uint32 patience_hops = 11;
 }
 
 // A score floor: a lower bound on the global k-th best score. Flows both
@@ -1611,6 +1619,10 @@ message ShardScanStats {
   // MIN_GRAPH_ROWS; docs/hnsw.md). Zero when every searched part has a
   // built graph or on exhaustive scan providers.
   uint64 tail_enumerated_rows = 9;
+  // Layer-0 graph walks that ended early via patience saturation (#95;
+  // docs/hnsw.md, "Patience"). Zero when patience is off or on exhaustive
+  // scan providers.
+  uint32 patience_stopped = 10;
 }
 
 // One scored vector. Ids are global across the cluster (see
@@ -1707,6 +1719,9 @@ message StartStreamSearch {
   optional uint32 candidate_depth = 10;
   // As `StartShardSearch.enumerate_max_rows`.
   optional uint32 enumerate_max_rows = 11;
+  // As `StartShardSearch.patience_saturation_ppm` and `patience_hops`.
+  optional uint32 patience_saturation_ppm = 12;
+  optional uint32 patience_hops = 13;
 }
 
 // Bounds for the post-scan identity exchange. All fields must be positive.
@@ -1843,6 +1858,10 @@ message StreamSearchSummary {
   // MIN_GRAPH_ROWS; docs/hnsw.md). Zero when every searched part has a
   // built graph or on exhaustive scan providers.
   uint64 tail_enumerated_rows = 11;
+  // Layer-0 graph walks that ended early via patience saturation (#95;
+  // docs/hnsw.md, "Patience"). Zero when patience is off or on exhaustive
+  // scan providers.
+  uint32 patience_stopped = 12;
 }
 
 // How a provider that can steer its search by the filter answered: one
@@ -2197,6 +2216,10 @@ message SearchRequest {
   // The enumerate threshold the shards answer the filter under, as
   // `StartShardSearch.enumerate_max_rows`. Absent = each provider's own.
   optional uint32 enumerate_max_rows = 9;
+  // Hop-to-hop beam saturation early-stop parameters forwarded to the shards,
+  // as `StartShardSearch.patience_saturation_ppm` and `patience_hops`.
+  optional uint32 patience_saturation_ppm = 10;
+  optional uint32 patience_hops = 11;
 }
 
 // Client-facing search response.
@@ -2231,6 +2254,9 @@ message SearchResponse {
   // Rows scored by enumeration across unlinked HNSW parts, summed over
   // every shard searched (docs/hnsw.md).
   uint64 tail_enumerated_rows = 8;
+  // Layer-0 graph walks that ended early via patience saturation, summed over
+  // every shard searched (#95; docs/hnsw.md, "Patience").
+  uint32 patience_stopped = 9;
 }
 
 // One parent document's chunks in a document-mode search response.
@@ -4735,6 +4761,11 @@ message HybridSearchRequest {
   // The enumerate threshold the shards answer the vector leg's filter
   // under, as `StartShardSearch.enumerate_max_rows`.
   optional uint32 enumerate_max_rows = 12;
+  // Hop-to-hop beam saturation early-stop parameters forwarded to the vector
+  // leg's shards, as `StartShardSearch.patience_saturation_ppm` and
+  // `patience_hops`.
+  optional uint32 patience_saturation_ppm = 13;
+  optional uint32 patience_hops = 14;
 }
 
 // Profile of one hybrid query; populated only when the request set
@@ -6006,6 +6037,10 @@ message DenseExecutionOutcome {
   // every shard searched (docs/hnsw.md). Withheld when physical execution
   // details are redacted.
   uint64 tail_enumerated_rows = 15;
+  // Layer-0 graph walks that ended early via patience saturation, summed over
+  // every shard searched (#95; docs/hnsw.md, "Patience"). Withheld when
+  // physical execution details are redacted.
+  uint32 patience_stopped = 16;
 }
 
 // One measured point of a dense execution policy
@@ -6021,6 +6056,11 @@ message DensePolicyPoint {
   // under: a segment whose mask allows at most this many rows is scored
   // exactly. Absent on a point for a provider without filter regimes.
   optional uint32 enumerate_max_rows = 6;
+  // Optional hop-to-hop beam saturation early-stop parameters the point was
+  // measured under and is served under (docs/hnsw.md, "Patience"). Set
+  // together or absent together.
+  optional uint32 patience_saturation_ppm = 7;
+  optional uint32 patience_hops = 8;
 }
 
 // Public streaming query controls. The query itself is byte-for-byte the

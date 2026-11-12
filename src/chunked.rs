@@ -79,6 +79,9 @@ pub struct ScanStats {
     /// tail, or sealed segments below `MIN_GRAPH_ROWS`); zero on a scan
     /// provider.
     pub tail_enumerated_rows: u64,
+    /// Layer-0 graph walks that ended early via patience saturation (`#95`);
+    /// zero on a scan provider.
+    pub patience_stopped: u32,
 }
 
 /// One kernel call's cost: encoded bytes streamed and wall time inside
@@ -235,6 +238,9 @@ pub struct BatchQuery<'a> {
     /// regime (`VectorSearchOptions::enumerate_max_rows`); the chunk scan
     /// has no regimes and ignores it.
     pub enumerate_max_rows: Option<usize>,
+    /// Optional hop-to-hop beam saturation early-stop policy for layer-0
+    /// walks (`VectorSearchOptions::patience`); ignored by chunk scans.
+    pub patience: Option<crate::vector::PatienceSpec>,
 }
 
 /// Scan `index` for the top-`k` of `query` in chunks, adopting external
@@ -277,6 +283,7 @@ pub fn chunked_topk(
         keep_ties,
         allow: allow.map(Mask::Bools),
         enumerate_max_rows: None,
+        patience: None,
     }];
     chunked_topk_batch(
         index,
@@ -550,6 +557,7 @@ fn searched_topk(
     let mut options = VectorSearchOptions::new().with_candidate_depth(query.k);
     options.allow = query.allow;
     options.enumerate_max_rows = query.enumerate_max_rows;
+    options.patience = query.patience;
     if let Some(floor) = floor.filter(|f| !f.is_nan() && *f != f32::NEG_INFINITY) {
         options = options.with_minimum_score(floor);
         stats.floor_updates_applied = 1;
@@ -567,6 +575,7 @@ fn searched_topk(
     stats.scan_nanos = pass.nanos;
     stats.regimes = results.regimes;
     stats.tail_enumerated_rows = results.tail_enumerated_rows;
+    stats.patience_stopped = results.patience_stopped;
     let mut hits: Vec<ChunkHit> = results
         .scores_for_query(0)
         .iter()
@@ -867,6 +876,7 @@ mod tests {
                 keep_ties: false,
                 allow: None,
                 enumerate_max_rows: None,
+                patience: None,
             })
             .collect();
         let mut observed_bytes = 0u64;
@@ -1170,6 +1180,7 @@ mod tests {
                     keep_ties: ties,
                     allow: None,
                     enumerate_max_rows: None,
+                    patience: None,
                 })
                 .collect();
             let mut published: Vec<Vec<f32>> = vec![Vec::new(); specs.len()];
@@ -1340,6 +1351,7 @@ mod tests {
                     keep_ties: false,
                     allow: Some(Mask::Bools(&even)),
                     enumerate_max_rows: None,
+                    patience: None,
                 },
                 BatchQuery {
                     vector: &q1,
@@ -1347,6 +1359,7 @@ mod tests {
                     keep_ties: false,
                     allow: Some(Mask::Bools(&odd)),
                     enumerate_max_rows: None,
+                    patience: None,
                 },
                 BatchQuery {
                     vector: &q2,
@@ -1354,6 +1367,7 @@ mod tests {
                     keep_ties: false,
                     allow: None,
                     enumerate_max_rows: None,
+                    patience: None,
                 },
             ];
             let batched =
@@ -1457,6 +1471,7 @@ mod tests {
                 keep_ties: false,
                 allow: None,
                 enumerate_max_rows: None,
+                patience: None,
             },
             BatchQuery {
                 vector: &q1,
@@ -1464,6 +1479,7 @@ mod tests {
                 keep_ties: false,
                 allow: None,
                 enumerate_max_rows: None,
+                patience: None,
             },
         ];
         // The true k-th best floors query 0 from the start; query 1 runs

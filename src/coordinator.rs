@@ -1664,6 +1664,11 @@ pub struct RequestFilters {
     /// (`StartShardSearch.enumerate_max_rows`); `None` leaves each
     /// provider its own.
     pub enumerate_max_rows: Option<u32>,
+    /// Optional hop-to-hop beam saturation early-stop parameters forwarded
+    /// to the shards (`StartShardSearch.patience_saturation_ppm` /
+    /// `patience_hops`).
+    pub patience_saturation_ppm: Option<u32>,
+    pub patience_hops: Option<u32>,
 }
 
 /// The provider-mismatch line of a cluster health report: empty when
@@ -1814,6 +1819,8 @@ impl RequestFilters {
             geo: geo.to_vec(),
             tree,
             enumerate_max_rows: None,
+            patience_saturation_ppm: None,
+            patience_hops: None,
         })
     }
 }
@@ -3636,6 +3643,7 @@ impl CoordinatorServiceImpl {
             quality,
             exhaustive,
             enumerates,
+            supports_patience,
             dimensions,
             rows,
             generation,
@@ -3645,6 +3653,7 @@ impl CoordinatorServiceImpl {
                 identity.scoring_fingerprint,
                 crate::pb::VectorQualityContract::ExhaustiveNativeScore,
                 true,
+                false,
                 false,
                 identity.dimensions,
                 identity.rows,
@@ -3669,6 +3678,7 @@ impl CoordinatorServiceImpl {
             // Every shard is one provider under one fingerprint, so
             // one that lacks the regime means none can be relied on.
             let mut enumerates = true;
+            let mut supports_patience = true;
             let mut dimensions = None;
             let mut rows: u64 = 0;
             for task in tasks {
@@ -3742,6 +3752,10 @@ impl CoordinatorServiceImpl {
                     .capabilities
                     .iter()
                     .any(|capability| capability == "mask_enumeration");
+                supports_patience &= descriptor
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "patience_early_stop");
 
                 for (held, actual, mismatch) in [
                     (
@@ -3794,12 +3808,14 @@ impl CoordinatorServiceImpl {
                 }
             }
             let enumerates = enumerates && provider.is_some();
+            let supports_patience = supports_patience && provider.is_some();
             (
                 provider.unwrap_or_default(),
                 fingerprint.unwrap_or_default(),
                 quality.unwrap_or(crate::pb::VectorQualityContract::Unspecified),
                 exhaustive.unwrap_or(false),
                 enumerates,
+                supports_patience,
                 dimensions.unwrap_or_default(),
                 rows,
                 self.topology_generation,
@@ -3930,6 +3946,19 @@ impl CoordinatorServiceImpl {
                     }
                     _ => {}
                 }
+                if let (Some(sat_ppm), Some(hops)) =
+                    (point.patience_saturation_ppm, point.patience_hops)
+                {
+                    if !supports_patience {
+                        return Err(Status::failed_precondition(format!(
+                            "dense execution policy {:?} point k={} depth {} names patience \
+                             (saturation {sat_ppm} ppm, {hops} hops), but provider {provider} \
+                             does not support patience early stopping (it does not advertise \
+                             patience_early_stop)",
+                            hit.policy_id, point.k, point.candidates
+                        )));
+                    }
+                }
                 let reason = format!(
                     "AUTO selected the provider's configured approximate traversal through \
                      policy {:?} point k={} selectivity {}..={} ppm depth {} (measured recall {} \
@@ -3947,6 +3976,12 @@ impl CoordinatorServiceImpl {
                         format!("{reason}; enumerate threshold {threshold} rows a segment")
                     }
                     None => reason,
+                };
+                let reason = match (point.patience_saturation_ppm, point.patience_hops) {
+                    (Some(sat_ppm), Some(hops)) => {
+                        format!("{reason}; patience {sat_ppm} ppm over {hops} hops")
+                    }
+                    _ => reason,
                 };
                 qualified = Some((hit, selectivity));
                 (crate::pb::DenseExecutionMode::Ann, reason)
@@ -3969,6 +4004,7 @@ impl CoordinatorServiceImpl {
             evidence_scope: crate::pb::DenseEvidenceScope::NotApplicable as i32,
             filter_regimes: None,
             tail_enumerated_rows: 0,
+            patience_stopped: 0,
         };
         if let Some((hit, selectivity)) = qualified {
             outcome.evidence_scope = crate::pb::DenseEvidenceScope::SelectivityBandBenchmark as i32;
@@ -3981,6 +4017,8 @@ impl CoordinatorServiceImpl {
                 candidates: hit.point.candidates,
                 measured_recall_ppm: hit.point.measured_recall_ppm,
                 enumerate_max_rows: hit.point.enumerate_max_rows,
+                patience_saturation_ppm: hit.point.patience_saturation_ppm,
+                patience_hops: hit.point.patience_hops,
             });
             outcome.filter_selectivity_ppm = selectivity;
             outcome.candidate_depth = hit.point.candidates;
@@ -8025,6 +8063,8 @@ impl CoordinatorServiceImpl {
                         initial_floor,
                         candidate_depth,
                         enumerate_max_rows: filters.enumerate_max_rows,
+                        patience_saturation_ppm: filters.patience_saturation_ppm,
+                        patience_hops: filters.patience_hops,
                         floor_token: lane.map_or(0, |(token, _)| token),
                         collapse_parents,
                         geo_filters: filters.geo.clone(),
@@ -12245,6 +12285,8 @@ async fn run_shard_stream(
                 geo_filters: ctx.filters.geo.clone(),
                 filter: ctx.shard_filters.get(shard as usize).cloned().flatten(),
                 enumerate_max_rows: ctx.filters.enumerate_max_rows,
+                patience_saturation_ppm: ctx.filters.patience_saturation_ppm,
+                patience_hops: ctx.filters.patience_hops,
             })),
         })
         .await
@@ -12467,6 +12509,12 @@ fn summed_filter_regimes(
 fn summed_tail_enumerated_rows(summaries: &[StreamSearchSummary]) -> u64 {
     summaries.iter().fold(0u64, |acc, summary| {
         acc.saturating_add(summary.tail_enumerated_rows)
+    })
+}
+
+fn summed_patience_stopped(summaries: &[StreamSearchSummary]) -> u32 {
+    summaries.iter().fold(0u32, |acc, summary| {
+        acc.saturating_add(summary.patience_stopped)
     })
 }
 
@@ -12824,6 +12872,8 @@ impl PlanCounter<'_> {
             geo: Vec::new(),
             tree,
             enumerate_max_rows: None,
+            patience_saturation_ppm: None,
+            patience_hops: None,
         };
         let count = crate::pb::CompiledAggregation {
             expr: Some(crate::cel::compile_value("1")?),
@@ -13033,6 +13083,8 @@ impl SearchService for CoordinatorServiceImpl {
             // shards execute; no shard ever sees CEL text.
             let mut filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
             filters.enumerate_max_rows = req.enumerate_max_rows;
+            filters.patience_saturation_ppm = req.patience_saturation_ppm;
+            filters.patience_hops = req.patience_hops;
             self.check_vector_scan(&filters, req.collapse_parents)?;
             // The fleet scores in one space or not at all: mixed provider
             // kinds or fingerprints are refused before any shard is asked
@@ -13050,6 +13102,7 @@ impl SearchService for CoordinatorServiceImpl {
                     return Ok(Response::new(SearchResponse {
                         filter_regimes: None,
                         tail_enumerated_rows: 0,
+                        patience_stopped: 0,
                         segments_total: 0,
                         segments_skipped: 0,
                         request_id,
@@ -13074,6 +13127,7 @@ impl SearchService for CoordinatorServiceImpl {
                 return Ok(Response::new(SearchResponse {
                     filter_regimes: None,
                     tail_enumerated_rows: 0,
+                    patience_stopped: 0,
                     segments_total: 0,
                     segments_skipped: 0,
                     request_id,
@@ -13096,6 +13150,7 @@ impl SearchService for CoordinatorServiceImpl {
                     return Ok(Response::new(SearchResponse {
                         filter_regimes: summed_filter_regimes(&doc.summaries),
                         tail_enumerated_rows: summed_tail_enumerated_rows(&doc.summaries),
+                        patience_stopped: summed_patience_stopped(&doc.summaries),
                         segments_total: 0,
                         segments_skipped: 0,
                         request_id,
@@ -13113,6 +13168,7 @@ impl SearchService for CoordinatorServiceImpl {
                 return Ok(Response::new(SearchResponse {
                     filter_regimes: summed_filter_regimes(&streamed.summaries),
                     tail_enumerated_rows: summed_tail_enumerated_rows(&streamed.summaries),
+                    patience_stopped: summed_patience_stopped(&streamed.summaries),
                     segments_total: 0,
                     segments_skipped: 0,
                     request_id,
@@ -13135,16 +13191,19 @@ impl SearchService for CoordinatorServiceImpl {
             );
             let mut regimes = crate::vector::FilterRegimeCounts::default();
             let mut tail_enumerated_rows = 0u64;
+            let mut patience_stopped = 0u32;
             for stats in result.shard_stats.iter().flatten() {
                 regimes.add(crate::vector::FilterRegimeCounts::from_proto(
                     stats.filter_regimes.as_ref(),
                 ));
                 tail_enumerated_rows =
                     tail_enumerated_rows.saturating_add(stats.tail_enumerated_rows);
+                patience_stopped = patience_stopped.saturating_add(stats.patience_stopped);
             }
             Ok(Response::new(SearchResponse {
                 filter_regimes: regimes.to_proto(),
                 tail_enumerated_rows,
+                patience_stopped,
                 segments_total,
                 segments_skipped,
                 request_id,
@@ -13494,6 +13553,8 @@ impl SearchService for CoordinatorServiceImpl {
             // misdescribed the result set (docs/vector-filters.md).
             let mut filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
             filters.enumerate_max_rows = req.enumerate_max_rows;
+            filters.patience_saturation_ppm = req.patience_saturation_ppm;
+            filters.patience_hops = req.patience_hops;
             // leg_k: default max(k, rrf_k) so the RRF constant never exceeds a
             // leg's depth; explicit values below k are clamped to k.
             let options = req.legs.unwrap_or_default();

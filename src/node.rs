@@ -5130,6 +5130,9 @@ struct ScanJob {
     filter: Option<crate::pb::FilterExpr>,
     /// The request's enumerate threshold (`StartShardSearch`).
     enumerate_max_rows: Option<u32>,
+    /// The request's patience early-stop parameters (`StartShardSearch`).
+    patience_saturation_ppm: Option<u32>,
+    patience_hops: Option<u32>,
     /// Polled between chunks for the best coordinator-pushed floor
     /// (returns `None` when floor sharing is off or no floor arrived).
     external: Box<dyn FnMut() -> Option<f32> + Send>,
@@ -5181,6 +5184,14 @@ async fn scan_scheduler(
     }
 }
 
+struct QueuedQuerySpec {
+    vector: Vec<f32>,
+    k: usize,
+    keep_ties: bool,
+    enumerate_max_rows: Option<usize>,
+    patience: Option<crate::vector::PatienceSpec>,
+}
+
 /// Run one batched scan under the shard read lock and deliver every job's
 /// result. Blocking-pool context.
 fn run_scan_batch(
@@ -5206,7 +5217,7 @@ fn run_scan_batch(
     // batch winning a slot.
     let dim = index.dim_opt();
     let slots = index.len();
-    let mut specs: Vec<(Vec<f32>, usize, bool, Option<usize>)> = Vec::with_capacity(batch.len());
+    let mut specs: Vec<QueuedQuerySpec> = Vec::with_capacity(batch.len());
     let mut allows: Vec<Option<crate::boolean_bits::Bits>> = Vec::with_capacity(batch.len());
     let mut prunes: Vec<crate::segment_prune::PruneStats> = Vec::with_capacity(batch.len());
     let mut knowns: Vec<(Vec<bool>, Vec<bool>)> = Vec::with_capacity(batch.len());
@@ -5225,6 +5236,14 @@ fn run_scan_batch(
             let _ = job.done.send(Err(refused));
             continue;
         }
+        let patience =
+            match check_patience_options(index, job.patience_saturation_ppm, job.patience_hops) {
+                Ok(spec) => spec,
+                Err(refused) => {
+                    let _ = job.done.send(Err(refused));
+                    continue;
+                }
+            };
         let resolved = guard.vector_scan_filters(
             slots,
             &job.geo_filters,
@@ -5261,12 +5280,13 @@ fn run_scan_batch(
             job.filter.as_ref(),
         ));
         allows.push(allow);
-        specs.push((
-            job.vector,
-            job.k,
-            job.tie_complete,
-            job.enumerate_max_rows.map(|rows| rows as usize),
-        ));
+        specs.push(QueuedQuerySpec {
+            vector: job.vector,
+            k: job.k,
+            keep_ties: job.tie_complete,
+            enumerate_max_rows: job.enumerate_max_rows.map(|rows| rows as usize),
+            patience,
+        });
         externals.push(job.external);
         publishers.push(job.publish);
         dones.push(job.done);
@@ -5291,15 +5311,14 @@ fn run_scan_batch(
     let queries: Vec<BatchQuery> = specs
         .iter()
         .zip(&allows)
-        .map(
-            |((vector, k, keep_ties, enumerate_max_rows), allow)| BatchQuery {
-                vector,
-                k: *k,
-                keep_ties: *keep_ties,
-                allow: allow.as_ref().map(crate::vector::Mask::Bits),
-                enumerate_max_rows: *enumerate_max_rows,
-            },
-        )
+        .map(|(spec, allow)| BatchQuery {
+            vector: &spec.vector,
+            k: spec.k,
+            keep_ties: spec.keep_ties,
+            allow: allow.as_ref().map(crate::vector::Mask::Bits),
+            enumerate_max_rows: spec.enumerate_max_rows,
+            patience: spec.patience,
+        })
         .collect();
     let mut pass_bytes = 0u64;
     let mut pass_nanos = 0u64;
@@ -6379,6 +6398,8 @@ impl NodeServiceImpl {
                 "query coordinate {coord} is invalid: {value}"
             )));
         }
+        check_enumerate_threshold(index, start.enumerate_max_rows)?;
+        check_patience_options(index, start.patience_saturation_ppm, start.patience_hops)?;
         Ok(())
     }
 
@@ -12109,6 +12130,7 @@ impl NodeService for NodeServiceImpl {
                                     segments_skipped: stats.segments_skipped,
                                     filter_regimes: stats.regimes.to_proto(),
                                     tail_enumerated_rows: stats.tail_enumerated_rows,
+                                    patience_stopped: stats.patience_stopped,
                                 }),
                                 geo_columns_known,
                                 filter_columns_known,
@@ -12154,6 +12176,8 @@ impl NodeService for NodeServiceImpl {
                                     geo_regions: geo_regions.clone(),
                                     filter: start.filter.clone(),
                                     enumerate_max_rows: start.enumerate_max_rows,
+                                    patience_saturation_ppm: start.patience_saturation_ppm,
+                                    patience_hops: start.patience_hops,
                                     external: Box::new(external_floor),
                                     publish: Box::new(publish_floor),
                                     done: done_tx,
@@ -12176,7 +12200,6 @@ impl NodeService for NodeServiceImpl {
                         // Solo path (the coalescing A/B baseline): one
                         // blocking scan per RPC, exactly the historical
                         // behavior.
-                        let mut external_floor = external_floor;
                         let mut publish_floor = publish_floor;
                         let scan = tokio::task::spawn_blocking(move || {
                             // The read guard is held for the whole chunked
@@ -12214,16 +12237,28 @@ impl NodeService for NodeServiceImpl {
                                         Status::cancelled("scoped scan response closed")
                                     })?;
                             }
-                            let (hits, mut stats) = chunked_topk(
+                            let patience = check_patience_options(
                                 index,
-                                &start.vector,
-                                start.k as usize,
+                                start.patience_saturation_ppm,
+                                start.patience_hops,
+                            )?;
+                            let solo_queries = [BatchQuery {
+                                vector: &start.vector,
+                                k: start.k as usize,
+                                keep_ties: start.tie_complete,
+                                allow: allow.as_ref().map(crate::vector::Mask::Bits),
+                                enumerate_max_rows: start.enumerate_max_rows.map(|r| r as usize),
+                                patience,
+                            }];
+                            let (hits, mut stats) = crate::chunked::chunked_topk_batch(
+                                index,
+                                &solo_queries,
                                 chunk_blocks,
-                                &mut external_floor,
-                                &mut publish_floor,
-                                start.tie_complete,
-                                allow.as_ref().map(|bits| bits.to_bools()).as_deref(),
-                            );
+                                &mut |_| external_floor(),
+                                &mut |_, f| publish_floor(f),
+                            )
+                            .pop()
+                            .expect("one query in, one result out");
                             stats.segments_total = prune.segments_total;
                             stats.segments_skipped = prune.segments_skipped;
                             crate::metrics::record_scan(&stats);
@@ -12277,6 +12312,7 @@ impl NodeService for NodeServiceImpl {
                                 segments_skipped: stats.segments_skipped,
                                 filter_regimes: stats.regimes.to_proto(),
                                 tail_enumerated_rows: stats.tail_enumerated_rows,
+                                patience_stopped: stats.patience_stopped,
                             }),
                             geo_columns_known,
                             filter_columns_known,
@@ -13585,6 +13621,13 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                         if let Some(rows) = start.enumerate_max_rows {
                             options = options.with_enumerate_max_rows(rows as usize);
                         }
+                        if let Some(patience) = check_patience_options(
+                            index,
+                            start.patience_saturation_ppm,
+                            start.patience_hops,
+                        )? {
+                            options = options.with_patience(patience);
+                        }
                         let mut floor_now = f32::NEG_INFINITY;
                         if let Some(f) = start.initial_floor {
                             options = options.with_initial_threshold(f);
@@ -13675,6 +13718,7 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                             segments_skipped: prune.segments_skipped,
                             filter_regimes: summary.regimes.to_proto(),
                             tail_enumerated_rows: summary.tail_enumerated_rows,
+                            patience_stopped: summary.patience_stopped,
                         }, identities))
                     });
                 let outcome = scan.await;
@@ -17010,6 +17054,44 @@ fn check_enumerate_threshold(index: &VectorIndex, rows: Option<u32>) -> Result<(
     )))
 }
 
+fn check_patience_options(
+    index: &VectorIndex,
+    saturation_ppm: Option<u32>,
+    hops: Option<u32>,
+) -> Result<Option<crate::vector::PatienceSpec>, Status> {
+    let (ppm, hops) = match (saturation_ppm, hops) {
+        (None, None) => return Ok(None),
+        (Some(ppm), Some(hops)) => (ppm, hops),
+        _ => {
+            return Err(Status::invalid_argument(
+                "patience_saturation_ppm and patience_hops must be set together",
+            ));
+        }
+    };
+    let descriptor = index.descriptor();
+    if !descriptor
+        .capabilities
+        .contains(&crate::vector::VectorCapability::PatienceEarlyStop)
+    {
+        return Err(Status::failed_precondition(format!(
+            "vector backend {:?} does not support patience early stopping (it does not advertise \
+             patience_early_stop)",
+            descriptor.backend_kind
+        )));
+    }
+    if !(1..=1_000_000).contains(&ppm) {
+        return Err(Status::invalid_argument(format!(
+            "patience_saturation_ppm {ppm} must be in 1..=1000000"
+        )));
+    }
+    if hops == 0 {
+        return Err(Status::invalid_argument(
+            "patience_hops must be positive when patience_saturation_ppm is set",
+        ));
+    }
+    Ok(Some(crate::vector::PatienceSpec::from_ppm(ppm, hops)))
+}
+
 /// Products of one dense pass over `mask` (an index-sized allowlist):
 /// every masked slot's calibrated score, or with `top` the best `depth`
 /// under a self-raised floor, ties at the floor included.
@@ -18472,6 +18554,8 @@ mod vector_scan_view_tests {
                 geo_regions: vec![],
                 filter: None,
                 enumerate_max_rows: None,
+                patience_saturation_ppm: None,
+                patience_hops: None,
                 external: Box::new(|| None),
                 publish: Box::new(|_| false),
                 done,

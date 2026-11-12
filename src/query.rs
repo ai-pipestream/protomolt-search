@@ -985,6 +985,12 @@ pub(crate) async fn execute(
         .as_ref()
         .and_then(|o| o.policy_point.as_ref())
         .and_then(|point| point.enumerate_max_rows);
+    let (policy_patience_saturation_ppm, policy_patience_hops) = dense_execution
+        .as_ref()
+        .and_then(|o| o.policy_point.as_ref())
+        .map_or((None, None), |point| {
+            (point.patience_saturation_ppm, point.patience_hops)
+        });
     let fp32_rerank = match &plan.shape {
         Shape::Dense { query, .. } => {
             let mode = dense_score_mode(query)?;
@@ -1455,6 +1461,8 @@ pub(crate) async fn execute(
                     geo_filters: plan.geo_filters.clone(),
                     filter,
                     enumerate_max_rows: policy_enumerate_max_rows,
+                    patience_saturation_ppm: policy_patience_saturation_ppm,
+                    patience_hops: policy_patience_hops,
                     ..Default::default()
                 })))
                 .await?
@@ -1469,6 +1477,7 @@ pub(crate) async fn execute(
             if let Some(outcome) = dense_execution.as_mut() {
                 outcome.filter_regimes = response.filter_regimes;
                 outcome.tail_enumerated_rows = response.tail_enumerated_rows;
+                outcome.patience_stopped = response.patience_stopped;
             }
             let mut hits: Vec<QueryHit> = response
                 .hits
@@ -1638,6 +1647,8 @@ pub(crate) async fn execute(
                     geo_filters: plan.geo_filters.clone(),
                     filter,
                     enumerate_max_rows: policy_enumerate_max_rows,
+                    patience_saturation_ppm: policy_patience_saturation_ppm,
+                    patience_hops: policy_patience_hops,
                     ..Default::default()
                 })))
                 .await?

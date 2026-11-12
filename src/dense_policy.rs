@@ -54,6 +54,8 @@ struct PointFile {
     candidates: u32,
     measured_recall_ppm: u32,
     enumerate_max_rows: Option<u32>,
+    patience_saturation_ppm: Option<u32>,
+    patience_hops: Option<u32>,
 }
 
 /// One measured point: the key AUTO matches exactly, and the recall
@@ -70,6 +72,12 @@ pub struct PolicyPoint {
     /// exactly, and a larger one is walked. `None` on a point for a
     /// provider without filter regimes, and on an unfiltered point.
     pub enumerate_max_rows: Option<u32>,
+    /// Optional hop-to-hop beam saturation threshold in parts per million
+    /// (`1..=1_000_000`) and consecutive hop count (`>= 1`) the point was
+    /// measured under (`docs/hnsw.md`, "Patience"). Set together or absent
+    /// together.
+    pub patience_saturation_ppm: Option<u32>,
+    pub patience_hops: Option<u32>,
 }
 
 /// What the live cluster reports; the policy must match it field by field.
@@ -189,6 +197,12 @@ impl DenseExecutionPolicy {
             if let Some(rows) = point.enumerate_max_rows {
                 out.push_str(&format!("enumerate_max_rows = {rows}\n"));
             }
+            if let Some(ppm) = point.patience_saturation_ppm {
+                out.push_str(&format!("patience_saturation_ppm = {ppm}\n"));
+            }
+            if let Some(hops) = point.patience_hops {
+                out.push_str(&format!("patience_hops = {hops}\n"));
+            }
         }
         out
     }
@@ -279,6 +293,31 @@ impl DenseExecutionPolicy {
                     ));
                 }
             }
+            match (p.patience_saturation_ppm, p.patience_hops) {
+                (Some(sat), Some(hops)) => {
+                    if !ppm.contains(&sat) {
+                        return Err(format!(
+                            "policy point k={} has patience_saturation_ppm {sat} outside \
+                             1..=1000000",
+                            p.k
+                        ));
+                    }
+                    if hops == 0 {
+                        return Err(format!(
+                            "policy point k={} has patience_hops 0; patience_hops must be positive",
+                            p.k
+                        ));
+                    }
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(format!(
+                        "policy point k={} must set patience_saturation_ppm and patience_hops \
+                         together",
+                        p.k
+                    ));
+                }
+            }
             let point = PolicyPoint {
                 k: p.k,
                 selectivity_min_ppm: p.filter_selectivity_ppm_min,
@@ -286,6 +325,8 @@ impl DenseExecutionPolicy {
                 candidates: p.candidates,
                 measured_recall_ppm: p.measured_recall_ppm,
                 enumerate_max_rows: p.enumerate_max_rows,
+                patience_saturation_ppm: p.patience_saturation_ppm,
+                patience_hops: p.patience_hops,
             };
             if let Some(prev) = points
                 .last()
@@ -735,5 +776,46 @@ measured_recall_ppm = 995000
         assert_eq!(selectivity_ppm(250, 1000), 250_000);
         assert_eq!(selectivity_ppm(1000, 1000), UNFILTERED_PPM);
         assert_eq!(selectivity_ppm(5, 0), UNFILTERED_PPM);
+    }
+
+    #[test]
+    fn a_point_carries_patience_parameters_and_validates_pairs() {
+        let text = TEXT.replace(
+            "candidates = 100\nmeasured_recall_ppm = 990000\n",
+            "candidates = 100\nmeasured_recall_ppm = 990000\npatience_saturation_ppm = 990000\npatience_hops = 15\n",
+        );
+        let policy = DenseExecutionPolicy::parse(&text).unwrap();
+        let again = DenseExecutionPolicy::parse(&policy.to_toml()).unwrap();
+        assert_eq!(again.points(), policy.points());
+        let hit = policy
+            .qualify(RequestKey {
+                k: 10,
+                candidate_depth: 0,
+                filter_selectivity_ppm: UNFILTERED_PPM,
+            })
+            .unwrap();
+        assert_eq!(hit.point.patience_saturation_ppm, Some(990_000));
+        assert_eq!(hit.point.patience_hops, Some(15));
+
+        let half = TEXT.replace(
+            "candidates = 100\nmeasured_recall_ppm = 990000\n",
+            "candidates = 100\nmeasured_recall_ppm = 990000\npatience_saturation_ppm = 990000\n",
+        );
+        assert!(DenseExecutionPolicy::parse(&half)
+            .unwrap_err()
+            .contains("patience_saturation_ppm and patience_hops together"));
+
+        let zero_hops = text.replace("patience_hops = 15", "patience_hops = 0");
+        assert!(DenseExecutionPolicy::parse(&zero_hops)
+            .unwrap_err()
+            .contains("patience_hops must be positive"));
+
+        let bad_ppm = text.replace(
+            "patience_saturation_ppm = 990000",
+            "patience_saturation_ppm = 1000001",
+        );
+        assert!(DenseExecutionPolicy::parse(&bad_ppm)
+            .unwrap_err()
+            .contains("patience_saturation_ppm 1000001 outside 1..=1000000"));
     }
 }
