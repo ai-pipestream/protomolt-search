@@ -127,6 +127,8 @@ struct RelaySignals {
     floor: watch::Sender<f32>,
     cancelled: AtomicBool,
     cancel: Notify,
+    finish_state: std::sync::atomic::AtomicU8,
+    finish: Notify,
     /// The newest signed sequence applied; a datagram at or behind it
     /// is a replay and is ignored.
     last_seq: AtomicU32,
@@ -139,6 +141,8 @@ impl RelaySignals {
             floor,
             cancelled: AtomicBool::new(false),
             cancel: Notify::new(),
+            finish_state: std::sync::atomic::AtomicU8::new(0),
+            finish: Notify::new(),
             last_seq: AtomicU32::new(0),
         }
     }
@@ -161,6 +165,18 @@ impl RelaySignals {
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
         self.cancel.notify_one();
+    }
+
+    fn request_finish(&self, deadline: bool) {
+        let code = if deadline { 2 } else { 1 };
+        let prev = self.finish_state.fetch_max(code, Ordering::AcqRel);
+        if code > prev {
+            self.finish.notify_one();
+        }
+    }
+
+    fn finish_state_raw(&self) -> u8 {
+        self.finish_state.load(Ordering::Acquire)
     }
 
     // fetch_update is deprecated in favor of try_update from Rust 1.99, but the
@@ -727,7 +743,8 @@ fn apply_datagram(
     };
     let token = match signal {
         crate::stream_signal::StreamSignal::RaiseFloor { token, .. }
-        | crate::stream_signal::StreamSignal::Cancel { token } => token,
+        | crate::stream_signal::StreamSignal::Cancel { token }
+        | crate::stream_signal::StreamSignal::Finish { token, .. } => token,
     };
     let state = signals
         .lock()
@@ -745,6 +762,9 @@ fn apply_datagram(
     match signal {
         crate::stream_signal::StreamSignal::RaiseFloor { floor, .. } => state.raise(floor),
         crate::stream_signal::StreamSignal::Cancel { .. } => state.cancel(),
+        crate::stream_signal::StreamSignal::Finish { deadline, .. } => {
+            state.request_finish(deadline);
+        }
     }
 }
 
@@ -1121,11 +1141,13 @@ struct StreamTotals {
     regimes: crate::vector::FilterRegimeCounts,
     tail_enumerated_rows: u64,
     patience_stopped: u32,
+    end_reason: crate::vector::VectorStreamEndReason,
 }
 
 enum StreamEvent {
     Message(Option<(usize, StreamSearchResponse)>),
     Floor(f32),
+    Finish(bool),
     Cancel,
     Deadline,
     MapMoved(u64),
@@ -1202,6 +1224,7 @@ async fn relay_stream(
     let mut last_floor = start.initial_floor.unwrap_or(f32::NEG_INFINITY);
     let mut floor_rx = signals.floor.subscribe();
     let mut floor_open = true;
+    let mut forwarded_finish: u8 = 0;
     let mut sleep = deadline.map(|at| Box::pin(tokio::time::sleep_until(at)));
 
     while remaining > 0 {
@@ -1209,6 +1232,17 @@ async fn relay_stream(
             biased;
             _ = signals.cancel.notified(), if !signals.cancelled.load(Ordering::Acquire) => StreamEvent::Cancel,
             _ = async { true }, if signals.cancelled.load(Ordering::Acquire) => StreamEvent::Cancel,
+            _ = signals.finish.notified(), if signals.finish_state_raw() <= forwarded_finish => {
+                let raw = signals.finish_state_raw();
+                if raw > forwarded_finish {
+                    StreamEvent::Finish(raw >= 2)
+                } else {
+                    continue;
+                }
+            },
+            _ = async { true }, if signals.finish_state_raw() > forwarded_finish => {
+                StreamEvent::Finish(signals.finish_state_raw() >= 2)
+            },
             _ = async { sleep.as_mut().expect("guarded").await }, if sleep.is_some() => StreamEvent::Deadline,
             moved = map_changes.changed() => match moved {
                 Ok(()) => StreamEvent::MapMoved(*map_changes.borrow_and_update()),
@@ -1247,6 +1281,7 @@ async fn relay_stream(
                     filter_regimes: totals.regimes.to_proto(),
                     tail_enumerated_rows: totals.tail_enumerated_rows,
                     patience_stopped: totals.patience_stopped,
+                    end_reason: crate::pb::StreamEndReason::Abandoned as i32,
                 };
                 let _ = tx
                     .send(Ok(StreamSearchResponse {
@@ -1254,6 +1289,12 @@ async fn relay_stream(
                     }))
                     .await;
                 return Ok(());
+            }
+            StreamEvent::Finish(deadline) => {
+                forwarded_finish = forwarded_finish.max(if deadline { 2 } else { 1 });
+                coordinator
+                    .push_stream_finish(&fanout, &summaries, deadline)
+                    .await;
             }
             StreamEvent::Deadline => {
                 return fanout
@@ -1417,6 +1458,9 @@ async fn relay_stream(
                         totals.patience_stopped = totals
                             .patience_stopped
                             .saturating_add(summary.patience_stopped);
+                        totals.end_reason = totals.end_reason.merge(
+                            crate::vector::VectorStreamEndReason::from_proto(summary.end_reason),
+                        );
                         summaries[shard] = Some(summary.clone());
                         if identity_limits.is_none() {
                             terminal[shard] = Some(summary);
@@ -1449,6 +1493,7 @@ async fn relay_stream(
         filter_regimes: totals.regimes.to_proto(),
         tail_enumerated_rows: totals.tail_enumerated_rows,
         patience_stopped: totals.patience_stopped,
+        end_reason: totals.end_reason.to_proto(),
     };
     if let Some(limits) = identity_limits {
         let range =
@@ -1562,6 +1607,7 @@ async fn relay_stream(
                         payload: Some(stream_search_response::Payload::Summary(
                             StreamSearchSummary {
                                 completed: false,
+                                end_reason: crate::pb::StreamEndReason::Abandoned as i32,
                                 ..summary
                             },
                         )),
@@ -3532,6 +3578,8 @@ impl NodeService for RelayService {
                 enumerate_max_rows: start.enumerate_max_rows,
                 patience_saturation_ppm: start.patience_saturation_ppm,
                 patience_hops: start.patience_hops,
+                finish_settle_us: None,
+                finish_deadline_us: None,
             };
             let signals = Arc::new(RelaySignals::new(
                 start.initial_floor.unwrap_or(f32::NEG_INFINITY),
@@ -3561,6 +3609,11 @@ impl NodeService for RelayService {
                         })) => {
                             pump.cancel();
                             return Ok(None);
+                        }
+                        Ok(Some(StreamSearchRequest {
+                            payload: Some(stream_search_request::Payload::Finish(f)),
+                        })) => {
+                            pump.request_finish(f.deadline);
                         }
                         Ok(Some(StreamSearchRequest {
                             payload:
@@ -3740,6 +3793,8 @@ impl NodeService for RelayService {
                 enumerate_max_rows: start.enumerate_max_rows,
                 patience_saturation_ppm: start.patience_saturation_ppm,
                 patience_hops: start.patience_hops,
+                finish_settle_us: None,
+                finish_deadline_us: None,
             };
             let (tx, rx) = mpsc::channel::<Result<SearchShardResponse, Status>>(64);
             let (pinned, frozen) = self.pin();
@@ -5091,6 +5146,8 @@ impl NodeService for RelayService {
                 enumerate_max_rows: None,
                 patience_saturation_ppm: None,
                 patience_hops: None,
+                finish_settle_us: None,
+                finish_deadline_us: None,
             };
             let (pinned, frozen) = self.pin();
             let children = frozen.node_addresses().to_vec();

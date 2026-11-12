@@ -30,6 +30,9 @@ pub const FORMAT_VERSION: u32 = 1;
 /// Selectivity of a request without a filter: the whole corpus.
 pub const UNFILTERED_PPM: u32 = 1_000_000;
 
+/// Upper bound on `finish_settle_us` in a policy point (60 seconds).
+pub const MAX_FINISH_SETTLE_US: u32 = 60_000_000;
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PolicyFile {
@@ -56,6 +59,7 @@ struct PointFile {
     enumerate_max_rows: Option<u32>,
     patience_saturation_ppm: Option<u32>,
     patience_hops: Option<u32>,
+    finish_settle_us: Option<u32>,
 }
 
 /// One measured point: the key AUTO matches exactly, and the recall
@@ -78,6 +82,10 @@ pub struct PolicyPoint {
     /// together.
     pub patience_saturation_ppm: Option<u32>,
     pub patience_hops: Option<u32>,
+    /// Optional coordinator streaming settle window in microseconds
+    /// (`1..=MAX_FINISH_SETTLE_US`) the point was measured under (`docs/hnsw.md`,
+    /// "Graceful stream close").
+    pub finish_settle_us: Option<u32>,
 }
 
 /// What the live cluster reports; the policy must match it field by field.
@@ -203,6 +211,9 @@ impl DenseExecutionPolicy {
             if let Some(hops) = point.patience_hops {
                 out.push_str(&format!("patience_hops = {hops}\n"));
             }
+            if let Some(settle_us) = point.finish_settle_us {
+                out.push_str(&format!("finish_settle_us = {settle_us}\n"));
+            }
         }
         out
     }
@@ -318,6 +329,15 @@ impl DenseExecutionPolicy {
                     ));
                 }
             }
+            if let Some(settle_us) = p.finish_settle_us {
+                if !(1..=MAX_FINISH_SETTLE_US).contains(&settle_us) {
+                    return Err(format!(
+                        "policy point k={} has finish_settle_us {settle_us} outside \
+                         1..={MAX_FINISH_SETTLE_US}",
+                        p.k
+                    ));
+                }
+            }
             let point = PolicyPoint {
                 k: p.k,
                 selectivity_min_ppm: p.filter_selectivity_ppm_min,
@@ -327,6 +347,7 @@ impl DenseExecutionPolicy {
                 enumerate_max_rows: p.enumerate_max_rows,
                 patience_saturation_ppm: p.patience_saturation_ppm,
                 patience_hops: p.patience_hops,
+                finish_settle_us: p.finish_settle_us,
             };
             if let Some(prev) = points
                 .last()
@@ -817,5 +838,33 @@ measured_recall_ppm = 995000
         assert!(DenseExecutionPolicy::parse(&bad_ppm)
             .unwrap_err()
             .contains("patience_saturation_ppm 1000001 outside 1..=1000000"));
+    }
+
+    #[test]
+    fn a_point_carries_finish_settle_us_and_validates_bounds() {
+        let text = TEXT.replace(
+            "candidates = 100\nmeasured_recall_ppm = 990000\n",
+            "candidates = 100\nmeasured_recall_ppm = 990000\nfinish_settle_us = 250\n",
+        );
+        let policy = DenseExecutionPolicy::parse(&text).unwrap();
+        let again = DenseExecutionPolicy::parse(&policy.to_toml()).unwrap();
+        assert_eq!(again.points(), policy.points());
+        let hit = policy
+            .qualify(RequestKey {
+                k: 10,
+                candidate_depth: 0,
+                filter_selectivity_ppm: UNFILTERED_PPM,
+            })
+            .unwrap();
+        assert_eq!(hit.point.finish_settle_us, Some(250));
+
+        let zero = text.replace("finish_settle_us = 250", "finish_settle_us = 0");
+        assert!(DenseExecutionPolicy::parse(&zero)
+            .unwrap_err()
+            .contains("finish_settle_us 0 outside"));
+        let huge = text.replace("finish_settle_us = 250", "finish_settle_us = 60000001");
+        assert!(DenseExecutionPolicy::parse(&huge)
+            .unwrap_err()
+            .contains("finish_settle_us 60000001 outside"));
     }
 }

@@ -875,6 +875,154 @@ fn streaming_emits_scored_rows_and_honors_stop_and_raised_floors() {
 }
 
 #[test]
+fn early_first_flush_and_graceful_finish_preserve_buffered_rows() {
+    use crate::vector::VectorStreamEndReason;
+
+    let dim = 24;
+    let (vectors, queries) = corpus_with_queries(1600, 1, dim, 0x9100);
+    let index = built(&vectors, dim, BuildMode::FixedOrder);
+    let q = &queries[..dim];
+
+    // Full streaming walk baseline at ef = 256.
+    let full = index
+        .search_streaming_controlled(
+            q,
+            VectorSearchOptions::new().with_candidate_depth(256),
+            &mut |_| VectorStreamControl::Continue,
+            &mut || VectorStreamControl::Continue,
+        )
+        .unwrap();
+    assert!(full.completed);
+    assert_eq!(full.end_reason, VectorStreamEndReason::WalkConverged);
+    assert!(full.units_scanned > 150);
+
+    // 1. Early first-flush: a batch must arrive on hop 2 even when fewer than
+    //    64 rows have been scored so far.
+    let hop_polls = std::cell::Cell::new(0usize);
+    let mut first_batch_poll = None;
+    index
+        .search_streaming_controlled(
+            q,
+            VectorSearchOptions::new().with_candidate_depth(256),
+            &mut |batch| {
+                if first_batch_poll.is_none() && !batch.slots.is_empty() {
+                    first_batch_poll = Some(hop_polls.get());
+                }
+                VectorStreamControl::Continue
+            },
+            &mut || {
+                hop_polls.set(hop_polls.get() + 1);
+                VectorStreamControl::Continue
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        first_batch_poll,
+        Some(2),
+        "early first-flush must emit after 2 layer-0 hops without waiting for 64 rows"
+    );
+
+    // 2. Graceful Finish (deadline = false): stops at the next hop, flushes
+    //    buffered candidates >= floor, marks completed = true with
+    //    FinishRequested, and scans strictly fewer rows than the full walk.
+    let floor = 0.1f32;
+    let mut polls = 0usize;
+    let mut finished_scores = Vec::new();
+    let finished = index
+        .search_streaming_controlled(
+            q,
+            VectorSearchOptions::new()
+                .with_candidate_depth(256)
+                .with_minimum_score(floor),
+            &mut |batch| {
+                finished_scores.extend_from_slice(batch.scores);
+                VectorStreamControl::Continue
+            },
+            &mut || {
+                polls += 1;
+                if polls >= 4 {
+                    VectorStreamControl::Finish { deadline: false }
+                } else {
+                    VectorStreamControl::Continue
+                }
+            },
+        )
+        .unwrap();
+    assert!(finished.completed);
+    assert_eq!(finished.end_reason, VectorStreamEndReason::FinishRequested);
+    assert!(finished.units_scanned < full.units_scanned / 2);
+    assert!(!finished_scores.is_empty());
+    assert!(finished_scores.iter().all(|&s| s >= floor));
+    assert_eq!(finished.emitted, finished_scores.len());
+
+    // 3. Graceful Finish (deadline = true): reports Deadline.
+    let mut polls = 0usize;
+    let deadline_fin = index
+        .search_streaming_controlled(
+            q,
+            VectorSearchOptions::new().with_candidate_depth(256),
+            &mut |_| VectorStreamControl::Continue,
+            &mut || {
+                polls += 1;
+                if polls >= 3 {
+                    VectorStreamControl::Finish { deadline: true }
+                } else {
+                    VectorStreamControl::Continue
+                }
+            },
+        )
+        .unwrap();
+    assert!(deadline_fin.completed);
+    assert_eq!(deadline_fin.end_reason, VectorStreamEndReason::Deadline);
+
+    // 4. Hard Stop at hop 1 (before early first-flush): drops buffered rows,
+    //    completed = false, Abandoned.
+    let mut polls = 0usize;
+    let mut stopped_emitted = 0usize;
+    let stopped = index
+        .search_streaming_controlled(
+            q,
+            VectorSearchOptions::new().with_candidate_depth(256),
+            &mut |batch| {
+                stopped_emitted += batch.slots.len();
+                VectorStreamControl::Continue
+            },
+            &mut || {
+                polls += 1;
+                if polls >= 1 {
+                    VectorStreamControl::Stop
+                } else {
+                    VectorStreamControl::Continue
+                }
+            },
+        )
+        .unwrap();
+    assert!(!stopped.completed);
+    assert_eq!(stopped.end_reason, VectorStreamEndReason::Abandoned);
+    assert_eq!(stopped_emitted, 0);
+
+    // 5. Enumerate regime ignores Finish so small filtered subsets stay exact.
+    let mut tiny_mask = vec![false; 1600];
+    for slot in &mut tiny_mask[..12] {
+        *slot = true;
+    }
+    let enum_fin = index
+        .search_streaming_controlled(
+            q,
+            VectorSearchOptions::new()
+                .with_candidate_depth(64)
+                .with_mask(&tiny_mask)
+                .with_enumerate_max_rows(64),
+            &mut |_| VectorStreamControl::Continue,
+            &mut || VectorStreamControl::Finish { deadline: false },
+        )
+        .unwrap();
+    assert!(enum_fin.completed);
+    assert_eq!(enum_fin.end_reason, VectorStreamEndReason::Exhausted);
+    assert_eq!(enum_fin.emitted, 12);
+}
+
+#[test]
 fn vectors_of_varied_length_keep_recall_under_inner_product() {
     let dim = 32;
     let (mut vectors, queries) = corpus_with_queries(4000, 100, dim, 0x8080);

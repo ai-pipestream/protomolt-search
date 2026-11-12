@@ -397,13 +397,21 @@ impl VectorProvider for SegmentedProvider {
         let nq = queries.len().checked_div(dim).unwrap_or(0);
         let floor = std::cell::Cell::new(options.minimum_score);
         let stopped = std::cell::Cell::new(false);
+        let finished = std::cell::Cell::new(false);
+        let end_reason = std::cell::Cell::new(crate::vector::VectorStreamEndReason::Unspecified);
+        let allow_early_finish = matches!(
+            self.descriptor().quality_contract,
+            crate::vector::QualityContract::ConfiguredAnn
+                | crate::vector::QualityContract::ProbabilisticBound
+        ) && options.filter_regime
+            != Some(crate::vector::FilterRegime::Enumerate);
         let mut emitted = 0usize;
         let mut units = 0usize;
         let mut regimes = crate::vector::FilterRegimeCounts::default();
         let mut tail_enumerated_rows = 0u64;
         let mut patience_stopped = 0u32;
         for (base, rows, image) in self.search_images() {
-            if stopped.get() {
+            if stopped.get() || finished.get() {
                 break;
             }
             let allow = match options.allow {
@@ -428,7 +436,20 @@ impl VectorProvider for SegmentedProvider {
                 VectorStreamControl::RaiseFloor(f) => {
                     floor.set(Some(floor.get().map_or(f, |cur| cur.max(f))));
                 }
-                VectorStreamControl::Stop => stopped.set(true),
+                VectorStreamControl::Finish { deadline } if allow_early_finish => {
+                    finished.set(true);
+                    let reason = if deadline {
+                        crate::vector::VectorStreamEndReason::Deadline
+                    } else {
+                        crate::vector::VectorStreamEndReason::FinishRequested
+                    };
+                    end_reason.set(end_reason.get().merge(reason));
+                }
+                VectorStreamControl::Finish { .. } => {}
+                VectorStreamControl::Stop => {
+                    stopped.set(true);
+                    end_reason.set(crate::vector::VectorStreamEndReason::Abandoned);
+                }
                 VectorStreamControl::Continue => {}
             };
             let mut remapped: Vec<i64> = Vec::new();
@@ -467,15 +488,28 @@ impl VectorProvider for SegmentedProvider {
             tail_enumerated_rows =
                 tail_enumerated_rows.saturating_add(summary.tail_enumerated_rows);
             patience_stopped = patience_stopped.saturating_add(summary.patience_stopped);
+            end_reason.set(end_reason.get().merge(summary.end_reason));
+            if summary.end_reason.is_early_finish() {
+                finished.set(true);
+            }
             if !summary.completed {
                 stopped.set(true);
+                end_reason.set(crate::vector::VectorStreamEndReason::Abandoned);
             }
         }
+        let final_reason = if stopped.get() {
+            crate::vector::VectorStreamEndReason::Abandoned
+        } else if end_reason.get() == crate::vector::VectorStreamEndReason::Unspecified {
+            crate::vector::VectorStreamEndReason::Exhausted
+        } else {
+            end_reason.get()
+        };
         Ok(VectorStreamSummary {
             query_count: nq,
             emitted,
             units_scanned: units,
             completed: !stopped.get(),
+            end_reason: final_reason,
             regimes,
             tail_enumerated_rows,
             patience_stopped,

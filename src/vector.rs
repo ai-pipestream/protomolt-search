@@ -482,7 +482,93 @@ pub struct VectorStreamBatch<'a> {
 pub enum VectorStreamControl {
     Continue,
     RaiseFloor(f32),
+    /// End an approximate walk gracefully at the next hop boundary (`#100`),
+    /// flushing buffered candidates at or above the floor (`completed = true`).
+    /// Ignored by exhaustive scan providers.
+    Finish {
+        deadline: bool,
+    },
     Stop,
+}
+
+/// Why a streaming provider ended its traversal (`#100`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VectorStreamEndReason {
+    #[default]
+    Unspecified,
+    /// Every allowed row or logical chunk was evaluated.
+    Exhausted,
+    /// Approximate graph walk converged naturally (beam frontier exhausted or
+    /// patience saturated).
+    WalkConverged,
+    /// Approximate graph walk stopped because remaining candidates fell below
+    /// the active score floor.
+    FloorPruned,
+    /// Coordinator requested a graceful finish after global top-k stillness.
+    FinishRequested,
+    /// Coordinator requested a graceful finish at the request deadline.
+    Deadline,
+    /// Scan was abandoned (`StopStreamSearch`, UDP `CANCEL`, or closed stream);
+    /// `completed` is `false`.
+    Abandoned,
+}
+
+impl VectorStreamEndReason {
+    /// True when the walk ended early because the coordinator requested a
+    /// graceful finish (`#100`).
+    #[inline]
+    pub const fn is_early_finish(self) -> bool {
+        matches!(self, Self::FinishRequested | Self::Deadline)
+    }
+
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Unspecified => 0,
+            Self::Exhausted => 1,
+            Self::WalkConverged => 2,
+            Self::FloorPruned => 3,
+            Self::FinishRequested => 4,
+            Self::Deadline => 5,
+            Self::Abandoned => 6,
+        }
+    }
+
+    /// Combine end reasons across segments or relay children, keeping the most
+    /// specific termination cause.
+    #[inline]
+    pub const fn merge(self, other: Self) -> Self {
+        if other.rank() > self.rank() {
+            other
+        } else {
+            self
+        }
+    }
+
+    #[inline]
+    pub const fn to_proto(self) -> i32 {
+        match self {
+            Self::Unspecified => crate::pb::StreamEndReason::Unspecified as i32,
+            Self::Exhausted => crate::pb::StreamEndReason::Exhausted as i32,
+            Self::WalkConverged => crate::pb::StreamEndReason::WalkConverged as i32,
+            Self::FloorPruned => crate::pb::StreamEndReason::FloorPruned as i32,
+            Self::FinishRequested => crate::pb::StreamEndReason::FinishRequested as i32,
+            Self::Deadline => crate::pb::StreamEndReason::Deadline as i32,
+            Self::Abandoned => crate::pb::StreamEndReason::Abandoned as i32,
+        }
+    }
+
+    #[inline]
+    pub fn from_proto(raw: i32) -> Self {
+        match crate::pb::StreamEndReason::try_from(raw) {
+            Ok(crate::pb::StreamEndReason::Exhausted) => Self::Exhausted,
+            Ok(crate::pb::StreamEndReason::WalkConverged) => Self::WalkConverged,
+            Ok(crate::pb::StreamEndReason::FloorPruned) => Self::FloorPruned,
+            Ok(crate::pb::StreamEndReason::FinishRequested) => Self::FinishRequested,
+            Ok(crate::pb::StreamEndReason::Deadline) => Self::Deadline,
+            Ok(crate::pb::StreamEndReason::Abandoned) => Self::Abandoned,
+            _ => Self::Unspecified,
+        }
+    }
 }
 
 /// Terminal provider-native streaming summary.
@@ -492,6 +578,7 @@ pub struct VectorStreamSummary {
     pub emitted: usize,
     pub units_scanned: usize,
     pub completed: bool,
+    pub end_reason: VectorStreamEndReason,
     /// How the filtered queries of this stream were answered; all zero for
     /// a provider with one way to filter.
     pub regimes: FilterRegimeCounts,
@@ -1123,7 +1210,9 @@ mod embedded_turbovec {
 
         fn map_control(control: VectorStreamControl) -> StreamControl {
             match control {
-                VectorStreamControl::Continue => StreamControl::Continue,
+                VectorStreamControl::Continue | VectorStreamControl::Finish { .. } => {
+                    StreamControl::Continue
+                }
                 VectorStreamControl::RaiseFloor(floor) => StreamControl::RaiseFloor(floor),
                 VectorStreamControl::Stop => StreamControl::Stop,
             }
@@ -1326,6 +1415,11 @@ mod embedded_turbovec {
                 emitted: summary.emitted,
                 units_scanned: summary.blocks_scanned,
                 completed: summary.completed,
+                end_reason: if summary.completed {
+                    VectorStreamEndReason::Exhausted
+                } else {
+                    VectorStreamEndReason::Abandoned
+                },
                 regimes: FilterRegimeCounts::default(),
                 tail_enumerated_rows: 0,
                 patience_stopped: 0,
@@ -1412,6 +1506,7 @@ mod tests {
                 emitted: 0,
                 units_scanned: 0,
                 completed: true,
+                end_reason: VectorStreamEndReason::Exhausted,
                 regimes: FilterRegimeCounts::default(),
                 tail_enumerated_rows: 0,
                 patience_stopped: 0,

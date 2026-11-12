@@ -426,6 +426,13 @@ pub struct CoordinatorServiceImpl {
     /// Serve `SearchService.Search` over the streaming protocol
     /// (`fanout_stream_search`) instead of the per-shard top-k fan-out.
     stream_search: bool,
+    /// Optional coordinator-wide default stillness window before sending
+    /// `FinishStreamSearch` to unfinished shards once top-`k` is full and a
+    /// shard quorum has completed (`docs/hnsw.md`, "Graceful stream close").
+    stream_finish_settle: Option<Duration>,
+    /// Optional coordinator-wide default deadline before sending
+    /// `FinishStreamSearch { deadline: true }` to unfinished shards.
+    stream_finish_deadline: Option<Duration>,
     /// Run `Bm25Search` over the exact `Bm25QueryStream` candidate
     /// protocol instead of the unary per-shard top-k round. The
     /// coordinator owns the only authoritative global heap, relays its
@@ -1669,6 +1676,10 @@ pub struct RequestFilters {
     /// `patience_hops`).
     pub patience_saturation_ppm: Option<u32>,
     pub patience_hops: Option<u32>,
+    /// Optional coordinator streaming settle and deadline windows in
+    /// microseconds (`docs/hnsw.md`, "Graceful stream close").
+    pub finish_settle_us: Option<u32>,
+    pub finish_deadline_us: Option<u32>,
 }
 
 /// The provider-mismatch line of a cluster health report: empty when
@@ -1821,6 +1832,8 @@ impl RequestFilters {
             enumerate_max_rows: None,
             patience_saturation_ppm: None,
             patience_hops: None,
+            finish_settle_us: None,
+            finish_deadline_us: None,
         })
     }
 }
@@ -2021,6 +2034,8 @@ impl CoordinatorServiceImpl {
             bm25_params: Bm25Params::default(),
             limits: FanoutLimits::default(),
             stream_search: false,
+            stream_finish_settle: None,
+            stream_finish_deadline: None,
             bm25_stream: false,
             knobs: Arc::new(crate::diagnostics::Knobs::coordinator(
                 "coordinator",
@@ -2653,6 +2668,20 @@ impl CoordinatorServiceImpl {
     /// differ in where pruning happens, not in what they return.
     pub fn with_stream_search(mut self, on: bool) -> Self {
         self.stream_search = on;
+        self
+    }
+
+    /// Configure the coordinator's default streaming settle window before
+    /// issuing `FinishStreamSearch` to unfinished ANN shards.
+    pub fn with_stream_finish_settle(mut self, settle: Option<Duration>) -> Self {
+        self.stream_finish_settle = settle;
+        self
+    }
+
+    /// Configure the coordinator's default streaming deadline before issuing
+    /// `FinishStreamSearch { deadline: true }` to unfinished ANN shards.
+    pub fn with_stream_finish_deadline(mut self, deadline: Option<Duration>) -> Self {
+        self.stream_finish_deadline = deadline;
         self
     }
 
@@ -3644,6 +3673,7 @@ impl CoordinatorServiceImpl {
             exhaustive,
             enumerates,
             supports_patience,
+            supports_stream,
             dimensions,
             rows,
             generation,
@@ -3653,6 +3683,7 @@ impl CoordinatorServiceImpl {
                 identity.scoring_fingerprint,
                 crate::pb::VectorQualityContract::ExhaustiveNativeScore,
                 true,
+                false,
                 false,
                 false,
                 identity.dimensions,
@@ -3679,6 +3710,7 @@ impl CoordinatorServiceImpl {
             // one that lacks the regime means none can be relied on.
             let mut enumerates = true;
             let mut supports_patience = true;
+            let mut supports_stream = true;
             let mut dimensions = None;
             let mut rows: u64 = 0;
             for task in tasks {
@@ -3756,6 +3788,10 @@ impl CoordinatorServiceImpl {
                     .capabilities
                     .iter()
                     .any(|capability| capability == "patience_early_stop");
+                supports_stream &= descriptor
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "candidate_stream");
 
                 for (held, actual, mismatch) in [
                     (
@@ -3809,6 +3845,7 @@ impl CoordinatorServiceImpl {
             }
             let enumerates = enumerates && provider.is_some();
             let supports_patience = supports_patience && provider.is_some();
+            let supports_stream = supports_stream && provider.is_some();
             (
                 provider.unwrap_or_default(),
                 fingerprint.unwrap_or_default(),
@@ -3816,6 +3853,7 @@ impl CoordinatorServiceImpl {
                 exhaustive.unwrap_or(false),
                 enumerates,
                 supports_patience,
+                supports_stream,
                 dimensions.unwrap_or_default(),
                 rows,
                 self.topology_generation,
@@ -3959,6 +3997,16 @@ impl CoordinatorServiceImpl {
                         )));
                     }
                 }
+                if let Some(settle_us) = point.finish_settle_us {
+                    if !supports_stream {
+                        return Err(Status::failed_precondition(format!(
+                            "dense execution policy {:?} point k={} depth {} names \
+                             finish_settle_us {settle_us}, but provider {provider} does not \
+                             support streaming search (it does not advertise candidate_stream)",
+                            hit.policy_id, point.k, point.candidates
+                        )));
+                    }
+                }
                 let reason = format!(
                     "AUTO selected the provider's configured approximate traversal through \
                      policy {:?} point k={} selectivity {}..={} ppm depth {} (measured recall {} \
@@ -3983,6 +4031,10 @@ impl CoordinatorServiceImpl {
                     }
                     _ => reason,
                 };
+                let reason = match point.finish_settle_us {
+                    Some(settle_us) => format!("{reason}; finish settle {settle_us} us"),
+                    None => reason,
+                };
                 qualified = Some((hit, selectivity));
                 (crate::pb::DenseExecutionMode::Ann, reason)
             }
@@ -4005,6 +4057,7 @@ impl CoordinatorServiceImpl {
             filter_regimes: None,
             tail_enumerated_rows: 0,
             patience_stopped: 0,
+            shards_finished_early: 0,
         };
         if let Some((hit, selectivity)) = qualified {
             outcome.evidence_scope = crate::pb::DenseEvidenceScope::SelectivityBandBenchmark as i32;
@@ -4019,6 +4072,7 @@ impl CoordinatorServiceImpl {
                 enumerate_max_rows: hit.point.enumerate_max_rows,
                 patience_saturation_ppm: hit.point.patience_saturation_ppm,
                 patience_hops: hit.point.patience_hops,
+                finish_settle_us: hit.point.finish_settle_us,
             });
             outcome.filter_selectivity_ppm = selectivity;
             outcome.candidate_depth = hit.point.candidates;
@@ -8161,6 +8215,78 @@ impl CoordinatorServiceImpl {
         }
     }
 
+    /// Push a graceful finish request (`FinishStreamSearch` + advisory UDP
+    /// `FINISH`) to every shard of `fanout` that has not yet delivered its
+    /// scan summary. Unlike `cancel`, finished ANN shards flush buffered hits
+    /// `>= floor` and report `completed = true` so `IdentityReady` succeeds.
+    pub(crate) async fn push_stream_finish(
+        &self,
+        fanout: &StreamFanout,
+        done: &[Option<StreamSearchSummary>],
+        deadline: bool,
+    ) {
+        let req = StreamSearchRequest {
+            payload: Some(stream_search_request::Payload::Finish(
+                crate::pb::FinishStreamSearch { deadline },
+            )),
+        };
+        let mut pending = Vec::new();
+        for (si, tx) in fanout.floor_txs.iter().enumerate() {
+            if done.get(si).is_some_and(Option::is_some) {
+                continue;
+            }
+            let Some(tx) = tx.as_ref() else {
+                continue;
+            };
+            if let (Some(socket), Some((token, target))) =
+                (fanout.udp_socket.as_deref(), fanout.udp_lanes[si])
+            {
+                fanout.send_signal(
+                    socket,
+                    target,
+                    crate::stream_signal::encode_finish(token, deadline),
+                );
+            }
+            match tx.try_send(req.clone()) {
+                Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => pending.push(tx.clone()),
+            }
+        }
+        for tx in pending {
+            let _ = tokio::time::timeout(Duration::from_millis(50), tx.send(req.clone())).await;
+        }
+    }
+
+    fn resolve_finish_windows(
+        &self,
+        filters: &RequestFilters,
+    ) -> Result<(Option<Duration>, Option<Duration>), Status> {
+        let parse_opt = |name: &str, raw: Option<u32>, fallback: Option<Duration>| match raw {
+            Some(us) => {
+                if !(1..=crate::dense_policy::MAX_FINISH_SETTLE_US).contains(&us) {
+                    return Err(Status::invalid_argument(format!(
+                        "{name} {us} is outside 1..={}",
+                        crate::dense_policy::MAX_FINISH_SETTLE_US
+                    )));
+                }
+                Ok(Some(Duration::from_micros(u64::from(us))))
+            }
+            None => Ok(fallback),
+        };
+        Ok((
+            parse_opt(
+                "finish_settle_us",
+                filters.finish_settle_us,
+                self.stream_finish_settle,
+            )?,
+            parse_opt(
+                "finish_deadline_us",
+                filters.finish_deadline_us,
+                self.stream_finish_deadline,
+            )?,
+        ))
+    }
+
     /// [`Self::fanout_search`] over the streaming protocol
     /// (`NodeService.StreamSearch`): shards hold no top-k and emit
     /// every candidate at or above the live floor; the heap here — the
@@ -8210,6 +8336,7 @@ impl CoordinatorServiceImpl {
         }
         // Without k the heap never fills, no floor ever rises, and
         // every shard would emit itself entirely for nothing.
+        let (settle_window, deadline_window) = self.resolve_finish_windows(filters)?;
         if k == 0 {
             if self.scoped_vector_scan() {
                 return Err(Status::invalid_argument(
@@ -8220,6 +8347,7 @@ impl CoordinatorServiceImpl {
                 hits: Vec::new(),
                 summaries: Vec::new(),
                 floors_sent: 0,
+                shards_finished_early: 0,
             });
         }
 
@@ -8257,14 +8385,47 @@ impl CoordinatorServiceImpl {
             }
         }
         let mut terminal = summaries.clone();
+        let active_shards = remaining;
+        let quorum = finish_quorum(active_shards);
+        let mut completed_active = 0usize;
+        let mut finish_sent = false;
+        let mut settle_at: Option<tokio::time::Instant> = None;
+        let mut deadline_at: Option<tokio::time::Instant> =
+            deadline_window.map(|d| tokio::time::Instant::now() + d);
         let mut last_floor = initial_floor.unwrap_or(f32::NEG_INFINITY);
         let mut floors_sent = 0u64;
         let mut scoring_fingerprint: Option<String> = None;
+        enum StreamLoopStep {
+            Settle,
+            Deadline,
+            Message(Result<Option<(usize, StreamSearchResponse)>, Status>),
+        }
         while remaining > 0 {
-            let (shard, msg) = match fanout.next_message(&terminal).await {
-                Ok(Some(pair)) => pair,
-                Ok(None) => continue,
-                Err(status) => return fanout.cancel_with(status).await,
+            let step = tokio::select! {
+                biased;
+                _ = async { tokio::time::sleep_until(deadline_at.expect("guarded")).await }, if deadline_at.is_some() => StreamLoopStep::Deadline,
+                _ = async { tokio::time::sleep_until(settle_at.expect("guarded")).await }, if settle_at.is_some() => StreamLoopStep::Settle,
+                msg = fanout.next_message(&terminal) => StreamLoopStep::Message(msg),
+            };
+            let (shard, msg) = match step {
+                StreamLoopStep::Deadline => {
+                    deadline_at = None;
+                    settle_at = None;
+                    finish_sent = true;
+                    self.push_stream_finish(&fanout, &summaries, true).await;
+                    continue;
+                }
+                StreamLoopStep::Settle => {
+                    settle_at = None;
+                    if !finish_sent {
+                        finish_sent = true;
+                        self.push_stream_finish(&fanout, &summaries, false).await;
+                    }
+                    continue;
+                }
+                StreamLoopStep::Message(Ok(Some(pair))) => pair,
+                StreamLoopStep::Message(Ok(None)) => continue,
+                StreamLoopStep::Message(Err(status)) => return fanout.cancel_with(status).await,
             };
             match msg.payload {
                 Some(stream_search_response::Payload::Batch(batch)) => {
@@ -8282,6 +8443,7 @@ impl CoordinatorServiceImpl {
                         ));
                         return fanout.cancel_with(status).await;
                     }
+                    let mut heap_changed = false;
                     for rec in batch.hits.as_chunks::<12>().0 {
                         let entry = StreamHeapEntry(MergedHit {
                             vector_id: u64::from_le_bytes(rec[..8].try_into().expect("8-byte id")),
@@ -8290,11 +8452,13 @@ impl CoordinatorServiceImpl {
                         });
                         if heap.len() < k as usize {
                             heap.push(entry);
+                            heap_changed = true;
                         } else if cmp_hits(&entry.0, &heap.peek().expect("heap is full").0)
                             == std::cmp::Ordering::Less
                         {
                             heap.pop();
                             heap.push(entry);
+                            heap_changed = true;
                         }
                     }
                     // Full heap: its worst survivor bounds the global
@@ -8311,6 +8475,13 @@ impl CoordinatorServiceImpl {
                             last_floor = floor;
                             floors_sent += 1;
                             self.push_stream_floor(&fanout, floor);
+                        }
+                        if !finish_sent && completed_active >= quorum {
+                            if let Some(window) = settle_window {
+                                if heap_changed || settle_at.is_none() {
+                                    settle_at = Some(tokio::time::Instant::now() + window);
+                                }
+                            }
                         }
                     }
                     self.publish_progress(
@@ -8366,7 +8537,18 @@ impl CoordinatorServiceImpl {
                         return fanout.cancel_with(e).await;
                     }
                     summaries[shard] = Some(summary);
+                    completed_active += 1;
                     remaining -= 1;
+                    if remaining > 0
+                        && !finish_sent
+                        && settle_at.is_none()
+                        && heap.len() == k as usize
+                        && completed_active >= quorum
+                    {
+                        if let Some(window) = settle_window {
+                            settle_at = Some(tokio::time::Instant::now() + window);
+                        }
+                    }
                 }
                 Some(stream_search_response::Payload::Summary(_)) => {
                     return fanout
@@ -8400,6 +8582,11 @@ impl CoordinatorServiceImpl {
         let identities = fanout
             .resolve_identities(&all, &summaries, &mut terminal, &identity_limits)
             .await?;
+        let summaries: Vec<StreamSearchSummary> = summaries
+            .into_iter()
+            .map(|s| s.expect("all summaries arrived"))
+            .collect();
+        let shards_finished_early = count_shards_finished_early(&summaries);
         Ok(StreamFanoutResult {
             hits: all
                 .into_iter()
@@ -8410,11 +8597,9 @@ impl CoordinatorServiceImpl {
                     identity: identities.get(&(h.shard, h.vector_id)).cloned().flatten(),
                 })
                 .collect(),
-            summaries: summaries
-                .into_iter()
-                .map(|s| s.expect("all summaries arrived"))
-                .collect(),
+            summaries,
             floors_sent,
+            shards_finished_early,
         })
     }
 
@@ -8459,6 +8644,7 @@ impl CoordinatorServiceImpl {
         if n_nodes == 0 {
             return Err(Status::failed_precondition("no shard nodes configured"));
         }
+        let (settle_window, deadline_window) = self.resolve_finish_windows(filters)?;
         if k == 0 {
             if self.scoped_vector_scan() {
                 return Err(Status::invalid_argument(
@@ -8471,6 +8657,7 @@ impl CoordinatorServiceImpl {
                 chunk_floor: f32::NEG_INFINITY,
                 summaries: Vec::new(),
                 floors_sent: 0,
+                shards_finished_early: 0,
             });
         }
         let mask = self.vector_scan_mask(filters.tree.as_ref());
@@ -8489,17 +8676,50 @@ impl CoordinatorServiceImpl {
                 remaining -= 1;
             }
         }
+        let active_shards = remaining;
+        let quorum = finish_quorum(active_shards);
+        let mut completed_active = 0usize;
+        let mut finish_sent = false;
+        let mut settle_at: Option<tokio::time::Instant> = None;
+        let mut deadline_at: Option<tokio::time::Instant> =
+            deadline_window.map(|d| tokio::time::Instant::now() + d);
         // The k-th best parent score, recomputed lazily: only a batch
         // that raised some parent's best (or added a parent) can move
         // it, and floors derive from nothing else.
         let mut kth = f32::NEG_INFINITY;
         let mut last_floor = f32::NEG_INFINITY;
         let mut floors_sent = 0u64;
+        enum CollapseLoopStep {
+            Settle,
+            Deadline,
+            Message(Result<Option<(usize, StreamSearchResponse)>, Status>),
+        }
         while remaining > 0 {
-            let (shard, msg) = match fanout.next_message(&summaries).await {
-                Ok(Some(pair)) => pair,
-                Ok(None) => continue,
-                Err(status) => return fanout.cancel_with(status).await,
+            let step = tokio::select! {
+                biased;
+                _ = async { tokio::time::sleep_until(deadline_at.expect("guarded")).await }, if deadline_at.is_some() => CollapseLoopStep::Deadline,
+                _ = async { tokio::time::sleep_until(settle_at.expect("guarded")).await }, if settle_at.is_some() => CollapseLoopStep::Settle,
+                msg = fanout.next_message(&summaries) => CollapseLoopStep::Message(msg),
+            };
+            let (shard, msg) = match step {
+                CollapseLoopStep::Deadline => {
+                    deadline_at = None;
+                    settle_at = None;
+                    finish_sent = true;
+                    self.push_stream_finish(&fanout, &summaries, true).await;
+                    continue;
+                }
+                CollapseLoopStep::Settle => {
+                    settle_at = None;
+                    if !finish_sent {
+                        finish_sent = true;
+                        self.push_stream_finish(&fanout, &summaries, false).await;
+                    }
+                    continue;
+                }
+                CollapseLoopStep::Message(Ok(Some(pair))) => pair,
+                CollapseLoopStep::Message(Ok(None)) => continue,
+                CollapseLoopStep::Message(Err(status)) => return fanout.cancel_with(status).await,
             };
             match msg.payload {
                 Some(stream_search_response::Payload::Batch(batch)) => {
@@ -8537,19 +8757,30 @@ impl CoordinatorServiceImpl {
                             agg.best_id = doc;
                         }
                     }
-                    if dirty && parents.len() >= k as usize {
-                        let mut bests: Vec<f32> = parents.values().map(|a| a.best_score).collect();
-                        let idx = k as usize - 1;
-                        let new_kth = *bests.select_nth_unstable_by(idx, |a, b| b.total_cmp(a)).1;
-                        if new_kth > kth {
-                            kth = new_kth;
-                            // next_down, not bm25::floor_seed: parent
-                            // scores are signed vector scores.
-                            let floor = kth.next_down();
-                            if floor > last_floor {
-                                last_floor = floor;
-                                floors_sent += 1;
-                                self.push_stream_floor(&fanout, floor);
+                    if parents.len() >= k as usize {
+                        if dirty {
+                            let mut bests: Vec<f32> =
+                                parents.values().map(|a| a.best_score).collect();
+                            let idx = k as usize - 1;
+                            let new_kth =
+                                *bests.select_nth_unstable_by(idx, |a, b| b.total_cmp(a)).1;
+                            if new_kth > kth {
+                                kth = new_kth;
+                                // next_down, not bm25::floor_seed: parent
+                                // scores are signed vector scores.
+                                let floor = kth.next_down();
+                                if floor > last_floor {
+                                    last_floor = floor;
+                                    floors_sent += 1;
+                                    self.push_stream_floor(&fanout, floor);
+                                }
+                            }
+                        }
+                        if !finish_sent && completed_active >= quorum {
+                            if let Some(window) = settle_window {
+                                if dirty || settle_at.is_none() {
+                                    settle_at = Some(tokio::time::Instant::now() + window);
+                                }
                             }
                         }
                     }
@@ -8573,7 +8804,18 @@ impl CoordinatorServiceImpl {
                     }
                     summaries[shard] = Some(summary);
                     fanout.mark_completed(shard);
+                    completed_active += 1;
                     remaining -= 1;
+                    if remaining > 0
+                        && !finish_sent
+                        && settle_at.is_none()
+                        && parents.len() >= k as usize
+                        && completed_active >= quorum
+                    {
+                        if let Some(window) = settle_window {
+                            settle_at = Some(tokio::time::Instant::now() + window);
+                        }
+                    }
                 }
                 Some(_) => {
                     return fanout
@@ -8633,15 +8875,18 @@ impl CoordinatorServiceImpl {
                     .collect(),
             });
         }
+        let summaries: Vec<StreamSearchSummary> = summaries
+            .into_iter()
+            .map(|s| s.expect("all summaries arrived"))
+            .collect();
+        let shards_finished_early = count_shards_finished_early(&summaries);
         Ok(CollapseStreamResult {
             hits,
             groups,
             chunk_floor,
-            summaries: summaries
-                .into_iter()
-                .map(|s| s.expect("all summaries arrived"))
-                .collect(),
+            summaries,
             floors_sent,
+            shards_finished_early,
         })
     }
 
@@ -10969,6 +11214,7 @@ impl CoordinatorServiceImpl {
                 chunk_floor: f32::NEG_INFINITY,
                 summaries: Vec::new(),
                 floors_sent: 0,
+                shards_finished_early: 0,
             });
         }
         let backend = self
@@ -11099,6 +11345,7 @@ impl CoordinatorServiceImpl {
             chunk_floor,
             summaries: Vec::new(),
             floors_sent,
+            shards_finished_early: 0,
         })
     }
 
@@ -12518,6 +12765,27 @@ fn summed_patience_stopped(summaries: &[StreamSearchSummary]) -> u32 {
     })
 }
 
+fn count_shards_finished_early(summaries: &[StreamSearchSummary]) -> u32 {
+    summaries
+        .iter()
+        .filter(|summary| {
+            crate::vector::VectorStreamEndReason::from_proto(summary.end_reason).is_early_finish()
+        })
+        .count() as u32
+}
+
+/// Quorum of active shards that must report scan completion before the
+/// coordinator arms its top-`k` stillness settle window: never self-triggers
+/// on a single-shard scan (`1`), `1` on 2 shards, and `floor(3*N/4)` clamped
+/// to `[1, N-1]` on larger fleets (`3` on 4, `6` on 8-9, `12` on 16).
+fn finish_quorum(active_shards: usize) -> usize {
+    if active_shards <= 1 {
+        1
+    } else {
+        (active_shards * 3 / 4).max(1).min(active_shards - 1)
+    }
+}
+
 /// Outcome of one coordinator fan-out: the merged global top-k plus the
 /// per-shard scan statistics (in completion order), the latter powering the
 /// floor-sharing benchmark.
@@ -12558,6 +12826,9 @@ pub struct CollapseStreamResult {
     pub summaries: Vec<StreamSearchSummary>,
     /// Parent-floor raises pushed to the fleet.
     pub floors_sent: u64,
+    /// Shards whose walk ended cleanly via `FinishStreamSearch` (`FINISH_REQUESTED`
+    /// or `DEADLINE`).
+    pub shards_finished_early: u32,
 }
 
 pub struct StreamFanoutResult {
@@ -12569,6 +12840,9 @@ pub struct StreamFanoutResult {
     pub summaries: Vec<StreamSearchSummary>,
     /// Floor raises this coordinator broadcast.
     pub floors_sent: u64,
+    /// Shards whose walk ended cleanly via `FinishStreamSearch` (`FINISH_REQUESTED`
+    /// or `DEADLINE`).
+    pub shards_finished_early: u32,
 }
 
 /// Heap wrapper whose `Ord` IS the merge's total order ([`cmp_hits`]:
@@ -12874,6 +13148,8 @@ impl PlanCounter<'_> {
             enumerate_max_rows: None,
             patience_saturation_ppm: None,
             patience_hops: None,
+            finish_settle_us: None,
+            finish_deadline_us: None,
         };
         let count = crate::pb::CompiledAggregation {
             expr: Some(crate::cel::compile_value("1")?),
@@ -13085,6 +13361,9 @@ impl SearchService for CoordinatorServiceImpl {
             filters.enumerate_max_rows = req.enumerate_max_rows;
             filters.patience_saturation_ppm = req.patience_saturation_ppm;
             filters.patience_hops = req.patience_hops;
+            filters.finish_settle_us = req.finish_settle_us;
+            filters.finish_deadline_us = req.finish_deadline_us;
+            let _ = self.resolve_finish_windows(&filters)?;
             self.check_vector_scan(&filters, req.collapse_parents)?;
             // The fleet scores in one space or not at all: mixed provider
             // kinds or fingerprints are refused before any shard is asked
@@ -13103,6 +13382,7 @@ impl SearchService for CoordinatorServiceImpl {
                         filter_regimes: None,
                         tail_enumerated_rows: 0,
                         patience_stopped: 0,
+                        shards_finished_early: 0,
                         segments_total: 0,
                         segments_skipped: 0,
                         request_id,
@@ -13128,6 +13408,7 @@ impl SearchService for CoordinatorServiceImpl {
                     filter_regimes: None,
                     tail_enumerated_rows: 0,
                     patience_stopped: 0,
+                    shards_finished_early: 0,
                     segments_total: 0,
                     segments_skipped: 0,
                     request_id,
@@ -13137,13 +13418,16 @@ impl SearchService for CoordinatorServiceImpl {
                 }));
             }
 
+            let use_streaming = self.stream_search
+                || filters.finish_settle_us.is_some()
+                || filters.finish_deadline_us.is_some();
             let result = if req.collapse_parents {
                 // Document mode on a streaming coordinator: parents
                 // aggregate here from tagged chunk emissions, and the
                 // response carries the per-parent chunk groups. The bidi
                 // path collapses shard-side and returns representatives
                 // only.
-                if self.stream_search {
+                if use_streaming {
                     let doc = self
                         .fanout_stream_search_collapse(&request_id, &req.vector, k, &filters)
                         .await?;
@@ -13151,6 +13435,7 @@ impl SearchService for CoordinatorServiceImpl {
                         filter_regimes: summed_filter_regimes(&doc.summaries),
                         tail_enumerated_rows: summed_tail_enumerated_rows(&doc.summaries),
                         patience_stopped: summed_patience_stopped(&doc.summaries),
+                        shards_finished_early: doc.shards_finished_early,
                         segments_total: 0,
                         segments_skipped: 0,
                         request_id,
@@ -13161,7 +13446,7 @@ impl SearchService for CoordinatorServiceImpl {
                 }
                 self.fanout_search_collapse(&request_id, &req.vector, k, &filters)
                     .await?
-            } else if self.stream_search {
+            } else if use_streaming {
                 let streamed = self
                     .fanout_stream_search(&request_id, &req.vector, k, None, &filters)
                     .await?;
@@ -13169,6 +13454,7 @@ impl SearchService for CoordinatorServiceImpl {
                     filter_regimes: summed_filter_regimes(&streamed.summaries),
                     tail_enumerated_rows: summed_tail_enumerated_rows(&streamed.summaries),
                     patience_stopped: summed_patience_stopped(&streamed.summaries),
+                    shards_finished_early: streamed.shards_finished_early,
                     segments_total: 0,
                     segments_skipped: 0,
                     request_id,
@@ -13204,6 +13490,7 @@ impl SearchService for CoordinatorServiceImpl {
                 filter_regimes: regimes.to_proto(),
                 tail_enumerated_rows,
                 patience_stopped,
+                shards_finished_early: 0,
                 segments_total,
                 segments_skipped,
                 request_id,
@@ -13555,6 +13842,9 @@ impl SearchService for CoordinatorServiceImpl {
             filters.enumerate_max_rows = req.enumerate_max_rows;
             filters.patience_saturation_ppm = req.patience_saturation_ppm;
             filters.patience_hops = req.patience_hops;
+            filters.finish_settle_us = req.finish_settle_us;
+            filters.finish_deadline_us = req.finish_deadline_us;
+            let _ = self.resolve_finish_windows(&filters)?;
             // leg_k: default max(k, rrf_k) so the RRF constant never exceeds a
             // leg's depth; explicit values below k are clamped to k.
             let options = req.legs.unwrap_or_default();

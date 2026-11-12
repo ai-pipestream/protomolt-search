@@ -379,6 +379,15 @@ pub struct Config {
     /// holds the only top-k). Identical results, different pruning
     /// locus. Off by default.
     pub stream_search: bool,
+    /// Coordinator: default top-`k` stillness window (µs) before sending
+    /// `FinishStreamSearch` to unfinished ANN shards.
+    pub stream_finish_settle_us: Option<u32>,
+    /// Coordinator: default streaming deadline (µs) before sending
+    /// `FinishStreamSearch { deadline: true }` to unfinished ANN shards.
+    pub stream_finish_deadline_us: Option<u32>,
+    /// Node: optional per-poll sleep (µs) injected on streaming searches for
+    /// straggler fault injection in benchmarks and tests.
+    pub stream_poll_delay_us: Option<u64>,
     /// Coordinator: serve as a RELAY (`docs/relay-coordinators.md`): the
     /// node-facing surface over this coordinator's shard set, presented
     /// to a parent coordinator as one shard. StreamSearch, TermStats,
@@ -680,6 +689,9 @@ struct FileConfig {
     max_message_mib: Option<usize>,
     demo_query: Option<bool>,
     stream_search: Option<bool>,
+    stream_finish_settle_us: Option<u32>,
+    stream_finish_deadline_us: Option<u32>,
+    stream_poll_delay_us: Option<u64>,
     relay: Option<bool>,
     bm25_stream: Option<bool>,
     max_k: Option<u32>,
@@ -1918,6 +1930,48 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             .unwrap_or(false)
         || file.stream_search.unwrap_or(false);
 
+    let parse_window_us =
+        |key: &str, env: &str, from_file: Option<u32>| -> Result<Option<u32>, String> {
+            let value = match opt(args, key, env, None) {
+                Some(raw) => Some(
+                    raw.parse::<u32>()
+                        .map_err(|e| format!("invalid --{key}: {e}"))?,
+                ),
+                None => from_file,
+            };
+            if let Some(us) = value {
+                if !(1..=crate::dense_policy::MAX_FINISH_SETTLE_US).contains(&us) {
+                    return Err(format!(
+                        "--{key} {us} is outside 1..={}",
+                        crate::dense_policy::MAX_FINISH_SETTLE_US
+                    ));
+                }
+            }
+            Ok(value)
+        };
+    let stream_finish_settle_us = parse_window_us(
+        "stream-finish-settle-us",
+        "TURBOVEC_STREAM_FINISH_SETTLE_US",
+        file.stream_finish_settle_us,
+    )?;
+    let stream_finish_deadline_us = parse_window_us(
+        "stream-finish-deadline-us",
+        "TURBOVEC_STREAM_FINISH_DEADLINE_US",
+        file.stream_finish_deadline_us,
+    )?;
+    let stream_poll_delay_us = match opt(
+        args,
+        "stream-poll-delay-us",
+        "TURBOVEC_STREAM_POLL_DELAY_US",
+        None,
+    ) {
+        Some(raw) => Some(
+            raw.parse::<u64>()
+                .map_err(|e| format!("invalid --stream-poll-delay-us: {e}"))?,
+        ),
+        None => file.stream_poll_delay_us,
+    };
+
     let relay = flag_present(args, "relay")
         || std::env::var("PIPESTREAM_SEARCH_RELAY")
             .map(|s| parse_env_bool(&s))
@@ -2651,6 +2705,9 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         max_message_bytes,
         demo_query,
         stream_search,
+        stream_finish_settle_us,
+        stream_finish_deadline_us,
+        stream_poll_delay_us,
         relay,
         bm25_stream,
         max_k,

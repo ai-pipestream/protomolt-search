@@ -13,6 +13,7 @@
 const MAGIC: [u8; 4] = *b"TVS1";
 const RAISE_FLOOR: u8 = 1;
 const CANCEL: u8 = 2;
+const FINISH: u8 = 3;
 
 /// Four magic bytes, one opcode, three reserved bytes, a token, and an f32.
 pub(crate) const FRAME_LEN: usize = 20;
@@ -21,6 +22,7 @@ pub(crate) const FRAME_LEN: usize = 20;
 pub(crate) enum StreamSignal {
     RaiseFloor { token: u64, floor: f32 },
     Cancel { token: u64 },
+    Finish { token: u64, deadline: bool },
 }
 
 pub(crate) fn encode_floor(token: u64, floor: f32) -> [u8; FRAME_LEN] {
@@ -30,6 +32,10 @@ pub(crate) fn encode_floor(token: u64, floor: f32) -> [u8; FRAME_LEN] {
 
 pub(crate) fn encode_cancel(token: u64) -> [u8; FRAME_LEN] {
     encode(token, CANCEL, 0.0)
+}
+
+pub(crate) fn encode_finish(token: u64, deadline: bool) -> [u8; FRAME_LEN] {
+    encode(token, FINISH, if deadline { 1.0 } else { 0.0 })
 }
 
 fn encode(token: u64, opcode: u8, value: f32) -> [u8; FRAME_LEN] {
@@ -92,6 +98,14 @@ pub(crate) fn decode(frame: &[u8]) -> Option<StreamSignal> {
             (!floor.is_nan()).then_some(StreamSignal::RaiseFloor { token, floor })
         }
         CANCEL if frame[16..20] == 0.0f32.to_le_bytes() => Some(StreamSignal::Cancel { token }),
+        FINISH if frame[16..20] == 0.0f32.to_le_bytes() => Some(StreamSignal::Finish {
+            token,
+            deadline: false,
+        }),
+        FINISH if frame[16..20] == 1.0f32.to_le_bytes() => Some(StreamSignal::Finish {
+            token,
+            deadline: true,
+        }),
         _ => None,
     }
 }
@@ -112,6 +126,28 @@ mod tests {
         assert_eq!(
             decode(&encode_cancel(7)),
             Some(StreamSignal::Cancel { token: 7 })
+        );
+        assert_eq!(
+            decode(&encode_finish(7, false)),
+            Some(StreamSignal::Finish {
+                token: 7,
+                deadline: false
+            })
+        );
+        assert_eq!(
+            decode(&encode_finish(7, true)),
+            Some(StreamSignal::Finish {
+                token: 7,
+                deadline: true
+            })
+        );
+
+        let mut bad_finish = encode_finish(7, false);
+        bad_finish[16..20].copy_from_slice(&2.0f32.to_le_bytes());
+        assert_eq!(
+            decode(&bad_finish),
+            None,
+            "finish value must be canonical 0.0 or 1.0"
         );
 
         let mut bad = encode_cancel(7);
@@ -161,6 +197,17 @@ mod tests {
             decode_signed(&key, &encode_floor(7, 0.5)),
             None,
             "a plain frame is not signed"
+        );
+        let signed_finish = sign(&key, 43, &encode_finish(9, true));
+        assert_eq!(
+            decode_signed(&key, &signed_finish),
+            Some((
+                StreamSignal::Finish {
+                    token: 9,
+                    deadline: true
+                },
+                43
+            ))
         );
     }
 }

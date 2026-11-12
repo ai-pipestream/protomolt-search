@@ -419,11 +419,76 @@ One walk per query at the request's depth. Every allowed row the walk
 scores at layer 0 (the entry point included; the rows the descent scores
 are not) and whose exact score is at or above the floor is emitted, in
 batches of up to 64 as the walk proceeds, each batch ordered score
-descending then row ascending. The control callback is polled after every
-expansion. `Stop` from either callback ends the stream uncompleted; a floor
-raised by either gates the rest of that query and every later one, and a
-buffered row that fell below a floor raised since it was scored is dropped
-before the sink sees it.
+descending then row ascending. To seed the coordinator's global top-`k`
+floor without waiting for 64 layer-0 candidates, `StreamHook` performs an
+early first-flush after `STREAM_FIRST_FLUSH_HOPS = 2` layer-0 expansions
+whenever at least `STREAM_FIRST_FLUSH_ROWS = 8` rows are buffered above the
+current floor.
+
+The control callback is polled after every expansion:
+
+- `Stop` (`StopStreamSearch` / `TVS1` UDP `CANCEL = 2`) abandons the walk
+  immediately (`completed = false`, `end_reason = ABANDONED`); any partial
+  shard emissions are discarded.
+- `Finish` (`FinishStreamSearch` / `TVS1` UDP `FINISH = 3`, `#100`) ends the
+  layer-0 walk cleanly at the next hop (`completed = true`,
+  `end_reason = FINISH_REQUESTED` or `DEADLINE`), flushes any buffered
+  candidates still at or above the latest floor, emits its normal terminal
+  `StreamSearchSummary` (or `IdentityReady` followed by
+  `ResolveStreamIdentities`), and closes the stream so its rows count as a
+  usable ANN result. Exhaustive providers (`EXHAUSTIVE_NATIVE_SCORE`) and the
+  exact `Enumerate` filter regime ignore `Finish` so an `EXACT` or
+  exhaustive-regime scan never returns truncated results claiming completion.
+- A floor raised by either callback gates the rest of that query and every
+  later one, and a buffered row that fell below a floor raised since it was
+  scored is dropped before the sink sees it.
+
+### Graceful stream close (`#100`)
+
+On a multi-shard streaming fanout (`fanout_stream_search` and
+`fanout_stream_search_collapse`), once a shard has `floor-sharing` enabled
+and an approximate traversal active, the coordinator may send
+`FinishStreamSearch` (paired with an advisory `TVS1` UDP `FINISH = 3`
+datagram, HMAC-SHA256 authenticated when `--udp-hmac-key` is configured) under
+two optional microsecond windows (`--stream-finish-settle-us` /
+`--stream-finish-deadline-us`, per-request `finish_settle_us` /
+`finish_deadline_us`, or policy-bound `DensePolicyPoint.finish_settle_us`):
+
+- **Settle window (`finish_settle_us`).** Armed only after the merged global
+  top-`k` heap (or `k` parent groups in collapse mode) is full **and** a shard
+  quorum (`1` for `<= 2` active shards, `floor(3N / 4)` for `N > 2`, so 12 of
+  16 shards) has reached `IdentityReady` / `Summary`. Every improvement to the
+  merged `k`-th floor resets the settle timer; if the timer expires with
+  stragglers still walking, the coordinator pushes `Finish { deadline: false }`
+  to the remaining active shards.
+- **Deadline window (`finish_deadline_us`).** Bounds total streaming fanout
+  wall time by pushing `Finish { deadline: true }` to remaining shards when
+  expired, reporting `end_reason = DEADLINE` while keeping `completed = true`
+  on approximate walks.
+
+Relays (`RelayNodeService`) forward both the advisory UDP `FINISH` datagram
+and the authoritative gRPC `FinishStreamSearch` message to unfinished children
+and merge child `StreamEndReason` values (`Abandoned > Deadline >
+FinishRequested > FloorPruned > Exhausted`). The number of shards that ended via
+`FINISH_REQUESTED` or `DEADLINE` is reported in
+`SearchResponse.shards_finished_early` and
+`DenseExecutionOutcome.shards_finished_early` (withheld on document-scoped
+responses).
+
+On a 16-shard Raspberry Pi 5 fleet (`court200k`, 200,000 × 256 FP32 vectors,
+8 shard hosts × 2 shards + 1 coordinator Pi 5, 5 staggered repeats):
+- **Uniform fleet (`hash` and spherical `kmeans`):** `shards_finished_early = 0`
+  and bit-identical recall across `k ∈ {100, 1000, 10000}` (zero false-positive
+  early closes).
+- **Straggler shard (`hash`, `350 µs/hop`, `settle_us = 500`):** cuts `p50`
+  from `430.7 ms → 143.8 ms` (`3.00×`, `recall@1000 = 0.9976` vs `0.9977`) and
+  from `4,295.4 ms → 261.8 ms` (`16.4×`, `recall@10000 = 0.9975` vs `0.9981`).
+- **Straggler Voronoi shard (`kmeans`):** at `settle_us = 15,000..30,000`
+  (wider than a stalled hot cluster's inter-batch interval so active top-`k`
+  batches reset the settle timer while cold-cluster stragglers close), cuts
+  `k = 1,000` `p50` (`350 µs/hop`) from `430.4 ms → 175.9 ms` (`2.45×`,
+  `recall@1000 = 0.9658` vs `0.9698`) and `k = 10,000` `p50` (`50 µs/hop`) from
+  `1,081.5 ms → 320.2 ms` (`3.38×`, `recall@10000 = 0.9712` vs `0.9734`).
 
 ## Rows and their identity
 

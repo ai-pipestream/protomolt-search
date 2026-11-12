@@ -297,13 +297,16 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 bigram_fields: cfg.bigram_fields.clone(),
                 sentence_fields: cfg.sentence_fields.clone(),
             };
-            let node = if shard.demo.is_some() {
+            let mut node = if shard.demo.is_some() {
                 NodeServiceImpl::new(load_shard_index(shard, None)?, node_config)
                     .with_phrase_index(phrase_index.clone())
             } else {
                 NodeServiceImpl::open(node_config, phrase_index.clone(), cfg.allow_missing_bm25)?
             }
             .with_flush_notify(std::sync::Arc::clone(&flush_notify));
+            if let Some(us) = cfg.stream_poll_delay_us.filter(|&us| us > 0) {
+                node = node.with_stream_poll_delay(std::time::Duration::from_micros(us));
+            }
             let listener = TcpListener::bind(shard.listen).await?;
             let addr: SocketAddr = listener.local_addr()?;
             // The UDP stream-signal lane shares the gRPC listener's host:port.
@@ -625,6 +628,8 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 enumerate_max_rows: None,
                 patience_saturation_ppm: None,
                 patience_hops: None,
+                finish_settle_us: None,
+                finish_deadline_us: None,
             })
             .await?
             .into_inner();
@@ -1383,6 +1388,14 @@ async fn build_corpus(
         })
         .with_replicas(dataset.replica_addrs.to_vec())
         .with_stream_search(cfg.stream_search)
+        .with_stream_finish_settle(
+            cfg.stream_finish_settle_us
+                .map(|us| std::time::Duration::from_micros(u64::from(us))),
+        )
+        .with_stream_finish_deadline(
+            cfg.stream_finish_deadline_us
+                .map(|us| std::time::Duration::from_micros(u64::from(us))),
+        )
         .with_bm25_stream(cfg.bm25_stream)
         .with_max_k(cfg.max_k)
         .with_signal_batch(cfg.signal_batch)

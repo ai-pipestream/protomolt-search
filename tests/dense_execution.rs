@@ -247,6 +247,7 @@ fn qualified_point() -> DensePolicyPoint {
         enumerate_max_rows: None,
         patience_saturation_ppm: None,
         patience_hops: None,
+        finish_settle_us: None,
     }
 }
 
@@ -563,6 +564,26 @@ async fn a_filter_keys_the_point_on_its_live_selectivity() {
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     assert!(
         error.message().contains("patience") && error.message().contains("patience_early_stop"),
+        "{}",
+        error.message()
+    );
+    // And a point naming `finish_settle_us` is refused on a provider that does
+    // not advertise `candidate_stream`.
+    let with_finish = format!("{text}finish_settle_us = 250\n");
+    let coordinator = fixture
+        .coordinator
+        .clone()
+        .with_dense_execution_policy(load_policy("finish", &with_finish));
+    let error = query(
+        &coordinator,
+        request(2, 0, filtered("court == \"ca9\"", leaf())),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        error.message().contains("finish_settle_us 250")
+            && error.message().contains("candidate_stream"),
         "{}",
         error.message()
     );

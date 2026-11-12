@@ -1656,6 +1656,12 @@ message StreamSearchRequest {
     // Only after IdentityReady, exactly once. Select the final winning IDs
     // from this stream's scan snapshot; an empty selection releases it.
     ResolveStreamIdentities resolve_identities = 4;
+    // Gracefully closes an approximate scan at the next hop boundary (#100):
+    // buffered candidates at or above the floor are flushed, the terminal
+    // summary (or IdentityReady) arrives with `completed = true` and
+    // `end_reason = FINISH_REQUESTED` or `DEADLINE`, and the stream closes.
+    // Ignored by exhaustive scan providers.
+    FinishStreamSearch finish = 5;
   }
 }
 
@@ -1776,8 +1782,42 @@ message StreamIdentities {
 // Authoritative abandon request for a streaming scan. The coordinator may
 // send a typed UDP CANCEL first to reduce reaction latency, but this gRPC
 // message defines the protocol action. A stopped scan returns
-// `StreamSearchSummary.completed = false`.
+// `StreamSearchSummary.completed = false` and `end_reason = ABANDONED`.
 message StopStreamSearch {}
+
+// Graceful close request for an approximate streaming scan (#100). The
+// coordinator may send a typed UDP FINISH first to reduce reaction latency,
+// paired with this gRPC message. Unlike StopStreamSearch, buffered rows at or
+// above the floor are flushed and the scan completes cleanly (`completed =
+// true`) with `end_reason = FINISH_REQUESTED` (or `DEADLINE` when `deadline`
+// is set). Ignored by exhaustive scan providers.
+message FinishStreamSearch {
+  // True when graceful close was triggered by the request deadline rather
+  // than global top-k settle stillness.
+  bool deadline = 1;
+}
+
+// Why a shard's streaming scan ended (#100).
+enum StreamEndReason {
+  STREAM_END_REASON_UNSPECIFIED = 0;
+  // Every allowed row or logical chunk in the shard was evaluated.
+  STREAM_END_REASON_EXHAUSTED = 1;
+  // Approximate graph walk converged naturally (beam frontier exhausted or
+  // patience saturated).
+  STREAM_END_REASON_WALK_CONVERGED = 2;
+  // Approximate graph walk ended because remaining candidates fell below the
+  // active score floor.
+  STREAM_END_REASON_FLOOR_PRUNED = 3;
+  // Coordinator requested a graceful finish (`FinishStreamSearch`) after the
+  // global top-k settled.
+  STREAM_END_REASON_FINISH_REQUESTED = 4;
+  // Coordinator requested a graceful finish (`FinishStreamSearch.deadline`) at
+  // the request deadline.
+  STREAM_END_REASON_DEADLINE = 5;
+  // Scan was abandoned (`StopStreamSearch`, UDP CANCEL, or closed stream);
+  // `completed` is false.
+  STREAM_END_REASON_ABANDONED = 6;
+}
 
 // One message on the shard-to-client leg of `StreamSearch`.
 message StreamSearchResponse {
@@ -1862,6 +1902,8 @@ message StreamSearchSummary {
   // docs/hnsw.md, "Patience"). Zero when patience is off or on exhaustive
   // scan providers.
   uint32 patience_stopped = 12;
+  // Why this shard's streaming scan ended (#100; docs/hnsw.md).
+  StreamEndReason end_reason = 13;
 }
 
 // How a provider that can steer its search by the filter answered: one
@@ -2220,6 +2262,13 @@ message SearchRequest {
   // as `StartShardSearch.patience_saturation_ppm` and `patience_hops`.
   optional uint32 patience_saturation_ppm = 10;
   optional uint32 patience_hops = 11;
+  // Settle window in microseconds after the global top-k heap fills and a
+  // shard quorum completes before the coordinator sends `FinishStreamSearch`
+  // to remaining approximate shards (#100). Absent = coordinator default (off).
+  optional uint32 finish_settle_us = 12;
+  // Graceful finish deadline in microseconds for approximate streaming scans
+  // (#100): sends `FinishStreamSearch { deadline = true }` when reached.
+  optional uint32 finish_deadline_us = 13;
 }
 
 // Client-facing search response.
@@ -2257,6 +2306,9 @@ message SearchResponse {
   // Layer-0 graph walks that ended early via patience saturation, summed over
   // every shard searched (#95; docs/hnsw.md, "Patience").
   uint32 patience_stopped = 9;
+  // Shards whose approximate streaming walk ended early via
+  // `FinishStreamSearch` (`FINISH_REQUESTED` or `DEADLINE`; #100).
+  uint32 shards_finished_early = 10;
 }
 
 // One parent document's chunks in a document-mode search response.
@@ -4766,6 +4818,11 @@ message HybridSearchRequest {
   // `patience_hops`.
   optional uint32 patience_saturation_ppm = 13;
   optional uint32 patience_hops = 14;
+  // Graceful stream-finish settle window and deadline in microseconds for an
+  // approximate vector leg (#100), as `SearchRequest.finish_settle_us` and
+  // `finish_deadline_us`.
+  optional uint32 finish_settle_us = 15;
+  optional uint32 finish_deadline_us = 16;
 }
 
 // Profile of one hybrid query; populated only when the request set
@@ -6041,6 +6098,10 @@ message DenseExecutionOutcome {
   // every shard searched (#95; docs/hnsw.md, "Patience"). Withheld when
   // physical execution details are redacted.
   uint32 patience_stopped = 16;
+  // Shards whose approximate streaming walk ended early via
+  // `FinishStreamSearch` (#100; docs/hnsw.md). Withheld when physical
+  // execution details are redacted.
+  uint32 shards_finished_early = 17;
 }
 
 // One measured point of a dense execution policy
@@ -6061,6 +6122,9 @@ message DensePolicyPoint {
   // together or absent together.
   optional uint32 patience_saturation_ppm = 7;
   optional uint32 patience_hops = 8;
+  // Optional settle window in microseconds the point was measured under and
+  // is served under for graceful stream finish (#100; docs/hnsw.md).
+  optional uint32 finish_settle_us = 9;
 }
 
 // Public streaming query controls. The query itself is byte-for-byte the

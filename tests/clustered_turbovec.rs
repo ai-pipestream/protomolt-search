@@ -399,6 +399,8 @@ async fn embedded_in_process_and_external_transports_are_bit_exact() {
             enumerate_max_rows: None,
             patience_saturation_ppm: None,
             patience_hops: None,
+            finish_settle_us: None,
+            finish_deadline_us: None,
         }),
     )
     .await
@@ -418,6 +420,8 @@ async fn embedded_in_process_and_external_transports_are_bit_exact() {
             enumerate_max_rows: None,
             patience_saturation_ppm: None,
             patience_hops: None,
+            finish_settle_us: None,
+            finish_deadline_us: None,
         }),
     )
     .await
@@ -447,6 +451,8 @@ async fn embedded_in_process_and_external_transports_are_bit_exact() {
             enumerate_max_rows: None,
             patience_saturation_ppm: None,
             patience_hops: None,
+            finish_settle_us: None,
+            finish_deadline_us: None,
         }),
     )
     .await

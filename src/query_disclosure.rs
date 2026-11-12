@@ -83,12 +83,14 @@ pub(crate) fn redact_execution(response: &mut QueryResponse) {
         filter_regimes,
         tail_enumerated_rows,
         patience_stopped,
+        shards_finished_early,
     }) = dense_execution
     {
-        // Counts per segment searched: the physical layout.
+        // Counts per segment/shard searched: the physical layout.
         *filter_regimes = None;
         *tail_enumerated_rows = 0;
         *patience_stopped = 0;
+        *shards_finished_early = 0;
         planner_reason.clear();
         policy_id.clear();
         *filter_selectivity_ppm = 0;
@@ -101,6 +103,7 @@ pub(crate) fn redact_execution(response: &mut QueryResponse) {
             enumerate_max_rows,
             patience_saturation_ppm: _,
             patience_hops: _,
+            finish_settle_us: _,
         }) = policy_point
         {
             *filter_selectivity_ppm_min = 0;
@@ -179,6 +182,7 @@ mod tests {
                     enumerate_max_rows: Some(4096),
                     patience_saturation_ppm: Some(990_000),
                     patience_hops: Some(15),
+                    finish_settle_us: Some(250),
                 }),
                 filter_selectivity_ppm: 500_000,
                 candidate_depth: 100,
@@ -191,6 +195,7 @@ mod tests {
                 }),
                 tail_enumerated_rows: 42,
                 patience_stopped: 7,
+                shards_finished_early: 2,
             }),
             ..Default::default()
         };
@@ -242,6 +247,7 @@ mod tests {
         assert_eq!(execution.filter_regimes, None);
         assert_eq!(execution.tail_enumerated_rows, 0);
         assert_eq!(execution.patience_stopped, 0);
+        assert_eq!(execution.shards_finished_early, 0);
         assert_eq!(execution.policy_fingerprint, "b".repeat(64));
         assert_eq!(
             execution.policy_point,
@@ -251,6 +257,7 @@ mod tests {
                 measured_recall_ppm: 980_000,
                 patience_saturation_ppm: Some(990_000),
                 patience_hops: Some(15),
+                finish_settle_us: Some(250),
                 ..Default::default()
             })
         );

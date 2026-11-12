@@ -49,7 +49,7 @@ use crate::vector::{
     first_invalid_coordinate, FilterRegime, Mask, PatienceSpec, PatienceWindow, QualityContract,
     ScoreDirection, VectorBackendConfig, VectorBackendDescriptor, VectorCapability, VectorError,
     VectorIndex, VectorProvider, VectorSearchOptions, VectorSearchResults, VectorStreamBatch,
-    VectorStreamControl, VectorStreamSummary,
+    VectorStreamControl, VectorStreamEndReason, VectorStreamSummary,
 };
 
 use distance::prefetch;
@@ -76,6 +76,12 @@ pub const MIN_GRAPH_ROWS: usize = 256;
 const PARALLEL_MIN_BATCH: usize = 256;
 /// Streaming emission batch: rows scored before the sink is called.
 const STREAM_BATCH_ROWS: usize = 64;
+/// Hops before `StreamHook` emits its early first-flush batch so the
+/// coordinator establishes a global floor without waiting for 64 rows.
+const STREAM_FIRST_FLUSH_HOPS: usize = 2;
+/// Minimum buffered rows required for the early first-flush after
+/// [`STREAM_FIRST_FLUSH_HOPS`] layer-0 hops.
+const STREAM_FIRST_FLUSH_ROWS: usize = 8;
 /// Rows the enumerate regime streams between polls of the control.
 const STREAM_POLL_ROWS: usize = 16;
 /// Enumerate wins while the allowed rows cost less to score in row order
@@ -700,7 +706,7 @@ impl HnswIndex {
                         hook.scored(node, 0.0, view.row(node));
                     }
                 }
-                if hook.stopped {
+                if hook.stopped || hook.finish_reason.is_some() {
                     return false;
                 }
                 if chunk.len() == STREAM_POLL_ROWS && !hook.hop() {
@@ -734,17 +740,17 @@ impl HnswIndex {
                 ControlFlow::Continue(())
             });
             if flow.is_break() {
-                return (total_scored, false);
+                return (total_scored, !hook.stopped);
             }
             if cur_len > 0
                 && !run_chunk(&cur[..cur_len], &next[..next_len], hook, &mut total_scored)
             {
-                return (total_scored, false);
+                return (total_scored, !hook.stopped);
             }
             if next_len > 0 && !run_chunk(&next[..next_len], &[], hook, &mut total_scored) {
-                return (total_scored, false);
+                return (total_scored, !hook.stopped);
             }
-            (total_scored, true)
+            (total_scored, !hook.stopped)
         })
     }
 
@@ -763,17 +769,21 @@ impl HnswIndex {
 /// The streaming walk's hook: rescores every allowed row the walk scores
 /// with the scalar scorer, buffers those at or above the floor, hands
 /// batches to the sink ordered score descending then row ascending, polls
-/// the control after each expansion, and lets either raise the floor or
-/// stop.
+/// the control after each expansion, and lets either raise the floor,
+/// finish gracefully at a hop boundary (`#100`), or abandon (`Stop`).
 struct StreamHook<'a> {
     query_index: usize,
     query: &'a [f32],
     floor: &'a mut f32,
+    allow_early_finish: bool,
+    hops: usize,
+    flushed_once: bool,
     scores: Vec<f32>,
     slots: Vec<i64>,
     sink: &'a mut dyn FnMut(&VectorStreamBatch<'_>) -> VectorStreamControl,
     control: &'a mut dyn FnMut() -> VectorStreamControl,
     stopped: bool,
+    finish_reason: Option<VectorStreamEndReason>,
     emitted: usize,
 }
 
@@ -784,6 +794,15 @@ impl StreamHook<'_> {
             VectorStreamControl::RaiseFloor(raised) => {
                 if raised > *self.floor {
                     *self.floor = raised;
+                }
+            }
+            VectorStreamControl::Finish { deadline } => {
+                if self.allow_early_finish && self.finish_reason.is_none() {
+                    self.finish_reason = Some(if deadline {
+                        VectorStreamEndReason::Deadline
+                    } else {
+                        VectorStreamEndReason::FinishRequested
+                    });
                 }
             }
             VectorStreamControl::Stop => self.stopped = true,
@@ -823,6 +842,7 @@ impl StreamHook<'_> {
         let slots: Vec<i64> = order.iter().map(|&i| self.slots[i]).collect();
         self.scores = scores;
         self.slots = slots;
+        self.flushed_once = true;
         self.emitted += kept;
         let decision = (self.sink)(&VectorStreamBatch {
             query_index: self.query_index,
@@ -853,11 +873,20 @@ impl Hook for StreamHook<'_> {
     }
 
     fn hop(&mut self) -> bool {
-        if !self.stopped {
+        self.hops += 1;
+        if !self.stopped && self.finish_reason.is_none() {
             let decision = (self.control)();
             self.apply(decision);
         }
-        !self.stopped
+        if !self.stopped
+            && self.finish_reason.is_none()
+            && !self.flushed_once
+            && self.hops >= STREAM_FIRST_FLUSH_HOPS
+            && self.scores.len() >= STREAM_FIRST_FLUSH_ROWS
+        {
+            self.flush();
+        }
+        !self.stopped && self.finish_reason.is_none()
     }
 }
 
@@ -1077,12 +1106,14 @@ impl VectorProvider for HnswIndex {
             )));
         }
         let ef = depth.max(EF_FLOOR);
+        let allow_early_finish = options.filter_regime != Some(FilterRegime::Enumerate);
         let plan = self.plan(ef, &options)?;
         let linked = self.is_graph_linked();
         let mut floor = options.minimum_score.unwrap_or(f32::NEG_INFINITY);
         let mut emitted = 0usize;
         let mut units = 0usize;
         let mut stopped = false;
+        let mut end_reason = VectorStreamEndReason::Unspecified;
         let mut regimes = crate::vector::FilterRegimeCounts::default();
         let mut tail_enumerated_rows = 0u64;
         let mut patience_stopped = 0u32;
@@ -1092,25 +1123,30 @@ impl VectorProvider for HnswIndex {
                     query_index,
                     query,
                     floor: &mut floor,
+                    allow_early_finish,
+                    hops: 0,
+                    flushed_once: false,
                     scores: Vec::with_capacity(STREAM_BATCH_ROWS),
                     slots: Vec::with_capacity(STREAM_BATCH_ROWS),
                     sink,
                     control,
                     stopped: false,
+                    finish_reason: None,
                     emitted: 0,
                 };
                 let mut answered = plan.regime;
                 let mut budget_handoff = false;
-                let (scored, completed) = if !linked {
+                let (scored, completed, query_reason) = if !linked {
                     answered = plan.regime.map(|_| FilterRegime::Enumerate);
                     let allow = plan.allow.unwrap_or(Mask::All(self.len()));
                     let (rows, done) = self.stream_rows(allow, |_| false, &mut hook);
                     tail_enumerated_rows = tail_enumerated_rows.saturating_add(rows as u64);
-                    (rows, done)
+                    (rows, done, VectorStreamEndReason::Exhausted)
                 } else {
                     match (plan.regime, plan.allow) {
                         (Some(FilterRegime::Enumerate), Some(allow)) => {
-                            self.stream_rows(allow, |_| false, &mut hook)
+                            let (rows, done) = self.stream_rows(allow, |_| false, &mut hook);
+                            (rows, done, VectorStreamEndReason::Exhausted)
                         }
                         _ => {
                             let patience = plan.patience(ef, *hook.floor);
@@ -1128,7 +1164,7 @@ impl VectorProvider for HnswIndex {
                                     answered = Some(FilterRegime::Enumerate);
                                     let (rows, done) =
                                         self.stream_rows(allow, |_| false, &mut hook);
-                                    (walked + rows, done)
+                                    (walked + rows, done, VectorStreamEndReason::Exhausted)
                                 }
                                 // The walk already emitted the rows it reached.
                                 (Walk::Short | Walk::Budget, Some(allow)) => {
@@ -1136,13 +1172,15 @@ impl VectorProvider for HnswIndex {
                                     budget_handoff = walk == Walk::Budget;
                                     let (rows, done) =
                                         self.stream_rows(allow, |row| scratch.seen(row), &mut hook);
-                                    (walked + rows, done)
+                                    (walked + rows, done, VectorStreamEndReason::Exhausted)
                                 }
                                 (walk, _) => {
                                     if walk == Walk::Patience {
                                         patience_stopped = patience_stopped.saturating_add(1);
                                     }
-                                    (walked, walk != Walk::Stopped)
+                                    let done =
+                                        walk != Walk::Stopped || hook.finish_reason.is_some();
+                                    (walked, done, VectorStreamEndReason::WalkConverged)
                                 }
                             }
                         }
@@ -1158,15 +1196,25 @@ impl VectorProvider for HnswIndex {
                 emitted += hook.emitted;
                 if !completed || hook.stopped {
                     stopped = true;
+                    end_reason = VectorStreamEndReason::Abandoned;
                     break;
                 }
+                if let Some(reason) = hook.finish_reason {
+                    end_reason = end_reason.merge(reason);
+                    break;
+                }
+                end_reason = end_reason.merge(query_reason);
             }
         });
+        if !stopped && end_reason == VectorStreamEndReason::Unspecified {
+            end_reason = VectorStreamEndReason::Exhausted;
+        }
         Ok(VectorStreamSummary {
             query_count,
             emitted,
             units_scanned: units,
             completed: !stopped,
+            end_reason,
             regimes,
             tail_enumerated_rows,
             patience_stopped,

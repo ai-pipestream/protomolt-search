@@ -4814,6 +4814,9 @@ pub struct NodeServiceImpl {
     /// Woken after every flush: the node agent reports the shard to the
     /// control plane on it (`docs/cluster-control.md`).
     flush_notify: Option<Arc<tokio::sync::Notify>>,
+    /// Optional per-poll sleep injected on streaming scans for deterministic
+    /// straggler simulation in multi-shard tests and benchmarks.
+    stream_poll_delay: Option<std::time::Duration>,
 }
 
 /// One compiled MaterializeSpec, cached against spec equality.
@@ -4880,6 +4883,9 @@ fn raise_floor_cell(cell: &std::sync::atomic::AtomicU32, floor: f32) {
 struct StreamSignals {
     floor: std::sync::atomic::AtomicU32,
     cancelled: std::sync::atomic::AtomicBool,
+    /// `0` = running, `1` = coordinator settle finish (`deadline = false`),
+    /// `2` = coordinator deadline finish (`deadline = true`).
+    finish_state: std::sync::atomic::AtomicU8,
     /// The newest signed sequence applied to this stream; a datagram
     /// at or behind it is a replay and is ignored.
     last_seq: std::sync::atomic::AtomicU32,
@@ -4891,7 +4897,22 @@ impl StreamSignals {
         Self {
             floor: std::sync::atomic::AtomicU32::new(initial_floor.to_bits()),
             cancelled: std::sync::atomic::AtomicBool::new(false),
+            finish_state: std::sync::atomic::AtomicU8::new(0),
             last_seq: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    fn request_finish(&self, deadline: bool) {
+        let code = if deadline { 2 } else { 1 };
+        self.finish_state
+            .fetch_max(code, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    fn finish_state(&self) -> Option<bool> {
+        match self.finish_state.load(std::sync::atomic::Ordering::Acquire) {
+            1 => Some(false),
+            2 => Some(true),
+            _ => None,
         }
     }
 
@@ -4936,7 +4957,8 @@ fn apply_stream_datagram(
     };
     let token = match signal {
         Some(crate::stream_signal::StreamSignal::RaiseFloor { token, .. })
-        | Some(crate::stream_signal::StreamSignal::Cancel { token }) => token,
+        | Some(crate::stream_signal::StreamSignal::Cancel { token })
+        | Some(crate::stream_signal::StreamSignal::Finish { token, .. }) => token,
         None => return,
     };
     let state = signals
@@ -4960,6 +4982,9 @@ fn apply_stream_datagram(
             state
                 .cancelled
                 .store(true, std::sync::atomic::Ordering::Release);
+        }
+        crate::stream_signal::StreamSignal::Finish { deadline, .. } => {
+            state.request_finish(deadline);
         }
     }
 }
@@ -5736,12 +5761,20 @@ impl NodeServiceImpl {
             materialize_cache: Arc::new(std::sync::Mutex::new(None)),
             phrase_index: None,
             flush_notify: None,
+            stream_poll_delay: None,
         }
     }
 
     /// Wake `notify` after every flush (the node agent's report trigger).
     pub fn with_flush_notify(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
         self.flush_notify = Some(notify);
+        self
+    }
+
+    /// Inject a per-hop poll delay on streaming searches (used to simulate a
+    /// straggler shard deterministically in tests and benchmarks).
+    pub fn with_stream_poll_delay(mut self, delay: std::time::Duration) -> Self {
+        self.stream_poll_delay = Some(delay);
         self
     }
 
@@ -13417,6 +13450,8 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
             let state = self.state.clone();
             let slot_offset = self.config.slot_offset;
             let segment_pruning = self.knobs.segment_pruning();
+            let share_floors = self.knobs.share_floors();
+            let stream_poll_delay = self.stream_poll_delay;
             let stream_signals = Arc::clone(&self.stream_signals);
 
             tokio::spawn(async move {
@@ -13501,6 +13536,11 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                                     .cancelled
                                     .store(true, std::sync::atomic::Ordering::Release);
                                 return Ok(None);
+                            }
+                            Ok(Some(StreamSearchRequest {
+                                payload: Some(stream_search_request::Payload::Finish(f)),
+                            })) => {
+                                pump_signals.request_finish(f.deadline);
                             }
                             Ok(Some(StreamSearchRequest {
                                 payload: Some(stream_search_request::Payload::ResolveIdentities(selection)),
@@ -13628,10 +13668,17 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                         )? {
                             options = options.with_patience(patience);
                         }
+                        let allow_early_finish = matches!(
+                            index.descriptor().quality_contract,
+                            crate::vector::QualityContract::ConfiguredAnn
+                                | crate::vector::QualityContract::ProbabilisticBound
+                        );
                         let mut floor_now = f32::NEG_INFINITY;
-                        if let Some(f) = start.initial_floor {
-                            options = options.with_initial_threshold(f);
-                            floor_now = f;
+                        if share_floors {
+                            if let Some(f) = start.initial_floor {
+                                options = options.with_initial_threshold(f);
+                                floor_now = f;
+                            }
                         }
                         let mut raises = 0u64;
                         let stride = if parents.is_some() { 20 } else { 12 };
@@ -13674,24 +13721,33 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                                     }
                                 },
                                 || {
+                                    if let Some(delay) = stream_poll_delay {
+                                        std::thread::sleep(delay);
+                                    }
                                     if scan_signals
                                         .cancelled
                                         .load(std::sync::atomic::Ordering::Acquire)
                                     {
                                         return VectorStreamControl::Stop;
                                     }
-                                    let f = f32::from_bits(
-                                        scan_signals
-                                            .floor
-                                            .load(std::sync::atomic::Ordering::Acquire),
-                                    );
-                                    if f > floor_now {
-                                        floor_now = f;
-                                        raises += 1;
-                                        VectorStreamControl::RaiseFloor(f)
-                                    } else {
-                                        VectorStreamControl::Continue
+                                    if allow_early_finish {
+                                        if let Some(deadline) = scan_signals.finish_state() {
+                                            return VectorStreamControl::Finish { deadline };
+                                        }
                                     }
+                                    if share_floors {
+                                        let f = f32::from_bits(
+                                            scan_signals
+                                                .floor
+                                                .load(std::sync::atomic::Ordering::Acquire),
+                                        );
+                                        if f > floor_now {
+                                            floor_now = f;
+                                            raises += 1;
+                                            return VectorStreamControl::RaiseFloor(f);
+                                        }
+                                    }
+                                    VectorStreamControl::Continue
                                 },
                             )
                             .map_err(|e| Status::invalid_argument(e.to_string()))?;
@@ -13703,11 +13759,17 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                                 slot_offset, index.len(), identities, allow,
                             )?)
                         } else { None };
+                        let cancelled_now = scan_signals
+                            .cancelled
+                            .load(std::sync::atomic::Ordering::Acquire);
+                        let completed = summary.completed && !cancelled_now;
+                        let end_reason = if !completed {
+                            crate::vector::VectorStreamEndReason::Abandoned.to_proto()
+                        } else {
+                            summary.end_reason.to_proto()
+                        };
                         Ok((StreamSearchSummary {
-                            completed: summary.completed
-                                && !scan_signals
-                                    .cancelled
-                                    .load(std::sync::atomic::Ordering::Acquire),
+                            completed,
                             emitted: summary.emitted as u64,
                             blocks_scanned: summary.units_scanned as u64,
                             floor_raises_applied: raises,
@@ -13719,6 +13781,7 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                             filter_regimes: summary.regimes.to_proto(),
                             tail_enumerated_rows: summary.tail_enumerated_rows,
                             patience_stopped: summary.patience_stopped,
+                            end_reason,
                         }, identities))
                     });
                 let outcome = scan.await;
@@ -13753,7 +13816,10 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                                     tx.send(Ok(response)).await
                                         .map_err(|_| Status::cancelled("identity response stream closed"))?;
                                 }
-                                None => summary.completed = false,
+                                None => {
+                                    summary.completed = false;
+                                    summary.end_reason = crate::pb::StreamEndReason::Abandoned as i32;
+                                }
                             }
                         } else if pump.is_finished() {
                             (&mut pump).await.map_err(|e| Status::internal(format!("identity request task failed: {e}")))??;
@@ -18088,6 +18154,27 @@ mod floor_lane_tests {
         assert_eq!(floor_of(&signals, 7), 0.75);
 
         let state = state_of(&signals, 7);
+        assert_eq!(state.finish_state(), None);
+        apply_stream_datagram(
+            &signals,
+            None,
+            &crate::stream_signal::encode_finish(7, false),
+        );
+        assert_eq!(state.finish_state(), Some(false));
+        apply_stream_datagram(
+            &signals,
+            None,
+            &crate::stream_signal::encode_finish(7, true),
+        );
+        assert_eq!(state.finish_state(), Some(true));
+        // A later non-deadline finish does not downgrade a deadline finish.
+        apply_stream_datagram(
+            &signals,
+            None,
+            &crate::stream_signal::encode_finish(7, false),
+        );
+        assert_eq!(state.finish_state(), Some(true));
+
         assert!(!state.cancelled.load(Ordering::Acquire));
         apply_stream_datagram(&signals, None, &crate::stream_signal::encode_cancel(7));
         assert!(state.cancelled.load(Ordering::Acquire));
@@ -18160,13 +18247,32 @@ mod floor_lane_tests {
         assert_eq!(floor_of(&signals, 7), 0.5);
         apply_stream_datagram(&signals, Some(&key), &sign(&key, 3, &encode_cancel(7)));
         assert!(state.cancelled.load(Ordering::Acquire));
-        // Sequences are per stream: a fresh token starts at zero.
+        // Sequences are per stream: a fresh token starts at zero, and signed
+        // FINISH datagrams obey the same HMAC + replay check.
         signals
             .lock()
             .unwrap()
             .insert(8, Arc::new(StreamSignals::new(f32::NEG_INFINITY)));
+        let state8 = state_of(&signals, 8);
         apply_stream_datagram(&signals, Some(&key), &sign(&key, 1, &encode_floor(8, 0.1)));
         assert_eq!(floor_of(&signals, 8), 0.1);
+        apply_stream_datagram(
+            &signals,
+            Some(&key),
+            &crate::stream_signal::encode_finish(8, false),
+        );
+        apply_stream_datagram(
+            &signals,
+            Some(&key),
+            &sign(&other, 2, &crate::stream_signal::encode_finish(8, false)),
+        );
+        assert_eq!(state8.finish_state(), None);
+        apply_stream_datagram(
+            &signals,
+            Some(&key),
+            &sign(&key, 2, &crate::stream_signal::encode_finish(8, true)),
+        );
+        assert_eq!(state8.finish_state(), Some(true));
     }
 }
 

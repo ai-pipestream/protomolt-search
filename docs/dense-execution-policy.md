@@ -159,6 +159,19 @@ refused on any provider that does not advertise `patience_early_stop`; points
 where plain `ef` won the benchmark omit both fields and run to standard beam
 convergence.
 
+## Finish settle window
+
+A policy point measured on a streaming provider advertising `candidate_stream`
+(`docs/hnsw.md`, "Graceful stream close") may name `finish_settle_us`
+(`1..=60,000,000` microseconds). When AUTO qualifies a point carrying
+`finish_settle_us`, the coordinator enables streaming fanout for that dense leg
+and arms the graceful-close settle timer at `finish_settle_us` once the merged
+top-`k` heap is full and shard quorum has reported, naming `finish_settle_us`
+in `planner_reason` and `policy_point` and reporting the count of early-finished
+shards in `DenseExecutionOutcome.shards_finished_early` (redacted when physical
+execution details are withheld). A point naming `finish_settle_us` is refused on
+any provider that does not advertise `candidate_stream`.
+
 ## AUTO and FP32 rerank
 
 Landed 2026-09-04. Step 2 resolves the traversal, not the rerank depth. When
