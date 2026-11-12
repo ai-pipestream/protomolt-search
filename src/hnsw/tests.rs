@@ -1705,6 +1705,7 @@ fn bulk_walk_and_enumerate_visit_identical_nodes_and_scores_to_single_row_dot() 
                             allow: mask,
                             allowed,
                             adaptive: false,
+                            budget: None,
                         },
                         Some((mask, true)),
                     ),
@@ -1734,4 +1735,343 @@ fn bulk_walk_and_enumerate_visit_identical_nodes_and_scores_to_single_row_dot() 
             }
         }
     }
+}
+
+#[test]
+fn a_walk_that_defeats_the_probe_stops_at_its_visit_budget() {
+    use super::graph::{with_scratch, Filter, LinkCells, NoHook, Scored, Walk};
+    use crate::vector::{FilterRegimeCounts, Mask};
+    use std::collections::HashSet;
+
+    let dim = 32;
+    let n = 12_000;
+    let mut rng = Rng(0x94B0);
+    let mut draw_isotropic = |count: usize| -> Vec<f32> {
+        let mut out = Vec::with_capacity(count * dim);
+        for _ in 0..count {
+            let mut row: Vec<f32> = (0..dim).map(|_| rng.normal()).collect();
+            let norm = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+            for x in &mut row {
+                *x /= norm;
+            }
+            out.extend_from_slice(&row);
+        }
+        out
+    };
+    let vectors = draw_isotropic(n);
+    let queries = draw_isotropic(1);
+    let mut cfg = config(BuildMode::FixedOrder);
+    cfg.m = 6;
+    cfg.ef_construction = 48;
+    let mut index = HnswIndex::new(dim, cfg).unwrap();
+    index.add(&vectors, dim).unwrap();
+    index.prepare().unwrap();
+    let query = &queries[..dim];
+
+    // Inspect the upper-layer descent landing point and layer-0 adjacency so
+    // the mask deterministically defeats both `Walk::Far` (2-hop probe) and
+    // `Walk::Short` (unfilled beam) while walling off the true top-k pocket.
+    let (ep, descent_scored, allow) = {
+        let super::Backing::Heap(store) = &index.backing else {
+            unreachable!()
+        };
+        let view = store.view();
+        let neighbors0 = |node: u32| -> Vec<u32> {
+            let start = node as usize * (view.m0 + 1);
+            let count = (LinkCells::get(view.links0, start) as usize).min(view.m0);
+            (0..count)
+                .map(|i| LinkCells::get(view.links0, start + 1 + i))
+                .collect()
+        };
+        let ball_2hop = |seeds: &[u32]| -> HashSet<u32> {
+            let mut out: HashSet<u32> = seeds.iter().copied().collect();
+            let mut ring1 = Vec::new();
+            for &u in seeds {
+                for v in neighbors0(u) {
+                    if out.insert(v) {
+                        ring1.push(v);
+                    }
+                }
+            }
+            for u in ring1 {
+                for v in neighbors0(u) {
+                    out.insert(v);
+                }
+            }
+            out
+        };
+
+        // Run a zero-budget walk to read the exact descent score count and `ep`.
+        let mut ep = Scored {
+            score: view.kernel.dot(query, view.row(view.entry)),
+            node: view.entry,
+        };
+        for layer in (1..=view.top as usize).rev() {
+            loop {
+                let u = view.upper_slot[ep.node as usize] as usize;
+                let start = view.upper_base[u] as usize + (layer - 1) * (view.m + 1);
+                let count = (LinkCells::get(view.upper, start) as usize).min(view.m);
+                let mut improved = false;
+                for i in 0..count {
+                    let v = LinkCells::get(view.upper, start + 1 + i);
+                    let s = view.kernel.dot(query, view.row(v));
+                    if s > ep.score {
+                        ep = Scored { score: s, node: v };
+                        improved = true;
+                    }
+                }
+                if !improved {
+                    break;
+                }
+            }
+        }
+        let dummy = vec![false; n];
+        let (_, zero_stats, zero_walk) = with_scratch(|scratch| {
+            view.walk(
+                query,
+                16,
+                Filter::Aware {
+                    allow: Mask::Bools(&dummy),
+                    allowed: 0,
+                    adaptive: false,
+                    budget: Some(0),
+                },
+                scratch,
+                &mut NoHook,
+            )
+        });
+        assert_eq!(zero_walk, Walk::Budget);
+        let descent_scored = zero_stats.scored;
+
+        let ranked = exact_top(&vectors, dim, query, n);
+        let exact_score =
+            |row: u32| crate::exact_vectors::dot(&vectors[row as usize * dim..][..dim], query);
+
+        // Allow 20 mid-low-scoring nodes in `ep`'s 2-hop layer-0 ball (`>= ef = 16`,
+        // so `Walk::Short` cannot fire and the 2-hop `far` probe clears easily),
+        // leaving thousands of rows strictly below `lowest_decoy_score` for
+        // non-interfering cardinality padding and thousands strictly above
+        // `best_decoy_score` for uphill wave steps.
+        let ep_reach = ball_2hop(&[ep.node]);
+        let mut ep_ball: Vec<u32> = ep_reach.iter().copied().collect();
+        ep_ball.sort_by(|&a, &b| exact_score(a).total_cmp(&exact_score(b)).then(a.cmp(&b)));
+        let decoy_offset = ep_ball.len() / 4;
+        let decoys: Vec<u32> = ep_ball.into_iter().skip(decoy_offset).take(20).collect();
+        assert_eq!(decoys.len(), 20);
+        let best_decoy_score = decoys
+            .iter()
+            .map(|&u| exact_score(u))
+            .fold(f32::NEG_INFINITY, f32::max);
+        let mut start_reach = ball_2hop(&decoys);
+        start_reach.extend(ep_reach);
+
+        // Isolate a single top hit outside the 2-hop outgoing reach of `ep`
+        // and `decoys`, walled off by its 2-hop incoming predecessors (~100
+        // rows) so no directed 1-hop bridge step `c -> bridge -> p` can reach
+        // it while leaving 99.5% of the positive hemisphere open to the beam.
+        let pocket: Vec<u32> = ranked
+            .iter()
+            .copied()
+            .filter(|u| exact_score(*u) > best_decoy_score && !start_reach.contains(u))
+            .take(1)
+            .collect();
+        assert_eq!(pocket.len(), 1, "expected an isolated top-1 pocket row");
+        let pocket_set: HashSet<u32> = pocket.iter().copied().collect();
+        let mut in_1hop: HashSet<u32> = HashSet::new();
+        for u in 0..n as u32 {
+            if !pocket_set.contains(&u) && neighbors0(u).iter().any(|v| pocket_set.contains(v)) {
+                in_1hop.insert(u);
+            }
+        }
+        let mut moat = in_1hop.clone();
+        for u in 0..n as u32 {
+            if !pocket_set.contains(&u)
+                && neighbors0(u)
+                    .iter()
+                    .any(|v| pocket_set.contains(v) || in_1hop.contains(v))
+            {
+                moat.insert(u);
+            }
+        }
+
+        // Default threshold at `m = 6` (`m0 = 12`), `ef = 32` is `4 * 32 * 12 = 1536`,
+        // so `target_allowed = 1550` (`12.9%` uncorrelated sparsity outside `moat`)
+        // sets `budget = ceil(1550 / 3.5) = 443` layer-0 work units
+        // (`layer0_scored + bridges`), while at `dim = 64` full `m0` lists drive
+        // ~40 hops of bridge + neighbor expansions (~700+ work units >> 443).
+        let target_allowed = 1_550usize;
+        let mut allow = vec![false; n];
+        for &u in &pocket {
+            allow[u as usize] = true;
+        }
+        for &u in &decoys {
+            allow[u as usize] = true;
+        }
+        for u in 0..n as u32 {
+            if allow.iter().filter(|&&on| on).count() >= target_allowed {
+                break;
+            }
+            if !allow[u as usize] && !moat.contains(&u) && u % 8 == 0 {
+                allow[u as usize] = true;
+            }
+        }
+        for &u in ranked.iter().rev() {
+            if allow.iter().filter(|&&on| on).count() >= target_allowed {
+                break;
+            }
+            if !allow[u as usize] && !moat.contains(&u) {
+                allow[u as usize] = true;
+            }
+        }
+        (ep.node, descent_scored, allow)
+    };
+
+    let ep_allowed = u64::from(allow[ep as usize]);
+    let k = 10;
+    let ef = 32;
+    let allowed = allow.iter().filter(|&&on| on).count();
+    assert_eq!(allowed, 1_550);
+    let truth = exact_top_masked(&vectors, dim, query, &allow, k);
+
+    // 1. Pinned `FilterAware` ignores both the probe and the budget: it fills
+    // the beam (`>= k`, not stranded), burns heavy work, and misses the
+    // moated pocket.
+    let pinned_opts = VectorSearchOptions::new()
+        .with_mask(&allow)
+        .with_filter_regime(FilterRegime::FilterAware);
+    let (pinned_hits, pinned_answer) = index.search_with_stats(query, k, ef, pinned_opts).unwrap();
+    assert_eq!(pinned_answer.regime, Some(FilterRegime::FilterAware));
+    assert!(!pinned_answer.budget_handoff);
+    assert_eq!(pinned_hits.len(), k);
+    assert_ne!(
+        pinned_hits, truth,
+        "moated pocket should be unreachable without budget handoff"
+    );
+
+    // 2. Adaptive (`ANN` default): `far` probe runs and does NOT trip
+    // (`hops > 0`, `bridges > 0`), `Walk::Budget` fires mid-walk, skips every
+    // allowed row the walk already scored, and returns the exact top `k`.
+    let adaptive_opts = VectorSearchOptions::new().with_mask(&allow);
+    let (hits, answer) = index
+        .search_with_stats(query, k, ef, adaptive_opts)
+        .unwrap();
+    assert_eq!(
+        answer.regime,
+        Some(FilterRegime::Enumerate),
+        "answer={answer:?}, pinned={pinned_answer:?}, descent={descent_scored}"
+    );
+    assert!(
+        answer.budget_handoff,
+        "expected Walk::Budget handoff: {answer:?}"
+    );
+    assert!(
+        answer.stats.probed > 0,
+        "far probe must have run and cleared"
+    );
+    assert!(answer.stats.hops > 0 && answer.stats.bridges > 0);
+    assert!(
+        answer.stats.hops < pinned_answer.stats.hops,
+        "budget must stop the walk earlier than pinned ({} vs {})",
+        answer.stats.hops,
+        pinned_answer.stats.hops
+    );
+    assert_eq!(
+        answer.stats.scored - descent_scored + ep_allowed,
+        allowed as u64,
+        "every allowed row must be scored at descent/layer-0 + enumerate_skipping exactly once"
+    );
+    assert_eq!(hits, truth);
+
+    // `VectorProvider::search` reports both `enumerate` and `budget_handoffs`.
+    let unary = index
+        .search(
+            query,
+            k,
+            VectorSearchOptions::new()
+                .with_mask(&allow)
+                .with_candidate_depth(ef),
+        )
+        .unwrap();
+    assert_eq!(
+        unary.regimes,
+        FilterRegimeCounts {
+            enumerate: 1,
+            filter_aware: 0,
+            plain: 0,
+            budget_handoffs: 1,
+        }
+    );
+
+    // 3. Streaming: `Walk::Budget` emits what the walk reached and streams the
+    // remaining allowed rows with zero duplicates, reporting `budget_handoffs = 1`.
+    let mut streamed: Vec<(i64, f32)> = Vec::new();
+    let summary = index
+        .search_streaming_controlled(
+            query,
+            VectorSearchOptions::new()
+                .with_mask(&allow)
+                .with_candidate_depth(ef),
+            &mut |batch| {
+                streamed.extend(
+                    batch
+                        .slots
+                        .iter()
+                        .copied()
+                        .zip(batch.scores.iter().copied()),
+                );
+                VectorStreamControl::Continue
+            },
+            &mut || VectorStreamControl::Continue,
+        )
+        .unwrap();
+    assert!(summary.completed);
+    assert_eq!(summary.emitted, allowed);
+    assert_eq!(
+        summary.regimes,
+        FilterRegimeCounts {
+            enumerate: 1,
+            filter_aware: 0,
+            plain: 0,
+            budget_handoffs: 1,
+        }
+    );
+    let mut seen_slots: Vec<i64> = streamed.iter().map(|r| r.0).collect();
+    seen_slots.sort_unstable();
+    seen_slots.dedup();
+    assert_eq!(seen_slots.len(), allowed, "stream emitted a row twice");
+    for (slot, score) in &streamed {
+        assert!(allow[*slot as usize]);
+        let exact = crate::exact_vectors::dot(&vectors[*slot as usize * dim..][..dim], query);
+        assert_eq!(score.to_bits(), exact.to_bits());
+    }
+
+    // 4. Policy `enumerate_max_rows` scales the budget: a higher threshold
+    // implies cheaper enumeration relative to walking and stops in fewer hops.
+    let (_, loose) = index
+        .search_with_stats(
+            query,
+            k,
+            ef,
+            VectorSearchOptions::new()
+                .with_mask(&allow)
+                .with_enumerate_max_rows(400),
+        )
+        .unwrap();
+    let (_, tight) = index
+        .search_with_stats(
+            query,
+            k,
+            ef,
+            VectorSearchOptions::new()
+                .with_mask(&allow)
+                .with_enumerate_max_rows(1_536),
+        )
+        .unwrap();
+    assert!(tight.budget_handoff);
+    assert!(
+        tight.stats.hops < loose.stats.hops,
+        "tighter enumerate_max_rows budget should stop in fewer hops ({} vs {})",
+        tight.stats.hops,
+        loose.stats.hops
+    );
 }

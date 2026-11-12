@@ -132,12 +132,13 @@ of the point, not a constant of the build:
   leg of a hybrid query), and the provider chooses under it instead of its
   own. A shard whose provider has no enumerate regime refuses the scan by
   name.
-- The provider's two handoffs to enumerate (a mask far from the query, a
+- The provider's three handoffs to enumerate (a mask far from the query, a
+  walk that spends its visit budget derived from `enumerate_max_rows`, a
   walk stranded on an island) still apply. They move a query to the exact
   answer and cannot lower a measured recall.
 - The outcome reports the threshold in `policy_point.enumerate_max_rows`,
   names it in `planner_reason`, and counts the regimes that actually
-  answered in `filter_regimes`.
+  answered in `filter_regimes` (including `budget_handoffs`).
 
 A request whose view and filters admit every row carries no mask, and an
 unfiltered point names no threshold. Explicit `ANN` never consults a policy

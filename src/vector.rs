@@ -404,6 +404,9 @@ pub struct FilterRegimeCounts {
     pub enumerate: u32,
     pub filter_aware: u32,
     pub plain: u32,
+    /// Subset of `enumerate`: filter-aware walks handed over once their
+    /// visit budget was spent.
+    pub budget_handoffs: u32,
 }
 
 impl FilterRegimeCounts {
@@ -416,10 +419,16 @@ impl FilterRegimeCounts {
         *slot = slot.saturating_add(1);
     }
 
+    pub fn count_budget_handoff(&mut self) {
+        self.enumerate = self.enumerate.saturating_add(1);
+        self.budget_handoffs = self.budget_handoffs.saturating_add(1);
+    }
+
     pub fn add(&mut self, other: FilterRegimeCounts) {
         self.enumerate = self.enumerate.saturating_add(other.enumerate);
         self.filter_aware = self.filter_aware.saturating_add(other.filter_aware);
         self.plain = self.plain.saturating_add(other.plain);
+        self.budget_handoffs = self.budget_handoffs.saturating_add(other.budget_handoffs);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -432,6 +441,7 @@ impl FilterRegimeCounts {
             enumerate: self.enumerate,
             filter_aware: self.filter_aware,
             plain: self.plain,
+            budget_handoffs: self.budget_handoffs,
         })
     }
 
@@ -440,6 +450,7 @@ impl FilterRegimeCounts {
             enumerate: r.enumerate,
             filter_aware: r.filter_aware,
             plain: r.plain,
+            budget_handoffs: r.budget_handoffs,
         })
     }
 }

@@ -1842,12 +1842,16 @@ message StreamSearchSummary {
 // measured in, so the regime that ran is reported, never implied.
 message DenseFilterRegimes {
   // Every allowed row was scored: exact over the filter. Includes a search
-  // a graph walk handed over because the filter lay away from the query.
+  // a graph walk handed over because the filter lay away from the query or
+  // spent its visit budget.
   uint32 enumerate = 1;
   // A graph walk that scored allowed rows only.
   uint32 filter_aware = 2;
   // A graph walk as if unfiltered, the filter gating results.
   uint32 plain = 3;
+  // Subset of `enumerate`: filter-aware walks that reached their visit
+  // budget and handed the remaining allowed rows to enumerate (#94).
+  uint32 budget_handoffs = 4;
 }
 
 enum VectorScoreDirection {

@@ -245,23 +245,37 @@ regime ran (`hnsw::Answer`).
   every selectivity measured; it can be pinned
   (`VectorSearchOptions::filter_regime`) so a measurement can compare.
 
-A mask can sit where the graph cannot serve it: one court, one tenant, a
-region of the space away from the query. The descent lands among rows the
-walk may not score, and whatever allowed rows it reaches through them are
-not the nearest ones. Two checks hand such a query to enumerate, so the
-answer is exact instead of quietly short:
+A mask can sit where the graph cannot serve it, or cost more to walk through
+than to scan in mask order: one court, one tenant, a region away from the
+query, or a correlated mask whose landing neighborhood clears the initial
+sample while its best matches sit across disallowed bridges. Three checks
+hand such a query to enumerate, so the answer is exact and bounded in work:
 
 - **The far probe**, before the walk. The sample is the landing row's
   layer-0 neighbors and theirs, read from the links alone. When the mask's
   share of the rows predicts at least 8 allowed rows in the sample and
   fewer than a quarter of them are there, the query is enumerated.
+- **The visit budget**, during the walk (`#94`). Each expansion of the
+  filter-aware walk counts layer-0 work units `layer0_scored + bridges`
+  (one unit per layer-0 scored row plus one unit per disallowed bridge
+  neighbor list read and probed). Across AVX2/AVX-512F and NEON (`d = 64` and
+  `d = 256`), one random walk or bridge unit costs ~3.0–3.6× one sequential
+  mask-ordered row in `enumerate` (`WALK_WORK_ENUMERATE_ROWS = 3.5` under the
+  default `ENUMERATE_ROWS_PER_WALK_ROW = 4`, or scaled proportionally by a
+  policy point's `enumerate_max_rows / (4 · ef · 2M)` with a floor of `1.0`).
+  Once `work_units >= ceil(allowed / cost_ratio)` and the beam has not yet
+  converged, the walk stops and hands the remaining unvisited allowed rows
+  (`!scratch.seen(row)`) to `enumerate` (or `stream_rows`), merging with the
+  allowed rows already scored so no row is scored or emitted twice.
 - **A stranded walk**, after it. A walk that runs dry with its beam
   unfilled while the mask allows more rows reached an island; the query is
-  enumerated. A stream has already emitted the rows the walk reached, so it
-  emits the remaining allowed rows and no row twice.
+  finished by enumerating the unvisited allowed rows on both the unary and
+  streaming paths, scoring and emitting no row twice.
 
-Neither applies to a pinned regime, which runs as pinned. Both apply under
-a request's threshold: they only ever move a query to the exact answer.
+None of the three applies to a pinned regime, which runs as pinned. All
+three apply under a request's threshold: they only ever move a query to the
+exact answer, and under a policy point the visit budget derives from that
+point's `enumerate_max_rows`.
 
 Enumerating a far mask costs its allowed rows, as a filtered flat scan
 does. That is the price of the exact answer where the graph has none; the
@@ -316,9 +330,12 @@ or emitted; neither cuts a walk short. Floor pruning is #72.
   regime that answered it, per segment, and the counts travel with the
   scan's statistics through relays to
   `QueryResponse.dense_execution.filter_regimes` (`enumerate`,
-  `filter_aware`, `plain`). A query the probe or a stranded walk handed
-  over counts as enumerate. Absent when no search was filtered; withheld,
-  like the rest of the physical layout, from a document-scoped response
+  `filter_aware`, `plain`, and `budget_handoffs`). A query the probe, the
+  visit budget, or a stranded walk handed over counts as `enumerate`, and
+  one handed over by the visit budget also increments `budget_handoffs` so a
+  measurement separates mid-walk budget handoffs from pre-walk and stranded
+  ones. Absent when no search was filtered; withheld, like the rest of the
+  physical layout, from a document-scoped response
   ([Query execution disclosure](query-disclosure.md)).
 - **The threshold is the policy's.** `AUTO` serves a measured recall claim,
   and a claim measured under one threshold must not be served under

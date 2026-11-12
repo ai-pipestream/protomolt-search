@@ -129,9 +129,11 @@ pub struct Scratch {
     pool: Vec<Scored>,
     sel: Vec<u32>,
     /// Filter-aware walk: the disallowed neighbors of the node being
-    /// expanded, and the allowed rows about to be scored.
+    /// expanded, the allowed rows about to be scored, and every allowed row
+    /// scored at layer 0 (so a handoff to enumerate never scores them twice).
     routes: Vec<u32>,
     fresh: Vec<u32>,
+    scored_allowed: Vec<Scored>,
 }
 
 impl Scratch {
@@ -146,6 +148,7 @@ impl Scratch {
         }
         self.cand.clear();
         self.res.clear();
+        self.scored_allowed.clear();
     }
 
     /// Mark `node` visited; true when it was not.
@@ -165,6 +168,13 @@ impl Scratch {
     #[inline]
     pub fn seen(&self, node: u32) -> bool {
         self.visited[node as usize] == self.epoch
+    }
+
+    /// Allowed rows scored during the last filter-aware walk, with their
+    /// traversal-kernel scores.
+    #[inline]
+    pub fn scored_allowed(&self) -> &[Scored] {
+        &self.scored_allowed
     }
 
     /// The results, best first.
@@ -229,13 +239,15 @@ pub enum Filter<'a> {
     /// The walk moves through the allowed rows: a disallowed neighbor is
     /// never scored, its own neighbors are looked through instead.
     /// `allowed` is the mask's count. With `adaptive` the walk gives the
-    /// query up to the caller ([`Walk::Far`], [`Walk::Short`]) where the
-    /// graph cannot serve this mask; without it the walk runs regardless
+    /// query up to the caller ([`Walk::Far`], [`Walk::Short`],
+    /// [`Walk::Budget`]) where the graph cannot serve this mask or `budget`
+    /// work units have been spent; without it the walk runs regardless
     /// (a pinned regime).
     Aware {
         allow: Mask<'a>,
         allowed: usize,
         adaptive: bool,
+        budget: Option<u64>,
     },
 }
 
@@ -252,6 +264,16 @@ pub enum Walk {
     /// the allowed rows it reached are an island. `Scratch::seen` tells
     /// which rows it scored.
     Short,
+    /// Spent its layer-0 work-unit budget (`layer0_scored + bridges`) before
+    /// the beam converged: enumerating the remaining allowed rows is cheaper
+    /// than continuing the walk. `Scratch::seen` and `Scratch::scored_allowed`
+    /// name the allowed rows already scored.
+    Budget,
+}
+
+#[inline]
+fn walk_work_units(stats: &SearchStats, base_scored: u64) -> u64 {
+    stats.scored.saturating_sub(base_scored) + stats.bridges
 }
 
 /// The far probe trips when the mask's share of the rows predicts at least
@@ -501,10 +523,11 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
         entries: &[Scored],
         ef: usize,
         allow: Mask<'_>,
+        visit_budget: Option<u64>,
         scratch: &mut Scratch,
         hook: &mut H,
         stats: &mut SearchStats,
-    ) -> bool {
+    ) -> Walk {
         let ef = ef.max(1);
         scratch.begin(self.n());
         for &e in entries {
@@ -512,6 +535,7 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
                 scratch.cand.push(e);
                 if allow.test(e.node as usize) {
                     hook.scored(e.node, e.score, self.row(e.node));
+                    scratch.scored_allowed.push(e);
                     scratch.res.push(Reverse(e));
                 }
             }
@@ -522,14 +546,19 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
         let mut nbrs = std::mem::take(&mut scratch.nbrs);
         let mut routes = std::mem::take(&mut scratch.routes);
         let mut fresh = std::mem::take(&mut scratch.fresh);
-        let budget = self.m0;
-        let mut completed = true;
+        let hop_budget = self.m0;
+        let base_scored = stats.scored;
+        let mut outcome = Walk::Completed;
         while let Some(c) = scratch.cand.pop() {
             if scratch.res.len() >= ef {
                 let worst = scratch.res.peek().map_or(f32::NEG_INFINITY, |r| r.0.score);
                 if c.score < worst {
                     break;
                 }
+            }
+            if visit_budget.is_some_and(|limit| walk_work_units(stats, base_scored) >= limit) {
+                outcome = Walk::Budget;
+                break;
             }
             stats.hops += 1;
             self.copy_links(c.node, 0, None, &mut nbrs);
@@ -545,7 +574,7 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
                 }
             }
             for &bridge in routes.iter() {
-                if fresh.len() >= budget {
+                if fresh.len() >= hop_budget {
                     break;
                 }
                 if !scratch.visit(bridge) {
@@ -554,7 +583,7 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
                 stats.bridges += 1;
                 self.copy_links(bridge, 0, None, &mut nbrs);
                 for &w in nbrs.iter() {
-                    if fresh.len() >= budget {
+                    if fresh.len() >= hop_budget {
                         break;
                     }
                     if allow.test(w as usize) && scratch.visit(w) {
@@ -565,10 +594,11 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
             stats.scored += fresh.len() as u64;
             self.for_each_scored(q, &fresh, |v, s| {
                 hook.scored(v, s, self.row(v));
+                let scored = Scored { score: s, node: v };
+                scratch.scored_allowed.push(scored);
                 let full = scratch.res.len() >= ef;
                 let worst = scratch.res.peek().map_or(f32::NEG_INFINITY, |r| r.0.score);
                 if !full || s > worst {
-                    let scored = Scored { score: s, node: v };
                     scratch.cand.push(scored);
                     scratch.res.push(Reverse(scored));
                     if scratch.res.len() > ef {
@@ -577,14 +607,14 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
                 }
             });
             if !hook.hop() {
-                completed = false;
+                outcome = Walk::Stopped;
                 break;
             }
         }
         scratch.nbrs = nbrs;
         scratch.routes = routes;
         scratch.fresh = fresh;
-        completed
+        outcome
     }
 
     /// The enumerate regime's pass over the mask: score every allowed row
@@ -611,14 +641,43 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
         slack_per_norm: f64,
         out: &mut Vec<Scored>,
     ) -> u64 {
+        self.enumerate_skipping(q, allow, k, slack_per_norm, &[], |_| false, out)
+    }
+
+    /// [`View::enumerate`] seeded with `already_scored` allowed rows from an
+    /// aborted or stranded filter-aware walk, scoring only allowed rows where
+    /// `!skip(row)` and applying the `2B` error-bar filter across the union.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enumerate_skipping(
+        &self,
+        q: &[f32],
+        allow: Mask<'_>,
+        k: usize,
+        slack_per_norm: f64,
+        already_scored: &[Scored],
+        skip: impl Fn(u32) -> bool,
+        out: &mut Vec<Scored>,
+    ) -> u64 {
         out.clear();
         let mut top: BinaryHeap<Reverse<Scored>> = BinaryHeap::with_capacity(k + 1);
         let mut shortest_inv = f32::INFINITY;
+        let mut consider = |scored: Scored| {
+            let inv = self.inv_norm[scored.node as usize];
+            if inv > 0.0 {
+                shortest_inv = shortest_inv.min(inv);
+                if top.len() < k {
+                    top.push(Reverse(scored));
+                } else if top.peek().is_some_and(|worst| scored > worst.0) {
+                    top.pop();
+                    top.push(Reverse(scored));
+                }
+            }
+        };
         let _ = allow.try_for_each(|row| {
-            out.push(Scored {
-                score: 0.0,
-                node: row as u32,
-            });
+            let node = row as u32;
+            if !skip(node) {
+                out.push(Scored { score: 0.0, node });
+            }
             ControlFlow::<()>::Continue(())
         });
         let lines = self.prefetch_lines();
@@ -655,20 +714,15 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
                     node: slot.node,
                 };
                 *slot = scored;
-                let inv = self.inv_norm[scored.node as usize];
-                if inv > 0.0 {
-                    shortest_inv = shortest_inv.min(inv);
-                    if top.len() < k {
-                        top.push(Reverse(scored));
-                    } else if top.peek().is_some_and(|worst| scored > worst.0) {
-                        top.pop();
-                        top.push(Reverse(scored));
-                    }
-                }
+                consider(scored);
             }
             base = end;
         }
-        let scored = out.len() as u64;
+        let scored = total as u64;
+        for &prior in already_scored {
+            consider(prior);
+        }
+        out.extend_from_slice(already_scored);
         if let (true, Some(Reverse(kth))) = (top.len() == k, top.peek()) {
             let bar = f64::from(kth.score) - 2.0 * slack_per_norm / f64::from(shortest_inv);
             out.retain(|s| f64::from(s.score) >= bar || self.inv_norm[s.node as usize] <= 0.0);
@@ -766,16 +820,20 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
                 allow,
                 allowed,
                 adaptive,
+                budget,
             } => {
                 if adaptive && self.far(ep.node, allow, allowed, scratch, &mut stats) {
                     return (Vec::new(), stats, Walk::Far);
                 }
-                let completed =
-                    self.search_layer_aware(q, &[ep], ef, allow, scratch, hook, &mut stats);
-                if completed && adaptive && scratch.res.len() < ef.max(1).min(allowed) {
+                let outcome =
+                    self.search_layer_aware(q, &[ep], ef, allow, budget, scratch, hook, &mut stats);
+                if outcome == Walk::Completed
+                    && adaptive
+                    && scratch.res.len() < ef.max(1).min(allowed)
+                {
                     return (scratch.drain_results(), stats, Walk::Short);
                 }
-                completed
+                return (scratch.drain_results(), stats, outcome);
             }
         };
         let walk = if completed {

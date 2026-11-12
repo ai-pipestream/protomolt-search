@@ -179,6 +179,7 @@ mod tests {
                     enumerate: 3,
                     filter_aware: 5,
                     plain: 0,
+                    budget_handoffs: 1,
                 }),
             }),
             ..Default::default()

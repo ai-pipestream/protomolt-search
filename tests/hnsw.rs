@@ -468,12 +468,15 @@ const FILTERED_SHARD_DOCS: usize = 6000;
 
 /// Global doc id -> court: every even id is "wide" (half of each shard, more
 /// rows than enumerating is worth at this beam), one odd id in 300 is
-/// "narrow" (twenty rows a shard), the rest are "rest".
+/// "narrow" (twenty rows a shard), one odd id in 30 is "sparse" (two hundred
+/// rows a shard, bridge-heavy when walked), the rest are "rest".
 fn court_of(id: usize) -> &'static str {
     if id.is_multiple_of(2) {
         "wide"
     } else if id % 300 == 1 {
         "narrow"
+    } else if id % 30 == 3 {
+        "sparse"
     } else {
         "rest"
     }
@@ -857,5 +860,61 @@ async fn a_policy_point_serves_a_filter_under_its_measured_threshold() {
             "{}",
             error.message()
         );
+
+        // A bridge-heavy sparse filter just above the policy's enumerate
+        // threshold starts filter-aware, hits its visit budget mid-walk,
+        // finishes by enumerating the remaining allowed rows without
+        // duplicates, and reports both `enumerate` and `budget_handoffs`.
+        let budget_policy = load_policy(
+            "budget-handoff",
+            &format!(
+                "format_version = 1\npolicy_id = \"hnsw-budget\"\n\
+                 embedding_model = \"test-embed\"\ncorpus_generation = {GENERATION}\n\
+                 corpus_rows = {rows}\ndimensions = {DIM}\nprovider_backend = \"{HNSW}\"\n\
+                 scoring_fingerprint = \"{fingerprint}\"\nmeasured_queries = 16\n\n\
+                 [[points]]\nk = {K}\nfilter_selectivity_ppm_min = 20000\n\
+                 filter_selectivity_ppm_max = 50000\ncandidates = {K}\n\
+                 measured_recall_ppm = 900000\nenumerate_max_rows = 150\n"
+            ),
+        );
+        let mut exact_sparse: Vec<(u64, f32)> = fixture
+            .corpus
+            .as_chunks::<DIM>()
+            .0
+            .iter()
+            .enumerate()
+            .filter(|(id, _)| court_of(*id) == "sparse")
+            .map(|(id, row)| {
+                (
+                    id as u64,
+                    pipestream_search::exact_vectors::dot(row, &query_vector),
+                )
+            })
+            .collect();
+        exact_sparse.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        exact_sparse.truncate(K);
+        let exact_sparse: Vec<u64> = exact_sparse.into_iter().map(|hit| hit.0).collect();
+
+        let budgeted = coordinator
+            .clone()
+            .with_dense_execution_policy(budget_policy);
+        let response = query(
+            &budgeted,
+            filtered_dense_request(&query_vector, K as u32, "sparse", DenseExecutionMode::Auto),
+        )
+        .await
+        .unwrap();
+        let outcome = response.dense_execution.unwrap();
+        assert_eq!(
+            outcome.filter_regimes,
+            Some(DenseFilterRegimes {
+                enumerate: SHARDS as u32,
+                budget_handoffs: SHARDS as u32,
+                ..Default::default()
+            }),
+            "streaming={streaming}"
+        );
+        let got_sparse: Vec<u64> = response.hits.iter().map(|hit| hit.doc_id).collect();
+        assert_eq!(got_sparse, exact_sparse, "streaming={streaming}");
     }
 }

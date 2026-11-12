@@ -23,6 +23,8 @@ pub struct Allow {
 pub struct QueryStats {
     pub hops: u64,
     pub exact: u64,
+    pub bridges: u64,
+    pub budget_handoffs: u64,
 }
 
 /// Build parameters of one sweep point.
@@ -483,6 +485,8 @@ impl Index for Hnsw {
             .expect("hnsw search");
         stats.hops += answer.stats.hops;
         stats.exact += answer.stats.scored;
+        stats.bridges += answer.stats.bridges;
+        stats.budget_handoffs += u64::from(answer.budget_handoff);
         hits
     }
 

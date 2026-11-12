@@ -77,6 +77,15 @@ const STREAM_POLL_ROWS: usize = 16;
 /// (`docs/hnsw.md`, "Filters"); a dense execution policy will carry the
 /// thresholds measured per host class (#55).
 const ENUMERATE_ROWS_PER_WALK_ROW: usize = 4;
+/// Measured mask-order `enumerate` rows per layer-0 walk work unit
+/// (`layer0_scored + bridges`, `docs/hnsw.md`, "Filters"): across
+/// AVX2/AVX-512F and NEON (`d = 64` and `d = 256`), one random walk or bridge
+/// expansion costs ~3.0–3.6× one sequential mask-ordered row in `enumerate`.
+/// At `allowed = 4 · ef · m0` this sets a layer-0 budget of `1.14 · ef · m0`
+/// work units (above a healthy walk's layer-0 work), and scales
+/// proportionally with a policy point's `enumerate_max_rows`.
+const WALK_WORK_ENUMERATE_ROWS: f64 = 3.5;
+
 /// How one query was answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Answer {
@@ -84,6 +93,9 @@ pub struct Answer {
     /// filter-aware walk that gave the query up reports enumerate.
     pub regime: Option<FilterRegime>,
     pub stats: SearchStats,
+    /// True when a filter-aware walk spent its visit budget and handed the
+    /// remaining allowed rows to enumerate (`regime` is `Enumerate`).
+    pub budget_handoff: bool,
 }
 
 /// The mask of one search with what the regimes need of it.
@@ -96,6 +108,9 @@ struct Plan<'a> {
     /// The provider chose the regime, so a filter-aware walk may hand the
     /// query to enumerate; a pinned regime runs as pinned.
     adaptive: bool,
+    /// Work-unit cap before a filter-aware walk hands the remaining allowed
+    /// rows to enumerate (`None` when pinned).
+    budget: Option<u64>,
 }
 
 impl Plan<'_> {
@@ -104,6 +119,7 @@ impl Plan<'_> {
         allow: None,
         allowed: 0,
         adaptive: false,
+        budget: None,
     };
 
     fn filter(&self) -> Filter<'_> {
@@ -112,6 +128,7 @@ impl Plan<'_> {
                 allow,
                 allowed: self.allowed,
                 adaptive: self.adaptive,
+                budget: self.budget,
             },
             (Some(FilterRegime::Plain), Some(allow)) => Filter::Plain(allow),
             _ => Filter::None,
@@ -342,16 +359,26 @@ impl HnswIndex {
             )));
         }
         let allowed = allow.count();
+        let walk_units = ef * self.m0();
+        let default_threshold = ENUMERATE_ROWS_PER_WALK_ROW * walk_units;
+        let mut budget = None;
         let regime = match options.filter_regime {
             Some(regime) => regime,
             None if allowed == allow.len() => return Ok(Plan::UNFILTERED),
             None => {
-                let threshold = options
-                    .enumerate_max_rows
-                    .unwrap_or(ENUMERATE_ROWS_PER_WALK_ROW * ef * self.m0());
+                let threshold = options.enumerate_max_rows.unwrap_or(default_threshold);
                 if allowed <= threshold {
                     FilterRegime::Enumerate
                 } else {
+                    if threshold > 0 && default_threshold > 0 {
+                        // Scale the measured enumerate-rows-per-walk-unit
+                        // ratio by the policy's `enumerate_max_rows`, bounded
+                        // below by 1.
+                        let cost_ratio = (WALK_WORK_ENUMERATE_ROWS
+                            * (threshold as f64 / default_threshold as f64))
+                            .max(1.0);
+                        budget = Some(((allowed as f64) / cost_ratio).ceil() as u64);
+                    }
                     FilterRegime::FilterAware
                 }
             }
@@ -361,6 +388,7 @@ impl HnswIndex {
             allow: Some(allow),
             allowed,
             adaptive: options.filter_regime.is_none(),
+            budget,
         })
     }
 
@@ -375,6 +403,18 @@ impl HnswIndex {
         allow: Mask<'_>,
         floor: f32,
     ) -> (Vec<(u32, f32)>, SearchStats) {
+        self.enumerate_skipping(query, k, allow, floor, &[], |_| false)
+    }
+
+    fn enumerate_skipping(
+        &self,
+        query: &[f32],
+        k: usize,
+        allow: Mask<'_>,
+        floor: f32,
+        already_scored: &[Scored],
+        skip: impl Fn(u32) -> bool,
+    ) -> (Vec<(u32, f32)>, SearchStats) {
         let du = self.dim as f64 / (1u64 << 24) as f64;
         let gamma = du / (1.0 - du);
         let query_norm = query
@@ -383,11 +423,13 @@ impl HnswIndex {
             .sum::<f64>()
             .sqrt();
         let mut survivors = Vec::new();
-        let scored = with_view!(self, |view| view.enumerate(
+        let scored = with_view!(self, |view| view.enumerate_skipping(
             query,
             allow,
             k,
             4.0 * gamma * query_norm,
+            already_scored,
+            skip,
             &mut survivors
         ));
         let stats = SearchStats {
@@ -416,6 +458,7 @@ impl HnswIndex {
                 Answer {
                     regime: plan.regime,
                     stats,
+                    budget_handoff: false,
                 },
             );
         }
@@ -426,18 +469,43 @@ impl HnswIndex {
             scratch,
             &mut NoHook
         ));
-        if let (Walk::Far | Walk::Short, Some(allow)) = (walk, plan.allow) {
-            // The graph cannot serve this mask from where the query lands:
-            // the answer is the exact top k of the mask.
-            let (hits, exact) = self.enumerate(query, k, allow, floor);
-            stats.scored += exact.scored;
-            return (
-                hits,
-                Answer {
-                    regime: Some(FilterRegime::Enumerate),
-                    stats,
-                },
-            );
+        match (walk, plan.allow) {
+            (Walk::Far, Some(allow)) => {
+                // The graph cannot serve this mask from where the query lands:
+                // the answer is the exact top k of the mask.
+                let (hits, exact) = self.enumerate(query, k, allow, floor);
+                stats.scored += exact.scored;
+                return (
+                    hits,
+                    Answer {
+                        regime: Some(FilterRegime::Enumerate),
+                        stats,
+                        budget_handoff: false,
+                    },
+                );
+            }
+            (Walk::Short | Walk::Budget, Some(allow)) => {
+                // Keep the allowed rows the walk already scored and score
+                // only the remaining allowed rows in mask order.
+                let (hits, exact) = self.enumerate_skipping(
+                    query,
+                    k,
+                    allow,
+                    floor,
+                    scratch.scored_allowed(),
+                    |row| scratch.seen(row),
+                );
+                stats.scored += exact.scored;
+                return (
+                    hits,
+                    Answer {
+                        regime: Some(FilterRegime::Enumerate),
+                        stats,
+                        budget_handoff: walk == Walk::Budget,
+                    },
+                );
+            }
+            _ => {}
         }
         let hits = self.with_row_source(|rows| Self::report(hits, query, rows, floor, k));
         (
@@ -445,6 +513,7 @@ impl HnswIndex {
             Answer {
                 regime: plan.regime,
                 stats,
+                budget_handoff: false,
             },
         )
     }
@@ -743,7 +812,9 @@ impl VectorProvider for HnswIndex {
         with_scratch(|scratch| {
             for query in queries.chunks_exact(self.dim) {
                 let (hits, answer) = self.answer(query, k, ef, floor, &plan, scratch);
-                if let Some(regime) = answer.regime {
+                if answer.budget_handoff {
+                    regimes.count_budget_handoff();
+                } else if let Some(regime) = answer.regime {
                     regimes.count(regime);
                 }
                 for (node, score) in &hits {
@@ -816,6 +887,7 @@ impl VectorProvider for HnswIndex {
                     emitted: 0,
                 };
                 let mut answered = plan.regime;
+                let mut budget_handoff = false;
                 let (scored, completed) = match (plan.regime, plan.allow) {
                     (Some(FilterRegime::Enumerate), Some(allow)) => {
                         self.stream_rows(allow, |_| false, &mut hook)
@@ -836,8 +908,9 @@ impl VectorProvider for HnswIndex {
                                 (walked + rows, done)
                             }
                             // The walk already emitted the rows it reached.
-                            (Walk::Short, Some(allow)) => {
+                            (Walk::Short | Walk::Budget, Some(allow)) => {
                                 answered = Some(FilterRegime::Enumerate);
+                                budget_handoff = walk == Walk::Budget;
                                 let (rows, done) =
                                     self.stream_rows(allow, |row| scratch.seen(row), &mut hook);
                                 (walked + rows, done)
@@ -847,7 +920,9 @@ impl VectorProvider for HnswIndex {
                     }
                 };
                 hook.flush();
-                if let Some(regime) = answered {
+                if budget_handoff {
+                    regimes.count_budget_handoff();
+                } else if let Some(regime) = answered {
                     regimes.count(regime);
                 }
                 units += scored;

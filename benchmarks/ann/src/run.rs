@@ -207,6 +207,8 @@ fn measure(
         "predicate_ms_mean": predicate.as_secs_f64() * 1e3 / done as f64,
         "hops_mean": stats.hops as f64 / qn as f64,
         "exact_scores_mean": stats.exact as f64 / qn as f64,
+        "bridges_mean": stats.bridges as f64 / qn as f64,
+        "budget_handoffs": stats.budget_handoffs,
     })
 }
 
