@@ -14,6 +14,7 @@ mod engines;
 mod fixture;
 mod gate;
 mod run;
+mod tail;
 mod util;
 
 fn main() {
@@ -23,8 +24,10 @@ fn main() {
         "run" => run::command(),
         "gate" => gate::command(),
         "calibrate" => calibrate::command(),
+        "tail" => tail::command(),
         _ => Err(
-            "usage: ann_bench fixture|run|gate|calibrate [--key=value ...] (see README.md)".into(),
+            "usage: ann_bench fixture|run|gate|calibrate|tail [--key=value ...] (see README.md)"
+                .into(),
         ),
     };
     if let Err(e) = result {

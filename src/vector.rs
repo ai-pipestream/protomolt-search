@@ -184,6 +184,8 @@ impl FilterRegime {
 pub enum Mask<'a> {
     Bools(&'a [bool]),
     Bits(&'a Bits),
+    /// Every row in `0..len` is allowed without materializing a flag buffer.
+    All(usize),
 }
 
 impl<'a> Mask<'a> {
@@ -192,6 +194,7 @@ impl<'a> Mask<'a> {
         match self {
             Mask::Bools(allow) => allow.len(),
             Mask::Bits(bits) => bits.len(),
+            Mask::All(len) => *len,
         }
     }
 
@@ -204,6 +207,10 @@ impl<'a> Mask<'a> {
         match self {
             Mask::Bools(allow) => allow[row],
             Mask::Bits(bits) => bits.test(row),
+            Mask::All(len) => {
+                assert!(row < *len, "mask row {row} out of bounds for len {len}");
+                true
+            }
         }
     }
 
@@ -212,6 +219,7 @@ impl<'a> Mask<'a> {
         match self {
             Mask::Bools(allow) => allow.iter().filter(|&&on| on).count(),
             Mask::Bits(bits) => bits.count() as usize,
+            Mask::All(len) => *len,
         }
     }
 
@@ -227,6 +235,12 @@ impl<'a> Mask<'a> {
                 ControlFlow::Continue(())
             }
             Mask::Bits(bits) => bits.iter().try_for_each(each),
+            Mask::All(len) => {
+                for row in 0..*len {
+                    each(row)?;
+                }
+                ControlFlow::Continue(())
+            }
         }
     }
 
@@ -246,6 +260,7 @@ impl<'a> Mask<'a> {
                 let part = bits.slice(start, end);
                 (part.count() > 0).then_some(OwnedMask::Bits(part))
             }
+            Mask::All(_) => (start < end).then_some(OwnedMask::All(end - start)),
         }
     }
 
@@ -254,6 +269,7 @@ impl<'a> Mask<'a> {
         match self {
             Mask::Bools(allow) => Cow::Borrowed(allow),
             Mask::Bits(bits) => Cow::Owned(bits.to_bools()),
+            Mask::All(len) => Cow::Owned(vec![true; *len]),
         }
     }
 }
@@ -263,6 +279,7 @@ impl<'a> Mask<'a> {
 pub enum OwnedMask {
     Bools(Vec<bool>),
     Bits(Bits),
+    All(usize),
 }
 
 impl OwnedMask {
@@ -270,6 +287,7 @@ impl OwnedMask {
         match self {
             OwnedMask::Bools(allow) => Mask::Bools(allow),
             OwnedMask::Bits(bits) => Mask::Bits(bits),
+            OwnedMask::All(len) => Mask::All(*len),
         }
     }
 }
@@ -351,6 +369,9 @@ pub struct VectorSearchResults {
     /// How the filtered queries were answered; all zero for a provider
     /// with one way to filter.
     pub regimes: FilterRegimeCounts,
+    /// Rows scored by enumeration across unlinked HNSW parts (tail, frozen
+    /// tail, or sealed segments below `MIN_GRAPH_ROWS`).
+    pub tail_enumerated_rows: u64,
 }
 
 impl VectorSearchResults {
@@ -396,6 +417,9 @@ pub struct VectorStreamSummary {
     /// How the filtered queries of this stream were answered; all zero for
     /// a provider with one way to filter.
     pub regimes: FilterRegimeCounts,
+    /// Rows scored by enumeration across unlinked HNSW parts (tail, frozen
+    /// tail, or sealed segments below `MIN_GRAPH_ROWS`).
+    pub tail_enumerated_rows: u64,
 }
 
 /// Filtered searches by the regime that answered them.
@@ -490,6 +514,13 @@ pub trait VectorProvider: Send + Sync {
     /// Whether the provider serves from a mapped file; owned by default.
     fn is_mapped(&self) -> bool {
         false
+    }
+    /// Whether this image has its navigation structure built (true for scan
+    /// providers and linked HNSW segments; false for an unlinked HNSW tail or
+    /// tiny segment below `MIN_GRAPH_ROWS`). Segmented search runs linked
+    /// parts first so their `k`-th score prunes unlinked parts.
+    fn is_graph_linked(&self) -> bool {
+        true
     }
     fn as_segmented_mut(&mut self) -> Option<&mut crate::segmented_vectors::SegmentedProvider> {
         None
@@ -742,6 +773,10 @@ impl VectorIndex {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    pub fn is_graph_linked(&self) -> bool {
+        self.engine.is_graph_linked()
     }
 
     /// The row ranges that hold vectors, `(base, rows)` in row order. A
@@ -1177,6 +1212,7 @@ mod embedded_turbovec {
                 query_count: result.nq,
                 result_count: result.k,
                 regimes: FilterRegimeCounts::default(),
+                tail_enumerated_rows: 0,
             })
         }
 
@@ -1210,6 +1246,7 @@ mod embedded_turbovec {
                 units_scanned: summary.blocks_scanned,
                 completed: summary.completed,
                 regimes: FilterRegimeCounts::default(),
+                tail_enumerated_rows: 0,
             })
         }
     }
@@ -1276,6 +1313,7 @@ mod tests {
                 query_count: 1,
                 result_count: k,
                 regimes: FilterRegimeCounts::default(),
+                tail_enumerated_rows: 0,
             })
         }
 
@@ -1292,6 +1330,7 @@ mod tests {
                 units_scanned: 0,
                 completed: true,
                 regimes: FilterRegimeCounts::default(),
+                tail_enumerated_rows: 0,
             })
         }
     }

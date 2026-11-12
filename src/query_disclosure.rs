@@ -81,10 +81,12 @@ pub(crate) fn redact_execution(response: &mut QueryResponse) {
         candidate_depth: _,
         evidence_scope: _,
         filter_regimes,
+        tail_enumerated_rows,
     }) = dense_execution
     {
         // Counts per segment searched: the physical layout.
         *filter_regimes = None;
+        *tail_enumerated_rows = 0;
         planner_reason.clear();
         policy_id.clear();
         *filter_selectivity_ppm = 0;
@@ -181,6 +183,7 @@ mod tests {
                     plain: 0,
                     budget_handoffs: 1,
                 }),
+                tail_enumerated_rows: 42,
             }),
             ..Default::default()
         };
@@ -230,6 +233,7 @@ mod tests {
         assert_eq!(execution.resolved_mode, DenseExecutionMode::Ann as i32);
         assert_eq!(execution.candidate_depth, 100);
         assert_eq!(execution.filter_regimes, None);
+        assert_eq!(execution.tail_enumerated_rows, 0);
         assert_eq!(execution.policy_fingerprint, "b".repeat(64));
         assert_eq!(
             execution.policy_point,

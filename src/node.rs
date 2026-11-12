@@ -6741,7 +6741,14 @@ impl NodeServiceImpl {
 
     pub fn flush_index(&self) -> Result<FlushResponse, Status> {
         let Some(config_path) = self.config.index_path.clone() else {
-            let guard = read_shard(&self.state);
+            let mut guard = write_shard(&self.state);
+            if let Some(index) = guard.index.as_mut() {
+                if index.as_segmented().is_none() {
+                    index
+                        .prepare()
+                        .map_err(|e| Status::internal(format!("prepare index: {e}")))?;
+                }
+            }
             return Ok(FlushResponse {
                 path: String::new(),
                 num_vectors: guard.index.as_ref().map_or(0, |i| i.len() as u64),
@@ -6797,7 +6804,7 @@ impl NodeServiceImpl {
                 ));
             }
         }
-        if let Some(index) = guard.index.as_ref() {
+        if let Some(index) = guard.index.as_mut() {
             if let Some(provider) = index.as_segmented() {
                 // With no rows, no sealed image carries the provider state.
                 // Persist the empty tail so reopening without WAL retains its
@@ -6808,6 +6815,9 @@ impl NodeServiceImpl {
                     })?;
                 }
             } else {
+                index.prepare().map_err(|e| {
+                    Status::internal(format!("prepare {}: {e}", vector_path.display()))
+                })?;
                 index.write(&vector_path).map_err(|e| {
                     Status::internal(format!("write {}: {e}", vector_path.display()))
                 })?;
@@ -12098,6 +12108,7 @@ impl NodeService for NodeServiceImpl {
                                     segments_total: stats.segments_total,
                                     segments_skipped: stats.segments_skipped,
                                     filter_regimes: stats.regimes.to_proto(),
+                                    tail_enumerated_rows: stats.tail_enumerated_rows,
                                 }),
                                 geo_columns_known,
                                 filter_columns_known,
@@ -12265,6 +12276,7 @@ impl NodeService for NodeServiceImpl {
                                 segments_total: stats.segments_total,
                                 segments_skipped: stats.segments_skipped,
                                 filter_regimes: stats.regimes.to_proto(),
+                                tail_enumerated_rows: stats.tail_enumerated_rows,
                             }),
                             geo_columns_known,
                             filter_columns_known,
@@ -13662,6 +13674,7 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                             segments_total: prune.segments_total,
                             segments_skipped: prune.segments_skipped,
                             filter_regimes: summary.regimes.to_proto(),
+                            tail_enumerated_rows: summary.tail_enumerated_rows,
                         }, identities))
                     });
                 let outcome = scan.await;

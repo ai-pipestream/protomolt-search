@@ -1606,6 +1606,11 @@ message ShardScanStats {
   // (docs/hnsw.md, "Filters"). Unset for an unfiltered scan and for a
   // provider with one way to filter.
   DenseFilterRegimes filter_regimes = 8;
+  // Rows scored by exact enumeration across unlinked HNSW parts (the
+  // unsealed heap tail, a frozen tail in flight, or sealed segments below
+  // MIN_GRAPH_ROWS; docs/hnsw.md). Zero when every searched part has a
+  // built graph or on exhaustive scan providers.
+  uint64 tail_enumerated_rows = 9;
 }
 
 // One scored vector. Ids are global across the cluster (see
@@ -1833,6 +1838,11 @@ message StreamSearchSummary {
   // (docs/hnsw.md, "Filters"). All zero for an unfiltered scan and for a
   // provider with one way to filter.
   DenseFilterRegimes filter_regimes = 10;
+  // Rows scored by enumeration across unlinked HNSW parts (the unsealed
+  // heap tail, a frozen tail in flight, or sealed segments below
+  // MIN_GRAPH_ROWS; docs/hnsw.md). Zero when every searched part has a
+  // built graph or on exhaustive scan providers.
+  uint64 tail_enumerated_rows = 11;
 }
 
 // How a provider that can steer its search by the filter answered: one
@@ -2218,6 +2228,9 @@ message SearchResponse {
   // How the shards' providers answered this request's filter, summed over
   // every segment searched. Unset when no provider reported a regime.
   DenseFilterRegimes filter_regimes = 7;
+  // Rows scored by enumeration across unlinked HNSW parts, summed over
+  // every shard searched (docs/hnsw.md).
+  uint64 tail_enumerated_rows = 8;
 }
 
 // One parent document's chunks in a document-mode search response.
@@ -5989,6 +6002,10 @@ message DenseExecutionOutcome {
   // request and for providers with one way to filter. A request reported
   // as ANN whose every count is `enumerate` scored every allowed row.
   DenseFilterRegimes filter_regimes = 14;
+  // Rows scored by enumeration across unlinked HNSW parts, summed over
+  // every shard searched (docs/hnsw.md). Withheld when physical execution
+  // details are redacted.
+  uint64 tail_enumerated_rows = 15;
 }
 
 // One measured point of a dense execution policy

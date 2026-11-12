@@ -152,8 +152,12 @@ fn coordinator(addr: &str) -> CoordinatorServiceImpl {
 }
 
 /// Explicit ANN through the coordinator's query planner: `(global id,
-/// score)` best first.
-async fn ann(coordinator: &CoordinatorServiceImpl, vector: &[f32], k: usize) -> Vec<(u64, f32)> {
+/// score)` best first, plus `tail_enumerated_rows`.
+async fn ann_with_tail_stats(
+    coordinator: &CoordinatorServiceImpl,
+    vector: &[f32],
+    k: usize,
+) -> (Vec<(u64, f32)>, u64) {
     let response = coordinator
         .query(Request::new(QueryRequest {
             k: k as u32,
@@ -175,7 +179,14 @@ async fn ann(coordinator: &CoordinatorServiceImpl, vector: &[f32], k: usize) -> 
     let outcome = response.dense_execution.unwrap();
     assert_eq!(outcome.provider_backend, HNSW);
     assert_eq!(outcome.resolved_mode, DenseExecutionMode::Ann as i32);
-    response.hits.iter().map(|h| (h.doc_id, h.score)).collect()
+    (
+        response.hits.iter().map(|h| (h.doc_id, h.score)).collect(),
+        outcome.tail_enumerated_rows,
+    )
+}
+
+async fn ann(coordinator: &CoordinatorServiceImpl, vector: &[f32], k: usize) -> Vec<(u64, f32)> {
+    ann_with_tail_stats(coordinator, vector, k).await.0
 }
 
 /// The streaming scan through the coordinator: `(global id, score)`.
@@ -292,25 +303,32 @@ async fn sealed_segments_serve_mapped_and_exclude_deleted_rows() {
     for id in &doomed {
         live.remove(id);
     }
+    let live_tail_rows = (600..700u64).filter(|id| live.contains_key(id)).count() as u64;
+    assert!(live_tail_rows > 0);
     let probes = queries(6, 0x51A1_0000);
     let c = coordinator(&addr);
     for (q, query) in probes.iter().enumerate() {
-        check(
-            &ann(&c, query, K).await,
-            &live,
-            query,
-            8,
-            &format!("live query {q}"),
+        let (hits, tail_enum) = ann_with_tail_stats(&c, query, K).await;
+        assert_eq!(
+            tail_enum, live_tail_rows,
+            "live tail rows (600..700) must be enumerated until sealed"
         );
+        check(&hits, &live, query, 8, &format!("live query {q}"));
         let stream = streamed(&c, &format!("live-{q}"), query, K).await;
         check(&stream, &live, query, 8, &format!("live stream {q}"));
     }
-    // Seal the tail too: every row now sits in an image, and a reopen
-    // serves those images as written.
+    // Seal the 100-row tail too: because 100 < MIN_GRAPH_ROWS (256), segment 2
+    // persists as a compact unlinked PMHNSW01 image (`entry = NO_NODE`) while
+    // segments 0 and 1 (300 rows each) serve HNSW graphs, and reopen serves
+    // those images as written.
     flush(&addr).await;
     let mut before = Vec::new();
     for (q, query) in probes.iter().enumerate() {
-        let unary = ann(&c, query, K).await;
+        let (unary, tail_enum) = ann_with_tail_stats(&c, query, K).await;
+        assert_eq!(
+            tail_enum, live_tail_rows,
+            "tiny sealed segment (< MIN_GRAPH_ROWS) enumerates its live rows"
+        );
         check(&unary, &live, query, 8, &format!("sealed query {q}"));
         let stream = streamed(&c, &format!("sealed-{q}"), query, K).await;
         check(&stream, &live, query, 8, &format!("sealed stream {q}"));
@@ -326,9 +344,13 @@ async fn sealed_segments_serve_mapped_and_exclude_deleted_rows() {
         assert!(vector.is_mapped());
         assert_eq!(vector.descriptor().backend_kind, HNSW);
         assert_eq!(mapped.metadata(i).backend_kind, HNSW);
+        assert_eq!(vector.is_graph_linked(), i < 2, "segment {i} linked state");
     }
     let heap = OpenedSegmentSet::open_with(&root, VectorLoad::Heap).unwrap();
     assert!(!heap.vector(0).unwrap().is_mapped());
+    assert!(heap.vector(0).unwrap().is_graph_linked());
+    assert!(heap.vector(1).unwrap().is_graph_linked());
+    assert!(!heap.vector(2).unwrap().is_graph_linked());
 
     // Reopened either way, every answer is the one given before.
     for mmap in [true, false] {
@@ -653,10 +675,14 @@ fn check_texts(
 async fn compaction_rebuilds_the_graph_and_an_interrupted_publication_rolls_back() {
     let dir = tempdir("compact");
     let path = dir.join("shard.hnsw");
-    let (addr, handle) = start_empty_node(config(&path, true, true)).await;
+    let compact_cfg = || NodeConfig {
+        wal_buckets: 2,
+        ..config(&path, true, true)
+    };
+    let (addr, handle) = start_empty_node(compact_cfg()).await;
     configure(&addr).await;
     let mut live: BTreeMap<u64, Row> = BTreeMap::new();
-    for range in [0..260, 260..520] {
+    for range in [0..450, 450..900] {
         let batch = rows(range.clone());
         let first = ingest(&addr, &batch).await;
         for (i, row) in batch.into_iter().enumerate() {
@@ -664,7 +690,7 @@ async fn compaction_rebuilds_the_graph_and_an_interrupted_publication_rolls_back
         }
         flush(&addr).await;
     }
-    let doomed: Vec<u64> = (0..520u64).filter(|id| id % 5 == 1).collect();
+    let doomed: Vec<u64> = (0..900u64).filter(|id| id % 5 == 1).collect();
     let deleted = client(&addr)
         .await
         .delete_documents(DeleteDocumentsRequest {
@@ -701,12 +727,17 @@ async fn compaction_rebuilds_the_graph_and_an_interrupted_publication_rolls_back
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(compacted.rows_before, 520);
+    assert_eq!(compacted.rows_before, 900);
     assert_eq!(compacted.rows_after as usize, live.len());
     assert_eq!(compacted.tombstones_reclaimed as usize, doomed.len());
     let after_health = health(&addr).await;
     assert_eq!(after_health.deleted_docs, 0);
     assert_eq!(after_health.live_docs as usize, live.len());
+    let (_, post_tail_enum) = ann_with_tail_stats(&c, &probes[0], K).await;
+    assert_eq!(
+        post_tail_enum, 0,
+        "compacted segments >= MIN_GRAPH_ROWS must be linked"
+    );
     let after = dense_by_text(&addr, &probes).await;
     for (q, query) in probes.iter().enumerate() {
         check_texts(&after[q], &live, query, 8, &format!("post-compaction {q}"));
@@ -721,6 +752,7 @@ async fn compaction_rebuilds_the_graph_and_an_interrupted_publication_rolls_back
     for i in 0..reopened.len() {
         if let Some(vector) = reopened.vector(i) {
             assert!(vector.is_mapped());
+            assert!(vector.is_graph_linked());
             assert_eq!(vector.descriptor().backend_kind, HNSW);
         }
     }
@@ -731,7 +763,7 @@ async fn compaction_rebuilds_the_graph_and_an_interrupted_publication_rolls_back
         .map(|s| s.segment_id.clone())
         .collect();
     drop(reopened);
-    let (addr, handle) = start_opened_node(config(&path, true, true)).await;
+    let (addr, handle) = start_opened_node(compact_cfg()).await;
     assert_eq!(dense_by_text(&addr, &probes).await, after);
     handle.abort();
 
@@ -765,7 +797,7 @@ async fn compaction_rebuilds_the_graph_and_an_interrupted_publication_rolls_back
     )
     .unwrap();
 
-    let (addr, handle) = start_opened_node(config(&path, true, true)).await;
+    let (addr, handle) = start_opened_node(compact_cfg()).await;
     assert!(!marker.exists(), "the marker is consumed by the rollback");
     assert!(!staged.exists(), "the staged segment is removed");
     assert!(!PathBuf::from(&backup).exists());

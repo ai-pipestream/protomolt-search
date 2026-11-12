@@ -3968,6 +3968,7 @@ impl CoordinatorServiceImpl {
             candidate_depth: 0,
             evidence_scope: crate::pb::DenseEvidenceScope::NotApplicable as i32,
             filter_regimes: None,
+            tail_enumerated_rows: 0,
         };
         if let Some((hit, selectivity)) = qualified {
             outcome.evidence_scope = crate::pb::DenseEvidenceScope::SelectivityBandBenchmark as i32;
@@ -12463,6 +12464,12 @@ fn summed_filter_regimes(
     total.to_proto()
 }
 
+fn summed_tail_enumerated_rows(summaries: &[StreamSearchSummary]) -> u64 {
+    summaries.iter().fold(0u64, |acc, summary| {
+        acc.saturating_add(summary.tail_enumerated_rows)
+    })
+}
+
 /// Outcome of one coordinator fan-out: the merged global top-k plus the
 /// per-shard scan statistics (in completion order), the latter powering the
 /// floor-sharing benchmark.
@@ -13042,6 +13049,7 @@ impl SearchService for CoordinatorServiceImpl {
                         .await?;
                     return Ok(Response::new(SearchResponse {
                         filter_regimes: None,
+                        tail_enumerated_rows: 0,
                         segments_total: 0,
                         segments_skipped: 0,
                         request_id,
@@ -13065,6 +13073,7 @@ impl SearchService for CoordinatorServiceImpl {
                     .collect();
                 return Ok(Response::new(SearchResponse {
                     filter_regimes: None,
+                    tail_enumerated_rows: 0,
                     segments_total: 0,
                     segments_skipped: 0,
                     request_id,
@@ -13086,6 +13095,7 @@ impl SearchService for CoordinatorServiceImpl {
                         .await?;
                     return Ok(Response::new(SearchResponse {
                         filter_regimes: summed_filter_regimes(&doc.summaries),
+                        tail_enumerated_rows: summed_tail_enumerated_rows(&doc.summaries),
                         segments_total: 0,
                         segments_skipped: 0,
                         request_id,
@@ -13102,6 +13112,7 @@ impl SearchService for CoordinatorServiceImpl {
                     .await?;
                 return Ok(Response::new(SearchResponse {
                     filter_regimes: summed_filter_regimes(&streamed.summaries),
+                    tail_enumerated_rows: summed_tail_enumerated_rows(&streamed.summaries),
                     segments_total: 0,
                     segments_skipped: 0,
                     request_id,
@@ -13123,13 +13134,17 @@ impl SearchService for CoordinatorServiceImpl {
                 },
             );
             let mut regimes = crate::vector::FilterRegimeCounts::default();
+            let mut tail_enumerated_rows = 0u64;
             for stats in result.shard_stats.iter().flatten() {
                 regimes.add(crate::vector::FilterRegimeCounts::from_proto(
                     stats.filter_regimes.as_ref(),
                 ));
+                tail_enumerated_rows =
+                    tail_enumerated_rows.saturating_add(stats.tail_enumerated_rows);
             }
             Ok(Response::new(SearchResponse {
                 filter_regimes: regimes.to_proto(),
+                tail_enumerated_rows,
                 segments_total,
                 segments_skipped,
                 request_id,

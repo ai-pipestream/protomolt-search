@@ -231,6 +231,28 @@ impl SegmentedProvider {
         out
     }
 
+    /// Parts ordered for search: graph-linked images first (in row order),
+    /// then unlinked images (sealed segments below `MIN_GRAPH_ROWS`, a frozen
+    /// tail in flight, and the live tail) so the `k`-th score found by fast
+    /// graph walks prunes exact enumeration of unlinked parts. On scan
+    /// providers every part reports `is_graph_linked() == true`, preserving
+    /// strict row order.
+    fn search_images(&self) -> Vec<(usize, usize, &VectorIndex)> {
+        let all = self.images();
+        let mut out = Vec::with_capacity(all.len());
+        for &(base, rows, image) in &all {
+            if image.is_graph_linked() {
+                out.push((base, rows, image));
+            }
+        }
+        for &(base, rows, image) in &all {
+            if !image.is_graph_linked() {
+                out.push((base, rows, image));
+            }
+        }
+        out
+    }
+
     /// The row ranges that hold vectors, `(base, rows)` in row order: the
     /// parts with an image, the frozen image, and the tail. A sealed
     /// document-only segment's rows are not in the list, and neither are
@@ -292,7 +314,9 @@ impl VectorProvider for SegmentedProvider {
         let k = k.min(self.len());
         let mut per_query: Vec<Vec<(f32, i64)>> = vec![Vec::new(); nq];
         let mut regimes = crate::vector::FilterRegimeCounts::default();
-        for (base, rows, image) in self.images() {
+        let mut tail_enumerated_rows = 0u64;
+        let mut running_floor = options.minimum_score;
+        for (base, rows, image) in self.search_images() {
             let allow = match options.allow {
                 Some(allow) => match allow.slice(base, base + rows) {
                     Some(part) => Some(part),
@@ -302,7 +326,7 @@ impl VectorProvider for SegmentedProvider {
             };
             let mut part_options = VectorSearchOptions::new();
             part_options.allow = allow.as_ref().map(|part| part.as_mask());
-            if let Some(floor) = options.minimum_score {
+            if let Some(floor) = running_floor {
                 part_options = part_options.with_minimum_score(floor);
             }
             if let Some(depth) = options.candidate_depth {
@@ -312,6 +336,8 @@ impl VectorProvider for SegmentedProvider {
             part_options.enumerate_max_rows = options.enumerate_max_rows;
             let results = image.try_search(queries, k.min(rows), part_options)?;
             regimes.add(results.regimes);
+            tail_enumerated_rows =
+                tail_enumerated_rows.saturating_add(results.tail_enumerated_rows);
             for (q, hits) in per_query.iter_mut().enumerate() {
                 for (&slot, &score) in results
                     .slots_for_query(q)
@@ -322,6 +348,12 @@ impl VectorProvider for SegmentedProvider {
                         hits.push((score, slot + base as i64));
                     }
                 }
+            }
+            if nq == 1 && k > 0 && per_query[0].len() >= k {
+                per_query[0].sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+                per_query[0].truncate(k);
+                let kth = per_query[0][k - 1].0;
+                running_floor = Some(running_floor.map_or(kth, |cur| cur.max(kth)));
             }
         }
         let mut scores = Vec::with_capacity(nq * k);
@@ -344,6 +376,7 @@ impl VectorProvider for SegmentedProvider {
             query_count: nq,
             result_count: k,
             regimes,
+            tail_enumerated_rows,
         })
     }
 
@@ -363,7 +396,8 @@ impl VectorProvider for SegmentedProvider {
         let mut emitted = 0usize;
         let mut units = 0usize;
         let mut regimes = crate::vector::FilterRegimeCounts::default();
-        for (base, rows, image) in self.images() {
+        let mut tail_enumerated_rows = 0u64;
+        for (base, rows, image) in self.search_images() {
             if stopped.get() {
                 break;
             }
@@ -424,6 +458,8 @@ impl VectorProvider for SegmentedProvider {
             emitted += summary.emitted;
             units += summary.units_scanned;
             regimes.add(summary.regimes);
+            tail_enumerated_rows =
+                tail_enumerated_rows.saturating_add(summary.tail_enumerated_rows);
             if !summary.completed {
                 stopped.set(true);
             }
@@ -434,6 +470,7 @@ impl VectorProvider for SegmentedProvider {
             units_scanned: units,
             completed: !stopped.get(),
             regimes,
+            tail_enumerated_rows,
         })
     }
 

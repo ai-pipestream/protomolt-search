@@ -530,7 +530,7 @@ fn tail_insertion_keeps_recall_in_both_modes() {
         let mut index = HnswIndex::new(dim, config(mode)).unwrap();
         index.add(&vectors[..3000 * dim], dim).unwrap();
         // One by one, then a small batch, then one below and one above the
-        // parallel threshold.
+        // parallel threshold: appends stay unlinked until `prepare()` / `write()`.
         for row in 3000..3010 {
             index
                 .add(&vectors[row * dim..(row + 1) * dim], dim)
@@ -540,9 +540,26 @@ fn tail_insertion_keeps_recall_in_both_modes() {
         index.add(&vectors[3100 * dim..3300 * dim], dim).unwrap();
         index.add(&vectors[3300 * dim..5000 * dim], dim).unwrap();
         assert_eq!(index.len(), 5000);
+        assert!(!index.is_graph_linked());
+
+        // Before `prepare()`, the unlinked tail enumerates with exact recall.
+        let unlinked = index
+            .search(&queries[..dim], 10, VectorSearchOptions::new())
+            .unwrap();
+        assert_eq!(unlinked.tail_enumerated_rows, 5000);
+        let r_unlinked = recall(&index, &vectors, &queries, dim, 10, 64);
+        assert_eq!(r_unlinked, 1.0, "{mode:?}: unlinked recall@10 {r_unlinked}");
+
+        // Sealing / preparing builds the graph in bulk across all appended rows.
+        index.prepare().unwrap();
+        assert!(index.is_graph_linked());
+        let linked = index
+            .search(&queries[..dim], 10, VectorSearchOptions::new())
+            .unwrap();
+        assert_eq!(linked.tail_enumerated_rows, 0);
         let r = recall(&index, &vectors, &queries, dim, 10, 64);
-        assert!(r >= 0.95, "{mode:?}: recall@10 {r} after tail insertion");
-        // The tail rows themselves are found.
+        assert!(r >= 0.95, "{mode:?}: recall@10 {r} after seal-time build");
+        // The tail rows themselves are found in the sealed graph.
         let mut tail_found = 0;
         for row in 4900..5000 {
             let (hits, _) = index
@@ -876,20 +893,32 @@ fn vectors_of_varied_length_keep_recall_under_inner_product() {
             "{mode:?}: recall@10 {r} with varied lengths at ef 128"
         );
     }
-    // Zero rows are tolerated: they score 0 against everything.
+    // Zero rows are tolerated both before and after graph build: they score 0
+    // against everything.
     let mut index = HnswIndex::new(dim, config(BuildMode::FixedOrder)).unwrap();
-    let mut with_zero = vectors[..100 * dim].to_vec();
+    let mut with_zero = vectors[..300 * dim].to_vec();
     with_zero.extend(std::iter::repeat_n(0.0, dim));
     index.add(&with_zero, dim).unwrap();
-    assert_eq!(index.len(), 101);
+    assert_eq!(index.len(), 301);
+    assert!(!index.is_graph_linked());
     let results = index
         .search(
             &queries[..dim],
-            101,
+            301,
             VectorSearchOptions::new().with_candidate_depth(400),
         )
         .unwrap();
-    assert!(results.slots.contains(&100));
+    assert!(results.slots.contains(&300));
+    index.prepare().unwrap();
+    assert!(index.is_graph_linked());
+    let results = index
+        .search(
+            &queries[..dim],
+            301,
+            VectorSearchOptions::new().with_candidate_depth(400),
+        )
+        .unwrap();
+    assert!(results.slots.contains(&300));
 }
 
 #[test]
@@ -1693,8 +1722,9 @@ fn bulk_walk_and_enumerate_visit_identical_nodes_and_scores_to_single_row_dot() 
         let allowed = mask.count();
         for kernel in Kernel::available() {
             let mut store = Store::new(dim, 16, 64, 7, kernel);
-            let range = store.append_rows(&vectors).unwrap();
-            store.insert_sequential(range);
+            store.append_unlinked(&vectors).unwrap();
+            let links = store.build_links(false).unwrap();
+            store.install_links(links);
             let view = store.view();
             for q in queries.chunks_exact(dim) {
                 for (filter, spec) in [
@@ -2074,4 +2104,271 @@ fn a_walk_that_defeats_the_probe_stops_at_its_visit_budget() {
         tight.stats.hops,
         loose.stats.hops
     );
+}
+
+#[test]
+fn tiny_segments_persist_unlinked_and_refuse_hostile_unlinked_headers() {
+    use super::MIN_GRAPH_ROWS;
+
+    let dim = 16;
+    let rows = 100;
+    assert!(rows < MIN_GRAPH_ROWS);
+    let (vectors, queries) = corpus_with_queries(rows, 8, dim, 0x9701);
+    let mut index = HnswIndex::new(dim, config(BuildMode::Parallel)).unwrap();
+    index.add(&vectors, dim).unwrap();
+    index.prepare().unwrap();
+    assert!(!index.is_graph_linked());
+
+    let dir = temp_dir("tiny-unlinked");
+    let path = dir.join("tiny.hnsw");
+    index.write(&path).unwrap();
+    let file_len = std::fs::metadata(&path).unwrap().len();
+    let bytes_per_row = file_len as f64 / rows as f64;
+    // Rows (64 B) + inv_norm (4 B) + 192 B header + 32 B trailer + 64 B section
+    // alignment: well under 115 B/row, vs > 200 B/row when links are written.
+    assert!(
+        bytes_per_row < 115.0,
+        "unlinked tiny image wrote {bytes_per_row} B/row"
+    );
+
+    let heap = HnswIndex::load(&path).unwrap();
+    let mapped = HnswIndex::load_mapped(&path).unwrap();
+    assert!(!heap.is_graph_linked() && !mapped.is_graph_linked());
+    assert!(!heap.is_mapped() && mapped.is_mapped());
+    assert_eq!(heap.row_identity(), index.row_identity());
+    assert_eq!(mapped.row_identity(), index.row_identity());
+
+    let all_true = vec![true; rows];
+    let allow: Vec<bool> = (0..rows).map(|i| i % 2 == 0).collect();
+    let allowed = allow.iter().filter(|&&b| b).count();
+    for query in queries.chunks_exact(dim) {
+        let truth_all = exact_top_masked(&vectors, dim, query, &all_true, 10);
+        let truth_masked = exact_top_masked(&vectors, dim, query, &allow, 10);
+        for candidate in [&index, &heap, &mapped] {
+            let res = candidate
+                .search(query, 10, VectorSearchOptions::new())
+                .unwrap();
+            assert_eq!(res.tail_enumerated_rows, rows as u64);
+            let got: Vec<(u32, f32)> = res
+                .slots_for_query(0)
+                .iter()
+                .zip(res.scores_for_query(0))
+                .map(|(&id, &s)| (id as u32, s))
+                .collect();
+            assert_eq!(got, truth_all);
+
+            let masked = candidate
+                .search(query, 10, VectorSearchOptions::new().with_mask(&allow))
+                .unwrap();
+            assert_eq!(masked.tail_enumerated_rows, allowed as u64);
+            assert_eq!(masked.regimes.enumerate, 1);
+            let got_masked: Vec<(u32, f32)> = masked
+                .slots_for_query(0)
+                .iter()
+                .zip(masked.scores_for_query(0))
+                .map(|(&id, &s)| (id as u32, s))
+                .collect();
+            assert_eq!(got_masked, truth_masked);
+
+            // Streaming raises floor and counts `tail_enumerated_rows`.
+            let floor = truth_all[4].1;
+            let mut streamed = Vec::new();
+            let summary = candidate
+                .search_streaming_controlled(
+                    query,
+                    VectorSearchOptions::new()
+                        .with_candidate_depth(32)
+                        .with_minimum_score(floor),
+                    &mut |batch| {
+                        streamed.extend(
+                            batch
+                                .slots
+                                .iter()
+                                .copied()
+                                .zip(batch.scores.iter().copied()),
+                        );
+                        VectorStreamControl::Continue
+                    },
+                    &mut || VectorStreamControl::Continue,
+                )
+                .unwrap();
+            assert!(summary.completed);
+            assert_eq!(summary.tail_enumerated_rows, rows as u64);
+            assert!(streamed.iter().all(|&(_, s)| s >= floor));
+            for &(id, _) in &truth_all[..5] {
+                assert!(streamed.iter().any(|&(slot, _)| slot == i64::from(id)));
+            }
+        }
+    }
+
+    // Hostile `entry == NO_NODE` headers with non-zero `top`, `upper_nodes`,
+    // or `upper_cells` must be refused before mapping or allocating links.
+    let bytes = std::fs::read(&path).unwrap();
+    let header_len = super::image::header_len();
+    let reseal = |b: &mut [u8]| {
+        let crc = crate::wal::crc32(&b[..136]);
+        b[136..140].copy_from_slice(&crc.to_le_bytes());
+        let end = b.len() - 32;
+        let digest = crate::sha256::digest(&b[..end]);
+        b[end..].copy_from_slice(&digest);
+    };
+    assert_eq!(header_len, 192);
+    for (tag, patch_off, patch_len, val, expect) in [
+        ("bad-top", 68usize, 4usize, 1u64, "top=1"),
+        ("bad-upper-nodes", 48, 8, 1, "upper_nodes=1"),
+        ("bad-upper-cells", 56, 8, 17, "upper_cells=17"),
+    ] {
+        let mut bad = bytes.clone();
+        if patch_len == 4 {
+            bad[patch_off..patch_off + 4].copy_from_slice(&(val as u32).to_le_bytes());
+        } else {
+            bad[patch_off..patch_off + 8].copy_from_slice(&val.to_le_bytes());
+        }
+        reseal(&mut bad);
+        let bad_path = dir.join(tag);
+        std::fs::write(&bad_path, &bad).unwrap();
+        for (how, res) in [
+            ("load", HnswIndex::load(&bad_path)),
+            ("map", HnswIndex::load_mapped(&bad_path)),
+        ] {
+            let err = res.err().unwrap_or_else(|| panic!("{how} accepted {tag}"));
+            assert!(
+                err.to_string().contains(expect),
+                "{how} {tag}: {err} (expected {expect:?})"
+            );
+        }
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn segmented_provider_searches_linked_first_and_enumerates_unlinked_parts() {
+    use crate::exact_vectors::ExactVectorStore;
+    use crate::live_docs::LiveDocs;
+    use crate::postings::{AnalyzedDoc, Bm25Store};
+    use crate::segmented_vectors::SegmentedProvider;
+    use crate::segments::{SegmentCatalog, SegmentSource, VectorLoad};
+
+    let dim = 24;
+    // Segment 0: 600 rows (>= MIN_GRAPH_ROWS, linked).
+    // Segment 1: 100 rows (< MIN_GRAPH_ROWS, unlinked tiny segment).
+    // Live tail: 150 rows (unlinked heap tail).
+    let total = 850;
+    let (vectors, queries) = corpus_with_queries(total, 10, dim, 0x9702);
+    let cfg = config(BuildMode::FixedOrder);
+    let dir = temp_dir("seg-linked-first");
+    let catalog = SegmentCatalog::open_with(dir.join("catalog"), VectorLoad::Mapped).unwrap();
+
+    let stage_segment = |seg_id: &str, gen: u64, base: usize, count: usize| {
+        let stage = dir.join(seg_id);
+        std::fs::create_dir_all(&stage).unwrap();
+        let slice = &vectors[base * dim..(base + count) * dim];
+        let mut idx = HnswIndex::new(dim, cfg).unwrap();
+        idx.add(slice, dim).unwrap();
+        let vec_path = stage.join("vector.index");
+        idx.write(&vec_path).unwrap();
+        let exact_path = stage.join("vectors.f32");
+        ExactVectorStore::from_values(dim, slice.to_vec())
+            .unwrap()
+            .write(&exact_path)
+            .unwrap();
+        let mut bm25 = Bm25Store::new();
+        for id in 0..count as u32 {
+            bm25.add_document(id, String::new(), AnalyzedDoc::body(Vec::new(), 0));
+        }
+        let bm25_path = stage.join("bm25.bin");
+        bm25.save(&bm25_path).unwrap();
+        let live_path = stage.join("live.bin");
+        LiveDocs::default().write(&live_path, count as u64).unwrap();
+        catalog
+            .append(SegmentSource {
+                segment_id: seg_id,
+                generation: gen,
+                base_label: base as u64,
+                backend_kind: HNSW,
+                vector_path: Some(&vec_path),
+                exact_vector_path: Some(&exact_path),
+                bm25_path: &bm25_path,
+                live_docs_path: &live_path,
+                partition_column: None,
+            })
+            .unwrap()
+    };
+
+    let _ = stage_segment("seg-0001", 1, 0, 600);
+    let set = stage_segment("seg-0002", 2, 600, 100);
+    assert!(set.vector(0).unwrap().is_graph_linked());
+    assert!(!set.vector(1).unwrap().is_graph_linked());
+
+    let tail = HnswIndex::new(dim, cfg).unwrap().into_index();
+    let mut provider = SegmentedProvider::open(set, tail).unwrap();
+    provider.add(&vectors[700 * dim..total * dim], dim).unwrap();
+    assert!(!provider.tail().is_graph_linked());
+
+    let k = 10;
+    let mut recall_hits = 0usize;
+    for query in queries.chunks_exact(dim) {
+        let truth = exact_top(&vectors, dim, query, k);
+        let unary = provider
+            .search(
+                query,
+                k,
+                VectorSearchOptions::new().with_candidate_depth(64),
+            )
+            .unwrap();
+        // Segment 1 (100 rows) + live tail (150 rows) = 250 unlinked rows.
+        assert_eq!(unary.tail_enumerated_rows, 250);
+        let slots = unary.slots_for_query(0);
+        let scores = unary.scores_for_query(0);
+        for (&slot, &score) in slots.iter().zip(scores) {
+            let exact = crate::exact_vectors::dot(&vectors[slot as usize * dim..][..dim], query);
+            assert_eq!(score.to_bits(), exact.to_bits());
+            if truth.iter().any(|&id| i64::from(id) == slot) {
+                recall_hits += 1;
+            }
+        }
+
+        // Controlled streaming raises the floor from Segment 0's HNSW walk so
+        // Segment 1 and the tail emit only rows that beat the running top-k.
+        let mut streamed_top: Vec<(i64, f32)> = Vec::new();
+        let mut emitted_unlinked = 0usize;
+        let summary = provider
+            .search_streaming_controlled(
+                query,
+                VectorSearchOptions::new().with_candidate_depth(64),
+                &mut |batch| {
+                    for (&slot, &score) in batch.slots.iter().zip(batch.scores) {
+                        if slot >= 600 {
+                            emitted_unlinked += 1;
+                        }
+                        streamed_top.push((slot, score));
+                    }
+                    streamed_top.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+                    streamed_top.truncate(k);
+                    if streamed_top.len() == k {
+                        VectorStreamControl::RaiseFloor(streamed_top[k - 1].1)
+                    } else {
+                        VectorStreamControl::Continue
+                    }
+                },
+                &mut || VectorStreamControl::Continue,
+            )
+            .unwrap();
+        assert!(summary.completed);
+        assert_eq!(summary.tail_enumerated_rows, 250);
+        assert!(
+            emitted_unlinked < 100,
+            "linked-first floor should prune most of the 250 unlinked rows (emitted {emitted_unlinked})"
+        );
+        assert_eq!(
+            streamed_top.iter().map(|r| r.0).collect::<Vec<_>>(),
+            slots,
+            "unary and floor-pruned streaming over linked + unlinked parts must agree"
+        );
+    }
+    assert!(
+        recall_hits >= 95,
+        "segmented recall@10 {recall_hits}/100 across linked + tiny + tail"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -205,15 +205,33 @@ the top level holds the entry lock through its insertion so no other
 insertion starts from an entry whose upper lists are not yet written.
 `FIXED_ORDER` runs the same insertion on one thread in row order.
 
-## Appends
+## Appends and seal-time build
 
-Every row is linked when `add` returns. The first rows of an empty graph are
-a bulk build in the configured mode; later rows link into the live graph
-one by one in row order with the same heuristic (a parallel-mode batch of at
-least 256 rows still inserts from every thread). There is no unindexed
-tail, no rebuild at a threshold and no background build thread; `prepare()`
-has nothing to fold. In fixed-order mode a graph is the same whether its
-rows arrived in one batch or many, which is what the determinism test pins.
+`add` appends raw FP32 rows and their inverse norms only (`Store::append_unlinked`);
+no graph links are built per row during ingestion (#97). There is no online
+per-row insertion path:
+
+- **Seal / prepare (`MIN_GRAPH_ROWS = 256`).** `HnswIndex::write` and
+  `HnswIndex::prepare` build the graph in bulk across all appended rows when the
+  segment holds at least `MIN_GRAPH_ROWS` (`256`) rows (`PARALLEL` across rayon
+  workers at `>= 256` rows, or `FIXED_ORDER` sequentially in row order). Below
+  `MIN_GRAPH_ROWS`, sequential SIMD enumeration is faster than descending and
+  walking HNSW layers on both x86-64 and aarch64 while returning exact 1.0
+  recall, so tiny segments leave `entry = NO_NODE` and write zero link bytes.
+  In fixed-order mode a graph is identical whether its rows arrived in one batch
+  or many, which the determinism test pins.
+- **Unlinked tail and tiny segments.** Before `prepare()` / `write()` (and on
+  any sealed segment below `MIN_GRAPH_ROWS`), queries answer by SIMD batch
+  enumeration (`View::enumerate_skipping` for unary top-`k`, chunked SIMD
+  `stream_rows` for streaming) with online floor and top-`k` error-bound pruning
+  so exact scalar rescoring runs only on rows the traversal kernel cannot rule
+  out. On a segmented shard (`SegmentedProvider`), linked HNSW segments run
+  before tiny unlinked segments, any seal-in-flight `frozen` image, and the live
+  `tail`, carrying the running `k`-th score floor into the unlinked enumeration
+  pass. Every row scored across unlinked parts is reported in
+  `tail_enumerated_rows` (`ShardScanStats`, `StreamSearchSummary`,
+  `SearchResponse`, and `DenseExecutionOutcome`; redacted on document-scoped
+  responses).
 
 ## Filters
 
@@ -390,13 +408,17 @@ by content.
 The image (`PMHNSW01`, format 1) is a 192-byte little-endian header with a
 CRC32, then the sections (rows, inverse norms, levels, upper slots, upper
 bases, layer 0, upper layers), each on a 64-byte boundary, then a SHA-256
-trailer over everything before it. Loading parses and checks the header
-first (magic, format, CRC, every count, and that the counts lay out to
-exactly the file's length) before any section is allocated or touched, then
-verifies the trailer, then walks the structure: levels against the cap, the
-compact upper index, every list's count against its cap, every neighbor id
-against the row count, its own id and its level. After that no index into
-the graph can go out of bounds.
+trailer over everything before it. An unlinked image (`n == 0` or
+`n < MIN_GRAPH_ROWS`, recorded with `entry = NO_NODE`, `top = 0`,
+`upper_nodes = 0`, `upper_cells = 0`) stores only the header, aligned `rows`
+and `inv_norm` sections, and the SHA-256 trailer, omitting all five link
+sections (saving ~141 B/row at `M = 16`). Loading parses and checks the header
+first (magic, format, CRC, every count, unlinked header invariants, and that
+the counts lay out to exactly the file's length) before any section is
+allocated or touched, then verifies the trailer, then (when linked) walks the
+structure: levels against the cap, the compact upper index, every list's count
+against its cap, every neighbor id against the row count, its own id and its
+level. After that no index into the graph can go out of bounds.
 
 `load_mapped` maps the file and serves the graph and the rows straight from
 the map: the section alignment makes the typed views aligned, nothing is

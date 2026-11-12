@@ -274,6 +274,8 @@ impl VectorProvider for ExperimentalIvf {
             slots,
             query_count,
             result_count: k,
+            regimes: Default::default(),
+            tail_enumerated_rows: 0,
         })
     }
 

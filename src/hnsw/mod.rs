@@ -52,6 +52,7 @@ use crate::vector::{
     VectorStreamControl, VectorStreamSummary,
 };
 
+use distance::prefetch;
 use graph::{with_scratch, Filter, Hook, NoHook, Scored, Store, Walk};
 
 /// Stable identifier of the backend, as `vector_backend` names it.
@@ -63,6 +64,13 @@ pub const MAX_DIM: usize = 1 << 16;
 /// starts here, so a product query never runs a beam narrower than one the
 /// gate measured; below it the walk degenerates toward a greedy descent.
 pub const EF_FLOOR: usize = 16;
+/// Minimum row count at which `prepare` / `write` builds a graph
+/// (`docs/hnsw.md`, "Unlinked tail and tiny segments"). Below 256 rows,
+/// sequential SIMD enumeration achieves 100% exact recall faster than a
+/// realistic beam walk (`ef >= 16..32` crosses `enumerate` at `256..768`
+/// rows on AVX-512F and NEON) while avoiding graph construction and saving
+/// `141` bytes/row in `PMHNSW01` images (`entry = NO_NODE`).
+pub const MIN_GRAPH_ROWS: usize = 256;
 /// A parallel-mode batch at least this large is inserted from every
 /// thread; smaller batches are not worth the fork.
 const PARALLEL_MIN_BATCH: usize = 256;
@@ -96,6 +104,9 @@ pub struct Answer {
     /// True when a filter-aware walk spent its visit budget and handed the
     /// remaining allowed rows to enumerate (`regime` is `Enumerate`).
     pub budget_handoff: bool,
+    /// Rows scored by enumeration because this index was unlinked (heap tail,
+    /// frozen tail, or sealed segment below [`MIN_GRAPH_ROWS`]).
+    pub tail_enumerated_rows: u64,
 }
 
 /// The mask of one search with what the regimes need of it.
@@ -245,11 +256,7 @@ impl HnswIndex {
             return None;
         }
         let bytes = match &self.backing {
-            Backing::Heap(store) => {
-                (store.rows.values().len() + store.inv_norm.len() + store.upper_slot.len()) * 4
-                    + store.level.len()
-                    + (store.upper_base.len() + store.links0.len() + store.upper.len()) * 4
-            }
+            Backing::Heap(store) => store.heap_bytes(),
             Backing::Mapped(mapped) => mapped.byte_len(),
         };
         Some(bytes as f64 / n as f64)
@@ -392,6 +399,17 @@ impl HnswIndex {
         })
     }
 
+    fn slack_per_norm(&self, query: &[f32]) -> f64 {
+        let du = self.dim as f64 / (1u64 << 24) as f64;
+        let gamma = du / (1.0 - du);
+        let query_norm = query
+            .iter()
+            .map(|&v| f64::from(v) * f64::from(v))
+            .sum::<f64>()
+            .sqrt();
+        4.0 * gamma * query_norm
+    }
+
     /// The enumerate regime: the exact top `k` of the allowed rows at or
     /// above the floor. Every allowed row is scored with the traversal
     /// kernel, and the scalar scorer settles the rows the kernel cannot
@@ -415,19 +433,14 @@ impl HnswIndex {
         already_scored: &[Scored],
         skip: impl Fn(u32) -> bool,
     ) -> (Vec<(u32, f32)>, SearchStats) {
-        let du = self.dim as f64 / (1u64 << 24) as f64;
-        let gamma = du / (1.0 - du);
-        let query_norm = query
-            .iter()
-            .map(|&v| f64::from(v) * f64::from(v))
-            .sum::<f64>()
-            .sqrt();
+        let slack_per_norm = self.slack_per_norm(query);
         let mut survivors = Vec::new();
         let scored = with_view!(self, |view| view.enumerate_skipping(
             query,
             allow,
             k,
-            4.0 * gamma * query_norm,
+            floor,
+            slack_per_norm,
             already_scored,
             skip,
             &mut survivors
@@ -451,6 +464,20 @@ impl HnswIndex {
         plan: &Plan<'_>,
         scratch: &mut graph::Scratch,
     ) -> (Vec<(u32, f32)>, Answer) {
+        if !self.is_graph_linked() {
+            let allow = plan.allow.unwrap_or(Mask::All(self.len()));
+            let (hits, stats) = self.enumerate(query, k, allow, floor);
+            let tail_enumerated_rows = stats.scored;
+            return (
+                hits,
+                Answer {
+                    regime: plan.regime.map(|_| FilterRegime::Enumerate),
+                    stats,
+                    budget_handoff: false,
+                    tail_enumerated_rows,
+                },
+            );
+        }
         if let (Some(FilterRegime::Enumerate), Some(allow)) = (plan.regime, plan.allow) {
             let (hits, stats) = self.enumerate(query, k, allow, floor);
             return (
@@ -459,6 +486,7 @@ impl HnswIndex {
                     regime: plan.regime,
                     stats,
                     budget_handoff: false,
+                    tail_enumerated_rows: 0,
                 },
             );
         }
@@ -481,6 +509,7 @@ impl HnswIndex {
                         regime: Some(FilterRegime::Enumerate),
                         stats,
                         budget_handoff: false,
+                        tail_enumerated_rows: 0,
                     },
                 );
             }
@@ -502,6 +531,7 @@ impl HnswIndex {
                         regime: Some(FilterRegime::Enumerate),
                         stats,
                         budget_handoff: walk == Walk::Budget,
+                        tail_enumerated_rows: 0,
                     },
                 );
             }
@@ -514,6 +544,7 @@ impl HnswIndex {
                 regime: plan.regime,
                 stats,
                 budget_handoff: false,
+                tail_enumerated_rows: 0,
             },
         )
     }
@@ -542,30 +573,115 @@ impl HnswIndex {
     }
 
     /// The enumerate regime of a stream: every allowed row `skip` does not
-    /// name, in row order, scored by the scalar scorer alone. The control
-    /// is polled every `STREAM_POLL_ROWS` rows. Returns the rows scored and
-    /// whether the pass finished.
+    /// name, in row order. When a finite floor is active (from a prior
+    /// segment's `minimum_score` or a mid-stream `RaiseFloor`), chunks of
+    /// `STREAM_POLL_ROWS` rows are pre-filtered with the SIMD kernel using
+    /// the exact error bound before invoking the scalar scorer; when no
+    /// floor is active yet, rows go directly to the scalar scorer to avoid
+    /// double-scoring. The control is polled every `STREAM_POLL_ROWS` rows.
+    /// Returns the rows scored and whether the pass finished.
     fn stream_rows(
         &self,
         allow: Mask<'_>,
         skip: impl Fn(u32) -> bool,
         hook: &mut StreamHook<'_>,
     ) -> (usize, bool) {
-        self.with_row_source(|rows| {
-            let mut scored = 0usize;
+        let slack_per_norm = self.slack_per_norm(hook.query);
+        with_view!(self, |view| {
+            let lines = view.kernel.prefetch_lines(view.dim);
+            let batch = view.kernel.batch_width();
+            let mut cur = [0u32; STREAM_POLL_ROWS];
+            let mut cur_len = 0usize;
+            let mut next = [0u32; STREAM_POLL_ROWS];
+            let mut next_len = 0usize;
+            let mut simd_scores = [0.0f32; STREAM_POLL_ROWS];
+            let mut total_scored = 0usize;
+
+            let mut run_chunk = |chunk: &[u32],
+                                 ahead: &[u32],
+                                 hook: &mut StreamHook<'_>,
+                                 total: &mut usize|
+             -> bool {
+                for &node in &ahead[..ahead.len().min(batch)] {
+                    prefetch(view.row(node), lines);
+                }
+                if (*hook.floor).is_finite() {
+                    view.kernel.score_nodes(
+                        hook.query,
+                        view.rows,
+                        view.dim,
+                        chunk,
+                        lines,
+                        &mut simd_scores[..chunk.len()],
+                    );
+                    for (&node, &simd_score) in chunk.iter().zip(&simd_scores[..chunk.len()]) {
+                        if hook.stopped {
+                            return false;
+                        }
+                        *total += 1;
+                        let inv = view.inv_norm[node as usize];
+                        let keep = !(inv > 0.0 && inv.is_finite())
+                            || !(*hook.floor).is_finite()
+                            || f64::from(simd_score) + slack_per_norm / f64::from(inv)
+                                >= f64::from(*hook.floor);
+                        if keep {
+                            hook.scored(node, simd_score, view.row(node));
+                        }
+                    }
+                } else {
+                    for &node in chunk {
+                        if hook.stopped {
+                            return false;
+                        }
+                        *total += 1;
+                        hook.scored(node, 0.0, view.row(node));
+                    }
+                }
+                if hook.stopped {
+                    return false;
+                }
+                if chunk.len() == STREAM_POLL_ROWS && !hook.hop() {
+                    return false;
+                }
+                true
+            };
+
             let flow = allow.try_for_each(|row| {
-                let row = row as u32;
-                if skip(row) {
+                let node = row as u32;
+                if skip(node) {
                     return ControlFlow::Continue(());
                 }
-                hook.scored(row, 0.0, rows.row(row));
-                scored += 1;
-                if scored.is_multiple_of(STREAM_POLL_ROWS) && !hook.hop() {
-                    return ControlFlow::Break(());
+                if cur_len < STREAM_POLL_ROWS {
+                    cur[cur_len] = node;
+                    cur_len += 1;
+                } else {
+                    next[next_len] = node;
+                    next_len += 1;
+                    if next_len == STREAM_POLL_ROWS {
+                        if !run_chunk(&cur[..cur_len], &next[..next_len], hook, &mut total_scored) {
+                            cur_len = 0;
+                            next_len = 0;
+                            return ControlFlow::Break(());
+                        }
+                        cur = next;
+                        cur_len = next_len;
+                        next_len = 0;
+                    }
                 }
                 ControlFlow::Continue(())
             });
-            (scored, flow.is_continue())
+            if flow.is_break() {
+                return (total_scored, false);
+            }
+            if cur_len > 0
+                && !run_chunk(&cur[..cur_len], &next[..next_len], hook, &mut total_scored)
+            {
+                return (total_scored, false);
+            }
+            if next_len > 0 && !run_chunk(&next[..next_len], &[], hook, &mut total_scored) {
+                return (total_scored, false);
+            }
+            (total_scored, true)
         })
     }
 
@@ -660,6 +776,9 @@ impl StreamHook<'_> {
 impl Hook for StreamHook<'_> {
     #[inline]
     fn scored(&mut self, node: u32, _traversal_score: f32, row: &[f32]) {
+        if self.stopped {
+            return;
+        }
         let score = crate::exact_vectors::dot(row, self.query);
         if score >= *self.floor {
             self.scores.push(score);
@@ -735,11 +854,18 @@ impl VectorProvider for HnswIndex {
         matches!(self.backing, Backing::Mapped(_))
     }
 
-    /// Append rows and link every one of them into the graph before
-    /// returning: the first rows of an empty graph as a bulk build in the
-    /// configured mode, later rows one by one in row order (a parallel-mode
-    /// batch of at least [`PARALLEL_MIN_BATCH`] rows still inserts from
-    /// every thread). There is no unindexed tail and no rebuild.
+    fn is_graph_linked(&self) -> bool {
+        match &self.backing {
+            Backing::Heap(store) => store.is_linked(),
+            Backing::Mapped(mapped) => mapped.header().entry != graph::NO_NODE,
+        }
+    }
+
+    /// Append rows and their reciprocal norms to the unlinked heap store
+    /// without building graph edges (`docs/hnsw.md`, "Unlinked tail and tiny
+    /// segments"). Queries over an unlinked store answer by exact SIMD
+    /// enumeration until [`Self::prepare`] or [`Self::write`] builds the
+    /// graph in bulk at seal time.
     fn add(&mut self, vectors: &[f32], dimension: usize) -> Result<(), VectorError> {
         if dimension != self.dim {
             return Err(VectorError::new(format!(
@@ -759,7 +885,6 @@ impl VectorProvider for HnswIndex {
                 "vector {row} coordinate {coord} is invalid: {value}"
             )));
         }
-        let mode = self.config.build_mode;
         let store = match &mut self.backing {
             Backing::Heap(store) => store,
             Backing::Mapped(_) => {
@@ -768,24 +893,36 @@ impl VectorProvider for HnswIndex {
                 )))
             }
         };
-        let range = store.append_rows(vectors)?;
-        match mode {
-            BuildMode::Parallel if range.len() >= PARALLEL_MIN_BATCH => {
-                store.insert_parallel(range)
-            }
-            _ => store.insert_sequential(range),
-        }
-        Ok(())
+        store.append_unlinked(vectors)
     }
 
-    /// Every row is linked when `add` returns, so there is nothing to fold.
+    /// Build the graph in bulk when the heap store is unlinked and holds at
+    /// least [`MIN_GRAPH_ROWS`] rows; stores below [`MIN_GRAPH_ROWS`] remain
+    /// unlinked (`entry = NO_NODE`) and answer by exact SIMD enumeration.
     fn prepare(&mut self) -> Result<(), VectorError> {
+        let mode = self.config.build_mode;
+        if let Backing::Heap(store) = &mut self.backing {
+            if !store.is_linked() && store.n() >= MIN_GRAPH_ROWS {
+                let parallel = mode == BuildMode::Parallel && store.n() >= PARALLEL_MIN_BATCH;
+                let links = store.build_links(parallel)?;
+                store.install_links(links);
+            }
+        }
         Ok(())
     }
 
     fn write(&self, path: &Path) -> Result<(), VectorError> {
         match &self.backing {
-            Backing::Heap(store) => image::write(store, &self.config, path),
+            Backing::Heap(store) => {
+                if !store.is_linked() && store.n() >= MIN_GRAPH_ROWS {
+                    let parallel = self.config.build_mode == BuildMode::Parallel
+                        && store.n() >= PARALLEL_MIN_BATCH;
+                    let links = store.build_links(parallel)?;
+                    image::write_with_links(store, Some(&links), &self.config, path)
+                } else {
+                    image::write(store, &self.config, path)
+                }
+            }
             Backing::Mapped(_) => Err(VectorError::new(format!(
                 "{HNSW} image is served from a map; copy the file instead of rewriting it"
             ))),
@@ -809,9 +946,12 @@ impl VectorProvider for HnswIndex {
         let mut scores = Vec::with_capacity(query_count * k);
         let mut slots = Vec::with_capacity(query_count * k);
         let mut regimes = crate::vector::FilterRegimeCounts::default();
+        let mut tail_enumerated_rows = 0u64;
         with_scratch(|scratch| {
             for query in queries.chunks_exact(self.dim) {
                 let (hits, answer) = self.answer(query, k, ef, floor, &plan, scratch);
+                tail_enumerated_rows =
+                    tail_enumerated_rows.saturating_add(answer.tail_enumerated_rows);
                 if answer.budget_handoff {
                     regimes.count_budget_handoff();
                 } else if let Some(regime) = answer.regime {
@@ -833,6 +973,7 @@ impl VectorProvider for HnswIndex {
             query_count,
             result_count: k,
             regimes,
+            tail_enumerated_rows,
         })
     }
 
@@ -868,11 +1009,13 @@ impl VectorProvider for HnswIndex {
         }
         let ef = depth.max(EF_FLOOR);
         let plan = self.plan(ef, &options)?;
+        let linked = self.is_graph_linked();
         let mut floor = options.minimum_score.unwrap_or(f32::NEG_INFINITY);
         let mut emitted = 0usize;
         let mut units = 0usize;
         let mut stopped = false;
         let mut regimes = crate::vector::FilterRegimeCounts::default();
+        let mut tail_enumerated_rows = 0u64;
         with_scratch(|scratch| {
             for (query_index, query) in queries.chunks_exact(self.dim).enumerate() {
                 let mut hook = StreamHook {
@@ -888,34 +1031,43 @@ impl VectorProvider for HnswIndex {
                 };
                 let mut answered = plan.regime;
                 let mut budget_handoff = false;
-                let (scored, completed) = match (plan.regime, plan.allow) {
-                    (Some(FilterRegime::Enumerate), Some(allow)) => {
-                        self.stream_rows(allow, |_| false, &mut hook)
-                    }
-                    _ => {
-                        let (_, stats, walk) = with_view!(self, |view| view.walk(
-                            query,
-                            ef,
-                            plan.filter(),
-                            scratch,
-                            &mut hook
-                        ));
-                        let walked = stats.scored as usize;
-                        match (walk, plan.allow) {
-                            (Walk::Far, Some(allow)) => {
-                                answered = Some(FilterRegime::Enumerate);
-                                let (rows, done) = self.stream_rows(allow, |_| false, &mut hook);
-                                (walked + rows, done)
+                let (scored, completed) = if !linked {
+                    answered = plan.regime.map(|_| FilterRegime::Enumerate);
+                    let allow = plan.allow.unwrap_or(Mask::All(self.len()));
+                    let (rows, done) = self.stream_rows(allow, |_| false, &mut hook);
+                    tail_enumerated_rows = tail_enumerated_rows.saturating_add(rows as u64);
+                    (rows, done)
+                } else {
+                    match (plan.regime, plan.allow) {
+                        (Some(FilterRegime::Enumerate), Some(allow)) => {
+                            self.stream_rows(allow, |_| false, &mut hook)
+                        }
+                        _ => {
+                            let (_, stats, walk) = with_view!(self, |view| view.walk(
+                                query,
+                                ef,
+                                plan.filter(),
+                                scratch,
+                                &mut hook
+                            ));
+                            let walked = stats.scored as usize;
+                            match (walk, plan.allow) {
+                                (Walk::Far, Some(allow)) => {
+                                    answered = Some(FilterRegime::Enumerate);
+                                    let (rows, done) =
+                                        self.stream_rows(allow, |_| false, &mut hook);
+                                    (walked + rows, done)
+                                }
+                                // The walk already emitted the rows it reached.
+                                (Walk::Short | Walk::Budget, Some(allow)) => {
+                                    answered = Some(FilterRegime::Enumerate);
+                                    budget_handoff = walk == Walk::Budget;
+                                    let (rows, done) =
+                                        self.stream_rows(allow, |row| scratch.seen(row), &mut hook);
+                                    (walked + rows, done)
+                                }
+                                (walk, _) => (walked, walk != Walk::Stopped),
                             }
-                            // The walk already emitted the rows it reached.
-                            (Walk::Short | Walk::Budget, Some(allow)) => {
-                                answered = Some(FilterRegime::Enumerate);
-                                budget_handoff = walk == Walk::Budget;
-                                let (rows, done) =
-                                    self.stream_rows(allow, |row| scratch.seen(row), &mut hook);
-                                (walked + rows, done)
-                            }
-                            (walk, _) => (walked, walk != Walk::Stopped),
                         }
                     }
                 };
@@ -939,6 +1091,7 @@ impl VectorProvider for HnswIndex {
             units_scanned: units,
             completed: !stopped,
             regimes,
+            tail_enumerated_rows,
         })
     }
 

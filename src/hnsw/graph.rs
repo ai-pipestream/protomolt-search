@@ -325,7 +325,12 @@ pub struct View<'a, L: LinkCells + ?Sized> {
 impl<'a, L: LinkCells + ?Sized> View<'a, L> {
     #[inline]
     pub fn n(&self) -> usize {
-        self.level.len()
+        self.inv_norm.len()
+    }
+
+    #[inline]
+    pub fn is_linked(&self) -> bool {
+        self.entry != NO_NODE
     }
 
     #[inline]
@@ -641,91 +646,155 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
         slack_per_norm: f64,
         out: &mut Vec<Scored>,
     ) -> u64 {
-        self.enumerate_skipping(q, allow, k, slack_per_norm, &[], |_| false, out)
+        self.enumerate_skipping(
+            q,
+            allow,
+            k,
+            f32::NEG_INFINITY,
+            slack_per_norm,
+            &[],
+            |_| false,
+            out,
+        )
     }
 
     /// [`View::enumerate`] seeded with `already_scored` allowed rows from an
-    /// aborted or stranded filter-aware walk, scoring only allowed rows where
-    /// `!skip(row)` and applying the `2B` error-bar filter across the union.
+    /// aborted or stranded filter-aware walk and an optional exact score
+    /// `floor`, scoring only allowed rows where `!skip(row)` in stack-sized
+    /// SIMD chunks and pruning candidates online against both `floor` and the
+    /// running `k`-th kernel score before pushing to `out`.
     #[allow(clippy::too_many_arguments)]
     pub fn enumerate_skipping(
         &self,
         q: &[f32],
         allow: Mask<'_>,
         k: usize,
+        floor: f32,
         slack_per_norm: f64,
         already_scored: &[Scored],
         skip: impl Fn(u32) -> bool,
         out: &mut Vec<Scored>,
     ) -> u64 {
         out.clear();
-        let mut top: BinaryHeap<Reverse<Scored>> = BinaryHeap::with_capacity(k + 1);
+        let mut top: BinaryHeap<Reverse<Scored>> = BinaryHeap::with_capacity(k.saturating_add(1));
         let mut shortest_inv = f32::INFINITY;
-        let mut consider = |scored: Scored| {
-            let inv = self.inv_norm[scored.node as usize];
-            if inv > 0.0 {
-                shortest_inv = shortest_inv.min(inv);
-                if top.len() < k {
-                    top.push(Reverse(scored));
-                } else if top.peek().is_some_and(|worst| scored > worst.0) {
-                    top.pop();
-                    top.push(Reverse(scored));
+        let consider =
+            |scored: Scored, top: &mut BinaryHeap<Reverse<Scored>>, shortest_inv: &mut f32| {
+                if k == 0 {
+                    return;
                 }
+                let inv = self.inv_norm[scored.node as usize];
+                if inv > 0.0 && inv.is_finite() {
+                    *shortest_inv = (*shortest_inv).min(inv);
+                    if top.len() < k {
+                        top.push(Reverse(scored));
+                    } else if top.peek().is_some_and(|worst| scored > worst.0) {
+                        top.pop();
+                        top.push(Reverse(scored));
+                    }
+                }
+            };
+        for &prior in already_scored {
+            consider(prior, &mut top, &mut shortest_inv);
+        }
+        let finite_floor = floor.is_finite().then(|| f64::from(floor));
+        let current_bar = |top: &BinaryHeap<Reverse<Scored>>, shortest_inv: f32| -> Option<f64> {
+            let top_bar = if k > 0 && top.len() == k {
+                top.peek().map(|Reverse(kth)| {
+                    f64::from(kth.score) - slack_per_norm / f64::from(shortest_inv)
+                })
+            } else {
+                None
+            };
+            match (finite_floor, top_bar) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
             }
         };
-        let _ = allow.try_for_each(|row| {
-            let node = row as u32;
-            if !skip(node) {
-                out.push(Scored { score: 0.0, node });
+        let survives = |s: Scored, bar: Option<f64>| -> bool {
+            if k == 0 {
+                return false;
             }
-            ControlFlow::<()>::Continue(())
-        });
+            let Some(bar) = bar else {
+                return true;
+            };
+            let inv = self.inv_norm[s.node as usize];
+            if !(inv > 0.0 && inv.is_finite()) {
+                return true;
+            }
+            f64::from(s.score) + slack_per_norm / f64::from(inv) >= bar
+        };
+
         let lines = self.prefetch_lines();
         let batch = self.kernel.batch_width();
-        let mut nodes = [0u32; SCORE_CHUNK_NODES];
+        let mut cur = [0u32; SCORE_CHUNK_NODES];
+        let mut cur_len = 0usize;
+        let mut next = [0u32; SCORE_CHUNK_NODES];
+        let mut next_len = 0usize;
         let mut scores = [0.0f32; SCORE_CHUNK_NODES];
-        // The allowed rows lie apart, so the hardware prefetcher cannot
-        // follow them: `score_nodes` overlaps row loads in batches of 8
-        // (AVX-512F) or 4 inside one target-feature call per chunk, and the
-        // seam prefetch warms line 0 of the next chunk's head before scoring
-        // the current one.
-        let total = out.len();
-        let mut base = 0usize;
-        while base < total {
-            let end = (base + SCORE_CHUNK_NODES).min(total);
-            let len = end - base;
-            for (dst, slot) in nodes[..len].iter_mut().zip(&out[base..end]) {
-                *dst = slot.node;
-            }
-            for ahead in &out[end..total.min(end + batch)] {
-                prefetch(self.row(ahead.node), lines);
+        let mut scored = 0u64;
+
+        // Allowed rows lie apart in filtered masks and contiguous in unlinked
+        // tails: double-buffering two stack chunks keeps seam prefetches hot
+        // without allocating a candidate vector proportional to mask size.
+        let mut flush_chunk = |chunk: &[u32], ahead: &[u32]| {
+            for &node in &ahead[..ahead.len().min(batch)] {
+                prefetch(self.row(node), lines);
             }
             self.kernel.score_nodes(
                 q,
                 self.rows,
                 self.dim,
-                &nodes[..len],
+                chunk,
                 lines,
-                &mut scores[..len],
+                &mut scores[..chunk.len()],
             );
-            for (slot, &score) in out[base..end].iter_mut().zip(&scores[..len]) {
-                let scored = Scored {
-                    score,
-                    node: slot.node,
-                };
-                *slot = scored;
-                consider(scored);
+            for (&node, &score) in chunk.iter().zip(&scores[..chunk.len()]) {
+                let s = Scored { score, node };
+                consider(s, &mut top, &mut shortest_inv);
+                let bar = current_bar(&top, shortest_inv);
+                if survives(s, bar) {
+                    out.push(s);
+                }
             }
-            base = end;
+        };
+
+        let _ = allow.try_for_each(|row| {
+            let node = row as u32;
+            if skip(node) {
+                return ControlFlow::<()>::Continue(());
+            }
+            scored += 1;
+            if cur_len < SCORE_CHUNK_NODES {
+                cur[cur_len] = node;
+                cur_len += 1;
+            } else {
+                next[next_len] = node;
+                next_len += 1;
+                if next_len == SCORE_CHUNK_NODES {
+                    flush_chunk(&cur[..cur_len], &next[..next_len]);
+                    cur = next;
+                    cur_len = next_len;
+                    next_len = 0;
+                }
+            }
+            ControlFlow::Continue(())
+        });
+        if cur_len > 0 {
+            flush_chunk(&cur[..cur_len], &next[..next_len]);
         }
-        let scored = total as u64;
+        if next_len > 0 {
+            flush_chunk(&next[..next_len], &[]);
+        }
+
+        let final_bar = current_bar(&top, shortest_inv);
+        out.retain(|&s| survives(s, final_bar));
         for &prior in already_scored {
-            consider(prior);
-        }
-        out.extend_from_slice(already_scored);
-        if let (true, Some(Reverse(kth))) = (top.len() == k, top.peek()) {
-            let bar = f64::from(kth.score) - 2.0 * slack_per_norm / f64::from(shortest_inv);
-            out.retain(|s| f64::from(s.score) >= bar || self.inv_norm[s.node as usize] <= 0.0);
+            if survives(prior, final_bar) {
+                out.push(prior);
+            }
         }
         scored
     }
@@ -907,17 +976,15 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
     }
 }
 
-/// The heap graph: owns its arrays and grows by insertion.
-pub struct Store {
-    pub dim: usize,
-    pub m: usize,
-    pub m0: usize,
-    pub seed: u64,
-    pub ef_construction: usize,
-    pub kernel: Kernel,
-    level_mult: f64,
-    pub rows: OwnedRows,
-    pub inv_norm: Vec<f32>,
+static EMPTY_CELLS: [AtomicU32; 0] = [];
+
+/// Built adjacency and skeleton arrays over a fixed `(rows, inv_norm)` slice.
+///
+/// Kept `None` on an unsealed heap tail or a tiny segment below
+/// `MIN_GRAPH_ROWS`, materialized in place by [`Store::build_links`] when
+/// sealing (`HnswIndex::write`) or preparing (`HnswIndex::prepare`), and
+/// populated on [`HnswIndex::load`] when the persisted image carries links.
+pub struct GraphLinks {
     pub level: Vec<u8>,
     pub upper_slot: Vec<u32>,
     pub upper_base: Vec<u32>,
@@ -929,6 +996,58 @@ pub struct Store {
     /// that raises the top level, so no other insertion starts from an
     /// entry whose upper lists are not yet written.
     entry_lock: Mutex<()>,
+}
+
+impl GraphLinks {
+    pub fn from_parts(
+        level: Vec<u8>,
+        upper_slot: Vec<u32>,
+        upper_base: Vec<u32>,
+        links0: Vec<AtomicU32>,
+        upper: Vec<AtomicU32>,
+        entry: u32,
+        top: u8,
+    ) -> Self {
+        Self {
+            level,
+            upper_slot,
+            upper_base,
+            links0,
+            upper,
+            entry: AtomicU64::new(pack_entry(entry, top)),
+            entry_lock: Mutex::new(()),
+        }
+    }
+
+    pub fn entry_state(&self) -> (u32, u8) {
+        unpack_entry(self.entry.load(Atomic::Acquire))
+    }
+
+    fn publish_entry(&self, node: u32, top: u8) {
+        self.entry.store(pack_entry(node, top), Atomic::Release);
+    }
+
+    fn heap_bytes(&self) -> usize {
+        self.level.len()
+            + (self.upper_slot.len() + self.upper_base.len() + self.links0.len() + self.upper.len())
+                * 4
+    }
+}
+
+/// The heap store: owns FP32 rows and reciprocal norms during online tail
+/// ingestion, and holds [`GraphLinks`] only once built at seal/prepare or
+/// loaded from a linked image.
+pub struct Store {
+    pub dim: usize,
+    pub m: usize,
+    pub m0: usize,
+    pub seed: u64,
+    pub ef_construction: usize,
+    pub kernel: Kernel,
+    level_mult: f64,
+    pub rows: OwnedRows,
+    pub inv_norm: Vec<f32>,
+    links: Option<GraphLinks>,
 }
 
 /// The level of `node` under `seed`: a geometric draw with the paper's
@@ -961,18 +1080,13 @@ impl Store {
             level_mult: 1.0 / (m as f64).ln(),
             rows: OwnedRows::new(dim),
             inv_norm: Vec::new(),
-            level: Vec::new(),
-            upper_slot: Vec::new(),
-            upper_base: Vec::new(),
-            links0: Vec::new(),
-            upper: Vec::new(),
-            entry: AtomicU64::new(u64::from(NO_NODE)),
-            entry_lock: Mutex::new(()),
+            links: None,
         }
     }
 
     /// Reassemble a store from decoded arrays (an image loaded onto the
-    /// heap). The caller has validated them.
+    /// heap). The caller has validated them; an unlinked image (`entry ==
+    /// NO_NODE`) leaves `links` absent.
     #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
         dim: usize,
@@ -993,45 +1107,86 @@ impl Store {
         let mut store = Self::new(dim, m, ef_construction, seed, kernel);
         store.rows = OwnedRows::from_values(dim, rows);
         store.inv_norm = inv_norm;
-        store.level = level;
-        store.upper_slot = upper_slot;
-        store.upper_base = upper_base;
-        store.links0 = links0;
-        store.upper = upper;
-        store.entry = AtomicU64::new(pack_entry(entry, top));
+        if entry != NO_NODE {
+            store.links = Some(GraphLinks::from_parts(
+                level, upper_slot, upper_base, links0, upper, entry, top,
+            ));
+        }
         store
     }
 
+    #[inline]
     pub fn n(&self) -> usize {
-        self.level.len()
+        self.inv_norm.len()
+    }
+
+    #[inline]
+    pub fn is_linked(&self) -> bool {
+        self.links
+            .as_ref()
+            .is_some_and(|l| l.entry_state().0 != NO_NODE)
+    }
+
+    #[inline]
+    pub fn links(&self) -> Option<&GraphLinks> {
+        self.links.as_ref()
     }
 
     pub fn entry_state(&self) -> (u32, u8) {
-        unpack_entry(self.entry.load(Atomic::Acquire))
+        self.links
+            .as_ref()
+            .map_or((NO_NODE, 0), GraphLinks::entry_state)
+    }
+
+    pub fn heap_bytes(&self) -> usize {
+        (self.rows.values().len() + self.inv_norm.len()) * 4
+            + self.links.as_ref().map_or(0, GraphLinks::heap_bytes)
     }
 
     pub fn view(&self) -> View<'_, [AtomicU32]> {
-        let (entry, top) = self.entry_state();
-        View {
-            dim: self.dim,
-            m: self.m,
-            m0: self.m0,
-            rows: self.rows.values(),
-            inv_norm: &self.inv_norm,
-            level: &self.level,
-            upper_slot: &self.upper_slot,
-            upper_base: &self.upper_base,
-            links0: self.links0.as_slice(),
-            upper: self.upper.as_slice(),
-            entry,
-            top,
-            kernel: self.kernel,
+        match &self.links {
+            Some(links) => {
+                let (entry, top) = links.entry_state();
+                View {
+                    dim: self.dim,
+                    m: self.m,
+                    m0: self.m0,
+                    rows: self.rows.values(),
+                    inv_norm: &self.inv_norm,
+                    level: &links.level,
+                    upper_slot: &links.upper_slot,
+                    upper_base: &links.upper_base,
+                    links0: links.links0.as_slice(),
+                    upper: links.upper.as_slice(),
+                    entry,
+                    top,
+                    kernel: self.kernel,
+                }
+            }
+            None => View {
+                dim: self.dim,
+                m: self.m,
+                m0: self.m0,
+                rows: self.rows.values(),
+                inv_norm: &self.inv_norm,
+                level: &[],
+                upper_slot: &[],
+                upper_base: &[],
+                links0: &EMPTY_CELLS,
+                upper: &EMPTY_CELLS,
+                entry: NO_NODE,
+                top: 0,
+                kernel: self.kernel,
+            },
         }
     }
 
-    /// Append rows (validated by the caller) as unlinked nodes with their
-    /// levels drawn and their link slots zeroed. Returns the new node ids.
-    pub fn append_rows(&mut self, vectors: &[f32]) -> Result<std::ops::Range<u32>, VectorError> {
+    /// Append validated rows to the unlinked store (`rows` + `inv_norm`
+    /// only). If this heap store previously held built links (for example
+    /// a non-segmented single-image node that flushed and then accepted
+    /// new writes), those links are dropped so queries enumerate cleanly
+    /// until the next bulk build at `prepare` / `write`.
+    pub fn append_unlinked(&mut self, vectors: &[f32]) -> Result<(), VectorError> {
         let count = vectors.len() / self.dim;
         let first = self.n();
         if first + count > MAX_ROWS {
@@ -1040,14 +1195,13 @@ impl Store {
                 first + count
             )));
         }
+        if count == 0 {
+            return Ok(());
+        }
+        self.links = None;
         self.rows.reserve(vectors.len());
         self.inv_norm.reserve(count);
-        self.level.reserve(count);
-        self.upper_slot.reserve(count);
-        let stride0 = self.m0 + 1;
-        let stride_up = self.m + 1;
-        for (i, row) in vectors.chunks_exact(self.dim).enumerate() {
-            let node = (first + i) as u32;
+        for row in vectors.chunks_exact(self.dim) {
             let norm = self.kernel.dot(row, row).sqrt();
             self.rows.push(row);
             self.inv_norm.push(if norm > 0.0 && norm.is_finite() {
@@ -1055,34 +1209,115 @@ impl Store {
             } else {
                 0.0
             });
-            let level = level_for(self.seed, node, self.level_mult);
-            self.level.push(level);
-            if level == 0 {
-                self.upper_slot.push(NO_NODE);
+        }
+        Ok(())
+    }
+
+    /// Build a full [`GraphLinks`] over `0..self.n()` without mutating or
+    /// copying `self.rows` / `self.inv_norm`, so sealing a frozen tail can
+    /// run lock-free alongside concurrent readers.
+    pub fn build_links(&self, parallel: bool) -> Result<GraphLinks, VectorError> {
+        let n = self.n();
+        if n == 0 {
+            return Ok(GraphLinks::from_parts(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                NO_NODE,
+                0,
+            ));
+        }
+        let stride0 = self.m0 + 1;
+        let stride_up = self.m + 1;
+        let mut level = Vec::with_capacity(n);
+        let mut upper_slot = Vec::with_capacity(n);
+        let mut upper_base = Vec::new();
+        let mut upper_cells = 0usize;
+        for i in 0..n {
+            let lvl = level_for(self.seed, i as u32, self.level_mult);
+            level.push(lvl);
+            if lvl == 0 {
+                upper_slot.push(NO_NODE);
             } else {
-                let base = self.upper.len();
-                let cells = level as usize * stride_up;
-                if base + cells > u32::MAX as usize || self.upper_base.len() >= MAX_ROWS {
+                let cells = usize::from(lvl) * stride_up;
+                if upper_cells + cells > u32::MAX as usize || upper_base.len() >= MAX_ROWS {
                     return Err(VectorError::new(format!(
                         "{HNSW} upper layers exceed the addressable {} cells",
                         u32::MAX
                     )));
                 }
-                self.upper_slot.push(self.upper_base.len() as u32);
-                self.upper_base.push(base as u32);
-                self.upper
-                    .extend(std::iter::repeat_with(|| AtomicU32::new(0)).take(cells));
+                upper_slot.push(upper_base.len() as u32);
+                upper_base.push(upper_cells as u32);
+                upper_cells += cells;
             }
         }
-        self.links0
-            .extend(std::iter::repeat_with(|| AtomicU32::new(0)).take(count * stride0));
-        Ok(first as u32..(first + count) as u32)
+        let links0: Vec<AtomicU32> = std::iter::repeat_with(|| AtomicU32::new(0))
+            .take(n * stride0)
+            .collect();
+        let upper: Vec<AtomicU32> = std::iter::repeat_with(|| AtomicU32::new(0))
+            .take(upper_cells)
+            .collect();
+        let links =
+            GraphLinks::from_parts(level, upper_slot, upper_base, links0, upper, NO_NODE, 0);
+        let builder = LinkBuilder {
+            dim: self.dim,
+            m: self.m,
+            m0: self.m0,
+            ef_construction: self.ef_construction,
+            kernel: self.kernel,
+            rows: self.rows.values(),
+            inv_norm: &self.inv_norm,
+            links: &links,
+        };
+        let range = 0..n as u32;
+        if parallel {
+            builder.insert_parallel(range);
+        } else {
+            builder.insert_sequential(range);
+        }
+        Ok(links)
     }
 
-    /// Insert the nodes of `range` one after another in id order, on this
-    /// thread. The result depends only on the rows, the config and the
-    /// kernel.
-    pub fn insert_sequential(&self, range: std::ops::Range<u32>) {
+    pub fn install_links(&mut self, links: GraphLinks) {
+        debug_assert_eq!(links.level.len(), self.n());
+        self.links = Some(links);
+    }
+}
+
+struct LinkBuilder<'a> {
+    dim: usize,
+    m: usize,
+    m0: usize,
+    ef_construction: usize,
+    kernel: Kernel,
+    rows: &'a [f32],
+    inv_norm: &'a [f32],
+    links: &'a GraphLinks,
+}
+
+impl LinkBuilder<'_> {
+    fn view(&self) -> View<'_, [AtomicU32]> {
+        let (entry, top) = self.links.entry_state();
+        View {
+            dim: self.dim,
+            m: self.m,
+            m0: self.m0,
+            rows: self.rows,
+            inv_norm: self.inv_norm,
+            level: &self.links.level,
+            upper_slot: &self.links.upper_slot,
+            upper_base: &self.links.upper_base,
+            links0: self.links.links0.as_slice(),
+            upper: self.links.upper.as_slice(),
+            entry,
+            top,
+            kernel: self.kernel,
+        }
+    }
+
+    fn insert_sequential(&self, range: std::ops::Range<u32>) {
         with_scratch(|scratch| {
             for node in range {
                 self.insert(node, None, scratch);
@@ -1090,9 +1325,7 @@ impl Store {
         });
     }
 
-    /// Insert the nodes of `range` from every thread of the rayon pool,
-    /// under striped per-node locks.
-    pub fn insert_parallel(&self, range: std::ops::Range<u32>) {
+    fn insert_parallel(&self, range: std::ops::Range<u32>) {
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let locks = Locks::default();
         range
@@ -1100,17 +1333,13 @@ impl Store {
             .for_each(|node| with_scratch(|scratch| self.insert(node, Some(&locks), scratch)));
     }
 
-    fn publish_entry(&self, node: u32, top: u8) {
-        self.entry.store(pack_entry(node, top), Atomic::Release);
-    }
-
     fn write_links(&self, node: u32, layer: usize, list: &[u32], locks: Option<&Locks>) {
         let view = self.view();
         let start = view.list_start(node, layer);
         let cells = if layer == 0 {
-            &self.links0
+            &self.links.links0
         } else {
-            &self.upper
+            &self.links.upper
         };
         debug_assert!(list.len() <= view.cap(layer));
         let _guard = locks.map(|l| l.lock(node));
@@ -1143,9 +1372,9 @@ impl Store {
         let view = self.view();
         let start = view.list_start(node, layer);
         let cells = if layer == 0 {
-            &self.links0
+            &self.links.links0
         } else {
-            &self.upper
+            &self.links.upper
         };
         let _guard = locks.lock(node);
         let count = (cells[start].load(Atomic::Relaxed) as usize).min(cap);
@@ -1177,23 +1406,24 @@ impl Store {
     }
 
     /// Paper Algorithm 1 for one node.
-    pub fn insert(&self, node: u32, locks: Option<&Locks>, scratch: &mut Scratch) {
-        let level = self.level[node as usize];
-        let (mut entry, mut top) = self.entry_state();
+    fn insert(&self, node: u32, locks: Option<&Locks>, scratch: &mut Scratch) {
+        let level = self.links.level[node as usize];
+        let (mut entry, mut top) = self.links.entry_state();
         let mut raising = None;
         if entry == NO_NODE || level > top {
             let guard = self
+                .links
                 .entry_lock
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (entry, top) = self.entry_state();
+            (entry, top) = self.links.entry_state();
             if entry == NO_NODE || level > top {
                 raising = Some(guard);
             }
         }
         if entry == NO_NODE {
             // The first node: nothing to link to.
-            self.publish_entry(node, level);
+            self.links.publish_entry(node, level);
             return;
         }
         let view = self.view();
@@ -1239,7 +1469,7 @@ impl Store {
             scratch.pool = pool;
         }
         if raising.is_some() {
-            self.publish_entry(node, level);
+            self.links.publish_entry(node, level);
         }
     }
 
@@ -1259,9 +1489,9 @@ impl Store {
         let view = self.view();
         let start = view.list_start(e, layer);
         let cells = if layer == 0 {
-            &self.links0
+            &self.links.links0
         } else {
-            &self.upper
+            &self.links.upper
         };
         let _guard = locks.map(|l| l.lock(e));
         let count = (cells[start].load(Atomic::Relaxed) as usize).min(cap);

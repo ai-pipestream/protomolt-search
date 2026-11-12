@@ -2,9 +2,10 @@
 //! coordinator: it is selected by `vector_backend`, it is never treated as
 //! exact (EXACT, the legacy unspecified mode and AUTO without a policy
 //! refuse naming it), explicit ANN finds the FP32 top-k through a graph each
-//! node built as the rows arrived and reports exact FP32 scores, AUTO
-//! qualifies it only through a policy bound to its scoring fingerprint, and
-//! the streaming scan reaches it with the request's candidate depth.
+//! node builds on seal/flush (while unsealed tails enumerate) and reports
+//! exact FP32 scores, AUTO qualifies it only through a policy bound to its
+//! scoring fingerprint, and the streaming scan reaches it with the request's
+//! candidate depth.
 
 mod common;
 
@@ -22,8 +23,9 @@ use pipestream_search::pb::{
     filter_query, search_query, selection_query, stream_search_request, stream_search_response,
     AddDocumentsRequest, AddVectorsRequest, BooleanQuery, CompositeSearchStrategy,
     DenseExecutionMode, DenseFilterRegimes, DenseQuery, DenseScoreMode, FacetValue, FilterQuery,
-    GetVectorBackendRequest, QueryRequest, QueryResponse, SearchQuery, SelectionOperator,
-    SelectionQuery, StartStreamSearch, StreamSearchRequest, VectorQualityContract,
+    FlushRequest, GetVectorBackendRequest, QueryRequest, QueryResponse, SearchQuery,
+    SelectionOperator, SelectionQuery, StartStreamSearch, StreamSearchRequest,
+    VectorQualityContract,
 };
 use pipestream_search::vector::VectorIndex;
 use tokio::sync::mpsc;
@@ -102,8 +104,9 @@ async fn start_fixture() -> Fixture {
         .unwrap();
         drop(vtx);
         client.add_vectors(ReceiverStream::new(vrx)).await.unwrap();
-        // Every row is in the graph as soon as the append returns; the node
-        // reports the provider and its config.
+        // Flush builds the HNSW graph over all appended rows; the node reports
+        // the provider and its config.
+        client.flush(FlushRequest {}).await.unwrap();
         let backend = client
             .get_vector_backend(GetVectorBackendRequest {})
             .await
@@ -529,6 +532,7 @@ async fn start_filtered_fixture() -> (Fixture, Vec<String>) {
         .unwrap();
         drop(vtx);
         client.add_vectors(ReceiverStream::new(vrx)).await.unwrap();
+        client.flush(FlushRequest {}).await.unwrap();
         addrs.push(addr);
         handles.push(handle);
     }
@@ -916,5 +920,98 @@ async fn a_policy_point_serves_a_filter_under_its_measured_threshold() {
         );
         let got_sparse: Vec<u64> = response.hits.iter().map(|hit| hit.doc_id).collect();
         assert_eq!(got_sparse, exact_sparse, "streaming={streaming}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unsealed_tail_enumerates_until_flushed() {
+    let per_shard = 400usize;
+    let total = per_shard * SHARDS;
+    let corpus = unit_vectors(total, DIM, 0x4A5E_0097);
+    let query_vector = unit_vectors(1, DIM, 0x4A5E_9700);
+    let mut addrs = Vec::new();
+    let mut handles = Vec::new();
+    for shard in 0..SHARDS {
+        let start = shard * per_shard;
+        let (addr, handle) = start_node(
+            graph_index(),
+            NodeConfig {
+                slot_offset: start as u64,
+                analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+        let (tx, rx) = mpsc::channel(per_shard);
+        for i in 0..per_shard {
+            tx.send(AddDocumentsRequest {
+                text: format!("unsealed doc {}", start + i),
+                analysis: Some(body_spec()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx);
+        client.add_documents(ReceiverStream::new(rx)).await.unwrap();
+        client
+            .add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
+                vectors: corpus[start * DIM..(start + per_shard) * DIM].to_vec(),
+                dim: DIM as u32,
+            }]))
+            .await
+            .unwrap();
+        addrs.push(addr);
+        handles.push(handle);
+    }
+
+    for streaming in [false, true] {
+        let coordinator = CoordinatorServiceImpl::new(addrs.clone())
+            .with_bm25(
+                Some(NATIVE_ANALYSIS_BACKEND.to_string()),
+                Default::default(),
+            )
+            .with_stream_search(streaming);
+        let unsealed = query(
+            &coordinator,
+            dense_request(&query_vector, 5, DenseExecutionMode::Ann),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            unsealed.dense_execution.unwrap().tail_enumerated_rows,
+            total as u64,
+            "streaming={streaming}: unsealed shards must report tail_enumerated_rows"
+        );
+    }
+
+    for addr in &addrs {
+        let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+        client.flush(FlushRequest {}).await.unwrap();
+    }
+
+    for streaming in [false, true] {
+        let coordinator = CoordinatorServiceImpl::new(addrs.clone())
+            .with_bm25(
+                Some(NATIVE_ANALYSIS_BACKEND.to_string()),
+                Default::default(),
+            )
+            .with_stream_search(streaming);
+        let sealed = query(
+            &coordinator,
+            dense_request(&query_vector, 5, DenseExecutionMode::Ann),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sealed.dense_execution.unwrap().tail_enumerated_rows,
+            0,
+            "streaming={streaming}: flushed shards (>= MIN_GRAPH_ROWS) must build graphs"
+        );
+    }
+
+    for handle in handles {
+        handle.abort();
     }
 }

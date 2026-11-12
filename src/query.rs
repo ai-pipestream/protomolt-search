@@ -1468,6 +1468,7 @@ pub(crate) async fn execute(
             // report (docs/hnsw.md, "Filters").
             if let Some(outcome) = dense_execution.as_mut() {
                 outcome.filter_regimes = response.filter_regimes;
+                outcome.tail_enumerated_rows = response.tail_enumerated_rows;
             }
             let mut hits: Vec<QueryHit> = response
                 .hits

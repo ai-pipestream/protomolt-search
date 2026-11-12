@@ -75,6 +75,10 @@ pub struct ScanStats {
     /// How a provider that steers its search by the filter answered this
     /// query (`docs/hnsw.md`, "Filters"); all zero on a scan provider.
     pub regimes: crate::vector::FilterRegimeCounts,
+    /// Rows scored by enumeration across unlinked HNSW parts (tail, frozen
+    /// tail, or sealed segments below `MIN_GRAPH_ROWS`); zero on a scan
+    /// provider.
+    pub tail_enumerated_rows: u64,
 }
 
 /// One kernel call's cost: encoded bytes streamed and wall time inside
@@ -562,6 +566,7 @@ fn searched_topk(
     stats.chunk_calls = 1;
     stats.scan_nanos = pass.nanos;
     stats.regimes = results.regimes;
+    stats.tail_enumerated_rows = results.tail_enumerated_rows;
     let mut hits: Vec<ChunkHit> = results
         .scores_for_query(0)
         .iter()
@@ -586,11 +591,12 @@ fn searched_topk(
 fn group_by_allow(queries: &[BatchQuery<'_>]) -> Vec<Vec<usize>> {
     let key = |a: Option<Mask<'_>>| {
         a.map(|mask| match mask {
-            Mask::Bools(s) => (false, s.as_ptr() as usize, s.len()),
-            Mask::Bits(bits) => (true, std::ptr::from_ref(bits) as usize, bits.len()),
+            Mask::Bools(s) => (0u8, s.as_ptr() as usize, s.len()),
+            Mask::Bits(bits) => (1u8, std::ptr::from_ref(bits) as usize, bits.len()),
+            Mask::All(len) => (2u8, 0usize, len),
         })
     };
-    let mut keys: Vec<Option<(bool, usize, usize)>> = Vec::new();
+    let mut keys: Vec<Option<(u8, usize, usize)>> = Vec::new();
     let mut groups: Vec<Vec<usize>> = Vec::new();
     for (qi, q) in queries.iter().enumerate() {
         let k = key(q.allow);

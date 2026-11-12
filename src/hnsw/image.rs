@@ -21,7 +21,7 @@ use std::sync::atomic::AtomicU32;
 
 use super::config::{BuildMode, HnswConfig};
 use super::distance::Kernel;
-use super::graph::{LinkCells, Store, View, MAX_LEVEL, MAX_ROWS, NO_NODE};
+use super::graph::{GraphLinks, LinkCells, Store, View, MAX_LEVEL, MAX_ROWS, NO_NODE};
 use super::rows::{MappedRows, RowSource};
 use super::{HNSW, MAX_DIM};
 use crate::vector::VectorError;
@@ -57,6 +57,7 @@ impl Layout {
         m: u64,
         upper_nodes: u64,
         upper_cells: u64,
+        linked: bool,
     ) -> Result<Self, VectorError> {
         let overflow = || VectorError::new(format!("{HNSW} image layout overflows"));
         let mut at = HEADER_LEN as u64;
@@ -65,16 +66,17 @@ impl Layout {
             at = off.checked_add(bytes).ok_or_else(overflow)?;
             Ok(off)
         };
+        let graph_n = if linked { n } else { 0 };
         let rows_off = place(
             n.checked_mul(dim)
                 .and_then(|x| x.checked_mul(4))
                 .ok_or_else(overflow)?,
         )?;
         let inv_norm_off = place(n.checked_mul(4).ok_or_else(overflow)?)?;
-        let level_off = place(n)?;
-        let upper_slot_off = place(n.checked_mul(4).ok_or_else(overflow)?)?;
+        let level_off = place(graph_n)?;
+        let upper_slot_off = place(graph_n.checked_mul(4).ok_or_else(overflow)?)?;
         let upper_base_off = place(upper_nodes.checked_mul(4).ok_or_else(overflow)?)?;
-        let links0_cells = n
+        let links0_cells = graph_n
             .checked_mul(
                 m.checked_mul(2)
                     .and_then(|x| x.checked_add(1))
@@ -217,16 +219,29 @@ impl Header {
         }
         let entry = get_u32(h, 64);
         let top = get_u32(h, 68);
-        if n == 0 {
-            if entry != NO_NODE || top != 0 {
-                return Err(bad("is empty but names an entry point".into()));
+        let linked = entry != NO_NODE;
+        if n == 0 && (linked || top != 0) {
+            return Err(bad("is empty but names an entry point".into()));
+        }
+        if !linked {
+            if top != 0 || upper_nodes != 0 || upper_cells != 0 {
+                return Err(bad(format!(
+                    "is unlinked (entry = NO_NODE) but declares top={top}, upper_nodes={upper_nodes}, upper_cells={upper_cells}"
+                )));
             }
         } else if u64::from(entry) >= n || top > u32::from(MAX_LEVEL) {
             return Err(bad(format!(
                 "names entry {entry} at level {top} over {n} rows"
             )));
         }
-        let layout = Layout::compute(n, dim as u64, u64::from(config.m), upper_nodes, upper_cells)?;
+        let layout = Layout::compute(
+            n,
+            dim as u64,
+            u64::from(config.m),
+            upper_nodes,
+            upper_cells,
+            linked,
+        )?;
         let stored = Layout {
             rows_off: get_u64(h, 72),
             inv_norm_off: get_u64(h, 80),
@@ -280,22 +295,45 @@ impl<W: Write> Write for Hashing<W> {
 
 /// Write the store's image to `path`.
 pub fn write(store: &Store, config: &HnswConfig, path: &Path) -> Result<(), VectorError> {
+    write_with_links(store, None, config, path)
+}
+
+/// Write `store` to `path` using `built` (when sealing an unlinked frozen
+/// store) or `store.links()` (when already linked); when neither carries an
+/// entry point (empty or below `MIN_GRAPH_ROWS`), writes a valid unlinked
+/// `PMHNSW01` image (`entry == NO_NODE`) with 0-byte link sections.
+pub fn write_with_links(
+    store: &Store,
+    built: Option<&GraphLinks>,
+    config: &HnswConfig,
+    path: &Path,
+) -> Result<(), VectorError> {
     let io = |e: std::io::Error| VectorError::new(format!("write {}: {e}", path.display()));
-    let (entry, top) = store.entry_state();
+    let active = built
+        .or_else(|| store.links())
+        .filter(|l| l.entry_state().0 != NO_NODE);
+    let (entry, top, upper_nodes, upper_cells) = match active {
+        Some(links) => {
+            let (entry, top) = links.entry_state();
+            (entry, top, links.upper_base.len(), links.upper.len())
+        }
+        None => (NO_NODE, 0, 0, 0),
+    };
     let n = store.n();
     let layout = Layout::compute(
         n as u64,
         store.dim as u64,
         store.m as u64,
-        store.upper_base.len() as u64,
-        store.upper.len() as u64,
+        upper_nodes as u64,
+        upper_cells as u64,
+        active.is_some(),
     )?;
     let header = Header {
         dim: store.dim,
         config: *config,
         n,
-        upper_nodes: store.upper_base.len(),
-        upper_cells: store.upper.len(),
+        upper_nodes,
+        upper_cells,
         entry,
         top,
         layout,
@@ -324,16 +362,18 @@ pub fn write(store: &Store, config: &HnswConfig, path: &Path) -> Result<(), Vect
     write_f32s(&mut out, store.rows.values()).map_err(io)?;
     pad_to(&mut out, layout.inv_norm_off)?;
     write_f32s(&mut out, &store.inv_norm).map_err(io)?;
-    pad_to(&mut out, layout.level_off)?;
-    out.write_all(&store.level).map_err(io)?;
-    pad_to(&mut out, layout.upper_slot_off)?;
-    write_u32s(&mut out, &store.upper_slot).map_err(io)?;
-    pad_to(&mut out, layout.upper_base_off)?;
-    write_u32s(&mut out, &store.upper_base).map_err(io)?;
-    pad_to(&mut out, layout.links0_off)?;
-    write_cells(&mut out, &store.links0).map_err(io)?;
-    pad_to(&mut out, layout.upper_off)?;
-    write_cells(&mut out, &store.upper).map_err(io)?;
+    if let Some(links) = active {
+        pad_to(&mut out, layout.level_off)?;
+        out.write_all(&links.level).map_err(io)?;
+        pad_to(&mut out, layout.upper_slot_off)?;
+        write_u32s(&mut out, &links.upper_slot).map_err(io)?;
+        pad_to(&mut out, layout.upper_base_off)?;
+        write_u32s(&mut out, &links.upper_base).map_err(io)?;
+        pad_to(&mut out, layout.links0_off)?;
+        write_cells(&mut out, &links.links0).map_err(io)?;
+        pad_to(&mut out, layout.upper_off)?;
+        write_cells(&mut out, &links.upper).map_err(io)?;
+    }
     pad_to(&mut out, layout.total_len - TRAILER_LEN as u64)?;
     let digest = out.sha.clone().finalize();
     out.inner.write_all(&digest).map_err(io)?;
@@ -432,13 +472,14 @@ pub fn load_heap(path: &Path, kernel: Kernel) -> Result<(Store, HnswConfig), Vec
     check_trailer(&bytes, path)?;
     let l = &header.layout;
     let n = header.n;
+    let graph_n = if header.entry == NO_NODE { 0 } else { n };
     let m = header.config.m as usize;
     let rows = f32s_from(section(&bytes, l.rows_off, n * header.dim * 4));
     let inv_norm = f32s_from(section(&bytes, l.inv_norm_off, n * 4));
-    let level = section(&bytes, l.level_off, n).to_vec();
-    let upper_slot = u32s_from(section(&bytes, l.upper_slot_off, n * 4));
+    let level = section(&bytes, l.level_off, graph_n).to_vec();
+    let upper_slot = u32s_from(section(&bytes, l.upper_slot_off, graph_n * 4));
     let upper_base = u32s_from(section(&bytes, l.upper_base_off, header.upper_nodes * 4));
-    let links0 = u32s_from(section(&bytes, l.links0_off, n * (2 * m + 1) * 4));
+    let links0 = u32s_from(section(&bytes, l.links0_off, graph_n * (2 * m + 1) * 4));
     let upper = u32s_from(section(&bytes, l.upper_off, header.upper_cells * 4));
     drop(bytes);
     let view = View {
@@ -518,6 +559,7 @@ impl Mapped {
         let h = &self.header;
         let l = &h.layout;
         let n = h.n;
+        let graph_n = if h.entry == NO_NODE { 0 } else { n };
         let m = h.config.m as usize;
         View {
             dim: h.dim,
@@ -525,10 +567,10 @@ impl Mapped {
             m0: 2 * m,
             rows: self.rows().into_values(),
             inv_norm: f32s_view(section(&self.map, l.inv_norm_off, n * 4)),
-            level: section(&self.map, l.level_off, n),
-            upper_slot: u32s_view(section(&self.map, l.upper_slot_off, n * 4)),
+            level: section(&self.map, l.level_off, graph_n),
+            upper_slot: u32s_view(section(&self.map, l.upper_slot_off, graph_n * 4)),
             upper_base: u32s_view(section(&self.map, l.upper_base_off, h.upper_nodes * 4)),
-            links0: u32s_view(section(&self.map, l.links0_off, n * (2 * m + 1) * 4)),
+            links0: u32s_view(section(&self.map, l.links0_off, graph_n * (2 * m + 1) * 4)),
             upper: u32s_view(section(&self.map, l.upper_off, h.upper_cells * 4)),
             entry: h.entry,
             top: h.top,
@@ -582,7 +624,21 @@ fn validate_structure<L: LinkCells + ?Sized>(
     let n = header.n;
     let m = view.m;
     let stride_up = m + 1;
-    if view.rows.len() != n * view.dim || view.inv_norm.len() != n || view.level.len() != n {
+    if view.rows.len() != n * view.dim || view.inv_norm.len() != n {
+        return Err(bad("row sections disagree with the row count".into()));
+    }
+    if header.entry == NO_NODE {
+        if !view.level.is_empty()
+            || !view.upper_slot.is_empty()
+            || !view.upper_base.is_empty()
+            || view.links0.cell_count() != 0
+            || view.upper.cell_count() != 0
+        {
+            return Err(bad("unlinked image carries non-empty link sections".into()));
+        }
+        return Ok(());
+    }
+    if view.level.len() != n {
         return Err(bad("row sections disagree with the row count".into()));
     }
     if view.links0.cell_count() != n * (2 * m + 1) || view.upper.cell_count() != header.upper_cells

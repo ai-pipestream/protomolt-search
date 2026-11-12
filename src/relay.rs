@@ -1119,6 +1119,7 @@ struct StreamTotals {
     segments_total: u32,
     segments_skipped: u32,
     regimes: crate::vector::FilterRegimeCounts,
+    tail_enumerated_rows: u64,
 }
 
 enum StreamEvent {
@@ -1243,6 +1244,7 @@ async fn relay_stream(
                     segments_total: totals.segments_total,
                     segments_skipped: totals.segments_skipped,
                     filter_regimes: totals.regimes.to_proto(),
+                    tail_enumerated_rows: totals.tail_enumerated_rows,
                 };
                 let _ = tx
                     .send(Ok(StreamSearchResponse {
@@ -1407,6 +1409,9 @@ async fn relay_stream(
                             .add(crate::vector::FilterRegimeCounts::from_proto(
                                 summary.filter_regimes.as_ref(),
                             ));
+                        totals.tail_enumerated_rows = totals
+                            .tail_enumerated_rows
+                            .saturating_add(summary.tail_enumerated_rows);
                         summaries[shard] = Some(summary.clone());
                         if identity_limits.is_none() {
                             terminal[shard] = Some(summary);
@@ -1437,6 +1442,7 @@ async fn relay_stream(
         segments_total: totals.segments_total,
         segments_skipped: totals.segments_skipped,
         filter_regimes: totals.regimes.to_proto(),
+        tail_enumerated_rows: totals.tail_enumerated_rows,
     };
     if let Some(limits) = identity_limits {
         let range =
