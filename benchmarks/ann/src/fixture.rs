@@ -648,13 +648,17 @@ pub fn load(dir: &Path) -> Result<Fixture, Error> {
     let base = read_f32(&dir.join("base.f32"))?;
     let queries = read_f32(&dir.join("queries.f32"))?;
     let parents: Vec<u64> = std::fs::read(dir.join("parents.u64"))?
-        .chunks_exact(8)
-        .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c))
         .collect();
     let bucket = std::fs::read(dir.join("bucket.u8"))?;
     let cell: Vec<u16> = std::fs::read(dir.join("cell.u16"))?
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     let rows = Rows {
         base,

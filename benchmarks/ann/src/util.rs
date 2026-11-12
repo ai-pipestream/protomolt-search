@@ -297,8 +297,10 @@ pub fn read_f32(path: &Path) -> Result<Vec<f32>, Error> {
         return Err(format!("{}: length is not a multiple of 4", path.display()).into());
     }
     Ok(bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect())
 }
 
@@ -311,8 +313,10 @@ pub fn write_u32(path: &Path, values: &[u32]) -> Result<(), Error> {
 pub fn read_u32(path: &Path) -> Result<Vec<u32>, Error> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect())
 }
 
@@ -357,7 +361,7 @@ pub fn host() -> serde_json::Value {
                 .map(|s| s.trim().to_string())
         })
         .unwrap_or_default();
-    let mut features = Vec::new();
+    let mut features: Vec<&'static str> = Vec::new();
     #[cfg(target_arch = "x86_64")]
     {
         for (name, on) in [
@@ -370,6 +374,10 @@ pub fn host() -> serde_json::Value {
                 features.push(name);
             }
         }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        features.push("neon");
     }
     serde_json::json!({
         "name": hostname,

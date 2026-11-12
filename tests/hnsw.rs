@@ -387,7 +387,7 @@ async fn node_stream(
         let message = inbound.message().await?.expect("terminal summary");
         match message.payload {
             Some(stream_search_response::Payload::Batch(batch)) => {
-                for record in batch.hits.chunks_exact(12) {
+                for record in batch.hits.as_chunks::<12>().0 {
                     let id = u64::from_le_bytes(record[..8].try_into().unwrap());
                     let score = f32::from_le_bytes(record[8..].try_into().unwrap());
                     hits.push((id, score));
