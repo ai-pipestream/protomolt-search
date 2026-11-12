@@ -84,6 +84,7 @@ pub(crate) fn redact_execution(response: &mut QueryResponse) {
         tail_enumerated_rows,
         patience_stopped,
         shards_finished_early,
+        shards_floor_pruned,
     }) = dense_execution
     {
         // Counts per segment/shard searched: the physical layout.
@@ -91,6 +92,7 @@ pub(crate) fn redact_execution(response: &mut QueryResponse) {
         *tail_enumerated_rows = 0;
         *patience_stopped = 0;
         *shards_finished_early = 0;
+        *shards_floor_pruned = 0;
         planner_reason.clear();
         policy_id.clear();
         *filter_selectivity_ppm = 0;
@@ -104,6 +106,8 @@ pub(crate) fn redact_execution(response: &mut QueryResponse) {
             patience_saturation_ppm: _,
             patience_hops: _,
             finish_settle_us: _,
+            floor_greediness_ppm: _,
+            floor_clamp_min: _,
         }) = policy_point
         {
             *filter_selectivity_ppm_min = 0;
@@ -183,6 +187,8 @@ mod tests {
                     patience_saturation_ppm: Some(990_000),
                     patience_hops: Some(15),
                     finish_settle_us: Some(250),
+                    floor_greediness_ppm: Some(500_000),
+                    floor_clamp_min: Some(8),
                 }),
                 filter_selectivity_ppm: 500_000,
                 candidate_depth: 100,
@@ -196,6 +202,7 @@ mod tests {
                 tail_enumerated_rows: 42,
                 patience_stopped: 7,
                 shards_finished_early: 2,
+                shards_floor_pruned: 4,
             }),
             ..Default::default()
         };
@@ -248,6 +255,7 @@ mod tests {
         assert_eq!(execution.tail_enumerated_rows, 0);
         assert_eq!(execution.patience_stopped, 0);
         assert_eq!(execution.shards_finished_early, 0);
+        assert_eq!(execution.shards_floor_pruned, 0);
         assert_eq!(execution.policy_fingerprint, "b".repeat(64));
         assert_eq!(
             execution.policy_point,
@@ -258,6 +266,8 @@ mod tests {
                 patience_saturation_ppm: Some(990_000),
                 patience_hops: Some(15),
                 finish_settle_us: Some(250),
+                floor_greediness_ppm: Some(500_000),
+                floor_clamp_min: Some(8),
                 ..Default::default()
             })
         );

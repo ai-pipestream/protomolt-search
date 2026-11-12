@@ -1,4 +1,4 @@
-//! Multi-shard HNSW streaming fleet benchmark (`#100`, `#72`, `#101`).
+//! Multi-shard HNSW streaming fleet benchmark (`#100`, `#72`).
 //!
 //! Two subcommands:
 //! - `build`: partitions an `.f32` fixture (`manifest.json`, `base.f32`,
@@ -9,9 +9,10 @@
 //! - `sweep`: connects an in-process streaming `CoordinatorServiceImpl` (with
 //!   UDP `TVS1` floor/finish signaling + gRPC `StreamSearch`) to running
 //!   `pipestream-search --role=node --vector-backend=hnsw` shard processes and
-//!   sweeps `k`, `settle_us`, and `deadline_us` across staggered repeats,
-//!   reporting exact `recall@k`, `p50/p90/p99` ms, QPS, `units_scanned`,
-//!   `emitted`, `floors_sent`, and `shards_finished_early`.
+//!   sweeps `k`, floor-pruning `modes`, `settle_us`, and `deadline_us` across
+//!   staggered repeats, reporting exact `recall@k`, `p50/p90/p99` ms, QPS,
+//!   `units_scanned`, per-shard `min/med/max` scans, `emitted`, `floors_sent`,
+//!   `shards_finished_early`, and `shards_floor_pruned`.
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -23,7 +24,6 @@ use std::time::{Duration, Instant};
 
 use pipestream_search::coordinator::{CoordinatorServiceImpl, RequestFilters};
 use pipestream_search::hnsw::{BuildMode, HnswConfig, HNSW};
-use pipestream_search::pb::StreamEndReason;
 use pipestream_search::security::ToolClient;
 use pipestream_search::vector::VectorIndex;
 use rayon::prelude::*;
@@ -55,6 +55,7 @@ struct FleetManifest {
 #[derive(Debug, Serialize)]
 struct SweepRecord {
     label: String,
+    mode: String,
     placement: String,
     shards: usize,
     k: u32,
@@ -63,12 +64,18 @@ struct SweepRecord {
     repeats: usize,
     queries_per_repeat: usize,
     recall: f64,
+    recall_min: f64,
+    recall_p05: f64,
+    recall_std: f64,
     p50_ms: f64,
     p90_ms: f64,
     p99_ms: f64,
     mean_ms: f64,
     qps: f64,
     units_scanned_per_query: f64,
+    shard_min_scanned_per_query: f64,
+    shard_median_scanned_per_query: f64,
+    shard_max_scanned_per_query: f64,
     emitted_per_query: f64,
     floors_sent_per_query: f64,
     shards_finished_early_per_query: f64,
@@ -479,6 +486,57 @@ fn run_build() -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone)]
+struct ModeSpec {
+    name: String,
+    floor_prune: Option<bool>,
+    floor_greediness_ppm: Option<u32>,
+    floor_clamp_min: Option<u32>,
+}
+
+fn parse_modes(raw: Option<String>) -> Result<Vec<ModeSpec>, String> {
+    let Some(raw) = raw else {
+        return Ok(vec![ModeSpec {
+            name: "default".to_string(),
+            floor_prune: None,
+            floor_greediness_ppm: None,
+            floor_clamp_min: None,
+        }]);
+    };
+    let mut out = Vec::new();
+    for item in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let spec = match item {
+            "no_floor" | "emit_only" | "off" => ModeSpec {
+                name: item.to_string(),
+                floor_prune: Some(false),
+                floor_greediness_ppm: None,
+                floor_clamp_min: None,
+            },
+            "gate_k" => ModeSpec {
+                name: item.to_string(),
+                floor_prune: Some(true),
+                floor_greediness_ppm: Some(0),
+                floor_clamp_min: Some(32),
+            },
+            "clamp_050" => ModeSpec {
+                name: item.to_string(),
+                floor_prune: Some(true),
+                floor_greediness_ppm: Some(500_000),
+                floor_clamp_min: Some(32),
+            },
+            "hop0" => ModeSpec {
+                name: item.to_string(),
+                floor_prune: Some(true),
+                floor_greediness_ppm: Some(1_000_000),
+                floor_clamp_min: Some(1),
+            },
+            other => return Err(format!("unknown --modes entry {other:?}")),
+        };
+        out.push(spec);
+    }
+    Ok(out)
+}
+
 fn parse_opt_u32_list(raw: &str) -> Result<Vec<Option<u32>>, String> {
     raw.split(',')
         .map(str::trim)
@@ -539,8 +597,14 @@ async fn run_sweep() -> Result<(), String> {
         .collect();
     let label = arg_or("label", "fleet");
     let k_list = parse_u32_list(&arg_or("k", "100,1000,10000"))?;
-    let settle_list = parse_opt_u32_list(&arg_or("settle-us", "off,250,500,1000,2000"))?;
+    let settle_default = if arg("modes").is_some() {
+        "off"
+    } else {
+        "off,250,500,1000,2000"
+    };
+    let settle_list = parse_opt_u32_list(&arg_or("settle-us", settle_default))?;
     let deadline_list = parse_opt_u32_list(&arg_or("deadline-us", "off"))?;
+    let modes = parse_modes(arg("modes"))?;
     let repeats: usize = arg_or("repeats", "5")
         .parse()
         .map_err(|e| format!("--repeats: {e}"))?;
@@ -573,19 +637,23 @@ async fn run_sweep() -> Result<(), String> {
     wait_nodes_ready(&nodes).await?;
     let coordinator = CoordinatorServiceImpl::new(nodes.clone()).with_stream_search(true);
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone)]
     struct CellSpec {
         k: u32,
         settle_us: Option<u32>,
         deadline_us: Option<u32>,
+        mode: ModeSpec,
     }
 
     #[derive(Default)]
     struct CellAccum {
         walls_ms: Vec<f64>,
+        recalls: Vec<f64>,
         elapsed_s: f64,
-        recall_sum: f64,
         units_scanned: u64,
+        shard_min_scanned: u64,
+        shard_median_scanned: u64,
+        shard_max_scanned: u64,
         emitted: u64,
         floors_sent: u64,
         shards_finished_early: u64,
@@ -598,13 +666,16 @@ async fn run_sweep() -> Result<(), String> {
         if k as usize > manifest.max_k {
             return Err(format!("k={k} exceeds manifest max_k={}", manifest.max_k));
         }
-        for &deadline_us in &deadline_list {
-            for &settle_us in &settle_list {
-                specs.push(CellSpec {
-                    k,
-                    settle_us,
-                    deadline_us,
-                });
+        for mode in &modes {
+            for &deadline_us in &deadline_list {
+                for &settle_us in &settle_list {
+                    specs.push(CellSpec {
+                        k,
+                        settle_us,
+                        deadline_us,
+                        mode: mode.clone(),
+                    });
+                }
             }
         }
     }
@@ -624,10 +695,14 @@ async fn run_sweep() -> Result<(), String> {
     for rep in 0..repeats {
         for idx in 0..specs.len() {
             let cell_idx = (idx + rep) % specs.len();
-            let spec = specs[cell_idx];
+            let spec = &specs[cell_idx];
             let filters = RequestFilters {
                 finish_settle_us: spec.settle_us,
                 finish_deadline_us: spec.deadline_us,
+                floor_prune: spec.mode.floor_prune,
+                floor_k: Some(spec.k),
+                floor_greediness_ppm: spec.mode.floor_greediness_ppm,
+                floor_clamp_min: spec.mode.floor_clamp_min,
                 ..Default::default()
             };
             let cell_t0 = Instant::now();
@@ -643,7 +718,9 @@ async fn run_sweep() -> Result<(), String> {
                         &filters,
                     )
                     .await
-                    .map_err(|e| format!("search k={} q={qi}: {e}", spec.k))?;
+                    .map_err(|e| {
+                        format!("search mode={} k={} q={qi}: {e}", spec.mode.name, spec.k)
+                    })?;
                 let wall_ms = q_t0.elapsed().as_secs_f64() * 1e3;
 
                 let gt_slice =
@@ -657,16 +734,22 @@ async fn run_sweep() -> Result<(), String> {
                     .count();
                 let acc = &mut accums[cell_idx];
                 acc.walls_ms.push(wall_ms);
-                acc.recall_sum += (matched as f64) / f64::from(spec.k);
+                acc.recalls.push((matched as f64) / f64::from(spec.k));
                 acc.floors_sent += res.floors_sent;
                 acc.shards_finished_early += u64::from(res.shards_finished_early);
+                acc.shards_floor_pruned += u64::from(res.shards_floor_pruned);
+                let mut shard_scans: Vec<u64> = Vec::with_capacity(res.summaries.len());
                 for s in &res.summaries {
                     acc.units_scanned += s.blocks_scanned;
                     acc.emitted += s.emitted;
-                    if s.end_reason == StreamEndReason::FloorPruned as i32 {
-                        acc.shards_floor_pruned += 1;
-                    }
                     acc.shards_patience_stopped += u64::from(s.patience_stopped);
+                    shard_scans.push(s.blocks_scanned);
+                }
+                if !shard_scans.is_empty() {
+                    shard_scans.sort_unstable();
+                    acc.shard_min_scanned += shard_scans[0];
+                    acc.shard_median_scanned += shard_scans[shard_scans.len() / 2];
+                    acc.shard_max_scanned += *shard_scans.last().unwrap_or(&0);
                 }
             }
             accums[cell_idx].elapsed_s += cell_t0.elapsed().as_secs_f64();
@@ -674,9 +757,9 @@ async fn run_sweep() -> Result<(), String> {
     }
 
     println!(
-        "| label | placement | k | settle_us | deadline_us | recall@k | p50 ms | p90 ms | p99 ms | QPS | scanned/q | emitted/q | floors/q | early_fin/q | floor_pruned/q |"
+        "| label | mode | placement | k | settle | recall | min_rec | p50 ms | p99 ms | QPS | scanned/q | shard min/med/max | emitted/q | floors/q | pruned_sh/q |"
     );
-    println!("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+    println!("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|");
 
     let mut json_file = match &json_out {
         Some(path) => {
@@ -691,10 +774,19 @@ async fn run_sweep() -> Result<(), String> {
 
     for (spec, acc) in specs.iter().zip(accums.iter_mut()) {
         acc.walls_ms.sort_by(|a, b| a.total_cmp(b));
+        acc.recalls.sort_by(|a, b| a.total_cmp(b));
         let total_q = acc.walls_ms.len().max(1) as f64;
         let mean_ms = acc.walls_ms.iter().sum::<f64>() / total_q;
+        let mean_recall = acc.recalls.iter().sum::<f64>() / total_q;
+        let recall_var = acc
+            .recalls
+            .iter()
+            .map(|&r| (r - mean_recall) * (r - mean_recall))
+            .sum::<f64>()
+            / total_q;
         let rec = SweepRecord {
             label: label.clone(),
+            mode: spec.mode.name.clone(),
             placement: manifest.placement.clone(),
             shards: manifest.shards,
             k: spec.k,
@@ -702,13 +794,19 @@ async fn run_sweep() -> Result<(), String> {
             deadline_us: spec.deadline_us,
             repeats,
             queries_per_repeat: n_queries,
-            recall: acc.recall_sum / total_q,
+            recall: mean_recall,
+            recall_min: acc.recalls.first().copied().unwrap_or(0.0),
+            recall_p05: percentile(&acc.recalls, 0.05),
+            recall_std: recall_var.sqrt(),
             p50_ms: percentile(&acc.walls_ms, 0.50),
             p90_ms: percentile(&acc.walls_ms, 0.90),
             p99_ms: percentile(&acc.walls_ms, 0.99),
             mean_ms,
             qps: total_q / acc.elapsed_s.max(1e-9),
             units_scanned_per_query: (acc.units_scanned as f64) / total_q,
+            shard_min_scanned_per_query: (acc.shard_min_scanned as f64) / total_q,
+            shard_median_scanned_per_query: (acc.shard_median_scanned as f64) / total_q,
+            shard_max_scanned_per_query: (acc.shard_max_scanned as f64) / total_q,
             emitted_per_query: (acc.emitted as f64) / total_q,
             floors_sent_per_query: (acc.floors_sent as f64) / total_q,
             shards_finished_early_per_query: (acc.shards_finished_early as f64) / total_q,
@@ -718,25 +816,24 @@ async fn run_sweep() -> Result<(), String> {
         let settle_str = rec
             .settle_us
             .map_or_else(|| "off".to_string(), |v| v.to_string());
-        let deadline_str = rec
-            .deadline_us
-            .map_or_else(|| "off".to_string(), |v| v.to_string());
         println!(
-            "| {} | {} | {} | {} | {} | {:.4} | {:.2} | {:.2} | {:.2} | {:.1} | {:.0} | {:.0} | {:.1} | {:.2} | {:.2} |",
+            "| {} | {} | {} | {} | {} | {:.4} | {:.4} | {:.2} | {:.2} | {:.1} | {:.0} | {:.0}/{:.0}/{:.0} | {:.0} | {:.1} | {:.2} |",
             rec.label,
+            rec.mode,
             rec.placement,
             rec.k,
             settle_str,
-            deadline_str,
             rec.recall,
+            rec.recall_min,
             rec.p50_ms,
-            rec.p90_ms,
             rec.p99_ms,
             rec.qps,
             rec.units_scanned_per_query,
+            rec.shard_min_scanned_per_query,
+            rec.shard_median_scanned_per_query,
+            rec.shard_max_scanned_per_query,
             rec.emitted_per_query,
             rec.floors_sent_per_query,
-            rec.shards_finished_early_per_query,
             rec.shards_floor_pruned_per_query,
         );
         if let Some(f) = json_file.as_mut() {
@@ -757,12 +854,10 @@ async fn main() {
     let res = match mode.as_str() {
         "build" => run_build(),
         "sweep" => run_sweep().await,
-        _ => Err(
-            "usage: hnsw_fleet_bench <build|sweep> [--flags...]\n  \
+        _ => Err("usage: hnsw_fleet_bench <build|sweep> [--flags...]\n  \
              build --fixture=<dir> --out=<dir> [--placement=hash|kmeans] [--shards=16]\n  \
-             sweep --fleet=<dir> --nodes=h1:p1,... [--k=100,1000,10000] [--settle-us=off,250,500,1000]"
-                .to_string(),
-        ),
+             sweep --fleet=<dir> --nodes=h1:p1,... [--k=100,1000,10000] [--modes=...]"
+            .to_string()),
     };
     if let Err(err) = res {
         eprintln!("hnsw_fleet_bench error: {err}");

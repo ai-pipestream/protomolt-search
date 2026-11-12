@@ -5158,6 +5158,12 @@ struct ScanJob {
     /// The request's patience early-stop parameters (`StartShardSearch`).
     patience_saturation_ppm: Option<u32>,
     patience_hops: Option<u32>,
+    /// The request's shared-floor candidate pruning parameters (`StartShardSearch`).
+    floor_prune: Option<bool>,
+    floor_k: Option<u32>,
+    floor_share_ppm: Option<u32>,
+    floor_greediness_ppm: Option<u32>,
+    floor_clamp_min: Option<u32>,
     /// Polled between chunks for the best coordinator-pushed floor
     /// (returns `None` when floor sharing is off or no floor arrived).
     external: Box<dyn FnMut() -> Option<f32> + Send>,
@@ -5215,6 +5221,7 @@ struct QueuedQuerySpec {
     keep_ties: bool,
     enumerate_max_rows: Option<usize>,
     patience: Option<crate::vector::PatienceSpec>,
+    floor_prune: Option<crate::vector::FloorPruneSpec>,
 }
 
 /// Run one batched scan under the shard read lock and deliver every job's
@@ -5269,6 +5276,21 @@ fn run_scan_batch(
                     continue;
                 }
             };
+        let floor_prune = match check_floor_prune_options(
+            index,
+            job.floor_prune,
+            job.floor_k,
+            job.k as u32,
+            job.floor_share_ppm,
+            job.floor_greediness_ppm,
+            job.floor_clamp_min,
+        ) {
+            Ok(spec) => spec,
+            Err(refused) => {
+                let _ = job.done.send(Err(refused));
+                continue;
+            }
+        };
         let resolved = guard.vector_scan_filters(
             slots,
             &job.geo_filters,
@@ -5311,6 +5333,7 @@ fn run_scan_batch(
             keep_ties: job.tie_complete,
             enumerate_max_rows: job.enumerate_max_rows.map(|rows| rows as usize),
             patience,
+            floor_prune,
         });
         externals.push(job.external);
         publishers.push(job.publish);
@@ -5343,6 +5366,7 @@ fn run_scan_batch(
             allow: allow.as_ref().map(crate::vector::Mask::Bits),
             enumerate_max_rows: spec.enumerate_max_rows,
             patience: spec.patience,
+            floor_prune: spec.floor_prune,
         })
         .collect();
     let mut pass_bytes = 0u64;
@@ -6433,6 +6457,15 @@ impl NodeServiceImpl {
         }
         check_enumerate_threshold(index, start.enumerate_max_rows)?;
         check_patience_options(index, start.patience_saturation_ppm, start.patience_hops)?;
+        check_floor_prune_options(
+            index,
+            start.floor_prune,
+            start.floor_k,
+            start.k,
+            start.floor_share_ppm,
+            start.floor_greediness_ppm,
+            start.floor_clamp_min,
+        )?;
         Ok(())
     }
 
@@ -12164,6 +12197,7 @@ impl NodeService for NodeServiceImpl {
                                     filter_regimes: stats.regimes.to_proto(),
                                     tail_enumerated_rows: stats.tail_enumerated_rows,
                                     patience_stopped: stats.patience_stopped,
+                                    floor_pruned: stats.floor_pruned,
                                 }),
                                 geo_columns_known,
                                 filter_columns_known,
@@ -12211,6 +12245,11 @@ impl NodeService for NodeServiceImpl {
                                     enumerate_max_rows: start.enumerate_max_rows,
                                     patience_saturation_ppm: start.patience_saturation_ppm,
                                     patience_hops: start.patience_hops,
+                                    floor_prune: start.floor_prune,
+                                    floor_k: start.floor_k,
+                                    floor_share_ppm: start.floor_share_ppm,
+                                    floor_greediness_ppm: start.floor_greediness_ppm,
+                                    floor_clamp_min: start.floor_clamp_min,
                                     external: Box::new(external_floor),
                                     publish: Box::new(publish_floor),
                                     done: done_tx,
@@ -12275,6 +12314,15 @@ impl NodeService for NodeServiceImpl {
                                 start.patience_saturation_ppm,
                                 start.patience_hops,
                             )?;
+                            let floor_prune = check_floor_prune_options(
+                                index,
+                                start.floor_prune,
+                                start.floor_k,
+                                start.k,
+                                start.floor_share_ppm,
+                                start.floor_greediness_ppm,
+                                start.floor_clamp_min,
+                            )?;
                             let solo_queries = [BatchQuery {
                                 vector: &start.vector,
                                 k: start.k as usize,
@@ -12282,6 +12330,7 @@ impl NodeService for NodeServiceImpl {
                                 allow: allow.as_ref().map(crate::vector::Mask::Bits),
                                 enumerate_max_rows: start.enumerate_max_rows.map(|r| r as usize),
                                 patience,
+                                floor_prune,
                             }];
                             let (hits, mut stats) = crate::chunked::chunked_topk_batch(
                                 index,
@@ -12346,6 +12395,7 @@ impl NodeService for NodeServiceImpl {
                                 filter_regimes: stats.regimes.to_proto(),
                                 tail_enumerated_rows: stats.tail_enumerated_rows,
                                 patience_stopped: stats.patience_stopped,
+                                floor_pruned: stats.floor_pruned,
                             }),
                             geo_columns_known,
                             filter_columns_known,
@@ -13668,6 +13718,17 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                         )? {
                             options = options.with_patience(patience);
                         }
+                        if let Some(floor_prune) = check_floor_prune_options(
+                            index,
+                            start.floor_prune,
+                            start.floor_k,
+                            start.candidate_depth.unwrap_or(0),
+                            start.floor_share_ppm,
+                            start.floor_greediness_ppm,
+                            start.floor_clamp_min,
+                        )? {
+                            options = options.with_floor_prune(floor_prune);
+                        }
                         let allow_early_finish = matches!(
                             index.descriptor().quality_contract,
                             crate::vector::QualityContract::ConfiguredAnn
@@ -13782,6 +13843,7 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                             tail_enumerated_rows: summary.tail_enumerated_rows,
                             patience_stopped: summary.patience_stopped,
                             end_reason,
+                            floor_pruned: summary.floor_pruned,
                         }, identities))
                     });
                 let outcome = scan.await;
@@ -17158,6 +17220,80 @@ fn check_patience_options(
     Ok(Some(crate::vector::PatienceSpec::from_ppm(ppm, hops)))
 }
 
+fn check_floor_prune_options(
+    index: &VectorIndex,
+    floor_prune: Option<bool>,
+    floor_k: Option<u32>,
+    default_k: u32,
+    floor_share_ppm: Option<u32>,
+    floor_greediness_ppm: Option<u32>,
+    floor_clamp_min: Option<u32>,
+) -> Result<Option<crate::vector::FloorPruneSpec>, Status> {
+    if floor_prune == Some(false) && (floor_greediness_ppm.is_some() || floor_clamp_min.is_some()) {
+        return Err(Status::invalid_argument(
+            "floor_greediness_ppm and floor_clamp_min require floor_prune = true",
+        ));
+    }
+    let requested = floor_prune == Some(true)
+        || (floor_prune.is_none() && (floor_greediness_ppm.is_some() || floor_clamp_min.is_some()));
+    if let Some(share) = floor_share_ppm {
+        if share > 1_000_000 {
+            return Err(Status::invalid_argument(format!(
+                "floor_share_ppm {share} must be in 0..=1000000"
+            )));
+        }
+    }
+    if !requested {
+        // When `floor_k` and `floor_share_ppm` are supplied without enabling
+        // floor pruning, carry them with `enabled = false` on graph providers
+        // so `#95` patience still enforces `#72`'s ascent gate when a shared
+        // floor is active.
+        if let Some(k) = floor_k.filter(|&k| k > 0) {
+            let descriptor = index.descriptor();
+            if descriptor
+                .capabilities
+                .contains(&crate::vector::VectorCapability::PatienceEarlyStop)
+            {
+                return Ok(Some(crate::vector::FloorPruneSpec {
+                    enabled: false,
+                    floor_k: k as usize,
+                    share_ppm: floor_share_ppm.unwrap_or(1_000_000),
+                    greediness_ppm: 0,
+                    clamp_min: crate::vector::DEFAULT_FLOOR_CLAMP_MIN as usize,
+                }));
+            }
+        }
+        return Ok(None);
+    }
+    let descriptor = index.descriptor();
+    if !descriptor
+        .capabilities
+        .contains(&crate::vector::VectorCapability::FloorPruning)
+    {
+        return Err(Status::failed_precondition(format!(
+            "vector backend {:?} does not support graph floor pruning (it does not advertise \
+             floor_pruning)",
+            descriptor.backend_kind
+        )));
+    }
+    let greediness_ppm = floor_greediness_ppm.unwrap_or(0);
+    if greediness_ppm > 1_000_000 {
+        return Err(Status::invalid_argument(format!(
+            "floor_greediness_ppm {greediness_ppm} must be in 0..=1000000"
+        )));
+    }
+    let clamp_min = floor_clamp_min.unwrap_or(crate::vector::DEFAULT_FLOOR_CLAMP_MIN) as usize;
+    let share_ppm = floor_share_ppm.unwrap_or(1_000_000);
+    let resolved_k = floor_k.unwrap_or(default_k) as usize;
+    Ok(Some(crate::vector::FloorPruneSpec {
+        enabled: true,
+        floor_k: resolved_k,
+        share_ppm,
+        greediness_ppm,
+        clamp_min,
+    }))
+}
+
 /// Products of one dense pass over `mask` (an index-sized allowlist):
 /// every masked slot's calibrated score, or with `top` the best `depth`
 /// under a self-raised floor, ties at the floor included.
@@ -18662,6 +18798,11 @@ mod vector_scan_view_tests {
                 enumerate_max_rows: None,
                 patience_saturation_ppm: None,
                 patience_hops: None,
+                floor_prune: None,
+                floor_k: None,
+                floor_share_ppm: None,
+                floor_greediness_ppm: None,
+                floor_clamp_min: None,
                 external: Box::new(|| None),
                 publish: Box::new(|_| false),
                 done,

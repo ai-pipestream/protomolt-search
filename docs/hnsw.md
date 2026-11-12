@@ -327,8 +327,11 @@ the rules above are what they are:
 | far from the query 10% | recall 0.17 | 130 | 2704 | 2208 (probe, enumerate) |
 | far from the query 1% | recall 0.03 | 81 | 14549 | 13940 (enumerate) |
 
-`minimum_score` and a floor raised during a stream filter what is returned
-or emitted; neither cuts a walk short. Floor pruning is #72.
+`minimum_score` and a floor raised during a stream filter what is returned or
+emitted; when shared floor pruning is enabled (`floor_prune = true` on the scan,
+see "Shared floor pruning" below), a floor raised during a stream or carried
+from an earlier sealed segment also prunes the layer-0 walk once the ascent gate
+is satisfied (#72).
 
 ## Patience
 
@@ -490,6 +493,72 @@ On a 16-shard Raspberry Pi 5 fleet (`court200k`, 200,000 × 256 FP32 vectors,
   `recall@1000 = 0.9658` vs `0.9698`) and `k = 10,000` `p50` (`50 µs/hop`) from
   `1,081.5 ms → 320.2 ms` (`3.38×`, `recall@10000 = 0.9712` vs `0.9734`).
 
+### Shared floor pruning (`#72`)
+
+When `floor_prune = true` on `StartShardSearch` / `StartStreamSearch` (paired
+with `floor_k`, `floor_greediness_ppm`, and `floor_clamp_min`, advertised via
+`VectorBackendCapabilities.floor_pruning`), HNSW uses the active score floor to
+cut layer-0 walks short (`Walk::Floor`, `end_reason = FLOOR_PRUNED`,
+`completed = true`) in addition to gating emitted rows:
+
+- **Kernel-vs-exact numerical slack.** HNSW traverses with SIMD `dot` kernels
+  whose lane association differs from `exact_vectors::dot`. Before comparing any
+  traversal score `c.score` against a caller or shared exact floor `f`, the walk
+  subtracts Higham's deterministic pairwise-summation error bound
+  `4 · γ(d) · ‖q‖₂ · ‖x‖₂` (`γ(d) = d · u / (1 − d · u)`, `u = 2⁻²⁴`, with
+  `‖x‖₂ = 1 / inv_norm[u]` already stored in `PMHNSW01` and `‖q‖₂` computed once
+  per query), guaranteeing zero false-negative stops from floating-point
+  reassociation across `Scalar`, `Avx2`, `Avx512f`, and `Neon`.
+- **Expected-share ascent gate (`gateK`) and clamp.** Because a shard's fixed
+  entry point may sit far from the query, applying a shared floor at hop 0 would
+  sever the ascent path before reaching the query basin. Given `floor_k = k` and
+  this walk's eligible-row share `p = share_ppm / 1,000,000` (`s_e / E` across
+  the planned shard set, scaled proportionally across local segments), the
+  variance-padded ascent gate is
+  `gateK = ceil(k · p + 16 · sqrt(k · p · (1 − p)))` and the clamped gate is
+  `G = min(local_eligible, max(clamp_min, ceil((1 − g) · gateK)))` with default
+  `DEFAULT_FLOOR_CLAMP_MIN = 8` and `g = floor_greediness_ppm / 1,000,000`
+  (`0` = full `gateK`, `500,000` = half gate clamped by `clamp_min`, `1,000,000`
+  with `clamp_min = 1` = hop-0 floor). Only after `allowed_scored >= G` at
+  layer 0 does a candidate with `c.score + slack < floor` terminate the walk.
+- **Segmented search.** Within a shard (`SegmentedVectors`), sealed HNSW
+  segments run before unlinked `frozen`/`tail` slices (`#97`) and raise the
+  shared `ScoreFloor` as soon as `k` hits are collected, allowing later sealed
+  segments to prune their layer-0 walks once their segment-proportional `gateK`
+  is met.
+- **Provenance and telemetry.** `DenseExecutionPolicy` points may name
+  `floor_pruning = true` (with optional `floor_greediness_ppm` and
+  `floor_clamp_min`); shards ending via `Walk::Floor` report
+  `end_reason = FLOOR_PRUNED`, summed across relays into
+  `SearchResponse.shards_floor_pruned` and
+  `DenseExecutionOutcome.shards_floor_pruned` (withheld on document-scoped
+  responses).
+
+On the 16-shard Raspberry Pi 5 fleet (`court200k`, 200,000 × 256 FP32 vectors,
+`ef = max(k, 16)`):
+- **Uniform fleet (`hash` and spherical `kmeans`):** `gateK` (`greediness = 0`,
+  `clamp_min = 32`) matches `emit_only` recall within `0.0000`–`0.0001` at every
+  `k ∈ {100, 1000, 10000}` (`hash`: `0.9965` / `0.9988` / `0.9986`; `kmeans`:
+  `0.9591` / `0.9809` / `0.9802` bit-identical across all modes).
+- **Straggler shard (`350 µs/hop` on shard 13, `settle = off`):** once fast
+  shards establish the global `k`-th floor, `gateK` prunes the slow shard's
+  remaining tail walk without any coordinator timer:
+  - `hash`: `k = 1,000` `p50` drops from `431.0 ms → 146.3 ms` (`2.95×`,
+    `recall = 0.9986` vs `0.9988`, slow-shard scans `4,926 → 1,949`);
+    `k = 10,000` `p50` drops from `4,245.1 ms → 293.6 ms` (`14.5×`,
+    `recall = 0.9983` vs `0.9986`, slow-shard scans `11,804 → 4,043`).
+  - `kmeans`: `k = 1,000` `p50` drops from `432.3 ms → 195.2 ms` (`2.21×`,
+    `recall = 0.9801` vs `0.9809`); `k = 10,000` `p50` drops from
+    `4,072.4 ms → 396.9 ms` (`10.3×`, `recall = 0.9797` vs `0.9802`).
+- **Centroid topology hints (`#101`)** were measured against `gateK` on the same
+  16-shard `hash` and `kmeans` matrices (both coordinator-relayed
+  `FloorCentroidHint` bitmasks and zero-wire query-local top-`M` centroids) and
+  omitted: `gateK` already loses `0.0000` recall on uniform Voronoi shards,
+  whereas relayed centroid hints add `8.8–157.0 KB/query` of control traffic
+  (`-13%` to `-16%` QPS at `k = 10,000`) and saturate the active-centroid mask at
+  large `k`, defeating straggler floor pruning (`3,791.9 ms` vs `293.6 ms` on
+  `hash` `k = 10,000`; `3,892.6 ms` vs `396.9 ms` on `kmeans` `k = 10,000`).
+
 ## Rows and their identity
 
 The graph traverses and scores FP32 rows behind the `RowSource` trait
@@ -599,7 +668,6 @@ A node runs the provider through every path the exhaustive providers take;
   the measured dense execution policy of #58.
 - The FP32 rows are the provider's own copy, as FAISS `HNSWFlat` keeps one.
   Sharing them with the `.exact` sidecar through `RowSource` is #71.
-- The shared floor pruning the walk (#72), collapse (#73) and seeded
-  entries (#76) are later tickets.
+- Collapse (#73) and seeded entries (#76) are later tickets.
 - No measured dense execution policy ships for it; AUTO stays refused until
   one is measured on a real corpus.

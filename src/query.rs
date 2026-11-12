@@ -995,6 +995,13 @@ pub(crate) async fn execute(
         .as_ref()
         .and_then(|o| o.policy_point.as_ref())
         .and_then(|point| point.finish_settle_us);
+    let (policy_floor_greediness_ppm, policy_floor_clamp_min) = dense_execution
+        .as_ref()
+        .and_then(|o| o.policy_point.as_ref())
+        .map_or((None, None), |point| {
+            (point.floor_greediness_ppm, point.floor_clamp_min)
+        });
+    let policy_floor_prune: Option<bool> = policy_floor_greediness_ppm.map(|_| true);
     let fp32_rerank = match &plan.shape {
         Shape::Dense { query, .. } => {
             let mode = dense_score_mode(query)?;
@@ -1468,6 +1475,9 @@ pub(crate) async fn execute(
                     patience_saturation_ppm: policy_patience_saturation_ppm,
                     patience_hops: policy_patience_hops,
                     finish_settle_us: policy_finish_settle_us,
+                    floor_prune: policy_floor_prune,
+                    floor_greediness_ppm: policy_floor_greediness_ppm,
+                    floor_clamp_min: policy_floor_clamp_min,
                     ..Default::default()
                 })))
                 .await?
@@ -1484,6 +1494,7 @@ pub(crate) async fn execute(
                 outcome.tail_enumerated_rows = response.tail_enumerated_rows;
                 outcome.patience_stopped = response.patience_stopped;
                 outcome.shards_finished_early = response.shards_finished_early;
+                outcome.shards_floor_pruned = response.shards_floor_pruned;
             }
             let mut hits: Vec<QueryHit> = response
                 .hits
@@ -1656,6 +1667,9 @@ pub(crate) async fn execute(
                     patience_saturation_ppm: policy_patience_saturation_ppm,
                     patience_hops: policy_patience_hops,
                     finish_settle_us: policy_finish_settle_us,
+                    floor_prune: policy_floor_prune,
+                    floor_greediness_ppm: policy_floor_greediness_ppm,
+                    floor_clamp_min: policy_floor_clamp_min,
                     ..Default::default()
                 })))
                 .await?

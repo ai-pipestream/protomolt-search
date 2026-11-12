@@ -630,6 +630,9 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 patience_hops: None,
                 finish_settle_us: None,
                 finish_deadline_us: None,
+                floor_prune: None,
+                floor_greediness_ppm: None,
+                floor_clamp_min: None,
             })
             .await?
             .into_inner();

@@ -46,14 +46,15 @@ pub use graph::SearchStats;
 pub use rows::{RowSource, RowSourceIdentity};
 
 use crate::vector::{
-    first_invalid_coordinate, FilterRegime, Mask, PatienceSpec, PatienceWindow, QualityContract,
-    ScoreDirection, VectorBackendConfig, VectorBackendDescriptor, VectorCapability, VectorError,
-    VectorIndex, VectorProvider, VectorSearchOptions, VectorSearchResults, VectorStreamBatch,
-    VectorStreamControl, VectorStreamEndReason, VectorStreamSummary,
+    first_invalid_coordinate, FilterRegime, FloorPruneSpec, Mask, PatienceSpec, PatienceWindow,
+    QualityContract, ScoreDirection, VectorBackendConfig, VectorBackendDescriptor,
+    VectorCapability, VectorError, VectorIndex, VectorProvider, VectorSearchOptions,
+    VectorSearchResults, VectorStreamBatch, VectorStreamControl, VectorStreamEndReason,
+    VectorStreamSummary,
 };
 
 use distance::prefetch;
-use graph::{with_scratch, Filter, Hook, NoHook, Patience, Scored, Store, Walk};
+use graph::{with_scratch, Filter, FloorHook, FloorPrune, Hook, Patience, Scored, Store, Walk};
 
 /// Stable identifier of the backend, as `vector_backend` names it.
 pub const HNSW: &str = "hnsw";
@@ -113,6 +114,9 @@ pub struct Answer {
     /// True when the layer-0 walk stopped early after its tracked window
     /// stayed saturated for the configured patience hops.
     pub patience_stopped: bool,
+    /// True when the layer-0 walk pruned candidates against an active score
+    /// floor (`#72`).
+    pub floor_pruned: bool,
     /// Rows scored by enumeration because this index was unlinked (heap tail,
     /// frozen tail, or sealed segment below [`MIN_GRAPH_ROWS`]).
     pub tail_enumerated_rows: u64,
@@ -132,6 +136,8 @@ struct Plan<'a> {
     /// rows to enumerate (`None` when pinned).
     budget: Option<u64>,
     patience: PatienceSpec,
+    /// Clamped local allowed-row gate when `#72` floor pruning is enabled.
+    floor_prune_gate: Option<usize>,
 }
 
 impl Plan<'_> {
@@ -142,6 +148,7 @@ impl Plan<'_> {
         adaptive: false,
         budget: None,
         patience: PatienceSpec::OFF,
+        floor_prune_gate: None,
     };
 
     fn filter(&self) -> Filter<'_> {
@@ -170,8 +177,22 @@ impl Plan<'_> {
             saturation_ppm: self.patience.saturation_ppm,
             hops: self.patience.patience,
             top_k,
-            ascent_gate: self.patience.ascent_gate,
+            ascent_gate: self
+                .patience
+                .ascent_gate
+                .max(self.floor_prune_gate.unwrap_or(0)),
             floor_active: floor.is_finite(),
+        }
+    }
+
+    fn floor_prune(&self, slack_per_norm: f64) -> FloorPrune {
+        match self.floor_prune_gate {
+            Some(gate) => FloorPrune {
+                enabled: true,
+                gate,
+                slack_per_norm,
+            },
+            None => FloorPrune::OFF,
         }
     }
 }
@@ -395,13 +416,35 @@ impl HnswIndex {
         Ok(spec)
     }
 
+    fn check_floor_prune(
+        floor_prune: Option<FloorPruneSpec>,
+    ) -> Result<Option<FloorPruneSpec>, VectorError> {
+        let Some(spec) = floor_prune else {
+            return Ok(None);
+        };
+        if spec.share_ppm > 1_000_000 {
+            return Err(VectorError::new(format!(
+                "{HNSW} floor_prune share_ppm {} must be in 0..=1000000",
+                spec.share_ppm
+            )));
+        }
+        if spec.greediness_ppm > 1_000_000 {
+            return Err(VectorError::new(format!(
+                "{HNSW} floor_prune greediness_ppm {} must be in 0..=1000000",
+                spec.greediness_ppm
+            )));
+        }
+        Ok(Some(spec))
+    }
+
     fn plan<'a>(
         &self,
         ef: usize,
         options: &VectorSearchOptions<'a>,
     ) -> Result<Plan<'a>, VectorError> {
         self.check_allow(options.allow)?;
-        let patience = Self::check_patience(options.patience)?;
+        let mut patience = Self::check_patience(options.patience)?;
+        let floor_prune = Self::check_floor_prune(options.floor_prune)?;
         let Some(allow) = options.allow else {
             if let Some(regime) = options.filter_regime {
                 return Err(VectorError::new(format!(
@@ -409,8 +452,16 @@ impl HnswIndex {
                     regime.name()
                 )));
             }
+            let local_eligible = self.len();
+            if let Some(fp) = floor_prune {
+                patience.ascent_gate = patience.ascent_gate.max(fp.ascent_gate(local_eligible));
+            }
+            let floor_prune_gate = floor_prune
+                .filter(|fp| fp.enabled)
+                .map(|fp| fp.effective_gate(local_eligible));
             return Ok(Plan {
                 patience,
+                floor_prune_gate,
                 ..Plan::UNFILTERED
             });
         };
@@ -428,10 +479,18 @@ impl HnswIndex {
         let regime = match options.filter_regime {
             Some(regime) => regime,
             None if allowed == allow.len() => {
+                let local_eligible = self.len();
+                if let Some(fp) = floor_prune {
+                    patience.ascent_gate = patience.ascent_gate.max(fp.ascent_gate(local_eligible));
+                }
+                let floor_prune_gate = floor_prune
+                    .filter(|fp| fp.enabled)
+                    .map(|fp| fp.effective_gate(local_eligible));
                 return Ok(Plan {
                     patience,
+                    floor_prune_gate,
                     ..Plan::UNFILTERED
-                })
+                });
             }
             None => {
                 let threshold = options.enumerate_max_rows.unwrap_or(default_threshold);
@@ -451,6 +510,12 @@ impl HnswIndex {
                 }
             }
         };
+        if let Some(fp) = floor_prune {
+            patience.ascent_gate = patience.ascent_gate.max(fp.ascent_gate(allowed));
+        }
+        let floor_prune_gate = floor_prune
+            .filter(|fp| fp.enabled)
+            .map(|fp| fp.effective_gate(allowed));
         Ok(Plan {
             regime: Some(regime),
             allow: Some(allow),
@@ -458,6 +523,7 @@ impl HnswIndex {
             adaptive: options.filter_regime.is_none(),
             budget,
             patience,
+            floor_prune_gate,
         })
     }
 
@@ -537,6 +603,7 @@ impl HnswIndex {
                     stats,
                     budget_handoff: false,
                     patience_stopped: false,
+                    floor_pruned: false,
                     tail_enumerated_rows,
                 },
             );
@@ -550,18 +617,26 @@ impl HnswIndex {
                     stats,
                     budget_handoff: false,
                     patience_stopped: false,
+                    floor_pruned: false,
                     tail_enumerated_rows: 0,
                 },
             );
         }
         let patience = plan.patience(k, floor);
+        let floor_prune = plan.floor_prune(if plan.floor_prune_gate.is_some() {
+            self.slack_per_norm(query)
+        } else {
+            0.0
+        });
+        let mut hook = FloorHook(floor);
         let (hits, mut stats, walk) = with_view!(self, |view| view.walk(
             query,
             ef,
             plan.filter(),
             patience,
+            floor_prune,
             scratch,
-            &mut NoHook
+            &mut hook
         ));
         match (walk, plan.allow) {
             (Walk::Far, Some(allow)) => {
@@ -576,6 +651,7 @@ impl HnswIndex {
                         stats,
                         budget_handoff: false,
                         patience_stopped: false,
+                        floor_pruned: false,
                         tail_enumerated_rows: 0,
                     },
                 );
@@ -599,6 +675,7 @@ impl HnswIndex {
                         stats,
                         budget_handoff: walk == Walk::Budget,
                         patience_stopped: false,
+                        floor_pruned: false,
                         tail_enumerated_rows: 0,
                     },
                 );
@@ -613,6 +690,7 @@ impl HnswIndex {
                 stats,
                 budget_handoff: false,
                 patience_stopped: walk == Walk::Patience,
+                floor_pruned: walk == Walk::FloorPruned,
                 tail_enumerated_rows: 0,
             },
         )
@@ -888,6 +966,11 @@ impl Hook for StreamHook<'_> {
         }
         !self.stopped && self.finish_reason.is_none()
     }
+
+    #[inline]
+    fn current_floor(&self) -> f32 {
+        *self.floor
+    }
 }
 
 impl VectorProvider for HnswIndex {
@@ -924,6 +1007,7 @@ impl VectorProvider for HnswIndex {
                 VectorCapability::RawVectorRebuild,
                 VectorCapability::MaskEnumeration,
                 VectorCapability::PatienceEarlyStop,
+                VectorCapability::FloorPruning,
             ],
         }
     }
@@ -1041,6 +1125,7 @@ impl VectorProvider for HnswIndex {
         let mut regimes = crate::vector::FilterRegimeCounts::default();
         let mut tail_enumerated_rows = 0u64;
         let mut patience_stopped = 0u32;
+        let mut floor_pruned = 0u32;
         with_scratch(|scratch| {
             for query in queries.chunks_exact(self.dim) {
                 let (hits, answer) = self.answer(query, k, ef, floor, &plan, scratch);
@@ -1048,6 +1133,9 @@ impl VectorProvider for HnswIndex {
                     tail_enumerated_rows.saturating_add(answer.tail_enumerated_rows);
                 if answer.patience_stopped {
                     patience_stopped = patience_stopped.saturating_add(1);
+                }
+                if answer.floor_pruned {
+                    floor_pruned = floor_pruned.saturating_add(1);
                 }
                 if answer.budget_handoff {
                     regimes.count_budget_handoff();
@@ -1072,6 +1160,7 @@ impl VectorProvider for HnswIndex {
             regimes,
             tail_enumerated_rows,
             patience_stopped,
+            floor_pruned,
         })
     }
 
@@ -1117,6 +1206,7 @@ impl VectorProvider for HnswIndex {
         let mut regimes = crate::vector::FilterRegimeCounts::default();
         let mut tail_enumerated_rows = 0u64;
         let mut patience_stopped = 0u32;
+        let mut floor_pruned = 0u32;
         with_scratch(|scratch| {
             for (query_index, query) in queries.chunks_exact(self.dim).enumerate() {
                 let mut hook = StreamHook {
@@ -1150,11 +1240,18 @@ impl VectorProvider for HnswIndex {
                         }
                         _ => {
                             let patience = plan.patience(ef, *hook.floor);
+                            let floor_prune_cfg =
+                                plan.floor_prune(if plan.floor_prune_gate.is_some() {
+                                    self.slack_per_norm(query)
+                                } else {
+                                    0.0
+                                });
                             let (_, stats, walk) = with_view!(self, |view| view.walk(
                                 query,
                                 ef,
                                 plan.filter(),
                                 patience,
+                                floor_prune_cfg,
                                 scratch,
                                 &mut hook
                             ));
@@ -1178,9 +1275,17 @@ impl VectorProvider for HnswIndex {
                                     if walk == Walk::Patience {
                                         patience_stopped = patience_stopped.saturating_add(1);
                                     }
+                                    if walk == Walk::FloorPruned {
+                                        floor_pruned = floor_pruned.saturating_add(1);
+                                    }
                                     let done =
                                         walk != Walk::Stopped || hook.finish_reason.is_some();
-                                    (walked, done, VectorStreamEndReason::WalkConverged)
+                                    let reason = if walk == Walk::FloorPruned {
+                                        VectorStreamEndReason::FloorPruned
+                                    } else {
+                                        VectorStreamEndReason::WalkConverged
+                                    };
+                                    (walked, done, reason)
                                 }
                             }
                         }
@@ -1218,6 +1323,7 @@ impl VectorProvider for HnswIndex {
             regimes,
             tail_enumerated_rows,
             patience_stopped,
+            floor_pruned,
         })
     }
 

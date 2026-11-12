@@ -172,6 +172,24 @@ shards in `DenseExecutionOutcome.shards_finished_early` (redacted when physical
 execution details are withheld). A point naming `finish_settle_us` is refused on
 any provider that does not advertise `candidate_stream`.
 
+## Shared floor pruning
+
+A policy point measured on a provider advertising `floor_pruning`
+(`docs/hnsw.md`, "Shared floor pruning") may name `floor_pruning = true`, plus
+optional `floor_greediness_ppm` (`0..=1,000,000`, default `0` for full expected
+shard-share `gateK`) and `floor_clamp_min` (`>= 1`, default
+`DEFAULT_FLOOR_CLAMP_MIN = 8`). Setting `floor_greediness_ppm` or
+`floor_clamp_min` without `floor_pruning = true` is refused, and
+`floor_pruning = true` is refused on any provider that does not advertise
+`VectorBackendCapabilities.floor_pruning`. When AUTO qualifies a point with
+`floor_pruning = true`, the coordinator forwards `floor_prune = true`,
+`floor_k = k`, `expected_share_num` / `expected_share_den`,
+`floor_greediness_ppm`, and `floor_clamp_min` on `StartShardSearch` and
+`StartStreamSearch` (through relays and on hybrid vector legs), names the floor
+settings in `planner_reason` and `policy_point`, and sums the floor-pruned
+shards in `DenseExecutionOutcome.shards_floor_pruned` (redacted when physical
+execution details are withheld).
+
 ## AUTO and FP32 rerank
 
 Landed 2026-09-04. Step 2 resolves the traversal, not the rerank depth. When

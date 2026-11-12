@@ -60,6 +60,8 @@ struct PointFile {
     patience_saturation_ppm: Option<u32>,
     patience_hops: Option<u32>,
     finish_settle_us: Option<u32>,
+    floor_greediness_ppm: Option<u32>,
+    floor_clamp_min: Option<u32>,
 }
 
 /// One measured point: the key AUTO matches exactly, and the recall
@@ -86,6 +88,12 @@ pub struct PolicyPoint {
     /// (`1..=MAX_FINISH_SETTLE_US`) the point was measured under (`docs/hnsw.md`,
     /// "Graceful stream close").
     pub finish_settle_us: Option<u32>,
+    /// Optional shared-floor pruning greediness in parts per million
+    /// (`0..=1_000_000`) and minimum local allowed-row clamp (`<= corpus_rows`)
+    /// the point was measured under (`docs/hnsw.md`, "Shared floor pruning").
+    /// Set together or absent together.
+    pub floor_greediness_ppm: Option<u32>,
+    pub floor_clamp_min: Option<u32>,
 }
 
 /// What the live cluster reports; the policy must match it field by field.
@@ -214,6 +222,12 @@ impl DenseExecutionPolicy {
             if let Some(settle_us) = point.finish_settle_us {
                 out.push_str(&format!("finish_settle_us = {settle_us}\n"));
             }
+            if let Some(greediness) = point.floor_greediness_ppm {
+                out.push_str(&format!("floor_greediness_ppm = {greediness}\n"));
+            }
+            if let Some(clamp_min) = point.floor_clamp_min {
+                out.push_str(&format!("floor_clamp_min = {clamp_min}\n"));
+            }
         }
         out
     }
@@ -338,6 +352,32 @@ impl DenseExecutionPolicy {
                     ));
                 }
             }
+            match (p.floor_greediness_ppm, p.floor_clamp_min) {
+                (Some(greediness), Some(clamp_min)) => {
+                    if greediness > UNFILTERED_PPM {
+                        return Err(format!(
+                            "policy point k={} has floor_greediness_ppm {greediness} outside \
+                             0..=1000000",
+                            p.k
+                        ));
+                    }
+                    if u64::from(clamp_min) > file.corpus_rows {
+                        return Err(format!(
+                            "policy point k={} has floor_clamp_min {clamp_min} above the \
+                             corpus's {} rows",
+                            p.k, file.corpus_rows
+                        ));
+                    }
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(format!(
+                        "policy point k={} must set floor_greediness_ppm and floor_clamp_min \
+                         together",
+                        p.k
+                    ));
+                }
+            }
             let point = PolicyPoint {
                 k: p.k,
                 selectivity_min_ppm: p.filter_selectivity_ppm_min,
@@ -348,6 +388,8 @@ impl DenseExecutionPolicy {
                 patience_saturation_ppm: p.patience_saturation_ppm,
                 patience_hops: p.patience_hops,
                 finish_settle_us: p.finish_settle_us,
+                floor_greediness_ppm: p.floor_greediness_ppm,
+                floor_clamp_min: p.floor_clamp_min,
             };
             if let Some(prev) = points
                 .last()
@@ -866,5 +908,43 @@ measured_recall_ppm = 995000
         assert!(DenseExecutionPolicy::parse(&huge)
             .unwrap_err()
             .contains("finish_settle_us 60000001 outside"));
+    }
+
+    #[test]
+    fn a_point_carries_floor_prune_parameters_and_validates_pairs() {
+        let text = TEXT.replace(
+            "candidates = 100\nmeasured_recall_ppm = 990000\n",
+            "candidates = 100\nmeasured_recall_ppm = 990000\nfloor_greediness_ppm = 0\nfloor_clamp_min = 8\n",
+        );
+        let policy = DenseExecutionPolicy::parse(&text).unwrap();
+        let again = DenseExecutionPolicy::parse(&policy.to_toml()).unwrap();
+        assert_eq!(again.points(), policy.points());
+        let hit = policy
+            .qualify(RequestKey {
+                k: 10,
+                candidate_depth: 0,
+                filter_selectivity_ppm: UNFILTERED_PPM,
+            })
+            .unwrap();
+        assert_eq!(hit.point.floor_greediness_ppm, Some(0));
+        assert_eq!(hit.point.floor_clamp_min, Some(8));
+
+        let half = TEXT.replace(
+            "candidates = 100\nmeasured_recall_ppm = 990000\n",
+            "candidates = 100\nmeasured_recall_ppm = 990000\nfloor_greediness_ppm = 500000\n",
+        );
+        assert!(DenseExecutionPolicy::parse(&half)
+            .unwrap_err()
+            .contains("floor_greediness_ppm and floor_clamp_min together"));
+
+        let bad_ppm = text.replace("floor_greediness_ppm = 0", "floor_greediness_ppm = 1000001");
+        assert!(DenseExecutionPolicy::parse(&bad_ppm)
+            .unwrap_err()
+            .contains("floor_greediness_ppm 1000001 outside 0..=1000000"));
+
+        let huge_clamp = text.replace("floor_clamp_min = 8", "floor_clamp_min = 1001");
+        assert!(DenseExecutionPolicy::parse(&huge_clamp)
+            .unwrap_err()
+            .contains("floor_clamp_min 1001 above the corpus's 1000 rows"));
     }
 }

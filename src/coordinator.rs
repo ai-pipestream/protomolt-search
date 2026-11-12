@@ -461,6 +461,10 @@ pub struct CoordinatorServiceImpl {
     /// Resolved UDP floor target per node address (`None` =
     /// unresolvable), cached on first use. IPv4 preferred.
     floor_targets: Arc<Mutex<HashMap<String, Option<std::net::SocketAddr>>>>,
+    /// Cached vector row count per shard address from `GetVectorBackend`,
+    /// used to compute each shard's eligible-row share `p` (`floor_share_ppm`)
+    /// for `#72`'s ascent gate.
+    shard_vector_rows: Arc<Mutex<HashMap<String, u64>>>,
     /// Per-node BM25 term-stat shares, keyed by each node's
     /// `stats_epoch` (src/stats_cache.rs). Sound because the nodes
     /// enforce the epoch claim on every scoring request built from it.
@@ -1680,6 +1684,13 @@ pub struct RequestFilters {
     /// microseconds (`docs/hnsw.md`, "Graceful stream close").
     pub finish_settle_us: Option<u32>,
     pub finish_deadline_us: Option<u32>,
+    /// Optional shared-floor candidate pruning parameters forwarded to the
+    /// shards (`docs/hnsw.md`, "Shared floor pruning"; `#72`).
+    pub floor_prune: Option<bool>,
+    pub floor_k: Option<u32>,
+    pub parent_floor_share_ppm: Option<u32>,
+    pub floor_greediness_ppm: Option<u32>,
+    pub floor_clamp_min: Option<u32>,
 }
 
 /// The provider-mismatch line of a cluster health report: empty when
@@ -1834,6 +1845,11 @@ impl RequestFilters {
             patience_hops: None,
             finish_settle_us: None,
             finish_deadline_us: None,
+            floor_prune: None,
+            floor_k: None,
+            parent_floor_share_ppm: None,
+            floor_greediness_ppm: None,
+            floor_clamp_min: None,
         })
     }
 }
@@ -2052,6 +2068,7 @@ impl CoordinatorServiceImpl {
             allow_network: true,
             floor_socket: Arc::new(std::sync::OnceLock::new()),
             floor_targets: Arc::new(Mutex::new(HashMap::new())),
+            shard_vector_rows: Arc::new(Mutex::new(HashMap::new())),
             stats_cache,
             document_visibility: None,
             field_permissions: None,
@@ -2176,6 +2193,38 @@ impl CoordinatorServiceImpl {
         if self.scoped_vector_scan() && self.has_clustered_vectors() {
             return Err(Status::failed_precondition(
                 "scoped vector scans require product-node read receipts",
+            ));
+        }
+        if filters.floor_prune == Some(false)
+            && (filters.floor_greediness_ppm.is_some() || filters.floor_clamp_min.is_some())
+        {
+            return Err(Status::invalid_argument(
+                "floor_greediness_ppm and floor_clamp_min require floor_prune = true",
+            ));
+        }
+        if let Some(greediness) = filters.floor_greediness_ppm {
+            if greediness > 1_000_000 {
+                return Err(Status::invalid_argument(format!(
+                    "floor_greediness_ppm {greediness} must be in 0..=1000000"
+                )));
+            }
+        }
+        if let Some(share) = filters.parent_floor_share_ppm {
+            if share > 1_000_000 {
+                return Err(Status::invalid_argument(format!(
+                    "floor_share_ppm {share} must be in 0..=1000000"
+                )));
+            }
+        }
+        if self.has_clustered_vectors()
+            && (filters.floor_prune == Some(true)
+                || (filters.floor_prune.is_none()
+                    && (filters.floor_greediness_ppm.is_some()
+                        || filters.floor_clamp_min.is_some())))
+        {
+            return Err(Status::failed_precondition(
+                "vector backend \"clustered-turbovec\" does not support graph floor pruning \
+                 (it does not advertise floor_pruning)",
             ));
         }
         Ok(())
@@ -3119,6 +3168,10 @@ impl CoordinatorServiceImpl {
                 }
                 continue;
             };
+            self.shard_vector_rows
+                .lock()
+                .expect("shard vector row cache poisoned")
+                .insert(addr.clone(), backend.num_vectors);
             let seen = FleetVectorIdentity {
                 provider: descriptor.backend_kind.clone(),
                 scoring_fingerprint: descriptor.scoring_fingerprint.clone(),
@@ -3674,6 +3727,7 @@ impl CoordinatorServiceImpl {
             enumerates,
             supports_patience,
             supports_stream,
+            supports_floor_prune,
             dimensions,
             rows,
             generation,
@@ -3686,6 +3740,7 @@ impl CoordinatorServiceImpl {
                 false,
                 false,
                 false,
+                false,
                 identity.dimensions,
                 identity.rows,
                 identity.topology_generation,
@@ -3694,11 +3749,12 @@ impl CoordinatorServiceImpl {
             let mut tasks = Vec::with_capacity(self.node_addrs.len());
             for addr in &self.node_addrs {
                 let mut client = self.node_client(addr)?;
+                let addr = addr.clone();
                 tasks.push(tokio::spawn(async move {
                     client
                         .get_vector_backend(crate::pb::GetVectorBackendRequest {})
                         .await
-                        .map(tonic::Response::into_inner)
+                        .map(|resp| (addr, resp.into_inner()))
                 }));
             }
 
@@ -3711,10 +3767,11 @@ impl CoordinatorServiceImpl {
             let mut enumerates = true;
             let mut supports_patience = true;
             let mut supports_stream = true;
+            let mut supports_floor_prune = true;
             let mut dimensions = None;
             let mut rows: u64 = 0;
             for task in tasks {
-                let backend = task.await.map_err(|error| {
+                let (addr, backend) = task.await.map_err(|error| {
                     Status::internal(format!("dense execution preflight failed: {error}"))
                 })??;
                 rows = rows.checked_add(backend.num_vectors).ok_or_else(|| {
@@ -3725,6 +3782,10 @@ impl CoordinatorServiceImpl {
                         "dense execution preflight found an unconfigured vector shard",
                     )
                 })?;
+                self.shard_vector_rows
+                    .lock()
+                    .expect("shard vector row cache poisoned")
+                    .insert(addr, backend.num_vectors);
                 if descriptor.backend_kind.is_empty() {
                     return Err(Status::failed_precondition(
                         "dense execution preflight found an unnamed vector provider",
@@ -3792,6 +3853,10 @@ impl CoordinatorServiceImpl {
                     .capabilities
                     .iter()
                     .any(|capability| capability == "candidate_stream");
+                supports_floor_prune &= descriptor
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "floor_pruning");
 
                 for (held, actual, mismatch) in [
                     (
@@ -3846,6 +3911,7 @@ impl CoordinatorServiceImpl {
             let enumerates = enumerates && provider.is_some();
             let supports_patience = supports_patience && provider.is_some();
             let supports_stream = supports_stream && provider.is_some();
+            let supports_floor_prune = supports_floor_prune && provider.is_some();
             (
                 provider.unwrap_or_default(),
                 fingerprint.unwrap_or_default(),
@@ -3854,6 +3920,7 @@ impl CoordinatorServiceImpl {
                 enumerates,
                 supports_patience,
                 supports_stream,
+                supports_floor_prune,
                 dimensions.unwrap_or_default(),
                 rows,
                 self.topology_generation,
@@ -4007,6 +4074,19 @@ impl CoordinatorServiceImpl {
                         )));
                     }
                 }
+                if let (Some(greediness_ppm), Some(clamp_min)) =
+                    (point.floor_greediness_ppm, point.floor_clamp_min)
+                {
+                    if !supports_floor_prune {
+                        return Err(Status::failed_precondition(format!(
+                            "dense execution policy {:?} point k={} depth {} names floor pruning \
+                             (greediness {greediness_ppm} ppm, clamp_min {clamp_min}), but \
+                             provider {provider} does not support graph floor pruning (it does \
+                             not advertise floor_pruning)",
+                            hit.policy_id, point.k, point.candidates
+                        )));
+                    }
+                }
                 let reason = format!(
                     "AUTO selected the provider's configured approximate traversal through \
                      policy {:?} point k={} selectivity {}..={} ppm depth {} (measured recall {} \
@@ -4035,6 +4115,12 @@ impl CoordinatorServiceImpl {
                     Some(settle_us) => format!("{reason}; finish settle {settle_us} us"),
                     None => reason,
                 };
+                let reason = match (point.floor_greediness_ppm, point.floor_clamp_min) {
+                    (Some(greediness_ppm), Some(clamp_min)) => {
+                        format!("{reason}; floor prune {greediness_ppm} ppm (clamp {clamp_min})")
+                    }
+                    _ => reason,
+                };
                 qualified = Some((hit, selectivity));
                 (crate::pb::DenseExecutionMode::Ann, reason)
             }
@@ -4058,6 +4144,7 @@ impl CoordinatorServiceImpl {
             tail_enumerated_rows: 0,
             patience_stopped: 0,
             shards_finished_early: 0,
+            shards_floor_pruned: 0,
         };
         if let Some((hit, selectivity)) = qualified {
             outcome.evidence_scope = crate::pb::DenseEvidenceScope::SelectivityBandBenchmark as i32;
@@ -4073,6 +4160,8 @@ impl CoordinatorServiceImpl {
                 patience_saturation_ppm: hit.point.patience_saturation_ppm,
                 patience_hops: hit.point.patience_hops,
                 finish_settle_us: hit.point.finish_settle_us,
+                floor_greediness_ppm: hit.point.floor_greediness_ppm,
+                floor_clamp_min: hit.point.floor_clamp_min,
             });
             outcome.filter_selectivity_ppm = selectivity;
             outcome.candidate_depth = hit.point.candidates;
@@ -7416,6 +7505,7 @@ impl CoordinatorServiceImpl {
                 )));
             }
         } else {
+            self.ensure_shard_vector_rows().await;
             let mut fanout = self.open_stream_fanout(
                 request_id,
                 vector,
@@ -7922,6 +8012,7 @@ impl CoordinatorServiceImpl {
         }
 
         let admission = self.vector_read_barrier()?;
+        self.ensure_shard_vector_rows().await;
         let mut workers = tokio::task::JoinSet::new();
         let mask = self.vector_scan_mask(filters.tree.as_ref());
         let ctx = ShardQueryCtx {
@@ -7933,6 +8024,7 @@ impl CoordinatorServiceImpl {
             collapse: false,
             filters: Arc::new(filters.clone()),
             shard_filters: Arc::new(self.shard_filter_trees(filters, mask.as_ref())),
+            shard_floor_shares: Arc::new(self.shard_floor_share_ppms(filters, mask.as_ref())),
             tracker: Arc::new(Mutex::new(FloorTracker::new())),
             gfloor: Arc::new(watch::channel(f32::NEG_INFINITY).0),
             hedges: Arc::new(AtomicU64::new(0)),
@@ -8094,6 +8186,8 @@ impl CoordinatorServiceImpl {
         let mut udp_lanes: Vec<Option<(u64, std::net::SocketAddr)>> = Vec::with_capacity(n_nodes);
         let mut readers = tokio::task::JoinSet::new();
         let mask = self.vector_scan_mask(filters.tree.as_ref());
+        let floor_shares = self.shard_floor_share_ppms(filters, mask.as_ref());
+        let floor_k = filters.floor_k.or(candidate_depth);
         for shard in 0..n_nodes {
             if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
                 floor_txs.push(None);
@@ -8124,6 +8218,11 @@ impl CoordinatorServiceImpl {
                         geo_filters: filters.geo.clone(),
                         filter: Self::shard_filter_tree(filters, mask.as_ref(), shard),
                         identity_limits,
+                        floor_prune: filters.floor_prune,
+                        floor_k,
+                        floor_share_ppm: floor_shares.get(shard).copied().flatten(),
+                        floor_greediness_ppm: filters.floor_greediness_ppm,
+                        floor_clamp_min: filters.floor_clamp_min,
                     })),
                 })
                 .expect("fresh channel accepts the Start message");
@@ -8287,6 +8386,114 @@ impl CoordinatorServiceImpl {
         ))
     }
 
+    /// Best-effort refresh of per-shard row counts (`self.shard_vector_rows`)
+    /// when a caller invokes a fan-out helper directly without going through
+    /// `SearchService::search` or `resolve_dense_execution`. Errors on
+    /// unreachable or unconfigured shards are ignored here so the subsequent
+    /// RPC surfaces its canonical failure untouched.
+    pub(crate) async fn ensure_shard_vector_rows(&self) {
+        if self.has_clustered_vectors() || self.node_addrs.is_empty() {
+            return;
+        }
+        let needs_probe = {
+            let cache = self
+                .shard_vector_rows
+                .lock()
+                .expect("shard vector row cache poisoned");
+            self.node_addrs
+                .iter()
+                .any(|addr| cache.get(addr).copied().unwrap_or(0) == 0)
+        };
+        if !needs_probe {
+            return;
+        }
+        let mut tasks = Vec::with_capacity(self.node_addrs.len());
+        for addr in &self.node_addrs {
+            let Ok(mut client) = self.node_client(addr) else {
+                continue;
+            };
+            let addr = addr.clone();
+            tasks.push(tokio::spawn(async move {
+                client
+                    .get_vector_backend(crate::pb::GetVectorBackendRequest {})
+                    .await
+                    .ok()
+                    .map(|resp| (addr, resp.into_inner()))
+            }));
+        }
+        let mut observed = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            if let Ok(Some((addr, backend))) = task.await {
+                if backend.descriptor.is_some() {
+                    observed.push((addr, backend.num_vectors));
+                }
+            }
+        }
+        if !observed.is_empty() {
+            let mut cache = self
+                .shard_vector_rows
+                .lock()
+                .expect("shard vector row cache poisoned");
+            for (addr, rows) in observed {
+                cache.insert(addr, rows);
+            }
+        }
+    }
+
+    /// Per-shard proportional share (`0..=1_000_000`) of the parent's
+    /// `floor_share_ppm` across active (non-skipped) shards (`#72`).
+    pub(crate) fn shard_floor_share_ppms(
+        &self,
+        filters: &RequestFilters,
+        mask: Option<&crate::placement::ShardMask>,
+    ) -> Vec<Option<u32>> {
+        let n_nodes = self.node_addrs.len();
+        let active: Vec<usize> = (0..n_nodes)
+            .filter(|&shard| !mask.is_some_and(|m| m.skipped[shard]))
+            .collect();
+        let mut out = vec![None; n_nodes];
+        if active.is_empty() {
+            return out;
+        }
+        let parent_share = u128::from(filters.parent_floor_share_ppm.unwrap_or(1_000_000));
+        let cached: Option<Vec<(usize, u64)>> = {
+            let cache = self
+                .shard_vector_rows
+                .lock()
+                .expect("shard vector row cache poisoned");
+            active
+                .iter()
+                .map(|&shard| {
+                    cache
+                        .get(&self.node_addrs[shard])
+                        .map(|&rows| (shard, rows))
+                })
+                .collect()
+        };
+        if let Some(rows_by_shard) = cached {
+            let total_rows: u128 = rows_by_shard
+                .iter()
+                .map(|&(_, rows)| u128::from(rows))
+                .sum();
+            for (shard, rows) in rows_by_shard {
+                let share = if total_rows == 0 || rows == 0 {
+                    0
+                } else {
+                    (parent_share * u128::from(rows))
+                        .div_ceil(total_rows)
+                        .min(1_000_000) as u32
+                };
+                out[shard] = Some(share);
+            }
+        } else {
+            let uniform = parent_share.div_ceil(active.len() as u128).min(1_000_000) as u32;
+            for shard in active {
+                out[shard] = Some(uniform);
+            }
+        }
+        out
+    }
+
     /// [`Self::fanout_search`] over the streaming protocol
     /// (`NodeService.StreamSearch`): shards hold no top-k and emit
     /// every candidate at or above the live floor; the heap here — the
@@ -8348,9 +8555,11 @@ impl CoordinatorServiceImpl {
                 summaries: Vec::new(),
                 floors_sent: 0,
                 shards_finished_early: 0,
+                shards_floor_pruned: 0,
             });
         }
 
+        self.ensure_shard_vector_rows().await;
         let mask = self.vector_scan_mask(filters.tree.as_ref());
         let mut known = Self::filter_known(filters, mask.as_ref());
         let identity_limits = crate::pb::StreamIdentityLimits {
@@ -8373,6 +8582,8 @@ impl CoordinatorServiceImpl {
         // under the merge's total order, so peek() is the k-th best.
         let mut heap: std::collections::BinaryHeap<StreamHeapEntry> =
             std::collections::BinaryHeap::with_capacity(k as usize + 1);
+        let mut seen_rows: std::collections::HashSet<(u32, u64)> =
+            std::collections::HashSet::with_capacity(k as usize * 2);
         let mut summaries: Vec<Option<StreamSearchSummary>> = vec![None; n_nodes];
         let mut remaining = n_nodes;
         for (shard, summary) in summaries.iter_mut().enumerate() {
@@ -8445,8 +8656,12 @@ impl CoordinatorServiceImpl {
                     }
                     let mut heap_changed = false;
                     for rec in batch.hits.as_chunks::<12>().0 {
+                        let vector_id = u64::from_le_bytes(rec[..8].try_into().expect("8-byte id"));
+                        if !seen_rows.insert((shard as u32, vector_id)) {
+                            continue;
+                        }
                         let entry = StreamHeapEntry(MergedHit {
-                            vector_id: u64::from_le_bytes(rec[..8].try_into().expect("8-byte id")),
+                            vector_id,
                             shard: shard as u32,
                             score: f32::from_le_bytes(rec[8..12].try_into().expect("4-byte score")),
                         });
@@ -8587,6 +8802,7 @@ impl CoordinatorServiceImpl {
             .map(|s| s.expect("all summaries arrived"))
             .collect();
         let shards_finished_early = count_shards_finished_early(&summaries);
+        let shards_floor_pruned = count_shards_floor_pruned(&summaries);
         Ok(StreamFanoutResult {
             hits: all
                 .into_iter()
@@ -8600,6 +8816,7 @@ impl CoordinatorServiceImpl {
             summaries,
             floors_sent,
             shards_finished_early,
+            shards_floor_pruned,
         })
     }
 
@@ -8658,13 +8875,17 @@ impl CoordinatorServiceImpl {
                 summaries: Vec::new(),
                 floors_sent: 0,
                 shards_finished_early: 0,
+                shards_floor_pruned: 0,
             });
         }
+        self.ensure_shard_vector_rows().await;
         let mask = self.vector_scan_mask(filters.tree.as_ref());
         let mut known = Self::filter_known(filters, mask.as_ref());
         let mut fanout =
             self.open_stream_fanout(request_id, vector, None, Some(k), true, filters)?;
         let mut parents: HashMap<u64, ParentAgg> = HashMap::new();
+        let mut seen_chunks: std::collections::HashSet<(u32, u64)> =
+            std::collections::HashSet::with_capacity(k as usize * 2);
         let mut summaries: Vec<Option<StreamSearchSummary>> = vec![None; n_nodes];
         let mut remaining = n_nodes;
         for (shard, summary) in summaries.iter_mut().enumerate() {
@@ -8735,6 +8956,9 @@ impl CoordinatorServiceImpl {
                     let mut dirty = false;
                     for rec in batch.hits.as_chunks::<20>().0 {
                         let doc = u64::from_le_bytes(rec[..8].try_into().expect("8-byte id"));
+                        if !seen_chunks.insert((shard as u32, doc)) {
+                            continue;
+                        }
                         let score =
                             f32::from_le_bytes(rec[8..12].try_into().expect("4-byte score"));
                         let parent =
@@ -8880,6 +9104,7 @@ impl CoordinatorServiceImpl {
             .map(|s| s.expect("all summaries arrived"))
             .collect();
         let shards_finished_early = count_shards_finished_early(&summaries);
+        let shards_floor_pruned = count_shards_floor_pruned(&summaries);
         Ok(CollapseStreamResult {
             hits,
             groups,
@@ -8887,6 +9112,7 @@ impl CoordinatorServiceImpl {
             summaries,
             floors_sent,
             shards_finished_early,
+            shards_floor_pruned,
         })
     }
 
@@ -8917,6 +9143,7 @@ impl CoordinatorServiceImpl {
             return Err(Status::failed_precondition("no shard nodes configured"));
         }
         let admission = self.vector_read_barrier()?;
+        self.ensure_shard_vector_rows().await;
         let mut workers = tokio::task::JoinSet::new();
         let mask = self.vector_scan_mask(filters.tree.as_ref());
         let ctx = ShardQueryCtx {
@@ -8928,6 +9155,7 @@ impl CoordinatorServiceImpl {
             collapse: true,
             filters: Arc::new(filters.clone()),
             shard_filters: Arc::new(self.shard_filter_trees(filters, mask.as_ref())),
+            shard_floor_shares: Arc::new(self.shard_floor_share_ppms(filters, mask.as_ref())),
             tracker: Arc::new(Mutex::new(FloorTracker::new())),
             gfloor: Arc::new(watch::channel(f32::NEG_INFINITY).0),
             hedges: Arc::new(AtomicU64::new(0)),
@@ -11215,6 +11443,7 @@ impl CoordinatorServiceImpl {
                 summaries: Vec::new(),
                 floors_sent: 0,
                 shards_finished_early: 0,
+                shards_floor_pruned: 0,
             });
         }
         let backend = self
@@ -11346,6 +11575,7 @@ impl CoordinatorServiceImpl {
             summaries: Vec::new(),
             floors_sent,
             shards_finished_early: 0,
+            shards_floor_pruned: 0,
         })
     }
 
@@ -12486,6 +12716,8 @@ struct ShardQueryCtx {
     /// tree with the clauses its placement leaf implies removed. A hedge
     /// leg reads the same entry as its primary.
     shard_filters: Arc<Vec<Option<crate::pb::FilterExpr>>>,
+    /// Per shard, the proportional `floor_share_ppm` (`#72`).
+    shard_floor_shares: Arc<Vec<Option<u32>>>,
     /// Merges every shard's published floor into the running global max.
     tracker: Arc<Mutex<FloorTracker>>,
     /// Conflating broadcast cell for the global floor: pumps write raises
@@ -12534,6 +12766,15 @@ async fn run_shard_stream(
                 enumerate_max_rows: ctx.filters.enumerate_max_rows,
                 patience_saturation_ppm: ctx.filters.patience_saturation_ppm,
                 patience_hops: ctx.filters.patience_hops,
+                floor_prune: ctx.filters.floor_prune,
+                floor_k: ctx.filters.floor_k.or(Some(ctx.k)),
+                floor_share_ppm: ctx
+                    .shard_floor_shares
+                    .get(shard as usize)
+                    .copied()
+                    .flatten(),
+                floor_greediness_ppm: ctx.filters.floor_greediness_ppm,
+                floor_clamp_min: ctx.filters.floor_clamp_min,
             })),
         })
         .await
@@ -12774,6 +13015,17 @@ fn count_shards_finished_early(summaries: &[StreamSearchSummary]) -> u32 {
         .count() as u32
 }
 
+fn count_shards_floor_pruned(summaries: &[StreamSearchSummary]) -> u32 {
+    summaries
+        .iter()
+        .filter(|summary| {
+            summary.floor_pruned > 0
+                || crate::vector::VectorStreamEndReason::from_proto(summary.end_reason)
+                    == crate::vector::VectorStreamEndReason::FloorPruned
+        })
+        .count() as u32
+}
+
 /// Quorum of active shards that must report scan completion before the
 /// coordinator arms its top-`k` stillness settle window: never self-triggers
 /// on a single-shard scan (`1`), `1` on 2 shards, and `floor(3*N/4)` clamped
@@ -12829,6 +13081,9 @@ pub struct CollapseStreamResult {
     /// Shards whose walk ended cleanly via `FinishStreamSearch` (`FINISH_REQUESTED`
     /// or `DEADLINE`).
     pub shards_finished_early: u32,
+    /// Shards where at least one segment's walk pruned candidates against the
+    /// shared score floor (`#72`).
+    pub shards_floor_pruned: u32,
 }
 
 pub struct StreamFanoutResult {
@@ -12843,6 +13098,9 @@ pub struct StreamFanoutResult {
     /// Shards whose walk ended cleanly via `FinishStreamSearch` (`FINISH_REQUESTED`
     /// or `DEADLINE`).
     pub shards_finished_early: u32,
+    /// Shards where at least one segment's walk pruned candidates against the
+    /// shared score floor (`#72`).
+    pub shards_floor_pruned: u32,
 }
 
 /// Heap wrapper whose `Ord` IS the merge's total order ([`cmp_hits`]:
@@ -13150,6 +13408,11 @@ impl PlanCounter<'_> {
             patience_hops: None,
             finish_settle_us: None,
             finish_deadline_us: None,
+            floor_prune: None,
+            floor_k: None,
+            parent_floor_share_ppm: None,
+            floor_greediness_ppm: None,
+            floor_clamp_min: None,
         };
         let count = crate::pb::CompiledAggregation {
             expr: Some(crate::cel::compile_value("1")?),
@@ -13326,7 +13589,10 @@ impl SearchService for CoordinatorServiceImpl {
                 .await;
             }
             if self.scoped_vector_scan() && self.query_read_versions.is_none() {
-                let filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
+                let mut filters = RequestFilters::compile(&req.geo_filters, &req.filter)?;
+                filters.floor_prune = req.floor_prune;
+                filters.floor_greediness_ppm = req.floor_greediness_ppm;
+                filters.floor_clamp_min = req.floor_clamp_min;
                 self.check_vector_scan(&filters, req.collapse_parents)?;
                 let (pinned, reads) = self.pin_read_versions().await?;
                 let result = Box::pin(SearchService::search(
@@ -13363,6 +13629,10 @@ impl SearchService for CoordinatorServiceImpl {
             filters.patience_hops = req.patience_hops;
             filters.finish_settle_us = req.finish_settle_us;
             filters.finish_deadline_us = req.finish_deadline_us;
+            filters.floor_prune = req.floor_prune;
+            filters.floor_k = Some(k);
+            filters.floor_greediness_ppm = req.floor_greediness_ppm;
+            filters.floor_clamp_min = req.floor_clamp_min;
             let _ = self.resolve_finish_windows(&filters)?;
             self.check_vector_scan(&filters, req.collapse_parents)?;
             // The fleet scores in one space or not at all: mixed provider
@@ -13383,6 +13653,7 @@ impl SearchService for CoordinatorServiceImpl {
                         tail_enumerated_rows: 0,
                         patience_stopped: 0,
                         shards_finished_early: 0,
+                        shards_floor_pruned: 0,
                         segments_total: 0,
                         segments_skipped: 0,
                         request_id,
@@ -13409,6 +13680,7 @@ impl SearchService for CoordinatorServiceImpl {
                     tail_enumerated_rows: 0,
                     patience_stopped: 0,
                     shards_finished_early: 0,
+                    shards_floor_pruned: 0,
                     segments_total: 0,
                     segments_skipped: 0,
                     request_id,
@@ -13436,6 +13708,7 @@ impl SearchService for CoordinatorServiceImpl {
                         tail_enumerated_rows: summed_tail_enumerated_rows(&doc.summaries),
                         patience_stopped: summed_patience_stopped(&doc.summaries),
                         shards_finished_early: doc.shards_finished_early,
+                        shards_floor_pruned: doc.shards_floor_pruned,
                         segments_total: 0,
                         segments_skipped: 0,
                         request_id,
@@ -13455,6 +13728,7 @@ impl SearchService for CoordinatorServiceImpl {
                     tail_enumerated_rows: summed_tail_enumerated_rows(&streamed.summaries),
                     patience_stopped: summed_patience_stopped(&streamed.summaries),
                     shards_finished_early: streamed.shards_finished_early,
+                    shards_floor_pruned: streamed.shards_floor_pruned,
                     segments_total: 0,
                     segments_skipped: 0,
                     request_id,
@@ -13478,6 +13752,7 @@ impl SearchService for CoordinatorServiceImpl {
             let mut regimes = crate::vector::FilterRegimeCounts::default();
             let mut tail_enumerated_rows = 0u64;
             let mut patience_stopped = 0u32;
+            let mut shards_floor_pruned = 0u32;
             for stats in result.shard_stats.iter().flatten() {
                 regimes.add(crate::vector::FilterRegimeCounts::from_proto(
                     stats.filter_regimes.as_ref(),
@@ -13485,12 +13760,16 @@ impl SearchService for CoordinatorServiceImpl {
                 tail_enumerated_rows =
                     tail_enumerated_rows.saturating_add(stats.tail_enumerated_rows);
                 patience_stopped = patience_stopped.saturating_add(stats.patience_stopped);
+                if stats.floor_pruned > 0 {
+                    shards_floor_pruned = shards_floor_pruned.saturating_add(1);
+                }
             }
             Ok(Response::new(SearchResponse {
                 filter_regimes: regimes.to_proto(),
                 tail_enumerated_rows,
                 patience_stopped,
                 shards_finished_early: 0,
+                shards_floor_pruned,
                 segments_total,
                 segments_skipped,
                 request_id,
@@ -13844,6 +14123,10 @@ impl SearchService for CoordinatorServiceImpl {
             filters.patience_hops = req.patience_hops;
             filters.finish_settle_us = req.finish_settle_us;
             filters.finish_deadline_us = req.finish_deadline_us;
+            filters.floor_prune = req.floor_prune;
+            filters.floor_k = Some(k);
+            filters.floor_greediness_ppm = req.floor_greediness_ppm;
+            filters.floor_clamp_min = req.floor_clamp_min;
             let _ = self.resolve_finish_windows(&filters)?;
             // leg_k: default max(k, rrf_k) so the RRF constant never exceeds a
             // leg's depth; explicit values below k are clamped to k.

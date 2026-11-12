@@ -316,7 +316,13 @@ impl VectorProvider for SegmentedProvider {
         let mut regimes = crate::vector::FilterRegimeCounts::default();
         let mut tail_enumerated_rows = 0u64;
         let mut patience_stopped = 0u32;
+        let mut floor_pruned = 0u32;
         let mut running_floor = options.minimum_score;
+        let shard_eligible = if options.floor_prune.is_some() {
+            options.allow.map_or_else(|| self.len(), |m| m.count())
+        } else {
+            0
+        };
         for (base, rows, image) in self.search_images() {
             let allow = match options.allow {
                 Some(allow) => match allow.slice(base, base + rows) {
@@ -336,11 +342,16 @@ impl VectorProvider for SegmentedProvider {
             part_options.filter_regime = options.filter_regime;
             part_options.enumerate_max_rows = options.enumerate_max_rows;
             part_options.patience = options.patience;
+            if let Some(fp) = options.floor_prune {
+                let seg_eligible = part_options.allow.map_or(rows, |m| m.count());
+                part_options.floor_prune = Some(fp.for_segment(seg_eligible, shard_eligible));
+            }
             let results = image.try_search(queries, k.min(rows), part_options)?;
             regimes.add(results.regimes);
             tail_enumerated_rows =
                 tail_enumerated_rows.saturating_add(results.tail_enumerated_rows);
             patience_stopped = patience_stopped.saturating_add(results.patience_stopped);
+            floor_pruned = floor_pruned.saturating_add(results.floor_pruned);
             for (q, hits) in per_query.iter_mut().enumerate() {
                 for (&slot, &score) in results
                     .slots_for_query(q)
@@ -381,6 +392,7 @@ impl VectorProvider for SegmentedProvider {
             regimes,
             tail_enumerated_rows,
             patience_stopped,
+            floor_pruned,
         })
     }
 
@@ -410,6 +422,12 @@ impl VectorProvider for SegmentedProvider {
         let mut regimes = crate::vector::FilterRegimeCounts::default();
         let mut tail_enumerated_rows = 0u64;
         let mut patience_stopped = 0u32;
+        let mut floor_pruned = 0u32;
+        let shard_eligible = if options.floor_prune.is_some() {
+            options.allow.map_or_else(|| self.len(), |m| m.count())
+        } else {
+            0
+        };
         for (base, rows, image) in self.search_images() {
             if stopped.get() || finished.get() {
                 break;
@@ -432,6 +450,10 @@ impl VectorProvider for SegmentedProvider {
             part_options.filter_regime = options.filter_regime;
             part_options.enumerate_max_rows = options.enumerate_max_rows;
             part_options.patience = options.patience;
+            if let Some(fp) = options.floor_prune {
+                let seg_eligible = part_options.allow.map_or(rows, |m| m.count());
+                part_options.floor_prune = Some(fp.for_segment(seg_eligible, shard_eligible));
+            }
             let note = |verdict: VectorStreamControl| match verdict {
                 VectorStreamControl::RaiseFloor(f) => {
                     floor.set(Some(floor.get().map_or(f, |cur| cur.max(f))));
@@ -488,6 +510,7 @@ impl VectorProvider for SegmentedProvider {
             tail_enumerated_rows =
                 tail_enumerated_rows.saturating_add(summary.tail_enumerated_rows);
             patience_stopped = patience_stopped.saturating_add(summary.patience_stopped);
+            floor_pruned = floor_pruned.saturating_add(summary.floor_pruned);
             end_reason.set(end_reason.get().merge(summary.end_reason));
             if summary.end_reason.is_early_finish() {
                 finished.set(true);
@@ -513,6 +536,7 @@ impl VectorProvider for SegmentedProvider {
             regimes,
             tail_enumerated_rows,
             patience_stopped,
+            floor_pruned,
         })
     }
 

@@ -221,6 +221,11 @@ pub trait Hook {
     fn scored(&mut self, node: u32, score: f32, row: &[f32]);
     /// After each expansion; `false` stops the walk.
     fn hop(&mut self) -> bool;
+    /// Current exact score floor for layer-0 floor pruning (`#72`).
+    #[inline]
+    fn current_floor(&self) -> f32 {
+        f32::NEG_INFINITY
+    }
 }
 
 pub struct NoHook;
@@ -231,6 +236,22 @@ impl Hook for NoHook {
     #[inline]
     fn hop(&mut self) -> bool {
         true
+    }
+}
+
+/// Unary walk hook carrying a static score floor (`#72`).
+pub struct FloorHook(pub f32);
+
+impl Hook for FloorHook {
+    #[inline]
+    fn scored(&mut self, _node: u32, _score: f32, _row: &[f32]) {}
+    #[inline]
+    fn hop(&mut self) -> bool {
+        true
+    }
+    #[inline]
+    fn current_floor(&self) -> f32 {
+        self.0
     }
 }
 
@@ -313,6 +334,32 @@ impl Patience {
     }
 }
 
+/// Layer-0 shared floor pruning gate and Higham kernel-vs-scalar error slack (`#72`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FloorPrune {
+    pub enabled: bool,
+    /// Minimum allowed rows scored at layer 0 before candidates below the
+    /// live floor may be pruned.
+    pub gate: usize,
+    /// `4 * gamma(d) * |query|`: per-unit-norm kernel-vs-scalar dot-product
+    /// error slack.
+    pub slack_per_norm: f64,
+}
+
+impl Default for FloorPrune {
+    fn default() -> Self {
+        Self::OFF
+    }
+}
+
+impl FloorPrune {
+    pub const OFF: Self = Self {
+        enabled: false,
+        gate: 0,
+        slack_per_norm: 0.0,
+    };
+}
+
 /// How a walk ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Walk {
@@ -322,6 +369,10 @@ pub enum Walk {
     /// Ended early after `Patience::hops` consecutive saturated expansions
     /// once the beam (and ascent gate when a floor is active) filled.
     Patience,
+    /// Pruned at least one candidate or expansion against an active score floor
+    /// once the `#72` ascent gate was satisfied; never triggers a starvation
+    /// fallback to `enumerate`.
+    FloorPruned,
     /// Not started: the far probe found the query's neighborhood all but
     /// empty of allowed rows. Nothing was scored at layer 0 or reported.
     Far,
@@ -502,6 +553,20 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
         }
     }
 
+    /// True when `node`'s exact scalar score is provably strictly below `floor`
+    /// under `#70`'s Higham `4 · γ(d) · |q| · |x|` error bound (`#72`).
+    #[inline]
+    fn below_floor(&self, node: u32, kernel_score: f32, floor: f32, slack_per_norm: f64) -> bool {
+        if !floor.is_finite() {
+            return false;
+        }
+        let inv = self.inv_norm[node as usize];
+        if !(inv > 0.0 && inv.is_finite()) {
+            return false;
+        }
+        f64::from(kernel_score) + slack_per_norm / f64::from(inv) < f64::from(floor)
+    }
+
     /// Paper Algorithm 2 at one layer. Leaves up to `ef` results (allowed
     /// nodes only) in `scratch.res`. Disallowed nodes route: they enter the
     /// candidate heap and are expanded, but never the results.
@@ -514,6 +579,7 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
         layer: usize,
         allow: Option<Mask<'_>>,
         patience: Patience,
+        floor_prune: FloorPrune,
         locks: Option<&Locks>,
         scratch: &mut Scratch,
         hook: &mut H,
@@ -521,6 +587,8 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
     ) -> Walk {
         let ef = ef.max(1);
         scratch.begin(self.n());
+        let prune_active = layer == 0 && floor_prune.enabled;
+        let mut pruned_by_floor = false;
         let use_top_k = patience.enabled() && patience.top_k > 0 && patience.top_k < ef;
         let window = if use_top_k { patience.top_k } else { ef };
         let min_survived = patience.min_survived(window);
@@ -561,13 +629,26 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
                     break;
                 }
             }
+            if prune_active
+                && allowed_scored >= floor_prune.gate
+                && self.below_floor(
+                    c.node,
+                    c.score,
+                    hook.current_floor(),
+                    floor_prune.slack_per_norm,
+                )
+            {
+                pruned_by_floor = true;
+                continue;
+            }
             if patience.enabled() && consecutive_saturated >= patience.hops {
                 outcome = Walk::Patience;
                 break;
             }
+            let floor_live = patience.floor_active || hook.current_floor().is_finite();
             let gate_ok = patience.enabled()
                 && scratch.res.len() >= ef
-                && (!patience.floor_active || allowed_scored >= patience.ascent_gate)
+                && (!floor_live || allowed_scored >= patience.ascent_gate)
                 && (!use_top_k || patience_top.len() >= window);
             if gate_ok {
                 patience_added.clear();
@@ -586,6 +667,13 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
                 let full = scratch.res.len() >= ef;
                 let worst = scratch.res.peek().map_or(f32::NEG_INFINITY, |r| r.0.score);
                 if !full || s > worst {
+                    if prune_active
+                        && allowed_scored >= floor_prune.gate
+                        && self.below_floor(v, s, hook.current_floor(), floor_prune.slack_per_norm)
+                    {
+                        pruned_by_floor = true;
+                        return;
+                    }
                     let scored = Scored { score: s, node: v };
                     scratch.cand.push(scored);
                     if ok {
@@ -634,6 +722,9 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
         scratch.nbrs = nbrs;
         scratch.patience_added = patience_added;
         scratch.patience_top = patience_top;
+        if outcome == Walk::Completed && pruned_by_floor {
+            outcome = Walk::FloorPruned;
+        }
         outcome
     }
 
@@ -658,12 +749,14 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
         allow: Mask<'_>,
         visit_budget: Option<u64>,
         patience: Patience,
+        floor_prune: FloorPrune,
         scratch: &mut Scratch,
         hook: &mut H,
         stats: &mut SearchStats,
     ) -> Walk {
         let ef = ef.max(1);
         scratch.begin(self.n());
+        let mut pruned_by_floor = false;
         let use_top_k = patience.enabled() && patience.top_k > 0 && patience.top_k < ef;
         let window = if use_top_k { patience.top_k } else { ef };
         let min_survived = patience.min_survived(window);
@@ -708,6 +801,18 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
                     break;
                 }
             }
+            if floor_prune.enabled
+                && allowed_scored >= floor_prune.gate
+                && self.below_floor(
+                    c.node,
+                    c.score,
+                    hook.current_floor(),
+                    floor_prune.slack_per_norm,
+                )
+            {
+                pruned_by_floor = true;
+                continue;
+            }
             if patience.enabled() && consecutive_saturated >= patience.hops {
                 outcome = Walk::Patience;
                 break;
@@ -716,9 +821,10 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
                 outcome = Walk::Budget;
                 break;
             }
+            let floor_live = patience.floor_active || hook.current_floor().is_finite();
             let gate_ok = patience.enabled()
                 && scratch.res.len() >= ef
-                && (!patience.floor_active || allowed_scored >= patience.ascent_gate)
+                && (!floor_live || allowed_scored >= patience.ascent_gate)
                 && (!use_top_k || patience_top.len() >= window);
             if gate_ok {
                 patience_added.clear();
@@ -764,6 +870,13 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
                 let full = scratch.res.len() >= ef;
                 let worst = scratch.res.peek().map_or(f32::NEG_INFINITY, |r| r.0.score);
                 if !full || s > worst {
+                    if floor_prune.enabled
+                        && allowed_scored >= floor_prune.gate
+                        && self.below_floor(v, s, hook.current_floor(), floor_prune.slack_per_norm)
+                    {
+                        pruned_by_floor = true;
+                        return;
+                    }
                     scratch.cand.push(scored);
                     scratch.res.push(Reverse(scored));
                     if scratch.res.len() > ef {
@@ -810,6 +923,9 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
         scratch.fresh = fresh;
         scratch.patience_added = patience_added;
         scratch.patience_top = patience_top;
+        if outcome == Walk::Completed && pruned_by_floor {
+            outcome = Walk::FloorPruned;
+        }
         outcome
     }
 
@@ -1038,14 +1154,16 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
     }
 
     /// Paper Algorithm 5: descend greedily from the entry to layer 1, then
-    /// a beam of `ef` at layer 0, steered by `filter` and `patience`.
-    /// Results best first.
+    /// a beam of `ef` at layer 0, steered by `filter`, `patience`, and
+    /// `floor_prune`. Results best first.
+    #[allow(clippy::too_many_arguments)]
     pub fn walk<H: Hook>(
         &self,
         q: &[f32],
         ef: usize,
         filter: Filter<'_>,
         patience: Patience,
+        floor_prune: FloorPrune,
         scratch: &mut Scratch,
         hook: &mut H,
     ) -> (Vec<Scored>, SearchStats, Walk) {
@@ -1071,6 +1189,7 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
                 0,
                 None,
                 patience,
+                floor_prune,
                 None,
                 scratch,
                 hook,
@@ -1083,6 +1202,7 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
                 0,
                 Some(allow),
                 patience,
+                floor_prune,
                 None,
                 scratch,
                 hook,
@@ -1104,6 +1224,7 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
                     allow,
                     budget,
                     patience,
+                    floor_prune,
                     scratch,
                     hook,
                     &mut stats,
@@ -1655,6 +1776,7 @@ impl LinkBuilder<'_> {
                 layer,
                 None,
                 Patience::OFF,
+                FloorPrune::OFF,
                 locks,
                 scratch,
                 &mut NoHook,

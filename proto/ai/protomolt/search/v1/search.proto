@@ -1537,6 +1537,16 @@ message StartShardSearch {
   // `patience_early_stop` capability refuses them by name.
   optional uint32 patience_saturation_ppm = 10;
   optional uint32 patience_hops = 11;
+  // Shared-floor candidate pruning controls (#72; docs/hnsw.md, "Floor
+  // pruning"): whether monotone floor pruning is active on this scan, the
+  // rank `k` of the broadcast floor, this shard's eligible row share `p` in
+  // parts per million (0..=1,000,000), and the optional clamp parameters
+  // `g` (0..=1,000,000) and `clampMin` in `max(clampMin, ceil((1 - g) * gateK))`.
+  optional bool floor_prune = 12;
+  optional uint32 floor_k = 13;
+  optional uint32 floor_share_ppm = 14;
+  optional uint32 floor_greediness_ppm = 15;
+  optional uint32 floor_clamp_min = 16;
 }
 
 // A score floor: a lower bound on the global k-th best score. Flows both
@@ -1623,6 +1633,10 @@ message ShardScanStats {
   // docs/hnsw.md, "Patience"). Zero when patience is off or on exhaustive
   // scan providers.
   uint32 patience_stopped = 10;
+  // Layer-0 graph walks that pruned candidates against the active score floor
+  // (#72; docs/hnsw.md, "Shared floor pruning"). Zero when floor pruning is
+  // off or on exhaustive scan providers.
+  uint32 floor_pruned = 11;
 }
 
 // One scored vector. Ids are global across the cluster (see
@@ -1728,6 +1742,12 @@ message StartStreamSearch {
   // As `StartShardSearch.patience_saturation_ppm` and `patience_hops`.
   optional uint32 patience_saturation_ppm = 12;
   optional uint32 patience_hops = 13;
+  // As `StartShardSearch.floor_prune` .. `floor_clamp_min` (#72).
+  optional bool floor_prune = 14;
+  optional uint32 floor_k = 15;
+  optional uint32 floor_share_ppm = 16;
+  optional uint32 floor_greediness_ppm = 17;
+  optional uint32 floor_clamp_min = 18;
 }
 
 // Bounds for the post-scan identity exchange. All fields must be positive.
@@ -1904,6 +1924,9 @@ message StreamSearchSummary {
   uint32 patience_stopped = 12;
   // Why this shard's streaming scan ended (#100; docs/hnsw.md).
   StreamEndReason end_reason = 13;
+  // Layer-0 graph walks on this shard that pruned candidates against the
+  // active score floor (#72; docs/hnsw.md, "Shared floor pruning").
+  uint32 floor_pruned = 14;
 }
 
 // How a provider that can steer its search by the filter answered: one
@@ -2269,6 +2292,12 @@ message SearchRequest {
   // Graceful finish deadline in microseconds for approximate streaming scans
   // (#100): sends `FinishStreamSearch { deadline = true }` when reached.
   optional uint32 finish_deadline_us = 13;
+  // Shared-floor candidate pruning controls forwarded to approximate shards
+  // (#72; docs/hnsw.md, "Floor pruning"). Absent uses the node's floor-sharing
+  // setting with full `gateK` (`floor_greediness_ppm = 0`).
+  optional bool floor_prune = 14;
+  optional uint32 floor_greediness_ppm = 15;
+  optional uint32 floor_clamp_min = 16;
 }
 
 // Client-facing search response.
@@ -2309,6 +2338,9 @@ message SearchResponse {
   // Shards whose approximate streaming walk ended early via
   // `FinishStreamSearch` (`FINISH_REQUESTED` or `DEADLINE`; #100).
   uint32 shards_finished_early = 10;
+  // Shards whose approximate streaming walk pruned candidates against the
+  // shared score floor (`FLOOR_PRUNED`; #72).
+  uint32 shards_floor_pruned = 11;
 }
 
 // One parent document's chunks in a document-mode search response.
@@ -4823,6 +4855,11 @@ message HybridSearchRequest {
   // `finish_deadline_us`.
   optional uint32 finish_settle_us = 15;
   optional uint32 finish_deadline_us = 16;
+  // Shared-floor candidate pruning controls for an approximate vector leg
+  // (#72), as `SearchRequest.floor_prune` .. `floor_clamp_min`.
+  optional bool floor_prune = 17;
+  optional uint32 floor_greediness_ppm = 18;
+  optional uint32 floor_clamp_min = 19;
 }
 
 // Profile of one hybrid query; populated only when the request set
@@ -6102,6 +6139,10 @@ message DenseExecutionOutcome {
   // `FinishStreamSearch` (#100; docs/hnsw.md). Withheld when physical
   // execution details are redacted.
   uint32 shards_finished_early = 17;
+  // Shards whose approximate streaming walk pruned candidates against the
+  // shared score floor (#72; docs/hnsw.md). Withheld when physical execution
+  // details are redacted.
+  uint32 shards_floor_pruned = 18;
 }
 
 // One measured point of a dense execution policy
@@ -6125,6 +6166,11 @@ message DensePolicyPoint {
   // Optional settle window in microseconds the point was measured under and
   // is served under for graceful stream finish (#100; docs/hnsw.md).
   optional uint32 finish_settle_us = 9;
+  // Optional shared-floor pruning clamp parameters the point was measured
+  // under and is served under (#72; docs/hnsw.md, "Floor pruning"). Set
+  // together or absent together.
+  optional uint32 floor_greediness_ppm = 10;
+  optional uint32 floor_clamp_min = 11;
 }
 
 // Public streaming query controls. The query itself is byte-for-byte the

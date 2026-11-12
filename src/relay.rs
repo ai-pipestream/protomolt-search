@@ -1141,6 +1141,7 @@ struct StreamTotals {
     regimes: crate::vector::FilterRegimeCounts,
     tail_enumerated_rows: u64,
     patience_stopped: u32,
+    floor_pruned: u32,
     end_reason: crate::vector::VectorStreamEndReason,
 }
 
@@ -1186,6 +1187,7 @@ async fn relay_stream(
         crate::query_identity::validate_limits(limits)?;
     }
     let stride = if start.collapse_parents { 20 } else { 12 };
+    coordinator.ensure_shard_vector_rows().await;
     let mask = coordinator.shard_mask(filters.tree.as_ref());
     let mut fanout: StreamFanout = coordinator.open_stream_fanout_with_identities(
         &start.request_id,
@@ -1282,6 +1284,7 @@ async fn relay_stream(
                     tail_enumerated_rows: totals.tail_enumerated_rows,
                     patience_stopped: totals.patience_stopped,
                     end_reason: crate::pb::StreamEndReason::Abandoned as i32,
+                    floor_pruned: totals.floor_pruned,
                 };
                 let _ = tx
                     .send(Ok(StreamSearchResponse {
@@ -1458,6 +1461,8 @@ async fn relay_stream(
                         totals.patience_stopped = totals
                             .patience_stopped
                             .saturating_add(summary.patience_stopped);
+                        totals.floor_pruned =
+                            totals.floor_pruned.saturating_add(summary.floor_pruned);
                         totals.end_reason = totals.end_reason.merge(
                             crate::vector::VectorStreamEndReason::from_proto(summary.end_reason),
                         );
@@ -1494,6 +1499,7 @@ async fn relay_stream(
         tail_enumerated_rows: totals.tail_enumerated_rows,
         patience_stopped: totals.patience_stopped,
         end_reason: totals.end_reason.to_proto(),
+        floor_pruned: totals.floor_pruned,
     };
     if let Some(limits) = identity_limits {
         let range =
@@ -2763,7 +2769,9 @@ async fn relay_shard_search(
             "relay: a relay coordinator has no children",
         ));
     }
+    coordinator.ensure_shard_vector_rows().await;
     let mask = coordinator.shard_mask(filters.tree.as_ref());
+    let child_floor_shares = coordinator.shard_floor_share_ppms(&filters, mask.as_ref());
     let mut known = KnownFlags::new(&filters, mask.as_ref());
     let (event_tx, mut events) = mpsc::channel::<ShardEvent>(64);
     let mut legs = ShardLegs {
@@ -2790,6 +2798,11 @@ async fn relay_shard_search(
             enumerate_max_rows: filters.enumerate_max_rows,
             patience_saturation_ppm: filters.patience_saturation_ppm,
             patience_hops: filters.patience_hops,
+            floor_prune: filters.floor_prune,
+            floor_k: filters.floor_k.or(Some(start.k)),
+            floor_share_ppm: child_floor_shares.get(child).copied().flatten(),
+            floor_greediness_ppm: filters.floor_greediness_ppm,
+            floor_clamp_min: filters.floor_clamp_min,
         };
         req_tx
             .try_send(SearchShardRequest {
@@ -3021,6 +3034,12 @@ async fn relay_shard_search(
                         share.patience_stopped,
                         child,
                         "patience stopped count",
+                    )?;
+                    add_count32(
+                        &mut acc.floor_pruned,
+                        share.floor_pruned,
+                        child,
+                        "floor pruned count",
                     )?;
                 }
                 hits.extend(share.hits);
@@ -3580,6 +3599,11 @@ impl NodeService for RelayService {
                 patience_hops: start.patience_hops,
                 finish_settle_us: None,
                 finish_deadline_us: None,
+                floor_prune: start.floor_prune,
+                floor_k: start.floor_k.or(start.candidate_depth),
+                parent_floor_share_ppm: start.floor_share_ppm,
+                floor_greediness_ppm: start.floor_greediness_ppm,
+                floor_clamp_min: start.floor_clamp_min,
             };
             let signals = Arc::new(RelaySignals::new(
                 start.initial_floor.unwrap_or(f32::NEG_INFINITY),
@@ -3795,6 +3819,11 @@ impl NodeService for RelayService {
                 patience_hops: start.patience_hops,
                 finish_settle_us: None,
                 finish_deadline_us: None,
+                floor_prune: start.floor_prune,
+                floor_k: start.floor_k.or(Some(start.k)),
+                parent_floor_share_ppm: start.floor_share_ppm,
+                floor_greediness_ppm: start.floor_greediness_ppm,
+                floor_clamp_min: start.floor_clamp_min,
             };
             let (tx, rx) = mpsc::channel::<Result<SearchShardResponse, Status>>(64);
             let (pinned, frozen) = self.pin();
@@ -5148,6 +5177,11 @@ impl NodeService for RelayService {
                 patience_hops: None,
                 finish_settle_us: None,
                 finish_deadline_us: None,
+                floor_prune: None,
+                floor_k: None,
+                parent_floor_share_ppm: None,
+                floor_greediness_ppm: None,
+                floor_clamp_min: None,
             };
             let (pinned, frozen) = self.pin();
             let children = frozen.node_addresses().to_vec();

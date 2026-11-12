@@ -401,6 +401,9 @@ async fn embedded_in_process_and_external_transports_are_bit_exact() {
             patience_hops: None,
             finish_settle_us: None,
             finish_deadline_us: None,
+            floor_prune: None,
+            floor_greediness_ppm: None,
+            floor_clamp_min: None,
         }),
     )
     .await
@@ -422,6 +425,9 @@ async fn embedded_in_process_and_external_transports_are_bit_exact() {
             patience_hops: None,
             finish_settle_us: None,
             finish_deadline_us: None,
+            floor_prune: None,
+            floor_greediness_ppm: None,
+            floor_clamp_min: None,
         }),
     )
     .await
@@ -453,6 +459,9 @@ async fn embedded_in_process_and_external_transports_are_bit_exact() {
             patience_hops: None,
             finish_settle_us: None,
             finish_deadline_us: None,
+            floor_prune: None,
+            floor_greediness_ppm: None,
+            floor_clamp_min: None,
         }),
     )
     .await

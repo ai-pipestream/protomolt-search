@@ -248,6 +248,8 @@ fn qualified_point() -> DensePolicyPoint {
         patience_saturation_ppm: None,
         patience_hops: None,
         finish_settle_us: None,
+        floor_greediness_ppm: None,
+        floor_clamp_min: None,
     }
 }
 
@@ -584,6 +586,28 @@ async fn a_filter_keys_the_point_on_its_live_selectivity() {
     assert!(
         error.message().contains("finish_settle_us 250")
             && error.message().contains("candidate_stream"),
+        "{}",
+        error.message()
+    );
+    // And a point naming `floor_greediness_ppm` / `floor_clamp_min` is refused
+    // on a provider that does not advertise `floor_pruning`.
+    let with_floor_prune = format!("{text}floor_greediness_ppm = 500000\nfloor_clamp_min = 8\n");
+    let coordinator = fixture
+        .coordinator
+        .clone()
+        .with_dense_execution_policy(load_policy("floor-prune", &with_floor_prune));
+    let error = query(
+        &coordinator,
+        request(2, 0, filtered("court == \"ca9\"", leaf())),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        error
+            .message()
+            .contains("floor pruning (greediness 500000 ppm, clamp_min 8)")
+            && error.message().contains("floor_pruning"),
         "{}",
         error.message()
     );

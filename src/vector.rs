@@ -60,6 +60,9 @@ pub enum VectorCapability {
     MaskEnumeration,
     /// Layer-0 graph walks support hop-to-hop saturation early stopping (`#95`).
     PatienceEarlyStop,
+    /// Layer-0 graph walks support monotone candidate pruning against an active
+    /// score floor behind the `#72` ascent gate and clamp.
+    FloorPruning,
 }
 
 impl VectorCapability {
@@ -77,6 +80,7 @@ impl VectorCapability {
             Self::ExhaustiveCompletion => "exhaustive_completion",
             Self::MaskEnumeration => "mask_enumeration",
             Self::PatienceEarlyStop => "patience_early_stop",
+            Self::FloorPruning => "floor_pruning",
         }
     }
 }
@@ -361,6 +365,93 @@ impl PatienceSpec {
     }
 }
 
+/// Default `clampMin` in `max(clampMin, ceil((1 - g) * gateK))` (`#72`).
+pub const DEFAULT_FLOOR_CLAMP_MIN: u32 = 8;
+
+/// Shared-floor candidate pruning specification for a layer-0 walk (`#72`).
+///
+/// Given a global floor of rank `floor_k` and this walk's eligible-row share
+/// `p = share_ppm / 1,000,000` across the planned shard set, the ascent gate is
+/// `gateK = ceil(k * p + 16 * sqrt(k * p * (1 - p)))` and the clamped gate is
+/// `min(local_eligible, max(clamp_min, ceil((1 - g) * gateK)))`, where
+/// `g = greediness_ppm / 1,000,000`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FloorPruneSpec {
+    pub enabled: bool,
+    pub floor_k: usize,
+    pub share_ppm: u32,
+    pub greediness_ppm: u32,
+    pub clamp_min: usize,
+}
+
+impl Default for FloorPruneSpec {
+    fn default() -> Self {
+        Self::OFF
+    }
+}
+
+impl FloorPruneSpec {
+    pub const OFF: Self = Self {
+        enabled: false,
+        floor_k: 0,
+        share_ppm: 1_000_000,
+        greediness_ppm: 0,
+        clamp_min: 0,
+    };
+
+    /// Minimum local allowed rows scored at layer 0 before floor pruning may
+    /// discard candidates (`0` when `local_eligible == 0` or `enabled == false`).
+    pub fn effective_gate(self, local_eligible: usize) -> usize {
+        if !self.enabled || local_eligible == 0 {
+            return 0;
+        }
+        let p = (f64::from(self.share_ppm) / 1_000_000.0).clamp(0.0, 1.0);
+        let kf = self.floor_k as f64;
+        let gate_k = if kf <= 0.0 || p <= 0.0 {
+            0.0
+        } else {
+            (kf * p + 16.0 * (kf * p * (1.0 - p)).max(0.0).sqrt()).ceil()
+        };
+        let g = (f64::from(self.greediness_ppm) / 1_000_000.0).clamp(0.0, 1.0);
+        let scaled = ((1.0 - g) * gate_k).ceil().max(0.0) as usize;
+        scaled.max(self.clamp_min).min(local_eligible)
+    }
+
+    /// Scale `share_ppm` proportionally to a segment's share of its shard's
+    /// eligible rows (`p_seg = p_shard * seg_eligible / shard_eligible`).
+    pub fn for_segment(self, seg_eligible: usize, shard_eligible: usize) -> Self {
+        if shard_eligible == 0 {
+            return Self {
+                share_ppm: 0,
+                ..self
+            };
+        }
+        let num = u128::from(self.share_ppm) * (seg_eligible as u128);
+        let scaled =
+            ((num + (shard_eligible as u128) / 2) / (shard_eligible as u128)).min(1_000_000) as u32;
+        Self {
+            share_ppm: scaled,
+            ..self
+        }
+    }
+
+    /// Conservative `#72` ascent gate (`g = 0`) for guarding `#95` patience
+    /// early stopping when a finite score floor is active, even when floor
+    /// candidate pruning itself is disabled (`enabled == false`).
+    pub fn ascent_gate(self, local_eligible: usize) -> usize {
+        if self.floor_k == 0 || local_eligible == 0 {
+            return 0;
+        }
+        Self {
+            enabled: true,
+            greediness_ppm: 0,
+            clamp_min: self.clamp_min.max(DEFAULT_FLOOR_CLAMP_MIN as usize),
+            ..self
+        }
+        .effective_gate(local_eligible)
+    }
+}
+
 /// Options common to every provider search used by this product.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct VectorSearchOptions<'a> {
@@ -382,6 +473,8 @@ pub struct VectorSearchOptions<'a> {
     pub enumerate_max_rows: Option<usize>,
     /// Optional hop-to-hop saturation early-stop policy for layer-0 walks.
     pub patience: Option<PatienceSpec>,
+    /// Optional shared-floor candidate pruning policy for layer-0 walks (`#72`).
+    pub floor_prune: Option<FloorPruneSpec>,
 }
 
 impl<'a> VectorSearchOptions<'a> {
@@ -432,6 +525,11 @@ impl<'a> VectorSearchOptions<'a> {
         self.patience = Some(patience);
         self
     }
+
+    pub fn with_floor_prune(mut self, floor_prune: FloorPruneSpec) -> Self {
+        self.floor_prune = Some(floor_prune);
+        self
+    }
 }
 
 /// Row-major native search results. Negative slots and negative-infinity
@@ -450,6 +548,8 @@ pub struct VectorSearchResults {
     pub tail_enumerated_rows: u64,
     /// Layer-0 graph walks that ended early via patience saturation (`#95`).
     pub patience_stopped: u32,
+    /// Layer-0 graph walks that pruned candidates via the active score floor (`#72`).
+    pub floor_pruned: u32,
 }
 
 impl VectorSearchResults {
@@ -587,6 +687,8 @@ pub struct VectorStreamSummary {
     pub tail_enumerated_rows: u64,
     /// Layer-0 graph walks that ended early via patience saturation (`#95`).
     pub patience_stopped: u32,
+    /// Layer-0 graph walks that pruned candidates via the active score floor (`#72`).
+    pub floor_pruned: u32,
 }
 
 /// Filtered searches by the regime that answered them.
@@ -1383,6 +1485,7 @@ mod embedded_turbovec {
                 regimes: FilterRegimeCounts::default(),
                 tail_enumerated_rows: 0,
                 patience_stopped: 0,
+                floor_pruned: 0,
             })
         }
 
@@ -1423,6 +1526,7 @@ mod embedded_turbovec {
                 regimes: FilterRegimeCounts::default(),
                 tail_enumerated_rows: 0,
                 patience_stopped: 0,
+                floor_pruned: 0,
             })
         }
     }
@@ -1491,6 +1595,7 @@ mod tests {
                 regimes: FilterRegimeCounts::default(),
                 tail_enumerated_rows: 0,
                 patience_stopped: 0,
+                floor_pruned: 0,
             })
         }
 
@@ -1510,6 +1615,7 @@ mod tests {
                 regimes: FilterRegimeCounts::default(),
                 tail_enumerated_rows: 0,
                 patience_stopped: 0,
+                floor_pruned: 0,
             })
         }
     }
