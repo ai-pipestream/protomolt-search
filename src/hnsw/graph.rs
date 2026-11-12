@@ -47,11 +47,9 @@ pub const NO_NODE: u32 = u32::MAX;
 pub const MAX_LEVEL: u8 = 31;
 /// Rows beyond this cannot be addressed by a `u32` node id with the sentinel.
 pub const MAX_ROWS: usize = (u32::MAX - 1) as usize;
-/// Cache lines of a row prefetched ahead of scoring it.
-const PREFETCH_LINES: usize = 4;
-/// How many rows ahead of the one being scored the enumerate pass
-/// prefetches.
-const ENUMERATE_PREFETCH_AHEAD: usize = 8;
+/// Stack chunk size for [`View::for_each_scored`] and [`View::enumerate`]
+/// (`64` covers a full layer-0 neighbor list at `M <= 32` in one call).
+const SCORE_CHUNK_NODES: usize = 64;
 /// Striped per-node locks for the parallel build.
 const LOCK_STRIPES: usize = 1 << 14;
 
@@ -355,6 +353,35 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
         out.extend((0..count).map(|i| cells.get(start + 1 + i)));
     }
 
+    /// Cache lines of one row to prefetch ahead of scoring (`16` floats per
+    /// 64-byte line, bounded by [`Kernel::prefetch_lines`]).
+    #[inline]
+    fn prefetch_lines(&self) -> usize {
+        self.kernel.prefetch_lines(self.dim)
+    }
+
+    /// Score every node in `nodes` against `q` inside a single target-feature
+    /// call per [`SCORE_CHUNK_NODES`] slice, and deliver `(node, score)` in
+    /// `nodes` order.
+    #[inline]
+    fn for_each_scored(&self, q: &[f32], nodes: &[u32], mut f: impl FnMut(u32, f32)) {
+        let lines = self.prefetch_lines();
+        let mut scores = [0.0f32; SCORE_CHUNK_NODES];
+        for chunk in nodes.chunks(SCORE_CHUNK_NODES) {
+            self.kernel.score_nodes(
+                q,
+                self.rows,
+                self.dim,
+                chunk,
+                lines,
+                &mut scores[..chunk.len()],
+            );
+            for (&node, &score) in chunk.iter().zip(&scores[..chunk.len()]) {
+                f(node, score);
+            }
+        }
+    }
+
     /// Greedy descent at one layer: move to the best neighbor until none
     /// improves.
     fn greedy(
@@ -369,15 +396,14 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
         loop {
             self.copy_links(best.node, layer, locks, nbrs);
             stats.hops += 1;
+            stats.scored += nbrs.len() as u64;
             let mut improved = false;
-            for &v in nbrs.iter() {
-                let s = self.kernel.dot(q, self.row(v));
-                stats.scored += 1;
+            self.for_each_scored(q, nbrs, |v, s| {
                 if s > best.score {
                     best = Scored { score: s, node: v };
                     improved = true;
                 }
-            }
+            });
             if !improved {
                 return best;
             }
@@ -427,18 +453,9 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
             }
             stats.hops += 1;
             self.copy_links(c.node, layer, locks, &mut nbrs);
-            // Keep the unvisited neighbors and start their first lines on
-            // the way; scoring then prefetches the next row in full.
             nbrs.retain(|&v| scratch.visit(v));
-            for &v in nbrs.iter() {
-                prefetch(self.row(v), 1);
-            }
-            for (i, &v) in nbrs.iter().enumerate() {
-                if let Some(&next) = nbrs.get(i + 1) {
-                    prefetch(self.row(next), PREFETCH_LINES);
-                }
-                let s = self.kernel.dot(q, self.row(v));
-                stats.scored += 1;
+            stats.scored += nbrs.len() as u64;
+            self.for_each_scored(q, &nbrs, |v, s| {
                 let ok = allowed(v);
                 if ok {
                     hook.scored(v, s, self.row(v));
@@ -455,7 +472,7 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
                         }
                     }
                 }
-            }
+            });
             if !hook.hop() {
                 completed = false;
                 break;
@@ -521,7 +538,6 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
             for &v in nbrs.iter() {
                 if allow.test(v as usize) {
                     if scratch.visit(v) {
-                        prefetch(self.row(v), 1);
                         fresh.push(v);
                     }
                 } else if !scratch.seen(v) {
@@ -542,17 +558,12 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
                         break;
                     }
                     if allow.test(w as usize) && scratch.visit(w) {
-                        prefetch(self.row(w), 1);
                         fresh.push(w);
                     }
                 }
             }
-            for (i, &v) in fresh.iter().enumerate() {
-                if let Some(&next) = fresh.get(i + 1) {
-                    prefetch(self.row(next), PREFETCH_LINES);
-                }
-                let s = self.kernel.dot(q, self.row(v));
-                stats.scored += 1;
+            stats.scored += fresh.len() as u64;
+            self.for_each_scored(q, &fresh, |v, s| {
                 hook.scored(v, s, self.row(v));
                 let full = scratch.res.len() >= ef;
                 let worst = scratch.res.peek().map_or(f32::NEG_INFINITY, |r| r.0.score);
@@ -564,7 +575,7 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
                         scratch.res.pop();
                     }
                 }
-            }
+            });
             if !hook.hop() {
                 completed = false;
                 break;
@@ -610,28 +621,52 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
             });
             ControlFlow::<()>::Continue(())
         });
+        let lines = self.prefetch_lines();
+        let batch = self.kernel.batch_width();
+        let mut nodes = [0u32; SCORE_CHUNK_NODES];
+        let mut scores = [0.0f32; SCORE_CHUNK_NODES];
         // The allowed rows lie apart, so the hardware prefetcher cannot
-        // follow them: each row is asked for a few rows ahead of its turn.
-        for at in 0..out.len() {
-            if let Some(ahead) = out.get(at + ENUMERATE_PREFETCH_AHEAD) {
-                prefetch(self.row(ahead.node), PREFETCH_LINES);
+        // follow them: `score_nodes` overlaps row loads in batches of 8
+        // (AVX-512F) or 4 inside one target-feature call per chunk, and the
+        // seam prefetch warms line 0 of the next chunk's head before scoring
+        // the current one.
+        let total = out.len();
+        let mut base = 0usize;
+        while base < total {
+            let end = (base + SCORE_CHUNK_NODES).min(total);
+            let len = end - base;
+            for (dst, slot) in nodes[..len].iter_mut().zip(&out[base..end]) {
+                *dst = slot.node;
             }
-            let node = out[at].node;
-            let scored = Scored {
-                score: self.kernel.dot(q, self.row(node)),
-                node,
-            };
-            out[at] = scored;
-            let inv = self.inv_norm[node as usize];
-            if inv > 0.0 {
-                shortest_inv = shortest_inv.min(inv);
-                if top.len() < k {
-                    top.push(Reverse(scored));
-                } else if top.peek().is_some_and(|worst| scored > worst.0) {
-                    top.pop();
-                    top.push(Reverse(scored));
+            for ahead in &out[end..total.min(end + batch)] {
+                prefetch(self.row(ahead.node), lines);
+            }
+            self.kernel.score_nodes(
+                q,
+                self.rows,
+                self.dim,
+                &nodes[..len],
+                lines,
+                &mut scores[..len],
+            );
+            for (slot, &score) in out[base..end].iter_mut().zip(&scores[..len]) {
+                let scored = Scored {
+                    score,
+                    node: slot.node,
+                };
+                *slot = scored;
+                let inv = self.inv_norm[scored.node as usize];
+                if inv > 0.0 {
+                    shortest_inv = shortest_inv.min(inv);
+                    if top.len() < k {
+                        top.push(Reverse(scored));
+                    } else if top.peek().is_some_and(|worst| scored > worst.0) {
+                        top.pop();
+                        top.push(Reverse(scored));
+                    }
                 }
             }
+            base = end;
         }
         let scored = out.len() as u64;
         if let (true, Some(Reverse(kth))) = (top.len() == k, top.peek()) {
@@ -761,16 +796,52 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
     /// lengths a long row cannot crowd out its neighbors just by being long.
     fn select(&self, base_inv_norm: f32, pool: &[Scored], cap: usize, sel: &mut Vec<u32>) {
         sel.clear();
-        for c in pool {
+        let lines = self.prefetch_lines();
+        for (idx, c) in pool.iter().enumerate() {
             if sel.len() >= cap {
                 break;
             }
+            if let Some(ahead) = pool.get(idx + 2) {
+                prefetch(self.row(ahead.node), lines);
+            }
             let to_base = c.score * base_inv_norm;
             let row_c = self.row(c.node);
-            let keep = sel.iter().all(|&s| {
-                let to_s = self.kernel.dot(row_c, self.row(s)) * self.inv_norm[s as usize];
-                to_s < to_base
-            });
+            let mut keep = true;
+            let mut at = 0usize;
+            let mut dots = [0.0f32; 4];
+            // Short-circuit in 4-neighbor batches on targets with software
+            // prefetch: rejected candidates fail against an early,
+            // higher-scoring neighbor without scoring the rest of `sel`, while
+            // kept candidates score four neighbors per pass over `row_c`.
+            // `sel` stays cache-resident across pool iterations, so `lines = 0`
+            // avoids redundant prefetches; on 128-bit NEON (`lines == 0`)
+            // per-neighbor short-circuiting avoids extra FMAs on early
+            // rejections.
+            while lines > 0 && at + 4 <= sel.len() {
+                self.kernel
+                    .score_nodes(row_c, self.rows, self.dim, &sel[at..at + 4], 0, &mut dots);
+                let s0 = sel[at] as usize;
+                let s1 = sel[at + 1] as usize;
+                let s2 = sel[at + 2] as usize;
+                let s3 = sel[at + 3] as usize;
+                let closer = [
+                    dots[0] * self.inv_norm[s0] < to_base,
+                    dots[1] * self.inv_norm[s1] < to_base,
+                    dots[2] * self.inv_norm[s2] < to_base,
+                    dots[3] * self.inv_norm[s3] < to_base,
+                ];
+                if !closer.into_iter().all(|ok| ok) {
+                    keep = false;
+                    break;
+                }
+                at += 4;
+            }
+            if keep {
+                keep = sel[at..].iter().all(|&s| {
+                    let to_s = self.kernel.dot(row_c, self.row(s)) * self.inv_norm[s as usize];
+                    to_s < to_base
+                });
+            }
             if keep {
                 sel.push(c.node);
             }
@@ -1032,10 +1103,10 @@ impl Store {
         if merged.len() > cap {
             let row = view.row(node);
             pool.clear();
-            pool.extend(merged.iter().map(|&v| Scored {
-                score: view.kernel.dot(row, view.row(v)),
-                node: v,
-            }));
+            pool.reserve(merged.len());
+            view.for_each_scored(row, &merged, |v, score| {
+                pool.push(Scored { score, node: v });
+            });
             pool.sort_unstable_by(|a, b| b.cmp(a));
             merged.clear();
             view.select(view.inv_norm[node as usize], pool, cap, &mut merged);
@@ -1145,22 +1216,24 @@ impl Store {
             cells[start].store((count + 1) as u32, Atomic::Relaxed);
             return;
         }
-        let row_e = view.row(e);
-        pool.clear();
+        let mut candidates = std::mem::take(&mut scratch.nbrs);
+        candidates.clear();
         for i in 0..count {
             let v = cells[start + 1 + i].load(Atomic::Relaxed);
             if v == node {
+                scratch.nbrs = candidates;
                 return; // already linked by another insertion of this pair
             }
-            pool.push(Scored {
-                score: view.kernel.dot(row_e, view.row(v)),
-                node: v,
-            });
+            candidates.push(v);
         }
-        pool.push(Scored {
-            score: view.kernel.dot(row_e, view.row(node)),
-            node,
+        candidates.push(node);
+        let row_e = view.row(e);
+        pool.clear();
+        pool.reserve(candidates.len());
+        view.for_each_scored(row_e, &candidates, |v, score| {
+            pool.push(Scored { score, node: v });
         });
+        scratch.nbrs = candidates;
         pool.sort_unstable_by(|a, b| b.cmp(a));
         let mut sel = std::mem::take(&mut scratch.sel);
         view.select(view.inv_norm[e as usize], pool, cap, &mut sel);

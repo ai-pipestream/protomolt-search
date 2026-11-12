@@ -1531,3 +1531,207 @@ fn streaming_follows_the_regimes() {
         assert!(hit >= 4, "{regime:?}: stream covers {hit} of the top 5");
     }
 }
+
+#[test]
+fn bulk_walk_and_enumerate_visit_identical_nodes_and_scores_to_single_row_dot() {
+    use super::distance::Kernel;
+    use super::graph::{with_scratch, Filter, Hook, LinkCells, Scored, Store};
+    use crate::vector::Mask;
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    struct Trace(Vec<(u32, u32)>);
+    impl Hook for Trace {
+        fn scored(&mut self, node: u32, score: f32, _row: &[f32]) {
+            self.0.push((node, score.to_bits()));
+        }
+        fn hop(&mut self) -> bool {
+            true
+        }
+    }
+
+    type ScoreTrace = Vec<(u32, u32)>;
+
+    // Reference single-row-dot walk (unfiltered, plain, and filter-aware) to
+    // pin that bulk neighbor-list scoring changes neither the visited path
+    // nor a single traversal score bit on any kernel or odd dimension.
+    fn single_row_walk<L: LinkCells + ?Sized>(
+        view: &super::graph::View<'_, L>,
+        q: &[f32],
+        ef: usize,
+        allow: Option<(Mask<'_>, bool)>,
+    ) -> (ScoreTrace, ScoreTrace) {
+        let row = |n: u32| view.row(n);
+        let links = |node: u32, layer: usize| -> Vec<u32> {
+            let (cells, cap, start) = if layer == 0 {
+                (view.links0, view.m0, node as usize * (view.m0 + 1))
+            } else {
+                let u = view.upper_slot[node as usize] as usize;
+                let base = view.upper_base[u] as usize + (layer - 1) * (view.m + 1);
+                (view.upper, view.m, base)
+            };
+            let count = (cells.get(start) as usize).min(cap);
+            (0..count).map(|i| cells.get(start + 1 + i)).collect()
+        };
+        let mut ep = Scored {
+            score: view.kernel.dot(q, row(view.entry)),
+            node: view.entry,
+        };
+        for layer in (1..=view.top as usize).rev() {
+            loop {
+                let mut improved = false;
+                for v in links(ep.node, layer) {
+                    let s = view.kernel.dot(q, row(v));
+                    if s > ep.score {
+                        ep = Scored { score: s, node: v };
+                        improved = true;
+                    }
+                }
+                if !improved {
+                    break;
+                }
+            }
+        }
+        let mut visited = vec![false; view.n()];
+        let mut cand = BinaryHeap::new();
+        let mut res: BinaryHeap<Reverse<Scored>> = BinaryHeap::new();
+        let mut trace = Vec::new();
+        visited[ep.node as usize] = true;
+        cand.push(ep);
+        if allow.is_none_or(|(m, _)| m.test(ep.node as usize)) {
+            trace.push((ep.node, ep.score.to_bits()));
+            res.push(Reverse(ep));
+        }
+        while let Some(c) = cand.pop() {
+            if res.len() >= ef && c.score < res.peek().unwrap().0.score {
+                break;
+            }
+            match allow {
+                Some((mask, true)) => {
+                    let mut routes = Vec::new();
+                    let mut fresh = Vec::new();
+                    for v in links(c.node, 0) {
+                        if mask.test(v as usize) {
+                            if !visited[v as usize] {
+                                visited[v as usize] = true;
+                                fresh.push(v);
+                            }
+                        } else if !visited[v as usize] {
+                            routes.push(v);
+                        }
+                    }
+                    for bridge in routes {
+                        if fresh.len() >= view.m0 {
+                            break;
+                        }
+                        if visited[bridge as usize] {
+                            continue;
+                        }
+                        visited[bridge as usize] = true;
+                        for w in links(bridge, 0) {
+                            if fresh.len() >= view.m0 {
+                                break;
+                            }
+                            if mask.test(w as usize) && !visited[w as usize] {
+                                visited[w as usize] = true;
+                                fresh.push(w);
+                            }
+                        }
+                    }
+                    for v in fresh {
+                        let s = view.kernel.dot(q, row(v));
+                        trace.push((v, s.to_bits()));
+                        if res.len() < ef || s > res.peek().unwrap().0.score {
+                            let sc = Scored { score: s, node: v };
+                            cand.push(sc);
+                            res.push(Reverse(sc));
+                            if res.len() > ef {
+                                res.pop();
+                            }
+                        }
+                    }
+                }
+                plain => {
+                    for v in links(c.node, 0) {
+                        if visited[v as usize] {
+                            continue;
+                        }
+                        visited[v as usize] = true;
+                        let s = view.kernel.dot(q, row(v));
+                        let ok = plain.is_none_or(|(m, _)| m.test(v as usize));
+                        if ok {
+                            trace.push((v, s.to_bits()));
+                        }
+                        if res.len() < ef || s > res.peek().unwrap().0.score {
+                            let sc = Scored { score: s, node: v };
+                            cand.push(sc);
+                            if ok {
+                                res.push(Reverse(sc));
+                                if res.len() > ef {
+                                    res.pop();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut out: Vec<Scored> = res.into_iter().map(|r| r.0).collect();
+        out.sort_unstable_by(|a, b| b.cmp(a));
+        (
+            trace,
+            out.into_iter()
+                .map(|s| (s.node, s.score.to_bits()))
+                .collect(),
+        )
+    }
+
+    for dim in [17usize, 33, 64, 65] {
+        let (vectors, queries) = corpus_with_queries(600, 6, dim, 0x9600 + dim as u64);
+        let allow_flags: Vec<bool> = (0..600).map(|i| i % 3 != 0).collect();
+        let mask = Mask::Bools(&allow_flags);
+        let allowed = mask.count();
+        for kernel in Kernel::available() {
+            let mut store = Store::new(dim, 16, 64, 7, kernel);
+            let range = store.append_rows(&vectors).unwrap();
+            store.insert_sequential(range);
+            let view = store.view();
+            for q in queries.chunks_exact(dim) {
+                for (filter, spec) in [
+                    (Filter::None, None),
+                    (Filter::Plain(mask), Some((mask, false))),
+                    (
+                        Filter::Aware {
+                            allow: mask,
+                            allowed,
+                            adaptive: false,
+                        },
+                        Some((mask, true)),
+                    ),
+                ] {
+                    let mut trace = Trace(Vec::new());
+                    let hits =
+                        with_scratch(|scratch| view.walk(q, 24, filter, scratch, &mut trace).0);
+                    let got_hits: Vec<(u32, u32)> = hits
+                        .into_iter()
+                        .map(|s| (s.node, s.score.to_bits()))
+                        .collect();
+                    let (exp_trace, exp_hits) = single_row_walk(&view, q, 24, spec);
+                    assert_eq!(trace.0, exp_trace, "{} dim={dim}", kernel.name());
+                    assert_eq!(got_hits, exp_hits, "{} dim={dim}", kernel.name());
+                }
+                let mut surv = Vec::new();
+                let count = view.enumerate(q, mask, 10, 1.0e-5, &mut surv);
+                assert_eq!(count, allowed as u64);
+                for s in &surv {
+                    assert_eq!(
+                        s.score.to_bits(),
+                        kernel.dot(q, view.row(s.node)).to_bits(),
+                        "{} dim={dim} enumerate",
+                        kernel.name()
+                    );
+                }
+            }
+        }
+    }
+}

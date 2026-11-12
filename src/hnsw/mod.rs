@@ -9,7 +9,8 @@
 //!
 //! - [`config`]: the protobuf-carried build parameters and the fingerprint
 //!   contract.
-//! - [`distance`]: single-row inner-product kernels with runtime dispatch.
+//! - [`distance`]: single-row and multi-row inner-product kernels with
+//!   runtime dispatch.
 //! - [`graph`]: the flat layered graph, insertion and the walk.
 //! - [`image`]: the persisted format, loaded onto the heap or served from
 //!   a memory map.

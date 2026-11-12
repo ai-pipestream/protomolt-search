@@ -175,13 +175,22 @@ epoch-stamped `u32` array reset in O(1); a walk uses one candidate heap and
 one result heap, both over 8-byte `(score, node)` entries ordered totally
 (score, then node), so heaps behave the same on every run.
 
-**One traversal distance per visited node.** Every row the walk visits is
-scored once from its FP32 row with the provider's own single-row kernels
-(`src/hnsw/distance.rs`): AVX-512F and AVX2+FMA on x86-64 chosen at run time
-with `is_x86_feature_detected!` (the crate still compiles for the
-x86-64-v2 baseline), NEON on aarch64, a four-accumulator scalar loop
-elsewhere. The walk prefetches the first line of each unvisited neighbor's
-row while collecting them and the next row in full while scoring.
+**One traversal distance per visited node, scored in bulk.** Every row the
+walk visits is scored once from its FP32 row with the provider's own kernels
+(`src/hnsw/distance.rs`): 8-row and 4-row batches on AVX-512F, 4-row batches
+on AVX2+FMA (x86-64, chosen at run time with `is_x86_feature_detected!` while
+the crate compiles for the x86-64-v2 baseline), 4-row `dot_batch4` and a tight
+row-sequential `score_nodes` loop on NEON (aarch64, keeping contiguous cache
+lines per row intact so 4-core builds and walks do not thrash shared LPDDR4X
+row buffers), and a four-accumulator 4-row scalar batch elsewhere, with
+single-row tails. Every batch kernel preserves its single-row kernel's exact
+accumulation order per row, so a `FIXED_ORDER` build and walk visit the exact
+same nodes bit for bit as single-row `dot`. Neighbor expansions and `enumerate`
+pipeline software prefetching one batch ahead on x86-64 (`_mm_prefetch`, capped
+at 8 cache lines on AVX-512F and 4 on AVX2/scalar so fill requests stay within
+per-core MSHR budgets), while heuristic `select` prefetches upcoming pool
+candidates and scores already-selected cache-resident neighbors in 4-row batches
+without redundant prefetches.
 
 **Parallel build.** `build_mode = PARALLEL` inserts a batch of at least 256
 rows from every thread of the rayon pool. Link cells are `AtomicU32`, written
