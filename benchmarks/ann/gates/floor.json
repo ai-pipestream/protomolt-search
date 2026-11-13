@@ -4,8 +4,8 @@
   "issue": "#54",
   "note": "Sharded cells of the #54 replacement gate, decided 2026-11-13: the system is designed for k = 1,000, so the sharded cells at k = 1,000 (the lead cell), 100 and 10,000 are required alongside the k = 10 cells of replacement.json. Hash and skewed (whole k-means cells) placement, 4 and 16 shards, floor off and floor on as separate cells. Floor-off cells require stock Lucene (lucene-hnsw) and the build of apache/lucene PR #16357 (lucene-hnsw-16357), both run without a shared floor. Floor-on cells require the #16357 build with its shared floor; stock Lucene has none. Until the shared floor exists (#72) and the Lucene runner drives the #16357 floor code, no runner writes a floor-on result and those cells are INCOMPLETE.",
   "candidate": "hnsw",
-  "unfiltered_margin": 0.2,
-  "unfiltered_margin_provisional": true,
+  "unfiltered_margin": 0.1,
+  "unfiltered_margin_provisional": false,
   "cells": [
     {
       "fixture": "challenge-100000x64",
