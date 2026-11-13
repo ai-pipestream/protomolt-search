@@ -28,6 +28,22 @@ pub struct QueryStats {
     pub budget_handoffs: u64,
 }
 
+impl QueryStats {
+    /// Adds every counter of `other`, so a sum over parts loses none.
+    pub fn add(&mut self, other: &QueryStats) {
+        let QueryStats {
+            hops,
+            exact,
+            bridges,
+            budget_handoffs,
+        } = *other;
+        self.hops += hops;
+        self.exact += exact;
+        self.bridges += bridges;
+        self.budget_handoffs += budget_handoffs;
+    }
+}
+
 /// Build parameters of one sweep point.
 #[derive(Clone, Debug)]
 pub struct BuildParams {

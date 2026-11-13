@@ -291,8 +291,7 @@ fn measure(
         predicate += p;
         recalls.push(recall(fx, filter, q, k, &ids));
         for part in &per_part {
-            stats.hops += part.hops;
-            stats.exact += part.exact;
+            stats.add(part);
         }
         part_work.add(&per_part);
         // A point slower than --min-qps on one core is abandoned after 50
@@ -779,6 +778,86 @@ mod tests {
         assert_eq!(rows, vec![vec![1, 4], vec![0, 2, 3]]);
         assert_eq!(Global::Rows(Arc::new(rows[1].clone())).row(2), 3);
         assert_eq!(Global::Offset(10).row(2), 12);
+    }
+
+    /// Reports fixed work per search, so every counter's path from
+    /// `Index::search` to the measured point can be checked.
+    struct Counting(QueryStats);
+
+    impl Index for Counting {
+        fn search(
+            &self,
+            _query: &[f32],
+            _k: usize,
+            _ef: usize,
+            _allow: Option<&Allow>,
+            stats: &mut QueryStats,
+        ) -> Vec<(u32, f32)> {
+            stats.add(&self.0);
+            vec![(0, 1.0)]
+        }
+    }
+
+    fn one_row_fixture() -> Fixture {
+        Fixture {
+            dir: std::path::PathBuf::new(),
+            manifest: json!({}),
+            rows: crate::fixture::synthetic(4, 4, 1),
+            k_truth: 1,
+            k_truth_none: 1,
+            filters: Vec::new(),
+            truth: vec![vec![0]],
+            index: crate::fixture::ColumnIndex::new(&[0; 4], &[0; 4], 1),
+        }
+    }
+
+    #[test]
+    fn every_counter_reaches_the_point_whatever_the_part_count() {
+        let work = QueryStats {
+            hops: 2,
+            exact: 3,
+            bridges: 7,
+            budget_handoffs: 1,
+        };
+        let fx = one_row_fixture();
+        let settings = Settings {
+            ks: vec![1],
+            efs: vec![1],
+            rerank_depths: Vec::new(),
+            min_time: Duration::from_millis(1),
+            threads: 1,
+            recall_stop: 1.0,
+            min_qps: 0.0,
+            filters: Vec::new(),
+        };
+        for parts in [1usize, 3] {
+            let shape = Shape {
+                parts: (0..parts)
+                    .map(|_| Part {
+                        index: Box::new(Counting(work)),
+                        global: Global::Offset(0),
+                    })
+                    .collect(),
+            };
+            let point = measure(&fx, &shape, false, 0, 1, 1, &settings);
+            let n = parts as f64;
+            assert_eq!(point["hops_mean"].as_f64(), Some(2.0 * n), "{parts} parts");
+            assert_eq!(
+                point["exact_scores_mean"].as_f64(),
+                Some(3.0 * n),
+                "{parts} parts"
+            );
+            assert_eq!(
+                point["bridges_mean"].as_f64(),
+                Some(7.0 * n),
+                "{parts} parts"
+            );
+            assert_eq!(
+                point["budget_handoffs"].as_u64(),
+                Some(parts as u64),
+                "{parts} parts"
+            );
+        }
     }
 
     #[test]
