@@ -26,6 +26,9 @@ pub struct QueryStats {
     pub exact: u64,
     pub bridges: u64,
     pub budget_handoffs: u64,
+    /// Searches answered by each filter regime: enumerate, filter-aware,
+    /// plain. Unfiltered searches count in none.
+    pub regimes: [u64; 3],
 }
 
 impl QueryStats {
@@ -36,11 +39,15 @@ impl QueryStats {
             exact,
             bridges,
             budget_handoffs,
+            regimes,
         } = *other;
         self.hops += hops;
         self.exact += exact;
         self.bridges += bridges;
         self.budget_handoffs += budget_handoffs;
+        for (sum, n) in self.regimes.iter_mut().zip(regimes) {
+            *sum += n;
+        }
     }
 }
 
@@ -505,6 +512,14 @@ impl Index for Hnsw {
         stats.exact += answer.stats.scored;
         stats.bridges += answer.stats.bridges;
         stats.budget_handoffs += u64::from(answer.budget_handoff);
+        if let Some(regime) = answer.regime {
+            use pipestream_search::vector::FilterRegime;
+            stats.regimes[match regime {
+                FilterRegime::Enumerate => 0,
+                FilterRegime::FilterAware => 1,
+                FilterRegime::Plain => 2,
+            }] += 1;
+        }
         hits
     }
 

@@ -367,6 +367,15 @@ At ef 96 the old rule enumerated near-10's 10,252 allowed rows (under
 `4 · 96 · 32 = 12,288`) where the plain walk was 2.8 times faster; that is
 why only `ef · 2M` rows enumerate before the probe looks.
 
+The trade is speed for exactness at a fixed beam: a mask the old rule
+enumerated (exact, recall 1.0) is now walked, so at the same beam it gets
+an approximate answer. On krick-1 near-10 at k 10 went from 1.0 to about
+0.94 at M 48, ef 32, and the mean recall over its sweep fell by 0.014
+(uncorrelated 50%: 0.012); at matched recall it is faster everywhere it
+moved (near-10 k 10 at 0.99: 7,922 to 18,772 queries per second on one
+core). A caller that needs the exact answer for a mask pins enumerate, or
+a policy point sets the `enumerate_max_rows` it was measured with.
+
 `minimum_score` and a floor raised during a stream filter what is returned or
 emitted; when shared floor pruning is enabled (`floor_prune = true` on the scan,
 see "Shared floor pruning" below), a floor raised during a stream or carried

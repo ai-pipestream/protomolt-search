@@ -172,13 +172,14 @@ impl Scratch {
         }
     }
 
-    /// Whether the last walk reached `node`. An allowed row a filter-aware
-    /// walk reached was scored and handed to its hook.
+    /// Whether the last walk's far probe routed it plain.
     #[inline]
     pub fn walked_plain(&self) -> bool {
         self.walked_plain
     }
 
+    /// Whether the last walk reached `node`. An allowed row a filter-aware
+    /// walk reached was scored and handed to its hook.
     pub fn seen(&self, node: u32) -> bool {
         self.visited[node as usize] == self.epoch
     }

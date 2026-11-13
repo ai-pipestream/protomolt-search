@@ -364,6 +364,11 @@ fn measure(
         "exact_scores_mean": stats.exact as f64 / qn as f64,
         "bridges_mean": stats.bridges as f64 / qn as f64,
         "budget_handoffs": stats.budget_handoffs,
+        "regimes": {
+            "enumerate": stats.regimes[0],
+            "filter_aware": stats.regimes[1],
+            "plain": stats.regimes[2],
+        },
     });
     if parts > 1 {
         point["per_part"] = part_work.to_json(parts, qn, &stats);
@@ -818,6 +823,7 @@ mod tests {
             exact: 3,
             bridges: 7,
             budget_handoffs: 1,
+            regimes: [1, 2, 3],
         };
         let fx = one_row_fixture();
         let settings = Settings {
@@ -857,6 +863,13 @@ mod tests {
                 Some(parts as u64),
                 "{parts} parts"
             );
+            for (name, n) in [("enumerate", 1), ("filter_aware", 2), ("plain", 3)] {
+                assert_eq!(
+                    point["regimes"][name].as_u64(),
+                    Some(n * parts as u64),
+                    "{name}, {parts} parts"
+                );
+            }
         }
     }
 
