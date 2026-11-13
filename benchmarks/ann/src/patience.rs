@@ -270,6 +270,7 @@ pub fn command() -> Result<(), Error> {
         ef_construction,
         build_mode: BuildMode::Parallel,
         seed: 0x5EED_0A11,
+        ..HnswConfig::default()
     };
     eprintln!(
         "building hnsw (m={m}, ef_construction={ef_construction}) over {}x{}...",

@@ -17,7 +17,7 @@ path is decided by the measured dense execution policy of #58, not here.
 Sharing its rows with the `.exact` sidecar is #71.
 
 Code: `src/hnsw/` (`config.rs`, `distance.rs`, `graph.rs`, `image.rs`,
-`merge.rs`, `rows.rs`). Tests: the module's unit tests, `tests/hnsw.rs` (real nodes
+`merge.rs`, `reorder.rs`, `rows.rs`). Tests: the module's unit tests, `tests/hnsw.rs` (real nodes
 behind a coordinator: planner refusals, corruption, streaming control,
 masks and floors, the candidate depth, multi-node fan-out, filter regimes
 through the Query API, Boolean dense leaves, the policy's enumerate
@@ -48,6 +48,7 @@ payload is the serialized `HnswConfig` message of
 | `ef_construction` | 200 | Insertion beam: candidates considered per layer before the neighbor heuristic selects. At least `m`, at most 65,536. |
 | `build_mode` | `PARALLEL` | `FIXED_ORDER` inserts rows in row order on one thread and reproduces the graph bit for bit; `PARALLEL` inserts from every thread under per-node locks. `UNSPECIFIED` is refused. |
 | `seed` | fixed | Seeds the level draw of every node. |
+| `locality_order` | `NONE` | Optional graph-locality vertex permutation (`#98`): `NONE` keeps ingest/replay slot order unchanged; `RCM` runs `O(V + E)` symmetrized Reverse Cuthill–McKee; `RECURSIVE_BISECTION` runs bounded min-cut recursive graph bisection down to 4 KB page-sized leaves (`max(8, min(64, 4096 / (4 · dim)))`) and is the recommended locality mode. |
 
 `HnswConfig::backend_config()` builds it. Every field is part of the scoring
 fingerprint (with the dimension, the backend version and the config format),
@@ -583,18 +584,23 @@ by content.
 
 The image (`PMHNSW01`, format 1) is a 192-byte little-endian header with a
 CRC32, then the sections (rows, inverse norms, levels, upper slots, upper
-bases, layer 0, upper layers), each on a 64-byte boundary, then a SHA-256
-trailer over everything before it. An unlinked image (`n == 0` or
-`n < MIN_GRAPH_ROWS`, recorded with `entry = NO_NODE`, `top = 0`,
-`upper_nodes = 0`, `upper_cells = 0`) stores only the header, aligned `rows`
-and `inv_norm` sections, and the SHA-256 trailer, omitting all five link
-sections (saving ~141 B/row at `M = 16`). Loading parses and checks the header
-first (magic, format, CRC, every count, unlinked header invariants, and that
-the counts lay out to exactly the file's length) before any section is
-allocated or touched, then verifies the trailer, then (when linked) walks the
-structure: levels against the cap, the compact upper index, every list's count
-against its cap, every neighbor id against the row count, its own id and its
-level. After that no index into the graph can go out of bounds.
+bases, layer 0, upper layers, plus optional 64-byte-aligned `node_to_row` and
+`row_to_node` `u32` bijection sections when a seal-time `locality_order` map is
+present), each on a 64-byte boundary, then a SHA-256 trailer over everything
+before it. Offset 68 packs `top | (locality_order << 8) | (has_node_map << 16)`,
+leaving `LocalityOrder::None` images byte-for-byte identical to the base format.
+An unlinked image (`n == 0` or `n < MIN_GRAPH_ROWS`, recorded with
+`entry = NO_NODE`, `top = 0`, `upper_nodes = 0`, `upper_cells = 0`) stores only
+the header, aligned `rows` and `inv_norm` sections, and the SHA-256 trailer,
+omitting all five link sections (saving ~141 B/row at `M = 16`). Loading parses
+and checks the header first (magic, format, CRC, every count, unlinked and
+locality-flag invariants, and that the counts lay out to exactly the file's
+length) before any section is allocated or touched, then verifies the trailer,
+validates the inverse `node_to_row` / `row_to_node` bijection when present, and
+(when linked) walks the structure: levels against the cap, the compact upper
+index, every list's count against its cap, every neighbor id against the row
+count, its own id and its level. After that no index into the graph can go out
+of bounds.
 
 `load_mapped` maps the file and serves the graph and the rows straight from
 the map: the section alignment makes the typed views aligned, nothing is
@@ -704,6 +710,46 @@ A node runs the provider through every path the exhaustive providers take;
      caches uninitialized (`OnceLock::new()`), so pre-compaction cached bitmaps or
      sorted `(value, row)` tables are dropped with the retired `OpenedSegmentSet`
      and built fresh on first filtered query against the compacted segment.
+  5. **Locality row reordering (`#98`).** When `locality_order` is enabled
+     (`RECURSIVE_BISECTION` or `RCM` in `src/hnsw/reorder.rs`), neighbor lists keep
+     `select()`'s exact relative candidate order while nodes and stored rows are
+     permuted to cluster layer-0 neighborhoods onto shared cache lines and 4 KB OS
+     pages:
+     - **At seal (`Flush`):** WAL, `Bm25Store`, `.exact`, `LiveDocs`, `parent_ids`,
+       and column filter structures keep their ingest-assigned slot IDs untouched;
+       `HnswIndex::write(&self)` constructs the permuted `PMHNSW01` image without
+       mutating the shared frozen-tail `Arc`, persisting an `8 B/row`
+       (`node_to_row` + `row_to_node`) bijection served zero-copy from the mmap
+       (translating external filter masks into node-order `Bits` once per query and
+       remapping reported/streamed hits back to external slot IDs).
+     - **At non-partitioned compaction:** `compact_log_with_sources` folds the
+       locality permutation directly into the child segment's global slot order,
+       aligning WAL, `id_map`, `Bm25Store`, `.exact`, `parent_ids`, fresh lazy
+       `FacetRows` / `NumberRows` caches, and `.hnsw` (`has_node_map = false`,
+       `0 B/row` map overhead) under one shared locality-ordered ID space
+       (partitioned compaction preserves `PartitionRange` contiguity and falls back
+       automatically to the seal-local `NodeMap`).
+     - **Measured `RECURSIVE_BISECTION` vs `RCM` trade-off (`protomolt-ann-bench reorder`):**
+       `RECURSIVE_BISECTION` seeds each balanced split with an `O(V + E)` bucketed
+       max-overlap hemisphere queue (preventing HNSW's small-world angular-diversity
+       shortcuts from polluting initial cuts) followed by `O(V + E)` bucket-sorted
+       Fiduccia–Mattheyses pair-swap refinement down to page-sized leaves. On
+       `challenge` (`100k × 64d`), `RECURSIVE_BISECTION` adds `4.2%–10.7%` to build
+       time, shrinks mean `|u - v|` **20.5×** (`33,680 → 1,624`) and unique 4 KB
+       vector pages/query up to **10.3×** (`4,037 → 391`), boosts pure in-RAM
+       mapped QPS **+10% to +14%** (`Avx512f`), **+14% to +24%** (`Avx2`), and
+       **+16% to +40%** (`Neon`) at `0.0000` recall delta, and cuts cold ext4 NVMe
+       `majflt`/query **6.0×–9.5×** (`1,586 → 167` at `ef = 160`, **8.2×** higher
+       cold NVMe QPS). On `court200k` (`200k × 256d`, `223 MiB` `.hnsw`),
+       `RECURSIVE_BISECTION` adds only `1.0%–7.4%` to build time, cuts median
+       `|u - v|` **7.7×–8.8×** (`35,908 → 4,064`), boosts pure in-RAM mapped QPS
+       **+15% to +30%** on `Avx512f` (`p99` cut **2.0×–2.6×**), **+9% to +22%** on
+       `Avx2`, and **+7% to +10%** on `Neon`, cuts cold NVMe `majflt`/query
+       **30%–36%** (**+45% to +56%** cold NVMe QPS), and reduces `64 MiB` cgroup
+       (`mapped > page cache`) `majflt`/query **6%–12%** (`+13% to +72%` 4t QPS) —
+       whereas FIFO breadth-first `RCM` smears across small-world shortcuts on
+       multi-chunk corpora (`same_4k_row_page_frac` `2.63% → 0.29%`). Prefer
+       `RECURSIVE_BISECTION` whenever locality ordering is enabled.
   A publication interrupted between the write of its outputs and the publish of
   its manifest rolls back at open: the staged segment and the marker are removed
   and the old generation serves.

@@ -516,6 +516,7 @@ pub fn command() -> Result<(), Error> {
         ef_construction: efc,
         build_mode: BuildMode::Parallel,
         seed: 0x5EED_0A97,
+        ..HnswConfig::default()
     };
     let min_time = Duration::from_millis(arg("min-time-ms", "200").parse()?);
     let crossover_raw = arg(

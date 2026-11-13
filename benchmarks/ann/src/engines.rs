@@ -403,6 +403,7 @@ impl Hnsw {
             ef_construction: p.ef_construction as u32,
             build_mode: BuildMode::Parallel,
             seed: 0x5EED_0A11,
+            ..HnswConfig::default()
         };
         let mut index = HnswIndex::new(rows.dim, config)?;
         index.add(rows.slice(), rows.dim)?;

@@ -1982,6 +1982,9 @@ message HnswConfig {
   HnswBuildMode build_mode = 3;
   // Seeds every node's level draw.
   uint64 seed = 4;
+  // Optional graph-locality node reordering applied at seal and compaction
+  // (#98). NONE (0, default) preserves ingest/caller row order bit for bit.
+  HnswLocalityOrder locality_order = 5;
 }
 
 enum HnswBuildMode {
@@ -1992,6 +1995,16 @@ enum HnswBuildMode {
   // Every thread inserts under per-node locks; the graph depends on
   // scheduling.
   HNSW_BUILD_MODE_PARALLEL = 2;
+}
+
+enum HnswLocalityOrder {
+  // Keep ingest or caller-assigned row order untouched.
+  HNSW_LOCALITY_ORDER_NONE = 0;
+  // Symmetrized O(V + E) Reverse Cuthill-McKee ordering over layer-0 links.
+  HNSW_LOCALITY_ORDER_RCM = 1;
+  // Bounded recursive graph bisection over layer-0 links down to page-sized
+  // leaves.
+  HNSW_LOCALITY_ORDER_RECURSIVE_BISECTION = 2;
 }
 
 message VectorBackendDescriptor {

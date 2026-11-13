@@ -23,7 +23,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use pipestream_search::coordinator::{CoordinatorServiceImpl, RequestFilters};
-use pipestream_search::hnsw::{BuildMode, HnswConfig, HNSW};
+use pipestream_search::hnsw::{BuildMode, HnswConfig, LocalityOrder, HNSW};
 use pipestream_search::security::ToolClient;
 use pipestream_search::vector::VectorIndex;
 use rayon::prelude::*;
@@ -418,6 +418,7 @@ fn run_build() -> Result<(), String> {
         ef_construction,
         build_mode: BuildMode::Parallel,
         seed: DEFAULT_SEED,
+        locality_order: LocalityOrder::None,
     }
     .backend_config()
     .map_err(|e| format!("hnsw backend_config: {e}"))?;

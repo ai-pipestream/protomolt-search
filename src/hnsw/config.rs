@@ -75,6 +75,60 @@ impl BuildMode {
     }
 }
 
+/// Optional graph-locality row permutation applied at seal and compaction
+/// (`#98`, `docs/hnsw.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LocalityOrder {
+    /// Preserve ingest or caller-assigned row order (`0 B/row` overhead,
+    /// bit-identical to unreordered layout).
+    #[default]
+    None,
+    /// Symmetrized `O(V + E)` Reverse Cuthill–McKee pass over layer-0 links.
+    Rcm,
+    /// Bounded recursive graph bisection over layer-0 links down to page-sized
+    /// leaves.
+    RecursiveBisection,
+}
+
+impl LocalityOrder {
+    fn to_proto(self) -> crate::pb::HnswLocalityOrder {
+        match self {
+            Self::None => crate::pb::HnswLocalityOrder::None,
+            Self::Rcm => crate::pb::HnswLocalityOrder::Rcm,
+            Self::RecursiveBisection => crate::pb::HnswLocalityOrder::RecursiveBisection,
+        }
+    }
+
+    fn from_proto(order: i32) -> Result<Self, VectorError> {
+        match crate::pb::HnswLocalityOrder::try_from(order) {
+            Ok(crate::pb::HnswLocalityOrder::None) => Ok(Self::None),
+            Ok(crate::pb::HnswLocalityOrder::Rcm) => Ok(Self::Rcm),
+            Ok(crate::pb::HnswLocalityOrder::RecursiveBisection) => Ok(Self::RecursiveBisection),
+            Err(_) => Err(VectorError::new(format!(
+                "{HNSW} config names unknown locality_order {order}"
+            ))),
+        }
+    }
+
+    /// Compact `u8` tag stored in the `PMHNSW01` header.
+    pub fn as_u8(self) -> u8 {
+        self.to_proto() as u8
+    }
+
+    /// Inverse of [`Self::as_u8`].
+    pub fn from_u8(value: u8) -> Result<Self, VectorError> {
+        Self::from_proto(i32::from(value))
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Rcm => "rcm",
+            Self::RecursiveBisection => "recursive_bisection",
+        }
+    }
+}
+
 /// Validated build parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HnswConfig {
@@ -86,6 +140,8 @@ pub struct HnswConfig {
     pub build_mode: BuildMode,
     /// Seeds the level draw of every node (and nothing else).
     pub seed: u64,
+    /// Optional graph-locality node ordering applied at seal and compaction.
+    pub locality_order: LocalityOrder,
 }
 
 impl Default for HnswConfig {
@@ -95,6 +151,7 @@ impl Default for HnswConfig {
             ef_construction: 200,
             build_mode: BuildMode::Parallel,
             seed: 0x4857_4E53_5700_0001,
+            locality_order: LocalityOrder::None,
         }
     }
 }
@@ -131,6 +188,7 @@ impl HnswConfig {
             ef_construction: self.ef_construction,
             build_mode: self.build_mode.to_proto() as i32,
             seed: self.seed,
+            locality_order: self.locality_order.to_proto() as i32,
         }
     }
 
@@ -141,6 +199,7 @@ impl HnswConfig {
             ef_construction: message.ef_construction,
             build_mode: BuildMode::from_proto(message.build_mode)?,
             seed: message.seed,
+            locality_order: LocalityOrder::from_proto(message.locality_order)?,
         };
         config.validate()?;
         Ok(config)

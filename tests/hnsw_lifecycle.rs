@@ -1125,3 +1125,571 @@ async fn compaction_merges_segments_and_rebuilds_facet_and_number_rows_fresh() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `#98` locality row reordering end-to-end across both `Rcm` and
+/// `RecursiveBisection`:
+/// 1. At `Flush` (seal), `.hnsw` persists a vector-local `NodeMap`
+///    (`has_node_map == true`) so WAL, `Bm25Store`, `.exact`, `parent_ids`, and
+///    column filters keep untouched slot IDs while unfiltered, facet-filtered,
+///    number-range-filtered, column-collapsed, and parent-collapsed queries
+///    agree bit-for-bit with `LocalityOrder::None`.
+/// 2. At `CompactShard` (after warming lazy `FacetRows` and `NumberRows` caches
+///    and applying deletes + `CommitReplacements`), non-partitioned compaction
+///    globally permutes the child segment (`has_node_map == false`, `0 B/row`
+///    map overhead), shrinking physical `|u - v|` edge gaps while keeping
+///    documents, vectors, facets, numbers, `parent_ids`, deletes, and
+///    replacements strictly aligned across restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn locality_reordering_round_trips_seal_compaction_collapse_and_column_filters() {
+    use pipestream_search::hnsw::{BuildMode, HnswIndex, LocalityOrder};
+    use pipestream_search::pb::{
+        filter_query, CollapseSpec, CompositeSearchStrategy, DocLineage, FacetValue, FilterQuery,
+        IntegerValue, NumericValue, SearchRequest, SelectionOperator,
+    };
+
+    #[derive(Clone)]
+    struct RichRow {
+        text: String,
+        court: &'static str,
+        year: i64,
+        pages: f64,
+        parent_id: u64,
+        vector: Vec<f32>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PreCompactSnapshot {
+        unfiltered: Vec<Vec<(String, u32)>>,
+        facet: Vec<Vec<(String, u32)>>,
+        number_range: Vec<Vec<(String, u32)>>,
+        col_collapse: Vec<Vec<(String, u32, usize)>>,
+        parent_collapse: Vec<Vec<(u64, String, u32)>>,
+    }
+
+    let courts = ["scotus", "ca9", "ca2", "ca5"];
+    let probes = queries(4, 0x98C0_FFEE);
+
+    let run_order = |order: LocalityOrder| {
+        let probes = probes.clone();
+        async move {
+            let tag = format!("reorder-{order:?}");
+            let dir = tempdir(&tag);
+            let path = dir.join("shard.hnsw");
+            let node_cfg = || NodeConfig {
+                wal_buckets: 1,
+                facet_fields: vec!["court".into()],
+                integer_fields: vec!["year".into()],
+                numeric_fields: vec!["pages".into()],
+                ..config(&path, true, true)
+            };
+            let (addr, handle) = start_empty_node(node_cfg()).await;
+            let hnsw_cfg = HnswConfig {
+                m: 12,
+                ef_construction: 96,
+                seed: 42,
+                build_mode: BuildMode::FixedOrder,
+                locality_order: order,
+            }
+            .backend_config()
+            .unwrap();
+            client(&addr)
+                .await
+                .configure_vector_backend(ConfigureVectorBackendRequest {
+                    dim: DIM as u32,
+                    config: Some(VectorBackendConfig {
+                        backend_kind: hnsw_cfg.backend_kind,
+                        config_format: hnsw_cfg.config_format,
+                        payload: hnsw_cfg.payload,
+                    }),
+                })
+                .await
+                .unwrap();
+
+            let mut live: BTreeMap<u64, RichRow> = BTreeMap::new();
+            for (seg_idx, range) in [0..320usize, 320..640, 640..680].into_iter().enumerate() {
+                let mut docs = Vec::with_capacity(range.len());
+                let mut vecs = Vec::with_capacity(range.len() * DIM);
+                let mut rows_batch = Vec::with_capacity(range.len());
+                for i in range {
+                    let court = courts[i % courts.len()];
+                    let year = 2000 + (i % 25) as i64;
+                    let pages = ((i * 11) % 100) as f64;
+                    let parent_id = 1_000 + (i / 3) as u64;
+                    let topic = i % 8;
+                    let mut v = unit_vectors(1, DIM, SEED + 0x98_0000 + i as u64 * 137);
+                    v[topic * 3] += 2.5;
+                    let v_norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    for x in &mut v {
+                        *x /= v_norm;
+                    }
+                    let text = format!("doc-{i} {court} y{year} p{parent_id}");
+                    docs.push(AddDocumentsRequest {
+                        text: text.clone(),
+                        analysis: Some(body_spec()),
+                        facets: vec![FacetValue {
+                            field: "court".into(),
+                            value: court.into(),
+                        }],
+                        integers: vec![IntegerValue {
+                            field: "year".into(),
+                            value: year,
+                        }],
+                        numerics: vec![NumericValue {
+                            field: "pages".into(),
+                            value: pages,
+                        }],
+                        lineage: Some(DocLineage {
+                            parent_id,
+                            group_id: parent_id,
+                            span_start: 0,
+                            span_end: 10,
+                        }),
+                        ..Default::default()
+                    });
+                    vecs.extend_from_slice(&v);
+                    rows_batch.push(RichRow {
+                        text,
+                        court,
+                        year,
+                        pages,
+                        parent_id,
+                        vector: v,
+                    });
+                }
+                let mut cli = client(&addr).await;
+                let d_res = cli
+                    .add_documents(tokio_stream::iter(docs))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                let v_res = cli
+                    .add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
+                        vectors: vecs,
+                        dim: DIM as u32,
+                    }]))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(d_res.first_id, v_res.first_id);
+                for (off, r) in rows_batch.into_iter().enumerate() {
+                    live.insert(d_res.first_id + off as u64, r);
+                }
+                if seg_idx < 2 {
+                    flush(&addr).await;
+                }
+            }
+
+            // Delete every 6th row and atomically replace 6 live rows across sealed + tail.
+            let doomed: Vec<u64> = (0..680u64).filter(|id| id % 6 == 2).collect();
+            let del_res = client(&addr)
+                .await
+                .delete_documents(DeleteDocumentsRequest {
+                    doc_ids: doomed.clone(),
+                    expected_wal_generation: None,
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(del_res.deleted as usize, doomed.len());
+            for id in &doomed {
+                live.remove(id);
+            }
+
+            for rep_old in [5u64, 121, 333, 511, 645] {
+                let old_row = live.remove(&rep_old).unwrap();
+                let new_v = unit_vectors(1, DIM, SEED + 0x98_BEEF + rep_old * 97);
+                let new_text = format!("{}-replaced", old_row.text);
+                let mut cli = client(&addr).await;
+                let d_res = cli
+                    .add_documents(tokio_stream::iter(vec![AddDocumentsRequest {
+                        text: new_text.clone(),
+                        analysis: Some(body_spec()),
+                        facets: vec![FacetValue {
+                            field: "court".into(),
+                            value: old_row.court.into(),
+                        }],
+                        integers: vec![IntegerValue {
+                            field: "year".into(),
+                            value: old_row.year,
+                        }],
+                        numerics: vec![NumericValue {
+                            field: "pages".into(),
+                            value: old_row.pages,
+                        }],
+                        lineage: Some(DocLineage {
+                            parent_id: old_row.parent_id,
+                            group_id: old_row.parent_id,
+                            span_start: 0,
+                            span_end: 10,
+                        }),
+                        ..Default::default()
+                    }]))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                let v_res = cli
+                    .add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
+                        vectors: new_v.clone(),
+                        dim: DIM as u32,
+                    }]))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(d_res.first_id, v_res.first_id);
+                let committed = cli
+                    .commit_replacements(CommitReplacementsRequest {
+                        replacements: vec![Replacement {
+                            old_doc_id: rep_old,
+                            new_doc_id: d_res.first_id,
+                        }],
+                        expected_wal_generation: None,
+                    })
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(committed.committed, 1);
+                live.insert(
+                    d_res.first_id,
+                    RichRow {
+                        text: new_text,
+                        vector: new_v,
+                        ..old_row
+                    },
+                );
+            }
+
+            // Inspect sealed segment `.hnsw` files on disk before compaction:
+            // seal writes `has_node_map == true` when `order != None`.
+            let root = segments_root(&path);
+            {
+                let sealed = OpenedSegmentSet::open_with(&root, VectorLoad::Mapped).unwrap();
+                assert_eq!(sealed.len(), 2);
+                for seg_i in 0..sealed.len() {
+                    let meta = sealed.metadata(seg_i);
+                    let vec_p = SegmentCatalog::segment_dir(&root, &meta.segment_id)
+                        .join(&meta.vector.file);
+                    let mapped = HnswIndex::load_mapped(&vec_p).unwrap();
+                    assert_eq!(mapped.config().locality_order, order);
+                    assert_eq!(
+                        mapped.has_node_map(),
+                        order != LocalityOrder::None,
+                        "sealed segment {seg_i} node-map flag for {order:?}"
+                    );
+                }
+            }
+
+            let eval_queries = |addr_s: String, live_map: BTreeMap<u64, RichRow>, stage: String| {
+                let probes_ref = probes.clone();
+                async move {
+                    let coord = coordinator(&addr_s);
+                    let mut cli = client(&addr_s).await;
+                    let by_text: BTreeMap<&str, &RichRow> =
+                        live_map.values().map(|r| (r.text.as_str(), r)).collect();
+
+                    let fetch_texts = |cli: &mut NodeServiceClient<Channel>, ids: Vec<u64>| {
+                        let mut c = cli.clone();
+                        async move {
+                            let docs = c
+                                .get_documents(GetDocumentsRequest { doc_ids: ids })
+                                .await
+                                .unwrap()
+                                .into_inner()
+                                .documents;
+                            docs.into_iter()
+                                .map(|d| (d.doc_id, d.text))
+                                .collect::<BTreeMap<_, _>>()
+                        }
+                    };
+
+                    let mut snap = PreCompactSnapshot {
+                        unfiltered: Vec::new(),
+                        facet: Vec::new(),
+                        number_range: Vec::new(),
+                        col_collapse: Vec::new(),
+                        parent_collapse: Vec::new(),
+                    };
+
+                    for qv in &probes_ref {
+                        // 1. Unfiltered Query.
+                        let un_resp = coord
+                            .query(Request::new(QueryRequest {
+                                k: K as u32,
+                                selection: Some(SelectionQuery {
+                                    node: Some(selection_query::Node::Search(SearchQuery {
+                                        id: "vec".into(),
+                                        query: Some(search_query::Query::Dense(DenseQuery {
+                                            vector: qv.clone(),
+                                            execution_mode: DenseExecutionMode::Ann as i32,
+                                            ..Default::default()
+                                        })),
+                                    })),
+                                }),
+                                ..Default::default()
+                            }))
+                            .await
+                            .unwrap()
+                            .into_inner();
+                        let tmap =
+                            fetch_texts(&mut cli, un_resp.hits.iter().map(|h| h.doc_id).collect())
+                                .await;
+                        let mut un_vec = Vec::new();
+                        for h in &un_resp.hits {
+                            let txt = &tmap[&h.doc_id];
+                            let row = by_text
+                                .get(txt.as_str())
+                                .unwrap_or_else(|| panic!("{stage}: stale/deleted row {txt}"));
+                            assert_eq!(h.score.to_bits(), dot(&row.vector, qv).to_bits());
+                            un_vec.push((txt.clone(), h.score.to_bits()));
+                        }
+                        snap.unfiltered.push(un_vec);
+
+                        // 2. Facet-filtered Query (warms lazy FacetRows).
+                        let mk_flt = |cel: &str| QueryRequest {
+                            k: K as u32,
+                            selection: Some(SelectionQuery {
+                                node: Some(selection_query::Node::Composite(
+                                    CompositeSearchStrategy {
+                                        operator: SelectionOperator::And as i32,
+                                        clauses: vec![
+                                            SelectionQuery {
+                                                node: Some(selection_query::Node::Search(
+                                                    SearchQuery {
+                                                        id: "vec".into(),
+                                                        query: Some(search_query::Query::Dense(
+                                                            DenseQuery {
+                                                                vector: qv.clone(),
+                                                                execution_mode:
+                                                                    DenseExecutionMode::Ann as i32,
+                                                                ..Default::default()
+                                                            },
+                                                        )),
+                                                    },
+                                                )),
+                                            },
+                                            SelectionQuery {
+                                                node: Some(selection_query::Node::Filter(
+                                                    FilterQuery {
+                                                        id: "flt".into(),
+                                                        predicate: Some(
+                                                            filter_query::Predicate::Cel(
+                                                                cel.into(),
+                                                            ),
+                                                        ),
+                                                    },
+                                                )),
+                                            },
+                                        ],
+                                        scoring: None,
+                                    },
+                                )),
+                            }),
+                            ..Default::default()
+                        };
+
+                        let fac_resp = coord
+                            .query(Request::new(mk_flt("court == 'ca9'")))
+                            .await
+                            .unwrap()
+                            .into_inner();
+                        let tmap =
+                            fetch_texts(&mut cli, fac_resp.hits.iter().map(|h| h.doc_id).collect())
+                                .await;
+                        let mut fac_vec = Vec::new();
+                        for h in &fac_resp.hits {
+                            let txt = &tmap[&h.doc_id];
+                            let row = by_text[txt.as_str()];
+                            assert_eq!(row.court, "ca9", "{stage}: wrong court on {txt}");
+                            assert_eq!(h.score.to_bits(), dot(&row.vector, qv).to_bits());
+                            fac_vec.push((txt.clone(), h.score.to_bits()));
+                        }
+                        snap.facet.push(fac_vec);
+
+                        // 3. Number-range Query (warms lazy NumberRows).
+                        let num_resp = coord
+                            .query(Request::new(mk_flt(
+                                "year >= 2005 && year <= 2018 && pages >= 20.0 && pages <= 80.0",
+                            )))
+                            .await
+                            .unwrap()
+                            .into_inner();
+                        let tmap =
+                            fetch_texts(&mut cli, num_resp.hits.iter().map(|h| h.doc_id).collect())
+                                .await;
+                        let mut num_vec = Vec::new();
+                        for h in &num_resp.hits {
+                            let txt = &tmap[&h.doc_id];
+                            let row = by_text[txt.as_str()];
+                            assert!(
+                                (2005..=2018).contains(&row.year)
+                                    && (20.0..=80.0).contains(&row.pages),
+                                "{stage}: out-of-range row {txt}"
+                            );
+                            assert_eq!(h.score.to_bits(), dot(&row.vector, qv).to_bits());
+                            num_vec.push((txt.clone(), h.score.to_bits()));
+                        }
+                        snap.number_range.push(num_vec);
+
+                        // 4. Column-collapsed Query (`court`, 4 distinct values).
+                        let col_resp = coord
+                            .query(Request::new(QueryRequest {
+                                k: 4,
+                                selection_k: 40,
+                                selection: Some(SelectionQuery {
+                                    node: Some(selection_query::Node::Search(SearchQuery {
+                                        id: "vec".into(),
+                                        query: Some(search_query::Query::Dense(DenseQuery {
+                                            vector: qv.clone(),
+                                            execution_mode: DenseExecutionMode::Ann as i32,
+                                            ..Default::default()
+                                        })),
+                                    })),
+                                }),
+                                collapse: Some(CollapseSpec {
+                                    column: "court".into(),
+                                    inner_hits: 2,
+                                    map: None,
+                                }),
+                                ..Default::default()
+                            }))
+                            .await
+                            .unwrap()
+                            .into_inner();
+                        let tmap =
+                            fetch_texts(&mut cli, col_resp.hits.iter().map(|h| h.doc_id).collect())
+                                .await;
+                        assert_eq!(col_resp.groups.len(), col_resp.hits.len());
+                        let mut seen_courts = std::collections::BTreeSet::new();
+                        let mut col_vec = Vec::new();
+                        for (h, g) in col_resp.hits.iter().zip(&col_resp.groups) {
+                            let txt = &tmap[&h.doc_id];
+                            let row = by_text[txt.as_str()];
+                            assert!(
+                                seen_courts.insert(row.court),
+                                "{stage}: duplicate collapsed court {}",
+                                row.court
+                            );
+                            assert_eq!(h.score.to_bits(), dot(&row.vector, qv).to_bits());
+                            col_vec.push((txt.clone(), h.score.to_bits(), g.hits.len()));
+                        }
+                        snap.col_collapse.push(col_vec);
+
+                        // 5. Parent-collapsed Search (`parent_ids` sidecar).
+                        let par_resp = coord
+                            .search(Request::new(SearchRequest {
+                                request_id: format!("{stage}-pcollapse"),
+                                k: K as u32,
+                                vector: qv.clone(),
+                                collapse_parents: true,
+                                ..Default::default()
+                            }))
+                            .await
+                            .unwrap()
+                            .into_inner();
+                        let tmap = fetch_texts(
+                            &mut cli,
+                            par_resp.hits.iter().map(|h| h.vector_id).collect(),
+                        )
+                        .await;
+                        let mut seen_parents = std::collections::BTreeSet::new();
+                        let mut par_vec = Vec::new();
+                        for h in &par_resp.hits {
+                            let txt = &tmap[&h.vector_id];
+                            let row = by_text[txt.as_str()];
+                            assert_eq!(
+                                h.parent_id, row.parent_id,
+                                "{stage}: lineage parent_id mismatch on {txt}"
+                            );
+                            assert!(
+                                seen_parents.insert(h.parent_id),
+                                "{stage}: duplicate parent_id {}",
+                                h.parent_id
+                            );
+                            assert_eq!(h.score.to_bits(), dot(&row.vector, qv).to_bits());
+                            par_vec.push((h.parent_id, txt.clone(), h.score.to_bits()));
+                        }
+                        snap.parent_collapse.push(par_vec);
+                    }
+                    snap
+                }
+            };
+
+            let pre_snap = eval_queries(addr.clone(), live.clone(), format!("{order:?}-pre")).await;
+
+            // Compact online: global segment permutation (`has_node_map == false`).
+            let mut req = Request::new(CompactShardRequest::default());
+            req.set_timeout(Duration::from_secs(600));
+            let compacted = client(&addr)
+                .await
+                .compact_shard(req)
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(compacted.rows_after as usize, live.len());
+
+            let post_snap =
+                eval_queries(addr.clone(), live.clone(), format!("{order:?}-post")).await;
+            handle.abort();
+
+            // Verify compacted `.hnsw` on disk: global remap uses `0 B/row` (`!has_node_map`).
+            let compacted_gap = {
+                let reopened = OpenedSegmentSet::open_with(&root, VectorLoad::Mapped).unwrap();
+                assert_eq!(reopened.len(), 1);
+                let meta = reopened.metadata(0);
+                let vec_p =
+                    SegmentCatalog::segment_dir(&root, &meta.segment_id).join(&meta.vector.file);
+                let mapped = HnswIndex::load_mapped(&vec_p).unwrap();
+                assert!(mapped.is_graph_linked());
+                assert_eq!(mapped.config().locality_order, order);
+                assert!(
+                    !mapped.has_node_map(),
+                    "compacted segment must use global slot order without NodeMap"
+                );
+                assert_eq!(mapped.unreachable_from_entry(), 0);
+                mapped.locality_metrics().mean_id_gap
+            };
+
+            // Verify restart serves identical answers from the compacted disk state.
+            let (re_addr, re_handle) = start_opened_node(node_cfg()).await;
+            let restart_snap =
+                eval_queries(re_addr.clone(), live.clone(), format!("{order:?}-restart")).await;
+            assert_eq!(restart_snap, post_snap, "{order:?} restart mismatch");
+            re_handle.abort();
+            let _ = std::fs::remove_dir_all(&dir);
+
+            (pre_snap, post_snap, compacted_gap)
+        }
+    };
+
+    let (none_pre, none_post, none_gap) = run_order(LocalityOrder::None).await;
+    for order in [LocalityOrder::Rcm, LocalityOrder::RecursiveBisection] {
+        let (pre, post, gap) = run_order(order).await;
+        // Pre-compaction seal uses FixedOrder + vector-local NodeMap over identical
+        // segments, so every query mode must agree with None bit-for-bit!
+        assert_eq!(
+            pre, none_pre,
+            "{order:?} pre-compaction seal answers diverged from None"
+        );
+        // Post-compaction global remap shrinks physical |u - v| edge gaps.
+        assert!(
+            gap < none_gap * 0.90,
+            "{order:?} compacted mean_id_gap {gap:.1} did not beat None {none_gap:.1}"
+        );
+        // Every post-compaction query mode returns full K / distinct-group count.
+        for qi in 0..probes.len() {
+            assert_eq!(post.unfiltered[qi].len(), none_post.unfiltered[qi].len());
+            assert_eq!(post.facet[qi].len(), none_post.facet[qi].len());
+            assert_eq!(
+                post.number_range[qi].len(),
+                none_post.number_range[qi].len()
+            );
+            assert_eq!(
+                post.col_collapse[qi].len(),
+                none_post.col_collapse[qi].len()
+            );
+            assert_eq!(
+                post.parent_collapse[qi].len(),
+                none_post.parent_collapse[qi].len()
+            );
+        }
+    }
+}

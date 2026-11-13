@@ -206,6 +206,7 @@ pub fn command() -> Result<(), Error> {
         ef_construction: 200,
         seed: 0x7699_2026,
         build_mode: BuildMode::Parallel,
+        ..HnswConfig::default()
     };
 
     eprintln!(

@@ -176,13 +176,13 @@ pub(super) fn heal_tombstones(
         survivor_old_ids.push(row as u32);
         ControlFlow::<()>::Continue(())
     });
-    let (merged, stats) = source.with_row_source(|rows_src| {
+    let (mut merged, stats) = source.with_row_source(|rows_src| {
         let mut ordered = Vec::with_capacity(survivor_old_ids.len());
         for &old_node in &survivor_old_ids {
             ordered.push(OrderedMergeRow::FromSegment {
                 segment: 0,
                 old_node,
-                vector: rows_src.row(old_node),
+                vector: rows_src.row(source.row_to_node(old_node)),
             });
         }
         // Single-source tombstone healing always reuses the linked graph even at
@@ -196,6 +196,12 @@ pub(super) fn heal_tombstones(
             true,
         )
     })?;
+    if let Some(perm) = merged.reorder_global_in_place()? {
+        survivor_old_ids = perm
+            .into_iter()
+            .map(|idx| survivor_old_ids[idx as usize])
+            .collect();
+    }
     Ok((merged, survivor_old_ids, stats))
 }
 
@@ -262,7 +268,8 @@ pub(super) fn merge_segments(
         let flat = row_slices[seg_idx];
         let mask = seg.live.unwrap_or(Mask::All(seg.index.len()));
         let _ = mask.try_for_each(|row| {
-            let at = row * dim;
+            let donor_node = seg.index.row_to_node(row as u32);
+            let at = donor_node as usize * dim;
             ordered.push(OrderedMergeRow::FromSegment {
                 segment: seg_idx,
                 old_node: row as u32,
@@ -274,7 +281,9 @@ pub(super) fn merge_segments(
     for raw in unlinked_vectors.chunks_exact(dim) {
         ordered.push(OrderedMergeRow::Raw(raw));
     }
-    merge_ordered(dim, config, &source_refs, &ordered, strategy)
+    let (mut merged, stats) = merge_ordered(dim, config, &source_refs, &ordered, strategy)?;
+    merged.reorder_local_in_place();
+    Ok((merged, stats))
 }
 
 /// Build a dense [`HnswIndex`] over `rows` in exact caller-specified slot order,
@@ -385,10 +394,11 @@ fn merge_ordered_inner(
                     let old_idx = old_node as usize;
                     let src_len = sources[segment].len();
                     if old_idx < src_len {
-                        let start = old_idx * dim;
+                        let donor_node = sources[segment].row_to_node(old_node);
+                        let start = donor_node as usize * dim;
                         if &src_flat[start..start + dim] == vector {
                             seg_surviving[segment] += 1;
-                            Some((segment, old_node))
+                            Some((segment, donor_node))
                         } else {
                             None
                         }

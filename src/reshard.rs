@@ -637,12 +637,12 @@ impl HnswCompactionSources {
         })
     }
 
-    fn build_merged_index(
+    fn build_merged_hnsw(
         &self,
         dim: usize,
         backend_config: &crate::vector::VectorBackendConfig,
         vectors: &[(u64, Vec<f32>)],
-    ) -> Result<Option<VectorIndex>, String> {
+    ) -> Result<Option<crate::hnsw::HnswIndex>, String> {
         if backend_config.backend_kind != crate::hnsw::HNSW || self.ranges.is_empty() {
             return Ok(None);
         }
@@ -686,7 +686,18 @@ impl HnswCompactionSources {
             crate::hnsw::MergeStrategy::JoinSet,
         )
         .map_err(|e| format!("merge child hnsw segments: {e}"))?;
-        Ok(Some(merged.into_index()))
+        Ok(Some(merged))
+    }
+
+    fn build_merged_index(
+        &self,
+        dim: usize,
+        backend_config: &crate::vector::VectorBackendConfig,
+        vectors: &[(u64, Vec<f32>)],
+    ) -> Result<Option<VectorIndex>, String> {
+        Ok(self
+            .build_merged_hnsw(dim, backend_config, vectors)?
+            .map(crate::hnsw::HnswIndex::into_index))
     }
 }
 
@@ -713,6 +724,7 @@ fn build_child(
     columns: Option<&ColumnTables>,
     mut transplanted: Option<BTreeMap<u64, Vec<AnalyzedField>>>,
     hnsw_sources: Option<&HnswCompactionSources>,
+    prebuilt_index: Option<VectorIndex>,
     analyze: &mut Analyzer,
 ) -> Result<ChildImage, String> {
     let dim = manifest.dim as usize;
@@ -725,22 +737,27 @@ fn build_child(
         parent_ids.push(*id);
         flat.extend_from_slice(vector);
     }
-    let merged_hnsw = match hnsw_sources {
-        Some(sources) => sources.build_merged_index(dim, &backend_config, &vectors)?,
-        None => None,
-    };
-    let index = match merged_hnsw {
+    let index = match prebuilt_index {
         Some(index) => index,
         None => {
-            let mut index = VectorIndex::from_backend_config(dim, &backend_config)
-                .map_err(|e| format!("construct child index: {e}"))?;
-            index
-                .add(&flat, dim)
-                .map_err(|e| format!("add child vectors: {e}"))?;
-            index
-                .prepare()
-                .map_err(|e| format!("prepare child index: {e}"))?;
-            index
+            let merged_hnsw = match hnsw_sources {
+                Some(sources) => sources.build_merged_index(dim, &backend_config, &vectors)?,
+                None => None,
+            };
+            match merged_hnsw {
+                Some(index) => index,
+                None => {
+                    let mut index = VectorIndex::from_backend_config(dim, &backend_config)
+                        .map_err(|e| format!("construct child index: {e}"))?;
+                    index
+                        .add(&flat, dim)
+                        .map_err(|e| format!("add child vectors: {e}"))?;
+                    index
+                        .prepare()
+                        .map_err(|e| format!("prepare child index: {e}"))?;
+                    index
+                }
+            }
         }
     };
     index
@@ -1660,6 +1677,44 @@ fn finish_child_pinned_with_sources(
 #[allow(clippy::too_many_arguments)]
 fn finish_child_ordered_with_sources(
     manifest: &WalManifest,
+    replay: Replay,
+    order: &[u64],
+    ordinal: usize,
+    out_dir: &Path,
+    slot_offset: u64,
+    hash_lo: u64,
+    hash_hi: u64,
+    bm25_fields: Option<&[String]>,
+    pinned_fingerprints: Option<&[u64]>,
+    binding: Option<&crate::postings::StoredBinding>,
+    derived: Option<&crate::postings::StoredDerived>,
+    columns: Option<&ColumnTables>,
+    hnsw_sources: Option<&HnswCompactionSources>,
+    analyze: &mut Analyzer,
+) -> Result<ChildImage, String> {
+    finish_child_ordered_with_prebuilt(
+        manifest,
+        replay,
+        order,
+        ordinal,
+        out_dir,
+        slot_offset,
+        hash_lo,
+        hash_hi,
+        bm25_fields,
+        pinned_fingerprints,
+        binding,
+        derived,
+        columns,
+        hnsw_sources,
+        None,
+        analyze,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_child_ordered_with_prebuilt(
+    manifest: &WalManifest,
     mut replay: Replay,
     order: &[u64],
     ordinal: usize,
@@ -1673,6 +1728,7 @@ fn finish_child_ordered_with_sources(
     derived: Option<&crate::postings::StoredDerived>,
     columns: Option<&ColumnTables>,
     hnsw_sources: Option<&HnswCompactionSources>,
+    prebuilt_index: Option<VectorIndex>,
     analyze: &mut Analyzer,
 ) -> Result<ChildImage, String> {
     replay.compact();
@@ -1713,6 +1769,7 @@ fn finish_child_ordered_with_sources(
         columns,
         transplanted,
         hnsw_sources,
+        prebuilt_index,
         analyze,
     )?;
     child.slot_offset = slot_offset;
@@ -4173,20 +4230,6 @@ pub struct CompactionBuild {
     pub binding: Option<crate::postings::StoredBinding>,
 }
 
-/// Hand every live row of `replay` to `sink` in dense slot order — the
-/// order [`build_child`] assigns: vector rows in parent-id order, then
-/// the document-only rows in parent-id order — and extend `id_map`
-/// with the mapping. Returns the number of rows emitted.
-fn emit_rows(
-    replay: &Replay,
-    slot_base: u64,
-    id_map: &mut BTreeMap<u64, u64>,
-    sink: &mut RowSink,
-) -> Result<u64, String> {
-    let order = child_order(replay);
-    emit_rows_in(replay, &order, slot_base, id_map, sink)
-}
-
 /// The slot order [`build_child`] assigns a replay by default: vector
 /// rows in source-id order, then the document-only rows in source-id
 /// order.
@@ -4202,7 +4245,9 @@ fn child_order(replay: &Replay) -> Vec<u64> {
     order
 }
 
-/// [`emit_rows`] in an explicit slot order.
+/// Hand every live row of `replay` to `sink` in explicit dense slot `order`,
+/// extending `id_map` with `old_id -> new_local`. Returns the number of rows
+/// emitted.
 fn emit_rows_in(
     replay: &Replay,
     order: &[u64],
@@ -4291,6 +4336,79 @@ pub fn compact_log(
     )
 }
 
+/// When `manifest`'s backend is `hnsw` with a non-`None` `locality_order` and
+/// `replay` holds at least `MIN_GRAPH_ROWS` vectors, build/merge the HNSW
+/// graph up front, permute it globally in-place (`0 B/row` overhead, no node
+/// map), and return the matching segment-wide slot order (`#98`).
+fn prepare_compacted_replay_order(
+    manifest: &WalManifest,
+    replay: &Replay,
+    hnsw_sources: Option<&HnswCompactionSources>,
+) -> Result<(Vec<u64>, Option<VectorIndex>), String> {
+    let default_order = child_order(replay);
+    if replay.vectors.len() < crate::hnsw::MIN_GRAPH_ROWS {
+        return Ok((default_order, None));
+    }
+    let backend_config = manifest
+        .backend_config()
+        .map_err(|e| format!("construct child backend config: {e}"))?;
+    if backend_config.backend_kind != crate::hnsw::HNSW {
+        return Ok((default_order, None));
+    }
+    let config = crate::hnsw::HnswConfig::from_backend_config(&backend_config)
+        .map_err(|e| format!("decode child hnsw config: {e}"))?;
+    if config.locality_order == crate::hnsw::LocalityOrder::None {
+        return Ok((default_order, None));
+    }
+    let dim = manifest.dim as usize;
+    let vec_pairs: Vec<(u64, Vec<f32>)> = replay
+        .vectors
+        .iter()
+        .map(|(&id, v)| (id, v.clone()))
+        .collect();
+    let merged = match hnsw_sources {
+        Some(sources) => sources.build_merged_hnsw(dim, &backend_config, &vec_pairs)?,
+        None => None,
+    };
+    let mut hnsw = match merged {
+        Some(index) => index,
+        None => {
+            use crate::vector::VectorProvider;
+            let mut flat = Vec::with_capacity(vec_pairs.len() * dim);
+            for (_, v) in &vec_pairs {
+                flat.extend_from_slice(v);
+            }
+            let mut index = crate::hnsw::HnswIndex::new(dim, config)
+                .map_err(|e| format!("construct child hnsw index: {e}"))?;
+            index
+                .add(&flat, dim)
+                .map_err(|e| format!("add child hnsw vectors: {e}"))?;
+            index
+        }
+    };
+    let perm = hnsw
+        .reorder_global_in_place()
+        .map_err(|e| format!("reorder child hnsw index: {e}"))?;
+    let order = match perm {
+        Some(new_to_old) => {
+            let mut out = Vec::with_capacity(default_order.len());
+            for old_idx in new_to_old {
+                out.push(vec_pairs[old_idx as usize].0);
+            }
+            out.extend(
+                replay
+                    .documents
+                    .keys()
+                    .filter(|id| !replay.vectors.contains_key(id))
+                    .copied(),
+            );
+            out
+        }
+        None => default_order,
+    };
+    Ok((order, Some(hnsw.into_index())))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compact_log_with_sources(
     gen: &Path,
@@ -4336,10 +4454,12 @@ pub(crate) fn compact_log_with_sources(
         rows_before = present;
         tombstones = tombstoned;
         replay.compact();
-        emit_rows(&replay, 0, &mut id_map, sink)?;
-        images.push(finish_child_pinned_with_sources(
+        let (order, prebuilt) = prepare_compacted_replay_order(&manifest, &replay, hnsw_sources)?;
+        emit_rows_in(&replay, &order, 0, &mut id_map, sink)?;
+        images.push(finish_child_ordered_with_prebuilt(
             &manifest,
             replay,
+            &order,
             0,
             out_dir,
             0,
@@ -4351,6 +4471,7 @@ pub(crate) fn compact_log_with_sources(
             derived,
             columns,
             hnsw_sources,
+            prebuilt,
             analyze,
         )?);
     } else {
@@ -4370,14 +4491,20 @@ pub(crate) fn compact_log_with_sources(
             rows_before += present;
             tombstones += tombstoned;
             replay.compact();
-            let rows = emit_rows(&replay, next_slot, &mut id_map, sink)?;
+            if replay.vectors.is_empty() && replay.documents.is_empty() {
+                continue;
+            }
+            let (order, prebuilt) =
+                prepare_compacted_replay_order(&manifest, &replay, hnsw_sources)?;
+            let rows = emit_rows_in(&replay, &order, next_slot, &mut id_map, sink)?;
             if rows == 0 {
                 continue;
             }
             let ordinal = images.len();
-            images.push(finish_child_pinned_with_sources(
+            images.push(finish_child_ordered_with_prebuilt(
                 &manifest,
                 replay,
+                &order,
                 ordinal,
                 out_dir,
                 next_slot,
@@ -4389,6 +4516,7 @@ pub(crate) fn compact_log_with_sources(
                 derived,
                 columns,
                 hnsw_sources,
+                prebuilt,
                 analyze,
             )?);
             next_slot = next_slot

@@ -34,6 +34,7 @@ pub mod distance;
 pub mod graph;
 pub mod image;
 pub mod merge;
+pub mod reorder;
 pub mod rows;
 #[cfg(test)]
 mod tests;
@@ -41,10 +42,12 @@ mod tests;
 use std::ops::{ControlFlow, Range};
 use std::path::Path;
 
-pub use config::{BuildMode, HnswConfig, CONFIG_FORMAT};
+pub use config::{BuildMode, HnswConfig, LocalityOrder, CONFIG_FORMAT};
 pub use distance::Kernel;
 pub use graph::SearchStats;
 pub use merge::{MergeStats, MergeStrategy, SegmentMergeInput, JOIN_DOMINATION_K};
+pub use reorder::LocalityMetrics;
+pub use reorder::NodeMap;
 pub use rows::{RowSource, RowSourceIdentity};
 
 use crate::vector::{
@@ -314,7 +317,7 @@ impl HnswIndex {
         Some(bytes as f64 / n as f64)
     }
 
-    /// Run `f` over the rows the graph was built over.
+    /// Run `f` over the internal node-ordered rows the graph traverses.
     pub fn with_row_source<R>(&self, f: impl FnOnce(&dyn RowSource) -> R) -> R {
         match &self.backing {
             Backing::Heap(store) => f(&store.rows),
@@ -322,10 +325,178 @@ impl HnswIndex {
         }
     }
 
+    /// True when this index carries a seal-time `node <-> row` permutation.
+    pub fn has_node_map(&self) -> bool {
+        self.node_to_row_slice().is_some()
+    }
+
+    /// Structural layer-0 locality summary (`#98`).
+    pub fn locality_metrics(&self) -> LocalityMetrics {
+        with_view!(self, |v| reorder::compute_locality_metrics(&v))
+    }
+
+    /// Count distinct 4 KB vector-row pages touched during an unfiltered
+    /// layer-0 walk at beam `ef` (`#98`).
+    pub fn walk_row_4k_pages(&self, query: &[f32], ef: usize) -> usize {
+        with_view!(self, |v| reorder::walk_row_4k_pages(&v, query, ef))
+    }
+
+    /// Disable OS readahead and unmap active PTEs on a memory-mapped `.hnsw`
+    /// image (`MADV_RANDOM` + `MADV_DONTNEED`) so subsequent queries measure
+    /// cold page-table / page-cache fault behavior (`#98`).
+    pub fn advise_cold_mmap(&self) -> Result<(), VectorError> {
+        match &self.backing {
+            Backing::Mapped(mapped) => mapped.advise_cold(),
+            Backing::Heap(_) => Ok(()),
+        }
+    }
+
+    /// Evict clean kernel page-cache pages backing `path` (`POSIX_FADV_DONTNEED`).
+    pub fn drop_file_page_cache(path: &Path) -> Result<(), VectorError> {
+        image::drop_file_page_cache(path)
+    }
+
+    /// Optional `node_to_row[node] = ext_row` permutation slice.
+    pub fn node_to_row_slice(&self) -> Option<&[u32]> {
+        match &self.backing {
+            Backing::Heap(store) => store.node_map().map(|m| m.node_to_row.as_slice()),
+            Backing::Mapped(mapped) => mapped.node_to_row(),
+        }
+    }
+
+    /// Optional `row_to_node[ext_row] = node` permutation slice.
+    pub fn row_to_node_slice(&self) -> Option<&[u32]> {
+        match &self.backing {
+            Backing::Heap(store) => store.node_map().map(|m| m.row_to_node.as_slice()),
+            Backing::Mapped(mapped) => mapped.row_to_node(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn row_to_node(&self, ext_row: u32) -> u32 {
+        self.row_to_node_slice()
+            .map_or(ext_row, |m| m[ext_row as usize])
+    }
+
     /// The identity a shared row store must match to replace the
-    /// provider's own rows (#71): dimension, row count, content digest.
+    /// provider's own rows (#71): dimension, row count, content digest in
+    /// external row order `0..self.len()`.
     pub fn row_identity(&self) -> RowSourceIdentity {
-        self.with_row_source(|rows| rows.identity())
+        let Some(r2n) = self.row_to_node_slice() else {
+            return self.with_row_source(|rows| rows.identity());
+        };
+        self.with_row_source(|rows| {
+            let mut sha = crate::sha256::Sha256::new();
+            let mut bytes = Vec::with_capacity(4 * self.dim.max(256));
+            for &node in r2n {
+                bytes.clear();
+                for &v in rows.row(node) {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                sha.update(&bytes);
+            }
+            RowSourceIdentity {
+                dim: rows.dim(),
+                rows: rows.row_count(),
+                content_digest: sha.finalize(),
+            }
+        })
+    }
+
+    /// Permute this heap index in-place for a global segment compaction remap
+    /// (`#98`), leaving `node_map` absent (`0 B/row` overhead) and returning
+    /// `new_to_old` (`new_slot -> old_slot`) when reordering ran.
+    pub(crate) fn reorder_global_in_place(&mut self) -> Result<Option<Vec<u32>>, VectorError> {
+        let order = self.config.locality_order;
+        if order == LocalityOrder::None {
+            return Ok(None);
+        }
+        let Backing::Heap(store) = &mut self.backing else {
+            return Err(VectorError::new(format!(
+                "{HNSW} mapped image cannot be reordered in place"
+            )));
+        };
+        if store.n() < MIN_GRAPH_ROWS {
+            return Ok(None);
+        }
+        if !store.is_linked() {
+            let parallel =
+                self.config.build_mode == BuildMode::Parallel && store.n() >= PARALLEL_MIN_BATCH;
+            let links = store.build_links(parallel)?;
+            store.install_links(links);
+        }
+        if store.is_reordered() && store.node_map().is_none() {
+            return Ok(None);
+        }
+        // If `store` already held a local `node_map`, drop its map and return
+        // its existing `node_to_row` directly without permuting twice.
+        if store.is_reordered() {
+            if let Some(prev) = store.take_node_map() {
+                store.set_reorder_state(true, None);
+                return Ok(Some(prev.node_to_row));
+            }
+        }
+        let new_to_old = reorder::compute_locality_order(&store.view(), order);
+        let links = store.links().expect("linked above");
+        let permuted = reorder::permute_store_with_links(store, links, &new_to_old, false);
+        *store = permuted;
+        Ok(Some(new_to_old))
+    }
+
+    /// Apply a vector-local `NodeMap` permutation in-place on a linked heap
+    /// store when `config.locality_order != None` and not yet reordered.
+    pub(crate) fn reorder_local_in_place(&mut self) {
+        let order = self.config.locality_order;
+        if order == LocalityOrder::None {
+            return;
+        }
+        if let Backing::Heap(store) = &mut self.backing {
+            if store.is_linked() && !store.is_reordered() && store.n() >= MIN_GRAPH_ROWS {
+                let new_to_old = reorder::compute_locality_order(&store.view(), order);
+                let links = store.links().expect("linked");
+                *store = reorder::permute_store_with_links(store, links, &new_to_old, true);
+            }
+        }
+    }
+
+    /// Produce a permuted copy of a linked heap index with the exact same
+    /// graph topology under `locality_order` (for controlled A/B benchmarking
+    /// and equivalence verification).
+    pub fn permute_from_linked(
+        &self,
+        locality_order: LocalityOrder,
+        attach_node_map: bool,
+    ) -> Result<(Self, Vec<u32>), VectorError> {
+        let Backing::Heap(store) = &self.backing else {
+            return Err(VectorError::new(format!(
+                "permute_from_linked requires a heap-backed {HNSW} index"
+            )));
+        };
+        let Some(links) = store.links() else {
+            return Err(VectorError::new(format!(
+                "permute_from_linked requires a linked {HNSW} index"
+            )));
+        };
+        let mut config = self.config;
+        config.locality_order = locality_order;
+        let new_to_old = reorder::compute_locality_order(&store.view(), locality_order);
+        let out_store = if locality_order == LocalityOrder::None {
+            let identity: Vec<u32> = (0..store.n() as u32).collect();
+            let mut cloned = reorder::permute_store_with_links(store, links, &identity, false);
+            cloned.set_reorder_state(false, None);
+            cloned
+        } else {
+            reorder::permute_store_with_links(store, links, &new_to_old, attach_node_map)
+        };
+        Ok((
+            Self {
+                dim: self.dim,
+                config,
+                kernel: self.kernel,
+                backing: Backing::Heap(out_store),
+            },
+            new_to_old,
+        ))
     }
 
     /// Compact this index to the rows allowed by `live`, healing broken edges
@@ -370,23 +541,50 @@ impl HnswIndex {
     }
 
     /// Rescore the walk's results with the scalar scorer, drop those below
-    /// the floor, and order them score descending then row ascending. This
-    /// is the only path a unary result takes out of the provider.
+    /// the floor, map internal nodes back to external row IDs when a seal-time
+    /// node map is present, and order them score descending then row ascending.
+    /// This is the only path a unary result takes out of the provider.
     fn report(
         hits: Vec<Scored>,
         query: &[f32],
         rows: &dyn RowSource,
         floor: f32,
         k: usize,
+        node_to_row: Option<&[u32]>,
     ) -> Vec<(u32, f32)> {
         let mut exact: Vec<(u32, f32)> = hits
             .into_iter()
-            .map(|h| (h.node, crate::exact_vectors::dot(rows.row(h.node), query)))
+            .map(|h| {
+                let ext_row = node_to_row.map_or(h.node, |m| m[h.node as usize]);
+                (ext_row, crate::exact_vectors::dot(rows.row(h.node), query))
+            })
             .filter(|(_, score)| *score >= floor)
             .collect();
         exact.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         exact.truncate(k);
         exact
+    }
+
+    /// When this index carries a seal-time `row_to_node` permutation and the
+    /// query specifies a non-trivial `allow` mask in external row coordinates,
+    /// translate `allow` once into internal node coordinates (`Bits`).
+    fn node_allow_bits(
+        &self,
+        allow: Option<Mask<'_>>,
+    ) -> Result<Option<crate::boolean_bits::Bits>, VectorError> {
+        self.check_allow(allow)?;
+        let (Some(ext_allow), Some(row_to_node)) = (allow, self.row_to_node_slice()) else {
+            return Ok(None);
+        };
+        if matches!(ext_allow, Mask::All(_)) {
+            return Ok(None);
+        }
+        let mut bits = crate::boolean_bits::Bits::empty(self.len());
+        let _ = ext_allow.try_for_each(|ext_row| {
+            bits.set(row_to_node[ext_row] as usize);
+            ControlFlow::<()>::Continue(())
+        });
+        Ok(Some(bits))
     }
 
     fn check_queries(&self, queries: &[f32]) -> Result<usize, VectorError> {
@@ -620,7 +818,8 @@ impl HnswIndex {
             scored,
             ..SearchStats::default()
         };
-        let hits = self.with_row_source(|rows| Self::report(survivors, query, rows, floor, k));
+        let n2r = self.node_to_row_slice();
+        let hits = self.with_row_source(|rows| Self::report(survivors, query, rows, floor, k, n2r));
         (hits, stats)
     }
 
@@ -725,7 +924,8 @@ impl HnswIndex {
             }
             _ => {}
         }
-        let hits = self.with_row_source(|rows| Self::report(hits, query, rows, floor, k));
+        let n2r = self.node_to_row_slice();
+        let hits = self.with_row_source(|rows| Self::report(hits, query, rows, floor, k, n2r));
         (
             hits,
             Answer {
@@ -755,8 +955,16 @@ impl HnswIndex {
             ));
         }
         let ef = beam.max(k).max(EF_FLOOR);
-        let plan = self.plan(ef, &options)?;
-        let floor = options.minimum_score.unwrap_or(f32::NEG_INFINITY);
+        let node_bits = self.node_allow_bits(options.allow)?;
+        let effective_options = match &node_bits {
+            Some(bits) => VectorSearchOptions {
+                allow: Some(Mask::Bits(bits)),
+                ..options
+            },
+            None => options,
+        };
+        let plan = self.plan(ef, &effective_options)?;
+        let floor = effective_options.minimum_score.unwrap_or(f32::NEG_INFINITY);
         Ok(with_scratch(|scratch| {
             self.answer(query, k, ef, floor, &plan, scratch)
         }))
@@ -878,7 +1086,8 @@ impl HnswIndex {
     fn row_bytes_into(&self, row: usize, out: &mut Vec<u8>) {
         match &self.backing {
             Backing::Heap(store) => {
-                for v in store.rows.row(row as u32) {
+                let node = self.row_to_node(row as u32);
+                for v in store.rows.row(node) {
                     out.extend_from_slice(&v.to_le_bytes());
                 }
             }
@@ -895,6 +1104,7 @@ impl HnswIndex {
 struct StreamHook<'a> {
     query_index: usize,
     query: &'a [f32],
+    node_to_row: Option<&'a [u32]>,
     floor: &'a mut f32,
     allow_early_finish: bool,
     hops: usize,
@@ -985,8 +1195,9 @@ impl Hook for StreamHook<'_> {
         }
         let score = crate::exact_vectors::dot(row, self.query);
         if score >= *self.floor {
+            let ext_row = self.node_to_row.map_or(node, |m| m[node as usize]);
             self.scores.push(score);
-            self.slots.push(i64::from(node));
+            self.slots.push(i64::from(ext_row));
             if self.scores.len() >= STREAM_BATCH_ROWS {
                 self.flush();
             }
@@ -1132,6 +1343,7 @@ impl VectorProvider for HnswIndex {
                 store.install_links(links);
             }
         }
+        self.reorder_local_in_place();
         Ok(())
     }
 
@@ -1142,7 +1354,41 @@ impl VectorProvider for HnswIndex {
                     let parallel = self.config.build_mode == BuildMode::Parallel
                         && store.n() >= PARALLEL_MIN_BATCH;
                     let links = store.build_links(parallel)?;
-                    image::write_with_links(store, Some(&links), &self.config, path)
+                    if self.config.locality_order != LocalityOrder::None {
+                        let (entry, top) = links.entry_state();
+                        let temp_view = graph::View {
+                            dim: store.dim,
+                            m: store.m,
+                            m0: store.m0,
+                            rows: store.rows.values(),
+                            inv_norm: &store.inv_norm,
+                            level: &links.level,
+                            upper_slot: &links.upper_slot,
+                            upper_base: &links.upper_base,
+                            links0: links.links0.as_slice(),
+                            upper: links.upper.as_slice(),
+                            entry,
+                            top,
+                            kernel: store.kernel,
+                        };
+                        let new_to_old =
+                            reorder::compute_locality_order(&temp_view, self.config.locality_order);
+                        let reordered =
+                            reorder::permute_store_with_links(store, &links, &new_to_old, true);
+                        image::write(&reordered, &self.config, path)
+                    } else {
+                        image::write_with_links(store, Some(&links), &self.config, path)
+                    }
+                } else if store.is_linked()
+                    && !store.is_reordered()
+                    && self.config.locality_order != LocalityOrder::None
+                {
+                    let links = store.links().expect("linked");
+                    let new_to_old =
+                        reorder::compute_locality_order(&store.view(), self.config.locality_order);
+                    let reordered =
+                        reorder::permute_store_with_links(store, links, &new_to_old, true);
+                    image::write(&reordered, &self.config, path)
                 } else {
                     image::write(store, &self.config, path)
                 }
@@ -1165,8 +1411,16 @@ impl VectorProvider for HnswIndex {
     ) -> Result<VectorSearchResults, VectorError> {
         let query_count = self.check_queries(queries)?;
         let ef = k.max(EF_FLOOR).max(options.candidate_depth.unwrap_or(0));
-        let plan = self.plan(ef, &options)?;
-        let floor = options.minimum_score.unwrap_or(f32::NEG_INFINITY);
+        let node_bits = self.node_allow_bits(options.allow)?;
+        let effective_options = match &node_bits {
+            Some(bits) => VectorSearchOptions {
+                allow: Some(Mask::Bits(bits)),
+                ..options
+            },
+            None => options,
+        };
+        let plan = self.plan(ef, &effective_options)?;
+        let floor = effective_options.minimum_score.unwrap_or(f32::NEG_INFINITY);
         let mut scores = Vec::with_capacity(query_count * k);
         let mut slots = Vec::with_capacity(query_count * k);
         let mut regimes = crate::vector::FilterRegimeCounts::default();
@@ -1243,9 +1497,18 @@ impl VectorProvider for HnswIndex {
         }
         let ef = depth.max(EF_FLOOR);
         let allow_early_finish = options.filter_regime != Some(FilterRegime::Enumerate);
-        let plan = self.plan(ef, &options)?;
+        let node_bits = self.node_allow_bits(options.allow)?;
+        let effective_options = match &node_bits {
+            Some(bits) => VectorSearchOptions {
+                allow: Some(Mask::Bits(bits)),
+                ..options
+            },
+            None => options,
+        };
+        let plan = self.plan(ef, &effective_options)?;
         let linked = self.is_graph_linked();
-        let mut floor = options.minimum_score.unwrap_or(f32::NEG_INFINITY);
+        let node_to_row = self.node_to_row_slice();
+        let mut floor = effective_options.minimum_score.unwrap_or(f32::NEG_INFINITY);
         let mut emitted = 0usize;
         let mut units = 0usize;
         let mut stopped = false;
@@ -1259,6 +1522,7 @@ impl VectorProvider for HnswIndex {
                 let mut hook = StreamHook {
                     query_index,
                     query,
+                    node_to_row,
                     floor: &mut floor,
                     allow_early_finish,
                     hops: 0,

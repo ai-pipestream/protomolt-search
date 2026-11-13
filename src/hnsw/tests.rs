@@ -102,6 +102,7 @@ fn config(mode: BuildMode) -> HnswConfig {
         ef_construction: 100,
         build_mode: mode,
         seed: 7,
+        locality_order: super::config::LocalityOrder::None,
     }
 }
 
@@ -125,6 +126,7 @@ fn config_round_trips_and_refuses_bad_configs() {
         ef_construction: 150,
         build_mode: BuildMode::FixedOrder,
         seed: 0xDEAD_BEEF,
+        locality_order: super::config::LocalityOrder::None,
     };
     let wire = config.backend_config().unwrap();
     assert_eq!(wire.backend_kind, HNSW);
@@ -151,6 +153,7 @@ fn config_round_trips_and_refuses_bad_configs() {
         ef_construction: 100,
         build_mode: 0,
         seed: 1,
+        locality_order: 0,
     };
     assert!(HnswConfig::from_proto(&unspecified)
         .unwrap_err()
@@ -164,6 +167,15 @@ fn config_round_trips_and_refuses_bad_configs() {
         .unwrap_err()
         .to_string()
         .contains("unknown build_mode 99"));
+    let unknown_locality = crate::pb::HnswConfig {
+        build_mode: 1,
+        locality_order: 99,
+        ..unspecified
+    };
+    assert!(HnswConfig::from_proto(&unknown_locality)
+        .unwrap_err()
+        .to_string()
+        .contains("unknown locality_order 99"));
 
     let other_format = VectorBackendConfig {
         config_format: "text/plain".into(),
@@ -214,6 +226,20 @@ fn config_round_trips_and_refuses_bad_configs() {
         })
     );
     assert_ne!(base, fingerprint(HnswConfig { seed: 1, ..config }));
+    assert_ne!(
+        base,
+        fingerprint(HnswConfig {
+            locality_order: super::config::LocalityOrder::Rcm,
+            ..config
+        })
+    );
+    assert_ne!(
+        base,
+        fingerprint(HnswConfig {
+            locality_order: super::config::LocalityOrder::RecursiveBisection,
+            ..config
+        })
+    );
     assert_ne!(
         base,
         HnswIndex::new(9, config)
@@ -3072,6 +3098,7 @@ fn forced_island_connectivity_repair_and_deleted_entry_tombstone_healing() {
         ef_construction: 80,
         seed: 0x7699,
         build_mode: BuildMode::FixedOrder,
+        locality_order: super::config::LocalityOrder::None,
     };
     let mut store = Store::new(
         dim,
@@ -3266,6 +3293,7 @@ fn tombstone_10pct_and_30pct_live_only_recall_and_transcript_identity() {
         ef_construction: 120,
         seed: 42,
         build_mode: BuildMode::FixedOrder,
+        locality_order: super::config::LocalityOrder::None,
     };
     let mut index = HnswIndex::new(dim, cfg).unwrap();
     index.add(&vectors, dim).unwrap();
@@ -3388,6 +3416,7 @@ fn join_set_merge_2_4_8_equal_and_skewed_segments_matches_rebuild_recall() {
         ef_construction: 120,
         seed: 101,
         build_mode: BuildMode::FixedOrder,
+        locality_order: super::config::LocalityOrder::None,
     };
 
     let mut rebuilt = HnswIndex::new(dim, cfg).unwrap();
@@ -3556,4 +3585,340 @@ fn join_set_merge_2_4_8_equal_and_skewed_segments_matches_rebuild_recall() {
     )
     .unwrap();
     assert!(!tiny.is_graph_linked());
+}
+
+#[test]
+fn locality_reordering_preserves_exact_identity_transcripts_regimes_and_refuses_bad_maps() {
+    use super::config::LocalityOrder;
+    use super::{MergeStrategy, SegmentMergeInput};
+    use crate::vector::{Mask, VectorProvider};
+
+    let dim = 64;
+    let n = 1_200usize;
+    let qn = 24usize;
+    let (vectors, queries) = corpus_with_queries(n, qn, dim, 0x9800_10CA);
+    let base_cfg = HnswConfig {
+        m: 12,
+        ef_construction: 96,
+        seed: 77,
+        build_mode: BuildMode::FixedOrder,
+        locality_order: LocalityOrder::None,
+    };
+    let mut base = HnswIndex::new(dim, base_cfg).unwrap();
+    base.add(&vectors, dim).unwrap();
+    base.prepare().unwrap();
+    assert!(!base.has_node_map());
+
+    let dir = temp_dir("locality-reorder");
+    let none_path = dir.join("none.hnsw");
+    base.write(&none_path).unwrap();
+    let none_bytes = std::fs::read(&none_path).unwrap();
+    let raw_top = u32::from_le_bytes(none_bytes[68..72].try_into().unwrap());
+    assert_eq!(
+        raw_top >> 8,
+        0,
+        "LocalityOrder::None must leave upper 24 bits of offset 68 zero"
+    );
+    let none_mapped = HnswIndex::load_mapped(&none_path).unwrap();
+    assert!(!none_mapped.has_node_map());
+
+    let none_metrics = none_mapped.locality_metrics();
+    let none_avg_pages: f64 = (0..qn)
+        .map(|qi| none_mapped.walk_row_4k_pages(&queries[qi * dim..(qi + 1) * dim], 48) as f64)
+        .sum::<f64>()
+        / qn as f64;
+
+    let mut base_tx = Vec::new();
+    none_mapped
+        .row_transcripts(0..n, &mut |r, b| base_tx.push((r, b.to_vec())))
+        .unwrap();
+
+    let sparse_mask: Vec<bool> = (0..n).map(|i| i % 25 == 3).collect();
+    let mid_mask: Vec<bool> = (0..n).map(|i| i % 5 == 1).collect();
+    let dense_mask: Vec<bool> = (0..n).map(|i| i % 3 != 0).collect();
+
+    for order in [LocalityOrder::Rcm, LocalityOrder::RecursiveBisection] {
+        // 1. Determinism across 1 vs 4 Rayon worker threads.
+        let pool1 = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let pool4 = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let (_, perm1) = pool1.install(|| base.permute_from_linked(order, true).unwrap());
+        let (local_heap, perm4) = pool4.install(|| base.permute_from_linked(order, true).unwrap());
+        assert_eq!(
+            perm1, perm4,
+            "{order:?} permutation must be thread-count deterministic"
+        );
+        assert!(local_heap.has_node_map());
+
+        // 2. Write + reload (both heap and mapped) for seal-local (`has_node_map = true`)
+        //    and compaction-global (`has_node_map = false`).
+        let local_path = dir.join(format!("{order:?}-local.hnsw"));
+        local_heap.write(&local_path).unwrap();
+        let local_loaded = HnswIndex::load(&local_path).unwrap();
+        let local_mapped = HnswIndex::load_mapped(&local_path).unwrap();
+        assert!(local_loaded.has_node_map() && local_mapped.has_node_map());
+        assert_eq!(local_mapped.config().locality_order, order);
+        assert_eq!(local_mapped.unreachable_from_entry(), 0);
+
+        let (global_heap, _) = base.permute_from_linked(order, false).unwrap();
+        assert!(!global_heap.has_node_map());
+        let global_path = dir.join(format!("{order:?}-global.hnsw"));
+        global_heap.write(&global_path).unwrap();
+        let global_mapped = HnswIndex::load_mapped(&global_path).unwrap();
+        assert!(!global_mapped.has_node_map());
+        assert_eq!(global_mapped.config().locality_order, order);
+        assert_eq!(global_mapped.unreachable_from_entry(), 0);
+
+        // Also verify `HnswIndex::write(&self)` on an unpermuted heap store configured
+        // with `order` produces byte-identical seal output without mutating `self`.
+        let mut seal_cfg = base_cfg;
+        seal_cfg.locality_order = order;
+        let mut unsealed = HnswIndex::new(dim, seal_cfg).unwrap();
+        unsealed.add(&vectors, dim).unwrap();
+        let seal_path = dir.join(format!("{order:?}-seal.hnsw"));
+        unsealed.write(&seal_path).unwrap();
+        assert!(
+            !unsealed.has_node_map(),
+            "write(&self) must not mutate shared frozen-tail store"
+        );
+        assert_eq!(
+            std::fs::read(&seal_path).unwrap(),
+            std::fs::read(&local_path).unwrap(),
+            "{order:?}: seal write(&self) must match permute_from_linked(true)"
+        );
+
+        // 3. Locality metrics improve strictly over random insertion order;
+        //    RecursiveBisection cuts across small-world shortcuts far more
+        //    deeply than FIFO breadth-first RCM.
+        let m = local_mapped.locality_metrics();
+        assert_eq!(m.edges, none_metrics.edges);
+        let gap_ratio = match order {
+            LocalityOrder::Rcm => 0.90,
+            LocalityOrder::RecursiveBisection => 0.65,
+            LocalityOrder::None => 1.0,
+        };
+        assert!(
+            m.mean_id_gap < none_metrics.mean_id_gap * gap_ratio,
+            "{order:?}: mean_id_gap {:.1} did not beat None {:.1} * {gap_ratio}",
+            m.mean_id_gap,
+            none_metrics.mean_id_gap
+        );
+        assert!(
+            m.same_4k_row_page_frac > none_metrics.same_4k_row_page_frac * 1.5,
+            "{order:?}: same_4k_row_page_frac {:.4} did not beat None {:.4}",
+            m.same_4k_row_page_frac,
+            none_metrics.same_4k_row_page_frac
+        );
+        let avg_pages: f64 = (0..qn)
+            .map(|qi| local_mapped.walk_row_4k_pages(&queries[qi * dim..(qi + 1) * dim], 48) as f64)
+            .sum::<f64>()
+            / qn as f64;
+        assert!(
+            avg_pages < none_avg_pages,
+            "{order:?}: avg 4KB pages {avg_pages:.2} did not beat None {none_avg_pages:.2}"
+        );
+
+        // 4. External row identity, transcripts, and search hits across all filter regimes
+        //    and streaming match `LocalityOrder::None` bit-for-bit!
+        for candidate in [&local_heap, &local_loaded, &local_mapped] {
+            assert_eq!(candidate.row_identity(), none_mapped.row_identity());
+            let mut tx = Vec::new();
+            candidate
+                .row_transcripts(0..n, &mut |r, b| tx.push((r, b.to_vec())))
+                .unwrap();
+            assert_eq!(tx, base_tx);
+
+            for mask_opt in [
+                None,
+                Some(sparse_mask.as_slice()),
+                Some(mid_mask.as_slice()),
+                Some(dense_mask.as_slice()),
+            ] {
+                let mut opts = VectorSearchOptions::new().with_candidate_depth(48);
+                if let Some(m) = mask_opt {
+                    opts = opts.with_mask(m);
+                }
+                let got = candidate.search(&queries, 10, opts).unwrap();
+                let want = none_mapped.search(&queries, 10, opts).unwrap();
+                assert_eq!(got.regimes, want.regimes, "{order:?} regimes");
+                for qi in 0..qn {
+                    assert_eq!(
+                        got.slots_for_query(qi),
+                        want.slots_for_query(qi),
+                        "{order:?} q={qi} slots"
+                    );
+                    let got_bits: Vec<u32> = got
+                        .scores_for_query(qi)
+                        .iter()
+                        .map(|s| s.to_bits())
+                        .collect();
+                    let want_bits: Vec<u32> = want
+                        .scores_for_query(qi)
+                        .iter()
+                        .map(|s| s.to_bits())
+                        .collect();
+                    assert_eq!(got_bits, want_bits, "{order:?} q={qi} scores");
+                }
+            }
+
+            // Floor-pruned streaming over `local_mapped`.
+            let q0 = &queries[..dim];
+            let mut got_stream = Vec::new();
+            let mut want_stream = Vec::new();
+            let s_got = candidate
+                .search_streaming_controlled(
+                    q0,
+                    VectorSearchOptions::new()
+                        .with_mask(&mid_mask)
+                        .with_candidate_depth(48),
+                    &mut |b| {
+                        for (&id, &sc) in b.slots.iter().zip(b.scores) {
+                            got_stream.push((id, sc.to_bits()));
+                        }
+                        VectorStreamControl::Continue
+                    },
+                    &mut || VectorStreamControl::Continue,
+                )
+                .unwrap();
+            let s_want = none_mapped
+                .search_streaming_controlled(
+                    q0,
+                    VectorSearchOptions::new()
+                        .with_mask(&mid_mask)
+                        .with_candidate_depth(48),
+                    &mut |b| {
+                        for (&id, &sc) in b.slots.iter().zip(b.scores) {
+                            want_stream.push((id, sc.to_bits()));
+                        }
+                        VectorStreamControl::Continue
+                    },
+                    &mut || VectorStreamControl::Continue,
+                )
+                .unwrap();
+            assert_eq!(s_got.emitted, s_want.emitted);
+            got_stream.sort_unstable();
+            want_stream.sort_unstable();
+            assert_eq!(got_stream, want_stream, "{order:?} streamed set");
+        }
+
+        // 5. Appending unlinked tail rows onto a locally-reordered heap index
+        //    unpermutes back to external order before appending.
+        let (mut extendable, _) = base.permute_from_linked(order, true).unwrap();
+        assert!(extendable.has_node_map());
+        let (extra_vecs, _) = corpus_with_queries(80, 1, dim, 0x98EE);
+        extendable.add(&extra_vecs, dim).unwrap();
+        assert!(!extendable.has_node_map());
+        assert!(!extendable.is_graph_linked());
+        extendable.prepare().unwrap();
+        assert!(extendable.has_node_map());
+        let mut combined = vectors.clone();
+        combined.extend_from_slice(&extra_vecs);
+        let mut ref_idx = HnswIndex::new(dim, base_cfg).unwrap();
+        ref_idx.add(&combined, dim).unwrap();
+        assert_eq!(extendable.row_identity(), ref_idx.row_identity());
+
+        // 6. `#76` heal_tombstones and `#99` merge_segments over locally-reordered
+        //    donor/source segments translate external masks & IDs accurately.
+        let live_flags: Vec<bool> = (0..n).map(|i| i % 4 != 2).collect();
+        let (healed, surv_ids, _) = local_mapped
+            .heal_tombstones(Mask::Bools(&live_flags))
+            .unwrap();
+        assert!(
+            !healed.has_node_map(),
+            "heal_tombstones produces global order"
+        );
+        assert_eq!(healed.unreachable_from_entry(), 0);
+        let mut expected_surv_vecs = Vec::new();
+        for &old_id in &surv_ids {
+            assert!(live_flags[old_id as usize]);
+            expected_surv_vecs
+                .extend_from_slice(&vectors[old_id as usize * dim..(old_id as usize + 1) * dim]);
+        }
+        let mut surv_ref = HnswIndex::new(dim, base_cfg).unwrap();
+        surv_ref.add(&expected_surv_vecs, dim).unwrap();
+        assert_eq!(healed.row_identity(), surv_ref.row_identity());
+
+        let half = n / 2;
+        let mut seg_a = HnswIndex::new(dim, seal_cfg).unwrap();
+        seg_a.add(&vectors[..half * dim], dim).unwrap();
+        let path_a = dir.join(format!("{order:?}-seg-a.hnsw"));
+        seg_a.write(&path_a).unwrap();
+        let map_a = HnswIndex::load_mapped(&path_a).unwrap();
+
+        let mut seg_b = HnswIndex::new(dim, seal_cfg).unwrap();
+        seg_b.add(&vectors[half * dim..], dim).unwrap();
+        let path_b = dir.join(format!("{order:?}-seg-b.hnsw"));
+        seg_b.write(&path_b).unwrap();
+        let map_b = HnswIndex::load_mapped(&path_b).unwrap();
+
+        let (merged, _) = HnswIndex::merge_segments(
+            dim,
+            seal_cfg,
+            &[
+                SegmentMergeInput {
+                    index: &map_a,
+                    live: None,
+                },
+                SegmentMergeInput {
+                    index: &map_b,
+                    live: None,
+                },
+            ],
+            &[],
+            MergeStrategy::JoinSet,
+        )
+        .unwrap();
+        assert!(merged.has_node_map());
+        assert_eq!(merged.unreachable_from_entry(), 0);
+        assert_eq!(merged.row_identity(), none_mapped.row_identity());
+    }
+
+    // 7. Hostile / corrupted node maps are rejected on both `load` and `load_mapped`.
+    let reseal = |b: &mut [u8]| {
+        let crc = crate::wal::crc32(&b[..136]);
+        b[136..140].copy_from_slice(&crc.to_le_bytes());
+        let end = b.len() - 32;
+        let digest = crate::sha256::digest(&b[..end]);
+        b[end..].copy_from_slice(&digest);
+    };
+    let good_local = std::fs::read(dir.join("Rcm-local.hnsw")).unwrap();
+    let parsed_hdr = super::image::load_mapped(&dir.join("Rcm-local.hnsw"), base.kernel()).unwrap();
+    let n2r_off = parsed_hdr.header().layout.node_to_row_off as usize;
+
+    // Case A: duplicate entry in `node_to_row` breaks bijection with `row_to_node`.
+    let mut dup_map = good_local.clone();
+    let row1 = u32::from_le_bytes(dup_map[n2r_off + 4..n2r_off + 8].try_into().unwrap());
+    dup_map[n2r_off..n2r_off + 4].copy_from_slice(&row1.to_le_bytes());
+    reseal(&mut dup_map);
+    let dup_path = dir.join("bad-dup-map.hnsw");
+    std::fs::write(&dup_path, &dup_map).unwrap();
+    assert!(HnswIndex::load(&dup_path).is_err());
+    assert!(HnswIndex::load_mapped(&dup_path).is_err());
+
+    // Case B: out-of-range row in `node_to_row`.
+    let mut oor_map = good_local.clone();
+    oor_map[n2r_off..n2r_off + 4].copy_from_slice(&(n as u32).to_le_bytes());
+    reseal(&mut oor_map);
+    let oor_path = dir.join("bad-oor-map.hnsw");
+    std::fs::write(&oor_path, &oor_map).unwrap();
+    assert!(HnswIndex::load(&oor_path).is_err());
+    assert!(HnswIndex::load_mapped(&oor_path).is_err());
+
+    // Case C: `has_node_map = 1` combined with `locality_order = None (0)` in header.
+    let mut bad_hdr = good_local;
+    let cur_top = u32::from_le_bytes(bad_hdr[68..72].try_into().unwrap()) & 0xFF;
+    let invalid_packed = cur_top | (1u32 << 16);
+    bad_hdr[68..72].copy_from_slice(&invalid_packed.to_le_bytes());
+    reseal(&mut bad_hdr);
+    let hdr_path = dir.join("bad-hdr-map.hnsw");
+    std::fs::write(&hdr_path, &bad_hdr).unwrap();
+    assert!(HnswIndex::load(&hdr_path).is_err());
+    assert!(HnswIndex::load_mapped(&hdr_path).is_err());
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

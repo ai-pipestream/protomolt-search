@@ -19,9 +19,10 @@ use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::atomic::AtomicU32;
 
-use super::config::{BuildMode, HnswConfig};
+use super::config::{BuildMode, HnswConfig, LocalityOrder};
 use super::distance::Kernel;
 use super::graph::{GraphLinks, LinkCells, Store, View, MAX_LEVEL, MAX_ROWS, NO_NODE};
+use super::reorder::NodeMap;
 use super::rows::{MappedRows, RowSource};
 use super::{HNSW, MAX_DIM};
 use crate::vector::VectorError;
@@ -47,6 +48,8 @@ pub struct Layout {
     pub upper_base_off: u64,
     pub links0_off: u64,
     pub upper_off: u64,
+    pub node_to_row_off: u64,
+    pub row_to_node_off: u64,
     pub total_len: u64,
 }
 
@@ -58,6 +61,7 @@ impl Layout {
         upper_nodes: u64,
         upper_cells: u64,
         linked: bool,
+        has_node_map: bool,
     ) -> Result<Self, VectorError> {
         let overflow = || VectorError::new(format!("{HNSW} image layout overflows"));
         let mut at = HEADER_LEN as u64;
@@ -85,6 +89,9 @@ impl Layout {
             .ok_or_else(overflow)?;
         let links0_off = place(links0_cells.checked_mul(4).ok_or_else(overflow)?)?;
         let upper_off = place(upper_cells.checked_mul(4).ok_or_else(overflow)?)?;
+        let map_n = if has_node_map { n } else { 0 };
+        let node_to_row_off = place(map_n.checked_mul(4).ok_or_else(overflow)?)?;
+        let row_to_node_off = place(map_n.checked_mul(4).ok_or_else(overflow)?)?;
         let total_len = align(at)
             .and_then(|x| x.checked_add(TRAILER_LEN as u64))
             .ok_or_else(overflow)?;
@@ -96,6 +103,8 @@ impl Layout {
             upper_base_off,
             links0_off,
             upper_off,
+            node_to_row_off,
+            row_to_node_off,
             total_len,
         })
     }
@@ -111,6 +120,7 @@ pub struct Header {
     pub upper_cells: usize,
     pub entry: u32,
     pub top: u8,
+    pub has_node_map: bool,
     pub layout: Layout,
 }
 
@@ -129,7 +139,10 @@ impl Header {
         put_u64(&mut h, 48, self.upper_nodes as u64);
         put_u64(&mut h, 56, self.upper_cells as u64);
         put_u32(&mut h, 64, self.entry);
-        put_u32(&mut h, 68, u32::from(self.top));
+        let packed_top = u32::from(self.top)
+            | (u32::from(self.config.locality_order.as_u8()) << 8)
+            | (u32::from(self.has_node_map) << 16);
+        put_u32(&mut h, 68, packed_top);
         let l = &self.layout;
         for (i, off) in [
             l.rows_off,
@@ -188,11 +201,30 @@ impl Header {
                 "names dimension {dim}; the limit is {MAX_DIM}"
             )));
         }
+        let raw_top = get_u32(h, 68);
+        if (raw_top >> 24) != 0 {
+            return Err(bad(format!(
+                "declares unknown header flags {raw_top:#010x} at offset 68"
+            )));
+        }
+        let top = raw_top & 0xFF;
+        let locality_order = LocalityOrder::from_u8(((raw_top >> 8) & 0xFF) as u8)?;
+        let map_flag = ((raw_top >> 16) & 0xFF) as u8;
+        if map_flag > 1 {
+            return Err(bad(format!("declares invalid node-map flag {map_flag}")));
+        }
+        let has_node_map = map_flag == 1;
+        if has_node_map && locality_order == LocalityOrder::None {
+            return Err(bad(
+                "declares a node map while locality_order is none".into()
+            ));
+        }
         let config = HnswConfig {
             m: get_u32(h, 20),
             ef_construction: get_u32(h, 24),
             build_mode: BuildMode::from_u32(get_u32(h, 28))?,
             seed: get_u64(h, 32),
+            locality_order,
         };
         config.validate()?;
         let n = get_u64(h, 40);
@@ -218,15 +250,14 @@ impl Header {
             )));
         }
         let entry = get_u32(h, 64);
-        let top = get_u32(h, 68);
         let linked = entry != NO_NODE;
-        if n == 0 && (linked || top != 0) {
+        if n == 0 && (linked || top != 0 || has_node_map) {
             return Err(bad("is empty but names an entry point".into()));
         }
         if !linked {
-            if top != 0 || upper_nodes != 0 || upper_cells != 0 {
+            if top != 0 || upper_nodes != 0 || upper_cells != 0 || has_node_map {
                 return Err(bad(format!(
-                    "is unlinked (entry = NO_NODE) but declares top={top}, upper_nodes={upper_nodes}, upper_cells={upper_cells}"
+                    "is unlinked (entry = NO_NODE) but declares top={top}, upper_nodes={upper_nodes}, upper_cells={upper_cells}, has_node_map={has_node_map}"
                 )));
             }
         } else if u64::from(entry) >= n || top > u32::from(MAX_LEVEL) {
@@ -241,18 +272,29 @@ impl Header {
             upper_nodes,
             upper_cells,
             linked,
+            has_node_map,
         )?;
-        let stored = Layout {
-            rows_off: get_u64(h, 72),
-            inv_norm_off: get_u64(h, 80),
-            level_off: get_u64(h, 88),
-            upper_slot_off: get_u64(h, 96),
-            upper_base_off: get_u64(h, 104),
-            links0_off: get_u64(h, 112),
-            upper_off: get_u64(h, 120),
-            total_len: get_u64(h, 128),
-        };
-        if stored != layout {
+        let stored = (
+            get_u64(h, 72),
+            get_u64(h, 80),
+            get_u64(h, 88),
+            get_u64(h, 96),
+            get_u64(h, 104),
+            get_u64(h, 112),
+            get_u64(h, 120),
+            get_u64(h, 128),
+        );
+        let expected = (
+            layout.rows_off,
+            layout.inv_norm_off,
+            layout.level_off,
+            layout.upper_slot_off,
+            layout.upper_base_off,
+            layout.links0_off,
+            layout.upper_off,
+            layout.total_len,
+        );
+        if stored != expected {
             return Err(bad(
                 "stores section offsets that do not follow from its counts".into(),
             ));
@@ -268,6 +310,7 @@ impl Header {
             upper_cells: upper_cells as usize,
             entry,
             top: top as u8,
+            has_node_map,
             layout,
         })
     }
@@ -320,6 +363,11 @@ pub fn write_with_links(
         None => (NO_NODE, 0, 0, 0),
     };
     let n = store.n();
+    let node_map = if active.is_some() && config.locality_order != LocalityOrder::None {
+        store.node_map()
+    } else {
+        None
+    };
     let layout = Layout::compute(
         n as u64,
         store.dim as u64,
@@ -327,6 +375,7 @@ pub fn write_with_links(
         upper_nodes as u64,
         upper_cells as u64,
         active.is_some(),
+        node_map.is_some(),
     )?;
     let header = Header {
         dim: store.dim,
@@ -336,6 +385,7 @@ pub fn write_with_links(
         upper_cells,
         entry,
         top,
+        has_node_map: node_map.is_some(),
         layout,
     };
     let file = File::create(path).map_err(io)?;
@@ -373,6 +423,12 @@ pub fn write_with_links(
         write_cells(&mut out, &links.links0).map_err(io)?;
         pad_to(&mut out, layout.upper_off)?;
         write_cells(&mut out, &links.upper).map_err(io)?;
+    }
+    if let Some(map) = node_map {
+        pad_to(&mut out, layout.node_to_row_off)?;
+        write_u32s(&mut out, &map.node_to_row).map_err(io)?;
+        pad_to(&mut out, layout.row_to_node_off)?;
+        write_u32s(&mut out, &map.row_to_node).map_err(io)?;
     }
     pad_to(&mut out, layout.total_len - TRAILER_LEN as u64)?;
     let digest = out.sha.clone().finalize();
@@ -481,6 +537,18 @@ pub fn load_heap(path: &Path, kernel: Kernel) -> Result<(Store, HnswConfig), Vec
     let upper_base = u32s_from(section(&bytes, l.upper_base_off, header.upper_nodes * 4));
     let links0 = u32s_from(section(&bytes, l.links0_off, graph_n * (2 * m + 1) * 4));
     let upper = u32s_from(section(&bytes, l.upper_off, header.upper_cells * 4));
+    let node_map = if header.has_node_map {
+        let node_to_row = u32s_from(section(&bytes, l.node_to_row_off, n * 4));
+        let row_to_node = u32s_from(section(&bytes, l.row_to_node_off, n * 4));
+        validate_node_map(&node_to_row, &row_to_node, n)
+            .map_err(|e| VectorError::new(format!("load {}: {e}", path.display())))?;
+        Some(NodeMap {
+            node_to_row,
+            row_to_node,
+        })
+    } else {
+        None
+    };
     drop(bytes);
     let view = View {
         dim: header.dim,
@@ -499,7 +567,7 @@ pub fn load_heap(path: &Path, kernel: Kernel) -> Result<(Store, HnswConfig), Vec
     };
     validate_structure(&view, &header)
         .map_err(|e| VectorError::new(format!("load {}: {e}", path.display())))?;
-    let store = Store::from_parts(
+    let mut store = Store::from_parts(
         header.dim,
         m,
         header.config.ef_construction as usize,
@@ -514,6 +582,10 @@ pub fn load_heap(path: &Path, kernel: Kernel) -> Result<(Store, HnswConfig), Vec
         upper.into_iter().map(AtomicU32::new).collect(),
         header.entry,
         header.top,
+    );
+    store.set_reorder_state(
+        header.entry != NO_NODE && header.config.locality_order != LocalityOrder::None,
+        node_map,
     );
     Ok((store, header.config))
 }
@@ -539,10 +611,25 @@ impl Mapped {
         self.map.len()
     }
 
-    /// The row bytes of `row`, as stored.
+    #[inline]
+    pub fn node_to_row(&self) -> Option<&[u32]> {
+        let h = &self.header;
+        h.has_node_map
+            .then(|| u32s_view(section(&self.map, h.layout.node_to_row_off, h.n * 4)))
+    }
+
+    #[inline]
+    pub fn row_to_node(&self) -> Option<&[u32]> {
+        let h = &self.header;
+        h.has_node_map
+            .then(|| u32s_view(section(&self.map, h.layout.row_to_node_off, h.n * 4)))
+    }
+
+    /// The row bytes of external `row`, as stored.
     pub fn row_bytes(&self, row: usize) -> &[u8] {
+        let node = self.row_to_node().map_or(row, |m| m[row] as usize);
         let stride = self.header.dim * 4;
-        let at = self.header.layout.rows_off as usize + row * stride;
+        let at = self.header.layout.rows_off as usize + node * stride;
         &self.map[at..at + stride]
     }
 
@@ -577,6 +664,57 @@ impl Mapped {
             kernel: self.kernel,
         }
     }
+
+    #[cfg(unix)]
+    pub fn advise_cold(&self) -> Result<(), VectorError> {
+        if self.map.is_empty() {
+            return Ok(());
+        }
+        // SAFETY: `self.map` is a valid immutable file-backed memory map of
+        // length `self.map.len()` aligned to the OS page size.
+        let ptr = self.map.as_ptr() as *mut libc::c_void;
+        let len = self.map.len();
+        for (name, advice) in [
+            ("MADV_RANDOM", libc::MADV_RANDOM),
+            ("MADV_DONTNEED", libc::MADV_DONTNEED),
+        ] {
+            let rc = unsafe { libc::madvise(ptr, len, advice) };
+            if rc != 0 {
+                return Err(VectorError::new(format!(
+                    "{HNSW} madvise({name}): {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    pub fn advise_cold(&self) -> Result<(), VectorError> {
+        Ok(())
+    }
+}
+
+/// Evict clean kernel page-cache pages for `path` (`POSIX_FADV_DONTNEED`).
+#[cfg(target_os = "linux")]
+pub fn drop_file_page_cache(path: &Path) -> Result<(), VectorError> {
+    use std::os::fd::AsRawFd;
+    let file = File::open(path)
+        .map_err(|e| VectorError::new(format!("open {} for fadvise: {e}", path.display())))?;
+    // SAFETY: `file` is an open file descriptor owned for the duration of the call.
+    let rc = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+    if rc != 0 {
+        return Err(VectorError::new(format!(
+            "posix_fadvise(DONTNEED) on {} returned {rc}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn drop_file_page_cache(_path: &Path) -> Result<(), VectorError> {
+    Ok(())
 }
 
 /// Map an image and check it; rows and links are then read from the map.
@@ -608,9 +746,39 @@ pub fn load_mapped(path: &Path, kernel: Kernel) -> Result<Mapped, VectorError> {
         header,
         kernel,
     };
+    if let (Some(n2r), Some(r2n)) = (mapped.node_to_row(), mapped.row_to_node()) {
+        validate_node_map(n2r, r2n, mapped.header.n)
+            .map_err(|e| VectorError::new(format!("map {}: {e}", path.display())))?;
+    }
     validate_structure(&mapped.view(), &mapped.header)
         .map_err(|e| VectorError::new(format!("map {}: {e}", path.display())))?;
     Ok(mapped)
+}
+
+fn validate_node_map(
+    node_to_row: &[u32],
+    row_to_node: &[u32],
+    n: usize,
+) -> Result<(), VectorError> {
+    let bad = |what: String| VectorError::new(format!("{HNSW} image {what}"));
+    if node_to_row.len() != n || row_to_node.len() != n {
+        return Err(bad("node-map sections disagree with the row count".into()));
+    }
+    for (node, &row_u32) in node_to_row.iter().enumerate() {
+        let row = row_u32 as usize;
+        if row >= n {
+            return Err(bad(format!(
+                "node_to_row[{node}] names row {row} over {n} rows"
+            )));
+        }
+        if row_to_node[row] != node as u32 {
+            return Err(bad(format!(
+                "node_to_row[{node}]={row} disagrees with row_to_node[{row}]={}",
+                row_to_node[row]
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Check the decoded arrays against each other: levels, the compact upper

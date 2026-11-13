@@ -37,6 +37,7 @@ use std::sync::{Mutex, MutexGuard};
 use crate::vector::{Mask, VectorError};
 
 use super::distance::{prefetch, Kernel};
+use super::reorder::{unpermute_rows_in_place, NodeMap};
 use super::rows::{OwnedRows, RowSource};
 use super::HNSW;
 
@@ -1388,6 +1389,8 @@ pub struct Store {
     pub rows: OwnedRows,
     pub inv_norm: Vec<f32>,
     links: Option<GraphLinks>,
+    reordered: bool,
+    node_map: Option<NodeMap>,
 }
 
 /// The level of `node` under `seed`: a geometric draw with the paper's
@@ -1421,6 +1424,8 @@ impl Store {
             rows: OwnedRows::new(dim),
             inv_norm: Vec::new(),
             links: None,
+            reordered: false,
+            node_map: None,
         }
     }
 
@@ -1472,6 +1477,25 @@ impl Store {
         self.links.as_ref()
     }
 
+    #[inline]
+    pub fn is_reordered(&self) -> bool {
+        self.reordered
+    }
+
+    #[inline]
+    pub fn node_map(&self) -> Option<&NodeMap> {
+        self.node_map.as_ref()
+    }
+
+    pub(super) fn take_node_map(&mut self) -> Option<NodeMap> {
+        self.node_map.take()
+    }
+
+    pub(super) fn set_reorder_state(&mut self, reordered: bool, node_map: Option<NodeMap>) {
+        self.reordered = reordered;
+        self.node_map = node_map;
+    }
+
     pub fn entry_state(&self) -> (u32, u8) {
         self.links
             .as_ref()
@@ -1481,6 +1505,7 @@ impl Store {
     pub fn heap_bytes(&self) -> usize {
         (self.rows.values().len() + self.inv_norm.len()) * 4
             + self.links.as_ref().map_or(0, GraphLinks::heap_bytes)
+            + self.node_map.as_ref().map_or(0, NodeMap::heap_bytes)
     }
 
     pub fn view(&self) -> View<'_, [AtomicU32]> {
@@ -1539,6 +1564,7 @@ impl Store {
             return Ok(());
         }
         self.links = None;
+        unpermute_rows_in_place(self);
         self.rows.reserve(vectors.len());
         self.inv_norm.reserve(count);
         for row in vectors.chunks_exact(self.dim) {

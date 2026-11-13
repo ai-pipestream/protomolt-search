@@ -1416,6 +1416,7 @@ async fn floor_prune_multi_shard_prunes_cold_shard_handles_underfilled_and_dedup
         ef_construction: 64,
         build_mode: BuildMode::FixedOrder,
         seed: 0x7200,
+        ..HnswConfig::default()
     };
     let backend_cfg = shared_cfg.backend_config().unwrap();
 
