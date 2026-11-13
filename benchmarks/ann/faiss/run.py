@@ -9,16 +9,14 @@ grid as the Rust runner, and writes a results file in the same
 Timing:
 - Latency percentiles always come from one query per call on one OpenMP
   thread.
-- Throughput for unfiltered cells and shared (uncorrelated) filters uses
-  FAISS's batch search: one OpenMP thread for the one-core figure, all
-  threads for the all-cores figure. The shared mask is built once per
-  batch, so the batch is charged the per-query mask cost measured on the
-  latency pass (divided by the thread count), as the Rust runner builds one
-  mask per query inside its timed region.
-- Per-query (correlated) filters cannot share one selector, so throughput
-  is one query per call: sequential for one core, and for all cores one
-  forked worker process per core (the per-query mask is numpy work under
-  the GIL, so threads would measure the GIL, not FAISS).
+- Throughput for unfiltered cells uses FAISS's batch search: one OpenMP
+  thread for the one-core figure, all threads for the all-cores figure.
+- Filtered cells, shared (uncorrelated) masks included, are timed one query
+  per call with the mask built inside the timed region, as the Rust runner
+  does: sequential for one core, and for all cores one forked worker process
+  per core (the mask is numpy work under the GIL, so threads would measure
+  the GIL, not FAISS). A shared mask is still rebuilt per query, so every
+  filtered QPS is a measurement, never a modelled mask charge.
 - The filter is FAISS's native IDSelectorBitmap, built from the column
   postings inside the timed region, as the Rust engines do.
 
@@ -167,7 +165,7 @@ def _worker(tid):
         shape.search(queries[q % qn : q % qn + 1], k, ef, bits_for(q % qn))
         local += 1
         q += threads
-    return local
+    return local, time.perf_counter() - start
 
 
 def mask_bits(postings, column, values, n):
@@ -215,23 +213,15 @@ def measure(shape, queries, postings, filt, truth, k, ef, min_time, threads):
         done += 1
     per_query_one_core = done / (time.perf_counter() - t0)
 
-    batch = per_query is None
-    # A batched search builds a shared mask once for every query, while the
-    # Rust runner (and the per-query path below) builds one per query inside
-    # the timed region. Charge the batch the per-query mask cost measured
-    # above, spread over the threads as the Rust runner's threads build
-    # theirs in parallel, so filtered cells compare like for like.
-    mask_s = pred / done if column is not None else 0.0
-    if batch:
+    if column is None:
         def run_batch(nthreads):
             faiss.omp_set_num_threads(nthreads)
             count = 0
             start = time.perf_counter()
             while count == 0 or time.perf_counter() - start < min_time:
-                shape.search(queries, k, ef, bits_for(0))
+                shape.search(queries, k, ef, None)
                 count += qn
-            elapsed = time.perf_counter() - start
-            return count / (elapsed + count * mask_s / nthreads)
+            return count / (time.perf_counter() - start)
 
         qps_one = run_batch(1)
         qps_all = run_batch(threads)
@@ -245,10 +235,9 @@ def measure(shape, queries, postings, filt, truth, k, ef, min_time, threads):
         global _STATE
         _STATE = (shape, queries, bits_for, k, ef, min_time, threads, qn)
         ctx = multiprocessing.get_context("fork")
-        start = time.perf_counter()
+        # Each worker times its own loop, so pool start-up is not charged.
         with ctx.Pool(threads) as pool:
-            total = sum(pool.map(_worker, range(threads)))
-        qps_all = total / (time.perf_counter() - start)
+            qps_all = sum(n / s for n, s in pool.map(_worker, range(threads)))
         timing = "per-query"
     lat.sort()
     pct = lambda f: lat[int(round((len(lat) - 1) * f))]
