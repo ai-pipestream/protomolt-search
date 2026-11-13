@@ -47,8 +47,9 @@ def ints(s):
 
 def load(dirpath):
     m = json.load(open(os.path.join(dirpath, "manifest.json")))
-    assert m["format"] == "protomolt-ann-fixture-v1", m["format"]
-    n, d, qn, kt = m["rows"], m["dim"], m["queries"], m["k_truth"]
+    if m["format"] != "protomolt-ann-fixture-v2":
+        sys.exit(f"faiss: {dirpath} is a {m['format']} fixture, not protomolt-ann-fixture-v2; rebuild it")
+    n, d, qn, kt, kt_none = m["rows"], m["dim"], m["queries"], m["k_truth"], m["k_truth_none"]
     base = np.fromfile(os.path.join(dirpath, "base.f32"), dtype="<f4").reshape(n, d)
     queries = np.fromfile(os.path.join(dirpath, "queries.f32"), dtype="<f4").reshape(qn, d)
     bucket = np.fromfile(os.path.join(dirpath, "bucket.u8"), dtype=np.uint8)
@@ -58,7 +59,7 @@ def load(dirpath):
         "cell": [np.flatnonzero(cell == v) for v in range(m["cells"])],
     }
     filters = [("none", None, None, None)]
-    truth = {"none": np.fromfile(os.path.join(dirpath, "truth/none.u32"), dtype="<u4").reshape(qn, kt)}
+    truth = {"none": np.fromfile(os.path.join(dirpath, "truth/none.u32"), dtype="<u4").reshape(qn, kt_none)}
     for f in m["filters"]:
         body = json.load(open(os.path.join(dirpath, "filters", f["name"] + ".json")))
         shared = body.get("shared")
@@ -293,6 +294,12 @@ def main():
     only = [f for f in a.filters.split(",") if f]
     if only:
         filters = [f for f in filters if f[0] in only]
+    # Recall at a k deeper than the truth cannot be judged; refuse it.
+    for filt in filters:
+        depth = truth[filt[0]].shape[1]
+        for k in ints(a.k):
+            if k > depth:
+                sys.exit(f"faiss: k={k} exceeds the fixture's truth depth {depth} for {filt[0]}")
     report = {
         "format": FORMAT,
         "fixture": {

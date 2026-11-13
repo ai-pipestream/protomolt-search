@@ -1,8 +1,9 @@
 //! In-process engines behind one seam. Every engine indexes a contiguous
-//! run of fixture rows (a whole fixture, or one segment of it) and returns
-//! `(local row, similarity)` best first, where similarity is the inner
-//! product (or a monotone function of the engine's own distance on unit
-//! vectors, mapped back to the inner product) so segment results merge.
+//! run of rows (a whole fixture, one segment of it, or one shard's rows
+//! gathered into their own copy) and returns `(local row, similarity)` best
+//! first, where similarity is the inner product (or a monotone function of
+//! the engine's own distance on unit vectors, mapped back to the inner
+//! product) so segment and shard results merge.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU32, Ordering};

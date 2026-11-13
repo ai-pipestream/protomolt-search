@@ -4,7 +4,11 @@
 //!
 //! The expected cells come from a checked-in matrix file (`gates/*.json`):
 //! fixture, shape, filter, k, recall target, cores, and the baselines each
-//! cell requires. A gate verdict is evidence only when it is complete:
+//! cell requires. A block with `"shape": "sharded"` also lists shard
+//! counts, placements and floor settings, and names one group per
+//! combination (`sharded:<shards>:<placement>:floor-<off|on>`), the shape a
+//! sharded result file records. A gate verdict is evidence only when it is
+//! complete:
 //!
 //! - Every engine is compared at its best Pareto point: the highest QPS of
 //!   any build and breadth whose mean recall reaches the target.
@@ -124,54 +128,8 @@ fn parse_matrix(matrix: &Value) -> Result<Matrix, Error> {
         let shape = block["shape"]
             .as_str()
             .ok_or("matrix: a cell block needs a shape")?;
-        let group = format!("{fixture} | {shape}");
-        let baselines = strings(&block["baselines"], "baselines")?;
-        let no_baseline_expected = match &block["no_baseline_expected"] {
-            Value::Null => false,
-            Value::Bool(b) => *b,
-            _ => return Err("matrix: no_baseline_expected must be true or false".into()),
-        };
-        let ks = block["k"]
-            .as_array()
-            .filter(|k| !k.is_empty())
-            .ok_or("matrix: k must be a non-empty list")?;
-        let recalls = block["recall"]
-            .as_array()
-            .filter(|r| !r.is_empty())
-            .ok_or("matrix: recall must be a non-empty list")?;
-        for filter in strings(&block["filters"], "filters")? {
-            for k in ks {
-                let k = k.as_u64().ok_or("matrix: k must hold integers")?;
-                for recall in recalls {
-                    let recall = recall.as_f64().ok_or("matrix: recall must hold numbers")?;
-                    let target = TARGETS
-                        .iter()
-                        .position(|t| (t - recall).abs() < 1e-9)
-                        .ok_or_else(|| {
-                            format!("matrix: recall {recall} is not a measured target {TARGETS:?}")
-                        })?;
-                    for cores in strings(&block["cores"], "cores")? {
-                        let mode = CORES.iter().position(|c| *c == cores).ok_or_else(|| {
-                            format!("matrix: cores {cores:?} must be one of {CORES:?}")
-                        })?;
-                        if !seen.insert((group.clone(), filter.clone(), k, target, mode)) {
-                            return Err(format!(
-                                "matrix: cell {group} / {filter} / k={k} / recall {recall} / cores {cores} is listed twice"
-                            )
-                            .into());
-                        }
-                        cells.push(Expected {
-                            group: group.clone(),
-                            filter: filter.clone(),
-                            k,
-                            target,
-                            mode,
-                            baselines: baselines.clone(),
-                            no_baseline_expected,
-                        });
-                    }
-                }
-            }
+        for group in block_groups(fixture, shape, block)? {
+            parse_block(block, group, &mut cells, &mut seen)?;
         }
     }
     let candidate = text("candidate")?;
@@ -185,6 +143,137 @@ fn parse_matrix(matrix: &Value) -> Result<Matrix, Error> {
         margin_provisional,
         cells,
     })
+}
+
+/// The shape name a sharded result file records, and the group a sharded
+/// matrix block expands to: `sharded:<shards>:<placement>:floor-<off|on>`.
+pub fn sharded_shape_name(shards: usize, placement: &str, floor: bool) -> String {
+    format!(
+        "sharded:{shards}:{placement}:floor-{}",
+        if floor { "on" } else { "off" }
+    )
+}
+
+const SHARD_KEYS: [&str; 3] = ["shards", "placements", "floor"];
+const PLACEMENTS: [&str; 2] = ["hash", "skewed"];
+
+/// The groups (fixture | shape) a block names. A `"shape": "sharded"` block
+/// names every combination of its `shards`, `placements` and `floor` lists;
+/// any other shape names itself and must not carry those keys.
+fn block_groups(fixture: &str, shape: &str, block: &Value) -> Result<Vec<String>, Error> {
+    if shape != "sharded" {
+        if shape.starts_with("sharded") {
+            return Err(format!(
+                "matrix: shape {shape:?}: name sharded cells with \"shape\": \"sharded\" and its shards, placements and floor lists"
+            )
+            .into());
+        }
+        if let Some(key) = SHARD_KEYS.iter().find(|k| !block[**k].is_null()) {
+            return Err(
+                format!("matrix: {key} belongs to a sharded block, not shape {shape:?}").into(),
+            );
+        }
+        return Ok(vec![format!("{fixture} | {shape}")]);
+    }
+    let shards = block["shards"]
+        .as_array()
+        .filter(|s| !s.is_empty())
+        .ok_or("matrix: a sharded block needs a non-empty shards list")?
+        .iter()
+        .map(|s| {
+            s.as_u64()
+                .filter(|n| *n >= 2)
+                .map(|n| n as usize)
+                .ok_or_else(|| Error::from("matrix: shards must hold integers of at least 2"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let placements = strings(&block["placements"], "placements")?;
+    if let Some(bad) = placements
+        .iter()
+        .find(|p| !PLACEMENTS.contains(&p.as_str()))
+    {
+        return Err(format!("matrix: placement {bad:?} must be one of {PLACEMENTS:?}").into());
+    }
+    let floors = strings(&block["floor"], "floor")?
+        .iter()
+        .map(|f| match f.as_str() {
+            "off" => Ok(false),
+            "on" => Ok(true),
+            other => Err(Error::from(format!(
+                "matrix: floor {other:?} must be \"off\" or \"on\""
+            ))),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut groups = Vec::new();
+    for &n in &shards {
+        for placement in &placements {
+            for &floor in &floors {
+                groups.push(format!(
+                    "{fixture} | {}",
+                    sharded_shape_name(n, placement, floor)
+                ));
+            }
+        }
+    }
+    Ok(groups)
+}
+
+/// The expected cells of one block for one group.
+fn parse_block(
+    block: &Value,
+    group: String,
+    cells: &mut Vec<Expected>,
+    seen: &mut BTreeSet<(String, String, u64, usize, usize)>,
+) -> Result<(), Error> {
+    let baselines = strings(&block["baselines"], "baselines")?;
+    let no_baseline_expected = match &block["no_baseline_expected"] {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        _ => return Err("matrix: no_baseline_expected must be true or false".into()),
+    };
+    let ks = block["k"]
+        .as_array()
+        .filter(|k| !k.is_empty())
+        .ok_or("matrix: k must be a non-empty list")?;
+    let recalls = block["recall"]
+        .as_array()
+        .filter(|r| !r.is_empty())
+        .ok_or("matrix: recall must be a non-empty list")?;
+    for filter in strings(&block["filters"], "filters")? {
+        for k in ks {
+            let k = k.as_u64().ok_or("matrix: k must hold integers")?;
+            for recall in recalls {
+                let recall = recall.as_f64().ok_or("matrix: recall must hold numbers")?;
+                let target = TARGETS
+                    .iter()
+                    .position(|t| (t - recall).abs() < 1e-9)
+                    .ok_or_else(|| {
+                        format!("matrix: recall {recall} is not a measured target {TARGETS:?}")
+                    })?;
+                for cores in strings(&block["cores"], "cores")? {
+                    let mode = CORES.iter().position(|c| *c == cores).ok_or_else(|| {
+                        format!("matrix: cores {cores:?} must be one of {CORES:?}")
+                    })?;
+                    if !seen.insert((group.clone(), filter.clone(), k, target, mode)) {
+                        return Err(format!(
+                                "matrix: cell {group} / {filter} / k={k} / recall {recall} / cores {cores} is listed twice"
+                            )
+                            .into());
+                    }
+                    cells.push(Expected {
+                        group: group.clone(),
+                        filter: filter.clone(),
+                        k,
+                        target,
+                        mode,
+                        baselines: baselines.clone(),
+                        no_baseline_expected,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn normal_arch(arch: &str) -> &str {
@@ -780,9 +869,18 @@ fn judge(
             }
         }
 
+        // The smallest unfiltered k the group measured: 10 for the single
+        // and segmented shapes, 100 for the sharded shape.
+        let build_k = engines
+            .values()
+            .flat_map(|e| e.keys())
+            .filter(|(filter, _)| filter == "none")
+            .map(|(_, k)| *k)
+            .min()
+            .unwrap_or(10);
         writeln!(
             md,
-            "\n### Build cost (best unfiltered k=10 recall 0.95 one-core point)\n"
+            "\n### Build cost (best unfiltered k={build_k} recall 0.95 one-core point)\n"
         )?;
         writeln!(
             md,
@@ -791,7 +889,7 @@ fn judge(
         writeln!(md, "| --- | --- | ---: | ---: | ---: | ---: |")?;
         for (name, cellmap) in engines {
             let Some(b) = cellmap
-                .get(&("none".to_string(), 10))
+                .get(&("none".to_string(), build_k))
                 .and_then(|b| b[slot(0, 0)].clone())
             else {
                 continue;
@@ -819,10 +917,11 @@ fn judge(
     writeln!(md, "\n## Not yet measurable\n")?;
     writeln!(
         md,
-        "These #53 cells need provider features and harness cells that land with #60, #72, #73 and #76; no \
-         matrix lists them until they can run:\n\n\
-         - Collaborative floor (K = 100, 1,000 and 10,000, floor on/off, segmented and sharded) and the Lucene \
-           collaborative-floor row (apache/lucene#16958 sandbox build).\n\
+        "These #53 cells need provider features and harness cells that land with #72, #73 and #76:\n\n\
+         - Floor-on cells. `gates/floor.json` lists the sharded cells at k = 100, 1,000 and 10,000 with the \
+           floor off and on; the floor-on cells stay incomplete until the shared floor exists (#72) and the \
+           Lucene runner drives the shared-floor code of apache/lucene PR #16357 (for apache/lucene \
+           issue #16958).\n\
          - Collapse cells (`collapse_parents`, D = 10 and 100, parent table on/off) on the court fixture.\n\
          - Seeded-entry cells (own top / local skeleton descent / coordinator-seeded entry).\n\
          - Tombstone cells (10% and 30% deleted rows).\n"
@@ -956,19 +1055,175 @@ mod tests {
 
     /// One result file: engines as (name, cells).
     fn report(host: &str, digest: &str, engines: &[(&str, &Cells)]) -> Value {
+        report_at(host, digest, "single", 10, engines)
+    }
+
+    /// One result file of a shape, every cell at one k.
+    fn report_at(
+        host: &str,
+        digest: &str,
+        shape: &str,
+        k: u64,
+        engines: &[(&str, &Cells)],
+    ) -> Value {
         json!({
             "fixture": { "name": "fx", "base_sha256": digest, "filters": [] },
-            "shape": "single",
+            "shape": shape,
             "host": { "name": host, "cpu": "cpu", "arch": "x86_64", "threads": 32, "kernel": "6.1" },
             "harness": { "commit": "abc", "started_at": 1 },
             "engines": engines.iter().map(|(name, cells)| json!({
                 "engine": name,
                 "builds": [{ "params": {}, "cells": cells.iter().map(|(filter, recall, qps)| json!({
-                    "filter": filter, "k": 10,
+                    "filter": filter, "k": k,
                     "points": [{ "recall_mean": recall, "qps_one_core": qps, "qps_all_cores": qps, "ef": 64 }],
                 })).collect::<Vec<_>>() }],
             })).collect::<Vec<_>>(),
         })
+    }
+
+    /// A sharded matrix: one block for floor off, one for floor on, as
+    /// gates/floor.json lists them.
+    fn floor_matrix() -> Value {
+        json!({
+            "format": MATRIX_FORMAT, "name": "floor", "candidate": "hnsw",
+            "unfiltered_margin": 0.2, "unfiltered_margin_provisional": false,
+            "cells": [
+                {
+                    "fixture": "fx", "shape": "sharded", "shards": [4], "placements": ["hash", "skewed"],
+                    "floor": ["off"], "filters": ["none"], "k": [1000], "recall": [0.95], "cores": ["1"],
+                    "baselines": ["lucene-hnsw", "lucene-hnsw-16357"],
+                },
+                {
+                    "fixture": "fx", "shape": "sharded", "shards": [4], "placements": ["hash", "skewed"],
+                    "floor": ["on"], "filters": ["none"], "k": [1000], "recall": [0.95], "cores": ["1"],
+                    "baselines": ["lucene-hnsw-16357"],
+                },
+            ],
+        })
+    }
+
+    /// Floor-off results for both placements at k = 1,000: ours and both
+    /// Lucene builds.
+    fn floor_off_reports() -> Vec<(String, Value)> {
+        let mut out = Vec::new();
+        for placement in ["hash", "skewed"] {
+            let shape = sharded_shape_name(4, placement, false);
+            out.push((
+                format!("ours-{placement}.json"),
+                report_at("krick", "d1", &shape, 1000, &[("hnsw", FAST)]),
+            ));
+            out.push((
+                format!("lucene-{placement}.json"),
+                report_at(
+                    "krick",
+                    "d1",
+                    &shape,
+                    1000,
+                    &[("lucene-hnsw", BOTH), ("lucene-hnsw-16357", BOTH)],
+                ),
+            ));
+        }
+        out
+    }
+
+    #[test]
+    fn a_sharded_block_names_one_group_per_shard_count_placement_and_floor() {
+        let m = parse_matrix(&floor_matrix()).unwrap();
+        let groups: BTreeSet<&str> = m.cells.iter().map(|c| c.group.as_str()).collect();
+        assert_eq!(
+            groups,
+            BTreeSet::from([
+                "fx | sharded:4:hash:floor-off",
+                "fx | sharded:4:hash:floor-on",
+                "fx | sharded:4:skewed:floor-off",
+                "fx | sharded:4:skewed:floor-on",
+            ])
+        );
+        assert!(m.cells.iter().all(|c| c.k == 1000));
+    }
+
+    #[test]
+    fn floor_on_cells_without_a_floor_measurement_are_incomplete() {
+        let pass = calibration("PASS");
+        let out = judge(&floor_matrix(), &floor_off_reports(), Some(&pass)).unwrap();
+        assert_eq!(out.overall, "INCOMPLETE");
+        assert_eq!(out.json["cells"]["pass"], 2);
+        assert_eq!(out.json["cells"]["incomplete"], 2);
+        for v in out.json["verdicts"].as_array().unwrap() {
+            let group = v["group"].as_str().unwrap();
+            let verdict = v["verdict"].as_str().unwrap();
+            if group.ends_with("floor-on") {
+                assert_eq!(verdict, "INCOMPLETE (candidate not measured)", "{group}");
+            } else {
+                assert_eq!(verdict, "PASS", "{group}");
+            }
+        }
+        // A floor-off result at another k does not fill the k = 1,000 cell.
+        let mut reports = floor_off_reports();
+        reports[0].1 = report_at(
+            "krick",
+            "d1",
+            &sharded_shape_name(4, "hash", false),
+            100,
+            &[("hnsw", FAST)],
+        );
+        let out = judge(&floor_matrix(), &reports, Some(&pass)).unwrap();
+        assert_eq!(out.json["cells"]["incomplete"], 3);
+        // The #16357 build missing from a floor-off cell is incomplete too.
+        let mut reports = floor_off_reports();
+        reports[1].1 = report_at(
+            "krick",
+            "d1",
+            &sharded_shape_name(4, "hash", false),
+            1000,
+            &[("lucene-hnsw", BOTH)],
+        );
+        let out = judge(&floor_matrix(), &reports, Some(&pass)).unwrap();
+        assert!(out
+            .md
+            .contains("INCOMPLETE (not measured: lucene-hnsw-16357)"));
+    }
+
+    #[test]
+    fn the_checked_in_matrices_parse_and_floor_lists_every_sharded_cell() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("gates");
+        for name in ["core-unfiltered", "filtered", "replacement", "floor"] {
+            let m = read_json(&dir.join(format!("{name}.json"))).unwrap();
+            parse_matrix(&m).unwrap_or_else(|e| panic!("gates/{name}.json: {e}"));
+        }
+        // 2 fixtures x 2 shard counts x 2 placements x floor off and on x
+        // k 100, 1,000, 10,000 x 2 recall targets x 2 core modes.
+        let floor = read_json(&dir.join("floor.json")).unwrap();
+        let m = parse_matrix(&floor).unwrap();
+        assert_eq!(m.cells.len(), 192);
+        let on = m
+            .cells
+            .iter()
+            .filter(|c| c.group.ends_with("floor-on"))
+            .count();
+        assert_eq!(on, 96);
+        assert!(m.cells.iter().all(|c| [100, 1000, 10000].contains(&c.k)));
+    }
+
+    #[test]
+    fn a_malformed_sharded_block_is_refused() {
+        for (pointer, value) in [
+            ("/cells/0/shards", json!([1])),
+            ("/cells/0/shards", json!([])),
+            ("/cells/0/placements", json!(["random"])),
+            ("/cells/0/floor", json!(["maybe"])),
+            ("/cells/0/floor", Value::Null),
+            ("/cells/0/shape", json!("sharded:4:hash:floor-off")),
+            ("/cells/0/shape", json!("single")),
+        ] {
+            let mut m = floor_matrix();
+            *m.pointer_mut(pointer).unwrap() = value;
+            assert!(parse_matrix(&m).is_err(), "{pointer}");
+        }
+        // The same cell listed by two blocks is refused.
+        let mut m = floor_matrix();
+        m["cells"][1]["floor"] = json!(["off"]);
+        assert!(parse_matrix(&m).is_err());
     }
 
     fn calibration(verdict: &str) -> Value {
