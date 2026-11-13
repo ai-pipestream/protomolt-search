@@ -12,7 +12,10 @@
 //! bucket.u8            rows; a hash of the row id mod 100 (uncorrelated filters)
 //! cell.u16             rows; the row's k-means cell (correlated filters)
 //! filters/<name>.json  {"column", "shared"|"per_query": allowed values}
+//! truth/none.u32       queries x k_truth_none exact FP32 top rows, unfiltered
 //! truth/<name>.u32     queries x k_truth exact FP32 top rows under the filter
+//! placements/<placement>-<shards>.u16
+//!                      rows; the shard each row lives on in the sharded shape
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -20,11 +23,12 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 use crate::util::{
-    arg, dot, normalize, par_map, read_f32, read_json, read_u32, write_f32, write_json, write_u32,
-    Bitset, Error, TopK,
+    arg, dot, list_usize, normalize, par_map, read_f32, read_json, read_u32, write_f32, write_json,
+    write_u32, Bitset, Error, TopK,
 };
 
-pub const FORMAT: &str = "protomolt-ann-fixture-v1";
+pub const FORMAT: &str = "protomolt-ann-fixture-v2";
+pub const PLACEMENTS: [&str; 2] = ["hash", "skewed"];
 pub const SELECTIVITIES: [usize; 3] = [50, 10, 1];
 pub const SETS: [&str; 3] = ["uncorrelated", "near", "far"];
 
@@ -198,12 +202,68 @@ pub fn synthetic(rows: usize, dim: usize, queries: usize) -> Rows {
     }
 }
 
-/// splitmix64 of the row id mod 100: a column uncorrelated with the vectors.
-pub fn bucket(row: u64) -> u8 {
+/// splitmix64 of the row id: a hash uncorrelated with the vectors.
+pub fn row_hash(row: u64) -> u64 {
     let mut h = row.wrapping_add(0x9E37_79B9_7F4A_7C15);
     h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     h = (h ^ (h >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    ((h ^ (h >> 31)) % 100) as u8
+    h ^ (h >> 31)
+}
+
+/// The row hash mod 100: a column uncorrelated with the vectors.
+pub fn bucket(row: u64) -> u8 {
+    (row_hash(row) % 100) as u8
+}
+
+/// Hash placement: the row hash mod the shard count, so every shard holds a
+/// uniform sample of the rows and a query's true neighbors spread evenly.
+/// The bucket column is not reused because 100 buckets do not divide evenly
+/// over every shard count (16 shards would get 7 or 6 buckets).
+pub fn hash_placement(rows: usize, shards: usize) -> Vec<u16> {
+    (0..rows as u64)
+        .map(|r| (row_hash(r) % shards as u64) as u16)
+        .collect()
+}
+
+/// Skewed placement: whole k-means cells per shard. Cells are taken in cell
+/// id order and a shard is closed once it holds its share of the rows not
+/// yet placed (those rows over the shards still open), so shard sizes stay
+/// close while every cell, and with it most of a query's true neighbors,
+/// lives on one shard. Refuses a split that leaves a shard empty (fewer
+/// populated cells than shards).
+pub fn skewed_placement(cell: &[u16], cells: usize, shards: usize) -> Result<Vec<u16>, Error> {
+    let mut sizes = vec![0usize; cells];
+    for c in cell {
+        sizes[*c as usize] += 1;
+    }
+    let mut target = cell.len().div_ceil(shards);
+    let mut shard_of_cell = vec![0u16; cells];
+    let mut shard = 0usize;
+    let mut held = vec![0usize; shards];
+    let mut placed = 0usize;
+    for (c, size) in sizes.iter().enumerate() {
+        shard_of_cell[c] = shard as u16;
+        held[shard] += size;
+        placed += size;
+        if held[shard] >= target && shard + 1 < shards {
+            shard += 1;
+            // The rows still to place, spread over the shards still open,
+            // so the last shard is not left with a remainder.
+            target = (cell.len() - placed).div_ceil(shards - shard);
+        }
+    }
+    if let Some(empty) = held.iter().position(|h| *h == 0) {
+        return Err(format!(
+            "skewed placement over {shards} shards leaves shard {empty} empty ({cells} cells)"
+        )
+        .into());
+    }
+    Ok(cell.iter().map(|c| shard_of_cell[*c as usize]).collect())
+}
+
+/// The placement file of a shard count, as `ann_bench fixture` writes it.
+pub fn placement_name(placement: &str, shards: usize) -> String {
+    format!("{placement}-{shards}")
 }
 
 struct Rng(u64);
@@ -408,10 +468,13 @@ pub struct Fixture {
     pub dir: PathBuf,
     pub manifest: Value,
     pub rows: Rows,
+    /// Truth depth of every filter cell.
     pub k_truth: usize,
+    /// Truth depth unfiltered, deep enough for the sharded shape's large k.
+    pub k_truth_none: usize,
     /// "none" first, then every filter cell.
     pub filters: Vec<Filter>,
-    /// Truth per entry of `filter_names()`: queries x k_truth.
+    /// Truth per entry of `filter_names()`: queries x `truth_depth(filter)`.
     pub truth: Vec<Vec<u32>>,
     pub index: ColumnIndex,
 }
@@ -423,12 +486,54 @@ impl Fixture {
             .collect()
     }
 
+    /// How many exact top rows the truth holds per query for a filter
+    /// (index 0 is unfiltered). A recall at a larger k cannot be judged.
+    pub fn truth_depth(&self, filter: usize) -> usize {
+        if filter == 0 {
+            self.k_truth_none
+        } else {
+            self.k_truth
+        }
+    }
+
     pub fn truth_for(&self, filter: usize, query: usize) -> &[u32] {
-        &self.truth[filter][query * self.k_truth..(query + 1) * self.k_truth]
+        let depth = self.truth_depth(filter);
+        &self.truth[filter][query * depth..(query + 1) * depth]
     }
 
     pub fn name(&self) -> String {
         self.manifest["name"].as_str().unwrap_or("").to_string()
+    }
+
+    /// The shard of every row under a placement the fixture wrote. Refuses
+    /// a placement or shard count the fixture was not built with.
+    pub fn placement(&self, placement: &str, shards: usize) -> Result<Vec<u16>, Error> {
+        let name = placement_name(placement, shards);
+        let listed = self.manifest["placements"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|p| p["name"] == name.as_str());
+        if !listed {
+            return Err(format!(
+                "{}: no placement {name}; rebuild the fixture with --shard-counts listing {shards}",
+                self.dir.display()
+            )
+            .into());
+        }
+        let bytes = std::fs::read(self.dir.join(format!("placements/{name}.u16")))?;
+        let shard: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        if shard.len() != self.rows.rows() || shard.iter().any(|s| *s as usize >= shards) {
+            return Err(format!(
+                "{}: placements/{name}.u16 does not hold one shard below {shards} per row",
+                self.dir.display()
+            )
+            .into());
+        }
+        Ok(shard)
     }
 }
 
@@ -459,6 +564,23 @@ pub fn build_command() -> Result<(), Error> {
     let default_cells = if n >= 500_000 { 400 } else { 200 };
     let cells: usize = arg("cells", &default_cells.to_string()).parse()?;
     let k_truth: usize = arg("k-truth", "100").parse()?;
+    let k_truth_none: usize = arg("k-truth-none", "10000").parse()?;
+    if k_truth == 0 || k_truth_none < k_truth {
+        return Err(format!(
+            "--k-truth={k_truth} must be at least 1 and --k-truth-none={k_truth_none} at least --k-truth"
+        )
+        .into());
+    }
+    if k_truth_none > n {
+        return Err(format!("--k-truth-none={k_truth_none} exceeds the fixture's {n} rows").into());
+    }
+    let shard_counts = list_usize("shard-counts", "4,16")?;
+    if let Some(bad) = shard_counts
+        .iter()
+        .find(|s| **s < 2 || **s > u16::MAX as usize)
+    {
+        return Err(format!("--shard-counts: {bad} is not a shard count of at least 2").into());
+    }
     let name = arg("name", &format!("{}-{}x{}", rows.source, n, rows.dim));
     eprintln!(
         "fixture: {} ({n} rows, {} queries)",
@@ -478,7 +600,7 @@ pub fn build_command() -> Result<(), Error> {
     // Unfiltered truth first: correlated filters are defined from it.
     let qn = rows.query_count();
     let unfiltered: Vec<Vec<(u32, f32)>> = par_map(qn, threads, |q| {
-        exact_top(&rows, rows.query(q), k_truth.max(100), None)
+        exact_top(&rows, rows.query(q), k_truth_none.max(100), None)
     });
 
     let mut filters = Vec::new();
@@ -567,9 +689,9 @@ pub fn build_command() -> Result<(), Error> {
 
     std::fs::create_dir_all(out.join("filters"))?;
     std::fs::create_dir_all(out.join("truth"))?;
-    let mut truth_none = Vec::with_capacity(qn * k_truth);
+    let mut truth_none = Vec::with_capacity(qn * k_truth_none);
     for hits in &unfiltered {
-        truth_none.extend(hits.iter().take(k_truth).map(|(r, _)| *r));
+        truth_none.extend(hits.iter().take(k_truth_none).map(|(r, _)| *r));
     }
     write_u32(&out.join("truth/none.u32"), &truth_none)?;
 
@@ -612,6 +734,27 @@ pub fn build_command() -> Result<(), Error> {
     std::fs::write(out.join("bucket.u8"), &bucket)?;
     let cell_bytes: Vec<u8> = cell.iter().flat_map(|c| c.to_le_bytes()).collect();
     std::fs::write(out.join("cell.u16"), cell_bytes)?;
+    std::fs::create_dir_all(out.join("placements"))?;
+    let mut placements = Vec::new();
+    for &shards in &shard_counts {
+        for placement in PLACEMENTS {
+            let shard = match placement {
+                "hash" => hash_placement(n, shards),
+                _ => skewed_placement(&cell, cells, shards)?,
+            };
+            let name = placement_name(placement, shards);
+            let mut rows_per_shard = vec![0usize; shards];
+            for s in &shard {
+                rows_per_shard[*s as usize] += 1;
+            }
+            let bytes: Vec<u8> = shard.iter().flat_map(|s| s.to_le_bytes()).collect();
+            std::fs::write(out.join(format!("placements/{name}.u16")), bytes)?;
+            placements.push(json!({
+                "name": name, "placement": placement, "shards": shards,
+                "rows_per_shard": rows_per_shard,
+            }));
+        }
+    }
     let base_bytes: Vec<u8> = rows.base.iter().flat_map(|v| v.to_le_bytes()).collect();
     let manifest = json!({
         "format": FORMAT,
@@ -624,12 +767,16 @@ pub fn build_command() -> Result<(), Error> {
         "metric": "inner product over unit vectors (equivalently L2)",
         "cells": cells,
         "k_truth": k_truth,
+        "k_truth_none": k_truth_none,
         "base_sha256": pipestream_search::sha256::hex_digest(&base_bytes),
         "filters": filter_meta,
         "masks": "uncorrelated: bucket in 0..p (bucket = splitmix64(row) mod 100). \
                   near: the k-means cell holding most of the query's unfiltered top-10, then cells by \
                   centroid similarity to the query until p% of rows. far: cells holding none of the \
                   query's unfiltered top-100, in a seeded random order, until p% of rows.",
+        "placements": placements,
+        "placement_rules": "hash: splitmix64(row) mod shards. skewed: whole k-means cells in cell id \
+                  order, a shard closed once it holds its share of the rows not yet placed.",
     });
     write_json(&out.join("manifest.json"), &manifest)?;
     eprintln!("fixture: wrote {}", out.display());
@@ -640,10 +787,18 @@ pub fn build_command() -> Result<(), Error> {
 pub fn load(dir: &Path) -> Result<Fixture, Error> {
     let manifest = read_json(&dir.join("manifest.json"))?;
     if manifest["format"] != FORMAT {
-        return Err(format!("{}: not a {FORMAT} fixture", dir.display()).into());
+        return Err(format!(
+            "{}: not a {FORMAT} fixture (format {}); rebuild it with ann_bench fixture",
+            dir.display(),
+            manifest["format"]
+        )
+        .into());
     }
     let dim = manifest["dim"].as_u64().ok_or("manifest dim")? as usize;
     let k_truth = manifest["k_truth"].as_u64().ok_or("manifest k_truth")? as usize;
+    let k_truth_none = manifest["k_truth_none"]
+        .as_u64()
+        .ok_or("manifest k_truth_none")? as usize;
     let cells = manifest["cells"].as_u64().ok_or("manifest cells")? as usize;
     let base = read_f32(&dir.join("base.f32"))?;
     let queries = read_f32(&dir.join("queries.f32"))?;
@@ -708,13 +863,60 @@ pub fn load(dir: &Path) -> Result<Fixture, Error> {
         truth.push(read_u32(&dir.join(format!("truth/{name}.u32")))?);
     }
     let index = ColumnIndex::new(&bucket, &cell, cells);
-    Ok(Fixture {
+    let fixture = Fixture {
         dir: dir.to_path_buf(),
         manifest,
         rows,
         k_truth,
+        k_truth_none,
         filters,
         truth,
         index,
-    })
+    };
+    let queries = fixture.rows.query_count();
+    for (filter, name) in fixture.filter_names().iter().enumerate() {
+        let want = queries * fixture.truth_depth(filter);
+        if fixture.truth[filter].len() != want {
+            return Err(format!(
+                "{}: truth/{name}.u32 holds {} rows, the manifest implies {want}",
+                dir.display(),
+                fixture.truth[filter].len()
+            )
+            .into());
+        }
+    }
+    Ok(fixture)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hash_placement_is_fixed_and_fills_every_shard() {
+        let shard = hash_placement(10_000, 16);
+        assert_eq!(shard, hash_placement(10_000, 16));
+        let mut sizes = [0usize; 16];
+        for s in &shard {
+            sizes[*s as usize] += 1;
+        }
+        // A uniform hash puts 625 rows on each shard; allow a wide band.
+        assert!(sizes.iter().all(|s| (500..750).contains(s)), "{sizes:?}");
+    }
+
+    #[test]
+    fn skewed_placement_keeps_whole_cells_and_closes_shards_by_size() {
+        // Six cells of 10 rows, rows interleaved by cell.
+        let cell: Vec<u16> = (0..60u16).map(|r| r % 6).collect();
+        let shard = skewed_placement(&cell, 6, 3).unwrap();
+        for (row, s) in shard.iter().enumerate() {
+            let c = cell[row];
+            assert_eq!(*s, shard[c as usize], "cell {c} split across shards");
+        }
+        // Target 20 rows per shard: cells 0-1, 2-3, 4-5.
+        assert_eq!(&shard[..6], &[0, 0, 1, 1, 2, 2]);
+        // Two cells cannot fill three shards.
+        let two: Vec<u16> = (0..20u16).map(|r| r % 2).collect();
+        assert!(skewed_placement(&two, 2, 3).is_err());
+    }
 }
