@@ -396,7 +396,7 @@ Who selects which:
 | caller | routing | how |
 |---|---|---|
 | the provider API | either | `VectorSearchOptions::with_filter_routing` |
-| explicit `ANN` through the product | speed | the default; a request field for exact is not built yet |
+| explicit `ANN` through the product | speed | the default; a request field for exact is #124 |
 | `AUTO` at a policy point | exact up to the point's threshold | the point's `enumerate_max_rows` is served as measured: every mask at or under it enumerates |
 | `EXACT` through the product | exhaustive | not a graph walk at all |
 | the harness | either | `--hnsw-routing=speed` (default) or `--hnsw-routing=exact` |
