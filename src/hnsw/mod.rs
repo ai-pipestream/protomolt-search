@@ -33,6 +33,7 @@ pub mod config;
 pub mod distance;
 pub mod graph;
 pub mod image;
+pub mod merge;
 pub mod rows;
 #[cfg(test)]
 mod tests;
@@ -43,6 +44,7 @@ use std::path::Path;
 pub use config::{BuildMode, HnswConfig, CONFIG_FORMAT};
 pub use distance::Kernel;
 pub use graph::SearchStats;
+pub use merge::{MergeStats, MergeStrategy, SegmentMergeInput, JOIN_DOMINATION_K};
 pub use rows::{RowSource, RowSourceIdentity};
 
 use crate::vector::{
@@ -324,6 +326,47 @@ impl HnswIndex {
     /// provider's own rows (#71): dimension, row count, content digest.
     pub fn row_identity(&self) -> RowSourceIdentity {
         self.with_row_source(|rows| rows.identity())
+    }
+
+    /// Compact this index to the rows allowed by `live`, healing broken edges
+    /// across deleted neighbors via 2-hop surviving bridges (`#76`) and
+    /// verifying/repairing directed layer-0 reachability from `entry` (`#99`).
+    /// Returns `(compacted_index, survivor_old_ids, stats)`.
+    pub fn heal_tombstones(
+        &self,
+        live: Mask<'_>,
+    ) -> Result<(Self, Vec<u32>, MergeStats), VectorError> {
+        merge::heal_tombstones(self, live)
+    }
+
+    /// Merge `segments` (each filtered by its optional `live` mask) plus
+    /// optional `unlinked_vectors` into one dense [`HnswIndex`] using
+    /// `strategy` (`#76`, `#99`).
+    pub fn merge_segments(
+        dim: usize,
+        config: HnswConfig,
+        segments: &[SegmentMergeInput<'_>],
+        unlinked_vectors: &[f32],
+        strategy: MergeStrategy,
+    ) -> Result<(Self, MergeStats), VectorError> {
+        merge::merge_segments(dim, config, segments, unlinked_vectors, strategy)
+    }
+
+    /// Count nodes in `0..self.len()` that are not forward-reachable from
+    /// `entry` via directed layer-0 edges (`0` when unlinked or fully
+    /// connected).
+    pub fn unreachable_from_entry(&self) -> usize {
+        merge::unreachable_from_entry(self)
+    }
+
+    pub(crate) fn merge_ordered(
+        dim: usize,
+        config: HnswConfig,
+        sources: &[&Self],
+        rows: &[merge::OrderedMergeRow<'_>],
+        strategy: MergeStrategy,
+    ) -> Result<(Self, MergeStats), VectorError> {
+        merge::merge_ordered(dim, config, sources, rows, strategy)
     }
 
     /// Rescore the walk's results with the scalar scorer, drop those below
@@ -1036,6 +1079,10 @@ impl VectorProvider for HnswIndex {
             Backing::Heap(store) => store.is_linked(),
             Backing::Mapped(mapped) => mapped.header().entry != graph::NO_NODE,
         }
+    }
+
+    fn as_hnsw(&self) -> Option<&HnswIndex> {
+        Some(self)
     }
 
     /// Append rows and their reciprocal norms to the unlinked heap store

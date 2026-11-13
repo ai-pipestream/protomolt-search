@@ -123,16 +123,16 @@ pub struct SearchStats {
 pub struct Scratch {
     visited: Vec<u32>,
     epoch: u32,
-    cand: BinaryHeap<Scored>,
-    res: BinaryHeap<Reverse<Scored>>,
-    nbrs: Vec<u32>,
-    pool: Vec<Scored>,
-    sel: Vec<u32>,
+    pub(super) cand: BinaryHeap<Scored>,
+    pub(super) res: BinaryHeap<Reverse<Scored>>,
+    pub(super) nbrs: Vec<u32>,
+    pub(super) pool: Vec<Scored>,
+    pub(super) sel: Vec<u32>,
     /// Filter-aware walk: the disallowed neighbors of the node being
     /// expanded, the allowed rows about to be scored, and every allowed row
     /// scored at layer 0 (so a handoff to enumerate never scores them twice).
-    routes: Vec<u32>,
-    fresh: Vec<u32>,
+    pub(super) routes: Vec<u32>,
+    pub(super) fresh: Vec<u32>,
     scored_allowed: Vec<Scored>,
     /// Patience early-stop scratch: nodes inserted into the tracked window
     /// during the current hop, and the optional `top_k` (`< ef`) min-heap.
@@ -141,7 +141,7 @@ pub struct Scratch {
 }
 
 impl Scratch {
-    fn begin(&mut self, n: usize) {
+    pub(super) fn begin(&mut self, n: usize) {
         if self.visited.len() < n {
             self.visited.resize(n, 0);
         }
@@ -159,7 +159,7 @@ impl Scratch {
 
     /// Mark `node` visited; true when it was not.
     #[inline]
-    fn visit(&mut self, node: u32) -> bool {
+    pub(super) fn visit(&mut self, node: u32) -> bool {
         let slot = &mut self.visited[node as usize];
         if *slot == self.epoch {
             false
@@ -184,7 +184,7 @@ impl Scratch {
     }
 
     /// The results, best first.
-    fn drain_results(&mut self) -> Vec<Scored> {
+    pub(super) fn drain_results(&mut self) -> Vec<Scored> {
         let mut out: Vec<Scored> = self.res.drain().map(|r| r.0).collect();
         out.sort_unstable_by(|a, b| b.cmp(a));
         out
@@ -415,7 +415,7 @@ impl Default for Locks {
 }
 
 impl Locks {
-    fn lock(&self, node: u32) -> MutexGuard<'_, ()> {
+    pub(super) fn lock(&self, node: u32) -> MutexGuard<'_, ()> {
         let guard = self.0[node as usize % LOCK_STRIPES].lock();
         guard.unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -456,7 +456,7 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
     }
 
     #[inline]
-    fn cap(&self, layer: usize) -> usize {
+    pub(super) fn cap(&self, layer: usize) -> usize {
         if layer == 0 {
             self.m0
         } else {
@@ -475,7 +475,7 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
 
     /// Where `node`'s list at `layer` starts (its count cell).
     #[inline]
-    fn list_start(&self, node: u32, layer: usize) -> usize {
+    pub(super) fn list_start(&self, node: u32, layer: usize) -> usize {
         if layer == 0 {
             node as usize * (self.m0 + 1)
         } else {
@@ -487,7 +487,13 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
     /// Copy `node`'s neighbors at `layer` into `out`, under the node's lock
     /// when a build is running.
     #[inline]
-    fn copy_links(&self, node: u32, layer: usize, locks: Option<&Locks>, out: &mut Vec<u32>) {
+    pub(super) fn copy_links(
+        &self,
+        node: u32,
+        layer: usize,
+        locks: Option<&Locks>,
+        out: &mut Vec<u32>,
+    ) {
         let start = self.list_start(node, layer);
         let cells = self.cells(layer);
         let _guard = locks.map(|l| l.lock(node));
@@ -507,7 +513,7 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
     /// call per [`SCORE_CHUNK_NODES`] slice, and deliver `(node, score)` in
     /// `nodes` order.
     #[inline]
-    fn for_each_scored(&self, q: &[f32], nodes: &[u32], mut f: impl FnMut(u32, f32)) {
+    pub(super) fn for_each_scored(&self, q: &[f32], nodes: &[u32], mut f: impl FnMut(u32, f32)) {
         let lines = self.prefetch_lines();
         let mut scores = [0.0f32; SCORE_CHUNK_NODES];
         for chunk in nodes.chunks(SCORE_CHUNK_NODES) {
@@ -571,7 +577,7 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
     /// nodes only) in `scratch.res`. Disallowed nodes route: they enter the
     /// candidate heap and are expanded, but never the results.
     #[allow(clippy::too_many_arguments)]
-    fn search_layer<H: Hook>(
+    pub(super) fn search_layer<H: Hook>(
         &self,
         q: &[f32],
         entries: &[Scored],
@@ -1249,7 +1255,13 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
     /// inner products by the other row's `1/|row|` only. With unit rows this
     /// is the paper's test on inner products; with rows of different
     /// lengths a long row cannot crowd out its neighbors just by being long.
-    fn select(&self, base_inv_norm: f32, pool: &[Scored], cap: usize, sel: &mut Vec<u32>) {
+    pub(super) fn select(
+        &self,
+        base_inv_norm: f32,
+        pool: &[Scored],
+        cap: usize,
+        sel: &mut Vec<u32>,
+    ) {
         sel.clear();
         let lines = self.prefetch_lines();
         for (idx, c) in pool.iter().enumerate() {
@@ -1351,7 +1363,7 @@ impl GraphLinks {
         unpack_entry(self.entry.load(Atomic::Acquire))
     }
 
-    fn publish_entry(&self, node: u32, top: u8) {
+    pub(super) fn publish_entry(&self, node: u32, top: u8) {
         self.entry.store(pack_entry(node, top), Atomic::Release);
     }
 
@@ -1372,7 +1384,7 @@ pub struct Store {
     pub seed: u64,
     pub ef_construction: usize,
     pub kernel: Kernel,
-    level_mult: f64,
+    pub(super) level_mult: f64,
     pub rows: OwnedRows,
     pub inv_norm: Vec<f32>,
     links: Option<GraphLinks>,
@@ -1614,19 +1626,32 @@ impl Store {
     }
 }
 
-struct LinkBuilder<'a> {
-    dim: usize,
-    m: usize,
-    m0: usize,
-    ef_construction: usize,
-    kernel: Kernel,
-    rows: &'a [f32],
-    inv_norm: &'a [f32],
-    links: &'a GraphLinks,
+pub(super) struct LinkBuilder<'a> {
+    pub(super) dim: usize,
+    pub(super) m: usize,
+    pub(super) m0: usize,
+    pub(super) ef_construction: usize,
+    pub(super) kernel: Kernel,
+    pub(super) rows: &'a [f32],
+    pub(super) inv_norm: &'a [f32],
+    pub(super) links: &'a GraphLinks,
 }
 
-impl LinkBuilder<'_> {
-    fn view(&self) -> View<'_, [AtomicU32]> {
+impl<'a> LinkBuilder<'a> {
+    pub(super) fn new(store: &'a Store, links: &'a GraphLinks) -> Self {
+        Self {
+            dim: store.dim,
+            m: store.m,
+            m0: store.m0,
+            ef_construction: store.ef_construction,
+            kernel: store.kernel,
+            rows: store.rows.values(),
+            inv_norm: &store.inv_norm,
+            links,
+        }
+    }
+
+    pub(super) fn view(&self) -> View<'_, [AtomicU32]> {
         let (entry, top) = self.links.entry_state();
         View {
             dim: self.dim,
@@ -1661,7 +1686,27 @@ impl LinkBuilder<'_> {
             .for_each(|node| with_scratch(|scratch| self.insert(node, Some(&locks), scratch)));
     }
 
-    fn write_links(&self, node: u32, layer: usize, list: &[u32], locks: Option<&Locks>) {
+    pub(super) fn insert_slice(&self, nodes: &[u32], parallel: bool) {
+        if nodes.is_empty() {
+            return;
+        }
+        if parallel {
+            use rayon::iter::ParallelIterator;
+            use rayon::slice::ParallelSlice;
+            let locks = Locks::default();
+            nodes.par_chunks(1).for_each(|chunk| {
+                with_scratch(|scratch| self.insert(chunk[0], Some(&locks), scratch));
+            });
+        } else {
+            with_scratch(|scratch| {
+                for &node in nodes {
+                    self.insert(node, None, scratch);
+                }
+            });
+        }
+    }
+
+    pub(super) fn write_links(&self, node: u32, layer: usize, list: &[u32], locks: Option<&Locks>) {
         let view = self.view();
         let start = view.list_start(node, layer);
         let cells = if layer == 0 {
@@ -1734,7 +1779,7 @@ impl LinkBuilder<'_> {
     }
 
     /// Paper Algorithm 1 for one node.
-    fn insert(&self, node: u32, locks: Option<&Locks>, scratch: &mut Scratch) {
+    pub(super) fn insert(&self, node: u32, locks: Option<&Locks>, scratch: &mut Scratch) {
         let level = self.links.level[node as usize];
         let (mut entry, mut top) = self.links.entry_state();
         let mut raising = None;
@@ -1806,7 +1851,7 @@ impl LinkBuilder<'_> {
     /// Add `node` to `e`'s list at `layer`; when the list is full, keep
     /// the heuristic's choice among the old neighbors and the newcomer.
     #[allow(clippy::too_many_arguments)]
-    fn connect_back(
+    pub(super) fn connect_back(
         &self,
         e: u32,
         node: u32,

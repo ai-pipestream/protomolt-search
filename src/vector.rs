@@ -780,6 +780,10 @@ pub trait VectorProvider: Send + Sync {
     fn as_segmented(&self) -> Option<&crate::segmented_vectors::SegmentedProvider> {
         None
     }
+    /// The HNSW provider behind this index, when it is one (`src/hnsw/mod.rs`).
+    fn as_hnsw(&self) -> Option<&crate::hnsw::HnswIndex> {
+        None
+    }
     /// Whether the provider serves from a mapped file; owned by default.
     fn is_mapped(&self) -> bool {
         false
@@ -898,6 +902,10 @@ impl VectorIndex {
     /// The segmented provider behind this index, when it is one.
     pub fn as_segmented(&self) -> Option<&crate::segmented_vectors::SegmentedProvider> {
         self.engine.as_segmented()
+    }
+
+    pub(crate) fn as_hnsw(&self) -> Option<&crate::hnsw::HnswIndex> {
+        self.engine.as_hnsw()
     }
 
     pub fn as_segmented_mut(&mut self) -> Option<&mut crate::segmented_vectors::SegmentedProvider> {

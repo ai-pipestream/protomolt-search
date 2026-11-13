@@ -33,7 +33,7 @@ use crate::analyzer::SessionLayers;
 use crate::pb::wal::wal_record;
 use crate::pb::{AddDocumentsRequest, AnalysisSpec};
 use crate::postings::{AnalyzedDoc, AnalyzedField, SpillBuilder};
-use crate::vector::VectorIndex;
+use crate::vector::{VectorIndex, VectorProvider};
 use crate::wal::{self, RecordReader, WalManifest};
 
 /// Text analyzer for rebuilding BM25 stores: a batch of (raw text, the
@@ -576,6 +576,120 @@ fn same_backend_config(a: &WalManifest, b: &WalManifest) -> bool {
         && a.backend_config().ok() == b.backend_config().ok()
 }
 
+/// Sealed HNSW segment images available for donor transplant and `#99`
+/// join-set graph merge during shard compaction (`#76`, `#99`).
+pub(crate) struct HnswCompactionSources {
+    slot_offset: u64,
+    ranges: Vec<HnswSourceRange>,
+}
+
+struct HnswSourceRange {
+    base_label: u64,
+    rows: u64,
+    index: std::sync::Arc<VectorIndex>,
+}
+
+impl HnswCompactionSources {
+    pub(crate) fn from_segment_set(
+        slot_offset: u64,
+        set: &crate::segments::OpenedSegmentSet,
+    ) -> Option<Self> {
+        let mut ranges = Vec::new();
+        for i in 0..set.len() {
+            if let Some(arc) = set.vector_arc(i) {
+                if let Some(hnsw) = arc.as_hnsw() {
+                    if hnsw.is_graph_linked() {
+                        let meta = set.metadata(i);
+                        ranges.push(HnswSourceRange {
+                            base_label: meta.base_label,
+                            rows: meta.rows,
+                            index: std::sync::Arc::clone(arc),
+                        });
+                    }
+                }
+            }
+        }
+        (!ranges.is_empty()).then(|| {
+            ranges.sort_by_key(|r| r.base_label);
+            Self {
+                slot_offset,
+                ranges,
+            }
+        })
+    }
+
+    pub(crate) fn from_single_image_path(slot_offset: u64, path: &Path) -> Option<Self> {
+        if !path.exists() {
+            return None;
+        }
+        let loaded = VectorIndex::load_mapped(crate::hnsw::HNSW, path).ok()?;
+        let rows = loaded.len() as u64;
+        if rows == 0 || !loaded.is_graph_linked() || loaded.as_hnsw().is_none() {
+            return None;
+        }
+        Some(Self {
+            slot_offset,
+            ranges: vec![HnswSourceRange {
+                base_label: 0,
+                rows,
+                index: std::sync::Arc::new(loaded),
+            }],
+        })
+    }
+
+    fn build_merged_index(
+        &self,
+        dim: usize,
+        backend_config: &crate::vector::VectorBackendConfig,
+        vectors: &[(u64, Vec<f32>)],
+    ) -> Result<Option<VectorIndex>, String> {
+        if backend_config.backend_kind != crate::hnsw::HNSW || self.ranges.is_empty() {
+            return Ok(None);
+        }
+        let config = crate::hnsw::HnswConfig::from_backend_config(backend_config)
+            .map_err(|e| format!("decode child hnsw config: {e}"))?;
+        let sources: Vec<&crate::hnsw::HnswIndex> = self
+            .ranges
+            .iter()
+            .map(|r| r.index.as_hnsw().expect("checked in constructor"))
+            .collect();
+        let mut ordered = Vec::with_capacity(vectors.len());
+        for (global_id, vec) in vectors {
+            let mapped = global_id.checked_sub(self.slot_offset).and_then(|rel| {
+                let pos = self
+                    .ranges
+                    .partition_point(|r| r.base_label.saturating_add(r.rows) <= rel);
+                let range = self.ranges.get(pos)?;
+                if rel >= range.base_label && rel < range.base_label.saturating_add(range.rows) {
+                    let old_node = u32::try_from(rel - range.base_label).ok()?;
+                    Some((pos, old_node))
+                } else {
+                    None
+                }
+            });
+            match mapped {
+                Some((seg_idx, old_node)) => {
+                    ordered.push(crate::hnsw::merge::OrderedMergeRow::FromSegment {
+                        segment: seg_idx,
+                        old_node,
+                        vector: vec.as_slice(),
+                    })
+                }
+                None => ordered.push(crate::hnsw::merge::OrderedMergeRow::Raw(vec.as_slice())),
+            }
+        }
+        let (merged, _) = crate::hnsw::HnswIndex::merge_ordered(
+            dim,
+            config,
+            &sources,
+            &ordered,
+            crate::hnsw::MergeStrategy::JoinSet,
+        )
+        .map_err(|e| format!("merge child hnsw segments: {e}"))?;
+        Ok(Some(merged.into_index()))
+    }
+}
+
 /// Build one child image from its share of the replay: the vector index
 /// (constructed from manifest provider state, vectors in id order), the BM25
 /// sidecar from the documents, and the two output files.
@@ -598,26 +712,37 @@ fn build_child(
     derived: Option<&crate::postings::StoredDerived>,
     columns: Option<&ColumnTables>,
     mut transplanted: Option<BTreeMap<u64, Vec<AnalyzedField>>>,
+    hnsw_sources: Option<&HnswCompactionSources>,
     analyze: &mut Analyzer,
 ) -> Result<ChildImage, String> {
     let dim = manifest.dim as usize;
     let backend_config = manifest
         .backend_config()
         .map_err(|e| format!("construct child backend config: {e}"))?;
-    let mut index = VectorIndex::from_backend_config(dim, &backend_config)
-        .map_err(|e| format!("construct child index: {e}"))?;
     let mut parent_ids = Vec::with_capacity(vectors.len());
     let mut flat = Vec::with_capacity(vectors.len() * dim);
     for (id, vector) in &vectors {
         parent_ids.push(*id);
         flat.extend_from_slice(vector);
     }
-    index
-        .add(&flat, dim)
-        .map_err(|e| format!("add child vectors: {e}"))?;
-    index
-        .prepare()
-        .map_err(|e| format!("prepare child index: {e}"))?;
+    let merged_hnsw = match hnsw_sources {
+        Some(sources) => sources.build_merged_index(dim, &backend_config, &vectors)?,
+        None => None,
+    };
+    let index = match merged_hnsw {
+        Some(index) => index,
+        None => {
+            let mut index = VectorIndex::from_backend_config(dim, &backend_config)
+                .map_err(|e| format!("construct child index: {e}"))?;
+            index
+                .add(&flat, dim)
+                .map_err(|e| format!("add child vectors: {e}"))?;
+            index
+                .prepare()
+                .map_err(|e| format!("prepare child index: {e}"))?;
+            index
+        }
+    };
     index
         .write(vector_path)
         .map_err(|e| format!("write {}: {e}", vector_path.display()))?;
@@ -1458,7 +1583,7 @@ pub fn manifest_derived(
 #[allow(clippy::too_many_arguments)]
 fn finish_child_pinned(
     manifest: &WalManifest,
-    mut replay: Replay,
+    replay: Replay,
     ordinal: usize,
     out_dir: &Path,
     slot_offset: u64,
@@ -1471,9 +1596,44 @@ fn finish_child_pinned(
     columns: Option<&ColumnTables>,
     analyze: &mut Analyzer,
 ) -> Result<ChildImage, String> {
+    finish_child_pinned_with_sources(
+        manifest,
+        replay,
+        ordinal,
+        out_dir,
+        slot_offset,
+        hash_lo,
+        hash_hi,
+        bm25_fields,
+        pinned_fingerprints,
+        binding,
+        derived,
+        columns,
+        None,
+        analyze,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_child_pinned_with_sources(
+    manifest: &WalManifest,
+    mut replay: Replay,
+    ordinal: usize,
+    out_dir: &Path,
+    slot_offset: u64,
+    hash_lo: u64,
+    hash_hi: u64,
+    bm25_fields: Option<&[String]>,
+    pinned_fingerprints: Option<&[u64]>,
+    binding: Option<&crate::postings::StoredBinding>,
+    derived: Option<&crate::postings::StoredDerived>,
+    columns: Option<&ColumnTables>,
+    hnsw_sources: Option<&HnswCompactionSources>,
+    analyze: &mut Analyzer,
+) -> Result<ChildImage, String> {
     replay.compact();
     let order = child_order(&replay);
-    finish_child_ordered(
+    finish_child_ordered_with_sources(
         manifest,
         replay,
         &order,
@@ -1487,6 +1647,7 @@ fn finish_child_pinned(
         binding,
         derived,
         columns,
+        hnsw_sources,
         analyze,
     )
 }
@@ -1497,7 +1658,7 @@ fn finish_child_pinned(
 /// image takes its slots in that sequence. [`emit_rows_in`] with the same
 /// order writes the matching log.
 #[allow(clippy::too_many_arguments)]
-fn finish_child_ordered(
+fn finish_child_ordered_with_sources(
     manifest: &WalManifest,
     mut replay: Replay,
     order: &[u64],
@@ -1511,6 +1672,7 @@ fn finish_child_ordered(
     binding: Option<&crate::postings::StoredBinding>,
     derived: Option<&crate::postings::StoredDerived>,
     columns: Option<&ColumnTables>,
+    hnsw_sources: Option<&HnswCompactionSources>,
     analyze: &mut Analyzer,
 ) -> Result<ChildImage, String> {
     replay.compact();
@@ -1550,6 +1712,7 @@ fn finish_child_ordered(
         derived,
         columns,
         transplanted,
+        hnsw_sources,
         analyze,
     )?;
     child.slot_offset = slot_offset;
@@ -4113,6 +4276,35 @@ pub fn compact_log(
     analyze: &mut Analyzer,
     sink: &mut RowSink,
 ) -> Result<CompactionBuild, String> {
+    compact_log_with_sources(
+        gen,
+        cutoff_clock,
+        out_dir,
+        segmented,
+        bm25_fields,
+        pinned_fingerprints,
+        columns,
+        derived,
+        None,
+        analyze,
+        sink,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compact_log_with_sources(
+    gen: &Path,
+    cutoff_clock: u64,
+    out_dir: &Path,
+    segmented: bool,
+    bm25_fields: Option<&[String]>,
+    pinned_fingerprints: Option<&[u64]>,
+    columns: Option<&ColumnTables>,
+    derived: Option<&crate::postings::StoredDerived>,
+    hnsw_sources: Option<&HnswCompactionSources>,
+    analyze: &mut Analyzer,
+    sink: &mut RowSink,
+) -> Result<CompactionBuild, String> {
     let manifest = read_gen_manifest(gen)?;
     require_backend_config(&manifest, gen)?;
     require_complete_history(&manifest, gen)?;
@@ -4145,7 +4337,7 @@ pub fn compact_log(
         tombstones = tombstoned;
         replay.compact();
         emit_rows(&replay, 0, &mut id_map, sink)?;
-        images.push(finish_child_pinned(
+        images.push(finish_child_pinned_with_sources(
             &manifest,
             replay,
             0,
@@ -4158,6 +4350,7 @@ pub fn compact_log(
             binding.as_ref(),
             derived,
             columns,
+            hnsw_sources,
             analyze,
         )?);
     } else {
@@ -4182,7 +4375,7 @@ pub fn compact_log(
                 continue;
             }
             let ordinal = images.len();
-            images.push(finish_child_pinned(
+            images.push(finish_child_pinned_with_sources(
                 &manifest,
                 replay,
                 ordinal,
@@ -4195,6 +4388,7 @@ pub fn compact_log(
                 binding.as_ref(),
                 derived,
                 columns,
+                hnsw_sources,
                 analyze,
             )?);
             next_slot = next_slot
@@ -5123,6 +5317,35 @@ pub fn compact_log_partitioned(
     analyze: &mut Analyzer,
     sink: &mut RowSink,
 ) -> Result<CompactionBuild, String> {
+    compact_log_partitioned_with_sources(
+        gen,
+        cutoff_clock,
+        out_dir,
+        spec,
+        bm25_fields,
+        pinned_fingerprints,
+        columns,
+        derived,
+        None,
+        analyze,
+        sink,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compact_log_partitioned_with_sources(
+    gen: &Path,
+    cutoff_clock: u64,
+    out_dir: &Path,
+    spec: PartitionSpec<'_>,
+    bm25_fields: Option<&[String]>,
+    pinned_fingerprints: Option<&[u64]>,
+    columns: Option<&ColumnTables>,
+    derived: Option<&crate::postings::StoredDerived>,
+    hnsw_sources: Option<&HnswCompactionSources>,
+    analyze: &mut Analyzer,
+    sink: &mut RowSink,
+) -> Result<CompactionBuild, String> {
     let manifest = read_gen_manifest(gen)?;
     require_backend_config(&manifest, gen)?;
     require_complete_history(&manifest, gen)?;
@@ -5285,7 +5508,7 @@ pub fn compact_log_partitioned(
                 .filter(|id| !replay.vectors.contains_key(id)),
         );
         let rows = emit_rows_in(&replay, &order, next_slot, &mut id_map, sink)?;
-        images.push(finish_child_ordered(
+        images.push(finish_child_ordered_with_sources(
             &manifest,
             replay,
             &order,
@@ -5299,6 +5522,7 @@ pub fn compact_log_partitioned(
             binding.as_ref(),
             derived,
             columns,
+            hnsw_sources,
             analyze,
         )?);
         next_slot = next_slot
@@ -5767,6 +5991,7 @@ pub fn compact_segments_partitioned(
 
     // Pass 3: one image per cut, in cut order. One cut replayed and
     // sealed at `slot`; `None` for an empty cut.
+    let hnsw_sources = HnswCompactionSources::from_segment_set(slot_offset, set);
     let build = |bucket: u32,
                  ordinal: usize,
                  slot: u64,
@@ -5805,7 +6030,7 @@ pub fn compact_segments_partitioned(
                 .copied()
                 .filter(|id| !replay.vectors.contains_key(id)),
         );
-        let image = finish_child_ordered(
+        let image = finish_child_ordered_with_sources(
             &manifest,
             replay,
             &final_order,
@@ -5819,6 +6044,7 @@ pub fn compact_segments_partitioned(
             Some(&binding),
             derived.as_ref(),
             Some(&tables.columns),
+            hnsw_sources.as_ref(),
             analyze,
         )?;
         Ok(Some((image, rows)))

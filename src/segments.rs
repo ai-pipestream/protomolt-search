@@ -728,6 +728,10 @@ impl OpenedSegmentSet {
         self.segments[i].vector.as_deref()
     }
 
+    pub(crate) fn vector_arc(&self, i: usize) -> Option<&Arc<VectorIndex>> {
+        self.segments[i].vector.as_ref()
+    }
+
     /// The immutable FP32 image opened and verified with this segment snapshot.
     /// Documents-only segments have no exact rows. Bitmap-only publications
     /// share this image while retaining their own tombstone overlays.
@@ -1400,7 +1404,15 @@ impl SegmentCatalog {
                     &crate::wal::read_manifest(gen)
                         .map_err(|e| format!("read manifest of {}: {e}", gen.display()))?,
                 )?;
-                let build = crate::reshard::compact_log_partitioned(
+                let hnsw_sources = (backend_kind == crate::hnsw::HNSW)
+                    .then(|| {
+                        crate::reshard::HnswCompactionSources::from_segment_set(
+                            slot_base,
+                            &self.snapshot(),
+                        )
+                    })
+                    .flatten();
+                let build = crate::reshard::compact_log_partitioned_with_sources(
                     gen,
                     u64::MAX,
                     work_dir,
@@ -1409,6 +1421,7 @@ impl SegmentCatalog {
                     None,
                     None,
                     derived.as_ref(),
+                    hnsw_sources.as_ref(),
                     analyze,
                     &mut sink,
                 )?;

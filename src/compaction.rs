@@ -393,6 +393,9 @@ struct Preflight {
     /// The live shard's column tables on the segment layout, given to
     /// the build so every output declares them.
     columns: Option<crate::reshard::ColumnTables>,
+    /// Sealed HNSW segments available for donor transplant and `#99` join-set
+    /// graph merge during compaction.
+    hnsw_sources: Option<crate::reshard::HnswCompactionSources>,
 }
 
 /// The row source the cutoff qualified for: the log (the historical
@@ -826,6 +829,32 @@ impl NodeServiceImpl {
                 }
             }
         }
+        let hnsw_sources = if backend_kind == crate::hnsw::HNSW {
+            if segmented {
+                guard
+                    .index
+                    .as_ref()
+                    .and_then(VectorIndex::as_segmented)
+                    .and_then(|provider| {
+                        crate::reshard::HnswCompactionSources::from_segment_set(
+                            self.config.slot_offset,
+                            provider.snapshot(),
+                        )
+                    })
+            } else {
+                let persisted = guard
+                    .generation
+                    .as_ref()
+                    .map(|g| crate::node::generation_vector(g))
+                    .unwrap_or_else(|| index_path.clone());
+                crate::reshard::HnswCompactionSources::from_single_image_path(
+                    self.config.slot_offset,
+                    &persisted,
+                )
+            }
+        } else {
+            None
+        };
         let rows_now = crate::node::physical_rows(&guard);
         Ok(Ok(PreflightKind::Wal(Box::new(Preflight {
             index_path,
@@ -843,6 +872,7 @@ impl NodeServiceImpl {
             stats_epoch: guard.stats_epoch,
             partition,
             columns,
+            hnsw_sources,
         }))))
     }
 
@@ -1073,7 +1103,7 @@ impl NodeServiceImpl {
             };
             let derived = crate::node::stored_derived(&self.config);
             match pre.partition.as_deref() {
-                Some(column) => crate::reshard::compact_log_partitioned(
+                Some(column) => crate::reshard::compact_log_partitioned_with_sources(
                     &pre.gen_dir,
                     pre.cutoff_clock,
                     &build_dir,
@@ -1085,10 +1115,11 @@ impl NodeServiceImpl {
                     pins.as_deref(),
                     pre.columns.as_ref(),
                     derived.as_ref(),
+                    pre.hnsw_sources.as_ref(),
                     analyze,
                     &mut sink,
                 ),
-                None => crate::reshard::compact_log(
+                None => crate::reshard::compact_log_with_sources(
                     &pre.gen_dir,
                     pre.cutoff_clock,
                     &build_dir,
@@ -1097,6 +1128,7 @@ impl NodeServiceImpl {
                     pins.as_deref(),
                     pre.columns.as_ref(),
                     derived.as_ref(),
+                    pre.hnsw_sources.as_ref(),
                     analyze,
                     &mut sink,
                 ),

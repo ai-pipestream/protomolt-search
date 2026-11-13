@@ -3028,3 +3028,532 @@ fn floor_prune_respects_higham_bound_boundary_ties_starved_filter_and_determinis
     assert_eq!(emitted, 0);
     assert_eq!(summary.emitted, 0);
 }
+
+#[test]
+fn forced_island_connectivity_repair_and_deleted_entry_tombstone_healing() {
+    use super::distance::Kernel;
+    use super::graph::{LinkBuilder, Store};
+    use super::merge::repair_connectivity;
+    use crate::vector::Mask;
+    use std::sync::atomic::Ordering as Atomic;
+
+    let dim = 24;
+    let half = 300usize;
+    let total = half * 2;
+    let mut vectors = vec![0.0f32; total * dim];
+    // Cluster A centered near +e_0, Cluster B centered near -e_0.
+    let (noise, queries_b) = corpus_with_queries(total, 16, dim, 0x99A1_0001);
+    for i in 0..total {
+        let sign = if i < half { 1.0f32 } else { -1.0f32 };
+        let row = &mut vectors[i * dim..(i + 1) * dim];
+        row.copy_from_slice(&noise[i * dim..(i + 1) * dim]);
+        row[0] = sign * 4.0 + row[0] * 0.25;
+        let norm: f32 = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+        for x in row.iter_mut() {
+            *x /= norm;
+        }
+    }
+    let mut cluster_b_queries = vec![0.0f32; 16 * dim];
+    for q in 0..16 {
+        let dst = &mut cluster_b_queries[q * dim..(q + 1) * dim];
+        dst.copy_from_slice(&queries_b[q * dim..(q + 1) * dim]);
+        dst[0] = -4.0 + dst[0] * 0.25;
+        let norm: f32 = dst.iter().map(|v| v * v).sum::<f32>().sqrt();
+        for x in dst.iter_mut() {
+            *x /= norm;
+        }
+    }
+
+    // 1. Direct forced-island test: build links, then sever every cross-cluster
+    //    edge between 0..half and half..total so half..total is an unreachable
+    //    island from an entry in 0..half.
+    let cfg = HnswConfig {
+        m: 12,
+        ef_construction: 80,
+        seed: 0x7699,
+        build_mode: BuildMode::FixedOrder,
+    };
+    let mut store = Store::new(
+        dim,
+        cfg.m as usize,
+        cfg.ef_construction as usize,
+        cfg.seed,
+        Kernel::detect(),
+    );
+    store.append_unlinked(&vectors).unwrap();
+    let links = store.build_links(false).unwrap();
+    let stride0 = 2 * cfg.m as usize + 1;
+    let stride_up = cfg.m as usize + 1;
+    for u in 0..total {
+        let cluster_a = u < half;
+        let s0 = u * stride0;
+        let c0 = links.links0[s0].load(Atomic::Relaxed) as usize;
+        let mut kept0 = Vec::new();
+        for i in 0..c0 {
+            let v = links.links0[s0 + 1 + i].load(Atomic::Relaxed) as usize;
+            if (v < half) == cluster_a {
+                kept0.push(v as u32);
+            }
+        }
+        links.links0[s0].store(kept0.len() as u32, Atomic::Relaxed);
+        for (i, &v) in kept0.iter().enumerate() {
+            links.links0[s0 + 1 + i].store(v, Atomic::Relaxed);
+        }
+
+        let lvl = links.level[u] as usize;
+        if lvl > 0 {
+            let slot = links.upper_slot[u] as usize;
+            let base = links.upper_base[slot] as usize;
+            for layer in 1..=lvl {
+                let st = base + (layer - 1) * stride_up;
+                let cu = links.upper[st].load(Atomic::Relaxed) as usize;
+                let mut keptu = Vec::new();
+                for i in 0..cu {
+                    let v = links.upper[st + 1 + i].load(Atomic::Relaxed) as usize;
+                    if (v < half) == cluster_a {
+                        keptu.push(v as u32);
+                    }
+                }
+                links.upper[st].store(keptu.len() as u32, Atomic::Relaxed);
+                for (i, &v) in keptu.iter().enumerate() {
+                    links.upper[st + 1 + i].store(v, Atomic::Relaxed);
+                }
+            }
+        }
+    }
+    store.install_links(links);
+    let severed = HnswIndex {
+        dim,
+        config: cfg,
+        kernel: Kernel::detect(),
+        backing: super::Backing::Heap(store),
+    };
+    assert!(
+        severed.unreachable_from_entry() >= half,
+        "expected severed island >= {half} unreachable nodes, got {}",
+        severed.unreachable_from_entry()
+    );
+
+    // Repair via `heal_tombstones` while ALSO deleting the current entry node
+    // and 20% of rows across both clusters.
+    let orig_entry = match &severed.backing {
+        super::Backing::Heap(st) => st.entry_state().0 as usize,
+        super::Backing::Mapped(_) => unreachable!(),
+    };
+    let mut live_flags: Vec<bool> = (0..total).map(|i| i % 5 != 2).collect();
+    live_flags[orig_entry] = false;
+    // Ensure `repair_connectivity` also runs directly on an un-tombstoned severed store.
+    if let super::Backing::Heap(st) = &severed.backing {
+        let links_ref = st.links().unwrap();
+        let builder = LinkBuilder::new(st, links_ref);
+        let repaired = repair_connectivity(&builder);
+        assert!(
+            repaired >= 1,
+            "expected >= 1 island repaired, got {repaired}"
+        );
+    }
+    assert_eq!(severed.unreachable_from_entry(), 0);
+
+    // Re-sever cross-cluster links across both layer 0 and upper layers.
+    if let super::Backing::Heap(st) = &severed.backing {
+        let links_ref = st.links().unwrap();
+        for u in 0..total {
+            let cluster_a = u < half;
+            let s0 = u * stride0;
+            let c0 = links_ref.links0[s0].load(Atomic::Relaxed) as usize;
+            let mut kept0 = Vec::new();
+            for i in 0..c0 {
+                let v = links_ref.links0[s0 + 1 + i].load(Atomic::Relaxed) as usize;
+                if (v < half) == cluster_a {
+                    kept0.push(v as u32);
+                }
+            }
+            links_ref.links0[s0].store(kept0.len() as u32, Atomic::Relaxed);
+            for (i, &v) in kept0.iter().enumerate() {
+                links_ref.links0[s0 + 1 + i].store(v, Atomic::Relaxed);
+            }
+            let lvl = usize::from(links_ref.level[u]);
+            if lvl > 0 {
+                let base = links_ref.upper_base[links_ref.upper_slot[u] as usize] as usize;
+                for layer in 1..=lvl {
+                    let st_up = base + (layer - 1) * stride_up;
+                    let cu = links_ref.upper[st_up].load(Atomic::Relaxed) as usize;
+                    let mut keptu = Vec::new();
+                    for i in 0..cu {
+                        let v = links_ref.upper[st_up + 1 + i].load(Atomic::Relaxed) as usize;
+                        if (v < half) == cluster_a {
+                            keptu.push(v as u32);
+                        }
+                    }
+                    links_ref.upper[st_up].store(keptu.len() as u32, Atomic::Relaxed);
+                    for (i, &v) in keptu.iter().enumerate() {
+                        links_ref.upper[st_up + 1 + i].store(v, Atomic::Relaxed);
+                    }
+                }
+            }
+        }
+    }
+    assert!(severed.unreachable_from_entry() >= half);
+
+    // 1. With `orig_entry` kept alive, Cluster B has zero incoming edges from
+    //    Cluster A and must be repaired by `repair_connectivity` (`islands_repaired >= 1`).
+    let mut live_keep_entry = live_flags.clone();
+    live_keep_entry[orig_entry] = true;
+    let (healed_keep, _, stats_keep) = severed
+        .heal_tombstones(Mask::Bools(&live_keep_entry))
+        .unwrap();
+    assert!(stats_keep.islands_repaired >= 1);
+    assert_eq!(healed_keep.unreachable_from_entry(), 0);
+
+    // 2. With `orig_entry` deleted (`live_flags[orig_entry] == false`),
+    //    `heal_tombstones` promotes a surviving entry, inherits highways, and
+    //    leaves zero unreachable nodes.
+    let (healed, survivors, _stats) = severed.heal_tombstones(Mask::Bools(&live_flags)).unwrap();
+    assert!(!survivors.contains(&(orig_entry as u32)));
+    assert_eq!(healed.len(), survivors.len());
+    assert_eq!(healed.unreachable_from_entry(), 0);
+
+    // Persist and reopen through `load_mapped` to exercise full PMHNSW01 structural validation.
+    let dir = temp_dir("forced-island-heal");
+    let img = dir.join("healed.hnsw");
+    healed.write(&img).unwrap();
+    let mapped = HnswIndex::load_mapped(&img).unwrap();
+    assert_eq!(mapped.unreachable_from_entry(), 0);
+
+    // Queries into Cluster B (previously disconnected) must achieve high live-only recall.
+    let mut survivor_vectors = Vec::with_capacity(survivors.len() * dim);
+    for &old in &survivors {
+        let at = old as usize * dim;
+        survivor_vectors.extend_from_slice(&vectors[at..at + dim]);
+    }
+    let res = mapped
+        .search(
+            &cluster_b_queries,
+            10,
+            VectorSearchOptions::new().with_candidate_depth(64),
+        )
+        .unwrap();
+    let mut hits_ok = 0usize;
+    let mut expected_total = 0usize;
+    for q_idx in 0..16 {
+        let q = &cluster_b_queries[q_idx * dim..(q_idx + 1) * dim];
+        let truth = exact_top(&survivor_vectors, dim, q, 10);
+        expected_total += truth.len();
+        let got = res.slots_for_query(q_idx);
+        hits_ok += truth
+            .iter()
+            .filter(|&&id| got.contains(&i64::from(id)))
+            .count();
+    }
+    drop(mapped);
+    let _ = std::fs::remove_dir_all(&dir);
+    let recall = hits_ok as f64 / expected_total as f64;
+    assert!(
+        recall >= 0.95,
+        "expected >= 0.95 recall on repaired island cluster, got {recall:.4}"
+    );
+}
+
+#[test]
+fn tombstone_10pct_and_30pct_live_only_recall_and_transcript_identity() {
+    use crate::vector::{Mask, VectorProvider};
+
+    let dim = 32;
+    let n = 1200usize;
+    let (vectors, queries) = corpus_with_queries(n, 24, dim, 0x7610_3000);
+    let cfg = HnswConfig {
+        m: 16,
+        ef_construction: 120,
+        seed: 42,
+        build_mode: BuildMode::FixedOrder,
+    };
+    let mut index = HnswIndex::new(dim, cfg).unwrap();
+    index.add(&vectors, dim).unwrap();
+    index.prepare().unwrap();
+
+    for (tag, mod_step, drop_rem) in [("10pct", 10usize, 1usize), ("30pct", 10usize, 3usize)] {
+        let mut live: Vec<bool> = (0..n).map(|i| (i % mod_step) >= drop_rem).collect();
+        // Target node 0 and high-degree early hubs as well.
+        live[0] = false;
+        live[1] = false;
+
+        // 1. Online masked search never returns deleted rows and maintains live-only recall.
+        let online = index
+            .search(
+                &queries,
+                10,
+                VectorSearchOptions::new()
+                    .with_allowlist(&live)
+                    .with_candidate_depth(80),
+            )
+            .unwrap();
+        let mut online_hits = 0usize;
+        let mut truth_total = 0usize;
+        for q_idx in 0..24 {
+            let q = &queries[q_idx * dim..(q_idx + 1) * dim];
+            let truth = exact_top_masked(&vectors, dim, q, &live, 10);
+            truth_total += truth.len();
+            for &slot in online.slots_for_query(q_idx) {
+                assert!(
+                    slot >= 0 && live[slot as usize],
+                    "{tag}: returned deleted slot {slot}"
+                );
+            }
+            online_hits += truth
+                .iter()
+                .filter(|&&(id, _)| online.slots_for_query(q_idx).contains(&i64::from(id)))
+                .count();
+        }
+        let online_recall = online_hits as f64 / truth_total as f64;
+        assert!(
+            online_recall >= 0.95,
+            "{tag}: online recall {online_recall:.4}"
+        );
+
+        // 2. Healed compacted graph matches rebuild recall within 0.005 and preserves transcripts.
+        let (healed, survivors, stats) = index.heal_tombstones(Mask::Bools(&live)).unwrap();
+        assert_eq!(healed.unreachable_from_entry(), 0);
+        assert!(stats.donor_healed_lists > 0);
+
+        let mut survivor_flat = Vec::with_capacity(survivors.len() * dim);
+        for &old in &survivors {
+            let at = old as usize * dim;
+            survivor_flat.extend_from_slice(&vectors[at..at + dim]);
+        }
+        let mut rebuilt = HnswIndex::new(dim, cfg).unwrap();
+        rebuilt.add(&survivor_flat, dim).unwrap();
+        rebuilt.prepare().unwrap();
+
+        assert_eq!(healed.row_identity(), rebuilt.row_identity());
+        let mut healed_tx = Vec::new();
+        let mut rebuilt_tx = Vec::new();
+        healed
+            .row_transcripts(0..healed.len(), &mut |r, b| healed_tx.push((r, b.to_vec())))
+            .unwrap();
+        rebuilt
+            .row_transcripts(0..rebuilt.len(), &mut |r, b| {
+                rebuilt_tx.push((r, b.to_vec()))
+            })
+            .unwrap();
+        assert_eq!(healed_tx, rebuilt_tx);
+
+        let healed_res = healed
+            .search(
+                &queries,
+                10,
+                VectorSearchOptions::new().with_candidate_depth(80),
+            )
+            .unwrap();
+        let rebuilt_res = rebuilt
+            .search(
+                &queries,
+                10,
+                VectorSearchOptions::new().with_candidate_depth(80),
+            )
+            .unwrap();
+        let mut healed_hits = 0usize;
+        let mut rebuilt_hits = 0usize;
+        for q_idx in 0..24 {
+            let q = &queries[q_idx * dim..(q_idx + 1) * dim];
+            let truth = exact_top(&survivor_flat, dim, q, 10);
+            healed_hits += truth
+                .iter()
+                .filter(|&&id| healed_res.slots_for_query(q_idx).contains(&i64::from(id)))
+                .count();
+            rebuilt_hits += truth
+                .iter()
+                .filter(|&&id| rebuilt_res.slots_for_query(q_idx).contains(&i64::from(id)))
+                .count();
+        }
+        let healed_recall = healed_hits as f64 / (24.0 * 10.0);
+        let rebuilt_recall = rebuilt_hits as f64 / (24.0 * 10.0);
+        assert!(
+            healed_recall + 0.005 >= rebuilt_recall,
+            "{tag}: healed recall {healed_recall:.4} vs rebuilt {rebuilt_recall:.4}"
+        );
+    }
+}
+
+#[test]
+fn join_set_merge_2_4_8_equal_and_skewed_segments_matches_rebuild_recall() {
+    use super::{MergeStrategy, SegmentMergeInput, MIN_GRAPH_ROWS};
+    use crate::vector::{Mask, VectorProvider};
+
+    let dim = 32;
+    let n = 2400usize;
+    let qn = 60usize;
+    let (vectors, queries) = corpus_with_queries(n, qn, dim, 0x9999_2480);
+    let cfg = HnswConfig {
+        m: 16,
+        ef_construction: 120,
+        seed: 101,
+        build_mode: BuildMode::FixedOrder,
+    };
+
+    let mut rebuilt = HnswIndex::new(dim, cfg).unwrap();
+    rebuilt.add(&vectors, dim).unwrap();
+    rebuilt.prepare().unwrap();
+    let rebuilt_res = rebuilt
+        .search(
+            &queries,
+            10,
+            VectorSearchOptions::new().with_candidate_depth(80),
+        )
+        .unwrap();
+    let mut rebuilt_hits = 0usize;
+    for q_idx in 0..qn {
+        let q = &queries[q_idx * dim..(q_idx + 1) * dim];
+        let truth = exact_top(&vectors, dim, q, 10);
+        rebuilt_hits += truth
+            .iter()
+            .filter(|&&id| rebuilt_res.slots_for_query(q_idx).contains(&i64::from(id)))
+            .count();
+    }
+    let rebuilt_recall = rebuilt_hits as f64 / (qn * 10) as f64;
+
+    let layouts: &[(&str, &[usize])] = &[
+        ("2-equal", &[1200, 1200]),
+        ("4-equal", &[600, 600, 600, 600]),
+        ("8-equal", &[300, 300, 300, 300, 300, 300, 300, 300]),
+        ("4-skewed", &[1200, 500, 400, 300]),
+    ];
+
+    let dir = temp_dir("join-set-merge-layouts");
+    for &(label, counts) in layouts {
+        let mut segs: Vec<HnswIndex> = Vec::with_capacity(counts.len());
+        let mut cursor = 0usize;
+        for (i, &cnt) in counts.iter().enumerate() {
+            let mut s = HnswIndex::new(dim, cfg).unwrap();
+            s.add(&vectors[cursor * dim..(cursor + cnt) * dim], dim)
+                .unwrap();
+            s.prepare().unwrap();
+            // Mix Mapped and Heap source segments to verify generic `LinkCells` dispatch.
+            if i % 2 == 1 {
+                let p = dir.join(format!("{label}-{i}.hnsw"));
+                s.write(&p).unwrap();
+                segs.push(HnswIndex::load_mapped(&p).unwrap());
+            } else {
+                segs.push(s);
+            }
+            cursor += cnt;
+        }
+        assert_eq!(cursor, n);
+
+        let inputs: Vec<SegmentMergeInput<'_>> = segs
+            .iter()
+            .map(|index| SegmentMergeInput { index, live: None })
+            .collect();
+
+        for strategy in [MergeStrategy::DonorReinsert, MergeStrategy::JoinSet] {
+            let (merged, stats) =
+                HnswIndex::merge_segments(dim, cfg, &inputs, &[], strategy).unwrap();
+            assert_eq!(merged.len(), n);
+            assert_eq!(merged.unreachable_from_entry(), 0, "{label} {strategy:?}");
+            assert_eq!(stats.donor_segment, Some(0));
+            assert_eq!(stats.donor_rows, counts[0]);
+            if strategy == MergeStrategy::JoinSet {
+                let non_donor = n - counts[0];
+                assert!(
+                    stats.join_set_rows < non_donor,
+                    "{label}: expected join_set ({}) < non_donor ({non_donor})",
+                    stats.join_set_rows
+                );
+                assert!(stats.grafted_rows > 0);
+            }
+
+            let out_path = dir.join(format!("{label}-{strategy:?}.hnsw"));
+            merged.write(&out_path).unwrap();
+            let mapped = HnswIndex::load_mapped(&out_path).unwrap();
+            assert_eq!(mapped.row_identity(), rebuilt.row_identity());
+
+            let res = mapped
+                .search(
+                    &queries,
+                    10,
+                    VectorSearchOptions::new().with_candidate_depth(80),
+                )
+                .unwrap();
+            let mut hits = 0usize;
+            for q_idx in 0..qn {
+                let q = &queries[q_idx * dim..(q_idx + 1) * dim];
+                let truth = exact_top(&vectors, dim, q, 10);
+                hits += truth
+                    .iter()
+                    .filter(|&&id| res.slots_for_query(q_idx).contains(&i64::from(id)))
+                    .count();
+            }
+            let recall = hits as f64 / (qn * 10) as f64;
+            assert!(
+                recall + 0.005 >= rebuilt_recall,
+                "{label} {strategy:?}: recall {recall:.4} vs rebuild {rebuilt_recall:.4}"
+            );
+        }
+
+        // Also exercise parallel mode on 4-equal to cover concurrent Locks + graft.
+        if label == "4-equal" {
+            let par_cfg = HnswConfig {
+                build_mode: BuildMode::Parallel,
+                ..cfg
+            };
+            let (par_merged, _) =
+                HnswIndex::merge_segments(dim, par_cfg, &inputs, &[], MergeStrategy::JoinSet)
+                    .unwrap();
+            assert_eq!(par_merged.unreachable_from_entry(), 0);
+            let par_res = par_merged
+                .search(
+                    &queries,
+                    10,
+                    VectorSearchOptions::new().with_candidate_depth(80),
+                )
+                .unwrap();
+            let mut par_hits = 0usize;
+            for q_idx in 0..qn {
+                let q = &queries[q_idx * dim..(q_idx + 1) * dim];
+                let truth = exact_top(&vectors, dim, q, 10);
+                par_hits += truth
+                    .iter()
+                    .filter(|&&id| par_res.slots_for_query(q_idx).contains(&i64::from(id)))
+                    .count();
+            }
+            let par_recall = par_hits as f64 / (qn * 10) as f64;
+            assert!(
+                par_recall >= 0.985,
+                "parallel 4-equal recall {par_recall:.4}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // No-donor rebuild fallback when the sole linked donor is 100% deleted and
+    // surviving rows come from raw/unlinked vectors >= MIN_GRAPH_ROWS.
+    let mut donor_dead = HnswIndex::new(dim, cfg).unwrap();
+    donor_dead.add(&vectors[..300 * dim], dim).unwrap();
+    donor_dead.prepare().unwrap();
+    let dead_mask = vec![false; 300];
+    let (no_donor, nd_stats) = HnswIndex::merge_segments(
+        dim,
+        cfg,
+        &[SegmentMergeInput {
+            index: &donor_dead,
+            live: Some(Mask::Bools(&dead_mask)),
+        }],
+        &vectors[300 * dim..650 * dim],
+        MergeStrategy::JoinSet,
+    )
+    .unwrap();
+    assert!(nd_stats.used_no_donor_rebuild);
+    assert!(no_donor.is_graph_linked());
+    assert_eq!(no_donor.len(), 350);
+    assert_eq!(no_donor.unreachable_from_entry(), 0);
+
+    // Output below MIN_GRAPH_ROWS stays unlinked (#97 invariant).
+    let (tiny, _) = HnswIndex::merge_segments(
+        dim,
+        cfg,
+        &[],
+        &vectors[..(MIN_GRAPH_ROWS - 16) * dim],
+        MergeStrategy::JoinSet,
+    )
+    .unwrap();
+    assert!(!tiny.is_graph_linked());
+}

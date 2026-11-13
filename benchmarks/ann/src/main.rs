@@ -13,6 +13,7 @@ mod calibrate;
 mod engines;
 mod fixture;
 mod gate;
+mod merge;
 mod patience;
 mod run;
 mod tail;
@@ -27,8 +28,9 @@ fn main() {
         "calibrate" => calibrate::command(),
         "tail" => tail::command(),
         "patience" => patience::command(),
+        "merge" => merge::command(),
         _ => Err(
-            "usage: ann_bench fixture|run|gate|calibrate|tail|patience [--key=value ...] (see README.md)"
+            "usage: ann_bench fixture|run|gate|calibrate|tail|patience|merge [--key=value ...] (see README.md)"
                 .into(),
         ),
     };

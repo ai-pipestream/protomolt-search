@@ -17,7 +17,7 @@ path is decided by the measured dense execution policy of #58, not here.
 Sharing its rows with the `.exact` sidecar is #71.
 
 Code: `src/hnsw/` (`config.rs`, `distance.rs`, `graph.rs`, `image.rs`,
-`rows.rs`). Tests: the module's unit tests, `tests/hnsw.rs` (real nodes
+`merge.rs`, `rows.rs`). Tests: the module's unit tests, `tests/hnsw.rs` (real nodes
 behind a coordinator: planner refusals, corruption, streaming control,
 masks and floors, the candidate depth, multi-node fan-out, filter regimes
 through the Query API, Boolean dense leaves, the policy's enumerate
@@ -653,13 +653,60 @@ A node runs the provider through every path the exhaustive providers take;
   follows.
 - **Snapshot.** An hnsw image installs with its `.exact` sidecar and BM25
   store, answers at the slot offset, and survives a restart.
-- **Compaction.** A compaction replays the live rows into new segments and
-  builds their graphs again; the rebuilt graphs answer exactly scored live
-  rows at the recall the graph gives, not the old graph's misses, so a
-  by-text comparison across a compaction is a recall check, not a bit
-  comparison. A publication interrupted between the write of its outputs
-  and the publish of its manifest rolls back at open: the staged segment
-  and the marker are removed and the old generation serves.
+- **Compaction (`#76`, `#99`).** Online compaction (`src/compaction.rs`,
+  `src/reshard.rs`, `src/hnsw/merge.rs`) snapshots the shard's sealed mapped HNSW
+  segments before replay, matches each surviving dense output row against its
+  source `(segment_idx, old_local_slot)` (verifying FP32 bit equality so a
+  replaced vector never inherits stale edges), and merges the output graph via
+  `HnswIndex::merge_with_remap` (`MergeStrategy::JoinSet`) rather than rebuilding
+  from scratch:
+  1. **Donor transplant and tombstone link healing (`#76`).** Qualifying linked
+     source segments (`>= 64` surviving rows and `>= 35%` survival ratio, matching
+     `dim` and `M`) elect the segment with the most surviving rows as the donor.
+     Surviving donor nodes retain their levels and 100% of their surviving 1-hop
+     edges under the dense `0..N` numbering; any adjacency list that held a
+     deleted neighbor refills its vacated slots from heuristic-diversified and
+     top-scoring 2-hop bridges across deleted neighbors, wires reciprocal
+     `connect_back` links, and promotes a surviving top-level entry (inheriting
+     the deleted entry's surviving highways across layers when `entry` itself was
+     tombstoned). On 10% and 30% tombstone sweeps (`protomolt-ann-bench merge`),
+     `HnswIndex::heal_tombstones` runs **9.5×–10.3×** (`10%`) and **4.1×–4.2×**
+     (`30%`) faster than a clean rebuild on `challenge` (`100k × 64d`) and
+     **22.3×–32.4×** (`10%`) and **11.0×–18.5×** (`30%`) faster on `court200k`
+     (`200k × 256d`), matching rebuild `recall@10` within `0.003` and matching or
+     exceeding rebuild `recall@100` (`+0.000` to `+0.005`).
+  2. **Greedy `K`-dominating join-set merge (`#99`).** Each non-donor qualifying
+     segment selects a join set comprising all upper-layer nodes (`level >= 1`)
+     plus a greedy `K`-dominating layer-0 cover (`JOIN_DOMINATION_K = 2`, ordered
+     by surviving degree descending; ~21–24% of non-donor rows on `challenge`,
+     ~40–43% on `court200k`). Only the join set and any unlinked tail/tiny-segment
+     rows run full `LinkBuilder` insertion, interleaved round-robin across
+     segments; the remaining ~57–79% of non-donor layer-0 nodes run a bounded
+     local layer-0 beam walk (`GRAFT_MAX_EXPANSIONS = 40`, zero upper-layer
+     descent) seeded from their surviving intra-segment neighborhood and the
+     merged layer-0 CSR neighborhoods of their join-set neighbors, followed by
+     direction-heuristic pruning, intra-cluster slot retention, and reciprocal
+     `connect_back`. Across 2, 4, and 8 equal and skewed segments, `JoinSet`
+     runs **2.0×–5.7×** faster than `FullRebuild` (**1.6×–2.1×** faster than
+     `#76`'s `DonorReinsert`) on both `avx2+fma` and `neon` while holding recall
+     within `0.005` of `FullRebuild` (and exceeding `FullRebuild` `recall@10` on
+     every 2/4/8 layout on `court200k` `neon`). When no linked segment qualifies
+     (for example a multi-bucket hash sub-sample below 35% survival or a 100%
+     tombstoned donor), merge falls back cleanly to `FullRebuild`.
+  3. **Directed forward-BFS connectivity repair (`#99`).** Every merged, healed,
+     or rebuilt image runs an `O(V + E)` forward BFS from `entry` on layer 0,
+     tracking spanning-tree parents (`bfs_parent`) so reciprocal connections never
+     detach a mutual cycle, bridging leaf/duplicate islands in `O(m0)` via their
+     direct visited neighbors and multi-node islands via a masked layer-0 walk
+     from `entry`, and leaving `unreachable_from_entry() == 0`.
+  4. **Fresh column indexes after remap (`#76`).** `ChildImage` writes the
+     post-remap `Bm25Store` with lazy `OnceLock` `FacetRows` and `NumberRows`
+     caches uninitialized (`OnceLock::new()`), so pre-compaction cached bitmaps or
+     sorted `(value, row)` tables are dropped with the retired `OpenedSegmentSet`
+     and built fresh on first filtered query against the compacted segment.
+  A publication interrupted between the write of its outputs and the publish of
+  its manifest rolls back at open: the staged segment and the marker are removed
+  and the old generation serves.
 
 ## What this does not do yet
 
@@ -668,6 +715,6 @@ A node runs the provider through every path the exhaustive providers take;
   the measured dense execution policy of #58.
 - The FP32 rows are the provider's own copy, as FAISS `HNSWFlat` keeps one.
   Sharing them with the `.exact` sidecar through `RowSource` is #71.
-- Collapse (#73) and seeded entries (#76) are later tickets.
+- Collapse (#73) and per-value seeded entries (#55) are later tickets.
 - No measured dense execution policy ships for it; AUTO stays refused until
   one is measured on a real corpus.
