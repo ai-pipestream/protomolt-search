@@ -4,8 +4,8 @@
   "issue": "#54",
   "note": "The #54 replacement gate as far as the harness can measure it today: unfiltered and filtered cells on both fixtures, single and segmented court shape. The sharded k = 100, 1,000 and 10,000 cells, floor off and on, are required too and live in gates/floor.json; the collapse, seeded-entry and tombstone cells join when the harness can measure them.",
   "candidate": "hnsw",
-  "unfiltered_margin": 0.2,
-  "unfiltered_margin_provisional": true,
+  "unfiltered_margin": 0.1,
+  "unfiltered_margin_provisional": false,
   "cells": [
     {
       "fixture": "challenge-100000x64",
