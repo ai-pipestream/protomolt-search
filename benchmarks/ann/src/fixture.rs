@@ -225,13 +225,47 @@ pub fn hash_placement(rows: usize, shards: usize) -> Vec<u16> {
         .collect()
 }
 
-/// Skewed placement: whole k-means cells per shard. Cells are taken in cell
-/// id order and a shard is closed once it holds its share of the rows not
-/// yet placed (those rows over the shards still open), so shard sizes stay
-/// close while every cell, and with it most of a query's true neighbors,
-/// lives on one shard. Refuses a split that leaves a shard empty (fewer
-/// populated cells than shards).
-pub fn skewed_placement(cell: &[u16], cells: usize, shards: usize) -> Result<Vec<u16>, Error> {
+/// The k-means cells in a walk through centroid space: from cell 0, always
+/// on to the unvisited cell whose centroid is most similar to the current
+/// one (ties to the lower id). Runs of the walk are neighborhoods.
+fn centroid_walk(centroids: &[f32], dim: usize) -> Vec<usize> {
+    let cells = centroids.len() / dim;
+    let centroid = |c: usize| &centroids[c * dim..(c + 1) * dim];
+    let mut visited = vec![false; cells];
+    let mut order = Vec::with_capacity(cells);
+    let mut at = 0usize;
+    for _ in 0..cells {
+        visited[at] = true;
+        order.push(at);
+        let mut next: Option<(usize, f32)> = None;
+        for c in (0..cells).filter(|c| !visited[*c]) {
+            let s = dot(centroid(at), centroid(c));
+            if next.is_none_or(|(_, best)| s > best) {
+                next = Some((c, s));
+            }
+        }
+        match next {
+            Some((c, _)) => at = c,
+            None => break,
+        }
+    }
+    order
+}
+
+/// Skewed placement: whole k-means cells per shard, so a query's true
+/// neighbors gather on few shards. Cells are taken in the order of a walk
+/// from each centroid to its most similar unvisited one, so a shard holds a
+/// neighborhood of cells rather than unrelated ones, and a shard is closed
+/// once it holds its share of the rows not yet placed (those rows over the
+/// shards still open), so shard sizes stay close. Refuses a split that
+/// leaves a shard empty (fewer populated cells than shards).
+pub fn skewed_placement(
+    cell: &[u16],
+    centroids: &[f32],
+    dim: usize,
+    shards: usize,
+) -> Result<Vec<u16>, Error> {
+    let cells = centroids.len() / dim;
     let mut sizes = vec![0usize; cells];
     for c in cell {
         sizes[*c as usize] += 1;
@@ -241,7 +275,8 @@ pub fn skewed_placement(cell: &[u16], cells: usize, shards: usize) -> Result<Vec
     let mut shard = 0usize;
     let mut held = vec![0usize; shards];
     let mut placed = 0usize;
-    for (c, size) in sizes.iter().enumerate() {
+    for c in centroid_walk(centroids, dim) {
+        let size = sizes[c];
         shard_of_cell[c] = shard as u16;
         held[shard] += size;
         placed += size;
@@ -740,7 +775,7 @@ pub fn build_command() -> Result<(), Error> {
         for placement in PLACEMENTS {
             let shard = match placement {
                 "hash" => hash_placement(n, shards),
-                _ => skewed_placement(&cell, cells, shards)?,
+                _ => skewed_placement(&cell, &centroids, rows.dim, shards)?,
             };
             let name = placement_name(placement, shards);
             let mut rows_per_shard = vec![0usize; shards];
@@ -775,8 +810,9 @@ pub fn build_command() -> Result<(), Error> {
                   centroid similarity to the query until p% of rows. far: cells holding none of the \
                   query's unfiltered top-100, in a seeded random order, until p% of rows.",
         "placements": placements,
-        "placement_rules": "hash: splitmix64(row) mod shards. skewed: whole k-means cells in cell id \
-                  order, a shard closed once it holds its share of the rows not yet placed.",
+        "placement_rules": "hash: splitmix64(row) mod shards. skewed: whole k-means cells in the \
+                  order of a walk from cell 0 to each centroid's most similar unvisited centroid, a \
+                  shard closed once it holds its share of the rows not yet placed.",
     });
     write_json(&out.join("manifest.json"), &manifest)?;
     eprintln!("fixture: wrote {}", out.display());
@@ -905,18 +941,29 @@ mod tests {
     }
 
     #[test]
-    fn skewed_placement_keeps_whole_cells_and_closes_shards_by_size() {
-        // Six cells of 10 rows, rows interleaved by cell.
-        let cell: Vec<u16> = (0..60u16).map(|r| r % 6).collect();
-        let shard = skewed_placement(&cell, 6, 3).unwrap();
+    fn skewed_placement_keeps_whole_cells_and_neighboring_cells_together() {
+        // Four cells of 10 rows, rows interleaved by cell. Cells 0 and 2 lie
+        // near the x axis, cells 1 and 3 near the y axis.
+        let cell: Vec<u16> = (0..40u16).map(|r| r % 4).collect();
+        let mut centroids = vec![1.0, 0.0, 0.0, 1.0, 0.9, 0.1, 0.1, 0.9];
+        for c in centroids.chunks_mut(2) {
+            normalize(c);
+        }
+        assert_eq!(centroid_walk(&centroids, 2), vec![0, 2, 3, 1]);
+        let shard = skewed_placement(&cell, &centroids, 2, 2).unwrap();
         for (row, s) in shard.iter().enumerate() {
             let c = cell[row];
             assert_eq!(*s, shard[c as usize], "cell {c} split across shards");
         }
-        // Target 20 rows per shard: cells 0-1, 2-3, 4-5.
-        assert_eq!(&shard[..6], &[0, 0, 1, 1, 2, 2]);
-        // Two cells cannot fill three shards.
-        let two: Vec<u16> = (0..20u16).map(|r| r % 2).collect();
-        assert!(skewed_placement(&two, 2, 3).is_err());
+        // Target 20 rows per shard: cells 0 and 2, then cells 3 and 1.
+        assert_eq!(&shard[..4], &[0, 1, 0, 1]);
+        // Two populated cells cannot fill three shards.
+        assert!(skewed_placement(
+            &cell[..20].iter().map(|c| c % 2).collect::<Vec<_>>(),
+            &centroids[..4],
+            2,
+            3
+        )
+        .is_err());
     }
 }
