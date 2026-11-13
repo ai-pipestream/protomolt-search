@@ -189,9 +189,13 @@ def measure(shape, queries, postings, filt, truth, k, ef, min_time, threads):
     # Recall pass and per-query latency on one thread.
     faiss.omp_set_num_threads(1)
     recalls = []
+    faiss.cvar.hnsw_stats.reset()
     for q in range(qn):
         _, I = shape.search(queries[q : q + 1], k, ef, bits_for(q))
         recalls.append(recall(I[0], truth[q], k))
+    hstats = faiss.cvar.hnsw_stats
+    hops_mean = hstats.nhops / qn
+    scored_mean = hstats.ndis / qn
     lat = []
     pred = 0.0
     done = 0
@@ -250,8 +254,8 @@ def measure(shape, queries, postings, filt, truth, k, ef, min_time, threads):
         "p50_ms": pct(0.5),
         "p99_ms": pct(0.99),
         "predicate_ms_mean": pred * 1e3 / done,
-        "hops_mean": None,
-        "exact_scores_mean": None,
+        "hops_mean": hops_mean,
+        "exact_scores_mean": scored_mean,
         "timing": timing,
     }
 
