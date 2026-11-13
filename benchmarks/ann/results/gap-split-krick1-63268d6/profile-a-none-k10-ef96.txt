@@ -1,0 +1,220 @@
+-- self time by bucket (first match walking the inline chain outward) --
+ 39.99%  distance kernel (score_nodes/dot_*)
+           19.23%  core::core_arch::x86::avx512f::_mm512_fmadd_ps  <-  pipestream_search::hnsw::distance::x86::dot_batch8_avx512f_ptr
+            9.01%  ::spec_next  <-  pipestream_search::hnsw::distance::prefetch_range
+            2.39%  core::core_arch::x86::avx512f::_mm512_fmadd_ps  <-  pipestream_search::hnsw::distance::x86::dot_batch4_avx512f_ptr
+            2.34%  pipestream_search::hnsw::distance::x86::score_node  <-  pipestream_search::hnsw::distance::x86::score_nodes_avx512f
+ 19.55%  heap ops (BinaryHeap push/pop/peek)
+            6.57%  core::ptr::copy_nonoverlapping::  <-  core::ptr::copy_nonoverlapping::
+            3.11%  core::ptr::read::  <-  core::ptr::read::
+            2.08%  ::is_some_and::  <-  ::le
+            1.84%  ::le  <-  ::le
+ 13.59%  visited set (visit/seen/begin, retain)
+            5.42%  ::visit  <-  ::visit
+            4.48%  ::retain_mut::<::retain<<pipestream_search::hnsw::  <-  ::retain_mut::<::retain<<pipestream_search::hnsw::graph::View>::search
+            2.09%  core::ptr::copy_nonoverlapping::  <-  ::retain_mut::<::retain<<pipestream_search::hnsw::graph::View>::search
+            1.25%  ::index_mut  <-  ::visit
+ 13.55%  links (copy_links/list_start/cells/cap)
+            7.06%  core::sync::atomic::atomic_load::  <-  ::get
+            3.00%  core::ptr::write::  <-  ::extend_trusted::<core::iter::adapters::map::Map<core::ops::range::Ra
+            1.14%  <pipestream_search::hnsw::graph::View>::cap  <-  <pipestream_search::hnsw::graph::View>::cap
+            0.67%  <pipestream_search::hnsw::graph::View>::list_start  <-  <pipestream_search::hnsw::graph::View>::list_start
+  5.84%  search_layer body
+            2.58%  <pipestream_search::hnsw::graph::View>::search_lay  <-  <pipestream_search::hnsw::graph::View>::search_layer::::{closure#4}
+            1.06%  <pipestream_search::hnsw::graph::View>::for_each_s  <-  <pipestream_search::hnsw::graph::View>::for_each_scored::<<pipestream_
+            0.70%  <pipestream_search::hnsw::graph::View>::search_lay  <-  <pipestream_search::hnsw::graph::View>::search_layer::
+            0.43%  <pipestream_search::hnsw::graph::View>::row  <-  <pipestream_search::hnsw::graph::View>::row
+  5.18%  rescore / report / results
+            1.11%  <core::iter::adapters::zip::Zip as core::iter::ada  <-  <core::iter::adapters::zip::Zip as core::iter::adapters::zip::ZipImpl>
+            0.54%  ::unchecked_add  <-  <core::iter::adapters::zip::Zip as core::iter::adapters::zip::ZipImpl>
+            0.54%  ::spec_next  <-  <core::iter::adapters::zip::Zip as core::iter::adapters::zip::ZipImpl>
+            0.47%  ::sum::<core::iter::adapters::map::Map<core::iter:  <-  ::sum::<core::iter::adapters::map::Map<core::iter::adapters::zip::Zip,
+  1.03%  other: <pipestream_search::hnsw::graph::View>::select
+            0.46%  <pipestream_search::hnsw::graph::View>::select::{c  <-  <pipestream_search::hnsw::graph::View>::select::{closure#1}
+            0.28%  <pipestream_search::hnsw::graph::View>::select  <-  <pipestream_search::hnsw::graph::View>::select
+            0.19%  ::try_fold::<(), <core::array::iter::iter_inner::P  <-  ::try_fold::<(), <core::array::iter::iter_inner::PolymorphicIter>::try
+            0.02%  <pipestream_search::hnsw::graph::View>::row  <-  <pipestream_search::hnsw::graph::View>::row
+  0.21%  other: ::compress
+            0.07%  ::compress  <-  ::compress
+            0.05%  ::wrapping_add  <-  ::compress
+            0.05%  core::intrinsics::rotate_right::  <-  ::compress
+            0.01%  ::lt  <-  ::compress
+  0.16%  greedy descent
+            0.04%  <pipestream_search::hnsw::graph::View>::greedy::{c  <-  <pipestream_search::hnsw::graph::View>::greedy::{closure#0}
+            0.04%  <core::iter::adapters::zip::Zip as core::iter::ada  <-  <pipestream_search::hnsw::graph::View>::for_each_scored::<<pipestream_
+            0.03%  <pipestream_search::hnsw::graph::View>::for_each_s  <-  <pipestream_search::hnsw::graph::View>::for_each_scored::<<pipestream_
+            0.02%  <pipestream_search::hnsw::graph::View>::greedy  <-  <pipestream_search::hnsw::graph::View>::greedy
+  0.14%  walk / search entry
+            0.05%  <pipestream_search::hnsw::graph::View>::walk::  <-  <pipestream_search::hnsw::graph::View>::walk::
+            0.02%  ::search_with_stats  <-  ::search_with_stats
+            0.01%  ::total_cmp  <-  pipestream_search::chunked::searched_topk::{closure#3}
+            0.01%  ::search  <-  ::search
+  0.08%  other: ::row
+            0.03%  ::as_slice  <-  ::values
+            0.03%  ::dim  <-  ::dim
+            0.02%  ::row  <-  ::row
+  0.08%  enumerate body (consider/bar/survives)
+            0.05%  ::try_fold::<(), core::iter::adapters::copied::cop  <-  ::try_fold::<(), core::iter::adapters::copied::copy_try_fold<f32, (), 
+            0.01%  ::then_some::  <-  pipestream_search::vector::first_invalid_coordinate::{closure#0}
+            0.00%  ::eq  <-  ::connect_back
+            0.00%  ::try_fold::enumerate::::{closure#0}  <-  ::try_fold::enumerate::::{closure#0}
+  0.07%  other: ::connect_back
+            0.01%  ::connect_back  <-  ::connect_back
+            0.01%  ::lock  <-  ::lock
+            0.01%  ::unlock  <-  ::connect_back
+            0.00%  core::ptr::write::  <-  ::connect_back
+  0.07%  other: ::answer
+            0.04%  ::answer  <-  ::answer
+            0.01%  ::patience  <-  ::patience
+            0.01%  ::node_to_row_slice  <-  ::node_to_row_slice
+            0.00%  ::non_null::  <-  ::view
+  0.06%  bench harness
+            0.02%  protomolt_ann_bench::run::one_query  <-  protomolt_ann_bench::run::one_query
+            0.01%  ::as_secs_f64  <-  protomolt_ann_bench::run::measure
+            0.01%  protomolt_ann_bench::run::measure::{closure#0}::{c  <-  std::sys::backtrace::__rust_begin_short_backtrace::
+            0.00%  ::query  <-  protomolt_ann_bench::run::one_query
+  0.03%  other: ::plan
+            0.02%  ::plan  <-  ::plan
+            0.01%  ::check_patience  <-  ::check_patience
+  0.02%  other: pipestream_search::hnsw::graph::with_scratch::
+            0.01%  pipestream_search::hnsw::graph::with_scratch::  <-  pipestream_search::hnsw::graph::with_scratch::
+            0.01%  ::get  <-  <std::sys::thread_local::native::eager::Storage<core::cell::RefCell<co
+            0.01%  pipestream_search::hnsw::graph::SCRATCH::{K#0}::{c  <-  pipestream_search::hnsw::graph::SCRATCH::{K#0}::{closure#0}
+  0.02%  other: pipestream_search::hnsw::image::write_f32s::<pipestream_sear
+            0.01%  ::needs_to_grow  <-  pipestream_search::hnsw::image::write_f32s::<pipestream_search::hnsw::
+            0.00%  ::wrapping_sub  <-  pipestream_search::hnsw::image::write_f32s::<pipestream_search::hnsw::
+            0.00%  core::ptr::copy_nonoverlapping::  <-  pipestream_search::hnsw::image::write_f32s::<pipestream_search::hnsw::
+            0.00%  ::eq  <-  pipestream_search::hnsw::image::write_f32s::<pipestream_search::hnsw::
+  0.01%  other: ::insert
+            0.00%  ::unlock  <-  ::publish_links
+            0.00%  ::non_null::  <-  ::non_null::
+            0.00%  core::mem::replace::  <-  ::insert
+  0.01%  other: pipestream_search::hnsw::image::write_cells::<pipestream_sea
+            0.01%  ::capacity  <-  pipestream_search::hnsw::image::write_cells::<pipestream_search::hnsw:
+            0.00%  <core::ptr::non_null::NonNull as core::cmp::Partia  <-  pipestream_search::hnsw::image::write_cells::<pipestream_search::hnsw:
+  0.01%  other: ::elapsed
+            0.00%  ::elapsed  <-  ::elapsed
+            0.00%  ::unwrap_or_default  <-  ::elapsed
+  0.01%  other: __rustc::__rust_no_alloc_shim_is_unstable_v2
+            0.01%  __rustc::__rust_no_alloc_shim_is_unstable_v2  <-  __rustc::__rust_no_alloc_shim_is_unstable_v2
+  0.00%  other: ::sub_timespec
+            0.00%  ::cmp  <-  ::sub_timespec
+  0.00%  other: __rustc::__rust_dealloc
+            0.00%  __rustc::__rust_dealloc  <-  __rustc::__rust_dealloc
+  0.00%  other: <rayon::iter::for_each::ForEachConsumer as rayon::iter::plum
+            0.00%  ::get  <-  <std::sys::thread_local::native::eager::Storage<core::cell::RefCell<co
+  0.00%  other: __rustc::__rdl_realloc
+            0.00%  ::realloc  <-  __rustc::__rdl_realloc
+  0.00%  other: ::node_allow_bits
+            0.00%  ::node_allow_bits  <-  ::node_allow_bits
+  0.00%  other: ::check_queries
+            0.00%  ::is_multiple_of  <-  ::check_queries
+  0.00%  other: ::now
+            0.00%  ::now  <-  ::now
+
+samples: 44931  (in binary 44807, other DSOs 124)
+
+-- self time, innermost (inlined) function --
+ 22.37%  core::core_arch::x86::avx512f::_mm512_fmadd_ps
+  9.71%  ::spec_next
+  9.06%  core::ptr::copy_nonoverlapping::
+  7.07%  core::sync::atomic::atomic_load::
+  5.42%  ::visit
+  4.48%  ::retain_mut::<::retain<<pipestream_search::hnsw::graph::View>::search_layer::{closure#3}>::{closure#0}>
+  3.68%  core::ptr::write::
+  3.63%  core::ptr::read::
+  2.58%  <pipestream_search::hnsw::graph::View>::search_layer::::{closure#4}
+  2.34%  pipestream_search::hnsw::distance::x86::score_nodes_avx512f
+  2.08%  ::is_some_and::
+  1.84%  ::le
+  1.81%  ::total_cmp
+  1.45%  pipestream_search::hnsw::distance::x86::dot_batch8_avx512f_ptr
+  1.25%  ::index_mut
+  1.14%  <pipestream_search::hnsw::graph::View>::cap
+  1.11%  <core::iter::adapters::zip::Zip as core::iter::adapters::zip::ZipImpl>::fold::<f32, core::iter::adapters::map::map_fold<(&f32, &f32), f32, f32, pipestream_search::exact_vectors::dot::{closure#0}, ::sum<core::iter::adapters::map::Map<core::iter::adapters::zip::Zip, pipestream_search::exact_vectors::dot::{closure#0}>>::{closure#0}>::{closure#0}>
+  1.06%  core::core_arch::x86::avx512f::_mm512_reduce_add_ps
+  1.06%  <pipestream_search::hnsw::graph::View>::for_each_scored::<<pipestream_search::hnsw::graph::View>::search_layer::{closure#4}>
+  0.76%  pipestream_search::hnsw::distance::x86::dot_avx512f_ptr
+  0.70%  pipestream_search::hnsw::distance::checked_row_ptr
+  0.70%  <pipestream_search::hnsw::graph::View>::search_layer::
+  0.67%  <alloc::collections::binary_heap::BinaryHeap>::sift_down_to_bottom
+  0.67%  <pipestream_search::hnsw::graph::View>::list_start
+  0.64%  ::sift_up
+  0.56%  ::unchecked_add
+  0.50%  <alloc::collections::binary_heap::BinaryHeap>::sift_up
+  0.48%  ::then_with::
+  0.47%  ::sum::<core::iter::adapters::map::Map<core::iter::adapters::zip::Zip, pipestream_search::exact_vectors::dot::{closure#0}>>::{closure#0}
+  0.46%  <pipestream_search::hnsw::graph::View>::select::{closure#1}
+  0.45%  <pipestream_search::hnsw::graph::View>::row
+  0.44%  ::lt
+  0.40%  ::eq
+  0.40%  core::core_arch::x86::sse::_mm_add_ps
+  0.39%  pipestream_search::hnsw::distance::x86::dot_batch4_avx512f_ptr
+  0.38%  ::get
+  0.35%  ::set_len
+  0.34%  core::core_arch::x86::avx512f::_mm512_add_ps
+  0.33%  <core::iter::adapters::zip::Zip as core::iter::adapters::zip::ZipImpl>::next
+  0.30%  ::lock
+
+-- self time, outermost real symbol --
+ 45.75%  <pipestream_search::hnsw::graph::View>::search_layer::
+ 39.84%  pipestream_search::hnsw::distance::x86::score_nodes_avx512f
+  4.13%  ::pop
+  3.02%  ::try_fold::<alloc::vec::in_place_drop::InPlaceDrop, core::iter::adapters::map::map_try_fold<pipestream_search::hnsw::graph::Scored, (u32, f32), alloc::vec::in_place_drop::InPlaceDrop, core::result::Result, ::report::{closure#0}, core::iter::adapters::filter::filter_try_fold<(u32, f32), alloc::vec::in_place_drop::InPlaceDrop, core::result::Result, ::report::{closure#1}, alloc::vec::in_place_collect::write_in_place_with_drop::{closure#0}>::{closure#0}>::{closure#0}, core::result::Result>
+  2.63%  <pipestream_search::hnsw::graph::View>::copy_links
+  1.38%  core::slice::sort::shared::smallsort::small_sort_network::<pipestream_search::hnsw::graph::Scored, ::sort_unstable_by<pipestream_search::hnsw::merge::transplant_and_heal_donor::{closure#0}::{closure#2}>::{closure#0}>
+  1.07%  <pipestream_search::hnsw::graph::View>::select
+  0.41%  core::slice::sort::unstable::quicksort::quicksort::<pipestream_search::hnsw::graph::Scored, ::sort_unstable_by::{closure#0}>
+  0.21%  ::compress
+  0.18%  core::slice::sort::stable::drift::sort::<(u32, f32), ::sort_by::{closure#0}>
+  0.16%  <pipestream_search::hnsw::graph::View>::greedy
+  0.11%  pipestream_search::hnsw::distance::x86::dot_avx512f
+  0.08%  ::row
+  0.08%  ::check_queries
+  0.07%  ::connect_back
+
+-- other DSOs --
+  0.16%  libc.so.6
+  0.12%  [vdso]
+
+-- hottest source lines (innermost) --
+ 22.37%  avx512f.rs:3714                          core::core_arch::x86::avx512f::_mm512_fmadd_ps
+  9.71%  range.rs:900                             ::spec_next
+  9.06%  mod.rs:549                               core::ptr::copy_nonoverlapping::
+  7.07%  atomic.rs:3890                           core::sync::atomic::atomic_load::
+  5.41%  graph.rs:165                             ::visit
+  4.24%  mod.rs:2581                              ::retain_mut::<::retain<<pipestream_search::hnsw::graph::View>::search_layer::{closure#3}>::{closure#0}>
+  3.68%  mod.rs:1939                              core::ptr::write::
+  3.63%  mod.rs:1731                              core::ptr::read::
+  2.08%  option.rs:660                            ::is_some_and::
+  1.84%  cmp.rs:2146                              ::le
+  1.37%  distance.rs:745                          pipestream_search::hnsw::distance::x86::dot_batch8_avx512f_ptr
+  1.25%  index.rs:245                             ::index_mut
+  1.14%  graph.rs:?                               <pipestream_search::hnsw::graph::View>::cap
+  1.14%  graph.rs:?                               <pipestream_search::hnsw::graph::View>::search_layer::::{closure#4}
+  1.11%  zip.rs:281                               <core::iter::adapters::zip::Zip as core::iter::adapters::zip::ZipImpl>::fold::<f32, core::iter::adapters::map::map_fold<(&f32, &f32), f32, f32, pipestream_search::exact_vectors::dot::{closure#0}, ::sum<core::iter::adapters::map::Map<core::iter::adapters::zip::Zip, pipestream_search::exact_vectors::dot::{closure#0}>>::{closure#0}>::{closure#0}>
+  1.03%  f32.rs:1528                              ::total_cmp
+  0.84%  graph.rs:676                             <pipestream_search::hnsw::graph::View>::search_layer::::{closure#4}
+  0.77%  f32.rs:1529                              ::total_cmp
+  0.71%  distance.rs:?                            pipestream_search::hnsw::distance::x86::score_nodes_avx512f
+  0.70%  distance.rs:612                          pipestream_search::hnsw::distance::x86::dot_avx512f_ptr
+  0.64%  graph.rs:484                             <pipestream_search::hnsw::graph::View>::list_start
+  0.57%  graph.rs:529                             <pipestream_search::hnsw::graph::View>::for_each_scored::<<pipestream_search::hnsw::graph::View>::search_layer::{closure#4}>
+  0.56%  uint_macros.rs:973                       ::unchecked_add
+  0.55%  macros.rs:173                            core::core_arch::x86::avx512f::_mm512_reduce_add_ps
+  0.52%  avx512f.rs:34808                         core::core_arch::x86::avx512f::_mm512_reduce_add_ps
+  0.48%  cmp.rs:657                               ::then_with::
+  0.47%  accum.rs:166                             ::sum::<core::iter::adapters::map::Map<core::iter::adapters::zip::Zip, pipestream_search::exact_vectors::dot::{closure#0}>>::{closure#0}
+  0.46%  graph.rs:1310                            <pipestream_search::hnsw::graph::View>::select::{closure#1}
+  0.45%  distance.rs:248                          pipestream_search::hnsw::distance::checked_row_ptr
+  0.45%  mod.rs:?                                 <pipestream_search::hnsw::graph::View>::for_each_scored::<<pipestream_search::hnsw::graph::View>::search_layer::{closure#4}>
+  0.44%  cmp.rs:1916                              ::lt
+  0.40%  sse.rs:36                                core::core_arch::x86::sse::_mm_add_ps
+  0.37%  graph.rs:66                              ::get
+  0.37%  mod.rs:920                               <alloc::collections::binary_heap::BinaryHeap>::sift_down_to_bottom
+  0.35%  mod.rs:2231                              ::set_len
+  0.34%  graph.rs:674                             <pipestream_search::hnsw::graph::View>::search_layer::::{closure#4}
+  0.34%  avx512f.rs:882                           core::core_arch::x86::avx512f::_mm512_add_ps
+  0.34%  distance.rs:661                          pipestream_search::hnsw::distance::x86::dot_batch4_avx512f_ptr
+  0.33%  zip.rs:300                               <core::iter::adapters::zip::Zip as core::iter::adapters::zip::ZipImpl>::next
+  0.32%  mod.rs:820                               ::sift_up
