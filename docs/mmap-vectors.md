@@ -37,15 +37,17 @@ A mapped index is read-only:
 file is refused with the conversion advice `load` gives: converting a file
 forward is a file operation, not a corpus rebuild.
 
-Since upstream 1.1 the fork's `main` is one patch commit on upstream
-`main`, and an index of 32,768 vectors or more whose host kernels read the
-bit-plane layout (aarch64, or x86 with AVX-512 VBMI + VNNI) is written as a
-v8 image with bit-plane units. `load_mapped` serves those too: the chunk
-assembler converts each unit's canonical, host-independent planes back to
-sequential-blocked bytes (the converter's route) before the shared
-transform, and the mapped scan keeps the classic kernels
-(ai-pipestream/turbovec#8). Before that change such an image was refused,
-so a large sealed segment written on those hosts could not open mapped.
+Since upstream 1.1, an index of 32,768 vectors or more whose host kernels
+read the bit-plane layout (aarch64, or x86 with AVX-512 VBMI + VNNI) is
+written as a v8 image with bit-plane units. The `44321a8` fork revision
+pinned here serves those too: the chunk assembler converts each unit's
+canonical, host-independent planes back to sequential-blocked bytes (the
+converter's route) before the shared transform, and the mapped scan keeps
+the classic kernels (ai-pipestream/turbovec#8). The fork's current `main`
+(`68afa87`) predates that revision, so the lockfile intentionally retains
+the pinned commit rather than the older branch tip. Before that change such
+an image was refused, so a large sealed segment written on those hosts
+could not open mapped.
 `vector::tests::a_sealed_image_past_the_planes_threshold_serves_mapped`
 pins it here at 2 and 4 bits.
 
