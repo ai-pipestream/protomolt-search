@@ -127,6 +127,7 @@ mod stream_signal;
 pub mod synonyms;
 #[cfg(any(test, feature = "fork-guard"))]
 pub mod test_support;
+pub mod turbo_bridge;
 pub mod values;
 pub mod vector;
 pub mod visibility;

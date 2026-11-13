@@ -230,6 +230,7 @@ pub fn analyzed_field(postings: &[PhrasePosting]) -> crate::postings::AnalyzedFi
         // Concept postings are glossary matches over the raw text, not
         // tokens of the body analysis, so they have no token ordinals.
         positions: None,
+        ..Default::default()
     }
 }
 

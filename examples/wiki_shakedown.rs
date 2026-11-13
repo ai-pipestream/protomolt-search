@@ -43,8 +43,7 @@ use pipestream_search::pb::{
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-const SIDECAR_BIN: &str =
-    "/work/main/grpc-services/grpc-opennlp-analysis/build/native/nativeCompile/grpc-opennlp-analysis";
+const SIDECAR_BIN: &str = "turbo-kserve";
 const DEFAULT_DATA_DIR: &str = "/work/opensearch-grpc-knn/distributed_test_data/wikipedia";
 const VECTOR_BATCH: usize = 512;
 

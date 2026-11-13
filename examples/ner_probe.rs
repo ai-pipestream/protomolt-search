@@ -1,12 +1,12 @@
-//! What entity types does a sidecar actually find?
+//! What entity types does an analysis backend actually find?
 //!
-//! The stock English models cover one type each, so a deployment's
-//! entity coverage is a property of which models it was given rather
-//! than of the request. This prints what came back, typed, which is the
-//! only way to tell a model that found nothing from a model that is not
-//! loaded.
-use pipestream_search::pb::analysis::analysis_service_client::AnalysisServiceClient;
-use pipestream_search::pb::analysis::{AnalysisOptions, AnalyzeRequest};
+//! Runs a document through `turbo` (in-process) or a remote `turbo-kserve`
+//! endpoint with entity recognition enabled and prints the discovered entity
+//! types and surface strings.
+
+use pipestream_search::analyzer::{
+    analyze_document_with_options, body_spec, RemoteCallOptions, SessionLayers,
+};
 
 fn arg(key: &str, default: &str) -> String {
     let p = format!("--{key}=");
@@ -17,48 +17,44 @@ fn arg(key: &str, default: &str) -> String {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = arg("addr", "http://127.0.0.1:59222");
+    let addr = arg("addr", "turbo");
     let text = arg(
         "text",
         "On March 3, 2019, Judge Sonia Sotomayor of the Supreme Court in \
          Washington ordered Acme Corporation to pay $4.5 million, roughly \
          12% of its revenue, to Maria Rodriguez by 5:00 p.m.",
     );
-    let mut client = AnalysisServiceClient::connect(addr.clone()).await?;
-    let r = client
-        .analyze(AnalyzeRequest {
-            text: text.clone(),
-            options: Some(AnalysisOptions {
-                language: "en".into(),
-                sentence_detection: true,
-                ner: true,
-                ..Default::default()
-            }),
-        })
-        .await?
-        .into_inner();
+    let doc = analyze_document_with_options(
+        &addr,
+        &text,
+        Some(&body_spec()),
+        SessionLayers {
+            sentences: true,
+            entities: true,
+            ..Default::default()
+        },
+        &RemoteCallOptions::default(),
+    )
+    .await?;
 
     println!("text: {text}\n");
-    if r.entities.is_empty() {
-        println!("NO ENTITIES. Either no model is loaded or none matched.");
+    if doc.entities.is_empty() {
+        println!("NO ENTITIES. Either no entity rules/models matched or none are loaded.");
     }
     let mut by_type: std::collections::BTreeMap<String, Vec<String>> = Default::default();
-    for e in &r.entities {
+    for ent in &doc.entities {
         by_type
-            .entry(e.r#type.clone())
+            .entry(ent.kind.clone())
             .or_default()
-            .push(e.text.clone());
+            .push(ent.text.clone());
     }
     println!(
         "{} entities across {} types:",
-        r.entities.len(),
+        doc.entities.len(),
         by_type.len()
     );
     for (t, vals) in &by_type {
         println!("  {t:<14} {}", vals.join(", "));
-    }
-    for w in &r.warnings {
-        println!("warning: {w}");
     }
     Ok(())
 }

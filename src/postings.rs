@@ -215,6 +215,19 @@ fn sentences_section_size(n_slots: u64, total: u64) -> u64 {
     4 + 4 * (n_slots + 1) + 8 * total
 }
 
+/// Kind 18: token-lattice position lengths (`pos_lengths:<field>`), parallel
+/// to kind 7 (`positions:<field>`) with identical section geometry (`u64 off | u64 total`,
+/// `u32 n_terms | (n_terms + 1) x u32 base | total x u32 pos_len`), emitted only
+/// when a positional field records multi-token or parallel lattice arcs.
+const COLUMN_KIND_POS_LENGTHS: u8 = 18;
+const POS_LENGTHS_ENTRY_PREFIX: &str = "pos_lengths:";
+
+/// Kind 19: calibrated quantized `u8`/`u16` SPLADE 128-doc Block-Max postings
+/// (`splade:<field>`, `u64 off | u64 len`, `TVSPLD01` payload), emitted only
+/// when a field records non-empty SPLADE impacts.
+const COLUMN_KIND_SPLADE: u8 = 19;
+const SPLADE_ENTRY_PREFIX: &str = "splade:";
+
 /// v8 layout: a v6 or v7 payload, byte-identical, wearing integrity.
 /// The leading magic becomes `TVBM2508`; after the last payload byte
 /// sits an integrity section (u32 n_entries, then per entry u16
@@ -514,6 +527,14 @@ fn v6v7_section_starts(map: &[u8], v7: bool) -> io::Result<Vec<(String, u64)>> {
                     starts.push((format!("column:{name}:sources"), u64_at(base)));
                     cursor = base + 16;
                 }
+                COLUMN_KIND_POS_LENGTHS => {
+                    starts.push((format!("column:{name}:vals"), u64_at(base)));
+                    cursor = base + 16;
+                }
+                COLUMN_KIND_SPLADE => {
+                    starts.push((format!("column:{name}:splade"), u64_at(base)));
+                    cursor = base + 16;
+                }
                 COLUMN_KIND_BINDING
                 | COLUMN_KIND_ANALYSIS_BINDING
                 | COLUMN_KIND_VECTOR_BINDING
@@ -731,6 +752,36 @@ pub trait Bm25Index {
         let _ = (term, doc_id);
         None
     }
+    /// Whether this field carries token-lattice arc lengths (`pos_len`) parallel
+    /// to [`Self::posting_positions`].
+    fn has_pos_lengths(&self) -> bool {
+        false
+    }
+    /// Token-lattice arc lengths (`pos_len >= 1`) parallel to
+    /// [`Self::posting_positions`], or `None` when absent.
+    fn posting_pos_lengths(&self, term: &str, doc_id: u32) -> Option<Vec<u32>> {
+        let _ = (term, doc_id);
+        None
+    }
+    /// Whether this field carries quantized SPLADE Block-Max postings (`COLUMN_KIND_SPLADE`).
+    fn has_splade(&self) -> bool {
+        false
+    }
+    /// Score top-`k` documents against quantized SPLADE Block-Max postings with
+    /// L1 query rounding slack (`#104`, `#2343`).
+    fn score_splade(
+        &self,
+        query_weights: &[(String, f32)],
+        query_l1_slack: f32,
+        k: usize,
+        admitted: &dyn Fn(u32) -> bool,
+    ) -> (
+        Vec<(u32, f32)>,
+        crate::turbo_bridge::splade::SpladeTraversalStats,
+    ) {
+        let _ = (query_weights, query_l1_slack, k, admitted);
+        (Vec::new(), Default::default())
+    }
     /// Whether this field stores sentence spans per document
     /// (`docs/highlighting.md`). Sentence-mode snippets over a field
     /// answering false refuse by name.
@@ -799,7 +850,7 @@ pub trait Bm25Index {
 }
 
 /// One posting: a term occurrence set within one document.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Posting {
     /// Local document id (global id = slot_offset + this).
     pub doc_id: u32,
@@ -813,6 +864,10 @@ pub struct Posting {
     /// positional; every other field stores none, so the payload costs
     /// nothing where nobody asked for it.
     pub positions: Vec<u32>,
+    /// Token-lattice arc length (`pos_len >= 1`) per occurrence, parallel to
+    /// `positions` when the field records lattice arcs; empty when all arcs
+    /// have unit length.
+    pub pos_lengths: Vec<u32>,
 }
 
 /// Term data for one document, as produced from the sidecar's term
@@ -863,6 +918,16 @@ pub struct AnalyzedField {
     /// sentence, which [`Self::check_sentences`] enforces at ingest so
     /// the query path can trust the table.
     pub sentences: Option<Vec<(u32, u32)>>,
+    /// Optional token-lattice arc lengths (`pos_len >= 1`) parallel to
+    /// `positions` (`#103`, `#2340`). `None` when every token has unit length
+    /// and distinct ordinals; `Some` activates lattice traversal and kind-18
+    /// `.bm25` persistence.
+    pub pos_lengths: Option<DocPositions>,
+    /// Optional calibrated quantized SPLADE `(term, impact)` postings for this
+    /// field (`#104`, `#2343`).
+    pub splade: Vec<(String, u16)>,
+    /// IEEE-754 `f32::to_bits(scale)` for `splade` (`0` when empty).
+    pub splade_scale_bits: u32,
 }
 
 impl AnalyzedField {
@@ -882,12 +947,14 @@ impl AnalyzedField {
         })
     }
 
-    /// Check that `positions`, when present, is shaped exactly like the
-    /// term table: one list per term, one ordinal per occurrence, each
-    /// list strictly ascending (occurrences are in text order, and two
-    /// occurrences cannot share a token).
+    /// Check that `positions` (and optional `pos_lengths`), when present, is
+    /// shaped exactly like the term table: one list per term, one ordinal per
+    /// occurrence, each list strictly ascending.
     pub fn check_positions(&self) -> Result<(), String> {
         let Some(positions) = &self.positions else {
+            if self.pos_lengths.is_some() {
+                return Err("pos_lengths present without positions".into());
+            }
             return Ok(());
         };
         if positions.len() != self.terms.len() {
@@ -911,6 +978,27 @@ impl AnalyzedField {
                 ));
             }
         }
+        if let Some(pos_lengths) = &self.pos_lengths {
+            if pos_lengths.len() != self.terms.len() {
+                return Err(format!(
+                    "pos_lengths table has {} entries for {} terms",
+                    pos_lengths.len(),
+                    self.terms.len()
+                ));
+            }
+            for ((term, _, offsets), lengths) in self.terms.iter().zip(pos_lengths) {
+                if lengths.len() != offsets.len() {
+                    return Err(format!(
+                        "term {term:?} has {} occurrences but {} pos_lengths",
+                        offsets.len(),
+                        lengths.len()
+                    ));
+                }
+                if lengths.contains(&0) {
+                    return Err(format!("term {term:?} has zero pos_len"));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -919,7 +1007,7 @@ impl AnalyzedField {
 /// positionally matching the store's field table. Field 0 is the body
 /// (the stored text). A document may carry fewer entries than the
 /// store has fields; missing trailing fields index as empty.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct AnalyzedDoc {
     /// Per-field analyzed data, indexed by field id.
     pub fields: Vec<AnalyzedField>,
@@ -947,6 +1035,20 @@ pub struct AnalyzedDoc {
     /// materializes them into an ordinary map column. They are never mixed
     /// into body postings.
     pub entities: Vec<crate::phrases::DocEntity>,
+    /// Optional one-pass TurboEmbed NLP projection (`#103`, `#2345`) for
+    /// pre-WAL materialization of typed columns.
+    pub nlp: Option<Box<turbo_client::DocumentNlpProjection>>,
+}
+
+impl PartialEq for AnalyzedDoc {
+    fn eq(&self, other: &Self) -> bool {
+        self.fields == other.fields
+            && self.cased == other.cased
+            && self.quality == other.quality
+            && self.geography == other.geography
+            && self.entities == other.entities
+            && self.nlp.is_some() == other.nlp.is_some()
+    }
 }
 
 /// One document's geography reduction, derived at INGEST and stored
@@ -990,11 +1092,9 @@ impl AnalyzedDoc {
                 length,
                 positions: None,
                 sentences: None,
+                ..Default::default()
             }],
-            cased: None,
-            quality: None,
-            geography: None,
-            entities: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -1006,11 +1106,9 @@ impl AnalyzedDoc {
                 length,
                 positions: Some(positions),
                 sentences: None,
+                ..Default::default()
             }],
-            cased: None,
-            quality: None,
-            geography: None,
-            entities: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -1047,6 +1145,9 @@ struct FieldStore {
     /// from the file's kind-7 entry); a positional field refuses a
     /// document without positions instead of storing a hole.
     positions: bool,
+    /// Whether at least one document in this positional field carried
+    /// token-lattice arc lengths (`COLUMN_KIND_POS_LENGTHS`).
+    has_lattice: bool,
     /// Whether this field keeps sentence spans per document
     /// (`docs/highlighting.md`), declared at construction or read from
     /// the file's kind-8 entry.
@@ -1054,6 +1155,8 @@ struct FieldStore {
     /// Per-document sentence spans, indexed by local doc id, populated
     /// only when `sentences` is set (sparse slots hold an empty table).
     doc_sentences: Vec<Vec<(u32, u32)>>,
+    /// Optional calibrated quantized SPLADE inverted index (`COLUMN_KIND_SPLADE`).
+    splade: Option<crate::turbo_bridge::splade::SpladeFieldIndex>,
 }
 
 impl FieldStore {
@@ -1065,8 +1168,10 @@ impl FieldStore {
             doc_lengths: Vec::new(),
             total_length: 0,
             positions: false,
+            has_lattice: false,
             sentences: false,
             doc_sentences: Vec::new(),
+            splade: None,
         }
     }
 }
@@ -2912,6 +3017,20 @@ impl Bm25Store {
             } else {
                 None
             };
+            let pos_lengths = if field.positions {
+                if analyzed.pos_lengths.is_some() {
+                    field.has_lattice = true;
+                }
+                analyzed.pos_lengths
+            } else {
+                None
+            };
+            if !analyzed.splade.is_empty() {
+                field
+                    .splade
+                    .get_or_insert_with(Default::default)
+                    .insert_doc(doc_id, analyzed.splade_scale_bits, &analyzed.splade);
+            }
             for (ti, (term, tf, offsets)) in analyzed.terms.into_iter().enumerate() {
                 let positions = match &positions {
                     Some(table) => {
@@ -2924,11 +3043,23 @@ impl Bm25Store {
                     }
                     None => Vec::new(),
                 };
+                let pos_lengths = match &pos_lengths {
+                    Some(table) => {
+                        assert_eq!(
+                            table[ti].len(),
+                            offsets.len(),
+                            "pos_lengths must be parallel to offsets"
+                        );
+                        table[ti].clone()
+                    }
+                    None => Vec::new(),
+                };
                 field.postings.entry(term).or_default().push(Posting {
                     doc_id,
                     tf,
                     offsets,
                     positions,
+                    pos_lengths,
                 });
             }
         }
@@ -3333,7 +3464,9 @@ impl Bm25Store {
             || self.binding.is_some()
             || self.derived.is_some()
             || !self.sources.is_empty()
-            || self.fields.iter().any(|f| f.positions || f.sentences);
+            || self.fields.iter().any(|f| {
+                f.positions || f.sentences || f.splade.as_ref().is_some_and(|s| !s.is_empty())
+            });
         let column_table_size: u64 = if !has_columns {
             0
         } else {
@@ -3401,6 +3534,18 @@ impl Bm25Store {
                 } else {
                     SOURCE_ENTRY_BYTES
                 }
+                + self
+                    .fields
+                    .iter()
+                    .filter(|f| f.positions && f.has_lattice)
+                    .map(|f| 2 + (POS_LENGTHS_ENTRY_PREFIX.len() + f.name.len()) as u64 + 1 + 8 * 2)
+                    .sum::<u64>()
+                + self
+                    .fields
+                    .iter()
+                    .filter(|f| f.splade.as_ref().is_some_and(|s| !s.is_empty()))
+                    .map(|f| 2 + (SPLADE_ENTRY_PREFIX.len() + f.name.len()) as u64 + 1 + 8 * 2)
+                    .sum::<u64>()
         };
         let header_size: u64 = 8
             + 4
@@ -3535,8 +3680,37 @@ impl Bm25Store {
         let source_section = if self.sources.is_empty() {
             None
         } else {
-            Some((cursor, self.sources.encoded_len(n_slots as u32)?))
+            let len = self.sources.encoded_len(n_slots as u32)?;
+            let sec = (cursor, len);
+            cursor += len;
+            Some(sec)
         };
+        let mut pos_lengths_offs: Vec<(usize, u64, u64)> = Vec::new();
+        for (fi, field) in self.fields.iter().enumerate() {
+            if !(field.positions && field.has_lattice) {
+                continue;
+            }
+            let total: u64 = field_terms[fi]
+                .iter()
+                .map(|t| {
+                    field.postings[*t]
+                        .iter()
+                        .map(|p| p.positions.len() as u64)
+                        .sum::<u64>()
+                })
+                .sum();
+            pos_lengths_offs.push((fi, cursor, total));
+            cursor += positions_section_size(field_terms[fi].len() as u64, total);
+        }
+        let mut splade_offs: Vec<(usize, u64, u64)> = Vec::new();
+        for (fi, field) in self.fields.iter().enumerate() {
+            let Some(splade) = field.splade.as_ref().filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            let len = splade.encoded_len();
+            splade_offs.push((fi, cursor, len));
+            cursor += len;
+        }
 
         w.write_all(if has_columns { MAGIC_V7 } else { MAGIC_V6 })?;
         write_u32(w, self.fields.len() as u32)?;
@@ -3569,7 +3743,9 @@ impl Bm25Store {
                     + sentences_offs.len()
                     + usize::from(self.binding.is_some())
                     + usize::from(self.derived.is_some())
-                    + usize::from(!self.sources.is_empty())) as u32,
+                    + usize::from(!self.sources.is_empty())
+                    + pos_lengths_offs.len()
+                    + splade_offs.len()) as u32,
             )?;
             for (facet, &(dict_off, ords_off)) in self.facets.iter().zip(&facet_offs) {
                 write_u16(w, facet.name.len() as u16)?;
@@ -3672,6 +3848,22 @@ impl Bm25Store {
             write_binding_entry(w, self.binding.as_ref())?;
             write_derived_entry(w, self.derived.as_ref())?;
             write_source_entry(w, source_section)?;
+            for &(fi, off, total) in &pos_lengths_offs {
+                let name = format!("{POS_LENGTHS_ENTRY_PREFIX}{}", self.fields[fi].name);
+                write_u16(w, name.len() as u16)?;
+                w.write_all(name.as_bytes())?;
+                w.write_all(&[COLUMN_KIND_POS_LENGTHS])?;
+                write_u64(w, off)?;
+                write_u64(w, total)?;
+            }
+            for &(fi, off, len) in &splade_offs {
+                let name = format!("{SPLADE_ENTRY_PREFIX}{}", self.fields[fi].name);
+                write_u16(w, name.len() as u16)?;
+                w.write_all(name.as_bytes())?;
+                w.write_all(&[COLUMN_KIND_SPLADE])?;
+                write_u64(w, off)?;
+                write_u64(w, len)?;
+            }
         }
         self.write_shared_sections(w, 0)?;
         for (fi, field) in self.fields.iter().enumerate() {
@@ -3767,6 +3959,39 @@ impl Bm25Store {
         }
         if source_section.is_some() {
             self.sources.write(w, n_slots as u32)?;
+        }
+        for &(fi, _, total) in &pos_lengths_offs {
+            let field = &self.fields[fi];
+            let terms = &field_terms[fi];
+            write_u32(w, terms.len() as u32)?;
+            let mut base = 0u64;
+            for term in terms.iter() {
+                write_u32(w, u32::try_from(base).expect("pos_lengths exceed u32"))?;
+                base += field.postings[*term]
+                    .iter()
+                    .map(|p| p.positions.len() as u64)
+                    .sum::<u64>();
+            }
+            write_u32(w, u32::try_from(base).expect("pos_lengths exceed u32"))?;
+            debug_assert_eq!(base, total);
+            for term in terms.iter() {
+                for p in &field.postings[*term] {
+                    if p.pos_lengths.is_empty() {
+                        for _ in 0..p.positions.len() {
+                            write_u32(w, 1)?;
+                        }
+                    } else {
+                        for &len in &p.pos_lengths {
+                            write_u32(w, len)?;
+                        }
+                    }
+                }
+            }
+        }
+        for &(fi, _, _) in &splade_offs {
+            if let Some(splade) = self.fields[fi].splade.as_ref() {
+                splade.write(w)?;
+            }
         }
         Ok(())
     }
@@ -3920,8 +4145,10 @@ impl Bm25Store {
                 doc_lengths,
                 total_length,
                 positions: false,
+                has_lattice: false,
                 sentences: false,
                 doc_sentences: Vec::new(),
+                splade: None,
             }],
             texts,
             lineages,
@@ -4049,6 +4276,7 @@ impl Bm25Store {
                     tf,
                     offsets,
                     positions: Vec::new(),
+                    pos_lengths: Vec::new(),
                 });
             }
             postings.insert(term, plist);
@@ -4396,6 +4624,43 @@ impl Bm25Index for StoreFieldView<'_> {
             .ok()
             .map(|i| postings[i].positions.clone())
     }
+    fn has_pos_lengths(&self) -> bool {
+        self.field.positions && self.field.has_lattice
+    }
+    fn posting_pos_lengths(&self, term: &str, doc_id: u32) -> Option<Vec<u32>> {
+        if !(self.field.positions && self.field.has_lattice) {
+            return None;
+        }
+        let postings = self.field.postings.get(term)?;
+        postings
+            .binary_search_by_key(&doc_id, |p| p.doc_id)
+            .ok()
+            .map(|i| {
+                if postings[i].pos_lengths.is_empty() {
+                    vec![1; postings[i].positions.len()]
+                } else {
+                    postings[i].pos_lengths.clone()
+                }
+            })
+    }
+    fn has_splade(&self) -> bool {
+        self.field.splade.as_ref().is_some_and(|s| !s.is_empty())
+    }
+    fn score_splade(
+        &self,
+        query_weights: &[(String, f32)],
+        query_l1_slack: f32,
+        k: usize,
+        admitted: &dyn Fn(u32) -> bool,
+    ) -> (
+        Vec<(u32, f32)>,
+        crate::turbo_bridge::splade::SpladeTraversalStats,
+    ) {
+        match self.field.splade.as_ref() {
+            Some(splade) => splade.score_top_k(query_weights, query_l1_slack, k, admitted),
+            None => (Vec::new(), Default::default()),
+        }
+    }
     fn has_sentences(&self) -> bool {
         self.field.sentences
     }
@@ -4485,6 +4750,28 @@ impl Bm25Index for Bm25Store {
     }
     fn posting_positions(&self, term: &str, doc_id: u32) -> Option<Vec<u32>> {
         self.field(0).posting_positions(term, doc_id)
+    }
+    fn has_pos_lengths(&self) -> bool {
+        self.field(0).has_pos_lengths()
+    }
+    fn posting_pos_lengths(&self, term: &str, doc_id: u32) -> Option<Vec<u32>> {
+        self.field(0).posting_pos_lengths(term, doc_id)
+    }
+    fn has_splade(&self) -> bool {
+        self.field(0).has_splade()
+    }
+    fn score_splade(
+        &self,
+        query_weights: &[(String, f32)],
+        query_l1_slack: f32,
+        k: usize,
+        admitted: &dyn Fn(u32) -> bool,
+    ) -> (
+        Vec<(u32, f32)>,
+        crate::turbo_bridge::splade::SpladeTraversalStats,
+    ) {
+        self.field(0)
+            .score_splade(query_weights, query_l1_slack, k, admitted)
     }
     fn has_sentences(&self) -> bool {
         self.field(0).has_sentences()
@@ -4577,6 +4864,7 @@ impl Bm25Store {
                     tf,
                     offsets,
                     positions: Vec::new(),
+                    pos_lengths: Vec::new(),
                 });
             }
             postings.insert(term, plist);
@@ -4602,6 +4890,7 @@ impl Bm25Store {
         directory_off: u64,
         run_base: u64,
         positions_off: Option<u64>,
+        pos_lengths_off: Option<u64>,
     ) -> io::Result<std::collections::BTreeMap<String, Vec<Posting>>> {
         let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
         let at = |off: u64, len: u64| -> io::Result<&[u8]> {
@@ -4632,6 +4921,17 @@ impl Bm25Store {
             }
             None => None,
         };
+        let pos_lengths = match pos_lengths_off {
+            Some(off) => {
+                if u32_at(off)? as usize != n_terms {
+                    return Err(invalid(
+                        "pos_lengths section term count differs from directory",
+                    ));
+                }
+                Some((off + 4, off + 4 + 4 * (n_terms as u64 + 1)))
+            }
+            None => None,
+        };
         let mut postings = std::collections::BTreeMap::new();
         for i in 0..n_terms {
             let e = directory_off + 4 + 34 * i as u64;
@@ -4645,6 +4945,10 @@ impl Bm25Store {
             let term = String::from_utf8(at(blob_start + blob_off, term_len)?.to_vec())
                 .map_err(|_| invalid("invalid utf-8 in term"))?;
             let term_base = match positions {
+                Some((bases, data)) => Some((u64::from(u32_at(bases + 4 * i as u64)?), data)),
+                None => None,
+            };
+            let pl_base = match pos_lengths {
                 Some((bases, data)) => Some((u64::from(u32_at(bases + 4 * i as u64)?), data)),
                 None => None,
             };
@@ -4675,11 +4979,19 @@ impl Bm25Store {
                         positions.push(u32_at(data + 4 * (base + o))?);
                     }
                 }
+                let mut pos_lengths = Vec::new();
+                if let Some((base, data)) = pl_base {
+                    pos_lengths.reserve((occ_end - occ_start) as usize);
+                    for o in occ_start..occ_end {
+                        pos_lengths.push(u32_at(data + 4 * (base + o))?);
+                    }
+                }
                 plist.push(Posting {
                     doc_id,
                     tf,
                     offsets,
                     positions,
+                    pos_lengths,
                 });
             }
             postings.insert(term, plist);
@@ -4737,7 +5049,7 @@ impl Bm25Store {
             }
         }
         // postings: locate each term's runs through the directory.
-        let postings = Self::read_v5_shaped_postings(all, directory_off, 0, None)?;
+        let postings = Self::read_v5_shaped_postings(all, directory_off, 0, None, None)?;
         Ok(Self::from_single_field(
             postings,
             doc_lengths,
@@ -4809,6 +5121,8 @@ impl Bm25Store {
         // (field name, section_off) per kind-7 entry.
         let mut positions_metas: Vec<(String, u64)> = Vec::new();
         let mut sentences_metas: Vec<(String, u64)> = Vec::new();
+        let mut pos_lengths_metas: Vec<(String, u64)> = Vec::new();
+        let mut splade_metas: Vec<(String, u64, u64)> = Vec::new();
         let mut binding_meta: Option<StoredBinding> = None;
         let mut derived_meta: Option<StoredDerived> = None;
         let mut sources_meta = None;
@@ -4905,6 +5219,24 @@ impl Bm25Store {
                     }
                     COLUMN_KIND_SOURCES => {
                         sources_meta = Some((u64_at(base)?, u64_at(base + 8)?));
+                        cursor = base + 16;
+                    }
+                    COLUMN_KIND_POS_LENGTHS => {
+                        let field = name
+                            .strip_prefix(POS_LENGTHS_ENTRY_PREFIX)
+                            .ok_or_else(|| {
+                                invalid("kind-18 entry name lacks the pos_lengths: prefix")
+                            })?
+                            .to_string();
+                        pos_lengths_metas.push((field, u64_at(base)?));
+                        cursor = base + 16;
+                    }
+                    COLUMN_KIND_SPLADE => {
+                        let field = name
+                            .strip_prefix(SPLADE_ENTRY_PREFIX)
+                            .ok_or_else(|| invalid("kind-19 entry name lacks the splade: prefix"))?
+                            .to_string();
+                        splade_metas.push((field, u64_at(base)?, u64_at(base + 8)?));
                         cursor = base + 16;
                     }
                     COLUMN_KIND_BINDING
@@ -5061,7 +5393,18 @@ impl Bm25Store {
                 .iter()
                 .find(|(field, _)| *field == name)
                 .map(|(_, off)| *off);
-            let postings = Self::read_v5_shaped_postings(all, d_off, p_off, positions_off)?;
+            let pos_lengths_off = pos_lengths_metas
+                .iter()
+                .find(|(field, _)| *field == name)
+                .map(|(_, off)| *off);
+            let postings =
+                Self::read_v5_shaped_postings(all, d_off, p_off, positions_off, pos_lengths_off)?;
+            let splade = match splade_metas.iter().find(|(field, _, _)| *field == name) {
+                Some((_, off, len)) => Some(crate::turbo_bridge::splade::SpladeFieldIndex::decode(
+                    at(*off, *len)?,
+                )?),
+                None => None,
+            };
             // A kind-8 section (validated above) comes back into heap as
             // one table per slot.
             let sentences_off = sentences_metas
@@ -5090,6 +5433,8 @@ impl Bm25Store {
                 doc_lengths,
                 total_length,
                 positions: positions_off.is_some(),
+                has_lattice: pos_lengths_off.is_some(),
+                splade,
                 sentences: sentences_off.is_some(),
                 doc_sentences,
             });
@@ -5303,7 +5648,7 @@ impl Bm25Store {
 /// One field's slice of a [`SpillBuilder`]: its pending postings
 /// buffer, spilled runs, and per-document lengths — the spill-side
 /// mirror of [`FieldStore`].
-type PendingPosting = (String, u32, u32, Vec<(u32, u32)>, Vec<u32>);
+type PendingPosting = (String, u32, u32, Vec<(u32, u32)>, Vec<u32>, Vec<u32>);
 type PostingDirectoryEntry = (String, u64, u64, u64, u32);
 
 struct FieldSpill {
@@ -5311,7 +5656,7 @@ struct FieldSpill {
     /// Hash of the field's AnalysisSpec, persisted in the v6 field
     /// table. 0 until the ingest layer wires real fingerprints.
     analysis_fingerprint: u64,
-    /// Pending postings: (term, doc_id, tf, offsets, positions).
+    /// Pending postings: (term, doc_id, tf, offsets, positions, pos_lengths).
     buf: Vec<PendingPosting>,
     runs: Vec<PathBuf>,
     doc_lengths: Vec<u32>,
@@ -5321,6 +5666,8 @@ struct FieldSpill {
     /// occurrence after the offset pairs, and `finish` writes the
     /// field's kind-7 section.
     positions: bool,
+    has_lattice: bool,
+    splade: Option<crate::turbo_bridge::splade::SpladeFieldIndex>,
     /// Whether this field keeps sentence spans (the spill-side mirror of
     /// `FieldStore::sentences`): spans stream to a stage file as
     /// documents arrive, and `finish` writes the field's kind-8 section.
@@ -5350,6 +5697,8 @@ impl FieldSpill {
             doc_lengths: Vec::new(),
             total_length: 0,
             positions: false,
+            has_lattice: false,
+            splade: None,
             sentences: false,
             sentence_stage: None,
         }
@@ -6075,6 +6424,12 @@ impl SpillBuilder {
             // takes the document's ordinals, every other field drops
             // them. The node validated the shape and refused a
             // positionless document into a positional field upstream.
+            if !analyzed.splade.is_empty() {
+                field
+                    .splade
+                    .get_or_insert_with(crate::turbo_bridge::splade::SpladeFieldIndex::default)
+                    .insert_doc(doc_id, analyzed.splade_scale_bits, &analyzed.splade);
+            }
             let positions = if field.positions {
                 Some(analyzed.positions.unwrap_or_else(|| {
                     panic!(
@@ -6082,6 +6437,14 @@ impl SpillBuilder {
                         field.name
                     )
                 }))
+            } else {
+                None
+            };
+            let pos_lengths = if field.positions {
+                if analyzed.pos_lengths.is_some() {
+                    field.has_lattice = true;
+                }
+                analyzed.pos_lengths
             } else {
                 None
             };
@@ -6097,8 +6460,25 @@ impl SpillBuilder {
                     }
                     None => Vec::new(),
                 };
-                self.buf_bytes += term.len() + 24 + 16 * offsets.len() + 4 * positions.len();
-                field.buf.push((term, doc_id, tf, offsets, positions));
+                let pos_lengths = match &pos_lengths {
+                    Some(table) => {
+                        assert_eq!(
+                            table[ti].len(),
+                            offsets.len(),
+                            "pos_lengths must be parallel to offsets"
+                        );
+                        table[ti].clone()
+                    }
+                    None => Vec::new(),
+                };
+                self.buf_bytes += term.len()
+                    + 24
+                    + 16 * offsets.len()
+                    + 4 * positions.len()
+                    + 4 * pos_lengths.len();
+                field
+                    .buf
+                    .push((term, doc_id, tf, offsets, positions, pos_lengths));
             }
         }
         if lengths.iter().any(|&l| l > 0) {
@@ -6137,7 +6517,7 @@ impl SpillBuilder {
                 write_u16(&mut w, term.len() as u16)?;
                 w.write_all(term.as_bytes())?;
                 write_u32(&mut w, (group_end - i) as u32)?;
-                for (_, doc_id, tf, offsets, positions) in &field.buf[i..group_end] {
+                for (_, doc_id, tf, offsets, positions, pos_lengths) in &field.buf[i..group_end] {
                     write_u32(&mut w, *doc_id)?;
                     write_u32(&mut w, *tf)?;
                     write_u32(&mut w, offsets.len() as u32)?;
@@ -6152,6 +6532,15 @@ impl SpillBuilder {
                         debug_assert_eq!(positions.len(), offsets.len());
                         for &ordinal in positions {
                             write_u32(&mut w, ordinal)?;
+                        }
+                        if pos_lengths.is_empty() {
+                            w.write_all(&[0u8])?;
+                        } else {
+                            debug_assert_eq!(pos_lengths.len(), offsets.len());
+                            w.write_all(&[1u8])?;
+                            for &len in pos_lengths {
+                                write_u32(&mut w, len)?;
+                            }
                         }
                     }
                 }
@@ -6219,12 +6608,14 @@ impl SpillBuilder {
         body_path: &Path,
         occ_stage_path: &Path,
         positions: Option<&mut PositionsStage>,
+        pos_lengths: Option<&mut PositionsStage>,
     ) -> io::Result<Vec<PostingDirectoryEntry>> {
         let mut directory: Vec<PostingDirectoryEntry> = Vec::new();
         let mut out = io::BufWriter::new(std::fs::File::create(body_path)?);
         let mut heads: Vec<RunHead> = Vec::new();
         let positional = positions.is_some();
         let mut positions = positions;
+        let mut pos_lengths = pos_lengths;
         for run in runs {
             if let Some(head) = RunHead::open(run, positional)? {
                 heads.push(head);
@@ -6253,13 +6644,19 @@ impl SpillBuilder {
                     .bases
                     .push(u32::try_from(stage.total).expect("positions exceed u32"));
             }
+            if let Some(stage) = pos_lengths.as_deref_mut() {
+                stage
+                    .bases
+                    .push(u32::try_from(stage.total).expect("pos_lengths exceed u32"));
+            }
             {
                 let mut occ_stage = io::BufWriter::new(std::fs::File::create(occ_stage_path)?);
                 let mut idx = 0;
                 while idx < heads.len() {
                     if heads[idx].term == term {
                         for _ in 0..heads[idx].n_postings {
-                            let (doc_id, tf, offsets, ordinals) = heads[idx].next_posting_raw()?;
+                            let (doc_id, tf, offsets, ordinals, pos_lens) =
+                                heads[idx].next_posting_raw()?;
                             let dl = doc_lengths[doc_id as usize];
                             write_u32(&mut out, doc_id)?;
                             write_u32(&mut out, tf)?;
@@ -6271,6 +6668,18 @@ impl SpillBuilder {
                             if let Some(stage) = positions.as_deref_mut() {
                                 stage.writer.write_all(&ordinals)?;
                                 stage.total += ordinals.len() as u64 / 4;
+                            }
+                            if let Some(stage) = pos_lengths.as_deref_mut() {
+                                let n_occ = offsets.len() / 8;
+                                if pos_lens.is_empty() {
+                                    for _ in 0..n_occ {
+                                        write_u32(&mut stage.writer, 1)?;
+                                    }
+                                    stage.total += n_occ as u64;
+                                } else {
+                                    stage.writer.write_all(&pos_lens)?;
+                                    stage.total += pos_lens.len() as u64 / 4;
+                                }
                             }
                             skip.push(tf, dl, doc_id, &mut skip_l0)?;
                             occ_start += offsets.len() as u32 / 8;
@@ -6321,10 +6730,23 @@ impl SpillBuilder {
         // a file during the merge, bases kept in heap at 4 B per term).
         let mut position_stages: Vec<Option<PositionsStage>> =
             Vec::with_capacity(self.fields.len());
+        let mut pos_length_stages: Vec<Option<PositionsStage>> =
+            Vec::with_capacity(self.fields.len());
         for (fi, field) in self.fields.iter().enumerate() {
             let body_path = self.dir.join(format!("postings-f{fi:03}.body"));
             let mut stage = if field.positions {
                 let path = self.dir.join(format!("positions-f{fi:03}.stage"));
+                Some(PositionsStage {
+                    writer: io::BufWriter::new(std::fs::File::create(&path)?),
+                    path,
+                    bases: Vec::new(),
+                    total: 0,
+                })
+            } else {
+                None
+            };
+            let mut len_stage = if field.positions && field.has_lattice {
+                let path = self.dir.join(format!("pos-lengths-f{fi:03}.stage"));
                 Some(PositionsStage {
                     writer: io::BufWriter::new(std::fs::File::create(&path)?),
                     path,
@@ -6340,14 +6762,19 @@ impl SpillBuilder {
                 &body_path,
                 &occ_stage_path,
                 stage.as_mut(),
+                len_stage.as_mut(),
             )?;
             if let Some(stage) = stage.as_mut() {
+                stage.writer.flush()?;
+            }
+            if let Some(stage) = len_stage.as_mut() {
                 stage.writer.flush()?;
             }
             body_lens.push(std::fs::metadata(&body_path)?.len());
             body_paths.push(body_path);
             directories.push(directory);
             position_stages.push(stage);
+            pos_length_stages.push(len_stage);
         }
 
         // Section geometry, identical to Bm25Store::write_v6_to.
@@ -6364,7 +6791,9 @@ impl SpillBuilder {
             || self.binding.is_some()
             || self.derived.is_some()
             || !self.sources.is_empty()
-            || self.fields.iter().any(|f| f.positions || f.sentences);
+            || self.fields.iter().any(|f| {
+                f.positions || f.sentences || f.splade.as_ref().is_some_and(|s| !s.is_empty())
+            });
         let column_table_size: u64 = if !has_columns {
             0
         } else {
@@ -6432,6 +6861,18 @@ impl SpillBuilder {
                 } else {
                     SOURCE_ENTRY_BYTES
                 }
+                + self
+                    .fields
+                    .iter()
+                    .filter(|f| f.positions && f.has_lattice)
+                    .map(|f| 2 + (POS_LENGTHS_ENTRY_PREFIX.len() + f.name.len()) as u64 + 1 + 8 * 2)
+                    .sum::<u64>()
+                + self
+                    .fields
+                    .iter()
+                    .filter(|f| f.splade.as_ref().is_some_and(|s| !s.is_empty()))
+                    .map(|f| 2 + (SPLADE_ENTRY_PREFIX.len() + f.name.len()) as u64 + 1 + 8 * 2)
+                    .sum::<u64>()
         };
         let header_size: u64 = 8
             + 4
@@ -6554,8 +6995,28 @@ impl SpillBuilder {
         let source_section = if self.sources.is_empty() {
             None
         } else {
-            Some((cursor, self.sources.encoded_len(n_slots as u32)?))
+            let len = self.sources.encoded_len(n_slots as u32)?;
+            let off = cursor;
+            cursor += len;
+            Some((off, len))
         };
+        let mut pos_lengths_offs: Vec<(usize, u64, u64)> = Vec::new();
+        for (fi, stage) in pos_length_stages.iter().enumerate() {
+            let Some(stage) = stage else {
+                continue;
+            };
+            pos_lengths_offs.push((fi, cursor, stage.total));
+            cursor += positions_section_size(directories[fi].len() as u64, stage.total);
+        }
+        let mut splade_offs: Vec<(usize, u64, u64)> = Vec::new();
+        for (fi, field) in self.fields.iter().enumerate() {
+            let Some(splade) = field.splade.as_ref().filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            let len = splade.encoded_len();
+            splade_offs.push((fi, cursor, len));
+            cursor += len;
+        }
         let tmp = path.with_extension("bm25tmp");
         {
             let mut w = io::BufWriter::new(std::fs::File::create(&tmp)?);
@@ -6590,7 +7051,9 @@ impl SpillBuilder {
                         + sentences_offs.len()
                         + usize::from(self.binding.is_some())
                         + usize::from(self.derived.is_some())
-                        + usize::from(!self.sources.is_empty())) as u32,
+                        + usize::from(!self.sources.is_empty())
+                        + pos_lengths_offs.len()
+                        + splade_offs.len()) as u32,
                 )?;
                 for (facet, &(dict_off, ords_off)) in self.facets.iter().zip(&facet_offs) {
                     write_u16(&mut w, facet.name.len() as u16)?;
@@ -6693,6 +7156,22 @@ impl SpillBuilder {
                 write_binding_entry(&mut w, self.binding.as_ref())?;
                 write_derived_entry(&mut w, self.derived.as_ref())?;
                 write_source_entry(&mut w, source_section)?;
+                for &(fi, off, total) in &pos_lengths_offs {
+                    let name = format!("{POS_LENGTHS_ENTRY_PREFIX}{}", self.fields[fi].name);
+                    write_u16(&mut w, name.len() as u16)?;
+                    w.write_all(name.as_bytes())?;
+                    w.write_all(&[COLUMN_KIND_POS_LENGTHS])?;
+                    write_u64(&mut w, off)?;
+                    write_u64(&mut w, total)?;
+                }
+                for &(fi, off, len) in &splade_offs {
+                    let name = format!("{SPLADE_ENTRY_PREFIX}{}", self.fields[fi].name);
+                    write_u16(&mut w, name.len() as u16)?;
+                    w.write_all(name.as_bytes())?;
+                    w.write_all(&[COLUMN_KIND_SPLADE])?;
+                    write_u64(&mut w, off)?;
+                    write_u64(&mut w, len)?;
+                }
             }
             // texts: byte-copy of the spill (already section-encoded).
             let mut spill = std::fs::File::open(self.dir.join("texts.spill"))?;
@@ -6827,6 +7306,27 @@ impl SpillBuilder {
             }
             if source_section.is_some() {
                 self.sources.write(&mut w, n_slots as u32)?;
+            }
+            for &(fi, _, total) in &pos_lengths_offs {
+                let stage = pos_length_stages[fi]
+                    .as_ref()
+                    .expect("lattice field has a stage");
+                write_u32(&mut w, directories[fi].len() as u32)?;
+                debug_assert_eq!(stage.bases.len(), directories[fi].len());
+                for &base in &stage.bases {
+                    write_u32(&mut w, base)?;
+                }
+                write_u32(
+                    &mut w,
+                    u32::try_from(total).expect("pos_lengths exceed u32"),
+                )?;
+                let mut lens = std::fs::File::open(&stage.path)?;
+                io::copy(&mut lens, &mut w)?;
+            }
+            for &(fi, _, _) in &splade_offs {
+                if let Some(splade) = self.fields[fi].splade.as_ref() {
+                    splade.write(&mut w)?;
+                }
             }
             w.flush()?;
         }
@@ -7004,6 +7504,8 @@ struct PositionsStage {
     total: u64,
 }
 
+type RawSpillPosting = (u32, u32, Vec<u8>, Vec<u8>, Vec<u8>);
+
 /// One run's read cursor for the merge: the current term group's header
 /// plus a reader positioned at its postings.
 struct RunHead {
@@ -7070,11 +7572,11 @@ impl RunHead {
     }
 
     /// Read one posting of the current group as `(doc_id, tf, raw offset
-    /// bytes, raw ordinal bytes)` — the v5 merge splits the runs, and
-    /// the run encoding's offset bytes are already the v5 occurrence-run
-    /// pairs, its ordinal bytes already the kind-7 entries (empty on a
-    /// field without positions).
-    fn next_posting_raw(&mut self) -> io::Result<(u32, u32, Vec<u8>, Vec<u8>)> {
+    /// bytes, raw ordinal bytes, raw pos_len bytes)` — the v5 merge splits the
+    /// runs, and the run encoding's offset bytes are already the v5
+    /// occurrence-run pairs, its ordinal bytes already the kind-7 entries
+    /// (empty on a field without positions).
+    fn next_posting_raw(&mut self) -> io::Result<RawSpillPosting> {
         let mut fixed = [0u8; 12];
         self.reader.read_exact(&mut fixed)?;
         let doc_id = u32::from_le_bytes(fixed[0..4].try_into().expect("4 bytes"));
@@ -7083,11 +7585,18 @@ impl RunHead {
         let mut offsets = vec![0u8; 8 * n_offsets];
         self.reader.read_exact(&mut offsets)?;
         let mut ordinals = Vec::new();
+        let mut pos_lengths = Vec::new();
         if self.positional {
             ordinals = vec![0u8; 4 * n_offsets];
             self.reader.read_exact(&mut ordinals)?;
+            let mut flag = [0u8; 1];
+            self.reader.read_exact(&mut flag)?;
+            if flag[0] != 0 {
+                pos_lengths = vec![0u8; 4 * n_offsets];
+                self.reader.read_exact(&mut pos_lengths)?;
+            }
         }
-        Ok((doc_id, tf, offsets, ordinals))
+        Ok((doc_id, tf, offsets, ordinals, pos_lengths))
     }
 }
 
@@ -7688,6 +8197,8 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
     // (field name, section_off, total occurrences) per kind-7 entry.
     let mut positions: Vec<(Vec<u8>, u64, u64)> = Vec::new();
     let mut sentences: Vec<(Vec<u8>, u64, u64)> = Vec::new();
+    let mut pos_lengths: Vec<(Vec<u8>, u64, u64)> = Vec::new();
+    let mut splades: Vec<(Vec<u8>, u64, u64)> = Vec::new();
     let mut source_section = None;
     let mut integer_maps = Vec::new();
     if v7 {
@@ -7931,6 +8442,56 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
                     cur += 4 + len;
                     cursor = cur;
                 }
+                COLUMN_KIND_POS_LENGTHS => {
+                    let name = column_names.last().expect("pushed above");
+                    let field = name
+                        .strip_prefix(POS_LENGTHS_ENTRY_PREFIX.as_bytes())
+                        .ok_or_else(|| {
+                            invalid(format!(
+                                "column {i}: kind {COLUMN_KIND_POS_LENGTHS} must be named \
+                                 {POS_LENGTHS_ENTRY_PREFIX}<field>"
+                            ))
+                        })?;
+                    if !names.iter().any(|n| n == field) {
+                        return Err(invalid(format!(
+                            "column {i}: pos_lengths for field {:?}, which the field table lacks",
+                            String::from_utf8_lossy(field)
+                        )));
+                    }
+                    if pos_lengths.iter().any(|(f, _, _)| f == field) {
+                        return Err(invalid(format!(
+                            "column {i}: field {:?} has two pos_lengths entries",
+                            String::from_utf8_lossy(field)
+                        )));
+                    }
+                    pos_lengths.push((field.to_vec(), u64_at(base)?, u64_at(base + 8)?));
+                    cursor = base + 16;
+                }
+                COLUMN_KIND_SPLADE => {
+                    let name = column_names.last().expect("pushed above");
+                    let field = name
+                        .strip_prefix(SPLADE_ENTRY_PREFIX.as_bytes())
+                        .ok_or_else(|| {
+                            invalid(format!(
+                                "column {i}: kind {COLUMN_KIND_SPLADE} must be named \
+                                 {SPLADE_ENTRY_PREFIX}<field>"
+                            ))
+                        })?;
+                    if !names.iter().any(|n| n == field) {
+                        return Err(invalid(format!(
+                            "column {i}: splade for field {:?}, which the field table lacks",
+                            String::from_utf8_lossy(field)
+                        )));
+                    }
+                    if splades.iter().any(|(f, _, _)| f == field) {
+                        return Err(invalid(format!(
+                            "column {i}: field {:?} has two splade entries",
+                            String::from_utf8_lossy(field)
+                        )));
+                    }
+                    splades.push((field.to_vec(), u64_at(base)?, u64_at(base + 8)?));
+                    cursor = base + 16;
+                }
                 k => {
                     return Err(invalid(format!(
                         "column {i}: kind {k} unknown to this binary"
@@ -7939,7 +8500,12 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
             }
         }
     }
-    let integer_maps_end = source_section.map_or(file_len, |(off, _)| off);
+    let tail_sections_start = pos_lengths
+        .first()
+        .map(|p| p.1)
+        .or_else(|| splades.first().map(|s| s.1))
+        .unwrap_or(file_len);
+    let integer_maps_end = source_section.map_or(tail_sections_start, |(off, _)| off);
     let unsigned_end = integer_maps
         .first()
         .map_or(integer_maps_end, |entry| entry.1);
@@ -8571,10 +9137,82 @@ fn validate_structure_v6(map: &[u8], v7: bool) -> io::Result<()> {
         ));
     }
     if let Some((off, len)) = source_section {
-        if off != expected_start || off.checked_add(len) != Some(file_len) {
+        let end = off
+            .checked_add(len)
+            .ok_or_else(|| invalid("source section overflow".into()))?;
+        if off != expected_start || end != tail_sections_start {
             return Err(invalid("source section does not tile the file".into()));
         }
         crate::source_archive::SourceArchiveReader::open(bytes_at(off, len)?, n_slots as u32)?;
+        expected_start = end;
+    }
+    for (i, (field_name, off, total)) in pos_lengths.iter().enumerate() {
+        if !positions.iter().any(|(f, _, _)| f == field_name) {
+            return Err(invalid(format!(
+                "pos_lengths {i}: field {:?} lacks a positions section",
+                String::from_utf8_lossy(field_name)
+            )));
+        }
+        if *off != expected_start {
+            return Err(invalid(format!(
+                "pos_lengths {i}: section does not start at the previous section's end"
+            )));
+        }
+        let fi = names
+            .iter()
+            .position(|n| n == field_name)
+            .expect("kind-18 entries were tied to a field above");
+        let (_, _, _, directory_off) = fields[fi];
+        let n_terms = u64::from(u32_at(directory_off)?);
+        if u64::from(u32_at(*off)?) != n_terms {
+            return Err(invalid(format!(
+                "pos_lengths {i}: term count disagrees with field {:?}'s directory",
+                String::from_utf8_lossy(field_name)
+            )));
+        }
+        let mut prev = 0u64;
+        for t in 0..=n_terms {
+            let base = u64::from(u32_at(off + 4 + 4 * t)?);
+            if base < prev {
+                return Err(invalid(format!(
+                    "pos_lengths {i}: base table not monotone at term {t}"
+                )));
+            }
+            prev = base;
+        }
+        if prev != *total {
+            return Err(invalid(format!(
+                "pos_lengths {i}: base table ends at {prev} but the entry declares {total}"
+            )));
+        }
+        let group_end = off + positions_section_size(n_terms, *total);
+        let expected_end = pos_lengths
+            .get(i + 1)
+            .map(|p| p.1)
+            .or_else(|| splades.first().map(|s| s.1))
+            .unwrap_or(file_len);
+        if group_end != expected_end {
+            return Err(invalid(format!(
+                "pos_lengths {i}: section does not end at the next section's start"
+            )));
+        }
+        expected_start = group_end;
+    }
+    for (i, (_field_name, off, len)) in splades.iter().enumerate() {
+        let end = off
+            .checked_add(*len)
+            .ok_or_else(|| invalid("splade section overflow".into()))?;
+        let expected_end = splades.get(i + 1).map_or(file_len, |s| s.1);
+        if *off != expected_start || end != expected_end {
+            return Err(invalid(format!(
+                "splade {i}: section does not tile the file"
+            )));
+        }
+        crate::turbo_bridge::splade::SpladeSectionReader::open(bytes_at(*off, *len)?)?;
+        expected_start = end;
+    }
+    if expected_start != file_len {
+        return Err(invalid("sections leave trailing bytes before EOF".into()));
     }
     Ok(())
 }
@@ -8609,6 +9247,8 @@ struct FieldSlice {
     /// carries one (`docs/phrase-proximity.md`); `None` is a field
     /// without token positions, which refuses phrase and slop by name.
     positions_off: Option<u64>,
+    pos_lengths_off: Option<u64>,
+    splade_range: Option<(u64, u64)>,
     /// Start of this field's kind-8 sentence section, when the file
     /// carries one (`docs/highlighting.md`); `None` refuses sentence-mode
     /// snippets by name.
@@ -9588,6 +10228,8 @@ impl Bm25Reader {
                 n_terms,
                 run_base: 0,
                 positions_off: None,
+                pos_lengths_off: None,
+                splade_range: None,
                 sentences_off: None,
             }],
             facets: Vec::new(),
@@ -9667,6 +10309,8 @@ impl Bm25Reader {
                 n_terms,
                 run_base: postings_off,
                 positions_off: None,
+                pos_lengths_off: None,
+                splade_range: None,
                 sentences_off: None,
             });
             cursor = base + 40;
@@ -9880,6 +10524,28 @@ impl Bm25Reader {
                             n_slots as u32,
                         )?;
                         source_section = Some((off, len, reader));
+                        cursor = base + 16;
+                    }
+                    COLUMN_KIND_POS_LENGTHS => {
+                        let field = name
+                            .strip_prefix(POS_LENGTHS_ENTRY_PREFIX)
+                            .expect("validation checked the kind-18 name");
+                        let fi = fields
+                            .iter()
+                            .position(|f| f.name == field)
+                            .expect("validation tied the kind-18 entry to a field");
+                        fields[fi].pos_lengths_off = Some(u64_at(base));
+                        cursor = base + 16;
+                    }
+                    COLUMN_KIND_SPLADE => {
+                        let field = name
+                            .strip_prefix(SPLADE_ENTRY_PREFIX)
+                            .expect("validation checked the kind-19 name");
+                        let fi = fields
+                            .iter()
+                            .position(|f| f.name == field)
+                            .expect("validation tied the kind-19 entry to a field");
+                        fields[fi].splade_range = Some((u64_at(base), u64_at(base + 8)));
                         cursor = base + 16;
                     }
                     COLUMN_KIND_BINDING
@@ -10971,6 +11637,52 @@ impl Bm25Index for FieldView<'_> {
                 .collect(),
         )
     }
+    fn has_pos_lengths(&self) -> bool {
+        self.field.positions_off.is_some() && self.field.pos_lengths_off.is_some()
+    }
+    fn posting_pos_lengths(&self, term: &str, doc_id: u32) -> Option<Vec<u32>> {
+        let r = self.reader;
+        if !r.v5_runs {
+            return None;
+        }
+        let section = self.field.pos_lengths_off?;
+        let i = r.directory_index_v5(self.field, term)?;
+        let (_, doc_run_off, _, _, df) = r.directory_entry_v5(self.field, i);
+        let doc_run_off = doc_run_off as usize;
+        let j = r.v5_posting_index(doc_run_off, df, doc_id)?;
+        let section = section as usize;
+        let base = r.u32_at(section + 4 + 4 * i as usize) as usize;
+        let data = section + 4 + 4 * (self.field.n_terms as usize + 1);
+        let occ_start = r.u32_at(doc_run_off + 12 * j + 8) as usize;
+        let occ_end = r.v5_occ_start(doc_run_off, df as usize, j + 1) as usize;
+        Some(
+            (occ_start..occ_end)
+                .map(|o| r.u32_at(data + 4 * (base + o)))
+                .collect(),
+        )
+    }
+    fn has_splade(&self) -> bool {
+        self.field.splade_range.is_some()
+    }
+    fn score_splade(
+        &self,
+        query_weights: &[(String, f32)],
+        query_l1_slack: f32,
+        k: usize,
+        admitted: &dyn Fn(u32) -> bool,
+    ) -> (
+        Vec<(u32, f32)>,
+        crate::turbo_bridge::splade::SpladeTraversalStats,
+    ) {
+        let Some((off, len)) = self.field.splade_range else {
+            return (Vec::new(), Default::default());
+        };
+        let bytes = &self.reader.map[off as usize..(off + len) as usize];
+        match crate::turbo_bridge::splade::SpladeSectionReader::open(bytes) {
+            Ok(reader) => reader.score_top_k(query_weights, query_l1_slack, k, admitted),
+            Err(_) => (Vec::new(), Default::default()),
+        }
+    }
     fn prefix_terms(&self, prefix: &str) -> Box<dyn Iterator<Item = String> + '_> {
         self.prefix_iter(prefix)
     }
@@ -11020,10 +11732,15 @@ pub struct FieldTranspose {
     occurrences: Vec<(u32, u32)>,
     /// Every ordinal, parallel to `occurrences`, when the field has positions.
     positions: Option<Vec<u32>>,
+    pos_lengths: Option<Vec<u32>>,
     /// The field's doc-length table.
     lengths: Vec<u32>,
     /// Sentence tables per row, when the field has them.
     sentences: Option<Vec<Vec<(u32, u32)>>>,
+    /// Quantized SPLADE impact scale (`f32::to_bits`), when the field carries SPLADE postings.
+    splade_scale_bits: u32,
+    /// Quantized SPLADE `(term, impact)` entries per row, when the field carries SPLADE postings.
+    splade_by_row: Option<Vec<Vec<(String, u16)>>>,
 }
 
 impl FieldTranspose {
@@ -11037,6 +11754,7 @@ impl FieldTranspose {
         self.entries.len() * 20
             + self.occurrences.len() * 8
             + self.positions.as_ref().map_or(0, |p| p.len() * 4)
+            + self.pos_lengths.as_ref().map_or(0, |p| p.len() * 4)
             + self.row_starts.len() * 4
             + self.lengths.len() * 4
             + self.terms.iter().map(|t| t.len() + 24).sum::<usize>()
@@ -11044,6 +11762,10 @@ impl FieldTranspose {
                 .sentences
                 .as_ref()
                 .map_or(0, |s| s.iter().map(|t| t.len() * 8 + 24).sum())
+            + self
+                .splade_by_row
+                .as_ref()
+                .map_or(0, |rows| rows.iter().map(|v| v.len() * 32 + 24).sum())
     }
 
     /// Whether the field carries positions.
@@ -11071,19 +11793,40 @@ impl FieldTranspose {
             .positions
             .as_ref()
             .map(|_| Vec::with_capacity(to - from));
+        let mut pos_lengths: Option<DocPositions> = self
+            .pos_lengths
+            .as_ref()
+            .map(|_| Vec::with_capacity(to - from));
         for &(term, tf, occ_start, occ_end, pos_start) in &self.entries[from..to] {
             let spans = self.occurrences[occ_start as usize..occ_end as usize].to_vec();
+            let n = (occ_end - occ_start) as usize;
             if let (Some(all), Some(out)) = (&self.positions, positions.as_mut()) {
-                let n = (occ_end - occ_start) as usize;
+                out.push(all[pos_start as usize..pos_start as usize + n].to_vec());
+            }
+            if let (Some(all), Some(out)) = (&self.pos_lengths, pos_lengths.as_mut()) {
                 out.push(all[pos_start as usize..pos_start as usize + n].to_vec());
             }
             terms.push((self.terms[term as usize].clone(), tf, spans));
         }
+        let splade = self
+            .splade_by_row
+            .as_ref()
+            .and_then(|rows| rows.get(r))
+            .cloned()
+            .unwrap_or_default();
+        let splade_scale_bits = if splade.is_empty() {
+            0
+        } else {
+            self.splade_scale_bits
+        };
         Some(AnalyzedField {
             terms,
             length: self.lengths.get(r).copied().unwrap_or(0),
             positions,
+            pos_lengths,
             sentences: self.sentences.as_ref().map(|s| s[r].clone()),
+            splade,
+            splade_scale_bits,
         })
     }
 }
@@ -11105,6 +11848,7 @@ impl FieldView<'_> {
         let rows = r.doc_count as usize;
         let n_terms = self.field.n_terms;
         let positions_section = self.field.positions_off.map(|off| off as usize);
+        let pos_lengths_section = self.field.pos_lengths_off.map(|off| off as usize);
         let mut terms = Vec::with_capacity(n_terms as usize);
         // First walk: count postings per row, and total occurrences.
         let mut counts = vec![0u32; rows + 1];
@@ -11145,12 +11889,18 @@ impl FieldView<'_> {
         let mut occurrences: Vec<(u32, u32)> = Vec::with_capacity(total_occurrences);
         let mut positions: Option<Vec<u32>> =
             positions_section.map(|_| Vec::with_capacity(total_occurrences));
+        let mut pos_lengths: Option<Vec<u32>> =
+            pos_lengths_section.map(|_| Vec::with_capacity(total_occurrences));
         let positions_data =
             positions_section.map(|section| section + 4 + 4 * (n_terms as usize + 1));
+        let pos_lengths_data =
+            pos_lengths_section.map(|section| section + 4 + 4 * (n_terms as usize + 1));
         for i in 0..n_terms {
             let (_, doc_run_off, _, occ_run_off, df) = r.directory_entry_v5(self.field, i);
             let (doc_run_off, occ_run_off) = (doc_run_off as usize, occ_run_off as usize);
             let base = positions_section.map(|section| r.u32_at(section + 4 + 4 * i as usize));
+            let len_base =
+                pos_lengths_section.map(|section| r.u32_at(section + 4 + 4 * i as usize));
             for j in 0..df as usize {
                 let (doc, tf, occ_start) = r.v5_doc_entry(doc_run_off, j);
                 let occ_end = r.v5_occ_start(doc_run_off, df as usize, j + 1);
@@ -11162,6 +11912,13 @@ impl FieldView<'_> {
                 let pos_start = positions.as_ref().map_or(0, |p| p.len() as u32);
                 if let (Some(out), Some(data), Some(base)) =
                     (positions.as_mut(), positions_data, base)
+                {
+                    for o in occ_start..occ_end {
+                        out.push(r.u32_at(data + 4 * (base as usize + o as usize)));
+                    }
+                }
+                if let (Some(out), Some(data), Some(base)) =
+                    (pos_lengths.as_mut(), pos_lengths_data, len_base)
                 {
                     for o in occ_start..occ_end {
                         out.push(r.u32_at(data + 4 * (base as usize + o as usize)));
@@ -11187,14 +11944,41 @@ impl FieldView<'_> {
         } else {
             None
         };
+        let (splade_scale_bits, splade_by_row) = match self.field.splade_range {
+            Some((off, len)) => {
+                let bytes = &r.map[off as usize..(off + len) as usize];
+                let decoded = crate::turbo_bridge::splade::SpladeFieldIndex::decode(bytes)
+                    .map_err(|e| {
+                        format!("field {:?}: invalid SPLADE section: {e}", self.field.name)
+                    })?;
+                let mut by_row: Vec<Vec<(String, u16)>> = vec![Vec::new(); rows];
+                for (term, plist) in decoded.postings {
+                    for (doc, q) in plist {
+                        let slot = doc as usize;
+                        if slot >= rows {
+                            return Err(format!(
+                                "field {:?}: SPLADE term {:?} names row {doc} of a {rows}-row store",
+                                self.field.name, term
+                            ));
+                        }
+                        by_row[slot].push((term.clone(), q));
+                    }
+                }
+                (decoded.scale_bits, Some(by_row))
+            }
+            None => (0, None),
+        };
         Ok(FieldTranspose {
             terms,
             entries,
             row_starts,
             occurrences,
             positions,
+            pos_lengths,
             lengths: self.field.doc_lengths.clone(),
             sentences,
+            splade_scale_bits,
+            splade_by_row,
         })
     }
 
@@ -11286,6 +12070,28 @@ impl Bm25Index for Bm25Reader {
     }
     fn posting_positions(&self, term: &str, doc_id: u32) -> Option<Vec<u32>> {
         self.field(0).posting_positions(term, doc_id)
+    }
+    fn has_pos_lengths(&self) -> bool {
+        self.field(0).has_pos_lengths()
+    }
+    fn posting_pos_lengths(&self, term: &str, doc_id: u32) -> Option<Vec<u32>> {
+        self.field(0).posting_pos_lengths(term, doc_id)
+    }
+    fn has_splade(&self) -> bool {
+        self.field(0).has_splade()
+    }
+    fn score_splade(
+        &self,
+        query_weights: &[(String, f32)],
+        query_l1_slack: f32,
+        k: usize,
+        admitted: &dyn Fn(u32) -> bool,
+    ) -> (
+        Vec<(u32, f32)>,
+        crate::turbo_bridge::splade::SpladeTraversalStats,
+    ) {
+        self.field(0)
+            .score_splade(query_weights, query_l1_slack, k, admitted)
     }
     fn has_sentences(&self) -> bool {
         self.field(0).has_sentences()
@@ -11710,6 +12516,7 @@ mod tests {
                 terms,
                 length,
                 positions: Some(positions),
+                ..Default::default()
             }];
             fields.push(AnalyzedField {
                 sentences: None,
@@ -11719,6 +12526,7 @@ mod tests {
                     .collect(),
                 length: name.iter().map(|(_, tf)| *tf).sum(),
                 positions: None,
+                ..Default::default()
             });
             AnalyzedDoc {
                 cased: None,
@@ -11726,6 +12534,7 @@ mod tests {
                 quality: None,
                 geography: None,
                 entities: Vec::new(),
+                nlp: None,
             }
         };
         vec![
@@ -12026,6 +12835,7 @@ mod tests {
                 tf: 2,
                 offsets: vec![(0, 4), (10, 14)],
                 positions: Vec::new(),
+                pos_lengths: Vec::new(),
             }
         );
         assert_eq!(store.postings("vector").unwrap()[0].tf, 2);
@@ -12835,6 +13645,7 @@ mod tests {
                 terms: body,
                 length: body_len,
                 positions: None,
+                ..Default::default()
             }];
             if i % 3 != 2 {
                 // "smith" and "court" appear in BOTH fields, with
@@ -12848,6 +13659,7 @@ mod tests {
                     ],
                     length: 3,
                     positions: None,
+                    ..Default::default()
                 });
             }
             let lineage = (i % 4 == 0).then_some(DocLineage {
@@ -12865,6 +13677,7 @@ mod tests {
                     quality: None,
                     geography: None,
                     entities: Vec::new(),
+                    nlp: None,
                 },
                 lineage,
             ));

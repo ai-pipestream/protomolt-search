@@ -1783,3 +1783,94 @@ impl PinnedLeaf {
         ))
     }
 }
+
+/// Parameters for spherical k-means Voronoi routing centroid calibration on
+/// `turbo-kserve` (`#105` / `turboembed` `#2346`).
+#[cfg(feature = "net")]
+#[derive(Clone, Debug)]
+pub struct VoronoiTrainingSpec {
+    /// Embedding model identifier (`model_info.model_id`).
+    pub model_id: String,
+    /// Embedding model revision (`model_info.revision`).
+    pub model_revision: String,
+    /// Embedding manifest SHA-256 (`model_info.manifest_sha256`).
+    pub model_sha256: String,
+    /// Vector dimension (`> 0`).
+    pub dim: u32,
+    /// Target number of spherical k-means Voronoi partitions (`> 0`).
+    pub num_centroids: u32,
+    /// Maximum Lloyd iterations (`0` uses server default).
+    pub max_iters: u32,
+    /// Deterministic PRNG seed for k-means++ initialization.
+    pub seed: u64,
+    /// Tag set / routing table name stored in the `TCENT001` bundle.
+    pub tag_set_name: String,
+    /// Softmax temperature (`> 0.0`, default `1.0`).
+    pub temperature: f64,
+}
+
+/// Streams sample document embeddings to `turbo-kserve`'s
+/// `TurboVocabularyService::TrainVoronoiCentroids` (`#105` / `turboembed` `#2346`),
+/// calibrating spherical k-means Voronoi routing centroids (`TCENT001`) under
+/// `Bulk` priority.
+#[cfg(feature = "net")]
+pub async fn train_voronoi_centroids_on_kserve(
+    client: &turbo_client::RemoteClient,
+    spec: &VoronoiTrainingSpec,
+    flat_samples: &[f32],
+    finish_deadline_us: u64,
+) -> Result<turbo_client::proto::vocabulary::VoronoiCentroidArtifactDescriptor, tonic::Status> {
+    use turbo_client::proto::vocabulary::{
+        train_voronoi_centroids_request::Frame, TrainVoronoiCentroidsHeader,
+        TrainVoronoiCentroidsRequest, VoronoiSampleBatch,
+    };
+
+    let dim = spec.dim as usize;
+    if dim == 0 || !flat_samples.len().is_multiple_of(dim) {
+        return Err(tonic::Status::invalid_argument(format!(
+            "Voronoi sample buffer length {} is not a positive multiple of dim {}",
+            flat_samples.len(),
+            spec.dim
+        )));
+    }
+    let timeout = crate::turbo_bridge::remaining_deadline_duration(finish_deadline_us)?;
+    let rows_per_batch = (4096 / dim).max(1);
+    let floats_per_batch = rows_per_batch * dim;
+
+    let mut frames = Vec::with_capacity(1 + flat_samples.len().div_ceil(floats_per_batch));
+    frames.push(TrainVoronoiCentroidsRequest {
+        frame: Some(Frame::Header(TrainVoronoiCentroidsHeader {
+            model_id: spec.model_id.clone(),
+            model_revision: spec.model_revision.clone(),
+            model_sha256: spec.model_sha256.clone(),
+            dim: spec.dim,
+            num_centroids: spec.num_centroids,
+            max_iters: spec.max_iters,
+            seed: spec.seed,
+            tag_set_name: spec.tag_set_name.clone(),
+            temperature: spec.temperature,
+        })),
+    });
+    for chunk in flat_samples.chunks(floats_per_batch) {
+        frames.push(TrainVoronoiCentroidsRequest {
+            frame: Some(Frame::Batch(VoronoiSampleBatch {
+                values: chunk.to_vec(),
+            })),
+        });
+    }
+
+    let mut vocab = client
+        .vocabulary_client()
+        .map_err(|e| tonic::Status::from_error(Box::new(e)))?;
+    let req = client
+        .prepare_request(
+            tokio_stream::iter(frames),
+            Some(turbo_client::RemotePriority::Bulk),
+            timeout,
+        )
+        .map_err(|e| tonic::Status::from_error(Box::new(e)))?;
+    vocab
+        .train_voronoi_centroids(req)
+        .await
+        .map(|r| r.into_inner())
+}

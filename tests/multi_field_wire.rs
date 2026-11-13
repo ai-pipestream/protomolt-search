@@ -774,71 +774,6 @@ async fn request_level_analysis_with_fields_is_refused_not_ignored() {
     mock.abort();
 }
 
-/// A sidecar that records every UNARY `Analyze` it is asked for, and
-/// otherwise behaves exactly like the shared mock.
-struct CountingMock {
-    inner: pipestream_search::harness::mock_analysis::MockAnalysis,
-    unary: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    streams: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-}
-
-#[tonic::async_trait]
-impl pipestream_search::pb::analysis::analysis_service_server::AnalysisService for CountingMock {
-    async fn analyze(
-        &self,
-        request: tonic::Request<pipestream_search::pb::analysis::AnalyzeRequest>,
-    ) -> Result<tonic::Response<pipestream_search::pb::analysis::AnalyzeResponse>, tonic::Status>
-    {
-        self.unary
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        pipestream_search::pb::analysis::analysis_service_server::AnalysisService::analyze(
-            &self.inner,
-            request,
-        )
-        .await
-    }
-
-    type AnalyzeStreamStream = std::pin::Pin<
-        Box<
-            dyn tokio_stream::Stream<
-                    Item = Result<
-                        pipestream_search::pb::analysis::AnalyzeStreamResponse,
-                        tonic::Status,
-                    >,
-                > + Send,
-        >,
-    >;
-
-    async fn analyze_stream(
-        &self,
-        request: tonic::Request<
-            tonic::Streaming<pipestream_search::pb::analysis::AnalyzeStreamRequest>,
-        >,
-    ) -> Result<tonic::Response<Self::AnalyzeStreamStream>, tonic::Status> {
-        self.streams
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        pipestream_search::pb::analysis::analysis_service_server::AnalysisService::analyze_stream(
-            &self.inner,
-            request,
-        )
-        .await
-    }
-
-    async fn get_capabilities(
-        &self,
-        request: tonic::Request<pipestream_search::pb::analysis::GetCapabilitiesRequest>,
-    ) -> Result<
-        tonic::Response<pipestream_search::pb::analysis::GetCapabilitiesResponse>,
-        tonic::Status,
-    > {
-        pipestream_search::pb::analysis::analysis_service_server::AnalysisService::get_capabilities(
-            &self.inner,
-            request,
-        )
-        .await
-    }
-}
-
 /// Extra fields ride AnalyzeStream, not one unary `Analyze` per field.
 ///
 /// The body has always streamed; extra fields used to spawn a unary call
@@ -854,23 +789,8 @@ impl pipestream_search::pb::analysis::analysis_service_server::AnalysisService f
 /// per-field term identity the unary path produced.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn extra_fields_ride_the_analysis_stream_not_unary_calls() {
-    let unary = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let streams = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let analysis = format!("http://{}", listener.local_addr().unwrap());
-    let mock = tokio::spawn(
-        tonic::transport::Server::builder()
-            .add_service(
-                pipestream_search::pb::analysis::analysis_service_server::AnalysisServiceServer::new(
-                    CountingMock {
-                        inner: pipestream_search::harness::mock_analysis::MockAnalysis::default(),
-                        unary: unary.clone(),
-                        streams: streams.clone(),
-                    },
-                ),
-            )
-            .serve_with_incoming(pipestream_search::harness::nodelay_incoming(listener)),
-    );
+    use pipestream_search::harness::mock_analysis::start_mock_analysis_transport_counts;
+    let (analysis, mock, unary, streams) = start_mock_analysis_transport_counts().await;
 
     let (addr, node) = start_empty_node(two_field_node(&analysis, 0, None)).await;
     let mut client = NodeServiceClient::connect(addr).await.unwrap();

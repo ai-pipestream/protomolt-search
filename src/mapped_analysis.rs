@@ -107,7 +107,6 @@ impl MappedAnalysis {
 }
 
 fn validate_spec(spec: &AnalysisSpec) -> Result<(), Status> {
-    use crate::pb::analysis::{analysis_options, term_vector_options};
     if spec.tokenizer == 0
         || spec.stemmer == 0
         || spec.term_vector_mode == 0
@@ -122,14 +121,14 @@ fn validate_spec(spec: &AnalysisSpec) -> Result<(), Status> {
             "field_analysis STEMS sources require a stemmer",
         ));
     }
-    if analysis_options::Tokenizer::try_from(spec.tokenizer).is_err()
-        || analysis_options::Stemmer::try_from(spec.stemmer).is_err()
-        || term_vector_options::Mode::try_from(spec.term_vector_mode).is_err()
-        || term_vector_options::Source::try_from(spec.term_vector_source).is_err()
+    if !(1..=5).contains(&spec.tokenizer)
+        || !(1..=42).contains(&spec.stemmer)
+        || !(1..=2).contains(&spec.term_vector_mode)
+        || !(1..=3).contains(&spec.term_vector_source)
         || spec
             .char_filters
             .iter()
-            .any(|step| term_vector_options::NormalizerStep::try_from(*step).is_err())
+            .any(|step| !(1..=24).contains(step))
     {
         return Err(Status::invalid_argument(
             "field_analysis contains an unknown AnalysisSpec enum value",

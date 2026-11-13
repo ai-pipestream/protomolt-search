@@ -36,8 +36,7 @@ use pipestream_search::security::ToolClient;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-const SIDECAR_BIN: &str =
-    "/work/worktrees/turbovec-workspace/grpc-opennlp-analysis/build/native/nativeCompile/grpc-opennlp-analysis";
+const SIDECAR_BIN: &str = "turbo-kserve";
 
 fn arg(key: &str, default: &str) -> String {
     let prefix = format!("--{key}=");

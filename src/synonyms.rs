@@ -213,20 +213,33 @@ where
     }
     let query: Vec<String> = terms.clone();
     let mut expansions = Vec::new();
-    for term in &query {
+    for (q_idx, term) in query.iter().enumerate() {
         let mut added: Vec<String> = Vec::new();
         for rule in &analyzed {
-            let matched = rule
+            let single_matched = rule
                 .terms
                 .iter()
                 .any(|entry| entry.len() == 1 && entry[0] == *term);
-            if !matched {
+            let phrase_matched: Option<&[String]> = rule
+                .terms
+                .iter()
+                .find(|entry| {
+                    entry.len() >= 2
+                        && q_idx + entry.len() <= query.len()
+                        && query[q_idx..q_idx + entry.len()] == **entry
+                })
+                .map(|v| v.as_slice());
+
+            if !single_matched && phrase_matched.is_none() {
                 continue;
             }
             let sources: Vec<&Vec<String>> = if rule.to.is_empty() {
                 rule.terms
                     .iter()
-                    .filter(|entry| !(entry.len() == 1 && entry[0] == *term))
+                    .filter(|entry| {
+                        !(single_matched && entry.len() == 1 && entry[0] == *term)
+                            && phrase_matched.is_none_or(|pm| entry.as_slice() != pm)
+                    })
                     .collect()
             } else {
                 rule.to.iter().collect()
@@ -242,6 +255,8 @@ where
         if added.is_empty() {
             continue;
         }
+        let reported_trigger =
+            rule_phrase_label(&analyzed, &query, q_idx).unwrap_or_else(|| term.clone());
         for t in &added {
             if !terms.contains(t) {
                 terms.push(t.clone());
@@ -249,11 +264,32 @@ where
         }
         expansions.push(crate::pb::SynonymExpansion {
             field: field.to_string(),
-            term: term.clone(),
+            term: reported_trigger,
             terms: added,
         });
     }
     Ok(expansions)
+}
+
+fn rule_phrase_label(analyzed: &[AnalyzedRule], query: &[String], q_idx: usize) -> Option<String> {
+    let single_matched = analyzed.iter().any(|rule| {
+        rule.terms
+            .iter()
+            .any(|entry| entry.len() == 1 && entry[0] == query[q_idx])
+    });
+    if single_matched {
+        return None;
+    }
+    analyzed
+        .iter()
+        .flat_map(|r| r.terms.iter())
+        .filter(|entry| {
+            entry.len() >= 2
+                && q_idx + entry.len() <= query.len()
+                && query[q_idx..q_idx + entry.len()] == **entry
+        })
+        .max_by_key(|entry| entry.len())
+        .map(|entry| entry.join(" "))
 }
 
 /// Optimal string alignment distance over chars: insert, delete,

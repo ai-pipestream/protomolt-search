@@ -1842,6 +1842,87 @@ impl Bm25Index for UnionField<'_> {
             }
         }
     }
+    fn has_pos_lengths(&self) -> bool {
+        self.has_positions()
+            && (self.parts().any(|(_, _, v)| v.has_pos_lengths())
+                || self.heaps().any(|(_, v)| v.has_pos_lengths()))
+    }
+    fn posting_pos_lengths(&self, term: &str, doc_id: u32) -> Option<Vec<u32>> {
+        if !self.has_pos_lengths() {
+            return None;
+        }
+        let placement = self.shard.place(doc_id);
+        match self.heap_of(placement) {
+            Some((view, local)) => {
+                if view.has_pos_lengths() {
+                    view.posting_pos_lengths(term, local)
+                } else {
+                    view.posting_positions(term, local)
+                        .map(|pos| vec![1; pos.len()])
+                }
+            }
+            None => {
+                let Placement::Sealed { part, local } = placement else {
+                    unreachable!("heap_of covers every heap placement")
+                };
+                let view = self.shard.reader(part).field(self.fi);
+                if view.has_pos_lengths() {
+                    view.posting_pos_lengths(term, local)
+                } else {
+                    view.posting_positions(term, local)
+                        .map(|pos| vec![1; pos.len()])
+                }
+            }
+        }
+    }
+    fn has_splade(&self) -> bool {
+        self.parts().any(|(_, _, v)| v.has_splade()) || self.heaps().any(|(_, v)| v.has_splade())
+    }
+    fn score_splade(
+        &self,
+        query_weights: &[(String, f32)],
+        query_l1_slack: f32,
+        k: usize,
+        admitted: &dyn Fn(u32) -> bool,
+    ) -> (
+        Vec<(u32, f32)>,
+        crate::turbo_bridge::splade::SpladeTraversalStats,
+    ) {
+        if k == 0 {
+            return (Vec::new(), Default::default());
+        }
+        let mut merged: Vec<(u32, f32)> = Vec::new();
+        let mut total_stats = crate::turbo_bridge::splade::SpladeTraversalStats::default();
+        for (base, _, view) in self.parts() {
+            if !view.has_splade() {
+                continue;
+            }
+            let (hits, stats) = view.score_splade(query_weights, query_l1_slack, k, &|local| {
+                admitted(base + local)
+            });
+            total_stats.total_blocks += stats.total_blocks;
+            total_stats.blocks_visited += stats.blocks_visited;
+            total_stats.blocks_skipped += stats.blocks_skipped;
+            total_stats.postings_scored += stats.postings_scored;
+            merged.extend(hits.into_iter().map(|(local, s)| (base + local, s)));
+        }
+        for (base, view) in self.heaps() {
+            if !view.has_splade() {
+                continue;
+            }
+            let (hits, stats) = view.score_splade(query_weights, query_l1_slack, k, &|local| {
+                admitted(base + local)
+            });
+            total_stats.total_blocks += stats.total_blocks;
+            total_stats.blocks_visited += stats.blocks_visited;
+            total_stats.blocks_skipped += stats.blocks_skipped;
+            total_stats.postings_scored += stats.postings_scored;
+            merged.extend(hits.into_iter().map(|(local, s)| (base + local, s)));
+        }
+        merged.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        merged.truncate(k);
+        (merged, total_stats)
+    }
     fn has_sentences(&self) -> bool {
         self.shard.field_has_sentences(self.fi)
     }
@@ -1966,6 +2047,28 @@ impl Bm25Index for SegmentedShard {
     fn posting_positions(&self, term: &str, doc_id: u32) -> Option<Vec<u32>> {
         self.field(0).posting_positions(term, doc_id)
     }
+    fn has_pos_lengths(&self) -> bool {
+        self.field(0).has_pos_lengths()
+    }
+    fn posting_pos_lengths(&self, term: &str, doc_id: u32) -> Option<Vec<u32>> {
+        self.field(0).posting_pos_lengths(term, doc_id)
+    }
+    fn has_splade(&self) -> bool {
+        self.field(0).has_splade()
+    }
+    fn score_splade(
+        &self,
+        query_weights: &[(String, f32)],
+        query_l1_slack: f32,
+        k: usize,
+        admitted: &dyn Fn(u32) -> bool,
+    ) -> (
+        Vec<(u32, f32)>,
+        crate::turbo_bridge::splade::SpladeTraversalStats,
+    ) {
+        self.field(0)
+            .score_splade(query_weights, query_l1_slack, k, admitted)
+    }
     fn has_sentences(&self) -> bool {
         self.field_has_sentences(0)
     }
@@ -2061,6 +2164,28 @@ impl Bm25Index for MaskedShard<'_> {
     }
     fn posting_positions(&self, term: &str, doc_id: u32) -> Option<Vec<u32>> {
         Bm25Index::posting_positions(self.shard, term, doc_id)
+    }
+    fn has_pos_lengths(&self) -> bool {
+        self.body().has_pos_lengths()
+    }
+    fn posting_pos_lengths(&self, term: &str, doc_id: u32) -> Option<Vec<u32>> {
+        Bm25Index::posting_pos_lengths(self.shard, term, doc_id)
+    }
+    fn has_splade(&self) -> bool {
+        self.body().has_splade()
+    }
+    fn score_splade(
+        &self,
+        query_weights: &[(String, f32)],
+        query_l1_slack: f32,
+        k: usize,
+        admitted: &dyn Fn(u32) -> bool,
+    ) -> (
+        Vec<(u32, f32)>,
+        crate::turbo_bridge::splade::SpladeTraversalStats,
+    ) {
+        self.body()
+            .score_splade(query_weights, query_l1_slack, k, admitted)
     }
     fn has_sentences(&self) -> bool {
         self.shard.field_has_sentences(0)

@@ -179,8 +179,10 @@ impl RaftLogStore {
         }
         let mut builder = Database::builder();
         builder.set_cache_size(8 * 1024 * 1024);
+        let backend = redb::backends::FileBackend::new(file.try_clone().map_err(storage_status)?)
+            .map_err(storage_status)?;
         let database = builder
-            .create_file(file.try_clone().map_err(storage_status)?)
+            .create_with_backend(backend)
             .map_err(storage_status)?;
         if create {
             let parent = path

@@ -525,6 +525,19 @@ pub struct CoordinatorServiceImpl {
     /// cell intentionally conflates intermediate snapshots: every revision
     /// is a full replacement, so a slow client only needs the newest one.
     query_progress: Option<Arc<QueryProgressPublisher>>,
+    /// Optional memory-mapped stem-to-surface FST lexicon for stemmed `Suggest` (`#104`).
+    surface_lexicon: Option<Arc<crate::turbo_bridge::query_plan::SharedSurfaceLexicon>>,
+    /// Optional contextual bigram spellchecker for `TermSuggest` (`#104`).
+    spellchecker: Option<Arc<turbo_client::QuerySpellchecker>>,
+    /// Optional one-pass query analyzer + typed NLP column mapping (`#104`).
+    one_pass_query: Option<
+        Arc<(
+            turbo_client::OnePassQueryAnalyzer,
+            crate::turbo_bridge::NlpColumnSpec,
+        )>,
+    >,
+    /// Optional Stage-2 calibrated `RerankAndHighlight` policy (`#105`).
+    rerank_spec: Option<Arc<crate::turbo_bridge::rerank::RerankSpec>>,
 }
 
 /// A process-unique, well-mixed stream token for the UDP signal lane
@@ -2091,6 +2104,10 @@ impl CoordinatorServiceImpl {
             cutover_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             phrase_index: None,
             query_progress: None,
+            surface_lexicon: None,
+            spellchecker: None,
+            one_pass_query: None,
+            rerank_spec: None,
         }
     }
 
@@ -3070,6 +3087,161 @@ impl CoordinatorServiceImpl {
     pub fn with_synonyms(mut self, table: crate::synonyms::SynonymTable) -> Self {
         self.synonyms = Some(Arc::new(table));
         self
+    }
+
+    /// Install a memory-mapped stem-to-surface lexicon (`#104`, `#2341`) so
+    /// `SearchService.Suggest` on stemmed fields returns true surface completions.
+    pub fn with_surface_lexicon(
+        mut self,
+        lexicon: Arc<crate::turbo_bridge::query_plan::SharedSurfaceLexicon>,
+    ) -> Self {
+        self.surface_lexicon = Some(lexicon);
+        self
+    }
+
+    /// Install a contextual bigram spellchecker (`#104`, `#2341`) consulted by
+    /// `SearchService.TermSuggest`.
+    pub fn with_spellchecker(mut self, spellchecker: Arc<turbo_client::QuerySpellchecker>) -> Self {
+        self.spellchecker = Some(spellchecker);
+        self
+    }
+
+    /// Install a one-pass `AnalyzeQuery` planner and target NLP column mapping
+    /// (`#104`, `#2339`) for automatic structured filter binding and query synonyms.
+    pub fn with_one_pass_query(
+        mut self,
+        analyzer: turbo_client::OnePassQueryAnalyzer,
+        columns: crate::turbo_bridge::NlpColumnSpec,
+    ) -> Self {
+        self.one_pass_query = Some(Arc::new((analyzer, columns)));
+        self
+    }
+
+    /// Install a Stage-2 calibrated `RerankAndHighlight` policy (`#105`, `#2342`)
+    /// applied to dense and hybrid shortlists.
+    pub fn with_rerank_spec(mut self, spec: crate::turbo_bridge::rerank::RerankSpec) -> Self {
+        self.rerank_spec = Some(Arc::new(spec));
+        self
+    }
+
+    pub(crate) fn rerank_spec(&self) -> Option<&crate::turbo_bridge::rerank::RerankSpec> {
+        self.rerank_spec.as_deref()
+    }
+
+    pub(crate) fn one_pass_query(
+        &self,
+    ) -> Option<&(
+        turbo_client::OnePassQueryAnalyzer,
+        crate::turbo_bridge::NlpColumnSpec,
+    )> {
+        self.one_pass_query.as_deref()
+    }
+
+    /// Fan out quantized `u8`/`u16` SPLADE 128-doc Block-Max scoring across all
+    /// unmasked shards with CEL filter admission (`#104`).
+    pub async fn score_splade(
+        &self,
+        field: &str,
+        query_weights: &[(String, f32)],
+        query_l1_slack: f32,
+        k: usize,
+        filter_cel: &str,
+    ) -> Result<Vec<(u64, f32)>, Status> {
+        if k == 0 || query_weights.is_empty() {
+            return Ok(Vec::new());
+        }
+        let coordinator = self.request_snapshot().unwrap_or_else(|| self.clone());
+        let filters = RequestFilters::compile(&[], filter_cel)?;
+        let mask = coordinator.shard_mask(filters.tree.as_ref());
+        let trees = coordinator.shard_filter_trees(&filters, mask.as_ref());
+        let mut merged: Vec<(u64, f32)> = Vec::new();
+        for (shard, addr) in coordinator.node_addrs.iter().enumerate() {
+            if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
+                continue;
+            }
+            match coordinator.node_client(addr)? {
+                crate::link::NodeLink::Local(node) => {
+                    let shard_hits = node.score_splade_field(
+                        field,
+                        query_weights,
+                        query_l1_slack,
+                        k,
+                        trees[shard].as_ref(),
+                    )?;
+                    merged.extend(shard_hits);
+                }
+                #[cfg(feature = "net")]
+                crate::link::NodeLink::Remote(_) => {
+                    return Err(Status::unimplemented(
+                        "remote shard SPLADE scoring requires in-process shard links or composite shard RPC",
+                    ));
+                }
+            }
+        }
+        merged.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        merged.truncate(k);
+        Ok(merged)
+    }
+
+    /// Fetch stored text, optional sentence spans, and `DocLineage.span_start`
+    /// for a Stage-1 shortlist in shortlist order (`#105`).
+    pub async fn fetch_rerank_candidates(
+        &self,
+        hit_scores: &[(u64, f64)],
+    ) -> Result<Vec<crate::turbo_bridge::rerank::RerankCandidate>, Status> {
+        #[derive(Default)]
+        struct FetchedRerankDoc {
+            text: String,
+            sentence_spans: Vec<(u32, u32)>,
+            lineage_span_start: u32,
+        }
+
+        if hit_scores.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<u64> = hit_scores.iter().map(|&(id, _)| id).collect();
+        let mut docs_by_id: HashMap<u64, FetchedRerankDoc> = HashMap::with_capacity(ids.len());
+        for addr in &self.node_addrs {
+            let mut client = self.node_client(addr)?;
+            let local_node = match &client {
+                crate::link::NodeLink::Local(node) => Some(Arc::clone(node)),
+                #[cfg(feature = "net")]
+                crate::link::NodeLink::Remote(_) => None,
+            };
+            let resp = client
+                .get_documents(crate::pb::GetDocumentsRequest {
+                    doc_ids: ids.clone(),
+                })
+                .await?
+                .into_inner();
+            for doc in resp.documents {
+                let sentence_spans = local_node
+                    .as_ref()
+                    .and_then(|n| n.doc_sentence_spans(doc.doc_id))
+                    .unwrap_or_default();
+                let lineage_span_start = doc.lineage.map_or(0, |l| l.span_start);
+                docs_by_id.insert(
+                    doc.doc_id,
+                    FetchedRerankDoc {
+                        text: doc.text,
+                        sentence_spans,
+                        lineage_span_start,
+                    },
+                );
+            }
+        }
+        let mut out = Vec::with_capacity(hit_scores.len());
+        for &(doc_id, prior_score) in hit_scores {
+            let fetched = docs_by_id.remove(&doc_id).unwrap_or_default();
+            out.push(crate::turbo_bridge::rerank::RerankCandidate {
+                doc_id,
+                prior_score,
+                text: fetched.text,
+                sentence_spans: fetched.sentence_spans,
+                lineage_span_start: fetched.lineage_span_start,
+            });
+        }
+        Ok(out)
     }
 
     /// Expand one field's analyzed query terms under the table (unless
@@ -14830,16 +15002,33 @@ impl SearchService for CoordinatorServiceImpl {
                     union.len()
                 )));
             }
-            let dictionary_terms_with_prefix = union.len() as u64;
-            let mut ranked: Vec<(String, (u64, u32))> = union.into_iter().collect();
-            // df descending; the map's byte order breaks ties (stable sort).
-            ranked.sort_by_key(|(_, (df, _))| std::cmp::Reverse(*df));
-            ranked.truncate(limit);
+            let (suggestions, dictionary_terms_with_prefix) =
+                if let Some(lexicon) = self.surface_lexicon.as_deref() {
+                    let view = lexicon.view();
+                    let resolved = crate::turbo_bridge::query_plan::resolve_stemmed_suggestions(
+                        &view,
+                        &normalized,
+                        &union,
+                        limit,
+                    );
+                    let count = (resolved.len().max(union.len())) as u64;
+                    (resolved, count)
+                } else {
+                    let count = union.len() as u64;
+                    let mut ranked: Vec<(String, (u64, u32))> = union.into_iter().collect();
+                    // df descending; the map's byte order breaks ties (stable sort).
+                    ranked.sort_by_key(|(_, (df, _))| std::cmp::Reverse(*df));
+                    ranked.truncate(limit);
+                    (
+                        ranked
+                            .into_iter()
+                            .map(|(term, (df, shards))| crate::pb::Suggestion { term, df, shards })
+                            .collect(),
+                        count,
+                    )
+                };
             Ok(Response::new(crate::pb::SuggestResponse {
-                suggestions: ranked
-                    .into_iter()
-                    .map(|(term, (df, shards))| crate::pb::Suggestion { term, df, shards })
-                    .collect(),
+                suggestions,
                 dictionary_terms_with_prefix,
                 df_includes_tombstoned_rows: tombstoned,
             }))
@@ -15018,6 +15207,28 @@ impl SearchService for CoordinatorServiceImpl {
                     candidates,
                     dictionary_terms_scanned: union.len() as u64,
                 });
+            }
+            if let Some(checker) = self.spellchecker.as_deref() {
+                if let Some((_, contextual)) =
+                    crate::turbo_bridge::query_plan::spellcheck_query_terms(
+                        checker, &req.text, limit,
+                    )
+                {
+                    for ctx in contextual {
+                        if let Some(existing) = out.iter_mut().find(|t| t.term == ctx.term) {
+                            if existing.df == 0 || always {
+                                for cand in ctx.candidates {
+                                    if !existing.candidates.iter().any(|c| c.term == cand.term) {
+                                        existing.candidates.insert(0, cand);
+                                    }
+                                }
+                                existing.candidates.truncate(limit);
+                            }
+                        } else {
+                            out.push(ctx);
+                        }
+                    }
+                }
             }
             Ok(Response::new(crate::pb::TermSuggestResponse {
                 terms: out,

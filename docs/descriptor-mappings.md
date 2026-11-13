@@ -514,10 +514,9 @@ The exchange contract is vendored, never depended on:
 
 - The file is copied from the owning protomolt repository into this
   repo's vendored tree (package `ai.protomolt.proto.schema.registry.v1`,
-  import path following the same convention as
-  `proto/ai/pipestream/opennlp/analysis/v1/analysis.proto`), and it must
-  remain **byte-identical** to the source. Copy it from the owning repo;
-  never edit the vendored copy independently.
+  under `proto/ai/protomolt/proto/schema/registry/v1/descriptor_exchange.proto`),
+  and it must remain **byte-identical** to the source. Copy it from the owning
+  repo; never edit the vendored copy independently.
 - Byte identity is enforced by a check, not by convention:
   `scripts/check-vendored-protos.sh` pins the SHA-256 of each vendored
   file (descriptor_exchange.proto, its validate.proto import, and

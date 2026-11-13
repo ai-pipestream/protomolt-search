@@ -81,6 +81,62 @@ pub fn derive_bigrams(source: &AnalyzedField) -> Result<AnalyzedField, String> {
     let Some(positions) = &source.positions else {
         return Err("bigram column requires token positions, and the analysis carried none".into());
     };
+    if let Some(pos_lengths) = &source.pos_lengths {
+        let mut arcs: Vec<(u32, u32, usize, (u32, u32))> = Vec::new();
+        for (ti, (((term, _, offsets), ordinals), lengths)) in source
+            .terms
+            .iter()
+            .zip(positions)
+            .zip(pos_lengths)
+            .enumerate()
+        {
+            if term.contains(BIGRAM_SEPARATOR) {
+                return Err(format!(
+                    "term {term:?} contains the bigram separator; the analyzer contract forbids it"
+                ));
+            }
+            for ((&span, &ordinal), &len) in offsets.iter().zip(ordinals).zip(lengths) {
+                arcs.push((ordinal, len.max(1), ti, span));
+            }
+        }
+        arcs.sort_unstable();
+        let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut terms: DocTerms = Vec::new();
+        for &(first_ord, first_len, first_ti, first_span) in &arcs {
+            let next_ord = first_ord.saturating_add(first_len);
+            let start_idx = arcs.partition_point(|&(ord, _, _, _)| ord < next_ord);
+            for &(second_ord, _, second_ti, second_span) in &arcs[start_idx..] {
+                if second_ord != next_ord {
+                    break;
+                }
+                let term = bigram_term(&source.terms[first_ti].0, &source.terms[second_ti].0);
+                let span = (
+                    first_span.0.min(second_span.0),
+                    first_span.1.max(second_span.1),
+                );
+                match index.get(&term) {
+                    Some(&i) => {
+                        if !terms[i].2.contains(&span) {
+                            terms[i].1 += 1;
+                            terms[i].2.push(span);
+                        }
+                    }
+                    None => {
+                        index.insert(term.clone(), terms.len());
+                        terms.push((term, 1, vec![span]));
+                    }
+                }
+            }
+        }
+        let length = terms.iter().map(|(_, tf, _)| *tf).sum();
+        return Ok(AnalyzedField {
+            sentences: None,
+            terms,
+            length,
+            positions: None,
+            ..Default::default()
+        });
+    }
     // (ordinal, term index, span) over every occurrence, in ordinal order.
     let mut occurrences: Vec<(u32, usize, (u32, u32))> = Vec::new();
     for (ti, ((term, _, offsets), ordinals)) in source.terms.iter().zip(positions).enumerate() {
@@ -126,6 +182,7 @@ pub fn derive_bigrams(source: &AnalyzedField) -> Result<AnalyzedField, String> {
         terms,
         length,
         positions: None,
+        ..Default::default()
     })
 }
 
@@ -154,6 +211,64 @@ pub fn phrase_matches(
 ) -> bool {
     if sequence.is_empty() || !index.has_positions() {
         return false;
+    }
+    if index.has_pos_lengths() {
+        let mut per_term: Vec<Option<Vec<(u32, u32)>>> = vec![None; terms.len()];
+        for &ti in sequence {
+            if per_term[ti].is_none() {
+                let Some(positions) = index.posting_positions(&terms[ti], doc_id) else {
+                    return false;
+                };
+                if positions.is_empty() {
+                    return false;
+                }
+                let lengths = index
+                    .posting_pos_lengths(&terms[ti], doc_id)
+                    .filter(|pl| pl.len() == positions.len());
+                let arcs: Vec<(u32, u32)> = match lengths {
+                    Some(pl) => positions
+                        .into_iter()
+                        .zip(pl)
+                        .map(|(p, l)| (p, l.max(1)))
+                        .collect(),
+                    None => positions.into_iter().map(|p| (p, 1)).collect(),
+                };
+                per_term[ti] = Some(arcs);
+            }
+        }
+        let slots: Vec<&[(u32, u32)]> = sequence
+            .iter()
+            .map(|&ti| per_term[ti].as_deref().expect("filled above"))
+            .collect();
+        let max_slop = u64::from(slop);
+        let mut frontier: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        for &(pos, len) in slots[0] {
+            frontier.entry(pos.saturating_add(len)).or_insert(0);
+        }
+        for slot in &slots[1..] {
+            let mut next_frontier: std::collections::BTreeMap<u32, u64> =
+                std::collections::BTreeMap::new();
+            for (&cursor, &used_slop) in &frontier {
+                let first = slot.partition_point(|&(p, _)| p < cursor);
+                for &(pos, len) in &slot[first..] {
+                    let gap = u64::from(pos - cursor);
+                    let total_slop = used_slop + gap;
+                    if total_slop > max_slop {
+                        break;
+                    }
+                    let end = pos.saturating_add(len);
+                    next_frontier
+                        .entry(end)
+                        .and_modify(|prev| *prev = (*prev).min(total_slop))
+                        .or_insert(total_slop);
+                }
+            }
+            if next_frontier.is_empty() {
+                return false;
+            }
+            frontier = next_frontier;
+        }
+        return !frontier.is_empty();
     }
     // Positions per sequence slot; a term missing from the document ends
     // it. Terms repeated in the sequence read their positions once.
@@ -274,6 +389,7 @@ mod tests {
                 .collect(),
             length: terms.iter().map(|(_, ords, _)| ords.len() as u32).sum(),
             positions: Some(terms.iter().map(|(_, ords, _)| ords.to_vec()).collect()),
+            ..Default::default()
         }
     }
 

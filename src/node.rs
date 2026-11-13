@@ -4817,6 +4817,10 @@ pub struct NodeServiceImpl {
     /// Optional per-poll sleep injected on streaming scans for deterministic
     /// straggler simulation in multi-shard tests and benchmarks.
     stream_poll_delay: Option<std::time::Duration>,
+    /// Optional one-pass `DocumentNlpProjection` -> native typed column spec (`#103`).
+    nlp_columns: Option<Arc<crate::turbo_bridge::NlpColumnSpec>>,
+    /// Optional index-generation cryptographic handshake verified against analyzer / bundle fingerprints (`#103`).
+    turbo_handshake: Option<Arc<turbo_client::IndexGenerationHandshake>>,
 }
 
 /// One compiled MaterializeSpec, cached against spec equality.
@@ -5786,6 +5790,8 @@ impl NodeServiceImpl {
             phrase_index: None,
             flush_notify: None,
             stream_poll_delay: None,
+            nlp_columns: None,
+            turbo_handshake: None,
         }
     }
 
@@ -5815,6 +5821,119 @@ impl NodeServiceImpl {
     ) -> Self {
         self.phrase_index = phrase_index;
         self
+    }
+
+    /// Configure pre-WAL materialization of first-class one-pass NLP typed
+    /// columns (`money`, `quantity`, `date`, `geo_spine`, `sentiment`,
+    /// `affirmed`/`negated` entities, `simhash`) (`#103`).
+    pub fn with_nlp_columns(mut self, spec: crate::turbo_bridge::NlpColumnSpec) -> Self {
+        self.nlp_columns = Some(Arc::new(spec));
+        self
+    }
+
+    /// Pin an [`turbo_client::IndexGenerationHandshake`] verified against
+    /// field analysis and neural bundle scoring fingerprints (`#103`).
+    pub fn with_turbo_handshake(
+        mut self,
+        handshake: turbo_client::IndexGenerationHandshake,
+    ) -> Self {
+        self.turbo_handshake = Some(Arc::new(handshake));
+        self
+    }
+
+    /// Verify a loaded neural bundle's scoring fingerprint against this
+    /// shard's pinned [`turbo_client::IndexGenerationHandshake`], refusing
+    /// with `FAILED_PRECONDITION` on drift (`#103`).
+    pub fn verify_turbo_bundle_handshake(
+        &self,
+        actual: &turbo_client::BundleScoringFingerprint,
+    ) -> Result<(), Status> {
+        if let Some(hs) = self.turbo_handshake.as_deref() {
+            hs.verify_bundle(actual)
+                .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Score quantized `u8`/`u16` SPLADE 128-doc Block-Max postings on `field`
+    /// with live-doc + CEL filter admission and L1 rounding slack (`#104`).
+    pub fn score_splade_field(
+        &self,
+        field: &str,
+        query_weights: &[(String, f32)],
+        query_l1_slack: f32,
+        k: usize,
+        filter: Option<&crate::pb::FilterExpr>,
+    ) -> Result<Vec<(u64, f32)>, Status> {
+        let guard = read_shard(&self.state);
+        let Some(store) = guard.bm25.as_ref() else {
+            return Ok(Vec::new());
+        };
+        if store.as_index().is_none() {
+            return Err(Status::failed_precondition(
+                "bm25 bulk build in progress; Flush first",
+            ));
+        }
+        let Some(fi) = store.field_index(field) else {
+            return Ok(Vec::new());
+        };
+        let index = store.field_view(fi).expect("searchability checked above");
+        if !index.has_splade() {
+            return Ok(Vec::new());
+        }
+        let allow = if filter.is_some() {
+            let (_, allow, _) = resolve_shard_filters(
+                Some(store),
+                None,
+                store.next_doc_id() as usize,
+                &[],
+                &[],
+                filter,
+                self.knobs.segment_pruning(),
+                None,
+            )?;
+            allow
+        } else {
+            None
+        };
+        let admitted = |doc: u32| {
+            !guard.live_docs.is_deleted(doc as usize)
+                && allow.as_ref().is_none_or(|mask| mask.test(doc as usize))
+        };
+        let offset = self.config.slot_offset;
+        let (hits, _) = index.score_splade(query_weights, query_l1_slack, k, &admitted);
+        Ok(hits
+            .into_iter()
+            .map(|(doc_id, score)| (offset + u64::from(doc_id), score))
+            .collect())
+    }
+
+    /// Stored body sentence spans `(start_utf8, end_utf8)` for `global_id` on
+    /// this shard, when live and present (`#105`).
+    pub(crate) fn doc_sentence_spans(&self, global_id: u64) -> Option<Vec<(u32, u32)>> {
+        if global_id < self.config.slot_offset {
+            return None;
+        }
+        let local = u32::try_from(global_id - self.config.slot_offset).ok()?;
+        let guard = read_shard(&self.state);
+        if guard.live_docs.is_deleted(local as usize) {
+            return None;
+        }
+        let store = guard.bm25.as_ref()?.as_index()?;
+        store.doc_sentences(local)
+    }
+
+    fn doc_session_layers(&self, doc: &AddDocumentsRequest) -> crate::analyzer::SessionLayers {
+        let mut layers = session_layers(
+            doc,
+            self.phrase_index.as_deref(),
+            &self.config.sentence_fields,
+        );
+        layers.nlp_columns = self
+            .nlp_columns
+            .as_deref()
+            .is_some_and(crate::turbo_bridge::NlpColumnSpec::is_enabled);
+        layers
     }
 
     /// The shard's vocabulary listener, when accumulation is enabled.
@@ -9199,9 +9318,8 @@ impl FieldStreams {
                     .map_err(|status| {
                         if status.code() == tonic::Code::Unimplemented {
                             Status::failed_precondition(format!(
-                                "analysis sidecar at {} does not implement AnalyzeStream; \
-                                 it predates the RPC and must be rebuilt (./gradlew installDist \
-                                 in grpc-opennlp-analysis). Refusing to analyze fields on the \
+                                "analysis server at {} does not implement AnalyzeStream; \
+                                 rebuild turbo-kserve from main. Refusing to analyze fields on the \
                                  removed unary path.",
                                 self.addr
                             ))
@@ -9507,6 +9625,7 @@ pub(crate) fn join_fields(
     let quality = body.quality;
     let geography = body.geography.clone();
     let entities = body.entities.clone();
+    let nlp = body.nlp.take();
     fields[0] = body.into_body();
     for (fi, analyzed) in extras {
         fields[fi] = analyzed.ok_or_else(|| {
@@ -9525,6 +9644,7 @@ pub(crate) fn join_fields(
         quality,
         geography,
         entities,
+        nlp,
     })
 }
 
@@ -9726,6 +9846,7 @@ pub(crate) fn session_layers(
         // from that configuration only after analysis is requested.
         sentences: !sentence_fields.is_empty(),
         dual_cased: !doc.cased_field.is_empty(),
+        nlp_columns: false,
     }
 }
 
@@ -10516,10 +10637,20 @@ impl NodeServiceImpl {
         analyzed: crate::postings::AnalyzedDoc,
         stable_key: Option<&[u8]>,
     ) -> Result<(AddDocumentsRequest, crate::postings::AnalyzedDoc), Status> {
+        if let Some(hs) = self.turbo_handshake.as_deref() {
+            let cfg = crate::analyzer::turbo_field_config(doc.analysis.as_ref())?;
+            hs.verify_analysis(&cfg.fingerprint())
+                .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        }
         let (doc, analyzed) = self.materialize_proximity(doc, analyzed)?;
         let (doc, analyzed) = self.materialize_phrases(doc, analyzed)?;
         let doc = materialize_quality(doc, &analyzed)?;
         let doc = materialize_geography(doc, &analyzed)?;
+        let doc = crate::turbo_bridge::materialize_nlp_columns(
+            doc,
+            analyzed.nlp.as_deref(),
+            self.nlp_columns.as_deref(),
+        )?;
         let doc = self.materialize_columns(doc, stable_key)?;
         let doc = self.place_document(doc)?;
         Ok((doc, analyzed))
@@ -11841,11 +11972,7 @@ impl NodeServiceImpl {
                             addr,
                             doc.analysis.as_ref(),
                             self.vocab.clone(),
-                            session_layers(
-                                &doc,
-                                self.phrase_index.as_deref(),
-                                &self.config.sentence_fields,
-                            ),
+                            self.doc_session_layers(&doc),
                         )
                         .await?;
                         spec = doc.analysis.clone();
@@ -14262,11 +14389,7 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                     &addr,
                     first.req.analysis.as_ref(),
                     self.vocab.clone(),
-                    session_layers(
-                        &first.req,
-                        self.phrase_index.as_deref(),
-                        &self.config.sentence_fields,
-                    ),
+                    self.doc_session_layers(&first.req),
                 )
                 .await
                 {
@@ -14283,9 +14406,8 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                     }
                     Err(status) if status.code() == tonic::Code::Unimplemented => {
                         return Err(Status::failed_precondition(format!(
-                            "analysis sidecar at {addr} does not implement AnalyzeStream; \
-                         it predates the RPC and must be rebuilt (./gradlew installDist \
-                         in grpc-opennlp-analysis). Refusing to ingest on the removed \
+                            "analysis server at {addr} does not implement AnalyzeStream; \
+                         rebuild turbo-kserve from main. Refusing to ingest on the removed \
                          unary path."
                         )));
                     }
@@ -14395,11 +14517,7 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                     &addr,
                     first.req.analysis.as_ref(),
                     self.vocab.clone(),
-                    session_layers(
-                        &first.req,
-                        self.phrase_index.as_deref(),
-                        &self.config.sentence_fields,
-                    ),
+                    self.doc_session_layers(&first.req),
                 )
                 .await
                 {
@@ -14416,9 +14534,8 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                     }
                     Err(status) if status.code() == tonic::Code::Unimplemented => {
                         return Err(Status::failed_precondition(format!(
-                            "analysis sidecar at {addr} does not implement AnalyzeStream; \
-                         it predates the RPC and must be rebuilt (./gradlew installDist \
-                         in grpc-opennlp-analysis). Refusing to ingest on the removed \
+                            "analysis server at {addr} does not implement AnalyzeStream; \
+                         rebuild turbo-kserve from main. Refusing to ingest on the removed \
                          unary path."
                         )));
                     }

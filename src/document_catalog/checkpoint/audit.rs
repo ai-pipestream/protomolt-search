@@ -201,9 +201,9 @@ impl CatalogCheckpoint<'_> {
         owned.keep = false;
         let mut builder = Database::builder();
         builder.set_cache_size(CACHE_BYTES);
-        let proof = builder
-            .create_file(file.try_clone().map_err(storage)?)
+        let backend = redb::backends::FileBackend::new(file.try_clone().map_err(storage)?)
             .map_err(storage)?;
+        let proof = builder.create_with_backend(backend).map_err(storage)?;
         let within_budget = || {
             if file.metadata().map_err(storage)?.len() > scratch_bytes {
                 Err(Status::resource_exhausted(

@@ -188,9 +188,9 @@ impl ReplayJournal {
         }
         let mut builder = Database::builder();
         builder.set_cache_size(8 << 20);
-        let database = builder
-            .create_file(file.try_clone().map_err(storage)?)
+        let backend = redb::backends::FileBackend::new(file.try_clone().map_err(storage)?)
             .map_err(storage)?;
+        let database = builder.create_with_backend(backend).map_err(storage)?;
         let journal = Self {
             database,
             binding,

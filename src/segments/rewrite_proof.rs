@@ -278,7 +278,8 @@ impl OpenedSegmentSet {
         let file = options.open(scratch.0.join("rows.redb")).map_err(err)?;
         let mut builder = Database::builder();
         builder.set_cache_size(8 * 1024 * 1024);
-        let database = builder.create_file(file).map_err(err)?;
+        let backend = redb::backends::FileBackend::new(file).map_err(err)?;
+        let database = builder.create_with_backend(backend).map_err(err)?;
         #[cfg(test)]
         if let Some(observe) = AFTER_SCRATCH_CREATED.with(|hook| hook.borrow_mut().take()) {
             observe(&scratch.0);
@@ -595,6 +596,7 @@ mod tests {
                         length: if variant("length") { 3 } else { 2 },
                         positions: Some(vec![vec![if variant("position") { 1 } else { 0 }]]),
                         sentences: Some(vec![(0, if variant("sentence") { 8 } else { 9 })]),
+                        ..Default::default()
                     };
                     store.add_document_with_lineage(
                         row as u32,

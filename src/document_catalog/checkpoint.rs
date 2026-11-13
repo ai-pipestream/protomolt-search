@@ -202,9 +202,9 @@ impl CatalogCheckpoint<'_> {
         file.try_lock().map_err(storage)?;
         let mut builder = Database::builder();
         builder.set_cache_size(CACHE_BYTES);
-        let database = builder
-            .create_file(file.try_clone().map_err(storage)?)
+        let backend = redb::backends::FileBackend::new(file.try_clone().map_err(storage)?)
             .map_err(storage)?;
+        let database = builder.create_with_backend(backend).map_err(storage)?;
         let records = {
             let mut copy = Copier {
                 database: &database,

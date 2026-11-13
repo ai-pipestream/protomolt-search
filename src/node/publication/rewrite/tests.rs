@@ -50,6 +50,7 @@ async fn mixed_vectors_typed_values_and_analysis_survive_bounded_rebuilding() {
                             length: 2,
                             positions: Some(vec![vec![0, 1]]),
                             sentences: Some(vec![(0, 7)]),
+                            ..Default::default()
                         },
                         AnalyzedField::default(),
                     ],

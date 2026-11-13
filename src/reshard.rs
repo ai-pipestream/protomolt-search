@@ -1382,11 +1382,8 @@ fn build_child(
                         // (docs/quality-columns.md,
                         // docs/geography-columns.md).
                         crate::postings::AnalyzedDoc {
-                            cased: None,
                             fields,
-                            quality: None,
-                            geography: None,
-                            entities: Vec::new(),
+                            ..Default::default()
                         },
                         doc.lineage.map(|l| crate::postings::DocLineage {
                             parent_id: l.parent_id,
@@ -4730,6 +4727,7 @@ fn read_analysis_file(path: &Path) -> Result<BTreeMap<u64, Vec<AnalyzedField>>, 
                 length,
                 positions,
                 sentences,
+                ..Default::default()
             });
         }
         if out.insert(id, fields).is_some() {

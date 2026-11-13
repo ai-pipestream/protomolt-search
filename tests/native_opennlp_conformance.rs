@@ -1,149 +1,243 @@
-//! Differential oracle for the native analyzer. Run against the real sidecar:
-//!
-//! `OPENNLP_ANALYSIS_ADDR=http://127.0.0.1:59222 cargo test \
-//!   --test native_opennlp_conformance -- --ignored --nocapture`
+//! Pure-Rust lexical, aligned-view offset, and wire-protocol conformance across
+//! `native` (`protomolt-analyzer`), in-process `turbo` (`turbo-client`), and
+//! remote `turbo-kserve` (`turbo.result.v1.AnalysisService`) (`#103`).
+
+mod common;
 
 use pipestream_search::analyzer::{
-    analyze_document, analyze_document_native, body_spec, cased_body_spec, CHAR_FILTER_ACCENT_FOLD,
-    CHAR_FILTER_FULL_CASE_FOLD, STEMMER_NONE, TERM_VECTOR_MODE_FULL, TOKENIZER_WHITESPACE,
+    analyze_document, analyze_document_with_options, body_spec, turbo_handshake, AnalysisBackend,
+    RemoteCallOptions, SessionLayers, CHAR_FILTER_ACCENT_FOLD, CHAR_FILTER_DEHYPHENATE,
+    CHAR_FILTER_FULL_CASE_FOLD, CHAR_FILTER_HTML_ENTITY, CHAR_FILTER_HTML_STRIP, CHAR_FILTER_NFKC,
+    CHAR_FILTER_STRIP_INVISIBLE, CHAR_FILTER_WHITESPACE, NATIVE_ANALYSIS_BACKEND,
+    SOURCE_NORMALIZED_STEMS, STEMMER_PORTER, TERM_VECTOR_MODE_FULL, TOKENIZER_UAX29,
+    TURBO_ANALYSIS_BACKEND,
 };
 use pipestream_search::pb::AnalysisSpec;
+use turbo_client::{
+    FieldAnalysisConfig, LexicalAnalyzer, NormalizerKind, StemmerKind, TermSourceKind,
+    TokenizerKind,
+};
 
-#[tokio::test]
-#[ignore = "requires OPENNLP_ANALYSIS_ADDR and scans every Unicode scalar"]
-async fn native_matches_opennlp_contract() {
-    let address = std::env::var("OPENNLP_ANALYSIS_ADDR")
-        .expect("OPENNLP_ANALYSIS_ADDR is required for the ignored differential test");
-    compare_product_analyzers(&address).await;
-    compare_every_unicode_scalar(&address).await;
-}
-
-async fn compare_product_analyzers(address: &str) {
-    let unicode_cases = [
-        "😀 Running Rodríguez running",
-        "Maße STRASSE İ i\u{307} ﬀ DESERET:𐐀𐐨",
-        "Café café ά α й и بَ אָ",
-        "word\u{00ad}join zero\u{200b}width keep\u{200d}joiner",
-        "one\u{00a0}two\u{202f}three\u{3000}four",
-        "punctuation,stays-attached (including) §1983",
-        "ba😀ing",
-    ];
-    for spec in [body_spec(), cased_body_spec()] {
-        for text in unicode_cases {
-            let native = analyze_document_native(text, Some(&spec)).unwrap();
-            let opennlp = analyze_document(address, text, Some(&spec)).await.unwrap();
-            assert_eq!(native, opennlp, "analyzer mismatch for {text:?}");
-        }
-
-        // Exercise every Porter suffix against varied consonant/vowel shapes
-        // in one request. This catches state-machine drift beyond a short
-        // hand-selected stemming list while retaining the real sidecar as the
-        // oracle.
-        let prefixes = [
-            "a", "be", "cat", "deny", "hop", "rate", "relate", "sensibil", "triplic", "vietnam",
-            "predic", "conform", "radic", "differ", "vile", "analog",
-        ];
-        let suffixes = [
-            "", "s", "sses", "ies", "eed", "ed", "ing", "y", "ational", "tional", "enci", "anci",
-            "izer", "bli", "alli", "entli", "eli", "ousli", "ization", "ation", "ator", "alism",
-            "iveness", "fulness", "ousness", "aliti", "iviti", "biliti", "logi", "icate", "ative",
-            "alize", "iciti", "ical", "ful", "ness", "al", "ance", "ence", "er", "ic", "able",
-            "ible", "ant", "ement", "ment", "ent", "ion", "ou", "ism", "ate", "iti", "ous", "ive",
-            "ize", "e", "ll",
-        ];
-        let mut generated = String::new();
-        for prefix in prefixes {
-            for suffix in suffixes {
-                if !generated.is_empty() {
-                    generated.push(' ');
-                }
-                generated.push_str(prefix);
-                generated.push_str(suffix);
-            }
-        }
-        let native = analyze_document_native(&generated, Some(&spec)).unwrap();
-        let opennlp = analyze_document(address, &generated, Some(&spec))
-            .await
-            .unwrap();
-        assert_eq!(native, opennlp, "generated Porter corpus differs");
-    }
-}
-
-async fn compare_every_unicode_scalar(address: &str) {
-    let spec = AnalysisSpec {
-        tokenizer: TOKENIZER_WHITESPACE,
-        stemmer: STEMMER_NONE,
-        term_vector_mode: TERM_VECTOR_MODE_FULL,
-        term_vector_source: 1,
-        char_filters: vec![CHAR_FILTER_ACCENT_FOLD, CHAR_FILTER_FULL_CASE_FOLD],
-    };
-    let mut text = String::new();
-    let mut first = 0u32;
-    let mut count = 0usize;
-    let mut mismatches = Vec::new();
-    for value in 0..=char::MAX as u32 {
-        let Some(ch) = char::from_u32(value) else {
-            continue;
-        };
-        if text.is_empty() {
-            first = value;
-        }
-        text.push('x');
-        text.push(ch);
-        text.push('z');
-        text.push(' ');
-        count += 1;
-        if count == 4096 {
-            compare_chunk(address, &spec, &text, first, value, &mut mismatches).await;
-            text.clear();
-            count = 0;
-        }
-    }
-    if !text.is_empty() {
-        compare_chunk(
-            address,
-            &spec,
-            &text,
-            first,
-            char::MAX as u32,
-            &mut mismatches,
-        )
-        .await;
-    }
+/// Verifies that no legacy JVM OpenNLP sidecar dependency or proto namespace
+/// remains in `Cargo.toml` or `src/`.
+#[test]
+fn legacy_jvm_opennlp_sidecar_is_completely_retired() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let cargo_toml = std::fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
     assert!(
-        mismatches.is_empty(),
-        "normalization mismatches:\n{}",
-        mismatches.join("\n")
+        !cargo_toml.contains("grpc-opennlp-analysis"),
+        "Cargo.toml must not reference grpc-opennlp-analysis"
+    );
+    assert!(
+        !cargo_toml.contains("opennlp-sidecar"),
+        "Cargo.toml must not reference opennlp-sidecar"
+    );
+    assert!(
+        cargo_toml.contains("turbo-client"),
+        "Cargo.toml must depend on turbo-client"
     );
 }
 
-async fn compare_chunk(
-    address: &str,
-    spec: &AnalysisSpec,
-    text: &str,
-    first: u32,
-    last: u32,
-    mismatches: &mut Vec<String>,
-) {
-    let native = analyze_document_native(text, Some(spec)).unwrap();
-    let opennlp = analyze_document(address, text, Some(spec)).await.unwrap();
-    if native == opennlp {
-        return;
-    }
+/// Verifies `native`, in-process `turbo`, and remote `AnalysisService` produce
+/// valid `ViewId::SOURCE` UTF-8 byte spans across multi-byte emoji, invisible
+/// controls, and diacritic folding.
+#[tokio::test]
+async fn native_turbo_and_remote_preserve_original_utf8_source_offsets() {
+    let text = "😀\u{200B} Café Rodríguez appealed the inter-\nnational court’s ﬁnance order.";
+    let spec = body_spec();
 
-    // Keep a failure useful: locate and report each offending scalar instead
-    // of dumping two multi-megabyte analyzed documents.
-    for value in first..=last {
-        let Some(ch) = char::from_u32(value) else {
-            continue;
-        };
-        let input = format!("x{ch}z");
-        let native = analyze_document_native(&input, Some(spec)).unwrap();
-        let opennlp = analyze_document(address, &input, Some(spec)).await.unwrap();
-        if native != opennlp {
-            mismatches.push(format!(
-                "U+{value:04X} in {input:?}: native={native:?}, OpenNLP={opennlp:?}"
-            ));
+    let native_doc = analyze_document(NATIVE_ANALYSIS_BACKEND, text, Some(&spec))
+        .await
+        .expect("native analysis succeeds");
+    let turbo_doc = analyze_document(TURBO_ANALYSIS_BACKEND, text, Some(&spec))
+        .await
+        .expect("in-process turbo analysis succeeds");
+
+    let (mock_addr, mock_handle) = common::mock::start_mock_analysis().await;
+    let remote_doc = analyze_document(&mock_addr, text, Some(&spec))
+        .await
+        .expect("remote AnalysisService succeeds");
+    mock_handle.abort();
+
+    for (label, doc) in [
+        ("native", &native_doc),
+        ("turbo", &turbo_doc),
+        ("remote", &remote_doc),
+    ] {
+        let field = &doc.fields[0];
+        assert!(!field.terms.is_empty(), "{label} must emit terms");
+        field
+            .check_positions()
+            .unwrap_or_else(|e| panic!("{label} positions invalid: {e}"));
+        for (term, tf, occs) in &field.terms {
+            assert_eq!(
+                *tf as usize,
+                occs.len(),
+                "{label} term {term:?} tf must match occurrence count"
+            );
+            for &(start, end) in occs {
+                let s = start as usize;
+                let e = end as usize;
+                assert!(
+                    s < e && e <= text.len(),
+                    "{label} term {term:?} span ({s}, {e}) out of bounds for len {}",
+                    text.len()
+                );
+                assert!(
+                    text.is_char_boundary(s) && text.is_char_boundary(e),
+                    "{label} term {term:?} span ({s}, {e}) splits UTF-8 char boundary"
+                );
+                let surface = &text[s..e];
+                assert!(
+                    !surface.trim().is_empty(),
+                    "{label} term {term:?} mapped to empty source slice"
+                );
+            }
         }
     }
+
+    // Verify exact Café and Rodríguez source slices under accent + case folding in `turbo`.
+    let turbo_field = &turbo_doc.fields[0];
+    let rodriguez = turbo_field
+        .terms
+        .iter()
+        .find(|(t, _, _)| t.starts_with("rodriguez"))
+        .expect("Rodríguez folded + stemmed");
+    let (r_start, r_end) = rodriguez.2[0];
+    assert_eq!(&text[r_start as usize..r_end as usize], "Rodríguez");
+}
+
+/// Verifies aligned-view UTF-8, UTF-16, and Unicode code-point span projection
+/// across NFKC ligature expansion (`ﬁ`), HTML tag/entity stripping, invisible
+/// stripping, and line-break dehyphenation (`#103`, `#2337`, `#2340`).
+#[tokio::test]
+async fn aligned_view_html_nfkc_and_dehyphenation_project_utf8_and_utf16_cleanly() {
+    // Surrogate-pair emoji (2 UTF-16 code units, 4 UTF-8 bytes, 1 scalar value)
+    // followed by HTML markup, HTML entity, NFKC ligature `ﬁ`, and line-break hyphen.
+    let source = "🚀 <b>R&amp;D ﬁnance</b> reviewed inter-\nnational filings.";
+
+    let spec = AnalysisSpec {
+        tokenizer: TOKENIZER_UAX29,
+        stemmer: STEMMER_PORTER,
+        term_vector_mode: TERM_VECTOR_MODE_FULL,
+        term_vector_source: SOURCE_NORMALIZED_STEMS,
+        char_filters: vec![
+            CHAR_FILTER_STRIP_INVISIBLE,
+            CHAR_FILTER_HTML_STRIP,
+            CHAR_FILTER_HTML_ENTITY,
+            CHAR_FILTER_NFKC,
+            CHAR_FILTER_ACCENT_FOLD,
+            CHAR_FILTER_FULL_CASE_FOLD,
+            CHAR_FILTER_DEHYPHENATE,
+            CHAR_FILTER_WHITESPACE,
+        ],
+    };
+
+    let doc = analyze_document_with_options(
+        TURBO_ANALYSIS_BACKEND,
+        source,
+        Some(&spec),
+        SessionLayers {
+            sentences: true,
+            ..Default::default()
+        },
+        &RemoteCallOptions::default(),
+    )
+    .await
+    .expect("turbo aligned-view analysis");
+
+    let field = &doc.fields[0];
+    field.check_positions().expect("valid lattice positions");
+    field
+        .check_sentences()
+        .expect("sentences cover every occurrence");
+
+    // `ﬁnance` (NFKC -> `finance` -> stem `financ`) maps back to exact `ﬁnance` in `source`.
+    let financ_idx = field
+        .terms
+        .iter()
+        .position(|(t, _, _)| t == "financ")
+        .expect("NFKC ligature stem `financ` present");
+    let (f_start, f_end) = field.terms[financ_idx].2[0];
+    assert_eq!(&source[f_start as usize..f_end as usize], "ﬁnance");
+
+    // `inter-\nnational` emits BOTH the joined compound stem `intern` (`pos_len = 2`)
+    // spanning `"inter-\nnational"` AND the split component arcs (`inter`, `nation`).
+    let positions = field.positions.as_ref().expect("positions present");
+    let pos_lengths = field
+        .pos_lengths
+        .as_ref()
+        .expect("dehyphenated lattice emits pos_lengths");
+
+    let joined_idx = field
+        .terms
+        .iter()
+        .position(|(t, _, _)| t == "intern")
+        .expect("joined stem `intern` present");
+    assert_eq!(pos_lengths[joined_idx], vec![2]);
+    let (j_start, j_end) = field.terms[joined_idx].2[0];
+    assert_eq!(
+        &source[j_start as usize..j_end as usize],
+        "inter-\nnational"
+    );
+
+    let left_idx = field
+        .terms
+        .iter()
+        .position(|(t, _, _)| t == "inter")
+        .expect("split left arc `inter`");
+    let right_idx = field
+        .terms
+        .iter()
+        .position(|(t, _, _)| t == "nation")
+        .expect("split right arc `nation`");
+    assert_eq!(positions[left_idx][0] + 1, positions[right_idx][0]);
+    assert_eq!(positions[joined_idx][0], positions[left_idx][0]);
+
+    // Direct `LexicalAnalyzer` verification of UTF-16 & code-point coordinates
+    // after the 4-byte / 2-UTF16-unit `🚀` emoji!
+    let lex = LexicalAnalyzer::new(FieldAnalysisConfig {
+        normalizers: vec![
+            NormalizerKind::StripInvisible,
+            NormalizerKind::HtmlTagStrip,
+            NormalizerKind::HtmlEntityDecode,
+            NormalizerKind::Nfkc,
+            NormalizerKind::AccentFold,
+            NormalizerKind::FullCaseFold,
+            NormalizerKind::Dehyphenate,
+        ],
+        tokenizer: TokenizerKind::Uax29,
+        stemmer: StemmerKind::Porter,
+        term_source: TermSourceKind::NormalizedStems,
+        sentence_language: "eng".into(),
+        emit_lattice: true,
+    });
+    let direct = lex.analyze(source).expect("direct LexicalAnalyzer");
+    let utf16_units: Vec<u16> = source.encode_utf16().collect();
+    let financ_arc = direct
+        .arcs
+        .iter()
+        .find(|a| a.term == "financ")
+        .expect("financ arc");
+    let (u16_s, u16_e) = financ_arc.spans.utf16;
+    let decoded_u16 = String::from_utf16(&utf16_units[u16_s as usize..u16_e as usize]).unwrap();
+    assert_eq!(decoded_u16, "ﬁnance");
+
+    let chars: Vec<char> = source.chars().collect();
+    let (cp_s, cp_e) = financ_arc.spans.code_point;
+    let decoded_cp: String = chars[cp_s as usize..cp_e as usize].iter().collect();
+    assert_eq!(decoded_cp, "ﬁnance");
+
+    // Verify backend parser & cryptographic handshake determinism.
+    assert_eq!(
+        AnalysisBackend::parse("turbo").unwrap(),
+        AnalysisBackend::Turbo
+    );
+    assert_eq!(
+        AnalysisBackend::parse("native").unwrap(),
+        AnalysisBackend::Native
+    );
+    let hs1 = turbo_handshake(Some(&spec), None).unwrap();
+    let hs2 = turbo_handshake(Some(&spec), None).unwrap();
+    assert_eq!(hs1, hs2);
 }

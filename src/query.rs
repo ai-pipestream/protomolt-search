@@ -912,7 +912,7 @@ pub(crate) async fn execute(
             ..
         }))
     );
-    if req.highlight.is_some() && !single_lexical {
+    if req.highlight.is_some() && !single_lexical && coordinator.rerank_spec().is_none() {
         return Err(refuse(
             "highlight is served for the single lexical selection only: no other shape \
              carries the occurrence spans snippets are cut around",
@@ -931,12 +931,42 @@ pub(crate) async fn execute(
         }
         _ => coordinator,
     };
-    let filter = plan
+    let mut filter = plan
         .cel
         .iter()
         .map(|c| format!("({c})"))
         .collect::<Vec<_>>()
         .join(" && ");
+    let mut one_pass_bound: Option<crate::turbo_bridge::query_plan::BoundOnePassQuery> = None;
+    if let Some((q_analyzer, q_cols)) = coordinator.one_pass_query() {
+        let raw_q = match &plan.shape {
+            Shape::Lexical { query, .. } | Shape::Composite { lexical: query, .. } => {
+                Some(query.text.as_str())
+            }
+            Shape::Dense { .. } => coordinator
+                .rerank_spec()
+                .and_then(|s| s.query_text_override.as_deref()),
+            Shape::Browse => None,
+        };
+        if let Some(q_text) = raw_q.filter(|s| !s.trim().is_empty()) {
+            let q_plan = q_analyzer
+                .analyze(q_text)
+                .map_err(|e| Status::invalid_argument(format!("one-pass query analysis: {e}")))?;
+            let bound = crate::turbo_bridge::query_plan::bind_one_pass_query(
+                &q_plan,
+                q_cols,
+                (!filter.is_empty()).then_some(filter.as_str()),
+            )?;
+            if !bound.synthesized_cel.is_empty() {
+                filter = if filter.is_empty() {
+                    bound.synthesized_cel.clone()
+                } else {
+                    format!("({filter}) && ({})", bound.synthesized_cel)
+                };
+            }
+            one_pass_bound = Some(bound);
+        }
+    }
     if let Some(p) = prof.as_mut() {
         // The shards the plan's filter rules out before fan-out
         // (docs/placement.md); a plan without a filter skips none.
@@ -1216,6 +1246,7 @@ pub(crate) async fn execute(
         || scorer.is_some()
         || !req.boosts.is_empty()
         || fp32_rerank
+        || coordinator.rerank_spec().is_some()
         || req.collapse.is_some()
         || pool_aggregate.is_some();
     // A collapse over a single leaf deepens its pool itself (below), so
@@ -1367,9 +1398,13 @@ pub(crate) async fn execute(
         }
         Shape::Lexical { id, query } => {
             let t_sel = std::time::Instant::now();
+            let effective_text = one_pass_bound
+                .as_ref()
+                .filter(|b| !b.synthesized_cel.is_empty() && !b.residual_text.trim().is_empty())
+                .map_or_else(|| query.text.clone(), |b| b.residual_text.clone());
             let response = coordinator
                 .bm25_search(crate::metrics::nested(Request::new(Bm25SearchRequest {
-                    text: query.text.clone(),
+                    text: effective_text,
                     k: fetch_k,
                     analysis: query.analysis.clone(),
                     score_stages: query.score_stages.clone(),
@@ -1392,7 +1427,10 @@ pub(crate) async fn execute(
                 p.segments_skipped = response.segments_skipped;
             }
             let field_details_redacted = response.field_details_redacted;
-            let synonym_expansions = response.synonym_expansions.clone();
+            let mut synonym_expansions = response.synonym_expansions.clone();
+            if let Some(bound) = &one_pass_bound {
+                synonym_expansions.extend(bound.synonym_expansions.iter().cloned());
+            }
             let mut hits: Vec<QueryHit> = response
                 .hits
                 .iter()
@@ -1518,7 +1556,7 @@ pub(crate) async fn execute(
                 })
                 .collect();
             let dense_mode = dense_score_mode(query)?;
-            let route = if fp32_rerank {
+            let mut route = if fp32_rerank {
                 let t0 = std::time::Instant::now();
                 let ids: Vec<u64> = hits.iter().map(|hit| hit.doc_id).collect();
                 let reranked = coordinator
@@ -1563,6 +1601,14 @@ pub(crate) async fn execute(
                 }
                 "search"
             };
+            if let Some(rerank_spec) = coordinator.rerank_spec() {
+                let q_text = rerank_spec
+                    .query_text_override
+                    .as_deref()
+                    .unwrap_or(&req.request_id);
+                apply_turbo_rerank(coordinator, rerank_spec, q_text, &mut hits).await?;
+                route = "search:turbo_rerank";
+            }
             apply_boosts(coordinator, &boosts, &mut hits, scorer.is_some(), &mut prof).await?;
             let executed = apply_scorer(coordinator, &scorer, &mut hits, route, &mut prof).await?;
             let pool_ids: Vec<u64> = hits.iter().map(|h| h.doc_id).collect();
@@ -1648,10 +1694,14 @@ pub(crate) async fn execute(
             };
             let boost_id = legacy.as_ref().map(|(id, _)| id.clone());
             let t_sel = std::time::Instant::now();
+            let effective_lexical_text = one_pass_bound
+                .as_ref()
+                .filter(|b| !b.synthesized_cel.is_empty() && !b.residual_text.trim().is_empty())
+                .map_or_else(|| lexical.text.clone(), |b| b.residual_text.clone());
             let response = coordinator
                 .hybrid_search(crate::metrics::nested(Request::new(HybridSearchRequest {
                     request_id: req.request_id.clone(),
-                    text: lexical.text.clone(),
+                    text: effective_lexical_text,
                     vector: dense.vector.clone(),
                     // The selection phase runs selection_k deep; the
                     // final page trims to k below. For the exact modes
@@ -1772,7 +1822,7 @@ pub(crate) async fn execute(
                     })
                     .collect()
             };
-            let route = match mode {
+            let mut route = match mode {
                 FusionMode::GlobalRank => "hybrid_search:global_rank",
                 FusionMode::ScoreBlend => "hybrid_search:score_blend",
                 FusionMode::Decomposed => "hybrid_search:decomposed",
@@ -1817,6 +1867,14 @@ pub(crate) async fn execute(
                     }
                 }
             }
+            if let Some(rerank_spec) = coordinator.rerank_spec() {
+                let q_text = rerank_spec
+                    .query_text_override
+                    .as_deref()
+                    .unwrap_or(&lexical.text);
+                apply_turbo_rerank(coordinator, rerank_spec, q_text, &mut hits).await?;
+                route = "hybrid_search:turbo_rerank";
+            }
             apply_boosts(coordinator, &boosts, &mut hits, scorer.is_some(), &mut prof).await?;
             let executed = apply_scorer(coordinator, &scorer, &mut hits, route, &mut prof).await?;
             let pool_ids: Vec<u64> = hits.iter().map(|h| h.doc_id).collect();
@@ -1850,6 +1908,11 @@ pub(crate) async fn execute(
             );
             response.groups = groups;
             response.dense_execution = dense_execution;
+            if let Some(bound) = &one_pass_bound {
+                response
+                    .synonym_expansions
+                    .extend(bound.synonym_expansions.iter().cloned());
+            }
             response.aggregate =
                 aggregate_pool(coordinator, pool_aggregate.as_ref(), &pool_ids).await?;
             Ok(response)
@@ -1920,6 +1983,54 @@ async fn apply_scorer(
 /// (non-lexical shapes; the lexical route carries projections
 /// natively). A hit whose shard holds no column tables projects
 /// all-absent — exact, its document holds no such values.
+async fn apply_turbo_rerank(
+    coordinator: &CoordinatorServiceImpl,
+    spec: &crate::turbo_bridge::rerank::RerankSpec,
+    query_text: &str,
+    hits: &mut Vec<QueryHit>,
+) -> Result<(), Status> {
+    if hits.is_empty() || spec.shortlist_size == 0 {
+        return Ok(());
+    }
+    let limit = hits.len().min(spec.shortlist_size);
+    let shortlist_pairs: Vec<(u64, f64)> = hits[..limit]
+        .iter()
+        .map(|h| (h.doc_id, f64::from(h.score)))
+        .collect();
+    let candidates = coordinator
+        .fetch_rerank_candidates(&shortlist_pairs)
+        .await?;
+    let reranked = crate::turbo_bridge::rerank::rerank_and_highlight_shortlist(
+        spec,
+        query_text,
+        &candidates,
+        0,
+    )
+    .await?;
+    let mut reordered = Vec::with_capacity(hits.len());
+    let mut old_shortlist: Vec<Option<QueryHit>> = hits.drain(..limit).map(Some).collect();
+    for item in reranked {
+        if let Some(mut hit) = old_shortlist
+            .get_mut(item.input_index)
+            .and_then(Option::take)
+        {
+            hit.score = item.calibrated_probability as f32;
+            hit.snippets = item.snippets;
+            hit.signals.push(QuerySignal {
+                id: "turbo_rerank".to_string(),
+                score: hit.score,
+            });
+            reordered.push(hit);
+        }
+    }
+    for leftover in old_shortlist.into_iter().flatten() {
+        reordered.push(leftover);
+    }
+    reordered.append(hits);
+    *hits = reordered;
+    Ok(())
+}
+
 async fn fill_projected(
     coordinator: &CoordinatorServiceImpl,
     compiled: &[crate::pb::CompiledProjection],

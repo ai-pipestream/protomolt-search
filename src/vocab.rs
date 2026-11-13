@@ -2,14 +2,16 @@
 //! the ingest path, from the AnalyzeStream responses the node already
 //! receives — no new gRPC channel, no extra analysis pass.
 //!
-//! Design: `grpc-opennlp-analysis/VOCABULARY-LISTENER.md` (the sidecar
-//! repo). The split by role: Java calculates (term identity is counted
-//! exactly as produced), Rust accumulates, stores, and aggregates. Every
-//! analyzed document feeds two channels — TERMS (term-vector entries with
-//! their frequencies, exactly the BM25 index identity) and TOKENS (raw
-//! token surface forms) — each holding a HyperLogLog (cardinality), a
-//! count-min sketch (point frequencies), a space-saving top-K (heavy
-//! hitters), and counters. Memory is bounded by configuration, never by
+//! Persisted wire contract: `proto/ai/protomolt/search/storage/v1/vocab_snapshot.proto`
+//! (preserving byte-compatible FNV-1a + splitmix64 sketch layouts from the
+//! original `VOCABULARY-LISTENER.md` design). Term identity is counted
+//! exactly as produced by `turbo-client` / `protomolt-analyzer`; this module
+//! accumulates, stores, aggregates, and exports corpus DF (`TCIDF001`) to
+//! `TurboVocabularyService`. Every analyzed document feeds two channels —
+//! TERMS (term-vector entries with their frequencies, exactly the BM25 index
+//! identity) and TOKENS (raw token surface forms) — each holding a HyperLogLog
+//! (cardinality), a count-min sketch (point frequencies), a space-saving top-K
+//! (heavy hitters), and counters. Memory is bounded by configuration, never by
 //! corpus size (~11 MiB per channel per window).
 //!
 //! A window rolls over at [`DEFAULT_WINDOW_DOCS`] documents (or on an
@@ -31,7 +33,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use prost::Message;
 
-use crate::pb::analysis::{
+use crate::pb::storage::{
     VocabChannel, VocabChannelSnapshot, VocabChannelStats, VocabHeavyHitter, VocabSnapshot,
 };
 
@@ -1301,6 +1303,62 @@ fn scan_snapshots(vocab_dir: &Path) -> io::Result<(Vec<SnapshotMeta>, HashMap<u6
         .max()
         .map_or(0, |max| max + 1);
     Ok((found, files, next_sequence))
+}
+
+/// Streams collection-wide `(term, doc_freq)` statistics to `turbo-kserve`'s
+/// `TurboVocabularyService::ImportCorpusStatistics` (`#105` / `turboembed` `#2346`),
+/// compiling a deterministic `TCIDF001` corpus IDF artifact under `Bulk` priority.
+#[cfg(feature = "net")]
+pub async fn export_corpus_statistics_to_kserve(
+    client: &turbo_client::RemoteClient,
+    language: &str,
+    artifact_name: &str,
+    doc_count: u64,
+    term_doc_freqs: &[(String, u64)],
+    finish_deadline_us: u64,
+) -> Result<turbo_client::proto::vocabulary::CorpusStatisticsArtifactDescriptor, tonic::Status> {
+    use turbo_client::proto::vocabulary::{
+        import_corpus_statistics_request::Frame, CorpusStatisticsHeader, CorpusTermFrequencyBatch,
+        CorpusTermFrequencyEntry, ImportCorpusStatisticsRequest,
+    };
+
+    let timeout = crate::turbo_bridge::remaining_deadline_duration(finish_deadline_us)?;
+    let mut frames = Vec::with_capacity(1 + term_doc_freqs.len().div_ceil(1024));
+    frames.push(ImportCorpusStatisticsRequest {
+        frame: Some(Frame::Header(CorpusStatisticsHeader {
+            language: language.to_string(),
+            doc_count,
+            name: artifact_name.to_string(),
+        })),
+    });
+    for chunk in term_doc_freqs.chunks(1024) {
+        frames.push(ImportCorpusStatisticsRequest {
+            frame: Some(Frame::Batch(CorpusTermFrequencyBatch {
+                entries: chunk
+                    .iter()
+                    .map(|(term, df)| CorpusTermFrequencyEntry {
+                        term: term.clone(),
+                        doc_freq: *df,
+                    })
+                    .collect(),
+            })),
+        });
+    }
+
+    let mut vocab = client
+        .vocabulary_client()
+        .map_err(|e| tonic::Status::from_error(Box::new(e)))?;
+    let req = client
+        .prepare_request(
+            tokio_stream::iter(frames),
+            Some(turbo_client::RemotePriority::Bulk),
+            timeout,
+        )
+        .map_err(|e| tonic::Status::from_error(Box::new(e)))?;
+    vocab
+        .import_corpus_statistics(req)
+        .await
+        .map(|r| r.into_inner())
 }
 
 #[cfg(test)]
