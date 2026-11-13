@@ -135,6 +135,8 @@ pub struct Scratch {
     pub(super) routes: Vec<u32>,
     pub(super) fresh: Vec<u32>,
     scored_allowed: Vec<Scored>,
+    /// The last walk's far probe routed it plain (`Route::plain_share`).
+    walked_plain: bool,
     /// Patience early-stop scratch: nodes inserted into the tracked window
     /// during the current hop, and the optional `top_k` (`< ef`) min-heap.
     patience_added: Vec<u32>,
@@ -173,6 +175,10 @@ impl Scratch {
     /// Whether the last walk reached `node`. An allowed row a filter-aware
     /// walk reached was scored and handed to its hook.
     #[inline]
+    pub fn walked_plain(&self) -> bool {
+        self.walked_plain
+    }
+
     pub fn seen(&self, node: u32) -> bool {
         self.visited[node as usize] == self.epoch
     }
@@ -266,17 +272,33 @@ pub enum Filter<'a> {
     Plain(Mask<'a>),
     /// The walk moves through the allowed rows: a disallowed neighbor is
     /// never scored, its own neighbors are looked through instead.
-    /// `allowed` is the mask's count. With `adaptive` the walk gives the
-    /// query up to the caller ([`Walk::Far`], [`Walk::Short`],
-    /// [`Walk::Budget`]) where the graph cannot serve this mask or `budget`
-    /// work units have been spent; without it the walk runs regardless
-    /// (a pinned regime).
+    /// `allowed` is the mask's count. With `route` the provider chose the
+    /// regime, and the far probe routes the query: a neighborhood holding
+    /// at least `Route::plain_share` allowed rows is walked plain, one all
+    /// but empty of them, or too thin for bridging to beat enumerating
+    /// `allowed <= Route::enumerate_rows` rows, is given up to the caller
+    /// ([`Walk::Far`]); a filter-aware walk may still give the query up
+    /// ([`Walk::Short`], [`Walk::Budget`]) where the graph cannot serve
+    /// this mask or `budget` work units have been spent. Without it the
+    /// walk runs regardless (a pinned regime).
     Aware {
         allow: Mask<'a>,
         allowed: usize,
-        adaptive: bool,
+        route: Option<Route>,
         budget: Option<u64>,
     },
+}
+
+/// How the far probe routes a query the provider planned (`Filter::Aware`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Route {
+    /// Walk plain when the probe's sample holds at least this share of
+    /// allowed rows: disallowed rows are then cheaper to score and route
+    /// through than to bridge around.
+    pub plain_share: f64,
+    /// Below `plain_share`, enumerate when the mask allows at most this many
+    /// rows: a bridging walk costs more than scoring them in mask order.
+    pub enumerate_rows: usize,
 }
 
 /// Hop-to-hop saturation early-stop policy for a layer-0 walk (`#95`).
@@ -375,7 +397,9 @@ pub enum Walk {
     /// fallback to `enumerate`.
     FloorPruned,
     /// Not started: the far probe found the query's neighborhood all but
-    /// empty of allowed rows. Nothing was scored at layer 0 or reported.
+    /// empty of allowed rows, or too thin for a filter-aware walk to beat
+    /// enumerating the mask (`Route::enumerate_rows`). Nothing was scored at
+    /// layer 0 or reported.
     Far,
     /// Ran dry with the beam unfilled although the mask allows more rows:
     /// the allowed rows it reached are an island. `Scratch::seen` tells
@@ -403,6 +427,27 @@ const FAR_PROBE_RATIO: f64 = 4.0;
 /// The probe stops reading neighbor lists once the sample predicts this
 /// many allowed rows: a wide mask is judged from a few lists.
 const FAR_PROBE_ENOUGH_EXPECTED: f64 = 32.0;
+
+/// What the far probe saw: `hits` allowed rows in a `sample` of the rows
+/// around the query, against the mask's `share` of the whole index.
+struct Probe {
+    sample: usize,
+    hits: usize,
+    share: f64,
+}
+
+impl Probe {
+    /// The neighborhood is all but empty of allowed rows.
+    fn far(&self) -> bool {
+        let expected = self.sample as f64 * self.share;
+        expected >= FAR_PROBE_MIN_EXPECTED && (self.hits as f64) * FAR_PROBE_RATIO < expected
+    }
+
+    /// The allowed share of the sample.
+    fn local_share(&self) -> f64 {
+        self.hits as f64 / self.sample as f64
+    }
+}
 
 /// Striped locks over node ids. Insertion holds at most one node lock at
 /// a time (and takes the entry lock only while holding none), so striping
@@ -1113,23 +1158,23 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
         scored
     }
 
-    /// The far probe: is the neighborhood the descent landed in all but
-    /// empty of allowed rows? The sample is `entry`'s layer-0 neighbors and
+    /// The far probe: how many of the rows around where the descent landed
+    /// does the mask allow? The sample is `entry`'s layer-0 neighbors and
     /// theirs, read from the links alone (no row is touched), and no larger
     /// than the mask's share needs to be judged
     /// (`FAR_PROBE_ENOUGH_EXPECTED`). A mask spread
-    /// through the graph, or gathered around the query, holds its share of
-    /// the sample or more; a mask on a region away from the query (one
+    /// through the graph holds its share of the sample, one gathered around
+    /// the query holds more; a mask on a region away from the query (one
     /// court, one tenant) holds almost none of it, and a walk from here
     /// would have to cross rows it may not score to rows it cannot rank.
-    fn far(
+    fn probe(
         &self,
         entry: u32,
         allow: Mask<'_>,
         allowed: usize,
         scratch: &mut Scratch,
         stats: &mut SearchStats,
-    ) -> bool {
+    ) -> Probe {
         scratch.begin(self.n());
         scratch.visit(entry);
         let mut near = std::mem::take(&mut scratch.routes);
@@ -1156,8 +1201,11 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
         scratch.routes = near;
         scratch.nbrs = nbrs;
         stats.probed += sample as u64;
-        let expected = sample as f64 * share;
-        expected >= FAR_PROBE_MIN_EXPECTED && (hits as f64) * FAR_PROBE_RATIO < expected
+        Probe {
+            sample,
+            hits,
+            share,
+        }
     }
 
     /// Paper Algorithm 5: descend greedily from the entry to layer 1, then
@@ -1188,6 +1236,7 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
             ep = self.greedy(q, ep, layer, None, &mut nbrs, &mut stats);
         }
         scratch.nbrs = nbrs;
+        scratch.walked_plain = false;
         let walk = match filter {
             Filter::None => self.search_layer(
                 q,
@@ -1218,12 +1267,36 @@ impl<'a, L: LinkCells + ?Sized> View<'a, L> {
             Filter::Aware {
                 allow,
                 allowed,
-                adaptive,
+                route,
                 budget,
             } => {
-                if adaptive && self.far(ep.node, allow, allowed, scratch, &mut stats) {
-                    return (Vec::new(), stats, Walk::Far);
+                if let Some(route) = route {
+                    let probe = self.probe(ep.node, allow, allowed, scratch, &mut stats);
+                    if probe.far() {
+                        return (Vec::new(), stats, Walk::Far);
+                    }
+                    if probe.local_share() >= route.plain_share {
+                        scratch.walked_plain = true;
+                        let walk = self.search_layer(
+                            q,
+                            &[ep],
+                            ef,
+                            0,
+                            Some(allow),
+                            patience,
+                            floor_prune,
+                            None,
+                            scratch,
+                            hook,
+                            &mut stats,
+                        );
+                        return (scratch.drain_results(), stats, walk);
+                    }
+                    if allowed <= route.enumerate_rows {
+                        return (Vec::new(), stats, Walk::Far);
+                    }
                 }
+                let adaptive = route.is_some();
                 let outcome = self.search_layer_aware(
                     q,
                     &[ep],

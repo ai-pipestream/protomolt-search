@@ -1377,19 +1377,31 @@ fn the_regime_follows_the_mask_cardinality_and_a_pinned_regime_is_honored() {
             .1
             .regime
     };
-    // ef 16 at M 16: enumerate up to 4 * 16 * 32 = 2048 allowed rows.
+    // ef 16 at M 16: enumerate up to 16 * 32 = 512 allowed rows outright,
+    // and up to 4 * 16 * 32 = 2048 where the far probe finds the rows
+    // around the query mostly disallowed.
     assert_eq!(regime_at(100, false), Some(FilterRegime::Enumerate)); // 200 rows
-    assert_eq!(regime_at(4, false), Some(FilterRegime::FilterAware)); // 25%
-                                                                      // The plain walk is never chosen, however much the mask allows.
-    assert_eq!(regime_at(20, true), Some(FilterRegime::FilterAware)); // 95%
-                                                                      // A mask that allows everything is no filter at all.
+    assert_eq!(regime_at(12, false), Some(FilterRegime::Enumerate)); // 1667 rows, 8%
+    assert_eq!(regime_at(8, false), Some(FilterRegime::FilterAware)); // 2500 rows, 12.5%
+                                                                      // From a 20% local share the walk goes plain.
+    assert_eq!(regime_at(3, false), Some(FilterRegime::Plain)); // 33%
+    assert_eq!(regime_at(20, true), Some(FilterRegime::Plain)); // 95%
+                                                                // A mask that allows everything is no filter at all.
     assert_eq!(regime_at(1, false), None);
-    // A wider beam moves the enumerate threshold with it.
-    let allow: Vec<bool> = (0..n).map(|i| i % 4 == 0).collect();
+    // A mask gathered around the query is allowed locally whatever its
+    // global share: walked plain.
+    let near = region_mask(&vectors, dim, query, 10);
     let (_, answer) = index
-        .search_with_stats(query, 10, 64, VectorSearchOptions::new().with_mask(&allow))
+        .search_with_stats(query, 10, 16, VectorSearchOptions::new().with_mask(&near))
         .unwrap();
-    assert_eq!(answer.regime, Some(FilterRegime::Enumerate)); // 5000 <= 8192
+    assert_eq!(answer.regime, Some(FilterRegime::Plain)); // 2000 rows, 10%
+                                                          // A wider beam moves the enumerate threshold with it.
+    let sparse: Vec<bool> = (0..n).map(|i| i % 8 == 0).collect();
+    let (_, answer) = index
+        .search_with_stats(query, 10, 64, VectorSearchOptions::new().with_mask(&sparse))
+        .unwrap();
+    assert_eq!(answer.regime, Some(FilterRegime::Enumerate)); // 2500 <= 8192
+    let allow: Vec<bool> = (0..n).map(|i| i % 4 == 0).collect();
 
     for regime in [
         FilterRegime::Enumerate,
@@ -1559,12 +1571,21 @@ fn the_filter_aware_walk_keeps_recall_and_scores_only_allowed_rows() {
                     }
                     None => {
                         let allowed = allow.iter().filter(|&&on| on).count();
-                        let want = if allowed <= enumerated {
-                            FilterRegime::Enumerate
+                        assert!(allowed > enumerated);
+                        if name == "near" {
+                            // The rows around the query are all allowed.
+                            assert_eq!(answer.regime, Some(FilterRegime::Plain), "query {qi}");
                         } else {
-                            FilterRegime::FilterAware
-                        };
-                        assert_eq!(answer.regime, Some(want), "query {qi}");
+                            // A 30% share sampled around the query lands
+                            // either side of the plain share.
+                            assert!(
+                                matches!(
+                                    answer.regime,
+                                    Some(FilterRegime::Plain | FilterRegime::FilterAware)
+                                ),
+                                "query {qi}: {answer:?}"
+                            );
+                        }
                     }
                     Some(FilterRegime::FilterAware) => {
                         assert_eq!(answer.regime, regime);
@@ -1908,7 +1929,7 @@ fn bulk_walk_and_enumerate_visit_identical_nodes_and_scores_to_single_row_dot() 
                         Filter::Aware {
                             allow: mask,
                             allowed,
-                            adaptive: false,
+                            route: None,
                             budget: None,
                         },
                         Some((mask, true)),
@@ -2047,7 +2068,7 @@ fn a_walk_that_defeats_the_probe_stops_at_its_visit_budget() {
                 Filter::Aware {
                     allow: Mask::Bools(&dummy),
                     allowed: 0,
-                    adaptive: false,
+                    route: None,
                     budget: Some(0),
                 },
                 super::graph::Patience::OFF,
@@ -2127,7 +2148,7 @@ fn a_walk_that_defeats_the_probe_stops_at_its_visit_budget() {
             if allow.iter().filter(|&&on| on).count() >= target_allowed {
                 break;
             }
-            if !allow[u as usize] && !moat.contains(&u) && u % 8 == 0 {
+            if !allow[u as usize] && !moat.contains(&u) && u % 32 == 0 {
                 allow[u as usize] = true;
             }
         }
@@ -3016,10 +3037,8 @@ fn floor_prune_respects_higham_bound_boundary_ties_starved_filter_and_determinis
         )
         .unwrap();
     assert!(starved_ans.floor_pruned);
-    assert_eq!(
-        starved_ans.regime,
-        Some(crate::vector::FilterRegime::FilterAware)
-    );
+    // Half the rows allowed: routed plain.
+    assert_eq!(starved_ans.regime, Some(crate::vector::FilterRegime::Plain));
     assert!(!starved_ans.budget_handoff);
     assert!(
         starved_ans.stats.scored < 120,
