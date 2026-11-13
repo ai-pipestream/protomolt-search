@@ -2169,7 +2169,7 @@ dependencies = [
 [[package]]
 name = "turbovec"
 version = "1.1.2"
-source = "git+https://github.com/ai-pipestream/turbovec.git?branch=main#e518ff4c5971068b5f00b874b1a260dc6006609b"
+source = "git+https://github.com/ai-pipestream/turbovec.git?branch=main#44321a82930899e658ef67cf499596fb0c3e9dba"
 dependencies = [
  "memmap2",
  "ordered-float",
