@@ -158,6 +158,30 @@ impl fmt::Display for VectorError {
 
 impl std::error::Error for VectorError {}
 
+/// What a provider that chooses the filter regime itself optimizes for
+/// (`docs/hnsw.md`, "Speed or exact"). A provider with one way to filter
+/// ignores it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum FilterRouting {
+    /// The fastest regime at the request's beam: a mask is enumerated only
+    /// where that is cheaper than any walk, so a mask that could have been
+    /// enumerated may get an approximate answer.
+    #[default]
+    Speed,
+    /// Every mask of at most the enumerate threshold is enumerated, so it
+    /// gets the exact answer; larger masks are routed as under `Speed`.
+    Exact,
+}
+
+impl FilterRouting {
+    pub fn name(self) -> &'static str {
+        match self {
+            FilterRouting::Speed => "speed",
+            FilterRouting::Exact => "exact",
+        }
+    }
+}
+
 /// How a provider that can steer its search by the mask answers a filtered
 /// query (`docs/hnsw.md`, "Filters"). A provider with one way to filter
 /// ignores it.
@@ -471,6 +495,9 @@ pub struct VectorSearchOptions<'a> {
     /// `None` is the provider's own threshold. A dense execution policy
     /// point carries the one it was measured under.
     pub enumerate_max_rows: Option<usize>,
+    /// What a provider that chooses the regime optimizes for; ignored
+    /// under a pinned `filter_regime`.
+    pub filter_routing: FilterRouting,
     /// Optional hop-to-hop saturation early-stop policy for layer-0 walks.
     pub patience: Option<PatienceSpec>,
     /// Optional shared-floor candidate pruning policy for layer-0 walks (`#72`).
@@ -508,6 +535,11 @@ impl<'a> VectorSearchOptions<'a> {
 
     pub fn with_candidate_depth(mut self, depth: usize) -> Self {
         self.candidate_depth = Some(depth);
+        self
+    }
+
+    pub fn with_filter_routing(mut self, routing: FilterRouting) -> Self {
+        self.filter_routing = routing;
         self
     }
 

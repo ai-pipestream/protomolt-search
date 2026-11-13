@@ -7,8 +7,8 @@ use super::graph::{level_for, MAX_LEVEL};
 use super::{HnswIndex, HNSW};
 use crate::boolean_bits::Bits;
 use crate::vector::{
-    FilterRegime, QualityContract, VectorBackendConfig, VectorCapability, VectorIndex,
-    VectorProvider, VectorSearchOptions, VectorStreamControl, EMBEDDED_TURBOVEC,
+    FilterRegime, FilterRouting, QualityContract, VectorBackendConfig, VectorCapability,
+    VectorIndex, VectorProvider, VectorSearchOptions, VectorStreamControl, EMBEDDED_TURBOVEC,
 };
 
 struct Rng(u64);
@@ -1395,7 +1395,35 @@ fn the_regime_follows_the_mask_cardinality_and_a_pinned_regime_is_honored() {
         .search_with_stats(query, 10, 16, VectorSearchOptions::new().with_mask(&near))
         .unwrap();
     assert_eq!(answer.regime, Some(FilterRegime::Plain)); // 2000 rows, 10%
-                                                          // A wider beam moves the enumerate threshold with it.
+                                                          // Speed walks a mask gathered around the query that it could have
+                                                          // enumerated; exact routing enumerates every mask up to the threshold
+                                                          // and returns the exact answer.
+    let small = region_mask(&vectors, dim, query, 5); // 1000 rows: 512 < 1000 <= 2048
+    let truth = exact_top_masked(&vectors, dim, query, &small, 10);
+    let (_, speed) = index
+        .search_with_stats(query, 10, 16, VectorSearchOptions::new().with_mask(&small))
+        .unwrap();
+    assert_eq!(speed.regime, Some(FilterRegime::Plain));
+    let exact_opts = VectorSearchOptions::new()
+        .with_mask(&small)
+        .with_filter_routing(FilterRouting::Exact);
+    let (hits, exact) = index.search_with_stats(query, 10, 16, exact_opts).unwrap();
+    assert_eq!(exact.regime, Some(FilterRegime::Enumerate));
+    assert_eq!(hits, truth);
+    // Above the threshold both route alike.
+    let wide = region_mask(&vectors, dim, query, 20);
+    let (_, answer) = index
+        .search_with_stats(
+            query,
+            10,
+            16,
+            VectorSearchOptions::new()
+                .with_mask(&wide)
+                .with_filter_routing(FilterRouting::Exact),
+        )
+        .unwrap();
+    assert_eq!(answer.regime, Some(FilterRegime::Plain));
+    // A wider beam moves the enumerate threshold with it.
     let sparse: Vec<bool> = (0..n).map(|i| i % 8 == 0).collect();
     let (_, answer) = index
         .search_with_stats(query, 10, 64, VectorSearchOptions::new().with_mask(&sparse))

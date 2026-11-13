@@ -367,14 +367,43 @@ At ef 96 the old rule enumerated near-10's 10,252 allowed rows (under
 `4 · 96 · 32 = 12,288`) where the plain walk was 2.8 times faster; that is
 why only `ef · 2M` rows enumerate before the probe looks.
 
-The trade is speed for exactness at a fixed beam: a mask the old rule
-enumerated (exact, recall 1.0) is now walked, so at the same beam it gets
-an approximate answer. On krick-1 near-10 at k 10 went from 1.0 to about
-0.94 at M 48, ef 32, and the mean recall over its sweep fell by 0.014
-(uncorrelated 50%: 0.012); at matched recall it is faster everywhere it
-moved (near-10 k 10 at 0.99: 7,922 to 18,772 queries per second on one
-core). A caller that needs the exact answer for a mask pins enumerate, or
-a policy point sets the `enumerate_max_rows` it was measured with.
+### Speed or exact
+
+A provider that chooses the regime does so for one of two goals,
+`VectorSearchOptions::filter_routing` (`vector::FilterRouting`):
+
+- **`Speed`, the default.** The routing above: a mask enumerates outright
+  only up to `ef · 2M` rows, where that is cheaper than any walk, and the
+  probe walks the rest, plain or filter-aware. A mask between `ef · 2M`
+  rows and the enumerate threshold that the probe walks gets an
+  approximate answer at the request's beam.
+- **`Exact`.** Every mask of at most the enumerate threshold
+  (`ENUMERATE_ROWS_PER_WALK_ROW · ef · 2M`, or the request's
+  `enumerate_max_rows`) is enumerated, so it gets the exact top `k` of the
+  mask, as before the probe routing. Larger masks are routed as under
+  `Speed`; their answer is approximate under either.
+
+What the trade costs, measured on krick-1 (challenge fixture) when the
+default moved from the exact rule to speed: near-10 at k 10, M 48, ef 32
+went from recall 1.0 to about 0.94, and the mean recall over its sweep fell
+by 0.014 (uncorrelated 50%: 0.012). At matched recall speed is faster
+everywhere it moved: near-10 at k 10 and recall 0.99 went from 7,922 to
+18,772 queries per second on one core, and near-10 at k 100 from 6,777 to
+14,773 at 0.95.
+
+Who selects which:
+
+| caller | routing | how |
+|---|---|---|
+| the provider API | either | `VectorSearchOptions::with_filter_routing` |
+| explicit `ANN` through the product | speed | the default; a request field for exact is not built yet |
+| `AUTO` at a policy point | exact up to the point's threshold | the point's `enumerate_max_rows` is served as measured: every mask at or under it enumerates |
+| `EXACT` through the product | exhaustive | not a graph walk at all |
+| the harness | either | `--hnsw-routing=speed` (default) or `--hnsw-routing=exact` |
+
+`--hnsw-regime=enumerate` (or `VectorSearchOptions::filter_regime`) pins
+every filtered search to enumerate whatever the mask's size, which is
+neither mode: it is the exact answer at the cost of scoring the whole mask.
 
 `minimum_score` and a floor raised during a stream filter what is returned or
 emitted; when shared floor pruning is enabled (`floor_prune = true` on the scan,

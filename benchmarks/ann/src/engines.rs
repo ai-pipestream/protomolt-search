@@ -416,6 +416,9 @@ pub struct Hnsw {
     /// provider chooses under, as a dense execution policy point carries
     /// it; unset, the provider's own.
     enumerate_max_rows: Option<usize>,
+    /// `--hnsw-routing=speed|exact` is what the provider optimizes for when
+    /// it chooses the regime; unset, speed.
+    routing: pipestream_search::vector::FilterRouting,
 }
 
 impl Hnsw {
@@ -452,6 +455,17 @@ impl Hnsw {
                 format!("--hnsw-enumerate-max-rows={raw:?} is not a row count: {error}")
             })?),
         };
+        use pipestream_search::vector::FilterRouting;
+        let routing = match crate::util::arg("hnsw-routing", "").as_str() {
+            "" | "speed" => FilterRouting::Speed,
+            "exact" => FilterRouting::Exact,
+            other => return Err(format!("--hnsw-routing={other:?} must be speed or exact").into()),
+        };
+        if regime.is_some() && routing != FilterRouting::Speed {
+            return Err(
+                "--hnsw-regime pins the regime and --hnsw-routing chooses it; give one".into(),
+            );
+        }
         if regime.is_some() && enumerate_max_rows.is_some() {
             return Err(
                 "--hnsw-regime pins the regime and --hnsw-enumerate-max-rows chooses it; give one"
@@ -464,6 +478,7 @@ impl Hnsw {
             disk,
             regime,
             enumerate_max_rows,
+            routing,
         })
     }
 }
@@ -495,7 +510,9 @@ impl Index for Hnsw {
         });
         let options = match bits.as_ref() {
             Some(bits) => {
-                let options = VectorSearchOptions::new().with_bits(bits);
+                let options = VectorSearchOptions::new()
+                    .with_bits(bits)
+                    .with_filter_routing(self.routing);
                 match (self.regime, self.enumerate_max_rows) {
                     (Some(regime), _) => options.with_filter_regime(regime),
                     (None, Some(rows)) => options.with_enumerate_max_rows(rows),

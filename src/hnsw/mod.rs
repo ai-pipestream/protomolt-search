@@ -51,8 +51,8 @@ pub use reorder::NodeMap;
 pub use rows::{RowSource, RowSourceIdentity};
 
 use crate::vector::{
-    first_invalid_coordinate, FilterRegime, FloorPruneSpec, Mask, PatienceSpec, PatienceWindow,
-    QualityContract, ScoreDirection, VectorBackendConfig, VectorBackendDescriptor,
+    first_invalid_coordinate, FilterRegime, FilterRouting, FloorPruneSpec, Mask, PatienceSpec,
+    PatienceWindow, QualityContract, ScoreDirection, VectorBackendConfig, VectorBackendDescriptor,
     VectorCapability, VectorError, VectorIndex, VectorProvider, VectorSearchOptions,
     VectorSearchResults, VectorStreamBatch, VectorStreamControl, VectorStreamEndReason,
     VectorStreamSummary,
@@ -641,10 +641,11 @@ impl HnswIndex {
     /// the caller pinned, or the one the mask's cardinality calls for.
     ///
     /// - no mask, or a mask that allows every row: an unfiltered walk;
-    /// - at most the request's `enumerate_max_rows` (which a dense execution
-    ///   policy point carries from its measurement) or, without one,
-    ///   `ENUMERATE_ROWS_PER_PLAIN_ROW · ef · m0` allowed rows: enumerate,
-    ///   cheaper than any walk. The enumerate threshold is the request's or,
+    /// - at most the enumerate threshold under `FilterRouting::Exact` or a
+    ///   request's `enumerate_max_rows` (which a dense execution policy
+    ///   point carries from its measurement), and otherwise at most
+    ///   `ENUMERATE_ROWS_PER_PLAIN_ROW · ef · m0` allowed rows: enumerate.
+    ///   The enumerate threshold is the request's `enumerate_max_rows` or,
     ///   without one, `ENUMERATE_ROWS_PER_WALK_ROW · ef · m0`;
     /// - otherwise a routed walk: the far probe samples the rows around
     ///   where the descent landed and walks plain when at least
@@ -755,12 +756,15 @@ impl HnswIndex {
             None => {
                 let threshold = options.enumerate_max_rows.unwrap_or(default_threshold);
                 // A policy point's threshold was measured as the line below
-                // which it enumerates, and is served as measured; without
-                // one only a mask cheaper than a plain walk enumerates
-                // before the probe looks.
-                let outright = options
-                    .enumerate_max_rows
-                    .unwrap_or(ENUMERATE_ROWS_PER_PLAIN_ROW * walk_units);
+                // which it enumerates, and is served as measured, as is the
+                // threshold under exact routing; otherwise only a mask
+                // cheaper than a plain walk enumerates before the probe
+                // looks.
+                let outright = match (options.enumerate_max_rows, options.filter_routing) {
+                    (Some(rows), _) => rows,
+                    (None, FilterRouting::Exact) => threshold,
+                    (None, FilterRouting::Speed) => ENUMERATE_ROWS_PER_PLAIN_ROW * walk_units,
+                };
                 if allowed <= outright {
                     FilterRegime::Enumerate
                 } else {
