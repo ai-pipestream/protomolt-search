@@ -2653,7 +2653,7 @@ dependencies = [
 [[package]]
 name = "turbovec-grpc"
 version = "0.1.0"
-source = "git+https://github.com/ai-pipestream/turbovec-grpc.git?rev=c1a973e84047653ba9a3be77f2e9049cc1ca193b#c1a973e84047653ba9a3be77f2e9049cc1ca193b"
+source = "git+https://github.com/ai-pipestream/turbovec-grpc.git?rev=2cbab637a03d9ffeb5bcc3e40118c48c974a51d6#2cbab637a03d9ffeb5bcc3e40118c48c974a51d6"
 dependencies = [
  "crc32fast",
  "prost",

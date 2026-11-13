@@ -43,12 +43,10 @@ written as a v8 image with bit-plane units. The `44321a8` fork revision
 pinned here serves those too: the chunk assembler converts each unit's
 canonical, host-independent planes back to sequential-blocked bytes (the
 converter's route) before the shared transform, and the mapped scan keeps
-the classic kernels (ai-pipestream/turbovec#8). The fork's `main` has not
-advanced to that revision, so the product and ANN benchmark lockfiles
-intentionally retain the pinned commit rather than an older or incompatible
-branch tip. Before that change such
-an image was refused, so a large sealed segment written on those hosts
-could not open mapped.
+the classic kernels (ai-pipestream/turbovec#8). The product and ANN
+benchmark lockfiles both track this revision on the fork's `main`. Before
+that change such an image was refused, so a large sealed segment written on
+those hosts could not open mapped.
 `vector::tests::a_sealed_image_past_the_planes_threshold_serves_mapped`
 pins it here at 2 and 4 bits.
 
