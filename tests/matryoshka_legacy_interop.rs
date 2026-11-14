@@ -23,8 +23,7 @@ use pipestream_search::pb::{
 use pipestream_search::sha256::Sha256;
 
 const LEGACY_REVISION: &str = "b20c74f1bf393b99499d8609c4828f125a4db6a6";
-const LEGACY_SHA256: &str =
-    "50dc741d4318102dcf9ba9d2bc31148db2c9c735bd13a682a62e3addf50fb151";
+const LEGACY_SHA256: &str = "50dc741d4318102dcf9ba9d2bc31148db2c9c735bd13a682a62e3addf50fb151";
 const STARTUP_BOUND: Duration = Duration::from_secs(10);
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -73,7 +72,12 @@ fn verified_legacy_binary() -> PathBuf {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    assert_eq!(actual, LEGACY_SHA256, "unexpected legacy executable: {}", path.display());
+    assert_eq!(
+        actual,
+        LEGACY_SHA256,
+        "unexpected legacy executable: {}",
+        path.display()
+    );
     path
 }
 
@@ -156,7 +160,11 @@ impl LegacyNode {
         let stdout = directory.join("legacy-stdout.log");
         let stderr = directory.join("legacy-stderr.log");
         let log = |path: &Path| {
-            OpenOptions::new().write(true).create_new(true).open(path).unwrap()
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .unwrap()
         };
         let child = Command::new(binary)
             .current_dir(directory)
@@ -172,7 +180,12 @@ impl LegacyNode {
             .stderr(Stdio::from(log(&stderr)))
             .spawn()
             .unwrap();
-        Self { child, stdout, stderr, addr }
+        Self {
+            child,
+            stdout,
+            stderr,
+            addr,
+        }
     }
 
     fn diagnostics(&self) -> String {
@@ -183,7 +196,11 @@ impl LegacyNode {
             }
             text
         };
-        format!("stdout:\n{}\nstderr:\n{}", read(&self.stdout), read(&self.stderr))
+        format!(
+            "stdout:\n{}\nstderr:\n{}",
+            read(&self.stdout),
+            read(&self.stderr)
+        )
     }
 
     async fn exit(&mut self) -> ExitStatus {
@@ -203,22 +220,35 @@ impl LegacyNode {
         let endpoint = format!("http://{}", self.addr);
         tokio::time::timeout(STARTUP_BOUND, async {
             loop {
-                assert!(self.child.try_wait().unwrap().is_none(), "legacy node exited before Health: {}", self.diagnostics());
+                assert!(
+                    self.child.try_wait().unwrap().is_none(),
+                    "legacy node exited before Health: {}",
+                    self.diagnostics()
+                );
                 let probe = tokio::time::timeout(Duration::from_millis(250), async {
                     let mut client = NodeServiceClient::connect(endpoint.clone())
                         .await
                         .map_err(|error| error.to_string())?;
-                    client.health(HealthRequest {}).await
+                    client
+                        .health(HealthRequest {})
+                        .await
                         .map(|reply| reply.into_inner())
                         .map_err(|error| error.to_string())
-                }).await;
+                })
+                .await;
                 if let Ok(Ok(health)) = probe {
-                    assert!(self.child.try_wait().unwrap().is_none(), "legacy child exited during Health: {}", self.diagnostics());
+                    assert!(
+                        self.child.try_wait().unwrap().is_none(),
+                        "legacy child exited during Health: {}",
+                        self.diagnostics()
+                    );
                     return health;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-        }).await.unwrap_or_else(|_| panic!("legacy node never became healthy: {}", self.diagnostics()))
+        })
+        .await
+        .unwrap_or_else(|_| panic!("legacy node never became healthy: {}", self.diagnostics()))
     }
 }
 
@@ -241,8 +271,18 @@ async fn old_reader_refuses_retained_generation_and_serves_plain_v1_control() {
 
     let mut refusing = LegacyNode::spawn(&binary, &retained);
     let status = refusing.exit().await;
-    assert!(!status.success() && status.code().is_some(), "expected an ordinary nonzero startup refusal: {status}; {}", refusing.diagnostics());
-    assert!(refusing.diagnostics().contains("unsupported live-doc version"), "startup failed for another reason: {}", refusing.diagnostics());
+    assert!(
+        !status.success() && status.code().is_some(),
+        "expected an ordinary nonzero startup refusal: {status}; {}",
+        refusing.diagnostics()
+    );
+    assert!(
+        refusing
+            .diagnostics()
+            .contains("unsupported live-doc version"),
+        "startup failed for another reason: {}",
+        refusing.diagnostics()
+    );
     drop(refusing);
 
     let mut serving = LegacyNode::spawn(&binary, &plain);

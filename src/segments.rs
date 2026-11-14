@@ -279,7 +279,11 @@ impl SegmentSetManifest {
     /// Promote only after the final artifact inventory is assembled. Source
     /// publication establishes its binding before it appends staged segments.
     fn update_retained_format(&mut self) {
-        if self.segments.iter().any(|segment| segment.multi_res.is_some()) {
+        if self
+            .segments
+            .iter()
+            .any(|segment| segment.multi_res.is_some())
+        {
             self.format = RETAINED_SET_FORMAT;
         }
     }
