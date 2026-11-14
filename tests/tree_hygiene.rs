@@ -28,7 +28,6 @@ const RATCHET_HEADROOM: usize = 150;
 /// their ceilings (baseline size plus `RATCHET_HEADROOM`). Lower an entry
 /// when its file shrinks; remove it when the file is split or deleted.
 const RATCHET: &[(&str, usize)] = &[
-    ("src/node.rs", 19_895 + RATCHET_HEADROOM),
     ("src/coordinator.rs", 18_569 + RATCHET_HEADROOM),
     ("src/reshard.rs", 6_807 + RATCHET_HEADROOM),
     ("src/relay.rs", 6_208 + RATCHET_HEADROOM),
