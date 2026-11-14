@@ -304,6 +304,7 @@ async fn exact_integer_grpc_values_survive_flush_reopen_and_compaction() {
             assert!(response.document_contract_version >= 1);
             client
                 .add_vectors(tokio_stream::iter([pb::AddVectorsRequest {
+                    materialized_rows: Vec::new(),
                     vectors: vectors[range.start * 8..range.end * 8].to_vec(),
                     dim: 8,
                 }]))

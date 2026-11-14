@@ -114,6 +114,7 @@ async fn serve_product_filter_shard(
     client.add_documents(ReceiverStream::new(rx)).await.unwrap();
     client
         .add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors,
             dim: DIM as u32,
         }]))

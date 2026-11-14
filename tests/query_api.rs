@@ -144,6 +144,7 @@ async fn start_cluster_with_identities(
         let start = shard * SHARD_DOCS;
         let (vtx, vrx) = mpsc::channel(4);
         vtx.send(AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors: corpus[start * DIM..(start + SHARD_DOCS) * DIM].to_vec(),
             dim: DIM as u32,
         })
@@ -707,6 +708,7 @@ async fn fp32_mode_reranks_a_persisted_mmap_candidate_pool() {
     .await
     .unwrap();
     node.add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
+        materialized_rows: Vec::new(),
         vectors: corpus.clone(),
         dim: DIM as u32,
     }]))

@@ -434,6 +434,7 @@ async fn ingest_protomolt() -> Result<(), Error> {
         for batch in vectors.chunks(dim * 256) {
             vec_tx
                 .send(AddVectorsRequest {
+                    materialized_rows: Vec::new(),
                     vectors: batch.to_vec(),
                     dim: dim as u32,
                 })

@@ -107,6 +107,7 @@ async fn ingest(addr: &str, rows: &[Row]) -> u64 {
     let vectors: Vec<f32> = rows.iter().flat_map(|r| r.vector.iter().copied()).collect();
     let added = client
         .add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors,
             dim: DIM as u32,
         }]))
@@ -899,6 +900,7 @@ async fn compaction_merges_segments_and_rebuilds_facet_and_number_rows_fresh() {
             .into_inner();
         let v_res = cli
             .add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
+                materialized_rows: Vec::new(),
                 vectors: vecs,
                 dim: DIM as u32,
             }]))
@@ -1264,6 +1266,7 @@ async fn locality_reordering_round_trips_seal_compaction_collapse_and_column_fil
                     .into_inner();
                 let v_res = cli
                     .add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
+                        materialized_rows: Vec::new(),
                         vectors: vecs,
                         dim: DIM as u32,
                     }]))
@@ -1329,6 +1332,7 @@ async fn locality_reordering_round_trips_seal_compaction_collapse_and_column_fil
                     .into_inner();
                 let v_res = cli
                     .add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
+                        materialized_rows: Vec::new(),
                         vectors: new_v.clone(),
                         dim: DIM as u32,
                     }]))

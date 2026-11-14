@@ -452,6 +452,7 @@ async fn logged_shard(dir: &Path, analysis_addr: &str, corpus: &[f32]) -> (PathB
     tokio::spawn(async move {
         for chunk in vectors.chunks(50 * DIM) {
             tx.send(AddVectorsRequest {
+                materialized_rows: Vec::new(),
                 vectors: chunk.to_vec(),
                 dim: 0,
             })
@@ -739,6 +740,7 @@ async fn banded_shard(dir: &Path, corpus: &[f32]) -> PathBuf {
     tokio::spawn(async move {
         for chunk in vectors.chunks(50 * DIM) {
             tx.send(AddVectorsRequest {
+                materialized_rows: Vec::new(),
                 vectors: chunk.to_vec(),
                 dim: 0,
             })

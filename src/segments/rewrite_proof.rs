@@ -376,6 +376,10 @@ fn fill(
                     hash.update(&value.lat.to_bits().to_le_bytes());
                     hash.update(&value.lon.to_bits().to_le_bytes());
                 }
+                if let Some(retained) = set.retained_segment(segment).retained(row as u32) {
+                    part(&mut hash, b"protomolt.source-rewrite.retained-vector.v1");
+                    part(&mut hash, &crate::multi_res::encode(retained).map_err(err)?);
+                }
                 if let Some(exact) = set.exact_vectors(segment) {
                     hash.update(&[1]);
                     for value in exact.row_values(row, row + 1).map_err(err)? {
@@ -795,6 +799,7 @@ mod tests {
                 live.write(&lp, ids.len() as u64).unwrap();
                 catalog
                     .append(SegmentSource {
+                        multi_res_path: None,
                         segment_id: &format!("part-{segment}"),
                         generation: 1,
                         base_label: base as u64,

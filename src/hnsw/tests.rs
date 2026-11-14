@@ -2468,6 +2468,7 @@ fn segmented_provider_searches_linked_first_and_enumerates_unlinked_parts() {
         LiveDocs::default().write(&live_path, count as u64).unwrap();
         catalog
             .append(SegmentSource {
+                multi_res_path: None,
                 segment_id: seg_id,
                 generation: gen,
                 base_label: base as u64,

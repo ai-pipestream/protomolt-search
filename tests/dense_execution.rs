@@ -108,6 +108,7 @@ async fn start_fixture(shards: usize, fake: bool) -> Fixture {
         let start = shard * per_shard;
         let (vtx, vrx) = mpsc::channel(4);
         vtx.send(AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors: corpus[start * DIM..(start + per_shard) * DIM].to_vec(),
             dim: DIM as u32,
         })

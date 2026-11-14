@@ -125,6 +125,7 @@ async fn add_vectors(addr: &str, vectors: Vec<f32>, dim: usize) {
     let feed = tokio::spawn(async move {
         for batch in vectors.chunks(VECTOR_BATCH * dim) {
             tx.send(AddVectorsRequest {
+                materialized_rows: Vec::new(),
                 vectors: batch.to_vec(),
                 dim: dim as u32,
             })

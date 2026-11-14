@@ -418,6 +418,8 @@ async fn truncated_stream_rejected() {
     let (tx, rx) = mpsc::channel(4);
     tx.send(SnapshotChunk {
         payload: Some(snapshot_chunk::Payload::Manifest(SnapshotManifest {
+            multi_res_vector_bytes: 0,
+            multi_res_declaration: Vec::new(),
             vector_bytes: bytes.len() as u64 + 64,
             bm25_bytes: 0,
             exact_vector_bytes: 0,

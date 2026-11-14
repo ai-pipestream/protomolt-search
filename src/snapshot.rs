@@ -60,6 +60,42 @@ pub async fn install_snapshot_generation(
     bm25_path: Option<&Path>,
     live_docs_path: Option<&Path>,
 ) -> Result<InstallSnapshotResponse, Status> {
+    let retained = crate::multi_res::sidecar_path(vector_path);
+    install_snapshot_generation_with_retained(
+        addr,
+        vector_path,
+        exact_vector_path,
+        bm25_path,
+        live_docs_path,
+        Some(&retained),
+    )
+    .await
+}
+
+/// Stream a generation with an explicitly located retained-vector sidecar.
+/// The declaration beside that sidecar is included in the manifest.
+pub async fn install_snapshot_generation_with_retained(
+    addr: &str,
+    vector_path: &Path,
+    exact_vector_path: Option<&Path>,
+    bm25_path: Option<&Path>,
+    live_docs_path: Option<&Path>,
+    retained_path: Option<&Path>,
+) -> Result<InstallSnapshotResponse, Status> {
+    let multi_res_declaration = retained_path
+        .map(crate::multi_res_storage::export_declaration)
+        .transpose()
+        .map_err(|error| {
+            Status::failed_precondition(format!("snapshot retained vectors: {error}"))
+        })?
+        .flatten();
+    let retained_path = retained_path.filter(|_| multi_res_declaration.is_some());
+    let multi_res_vector_bytes = retained_path
+        .map(std::fs::metadata)
+        .transpose()
+        .map_err(|error| Status::internal(format!("stat retained vectors: {error}")))?
+        .map_or(0, |meta| meta.len());
+    let multi_res_declaration = multi_res_declaration.unwrap_or_default();
     let tv_bytes = std::fs::metadata(vector_path)
         .map_err(|e| Status::internal(format!("stat {}: {e}", vector_path.display())))?
         .len();
@@ -86,6 +122,7 @@ pub async fn install_snapshot_generation(
         exact_vector_path,
         bm25_path,
         live_docs_path,
+        retained_path,
     ]
     .into_iter()
     .flatten()
@@ -96,6 +133,8 @@ pub async fn install_snapshot_generation(
     tokio::spawn(async move {
         let manifest = SnapshotChunk {
             payload: Some(snapshot_chunk::Payload::Manifest(SnapshotManifest {
+                multi_res_vector_bytes,
+                multi_res_declaration,
                 vector_bytes: tv_bytes,
                 bm25_bytes,
                 exact_vector_bytes,
@@ -125,6 +164,17 @@ pub async fn install_snapshot_generation(
             .await
             .map_err(|e| Status::unavailable(format!("node at {addr}: {e}")))?,
     );
+    if multi_res_vector_bytes > 0 {
+        let health = client
+            .health(crate::pb::HealthRequest {})
+            .await?
+            .into_inner();
+        if health.multi_res_vector_version < 1 {
+            return Err(Status::failed_precondition(
+                "snapshot target does not support retained vector tiers",
+            ));
+        }
+    }
     Ok(client
         .install_snapshot(ReceiverStream::new(rx))
         .await?

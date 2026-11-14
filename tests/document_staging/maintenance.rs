@@ -77,6 +77,7 @@ async fn cutover(
             .map(|(ordinal, &i)| {
                 let m = before.metadata(i);
                 let source = SegmentSource {
+                    multi_res_path: None,
                     segment_id: &names[ordinal],
                     generation: before.epoch() + 1,
                     base_label: base,

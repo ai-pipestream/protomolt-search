@@ -97,6 +97,7 @@ async fn fixture(layout: Layout, coalesce: bool) -> Fixture {
         if row == 1 {
             client
                 .add_vectors(tokio_stream::iter([AddVectorsRequest {
+                    materialized_rows: Vec::new(),
                     dim: 16,
                     vectors: vectors[..32].to_vec(),
                 }]))
@@ -106,6 +107,7 @@ async fn fixture(layout: Layout, coalesce: bool) -> Fixture {
     }
     client
         .add_vectors(tokio_stream::iter([AddVectorsRequest {
+            materialized_rows: Vec::new(),
             dim: 16,
             vectors: vectors[32..].to_vec(),
         }]))

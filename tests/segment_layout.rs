@@ -522,6 +522,7 @@ fn the_union_index_equals_one_image_over_the_same_rows() {
         let published = union
             .catalog()
             .append(pipestream_search::segments::SegmentSource {
+                multi_res_path: None,
                 segment_id: &format!("seg-{}", union.sealed_parts()),
                 generation: union.sealed_parts() as u64 + 1,
                 base_label: u64::from(base),
@@ -686,6 +687,7 @@ async fn sealed_segments_serve_mapped_and_equal_the_heap_load_bit_for_bit() {
     assert_eq!(ingest(&addr, &docs).await, docs.len() as u64);
     client
         .add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors: corpus.clone(),
             dim: DIM as u32,
         }]))
@@ -847,6 +849,7 @@ fn a_mapped_sealed_image_opens_without_the_heap_load() {
     let catalog = SegmentCatalog::open(&root).unwrap();
     catalog
         .append(SegmentSource {
+            multi_res_path: None,
             segment_id: "seg-0",
             generation: 1,
             base_label: 0,

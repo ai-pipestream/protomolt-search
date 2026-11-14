@@ -155,6 +155,7 @@ async fn embed_ingest_hybrid_loop() {
         .add_vectors(
             0,
             vec![AddVectorsRequest {
+                materialized_rows: Vec::new(),
                 vectors: doc_vectors.concat(),
                 dim: DIM as u32,
             }],

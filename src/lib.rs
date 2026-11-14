@@ -75,6 +75,9 @@ pub mod mapped_vector;
 pub mod mapping;
 pub mod merge;
 pub mod metrics;
+pub(crate) mod multi_res;
+mod multi_res_storage;
+mod multi_res_wal;
 pub mod node;
 #[cfg(feature = "net")]
 pub mod node_agent;

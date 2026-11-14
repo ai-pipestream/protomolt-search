@@ -111,6 +111,7 @@ async fn ingest_keyed(addr: &str, i: usize) -> Result<(), tonic::Status> {
     c.add_documents(request).await?;
     let corpus = unit_vectors(i + 1, DIM, 0x5EED_CA11);
     let mut request = Request::new(tokio_stream::iter([AddVectorsRequest {
+        materialized_rows: Vec::new(),
         vectors: corpus[i * DIM..(i + 1) * DIM].to_vec(),
         dim: DIM as u32,
     }]));

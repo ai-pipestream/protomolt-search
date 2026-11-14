@@ -392,6 +392,7 @@ async fn exact_map_queries_survive_sealing_reopen_and_nested_relays() {
                 .unwrap();
             client
                 .add_vectors(tokio_stream::iter([pb::AddVectorsRequest {
+                    materialized_rows: Vec::new(),
                     dim: 8,
                     vectors: vectors[range.start * 8..range.end * 8].to_vec(),
                 }]))

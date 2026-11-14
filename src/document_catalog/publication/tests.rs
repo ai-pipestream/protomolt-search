@@ -194,6 +194,7 @@ impl Fixture {
             .map(|(i, paths)| {
                 let meta = candidate.segments().unwrap().metadata(i);
                 let source = SegmentSource {
+                    multi_res_path: None,
                     segment_id: &ids[i],
                     generation: candidate.info().accepted_sequence,
                     base_label: base,

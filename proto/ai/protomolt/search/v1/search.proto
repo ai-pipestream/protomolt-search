@@ -1373,6 +1373,8 @@ message HealthResponse {
   // logical identity through document ingestion. Zero does not prove support.
   // Relays that do not accept document writes report zero.
   uint32 document_contract_version = 22;
+  // Version 1 retains materialized vector tiers through ingestion and storage.
+  uint32 multi_res_vector_version = 23;
 }
 
 message ClusterHealthRequest {
@@ -2113,6 +2115,10 @@ message AddVectorsRequest {
   // and no seeded calibration yet; rejected if it disagrees with a known
   // dim.
   uint32 dim = 2;
+  // Optional materialized retention records, one per active-tier vector. Used
+  // by WAL replay and replication so derived float bits are never recomputed.
+  // Writers must negotiate HealthResponse.multi_res_vector_version >= 1.
+  repeated bytes materialized_rows = 3;
 }
 
 // Terminal response of an `AddVectors` stream.
@@ -2181,6 +2187,11 @@ message SnapshotManifest {
   uint64 exact_vector_bytes = 3;
   // Tombstone overlay after BM25 bytes. Zero means all rows are live.
   uint64 live_docs_bytes = 4;
+  // Optional retained multi-resolution vector sidecar after the live-row
+  // overlay. Zero means this image does not carry full-resolution tiers.
+  uint64 multi_res_vector_bytes = 5;
+  // Bounded JSON publication declaration authenticates the retained file.
+  bytes multi_res_declaration = 6;
 }
 
 // Result of an `InstallSnapshot` call.

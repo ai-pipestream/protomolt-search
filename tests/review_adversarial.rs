@@ -364,6 +364,7 @@ async fn single_pass_dense_and_hybrid_rerank_emit_snippets_with_zero_get_documen
     .await
     .unwrap();
     link.add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
+        materialized_rows: Vec::new(),
         vectors: vecs.clone(),
         dim: DIM as u32,
     }]))
@@ -571,6 +572,7 @@ async fn matryoshka_active_tier_indexes_compact_prefix_and_rescores_higher_tier_
     .await
     .unwrap();
     link.add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
+        materialized_rows: Vec::new(),
         vectors: raw_vectors,
         dim: 16,
     }]))

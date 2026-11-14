@@ -378,6 +378,7 @@ async fn visibility_survives_tombstones_flush_compaction_and_reopen() {
             ingest(&addr, rows).await;
             client
                 .add_vectors(tokio_stream::iter([AddVectorsRequest {
+                    materialized_rows: Vec::new(),
                     vectors: vectors[i * 2 * DIM..(i + 1) * 2 * DIM].to_vec(),
                     dim: DIM as u32,
                 }]))

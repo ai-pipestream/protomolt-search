@@ -227,6 +227,7 @@ async fn exact_column_stats_survive_partition_order_reopen_and_compaction() {
                     .unwrap();
                 client
                     .add_vectors(tokio_stream::iter([pb::AddVectorsRequest {
+                        materialized_rows: Vec::new(),
                         dim: 8,
                         vectors: common::unit_vectors(1, 8, 746 + row as u64),
                     }]))

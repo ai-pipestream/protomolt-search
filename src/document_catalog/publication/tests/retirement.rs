@@ -245,6 +245,7 @@ async fn retirement_allows_pending_maintenance_recovery_before_matching_seal() {
                 StatsClaim::required(active.stats_epoch, &active.stats_incarnation).unwrap(),
                 epoch,
                 vec![SegmentSource {
+                    multi_res_path: None,
                     segment_id: "retirement-maintenance-output",
                     generation: epoch + 1,
                     base_label: 0,

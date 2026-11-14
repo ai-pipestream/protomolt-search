@@ -858,6 +858,7 @@ fn score_candidates_plain_walks_are_bitwise_equal() {
         LiveDocs::default().write(&live, rows).unwrap();
         catalog
             .append(SegmentSource {
+                multi_res_path: None,
                 segment_id: &format!("part-{part}"),
                 generation: part as u64 + 1,
                 base_label: base,

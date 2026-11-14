@@ -607,6 +607,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let vf = tokio::spawn(async move {
                 for batch in vectors.chunks(512 * dim) {
                     tx.send(AddVectorsRequest {
+                        materialized_rows: Vec::new(),
                         vectors: batch.to_vec(),
                         dim: dim as u32,
                     })
@@ -934,6 +935,7 @@ async fn run_remote(
                 let batches: Vec<AddVectorsRequest> = values
                     .chunks(512 * dim)
                     .map(|batch| AddVectorsRequest {
+                        materialized_rows: Vec::new(),
                         vectors: batch.to_vec(),
                         dim: dim as u32,
                     })
@@ -968,6 +970,7 @@ async fn run_remote(
                     batch.extend(emb.next_vector().map_err(|e| e.to_string())?);
                     if batch.len() == 512 * dim {
                         tx.blocking_send(AddVectorsRequest {
+                            materialized_rows: Vec::new(),
                             vectors: std::mem::replace(&mut batch, Vec::with_capacity(512 * dim)),
                             dim: dim as u32,
                         })
@@ -976,6 +979,7 @@ async fn run_remote(
                 }
                 if !batch.is_empty() {
                     tx.blocking_send(AddVectorsRequest {
+                        materialized_rows: Vec::new(),
                         vectors: batch,
                         dim: dim as u32,
                     })
@@ -1115,6 +1119,7 @@ async fn run_remote(
                 let batches: Vec<AddVectorsRequest> = vectors
                     .chunks(512 * dim)
                     .map(|batch| AddVectorsRequest {
+                        materialized_rows: Vec::new(),
                         vectors: batch.to_vec(),
                         dim: dim as u32,
                     })

@@ -207,6 +207,7 @@ async fn one_pass_analyze_query_binds_structured_filters_across_lexical_dense_an
 
         let start = shard * 2 * DIM;
         link.add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors: corpus_vecs[start..start + 2 * DIM].to_vec(),
             dim: DIM as u32,
         }]))

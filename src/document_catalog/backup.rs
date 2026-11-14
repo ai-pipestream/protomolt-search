@@ -174,11 +174,15 @@ impl DocumentCatalog {
                     capture.bytes_file(format!("{prefix}/segment.json"), bytes)?;
                     let original = SegmentCatalog::segment_dir(set.root(), &segment.segment_id);
                     for artifact in [
-                        &segment.vector,
-                        &segment.exact_vectors,
-                        &segment.bm25,
-                        &segment.live_docs,
-                    ] {
+                        Some(&segment.vector),
+                        Some(&segment.exact_vectors),
+                        Some(&segment.bm25),
+                        Some(&segment.live_docs),
+                        segment.multi_res.as_ref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
                         if artifact.file.is_empty() {
                             continue;
                         }

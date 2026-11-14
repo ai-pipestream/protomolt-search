@@ -149,6 +149,7 @@ async fn check_topologies(second: pb::ScalarValueType) {
             .unwrap();
         client
             .add_vectors(tokio_stream::iter([pb::AddVectorsRequest {
+                materialized_rows: Vec::new(),
                 dim: 8,
                 vectors: common::unit_vectors(1, 8, 891 + slot as u64),
             }]))

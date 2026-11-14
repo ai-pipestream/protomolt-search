@@ -330,6 +330,7 @@ async fn integer_map_order_survives_tail_sealing_reopen_compaction_and_relay_gro
                     .unwrap();
                 client
                     .add_vectors(tokio_stream::iter([pb::AddVectorsRequest {
+                        materialized_rows: Vec::new(),
                         dim: 8,
                         vectors: common::unit_vectors(1, 8, 62880 + row as u64),
                     }]))

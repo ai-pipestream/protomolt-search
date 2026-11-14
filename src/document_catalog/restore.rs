@@ -372,11 +372,15 @@ fn inventory(
                 return Err(damaged("segment metadata differs from index manifest"));
             }
             for artifact in [
-                &segment.vector,
-                &segment.exact_vectors,
-                &segment.bm25,
-                &segment.live_docs,
-            ] {
+                Some(&segment.vector),
+                Some(&segment.exact_vectors),
+                Some(&segment.bm25),
+                Some(&segment.live_docs),
+                segment.multi_res.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
                 if artifact.file.is_empty() {
                     continue;
                 }

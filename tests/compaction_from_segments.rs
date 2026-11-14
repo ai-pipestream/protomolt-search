@@ -227,6 +227,7 @@ async fn seed(addr: &str, rows: usize) {
         }
         let (tx, rx) = mpsc::channel(2);
         tx.send(AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors,
             dim: DIM as u32,
         })
@@ -589,6 +590,7 @@ async fn reference_shard(
         }
         let (tx, rx) = mpsc::channel(2);
         tx.send(AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors,
             dim: DIM as u32,
         })
@@ -646,6 +648,7 @@ async fn walless_catalog_compacts_into_partitions_while_writes_continue() {
                     .unwrap();
                 let (tx, rx) = mpsc::channel(1);
                 tx.send(AddVectorsRequest {
+                    materialized_rows: Vec::new(),
                     vectors: row(i).vector.clone(),
                     dim: DIM as u32,
                 })
@@ -1125,6 +1128,7 @@ fn an_interrupted_walless_cutover_rolls_back_at_open() {
     LiveDocs::default().write(&live_path, 1).unwrap();
     catalog
         .append(pipestream_search::segments::SegmentSource {
+            multi_res_path: None,
             segment_id: "seg-00000001",
             generation: 1,
             base_label: 0,
@@ -1301,6 +1305,7 @@ fn partitioned_compaction_preserves_lattice_and_per_document_sparse_scales() {
         live.write(&lp, 3).unwrap();
         catalog
             .append(SegmentSource {
+                multi_res_path: None,
                 segment_id: &format!("source-{segment}"),
                 generation: 1,
                 base_label: (segment * 3) as u64,

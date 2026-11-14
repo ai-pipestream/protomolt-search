@@ -96,6 +96,7 @@ async fn start_fixture(tag: &str, rows_per_shard: &[usize]) -> Fixture {
         .await
         .unwrap();
         node.add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors: fixture.corpus[start * DIM..(start + rows) * DIM].to_vec(),
             dim: DIM as u32,
         }]))

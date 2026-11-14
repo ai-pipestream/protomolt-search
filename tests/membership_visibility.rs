@@ -47,6 +47,7 @@ async fn seed(client: &mut NodeServiceClient<Channel>, rows: usize) {
             .unwrap();
         client
             .add_vectors(tokio_stream::iter([AddVectorsRequest {
+                materialized_rows: Vec::new(),
                 dim: 16,
                 vectors: vector.to_vec(),
             }]))
@@ -250,7 +251,11 @@ async fn vector_only_rows_have_no_authorized_document_membership() {
         .await
         .unwrap();
     client
-        .add_vectors(tokio_stream::iter([AddVectorsRequest { dim: 16, vectors }]))
+        .add_vectors(tokio_stream::iter([AddVectorsRequest {
+            materialized_rows: Vec::new(),
+            dim: 16,
+            vectors,
+        }]))
         .await
         .unwrap();
     let all = client

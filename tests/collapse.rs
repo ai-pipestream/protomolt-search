@@ -104,6 +104,7 @@ async fn start_shard(
     add_documents_with_lineage(&addr, opinions).await;
     let (tx, rx) = mpsc::channel(4);
     tx.send(AddVectorsRequest {
+        materialized_rows: Vec::new(),
         vectors,
         dim: DIM as u32,
     })

@@ -212,6 +212,9 @@ fn validate_transition(
             expected.generation = actual.generation;
             expected.vector.file = actual.vector.file.clone();
             expected.exact_vectors.file = actual.exact_vectors.file.clone();
+            if let (Some(expected), Some(actual)) = (&mut expected.multi_res, &actual.multi_res) {
+                expected.file.clone_from(&actual.file);
+            }
             expected.bm25.file = actual.bm25.file.clone();
             expected.live_docs.file = actual.live_docs.file.clone();
             if &expected != actual

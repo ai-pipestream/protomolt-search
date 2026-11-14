@@ -162,6 +162,7 @@ async fn start_cluster(
         {
             let (tx, rx) = tokio::sync::mpsc::channel(4);
             tx.send(pipestream_search::pb::AddVectorsRequest {
+                materialized_rows: Vec::new(),
                 vectors,
                 dim: DIM as u32,
             })

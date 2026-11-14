@@ -104,6 +104,7 @@ fn append(
     bitmap.write(&live, 1).unwrap();
     catalog
         .append(SegmentSource {
+            multi_res_path: None,
             segment_id: id,
             generation: 1,
             base_label: base,

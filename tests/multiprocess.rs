@@ -115,12 +115,14 @@ async fn add_vectors(addr: &str, vectors: Vec<f32>) -> pipestream_search::pb::Ad
     // Two batches, to exercise the streaming path.
     let half = vectors.len() / 2;
     tx.send(AddVectorsRequest {
+        materialized_rows: Vec::new(),
         vectors: vectors[..half].to_vec(),
         dim: 0,
     })
     .await
     .unwrap();
     tx.send(AddVectorsRequest {
+        materialized_rows: Vec::new(),
         vectors: vectors[half..].to_vec(),
         dim: 0,
     })

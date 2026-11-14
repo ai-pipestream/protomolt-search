@@ -439,6 +439,7 @@ async fn unsigned_materialized_projections_survive_distributed_reopen_and_compac
                     .unwrap();
                 client
                     .add_vectors(tokio_stream::iter([pb::AddVectorsRequest {
+                        materialized_rows: Vec::new(),
                         dim: 8,
                         vectors: common::unit_vectors(1, 8, row as u64 + 891),
                     }]))

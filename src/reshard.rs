@@ -91,6 +91,8 @@ pub struct ChildImage {
     pub vector_path: PathBuf,
     /// Product-owned original FP32 rows aligned with `vector_path`.
     pub exact_vector_path: PathBuf,
+    /// Materialized multi-resolution rows and their authoritative declaration.
+    pub multi_res_path: Option<PathBuf>,
     /// The written BM25 sidecar (absent when the child received no
     /// documents).
     pub bm25_path: Option<PathBuf>,
@@ -186,6 +188,8 @@ impl SegmentedReshardOutput {
 struct Replay {
     /// global id -> one vector (`dim` floats).
     vectors: BTreeMap<u64, Vec<f32>>,
+    /// Validated materialized payload by source id; never re-project active rows.
+    retained: BTreeMap<u64, Vec<u8>>,
     /// global id -> the document as ingested.
     documents: BTreeMap<u64, AddDocumentsRequest>,
     /// Rows hidden by delete or replacement records. Build drops them,
@@ -204,6 +208,7 @@ impl Replay {
     fn compact(&mut self) {
         for id in &self.deleted {
             self.vectors.remove(id);
+            self.retained.remove(id);
             self.documents.remove(id);
             self.stable_keys.remove(id);
             self.analyzed.remove(id);
@@ -334,6 +339,14 @@ fn replay_buckets_routed(
                             batch.vectors.len()
                         ));
                     }
+                    if !batch.materialized_rows.is_empty() && batch.dim as usize != dim {
+                        return Err(format!(
+                            "replay {}: materialized vector dimension differs from manifest",
+                            path.display()
+                        ));
+                    }
+                    crate::multi_res_wal::decode_batch(&batch)
+                        .map_err(|error| format!("replay {}: {error}", path.display()))?;
                     for (i, vector) in batch.vectors.chunks_exact(dim).enumerate() {
                         if !a.stable_routing_keys.is_empty()
                             && a.stable_routing_keys.len() != batch.vectors.len() / dim
@@ -356,6 +369,9 @@ fn replay_buckets_routed(
                                 path.display(),
                                 id
                             ));
+                        }
+                        if let Some(retained) = batch.materialized_rows.get(i) {
+                            out.retained.insert(id, retained.clone());
                         }
                         if let Some(key) = a.stable_routing_keys.get(i) {
                             match out.stable_keys.insert(id, key.clone()) {
@@ -715,6 +731,7 @@ impl HnswCompactionSources {
 fn build_child(
     manifest: &WalManifest,
     vectors: Vec<(u64, Vec<f32>)>,
+    mut retained: BTreeMap<u64, Vec<u8>>,
     documents: Vec<(u64, AddDocumentsRequest)>,
     vector_path: &Path,
     bm25_fields: Option<&[String]>,
@@ -736,6 +753,25 @@ fn build_child(
     for (id, vector) in &vectors {
         parent_ids.push(*id);
         flat.extend_from_slice(vector);
+    }
+    let mut remapped = crate::multi_res::MultiResVectors::default();
+    for (slot, (id, vector)) in vectors.iter().enumerate() {
+        if let Some(bytes) = retained.remove(id) {
+            let batch = crate::pb::AddVectorsRequest {
+                vectors: vector.clone(),
+                dim: manifest.dim,
+                materialized_rows: vec![bytes],
+            };
+            let row = crate::multi_res_wal::decode_batch(&batch)?
+                .into_iter()
+                .next()
+                .ok_or("materialized child row is missing")?;
+            let slot = u32::try_from(slot).map_err(|_| "materialized child slot exceeds u32")?;
+            remapped.insert(slot, row);
+        }
+    }
+    if !retained.is_empty() {
+        return Err("materialized rows have no matching child vectors".into());
     }
     let index = match prebuilt_index {
         Some(index) => index,
@@ -1516,7 +1552,14 @@ fn build_child(
         bm25_path = Some(path);
     }
 
+    let payload = crate::multi_res::sidecar_path(vector_path);
+    // An empty publication also retires stale retention when an output path
+    // is reused. Segment metadata omits the artifact for an empty map.
+    crate::multi_res_storage::write(&remapped, &payload, row_parent_ids.len() as u64)
+        .map_err(|error| format!("write {}: {error}", payload.display()))?;
+    let multi_res_path = (!remapped.is_empty()).then_some(payload);
     Ok(ChildImage {
+        multi_res_path,
         vector_path: vector_path.to_path_buf(),
         exact_vector_path,
         bm25_path,
@@ -1757,6 +1800,7 @@ fn finish_child_ordered_with_prebuilt(
     let mut child = build_child(
         manifest,
         vectors,
+        replay.retained,
         documents,
         &vector_path,
         bm25_fields,
@@ -1927,15 +1971,21 @@ pub fn split_logs(
         }
         replay.compact();
         let shift = 64 - n.trailing_zeros();
-        type ReshardBucket = (Vec<(u64, Vec<f32>)>, Vec<(u64, AddDocumentsRequest)>);
-        let mut buckets: Vec<ReshardBucket> = (0..n).map(|_| (Vec::new(), Vec::new())).collect();
+        let mut buckets: Vec<Replay> = (0..n).map(|_| Replay::default()).collect();
         for (id, vector) in replay.vectors {
-            buckets[bucket_of(id, n)].0.push((id, vector));
+            let shard = bucket_of(id, n);
+            buckets[shard].vectors.insert(id, vector);
+            if let Some(row) = replay.retained.remove(&id) {
+                buckets[shard].retained.insert(id, row);
+            }
         }
         for (id, doc) in replay.documents {
-            buckets[bucket_of(id, n)].1.push((id, doc));
+            buckets[bucket_of(id, n)].documents.insert(id, doc);
         }
-        for (i, (vectors, documents)) in buckets.into_iter().enumerate() {
+        for (id, key) in replay.stable_keys {
+            buckets[bucket_of(id, n)].stable_keys.insert(id, key);
+        }
+        for (i, replay) in buckets.into_iter().enumerate() {
             let hash_lo = (i as u64) << shift;
             let hash_hi = if i + 1 == n {
                 u64::MAX
@@ -1944,13 +1994,7 @@ pub fn split_logs(
             };
             children.push(finish_child(
                 &manifest,
-                Replay {
-                    vectors: vectors.into_iter().collect(),
-                    documents: documents.into_iter().collect(),
-                    deleted: Default::default(),
-                    stable_keys: Default::default(),
-                    analyzed: Default::default(),
-                },
+                replay,
                 i,
                 out_dir,
                 slot_base + i as u64 * slot_stride,
@@ -2071,6 +2115,9 @@ pub fn split_logs_segmented(
         for (id, vector) in replay.vectors {
             let shard = bucket_of(id, n);
             partitions[shard].vectors.insert(id, vector);
+            if let Some(row) = replay.retained.remove(&id) {
+                partitions[shard].retained.insert(id, row);
+            }
             if let Some(key) = stable_keys.get(&id) {
                 partitions[shard].stable_keys.insert(id, key.clone());
             }
@@ -2223,6 +2270,9 @@ pub fn split_stable_logs(
             (crate::coordinator::stable_routing_hash(key) >> shift) as usize
         };
         buckets[shard].vectors.insert(id, vector);
+        if let Some(row) = replay.retained.remove(&id) {
+            buckets[shard].retained.insert(id, row);
+        }
         buckets[shard].stable_keys.insert(id, key.clone());
     }
     for (id, document) in replay.documents {
@@ -2368,6 +2418,9 @@ pub fn split_stable_logs_ranged(
         let key = keys.get(&id).expect("validated above");
         let shard = child_of(key)?;
         buckets[shard].vectors.insert(id, vector);
+        if let Some(row) = replay.retained.remove(&id) {
+            buckets[shard].retained.insert(id, row);
+        }
         buckets[shard].stable_keys.insert(id, key.clone());
     }
     for (id, document) in replay.documents {
@@ -2585,6 +2638,9 @@ pub fn split_placement_logs(
     for (id, vector) in replay.vectors {
         let shard = child_of(id, codes.get(&id).copied().flatten())?;
         buckets[shard].vectors.insert(id, vector);
+        if let Some(row) = replay.retained.remove(&id) {
+            buckets[shard].retained.insert(id, row);
+        }
         if let Some(key) = keys.get(&id) {
             buckets[shard].stable_keys.insert(id, key.clone());
         }
@@ -3318,7 +3374,7 @@ pub fn split_placement_tree_logs(
     let mut file_row = |index: usize,
                         id: u64,
                         rewritten: AddDocumentsRequest,
-                        vector: Option<(Vec<f32>, u32)>,
+                        vector: Option<(Vec<f32>, u32, Option<Vec<u8>>)>,
                         keys: Vec<Vec<u8>>,
                         fields: Option<&[AnalyzedField]>|
      -> Result<(), String> {
@@ -3342,10 +3398,11 @@ pub fn split_placement_tree_logs(
         .map_err(|error| format!("spill document {id}: {error}"))?;
         let filed = bucket.unwrap_or(bucket_of(id, spill_bucket_count as usize) as u32);
         bucket_docs[index][filed as usize] += 1;
-        if let Some((vector, dim)) = vector {
+        if let Some((vector, dim, retained)) = vector {
             let record = wal_record::Op::AddVectors(crate::pb::wal::LoggedAddVectors {
                 first_id: id,
                 batch: Some(crate::pb::AddVectorsRequest {
+                    materialized_rows: retained.into_iter().collect(),
                     vectors: vector,
                     dim,
                 }),
@@ -3417,10 +3474,13 @@ pub fn split_placement_tree_logs(
                         });
                         let keys: Vec<Vec<u8>> =
                             replay.stable_keys.get(&id).cloned().into_iter().collect();
-                        let vector = replay
-                            .vectors
-                            .get(&id)
-                            .map(|vector| (vector.clone(), current.dim));
+                        let vector = replay.vectors.get(&id).map(|vector| {
+                            (
+                                vector.clone(),
+                                current.dim,
+                                replay.retained.get(&id).cloned(),
+                            )
+                        });
                         file_row(index, id, rewritten, vector, keys, None)?;
                         placed[index] += 1;
                     }
@@ -3434,6 +3494,13 @@ pub fn split_placement_tree_logs(
                     let meta = shard.set.metadata(i);
                     let bm25 = shard.set.bm25(i);
                     let exact = open_segment_exact(shard, i)?;
+                    if exact.is_none() && !shard.set.retained_segment(i).is_empty() {
+                        return Err(format!(
+                            "{} segment {}: retained rows have no active vectors",
+                            shard.root.display(),
+                            meta.segment_id
+                        ));
+                    }
                     let rows = bm25.next_doc_id();
                     if u64::from(rows) != meta.rows {
                         return Err(format!(
@@ -3489,6 +3556,20 @@ pub fn split_placement_tree_logs(
                             })
                             .transpose()
                             .map_err(|e| format!("read exact row {row}: {e}"))?;
+                        let vector = vector
+                            .map(|(values, dim)| {
+                                let retained = shard
+                                    .set
+                                    .retained_segment(i)
+                                    .retained(row)
+                                    .map(crate::multi_res::encode)
+                                    .transpose()
+                                    .map_err(|error| {
+                                        format!("retain segment row {row}: {error}")
+                                    })?;
+                                Ok::<_, String>((values, dim, retained))
+                            })
+                            .transpose()?;
                         let fields: Vec<AnalyzedField> = transposes
                             .iter()
                             .map(|transpose| {
@@ -3734,6 +3815,7 @@ pub fn split_placement_tree_logs(
                         child.leaf
                     );
                     images.push(ChildImage {
+                        multi_res_path: None,
                         vector_path: index_path,
                         exact_vector_path: root,
                         bm25_path: None,
@@ -3848,6 +3930,7 @@ pub fn split_placement_tree_logs(
                     };
                     catalog
                         .append(crate::segments::SegmentSource {
+                            multi_res_path: image.multi_res_path.as_deref(),
                             segment_id: &segment_id,
                             generation,
                             // Labels are shard-local: the node adds its
@@ -3866,7 +3949,12 @@ pub fn split_placement_tree_logs(
                                 child.leaf
                             )
                         })?;
+                    let retained_path = crate::multi_res::sidecar_path(&image.vector_path);
+                    let retained_declaration =
+                        crate::multi_res_storage::declaration_path(&retained_path);
                     for path in [
+                        Some(retained_path.as_path()),
+                        Some(retained_declaration.as_path()),
                         Some(image.vector_path.as_path()),
                         Some(image.exact_vector_path.as_path()),
                         Some(bm25_path),
@@ -4077,6 +4165,7 @@ pub fn split_placement_tree_logs(
                     index_path.display()
                 );
                 images.push(ChildImage {
+                    multi_res_path: None,
                     vector_path: index_path,
                     exact_vector_path: root,
                     bm25_path: None,
@@ -4196,6 +4285,8 @@ pub struct CompactedRow<'a> {
     /// The global id the row had in the source generation.
     pub old_id: u64,
     pub vector: Option<&'a [f32]>,
+    /// Validated materialized retention for this vector, with original bits.
+    pub materialized_row: Option<&'a [u8]>,
     pub document: Option<&'a AddDocumentsRequest>,
     pub stable_key: Option<&'a [u8]>,
 }
@@ -4263,6 +4354,7 @@ fn emit_rows_in(
             new_local,
             old_id: *old_id,
             vector: replay.vectors.get(old_id).map(Vec::as_slice),
+            materialized_row: replay.retained.get(old_id).map(Vec::as_slice),
             document: replay.documents.get(old_id),
             stable_key: replay.stable_keys.get(old_id).map(Vec::as_slice),
         })?;
@@ -5637,6 +5729,12 @@ pub(crate) fn compact_log_partitioned_with_sources(
                         crate::pb::wal::LoggedAddVectors {
                             first_id: id,
                             batch: Some(crate::pb::AddVectorsRequest {
+                                materialized_rows: replay
+                                    .retained
+                                    .get(&id)
+                                    .cloned()
+                                    .into_iter()
+                                    .collect(),
                                 vectors: vector.clone(),
                                 dim: manifest.dim,
                             }),
@@ -6069,6 +6167,14 @@ pub fn compact_segments_partitioned(
                     crate::pb::wal::LoggedAddVectors {
                         first_id: id,
                         batch: Some(crate::pb::AddVectorsRequest {
+                            materialized_rows: set
+                                .retained_segment(i)
+                                .retained(row)
+                                .map(crate::multi_res::encode)
+                                .transpose()
+                                .map_err(|error| format!("retain segment row {row}: {error}"))?
+                                .into_iter()
+                                .collect(),
                             vectors: vector,
                             dim: dim as u32,
                         }),
@@ -6682,3 +6788,6 @@ mod legacy_analysis_tests {
         std::fs::remove_file(path).unwrap();
     }
 }
+
+#[cfg(test)]
+mod retained_vector_tests;

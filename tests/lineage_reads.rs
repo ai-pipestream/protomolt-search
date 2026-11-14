@@ -52,6 +52,7 @@ async fn seed(client: &mut NodeServiceClient<Channel>) {
             .unwrap();
         client
             .add_vectors(tokio_stream::iter([AddVectorsRequest {
+                materialized_rows: Vec::new(),
                 dim: 16,
                 vectors: vector.to_vec(),
             }]))
@@ -252,7 +253,11 @@ async fn vector_only_and_empty_shards_cannot_satisfy_a_document_view() {
                 .await
                 .unwrap();
             client
-                .add_vectors(tokio_stream::iter([AddVectorsRequest { dim: 16, vectors }]))
+                .add_vectors(tokio_stream::iter([AddVectorsRequest {
+                    materialized_rows: Vec::new(),
+                    dim: 16,
+                    vectors,
+                }]))
                 .await
                 .unwrap();
         }

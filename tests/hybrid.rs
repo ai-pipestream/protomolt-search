@@ -101,6 +101,7 @@ async fn add_vectors(addr: &str, vectors: Vec<f32>) {
     // dim is sent explicitly: harmless when the shard already knows it
     // (validated then), required for a from-scratch shard.
     tx.send(AddVectorsRequest {
+        materialized_rows: Vec::new(),
         vectors,
         dim: DIM as u32,
     })

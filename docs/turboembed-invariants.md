@@ -53,3 +53,40 @@ Lexical analysis is independent of this NLP marker.
 
 Old records without the marker remain unmaterialized inputs; there is no safe
 way to infer completed empty extraction from absent column values.
+
+## Retained vector tiers
+
+The provider and its FP32 sidecar contain the active indexing tier. Retained
+full vectors, prefixes, norms, optional codes, sentence vectors, and original
+input floats belong to the same shard generation. They survive flush, restart,
+snapshot installation, source backup/restore, and row renumbering. Recovery
+loads their original float bits; it does not normalize the active tier again
+or invoke an embedder. Tombstones apply before tier rescoring.
+
+A single-image generation writes `<index>.multi` with an authoritative
+`<index>.multi.json` declaration. Snapshot generations use `vectors.multi`
+and `vectors.multi.json`. Each immutable segment declares its optional
+`vectors.multi` artifact in the catalog, including its byte count and SHA-256.
+The private `PMMRES01` payload also verifies its row span and integrity footer.
+Each record is bounded to 64 MiB including its enclosing row message, and a
+separate decoded-allocation budget is checked before protobuf allocation.
+This does not impose a whole-corpus heap limit on retained vectors.
+
+Missing declared files, mismatched hashes, out-of-range rows, and absent
+configured tiers refuse recovery or installation before replacing serving
+state. A generation written before retention cannot recover a discarded full
+vector from its active prefix; rebuild it from full-resolution input. Explicit
+tier queries report unavailable retained data rather than silently omitting a
+live vector candidate. Document-only positions remain valid gaps.
+
+`AddVectorsRequest.materialized_rows` (tag 3) carries optional retention records
+parallel to its active vectors. Admission checks their cardinality and exact
+active-tier float bits. Replication negotiates
+`HealthResponse.multi_res_vector_version >= 1` before sending them. Ordinary
+vector batches leave this field empty. The WAL publishes format 9 before
+appending retained records; this reader continues accepting prior WAL formats.
+Retained segment catalogs use format 5, and repository snapshots carrying
+retention use format 2, so older readers refuse them. Streamed snapshots append
+the retained payload after the live bitmap and carry its bounded declaration
+in the manifest. The `.bm25` column layout and vector-provider image formats
+are unchanged.

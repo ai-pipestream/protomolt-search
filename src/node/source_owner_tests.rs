@@ -73,6 +73,7 @@ fn every_row_commit_boundary_refuses_an_owned_empty_index() {
         refused(node.apply_batch_locked(
             &mut state,
             AddVectorsRequest {
+                materialized_rows: Vec::new(),
                 dim: 8,
                 vectors: vec![0.2; 8],
             },

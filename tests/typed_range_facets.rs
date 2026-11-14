@@ -312,6 +312,7 @@ async fn typed_ranges_match_numeric_oracle_through_nested_relays_and_storage_lif
                     .unwrap();
                 client
                     .add_vectors(tokio_stream::iter([pb::AddVectorsRequest {
+                        materialized_rows: Vec::new(),
                         dim: 8,
                         vectors: common::unit_vectors(1, 8, 615 + row as u64),
                     }]))

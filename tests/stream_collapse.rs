@@ -115,6 +115,7 @@ async fn start_shard(
     feeder.await.unwrap();
     let (tx, rx) = mpsc::channel(4);
     tx.send(AddVectorsRequest {
+        materialized_rows: Vec::new(),
         vectors,
         dim: DIM as u32,
     })
@@ -394,6 +395,7 @@ async fn lineage_free_shards_self_parent() {
         .unwrap();
     let (tx, rx) = mpsc::channel(4);
     tx.send(AddVectorsRequest {
+        materialized_rows: Vec::new(),
         vectors: corpus.clone(),
         dim: DIM as u32,
     })

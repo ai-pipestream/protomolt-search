@@ -3847,6 +3847,9 @@ pub(crate) struct ShardState {
     /// slots. Legacy generations may lack this sidecar; native provider
     /// search remains available, while FP32 rerank refuses by name.
     pub(crate) exact_vectors: Option<ExactVectorStore>,
+    /// Multi-resolution rows belong to this physical generation, including
+    /// private compaction shadows; publication swaps them with the indexes.
+    pub(crate) multi_res_vectors: crate::multi_res::MultiResVectors,
     pub(crate) bm25: Option<Bm25Shard>,
     /// Generation tombstones shared by every lexical and vector read path.
     pub(crate) live_docs: LiveDocs,
@@ -4769,6 +4772,7 @@ pub(crate) fn wal_append_or_degrade(wal_slot: &mut Option<WalWriter>, op: wal_re
 /// the frozen part's rows and shared artifacts, gathered under the
 /// write lock, written with no lock held.
 struct SealPlan {
+    retained: crate::multi_res::MultiResVectors,
     base: usize,
     rows: usize,
     documents: Arc<Bm25Store>,
@@ -4840,8 +4844,6 @@ pub struct NodeServiceImpl {
     turbo_handshake: Option<Arc<turbo_client::IndexGenerationHandshake>>,
     /// Automatically pinned first-document lexical handshake on this shard.
     auto_turbo_handshake: Arc<std::sync::Mutex<Option<turbo_client::IndexGenerationHandshake>>>,
-    /// Multi-resolution Matryoshka + sentence vectors retained per local slot.
-    multi_res_vectors: Arc<RwLock<HashMap<u32, crate::turbo_bridge::MultiResVectorOutput>>>,
 }
 
 /// One compiled MaterializeSpec, cached against spec equality.
@@ -5809,10 +5811,7 @@ impl NodeServiceImpl {
         // for the direct constructor.
         check_wal_tables(index.as_ref(), &config)?;
         if let Some(idx) = index.as_ref() {
-            if let Some(expected_dim) = config
-                .matryoshka_active_dim
-                .or_else(|| config.matryoshka_prefix_dims.last().copied())
-            {
+            if let Some(expected_dim) = config.matryoshka_active_dim {
                 if expected_dim > 0 && idx.dim_opt().is_some_and(|d| d != expected_dim as usize) {
                     return Err(format!(
                         "persisted vector index dim {:?} disagrees with configured matryoshka dim {}",
@@ -5822,12 +5821,40 @@ impl NodeServiceImpl {
                 }
             }
         }
+        let mut multi_res_vectors = crate::multi_res::MultiResVectors::default();
+        if let Some(path) = config.index_path.as_ref() {
+            let physical = index.as_ref().map_or(0, VectorIndex::len).max(
+                bm25.as_ref()
+                    .map_or(0, |store| store.next_doc_id() as usize),
+            );
+            let payload = crate::multi_res::storage_path(path, generation.as_ref());
+            multi_res_vectors =
+                if let Some(provider) = index.as_ref().and_then(VectorIndex::as_segmented) {
+                    provider.snapshot().retained_vectors()?
+                } else {
+                    crate::multi_res_storage::open(&payload, physical as u64).map_err(|error| {
+                        format!("load retained vectors {}: {error}", payload.display())
+                    })?
+                };
+            crate::multi_res_wal::require_coverage(
+                &multi_res_vectors,
+                (0..index.as_ref().map_or(0, VectorIndex::len)).filter(|&slot| {
+                    exact_vectors
+                        .as_ref()
+                        .is_none_or(|exact| exact.contains_row(slot))
+                }),
+                &live_docs,
+                &config.matryoshka_prefix_dims,
+                config.matryoshka_active_dim,
+            )?;
+        }
         let service = Self::new(index, config)
             .with_bm25(bm25)
             .with_exact_vectors(exact_vectors)?
             .with_live_docs(live_docs)?
             .with_phrase_index(phrase_index)
             .with_generation(generation);
+        write_shard(&service.state).multi_res_vectors = multi_res_vectors;
         Ok(service)
     }
 
@@ -5853,6 +5880,7 @@ impl NodeServiceImpl {
             state: Arc::new(RwLock::new(ShardState {
                 index,
                 exact_vectors: None,
+                multi_res_vectors: Default::default(),
                 bm25: None,
                 live_docs: LiveDocs::default(),
                 generation: None,
@@ -5881,7 +5909,6 @@ impl NodeServiceImpl {
             nlp_columns: None,
             turbo_handshake: configured_handshake,
             auto_turbo_handshake: Arc::new(std::sync::Mutex::new(None)),
-            multi_res_vectors: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -6147,10 +6174,9 @@ impl NodeServiceImpl {
         &self,
         local_slot: u32,
     ) -> Option<crate::turbo_bridge::MultiResVectorOutput> {
-        self.multi_res_vectors
-            .read()
-            .expect("multi_res_vectors lock poisoned")
-            .get(&local_slot)
+        read_shard(&self.state)
+            .multi_res_vectors
+            .get(local_slot)
             .cloned()
     }
 
@@ -6178,10 +6204,7 @@ impl NodeServiceImpl {
             Status::invalid_argument(format!("cannot slice query vector to tier_dim {tier_dim}"))
         })?;
         let guard = read_shard(&self.state);
-        let rows = self
-            .multi_res_vectors
-            .read()
-            .expect("multi_res_vectors lock poisoned");
+        let rows = &guard.multi_res_vectors;
         let offset = self.config.slot_offset;
         let mut out = Vec::with_capacity(candidate_global_ids.len());
         for &gid in candidate_global_ids {
@@ -6194,7 +6217,23 @@ impl NodeServiceImpl {
             if guard.live_docs.is_deleted(local as usize) {
                 continue;
             }
-            if let Some(doc_tier) = rows.get(&local).and_then(|r| r.tier(tier_dim)) {
+            if local as usize >= guard.index.as_ref().map_or(0, VectorIndex::len)
+                || guard
+                    .exact_vectors
+                    .as_ref()
+                    .is_some_and(|exact| !exact.contains_row(local as usize))
+            {
+                continue;
+            }
+            let doc_tier = rows
+                .get(local)
+                .and_then(|r| r.tier(tier_dim))
+                .ok_or_else(|| {
+                    Status::failed_precondition(format!(
+                        "retained vector tier {tier_dim} is unavailable for row {local}"
+                    ))
+                })?;
+            {
                 let dot: f32 = q_slice
                     .iter()
                     .zip(doc_tier.iter())
@@ -7014,6 +7053,7 @@ impl NodeServiceImpl {
             bm25,
             index,
             live_docs,
+            multi_res_vectors,
             mapped_binding,
             ..
         } = &mut *guard;
@@ -7081,6 +7121,9 @@ impl NodeServiceImpl {
         // flush has not retired yet (docs/mutations.md).
         let generation = shard.snapshot().epoch() + 1;
         Ok(Some(SealPlan {
+            retained: multi_res_vectors
+                .range(base as u32, rows as u32)
+                .map_err(|error| Status::internal(error.to_string()))?,
             base,
             rows,
             documents,
@@ -7156,7 +7199,17 @@ impl NodeServiceImpl {
             }
             None => (None, None),
         };
+        let multi_res_path = if plan.retained.is_empty() {
+            None
+        } else {
+            let path = plan.stage.join(crate::multi_res::FILE_NAME);
+            plan.retained
+                .write(&path, plan.rows as u64)
+                .map_err(|error| io("retained vectors", error))?;
+            Some(path)
+        };
         let source = crate::segments::SegmentSource {
+            multi_res_path: multi_res_path.as_deref(),
             segment_id: &plan.segment_id,
             generation: plan.generation,
             base_label: plan.base as u64,
@@ -7346,6 +7399,16 @@ impl NodeServiceImpl {
             guard.exact_vectors = Some(mapped);
         }
         let physical_rows = physical_rows(&guard);
+        if guard
+            .index
+            .as_ref()
+            .and_then(VectorIndex::as_segmented)
+            .is_none()
+        {
+            let payload = crate::multi_res::storage_path(&config_path, guard.generation.as_ref());
+            crate::multi_res_storage::write(&guard.multi_res_vectors, &payload, physical_rows)
+                .map_err(|error| Status::internal(format!("persist retained vectors: {error}")))?;
+        }
         guard.live_docs = guard
             .live_docs
             .write(&live_docs_path, physical_rows)
@@ -7445,138 +7508,78 @@ impl NodeServiceImpl {
         tmp_dir: &Path,
     ) -> Result<(), Status> {
         use tokio::io::AsyncWriteExt;
-        let io_err = |what: &Path, e: std::io::Error| {
-            Status::internal(format!("snapshot receive {}: {e}", what.display()))
-        };
-        tokio::fs::create_dir_all(tmp_dir)
-            .await
-            .map_err(|e| io_err(tmp_dir, e))?;
-        let tv_tmp = generation_vector(tmp_dir);
-        let exact_tmp = generation_exact_vectors(tmp_dir);
-        let bm25_tmp = generation_bm25(tmp_dir);
-        let live_tmp = generation_live_docs(tmp_dir);
-        let mut tv = tokio::fs::File::create(&tv_tmp)
-            .await
-            .map_err(|e| io_err(&tv_tmp, e))?;
-        let mut exact = if manifest.exact_vector_bytes > 0 {
-            Some(
-                tokio::fs::File::create(&exact_tmp)
-                    .await
-                    .map_err(|e| io_err(&exact_tmp, e))?,
-            )
-        } else {
-            None
-        };
-        let mut bm25 = if manifest.bm25_bytes > 0 {
-            Some(
-                tokio::fs::File::create(&bm25_tmp)
-                    .await
-                    .map_err(|e| io_err(&bm25_tmp, e))?,
-            )
-        } else {
-            None
-        };
-        let mut live = if manifest.live_docs_bytes > 0 {
-            Some(
-                tokio::fs::File::create(&live_tmp)
-                    .await
-                    .map_err(|e| io_err(&live_tmp, e))?,
-            )
-        } else {
-            None
-        };
-        let (mut tv_written, mut exact_written, mut bm25_written, mut live_written) =
-            (0u64, 0u64, 0u64, 0u64);
+        if (manifest.multi_res_vector_bytes == 0) != manifest.multi_res_declaration.is_empty()
+            || manifest.multi_res_declaration.len() > 4096
+        {
+            return Err(Status::invalid_argument(
+                "invalid retained vector snapshot declaration",
+            ));
+        }
+        let io_err = |e: std::io::Error| Status::internal(format!("snapshot receive: {e}"));
+        tokio::fs::create_dir_all(tmp_dir).await.map_err(io_err)?;
+        let paths = [
+            generation_vector(tmp_dir),
+            generation_exact_vectors(tmp_dir),
+            generation_bm25(tmp_dir),
+            generation_live_docs(tmp_dir),
+            tmp_dir.join(crate::multi_res::FILE_NAME),
+        ];
+        let lengths = [
+            manifest.vector_bytes,
+            manifest.exact_vector_bytes,
+            manifest.bm25_bytes,
+            manifest.live_docs_bytes,
+            manifest.multi_res_vector_bytes,
+        ];
+        let mut files = Vec::with_capacity(paths.len());
+        for (path, length) in paths.iter().zip(lengths) {
+            files.push(if length > 0 {
+                Some(tokio::fs::File::create(path).await.map_err(io_err)?)
+            } else {
+                None
+            });
+        }
+        let mut written = [0u64; 5];
         while let Some(chunk) = inbound.message().await? {
-            let Some(snapshot_chunk::Payload::Data(mut data)) = chunk.payload else {
+            let Some(snapshot_chunk::Payload::Data(data)) = chunk.payload else {
                 return Err(Status::invalid_argument(
                     "SnapshotChunk after the manifest must carry data",
                 ));
             };
-            // Fill the provider image first, then the exact-vector sidecar,
-            // BM25, and the live-row overlay. A chunk may straddle any
-            // boundary.
-            let tv_take = (manifest.vector_bytes - tv_written).min(data.len() as u64) as usize;
-            if tv_take > 0 {
-                tv.write_all(&data[..tv_take])
-                    .await
-                    .map_err(|e| io_err(&tv_tmp, e))?;
-                tv_written += tv_take as u64;
-                data.drain(..tv_take);
-            }
-            let exact_take =
-                (manifest.exact_vector_bytes - exact_written).min(data.len() as u64) as usize;
-            if exact_take > 0 {
-                let Some(sidecar) = exact.as_mut() else {
-                    return Err(Status::invalid_argument(
-                        "snapshot carries exact-vector data absent from its manifest",
-                    ));
-                };
-                sidecar
-                    .write_all(&data[..exact_take])
-                    .await
-                    .map_err(|e| io_err(&exact_tmp, e))?;
-                exact_written += exact_take as u64;
-                data.drain(..exact_take);
-            }
-            let bm25_take = (manifest.bm25_bytes - bm25_written).min(data.len() as u64) as usize;
-            if bm25_take > 0 {
-                let Some(sidecar) = bm25.as_mut() else {
-                    return Err(Status::invalid_argument(
-                        "snapshot carries more data than the manifest declares",
-                    ));
-                };
-                sidecar
-                    .write_all(&data[..bm25_take])
-                    .await
-                    .map_err(|e| io_err(&bm25_tmp, e))?;
-                bm25_written += bm25_take as u64;
-                data.drain(..bm25_take);
-            }
-            if !data.is_empty() {
-                let Some(sidecar) = live.as_mut() else {
-                    return Err(Status::invalid_argument(
-                        "snapshot carries more data than the manifest declares",
-                    ));
-                };
-                if live_written + data.len() as u64 > manifest.live_docs_bytes {
-                    return Err(Status::invalid_argument(
-                        "snapshot carries more data than the manifest declares",
-                    ));
+            let mut remaining = data.as_slice();
+            for (i, file) in files.iter_mut().enumerate() {
+                let take = (lengths[i] - written[i]).min(remaining.len() as u64) as usize;
+                if take > 0 {
+                    file.as_mut()
+                        .expect("positive length opened its file")
+                        .write_all(&remaining[..take])
+                        .await
+                        .map_err(io_err)?;
+                    written[i] += take as u64;
+                    remaining = &remaining[take..];
                 }
-                sidecar
-                    .write_all(&data)
-                    .await
-                    .map_err(|e| io_err(&live_tmp, e))?;
-                live_written += data.len() as u64;
+            }
+            if !remaining.is_empty() {
+                return Err(Status::invalid_argument(
+                    "snapshot carries more data than declared",
+                ));
             }
         }
-        if tv_written != manifest.vector_bytes
-            || exact_written != manifest.exact_vector_bytes
-            || bm25_written != manifest.bm25_bytes
-            || live_written != manifest.live_docs_bytes
-        {
+        if written != lengths {
             return Err(Status::invalid_argument(format!(
-                "truncated snapshot: received {tv_written}+{exact_written}+{bm25_written}+{live_written} of \
-                 declared {}+{}+{}+{} bytes",
-                manifest.vector_bytes,
-                manifest.exact_vector_bytes,
-                manifest.bm25_bytes,
-                manifest.live_docs_bytes
+                "truncated snapshot: received {written:?}, declared {lengths:?}"
             )));
         }
-        tv.sync_all().await.map_err(|e| io_err(&tv_tmp, e))?;
-        if let Some(sidecar) = exact.as_mut() {
-            sidecar
-                .sync_all()
+        for file in files.iter_mut().flatten() {
+            file.sync_all().await.map_err(io_err)?;
+        }
+        if manifest.multi_res_vector_bytes > 0 {
+            let path = crate::multi_res_storage::declaration_path(&paths[4]);
+            let mut file = tokio::fs::File::create(path).await.map_err(io_err)?;
+            file.write_all(&manifest.multi_res_declaration)
                 .await
-                .map_err(|e| io_err(&exact_tmp, e))?;
-        }
-        if let Some(sidecar) = bm25.as_mut() {
-            sidecar.sync_all().await.map_err(|e| io_err(&bm25_tmp, e))?;
-        }
-        if let Some(sidecar) = live.as_mut() {
-            sidecar.sync_all().await.map_err(|e| io_err(&live_tmp, e))?;
+                .map_err(io_err)?;
+            file.sync_all().await.map_err(io_err)?;
         }
         Ok(())
     }
@@ -7720,6 +7723,24 @@ impl NodeServiceImpl {
             ));
         }
 
+        let incoming_rows = loaded
+            .as_ref()
+            .map_or(0, |index| index.len() as u64)
+            .max(incoming_doc_rows);
+        let retained = crate::multi_res_storage::open(
+            &tmp_dir.join(crate::multi_res::FILE_NAME),
+            incoming_rows,
+        )
+        .map_err(|error| Status::invalid_argument(format!("snapshot retained vectors: {error}")))?;
+        crate::multi_res_wal::require_coverage(
+            &retained,
+            0..loaded.as_ref().map_or(0, VectorIndex::len),
+            &incoming_live_docs,
+            &self.config.matryoshka_prefix_dims,
+            self.config.matryoshka_active_dim,
+        )
+        .map_err(Status::failed_precondition)?;
+
         let mut guard = write_shard(&self.state);
         guard.check_legacy_mutation()?;
         // Scoring comparability: a shard with a locked backend configuration
@@ -7778,6 +7799,7 @@ impl NodeServiceImpl {
         // would lie.
         guard.mapped_binding = guard.bm25.as_ref().and_then(|b| b.binding().cloned());
         guard.index = loaded;
+        guard.multi_res_vectors = retained;
         guard.live_docs = incoming_live_docs;
         guard.parents = None;
         guard.generation = Some(snap.clone());
@@ -7983,11 +8005,15 @@ impl NodeServiceImpl {
                     root.join(&directory).join("segment.json"),
                 ));
                 for artifact in [
-                    &metadata.vector,
-                    &metadata.exact_vectors,
-                    &metadata.bm25,
-                    &metadata.live_docs,
-                ] {
+                    Some(&metadata.vector),
+                    Some(&metadata.exact_vectors),
+                    Some(&metadata.bm25),
+                    Some(&metadata.live_docs),
+                    metadata.multi_res.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
                     if !artifact.file.is_empty() {
                         let name = format!("{directory}/{}", artifact.file);
                         sources.push((format!("{CATALOG_DIR}/{name}"), root.join(name)));
@@ -8018,11 +8044,17 @@ impl NodeServiceImpl {
         } else {
             let (vector, exact, bm25) = storage_paths(index_path, guard.generation.as_ref());
             let live = live_docs_storage_path(index_path, guard.generation.as_ref());
+            let retained = crate::multi_res::storage_path(index_path, guard.generation.as_ref());
             for (name, path) in [
                 ("vector.index", vector),
                 ("vectors.f32", exact),
                 ("documents.bm25", bm25),
                 ("live-docs.bin", live),
+                (
+                    "vectors.multi.json",
+                    crate::multi_res_storage::declaration_path(&retained),
+                ),
+                ("vectors.multi", retained),
             ] {
                 if path.is_file() {
                     sources.push((name.to_string(), path));
@@ -8071,7 +8103,13 @@ impl NodeServiceImpl {
             });
         Ok((
             RepositoryManifest {
-                format_version: repo::FORMAT_VERSION,
+                format_version: if artifacts.iter().any(|artifact: &repo::Artifact| {
+                    artifact.file == "vectors.multi" || artifact.file.ends_with("/vectors.multi")
+                }) {
+                    repo::RETAINED_FORMAT_VERSION
+                } else {
+                    repo::FORMAT_VERSION
+                },
                 layout: layout.to_string(),
                 backend_kind,
                 scoring_fingerprint,
@@ -8193,6 +8231,18 @@ impl NodeServiceImpl {
                      installs only on a single-image shard or an empty one (layouts do not mix)",
                     physical_rows(&guard)
                 )));
+            }
+        }
+        for name in ["vectors.multi", "vectors.multi.json"] {
+            if manifest.artifact(name).is_some()
+                != tmp_dir
+                    .join(name)
+                    .try_exists()
+                    .map_err(|error| Status::internal(error.to_string()))?
+            {
+                return Err(Status::invalid_argument(
+                    "retained snapshot files disagree with repository inventory",
+                ));
             }
         }
         let mut response = self.apply_snapshot(
@@ -8372,6 +8422,36 @@ impl NodeServiceImpl {
                 "snapshot live-row overlay exceeds every aligned artifact's row count",
             ));
         }
+        let has_sealed_vectors = (0..staged.len()).any(|i| staged.vector(i).is_some());
+        let retained = if has_sealed_vectors {
+            staged
+                .retained_vectors()
+                .map_err(Status::invalid_argument)?
+        } else {
+            crate::multi_res_storage::open(&tmp_dir.join(crate::multi_res::FILE_NAME), staged_rows)
+                .map_err(|error| {
+                    Status::invalid_argument(format!("snapshot retained vectors: {error}"))
+                })?
+        };
+        let vector_ranges: Vec<_> = if has_sealed_vectors {
+            staged
+                .manifest()
+                .segments
+                .iter()
+                .filter(|meta| !meta.vector.file.is_empty())
+                .map(|meta| meta.base_label as usize..(meta.base_label + meta.rows) as usize)
+                .collect()
+        } else {
+            std::iter::once(0..vector_rows).collect()
+        };
+        crate::multi_res_wal::require_coverage(
+            &retained,
+            vector_ranges.into_iter().flatten(),
+            &incoming_live,
+            &self.config.matryoshka_prefix_dims,
+            self.config.matryoshka_active_dim,
+        )
+        .map_err(Status::failed_precondition)?;
         drop(staged);
         drop(plain_image);
 
@@ -8407,6 +8487,14 @@ impl NodeServiceImpl {
             (vector_tmp, path.clone()),
             (exact_tmp, exact_vector_sidecar_path(&path)),
             (live_tmp, live_docs_sidecar_path(&path)),
+            (
+                tmp_dir.join(crate::multi_res::FILE_NAME),
+                crate::multi_res::sidecar_path(&path),
+            ),
+            (
+                tmp_dir.join("vectors.multi.json"),
+                crate::multi_res_storage::declaration_path(&crate::multi_res::sidecar_path(&path)),
+            ),
         ] {
             if tmp.exists() {
                 std::fs::rename(&tmp, &dst)
@@ -8492,6 +8580,7 @@ impl NodeServiceImpl {
         guard.bm25 = Some(Bm25Shard::Segmented(shard));
         guard.index = index;
         guard.exact_vectors = exact_vectors;
+        guard.multi_res_vectors = retained;
         guard.live_docs = live_docs;
         guard.parents = None;
         guard.generation = None;
@@ -8650,6 +8739,8 @@ impl NodeServiceImpl {
         stable_routing_key: Option<Vec<u8>>,
     ) -> Result<(u64, u64), Status> {
         guard.check_legacy_mutation()?;
+        let materialized =
+            crate::multi_res_wal::decode_batch(&batch).map_err(Status::invalid_argument)?;
         if batch.vectors.is_empty() {
             return Ok((0, 0));
         }
@@ -8692,7 +8783,28 @@ impl NodeServiceImpl {
             )));
         }
         let start_slot = guard.index.as_ref().map_or(0, VectorIndex::len);
-        let (effective_vectors, dim, multi_rows) = if matryoshka_enabled {
+        let (effective_vectors, dim, multi_rows) = if !materialized.is_empty() {
+            if known_dim.is_some_and(|known| known != raw_dim)
+                || self
+                    .config
+                    .matryoshka_active_dim
+                    .is_some_and(|dim| dim as usize != raw_dim)
+            {
+                return Err(Status::invalid_argument(
+                    "materialized active tier differs from shard dimension",
+                ));
+            }
+            let rows = materialized
+                .into_iter()
+                .enumerate()
+                .map(|(i, row)| {
+                    u32::try_from(start_slot + i)
+                        .map(|slot| (slot, row))
+                        .map_err(|_| Status::resource_exhausted("retained vector slot exceeds u32"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            (batch.vectors, raw_dim, rows)
+        } else if matryoshka_enabled {
             let active_target = self
                 .config
                 .matryoshka_active_dim
@@ -8711,10 +8823,38 @@ impl NodeServiceImpl {
                     )));
                 }
             }
-            (vecs, edim, rows)
+            let retained = rows
+                .into_iter()
+                .zip(batch.vectors.chunks_exact(raw_dim))
+                .map(|((slot, output), raw)| {
+                    (
+                        slot,
+                        crate::multi_res::RetainedVector {
+                            output,
+                            raw_full: raw.to_vec(),
+                        },
+                    )
+                })
+                .collect();
+            (vecs, edim, retained)
         } else {
             (batch.vectors, raw_dim, Vec::new())
         };
+        for (_, row) in &multi_rows {
+            crate::multi_res_wal::require_tiers(
+                row,
+                &self.config.matryoshka_prefix_dims,
+                self.config.matryoshka_active_dim,
+            )
+            .map_err(Status::invalid_argument)?;
+        }
+        let logged_multi_rows = multi_rows
+            .iter()
+            .map(|(_, row)| crate::multi_res::encode(row))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                Status::invalid_argument(format!("retain multi-resolution vectors: {error}"))
+            })?;
         // Invalidate before the first mutation, including failures after a
         // provider commit. Neither snapshot copy nor admitted physical reads
         // may keep using the pre-append generation claim.
@@ -8797,12 +8937,8 @@ impl NodeServiceImpl {
                 ))
             })?;
         if !multi_rows.is_empty() {
-            let mut mres = self
-                .multi_res_vectors
-                .write()
-                .expect("multi_res_vectors lock poisoned");
             for (slot, row) in multi_rows {
-                mres.insert(slot, row);
+                guard.multi_res_vectors.insert(slot, row);
             }
         }
         let committed_config = guard
@@ -8830,6 +8966,7 @@ impl NodeServiceImpl {
                 wal_record::Op::AddVectors(LoggedAddVectors {
                     first_id: first_id + i as u64,
                     batch: Some(AddVectorsRequest {
+                        materialized_rows: logged_multi_rows.get(i).cloned().into_iter().collect(),
                         vectors: vector.to_vec(),
                         dim: dim as u32,
                     }),
@@ -11137,13 +11274,28 @@ impl NodeServiceImpl {
                         .config
                         .matryoshka_active_dim
                         .filter(|&ad| (ad as usize) <= raw_dim);
-                    crate::turbo_bridge::MultiResVectorOutput::project_batch(
-                        &v,
-                        raw_dim,
-                        &self.config.matryoshka_prefix_dims,
-                        active_target,
-                        vector_tip as usize,
-                    )?
+                    let (active, dim, rows) =
+                        crate::turbo_bridge::MultiResVectorOutput::project_batch(
+                            &v,
+                            raw_dim,
+                            &self.config.matryoshka_prefix_dims,
+                            active_target,
+                            vector_tip as usize,
+                        )?;
+                    let retained = rows
+                        .into_iter()
+                        .zip(v.chunks_exact(raw_dim))
+                        .map(|((slot, output), raw)| {
+                            (
+                                slot,
+                                crate::multi_res::RetainedVector {
+                                    output,
+                                    raw_full: raw.to_vec(),
+                                },
+                            )
+                        })
+                        .collect();
+                    (active, dim, retained)
                 } else {
                     (v, raw_dim, Vec::new())
                 };
@@ -11183,6 +11335,22 @@ impl NodeServiceImpl {
             }
             None => (None, None, Vec::new()),
         };
+        for (_, row) in &mapped_multi_rows {
+            crate::multi_res_wal::require_tiers(
+                row,
+                &self.config.matryoshka_prefix_dims,
+                self.config.matryoshka_active_dim,
+            )
+            .map_err(Status::invalid_argument)?;
+        }
+        let mapped_multi_log = mapped_multi_rows
+            .iter()
+            .map(|(_, row)| crate::multi_res::encode(row))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                Status::invalid_argument(format!("retain multi-resolution vectors: {error}"))
+            })?;
+
         if guard.bm25.is_none() {
             let builder = self.new_builder(guard.generation.as_ref())?;
             guard.bm25 = Some(builder);
@@ -11869,12 +12037,8 @@ impl NodeServiceImpl {
                     ))
                 })?;
             if !mapped_multi_rows.is_empty() {
-                let mut mr = self
-                    .multi_res_vectors
-                    .write()
-                    .expect("multi-res vector lock poisoned");
                 for (slot, out) in mapped_multi_rows {
-                    mr.insert(slot, out);
+                    guard.multi_res_vectors.insert(slot, out);
                 }
             }
             let index = guard
@@ -11901,6 +12065,7 @@ impl NodeServiceImpl {
                 wal_record::Op::AddVectors(LoggedAddVectors {
                     first_id: global_id,
                     batch: Some(AddVectorsRequest {
+                        materialized_rows: mapped_multi_log,
                         vectors: v,
                         dim: dim as u32,
                     }),
@@ -14005,6 +14170,7 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                 )
             });
         Ok(Response::new(HealthResponse {
+            multi_res_vector_version: 1,
             document_contract_version: crate::document_contract::VERSION,
             collection: self.config.collection.clone(),
             num_vectors,
@@ -19163,6 +19329,7 @@ mod snapshot_publication_tests {
                 service
                     .apply_batch(
                         AddVectorsRequest {
+                            materialized_rows: Vec::new(),
                             dim: 8,
                             vectors: vec![0.25; 8],
                         },

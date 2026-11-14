@@ -117,6 +117,7 @@ async fn ingest(addr: &str) {
         let end = (start + chunk.len() * DIM).min(vectors.len());
         let (tx, rx) = mpsc::channel(2);
         tx.send(AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors: vectors[start..end].to_vec(),
             dim: DIM as u32,
         })

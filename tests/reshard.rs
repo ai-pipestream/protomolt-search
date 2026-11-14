@@ -194,6 +194,7 @@ async fn ingest(
     tokio::spawn(async move {
         for chunk in corpus[..vectors * DIM].chunks(500 * DIM) {
             tx.send(AddVectorsRequest {
+                materialized_rows: Vec::new(),
                 vectors: chunk.to_vec(),
                 dim: 0,
             })
@@ -796,6 +797,7 @@ fn segmented_replay_refuses_a_foreign_batch_that_straddles_buckets() {
             LoggedAddVectors {
                 first_id: first,
                 batch: Some(AddVectorsRequest {
+                    materialized_rows: Vec::new(),
                     vectors: unit_vectors(2, DIM, 0xBAD0_0001),
                     dim: DIM as u32,
                 }),
@@ -900,6 +902,7 @@ async fn one_child_reshard_compacts_generation_tombstones() {
     let catalog = SegmentCatalog::open(dir.join("catalog")).unwrap();
     catalog
         .append(SegmentSource {
+            multi_res_path: None,
             segment_id: "parent",
             generation: 0,
             base_label: 0,
@@ -1212,6 +1215,7 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
     tokio::spawn(async move {
         for chunk in flat.chunks(500 * DIM) {
             tx.send(AddVectorsRequest {
+                materialized_rows: Vec::new(),
                 vectors: chunk.to_vec(),
                 dim: 0,
             })

@@ -114,6 +114,7 @@ async fn mixed_vectors_typed_values_and_lattice_splade_survive_bounded_rebuildin
         }
         catalog
             .append(SegmentSource {
+                multi_res_path: None,
                 segment_id: &format!("input-{segment}"),
                 generation: 1,
                 base_label: base as u64,
@@ -196,6 +197,7 @@ async fn mixed_vectors_typed_values_and_lattice_splade_survive_bounded_rebuildin
                 .iter()
                 .zip(&paths)
                 .map(|(o, p)| SegmentSource {
+                    multi_res_path: None,
                     segment_id: &o.id,
                     generation: before.epoch() + 1,
                     base_label: o.base,

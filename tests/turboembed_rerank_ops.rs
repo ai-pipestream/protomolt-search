@@ -162,6 +162,7 @@ async fn stage2_rerank_and_highlight_reorders_dense_and_composite_and_composes_l
 
         let start = shard * 2 * DIM;
         link.add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors: corpus_vecs[start..start + 2 * DIM].to_vec(),
             dim: DIM as u32,
         }]))

@@ -86,6 +86,7 @@ struct Row {
     document: crate::pb::AddDocumentsRequest,
     fields: Vec<AnalyzedField>,
     vector: Option<Vec<f32>>,
+    materialized: Option<Vec<u8>>,
     bytes: usize,
 }
 
@@ -136,8 +137,21 @@ fn read_batch(
         if let Some(vector) = &vector {
             charge(&mut bytes, vector.len() * std::mem::size_of::<f32>(), limit)?;
         }
-        charge(&mut used, bytes, limit)?;
+        let materialized = before
+            .retained_segment(segment)
+            .retained(row)
+            .map(|retained| {
+                let size = crate::multi_res::encoded_len(retained).map_err(failure)?;
+                charge(&mut bytes, size, limit)?;
+                charge(&mut used, bytes, limit)?;
+                crate::multi_res::encode(retained).map_err(failure)
+            })
+            .transpose()?;
+        if materialized.is_none() {
+            charge(&mut used, bytes, limit)?;
+        }
         rows.push(Some(Row {
+            materialized,
             document,
             fields: vec![AnalyzedField::default(); reader.field_count()],
             vector,
@@ -298,6 +312,7 @@ struct Output {
     base: u64,
     directory: PathBuf,
     vector: bool,
+    retained: bool,
 }
 struct Builder<'a> {
     node: &'a NodeServiceImpl,
@@ -330,8 +345,15 @@ impl Builder<'_> {
             segment_tables(self.before.bm25(0)).columns
         };
         let mut vectors = Vec::new();
+        let mut retained = crate::multi_res::MultiResVectors::default();
         for (id, row) in self.pending.drain(..).enumerate() {
             let id = id as u32;
+            if let Some(materialized) = row.materialized {
+                retained.insert(
+                    id,
+                    crate::multi_res::decode(&materialized).map_err(failure)?,
+                );
+            }
             if row.vector.is_some() != has_vectors {
                 return Err(failure("mixed vector presence in a cut"));
             }
@@ -406,6 +428,11 @@ impl Builder<'_> {
                 .write(&directory.join("vectors.f32"))
                 .map_err(failure)?;
         }
+        if !retained.is_empty() {
+            retained
+                .write(&directory.join(crate::multi_res::FILE_NAME), rows as u64)
+                .map_err(failure)?;
+        }
         LiveDocs::default()
             .write(&directory.join("live-docs.bin"), rows as u64)
             .map_err(failure)?;
@@ -426,6 +453,7 @@ impl Builder<'_> {
             base: self.next_row,
             directory,
             vector: has_vectors,
+            retained: !retained.is_empty(),
         });
         self.next_row = self
             .next_row
@@ -569,6 +597,7 @@ impl NodeServiceImpl {
                     o.directory.join("vectors.f32"),
                     o.directory.join("documents.bm25"),
                     o.directory.join("live-docs.bin"),
+                    o.directory.join(crate::multi_res::FILE_NAME),
                 ]
             })
             .collect();
@@ -581,6 +610,7 @@ impl NodeServiceImpl {
             .iter()
             .zip(&paths)
             .map(|(output, paths)| SegmentSource {
+                multi_res_path: output.retained.then_some(paths[4].as_path()),
                 segment_id: &output.id,
                 generation: next_epoch,
                 base_label: output.base,

@@ -126,6 +126,7 @@ async fn ingest(addr: &str, from: usize, to: usize) {
     let (tx, rx) = mpsc::channel(8);
     tokio::spawn(async move {
         tx.send(AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors: corpus[from * DIM..to * DIM].to_vec(),
             dim: DIM as u32,
         })

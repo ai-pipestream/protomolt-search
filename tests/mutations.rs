@@ -54,6 +54,7 @@ async fn descending_deletes_and_replacement_stay_hidden_after_reopen() {
     .await
     .unwrap();
     node.add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
+        materialized_rows: Vec::new(),
         vectors: corpus.clone(),
         dim: DIM as u32,
     }]))
@@ -218,6 +219,7 @@ async fn delete_and_append_then_replace_are_consistent_across_read_paths() {
     .await
     .unwrap();
     node.add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
+        materialized_rows: Vec::new(),
         vectors: corpus[..4 * DIM].to_vec(),
         dim: DIM as u32,
     }]))
@@ -365,6 +367,7 @@ async fn delete_and_append_then_replace_are_consistent_across_read_paths() {
     assert_eq!(incomplete.code(), tonic::Code::FailedPrecondition);
     assert!(incomplete.message().contains("every active"));
     node.add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
+        materialized_rows: Vec::new(),
         vectors: corpus[4 * DIM..].to_vec(),
         dim: DIM as u32,
     }]))

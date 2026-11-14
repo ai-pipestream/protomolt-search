@@ -244,6 +244,7 @@ async fn ingest_aligned(addr: &str, docs: Vec<AddDocumentsRequest>) {
         let start = block * (SEAL / 2) * DIM;
         let (tx, rx) = mpsc::channel(1);
         tx.send(pipestream_search::pb::AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors: vectors[start..start + chunk.len() * DIM].to_vec(),
             dim: DIM as u32,
         })
@@ -955,6 +956,7 @@ fn an_empty_store_keeps_its_declaration_through_save_and_attach() {
         pipestream_search::segments::SegmentCatalog::open(dir.join("catalog.segments")).unwrap();
     let err = catalog
         .append(pipestream_search::segments::SegmentSource {
+            multi_res_path: None,
             segment_id: "seg-empty",
             generation: 1,
             base_label: 0,

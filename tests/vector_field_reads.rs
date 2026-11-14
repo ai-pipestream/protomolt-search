@@ -81,6 +81,7 @@ async fn node_vector_reads_bind_fields_filter_before_scoring_and_fence_even_empt
         // acquire it even though the provider owns its slot.
         client
             .add_vectors(tokio_stream::iter([AddVectorsRequest {
+                materialized_rows: Vec::new(),
                 dim: 16,
                 vectors: vectors.clone(),
             }]))
