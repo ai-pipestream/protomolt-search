@@ -15,7 +15,7 @@ it holds to is in that section and in
 ## Envelopes
 
 `raft_control.proto` types everything the consensus layer stores or moves:
-`RaftProposal { principal, command }` (control, import, capacity configure or
+`RaftProposal { principal, command }` (control, install, capacity configure or
 observation transition), `RaftReply` (the matching decision, or a
 `RaftRefusal` for an envelope or admission refusal at application),
 `RaftLogId`, `RaftVote`, `RaftMembership` (joint configs and nodes),
@@ -40,7 +40,7 @@ saved, so a crash between commit and apply replays on restart.
 ## State machine
 
 `ControlStateMachine` wraps the authority store and marks it Raft-hosted:
-the direct command paths (`execute`, import steps, capacity commands) refuse
+the direct command paths (`execute`, `install_control`, capacity commands) refuse
 with "propose through the host"; only the committed-replay paths apply. For
 each entry the applied position (`RaftApplied`: last log id and the stored
 membership) is written in the same transaction as the command's effect —
@@ -279,8 +279,8 @@ member, listening), `prepare_member` (the durable state of a member that
 will join, see below) and `start_member` (a prepared member, or any member
 restarting, listening on its recorded address). The host MUST admit proposals
 the way the direct paths did — a `ConfirmReady` needs the managed binding
-(`propose_confirm_ready`), a `Begin` needs the retirement holder
-(`propose_import`) — then write them through `Raft::client_write` and
+(`propose_confirm_ready`); a control install is pure data and needs no
+holder (`propose_install`) — then write them through `Raft::client_write` and
 return the committed reply. (`src/raft/tests.rs`, "the general proposal
 path refuses a readiness confirmation" and "stale and unauthorized
 proposals are recorded outcomes", fail if an unbound proposal applies.)
@@ -782,11 +782,10 @@ in `src/raft/tests.rs`.
 The migration and disaster-recovery exercise of the design's step 5 runs
 against the fleet's own root map on disposable state
 (`tests/control_raft_migration.rs`; [the exercise](raft-migration-exercise.md)):
-the map becomes a legacy control plane, is retired and imported into a
-bootstrapped group whose every voter then publishes it for the relay; the
-group loses its leader with a write in flight, replaces a lost member
-while the leader's image has changed bytes, restarts from cold, serves a
-write on every path, and recovers its retirement record.
+the map is installed into a bootstrapped group whose every voter then
+publishes it for the relay; the group loses its leader with a write in
+flight, replaces a lost member while the leader's image has changed bytes,
+restarts from cold and serves a write on every path.
 
 Single node (`src/raft/tests.rs`):
 

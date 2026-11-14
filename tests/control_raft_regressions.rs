@@ -3,7 +3,7 @@
 //! surface after the R1 repair.
 //!
 //! Independent reproductions of Astra's checkpoint review findings R1, R2
-//! and R4 (host level), plus the ACTIVE and Recover happy paths through the
+//! and R4 (host level), plus the ACTIVE happy path through the
 //! Raft host. Each test pins the REQUIRED behavior quoted in the review. The
 //! original runtime reproductions of R1 reached `RaftHost::propose`,
 //! `RaftHost::raft` and the store's replay paths; those are private since
@@ -32,7 +32,7 @@ use pipestream_search::authorization::{AccessPermit, Authorizer, PolicyAuthority
 use pipestream_search::document_catalog::AccessControlledCatalog;
 use pipestream_search::pb::storage::{CapacityTransitionOutcome, SourceOwnerCompletion};
 use pipestream_search::pb::storage::{
-    ConfirmSourceOwnerReady, ControlImportPhase, PreparedSourceOwnerPhase, SourceResourceBinding,
+    ConfirmSourceOwnerReady, PreparedSourceOwnerPhase, SourceResourceBinding,
 };
 use pipestream_search::pb::{
     accept_document_request::Mutation, AcceptDocumentRequest, AccessAction, ProtobufSource,
@@ -130,103 +130,42 @@ fn confirm_command(
 }
 
 /// R1 (review): "propose is public and calls only validate_proposal ...
-/// accepts raw Begin and ConfirmReady envelopes without the
-/// retirement/binding checks." REQUIRED: every public proposal entry point
-/// refuses a Begin without the retired holder and a ConfirmReady without
-/// the binding. The raw entry points (`propose`, `raft().client_write`)
-/// are private since 1f4ea13 — the `compile_fail` doctests on
-/// `pipestream_search::raft` pin that — and the supported entry points
-/// admit before they submit: this test pins those refusals and the absence
-/// of any staged workflow or READY owner afterwards.
+/// accepts raw ... ConfirmReady envelopes without the binding checks."
+/// REQUIRED: every public proposal entry point refuses a ConfirmReady
+/// without the binding. The raw entry points (`propose`,
+/// `raft().client_write`) are private since 1f4ea13 — the `compile_fail`
+/// doctests on `pipestream_search::raft` pin that — and the supported entry
+/// points admit before they submit: this test pins that refusal and the
+/// absence of any READY owner afterwards.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn r1_holder_free_begin_and_binding_free_confirm_refuse_at_proposal() {
+async fn r1_binding_free_confirm_refuses_at_proposal() {
     let _serial = serial();
-    let dir = kit::TestDir::new("r1-raw-begin");
+    let dir = kit::TestDir::new("r1-raw-confirm");
     let guard = HostGuard::new(raft_kit::bootstrap_host(&dir).await);
     let store = guard.store().unwrap();
     let authority = kit::identity(kit::SEED);
-    let legacy = kit::legacy_plane(&dir, 2);
-    let (retired, _request) = kit::retire(&store, &legacy, 1);
-    let payload = kit::import_payload(&retired);
-    let (chunk_bytes, chunk_count) = kit::plan_three_chunks(payload.len());
-    let begin = |id: &str, workflow: &[u8]| {
-        kit::import_command(
-            &authority,
-            id,
-            1,
-            workflow,
-            kit::begin_action(&retired, &payload, chunk_bytes, chunk_count),
-        )
-    };
-
-    // Positive control: the admitted path with the holder works.
-    let admitted = guard
-        .propose_import("alice", &begin("begin-held", kit::WORKFLOW), Some(&retired))
-        .await
-        .unwrap();
-    assert_eq!(admitted.code, 0, "{}", admitted.message);
-    let recover = kit::import_command(
-        &authority,
-        "recover-held",
-        2,
-        kit::WORKFLOW,
-        kit::recover_action(),
-    );
-    let recovered = guard.propose_import("bob", &recover, None).await.unwrap();
-    assert_eq!(recovered.code, 0, "{}", recovered.message);
 
     let mut findings: Vec<String> = Vec::new();
-    // The only public import entry: a Begin without the holder is refused
-    // at proposal, before anything reaches the log.
-    let position_before = raft_kit::durable_position(&guard);
-    let entries_before = guard.log_entries().unwrap().len();
-    let raw = begin("begin-raw", b"import-raw-a");
-    match guard.propose_import("alice", &raw, None).await {
-        Ok(decision) => findings.push(format!(
-            "propose_import applied a holder-free Begin (code {})",
-            decision.code
-        )),
-        Err(error) => {
-            if !matches!(
-                error.code(),
-                Code::PermissionDenied | Code::FailedPrecondition
-            ) {
-                findings.push(format!(
-                    "holder-free Begin refused with an unnamed code: {error}"
-                ));
-            }
-        }
-    }
-    if store
-        .control_import_workflow("alice", &kit::key(), b"import-raw-a")
-        .is_ok()
-    {
-        findings.push("workflow import-raw-a was staged without a holder".to_string());
-    }
-    if raft_kit::durable_position(&guard) != position_before
-        || guard.log_entries().unwrap().len() != entries_before
-    {
-        findings.push("a refused holder-free Begin consumed a log entry".to_string());
-    }
-
     // ConfirmReady through the general path is refused at proposal; the
     // owner stays PREPARED with no binding ever presented.
     let prepare = kit::source_command(
         &authority,
         &kit::owner_key(),
         "prepare-owner",
-        3,
+        1,
         1,
         0,
         kit::prepare_action(OWNER_WORKFLOW),
     );
     let decision = guard.propose_command("alice", &prepare).await.unwrap();
     assert_eq!(decision.code, 0, "{}", decision.message);
+    let position_before = raft_kit::durable_position(&guard);
+    let entries_before = guard.log_entries().unwrap().len();
     let confirm = kit::source_command(
         &authority,
         &kit::owner_key(),
         "confirm-raw",
-        4,
+        2,
         1,
         1,
         kit::confirm_ready_action(OWNER_WORKFLOW),
@@ -244,6 +183,11 @@ async fn r1_holder_free_begin_and_binding_free_confirm_refuse_at_proposal() {
             }
         }
     }
+    if raft_kit::durable_position(&guard) != position_before
+        || guard.log_entries().unwrap().len() != entries_before
+    {
+        findings.push("a refused binding-free ConfirmReady consumed a log entry".to_string());
+    }
     let owner = store.owner("alice", &kit::owner_key()).unwrap();
     if owner.phase != PreparedSourceOwnerPhase::Prepared as i32 {
         findings.push(format!(
@@ -253,8 +197,8 @@ async fn r1_holder_free_begin_and_binding_free_confirm_refuse_at_proposal() {
     }
     assert!(
         findings.is_empty(),
-        "R1 REQUIRED refusal of holder-free Begin and binding-free ConfirmReady \
-         through every public proposal entry point; observed:\n  - {}",
+        "R1 REQUIRED refusal of a binding-free ConfirmReady through every \
+         public proposal entry point; observed:\n  - {}",
         findings.join("\n  - ")
     );
     drop(store);
@@ -308,36 +252,10 @@ async fn r1_hosted_read_handle_refuses_every_direct_mutation() {
         &mut findings,
     );
 
-    // Retirement is a legacy-plane act; the Begin it enables is the hosted
-    // refusal under test.
-    let legacy = kit::legacy_plane(&dir, 2);
-    let (retired, _request) = kit::retire(&store, &legacy, 1);
-    let payload = kit::import_payload(&retired);
-    let (chunk_bytes, chunk_count) = kit::plan_three_chunks(payload.len());
-    let begin = kit::import_command(
-        &authority,
-        "direct-begin",
-        1,
-        kit::WORKFLOW,
-        kit::begin_action(&retired, &payload, chunk_bytes, chunk_count),
-    );
+    let install = kit::install_command(&authority, "direct-install", 1, kit::install_state(2));
     hosted(
-        "begin_control_import",
-        store
-            .begin_control_import("alice", &begin, &retired)
-            .map(|_| ()),
-        &mut findings,
-    );
-    let chunk = kit::import_command(
-        &authority,
-        "direct-chunk",
-        2,
-        kit::WORKFLOW,
-        kit::chunk_action(&payload, chunk_bytes, 0),
-    );
-    hosted(
-        "execute_control_import",
-        store.execute_control_import("alice", &chunk).map(|_| ()),
+        "install_control",
+        store.install_control("alice", &install).map(|_| ()),
         &mut findings,
     );
     let configure = kit::configure_command(
@@ -370,11 +288,8 @@ async fn r1_hosted_read_handle_refuses_every_direct_mutation() {
     if store.owner("alice", &kit::owner_key()).is_ok() {
         findings.push("the read handle shows a PREPARED owner written with no log entry".into());
     }
-    if store
-        .control_import_workflow("alice", &kit::key(), kit::WORKFLOW)
-        .is_ok()
-    {
-        findings.push("the read handle shows a staged workflow written with no log entry".into());
+    if store.control_snapshot("alice", &kit::key()).is_ok() {
+        findings.push("the read handle shows control state written with no log entry".into());
     }
     if store.capacity_state("alice", &kit::key()).is_ok() {
         findings.push("the read handle shows capacity state written with no log entry".into());
@@ -394,9 +309,8 @@ async fn r1_hosted_read_handle_refuses_every_direct_mutation() {
 }
 
 /// R1 positive coverage: the trusted host entry points keep working — the
-/// same command families the closed raw paths accepted holder-free succeed
-/// with their holders here, so the R1 refusals cannot be read as "raft is
-/// off".
+/// same command families the hosted read handle refuses succeed through the
+/// log here, so the R1 refusals cannot be read as "raft is off".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r1_positive_replay_through_trusted_host() {
     let _serial = serial();
@@ -417,30 +331,10 @@ async fn r1_positive_replay_through_trusted_host() {
         0
     );
 
-    // The prepare consumed control revision 1 and retirement consumes none,
-    // so the store sits at revision 2 and both the retirement request and
-    // the Begin must expect that.
-    let store = guard.store().unwrap();
-    let legacy = kit::legacy_plane(&dir, 2);
-    let (retired, _request) = kit::retire(&store, &legacy, 2);
-    let payload = kit::import_payload(&retired);
-    let (chunk_bytes, chunk_count) = kit::plan_three_chunks(payload.len());
-    let begin = kit::import_command(
-        &authority,
-        "begin",
-        2,
-        kit::WORKFLOW,
-        kit::begin_action(&retired, &payload, chunk_bytes, chunk_count),
-    );
-    assert_eq!(
-        guard
-            .propose_import("alice", &begin, Some(&retired))
-            .await
-            .unwrap()
-            .code,
-        0
-    );
-    let _ = chunk_count;
+    // The prepare consumed control revision 1, so the install expects 2.
+    let install = kit::install_command(&authority, "install", 2, kit::install_state(2));
+    let decision = guard.propose_install("alice", &install).await.unwrap();
+    assert_eq!(decision.code, 0, "{}", decision.message);
     guard.shutdown().await;
 }
 
@@ -542,79 +436,44 @@ async fn r2_exact_retry_advances_durable_applied_position() {
     guard.shutdown().await;
 }
 
-/// R2, import family: an exact Chunk retry and a changed-content Chunk
-/// retry both consume committed entries; the durable position must include
-/// them.
+/// R2, install family: an exact install retry and a changed-content
+/// install retry both consume committed entries; the durable position must
+/// include them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn r2_import_chunk_retry_advances_durable_applied_position() {
+async fn r2_install_retry_advances_durable_applied_position() {
     let _serial = serial();
-    let dir = kit::TestDir::new("r2-import-retry");
+    let dir = kit::TestDir::new("r2-install-retry");
     let guard = HostGuard::new(raft_kit::bootstrap_host(&dir).await);
     let authority = kit::identity(kit::SEED);
-    let store = guard.store().unwrap();
-    let legacy = kit::legacy_plane(&dir, 2);
-    let (retired, _request) = kit::retire(&store, &legacy, 1);
-    let payload = kit::import_payload(&retired);
-    let (chunk_bytes, chunk_count) = kit::plan_three_chunks(payload.len());
-    let begin = kit::import_command(
-        &authority,
-        "begin",
-        1,
-        kit::WORKFLOW,
-        kit::begin_action(&retired, &payload, chunk_bytes, chunk_count),
-    );
-    assert_eq!(
-        guard
-            .propose_import("alice", &begin, Some(&retired))
-            .await
-            .unwrap()
-            .code,
-        0
-    );
-    let chunk = |id: &str, ecr: u64, ordinal: u32| {
-        kit::import_command(
-            &authority,
-            id,
-            ecr,
-            kit::WORKFLOW,
-            kit::chunk_action(&payload, chunk_bytes, ordinal),
-        )
-    };
-    let staged = guard
-        .propose_import("alice", &chunk("chunk-0", 2, 0), None)
-        .await
-        .unwrap();
-    assert_eq!(staged.code, 0, "{}", staged.message);
-    raft_kit::wait_applied(&guard, 3).await;
+    let install =
+        |routes: usize| kit::install_command(&authority, "install", 1, kit::install_state(routes));
+    let installed = guard.propose_install("alice", &install(2)).await.unwrap();
+    assert_eq!(installed.code, 0, "{}", installed.message);
+    raft_kit::wait_applied(&guard, 2).await;
 
     // Changed-content retry of the same id: the idempotency refusal. The
     // entry is still consumed.
     let conflict = guard
-        .propose_import("alice", &chunk("chunk-0", 2, 1), None)
+        .propose_install("alice", &install(4))
         .await
         .expect_err("a changed-content retry must refuse");
     assert_eq!(conflict.code(), Code::FailedPrecondition);
-    raft_kit::wait_applied(&guard, 4).await;
+    raft_kit::wait_applied(&guard, 3).await;
 
     // The exact retry comes LAST: stored decision verbatim, a new consumed
-    // index. R2 REQUIRED the durable position to be 5.
-    let retried = guard
-        .propose_import("alice", &chunk("chunk-0", 2, 0), None)
-        .await
-        .unwrap();
-    assert_eq!(staged, retried, "the exact retry changed the decision");
-    raft_kit::wait_applied(&guard, 5).await;
+    // index. R2 REQUIRED the durable position to be 4.
+    let retried = guard.propose_install("alice", &install(2)).await.unwrap();
+    assert_eq!(installed, retried, "the exact retry changed the decision");
+    raft_kit::wait_applied(&guard, 4).await;
     assert_eq!(
         raft_kit::durable_position(&guard),
-        5,
-        "R2 REQUIRED the durable applied position to include the exact chunk \
-         retry at index 5 — the retry path skipped write_pending_applied"
+        4,
+        "R2 REQUIRED the durable applied position to include the exact install \
+         retry at index 4 — the retry path skipped write_pending_applied"
     );
     let (_image, meta) = raft_kit::snapshot_image(&dir, &guard).await;
-    assert_eq!(meta.last_log_id.unwrap().index, 5);
-    drop(store);
+    assert_eq!(meta.last_log_id.unwrap().index, 4);
     guard.shutdown().await;
-    let _ = chunk_count;
 }
 
 /// R2, capacity family: an exact configure retry, a changed-content
@@ -628,70 +487,19 @@ async fn r2_capacity_retries_and_observation_transition() {
     let guard = HostGuard::new(raft_kit::bootstrap_host(&dir).await);
     let authority = kit::identity(kit::SEED);
     let store = guard.store().unwrap();
-    // `legacy_plane_with_cluster` drives cluster routes through its own
-    // short-lived runtime, which panics inside an async runtime — build it
-    // on a plain thread.
-    let legacy = std::thread::scope(|scope| {
-        scope
-            .spawn(|| kit::legacy_plane_with_cluster(&dir))
-            .join()
-            .unwrap()
-    });
-    let (retired, _request) = kit::retire(&store, &legacy, 1);
-    let payload = kit::import_payload_placement(&retired);
-    let (chunk_bytes, chunk_count) = kit::plan_three_chunks(payload.len());
-    let begin = kit::import_command(
-        &authority,
-        "begin",
-        1,
-        kit::WORKFLOW,
-        kit::begin_action(&retired, &payload, chunk_bytes, chunk_count),
-    );
-    assert_eq!(
-        guard
-            .propose_import("alice", &begin, Some(&retired))
-            .await
-            .unwrap()
-            .code,
-        0
-    );
-    for ordinal in 0..chunk_count {
-        let chunk = kit::import_command(
-            &authority,
-            &format!("chunk-{ordinal}"),
-            2 + ordinal as u64,
-            kit::WORKFLOW,
-            kit::chunk_action(&payload, chunk_bytes, ordinal),
-        );
-        assert_eq!(
-            guard
-                .propose_import("alice", &chunk, None)
-                .await
-                .unwrap()
-                .code,
-            0
-        );
-    }
-    let commit = kit::import_command(
-        &authority,
-        "commit",
-        2 + chunk_count as u64,
-        kit::WORKFLOW,
-        kit::commit_action(),
-    );
-    assert_eq!(
-        guard
-            .propose_import("alice", &commit, None)
-            .await
-            .unwrap()
-            .code,
-        0
-    );
+    let installed = guard
+        .propose_install(
+            "alice",
+            &kit::install_command(&authority, "install", 1, kit::cluster_state()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(installed.code, 0, "{}", installed.message);
 
     let configure = kit::configure_command(
         &authority,
         "cfg",
-        6,
+        2,
         1,
         kit::capacity_configuration(1_000_000_000_000),
     );
@@ -700,7 +508,7 @@ async fn r2_capacity_retries_and_observation_transition() {
         .await
         .unwrap();
     assert_eq!(first.code, 0, "{}", first.message);
-    raft_kit::wait_applied(&guard, 7).await;
+    raft_kit::wait_applied(&guard, 3).await;
 
     // Changed-content retry of the same configure id: the idempotency
     // refusal, still a consumed entry.
@@ -710,7 +518,7 @@ async fn r2_capacity_retries_and_observation_transition() {
             &kit::configure_command(
                 &authority,
                 "cfg",
-                6,
+                2,
                 1,
                 kit::capacity_configuration(100_000_000_000),
             ),
@@ -718,7 +526,7 @@ async fn r2_capacity_retries_and_observation_transition() {
         .await
         .expect_err("a changed-content configure retry must refuse");
     assert_eq!(conflict.code(), Code::FailedPrecondition);
-    raft_kit::wait_applied(&guard, 8).await;
+    raft_kit::wait_applied(&guard, 4).await;
 
     for (node, incarnation) in [(kit::NODE_A, kit::INC_A), (kit::NODE_B, kit::INC_B)] {
         guard
@@ -747,15 +555,15 @@ async fn r2_capacity_retries_and_observation_transition() {
         .unwrap();
     assert_eq!(again.outcome, CapacityTransitionOutcome::Unchanged as i32);
     assert_eq!(again.observation_epoch, 1);
-    raft_kit::wait_applied(&guard, 12).await;
+    raft_kit::wait_applied(&guard, 8).await;
     assert_eq!(
         raft_kit::durable_position(&guard),
-        12,
+        8,
         "the unchanged observation transition must advance the durable position"
     );
 
     // The exact configure retry comes LAST: stored decision verbatim, a new
-    // consumed index. R2 REQUIRED the durable position to be 13.
+    // consumed index. R2 REQUIRED the durable position to be 9.
     let retried = guard
         .propose_capacity_configure("alice", &configure)
         .await
@@ -764,16 +572,16 @@ async fn r2_capacity_retries_and_observation_transition() {
         first, retried,
         "the exact configure retry changed the decision"
     );
-    raft_kit::wait_applied(&guard, 13).await;
+    raft_kit::wait_applied(&guard, 9).await;
     assert_eq!(
         raft_kit::durable_position(&guard),
-        13,
+        9,
         "R2 REQUIRED the durable applied position to include the configure \
-         retry at index 13 (after the refusal, both observation transitions \
+         retry at index 9 (after the refusal, both observation transitions \
          and the unchanged report) — the retry path skipped write_pending_applied"
     );
     let (_image, meta) = raft_kit::snapshot_image(&dir, &guard).await;
-    assert_eq!(meta.last_log_id.unwrap().index, 13);
+    assert_eq!(meta.last_log_id.unwrap().index, 9);
     drop(store);
     guard.shutdown().await;
 }
@@ -1096,87 +904,6 @@ async fn active_fence_through_the_host() {
         })
         .await
         .expect("the fence survives a restart");
-    drop(store);
-    guard.shutdown().await;
-}
-
-/// Recover happy path through the host: bob Recovers alice's staged import;
-/// the row keeps alice as initiator while the terminal step names bob; a
-/// later Commit is a recorded refusal. Positive coverage.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn recover_through_the_host() {
-    let _serial = serial();
-    let dir = kit::TestDir::new("recover-through-host");
-    let guard = HostGuard::new(raft_kit::bootstrap_host(&dir).await);
-    let authority = kit::identity(kit::SEED);
-    let store = guard.store().unwrap();
-    let legacy = kit::legacy_plane(&dir, 2);
-    let (retired, _request) = kit::retire(&store, &legacy, 1);
-    let payload = kit::import_payload(&retired);
-    let (chunk_bytes, chunk_count) = kit::plan_three_chunks(payload.len());
-    let begin = kit::import_command(
-        &authority,
-        "begin",
-        1,
-        kit::WORKFLOW,
-        kit::begin_action(&retired, &payload, chunk_bytes, chunk_count),
-    );
-    assert_eq!(
-        guard
-            .propose_import("alice", &begin, Some(&retired))
-            .await
-            .unwrap()
-            .code,
-        0
-    );
-    for ordinal in 0..2 {
-        let chunk = kit::import_command(
-            &authority,
-            &format!("chunk-{ordinal}"),
-            2 + ordinal as u64,
-            kit::WORKFLOW,
-            kit::chunk_action(&payload, chunk_bytes, ordinal),
-        );
-        assert_eq!(
-            guard
-                .propose_import("alice", &chunk, None)
-                .await
-                .unwrap()
-                .code,
-            0
-        );
-    }
-    let recover = kit::import_command(
-        &authority,
-        "recover-1",
-        4,
-        kit::WORKFLOW,
-        kit::recover_action(),
-    );
-    let recovered = guard.propose_import("bob", &recover, None).await.unwrap();
-    assert_eq!(recovered.code, 0, "{}", recovered.message);
-
-    let store = guard.store().unwrap();
-    let view = store
-        .control_import_workflow("alice", &kit::key(), kit::WORKFLOW)
-        .unwrap();
-    assert_eq!(view.phase, ControlImportPhase::Recovered as i32);
-    assert_eq!(view.principal, "alice", "the row keeps the initiator");
-    assert_eq!(
-        view.terminal.unwrap().principal,
-        "bob",
-        "the terminal step names the recovering Admin"
-    );
-
-    let commit = kit::import_command(&authority, "commit", 5, kit::WORKFLOW, kit::commit_action());
-    let refused = guard.propose_import("alice", &commit, None).await.unwrap();
-    assert_eq!(
-        refused.code,
-        Code::FailedPrecondition as u32,
-        "a Commit after Recover must be a recorded refusal: {}",
-        refused.message
-    );
-    let _ = chunk_count;
     drop(store);
     guard.shutdown().await;
 }

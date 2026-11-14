@@ -3,26 +3,20 @@
 //!
 //! Everything the planner sees here comes from the real persisted adapter:
 //! `SourceAuthorityStore::planner_input`, fed by `configure_capacity` and
-//! `capacity_transition` (Register/Report/Expire) on top of a legacy control
-//! plane that registered its nodes and shard replicas through the public
-//! `ClusterControl` routes before retirement. The plan digest is pinned
-//! across chunk staging order, store reopen, observation identity refusals,
-//! idempotent transitions, expiry, supersession, and SIGKILL recovery at a
-//! chunk boundary.
+//! `capacity_transition` (Register/Report/Expire) on top of installed
+//! collection control state holding two nodes and their shard replicas. The
+//! plan digest is pinned across store reopen, observation identity
+//! refusals, idempotent transitions, expiry and supersession.
 
 mod control_adversarial;
 
-use std::time::Duration;
-
 use control_adversarial::kit;
 use pipestream_search::capacity_tiers::{plan_tiers, TierSnapshot};
-use pipestream_search::pb::storage::{CapacityTransitionOutcome, LegacyControlRetirementRequest};
+use pipestream_search::pb::storage::CapacityTransitionOutcome;
 use pipestream_search::pb::AccessAction;
 use pipestream_search::sha256;
-use prost::Message;
 use tonic::Code;
 
-const MARKER_TIMEOUT: Duration = Duration::from_secs(60);
 const T: u64 = kit::PLANNING_INSTANT_UNIX_MS;
 const COHORT: u64 = kit::CAPACITY_COHORT_MS;
 
@@ -34,7 +28,7 @@ const COHORT: u64 = kit::CAPACITY_COHORT_MS;
 fn adapter_input_and_plan_digest_stable_across_reopen() {
     let fixture = kit::adapter_fixture("adapter-reopen");
     let before = kit::planner_view(&fixture.store, T);
-    assert!(before.0.contains("control_revision: 7"), "{}", before.0);
+    assert!(before.0.contains("control_revision: 3"), "{}", before.0);
     assert!(before.0.contains("policy_revision: 1"), "{}", before.0);
     assert!(before.0.contains("observation_epoch: 2"), "{}", before.0);
     assert!(
@@ -70,26 +64,6 @@ fn adapter_input_and_plan_digest_stable_across_reopen() {
     );
 }
 
-/// Forward and reverse chunk staging produce byte-identical adapter inputs
-/// and plan digests: the protocol keys chunks by ordinal, and every
-/// authority-derived field — nodes, replicas, placement codes — comes from
-/// the committed import, not from the staging order.
-#[test]
-fn adapter_plan_digest_stable_across_chunk_permutation() {
-    let forward = kit::adapter_fixture_staged("adapter-perm-fwd", false);
-    let reverse = kit::adapter_fixture_staged("adapter-perm-rev", true);
-    let forward_view = kit::planner_view(&forward.store, T);
-    let reverse_view = kit::planner_view(&reverse.store, T);
-    assert_eq!(
-        forward_view, reverse_view,
-        "reverse chunk staging changed the adapter's plan view"
-    );
-    eprintln!(
-        "adapter chunk permutation: plan digest {} stable",
-        sha256::to_hex(&forward_view.1)
-    );
-}
-
 /// Transitions are idempotent by content and scoped to the observation
 /// epoch: an exact report retry is UNCHANGED, a re-registration repeats the
 /// same receipt, a repeat expiry drops nothing, and no transition ever moves
@@ -104,7 +78,7 @@ fn adapter_transitions_are_idempotent_and_epoch_scoped() {
     let input = store
         .planner_input("alice", &kit::key(), &kit::planning_context(T, generation))
         .unwrap();
-    assert_eq!(input.control_revision, 7);
+    assert_eq!(input.control_revision, 3);
 
     // Exact retry of the scanned report: UNCHANGED, epoch still 2.
     let again = store
@@ -118,7 +92,7 @@ fn adapter_transitions_are_idempotent_and_epoch_scoped() {
         .unwrap();
     assert_eq!(again.outcome, CapacityTransitionOutcome::Unchanged as i32);
     assert_eq!(again.observation_epoch, 2);
-    assert_eq!(again.control_revision, 7);
+    assert_eq!(again.control_revision, 3);
 
     // Re-registration of the same incarnation repeats the same receipt.
     let first = store
@@ -146,11 +120,11 @@ fn adapter_transitions_are_idempotent_and_epoch_scoped() {
     assert_eq!(repeat.dropped, 0);
     assert_eq!(repeat.observation_epoch, 2);
 
-    // The control revision is still 7: transitions never move it.
+    // The control revision is still 3: transitions never move it.
     let input = store
         .planner_input("alice", &kit::key(), &kit::planning_context(T, generation))
         .unwrap();
-    assert_eq!(input.control_revision, 7);
+    assert_eq!(input.control_revision, 3);
     assert_eq!(input.policy_revision, 1);
 
     // A report whose leaf the committed shard does not cover refuses with
@@ -200,7 +174,7 @@ fn adapter_plan_digest_moves_with_policy_and_tier_changes() {
                 authority,
                 &kit::key(),
                 "grants",
-                7,
+                3,
                 1,
                 0,
                 kit::replace_grants_action(vec![alice, kit::grant("bob", kit::COLLECTION)]),
@@ -227,7 +201,7 @@ fn adapter_plan_digest_moves_with_policy_and_tier_changes() {
             &kit::configure_command(
                 authority,
                 "cfg-2",
-                8,
+                4,
                 2,
                 kit::capacity_configuration(100_000_000_000),
             ),
@@ -252,7 +226,7 @@ fn adapter_plan_digest_moves_with_policy_and_tier_changes() {
     let refused = store
         .configure_capacity(
             "alice",
-            &kit::configure_command(authority, "cfg-3", 9, 2, shifted),
+            &kit::configure_command(authority, "cfg-3", 5, 2, shifted),
         )
         .unwrap();
     assert_eq!(
@@ -470,103 +444,4 @@ fn adapter_refuses_reports_outside_the_committed_resource() {
     eprintln!(
         "adapter resource binding: foreign resource and generation refused, corrected twin landed"
     );
-}
-
-/// Kill the capacity worker with SIGKILL right after its first staged chunk
-/// (marker 2), recover the import through the public API, run the capacity
-/// steps deterministically, and pin the adapter's plan view to the no-crash
-/// baseline. The baseline and the recovered store are different directories
-/// registered at different wall-clock times; the comparison is the plan
-/// view, because node eligibility is judged at the fixed planning instant,
-/// not against the wall clock.
-#[test]
-fn plan_digest_stable_across_sigkill_recovery() {
-    let baseline = kit::adapter_fixture("adapter-sigkill-baseline");
-    let baseline_view = kit::planner_view(&baseline.store, T);
-    eprintln!(
-        "adapter sigkill baseline: plan digest {}",
-        sha256::to_hex(&baseline_view.1)
-    );
-
-    let dir = kit::TestDir::new("adapter-sigkill-k2");
-    let mut worker = kit::KillOnDrop(kit::spawn_worker(
-        "sigkill_capacity_worker",
-        &[
-            (kit::WORKER_ENV, "1"),
-            (kit::WORKER_DIR_ENV, dir.path().to_str().unwrap()),
-            (kit::WORKER_ARM_ENV, "2"),
-        ],
-    ));
-    kit::wait_marker(&dir, 2, MARKER_TIMEOUT);
-    kit::kill9(worker.child());
-
-    // Recovery through the public API only: the durable retirement request
-    // was written before the kill, and the recovered holder re-admits it.
-    let authority = kit::identity(kit::SEED);
-    let store = kit::open_store(&dir, &authority);
-    let request =
-        LegacyControlRetirementRequest::decode(std::fs::read(dir.request()).unwrap().as_slice())
-            .unwrap();
-    let retired = store
-        .recover_legacy_retirement("alice", &request, &dir.legacy())
-        .unwrap();
-    let payload = kit::import_payload_placement(&retired);
-    kit::run_import_staged(&store, &authority, &retired, &payload, false);
-    let generation = kit::committed_generation(&store);
-
-    let decision = store
-        .configure_capacity(
-            "alice",
-            &kit::configure_command(
-                &authority,
-                "cfg",
-                6,
-                1,
-                kit::capacity_configuration(1_000_000_000_000),
-            ),
-        )
-        .unwrap();
-    assert_eq!(decision.code, 0, "{}", decision.message);
-    for (node, incarnation) in [(kit::NODE_A, kit::INC_A), (kit::NODE_B, kit::INC_B)] {
-        store
-            .capacity_transition(
-                "alice",
-                &kit::register_transition(&authority, node, incarnation),
-            )
-            .unwrap();
-    }
-    store
-        .capacity_transition(
-            "alice",
-            &kit::report_transition(
-                &authority,
-                kit::scanned_observation(kit::NODE_A, kit::INC_A, generation),
-            ),
-        )
-        .unwrap();
-    store
-        .capacity_transition(
-            "alice",
-            &kit::report_transition(
-                &authority,
-                kit::silent_observation(kit::NODE_B, kit::INC_B, generation),
-            ),
-        )
-        .unwrap();
-
-    let recovered = kit::planner_view(&store, T);
-    assert_eq!(
-        baseline_view, recovered,
-        "crash recovery changed the adapter's plan view"
-    );
-    eprintln!("adapter sigkill k=2: recovered, plan digest matches baseline");
-}
-
-/// Worker for `plan_digest_stable_across_sigkill_recovery`; the body lives
-/// in `kit::sigkill_capacity_worker_body` (same marker schedule as the
-/// slice-1 import worker, plus the cluster registration and the placement
-/// supplement). Early-returns unless `PSEARCH_ADV_WORKER` is set.
-#[test]
-fn sigkill_capacity_worker() {
-    kit::sigkill_capacity_worker_body();
 }

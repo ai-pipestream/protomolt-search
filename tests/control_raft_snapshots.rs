@@ -884,8 +884,9 @@ async fn r5_announced_length_is_enforced_while_receiving() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn r5_install_hashing_is_bounded() {
     let _serial = serial();
-    // A leader whose image is several MiB: staged import chunks are retained
-    // in the store. Custom limits admit 1 MiB commands.
+    // A leader whose image is several MiB: each install keeps its command
+    // and its topology rows, near 1 MiB apiece, on its own collection.
+    // Custom limits admit 1 MiB commands.
     let group = kit::identity(kit::SEED);
     let limits = pipestream_search::pb::storage::SourceAuthorityLimits {
         max_owners: 16,
@@ -893,38 +894,31 @@ async fn r5_install_hashing_is_bounded() {
         max_payload_bytes: 256 << 20,
         max_command_bytes: 1 << 20,
     };
-    let mut cluster = Cluster::bootstrap("r5-bounded", &group, &kit::policy(), &limits).await;
-    let store = cluster.leader().store().unwrap();
-    let legacy = kit::legacy_plane(&cluster.leader_dir, 2);
-    let (retired, _request) = kit::retire(&store, &legacy, 1);
-    drop(store);
-    let payload: Vec<u8> = (0..12usize << 20).map(|i| (i % 251) as u8).collect();
-    let chunk_bytes: u32 = 512 << 10;
-    let chunk_count = (payload.len() as u32).div_ceil(chunk_bytes);
-    let begin = kit::import_command(
-        &group,
-        "begin",
-        1,
-        kit::WORKFLOW,
-        kit::begin_action(&retired, &payload, chunk_bytes, chunk_count),
-    );
-    let decision = cluster
-        .leader()
-        .propose_import("alice", &begin, Some(&retired))
-        .await
-        .unwrap();
-    assert_eq!(decision.code, 0, "{}", decision.message);
-    for ordinal in 0..chunk_count {
-        let chunk = kit::import_command(
+    const COLLECTIONS: usize = 10;
+    let collection = |index: usize| format!("{}-{index}", kit::COLLECTION);
+    let mut policy = kit::policy();
+    for index in 0..COLLECTIONS {
+        policy
+            .resources
+            .push(pipestream_search::pb::CollectionResource {
+                workspace: kit::WORKSPACE.into(),
+                collection: collection(index),
+            });
+        policy.grants.push(kit::grant("alice", &collection(index)));
+    }
+    let mut cluster = Cluster::bootstrap("r5-bounded", &group, &policy, &limits).await;
+    for index in 0..COLLECTIONS {
+        let mut install = kit::install_command(
             &group,
-            &format!("chunk-{ordinal}"),
-            2 + ordinal as u64,
-            kit::WORKFLOW,
-            kit::chunk_action(&payload, chunk_bytes, ordinal),
+            "install",
+            1 + index as u64,
+            kit::install_state(18_000),
         );
+        install.key.as_mut().unwrap().collection = collection(index);
+        assert!(install.encoded_len() < 1 << 20, "the install exceeds 1 MiB");
         let decision = cluster
             .leader()
-            .propose_import("alice", &chunk, None)
+            .propose_install("alice", &install)
             .await
             .unwrap();
         assert_eq!(decision.code, 0, "{}", decision.message);
@@ -932,7 +926,7 @@ async fn r5_install_hashing_is_bounded() {
     let (image, _meta) = raft_kit::snapshot_image(&cluster.leader_dir, cluster.leader()).await;
     assert!(
         image.len() >= 12 << 20,
-        "fixture image is {} bytes; raise the staged payload",
+        "fixture image is {} bytes; raise the installed payload",
         image.len()
     );
 

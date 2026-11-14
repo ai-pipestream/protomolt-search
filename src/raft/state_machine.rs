@@ -515,8 +515,8 @@ impl ControlStateMachine {
             Command::Control(command) => {
                 Ok(Reply::Control(store.replay_command(principal, command)?))
             }
-            Command::Import(command) => Ok(Reply::Import(
-                store.replay_control_import(principal, command)?,
+            Command::Install(command) => Ok(Reply::Install(
+                store.replay_control_install(principal, command)?,
             )),
             Command::Capacity(command) => Ok(Reply::Capacity(
                 store.replay_capacity_configure(principal, command)?,

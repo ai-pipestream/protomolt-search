@@ -1,7 +1,7 @@
 //! Shared kit for the control-authority adversarial suite
 //! (`docs/control-authority-test-harness.md`).
 //!
-//! Everything here mirrors the in-crate `src/source_authority/import_tests.rs`
+//! Everything here mirrors the in-crate `src/source_authority/control_tests.rs`
 //! helpers through the public API only: same fixtures, same command shapes,
 //! same revisions. No new dependencies; temp dirs and process control are
 //! hand-rolled (`tests/multiprocess.rs` idiom).
@@ -17,50 +17,33 @@ use std::time::{Duration, Instant};
 use pipestream_search::capacity_tiers::{
     plan_tiers, FragmentRequest, PartitionIdentity, TierSnapshot,
 };
-use pipestream_search::control_plane::{
-    ClusterControlService, ControlPolicy, DurableControlPlane, LegacyControlCheckpoint,
-    RetiredLegacyControl,
-};
-use pipestream_search::coordinator::TopologyRoute;
-use pipestream_search::pb::cluster_control_server::ClusterControl;
 use pipestream_search::pb::storage::capacity_transition::Action as CapacityAction;
-use pipestream_search::pb::storage::control_import_command::Action as ImportAction;
-use pipestream_search::pb::storage::legacy_control_import_supplement::{
-    Derived, Placement, Provider,
-};
+use pipestream_search::pb::storage::control_configuration::{Derived, Placement, Provider};
 use pipestream_search::pb::storage::source_authority_command::Action;
 use pipestream_search::pb::storage::{
-    AbortControlImport, ActivateSourceOwner, BeginControlImport, CancelPreparedSourceOwner,
-    CapacityConfiguration, CapacityConfigureCommand, CapacityObservation, CapacityPartition,
-    CapacityResidency, CapacityShardRef, CapacityTierPolicy, CapacityTierSpec, CapacityTransition,
-    CommitCapacityExpiry, CommitControlImport, ConfirmSourceOwnerReady, ControlImportChunk,
-    ControlImportCommand, ControlImportPayload, ControlImportReceipt, ControlPlannerPolicy,
-    ControlProviderGeometry, LegacyControlImportSupplement, LegacyControlRetirementRequest,
-    LogicalSourceOwner, PlacementRouteCode, RecoverControlImport, RegisterCapacityReporter,
+    ActivateSourceOwner, CancelPreparedSourceOwner, CapacityConfiguration,
+    CapacityConfigureCommand, CapacityObservation, CapacityPartition, CapacityResidency,
+    CapacityShardRef, CapacityTierPolicy, CapacityTierSpec, CapacityTransition,
+    CommitCapacityExpiry, ConfirmSourceOwnerReady, ControlConfiguration, ControlInstallCommand,
+    ControlInstallReceipt, ControlInstallState, ControlNodeRecord, ControlPlannerPolicy,
+    ControlProviderGeometry, ControlReconcilePolicy, ControlReplicaRecord, ControlRoute,
+    ControlRouteTable, LogicalSourceOwner, PlacementRouteCode, RegisterCapacityReporter,
     ReplaceSourceCollectionGrants, SourceAuthorityCommand, SourceAuthorityIdentity,
     SourceAuthorityLimits, SourceOwnerCompletion, SourceResidency, SourceStorageTarget,
 };
 use pipestream_search::pb::{
-    AccessAction, AccessPolicy, CollectionGrant, CollectionResource, NodeCapacity, NodeLease,
-    NodeResidency, PlacementNode, PlacementTree, RegisterNodeRequest, ReportShardRequest,
-    ShardReplicaRole, ShardReplicaState,
+    AccessAction, AccessPolicy, ClusterNodeState, CollectionGrant, CollectionResource,
+    NodeCapacity, NodeResidency, PlacementNode, PlacementTree, ShardReplicaRole,
 };
-use pipestream_search::sha256;
-use pipestream_search::source_authority::{
-    chunk_digest, payload_digest, retirement_digest, PlanningContext, SourceAuthorityStore,
-};
+use pipestream_search::source_authority::{PlanningContext, SourceAuthorityStore};
 use pipestream_search::test_support::ForkGuarded;
-use prost::Message;
-use tonic::Request;
 
 pub const WORKER_ENV: &str = "PSEARCH_ADV_WORKER";
 pub const WORKER_DIR_ENV: &str = "PSEARCH_ADV_DIR";
 pub const WORKER_ARM_ENV: &str = "PSEARCH_ADV_ARM";
 pub const WORKSPACE: &str = "test";
 pub const COLLECTION: &str = "books";
-pub const WORKFLOW: &[u8] = b"import-1";
-/// Number of chunks every import in this suite stages.
-pub const CHUNKS: u32 = 3;
+pub const WORKFLOW: &[u8] = b"workflow-1";
 /// Seed shared by every store in the suite so digests are comparable.
 pub const SEED: u8 = 7;
 
@@ -94,14 +77,6 @@ impl TestDir {
 
     pub fn authority(&self) -> PathBuf {
         self.0.join("authority.redb")
-    }
-
-    pub fn legacy(&self) -> PathBuf {
-        self.0.join("legacy.json")
-    }
-
-    pub fn request(&self) -> PathBuf {
-        self.0.join("request.bin")
     }
 }
 
@@ -143,7 +118,7 @@ pub fn policy() -> AccessPolicy {
     }
 }
 
-/// The collection resource key (empty owner), used by policy commands and imports.
+/// The collection resource key (empty owner), used by policy commands and installs.
 pub fn key() -> LogicalSourceOwner {
     LogicalSourceOwner {
         workspace: WORKSPACE.into(),
@@ -169,18 +144,6 @@ pub fn limits() -> SourceAuthorityLimits {
     }
 }
 
-pub fn control_policy() -> ControlPolicy {
-    ControlPolicy {
-        lease_ms: 31_337,
-        replication_factor: 3,
-        split_rows: 123_456,
-        merge_rows: 7_654,
-        compact_segments: 11,
-        compact_tombstone_ppm: 222_333,
-        history_limit: 17,
-    }
-}
-
 /// The suite's canonical store, seeded so every test starts identical.
 pub fn create_store(dir: &TestDir) -> (SourceAuthorityStore, SourceAuthorityIdentity) {
     let authority = identity(SEED);
@@ -191,61 +154,6 @@ pub fn create_store(dir: &TestDir) -> (SourceAuthorityStore, SourceAuthorityIden
 
 pub fn open_store(dir: &TestDir, authority: &SourceAuthorityIdentity) -> SourceAuthorityStore {
     SourceAuthorityStore::open(&dir.authority(), authority).unwrap()
-}
-
-/// A pristine durable legacy plane with `routes` current routes bootstrapped
-/// at generation 1; the routes tile the u64 hash space in order.
-pub fn legacy_plane(dir: &TestDir, routes: usize) -> DurableControlPlane {
-    let plane = DurableControlPlane::open(dir.legacy(), control_policy())
-        .unwrap()
-        .with_collection(COLLECTION)
-        .unwrap();
-    let space = u64::MAX as u128 + 1;
-    let routes: Vec<TopologyRoute> = (0..routes)
-        .map(|index| {
-            let lo = (index as u128 * space / routes as u128) as u64;
-            let hi = ((index as u128 + 1) * space / routes as u128 - 1) as u64;
-            TopologyRoute {
-                addr: format!("127.0.0.1:{}", 9_000 + index),
-                replica: None,
-                hash_range: Some((lo, hi)),
-                placement: None,
-            }
-        })
-        .collect();
-    plane.bootstrap_topology(1, &routes).unwrap();
-    plane
-}
-
-pub fn retirement_request(checkpoint: &[u8], command_id: &[u8]) -> LegacyControlRetirementRequest {
-    LegacyControlRetirementRequest {
-        format_version: 1,
-        key: Some(key()),
-        command_id: command_id.to_vec(),
-        expected_checkpoint_sha256: sha256::digest(checkpoint).to_vec(),
-        expected_control_revision: 1,
-        expected_policy_revision: 1,
-    }
-}
-
-/// Retire `plane` under current Admin rights; returns the holder (keeps the
-/// legacy lock) and the request for later recovery.
-pub fn retire(
-    store: &SourceAuthorityStore,
-    plane: &DurableControlPlane,
-    control_revision: u64,
-) -> (RetiredLegacyControl, LegacyControlRetirementRequest) {
-    let checkpoint = plane.checkpoint_for_import().unwrap();
-    let mut request = retirement_request(&checkpoint, b"retire-books");
-    request.expected_control_revision = control_revision;
-    let retired = store
-        .retire_legacy_control("alice", &request, plane)
-        .unwrap();
-    (retired, request)
-}
-
-pub fn checkpoint_of(retired: &RetiredLegacyControl) -> LegacyControlCheckpoint {
-    LegacyControlCheckpoint::decode(retired.checkpoint_bytes()).unwrap()
 }
 
 fn geometry() -> ControlProviderGeometry {
@@ -262,10 +170,10 @@ fn geometry() -> ControlProviderGeometry {
     }
 }
 
-/// The minimal valid supplement for a 2-route plane without placement trees
-/// or derived columns (mirrors `import_tests.rs`).
-pub fn supplement(checkpoint: &LegacyControlCheckpoint) -> LegacyControlImportSupplement {
-    LegacyControlImportSupplement {
+/// The minimal valid configuration: no placement tree, no derived columns
+/// (mirrors `control_tests.rs`).
+pub fn configuration() -> ControlConfiguration {
+    ControlConfiguration {
         format_version: 1,
         placement: Some(Placement::NoPlacement(true)),
         route_codes: Vec::new(),
@@ -275,158 +183,104 @@ pub fn supplement(checkpoint: &LegacyControlCheckpoint) -> LegacyControlImportSu
         policy: Some(ControlPlannerPolicy {
             format_version: 1,
             planner_version: 1,
-            control: Some(*checkpoint.policy()),
+            reconcile: Some(ControlReconcilePolicy {
+                lease_ms: 31_337,
+                replication_factor: 3,
+                split_rows: 123_456,
+                merge_rows: 7_654,
+                compact_segments: 11,
+                compact_tombstone_ppm: 222_333,
+                history_limit: 17,
+            }),
         }),
-        history_placement_unavailable: true,
     }
 }
 
-pub fn payload(
-    retired: &RetiredLegacyControl,
-    supplement: LegacyControlImportSupplement,
-) -> Vec<u8> {
-    ControlImportPayload {
-        format_version: 1,
-        retirement: retired.record().encode_to_vec(),
-        supplement: Some(supplement),
+/// The inclusive hash range of route `index` of `count` routes tiling the
+/// u64 hash space in order.
+pub fn route_range(index: usize, count: usize) -> (u64, u64) {
+    let space = u64::MAX as u128 + 1;
+    (
+        (index as u128 * space / count as u128) as u64,
+        ((index as u128 + 1) * space / count as u128 - 1) as u64,
+    )
+}
+
+/// `count` routes on 127.0.0.1:9000.. tiling the hash space.
+pub fn routes(count: usize) -> Vec<ControlRoute> {
+    (0..count)
+        .map(|index| {
+            let (hash_lo, hash_hi) = route_range(index, count);
+            ControlRoute {
+                addr: format!("127.0.0.1:{}", 9_000 + index),
+                replica: None,
+                hash_lo,
+                hash_hi,
+            }
+        })
+        .collect()
+}
+
+/// A bare collection: `routes` routes at generation 1, no nodes, replicas
+/// or actions.
+pub fn install_state(routes: usize) -> ControlInstallState {
+    ControlInstallState {
+        next_token: 1,
+        next_action: 1,
+        topology: Some(ControlRouteTable {
+            generation: 1,
+            routes: self::routes(routes),
+        }),
+        history: Vec::new(),
+        nodes: Vec::new(),
+        replicas: Vec::new(),
+        actions: Vec::new(),
+        completed_actions: Vec::new(),
+        configuration: Some(configuration()),
     }
-    .encode_to_vec()
 }
 
-/// Payload + supplement rebuilt from a (possibly recovered) holder.
-pub fn import_payload(retired: &RetiredLegacyControl) -> Vec<u8> {
-    payload(retired, supplement(&checkpoint_of(retired)))
-}
-
-/// Declare exactly [`CHUNKS`] chunks: `chunk_bytes = ceil(payload / CHUNKS)`.
-/// The protocol requires only `chunk_bytes <= chunk_capacity` and
-/// `chunk_count = ceil(payload_bytes / chunk_bytes)`, so this splits even the
-/// small 2-route payload into three chunks.
-pub fn plan_three_chunks(payload_bytes: usize) -> (u32, u32) {
-    let chunk_bytes = payload_bytes.div_ceil(CHUNKS as usize) as u32;
-    assert!(chunk_bytes > 0, "payload must be non-empty");
-    (chunk_bytes, CHUNKS)
-}
-
-pub fn import_command(
+pub fn install_command(
     authority: &SourceAuthorityIdentity,
     id: &str,
     control_revision: u64,
-    workflow: &[u8],
-    action: ImportAction,
-) -> ControlImportCommand {
-    import_command_policy(authority, id, control_revision, 1, workflow, action)
+    state: ControlInstallState,
+) -> ControlInstallCommand {
+    install_command_policy(authority, id, control_revision, 1, state)
 }
 
-/// The import-command builder with an explicit expected policy revision
-/// (the fixed-suite [`import_command`] pins 1, the bootstrap revision).
-pub fn import_command_policy(
+/// The install builder with an explicit expected policy revision (the
+/// fixed-suite [`install_command`] pins 1, the bootstrap revision).
+pub fn install_command_policy(
     authority: &SourceAuthorityIdentity,
     id: &str,
     control_revision: u64,
     policy_revision: u64,
-    workflow: &[u8],
-    action: ImportAction,
-) -> ControlImportCommand {
-    ControlImportCommand {
+    state: ControlInstallState,
+) -> ControlInstallCommand {
+    ControlInstallCommand {
         format_version: 1,
         authority: Some(authority.clone()),
         key: Some(key()),
         command_id: id.as_bytes().to_vec(),
         expected_control_revision: control_revision,
         expected_policy_revision: policy_revision,
-        workflow_id: workflow.to_vec(),
-        action: Some(action),
+        state: Some(state),
     }
 }
 
-pub fn begin_action(
-    retired: &RetiredLegacyControl,
-    payload: &[u8],
-    chunk_bytes: u32,
-    chunk_count: u32,
-) -> ImportAction {
-    ImportAction::Begin(BeginControlImport {
-        retirement_sha256: retirement_digest(retired.record()),
-        retirement_operation: retired.record().operation.clone(),
-        payload_bytes: payload.len() as u64,
-        payload_sha256: payload_digest(payload),
-        chunk_bytes,
-        chunk_count,
-    })
-}
-
-pub fn chunk_action(payload: &[u8], chunk_bytes: u32, ordinal: u32) -> ImportAction {
-    let start = ordinal as usize * chunk_bytes as usize;
-    let end = payload.len().min(start + chunk_bytes as usize);
-    ImportAction::Chunk(ControlImportChunk {
-        ordinal,
-        bytes: payload[start..end].to_vec(),
-        sha256: chunk_digest(&payload[start..end]),
-    })
-}
-
-pub fn commit_action() -> ImportAction {
-    ImportAction::Commit(CommitControlImport {})
-}
-
-pub fn abort_action() -> ImportAction {
-    ImportAction::Abort(AbortControlImport {})
-}
-
-/// Administrative recovery: any current Admin may terminate a staging
-/// workflow (docs/control-import.md, "Administrative recovery").
-pub fn recover_action() -> ImportAction {
-    ImportAction::Recover(RecoverControlImport {})
-}
-
-/// Begin at control revision 1, stage every chunk, commit; returns the receipt.
-pub fn run_import(
+/// Install `state` at control revision 1; returns the receipt (control
+/// revision 2).
+pub fn run_install(
     store: &SourceAuthorityStore,
     authority: &SourceAuthorityIdentity,
-    retired: &RetiredLegacyControl,
-    payload: &[u8],
-) -> (ControlImportReceipt, u32) {
-    let (chunk_bytes, chunk_count) = plan_three_chunks(payload.len());
-    let begin = store
-        .begin_control_import(
-            "alice",
-            &import_command(
-                authority,
-                "begin",
-                1,
-                WORKFLOW,
-                begin_action(retired, payload, chunk_bytes, chunk_count),
-            ),
-            retired,
-        )
+    state: ControlInstallState,
+) -> ControlInstallReceipt {
+    let decision = store
+        .install_control("alice", &install_command(authority, "install", 1, state))
         .unwrap();
-    assert_eq!(begin.code, 0, "{}", begin.message);
-    let mut revision = 2u64;
-    for ordinal in 0..chunk_count {
-        let decision = store
-            .execute_control_import(
-                "alice",
-                &import_command(
-                    authority,
-                    &format!("chunk-{ordinal}"),
-                    revision,
-                    WORKFLOW,
-                    chunk_action(payload, chunk_bytes, ordinal),
-                ),
-            )
-            .unwrap();
-        assert_eq!(decision.code, 0, "{}", decision.message);
-        revision += 1;
-    }
-    let commit = store
-        .execute_control_import(
-            "alice",
-            &import_command(authority, "commit", revision, WORKFLOW, commit_action()),
-        )
-        .unwrap();
-    assert_eq!(commit.code, 0, "{}", commit.message);
-    (commit.receipt.unwrap(), chunk_count)
+    assert_eq!(decision.code, 0, "{}", decision.message);
+    decision.receipt.unwrap()
 }
 
 pub fn snapshot_digest(
@@ -442,7 +296,7 @@ pub fn snapshot_digest(
         .expect("control snapshot digest is 32 bytes")
 }
 
-// ---- general (non-import) command builders -------------------------------
+// ---- general command builders ----------------------------------------------
 
 pub fn source_command(
     authority: &SourceAuthorityIdentity,
@@ -601,94 +455,10 @@ pub fn wait_marker(dir: &TestDir, k: u32, timeout: Duration) {
     }
 }
 
-// ---- SIGKILL import worker --------------------------------------------------
-
 /// How long an armed worker waits for the parent's `go` file at each
 /// durable step before exiting cleanly (which fails the parent's kill
 /// assertion loudly).
 pub const WORKER_GO_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// Worker body for the SIGKILL import-recovery tests
-/// (`control_authority_adversarial::sigkill_recovery_at_every_import_boundary`
-/// and `control_authority_planner::plan_digest_stable_across_sigkill_recovery`).
-/// Builds the same deterministic state as the parent's baseline, writes
-/// marker `mk` after each durable step, and when armed at `k` waits (up to
-/// [`WORKER_GO_TIMEOUT`]) for a `go` file so the parent controls the exact
-/// kill point. Early-returns unless [`WORKER_ENV`] is set.
-/// Staged import with the slice-1 marker schedule: begin (m1), one marker
-/// after each chunk (m2..m4), commit (m5). Shared by both SIGKILL worker
-/// bodies; the parent arms one marker and controls the kill point with a
-/// `go` file.
-fn import_with_markers(
-    store: &SourceAuthorityStore,
-    authority: &SourceAuthorityIdentity,
-    retired: &RetiredLegacyControl,
-    payload: &[u8],
-    dir: &TestDir,
-    arm: u32,
-) {
-    let (chunk_bytes, chunk_count) = plan_three_chunks(payload.len());
-    let begin = store
-        .begin_control_import(
-            "alice",
-            &import_command(
-                authority,
-                "begin",
-                1,
-                WORKFLOW,
-                begin_action(retired, payload, chunk_bytes, chunk_count),
-            ),
-            retired,
-        )
-        .unwrap();
-    assert_eq!(begin.code, 0, "{}", begin.message);
-    pause_for_go(dir, arm, 1, WORKER_GO_TIMEOUT);
-    let mut revision = 2u64;
-    for ordinal in 0..chunk_count {
-        let decision = store
-            .execute_control_import(
-                "alice",
-                &import_command(
-                    authority,
-                    &format!("chunk-{ordinal}"),
-                    revision,
-                    WORKFLOW,
-                    chunk_action(payload, chunk_bytes, ordinal),
-                ),
-            )
-            .unwrap();
-        assert_eq!(decision.code, 0, "{}", decision.message);
-        revision += 1;
-        pause_for_go(dir, arm, 2 + ordinal, WORKER_GO_TIMEOUT);
-    }
-    let commit = store
-        .execute_control_import(
-            "alice",
-            &import_command(authority, "commit", revision, WORKFLOW, commit_action()),
-        )
-        .unwrap();
-    assert_eq!(commit.code, 0, "{}", commit.message);
-    pause_for_go(dir, arm, 5, WORKER_GO_TIMEOUT);
-}
-
-pub fn sigkill_import_worker_body() {
-    if std::env::var_os(WORKER_ENV).is_none() {
-        return;
-    }
-    let dir = TestDir::from_env();
-    let arm: u32 = std::env::var(WORKER_ARM_ENV)
-        .unwrap()
-        .parse()
-        .expect("PSEARCH_ADV_ARM is a marker index");
-    let (store, authority) = create_store(&dir);
-    let legacy = legacy_plane(&dir, 2);
-    let (retired, request) = retire(&store, &legacy, 1);
-    std::fs::write(dir.request(), request.encode_to_vec()).unwrap();
-    pause_for_go(&dir, arm, 0, WORKER_GO_TIMEOUT);
-
-    let payload = import_payload(&retired);
-    import_with_markers(&store, &authority, &retired, &payload, &dir, arm);
-}
 
 // ---- capacity-planner leg (slice 3b: the persisted adapter) -----------------
 
@@ -698,8 +468,7 @@ pub fn sigkill_import_worker_body() {
 pub const CAPACITY_COHORT_MS: u64 = 600_000;
 /// Fixed planning instant: twenty cohorts past the epoch at phase 0. Node
 /// eligibility compares the committed lease expiry against this instant; the
-/// imported leases were captured at wall-clock registration time, so they
-/// always win and the instant stays deterministic.
+/// installed leases expire far later, so the instant stays deterministic.
 pub const PLANNING_INSTANT_UNIX_MS: u64 = 20 * CAPACITY_COHORT_MS;
 /// Generation every reported shard replica carries; the adapter names the
 /// primary's generation the shard's source generation.
@@ -740,46 +509,34 @@ fn leaf_code(name: &str) -> u64 {
     placement.leaf_by_name(name).unwrap().code as u64
 }
 
-/// The kit supplement plus the placement tree and one route code per route:
-/// route 0 names leaf "old", route 1 names leaf "rest". The planner adapter
-/// names a shard's leaf only when the import carried placement for the
-/// route whose hash range exactly matches the shard's primary.
-pub fn placement_supplement(checkpoint: &LegacyControlCheckpoint) -> LegacyControlImportSupplement {
-    let mut supplement = supplement(checkpoint);
-    supplement.placement = Some(Placement::Tree(placement_tree()));
-    supplement.route_codes = ["old", "rest"]
+/// The kit configuration plus the placement tree and one route code per
+/// route: route 0 names leaf "old", route 1 names leaf "rest". The planner
+/// adapter names a shard's leaf only when the install carried placement for
+/// the route whose hash range exactly matches the shard's primary.
+pub fn placement_configuration() -> ControlConfiguration {
+    let mut configuration = configuration();
+    configuration.placement = Some(Placement::Tree(placement_tree()));
+    configuration.route_codes = ["old", "rest"]
         .map(|name| PlacementRouteCode {
             has_placement: true,
             placement: leaf_code(name),
         })
         .to_vec();
-    supplement
+    configuration
 }
 
-/// Payload + placement supplement rebuilt from a (possibly recovered) holder.
-pub fn import_payload_placement(retired: &RetiredLegacyControl) -> Vec<u8> {
-    payload(retired, placement_supplement(&checkpoint_of(retired)))
-}
-
-/// A pristine 2-route legacy plane with two registered server nodes (rack-a,
-/// rack-b) and one reported ready primary per route — shard-a on node-a in
-/// route 0, shard-b on node-b in route 1 — exactly the committed shape the
-/// capacity adapter derives shards, leaves, pools and eligible nodes from.
-///
-/// Registration and shard reports are cluster routes, not source-authority
-/// commands, so they run through the public `ClusterControl` trait over a
-/// short-lived in-process runtime; the plane is then reopened from disk so
-/// the caller owns it for retirement. Lease duration is the plane maximum
-/// (300s) and is plenty: eligibility is judged at the fixed planning
-/// instant of 1970, long before any wall-clock expiry.
-pub fn legacy_plane_with_cluster(dir: &TestDir) -> DurableControlPlane {
-    let plane = legacy_plane(dir, 2);
-    let control = ClusterControlService::new(plane);
-    let runtime = tokio::runtime::Runtime::new().expect("cluster control runtime");
-    let register = |node_id: &str, port: u16, domain: &str| RegisterNodeRequest {
-        collection: COLLECTION.into(),
+/// A 2-route collection with two registered server nodes (rack-a, rack-b)
+/// and one ready primary per route — shard-a on node-a in route 0, shard-b
+/// on node-b in route 1 — exactly the committed shape the capacity adapter
+/// derives shards, leaves, pools and eligible nodes from. Leases expire far
+/// past the fixed planning instant.
+pub fn cluster_state() -> ControlInstallState {
+    let node = |node_id: &str, port: u16, domain: &str, lease_token: u64| ControlNodeRecord {
         node_id: node_id.into(),
         addr: format!("127.0.0.1:{port}"),
+        state: ClusterNodeState::Active as i32,
+        lease_token,
+        expires_unix_ms: 1 << 50,
         capacity: Some(NodeCapacity {
             disk_bytes: 26_843_545_600,
             used_disk_bytes: 0,
@@ -787,54 +544,32 @@ pub fn legacy_plane_with_cluster(dir: &TestDir) -> DurableControlPlane {
             residency: NodeResidency::Server as i32,
             ..Default::default()
         }),
-        lease_ms: 300_000,
     };
-    let lease_a = runtime
-        .block_on(ClusterControl::register_node(
-            &control,
-            Request::new(register(NODE_A, 9_101, "rack-a")),
-        ))
-        .unwrap()
-        .into_inner();
-    let lease_b = runtime
-        .block_on(ClusterControl::register_node(
-            &control,
-            Request::new(register(NODE_B, 9_102, "rack-b")),
-        ))
-        .unwrap()
-        .into_inner();
-    // One primary per route; the reported ranges exactly tile the two
-    // routes of `legacy_plane`, which is how derive() names each shard's
-    // leaf through its route's committed placement code.
-    let space = u64::MAX as u128 + 1;
-    let report = |lease: &NodeLease, shard: &str, route: usize| ReportShardRequest {
-        collection: COLLECTION.into(),
-        node_id: lease.node_id.clone(),
-        lease_token: lease.lease_token,
-        replica: Some(ShardReplicaState {
-            collection: COLLECTION.into(),
+    let replica = |node: &ControlNodeRecord, shard: &str, route: usize| {
+        let (hash_lo, hash_hi) = route_range(route, 2);
+        ControlReplicaRecord {
             shard_id: shard.into(),
-            node_id: lease.node_id.clone(),
+            node_id: node.node_id.clone(),
+            addr: node.addr.clone(),
             generation: SOURCE_GENERATION,
-            hash_lo: (route as u128 * space / 2) as u64,
-            hash_hi: ((route as u128 + 1) * space / 2 - 1) as u64,
+            hash_lo,
+            hash_hi,
             rows: 1_000_000,
             bytes: 268_435_456,
             role: ShardReplicaRole::Primary as i32,
             ready: true,
             ..Default::default()
-        }),
+        }
     };
-    for (lease, shard, route) in [(lease_a, SHARD_A, 0usize), (lease_b, SHARD_B, 1usize)] {
-        runtime
-            .block_on(ClusterControl::report_shard(
-                &control,
-                Request::new(report(&lease, shard, route)),
-            ))
-            .unwrap();
+    let node_a = node(NODE_A, 9_101, "rack-a", 1);
+    let node_b = node(NODE_B, 9_102, "rack-b", 2);
+    ControlInstallState {
+        next_token: 3,
+        replicas: vec![replica(&node_a, SHARD_A, 0), replica(&node_b, SHARD_B, 1)],
+        nodes: vec![node_a, node_b],
+        configuration: Some(placement_configuration()),
+        ..install_state(2)
     }
-    drop(control);
-    DurableControlPlane::open_existing(dir.legacy(), control_policy()).unwrap()
 }
 
 fn capacity_tier(name: &str, lo: u64, hi: u64, warmth: u64) -> CapacityTierSpec {
@@ -983,16 +718,14 @@ fn observation(
     }
 }
 
-/// The topology generation the committed control state carries after the
-/// import: each legacy `report_shard` reconciles and publishes, so the
-/// generation is whatever the plane published, read back from the snapshot
-/// rather than assumed.
+/// The topology generation the committed control state carries, read back
+/// from the snapshot rather than assumed.
 pub fn committed_generation(store: &SourceAuthorityStore) -> u64 {
     let snapshot = store.control_snapshot("alice", &key()).unwrap();
     snapshot
         .state
         .as_ref()
-        .expect("imported snapshot carries collection state")
+        .expect("installed snapshot carries collection state")
         .topology_generation
 }
 
@@ -1086,11 +819,10 @@ pub fn planner_view(store: &SourceAuthorityStore, instant: u64) -> (String, [u8;
     (rendered, snapshot.plan_digest(), plan.canonical_bytes())
 }
 
-/// A store that went through the full adapter flow: the cluster plane
-/// (registered nodes, reported primaries) retired and imported with the
-/// placement supplement, capacity configured at control revision 6, both
-/// reporters registered, and one report per shard in the current cohort
-/// window. Observation epoch is 2.
+/// A store that went through the full adapter flow: the cluster state
+/// installed, capacity configured at control revision 2, both reporters
+/// registered, and one report per shard in the current cohort window.
+/// Observation epoch is 2.
 pub struct AdapterFixture {
     pub dir: TestDir,
     pub authority: SourceAuthorityIdentity,
@@ -1100,28 +832,18 @@ pub struct AdapterFixture {
 }
 
 pub fn adapter_fixture(name: &str) -> AdapterFixture {
-    adapter_fixture_staged(name, false)
-}
-
-/// [`adapter_fixture`], with the chunk staging order reversed when `reverse`
-/// is set (the protocol keys chunks by ordinal and accepts any order).
-pub fn adapter_fixture_staged(name: &str, reverse: bool) -> AdapterFixture {
     let dir = TestDir::new(name);
     let (store, authority) = create_store(&dir);
-    let legacy = legacy_plane_with_cluster(&dir);
-    let (retired, _request) = retire(&store, &legacy, 1);
-    let payload = import_payload_placement(&retired);
-    run_import_staged(&store, &authority, &retired, &payload, reverse);
+    run_install(&store, &authority, cluster_state());
     let generation = committed_generation(&store);
-    // The import commits at control revision 6 (begin 1, three chunks,
-    // commit); configure is the next retained command.
+    // The install commits at control revision 2; configure is next.
     let decision = store
         .configure_capacity(
             "alice",
             &configure_command(
                 &authority,
                 "cfg",
-                6,
+                2,
                 1,
                 capacity_configuration(1_000_000_000_000),
             ),
@@ -1151,86 +873,6 @@ pub fn adapter_fixture_staged(name: &str, reverse: bool) -> AdapterFixture {
         store,
         generation,
     }
-}
-
-/// Begin -> three chunks -> commit; `reverse` stages the chunk ordinals in
-/// reverse order.
-pub fn run_import_staged(
-    store: &SourceAuthorityStore,
-    authority: &SourceAuthorityIdentity,
-    retired: &RetiredLegacyControl,
-    payload: &[u8],
-    reverse: bool,
-) {
-    let (chunk_bytes, chunk_count) = plan_three_chunks(payload.len());
-    let begin = store
-        .begin_control_import(
-            "alice",
-            &import_command(
-                authority,
-                "begin",
-                1,
-                WORKFLOW,
-                begin_action(retired, payload, chunk_bytes, chunk_count),
-            ),
-            retired,
-        )
-        .unwrap();
-    assert_eq!(begin.code, 0, "{}", begin.message);
-    let ordinals: Vec<u32> = if reverse {
-        (0..chunk_count).rev().collect()
-    } else {
-        (0..chunk_count).collect()
-    };
-    let mut revision = 2u64;
-    for ordinal in ordinals {
-        let decision = store
-            .execute_control_import(
-                "alice",
-                &import_command(
-                    authority,
-                    &format!("chunk-{ordinal}"),
-                    revision,
-                    WORKFLOW,
-                    chunk_action(payload, chunk_bytes, ordinal),
-                ),
-            )
-            .unwrap();
-        assert_eq!(decision.code, 0, "chunk {ordinal}: {}", decision.message);
-        revision += 1;
-    }
-    let commit = store
-        .execute_control_import(
-            "alice",
-            &import_command(authority, "commit", revision, WORKFLOW, commit_action()),
-        )
-        .unwrap();
-    assert_eq!(commit.code, 0, "{}", commit.message);
-}
-
-/// Worker body for the adapter SIGKILL-recovery test
-/// (`control_authority_planner::plan_digest_stable_across_sigkill_recovery`).
-/// Identical durable steps to the parent's baseline — cluster plane,
-/// retirement, placement import — on the slice-1 marker schedule. The parent
-/// recovers the import and then runs the capacity steps itself.
-/// Early-returns unless [`WORKER_ENV`] is set.
-pub fn sigkill_capacity_worker_body() {
-    if std::env::var_os(WORKER_ENV).is_none() {
-        return;
-    }
-    let dir = TestDir::from_env();
-    let arm: u32 = std::env::var(WORKER_ARM_ENV)
-        .unwrap()
-        .parse()
-        .expect("PSEARCH_ADV_ARM is a marker index");
-    let (store, authority) = create_store(&dir);
-    let legacy = legacy_plane_with_cluster(&dir);
-    let (retired, request) = retire(&store, &legacy, 1);
-    std::fs::write(dir.request(), request.encode_to_vec()).unwrap();
-    pause_for_go(&dir, arm, 0, WORKER_GO_TIMEOUT);
-
-    let payload = import_payload_placement(&retired);
-    import_with_markers(&store, &authority, &retired, &payload, &dir, arm);
 }
 
 /// A Prepare action carrying the caller's catalog history id (the

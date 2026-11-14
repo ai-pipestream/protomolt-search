@@ -312,9 +312,14 @@ learner membership remains an explicit operator action.
 
 ## Single-authority convergence boundary (2026-09-08)
 
-The [typed legacy checkpoint](control-checkpoint.md) now preserves the complete
-legacy state and captured runtime policy under explicit bounds. It is an import
-input, not a new authority or an activated source owner.
+Superseded 2026-11-14 (#133): the legacy checkpoint, retirement and chunked
+import below had no clients and were deleted. A collection's control state is
+now written by one bounded install command; see
+[control state](control-state.md). The steps are kept as the design record.
+
+The typed legacy checkpoint preserved the complete legacy state and captured
+runtime policy under explicit bounds. It was an import input, not a new
+authority or an activated source owner.
 
 The implemented source-owner store and the legacy topology adapter are still
 separate authorities. `SourceAuthorityStore::execute_locked` commits policy,
@@ -382,7 +387,7 @@ index, WAL or snapshot bytes from a phone enter this control state or its log.
    Missing placement state is an import error until supplied and verified from
    the quiesced map. Do not silently discard it.
 3. Durably retire the legacy authority **before** committing the new import.
-   The [legacy retirement adapter](control-retirement.md) replaces its JSON
+   The legacy retirement adapter replaced its JSON
    with a checksummed record containing the complete validated checkpoint,
    authenticated actor/resource/operation and destination authority identity.
    Every legacy clone is fenced; reopening that path as a writer refuses.

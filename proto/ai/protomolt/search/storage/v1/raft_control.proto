@@ -2,7 +2,7 @@ syntax = "proto3";
 package ai.protomolt.search.storage.v1;
 
 import "ai/protomolt/search/storage/v1/source_authority.proto";
-import "ai/protomolt/search/storage/v1/control_import.proto";
+import "ai/protomolt/search/storage/v1/control_state.proto";
 import "ai/protomolt/search/storage/v1/capacity_observations.proto";
 
 // Raft hosting of the source authority (docs/raft-control-design.md,
@@ -20,7 +20,7 @@ message RaftProposal {
   string principal = 2;
   oneof command {
     SourceAuthorityCommand control = 10;
-    ControlImportCommand import = 11;
+    ControlInstallCommand install = 11;
     CapacityConfigureCommand capacity = 12;
     CapacityTransition observation = 13;
   }
@@ -31,7 +31,7 @@ message RaftReply {
   uint32 format_version = 1; // 1
   oneof reply {
     SourceAuthorityDecision control = 10;
-    ControlImportDecision import = 11;
+    ControlInstallDecision install = 11;
     CapacityConfigureDecision capacity = 12;
     CapacityTransitionReceipt observation = 13;
     RaftRefusal refusal = 14;

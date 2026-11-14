@@ -376,9 +376,16 @@ async fn a_single_node_host_applies_through_the_log_and_restarts_in_place() {
     let applied = store.raft_applied().unwrap().unwrap();
     let last = applied.last_applied.unwrap();
     assert!(last.index >= 5, "{last:?}");
-    let metrics = host.metrics().borrow().clone();
-    assert_eq!(metrics.last_applied.map(|l| l.index), Some(last.index));
-    // No control state was imported into this group; the map is absent.
+    // The metrics channel publishes after the store commits; wait for it.
+    let mut metrics = host.metrics();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        metrics.wait_for(|m| m.last_applied.map(|l| l.index) == Some(last.index)),
+    )
+    .await
+    .expect("the metrics reach the store's applied position")
+    .unwrap();
+    // No control state was installed in this group; the map is absent.
     assert_eq!(
         store
             .published_map("alice", &owner("phone"))
@@ -1140,30 +1147,16 @@ async fn exact_retries_advance_the_applied_position_in_every_command_family() {
     let again = host.propose_command("alice", &command).await.unwrap();
     assert_eq!(first, again);
     assert_eq!(applied_index(&host), last_index(&host));
-    // Import: a recorded rejection (no workflow), then its exact retry.
-    let chunk = crate::pb::storage::ControlImportCommand {
-        format_version: 1,
-        authority: Some(group.clone()),
-        key: Some(LogicalSourceOwner {
-            workspace: "workspace-a".into(),
-            collection: "books".into(),
-            owner_id: Vec::new(),
-        }),
-        command_id: b"chunk".to_vec(),
-        expected_control_revision: 2,
-        expected_policy_revision: 1,
-        workflow_id: b"import-1".to_vec(),
-        action: Some(crate::pb::storage::control_import_command::Action::Chunk(
-            crate::pb::storage::ControlImportChunk {
-                ordinal: 0,
-                bytes: vec![1, 2, 3],
-                sha256: crate::source_authority::chunk_digest(&[1, 2, 3]),
-            },
-        )),
-    };
-    let first = host.propose_import("alice", &chunk, None).await.unwrap();
-    assert_eq!(first.code, Code::NotFound as u32);
-    let again = host.propose_import("alice", &chunk, None).await.unwrap();
+    // Install: a recorded rejection (stale revision), then its exact retry.
+    let install = crate::source_authority::control_tests::command(
+        &group,
+        "install",
+        9,
+        crate::source_authority::control_tests::state(2),
+    );
+    let first = host.propose_install("alice", &install).await.unwrap();
+    assert_eq!(first.code, Code::FailedPrecondition as u32);
+    let again = host.propose_install("alice", &install).await.unwrap();
     assert_eq!(first, again);
     assert_eq!(applied_index(&host), last_index(&host));
     // Capacity configure: a recorded rejection (no applied control state),
@@ -1171,7 +1164,7 @@ async fn exact_retries_advance_the_applied_position_in_every_command_family() {
     let configure = crate::pb::storage::CapacityConfigureCommand {
         format_version: 1,
         authority: Some(group.clone()),
-        key: chunk.key.clone(),
+        key: install.key.clone(),
         command_id: b"configure".to_vec(),
         expected_control_revision: 2,
         expected_policy_revision: 1,
@@ -1211,7 +1204,7 @@ async fn exact_retries_advance_the_applied_position_in_every_command_family() {
     let transition = crate::pb::storage::CapacityTransition {
         format_version: 1,
         authority: Some(group.clone()),
-        key: chunk.key.clone(),
+        key: install.key.clone(),
         action: Some(crate::pb::storage::capacity_transition::Action::Register(
             crate::pb::storage::RegisterCapacityReporter {
                 node_id: "server-a".into(),
@@ -1283,20 +1276,14 @@ async fn a_hosted_store_refuses_direct_mutation_and_local_admission() {
     };
     hosted(
         store
-            .execute_control_import(
+            .install_control(
                 "alice",
-                &crate::pb::storage::ControlImportCommand {
-                    format_version: 1,
-                    authority: Some(group.clone()),
-                    key: Some(key.clone()),
-                    command_id: b"abort".to_vec(),
-                    expected_control_revision: 1,
-                    expected_policy_revision: 1,
-                    workflow_id: b"import-1".to_vec(),
-                    action: Some(crate::pb::storage::control_import_command::Action::Abort(
-                        crate::pb::storage::AbortControlImport {},
-                    )),
-                },
+                &crate::source_authority::control_tests::command(
+                    &group,
+                    "install",
+                    1,
+                    crate::source_authority::control_tests::state(2),
+                ),
             )
             .map(|_| ()),
     );

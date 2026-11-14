@@ -6,11 +6,10 @@ use super::log_store::RaftLogStore;
 use super::reasons;
 use super::state_machine::{ControlStateMachine, SharedStore};
 use super::types::{validate_proposal, ControlRaft, NodeId};
-use crate::control_plane::RetiredLegacyControl;
 use crate::pb::storage::{
     raft_proposal::Command, raft_reply::Reply, CapacityConfigureCommand, CapacityTransition,
-    ControlImportCommand, RaftProposal, RaftReply, SourceAuthorityCommand, SourceAuthorityIdentity,
-    SourceAuthorityLimits,
+    ControlInstallCommand, RaftProposal, RaftReply, SourceAuthorityCommand,
+    SourceAuthorityIdentity, SourceAuthorityLimits,
 };
 use crate::pb::AccessPolicy;
 use crate::source_authority::{AdmissionLease, LeasedAdmission, SourceAdmission};
@@ -1152,24 +1151,21 @@ impl RaftHost {
         control_reply(reply)
     }
 
-    /// Import steps through the log; a Begin needs the retirement holder.
-    pub async fn propose_import(
+    /// A collection control-state install through the log.
+    pub async fn propose_install(
         &self,
         principal: &str,
-        command: &ControlImportCommand,
-        retired: Option<&RetiredLegacyControl>,
-    ) -> Result<crate::pb::storage::ControlImportDecision, Status> {
-        self.store()?
-            .proposal_admits_import(principal, command, retired)?;
+        command: &ControlInstallCommand,
+    ) -> Result<crate::pb::storage::ControlInstallDecision, Status> {
         let reply = self
             .propose(RaftProposal {
                 format_version: 1,
                 principal: principal.into(),
-                command: Some(Command::Import(command.clone())),
+                command: Some(Command::Install(command.clone())),
             })
             .await?;
         match reply.reply {
-            Some(Reply::Import(decision)) => Ok(decision),
+            Some(Reply::Install(decision)) => Ok(decision),
             Some(Reply::Refusal(refusal)) => Err(refusal_status(refusal)),
             _ => Err(Status::internal(
                 "raft reply kind differs from the proposal",
