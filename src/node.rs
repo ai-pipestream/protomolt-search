@@ -5929,10 +5929,11 @@ impl NodeServiceImpl {
             self.phrase_index.as_deref(),
             &self.config.sentence_fields,
         );
-        layers.nlp_columns = self
-            .nlp_columns
-            .as_deref()
-            .is_some_and(crate::turbo_bridge::NlpColumnSpec::is_enabled);
+        layers.nlp_columns = doc.nlp_materialization.is_empty()
+            && self
+                .nlp_columns
+                .as_deref()
+                .is_some_and(crate::turbo_bridge::NlpColumnSpec::is_enabled);
         layers
     }
 
@@ -8672,23 +8673,17 @@ impl NodeServiceImpl {
                             leg.field, leg.field
                         )));
                     }
-                    if phrase.sequence.len() < 2
-                        || phrase
-                            .sequence
-                            .iter()
-                            .any(|&i| i as usize >= leg.terms.len())
-                    {
-                        return Err(Status::invalid_argument(format!(
-                            "field {:?}: phrase sequence must name at least two of the leg's {} \
-                             terms",
-                            leg.field,
-                            leg.terms.len()
-                        )));
-                    }
+                    crate::proximity::validate_leg(phrase, leg.terms.len())
+                        .map_err(Status::invalid_argument)?;
                     phrase_gates.push(crate::filter::PhraseGate {
                         index: views[vi].as_ref(),
                         terms: &leg.terms,
                         sequence: phrase.sequence.iter().map(|&i| i as usize).collect(),
+                        alternatives: phrase
+                            .alternatives
+                            .iter()
+                            .map(|p| p.terms.iter().map(|&i| i as usize).collect())
+                            .collect(),
                         slop: phrase.slop,
                     });
                 }
@@ -11856,6 +11851,7 @@ impl NodeServiceImpl {
         let mut quality = first.quality.clone();
         let mut geography = first.geography.clone();
         let mut cased_field = first.cased_field.clone();
+        let mut nlp_layers = self.doc_session_layers(&first).nlp_columns;
         let mut submit = Some(session.submitter());
         // The body session covers the BODY only; extra fields ride their
         // own per-spec sessions, and a document applies once its body and
@@ -11938,6 +11934,7 @@ impl NodeServiceImpl {
                         || doc.quality != quality
                         || doc.geography != geography
                         || doc.cased_field != cased_field
+                        || self.doc_session_layers(&doc).nlp_columns != nlp_layers
                     {
                         // A mid-stream BODY spec change (rare): collect
                         // what the current session still owes so nothing
@@ -11979,6 +11976,7 @@ impl NodeServiceImpl {
                         quality = doc.quality.clone();
                         geography = doc.geography.clone();
                         cased_field = doc.cased_field.clone();
+                        nlp_layers = self.doc_session_layers(&doc).nlp_columns;
                         submit = Some(session.submitter());
                     }
                     submit
@@ -15958,21 +15956,17 @@ impl NodeServiceImpl {
                              slop query needs --position-fields=body and a rebuilt generation",
                         ));
                     }
-                    if constraint.sequence.len() < 2
-                        || constraint
-                            .sequence
-                            .iter()
-                            .any(|&i| i as usize >= req.terms.len())
-                    {
-                        return Err(Status::invalid_argument(format!(
-                            "phrase sequence must name at least two of the query's {} terms",
-                            req.terms.len()
-                        )));
-                    }
+                    crate::proximity::validate_leg(constraint, req.terms.len())
+                        .map_err(Status::invalid_argument)?;
                     phrase.push(crate::filter::PhraseGate {
                         index,
                         terms: &req.terms,
                         sequence: constraint.sequence.iter().map(|&i| i as usize).collect(),
+                        alternatives: constraint
+                            .alternatives
+                            .iter()
+                            .map(|p| p.terms.iter().map(|&i| i as usize).collect())
+                            .collect(),
                         slop: constraint.slop,
                     });
                 }

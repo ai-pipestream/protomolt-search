@@ -3822,6 +3822,7 @@ impl CoordinatorServiceImpl {
     /// The key that signs this coordinator's UDP datagrams, when one is
     /// configured (`docs/security.md`); a relay signs its own parent-facing
     /// lane with the same key.
+    #[cfg(feature = "net")]
     pub(crate) fn udp_key(&self) -> Option<&crate::security::UdpKey> {
         self.udp_hmac_key.as_ref()
     }
@@ -5377,6 +5378,7 @@ impl CoordinatorServiceImpl {
         // Per field: the phrase's term sequence (indexes into that
         // field's terms) and slop, when the field carries a PhraseMatch.
         let mut phrase_requests: Vec<Option<(Vec<usize>, u32)>> = Vec::with_capacity(fields.len());
+        let mut phrase_alternatives: Vec<Vec<Vec<usize>>> = Vec::with_capacity(fields.len());
         for f in fields {
             let analyzed = analyze_query(&addr, text, f.analysis.as_ref(), &f.prefixes).await?;
             // The analysis already lists each distinct term once, in
@@ -5394,6 +5396,7 @@ impl CoordinatorServiceImpl {
                 };
                 remap.push(at);
             }
+            let mut alternatives = Vec::new();
             let phrase = match f.phrase.as_ref() {
                 Some(m) => {
                     if terms.is_empty() {
@@ -5403,7 +5406,7 @@ impl CoordinatorServiceImpl {
                             f.field
                         )));
                     }
-                    let Some(positions) = analyzed.positions.as_ref() else {
+                    let Some(_positions) = analyzed.positions.as_ref() else {
                         return Err(Status::failed_precondition(format!(
                             "field {:?}: the query analysis carried no token positions, so the \
                              phrase's token order cannot be established; the analysis backend \
@@ -5411,12 +5414,17 @@ impl CoordinatorServiceImpl {
                             f.field
                         )));
                     };
-                    let sequence = crate::proximity::query_sequence(&analyzed.terms, positions)
-                        .map_err(|error| Status::internal(format!("query positions: {error}")))?;
-                    Some((
-                        sequence.into_iter().map(|ti| remap[ti]).collect::<Vec<_>>(),
-                        m.slop,
-                    ))
+                    let paths = crate::proximity::query_paths(&analyzed).map_err(|error| {
+                        Status::invalid_argument(format!("query positions: {error}"))
+                    })?;
+                    let mut paths = paths
+                        .into_iter()
+                        .map(|p| p.into_iter().map(|ti| remap[ti]).collect::<Vec<_>>());
+                    let sequence = paths
+                        .next()
+                        .ok_or_else(|| Status::invalid_argument("empty query lattice"))?;
+                    alternatives.extend(paths);
+                    Some((sequence, m.slop))
                 }
                 None => None,
             };
@@ -5438,6 +5446,7 @@ impl CoordinatorServiceImpl {
             );
             field_terms.push(terms);
             phrase_requests.push(phrase);
+            phrase_alternatives.push(alternatives);
         }
         let t_analyzed = t0.elapsed();
         if (k == 0 || field_terms.iter().all(|t| t.is_empty()))
@@ -5472,7 +5481,7 @@ impl CoordinatorServiceImpl {
         let mut bigram_probe: Vec<Option<usize>> = vec![None; fields.len()];
         for (fi, f) in fields.iter().enumerate() {
             if let Some((sequence, 0)) = phrase_requests[fi].as_ref().map(|(s, slop)| (s, *slop)) {
-                if sequence.len() == 2 {
+                if sequence.len() == 2 && phrase_alternatives[fi].is_empty() {
                     let column = crate::proximity::bigram_field_name(&f.field);
                     if self.field_permissions.as_ref().is_some_and(|fields| {
                         !fields.can_use(&column) || (explain && !fields.can_disclose(&column))
@@ -5530,11 +5539,18 @@ impl CoordinatorServiceImpl {
                 match phrase_requests[fi].as_ref() {
                     // A one-term "phrase" is the ordinary term query and
                     // constrains nothing, so it reports no routing.
-                    Some((sequence, slop)) if sequence.len() >= 2 => {
+                    Some((sequence, slop))
+                        if sequence.len() >= 2 || !phrase_alternatives[fi].is_empty() =>
+                    {
                         let bigram_everywhere =
                             bigram_probe[fi].is_some_and(|pi| globals.known_shards[pi] == n_shards);
                         let positions_everywhere = globals.known_shards[fi] == n_shards
                             && globals.positions_shards[fi] == n_shards;
+                        if !phrase_alternatives[fi].is_empty() && !positions_everywhere {
+                            return Err(Status::invalid_argument(format!(
+                                "field {:?}: query lattice alternatives require token positions on every shard", f.field
+                            )));
+                        }
                         match crate::proximity::choose_route(
                             &f.field,
                             sequence.len(),
@@ -5568,6 +5584,12 @@ impl CoordinatorServiceImpl {
                                 phrase_legs.push(Some(crate::pb::PhraseLeg {
                                     sequence: sequence.iter().map(|&i| i as u32).collect(),
                                     slop: *slop,
+                                    alternatives: phrase_alternatives[fi]
+                                        .iter()
+                                        .map(|path| crate::pb::PhraseSequence {
+                                            terms: path.iter().map(|&t| t as u32).collect(),
+                                        })
+                                        .collect(),
                                 }));
                                 fingerprints.push(base_fingerprint);
                                 routing.push(crate::pb::PhraseRouting {

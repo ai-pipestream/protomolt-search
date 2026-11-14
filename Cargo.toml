@@ -70,6 +70,8 @@ redb = "4"
 getrandom = "0.4"
 
 [features]
+# Explicit alias for the transport-free library; use with --no-default-features.
+embedded = []
 # Raft hosting of the source authority (docs/raft-control-design.md): the
 # redb log store, the state machine over the committed-replay paths and the
 # in-process host. Transport needs `net` as well.

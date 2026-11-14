@@ -223,7 +223,7 @@ const COLUMN_KIND_POS_LENGTHS: u8 = 18;
 const POS_LENGTHS_ENTRY_PREFIX: &str = "pos_lengths:";
 
 /// Kind 19: calibrated quantized `u8`/`u16` SPLADE 128-doc Block-Max postings
-/// (`splade:<field>`, `u64 off | u64 len`, `TVSPLD01` payload), emitted only
+/// (`splade:<field>`, `u64 off | u64 len`, `TVSPLD01`/`TVSPLD02` payload), emitted only
 /// when a field records non-empty SPLADE impacts.
 const COLUMN_KIND_SPLADE: u8 = 19;
 const SPLADE_ENTRY_PREFIX: &str = "splade:";
@@ -11738,7 +11738,7 @@ pub struct FieldTranspose {
     /// Sentence tables per row, when the field has them.
     sentences: Option<Vec<Vec<(u32, u32)>>>,
     /// Quantized SPLADE impact scale (`f32::to_bits`), when the field carries SPLADE postings.
-    splade_scale_bits: u32,
+    splade_scales: Vec<u32>,
     /// Quantized SPLADE `(term, impact)` entries per row, when the field carries SPLADE postings.
     splade_by_row: Option<Vec<Vec<(String, u16)>>>,
 }
@@ -11751,7 +11751,8 @@ impl FieldTranspose {
 
     /// Bytes the flat arrays take, the bound a replay reports.
     pub fn bytes(&self) -> usize {
-        self.entries.len() * 20
+        self.splade_scales.len() * 4
+            + self.entries.len() * 20
             + self.occurrences.len() * 8
             + self.positions.as_ref().map_or(0, |p| p.len() * 4)
             + self.pos_lengths.as_ref().map_or(0, |p| p.len() * 4)
@@ -11817,7 +11818,7 @@ impl FieldTranspose {
         let splade_scale_bits = if splade.is_empty() {
             0
         } else {
-            self.splade_scale_bits
+            self.splade_scales[r]
         };
         Some(AnalyzedField {
             terms,
@@ -11832,6 +11833,22 @@ impl FieldTranspose {
 }
 
 impl FieldView<'_> {
+    /// Read sparse impacts for a bounded row interval, without a field transpose.
+    pub(crate) fn visit_splade<E>(
+        &self,
+        start: u32,
+        end: u32,
+        visit: impl FnMut(&str, u32, u16, u32) -> Result<(), E>,
+    ) -> Result<(), E> {
+        if let Some((off, len)) = self.field.splade_range {
+            let bytes = &self.reader.map[off as usize..(off + len) as usize];
+            crate::turbo_bridge::splade::SpladeSectionReader::visit_validated_range(
+                bytes, start, end, visit,
+            )?;
+        }
+        Ok(())
+    }
+
     /// The field keyed by row (`docs/replay-from-segments.md`): one walk
     /// of the directory in term order, then a counting sort of the
     /// postings by row. Refused by name on a file without skip runs,
@@ -11944,13 +11961,16 @@ impl FieldView<'_> {
         } else {
             None
         };
-        let (splade_scale_bits, splade_by_row) = match self.field.splade_range {
+        let (splade_scales, splade_by_row) = match self.field.splade_range {
             Some((off, len)) => {
                 let bytes = &r.map[off as usize..(off + len) as usize];
                 let decoded = crate::turbo_bridge::splade::SpladeFieldIndex::decode(bytes)
                     .map_err(|e| {
                         format!("field {:?}: invalid SPLADE section: {e}", self.field.name)
                     })?;
+                let scales = (0..rows)
+                    .map(|row| decoded.doc_scale_bits(row as u32))
+                    .collect();
                 let mut by_row: Vec<Vec<(String, u16)>> = vec![Vec::new(); rows];
                 for (term, plist) in decoded.postings {
                     for (doc, q) in plist {
@@ -11964,9 +11984,9 @@ impl FieldView<'_> {
                         by_row[slot].push((term.clone(), q));
                     }
                 }
-                (decoded.scale_bits, Some(by_row))
+                (scales, Some(by_row))
             }
-            None => (0, None),
+            None => (Vec::new(), None),
         };
         Ok(FieldTranspose {
             terms,
@@ -11977,7 +11997,7 @@ impl FieldView<'_> {
             pos_lengths,
             lengths: self.field.doc_lengths.clone(),
             sentences,
-            splade_scale_bits,
+            splade_scales,
             splade_by_row,
         })
     }

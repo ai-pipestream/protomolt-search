@@ -93,7 +93,9 @@
 
 use crate::stats_identity::{StatsClaim, StatsIncarnation};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+#[cfg(feature = "net")]
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -131,6 +133,7 @@ struct RelaySignals {
     finish: Notify,
     /// The newest signed sequence applied; a datagram at or behind it
     /// is a replay and is ignored.
+    #[cfg(feature = "net")]
     last_seq: AtomicU32,
 }
 
@@ -143,6 +146,7 @@ impl RelaySignals {
             cancel: Notify::new(),
             finish_state: std::sync::atomic::AtomicU8::new(0),
             finish: Notify::new(),
+            #[cfg(feature = "net")]
             last_seq: AtomicU32::new(0),
         }
     }
@@ -182,6 +186,7 @@ impl RelaySignals {
     // fetch_update is deprecated in favor of try_update from Rust 1.99, but the
     // Pi binaries are built on 1.97, which lacks try_update.
     #[allow(deprecated)]
+    #[cfg(feature = "net")]
     fn accept_seq(&self, seq: u32) -> bool {
         self.last_seq
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |last| {

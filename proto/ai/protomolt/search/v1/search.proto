@@ -2746,6 +2746,9 @@ message AddDocumentsRequest {
   // declaration is refused naming both.
   // Requires document contract version 2 in Health and AddDocumentsResponse.
   string derived_fingerprint = 29;
+  // Versioned NLP mapping fingerprint written after materialization, including
+  // empty extraction results. Replay keeps concrete columns and skips NLP.
+  string nlp_materialization = 30;
 }
 
 // One canonical concept posting derived from a glossary match. Aliases share
@@ -3645,11 +3648,18 @@ message Bm25FieldLeg {
 // The shard-side form of PhraseMatch: the query's term SEQUENCE (with
 // repeats, in token order) as indexes into the leg's deduplicated
 // `terms`, plus the slop.
+message PhraseSequence {
+  repeated uint32 terms = 1;
+}
+
 message PhraseLeg {
   // Indexes into the leg's `terms`, one per query token, in order.
   repeated uint32 sequence = 1;
   // See PhraseMatch.slop.
   uint32 slop = 2;
+  // Additional complete query-lattice paths, ORed with sequence. No path may
+  // be empty; all use the same slop. Absent preserves the linear contract.
+  repeated PhraseSequence alternatives = 3;
 }
 
 // A half-open span [start, end) in original-text UTF-16 code units. Search

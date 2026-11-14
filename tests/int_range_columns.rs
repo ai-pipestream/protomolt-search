@@ -63,6 +63,7 @@ async fn add_documents_integer(
     let (tx, rx) = mpsc::channel(8);
     for (text, integers) in docs {
         tx.send(AddDocumentsRequest {
+            nlp_materialization: String::new(),
             unsigned_integers: Vec::new(),
             map_integers: Vec::new(),
             map_unsigned_integers: Vec::new(),
@@ -885,6 +886,7 @@ async fn timestamps_land_as_epoch_micros_in_the_integer_column() {
             .map(|_| ())
     };
     let stamped = |text: &str, seconds: i64, nanos: i32| AddDocumentsRequest {
+        nlp_materialization: String::new(),
         unsigned_integers: Vec::new(),
         map_integers: Vec::new(),
         map_unsigned_integers: Vec::new(),

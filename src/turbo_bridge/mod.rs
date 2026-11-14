@@ -73,6 +73,14 @@ pub struct NlpColumnSpec {
 }
 
 impl NlpColumnSpec {
+    fn materialization_id(&self) -> String {
+        let bytes = serde_json::to_vec(self).expect("NLP column spec serializes");
+        let mut hash = crate::sha256::Sha256::new();
+        hash.update(&bytes);
+        let digest: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        format!("v1:{digest}")
+    }
+
     /// Returns `true` when at least one NLP target column is configured.
     pub fn is_enabled(&self) -> bool {
         !self.money_column.is_empty()
@@ -99,6 +107,22 @@ pub fn materialize_nlp_columns(
     nlp: Option<&turbo_client::DocumentNlpProjection>,
     spec: Option<&NlpColumnSpec>,
 ) -> Result<AddDocumentsRequest, Status> {
+    if !doc.nlp_materialization.is_empty() {
+        if !doc.nlp_materialization.starts_with("v1:")
+            || doc.nlp_materialization.len() != 67
+            || !doc.nlp_materialization.as_bytes()[3..]
+                .iter()
+                .all(u8::is_ascii_hexdigit)
+            || spec
+                .filter(|s| s.is_enabled())
+                .is_some_and(|s| s.materialization_id() != doc.nlp_materialization)
+        {
+            return Err(Status::failed_precondition(
+                "NLP materialization version or column mapping differs from the logged document",
+            ));
+        }
+        return Ok(doc);
+    }
     let Some(spec) = spec.filter(|s| s.is_enabled()) else {
         return Ok(doc);
     };
@@ -300,6 +324,7 @@ pub fn materialize_nlp_columns(
         });
     }
 
+    doc.nlp_materialization = spec.materialization_id();
     Ok(doc)
 }
 

@@ -372,6 +372,72 @@ pub fn query_sequence(terms: &DocTerms, positions: &DocPositions) -> Result<Vec<
     Ok(ordered.into_iter().map(|(_, ti)| ti).collect())
 }
 
+/// Complete alternatives through the query lattice, rather than all parallel
+/// arcs flattened into a single phrase. Refuse excessive expansion explicitly.
+pub fn query_paths(field: &AnalyzedField) -> Result<Vec<Vec<usize>>, String> {
+    field.check_positions()?;
+    let positions = field.positions.as_ref().ok_or("query lacks positions")?;
+    if field.pos_lengths.is_none() {
+        return Ok(vec![query_sequence(&field.terms, positions)?]);
+    }
+    let lengths = field.pos_lengths.as_ref().unwrap();
+    let mut arcs: std::collections::BTreeMap<u32, Vec<(usize, u32)>> = Default::default();
+    let mut count = 0;
+    for (term, (positions, lengths)) in positions.iter().zip(lengths).enumerate() {
+        for (&pos, &len) in positions.iter().zip(lengths) {
+            let end = pos
+                .checked_add(len)
+                .ok_or("query lattice position overflow")?;
+            arcs.entry(pos).or_default().push((term, end));
+            count += 1;
+            if count > 4096 {
+                return Err("query lattice exceeds 4096 arcs".into());
+            }
+        }
+    }
+    let Some((&start, _)) = arcs.first_key_value() else {
+        return Ok(vec![]);
+    };
+    let mut pending = vec![(start, Vec::new())];
+    let mut paths = Vec::new();
+    while let Some((cursor, path)) = pending.pop() {
+        if let Some((_, choices)) = arcs.range(cursor..).next() {
+            for &(term, end) in choices {
+                let mut next = path.clone();
+                next.push(term);
+                pending.push((end, next));
+            }
+        } else {
+            paths.push(path);
+        }
+        if pending.len() + paths.len() > 256 {
+            return Err("query lattice exceeds 256 paths".into());
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+/// Validate both legacy linear phrases and bounded lattice alternatives at
+/// every shard entry point before indexing a query's term vector.
+pub(crate) fn validate_leg(leg: &crate::pb::PhraseLeg, terms: usize) -> Result<(), String> {
+    let minimum = if leg.alternatives.is_empty() { 2 } else { 1 };
+    if leg.alternatives.len() > 255
+        || leg.sequence.len() < minimum
+        || leg.sequence.len() > 4096
+        || leg.sequence.iter().any(|&i| i as usize >= terms)
+        || leg.alternatives.iter().any(|p| {
+            p.terms.is_empty()
+                || p.terms.len() > 4096
+                || p.terms.iter().any(|&i| i as usize >= terms)
+        })
+    {
+        return Err(format!("phrase sequence must name at least {minimum} of the query's {terms} terms; alternatives must be nonempty and bounded"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

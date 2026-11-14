@@ -162,6 +162,16 @@ fn read_batch(
                 ..Default::default()
             };
         }
+        field.visit_splade(start, end, |term, original, impact, scale| {
+            if let Some(row) = &mut rows[(original - start) as usize] {
+                let bytes = std::mem::size_of::<(String, u16)>() + term.len();
+                charge(&mut used, bytes, limit)?;
+                charge(&mut row.bytes, bytes, limit)?;
+                row.fields[fi].splade.push((term.to_owned(), impact));
+                row.fields[fi].splade_scale_bits = scale;
+            }
+            Ok::<(), Status>(())
+        })?;
         for term in field.prefix_iter("") {
             let mut cursor = field
                 .file_impacts(&term)

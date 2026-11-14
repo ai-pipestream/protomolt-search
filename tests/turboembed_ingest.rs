@@ -265,7 +265,7 @@ async fn dehyphenated_lattice_ingest_and_flush_preserve_both_joined_and_split_ph
         Request::new(Bm25SearchRequest {
             text: "inter national court".into(),
             k: 10,
-            analysis: Some(spec),
+            analysis: Some(spec.clone()),
             phrase: Some(PhraseMatch { slop: 0 }),
             ..Default::default()
         }),
@@ -275,6 +275,28 @@ async fn dehyphenated_lattice_ingest_and_flush_preserve_both_joined_and_split_ph
     .into_inner();
     assert_eq!(split_resp.hits.len(), 1);
     assert_eq!(split_resp.hits[0].doc_id, 0);
+    for (text, slop, expected) in [
+        ("inter-\nnational court", 0, 1),
+        ("inter-\nnational missing court", 0, 0),
+        ("inter-\nnational judgment", 0, 0),
+        ("inter-\nnational judgment", 3, 0),
+        ("inter-\nnational judgment", 4, 1),
+    ] {
+        let response = SearchService::bm25_search(
+            &coord,
+            Request::new(Bm25SearchRequest {
+                text: text.into(),
+                k: 10,
+                analysis: Some(spec.clone()),
+                phrase: Some(PhraseMatch { slop }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(response.hits.len(), expected, "{text:?}, slop={slop}");
+    }
 }
 
 #[tokio::test]
@@ -365,6 +387,9 @@ async fn pre_wal_nlp_columns_materialize_and_replay_deterministically_without_re
     }
     logged_docs.sort_by_key(|(id, _)| *id);
     assert_eq!(logged_docs.len(), 2);
+    assert!(logged_docs
+        .iter()
+        .all(|(_, d)| d.nlp_materialization.starts_with("v1:")));
     assert!(
         !logged_docs[0].1.map_numerics.is_empty()
             && !logged_docs[0].1.integers.is_empty()
@@ -375,17 +400,20 @@ async fn pre_wal_nlp_columns_materialize_and_replay_deterministically_without_re
     );
 
     // 3. Replay those exact WAL `AddDocumentsRequest` records onto a lexical-only `native` node
-    //    (which refuses all NLP layers!) with NO `nlp_columns` configured, flush, and reopen with
+    //    (which refuses all NLP layers!) with the SAME `nlp_columns` configured, flush, and reopen with
     //    `analysis_addr: None`!
     {
-        let replay_node = Arc::new(NodeServiceImpl::new(
-            None,
-            nlp_node_config(
-                replayed_path.clone(),
-                Some(NATIVE_ANALYSIS_BACKEND.to_string()),
-                false,
-            ),
-        ));
+        let replay_node = Arc::new(
+            NodeServiceImpl::new(
+                None,
+                nlp_node_config(
+                    replayed_path.clone(),
+                    Some(NATIVE_ANALYSIS_BACKEND.to_string()),
+                    false,
+                ),
+            )
+            .with_nlp_columns(nlp_spec.clone()),
+        );
         let mut link = NodeLink::local(replay_node);
         let replay_reqs: Vec<AddDocumentsRequest> =
             logged_docs.into_iter().map(|(_, d)| d).collect();
@@ -561,4 +589,121 @@ fn single_pass_multi_res_vector_output_normalizes_tiers_and_binds_sha256() {
         sent_vecs,
     );
     assert_eq!(out.sha256, out2.sha256);
+}
+
+#[tokio::test]
+async fn empty_nlp_results_and_mixed_replay_streams_keep_materialization_markers() {
+    use pipestream_search::turbo_bridge::materialize_nlp_columns;
+    use prost::Message;
+    let dir = tempdir("nlp_mixed_replay");
+    let mapping = NlpColumnSpec {
+        money_column: "money".into(),
+        ..Default::default()
+    };
+    let config = |name: &str| NodeConfig {
+        index_path: Some(dir.join(name)),
+        wal: true,
+        wal_buckets: 1,
+        analysis_addr: Some(TURBO_ANALYSIS_BACKEND.to_string()),
+        map_numeric_fields: vec!["money".into()],
+        ..Default::default()
+    };
+    let projection = turbo_client::OnePassDocumentNlp::builder()
+        .build()
+        .unwrap()
+        .analyze("")
+        .unwrap();
+    let empty = materialize_nlp_columns(
+        AddDocumentsRequest {
+            text: "ordinary words".into(),
+            analysis: Some(body_spec()),
+            ..Default::default()
+        },
+        Some(&projection),
+        Some(&mapping),
+    )
+    .unwrap();
+    assert!(empty.map_numerics.is_empty());
+    assert!(!empty.nlp_materialization.is_empty());
+    let decoded = AddDocumentsRequest::decode(empty.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(
+        materialize_nlp_columns(decoded, None, Some(&mapping)).unwrap(),
+        empty
+    );
+    let drifted = NlpColumnSpec {
+        money_column: "renamed_money".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        materialize_nlp_columns(empty.clone(), None, Some(&drifted))
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    let mut unknown = empty.clone();
+    unknown.nlp_materialization.replace_range(..2, "v2");
+    assert_eq!(
+        materialize_nlp_columns(unknown, None, Some(&mapping))
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    // Cross both session transitions: replay -> fresh -> replay. Money in
+    // the fresh record proves the middle session really requested extraction.
+    let path = config("mixed.idx").index_path.unwrap();
+    {
+        let node = Arc::new(
+            NodeServiceImpl::new(None, config("mixed.idx")).with_nlp_columns(mapping.clone()),
+        );
+        let mut link = NodeLink::local(node);
+        let fresh = AddDocumentsRequest {
+            text: "Paid $500 for goods.".into(),
+            analysis: Some(body_spec()),
+            ..Default::default()
+        };
+        assert_eq!(
+            link.add_documents(tokio_stream::iter(vec![
+                empty.clone(),
+                fresh,
+                empty.clone()
+            ]))
+            .await
+            .unwrap()
+            .into_inner()
+            .added,
+            3
+        );
+    }
+    let gen = reshard::resolve_gen(&wal::wal_dir(&path)).unwrap();
+    let logged: Vec<_> = wal::read_clocked_records(&gen, 0)
+        .unwrap()
+        .into_iter()
+        .filter_map(|r| match r.op {
+            Some(wal_record::Op::AddDocuments(b)) => Some(b.documents),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(logged.len(), 3);
+    assert!(logged
+        .iter()
+        .all(|d| d.nlp_materialization == empty.nlp_materialization));
+    assert_eq!(logged[0].map_numerics, empty.map_numerics);
+    assert!(!logged[1].map_numerics.is_empty());
+    assert_eq!(logged[2].map_numerics, empty.map_numerics);
+
+    // Empty extraction is still materialized: the native backend cannot
+    // satisfy an NLP request, so successful replay demonstrates no reanalysis.
+    let mut native_config = config("native.idx");
+    native_config.analysis_addr = Some(NATIVE_ANALYSIS_BACKEND.to_string());
+    let node = Arc::new(NodeServiceImpl::new(None, native_config).with_nlp_columns(mapping));
+    let mut link = NodeLink::local(node);
+    assert_eq!(
+        link.add_documents(tokio_stream::iter(logged))
+            .await
+            .unwrap()
+            .into_inner()
+            .added,
+        3
+    );
 }

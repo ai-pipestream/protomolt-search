@@ -12,8 +12,23 @@ use std::io::{self, Write};
 /// Postings per SPLADE skip block, matching BM25 v5 level-0 blocks (`128`).
 pub const SPLADE_BLOCK_SIZE: usize = 128;
 
-/// Magic bytes at the start of every `COLUMN_KIND_SPLADE` section.
+/// Magic bytes of legacy uniform-scale `COLUMN_KIND_SPLADE` sections.
 pub const SPLADE_SECTION_MAGIC: &[u8; 8] = b"TVSPLD01";
+/// Lossless mixed-scale variant: blocks append max-scale bits and postings
+/// append their document's scale bits. Uniform-scale fields keep v1 bytes.
+const SPLADE_SECTION_MAGIC_V2: &[u8; 8] = b"TVSPLD02";
+
+// Bound an f32 sum independently of term order. gamma_n accounts for the
+// worst-case rounding of the n-1 additions; one extra operation also covers
+// the much smaller f64 accumulation and division rounding error.
+fn conservative_sum(sum: f64, terms: usize) -> f64 {
+    let error = terms as f64 * (f64::from(f32::EPSILON) / 2.0);
+    if error >= 1.0 {
+        f64::INFINITY
+    } else {
+        sum / (1.0 - error)
+    }
+}
 
 /// Telemetry returned by a Block-Max SPLADE query evaluation.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -88,6 +103,8 @@ pub fn quantize_splade_impacts(
 pub struct SpladeFieldIndex {
     /// IEEE-754 `f32::to_bits()` of the impact quantization scale (`0` when empty).
     pub scale_bits: u32,
+    /// Per-document overrides; integer impacts are never requantized at merge.
+    pub scales: BTreeMap<u32, u32>,
     /// Term -> doc-id-ordered `(doc_id, quantized_impact)` postings.
     pub postings: BTreeMap<String, Vec<(u32, u16)>>,
 }
@@ -104,23 +121,21 @@ impl SpladeFieldIndex {
             return;
         }
         let doc_scale = f32::from_bits(scale_bits);
+        assert!(
+            doc_scale.is_finite() && doc_scale > 0.0,
+            "SPLADE impacts require a positive finite scale"
+        );
         if self.scale_bits == 0 && doc_scale > 0.0 && doc_scale.is_finite() {
             self.scale_bits = scale_bits;
         }
-        let target_scale = f32::from_bits(self.scale_bits);
+        if scale_bits != self.scale_bits {
+            self.scales.insert(doc_id, scale_bits);
+        }
         for (term, raw_q) in impacts {
             if *raw_q == 0 || term.is_empty() {
                 continue;
             }
-            let q =
-                if target_scale > 0.0 && doc_scale > 0.0 && (doc_scale - target_scale).abs() > 1e-9
-                {
-                    ((f32::from(*raw_q) * doc_scale / target_scale)
-                        .round()
-                        .clamp(1.0, 65535.0)) as u16
-                } else {
-                    *raw_q
-                };
+            let q = *raw_q;
             let list = self.postings.entry(term.clone()).or_default();
             if let Some(last) = list.last_mut() {
                 if last.0 == doc_id {
@@ -132,7 +147,12 @@ impl SpladeFieldIndex {
         }
     }
 
-    /// Exact serialized byte length of this section (`SPLADE_SECTION_MAGIC` layout).
+    /// Original document scale, including legacy uniform-scale fields.
+    pub fn doc_scale_bits(&self, doc: u32) -> u32 {
+        self.scales.get(&doc).copied().unwrap_or(self.scale_bits)
+    }
+
+    /// Exact serialized byte length of this section (v1 uniform or v2 mixed scale).
     pub fn encoded_len(&self) -> u64 {
         if self.postings.is_empty() {
             return 0;
@@ -142,17 +162,27 @@ impl SpladeFieldIndex {
         for (term, plist) in &self.postings {
             let n_blocks = plist.len().div_ceil(SPLADE_BLOCK_SIZE) as u64;
             // term_len (2) + term + df (4) + n_blocks (4) + blocks (n_blocks * 8) + postings (df * 6)
-            size += 2 + term.len() as u64 + 4 + 4 + n_blocks * 8 + (plist.len() as u64) * 6;
+            size += 2
+                + term.len() as u64
+                + 4
+                + 4
+                + n_blocks * if self.scales.is_empty() { 8 } else { 12 }
+                + (plist.len() as u64) * if self.scales.is_empty() { 6 } else { 10 };
         }
         size
     }
 
-    /// Writes the binary `TVSPLD01` section to `w`.
+    /// Writes v1 for uniform scales or lossless v2 for mixed document scales.
     pub fn write<W: Write>(&self, w: &mut W) -> io::Result<()> {
         if self.postings.is_empty() {
             return Ok(());
         }
-        w.write_all(SPLADE_SECTION_MAGIC)?;
+        let mixed = !self.scales.is_empty();
+        w.write_all(if mixed {
+            SPLADE_SECTION_MAGIC_V2
+        } else {
+            SPLADE_SECTION_MAGIC
+        })?;
         w.write_all(&self.scale_bits.to_le_bytes())?;
         w.write_all(&(self.postings.len() as u32).to_le_bytes())?;
         for (term, plist) in &self.postings {
@@ -169,19 +199,30 @@ impl SpladeFieldIndex {
                 w.write_all(&max_doc.to_le_bytes())?;
                 w.write_all(&max_impact.to_le_bytes())?;
                 w.write_all(&block_len.to_le_bytes())?;
+                if mixed {
+                    let max_scale = chunk
+                        .iter()
+                        .map(|&(d, _)| f32::from_bits(self.doc_scale_bits(d)))
+                        .fold(0.0_f32, f32::max);
+                    w.write_all(&max_scale.to_bits().to_le_bytes())?;
+                }
             }
             for &(doc_id, q) in plist {
                 w.write_all(&doc_id.to_le_bytes())?;
                 w.write_all(&q.to_le_bytes())?;
+                if mixed {
+                    w.write_all(&self.doc_scale_bits(doc_id).to_le_bytes())?;
+                }
             }
         }
         Ok(())
     }
 
-    /// Decodes a `TVSPLD01` section back into a [`SpladeFieldIndex`].
+    /// Decodes either SPLADE section version back into a [`SpladeFieldIndex`].
     pub fn decode(bytes: &[u8]) -> io::Result<Self> {
         let reader = SpladeSectionReader::open(bytes)?;
         let mut postings = BTreeMap::new();
+        let mut scales = BTreeMap::new();
         for entry in &reader.terms {
             let term = std::str::from_utf8(&bytes[entry.term_off..entry.term_off + entry.term_len])
                 .map_err(|_| {
@@ -190,15 +231,20 @@ impl SpladeFieldIndex {
                 .to_string();
             let mut plist = Vec::with_capacity(entry.df as usize);
             for j in 0..entry.df as usize {
-                let p = entry.postings_off + j * 6;
+                let p = entry.postings_off + j * reader.posting_stride;
                 let doc_id = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap());
                 let q = u16::from_le_bytes(bytes[p + 4..p + 6].try_into().unwrap());
+                let scale = reader.posting_scale_bits(p);
+                if scale != reader.scale_bits {
+                    scales.insert(doc_id, scale);
+                }
                 plist.push((doc_id, q));
             }
             postings.insert(term, plist);
         }
         Ok(Self {
             scale_bits: reader.scale_bits,
+            scales,
             postings,
         })
     }
@@ -236,25 +282,40 @@ struct SpladeTermMeta {
     blocks_off: usize,
     postings_off: usize,
     global_max_impact: u16,
+    global_max_scale: f32,
+    block_stride: usize,
+    posting_stride: usize,
 }
 
-/// Zero-copy memory-mapped reader over a `TVSPLD01` (`COLUMN_KIND_SPLADE`) section.
+/// Zero-copy memory-mapped reader over a `TVSPLD01`/`TVSPLD02` (`COLUMN_KIND_SPLADE`) section.
 #[derive(Clone, Debug)]
 pub struct SpladeSectionReader<'a> {
     bytes: &'a [u8],
     scale_bits: u32,
     terms: Vec<SpladeTermMeta>,
+    posting_stride: usize,
 }
 
 impl<'a> SpladeSectionReader<'a> {
-    /// Validates and opens a `TVSPLD01` byte slice without copying posting runs.
+    /// Validates and opens a v1 or v2 SPLADE byte slice without copying posting runs.
     pub fn open(bytes: &'a [u8]) -> io::Result<Self> {
         let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
-        if bytes.len() < 16 || &bytes[..8] != SPLADE_SECTION_MAGIC {
+        if bytes.len() < 16
+            || (&bytes[..8] != SPLADE_SECTION_MAGIC && &bytes[..8] != SPLADE_SECTION_MAGIC_V2)
+        {
             return Err(invalid("invalid SPLADE section magic"));
         }
         let scale_bits = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        let mixed = &bytes[..8] == SPLADE_SECTION_MAGIC_V2;
+        let (block_stride, posting_stride) = if mixed { (12, 10) } else { (8, 6) };
+        let scale = f32::from_bits(scale_bits);
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(invalid("invalid SPLADE scale"));
+        }
         let n_terms = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        if n_terms > bytes.len() / 10 {
+            return Err(invalid("excessive SPLADE term count"));
+        }
         let mut cur = 16usize;
         let mut terms = Vec::with_capacity(n_terms);
         let mut prev_term: Option<&[u8]> = None;
@@ -284,20 +345,32 @@ impl<'a> SpladeSectionReader<'a> {
                 return Err(invalid("SPLADE block count disagrees with df"));
             }
             let blocks_bytes = (n_blocks as usize)
-                .checked_mul(8)
+                .checked_mul(block_stride)
                 .ok_or_else(|| invalid("SPLADE blocks overflow"))?;
             let postings_bytes = (df as usize)
-                .checked_mul(6)
+                .checked_mul(posting_stride)
                 .ok_or_else(|| invalid("SPLADE postings overflow"))?;
             if cur + blocks_bytes + postings_bytes > bytes.len() {
                 return Err(invalid("truncated SPLADE blocks or postings"));
             }
             let blocks_off = cur;
             let mut global_max = 0u16;
+            let mut global_max_scale = scale;
             for b in 0..n_blocks as usize {
-                let bo = blocks_off + b * 8;
+                let bo = blocks_off + b * block_stride;
                 let bmax = u16::from_le_bytes(bytes[bo + 4..bo + 6].try_into().unwrap());
                 global_max = global_max.max(bmax);
+                let blen = u16::from_le_bytes(bytes[bo + 6..bo + 8].try_into().unwrap()) as usize;
+                if blen != (df as usize - b * SPLADE_BLOCK_SIZE).min(SPLADE_BLOCK_SIZE) {
+                    return Err(invalid("SPLADE block length disagrees with df"));
+                }
+                if mixed {
+                    let bs = f32::from_le_bytes(bytes[bo + 8..bo + 12].try_into().unwrap());
+                    if !bs.is_finite() || bs <= 0.0 {
+                        return Err(invalid("invalid SPLADE block scale"));
+                    }
+                    global_max_scale = global_max_scale.max(bs);
+                }
             }
             let postings_off = blocks_off + blocks_bytes;
             cur = postings_off + postings_bytes;
@@ -309,6 +382,9 @@ impl<'a> SpladeSectionReader<'a> {
                 blocks_off,
                 postings_off,
                 global_max_impact: global_max,
+                global_max_scale,
+                block_stride,
+                posting_stride,
             });
         }
         if cur != bytes.len() {
@@ -318,7 +394,63 @@ impl<'a> SpladeSectionReader<'a> {
             bytes,
             scale_bits,
             terms,
+            posting_stride,
         })
+    }
+
+    fn posting_scale_bits(&self, off: usize) -> u32 {
+        if self.posting_stride == 10 {
+            u32::from_le_bytes(self.bytes[off + 6..off + 10].try_into().unwrap())
+        } else {
+            self.scale_bits
+        }
+    }
+
+    /// Walk a section already checked by `open`, without allocating the term
+    /// metadata vector. Source rewrites must stay bounded even for a field
+    /// whose sparse vocabulary is much larger than a single output batch.
+    pub(crate) fn visit_validated_range<E>(
+        bytes: &[u8],
+        start: u32,
+        end: u32,
+        mut visit: impl FnMut(&str, u32, u16, u32) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mixed = &bytes[..8] == SPLADE_SECTION_MAGIC_V2;
+        let (block_stride, posting_stride) = if mixed { (12, 10) } else { (8, 6) };
+        let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let scale_bits = u32_at(8);
+        let mut at = 16;
+        for _ in 0..u32_at(12) {
+            let len = u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap()) as usize;
+            at += 2;
+            let name = std::str::from_utf8(&bytes[at..at + len]).expect("validated term");
+            at += len;
+            let df = u32_at(at) as usize;
+            let blocks = u32_at(at + 4) as usize;
+            let postings = at + 8 + blocks * block_stride;
+            at = postings + df * posting_stride;
+            let doc_at = |i: usize| u32_at(postings + i * posting_stride);
+            let (mut lo, mut hi) = (0, df);
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if doc_at(mid) < start {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            for i in lo..df {
+                let doc = doc_at(i);
+                if doc >= end {
+                    break;
+                }
+                let p = postings + i * posting_stride;
+                let q = u16::from_le_bytes(bytes[p + 4..p + 6].try_into().unwrap());
+                let scale = if mixed { u32_at(p + 6) } else { scale_bits };
+                visit(name, doc, q, scale)?;
+            }
+        }
+        Ok(())
     }
 
     fn lookup_term(&self, needle: &str) -> Option<&SpladeTermMeta> {
@@ -366,7 +498,7 @@ impl<'a> SpladeSectionReader<'a> {
         }
 
         impl<'b> Cursor<'b> {
-            fn new(bytes: &[u8], meta: &'b SpladeTermMeta, q_weight: f32, doc_scale: f32) -> Self {
+            fn new(bytes: &[u8], meta: &'b SpladeTermMeta, q_weight: f32, _doc_scale: f32) -> Self {
                 let cur_doc = if meta.df > 0 {
                     u32::from_le_bytes(
                         bytes[meta.postings_off..meta.postings_off + 4]
@@ -379,7 +511,9 @@ impl<'a> SpladeSectionReader<'a> {
                 Self {
                     meta,
                     q_weight,
-                    upper_bound: q_weight * f32::from(meta.global_max_impact) * doc_scale,
+                    upper_bound: q_weight
+                        * f32::from(meta.global_max_impact)
+                        * meta.global_max_scale,
                     block_idx: 0,
                     in_block_idx: 0,
                     posting_abs_idx: 0,
@@ -408,7 +542,7 @@ impl<'a> SpladeSectionReader<'a> {
             }
 
             fn block_header(&self, bytes: &[u8], b: usize) -> (u32, u16, u16) {
-                let bo = self.meta.blocks_off + b * 8;
+                let bo = self.meta.blocks_off + b * self.meta.block_stride;
                 let max_doc = u32::from_le_bytes(bytes[bo..bo + 4].try_into().unwrap());
                 let max_q = u16::from_le_bytes(bytes[bo + 4..bo + 6].try_into().unwrap());
                 let blen = u16::from_le_bytes(bytes[bo + 6..bo + 8].try_into().unwrap());
@@ -420,13 +554,24 @@ impl<'a> SpladeSectionReader<'a> {
                     return 0.0;
                 }
                 let (_, max_q, _) = self.block_header(bytes, self.block_idx);
-                self.q_weight * f32::from(max_q) * doc_scale
+                let scale = if self.meta.block_stride == 12 {
+                    let bo = self.meta.blocks_off + self.block_idx * self.meta.block_stride;
+                    f32::from_le_bytes(bytes[bo + 8..bo + 12].try_into().unwrap())
+                } else {
+                    doc_scale
+                };
+                self.q_weight * f32::from(max_q) * scale
             }
 
             fn current_impact(&self, bytes: &[u8], doc_scale: f32) -> f32 {
-                let p = self.meta.postings_off + self.posting_abs_idx * 6;
+                let p = self.meta.postings_off + self.posting_abs_idx * self.meta.posting_stride;
                 let q = u16::from_le_bytes(bytes[p + 4..p + 6].try_into().unwrap());
-                self.q_weight * f32::from(q) * doc_scale
+                let scale = if self.meta.posting_stride == 10 {
+                    f32::from_le_bytes(bytes[p + 6..p + 10].try_into().unwrap())
+                } else {
+                    doc_scale
+                };
+                self.q_weight * f32::from(q) * scale
             }
 
             fn advance_one(&mut self, bytes: &[u8], stats: &mut SpladeTraversalStats) {
@@ -445,7 +590,7 @@ impl<'a> SpladeSectionReader<'a> {
                     self.in_block_idx = 0;
                     self.block_entered = false;
                 }
-                let p = self.meta.postings_off + self.posting_abs_idx * 6;
+                let p = self.meta.postings_off + self.posting_abs_idx * self.meta.posting_stride;
                 self.cur_doc = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap());
             }
 
@@ -480,7 +625,8 @@ impl<'a> SpladeSectionReader<'a> {
                 let block_start = self.block_idx * SPLADE_BLOCK_SIZE;
                 let block_end = block_start + blen as usize;
                 while self.posting_abs_idx < block_end {
-                    let p = self.meta.postings_off + self.posting_abs_idx * 6;
+                    let p =
+                        self.meta.postings_off + self.posting_abs_idx * self.meta.posting_stride;
                     let d = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap());
                     if d >= target {
                         self.cur_doc = d;
@@ -523,11 +669,11 @@ impl<'a> SpladeSectionReader<'a> {
         let mut threshold = 0.0_f32;
 
         loop {
-            // Sort active cursors by current doc_id ascending, breaking ties by upper_bound desc.
+            // Sort active cursors by current doc_id ascending, breaking ties in canonical term order.
             cursors.sort_by(|a, b| {
                 a.cur_doc
                     .cmp(&b.cur_doc)
-                    .then_with(|| b.upper_bound.total_cmp(&a.upper_bound))
+                    .then_with(|| a.meta.term_off.cmp(&b.meta.term_off))
             });
             if cursors[0].cur_doc == u32::MAX {
                 for c in &mut cursors {
@@ -539,14 +685,14 @@ impl<'a> SpladeSectionReader<'a> {
             let effective_floor = (threshold - slack).max(0.0);
 
             // WAND pivot selection using per-term global upper bounds.
-            let mut cum_ub = 0.0_f32;
+            let mut cum_ub = 0.0_f64;
             let mut pivot_idx = None;
             for (idx, c) in cursors.iter().enumerate() {
                 if c.cur_doc == u32::MAX {
                     break;
                 }
-                cum_ub += c.upper_bound;
-                if cum_ub > effective_floor {
+                cum_ub += f64::from(c.upper_bound);
+                if conservative_sum(cum_ub, idx + 1) > f64::from(effective_floor) {
                     pivot_idx = Some(idx);
                     break;
                 }
@@ -568,29 +714,26 @@ impl<'a> SpladeSectionReader<'a> {
             }
 
             if cursors[0].cur_doc == pivot_doc {
-                // Refine with current 128-doc BLOCK upper bounds at `pivot_doc`!
-                let mut block_ub = 0.0_f32;
+                // Every query term can contribute before the next block boundary,
+                // including cursors not yet aligned at the candidate. Summing all
+                // current blocks permits whole-block skips without losing those hits.
+                let mut block_ub = 0.0_f64;
+                let mut min_block_end = u32::MAX;
                 let mut end_same = 0usize;
                 for c in &cursors {
-                    if c.cur_doc != pivot_doc {
+                    if c.cur_doc == u32::MAX {
                         break;
                     }
-                    block_ub += c.block_upper_bound(self.bytes, doc_scale);
-                    end_same += 1;
+                    block_ub += f64::from(c.block_upper_bound(self.bytes, doc_scale));
+                    let (last_doc, _, _) = c.block_header(self.bytes, c.block_idx);
+                    min_block_end = min_block_end.min(last_doc);
+                    if c.cur_doc == pivot_doc {
+                        end_same += 1;
+                    }
                 }
-                if block_ub <= effective_floor {
-                    // Block-Max bound rejects `pivot_doc` without scoring! Jump past the
-                    // tightest block boundary among aligned cursors.
-                    let mut next_target = pivot_doc.saturating_add(1);
-                    let mut min_block_end = u32::MAX;
-                    for c in &cursors[..end_same] {
-                        let (b_max_doc, _, _) = c.block_header(self.bytes, c.block_idx);
-                        min_block_end = min_block_end.min(b_max_doc);
-                    }
-                    if min_block_end < u32::MAX {
-                        next_target = next_target.max(min_block_end.saturating_add(1));
-                    }
-                    for c in &mut cursors[..end_same] {
+                if conservative_sum(block_ub, cursors.len()) <= f64::from(effective_floor) {
+                    let next_target = min_block_end.saturating_add(1);
+                    for c in &mut cursors {
                         c.seek_ge(self.bytes, next_target, &mut stats);
                     }
                     continue;

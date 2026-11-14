@@ -58,6 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             map_integers: Vec::new(),
             map_unsigned_integers: Vec::new(),
             derived_fingerprint: String::new(),
+            nlp_materialization: String::new(),
             original_source: None,
             source_chunk_ordinal: None,
             identity: None,
