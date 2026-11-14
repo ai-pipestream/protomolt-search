@@ -71,6 +71,12 @@ tests/examples compilation and formatting passed. The focused target peaked at
 8 GiB peak; its driver did not retain final swap/OOM counters, so those counters
 are not reported as zero. These are local checks, not device or fleet execution.
 
+The root library also exposes an explicit `embedded` feature alias:
+`cargo check --locked --no-default-features --features embedded --lib`.
+It enables no transports; `--no-default-features` is required to disable the
+default server stack. The embedded package dependency gate checks the resolved
+Tokio and tonic features independently.
+
 ## Contract
 
 The runtime exposes all public search routes:

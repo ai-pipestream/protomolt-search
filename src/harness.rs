@@ -339,15 +339,14 @@ pub async fn start_coordinator(
 // Mock analysis sidecar (test/dev fallback)
 // ---------------------------------------------------------------------------
 
-/// A mock AnalysisService: deterministic, model-free analysis with the
-/// same contract as the real sidecar — whitespace tokens with
-/// original-text spans, term vectors in first-occurrence order, and a toy
-/// stemmer for the SOURCE_STEMS path. Used by the test suite and as a
-/// documented fallback when the real native sidecar is unavailable.
-/// Corpora are ASCII, so byte offsets == char offsets == UTF-16 units.
+/// A mock `turbo.result.v1.AnalysisService`: deterministic, model-free
+/// analysis with the same contract as `turbo-kserve` — whitespace tokens
+/// with original-text UTF-8 spans, term vectors in first-occurrence order,
+/// and a toy stemmer for the `SOURCE_STEMS` path. Used by the test suite
+/// and as a deterministic loopback server when a model bundle is not needed.
 pub mod mock_analysis {
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -358,12 +357,28 @@ pub mod mock_analysis {
     use tonic::transport::{Error as TransportError, Server};
     use tonic::{Request, Response, Status, Streaming};
 
-    use crate::pb::analysis::analysis_service_server::{AnalysisService, AnalysisServiceServer};
-    use crate::pb::analysis::{
-        analyze_stream_request, analyze_stream_response, AnalysisOptions, AnalyzeRequest,
-        AnalyzeResponse, AnalyzeStreamError, AnalyzeStreamRequest, AnalyzeStreamResponse,
-        GeoLocation, GetCapabilitiesRequest, GetCapabilitiesResponse, NoiseSpan, RegionVote, Span,
-        TermVector, TextArtifact, Token,
+    use turbo_client::proto::result::analysis_service_server::{
+        AnalysisService, AnalysisServiceServer,
+    };
+    use turbo_client::proto::result::{
+        analyze_progressive_event, analyze_stream_request, analyze_stream_response,
+        AnalyzePipelineRequest, AnalyzeProgressiveEvent, AnalyzeQueryRequest, AnalyzeQueryResponse,
+        AnalyzeStreamRequest, AnalyzeStreamResponse, CapabilitiesRequest, CapabilitiesResponse,
+        ChunkLevelsResult, DocumentGraphRequest, DocumentGraphResponse, DocumentWindowRequest,
+        DocumentWindowResponse, ExtractionResult, FormatDocumentRequest, FormatDocumentResponse,
+        InspectDocumentGraphRequest, ListOutputFormatsRequest, ListOutputFormatsResponse,
+        LoadBundleRequest, LoadBundleResponse, MultiResVectorsResult, ProcessingReceipt,
+        ProfileCapabilities, ProjectChunksRequest, ProjectChunksResponse,
+        ProjectSearchDocumentRequest, RecordsResult, RerankAndHighlightRequest,
+        RerankAndHighlightResponse, RerankScoresResult, SearchDocumentProjection,
+        SparseTermsResult, TokenVectorsResult, TypedDocumentResult, UnloadBundleRequest,
+        UnloadBundleResponse,
+    };
+
+    use crate::analyzer::wire::{
+        analyze_failure_from_status, MockAnalyzeResponse, WireGeoLocation, WireNoiseSpan,
+        WireRegionVote, WireSessionOptions, WireSpan, WireTermVector, WireTextArtifact, WireToken,
+        NO_DUAL_CASED_PROFILE, WIRE_OFFSET_UTF8,
     };
     use crate::MAX_MESSAGE_BYTES;
 
@@ -439,34 +454,24 @@ pub mod mock_analysis {
         w
     }
 
-    /// The mock service: canned-but-faithful analysis.
+    /// Deterministic mock implementation of `turbo.result.v1.AnalysisService`.
     pub struct MockAnalysis {
-        /// Whether this mock models a sidecar with an NER model
-        /// configured — the capability the geography preflight checks.
-        /// Defaults to true; [`start_mock_analysis_without_ner`] models
-        /// the bare sidecar.
+        /// Whether this mock advertises NER/geo layers in `Capabilities`.
         pub ner: bool,
-        /// Whether this mock serves the sentence layer when asked
-        /// (`sentence_detection`). Defaults to true;
-        /// [`start_mock_analysis_without_sentences`] models a sidecar
-        /// that ignores the request — the state a sentence field's
-        /// ingest refuses by name (docs/highlighting.md).
+        /// Whether this mock populates sentence spans when requested.
         pub sentence_layer: bool,
-        /// Whether this mock serves both term identities from one pass
-        /// (`dual_cased`) and says so in `GetCapabilities`. Defaults to
-        /// true; [`start_mock_analysis_without_dual_identity`] models an
-        /// older jar, which ingest with a cased field refuses by name
-        /// (docs/dual-cased.md).
+        /// Whether this mock serves both folded and cased term identities in one pass.
         pub dual_identity: bool,
-        /// Analysis calls this mock served, unary and streaming alike,
-        /// one per document: the meter that proves a query path added
-        /// no analysis (docs/highlighting.md).
+        /// Whether `AnalyzeStream` answers `UNIMPLEMENTED` (`start_mock_analysis_without_stream`).
+        pub no_stream: bool,
+        /// Total per-document analyses executed across unary and streaming paths.
         pub calls: Arc<AtomicU64>,
+        /// Count of unary `AnalyzeDocumentProgressive` invocations.
+        pub unary_calls: Arc<AtomicUsize>,
+        /// Count of `AnalyzeStream` sessions opened.
+        pub stream_opens: Arc<AtomicUsize>,
         unary_delay: Option<(Duration, AnalysisDelayProbe)>,
-        /// When set, an `AnalyzeStream` call sends its last result and
-        /// then holds its response stream open until a permit arrives:
-        /// the shape that shows whether a client reads the server's end
-        /// of stream or lets the stream go with the trailers unread.
+        /// Optional semaphore holding `AnalyzeStream` open after its last result.
         pub stream_end_gate: Option<Arc<tokio::sync::Semaphore>>,
     }
 
@@ -476,27 +481,23 @@ pub mod mock_analysis {
                 ner: true,
                 sentence_layer: true,
                 dual_identity: true,
+                no_stream: false,
                 calls: Arc::new(AtomicU64::new(0)),
+                unary_calls: Arc::new(AtomicUsize::new(0)),
+                stream_opens: Arc::new(AtomicUsize::new(0)),
                 unary_delay: None,
                 stream_end_gate: None,
             }
         }
     }
 
-    /// The mock's toy gazetteer: a lowercased token matching an entry
-    /// is a location mention. Deterministic, so tests compute expected
-    /// column values. Springfield's low confidence models gazetteer
-    /// ambiguity (the United States has dozens).
     const GAZETTEER: [(&str, &str, &str, f64, f64, f64); 3] = [
         ("paris", "Paris", "FR", 48.8566, 2.3522, 0.9),
         ("berlin", "Berlin", "DE", 52.52, 13.405, 0.9),
         ("springfield", "Springfield", "US", 39.7817, -89.6501, 0.4),
     ];
 
-    /// The sidecar's model-free sentence detector: one span per line
-    /// holding a non-whitespace character, trimmed, in the same
-    /// coordinates as the tokens.
-    fn newline_sentences(text: &str) -> Vec<Span> {
+    fn newline_sentences(text: &str) -> Vec<WireSpan> {
         let mut out = Vec::new();
         let mut cursor = 0usize;
         for line in text.split_inclusive(['\n', '\r']) {
@@ -504,7 +505,7 @@ pub mod mock_analysis {
             let lead = body.len() - body.trim_start().len();
             let trimmed = body.trim();
             if !trimmed.is_empty() {
-                out.push(Span {
+                out.push(WireSpan {
                     start: (cursor + lead) as i32,
                     end: (cursor + lead + trimmed.len()) as i32,
                 });
@@ -514,125 +515,111 @@ pub mod mock_analysis {
         out
     }
 
-    /// The analysis itself, shared verbatim by the unary and streaming
-    /// paths — the same guarantee the real sidecar tests prove.
     fn analyze_text(
         text: &str,
-        options: &AnalysisOptions,
+        session: &WireSessionOptions,
         ner: bool,
         sentence_layer: bool,
         dual_identity: bool,
         calls: &AtomicU64,
-    ) -> Result<AnalyzeResponse, Status> {
+    ) -> Result<MockAnalyzeResponse, Status> {
         calls.fetch_add(1, Ordering::SeqCst);
         if text.is_empty() {
             return Err(Status::invalid_argument("empty text"));
         }
-        // Whitespace tokenize with original-text spans.
         let mut tokens = Vec::new();
         let mut offset = 0usize;
         for word in text.split_whitespace() {
             let start = text[offset..].find(word).map(|i| offset + i).unwrap();
             let end = start + word.len();
-            tokens.push(Token {
-                span: Some(Span {
+            tokens.push(WireToken {
+                span: Some(WireSpan {
                     start: start as i32,
                     end: end as i32,
                 }),
                 text: word.to_string(),
-                pos: String::new(),
             });
             offset = end;
         }
 
-        let stemming_on = options.stemmer > 1;
+        let (mode, source, steps, stemmer) = match &session.spec {
+            Some(s) => (
+                s.term_vector_mode,
+                s.term_vector_source,
+                s.char_filters.as_slice(),
+                s.stemmer,
+            ),
+            None => (0, 0, &[][..], 0),
+        };
+        let stemming_on = stemmer > 1;
         let stems: Vec<String> = if stemming_on {
             tokens.iter().map(|t| toy_stem(&t.text)).collect()
         } else {
             Vec::new()
         };
 
-        let mut term_vectors: Vec<TermVector> = Vec::new();
-        let mut cased_term_vectors: Vec<TermVector> = Vec::new();
-        if let Some(tv) = &options.term_vectors {
-            if tv.enabled {
-                const SOURCE_STEMS: i32 = 2;
-                const MODE_SCORING_ONLY: i32 = 2;
-                const FULL_CASE_FOLD: i32 = 6;
-                const CASE_FOLD: i32 = 16;
-                if tv.source == SOURCE_STEMS && !stemming_on {
-                    return Err(Status::invalid_argument("SOURCE_STEMS requires a stemmer"));
-                }
-                if tv.dual_cased && tv.source == SOURCE_STEMS {
-                    return Err(Status::invalid_argument(
-                        "dual_cased requires a step-chain term vector source; SOURCE_STEMS has no \
-                         folded form to contrast with",
-                    ));
-                }
-                // The mock honours the case-folding steps the way the
-                // sidecar does: a chain that names steps but no fold
-                // keeps the token's case, which is what a cased twin spec
-                // asks for. An empty chain is the server default, which
-                // folds, as every spec-less request here has assumed.
-                let folds = tv.steps.is_empty()
-                    || tv
-                        .steps
-                        .iter()
-                        .any(|step| *step == FULL_CASE_FOLD || *step == CASE_FOLD);
-                let push =
-                    |vectors: &mut Vec<TermVector>, identity: String, span: Span| match vectors
-                        .iter_mut()
-                        .find(|t| t.term == identity)
-                    {
-                        Some(entry) => {
-                            entry.frequency += 1;
-                            if tv.mode != MODE_SCORING_ONLY {
-                                entry.occurrences.push(span);
-                            }
+        let mut term_vectors: Vec<WireTermVector> = Vec::new();
+        let mut cased_term_vectors: Vec<WireTermVector> = Vec::new();
+        {
+            const SOURCE_STEMS: i32 = 2;
+            const MODE_SCORING_ONLY: i32 = 2;
+            const FULL_CASE_FOLD: i32 = 6;
+            const CASE_FOLD: i32 = 16;
+            if source == SOURCE_STEMS && !stemming_on {
+                return Err(Status::invalid_argument("SOURCE_STEMS requires a stemmer"));
+            }
+            if session.layers.dual_cased && source == SOURCE_STEMS {
+                return Err(Status::invalid_argument(
+                    "dual_cased requires a step-chain term vector source; SOURCE_STEMS has no \
+                     folded form to contrast with",
+                ));
+            }
+            let folds = steps.is_empty()
+                || steps
+                    .iter()
+                    .any(|step| *step == FULL_CASE_FOLD || *step == CASE_FOLD);
+            let push =
+                |vectors: &mut Vec<WireTermVector>, identity: String, span: WireSpan| match vectors
+                    .iter_mut()
+                    .find(|t| t.term == identity)
+                {
+                    Some(entry) => {
+                        entry.frequency += 1;
+                        if mode != MODE_SCORING_ONLY {
+                            entry.occurrences.push(span);
                         }
-                        None => vectors.push(TermVector {
-                            term: identity,
-                            frequency: 1,
-                            occurrences: if tv.mode == MODE_SCORING_ONLY {
-                                Vec::new()
-                            } else {
-                                vec![span]
-                            },
-                        }),
-                    };
-                for (i, token) in tokens.iter().enumerate() {
-                    let identity = if tv.source == SOURCE_STEMS {
-                        stems[i].clone()
-                    } else if folds {
-                        token.text.to_lowercase()
-                    } else {
-                        token.text.clone()
-                    };
-                    let span = token.span.unwrap();
-                    push(&mut term_vectors, identity, span);
-                    // The cased identity of the same token, from the
-                    // same pass: the chain minus case folding. A mock
-                    // without the capability ignores the flag, as an
-                    // older jar would.
-                    if tv.dual_cased && dual_identity {
-                        push(&mut cased_term_vectors, token.text.clone(), span);
                     }
+                    None => vectors.push(WireTermVector {
+                        term: identity,
+                        frequency: 1,
+                        occurrences: if mode == MODE_SCORING_ONLY {
+                            Vec::new()
+                        } else {
+                            vec![span]
+                        },
+                    }),
+                };
+            for (i, token) in tokens.iter().enumerate() {
+                let identity = if source == SOURCE_STEMS {
+                    stems[i].clone()
+                } else if folds {
+                    token.text.to_lowercase()
+                } else {
+                    token.text.clone()
+                };
+                let span = token.span.unwrap();
+                push(&mut term_vectors, identity, span);
+                if session.layers.dual_cased && dual_identity {
+                    push(&mut cased_term_vectors, token.text.clone(), span);
                 }
             }
         }
 
-        // Quality layers, emitted only when requested (the real
-        // sidecar's contract: "empty unless noise was requested" would
-        // otherwise be indistinguishable from "clean"). The rules are
-        // deterministic so tests can compute expected column values:
-        // a token made entirely of '#' is a noise finding scored
-        // len/10 capped at 1.0, and every U+FFFD in the text is a
-        // "replacement" artifact.
-        let noise = if options.noise {
+        let noise = if session.layers.quality {
             tokens
                 .iter()
                 .filter(|t| !t.text.is_empty() && t.text.bytes().all(|b| b == b'#'))
-                .map(|t| NoiseSpan {
+                .map(|t| WireNoiseSpan {
                     span: t.span,
                     severity: "gibberish".to_string(),
                     score: (t.text.len() as f64 / 10.0).min(1.0),
@@ -641,34 +628,28 @@ pub mod mock_analysis {
         } else {
             Vec::new()
         };
-        let artifacts = if options.artifacts {
+        let artifacts = if session.layers.quality {
             text.char_indices()
                 .filter(|&(_, c)| c == '\u{FFFD}')
-                .map(|(i, c)| TextArtifact {
-                    span: Some(Span {
+                .map(|(i, c)| WireTextArtifact {
+                    span: Some(WireSpan {
                         start: i as i32,
                         end: (i + c.len_utf8()) as i32,
                     }),
-                    r#type: "replacement".to_string(),
+                    kind: "replacement".to_string(),
                 })
                 .collect()
         } else {
             Vec::new()
         };
 
-        // The geocoding layer, emitted only when requested AND the mock
-        // models an NER-configured sidecar (the real one returns empty
-        // layers plus a warning without a model — the state the
-        // engine's preflight exists to refuse). Locations in text
-        // order; region votes are per-country evidence shares, ranked
-        // by share descending, country code ascending on ties.
-        let locations: Vec<GeoLocation> = if options.geo && ner {
+        let locations: Vec<WireGeoLocation> = if session.layers.geography && ner {
             tokens
                 .iter()
                 .filter_map(|t| {
                     let lower = t.text.to_lowercase();
                     GAZETTEER.iter().find(|(key, ..)| *key == lower).map(
-                        |&(_, name, country, lat, lon, confidence)| GeoLocation {
+                        |&(_, name, country, lat, lon, confidence)| WireGeoLocation {
                             span: t.span,
                             name: name.to_string(),
                             country_code: country.to_string(),
@@ -682,15 +663,15 @@ pub mod mock_analysis {
         } else {
             Vec::new()
         };
-        let regions: Vec<RegionVote> = {
-            let mut votes: Vec<RegionVote> = Vec::new();
+        let regions: Vec<WireRegionVote> = {
+            let mut votes: Vec<WireRegionVote> = Vec::new();
             for location in &locations {
                 match votes
                     .iter_mut()
                     .find(|v| v.country_code == location.country_code)
                 {
                     Some(vote) => vote.share += 1.0,
-                    None => votes.push(RegionVote {
+                    None => votes.push(WireRegionVote {
                         country_code: location.country_code.clone(),
                         share: 1.0,
                     }),
@@ -708,67 +689,111 @@ pub mod mock_analysis {
             votes
         };
 
-        Ok(AnalyzeResponse {
-            sentences: if options.sentence_detection && sentence_layer {
+        Ok(MockAnalyzeResponse {
+            offset_unit: WIRE_OFFSET_UTF8,
+            sentences: if session.layers.sentences && sentence_layer {
                 newline_sentences(text)
             } else {
                 Vec::new()
             },
             tokens,
-            stems,
-            entities: Vec::new(),
             term_vectors,
             cased_term_vectors,
-            embeddings: Vec::new(),
-            warnings: Vec::new(),
-            lemmas: Vec::new(),
             noise,
             artifacts,
             locations,
             regions,
-            // The rest of the sidecar's tier-1 surface (glossary, pii,
-            // coref, dependencies, relations, geo). The mock models term
-            // identity and the quality layers only, so it returns none
-            // of it rather than inventing plausible-looking annotations.
-            ..Default::default()
+            entities: Vec::new(),
         })
     }
 
     #[tonic::async_trait]
     impl AnalysisService for MockAnalysis {
-        async fn analyze(
+        type AnalyzeStreamStream =
+            Pin<Box<dyn Stream<Item = Result<AnalyzeStreamResponse, Status>> + Send>>;
+        type AnalyzeDocumentProgressiveStream =
+            Pin<Box<dyn Stream<Item = Result<AnalyzeProgressiveEvent, Status>> + Send>>;
+
+        async fn capabilities(
             &self,
-            request: Request<AnalyzeRequest>,
-        ) -> Result<Response<AnalyzeResponse>, Status> {
+            _request: Request<CapabilitiesRequest>,
+        ) -> Result<Response<CapabilitiesResponse>, Status> {
+            let mut profiles = vec![ProfileCapabilities {
+                name: "default-v1".to_string(),
+                version: "1".to_string(),
+                steps: Vec::new(),
+                layers: if self.ner {
+                    vec!["turbo:entities".to_string(), "turbo:geo".to_string()]
+                } else {
+                    Vec::new()
+                },
+                required_bundles: Vec::new(),
+            }];
+            if !self.dual_identity {
+                profiles.push(ProfileCapabilities {
+                    name: NO_DUAL_CASED_PROFILE.to_string(),
+                    version: "1".to_string(),
+                    ..Default::default()
+                });
+            }
+            Ok(Response::new(CapabilitiesResponse {
+                bundles: Vec::new(),
+                limits: None,
+                server: None,
+                profiles,
+            }))
+        }
+
+        async fn analyze_document_progressive(
+            &self,
+            request: Request<AnalyzePipelineRequest>,
+        ) -> Result<Response<Self::AnalyzeDocumentProgressiveStream>, Status> {
+            self.unary_calls.fetch_add(1, Ordering::Relaxed);
             if let Some((delay, probe)) = &self.unary_delay {
                 let call = DelayedCall::begin(probe.clone());
                 tokio::time::sleep(*delay).await;
                 call.complete();
             }
             let req = request.into_inner();
-            let options = req.options.unwrap_or_default();
-            Ok(Response::new(analyze_text(
+            let session = WireSessionOptions::from_binding(req.binding.as_ref())?;
+            let mock_resp = analyze_text(
                 &req.text,
-                &options,
+                &session,
                 self.ner,
                 self.sentence_layer,
                 self.dual_identity,
                 &self.calls,
-            )?))
+            )?;
+            let complete = AnalyzeProgressiveEvent {
+                sequence: 1,
+                event: Some(analyze_progressive_event::Event::Complete(
+                    DocumentGraphResponse {
+                        graph: mock_resp.encode_graph().into(),
+                        source_text: req.text,
+                        ..Default::default()
+                    },
+                )),
+            };
+            let receipt = AnalyzeProgressiveEvent {
+                sequence: 2,
+                event: Some(analyze_progressive_event::Event::Receipt(
+                    ProcessingReceipt::default(),
+                )),
+            };
+            Ok(Response::new(Box::pin(tokio_stream::iter([
+                Ok(complete),
+                Ok(receipt),
+            ]))))
         }
 
-        type AnalyzeStreamStream =
-            Pin<Box<dyn Stream<Item = Result<AnalyzeStreamResponse, Status>> + Send>>;
-
-        /// The streaming contract of the real sidecar: options must come
-        /// first (once), per-document failures come back as error results
-        /// on their sequence, and responses are delivered DELIBERATELY out
-        /// of request order (each pair swapped) so client reorder logic is
-        /// actually exercised by the tests.
         async fn analyze_stream(
             &self,
             request: Request<Streaming<AnalyzeStreamRequest>>,
         ) -> Result<Response<Self::AnalyzeStreamStream>, Status> {
+            if self.no_stream {
+                return Err(Status::unimplemented("this server predates AnalyzeStream"));
+            }
+            self.stream_opens.fetch_add(1, Ordering::Relaxed);
             let mut inbound = request.into_inner();
             let ner = self.ner;
             let sentence_layer = self.sentence_layer;
@@ -777,7 +802,7 @@ pub mod mock_analysis {
             let gate = self.stream_end_gate.clone();
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<AnalyzeStreamResponse, Status>>(16);
             tokio::spawn(async move {
-                let mut options: Option<AnalysisOptions> = None;
+                let mut saw_header = false;
                 let mut held: Option<AnalyzeStreamResponse> = None;
                 loop {
                     let message = match inbound.message().await {
@@ -785,46 +810,55 @@ pub mod mock_analysis {
                         Ok(None) => break,
                         Err(_) => return,
                     };
-                    match message.msg {
-                        Some(analyze_stream_request::Msg::Options(o)) => {
-                            if options.is_some() {
+                    match message.kind {
+                        Some(analyze_stream_request::Kind::Header(_)) => {
+                            if saw_header {
                                 let _ = tx
                                     .send(Err(Status::invalid_argument(
-                                        "options may only be the first message of the stream",
+                                        "header may only be the first message of the stream",
                                     )))
                                     .await;
                                 return;
                             }
-                            options = Some(o);
+                            saw_header = true;
                         }
-                        Some(analyze_stream_request::Msg::Doc(doc)) => {
-                            let Some(options) = options.as_ref() else {
+                        Some(analyze_stream_request::Kind::Document(doc)) => {
+                            if !saw_header {
                                 let _ = tx
                                     .send(Err(Status::invalid_argument(
-                                        "the first message of the stream must carry options",
+                                        "the first message of the stream must carry a header",
                                     )))
                                     .await;
                                 return;
-                            };
-                            let result = match analyze_text(
-                                &doc.text,
-                                options,
-                                ner,
-                                sentence_layer,
-                                dual_identity,
-                                &calls,
-                            ) {
-                                Ok(ok) => analyze_stream_response::Result::Ok(ok),
-                                Err(status) => {
-                                    analyze_stream_response::Result::Error(AnalyzeStreamError {
-                                        code: status.code() as i32,
-                                        message: status.message().to_string(),
+                            }
+                            let outcome = match std::str::from_utf8(&doc.text)
+                                .map_err(|_| Status::invalid_argument("document text is not UTF-8"))
+                                .and_then(|text| {
+                                    let session =
+                                        WireSessionOptions::from_binding(doc.binding.as_ref())?;
+                                    let ok = analyze_text(
+                                        text,
+                                        &session,
+                                        ner,
+                                        sentence_layer,
+                                        dual_identity,
+                                        &calls,
+                                    )?;
+                                    Ok(DocumentGraphResponse {
+                                        graph: ok.encode_graph().into(),
+                                        source_text: text.to_string(),
+                                        ..Default::default()
                                     })
-                                }
+                                }) {
+                                Ok(graph) => analyze_stream_response::Outcome::DocumentGraph(graph),
+                                Err(status) => analyze_stream_response::Outcome::Failure(
+                                    analyze_failure_from_status(status),
+                                ),
                             };
                             let response = AnalyzeStreamResponse {
-                                sequence: doc.sequence,
-                                result: Some(result),
+                                id: doc.id,
+                                outcome: Some(outcome),
+                                binding: doc.binding,
                             };
                             match held.take() {
                                 None => held = Some(response),
@@ -840,7 +874,7 @@ pub mod mock_analysis {
                         None => {
                             let _ = tx
                                 .send(Err(Status::invalid_argument(
-                                    "message carries neither options nor doc",
+                                    "message carries neither header nor document",
                                 )))
                                 .await;
                             return;
@@ -851,8 +885,6 @@ pub mod mock_analysis {
                     let _ = tx.send(Ok(last)).await;
                 }
                 if let Some(gate) = gate {
-                    // Hold the stream open past its last result until the
-                    // test releases it; the sender drops after.
                     let permit = gate.acquire().await;
                     drop(permit);
                 }
@@ -860,21 +892,309 @@ pub mod mock_analysis {
             Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
         }
 
-        async fn get_capabilities(
+        async fn load_bundle(
             &self,
-            _request: Request<GetCapabilitiesRequest>,
-        ) -> Result<Response<GetCapabilitiesResponse>, Status> {
-            Ok(Response::new(GetCapabilitiesResponse {
-                ner_available: self.ner,
-                dual_term_identity_available: self.dual_identity,
-                ..Default::default()
+            _request: Request<LoadBundleRequest>,
+        ) -> Result<Response<LoadBundleResponse>, Status> {
+            Err(Status::unimplemented(
+                "MockAnalysis does not serve LoadBundle",
+            ))
+        }
+
+        async fn unload_bundle(
+            &self,
+            _request: Request<UnloadBundleRequest>,
+        ) -> Result<Response<UnloadBundleResponse>, Status> {
+            Err(Status::unimplemented(
+                "MockAnalysis does not serve UnloadBundle",
+            ))
+        }
+
+        async fn round_trip_sparse_terms(
+            &self,
+            req: Request<SparseTermsResult>,
+        ) -> Result<Response<SparseTermsResult>, Status> {
+            Ok(Response::new(req.into_inner()))
+        }
+
+        async fn round_trip_token_vectors(
+            &self,
+            req: Request<TokenVectorsResult>,
+        ) -> Result<Response<TokenVectorsResult>, Status> {
+            Ok(Response::new(req.into_inner()))
+        }
+
+        async fn round_trip_multi_res_vectors(
+            &self,
+            req: Request<MultiResVectorsResult>,
+        ) -> Result<Response<MultiResVectorsResult>, Status> {
+            Ok(Response::new(req.into_inner()))
+        }
+
+        async fn round_trip_rerank_scores(
+            &self,
+            req: Request<RerankScoresResult>,
+        ) -> Result<Response<RerankScoresResult>, Status> {
+            Ok(Response::new(req.into_inner()))
+        }
+
+        async fn round_trip_extraction(
+            &self,
+            req: Request<ExtractionResult>,
+        ) -> Result<Response<ExtractionResult>, Status> {
+            Ok(Response::new(req.into_inner()))
+        }
+
+        async fn round_trip_records(
+            &self,
+            req: Request<RecordsResult>,
+        ) -> Result<Response<RecordsResult>, Status> {
+            Ok(Response::new(req.into_inner()))
+        }
+
+        async fn round_trip_chunk_levels(
+            &self,
+            req: Request<ChunkLevelsResult>,
+        ) -> Result<Response<ChunkLevelsResult>, Status> {
+            Ok(Response::new(req.into_inner()))
+        }
+
+        async fn round_trip_document_graph(
+            &self,
+            _req: Request<DocumentGraphRequest>,
+        ) -> Result<Response<DocumentGraphResponse>, Status> {
+            Err(Status::unimplemented(
+                "MockAnalysis does not round-trip TGRF",
+            ))
+        }
+
+        async fn inspect_document_graph(
+            &self,
+            _req: Request<InspectDocumentGraphRequest>,
+        ) -> Result<Response<TypedDocumentResult>, Status> {
+            Err(Status::unimplemented("MockAnalysis does not inspect TGRF"))
+        }
+
+        async fn round_trip_typed_document(
+            &self,
+            req: Request<TypedDocumentResult>,
+        ) -> Result<Response<TypedDocumentResult>, Status> {
+            Ok(Response::new(req.into_inner()))
+        }
+
+        async fn project_search_document(
+            &self,
+            _req: Request<ProjectSearchDocumentRequest>,
+        ) -> Result<Response<SearchDocumentProjection>, Status> {
+            Err(Status::unimplemented("MockAnalysis does not project TGRF"))
+        }
+
+        async fn round_trip_search_projection(
+            &self,
+            req: Request<SearchDocumentProjection>,
+        ) -> Result<Response<SearchDocumentProjection>, Status> {
+            Ok(Response::new(req.into_inner()))
+        }
+
+        async fn analyze_query(
+            &self,
+            _req: Request<AnalyzeQueryRequest>,
+        ) -> Result<Response<AnalyzeQueryResponse>, Status> {
+            Err(Status::unimplemented(
+                "MockAnalysis does not serve AnalyzeQuery",
+            ))
+        }
+
+        async fn round_trip_analyze_query(
+            &self,
+            req: Request<AnalyzeQueryResponse>,
+        ) -> Result<Response<AnalyzeQueryResponse>, Status> {
+            Ok(Response::new(req.into_inner()))
+        }
+
+        async fn rerank_and_highlight(
+            &self,
+            req: Request<RerankAndHighlightRequest>,
+        ) -> Result<Response<RerankAndHighlightResponse>, Status> {
+            use turbo_client::proto::result::{
+                ModelRef, RerankedCandidateProto, SemanticHighlightSpanProto,
+            };
+
+            let inner = req.into_inner();
+            let q_tokens: Vec<String> = inner
+                .query
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|t| !t.is_empty())
+                .map(|t| t.to_lowercase())
+                .collect();
+
+            let mut results: Vec<RerankedCandidateProto> =
+                Vec::with_capacity(inner.candidates.len());
+            for (idx, cand) in inner.candidates.iter().enumerate() {
+                let spans: Vec<(u32, u32)> = if !cand.sentence_span_start.is_empty()
+                    && cand.sentence_span_start.len() == cand.sentence_span_end.len()
+                {
+                    cand.sentence_span_start
+                        .iter()
+                        .copied()
+                        .zip(cand.sentence_span_end.iter().copied())
+                        .collect()
+                } else if !cand.text.is_empty() {
+                    vec![(0, cand.text.len() as u32)]
+                } else {
+                    Vec::new()
+                };
+
+                let mut scored_spans: Vec<(u32, u32, f64)> = Vec::with_capacity(spans.len());
+                let mut best = 0.0_f64;
+                for &(s, e) in &spans {
+                    let Some(slice) = cand.text.get(s as usize..e as usize) else {
+                        continue;
+                    };
+                    let words: Vec<String> = slice
+                        .split(|c: char| !c.is_alphanumeric())
+                        .filter(|t| !t.is_empty())
+                        .map(|t| t.to_lowercase())
+                        .collect();
+                    let overlap = if q_tokens.is_empty() {
+                        0.5
+                    } else {
+                        let matched = q_tokens
+                            .iter()
+                            .filter(|qt| {
+                                words.iter().any(|w| w == *qt || w.starts_with(qt.as_str()))
+                            })
+                            .count();
+                        matched as f64 / q_tokens.len() as f64
+                    };
+                    best = best.max(overlap);
+                    scored_spans.push((s, e, overlap));
+                }
+                scored_spans.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+
+                let raw_logit = (3.0 * best - 1.0) as f32;
+                let prob = (1.0 / (1.0 + (-f64::from(raw_logit)).exp())).clamp(0.0, 1.0);
+                let max_snips = inner.max_snippets_per_candidate as usize;
+                let highlights: Vec<SemanticHighlightSpanProto> = scored_spans
+                    .into_iter()
+                    .take(max_snips)
+                    .filter_map(|(s, e, sc)| {
+                        cand.text.get(s as usize..e as usize).map(|surface| {
+                            SemanticHighlightSpanProto {
+                                span_start: s,
+                                span_end: e,
+                                parent_span_start: cand.parent_offset + u64::from(s),
+                                parent_span_end: cand.parent_offset + u64::from(e),
+                                score: sc,
+                                surface: surface.to_string(),
+                            }
+                        })
+                    })
+                    .collect();
+
+                results.push(RerankedCandidateProto {
+                    input_index: idx as u32,
+                    doc_id: cand.doc_id.clone(),
+                    raw_logit,
+                    calibrated_probability: prob,
+                    conformal_p_value: None,
+                    highlights,
+                    qa_abstained: false,
+                    qa_null_probability: None,
+                });
+            }
+            results.sort_by(|a, b| {
+                b.calibrated_probability
+                    .total_cmp(&a.calibrated_probability)
+                    .then_with(|| a.input_index.cmp(&b.input_index))
+            });
+
+            Ok(Response::new(RerankAndHighlightResponse {
+                query: inner.query,
+                rerank_model: Some(ModelRef {
+                    id: inner.rerank_model,
+                    revision: "mock-v1".into(),
+                    sha256: String::new(),
+                }),
+                highlight_model: None,
+                offsets: inner.offsets,
+                results,
             }))
+        }
+
+        async fn round_trip_rerank_and_highlight(
+            &self,
+            req: Request<RerankAndHighlightResponse>,
+        ) -> Result<Response<RerankAndHighlightResponse>, Status> {
+            Ok(Response::new(req.into_inner()))
+        }
+
+        async fn inspect_document_window(
+            &self,
+            _req: Request<DocumentWindowRequest>,
+        ) -> Result<Response<DocumentWindowResponse>, Status> {
+            Err(Status::unimplemented(
+                "MockAnalysis does not serve InspectDocumentWindow",
+            ))
+        }
+
+        async fn project_chunks(
+            &self,
+            _req: Request<ProjectChunksRequest>,
+        ) -> Result<Response<ProjectChunksResponse>, Status> {
+            Err(Status::unimplemented(
+                "MockAnalysis does not serve ProjectChunks",
+            ))
+        }
+
+        async fn list_output_formats(
+            &self,
+            _req: Request<ListOutputFormatsRequest>,
+        ) -> Result<Response<ListOutputFormatsResponse>, Status> {
+            Ok(Response::new(ListOutputFormatsResponse::default()))
+        }
+
+        async fn format_document(
+            &self,
+            _req: Request<FormatDocumentRequest>,
+        ) -> Result<Response<FormatDocumentResponse>, Status> {
+            Err(Status::unimplemented(
+                "MockAnalysis does not serve FormatDocument",
+            ))
         }
     }
 
     /// Start the mock on 127.0.0.1:0; returns its `http://` address.
     pub async fn start_mock_analysis() -> (String, JoinHandle<Result<(), TransportError>>) {
         start_mock(MockAnalysis::default()).await
+    }
+
+    /// Start a mock whose `AnalyzeStream` RPC answers `UNIMPLEMENTED`.
+    pub async fn start_mock_analysis_without_stream(
+    ) -> (String, JoinHandle<Result<(), TransportError>>) {
+        start_mock(MockAnalysis {
+            no_stream: true,
+            ..MockAnalysis::default()
+        })
+        .await
+    }
+
+    /// Start a mock exposing separate unary and stream-open transport counters.
+    pub async fn start_mock_analysis_transport_counts() -> (
+        String,
+        JoinHandle<Result<(), TransportError>>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    ) {
+        let unary = Arc::new(AtomicUsize::new(0));
+        let streams = Arc::new(AtomicUsize::new(0));
+        let (addr, handle) = start_mock(MockAnalysis {
+            unary_calls: unary.clone(),
+            stream_opens: streams.clone(),
+            ..MockAnalysis::default()
+        })
+        .await;
+        (addr, handle, unary, streams)
     }
 
     /// A mock whose `AnalyzeStream` calls hold their response stream
@@ -894,7 +1214,7 @@ pub mod mock_analysis {
         (addr, gate, handle)
     }
 
-    /// A normal mock whose unary `Analyze` method pauses for `delay`.
+    /// A normal mock whose unary `AnalyzeDocumentProgressive` method pauses for `delay`.
     /// The returned probe distinguishes completed calls from futures dropped
     /// because their client cancelled or exceeded a deadline.
     pub async fn start_mock_analysis_delayed(
@@ -913,10 +1233,8 @@ pub mod mock_analysis {
         (address, handle, probe)
     }
 
-    /// [`start_mock_analysis`] modeling a sidecar with NO NER model
-    /// configured: `GetCapabilities.ner_available` is false, and the
-    /// geocoding layer stays empty even when requested — the state the
-    /// engine's geography preflight exists to refuse.
+    /// [`start_mock_analysis`] modeling an analysis server with NO NER/geo
+    /// layers advertised in `Capabilities`.
     pub async fn start_mock_analysis_without_ner(
     ) -> (String, JoinHandle<Result<(), TransportError>>) {
         start_mock(MockAnalysis {
@@ -954,9 +1272,7 @@ pub mod mock_analysis {
         .await
     }
 
-    /// A mock modelling a jar that predates the dual term identity: it
-    /// reports the capability false and ignores `dual_cased`. Returns
-    /// the call meter too, so a test can pin that nothing was analyzed.
+    /// A mock modelling an analysis server lacking dual term identity support.
     pub async fn start_mock_analysis_without_dual_identity() -> (
         String,
         JoinHandle<Result<(), TransportError>>,
@@ -990,15 +1306,14 @@ pub mod mock_analysis {
     }
 }
 
-/// Spawn the native OpenNLP analysis sidecar on `port` and wait for its
+/// Spawn a `turbo-kserve` analysis server binary on `port` and wait for its
 /// listener. Returns the child (kill on drop) and its `http://` address.
-/// Used by binaries that run against the sidecar; tests use the mock.
 pub fn start_sidecar(binary: &str, port: u16) -> Result<(Child, String), String> {
     start_sidecar_with_env(binary, port, &[])
 }
 
 /// Like [`start_sidecar`], with extra environment variables (for
-/// example `OPENNLP_EMBEDDINGS_DIR` to enable static embeddings).
+/// example `TURBO_EMBED_MODEL` or bundle paths).
 pub fn start_sidecar_with_env(
     binary: &str,
     port: u16,

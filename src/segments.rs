@@ -36,6 +36,7 @@ const BASE_SET_FORMAT: u32 = 1;
 const SET_FORMAT: u32 = 2;
 const SOURCE_SET_FORMAT: u32 = 3;
 const DECLARED_SET_FORMAT: u32 = 4;
+const RETAINED_SET_FORMAT: u32 = 5;
 const SET_FILE: &str = "segments.json";
 const SEGMENT_META_FILE: &str = "segment.json";
 
@@ -121,6 +122,8 @@ pub struct SegmentMetadata {
     pub total_document_length: u64,
     pub vector: SegmentArtifact,
     pub exact_vectors: SegmentArtifact,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multi_res: Option<SegmentArtifact>,
     pub bm25: SegmentArtifact,
     pub live_docs: SegmentArtifact,
     /// Absent on segments sealed before summaries existed; such a
@@ -273,9 +276,23 @@ impl Default for SegmentSetManifest {
 }
 
 impl SegmentSetManifest {
+    /// Promote only after the final artifact inventory is assembled. Source
+    /// publication establishes its binding before it appends staged segments.
+    fn update_retained_format(&mut self) {
+        if self
+            .segments
+            .iter()
+            .any(|segment| segment.multi_res.is_some())
+        {
+            self.format = RETAINED_SET_FORMAT;
+        }
+    }
+
     pub fn with_binding(mut self, binding: Option<&StoredBinding>) -> Result<Self, String> {
         self.binding = binding.map(SegmentBinding::encode).transpose()?;
-        self.format = if self.generation_declaration.is_some() {
+        self.format = if self.format == RETAINED_SET_FORMAT {
+            RETAINED_SET_FORMAT
+        } else if self.generation_declaration.is_some() {
             DECLARED_SET_FORMAT
         } else if self.source_owner.is_some() {
             SOURCE_SET_FORMAT
@@ -284,6 +301,7 @@ impl SegmentSetManifest {
         } else {
             BASE_SET_FORMAT
         };
+        self.update_retained_format();
         Ok(self)
     }
 }
@@ -297,6 +315,7 @@ pub struct SegmentSource<'a> {
     /// exact rows must be absent too.
     pub vector_path: Option<&'a Path>,
     pub exact_vector_path: Option<&'a Path>,
+    pub multi_res_path: Option<&'a Path>,
     pub bm25_path: &'a Path,
     pub live_docs_path: &'a Path,
     /// The integer column a partitioned compaction ordered this segment
@@ -344,6 +363,7 @@ struct OpenedSegment {
     /// `None` for a documents-only segment (an empty `vector` artifact).
     vector: Option<Arc<VectorIndex>>,
     exact: Option<Arc<ExactVectorStore>>,
+    retained: Arc<crate::multi_res::MultiResVectors>,
     bm25: Arc<Bm25Reader>,
     live_docs: LiveDocs,
 }
@@ -484,6 +504,12 @@ impl OpenedSegmentSet {
                     verify_artifact(&directory, &metadata.live_docs)?;
                     let live_docs = LiveDocs::open(&directory.join(&metadata.live_docs.file))
                         .map_err(|error| format!("open retired segment bitmap: {error}"))?;
+                    if live_docs.requires_retained_vectors() && metadata.multi_res.is_none() {
+                        return Err(format!(
+                            "segment {:?} requires a retained vector artifact",
+                            metadata.segment_id
+                        ));
+                    }
                     if live_docs.persisted_rows() != metadata.rows
                         || metadata.rows.checked_sub(live_docs.deleted_count())
                             != Some(metadata.live_rows)
@@ -496,6 +522,7 @@ impl OpenedSegmentSet {
                         metadata: metadata.clone(),
                         vector: held.vector.clone(),
                         exact: held.exact.clone(),
+                        retained: Arc::clone(&held.retained),
                         bm25: Arc::clone(&held.bm25),
                         live_docs,
                     }));
@@ -546,6 +573,18 @@ impl OpenedSegmentSet {
             } else {
                 None
             };
+            let retained = match &metadata.multi_res {
+                Some(artifact) => {
+                    verify_artifact(&directory, artifact)?;
+                    crate::multi_res::MultiResVectors::open(
+                        &directory.join(&artifact.file),
+                        metadata.rows,
+                        &artifact.sha256,
+                    )
+                    .map_err(|error| format!("open retained vector segment: {error}"))?
+                }
+                None => crate::multi_res::MultiResVectors::default(),
+            };
             let exact_rows = exact.as_ref().map_or(0, |store| store.len());
             let bm25 = Bm25Reader::open(&directory.join(&metadata.bm25.file))
                 .map_err(|error| format!("open BM25 segment {:?}: {error}", metadata.segment_id))?;
@@ -553,6 +592,12 @@ impl OpenedSegmentSet {
                 LiveDocs::open(&directory.join(&metadata.live_docs.file)).map_err(|error| {
                     format!("open live-doc segment {:?}: {error}", metadata.segment_id)
                 })?;
+            if live_docs.requires_retained_vectors() && metadata.multi_res.is_none() {
+                return Err(format!(
+                    "segment {:?} requires a retained vector artifact",
+                    metadata.segment_id
+                ));
+            }
             let rows = usize::try_from(metadata.rows)
                 .map_err(|_| format!("segment {:?} rows do not fit usize", metadata.segment_id))?;
             // Row alignment (docs/immutable-segments.md): every artifact
@@ -628,6 +673,7 @@ impl OpenedSegmentSet {
                 metadata: metadata.clone(),
                 vector: vector.map(Arc::new),
                 exact,
+                retained: Arc::new(retained),
                 bm25: Arc::new(bm25),
                 live_docs,
             }));
@@ -735,6 +781,21 @@ impl OpenedSegmentSet {
     /// The immutable FP32 image opened and verified with this segment snapshot.
     /// Documents-only segments have no exact rows. Bitmap-only publications
     /// share this image while retaining their own tombstone overlays.
+    pub(crate) fn retained_segment(&self, i: usize) -> &crate::multi_res::MultiResVectors {
+        &self.segments[i].retained
+    }
+
+    pub(crate) fn retained_vectors(&self) -> Result<crate::multi_res::MultiResVectors, String> {
+        let mut rows = crate::multi_res::MultiResVectors::default();
+        for segment in &self.segments {
+            let base = u32::try_from(segment.metadata.base_label)
+                .map_err(|_| "retained segment base exceeds u32")?;
+            rows.append_at(base, &segment.retained)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(rows)
+    }
+
     pub fn exact_vectors(&self, i: usize) -> Option<&Arc<ExactVectorStore>> {
         self.segments[i].exact.as_ref()
     }
@@ -1225,6 +1286,7 @@ impl SegmentCatalog {
             .ok_or("segment catalog epoch overflow")?;
         manifest.segments.push(metadata.clone());
         manifest.segments.sort_by_key(|segment| segment.base_label);
+        manifest.update_retained_format();
         let published = self.publish(manifest);
         if published.is_err() {
             cleanup_staged(&self.root, std::slice::from_ref(&metadata));
@@ -1342,6 +1404,7 @@ impl SegmentCatalog {
         manifest.segments.extend(outputs.iter().cloned());
         manifest.segments.sort_by_key(|segment| segment.base_label);
         manifest.partition_key = partition_key;
+        manifest.update_retained_format();
         let published = self.publish(manifest);
         if published.is_err() {
             cleanup_staged(&self.root, &outputs);
@@ -1479,6 +1542,7 @@ impl SegmentCatalog {
             .zip(ids.iter())
             .zip(live_paths.iter())
             .map(|((segment, id), live_docs_path)| SegmentSource {
+                multi_res_path: segment.image.multi_res_path.as_deref(),
                 segment_id: id,
                 generation: output.generation,
                 base_label: segment.image.slot_offset,
@@ -1672,6 +1736,17 @@ fn verify_retry_source(
         return Err("segment retry differs from the published partition contract".into());
     }
     let directory = SegmentCatalog::segment_dir(root, &held.segment_id);
+    match (source.multi_res_path, held.multi_res.as_ref()) {
+        (Some(path), Some(artifact)) => {
+            let (bytes, sha256) = digest_file(path)?;
+            if bytes != artifact.bytes || sha256 != artifact.sha256 {
+                return Err("segment retry differs from retained vector artifact".into());
+            }
+            verify_artifact(&directory, artifact)?;
+        }
+        (None, None) => {}
+        _ => return Err("segment retry differs from retained vector declaration".into()),
+    }
     for (source, artifact) in [
         (source.vector_path, &held.vector),
         (source.exact_vector_path, &held.exact_vectors),
@@ -1696,12 +1771,19 @@ fn verify_retry_source(
 }
 
 fn validate_manifest(manifest: &SegmentSetManifest) -> Result<(), String> {
-    if !(BASE_SET_FORMAT..=DECLARED_SET_FORMAT).contains(&manifest.format)
+    if !(BASE_SET_FORMAT..=RETAINED_SET_FORMAT).contains(&manifest.format)
         || (manifest.format == BASE_SET_FORMAT && manifest.binding.is_some())
         || (manifest.format == SET_FORMAT && manifest.binding.is_none())
         || (manifest.format < SOURCE_SET_FORMAT && manifest.source_owner.is_some())
         || (manifest.format == SOURCE_SET_FORMAT && manifest.source_owner.is_none())
-        || ((manifest.format == DECLARED_SET_FORMAT) != manifest.generation_declaration.is_some())
+        || (manifest.format < RETAINED_SET_FORMAT
+            && ((manifest.format == DECLARED_SET_FORMAT)
+                != manifest.generation_declaration.is_some()))
+        || (manifest.format < RETAINED_SET_FORMAT
+            && manifest
+                .segments
+                .iter()
+                .any(|segment| segment.multi_res.is_some()))
     {
         return Err(format!(
             "segment set format {} or binding declaration is unsupported; expected format \
@@ -1760,6 +1842,12 @@ fn validate_manifest(manifest: &SegmentSetManifest) -> Result<(), String> {
         if has_vectors {
             artifacts.push(&segment.vector);
             artifacts.push(&segment.exact_vectors);
+        }
+        if let Some(artifact) = &segment.multi_res {
+            if !has_vectors {
+                return Err("segment retains vector tiers without vector rows".into());
+            }
+            artifacts.push(artifact);
         }
         for artifact in artifacts {
             validate_relative_file(&artifact.file)?;
@@ -1929,6 +2017,22 @@ fn stage_segment(root: &Path, source: SegmentSource<'_>) -> Result<SegmentMetada
                 live_docs.persisted_rows()
             ));
         }
+        let multi_res = source
+            .multi_res_path
+            .map(|path| {
+                if vector.is_none() {
+                    return Err("cannot retain tiers in a documents-only segment".to_string());
+                }
+                let artifact = copy_artifact(path, &temp_dir, crate::multi_res::FILE_NAME)?;
+                crate::multi_res::MultiResVectors::open(
+                    &temp_dir.join(&artifact.file),
+                    rows as u64,
+                    &artifact.sha256,
+                )
+                .map_err(|error| format!("verify retained segment vectors: {error}"))?;
+                Ok(artifact)
+            })
+            .transpose()?;
         let (backend_kind, scoring_fingerprint) = match &vector {
             Some(vector) => {
                 let descriptor = vector.descriptor();
@@ -1963,6 +2067,7 @@ fn stage_segment(root: &Path, source: SegmentSource<'_>) -> Result<SegmentMetada
             total_document_length: Bm25Index::total_doc_length(&bm25),
             vector: vector_artifact,
             exact_vectors: exact_artifact,
+            multi_res,
             bm25: bm25_artifact,
             live_docs: live_artifact,
             summary: Some({
@@ -2130,6 +2235,7 @@ pub(crate) fn summarize_columns(bm25: &Bm25Reader, rows: u32) -> SegmentSummary 
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod retained_tests;
 
     #[test]
     fn source_owner_metadata_rejects_downgrade_corruption_and_noncanonical_protobuf() {
@@ -2264,6 +2370,7 @@ mod tests {
         generation: u64,
     ) -> SegmentSource<'a> {
         SegmentSource {
+            multi_res_path: None,
             segment_id: id,
             generation,
             base_label: base,

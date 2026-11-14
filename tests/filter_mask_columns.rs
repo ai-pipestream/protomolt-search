@@ -227,6 +227,7 @@ fn the_mask_from_the_columns_is_the_row_by_row_mask_across_every_part() {
         let published = shard
             .catalog()
             .append(SegmentSource {
+                multi_res_path: None,
                 segment_id: &format!("seg-{batch}"),
                 generation: batch as u64 + 1,
                 base_label: base as u64,
@@ -303,6 +304,7 @@ fn measure_the_mask_from_the_columns() {
         let published = shard
             .catalog()
             .append(SegmentSource {
+                multi_res_path: None,
                 segment_id: &format!("seg-{batch}"),
                 generation: batch as u64 + 1,
                 base_label: base as u64,

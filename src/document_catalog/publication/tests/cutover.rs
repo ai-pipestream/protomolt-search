@@ -42,6 +42,7 @@ async fn maintenance_cutover_recovers_both_runtime_windows_and_an_uncertain_mani
                 StatsClaim::required(active.stats_epoch, &active.stats_incarnation).unwrap(),
                 epoch,
                 vec![SegmentSource {
+                    multi_res_path: None,
                     segment_id: "maintenance-output",
                     generation: epoch + 1,
                     base_label: 0,
@@ -157,6 +158,7 @@ async fn a_source_write_can_finish_during_verification_and_invalidates_the_rewri
             StatsClaim::required(active.stats_epoch, &active.stats_incarnation).unwrap(),
             epoch,
             vec![SegmentSource {
+                multi_res_path: None,
                 segment_id: "stale-output",
                 generation: epoch + 1,
                 base_label: 0,

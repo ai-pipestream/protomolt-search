@@ -528,6 +528,19 @@ pub struct CoordinatorServiceImpl {
     /// cell intentionally conflates intermediate snapshots: every revision
     /// is a full replacement, so a slow client only needs the newest one.
     query_progress: Option<Arc<QueryProgressPublisher>>,
+    /// Optional memory-mapped stem-to-surface FST lexicon for stemmed `Suggest`.
+    surface_lexicon: Option<Arc<crate::turbo_bridge::query_plan::SharedSurfaceLexicon>>,
+    /// Optional contextual bigram spellchecker for `TermSuggest`.
+    spellchecker: Option<Arc<turbo_client::QuerySpellchecker>>,
+    /// Optional one-pass query analyzer + typed NLP column mapping.
+    one_pass_query: Option<
+        Arc<(
+            turbo_client::OnePassQueryAnalyzer,
+            crate::turbo_bridge::NlpColumnSpec,
+        )>,
+    >,
+    /// Optional Stage-2 calibrated `RerankAndHighlight` policy.
+    rerank_spec: Option<Arc<crate::turbo_bridge::rerank::RerankSpec>>,
 }
 
 /// A process-unique, well-mixed stream token for the UDP signal lane
@@ -1694,6 +1707,7 @@ pub struct RequestFilters {
     pub parent_floor_share_ppm: Option<u32>,
     pub floor_greediness_ppm: Option<u32>,
     pub floor_clamp_min: Option<u32>,
+    pub include_rerank_candidate: bool,
 }
 
 /// The provider-mismatch line of a cluster health report: empty when
@@ -1853,6 +1867,7 @@ impl RequestFilters {
             parent_floor_share_ppm: None,
             floor_greediness_ppm: None,
             floor_clamp_min: None,
+            include_rerank_candidate: false,
         })
     }
 }
@@ -2094,6 +2109,10 @@ impl CoordinatorServiceImpl {
             cutover_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             phrase_index: None,
             query_progress: None,
+            surface_lexicon: None,
+            spellchecker: None,
+            one_pass_query: None,
+            rerank_spec: None,
         }
     }
 
@@ -3075,6 +3094,234 @@ impl CoordinatorServiceImpl {
         self
     }
 
+    /// Install a memory-mapped stem-to-surface lexicon so
+    /// `SearchService.Suggest` on stemmed fields returns true surface completions.
+    pub fn with_surface_lexicon(
+        mut self,
+        lexicon: Arc<crate::turbo_bridge::query_plan::SharedSurfaceLexicon>,
+    ) -> Self {
+        self.surface_lexicon = Some(lexicon);
+        self
+    }
+
+    /// Install a contextual bigram spellchecker consulted by `SearchService.TermSuggest`.
+    pub fn with_spellchecker(mut self, spellchecker: Arc<turbo_client::QuerySpellchecker>) -> Self {
+        self.spellchecker = Some(spellchecker);
+        self
+    }
+
+    /// Install a one-pass `AnalyzeQuery` planner and target NLP column mapping
+    /// for structured filter binding and query synonyms.
+    pub fn with_one_pass_query(
+        mut self,
+        analyzer: turbo_client::OnePassQueryAnalyzer,
+        columns: crate::turbo_bridge::NlpColumnSpec,
+    ) -> Self {
+        self.one_pass_query = Some(Arc::new((analyzer, columns)));
+        self
+    }
+
+    /// Install a Stage-2 calibrated `RerankAndHighlight` policy applied to dense
+    /// and hybrid shortlists.
+    pub fn with_rerank_spec(mut self, spec: crate::turbo_bridge::rerank::RerankSpec) -> Self {
+        self.rerank_spec = Some(Arc::new(spec));
+        self
+    }
+
+    pub(crate) fn rerank_spec(&self) -> Option<&crate::turbo_bridge::rerank::RerankSpec> {
+        self.rerank_spec.as_deref()
+    }
+
+    pub(crate) fn one_pass_query(
+        &self,
+    ) -> Option<&(
+        turbo_client::OnePassQueryAnalyzer,
+        crate::turbo_bridge::NlpColumnSpec,
+    )> {
+        self.one_pass_query.as_deref()
+    }
+
+    /// Verify a remote `turbo-kserve` endpoint against an expected index-generation handshake.
+    #[cfg(feature = "net")]
+    pub async fn verify_remote_turbo_handshake(
+        &self,
+        endpoint: &str,
+        expected: turbo_client::IndexGenerationHandshake,
+    ) -> Result<(), Status> {
+        let opts = crate::analyzer::RemoteCallOptions {
+            tls: self.client_tls.clone(),
+            expected_handshake: Some(expected.clone()),
+            ..Default::default()
+        };
+        let _ =
+            crate::analyzer::connect_verified_turbo_client(endpoint, None, &opts, expected).await?;
+        Ok(())
+    }
+
+    /// Rescore a Stage-1 `(doc_id, score)` shortlist against a higher-dimensional
+    /// Matryoshka tier stored on local shards, returning the re-sorted shortlist.
+    pub fn rescore_matryoshka_shortlist(
+        &self,
+        candidates: &[(u64, f32)],
+        query: &[f32],
+        target_dim: u32,
+    ) -> Result<Vec<(u64, f32)>, Status> {
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let coordinator = self.request_snapshot().unwrap_or_else(|| self.clone());
+        let candidate_ids: Vec<u64> = candidates.iter().map(|&(id, _)| id).collect();
+        let mut rescored: Vec<(u64, f32)> = candidates.to_vec();
+        for addr in &coordinator.node_addrs {
+            match coordinator.node_client(addr)? {
+                crate::link::NodeLink::Local(node) => {
+                    let updated =
+                        node.rescore_matryoshka_tier(target_dim, query, &candidate_ids)?;
+                    for (gid, new_score) in updated {
+                        if let Some(slot) = rescored.iter_mut().find(|(id, _)| *id == gid) {
+                            slot.1 = new_score;
+                        }
+                    }
+                }
+                #[cfg(feature = "net")]
+                crate::link::NodeLink::Remote(_) => {}
+            }
+        }
+        rescored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(rescored)
+    }
+
+    /// Fan out quantized SPLADE 128-doc Block-Max scoring across all unmasked
+    /// local and remote shards with CEL filter admission and running top-k floor propagation.
+    pub async fn score_splade(
+        &self,
+        field: &str,
+        query_weights: &[(String, f32)],
+        query_l1_slack: f32,
+        k: usize,
+        filter_cel: &str,
+    ) -> Result<Vec<(u64, f32)>, Status> {
+        let coordinator = self.request_snapshot().unwrap_or_else(|| self.clone());
+        let max_k = coordinator.knobs.max_k();
+        if k > max_k as usize {
+            return Err(Status::invalid_argument(format!(
+                "k={k} exceeds this coordinator's max_k={max_k}; lower k or raise --max-k"
+            )));
+        }
+        let wire_k = u32::try_from(k)
+            .map_err(|_| Status::invalid_argument("SPLADE k exceeds the wire range"))?;
+        if k == 0 || query_weights.is_empty() {
+            return Ok(Vec::new());
+        }
+        let filters = RequestFilters::compile(&[], filter_cel)?;
+        let mask = coordinator.shard_mask(filters.tree.as_ref());
+        let trees = coordinator.shard_filter_trees(&filters, mask.as_ref());
+        let mut known = Self::filter_known(&filters, mask.as_ref());
+        let wire_weights: Vec<crate::pb::SpladeTermWeight> = query_weights
+            .iter()
+            .map(|(term, weight)| crate::pb::SpladeTermWeight {
+                term: term.clone(),
+                weight: *weight,
+            })
+            .collect();
+        let mut merged: Vec<(u64, f32)> = Vec::new();
+        let mut running_floor: f32 = 0.0;
+        for (shard, addr) in coordinator.node_addrs.iter().enumerate() {
+            if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
+                continue;
+            }
+            let mut link = coordinator.node_client(addr)?;
+            let resp = link
+                .score_splade(crate::pb::ScoreSpladeRequest {
+                    field: field.to_string(),
+                    query_weights: wire_weights.clone(),
+                    query_l1_slack,
+                    k: wire_k,
+                    filter: trees[shard].clone(),
+                    initial_floor: running_floor,
+                    visibility: coordinator.document_visibility.clone(),
+                    expected_stats_epoch: 0,
+                    expected_stats_incarnation: Vec::new(),
+                })
+                .await?
+                .into_inner();
+            known.merge_shard(shard, &[], &resp.filter_columns_known)?;
+            for hit in resp.hits {
+                merged.push((hit.doc_id, hit.score));
+            }
+            merged.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            if merged.len() > k {
+                merged.truncate(k);
+            }
+            if merged.len() == k {
+                running_floor = running_floor.max(merged[k - 1].1);
+            }
+        }
+        known.refuse_unknown(&filters)?;
+        Ok(merged)
+    }
+
+    /// Fetch stored text, optional sentence spans, and `DocLineage.span_start`
+    /// for a Stage-1 shortlist in shortlist order.
+    pub async fn fetch_rerank_candidates(
+        &self,
+        hit_scores: &[(u64, f64)],
+    ) -> Result<Vec<crate::turbo_bridge::rerank::RerankCandidate>, Status> {
+        #[derive(Default)]
+        struct FetchedRerankDoc {
+            text: String,
+            sentence_spans: Vec<(u32, u32)>,
+            lineage_span_start: u32,
+        }
+
+        if hit_scores.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<u64> = hit_scores.iter().map(|&(id, _)| id).collect();
+        let mut docs_by_id: HashMap<u64, FetchedRerankDoc> = HashMap::with_capacity(ids.len());
+        for addr in &self.node_addrs {
+            let mut client = self.node_client(addr)?;
+            let local_node = match &client {
+                crate::link::NodeLink::Local(node) => Some(Arc::clone(node)),
+                #[cfg(feature = "net")]
+                crate::link::NodeLink::Remote(_) => None,
+            };
+            let resp = client
+                .get_documents(crate::pb::GetDocumentsRequest {
+                    doc_ids: ids.clone(),
+                })
+                .await?
+                .into_inner();
+            for doc in resp.documents {
+                let sentence_spans = local_node
+                    .as_ref()
+                    .and_then(|n| n.doc_sentence_spans(doc.doc_id))
+                    .unwrap_or_default();
+                let lineage_span_start = doc.lineage.map_or(0, |l| l.span_start);
+                docs_by_id.insert(
+                    doc.doc_id,
+                    FetchedRerankDoc {
+                        text: doc.text,
+                        sentence_spans,
+                        lineage_span_start,
+                    },
+                );
+            }
+        }
+        let mut out = Vec::with_capacity(hit_scores.len());
+        for &(doc_id, prior_score) in hit_scores {
+            let fetched = docs_by_id.remove(&doc_id).unwrap_or_default();
+            out.push(crate::turbo_bridge::rerank::RerankCandidate {
+                doc_id,
+                prior_score,
+                text: fetched.text,
+                sentence_spans: fetched.sentence_spans,
+                lineage_span_start: fetched.lineage_span_start,
+            });
+        }
+        Ok(out)
+    }
+
     /// Expand one field's analyzed query terms under the table (unless
     /// `off`) and the request's rules, through the coordinator's
     /// analysis backend; the added terms are appended to `terms`.
@@ -3378,6 +3625,7 @@ impl CoordinatorServiceImpl {
         &self,
         mut request: crate::pb::QueryRequest,
         access: Option<&crate::pb::AccessDecision>,
+        finish_deadline_us: u64,
     ) -> Result<crate::pb::QueryResponse, Status> {
         let disclosure = self
             .field_permissions
@@ -3402,7 +3650,7 @@ impl CoordinatorServiceImpl {
                 .map_err(|_| Status::internal("query stream read context was initialized twice"))?;
         }
         let result = async {
-            let mut response = crate::query::execute(&scoped, request).await?;
+            let mut response = crate::query::execute(&scoped, request, finish_deadline_us).await?;
             if self
                 .field_permissions
                 .as_ref()
@@ -3525,6 +3773,7 @@ impl CoordinatorServiceImpl {
         &self,
         query: crate::pb::QueryRequest,
         access: Option<crate::pb::AccessDecision>,
+        finish_deadline_us: u64,
         mut progress_rx: watch::Receiver<Option<QueryProgress>>,
         tx: &mpsc::Sender<Result<crate::pb::QueryStreamResponse, Status>>,
         revision: &mut u64,
@@ -3533,7 +3782,11 @@ impl CoordinatorServiceImpl {
     ) -> Result<crate::pb::QueryResponse, Status> {
         let runner = self.clone();
         let mut execution = tokio::task::JoinSet::new();
-        execution.spawn(async move { runner.execute_query(query, access.as_ref()).await });
+        execution.spawn(async move {
+            runner
+                .execute_query(query, access.as_ref(), finish_deadline_us)
+                .await
+        });
         let mut last_content_fingerprint: Option<String> = None;
         let mut progress_open = true;
         loop {
@@ -3653,6 +3906,7 @@ impl CoordinatorServiceImpl {
     /// The key that signs this coordinator's UDP datagrams, when one is
     /// configured (`docs/security.md`); a relay signs its own parent-facing
     /// lane with the same key.
+    #[cfg(feature = "net")]
     pub(crate) fn udp_key(&self) -> Option<&crate::security::UdpKey> {
         self.udp_hmac_key.as_ref()
     }
@@ -4591,6 +4845,57 @@ impl CoordinatorServiceImpl {
         synonym_expansions: &mut Vec<crate::pb::SynonymExpansion>,
         explain: bool,
     ) -> Result<AggregatedHits, Status> {
+        self.fanout_bm25_aggregated_with_terms(
+            text,
+            &[],
+            k,
+            spec,
+            min_score,
+            facet_fields,
+            map_facet_fields,
+            range_facet_fields,
+            score_stages,
+            geo_filters,
+            filter,
+            stats_fields,
+            cardinality_fields,
+            projections,
+            prefixes,
+            expansions,
+            highlight,
+            synonyms,
+            synonyms_off,
+            synonym_expansions,
+            explain,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn fanout_bm25_aggregated_with_terms(
+        &self,
+        text: &str,
+        pre_analyzed_terms: &[String],
+        k: u32,
+        spec: Option<&crate::pb::AnalysisSpec>,
+        min_score: f32,
+        facet_fields: &[String],
+        map_facet_fields: &[crate::pb::MapFacetField],
+        range_facet_fields: &[crate::pb::RangeFacetField],
+        score_stages: &[crate::pb::ScoreStage],
+        geo_filters: &[crate::pb::GeoFilter],
+        filter: Option<&crate::pb::FilterExpr>,
+        stats_fields: &[String],
+        cardinality_fields: &[String],
+        projections: &[crate::pb::CompiledProjection],
+        prefixes: &[crate::pb::TermPrefix],
+        expansions: &mut Vec<crate::pb::PrefixExpansion>,
+        highlight: Option<&crate::pb::HighlightSpec>,
+        synonyms: &[crate::pb::SynonymRule],
+        synonyms_off: bool,
+        synonym_expansions: &mut Vec<crate::pb::SynonymExpansion>,
+        explain: bool,
+    ) -> Result<AggregatedHits, Status> {
         let analysis_fingerprint = crate::analyzer::analysis_fingerprint(spec);
         // Edge-list validation needs no shard, so it must not hide
         // behind the zero-term early return below: a malformed request
@@ -4607,16 +4912,26 @@ impl CoordinatorServiceImpl {
         if let Some(f) = filter {
             crate::filter::validate_filter(f)?;
         }
-        let addr = self.analysis_addr.clone().ok_or_else(|| {
-            Status::unavailable("no analysis backend configured on the coordinator (analysis_addr)")
-        })?;
-        // (a) Query analysis with the SAME options as ingest: query terms
-        // share identity with indexed terms (stems when SOURCE_STEMS).
-        let analyzed = analyze_query(&addr, text, spec, prefixes).await?;
         let mut terms: Vec<String> = Vec::new();
-        for (term, _, _) in analyzed.terms {
-            if !terms.contains(&term) {
-                terms.push(term);
+        if !pre_analyzed_terms.is_empty() {
+            for term in pre_analyzed_terms {
+                if !term.is_empty() && !terms.contains(term) {
+                    terms.push(term.clone());
+                }
+            }
+        } else {
+            let addr = self.analysis_addr.clone().ok_or_else(|| {
+                Status::unavailable(
+                    "no analysis backend configured on the coordinator (analysis_addr)",
+                )
+            })?;
+            // (a) Query analysis with the SAME options as ingest: query terms
+            // share identity with indexed terms (stems when SOURCE_STEMS).
+            let analyzed = analyze_query(&addr, text, spec, prefixes).await?;
+            for (term, _, _) in analyzed.terms {
+                if !terms.contains(&term) {
+                    terms.push(term);
+                }
             }
         }
         // Term prefixes join the analyzed terms (docs/prefix-terms.md).
@@ -5208,6 +5523,7 @@ impl CoordinatorServiceImpl {
         // Per field: the phrase's term sequence (indexes into that
         // field's terms) and slop, when the field carries a PhraseMatch.
         let mut phrase_requests: Vec<Option<(Vec<usize>, u32)>> = Vec::with_capacity(fields.len());
+        let mut phrase_alternatives: Vec<Vec<Vec<usize>>> = Vec::with_capacity(fields.len());
         for f in fields {
             let analyzed = analyze_query(&addr, text, f.analysis.as_ref(), &f.prefixes).await?;
             // The analysis already lists each distinct term once, in
@@ -5225,6 +5541,7 @@ impl CoordinatorServiceImpl {
                 };
                 remap.push(at);
             }
+            let mut alternatives = Vec::new();
             let phrase = match f.phrase.as_ref() {
                 Some(m) => {
                     if terms.is_empty() {
@@ -5234,7 +5551,7 @@ impl CoordinatorServiceImpl {
                             f.field
                         )));
                     }
-                    let Some(positions) = analyzed.positions.as_ref() else {
+                    let Some(_positions) = analyzed.positions.as_ref() else {
                         return Err(Status::failed_precondition(format!(
                             "field {:?}: the query analysis carried no token positions, so the \
                              phrase's token order cannot be established; the analysis backend \
@@ -5242,12 +5559,17 @@ impl CoordinatorServiceImpl {
                             f.field
                         )));
                     };
-                    let sequence = crate::proximity::query_sequence(&analyzed.terms, positions)
-                        .map_err(|error| Status::internal(format!("query positions: {error}")))?;
-                    Some((
-                        sequence.into_iter().map(|ti| remap[ti]).collect::<Vec<_>>(),
-                        m.slop,
-                    ))
+                    let paths = crate::proximity::query_paths(&analyzed).map_err(|error| {
+                        Status::invalid_argument(format!("query positions: {error}"))
+                    })?;
+                    let mut paths = paths
+                        .into_iter()
+                        .map(|p| p.into_iter().map(|ti| remap[ti]).collect::<Vec<_>>());
+                    let sequence = paths
+                        .next()
+                        .ok_or_else(|| Status::invalid_argument("empty query lattice"))?;
+                    alternatives.extend(paths);
+                    Some((sequence, m.slop))
                 }
                 None => None,
             };
@@ -5269,6 +5591,7 @@ impl CoordinatorServiceImpl {
             );
             field_terms.push(terms);
             phrase_requests.push(phrase);
+            phrase_alternatives.push(alternatives);
         }
         let t_analyzed = t0.elapsed();
         if (k == 0 || field_terms.iter().all(|t| t.is_empty()))
@@ -5303,7 +5626,7 @@ impl CoordinatorServiceImpl {
         let mut bigram_probe: Vec<Option<usize>> = vec![None; fields.len()];
         for (fi, f) in fields.iter().enumerate() {
             if let Some((sequence, 0)) = phrase_requests[fi].as_ref().map(|(s, slop)| (s, *slop)) {
-                if sequence.len() == 2 {
+                if sequence.len() == 2 && phrase_alternatives[fi].is_empty() {
                     let column = crate::proximity::bigram_field_name(&f.field);
                     if self.field_permissions.as_ref().is_some_and(|fields| {
                         !fields.can_use(&column) || (explain && !fields.can_disclose(&column))
@@ -5361,11 +5684,18 @@ impl CoordinatorServiceImpl {
                 match phrase_requests[fi].as_ref() {
                     // A one-term "phrase" is the ordinary term query and
                     // constrains nothing, so it reports no routing.
-                    Some((sequence, slop)) if sequence.len() >= 2 => {
+                    Some((sequence, slop))
+                        if sequence.len() >= 2 || !phrase_alternatives[fi].is_empty() =>
+                    {
                         let bigram_everywhere =
                             bigram_probe[fi].is_some_and(|pi| globals.known_shards[pi] == n_shards);
                         let positions_everywhere = globals.known_shards[fi] == n_shards
                             && globals.positions_shards[fi] == n_shards;
+                        if !phrase_alternatives[fi].is_empty() && !positions_everywhere {
+                            return Err(Status::invalid_argument(format!(
+                                "field {:?}: query lattice alternatives require token positions on every shard", f.field
+                            )));
+                        }
                         match crate::proximity::choose_route(
                             &f.field,
                             sequence.len(),
@@ -5399,6 +5729,12 @@ impl CoordinatorServiceImpl {
                                 phrase_legs.push(Some(crate::pb::PhraseLeg {
                                     sequence: sequence.iter().map(|&i| i as u32).collect(),
                                     slop: *slop,
+                                    alternatives: phrase_alternatives[fi]
+                                        .iter()
+                                        .map(|path| crate::pb::PhraseSequence {
+                                            terms: path.iter().map(|&t| t as u32).collect(),
+                                        })
+                                        .collect(),
                                 }));
                                 fingerprints.push(base_fingerprint);
                                 routing.push(crate::pb::PhraseRouting {
@@ -6281,12 +6617,37 @@ impl CoordinatorServiceImpl {
         debug: bool,
         filters: &RequestFilters,
     ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
+        self.fanout_hybrid_with_terms(request_id, text, &[], vector, k, spec, legs, debug, filters)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn fanout_hybrid_with_terms(
+        &self,
+        request_id: &str,
+        text: &str,
+        pre_analyzed_terms: &[String],
+        vector: &[f32],
+        k: u32,
+        spec: Option<&crate::pb::AnalysisSpec>,
+        legs: HybridLegs,
+        debug: bool,
+        filters: &RequestFilters,
+    ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
         self.check_vector_scan(filters, false)?;
         if self.scoped_vector_scan() && self.query_read_versions.is_none() {
             let (pinned, reads) = self.pin_read_versions().await?;
-            let result = Box::pin(
-                pinned.fanout_hybrid(request_id, text, vector, k, spec, legs, debug, filters),
-            )
+            let result = Box::pin(pinned.fanout_hybrid_with_terms(
+                request_id,
+                text,
+                pre_analyzed_terms,
+                vector,
+                k,
+                spec,
+                legs,
+                debug,
+                filters,
+            ))
             .await;
             pinned.validate_read_versions(&reads).await?;
             return result;
@@ -6296,19 +6657,31 @@ impl CoordinatorServiceImpl {
             return Ok((Vec::new(), None));
         }
         let t_total = std::time::Instant::now();
-        // Query analysis for the BM25 leg (same options as ingest).
-        let addr = self.analysis_addr.clone().ok_or_else(|| {
-            Status::unavailable("no analysis backend configured on the coordinator (analysis_addr)")
-        })?;
-        let t = std::time::Instant::now();
-        let analyzed = crate::analyzer::analyze_document(&addr, text, spec).await?;
-        let analysis_ms = t.elapsed().as_secs_f32() * 1e3;
         let mut terms: Vec<String> = Vec::new();
-        for (term, _, _) in analyzed.into_body().terms {
-            if !terms.contains(&term) {
-                terms.push(term);
+        let analysis_ms = if !pre_analyzed_terms.is_empty() {
+            for term in pre_analyzed_terms {
+                if !term.is_empty() && !terms.contains(term) {
+                    terms.push(term.clone());
+                }
             }
-        }
+            0.0
+        } else {
+            // Query analysis for the BM25 leg (same options as ingest).
+            let addr = self.analysis_addr.clone().ok_or_else(|| {
+                Status::unavailable(
+                    "no analysis backend configured on the coordinator (analysis_addr)",
+                )
+            })?;
+            let t = std::time::Instant::now();
+            let analyzed = crate::analyzer::analyze_document(&addr, text, spec).await?;
+            let ms = t.elapsed().as_secs_f32() * 1e3;
+            for (term, _, _) in analyzed.into_body().terms {
+                if !terms.contains(&term) {
+                    terms.push(term);
+                }
+            }
+            ms
+        };
 
         let t = std::time::Instant::now();
         // Stats + fusion run as a round: a stale-stats refusal from any
@@ -6527,6 +6900,7 @@ impl CoordinatorServiceImpl {
                 expected_stats_incarnation: claims[shard].incarnation(),
                 geo_filters: filters.geo.clone(),
                 filter: Self::shard_filter_tree(filters, mask.as_ref(), shard),
+                include_rerank_candidate: filters.include_rerank_candidate,
             };
             let mut client = self.node_client(node)?;
             shard_tasks.push(tokio::spawn(async move {
@@ -6540,6 +6914,7 @@ impl CoordinatorServiceImpl {
         let mut bm25_shards = Vec::with_capacity(shard_tasks.len());
         let mut shard_debug = Vec::new();
         let mut known = Self::filter_known(filters, mask.as_ref());
+        let mut rerank_candidates: HashMap<u64, crate::pb::RerankCandidatePayload> = HashMap::new();
         for task in shard_tasks {
             let (shard, elapsed, response) = task
                 .await
@@ -6566,7 +6941,12 @@ impl CoordinatorServiceImpl {
                 response
                     .bm25_hits
                     .into_iter()
-                    .map(|hit| (hit.doc_id, f64::from(hit.score)))
+                    .map(|hit| {
+                        if let Some(c) = hit.rerank_candidate {
+                            rerank_candidates.entry(hit.doc_id).or_insert(c);
+                        }
+                        (hit.doc_id, f64::from(hit.score))
+                    })
                     .collect::<Vec<_>>(),
             ));
         }
@@ -6622,6 +7002,7 @@ impl CoordinatorServiceImpl {
                 boost_score: 0.0,
                 vector_normalized: hit.leg_norms.first().copied().flatten(),
                 bm25_normalized: hit.leg_norms.get(1).copied().flatten(),
+                rerank_candidate: rerank_candidates.remove(&hit.doc_id),
             })
             .collect();
         let debug = debug.then(|| {
@@ -6711,6 +7092,7 @@ impl CoordinatorServiceImpl {
                 expected_stats_incarnation: claims[shard].incarnation(),
                 geo_filters: filters.geo.clone(),
                 filter: Self::shard_filter_tree(filters, mask.as_ref(), shard),
+                include_rerank_candidate: filters.include_rerank_candidate,
             };
             let mut client = self.node_client(node)?;
             shard_tasks.push(tokio::spawn(async move {
@@ -6728,6 +7110,7 @@ impl CoordinatorServiceImpl {
         let mut bm25_shards = Vec::with_capacity(shard_tasks.len());
         let mut shard_debug: Vec<HybridShardDebug> = Vec::new();
         let mut owner: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+        let mut rerank_candidates: HashMap<u64, crate::pb::RerankCandidatePayload> = HashMap::new();
         let mut known = Self::filter_known(filters, mask.as_ref());
         for task in shard_tasks {
             let (shard, rpc_ms, response) = task
@@ -6767,7 +7150,12 @@ impl CoordinatorServiceImpl {
                 response
                     .vector_hits
                     .into_iter()
-                    .map(|h| (h.doc_id, f64::from(h.score)))
+                    .map(|h| {
+                        if let Some(c) = h.rerank_candidate {
+                            rerank_candidates.entry(h.doc_id).or_insert(c);
+                        }
+                        (h.doc_id, f64::from(h.score))
+                    })
                     .collect::<Vec<_>>(),
             ));
             bm25_shards.push((
@@ -6775,7 +7163,12 @@ impl CoordinatorServiceImpl {
                 response
                     .bm25_hits
                     .into_iter()
-                    .map(|h| (h.doc_id, f64::from(h.score)))
+                    .map(|h| {
+                        if let Some(c) = h.rerank_candidate {
+                            rerank_candidates.entry(h.doc_id).or_insert(c);
+                        }
+                        (h.doc_id, f64::from(h.score))
+                    })
                     .collect::<Vec<_>>(),
             ));
         }
@@ -6854,6 +7247,7 @@ impl CoordinatorServiceImpl {
                 boost_score: 0.0,
                 vector_normalized: f.leg_norms.first().copied().flatten(),
                 bm25_normalized: f.leg_norms.get(1).copied().flatten(),
+                rerank_candidate: rerank_candidates.remove(&f.doc_id),
             })
             .collect();
         let dbg = debug.then(|| {
@@ -6922,6 +7316,7 @@ impl CoordinatorServiceImpl {
                 expected_stats_incarnation: claims[shard].incarnation(),
                 geo_filters: filters.geo.clone(),
                 filter: Self::shard_filter_tree(filters, mask.as_ref(), shard),
+                include_rerank_candidate: filters.include_rerank_candidate,
             };
             let mut client = self.node_client(node)?;
             tasks.push(tokio::spawn(async move {
@@ -6945,10 +7340,17 @@ impl CoordinatorServiceImpl {
                 &response.filter_columns_known,
             )?;
             let vector_leg = vector_legs[shard as usize].clone();
+            let mut shard_candidates: HashMap<u64, crate::pb::RerankCandidatePayload> =
+                HashMap::new();
             let bm25_leg: Vec<(u64, f64)> = response
                 .bm25_hits
-                .iter()
-                .map(|hit| (hit.doc_id, f64::from(hit.score)))
+                .into_iter()
+                .map(|hit| {
+                    if let Some(c) = hit.rerank_candidate {
+                        shard_candidates.insert(hit.doc_id, c);
+                    }
+                    (hit.doc_id, f64::from(hit.score))
+                })
                 .collect();
             let mut local: Vec<HybridLegHit> = fusion::rrf_fuse(
                 &[
@@ -6972,6 +7374,7 @@ impl CoordinatorServiceImpl {
                 vector_score: hit.leg_scores[0].unwrap_or(0.0) as f32,
                 bm25_rank: hit.leg_ranks[1],
                 bm25_score: hit.leg_scores[1].unwrap_or(0.0) as f32,
+                rerank_candidate: shard_candidates.remove(&hit.doc_id),
             })
             .collect();
             if legs.min_vector_score > 0.0 {
@@ -7027,6 +7430,7 @@ impl CoordinatorServiceImpl {
                     boost_score: 0.0,
                     vector_normalized: None,
                     bm25_normalized: None,
+                    rerank_candidate: source.rerank_candidate.clone(),
                 }
             })
             .collect();
@@ -7112,6 +7516,7 @@ impl CoordinatorServiceImpl {
                 expected_stats_incarnation: claims[shard].incarnation(),
                 geo_filters: filters.geo.clone(),
                 filter: Self::shard_filter_tree(filters, mask.as_ref(), shard),
+                include_rerank_candidate: filters.include_rerank_candidate,
             };
             let mut client = self.node_client(node)?;
             shard_tasks.push(tokio::spawn(async move {
@@ -7208,6 +7613,7 @@ impl CoordinatorServiceImpl {
                     boost_score: 0.0,
                     vector_normalized: None,
                     bm25_normalized: None,
+                    rerank_candidate: source.rerank_candidate.clone(),
                 }
             })
             .collect();
@@ -7291,6 +7697,7 @@ impl CoordinatorServiceImpl {
         // any shard returned is exact for its doc, so all of them pin
         // b(d) — the merge only decides b_1, the boundary, and ranks.
         let mut bm25_of: HashMap<u64, (f32, u32)> = HashMap::new();
+        let mut rerank_candidates: HashMap<u64, crate::pb::RerankCandidatePayload> = HashMap::new();
         let mut leg_counts: HashMap<u32, u32> = HashMap::new();
         let mut merged: Vec<(u64, f32, u32)> = Vec::new();
         if !terms.is_empty() {
@@ -7319,6 +7726,7 @@ impl CoordinatorServiceImpl {
                     geo_filters: filters.geo.clone(),
                     filter: Self::shard_filter_tree(filters, mask.as_ref(), shard),
                     read_context: admission.as_ref().map(|a| a.context(shard)).transpose()?,
+                    include_rerank_candidate: filters.include_rerank_candidate,
                 };
                 let mut client = self.node_client(node)?;
                 leg_tasks.push(tokio::spawn(async move {
@@ -7351,9 +7759,12 @@ impl CoordinatorServiceImpl {
                 }
                 known.merge(&geo_known, &filter_known)?;
                 leg_counts.insert(shard, hits.len() as u32);
-                for h in &hits {
+                for h in hits {
                     bm25_of.insert(h.doc_id, (h.score, shard));
                     merged.push((h.doc_id, h.score, shard));
+                    if let Some(c) = h.rerank_candidate {
+                        rerank_candidates.entry(h.doc_id).or_insert(c);
+                    }
                 }
             }
             if let Some(admission) = &admission {
@@ -7444,6 +7855,11 @@ impl CoordinatorServiceImpl {
         let mut summaries: Vec<Option<StreamSearchSummary>> = vec![None; n_nodes];
         let mut clustered_counts = vec![0u32; n_nodes];
         let mut last_floor = initial_floor.unwrap_or(f32::NEG_INFINITY);
+        let mut decomposed_stream_fanout: Option<(
+            StreamFanout,
+            Vec<Option<StreamSearchSummary>>,
+            crate::pb::StreamIdentityLimits,
+        )> = None;
         #[cfg(feature = "net")]
         if let Some(backend) = &self.clustered_vectors {
             let ranges = self.product_label_ranges().await?;
@@ -7509,13 +7925,22 @@ impl CoordinatorServiceImpl {
             }
         } else {
             self.ensure_shard_vector_rows().await;
-            let mut fanout = self.open_stream_fanout(
+            let decomposed_identity_limits =
+                filters
+                    .include_rerank_candidate
+                    .then_some(crate::pb::StreamIdentityLimits {
+                        max_rows: k,
+                        max_response_bytes: 32 * 1024 * 1024,
+                        timeout_ms: 60_000,
+                    });
+            let mut fanout = self.open_stream_fanout_with_identities(
                 request_id,
                 vector,
                 initial_floor,
                 Some(k),
                 false,
                 filters,
+                decomposed_identity_limits,
             )?;
             let mut remaining = n_nodes;
             for (shard, summary) in summaries.iter_mut().enumerate() {
@@ -7527,6 +7952,7 @@ impl CoordinatorServiceImpl {
                     remaining -= 1;
                 }
             }
+            let initial_terminal = summaries.clone();
             while remaining > 0 {
                 let (shard, msg) = match fanout.next_message(&summaries).await {
                     Ok(Some(pair)) => pair,
@@ -7568,7 +7994,35 @@ impl CoordinatorServiceImpl {
                             }
                         }
                     }
-                    Some(stream_search_response::Payload::Summary(summary)) => {
+                    Some(stream_search_response::Payload::IdentityReady(ready))
+                        if decomposed_identity_limits.is_some() =>
+                    {
+                        let Some(summary) = ready.scan else {
+                            return fanout
+                                .cancel_with(Status::internal(
+                                    "IdentityReady has no scan certificate",
+                                ))
+                                .await;
+                        };
+                        if !summary.completed {
+                            let status = Status::internal(format!(
+                                "shard {shard} stopped before completing its scan"
+                            ));
+                            return fanout.cancel_with(status).await;
+                        }
+                        if let Err(error) = known.merge_shard(
+                            shard,
+                            &summary.geo_columns_known,
+                            &summary.filter_columns_known,
+                        ) {
+                            return fanout.cancel_with(error).await;
+                        }
+                        summaries[shard] = Some(summary);
+                        remaining -= 1;
+                    }
+                    Some(stream_search_response::Payload::Summary(summary))
+                        if decomposed_identity_limits.is_none() =>
+                    {
                         if !summary.completed {
                             let status = Status::internal(format!(
                                 "shard {shard} stopped before completing its scan"
@@ -7588,15 +8042,16 @@ impl CoordinatorServiceImpl {
                     }
                     Some(_) => {
                         return fanout
-                            .cancel_with(Status::internal(
-                                "unexpected identity exchange on a legacy stream",
-                            ))
+                            .cancel_with(Status::internal("unexpected identity exchange on stream"))
                             .await
                     }
                     None => {}
                 }
             }
             known.refuse_unknown(filters)?;
+            if let Some(limits) = decomposed_identity_limits {
+                decomposed_stream_fanout = Some((fanout, initial_terminal, limits));
+            }
         }
         let legs_ms = t_legs.elapsed().as_secs_f32() * 1e3;
 
@@ -7668,6 +8123,25 @@ impl CoordinatorServiceImpl {
                 .then_with(|| a.0.cmp(&b.0))
         });
         ranked.truncate(k as usize);
+        if let Some((mut fanout, mut terminal, limits)) = decomposed_stream_fanout {
+            let stream_hits: Vec<MergedHit> = ranked
+                .iter()
+                .filter(|(doc, _, _, _, _)| !rerank_candidates.contains_key(doc))
+                .map(|&(doc, shard, v, _, _)| MergedHit {
+                    vector_id: doc,
+                    shard,
+                    score: v,
+                })
+                .collect();
+            let (_, stream_cands) = fanout
+                .resolve_identities_and_candidates(&stream_hits, &summaries, &mut terminal, &limits)
+                .await?;
+            for ((_, doc), cand) in stream_cands {
+                if let Some(c) = cand {
+                    rerank_candidates.entry(doc).or_insert(c);
+                }
+            }
+        }
         let hits: Vec<HybridHit> = ranked
             .into_iter()
             .map(|(doc, shard, v, b, fused)| HybridHit {
@@ -7681,6 +8155,7 @@ impl CoordinatorServiceImpl {
                 boost_score: 0.0,
                 vector_normalized: None,
                 bm25_normalized: None,
+                rerank_candidate: rerank_candidates.remove(&doc),
             })
             .collect();
         let dbg = debug.then(|| {
@@ -8069,6 +8544,7 @@ impl CoordinatorServiceImpl {
 
         let mut shard_hits: Vec<(u32, Vec<(u64, f32)>)> = Vec::with_capacity(n_nodes);
         let mut identities = HashMap::new();
+        let mut rerank_candidates: HashMap<u64, crate::pb::RerankCandidatePayload> = HashMap::new();
         let mut shard_stats: Vec<Option<ShardScanStats>> = Vec::with_capacity(n_nodes);
         let mut shard_wall_ms: Vec<(u32, f32)> = Vec::with_capacity(n_nodes);
         // A skipped shard is a shard with no matching row: no hits, no
@@ -8091,6 +8567,11 @@ impl CoordinatorServiceImpl {
                     for hit in &done.hits {
                         if let Some(identity) = hit.identity.as_ref() {
                             identities.insert((shard, hit.vector_id), identity.clone());
+                        }
+                        if let Some(cand) = hit.rerank_candidate.as_ref() {
+                            rerank_candidates
+                                .entry(hit.vector_id)
+                                .or_insert_with(|| cand.clone());
                         }
                     }
                     shard_hits.push((
@@ -8128,6 +8609,7 @@ impl CoordinatorServiceImpl {
                 vector_id: h.vector_id,
                 score: h.score,
                 parent_id: 0,
+                rerank_candidate: rerank_candidates.get(&h.vector_id).cloned(),
             })
             .collect();
         Ok(FanoutResult {
@@ -8137,6 +8619,7 @@ impl CoordinatorServiceImpl {
             shard_wall_ms,
             hedges_fired: hedges.load(AtomicOrdering::Relaxed),
             hedge_wins: hedge_wins.load(AtomicOrdering::Relaxed),
+            rerank_candidates,
         })
     }
 
@@ -8226,6 +8709,7 @@ impl CoordinatorServiceImpl {
                         floor_share_ppm: floor_shares.get(shard).copied().flatten(),
                         floor_greediness_ppm: filters.floor_greediness_ppm,
                         floor_clamp_min: filters.floor_clamp_min,
+                        include_rerank_candidate: filters.include_rerank_candidate,
                     })),
                 })
                 .expect("fresh channel accepts the Start message");
@@ -8752,8 +9236,8 @@ impl CoordinatorServiceImpl {
 
         let mut all: Vec<MergedHit> = heap.into_iter().map(|e| e.0).collect();
         all.sort_by(cmp_hits);
-        let identities = fanout
-            .resolve_identities(&all, &summaries, &mut terminal, &identity_limits)
+        let (identities, candidates) = fanout
+            .resolve_identities_and_candidates(&all, &summaries, &mut terminal, &identity_limits)
             .await?;
         let summaries: Vec<StreamSearchSummary> = summaries
             .into_iter()
@@ -8769,6 +9253,7 @@ impl CoordinatorServiceImpl {
                     score: h.score,
                     parent_id: 0,
                     identity: identities.get(&(h.shard, h.vector_id)).cloned().flatten(),
+                    rerank_candidate: candidates.get(&(h.shard, h.vector_id)).cloned().flatten(),
                 })
                 .collect(),
             summaries,
@@ -9037,6 +9522,7 @@ impl CoordinatorServiceImpl {
                 vector_id: agg.best_id,
                 score: agg.best_score,
                 parent_id: parent,
+                rerank_candidate: None,
             });
             let mut chunks: Vec<(u64, f32)> = agg
                 .chunks
@@ -9053,6 +9539,7 @@ impl CoordinatorServiceImpl {
                         vector_id: doc,
                         score,
                         parent_id: parent,
+                        rerank_candidate: None,
                     })
                     .collect(),
             });
@@ -9232,6 +9719,7 @@ impl CoordinatorServiceImpl {
             shard_wall_ms,
             hedges_fired: hedges.load(AtomicOrdering::Relaxed),
             hedge_wins: hedge_wins.load(AtomicOrdering::Relaxed),
+            rerank_candidates: HashMap::new(),
         })
     }
 
@@ -9255,6 +9743,33 @@ impl CoordinatorServiceImpl {
         &self,
         request_id: &str,
         text: &str,
+        vector: &[f32],
+        k: u32,
+        spec: Option<&crate::pb::AnalysisSpec>,
+        min_vector_score: f32,
+        debug: bool,
+        filters: &RequestFilters,
+    ) -> Result<(Vec<CascadeHit>, Option<HybridDebug>), Status> {
+        self.fanout_cascade_with_terms(
+            request_id,
+            text,
+            &[],
+            vector,
+            k,
+            spec,
+            min_vector_score,
+            debug,
+            filters,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fanout_cascade_with_terms(
+        &self,
+        request_id: &str,
+        text: &str,
+        pre_analyzed_terms: &[String],
         vector: &[f32],
         k: u32,
         spec: Option<&crate::pb::AnalysisSpec>,
@@ -9295,6 +9810,7 @@ impl CoordinatorServiceImpl {
                     hits: Vec::new(),
                     hedges_fired: 0,
                     hedge_wins: 0,
+                    rerank_candidates: HashMap::new(),
                 }
             })
         } else {
@@ -9302,7 +9818,7 @@ impl CoordinatorServiceImpl {
         };
         #[cfg(not(feature = "net"))]
         let clustered_phase1: Option<FanoutResult> = None;
-        let phase1 = match clustered_phase1 {
+        let mut phase1 = match clustered_phase1 {
             Some(phase1) => phase1,
             None => {
                 self.fanout_search(request_id, vector, k, true, filters)
@@ -9333,18 +9849,31 @@ impl CoordinatorServiceImpl {
         let pool: Vec<(u64, u32, f64)> = all.into_iter().filter(|h| h.2 >= boundary).collect();
 
         // Query analysis + global BM25 stats for phase 2.
-        let addr = self.analysis_addr.clone().ok_or_else(|| {
-            Status::unavailable("no analysis backend configured on the coordinator (analysis_addr)")
-        })?;
-        let t = std::time::Instant::now();
-        let analyzed = crate::analyzer::analyze_document(&addr, text, spec).await?;
-        let analysis_ms = t.elapsed().as_secs_f32() * 1e3;
-        let mut terms: Vec<String> = Vec::new();
-        for (term, _, _) in analyzed.into_body().terms {
-            if !terms.contains(&term) {
-                terms.push(term);
+        let (terms, analysis_ms) = if !pre_analyzed_terms.is_empty() {
+            let mut terms: Vec<String> = Vec::new();
+            for term in pre_analyzed_terms {
+                if !terms.contains(term) {
+                    terms.push(term.clone());
+                }
             }
-        }
+            (terms, 0.0f32)
+        } else {
+            let addr = self.analysis_addr.clone().ok_or_else(|| {
+                Status::unavailable(
+                    "no analysis backend configured on the coordinator (analysis_addr)",
+                )
+            })?;
+            let t = std::time::Instant::now();
+            let analyzed = crate::analyzer::analyze_document(&addr, text, spec).await?;
+            let analysis_ms = t.elapsed().as_secs_f32() * 1e3;
+            let mut terms: Vec<String> = Vec::new();
+            for (term, _, _) in analyzed.into_body().terms {
+                if !terms.contains(&term) {
+                    terms.push(term);
+                }
+            }
+            (terms, analysis_ms)
+        };
         // Phase 2: route candidates to their owning shards for
         // rescoring. Stats + rescore run as a round (a stale-stats
         // refusal reruns them once with fresh stats and a new fenced claim).
@@ -9395,6 +9924,7 @@ impl CoordinatorServiceImpl {
                 vector_score: vector_score as f32,
                 bm25_score: bm25_of.get(&doc_id).copied().unwrap_or(0.0) as f32,
                 boost_score: 0.0,
+                rerank_candidate: phase1.rerank_candidates.remove(&doc_id),
             })
             .collect();
         ranked.sort_by(|a, b| {
@@ -11506,6 +12036,7 @@ impl CoordinatorServiceImpl {
                 vector_id: agg.best_id,
                 score: agg.best_score,
                 parent_id: parent,
+                rerank_candidate: None,
             });
             let mut chunks: Vec<(u64, f32)> = agg
                 .chunks
@@ -11522,6 +12053,7 @@ impl CoordinatorServiceImpl {
                         vector_id,
                         score,
                         parent_id: parent,
+                        rerank_candidate: None,
                     })
                     .collect(),
             });
@@ -12414,6 +12946,7 @@ pub(crate) struct StreamFanout {
 }
 
 impl StreamFanout {
+    #[cfg(test)]
     pub(crate) async fn resolve_identities(
         &mut self,
         hits: &[MergedHit],
@@ -12421,6 +12954,25 @@ impl StreamFanout {
         terminal: &mut [Option<StreamSearchSummary>],
         limits: &crate::pb::StreamIdentityLimits,
     ) -> Result<HashMap<(u32, u64), Option<crate::pb::DocumentIdentity>>, Status> {
+        self.resolve_identities_and_candidates(hits, scans, terminal, limits)
+            .await
+            .map(|(identities, _)| identities)
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(crate) async fn resolve_identities_and_candidates(
+        &mut self,
+        hits: &[MergedHit],
+        scans: &[Option<StreamSearchSummary>],
+        terminal: &mut [Option<StreamSearchSummary>],
+        limits: &crate::pb::StreamIdentityLimits,
+    ) -> Result<
+        (
+            HashMap<(u32, u64), Option<crate::pb::DocumentIdentity>>,
+            HashMap<(u32, u64), Option<crate::pb::RerankCandidatePayload>>,
+        ),
+        Status,
+    > {
         let exchange = async {
             let mut expected = vec![Vec::new(); self.floor_txs.len()];
             for hit in hits {
@@ -12443,6 +12995,7 @@ impl StreamFanout {
             }
             let mut received = vec![false; expected.len()];
             let mut identities = HashMap::with_capacity(hits.len());
+            let mut candidates = HashMap::with_capacity(hits.len());
             let mut payload_bytes = 0usize;
             while remaining > 0 {
                 let Some((shard, message)) = self.next_message(terminal).await? else {
@@ -12490,6 +13043,7 @@ impl StreamFanout {
                                 ));
                             }
                             identities.insert((shard as u32, row.vector_id), row.identity);
+                            candidates.insert((shard as u32, row.vector_id), row.rerank_candidate);
                         }
                         received[shard] = true;
                     }
@@ -12510,7 +13064,7 @@ impl StreamFanout {
                     }
                 }
             }
-            Ok(identities)
+            Ok((identities, candidates))
         };
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(u64::from(limits.timeout_ms)),
@@ -12519,7 +13073,7 @@ impl StreamFanout {
         .await
         .unwrap_or_else(|_| Err(Status::deadline_exceeded("identity fan-out timed out")));
         match result {
-            Ok(identities) => Ok(identities),
+            Ok(pair) => Ok(pair),
             Err(status) => self.cancel_with(status).await,
         }
     }
@@ -12733,6 +13287,7 @@ async fn run_shard_stream(
                     .flatten(),
                 floor_greediness_ppm: ctx.filters.floor_greediness_ppm,
                 floor_clamp_min: ctx.filters.floor_clamp_min,
+                include_rerank_candidate: ctx.filters.include_rerank_candidate,
             })),
         })
         .await
@@ -13017,6 +13572,7 @@ pub struct FanoutResult {
     /// returned before their primary.
     pub hedges_fired: u64,
     pub hedge_wins: u64,
+    pub rerank_candidates: HashMap<u64, crate::pb::RerankCandidatePayload>,
 }
 
 /// Result of [`CoordinatorServiceImpl::fanout_stream_search`].
@@ -13371,6 +13927,7 @@ impl PlanCounter<'_> {
             parent_floor_share_ppm: None,
             floor_greediness_ppm: None,
             floor_clamp_min: None,
+            include_rerank_candidate: false,
         };
         let count = crate::pb::CompiledAggregation {
             expr: Some(crate::cel::compile_value("1")?),
@@ -13591,6 +14148,7 @@ impl SearchService for CoordinatorServiceImpl {
             filters.floor_k = Some(k);
             filters.floor_greediness_ppm = req.floor_greediness_ppm;
             filters.floor_clamp_min = req.floor_clamp_min;
+            filters.include_rerank_candidate = req.include_rerank_candidate;
             let _ = self.resolve_finish_windows(&filters)?;
             self.check_vector_scan(&filters, req.collapse_parents)?;
             // The fleet scores in one space or not at all: mixed provider
@@ -13631,6 +14189,7 @@ impl SearchService for CoordinatorServiceImpl {
                         vector_id,
                         score,
                         parent_id: 0,
+                        rerank_candidate: None,
                     })
                     .collect();
                 return Ok(Response::new(SearchResponse {
@@ -13833,8 +14392,9 @@ impl SearchService for CoordinatorServiceImpl {
                     phrase_routing = routing;
                     (hits, facets, ranges, Vec::new(), Vec::new(), fused_prune)
                 } else if req.fields.is_empty() {
-                    self.fanout_bm25_aggregated(
+                    self.fanout_bm25_aggregated_with_terms(
                         &req.text,
+                        &req.pre_analyzed_terms,
                         k,
                         req.analysis.as_ref(),
                         req.min_score,
@@ -14085,6 +14645,7 @@ impl SearchService for CoordinatorServiceImpl {
             filters.floor_k = Some(k);
             filters.floor_greediness_ppm = req.floor_greediness_ppm;
             filters.floor_clamp_min = req.floor_clamp_min;
+            filters.include_rerank_candidate = req.include_rerank_candidate;
             let _ = self.resolve_finish_windows(&filters)?;
             // leg_k: default max(k, rrf_k) so the RRF constant never exceeds a
             // leg's depth; explicit values below k are clamped to k.
@@ -14162,9 +14723,10 @@ impl SearchService for CoordinatorServiceImpl {
             let (mut hits, mut cascade_hits, mut debug) = match legs.fusion_mode {
                 FusionMode::Cascade | FusionMode::Unspecified => {
                     let (cascade_hits, debug) = self
-                        .fanout_cascade(
+                        .fanout_cascade_with_terms(
                             &request_id,
                             &req.text,
+                            &req.pre_analyzed_terms,
                             &req.vector,
                             k,
                             req.analysis.as_ref(),
@@ -14177,9 +14739,10 @@ impl SearchService for CoordinatorServiceImpl {
                 }
                 _ => {
                     let (hits, debug) = self
-                        .fanout_hybrid(
+                        .fanout_hybrid_with_terms(
                             &request_id,
                             &req.text,
+                            &req.pre_analyzed_terms,
                             &req.vector,
                             k,
                             req.analysis.as_ref(),
@@ -14226,13 +14789,25 @@ impl SearchService for CoordinatorServiceImpl {
                 ))
                 .await;
             }
+            let grpc_budget = crate::relay::grpc_timeout(request.metadata());
+            let finish_deadline_us = grpc_budget.map_or(0, |dur| {
+                let now_us = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_micros() as u64;
+                now_us
+                    .saturating_add(dur.as_micros().min(u128::from(u64::MAX)) as u64)
+                    .max(1)
+            });
             let access = request
                 .extensions()
                 .get::<crate::pb::AccessDecision>()
                 .cloned();
             let request = request.into_inner();
             self.require_topology_generation(request.required_topology_generation)?;
-            let response = self.execute_query(request, access.as_ref()).await?;
+            let response = self
+                .execute_query(request, access.as_ref(), finish_deadline_us)
+                .await?;
             Ok(Response::new(response))
         })
         .await
@@ -14252,6 +14827,7 @@ impl SearchService for CoordinatorServiceImpl {
                 .await
                 .map(|response| response.map(crate::metrics::Timed::into_inner));
         }
+        let grpc_budget = crate::relay::grpc_timeout(request.metadata());
         let access = request.extensions().get::<crate::pb::AccessDecision>().cloned();
         let mut request = request.into_inner();
         let request_fingerprint = request.query.as_ref().map(|query| crate::sha256::hex_digest(&prost::Message::encode_to_vec(query))).unwrap_or_default();
@@ -14312,7 +14888,22 @@ impl SearchService for CoordinatorServiceImpl {
             let (progress_tx, progress_rx) = watch::channel(None);
             let runner = service.with_stream_search(true).with_bm25_stream(true)
                 .with_query_progress(progress_tx);
-            let timeout = (request.timeout_ms > 0).then(|| Duration::from_millis(request.timeout_ms));
+            let req_timeout = (request.timeout_ms > 0).then(|| Duration::from_millis(request.timeout_ms));
+            let timeout = match (req_timeout, grpc_budget) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            let finish_deadline_us = timeout.map_or(0, |dur| {
+                let now_us = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_micros() as u64;
+                now_us
+                    .saturating_add(dur.as_micros().min(u128::from(u64::MAX)) as u64)
+                    .max(1)
+            });
             let deadline = async move {
                 match timeout {
                     Some(duration) => tokio::time::sleep(duration).await,
@@ -14322,7 +14913,7 @@ impl SearchService for CoordinatorServiceImpl {
             tokio::pin!(deadline);
             let mut scoring_fingerprints = Vec::new();
             let result = {
-                let attempt = runner.query_stream_attempt(query, access, progress_rx, &tx,
+                let attempt = runner.query_stream_attempt(query, access, finish_deadline_us, progress_rx, &tx,
                     &mut revision, &mut scoring_fingerprints, &request_fingerprint);
                 tokio::pin!(attempt);
                 tokio::select! {
@@ -14788,16 +15379,33 @@ impl SearchService for CoordinatorServiceImpl {
                     union.len()
                 )));
             }
-            let dictionary_terms_with_prefix = union.len() as u64;
-            let mut ranked: Vec<(String, (u64, u32))> = union.into_iter().collect();
-            // df descending; the map's byte order breaks ties (stable sort).
-            ranked.sort_by_key(|(_, (df, _))| std::cmp::Reverse(*df));
-            ranked.truncate(limit);
+            let (suggestions, dictionary_terms_with_prefix) =
+                if let Some(lexicon) = self.surface_lexicon.as_deref() {
+                    let view = lexicon.view();
+                    let resolved = crate::turbo_bridge::query_plan::resolve_stemmed_suggestions(
+                        &view,
+                        &normalized,
+                        &union,
+                        limit,
+                    );
+                    let count = (resolved.len().max(union.len())) as u64;
+                    (resolved, count)
+                } else {
+                    let count = union.len() as u64;
+                    let mut ranked: Vec<(String, (u64, u32))> = union.into_iter().collect();
+                    // df descending; the map's byte order breaks ties (stable sort).
+                    ranked.sort_by_key(|(_, (df, _))| std::cmp::Reverse(*df));
+                    ranked.truncate(limit);
+                    (
+                        ranked
+                            .into_iter()
+                            .map(|(term, (df, shards))| crate::pb::Suggestion { term, df, shards })
+                            .collect(),
+                        count,
+                    )
+                };
             Ok(Response::new(crate::pb::SuggestResponse {
-                suggestions: ranked
-                    .into_iter()
-                    .map(|(term, (df, shards))| crate::pb::Suggestion { term, df, shards })
-                    .collect(),
+                suggestions,
                 dictionary_terms_with_prefix,
                 df_includes_tombstoned_rows: tombstoned,
             }))
@@ -14976,6 +15584,28 @@ impl SearchService for CoordinatorServiceImpl {
                     candidates,
                     dictionary_terms_scanned: union.len() as u64,
                 });
+            }
+            if let Some(checker) = self.spellchecker.as_deref() {
+                if let Some((_, contextual)) =
+                    crate::turbo_bridge::query_plan::spellcheck_query_terms(
+                        checker, &req.text, limit,
+                    )
+                {
+                    for ctx in contextual {
+                        if let Some(existing) = out.iter_mut().find(|t| t.term == ctx.term) {
+                            if existing.df == 0 || always {
+                                for cand in ctx.candidates {
+                                    if !existing.candidates.iter().any(|c| c.term == cand.term) {
+                                        existing.candidates.insert(0, cand);
+                                    }
+                                }
+                                existing.candidates.truncate(limit);
+                            }
+                        } else {
+                            out.push(ctx);
+                        }
+                    }
+                }
             }
             Ok(Response::new(crate::pb::TermSuggestResponse {
                 terms: out,
@@ -15391,6 +16021,7 @@ mod stream_cancel_tests {
                         version: 7,
                         chunk_ordinal: None,
                     }),
+                    rerank_candidate: None,
                 };
                 let response = StreamSearchResponse {
                     payload: Some(stream_search_response::Payload::Identities(
@@ -15508,6 +16139,7 @@ mod stream_cancel_tests {
                     rows: vec![crate::pb::StreamIdentity {
                         vector_id: id,
                         identity: None,
+                        rerank_candidate: None,
                     }],
                 },
             )),
@@ -15980,7 +16612,7 @@ mod candidate_fetch_tests {
             }),
             ..Default::default()
         };
-        let planned = crate::query::execute(&reader, query).await.unwrap();
+        let planned = crate::query::execute(&reader, query, 0).await.unwrap();
         assert_eq!(
             planned
                 .hits
@@ -17111,11 +17743,11 @@ measured_recall_ppm = 980000
         for mut request in requests {
             request.profile = true;
             let (pinned, _) = reader.pin_read_versions().await.unwrap();
-            let raw = crate::query::execute(&pinned, request.clone())
+            let raw = crate::query::execute(&pinned, request.clone(), 0)
                 .await
                 .unwrap();
             let reply = reader
-                .execute_query(request.clone(), Some(&decision))
+                .execute_query(request.clone(), Some(&decision), 0)
                 .await
                 .unwrap();
             assert_eq!(reply.hits, raw.hits, "{}", reply.executed);
@@ -17201,7 +17833,7 @@ measured_recall_ppm = 980000
                     raw.executed
                 );
             }
-            let unrestricted = owner.execute_query(request, None).await.unwrap();
+            let unrestricted = owner.execute_query(request, None, 0).await.unwrap();
             assert!(!unrestricted.execution_details_redacted);
         }
         assert!(

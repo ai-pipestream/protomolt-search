@@ -149,6 +149,7 @@ async fn visible_dictionaries_survive_segments_deletes_compaction_and_reopen() {
                 .unwrap();
             client
                 .add_vectors(tokio_stream::iter([AddVectorsRequest {
+                    materialized_rows: Vec::new(),
                     vectors: vectors[i * 2 * DIM..(i * 2 + batch.len()) * DIM].to_vec(),
                     dim: DIM as u32,
                 }]))

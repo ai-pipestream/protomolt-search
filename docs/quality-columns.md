@@ -12,9 +12,9 @@ The whole feature is three scalars and a rule about where they live.
 
 ## 1. The measurements
 
-The OpenNLP sidecar's tier-1 surface includes two model-free structural
-scanners, requested per session via `AnalysisOptions.noise` and
-`.artifacts`:
+The pure-Rust `turboembed` (`turbo-normalize` / `turbo-kserve`) analysis
+surface includes two model-free structural scanners (`TextQualityAnnotator`
+and `ArtifactDetector`), requested per session via `SessionLayers.quality`:
 
 - a **noise** scanner that emits `NoiseSpan { span, severity, score }`
   per finding, score in (0, 1], higher is noisier (severities run

@@ -91,12 +91,14 @@ async fn start_fixture() -> Fixture {
         let split = start + per_shard / 2;
         let (vtx, vrx) = mpsc::channel(4);
         vtx.send(AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors: corpus[start * DIM..split * DIM].to_vec(),
             dim: DIM as u32,
         })
         .await
         .unwrap();
         vtx.send(AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors: corpus[split * DIM..(start + per_shard) * DIM].to_vec(),
             dim: DIM as u32,
         })
@@ -525,6 +527,7 @@ async fn start_filtered_fixture() -> (Fixture, Vec<String>) {
         feeder.await.unwrap();
         let (vtx, vrx) = mpsc::channel(1);
         vtx.send(AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors: corpus[start * DIM..(start + FILTERED_SHARD_DOCS) * DIM].to_vec(),
             dim: DIM as u32,
         })
@@ -958,6 +961,7 @@ async fn unsealed_tail_enumerates_until_flushed() {
         client.add_documents(ReceiverStream::new(rx)).await.unwrap();
         client
             .add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
+                materialized_rows: Vec::new(),
                 vectors: corpus[start * DIM..(start + per_shard) * DIM].to_vec(),
                 dim: DIM as u32,
             }]))
@@ -1182,6 +1186,7 @@ async fn finish_stream_search_flushes_straggler_resolves_identities_and_protects
         let end = (shard + 1) * PER_SHARD * DIM;
         client
             .add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
+                materialized_rows: Vec::new(),
                 vectors: corpus[start..end].to_vec(),
                 dim: DIM as u32,
             }]))

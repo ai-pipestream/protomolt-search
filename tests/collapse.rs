@@ -30,6 +30,7 @@ async fn add_documents_with_lineage(addr: &str, opinions: &[u64]) {
     let feeder = tokio::spawn(async move {
         for (i, &opinion) in opinions.iter().enumerate() {
             tx.send(AddDocumentsRequest {
+                nlp_materialization: String::new(),
                 unsigned_integers: Vec::new(),
                 map_integers: Vec::new(),
                 map_unsigned_integers: Vec::new(),
@@ -103,6 +104,7 @@ async fn start_shard(
     add_documents_with_lineage(&addr, opinions).await;
     let (tx, rx) = mpsc::channel(4);
     tx.send(AddVectorsRequest {
+        materialized_rows: Vec::new(),
         vectors,
         dim: DIM as u32,
     })

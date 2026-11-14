@@ -1,18 +1,20 @@
 //! Does removing a lock change the answers?
 //!
-//! Compares a REFERENCE sidecar driven serially against a CANDIDATE
-//! sidecar driven at high concurrency, asserting the annotations match
-//! per document. A data race in a shared annotator shows up as answers
-//! that differ from the serial ones, so serial-reference versus
-//! concurrent-candidate is the comparison that can actually catch it.
+//! Compares a REFERENCE analysis backend driven serially against a CANDIDATE
+//! backend driven at high concurrency, asserting the annotations match per
+//! document. Works with `"turbo"` (in-process) and `turbo-kserve` endpoints.
 //!
 //! ```text
 //! annotator_race_check --ref=http://127.0.0.1:59220 --cand=http://127.0.0.1:59221 \
 //!     --n=400 --concurrency=32
 //! ```
-use pipestream_search::pb::analysis::analysis_service_client::AnalysisServiceClient;
-use pipestream_search::pb::analysis::{AnalysisOptions, AnalyzeRequest, TermVectorOptions};
+
 use std::sync::Arc;
+
+use pipestream_search::analyzer::{
+    analyze_document_with_options, body_spec, RemoteCallOptions, SessionLayers,
+};
+use pipestream_search::postings::AnalyzedDoc;
 
 fn arg(key: &str, default: &str) -> String {
     let p = format!("--{key}=");
@@ -21,60 +23,53 @@ fn arg(key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
-fn opts() -> AnalysisOptions {
-    let spec = pipestream_search::analyzer::body_spec();
-    AnalysisOptions {
-        language: "en".into(),
-        tokenizer: spec.tokenizer,
-        stemmer: spec.stemmer,
-        sentence_detection: true,
-        ner: true,
-        pos_tags: true,
-        geo: true,
-        term_vectors: Some(TermVectorOptions {
-            enabled: true,
-            mode: spec.term_vector_mode,
-            steps: spec.char_filters.clone(),
-            source: spec.term_vector_source,
-            dual_cased: false,
-        }),
-        ..Default::default()
+fn layers() -> SessionLayers {
+    SessionLayers {
+        sentences: true,
+        entities: true,
+        geography: true,
+        quality: true,
+        dual_cased: false,
+        nlp_columns: false,
     }
 }
 
-/// Everything the guarded annotators produce, flattened to a comparable
-/// string: entity spans with their types, and the POS tag sequence.
-fn fingerprint(r: &pipestream_search::pb::analysis::AnalyzeResponse) -> String {
-    let mut ents: Vec<String> = r
+/// Deterministic summary of lexical, entity, sentence, and geography output.
+fn fingerprint(doc: &AnalyzedDoc) -> String {
+    let mut ents: Vec<String> = doc
         .entities
         .iter()
-        .map(|e| {
-            let (s, t) = e.span.map(|s| (s.start, s.end)).unwrap_or((0, 0));
-            format!("{}:{}:{}:{}", e.r#type, s, t, e.text)
-        })
+        .map(|e| format!("{}:{}:{}:{}", e.kind, e.start, e.end, e.text))
         .collect();
     ents.sort();
-    let pos: Vec<&str> = r.tokens.iter().map(|t| t.pos.as_str()).collect();
-    // Geocoding resolves a name to a place, so the resolved identity and
-    // its coordinates are what a race would corrupt, not just the count.
-    let mut geo: Vec<String> = r
-        .locations
-        .iter()
-        .map(|l| format!("{}@{:.5},{:.5}", l.name, l.latitude, l.longitude))
-        .collect();
-    geo.sort();
+    let terms: Vec<String> = doc
+        .fields
+        .first()
+        .map(|f| f.terms.iter().map(|(t, c, _)| format!("{t}:{c}")).collect())
+        .unwrap_or_default();
+    let geo = match &doc.geography {
+        Some(g) => match g.point {
+            Some((lat, lon)) => format!("{}@{lat:.5},{lon:.5}", g.country),
+            None => g.country.clone(),
+        },
+        None => String::new(),
+    };
     format!(
-        "E[{}] P[{}] G[{}]",
+        "E[{}] T[{}] S[{}] G[{}]",
         ents.join(","),
-        pos.join(" "),
-        geo.join(",")
+        terms.join(" "),
+        doc.fields
+            .first()
+            .and_then(|f| f.sentences.as_ref())
+            .map_or(0, Vec::len),
+        geo
     )
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let reference = arg("ref", "http://127.0.0.1:59220");
-    let candidate = arg("cand", "http://127.0.0.1:59221");
+    let reference = arg("ref", "turbo");
+    let candidate = arg("cand", "turbo");
     let n: usize = arg("n", "400").parse()?;
     let concurrency: usize = arg("concurrency", "32").parse()?;
     let path = arg("chunks", "/work/court-corpus/canary-chunks.ndjson");
@@ -99,53 +94,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         texts.len()
     );
 
-    // Reference: one at a time, so nothing can interfere with it.
-    let mut rc = AnalysisServiceClient::connect(reference).await?;
+    let spec = body_spec();
+    let opts = RemoteCallOptions::default();
     let mut expected = Vec::with_capacity(texts.len());
     for t in texts.iter() {
-        let r = rc
-            .analyze(AnalyzeRequest {
-                text: t.clone(),
-                options: Some(opts()),
-            })
-            .await?
-            .into_inner();
-        expected.push(fingerprint(&r));
+        let doc =
+            analyze_document_with_options(&reference, t, Some(&spec), layers(), &opts).await?;
+        expected.push(fingerprint(&doc));
     }
-    // Report coverage per layer. A layer that produced nothing on every
-    // document makes its share of this comparison vacuous: it would
-    // "agree" no matter how badly it raced.
     let entities = expected.iter().filter(|f| !f.contains("E[]")).count();
-    let pos = expected.iter().filter(|f| !f.contains("P[]")).count();
+    let terms = expected.iter().filter(|f| !f.contains("T[]")).count();
     let geo = expected.iter().filter(|f| !f.contains("G[]")).count();
     println!(
-        "reference done: {} docs; with entities {entities}, with POS {pos}, with locations {geo}",
+        "reference done: {} docs; with entities {entities}, with terms {terms}, with locations {geo}",
         expected.len()
     );
-    for (layer, n) in [("entities", entities), ("POS", pos), ("locations", geo)] {
-        if n == 0 {
+    for (layer, count) in [("entities", entities), ("terms", terms), ("locations", geo)] {
+        if count == 0 {
             println!(
                 "  WARNING: {layer} empty on every document; this run does not test that layer"
             );
         }
     }
 
-    // Candidate: all at once.
-    let cc = AnalysisServiceClient::connect(candidate).await?;
     let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
     let mut tasks = Vec::new();
     for i in 0..texts.len() {
         let permit = sem.clone().acquire_owned().await.unwrap();
-        let mut c = cc.clone();
+        let cand = candidate.clone();
         let t = texts.clone();
+        let spec = spec.clone();
         tasks.push(tokio::spawn(async move {
             let _p = permit;
-            c.analyze(AnalyzeRequest {
-                text: t[i].clone(),
-                options: Some(opts()),
-            })
+            analyze_document_with_options(
+                &cand,
+                &t[i],
+                Some(&spec),
+                layers(),
+                &RemoteCallOptions::default(),
+            )
             .await
-            .map(|r| fingerprint(&r.into_inner()))
+            .map(|r| fingerprint(&r))
             .map_err(|e| e.message().to_string())
         }));
     }

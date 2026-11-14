@@ -158,6 +158,7 @@ async fn the_https_source_trusts_the_cluster_ca_and_resumes_with_range() {
     let (tx, rx) = mpsc::channel(8);
     tokio::spawn(async move {
         tx.send(AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors: corpus,
             dim: 128,
         })

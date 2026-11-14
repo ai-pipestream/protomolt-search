@@ -16,13 +16,16 @@ New here? The user manual is [docs/manual/README.md](docs/manual/README.md).
 | [ai-pipestream/turbovec](https://github.com/ai-pipestream/turbovec), branch `main` | Patch fork carrying the seedable top-k floor, live-floor streaming collector, and mapped-image reader, rebased onto upstream `main` | upstream `main` |
 | [ai-pipestream/turbovec-grpc](https://github.com/ai-pipestream/turbovec-grpc) | Network and sharding facade for the local turbovec engine | fork branch `main` |
 | [Pipestream Search](https://github.com/ai-pipestream/protomolt-search) (this repository) | Full search product: distributed vector, BM25, CEL selection, hybrid ranking, document semantics, persistence, and operations | fork branch `main` |
-| [ai-pipestream/grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis) | Text-analysis sidecar: sentence/token spans, term vectors, static embeddings, served over gRPC | — |
+| [ai-pipestream/turboembed](https://github.com/ai-pipestream/turboembed) | Unified Rust analysis, multi-resolution embeddings, quantized SPLADE, calibrated reranking, and vocabulary service (`turbo-client` in-process or `turbo-kserve` over gRPC/mTLS) | — |
 
 The in-repository [`protomolt-analyzer`](crates/protomolt-analyzer) crate is
 the portable Rust lexical core. It runs the product's whitespace, Porter,
 normalization, and term-vector contract in-process on servers and native
-clients. OpenNLP remains the provider for embeddings, sentence and model
-analysis, and analyzer options outside that native subset. See
+clients. [`turboembed`](https://github.com/ai-pipestream/turboembed) (`turbo-client`
+in-process or `turbo-kserve` over gRPC) supplies full linguistic analysis,
+aligned-view source offsets, `(pos, pos_len)` token lattices, multi-resolution
+and sentence embeddings, quantized SPLADE impacts, calibrated Stage-2
+reranking, and surface-form/spellcheck lexicons. See
 [Native lexical analysis](docs/native-analysis.md) for the exact boundary and
 Android/iOS build checks.
 
@@ -380,16 +383,17 @@ Each shard also carries a **BM25 postings index** next to its vector index:
 term → postings (doc id, tf, occurrence offsets in original-text
 coordinates), per-doc lengths and corpus totals, plus a doc store of raw
 texts (the highlight source). Term identity is supplied by one of two
-interchangeable providers. The in-process Rust provider implements the
-production `ingest`/`folded` and `cased` analyzer specs. The
-[grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis)
-sidecar supplies the wider OpenNLP surface, including embeddings and
-model-backed layers. Its proto is vendored at
-`proto/ai/pipestream/opennlp/analysis/v1/analysis.proto`; see the file header.
-Both providers support original-text UTF-16 coordinates. The portable Rust
-analyzer and sidecar can also return UTF-8 byte offsets to direct callers.
-Protomolt Search explicitly requests and persists UTF-16 offsets so one index
-generation cannot mix coordinate systems.
+interchangeable Rust providers: the portable in-process `protomolt-analyzer`
+provider implements the zero-model `ingest`/`folded` and `cased` analyzer
+specs, while [`turboembed`](https://github.com/ai-pipestream/turboembed)
+(`turbo-client` in-process or `turbo-kserve` over gRPC, checked by
+`IndexGenerationHandshake`) supplies full linguistic normalization,
+`(pos, pos_len)` token lattices (`COLUMN_KIND_POS_LENGTHS = 18`), quantized
+SPLADE postings (`COLUMN_KIND_SPLADE = 19`), embeddings, and model-backed NLP
+projections. Both providers emit aligned `ViewId::SOURCE` original-text
+UTF-16, UTF-8, and Unicode code-point coordinates; Protomolt Search persists
+UTF-16 offsets in postings so one index generation cannot mix coordinate
+systems.
 
 Glossary-backed phrase and entity search is an additive product capability:
 ordinary body terms preserve recall, a dedicated phrase field stores only
@@ -526,15 +530,15 @@ contract.
 versioned binary format, atomic write), flushed with `Flush` and on
 graceful shutdown, loaded at startup when present.
 
-### Live interop with grpc-opennlp-analysis
+### Live interop with `turboembed` (`turbo-client` / `turbo-kserve`)
 
-Verified against the native sidecar rather than the test mock. The vendored
-proto is byte-identical to upstream (drift-checked with `diff` before the
-run). Setup:
+Analysis and inference run either in-process through `turbo-client` (`--analysis-backend=turbo`)
+or against a pooled `turbo-kserve` endpoint (`--analysis-addr=...`, verified at
+bind time with `IndexGenerationHandshake`):
 
 ```bash
-# 1. the sidecar (native binary, no models needed)
-PORT=59101 .../grpc-opennlp-analysis/build/native/nativeCompile/grpc-opennlp-analysis &
+# 1. optional remote turbo-kserve endpoint (or omit --analysis-addr for in-process turbo-client)
+turbo-kserve --listen=127.0.0.1:59101 &
 
 # 2. a pipestream-search node+coordinator pointed at it
 pipestream-search --role=both --index=/tmp/tv-live/shard-0.tv \

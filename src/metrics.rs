@@ -129,12 +129,14 @@ pub enum Route {
     RemoveMember,
     /// `RaftOperatorService.VerifyPublishedImage`.
     VerifyPublishedImage,
+    /// `NodeService.ScoreSplade`.
+    ScoreSplade,
 }
 
 /// Route names as they appear in the `rpc` label, parallel to the
 /// counter tables, with whether the route answers with a response
 /// stream (and so reports two latency phases).
-const REQUEST_ROUTES: [(Route, &str, bool); 73] = [
+const REQUEST_ROUTES: [(Route, &str, bool); 74] = [
     (Route::SearchShard, "search_shard", true),
     (Route::StreamSearch, "stream_search", true),
     (Route::BrowseShard, "browse_shard", false),
@@ -220,6 +222,7 @@ const REQUEST_ROUTES: [(Route, &str, bool); 73] = [
     (Route::PromoteLearners, "promote_learners", false),
     (Route::RemoveMember, "remove_member", false),
     (Route::VerifyPublishedImage, "verify_published_image", false),
+    (Route::ScoreSplade, "score_splade", false),
 ];
 
 const N_ROUTES: usize = REQUEST_ROUTES.len();

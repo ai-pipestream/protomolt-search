@@ -56,6 +56,7 @@ async fn document_only_segment_is_a_gap_in_bitmap_and_boolean_membership() {
         }
         catalog
             .append(SegmentSource {
+                multi_res_path: None,
                 segment_id: &format!("part-{part}"),
                 generation: part as u64 + 1,
                 base_label: (part * 2) as u64,

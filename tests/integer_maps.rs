@@ -284,6 +284,7 @@ fn integer_maps_translate_keys_across_sealed_frozen_and_mutable_parts() {
         let published = shard
             .catalog()
             .append(SegmentSource {
+                multi_res_path: None,
                 segment_id: &format!("seg-{batch}"),
                 generation: batch as u64 + 1,
                 base_label: base as u64,

@@ -59,9 +59,9 @@ fn resolve<'a>(scan: &'a [(SnapshotMeta, PathBuf)], reference: &str) -> Result<&
 }
 
 fn channel_name(channel: i32) -> &'static str {
-    match pipestream_search::pb::analysis::VocabChannel::try_from(channel) {
-        Ok(pipestream_search::pb::analysis::VocabChannel::Terms) => "TERMS ",
-        Ok(pipestream_search::pb::analysis::VocabChannel::Tokens) => "TOKENS",
+    match pipestream_search::pb::storage::VocabChannel::try_from(channel) {
+        Ok(pipestream_search::pb::storage::VocabChannel::Terms) => "TERMS ",
+        Ok(pipestream_search::pb::storage::VocabChannel::Tokens) => "TOKENS",
         _ => "????? ",
     }
 }
@@ -184,7 +184,7 @@ fn main() {
                     m.novelty_rate,
                     m.jensen_shannon_divergence
                 );
-                if channel.channel == pipestream_search::pb::analysis::VocabChannel::Tokens {
+                if channel.channel == pipestream_search::pb::storage::VocabChannel::Tokens {
                     if m.embedding_oov_computed {
                         println!(
                             "        embedding OOV share (token mass): {:.4}",

@@ -445,6 +445,7 @@ struct MidRow {
 /// (staged, uncommitted), the shadow serving state opened over it, the
 /// translated overlay, and the fence values the install re-checks.
 struct PreparedSegmentCutover {
+    multi_res_vectors: crate::multi_res::MultiResVectors,
     catalog: SegmentCatalog,
     shard: Option<crate::segmented::SegmentedShard>,
     index: Option<VectorIndex>,
@@ -1117,6 +1118,11 @@ impl NodeServiceImpl {
                         .append(wal_record::Op::AddVectors(LoggedAddVectors {
                             first_id,
                             batch: Some(AddVectorsRequest {
+                                materialized_rows: row
+                                    .materialized_row
+                                    .map(<[u8]>::to_vec)
+                                    .into_iter()
+                                    .collect(),
                                 vectors: vector.to_vec(),
                                 dim: pre.manifest.dim,
                             }),
@@ -1291,8 +1297,24 @@ impl NodeServiceImpl {
         if let Some(path) = &image.bm25_path {
             mv(path, &bm25_path)?;
         }
-        LiveDocs::default()
-            .write(&live_path, rows)
+        let retained_path = gen.join(crate::multi_res::FILE_NAME);
+        if let Some(path) = &image.multi_res_path {
+            mv(path, &retained_path)?;
+            mv(
+                &crate::multi_res_storage::declaration_path(path),
+                &crate::multi_res_storage::declaration_path(&retained_path),
+            )?;
+        }
+        let multi_res_vectors =
+            crate::multi_res_storage::open(&retained_path, rows).map_err(|error| {
+                Status::internal(format!("open compacted retained vectors: {error}"))
+            })?;
+        let live = if multi_res_vectors.is_empty() {
+            LiveDocs::default()
+        } else {
+            LiveDocs::default().with_retained_vectors()
+        };
+        live.write(&live_path, rows)
             .map_err(|e| Status::internal(format!("write {}: {e}", live_path.display())))?;
         crate::postings::fsync_parent(&live_path)
             .map_err(|e| Status::internal(format!("fsync {}: {e}", gen.display())))?;
@@ -1364,6 +1386,7 @@ impl NodeServiceImpl {
         let mapped_binding = bm25.as_ref().and_then(|b| b.binding().cloned());
         Ok(Shadow {
             state: ShardState {
+                multi_res_vectors,
                 index,
                 exact_vectors,
                 bm25,
@@ -1444,6 +1467,7 @@ impl NodeServiceImpl {
             .zip(&ids)
             .zip(&live_paths)
             .map(|((image, id), live)| SegmentSource {
+                multi_res_path: image.multi_res_path.as_deref(),
                 segment_id: id,
                 generation,
                 base_label: image.slot_offset,
@@ -1530,6 +1554,7 @@ impl NodeServiceImpl {
             let mapped_binding = bm25.binding().cloned();
             Ok(Shadow {
                 state: ShardState {
+                    multi_res_vectors: set.retained_vectors().map_err(Status::internal)?,
                     index,
                     exact_vectors,
                     bm25: Some(bm25),
@@ -1986,6 +2011,10 @@ impl NodeServiceImpl {
                 crate::node::exact_vector_sidecar_path(&pre.index_path),
                 crate::node::bm25_sidecar_path(&pre.index_path),
                 crate::node::live_docs_sidecar_path(&pre.index_path),
+                crate::multi_res::sidecar_path(&pre.index_path),
+                crate::multi_res_storage::declaration_path(&crate::multi_res::sidecar_path(
+                    &pre.index_path,
+                )),
             ]
             .into_iter()
             .filter(|p| p.exists())
@@ -2482,6 +2511,7 @@ impl NodeServiceImpl {
             .zip(&ids)
             .zip(&live_paths)
             .map(|((image, id), live)| SegmentSource {
+                multi_res_path: image.multi_res_path.as_deref(),
                 segment_id: id,
                 generation,
                 base_label: image.slot_offset,
@@ -2675,6 +2705,7 @@ impl NodeServiceImpl {
             })?);
         }
         Ok(PreparedSegmentCutover {
+            multi_res_vectors: set.retained_vectors().map_err(Status::internal)?,
             catalog,
             shard: Some(shard),
             index,
@@ -2757,6 +2788,7 @@ impl NodeServiceImpl {
             let shard = prepared.shard.take().expect("checked above");
             let mapped_binding = shard.binding().cloned();
             let mut state = ShardState {
+                multi_res_vectors: std::mem::take(&mut prepared.multi_res_vectors),
                 index: prepared.index.take(),
                 exact_vectors: prepared.exact_vectors.take(),
                 bm25: Some(Bm25Shard::Segmented(shard)),

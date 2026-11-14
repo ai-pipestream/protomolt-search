@@ -2,12 +2,15 @@
 
 `AddDocumentsRequest.geography` (a `GeographySpec`) asks the node to
 geocode a document's location mentions during ingest and store the
-result as ordinary typed columns. It connects two things that were both
-already built and tested but never touched: the sidecar's geography
-layer (`GeoLocation` mentions geocoded against the bundled Natural
-Earth gazetteer, plus document-level `RegionVote`s) and the engine's
-kind-5 geo-point columns with their bbox/radius filters and
-distance-decay stages (`docs/geo-columns.md`).
+result as ordinary typed columns. It connects the pure-Rust `turbo-geo`
+spatial-coherence gazetteer (`BundledGazetteer` + `ContainmentSpine`, via
+in-process `turbo` or remote `turbo-kserve`) to the engine's kind-5
+geo-point columns with their bbox/radius filters and distance-decay stages
+(`docs/geo-columns.md`). In addition, `NodeServiceImpl::with_nlp_columns`
+(`NlpColumnSpec`, `#103`) materializes hierarchical `ContainmentSpine`
+paths (`"EU"`, `"EU/DE"`, `"EU/DE/Berlin"`), ECB-normalized `money`, SI
+`quantity`, UTC `date`, `sentiment`, affirmed vs negated KB entities, and
+`SimHash` sketches prior to WAL logging.
 
 The result is spatial search over a corpus whose source data carries no
 coordinates anywhere.

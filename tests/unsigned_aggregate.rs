@@ -318,6 +318,7 @@ async fn unsigned_folds_and_percentiles_survive_reopen_compaction_and_query_pool
                     .unwrap();
                 client
                     .add_vectors(tokio_stream::iter([pb::AddVectorsRequest {
+                        materialized_rows: Vec::new(),
                         dim: 8,
                         vectors: common::unit_vectors(1, 8, 816 + row as u64),
                     }]))

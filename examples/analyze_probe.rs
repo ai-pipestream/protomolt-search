@@ -94,9 +94,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  {term:<24} tf={tf}");
     }
 
-    // Embedding is a SEPARATE capability of the same sidecar, and the one
-    // that fails silently at deploy time: a sidecar started without
-    // OPENNLP_EMBEDDINGS_DIR analyzes perfectly, builds a perfectly good
+    // Embedding is a SEPARATE capability of `turbo-kserve`, and the one
+    // that fails silently at deploy time: a server started without
+    // TURBO_KSERVE_BUNDLE_DIR analyzes perfectly, builds a perfectly good
     // index, and then cannot embed a single query. Checking it here means
     // finding out before the cluster is serving rather than from the
     // first hybrid search.
@@ -115,7 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Err(e) => {
                 println!("embedding: FAILED -- {e}");
-                println!("  the sidecar analyzes but cannot embed; check OPENNLP_EMBEDDINGS_DIR");
+                println!("  the server analyzes but cannot embed; check TURBO_KSERVE_BUNDLE_DIR");
                 std::process::exit(1);
             }
         }

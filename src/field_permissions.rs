@@ -162,6 +162,7 @@ impl FieldScope {
             synonyms: _,
             synonyms_off: _,
             explain,
+            pre_analyzed_terms: _,
         } = req;
         let fields: Vec<&str> = if query_fields.is_empty() {
             vec!["body"]

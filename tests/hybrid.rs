@@ -56,6 +56,7 @@ async fn add_documents(addr: &str, texts: &[String]) {
     let feeder = tokio::spawn(async move {
         for text in texts {
             tx.send(AddDocumentsRequest {
+                nlp_materialization: String::new(),
                 unsigned_integers: Vec::new(),
                 map_integers: Vec::new(),
                 map_unsigned_integers: Vec::new(),
@@ -100,6 +101,7 @@ async fn add_vectors(addr: &str, vectors: Vec<f32>) {
     // dim is sent explicitly: harmless when the shard already knows it
     // (validated then), required for a from-scratch shard.
     tx.send(AddVectorsRequest {
+        materialized_rows: Vec::new(),
         vectors,
         dim: DIM as u32,
     })

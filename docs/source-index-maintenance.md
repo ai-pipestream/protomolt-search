@@ -91,8 +91,11 @@ A provider that cannot expose its stored representation refuses
 issued for a dense image the proof could not read. Format 1 certificates,
 which older journals hold, remain valid records of stored content and exact
 rows only; they say nothing about the dense image, and nothing rewrites them.
-The journal accepts both formats on recovery (`validate_maintenance`); new
-publications always write format 2.
+The journal accepts formats 1, 2, and 3 on recovery (`validate_maintenance`).
+New publications write format 3, which additionally includes lattice arc
+lengths and original SPLADE integer impacts and document scales. Absent
+length columns denote unit arcs, so merging legacy positional rows with
+lattice rows preserves their meaning.
 
 The certificate is still an artifact-content comparison, not proof of source
 acceptance, authorization, durability, or runtime activation. The publisher
@@ -146,10 +149,10 @@ duplicate, reordered and out-of-range callbacks refuse; invalid indices never
 reach the proof's bitmap or digest array. Single-row requests use checked range
 arithmetic. Provider failure remains a proof failure even after partial output.
 
-The format-2 transcript uses SHA-256 with length-prefixed byte strings and
+The format-3 transcript uses SHA-256 with length-prefixed byte strings and
 fixed-width little-endian counts, under the domain strings
-`protomolt.source-rewrite.row.v2` and `protomolt.source-rewrite.rows.v2`, so
-a format-1 digest never equals a format-2 digest. Row content starts with the
+`protomolt.source-rewrite.row.v3` and `protomolt.source-rewrite.rows.v3`,
+separating it from the earlier certificate transcripts. Row content starts with the
 reconstructed `AddDocumentsRequest` protobuf. Stored f64 bits are included
 separately because protobuf default elision normalizes negative zero. FP32
 vector bits are included explicitly, then the provider row transcript.

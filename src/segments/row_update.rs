@@ -133,6 +133,7 @@ impl SegmentCatalog {
             }
             manifest.segments = outputs.clone();
             manifest.segments.sort_by_key(|segment| segment.base_label);
+            manifest.update_retained_format();
             let mut end = 0;
             for segment in &manifest.segments {
                 if segment.base_label != end {
@@ -317,6 +318,7 @@ impl SegmentCatalog {
             }
             manifest.segments.extend(outputs.iter().cloned());
             manifest.segments.sort_by_key(|segment| segment.base_label);
+            manifest.update_retained_format();
             let opened = Arc::new(OpenedSegmentSet::open_manifest_reusing(
                 self.root.clone(),
                 manifest,

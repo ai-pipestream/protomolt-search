@@ -106,6 +106,7 @@ fn random_two_field_corpus(
             terms: body,
             length: body_len,
             positions: None,
+            ..Default::default()
         }];
         // Two docs in three carry a name field, shorter and flatter.
         if rng.below(3) != 2 {
@@ -124,17 +125,15 @@ fn random_two_field_corpus(
                 terms: name,
                 length: name_len,
                 positions: None,
+                ..Default::default()
             });
         }
         docs.push((
             id,
             format!("doc {id}"),
             AnalyzedDoc {
-                cased: None,
                 fields,
-                quality: None,
-                geography: None,
-                entities: Vec::new(),
+                ..Default::default()
             },
         ));
     }
@@ -398,24 +397,23 @@ fn fused_ties_at_floor_and_kth_slot() {
             i,
             format!("doc {i}"),
             AnalyzedDoc {
-                cased: None,
                 fields: vec![
                     AnalyzedField {
                         sentences: None,
                         terms: vec![("court".to_string(), 2, vec![(0, 4), (10, 14)])],
                         length: 3,
                         positions: None,
+                        ..Default::default()
                     },
                     AnalyzedField {
                         sentences: None,
                         terms: vec![("smith".to_string(), 1, vec![(0, 5)])],
                         length: 1,
                         positions: None,
+                        ..Default::default()
                     },
                 ],
-                quality: None,
-                geography: None,
-                entities: Vec::new(),
+                ..Default::default()
             },
         );
     }
@@ -498,6 +496,7 @@ fn fused_ties_at_floor_and_kth_slot() {
             terms: vec![("court".to_string(), 1, vec![(0, 4)])],
             length: 3,
             positions: None,
+            ..Default::default()
         }];
         if i % 25 == 0 {
             fields.push(AnalyzedField {
@@ -505,17 +504,15 @@ fn fused_ties_at_floor_and_kth_slot() {
                 terms: vec![("smith".to_string(), 1, vec![(0, 5)])],
                 length: 1,
                 positions: None,
+                ..Default::default()
             });
         }
         store.add_document(
             i,
             format!("doc {i}"),
             AnalyzedDoc {
-                cased: None,
                 fields,
-                quality: None,
-                geography: None,
-                entities: Vec::new(),
+                ..Default::default()
             },
         );
     }
@@ -597,23 +594,22 @@ fn fused_blocks_actually_skip() {
                 ],
                 length: 100 + i % 50,
                 positions: None,
+                ..Default::default()
             },
             AnalyzedField {
                 sentences: None,
                 terms: vec![("smith".to_string(), 1 + (i / 128) % 3, vec![(0, 5)])],
                 length: 10 + i % 5,
                 positions: None,
+                ..Default::default()
             },
         ];
         store.add_document(
             i,
             format!("doc {i}"),
             AnalyzedDoc {
-                cased: None,
                 fields,
-                quality: None,
-                geography: None,
-                entities: Vec::new(),
+                ..Default::default()
             },
         );
     }
@@ -852,6 +848,7 @@ fn fused_pruned_distributed_equals_monolithic() {
             terms: body,
             length: body_len,
             positions: None,
+            ..Default::default()
         }];
         if g % 3 != 1 {
             fields.push(AnalyzedField {
@@ -862,14 +859,12 @@ fn fused_pruned_distributed_equals_monolithic() {
                 ],
                 length: 2,
                 positions: None,
+                ..Default::default()
             });
         }
         AnalyzedDoc {
-            cased: None,
             fields,
-            quality: None,
-            geography: None,
-            entities: Vec::new(),
+            ..Default::default()
         }
     }
     fn build(range: std::ops::Range<u32>, offset: u32) -> Bm25Store {
@@ -1028,24 +1023,23 @@ fn a_term_absent_from_this_shard_does_not_disable_fused_pruning() {
             i,
             format!("doc {i}"),
             AnalyzedDoc {
-                cased: None,
                 fields: vec![
                     AnalyzedField {
                         sentences: None,
                         terms: vec![("court".to_string(), tf, vec![(0, 5)])],
                         length: 4,
                         positions: None,
+                        ..Default::default()
                     },
                     AnalyzedField {
                         sentences: None,
                         terms: vec![("smith".to_string(), 1, vec![(0, 5)])],
                         length: 1,
                         positions: None,
+                        ..Default::default()
                     },
                 ],
-                quality: None,
-                geography: None,
-                entities: Vec::new(),
+                ..Default::default()
             },
         );
     }

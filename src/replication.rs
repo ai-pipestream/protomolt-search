@@ -267,6 +267,8 @@ pub async fn sync_once(cursor: &ReplicaCursor) -> Result<ReplicaCursor, String> 
                 let batch = add
                     .batch
                     .ok_or_else(|| "WAL vector record has no batch".to_string())?;
+                crate::multi_res_wal::require_supported(target.multi_res_vector_version, &batch)?;
+                crate::multi_res_wal::decode_batch(&batch)?;
                 let dim = usize::try_from(batch.dim).unwrap_or(0);
                 if dim == 0 || !batch.vectors.len().is_multiple_of(dim) {
                     return Err("WAL vector record has invalid dimensions".to_string());
@@ -303,6 +305,12 @@ pub async fn sync_once(cursor: &ReplicaCursor) -> Result<ReplicaCursor, String> 
                             .enumerate()
                         {
                             let row = crate::pb::AddVectorsRequest {
+                                materialized_rows: batch
+                                    .materialized_rows
+                                    .get(offset)
+                                    .cloned()
+                                    .into_iter()
+                                    .collect(),
                                 vectors: vector.to_vec(),
                                 dim: batch.dim,
                             };
@@ -680,6 +688,7 @@ pub async fn catch_up_children_once(state: &LiveReshardState) -> Result<LiveResh
     let mut skip_vectors = Vec::with_capacity(state.children.len());
     let mut skip_documents = Vec::with_capacity(state.children.len());
     let mut document_versions = Vec::with_capacity(state.children.len());
+    let mut vector_versions = Vec::with_capacity(state.children.len());
     for child in &state.children {
         let mut child_client = client(&child.addr)?;
         let health = child_client
@@ -698,6 +707,7 @@ pub async fn catch_up_children_once(state: &LiveReshardState) -> Result<LiveResh
         skip_vectors.push(health.num_vectors - expected_vectors);
         skip_documents.push(health.document_slots - expected_documents);
         document_versions.push(health.document_contract_version);
+        vector_versions.push(health.multi_res_vector_version);
         clients.push(child_client);
     }
     let mut stream = source
@@ -744,14 +754,27 @@ pub async fn catch_up_children_once(state: &LiveReshardState) -> Result<LiveResh
                         "live child catch-up requires one stable key per vector".to_string()
                     );
                 }
-                for (vector, key) in batch.vectors.chunks_exact(dim).zip(add.stable_routing_keys) {
+                crate::multi_res_wal::decode_batch(&batch)?;
+                for (offset, (vector, key)) in batch
+                    .vectors
+                    .chunks_exact(dim)
+                    .zip(add.stable_routing_keys)
+                    .enumerate()
+                {
                     let child = updated.route(&key)?;
+                    crate::multi_res_wal::require_supported(vector_versions[child], &batch)?;
                     if skip_vectors[child] > 0 {
                         skip_vectors[child] -= 1;
                     } else {
                         add_vector_with_key(
                             &mut clients[child],
                             crate::pb::AddVectorsRequest {
+                                materialized_rows: batch
+                                    .materialized_rows
+                                    .get(offset)
+                                    .cloned()
+                                    .into_iter()
+                                    .collect(),
                                 vectors: vector.to_vec(),
                                 dim: dim as u32,
                             },

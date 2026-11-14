@@ -8,8 +8,9 @@ use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinitio
 const BEFORE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("before");
 const AFTER: TableDefinition<&[u8], &[u8]> = TableDefinition::new("after");
 /// The certificate this module writes. Format 1 covered stored content and
-/// exact FP32 rows; format 2 adds the provider's own encoded rows.
-pub const CERTIFICATE_FORMAT: u32 = 2;
+/// exact FP32 rows; format 2 adds the provider's own encoded rows. Format 3
+/// also covers lattice arc lengths and lossless SPLADE impacts/scales.
+pub const CERTIFICATE_FORMAT: u32 = 3;
 /// Digest bytes held per batch row.
 pub const BATCH_ROW_BYTES: usize = 32;
 /// The largest batch: 32 MiB of digests.
@@ -278,9 +279,8 @@ impl OpenedSegmentSet {
         let file = options.open(scratch.0.join("rows.redb")).map_err(err)?;
         let mut builder = Database::builder();
         builder.set_cache_size(8 * 1024 * 1024);
-        let database = builder
-            .create_with_backend(redb::backends::FileBackend::new(file).map_err(err)?)
-            .map_err(err)?;
+        let backend = redb::backends::FileBackend::new(file).map_err(err)?;
+        let database = builder.create_with_backend(backend).map_err(err)?;
         #[cfg(test)]
         if let Some(observe) = AFTER_SCRATCH_CREATED.with(|hook| hook.borrow_mut().take()) {
             observe(&scratch.0);
@@ -293,7 +293,7 @@ impl OpenedSegmentSet {
         let before = tx.open_table(BEFORE).map_err(err)?;
         let after = tx.open_table(AFTER).map_err(err)?;
         let mut hash = Sha256::new();
-        part(&mut hash, b"protomolt.source-rewrite.rows.v2");
+        part(&mut hash, b"protomolt.source-rewrite.rows.v3");
         for (left, right) in before.iter().map_err(err)?.zip(after.iter().map_err(err)?) {
             let (lk, lv) = left.map_err(err)?;
             let (rk, rv) = right.map_err(err)?;
@@ -362,7 +362,7 @@ fn fill(
                     return Err(err("live source row has no original protobuf"));
                 }
                 let mut hash = Sha256::new();
-                part(&mut hash, b"protomolt.source-rewrite.row.v2");
+                part(&mut hash, b"protomolt.source-rewrite.row.v3");
                 part(&mut hash, &doc.encode_to_vec());
                 // Protobuf scalar default elision normalizes -0. Preserve its
                 // stored bits too, just as the FP32 vector transcript does.
@@ -375,6 +375,10 @@ fn fill(
                 for value in &doc.geo_points {
                     hash.update(&value.lat.to_bits().to_le_bytes());
                     hash.update(&value.lon.to_bits().to_le_bytes());
+                }
+                if let Some(retained) = set.retained_segment(segment).retained(row as u32) {
+                    part(&mut hash, b"protomolt.source-rewrite.retained-vector.v1");
+                    part(&mut hash, &crate::multi_res::encode(retained).map_err(err)?);
                 }
                 if let Some(exact) = set.exact_vectors(segment) {
                     hash.update(&[1]);
@@ -455,6 +459,17 @@ fn fill(
                     }
                     digests[row - start] = hash.finalize();
                 }
+                field.visit_splade(start as u32, end as u32, |term, row, impact, scale| {
+                    let row = row as usize;
+                    if !live.is_deleted(row) {
+                        let mut hash = extend(&digests[row - start], b"splade");
+                        part(&mut hash, term.as_bytes());
+                        hash.update(&impact.to_le_bytes());
+                        hash.update(&scale.to_le_bytes());
+                        digests[row - start] = hash.finalize();
+                    }
+                    Ok::<(), String>(())
+                })?;
                 for term in field.prefix_iter("") {
                     let mut cursor = field
                         .file_impacts(&term)
@@ -478,6 +493,16 @@ fn fill(
                                 hash.update(&(positions.len() as u64).to_le_bytes());
                                 for pos in positions {
                                     hash.update(&pos.to_le_bytes());
+                                }
+                            }
+                            // Absence means unit arcs, including legacy segments merged
+                            // with lattice-bearing rows in the same destination field.
+                            if let Some(positions) = field.posting_positions(&term, row as u32) {
+                                let lengths = field
+                                    .posting_pos_lengths(&term, row as u32)
+                                    .unwrap_or_else(|| vec![1; positions.len()]);
+                                for len in lengths {
+                                    hash.update(&len.to_le_bytes());
                                 }
                             }
                             digests[row - start] = hash.finalize();
@@ -597,6 +622,21 @@ mod tests {
                         length: if variant("length") { 3 } else { 2 },
                         positions: Some(vec![vec![if variant("position") { 1 } else { 0 }]]),
                         sentences: Some(vec![(0, if variant("sentence") { 8 } else { 9 })]),
+                        pos_lengths: Some(vec![vec![if variant("pos_length") { 1 } else { 2 }]]),
+                        splade: if variant("missing_splade") {
+                            vec![]
+                        } else {
+                            vec![(
+                                "neural".into(),
+                                if variant("splade_impact") { 199 } else { 200 },
+                            )]
+                        },
+                        splade_scale_bits: (if variant("splade_scale") {
+                            0.9_f32
+                        } else {
+                            0.01_f32 * (id + 1) as f32
+                        })
+                        .to_bits(),
                     };
                     store.add_document_with_lineage(
                         row as u32,
@@ -759,6 +799,7 @@ mod tests {
                 live.write(&lp, ids.len() as u64).unwrap();
                 catalog
                     .append(SegmentSource {
+                        multi_res_path: None,
                         segment_id: &format!("part-{segment}"),
                         generation: 1,
                         base_label: base as u64,
@@ -789,6 +830,26 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn rewrite_proof_rejects_lost_or_changed_lattice_and_splade_payloads() {
+        let fixture = Fixture::new();
+        let before = fixture.set("original", &[0, 1, 2], &[], "", 2);
+        for change in [
+            "pos_length",
+            "missing_splade",
+            "splade_impact",
+            "splade_scale",
+        ] {
+            let after = fixture.set(change, &[2, 1, 0], &[], change, 3);
+            assert!(
+                before
+                    .verify_source_rewrite(&after, &fixture.0.join("proof"), 1)
+                    .is_err(),
+                "accepted {change}"
+            );
         }
     }
 

@@ -166,6 +166,41 @@ pub fn process_client_tls() -> Option<&'static ClientTls> {
     PROCESS_CLIENT_TLS.get().and_then(Option::as_ref)
 }
 
+/// Process-wide client bearer token presented to authenticated `turbo-kserve`
+/// and coordinator endpoints when no per-call override is supplied.
+static PROCESS_CLIENT_BEARER: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// Install the process-wide client bearer token once (from `main` or [`ToolClient::install`]).
+pub fn install_client_bearer_token(token: Option<String>) {
+    let normalized = token
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    let _ = PROCESS_CLIENT_BEARER.set(normalized);
+}
+
+/// Resolve the active client bearer token from installed process state,
+/// `TURBO_BEARER_TOKEN_FILE`, or `TURBO_BEARER_TOKEN`.
+pub fn process_client_bearer_token() -> Option<String> {
+    if let Some(installed) = PROCESS_CLIENT_BEARER.get().and_then(Option::clone) {
+        return Some(installed);
+    }
+    if let Ok(path) = std::env::var("TURBO_BEARER_TOKEN_FILE") {
+        let trimmed_path = path.trim();
+        if !trimmed_path.is_empty() {
+            if let Ok(contents) = std::fs::read_to_string(trimmed_path) {
+                let tok = contents.trim();
+                if !tok.is_empty() {
+                    return Some(tok.to_string());
+                }
+            }
+        }
+    }
+    std::env::var("TURBO_BEARER_TOKEN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// The URL a client dials for `addr` under `tls`: `https://` with TLS
 /// material, `http://` without, whatever scheme `addr` carried (a bare
 /// `host:port` gets one). `tonic` applies a channel's TLS only to an
@@ -235,6 +270,7 @@ pub fn is_loopback(addr: &std::net::SocketAddr) -> bool {
 pub struct ToolClient {
     tls: Option<ClientTls>,
     bearer: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+    raw_token: Option<String>,
 }
 
 #[cfg(feature = "net")]
@@ -286,20 +322,23 @@ impl ToolClient {
                 None
             }
         };
-        let bearer = match token {
+        let (bearer, raw_token) = match token {
             Some(token) => {
                 if token.len() < 16 {
                     return Err("a bearer token is at least 16 bytes".to_string());
                 }
-                Some(
-                    format!("Bearer {token}")
-                        .parse()
-                        .map_err(|e| format!("bearer token is not a header value: {e}"))?,
-                )
+                let header = format!("Bearer {token}")
+                    .parse()
+                    .map_err(|e| format!("bearer token is not a header value: {e}"))?;
+                (Some(header), Some(token))
             }
-            None => None,
+            None => (None, None),
         };
-        Ok(ToolClient { tls, bearer })
+        Ok(ToolClient {
+            tls,
+            bearer,
+            raw_token,
+        })
     }
 
     /// Whether the tool dials TLS.
@@ -312,11 +351,17 @@ impl ToolClient {
         self.bearer.is_some()
     }
 
-    /// Install the TLS material process-wide, for the library's own
-    /// channels (an in-process coordinator, replica and snapshot
-    /// helpers).
+    /// Raw bearer token secret (without the `"Bearer "` prefix), if configured.
+    pub fn raw_bearer_token(&self) -> Option<&str> {
+        self.raw_token.as_deref()
+    }
+
+    /// Install the TLS and bearer material process-wide, for the library's own
+    /// channels (an in-process coordinator, `turbo-kserve` offload, replica and
+    /// snapshot helpers).
     pub fn install(&self) {
         install_client_tls(self.tls.clone());
+        install_client_bearer_token(self.raw_token.clone());
     }
 
     /// `host:port` (or a schemed address) as the URL the tool dials:

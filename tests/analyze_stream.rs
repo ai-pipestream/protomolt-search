@@ -10,27 +10,15 @@
 
 mod common;
 
-use std::pin::Pin;
-
 use pipestream_search::analyzer::{
     analyze_batch, analyze_batch_streams, analyze_document, AnalyzeStream,
 };
-use pipestream_search::harness::mock_analysis::MockAnalysis;
-use pipestream_search::harness::nodelay_incoming;
+use pipestream_search::harness::mock_analysis::start_mock_analysis_without_stream;
 use pipestream_search::node::NodeConfig;
-use pipestream_search::pb::analysis::analysis_service_server::{
-    AnalysisService, AnalysisServiceServer,
-};
-use pipestream_search::pb::analysis::{
-    AnalyzeRequest, AnalyzeResponse, AnalyzeStreamRequest, AnalyzeStreamResponse,
-    GetCapabilitiesRequest, GetCapabilitiesResponse,
-};
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::{AddDocumentsRequest, AnalysisSpec};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_stream::Stream;
-use tonic::{Request, Response, Status, Streaming};
 
 use common::{mock::start_mock_analysis, start_empty_node};
 
@@ -119,52 +107,11 @@ async fn one_bad_document_fails_only_its_sequence() {
     server.abort();
 }
 
-/// A sidecar that predates AnalyzeStream: same unary analysis, but the
-/// stream RPC answers UNIMPLEMENTED, the way a live grpc-java server
-/// without the method does.
-struct NoStreamMock(MockAnalysis);
-
-#[tonic::async_trait]
-impl AnalysisService for NoStreamMock {
-    async fn analyze(
-        &self,
-        request: Request<AnalyzeRequest>,
-    ) -> Result<Response<AnalyzeResponse>, Status> {
-        AnalysisService::analyze(&self.0, request).await
-    }
-
-    type AnalyzeStreamStream =
-        Pin<Box<dyn Stream<Item = Result<AnalyzeStreamResponse, Status>> + Send>>;
-
-    async fn analyze_stream(
-        &self,
-        _request: Request<Streaming<AnalyzeStreamRequest>>,
-    ) -> Result<Response<Self::AnalyzeStreamStream>, Status> {
-        Err(Status::unimplemented("this sidecar predates AnalyzeStream"))
-    }
-
-    async fn get_capabilities(
-        &self,
-        request: Request<GetCapabilitiesRequest>,
-    ) -> Result<Response<GetCapabilitiesResponse>, Status> {
-        AnalysisService::get_capabilities(&self.0, request).await
-    }
-}
-
 async fn start_no_stream_mock() -> (
     String,
     tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
 ) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let handle = tokio::spawn(
-        tonic::transport::Server::builder()
-            .add_service(AnalysisServiceServer::new(NoStreamMock(
-                MockAnalysis::default(),
-            )))
-            .serve_with_incoming(nodelay_incoming(listener)),
-    );
-    (format!("http://{addr}"), handle)
+    start_mock_analysis_without_stream().await
 }
 
 #[tokio::test]
@@ -202,6 +149,7 @@ async fn ingest_refuses_a_sidecar_without_analyze_stream() {
     let (tx, rx) = mpsc::channel(8);
     for text in TEXTS {
         tx.send(AddDocumentsRequest {
+            nlp_materialization: String::new(),
             unsigned_integers: Vec::new(),
             map_integers: Vec::new(),
             map_unsigned_integers: Vec::new(),

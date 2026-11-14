@@ -176,6 +176,7 @@ impl NodeServiceImpl {
         };
         guard.index = prepared.index;
         guard.exact_vectors = prepared.exact;
+        guard.multi_res_vectors = prepared.retained;
         guard.mapped_binding = prepared.bm25.binding().cloned();
         guard.bm25 = Some(prepared.bm25);
         guard.live_docs = prepared.live;

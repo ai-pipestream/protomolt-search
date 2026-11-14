@@ -36,12 +36,6 @@ pub mod mobile {
     pub use v1::*;
 }
 
-/// The vendored analysis-sidecar API (`proto/ai/pipestream/opennlp/analysis/v1/analysis.proto`,
-/// copied from the grpc-opennlp-analysis repo — see the file header).
-pub mod analysis {
-    tonic::include_proto!("ai.pipestream.opennlp.analysis.v1");
-}
-
 /// The vendored Text Embeddings Inference API (`proto/tei/v1/tei.proto`,
 /// from huggingface/text-embeddings-inference v1.9.3 — see the file header).
 pub mod tei {

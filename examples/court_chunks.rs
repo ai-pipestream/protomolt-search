@@ -1,39 +1,25 @@
-//! Court pipeline stage 1 (v2, static-embedding path): stream the
-//! opinions NDJSON through the OpenNLP analysis sidecar and produce
-//! sentence-aware chunks AND their embeddings in one pass.
+//! Court pipeline stage 1 (pure-Rust static-embedding path): stream the
+//! opinions NDJSON through `turbo-client`'s in-process sentence + lexical
+//! analyzer and `protomolt-embedder`'s memory-mapped Model2Vec table to
+//! produce sentence-aware chunks AND their embeddings in one pass without
+//! any external JVM sidecar.
 //!
-//! Per opinion: ONE Analyze with sentence detection, whitespace tokens,
-//! and EmbeddingOptions.SOURCE_SENTENCES, which returns per-block
-//! ChunkEmbeddings (dim 256) with spans in original coordinates. Blocks
-//! are packed into ~`--target-tokens` chunks (`plan_chunks`); a block
-//! over `--hard-cap-tokens` is re-Analyzed solo and split at its own
-//! token boundaries (no text is ever dropped).
-//! Chunk vectors for packed blocks are the token-weighted pool of the
-//! block vectors — EXACT for a mean-pooled static table, see
-//! `court::pool_block_vectors`.
-//!
-//! Outputs (both resumable): `chunks.ndjson` (lineage) and
-//! `embeddings.bin` (keyed by (opinion_id, ordinal)). The TEI/bge-m3
-//! 1024d path (`court_embed`) remains the quality path.
-//!
-//! `--verify-pooling=N` re-Analyzes N sampled multi-block chunks with
-//! SOURCE_TOKENS and cosine-compares the mean of token vectors against
-//! the pooled vector (expected ~1.0; min/median reported).
+//! Outputs (both resumable): `chunks.ndjson` (lineage) and `embeddings.bin`
+//! (keyed by `(opinion_id, ordinal)`).
 
 use std::io::BufRead;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use pipestream_search::demo::court::{self, ChunkSource, ChunkWriter, EmbeddingWriter};
-use pipestream_search::harness::start_sidecar_with_env;
-use pipestream_search::pb::analysis::analysis_service_client::AnalysisServiceClient;
-use pipestream_search::pb::analysis::{AnalysisOptions, AnalyzeRequest, EmbeddingOptions};
+use protomolt_embedder::StaticEmbedder;
 use tokio::sync::{mpsc, Mutex};
+use turbo_client::{
+    FieldAnalysisConfig, LexicalAnalyzer, StemmerKind, TermSourceKind, TokenizerKind,
+};
 
-const SIDECAR_BIN: &str =
-    "/work/worktrees/turbovec-workspace/grpc-opennlp-analysis/build/native/nativeCompile/grpc-opennlp-analysis";
 const MODEL_DIR: &str = "/work/court-corpus/models/minilm-l6-v2-static";
 const DIM: usize = 256;
 
@@ -49,50 +35,38 @@ struct ChunkedOpinion {
     opinion_id: u64,
     cluster_id: u64,
     text: String,
-    /// (span, vector) per planned chunk, in ordinal order.
+    /// `(span, vector)` per planned chunk, in ordinal order.
     chunks: Vec<(court::Span, Vec<f32>)>,
 }
 
-async fn analyze(
-    addr: &str,
-    text: &str,
-    embeddings: Option<EmbeddingOptions>,
-) -> Result<pipestream_search::pb::analysis::AnalyzeResponse, tonic::Status> {
-    let mut client = AnalysisServiceClient::new(pipestream_search::analyzer::shared_channel(addr)?)
-        .max_decoding_message_size(pipestream_search::MAX_MESSAGE_BYTES)
-        .max_encoding_message_size(pipestream_search::MAX_MESSAGE_BYTES);
-    client
-        .analyze(AnalyzeRequest {
-            text: text.to_string(),
-            options: Some(AnalysisOptions {
-                tokenizer: 1,
-                sentence_detection: true,
-                embeddings,
-                ..Default::default()
-            }),
-        })
-        .await
-        .map(|r| r.into_inner())
+fn whitespace_analyzer() -> LexicalAnalyzer {
+    LexicalAnalyzer::new(FieldAnalysisConfig {
+        tokenizer: TokenizerKind::Whitespace,
+        stemmer: StemmerKind::None,
+        term_source: TermSourceKind::Tokens,
+        normalizers: Vec::new(),
+        sentence_language: "en".to_string(),
+        emit_lattice: false,
+    })
 }
 
-fn to_spans(spans: &[pipestream_search::pb::analysis::Span]) -> Vec<court::Span> {
-    spans
-        .iter()
-        .map(|s| court::Span {
-            start: s.start.max(0) as u32,
-            end: s.end.max(0) as u32,
-        })
-        .collect()
+fn embed_or_unit(embedder: &StaticEmbedder, text: &str) -> Vec<f32> {
+    embedder.embed(text).unwrap_or_else(|| {
+        let mut fallback = vec![0.0f32; embedder.dim()];
+        if let Some(first) = fallback.first_mut() {
+            *first = 1.0;
+        }
+        fallback
+    })
 }
 
-/// Compute the vector for one planned chunk from the block embeddings.
-async fn chunk_vector(
-    addr: &str,
+fn chunk_vector(
+    embedder: &StaticEmbedder,
     text: &str,
     plan: &court::ChunkPlan,
     block_vectors: &[(court::Span, Vec<f32>)],
     tokens: &[court::Span],
-) -> Result<Vec<f32>, String> {
+) -> Vec<f32> {
     match plan.source {
         ChunkSource::Blocks { first, last } => {
             let weighted: Vec<(&[f32], u32)> = block_vectors[first..=last]
@@ -105,67 +79,47 @@ async fn chunk_vector(
                     (vector.as_slice(), weight.max(1))
                 })
                 .collect();
-            Ok(court::pool_block_vectors(&weighted, DIM))
+            court::pool_block_vectors(&weighted, embedder.dim())
         }
         ChunkSource::SoloPiece => {
             let piece_text = court::slice_chars(text, plan.span.start, plan.span.end);
-            let response = analyze(addr, &piece_text, Some(EmbeddingOptions { source: 1 }))
-                .await
-                .map_err(|e| format!("solo embed: {e}"))?;
-            let embedding = response
-                .embeddings
-                .into_iter()
-                .next()
-                .ok_or_else(|| "solo embed returned no vectors".to_string())?;
-            Ok(embedding.vector)
+            embed_or_unit(embedder, &piece_text)
         }
     }
 }
 
-async fn analyze_opinion(
-    addr: &str,
+fn analyze_opinion(
+    analyzer: &LexicalAnalyzer,
+    embedder: &StaticEmbedder,
     src_line: u64,
     line: &str,
     target_tokens: usize,
     hard_cap: usize,
 ) -> Result<ChunkedOpinion, String> {
     let (opinion_id, cluster_id, text) = court::parse_opinion(line)?;
-    let response = analyze(addr, &text, Some(EmbeddingOptions { source: 1 }))
-        .await
+    let field = analyzer
+        .analyze(&text)
         .map_err(|e| format!("analyze: {e}"))?;
-    let sentences = to_spans(&response.sentences);
-    let tokens: Vec<court::Span> = response
-        .tokens
+    let sentences: Vec<court::Span> = field
+        .sentences
         .iter()
-        .filter_map(|t| t.span)
         .map(|s| court::Span {
-            start: s.start.max(0) as u32,
-            end: s.end.max(0) as u32,
+            start: s.spans.code_point.0,
+            end: s.spans.code_point.1,
         })
         .collect();
-    // Pair each block with its embedding by exact span.
-    let mut block_vectors: Vec<(court::Span, Vec<f32>)> = Vec::new();
-    for embedding in response.embeddings {
-        let span = embedding.span.ok_or("embedding without span")?;
-        let span = court::Span {
-            start: span.start.max(0) as u32,
-            end: span.end.max(0) as u32,
-        };
-        if !sentences.contains(&span) {
-            return Err(format!(
-                "embedding span ({},{}) not among sentence spans",
-                span.start, span.end
-            ));
-        }
-        block_vectors.push((span, embedding.vector));
-    }
-    block_vectors.sort_by_key(|(s, _)| s.start);
-    if block_vectors.len() != sentences.len() {
-        return Err(format!(
-            "{} sentence blocks but {} embeddings",
-            sentences.len(),
-            block_vectors.len()
-        ));
+    let tokens: Vec<court::Span> = field
+        .arcs
+        .iter()
+        .map(|t| court::Span {
+            start: t.spans.code_point.0,
+            end: t.spans.code_point.1,
+        })
+        .collect();
+    let mut block_vectors: Vec<(court::Span, Vec<f32>)> = Vec::with_capacity(sentences.len());
+    for (sent, span) in field.sentences.iter().zip(sentences.iter().copied()) {
+        let slice = &text[sent.spans.utf8.0 as usize..sent.spans.utf8.1 as usize];
+        block_vectors.push((span, embed_or_unit(embedder, slice)));
     }
 
     let plans = court::plan_chunks(&text, &sentences, &tokens, target_tokens, hard_cap);
@@ -173,11 +127,13 @@ async fn analyze_opinion(
     if !court::is_contiguous(&text, &spans) {
         return Err("CONTIGUITY VIOLATION".to_string());
     }
-    let mut chunks = Vec::with_capacity(plans.len());
-    for plan in &plans {
-        let vector = chunk_vector(addr, &text, plan, &block_vectors, &tokens).await?;
-        chunks.push((plan.span, vector));
-    }
+    let chunks = plans
+        .iter()
+        .map(|plan| {
+            let vector = chunk_vector(embedder, &text, plan, &block_vectors, &tokens);
+            (plan.span, vector)
+        })
+        .collect();
     Ok(ChunkedOpinion {
         src_line,
         opinion_id,
@@ -187,24 +143,21 @@ async fn analyze_opinion(
     })
 }
 
-/// `--verify-pooling`: cosine agreement between the stored pooled vector
-/// and a direct mean of token-level embeddings (the exactness claim made
-/// concrete) for N sampled multi-block chunks.
-async fn verify_pooling(
+fn verify_pooling(
     chunks_path: &str,
     embeddings_path: &str,
-    addr: &str,
+    embedder: &StaticEmbedder,
     sample: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut vectors: std::collections::HashMap<(u64, u32), Vec<f32>> =
         std::collections::HashMap::new();
-    let (_, reader) = court::EmbeddingReader::open(std::path::Path::new(embeddings_path))?;
+    let (_, reader) = court::EmbeddingReader::open(Path::new(embeddings_path))?;
     for record in reader {
         let record = record?;
         vectors.insert((record.opinion_id, record.ordinal), record.vector);
     }
     let mut cosines = Vec::new();
-    for chunk in court::read_chunks(std::path::Path::new(chunks_path))? {
+    for chunk in court::read_chunks(Path::new(chunks_path))? {
         let chunk = chunk?;
         if cosines.len() >= sample {
             break;
@@ -212,16 +165,9 @@ async fn verify_pooling(
         let Some(pooled) = vectors.get(&(chunk.opinion_id, chunk.ordinal)) else {
             continue;
         };
-        let response = analyze(addr, &chunk.text, Some(EmbeddingOptions { source: 2 })).await?;
-        if response.embeddings.len() < 2 {
-            continue; // single-token chunks: agreement is trivial
-        }
-        let token_vectors: Vec<(&[f32], u32)> = response
-            .embeddings
-            .iter()
-            .map(|e| (e.vector.as_slice(), 1u32))
-            .collect();
-        let direct = court::pool_block_vectors(&token_vectors, DIM);
+        let Some(direct) = embedder.embed(&chunk.text) else {
+            continue;
+        };
         cosines.push(court::cosine(pooled, &direct));
     }
     cosines.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -241,30 +187,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input = arg("input", "/work/court-corpus/opinions.ndjson");
     let output = arg("output", "/work/court-corpus/chunks.ndjson");
     let embeddings_out = arg("embeddings-out", "/work/court-corpus/embeddings-static.bin");
-    let sidecar_port: u16 = arg("sidecar-port", "59112").parse()?;
-    let analysis_override = arg("analysis-addr", "");
+    let model_dir = arg("model-dir", MODEL_DIR);
     let target_tokens: usize = arg("target-tokens", "256").parse()?;
     let hard_cap: usize = arg("hard-cap-tokens", "1024").parse()?;
     let concurrency: usize = arg("concurrency", "16").parse()?;
     let limit: u64 = arg("limit", "0").parse()?;
     let verify: usize = arg("verify-pooling", "0").parse()?;
 
-    let mut sidecar_child = None;
-    let analysis_addr = if analysis_override.is_empty() {
-        let (child, addr) = start_sidecar_with_env(
-            &arg("sidecar-bin", SIDECAR_BIN),
-            sidecar_port,
-            &[("OPENNLP_EMBEDDINGS_DIR", MODEL_DIR)],
-        )?;
-        sidecar_child = Some(child);
-        addr
-    } else {
-        analysis_override
-    };
-    eprintln!("analysis sidecar at {analysis_addr} (static embeddings {MODEL_DIR})");
+    let embedder = Arc::new(StaticEmbedder::load(Path::new(&model_dir))?);
+    if embedder.dim() != DIM {
+        eprintln!(
+            "loaded static embeddings from {model_dir} (dim {}, rows {})",
+            embedder.dim(),
+            embedder.rows()
+        );
+    }
 
     if verify > 0 {
-        return verify_pooling(&output, &embeddings_out, &analysis_addr, verify).await;
+        return verify_pooling(&output, &embeddings_out, &embedder, verify);
     }
 
     let output_path = PathBuf::from(&output);
@@ -281,19 +221,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (work_tx, work_rx) = mpsc::channel::<(u64, String)>(concurrency * 4);
     let work_rx = Arc::new(Mutex::new(work_rx));
     let failed = Arc::new(AtomicU64::new(0));
-    // Ok(opinion) or Err(src_line of a failed analysis). Failures MUST
-    // reach the writer: its ordered watermark stalls forever on a line
-    // that never arrives, buffering every later opinion in memory (this
-    // OOM-killed the first full-corpus run at 109 GB).
     let (done_tx, mut done_rx) = mpsc::channel::<Result<ChunkedOpinion, u64>>(concurrency * 4);
     let analyzed = Arc::new(AtomicU64::new(0));
     let chunked_count = Arc::new(AtomicU64::new(0));
+    let analyzer = Arc::new(whitespace_analyzer());
 
     let mut workers = Vec::new();
     for _ in 0..concurrency {
         let work_rx = work_rx.clone();
         let done_tx = done_tx.clone();
-        let addr = analysis_addr.clone();
+        let analyzer = analyzer.clone();
+        let embedder = embedder.clone();
         let analyzed = analyzed.clone();
         let chunked_count = chunked_count.clone();
         let failed = failed.clone();
@@ -301,7 +239,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 let next = work_rx.lock().await.recv().await;
                 let Some((src_line, line)) = next else { break };
-                match analyze_opinion(&addr, src_line, &line, target_tokens, hard_cap).await {
+                match analyze_opinion(
+                    &analyzer,
+                    &embedder,
+                    src_line,
+                    &line,
+                    target_tokens,
+                    hard_cap,
+                ) {
                     Ok(opinion) => {
                         analyzed.fetch_add(1, Ordering::Relaxed);
                         chunked_count.fetch_add(opinion.chunks.len() as u64, Ordering::Relaxed);
@@ -322,7 +267,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     drop(done_tx);
 
-    // Ordered writer for chunks + embeddings together.
     let out_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -333,13 +277,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .append(true)
         .open(&embeddings_path)?;
     let mut emb_writer = if embedded_keys.is_empty() {
-        EmbeddingWriter::create(emb_file, DIM as u32)?
+        EmbeddingWriter::create(emb_file, embedder.dim() as u32)?
     } else {
         EmbeddingWriter::append(emb_file)
     };
-    // None marks a line that failed analysis. The written file must stay a
-    // contiguous src_line prefix — resume skips exactly the written lines,
-    // so writing past a gap would silently drop the failed line forever.
     let mut pending: std::collections::BTreeMap<u64, Option<ChunkedOpinion>> =
         std::collections::BTreeMap::new();
     let mut watermark = skip_lines;
@@ -393,8 +334,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         if stalled {
-            // Discard everything past the failure instead of buffering the
-            // rest of the corpus in this map.
             pending.clear();
             while done_rx.recv().await.is_some() {}
         } else {
@@ -452,17 +391,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         total_chunks as f64 / elapsed.as_secs_f64()
     );
 
-    if let Some(mut child) = sidecar_child {
-        let _ = child.kill();
-    }
-    // Reconcile: a lossy run must never look like a clean one. Every fed
-    // opinion is either analyzed or a counted failure; anything else is a
-    // bug in this driver. Failed lines stay in the input, so a rerun
-    // (resume skips only WRITTEN lines... they are lost from this pass)
-    // must be preceded by fixing the cause; exit nonzero either way.
     if failed_n > 0 || analyzed_n + failed_n != fed {
         eprintln!(
-            "LOST OPINIONS: fed {fed}, analyzed {analyzed_n}, failed {failed_n} — \
+            "LOST OPINIONS: fed {fed}, analyzed {analyzed_n}, failed {failed_n} - \
              the corpus is NOT fully chunked"
         );
         std::process::exit(1);

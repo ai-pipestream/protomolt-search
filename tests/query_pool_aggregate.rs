@@ -94,6 +94,7 @@ async fn start_cluster() -> (
         let start = shard * SHARD_DOCS;
         let (vtx, vrx) = mpsc::channel(4);
         vtx.send(AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors: corpus[start * DIM..(start + SHARD_DOCS) * DIM].to_vec(),
             dim: DIM as u32,
         })

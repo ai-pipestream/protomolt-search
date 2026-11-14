@@ -36,8 +36,7 @@ use pipestream_search::security::ToolClient;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-const SIDECAR_BIN: &str =
-    "/work/worktrees/turbovec-workspace/grpc-opennlp-analysis/build/native/nativeCompile/grpc-opennlp-analysis";
+const SIDECAR_BIN: &str = "turbo-kserve";
 
 fn arg(key: &str, default: &str) -> String {
     let prefix = format!("--{key}=");
@@ -552,6 +551,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         map_integers: Vec::new(),
                         map_unsigned_integers: Vec::new(),
                         derived_fingerprint: String::new(),
+                        nlp_materialization: String::new(),
                         original_source: None,
                         source_chunk_ordinal: None,
                         identity: None,
@@ -607,6 +607,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let vf = tokio::spawn(async move {
                 for batch in vectors.chunks(512 * dim) {
                     tx.send(AddVectorsRequest {
+                        materialized_rows: Vec::new(),
                         vectors: batch.to_vec(),
                         dim: dim as u32,
                     })
@@ -934,6 +935,7 @@ async fn run_remote(
                 let batches: Vec<AddVectorsRequest> = values
                     .chunks(512 * dim)
                     .map(|batch| AddVectorsRequest {
+                        materialized_rows: Vec::new(),
                         vectors: batch.to_vec(),
                         dim: dim as u32,
                     })
@@ -968,6 +970,7 @@ async fn run_remote(
                     batch.extend(emb.next_vector().map_err(|e| e.to_string())?);
                     if batch.len() == 512 * dim {
                         tx.blocking_send(AddVectorsRequest {
+                            materialized_rows: Vec::new(),
                             vectors: std::mem::replace(&mut batch, Vec::with_capacity(512 * dim)),
                             dim: dim as u32,
                         })
@@ -976,6 +979,7 @@ async fn run_remote(
                 }
                 if !batch.is_empty() {
                     tx.blocking_send(AddVectorsRequest {
+                        materialized_rows: Vec::new(),
                         vectors: batch,
                         dim: dim as u32,
                     })
@@ -1044,6 +1048,7 @@ async fn run_remote(
                         map_integers: Vec::new(),
                         map_unsigned_integers: Vec::new(),
                         derived_fingerprint: String::new(),
+                        nlp_materialization: String::new(),
                         original_source: None,
                         source_chunk_ordinal: None,
                         identity: None,
@@ -1114,6 +1119,7 @@ async fn run_remote(
                 let batches: Vec<AddVectorsRequest> = vectors
                     .chunks(512 * dim)
                     .map(|batch| AddVectorsRequest {
+                        materialized_rows: Vec::new(),
                         vectors: batch.to_vec(),
                         dim: dim as u32,
                     })

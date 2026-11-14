@@ -108,6 +108,7 @@ impl Fixture {
                 .unwrap();
             client
                 .add_vectors(tokio_stream::iter([AddVectorsRequest {
+                    materialized_rows: Vec::new(),
                     dim: DIM as u32,
                     vectors: vectors.clone(),
                 }]))
@@ -533,6 +534,7 @@ async fn absent_optional_field_keeps_its_query_contract_after_restart() {
         .unwrap();
     client
         .add_vectors(tokio_stream::iter([AddVectorsRequest {
+            materialized_rows: Vec::new(),
             dim: DIM as u32,
             vectors: fixture.vector.clone(),
         }]))

@@ -22,6 +22,7 @@ struct SourcePublication<'a> {
 }
 
 struct PreparedServingState {
+    retained: crate::multi_res::MultiResVectors,
     index: Option<VectorIndex>,
     exact: Option<ExactVectorStore>,
     bm25: Bm25Shard,
@@ -183,6 +184,11 @@ impl NodeServiceImpl {
                         dir.join(&meta.exact_vectors.file),
                         dir.join(&meta.bm25.file),
                         dir.join(&meta.live_docs.file),
+                        dir.join(
+                            meta.multi_res
+                                .as_ref()
+                                .map_or("", |artifact| artifact.file.as_str()),
+                        ),
                     ]
                 })
             })
@@ -201,6 +207,7 @@ impl NodeServiceImpl {
                 .expect("candidate paths require segments")
                 .metadata(i);
             sources.push(SegmentSource {
+                multi_res_path: meta.multi_res.as_ref().map(|_| paths[4].as_path()),
                 segment_id: &ids[i],
                 generation: info.accepted_sequence,
                 base_label: base,
@@ -406,6 +413,7 @@ impl NodeServiceImpl {
         // publication, the journal decision is checked next under this guard.
         guard.index = prepared.index;
         guard.exact_vectors = prepared.exact;
+        guard.multi_res_vectors = prepared.retained;
         guard.mapped_binding = prepared.bm25.binding().cloned();
         guard.bm25 = Some(prepared.bm25);
         guard.live_docs = prepared.live;
@@ -552,7 +560,17 @@ impl NodeServiceImpl {
             (None, None)
         };
         set.merge_tombstones(&mut live)?;
+        let retained = set.retained_vectors()?;
+        crate::multi_res_wal::require_coverage(
+            &retained,
+            (0..index.as_ref().map_or(0, VectorIndex::len))
+                .filter(|&slot| exact.as_ref().is_none_or(|exact| exact.contains_row(slot))),
+            &live,
+            &self.config.matryoshka_prefix_dims,
+            self.config.matryoshka_active_dim,
+        )?;
         Ok(PreparedServingState {
+            retained,
             index,
             exact,
             bm25: Bm25Shard::Segmented(shard),
@@ -650,6 +668,7 @@ mod tests {
         let catalog = SegmentCatalog::open(segments_root(&path)).unwrap();
         let old = catalog
             .append(SegmentSource {
+                multi_res_path: None,
                 segment_id: "old",
                 generation: 1,
                 base_label: 0,

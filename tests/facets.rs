@@ -60,6 +60,7 @@ async fn add_documents_faceted(
     let (tx, rx) = mpsc::channel(8);
     for (text, facets) in docs {
         tx.send(AddDocumentsRequest {
+            nlp_materialization: String::new(),
             unsigned_integers: Vec::new(),
             map_integers: Vec::new(),
             map_unsigned_integers: Vec::new(),
@@ -379,6 +380,7 @@ async fn bm25_search_rpc_carries_facets_and_refuses_unknown_fields() {
             prefixes: Vec::new(),
             synonyms: Vec::new(),
             synonyms_off: false,
+            pre_analyzed_terms: Vec::new(),
         }),
     )
     .await
@@ -413,6 +415,7 @@ async fn bm25_search_rpc_carries_facets_and_refuses_unknown_fields() {
             prefixes: Vec::new(),
             synonyms: Vec::new(),
             synonyms_off: false,
+            pre_analyzed_terms: Vec::new(),
         }),
     )
     .await

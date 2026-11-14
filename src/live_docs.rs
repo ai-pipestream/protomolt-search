@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 const MAGIC: &[u8; 8] = b"PMLIVE01";
 const VERSION: u32 = 1;
+const RETAINED_VECTOR_VERSION: u32 = 2;
 const HEADER_BYTES: usize = 80;
 const HASH_START: usize = 40;
 const HASH_END: usize = 72;
@@ -24,6 +25,7 @@ pub struct LiveDocs {
     deleted: Arc<Vec<u64>>,
     revision: u64,
     persisted_rows: u64,
+    retained_vectors: bool,
 }
 
 impl LiveDocs {
@@ -35,7 +37,9 @@ impl LiveDocs {
                 path.display()
             )));
         }
-        if read_u32(&bytes, 8) != VERSION || read_u32(&bytes, 12) as usize != HEADER_BYTES {
+        if !matches!(read_u32(&bytes, 8), VERSION | RETAINED_VECTOR_VERSION)
+            || read_u32(&bytes, 12) as usize != HEADER_BYTES
+        {
             return Err(invalid(format!(
                 "{} has unsupported live-doc version",
                 path.display()
@@ -93,7 +97,18 @@ impl LiveDocs {
             deleted: Arc::new(deleted),
             revision,
             persisted_rows: rows,
+            retained_vectors: read_u32(&bytes, 8) == RETAINED_VECTOR_VERSION,
         })
+    }
+
+    /// Version 2 keeps older node readers from silently ignoring retained tiers.
+    pub(crate) fn with_retained_vectors(mut self) -> Self {
+        self.retained_vectors = true;
+        self
+    }
+
+    pub(crate) fn requires_retained_vectors(&self) -> bool {
+        self.retained_vectors
     }
 
     pub fn revision(&self) -> u64 {
@@ -139,6 +154,7 @@ impl LiveDocs {
             }
         }
         out.revision = self.revision;
+        out.retained_vectors = self.retained_vectors;
         out
     }
 
@@ -182,7 +198,12 @@ impl LiveDocs {
         let hash = crate::sha256::digest(&payload);
         let mut header = [0u8; HEADER_BYTES];
         header[..8].copy_from_slice(MAGIC);
-        header[8..12].copy_from_slice(&VERSION.to_le_bytes());
+        let version = if self.retained_vectors {
+            RETAINED_VECTOR_VERSION
+        } else {
+            VERSION
+        };
+        header[8..12].copy_from_slice(&version.to_le_bytes());
         header[12..16].copy_from_slice(&(HEADER_BYTES as u32).to_le_bytes());
         header[16..24].copy_from_slice(&rows.to_le_bytes());
         header[24..32].copy_from_slice(&self.revision.to_le_bytes());
@@ -283,6 +304,16 @@ mod tests {
         assert!(reopened.is_deleted(1));
         assert!(reopened.is_deleted(129));
         assert!(!reopened.is_deleted(128));
+        let v1 = std::fs::read(&path).unwrap();
+        assert_eq!(read_u32(&v1, 8), VERSION);
+        let gated = reopened.with_retained_vectors().write(&path, 130).unwrap();
+        let v2 = std::fs::read(&path).unwrap();
+        assert_eq!(read_u32(&v2, 8), RETAINED_VECTOR_VERSION);
+        assert_eq!(&v1[HEADER_BYTES..], &v2[HEADER_BYTES..]);
+        assert_eq!(gated.deleted_count(), 2);
+        assert!(gated.requires_retained_vectors());
+        assert!(gated.slice(64, 66).requires_retained_vectors());
+        assert_eq!(gated.revision(), 2);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

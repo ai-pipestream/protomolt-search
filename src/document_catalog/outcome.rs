@@ -12,6 +12,7 @@
 use super::*;
 
 /// The settled decision of an unconfirmed write.
+#[cfg(feature = "net")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Settled {
     /// The actor's right was current under a fresh lease.
@@ -20,6 +21,7 @@ pub(crate) enum Settled {
     Fenced { at_revision: u64 },
 }
 
+#[cfg(feature = "net")]
 impl DocumentCatalog {
     /// Mark the operation and its version UNCONFIRMED: the commit returned
     /// durable after the lease lapsed. Idempotent for a record already

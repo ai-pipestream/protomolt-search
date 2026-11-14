@@ -6,8 +6,8 @@
 mod common;
 
 use pipestream_search::node::NodeConfig;
-use pipestream_search::pb::analysis::VocabChannel;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
+use pipestream_search::pb::storage::VocabChannel;
 use pipestream_search::pb::{AddDocumentsRequest, AddDocumentsResponse};
 use pipestream_search::vocab;
 use tokio::sync::mpsc;

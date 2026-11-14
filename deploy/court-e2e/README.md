@@ -2,8 +2,8 @@
 
 Full pipeline from public bulk data to a queried 4-shard pipestream-search
 cluster, as a reproducible installer **and** an end-to-end test. No
-Python anywhere: data movement is the AWS CLI, extraction is Rust,
-embedding/serving is Rust + the GraalVM-native OpenNLP sidecar.
+Python or JVM anywhere: data movement is the AWS CLI, extraction is Rust,
+embedding/serving is Rust + `turbo-kserve` (`ai-pipestream/turboembed`).
 
 ```mermaid
 flowchart TD
@@ -16,7 +16,7 @@ flowchart TD
     A -->|"seed job: aws s3 cp (anonymous) → rustfs"| B
     B -->|"pipeline job: rclone pull"| C
     C -->|"opinions-sample.ndjson"| D
-    D -->|"OpenNLP analysis sidecar (native):<br/>sentence detect + static Model2Vec embeddings<br/>→ chunks.ndjson + embeddings.bin"| E
+    D -->|"turbo-kserve (Rust):<br/>sentence detect + static Model2Vec embeddings<br/>→ chunks.ndjson + embeddings.bin"| E
     E -->|"calibration broadcast, AddDocuments+AddVectors, Flush → node1..4"| F
     F -->|"vector self-match + distributed BM25 gate"| G(["exit 0 = PASS"])
 ```
@@ -46,7 +46,7 @@ rustfsadmin/rustfsadmin).
 | `rustfs`      | `rustfs/rustfs` | S3-compatible object store holding the corpus |
 | `seed`        | `./seed` (`amazon/aws-cli`) | one-shot: `aws s3 cp` the bulk file from the public CourtListener bucket into rustfs |
 | `model`       | `./model` (`curlimages/curl`) | one-shot: downloads a Model2Vec static table from HuggingFace (default `minishlab/potion-retrieval-32M`) |
-| `analysis`    | builds `grpc-opennlp-analysis` (sibling repo, GraalVM native) | sentence detection, term vectors, static embeddings |
+| `analysis`    | builds `turbo-kserve` (`server/Dockerfile` in sibling `turboembed` repo) | sentence detection, term vectors, static embeddings |
 | `node1`–`node4` | repo-root `Dockerfile` | shard owners (`NodeService`), slot offsets 0/10M/20M/30M |
 | `coordinator` | repo-root `Dockerfile` | client-facing `SearchService` (vector, BM25, hybrid) |
 | `pipeline`    | repo-root `Dockerfile` | one-shot driver: pull → extract → chunk/embed → ingest → verify |
@@ -67,20 +67,18 @@ real evaluation.
 ## The embedding model
 
 The default table is `minishlab/potion-retrieval-32M` (256d static
-Model2Vec, MIT) — the OpenNLP sidecar reads the Model2Vec layout
-natively, so the model job is a plain download. The longer-term target
-is a bge-m3 distillation (multilingual, longer effective dimensionality)
-produced by the Java distiller in the `opennlp-embeddings` module
-(`static-embeddings` branch); swap it in via `MODEL_REPO`/`MODEL_FILES`
-once published.
+Model2Vec, MIT) — `turbo-kserve` serves bundles mounted under `/bundles`
+(`TURBO_KSERVE_BUNDLE_DIR`), so the model job stages the bundle files
+directly. Swap in a distilled `bge-m3` or Matryoshka bundle via
+`MODEL_REPO`/`MODEL_FILES`.
 
 ## Requirements
 
 - Docker with the compose plugin; ~60 GB free disk for a default run
   (the synced bulk file dominates), ~250 GB more for the full corpus.
-- The `grpc-opennlp-analysis` repository checked out next to this one
-  (override with `OPENNLP_ANALYSIS_REPO`). Building it runs a GraalVM
-  native-image build — first build is slow (10–20 min), then cached.
+- The `turboembed` repository checked out next to this one (override with
+  `TURBOEMBED_REPO`). Building `server/Dockerfile` produces the pure-Rust
+  `turbo-kserve` image without any JVM or Python toolchain.
 - Outbound network access to `s3.amazonaws.com` (CourtListener bucket)
   and `huggingface.co` (embedding table).
 

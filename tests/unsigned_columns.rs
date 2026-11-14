@@ -299,6 +299,7 @@ fn unsigned_values_survive_sealing_publication_and_reopen() {
         let published = shard
             .catalog()
             .append(SegmentSource {
+                multi_res_path: None,
                 segment_id: &format!("seg-{index}"),
                 generation: index as u64 + 1,
                 base_label: u64::from(base),

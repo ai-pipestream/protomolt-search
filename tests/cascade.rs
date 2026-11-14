@@ -118,6 +118,7 @@ async fn start_cluster(
             let feed = tokio::spawn(async move {
                 for text in texts {
                     tx.send(pipestream_search::pb::AddDocumentsRequest {
+                        nlp_materialization: String::new(),
                         unsigned_integers: Vec::new(),
                         map_integers: Vec::new(),
                         map_unsigned_integers: Vec::new(),
@@ -161,6 +162,7 @@ async fn start_cluster(
         {
             let (tx, rx) = tokio::sync::mpsc::channel(4);
             tx.send(pipestream_search::pb::AddVectorsRequest {
+                materialized_rows: Vec::new(),
                 vectors,
                 dim: DIM as u32,
             })

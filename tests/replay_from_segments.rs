@@ -228,6 +228,7 @@ async fn source_shard_at(
         client.add_documents(ReceiverStream::new(rx)).await.unwrap();
         let (tx, rx) = mpsc::channel(2);
         tx.send(AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors: vectors[start * DIM..end * DIM].to_vec(),
             dim: DIM as u32,
         })
@@ -884,6 +885,7 @@ async fn the_transplant_refuses_by_name() {
     single.add_documents(ReceiverStream::new(rx)).await.unwrap();
     let (tx, rx) = mpsc::channel(1);
     tx.send(AddVectorsRequest {
+        materialized_rows: Vec::new(),
         vectors: corpus()[..8 * DIM].to_vec(),
         dim: DIM as u32,
     })
@@ -1199,6 +1201,7 @@ async fn sources_with_different_analyzers_are_refused() {
     client.add_documents(ReceiverStream::new(rx)).await.unwrap();
     let (tx, rx) = mpsc::channel(1);
     tx.send(AddVectorsRequest {
+        materialized_rows: Vec::new(),
         vectors: corpus()[..8 * DIM].to_vec(),
         dim: DIM as u32,
     })

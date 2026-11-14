@@ -680,6 +680,7 @@ pub struct PhraseGate<'a> {
     pub index: &'a dyn crate::postings::Bm25Index,
     pub terms: &'a [String],
     pub sequence: Vec<usize>,
+    pub alternatives: Vec<Vec<usize>>,
     pub slop: u32,
 }
 
@@ -711,13 +712,13 @@ impl DocFilter<'_> {
                 .as_ref()
                 .is_none_or(|p| p.eval(doc_id, cols) == Tri::True)
             && self.phrase.iter().all(|gate| {
-                crate::proximity::phrase_matches(
-                    gate.index,
-                    gate.terms,
-                    &gate.sequence,
-                    gate.slop,
-                    doc_id,
-                )
+                std::iter::once(&gate.sequence)
+                    .chain(&gate.alternatives)
+                    .any(|sequence| {
+                        crate::proximity::phrase_matches(
+                            gate.index, gate.terms, sequence, gate.slop, doc_id,
+                        )
+                    })
             })
     }
 }

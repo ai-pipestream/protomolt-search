@@ -186,6 +186,7 @@ async fn ingest(addr: &str, p: &Params, vectors: &[f32]) {
         let sender = tokio::spawn(async move {
             for chunk in block.chunks(2_000 * dim as usize) {
                 tx.send(AddVectorsRequest {
+                    materialized_rows: Vec::new(),
                     vectors: chunk.to_vec(),
                     dim,
                 })

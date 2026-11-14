@@ -194,6 +194,7 @@ async fn add_document(client: &mut NodeServiceClient<Channel>, row: &Row) -> Add
 /// The vector half of a legacy two-RPC append, keyed.
 async fn add_vector(client: &mut NodeServiceClient<Channel>, row: &Row) -> AddVectorsResponse {
     let mut request = Request::new(tokio_stream::iter([AddVectorsRequest {
+        materialized_rows: Vec::new(),
         vectors: row.vector.clone(),
         dim: DIM as u32,
     }]));
@@ -1294,6 +1295,7 @@ async fn refusals_name_the_cause_and_a_dry_run_writes_nothing() {
                 pipestream_search::pb::wal::LoggedAddVectors {
                     first_id: 0,
                     batch: Some(AddVectorsRequest {
+                        materialized_rows: Vec::new(),
                         vectors: vec![0.0; DIM],
                         dim: DIM as u32,
                     }),
@@ -1400,6 +1402,7 @@ async fn add_block(client: &mut NodeServiceClient<Channel>, rows: &[Row]) {
     let vectors: Vec<f32> = rows.iter().flat_map(|row| row.vector.clone()).collect();
     let added = client
         .add_vectors(tokio_stream::iter([AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors,
             dim: DIM as u32,
         }]))
@@ -1512,6 +1515,7 @@ async fn blocks_seal_with_their_vectors_and_documents_first_is_refused_by_name()
     let vectors: Vec<f32> = rows[..250].iter().flat_map(|r| r.vector.clone()).collect();
     let status = docs_first
         .add_vectors(tokio_stream::iter([AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors,
             dim: DIM as u32,
         }]))
@@ -1689,6 +1693,8 @@ async fn a_second_compaction_and_a_snapshot_install_during_one_refuse_by_name() 
         let (tx, rx) = mpsc::channel(8);
         tx.send(SnapshotChunk {
             payload: Some(snapshot_chunk::Payload::Manifest(SnapshotManifest {
+                multi_res_vector_bytes: 0,
+                multi_res_declaration: Vec::new(),
                 vector_bytes: image.len() as u64,
                 bm25_bytes: bm25.len() as u64,
                 exact_vector_bytes: exact.len() as u64,

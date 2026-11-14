@@ -810,6 +810,7 @@ async fn add_vectors(addr: &str, vectors: Vec<f32>) {
     let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
     let (tx, rx) = mpsc::channel(1);
     tx.send(AddVectorsRequest {
+        materialized_rows: Vec::new(),
         vectors,
         dim: DIM as u32,
     })

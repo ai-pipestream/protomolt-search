@@ -51,11 +51,14 @@ refuses by name before any shard is asked. A sorted lexical leaf computes
 no relevance and refuses rules on the leaf, as it refuses every other
 relevance shape.
 
-What this does not do: no multi-term matching on the query side (a
-phrase entry contributes expansions but is not matched as a phrase in the
-query), no weights on expansions (an expansion is a term; weight it with
-a `QueryField` if a field-level weight is what is meant), no expansion
-inside a `PhraseMatch` window, no ingest-time synonyms.
+What the static coordinator table alone does not do: no weights on expansions
+(an expansion is a term; weight it with a `QueryField` if a field-level weight
+is what is meant), no expansion inside a `PhraseMatch` window, and no
+ingest-time synonyms. For multi-word query-side synonym matching (for example
+matching `"new york city"` in the query string in one Aho-Corasick /
+`turbo-matcher` pass without coordinator-side stemmer duplication), install
+`CoordinatorServiceImpl::with_one_pass_query` (`#104` / `turboembed` `#2339`) or
+use `SynonymTable::expand_multi_word`.
 
 ## Did you mean
 
@@ -81,10 +84,11 @@ and at most 2; `limit` is 5 per term and at most 100. Two shards equal one
 shard bitwise, as for `Suggest`, and `tests/synonyms.rs` holds the fleet
 to a brute-force ranked scan of the analyzed corpus.
 
-A stemmed field proposes stems, for the reason `docs/suggest.md` gives:
-the dictionary holds stems, and the engine will not guess the surface
-form. df is posting df, so `df_includes_tombstoned_rows` says when a
-tombstoned row still counts.
+A stemmed field proposes stems unless a contextual bigram spellchecker
+(`CoordinatorServiceImpl::with_spellchecker`, `#104` / `turboembed` `#2341`)
+is attached, which augments `TermSuggest` with surface-level and real-word
+contextual bigram corrections. df is posting df, so `df_includes_tombstoned_rows`
+says when a tombstoned row still counts.
 
 Cost: no new section, column, or payload; one bounded dictionary scan per
 term per shard, one analysis call for the text, and an edit-distance

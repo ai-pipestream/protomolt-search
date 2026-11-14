@@ -284,6 +284,7 @@ async fn populate_embedded(runtime: &EmbeddedSearch, corpus: &[f32]) {
             .add_vectors(
                 shard,
                 vec![AddVectorsRequest {
+                    materialized_rows: Vec::new(),
                     vectors: corpus[start..end].to_vec(),
                     dim: DIM as u32,
                 }],
@@ -329,6 +330,7 @@ async fn populate_network(addrs: &[String], corpus: &[f32], shift: &[f32], scale
         let end = start + SHARD_ROWS * DIM;
         client
             .add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
+                materialized_rows: Vec::new(),
                 vectors: corpus[start..end].to_vec(),
                 dim: DIM as u32,
             }]))
@@ -500,6 +502,7 @@ async fn local_mutations_and_persistence_survive_reopen() {
         .add_vectors(
             0,
             vec![AddVectorsRequest {
+                materialized_rows: Vec::new(),
                 vectors: corpus,
                 dim: DIM as u32,
             }],

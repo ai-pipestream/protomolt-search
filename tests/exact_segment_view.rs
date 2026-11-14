@@ -69,6 +69,7 @@ impl Fixture {
             }
             catalog
                 .append(SegmentSource {
+                    multi_res_path: None,
                     segment_id: &format!("part-{part}"),
                     generation: part as u64 + 1,
                     base_label: (part * 2) as u64,
@@ -313,6 +314,7 @@ fn mismatched_exact_dimensions_cannot_enter_a_catalog() {
         .unwrap();
     let error = catalog
         .append(SegmentSource {
+            multi_res_path: None,
             segment_id: "wrong-dim",
             generation: 4,
             base_label: 6,
@@ -445,6 +447,7 @@ fn publication_switches_sealed_rows_and_read_version_together() {
                 rows: vec![0],
             }],
             vec![SegmentSource {
+                multi_res_path: None,
                 segment_id: "replacement",
                 generation: held.epoch() + 1,
                 base_label: 6,

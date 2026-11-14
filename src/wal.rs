@@ -125,7 +125,9 @@ pub fn crc32(data: &[u8]) -> u32 {
 // ---------------------------------------------------------------------------
 
 /// Current on-disk format version (manifest `format_version`).
-pub const FORMAT_VERSION: u32 = 8;
+pub const FORMAT_VERSION: u32 = 9;
+/// Materialized full and prefix vector tiers require version 9.
+pub const MULTI_RES_FORMAT_VERSION: u32 = 9;
 /// Complete column tables and derived fingerprints require version 8.
 /// Derived fingerprints use document tag 29; prior main used tag 27.
 pub const DERIVED_FORMAT_VERSION: u32 = 8;
@@ -1418,6 +1420,23 @@ impl WalWriter {
     }
 
     fn append_routed(&mut self, mut op: wal_record::Op, forced: Option<u32>) -> io::Result<()> {
+        if let wal_record::Op::AddVectors(add) = &op {
+            crate::multi_res_wal::decode_batch(add.batch.as_ref().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing vector batch")
+            })?)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            if add
+                .batch
+                .as_ref()
+                .is_some_and(|batch| !batch.materialized_rows.is_empty())
+                && self.manifest.format_version < MULTI_RES_FORMAT_VERSION
+            {
+                let mut upgraded = self.manifest.clone();
+                upgraded.format_version = MULTI_RES_FORMAT_VERSION;
+                write_manifest(&self.dir, &upgraded)?;
+                self.manifest = upgraded;
+            }
+        }
         if let wal_record::Op::Bind(binding) = &op {
             crate::mapped_analysis::decode_contract(
                 &binding.analysis_sha,
@@ -1643,6 +1662,7 @@ mod tests {
         wal_record::Op::AddVectors(LoggedAddVectors {
             first_id: id,
             batch: Some(AddVectorsRequest {
+                materialized_rows: Vec::new(),
                 vectors: vec![1.0; 8],
                 dim: 8,
             }),
@@ -1654,6 +1674,7 @@ mod tests {
         wal_record::Op::AddDocuments(LoggedAddDocuments {
             first_id: id,
             documents: vec![AddDocumentsRequest {
+                nlp_materialization: String::new(),
                 cased_field: String::new(),
                 collection: String::new(),
                 sentence_fields: Vec::new(),

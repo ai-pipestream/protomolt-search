@@ -1,13 +1,12 @@
-//! Ask a running analysis sidecar what it serves: `GetCapabilities` as
-//! the jar answers it, not as the checked-in proto or source says
-//! (`docs/dual-cased.md`: an open port is not the jar). Exits non-zero
-//! when the dual term identity is not served, so a deploy script can
-//! gate on it.
+//! Ask a running `turbo-kserve` analysis server what capabilities it serves:
+//! `Capabilities` on `turbo.result.v1.AnalysisService` (`docs/dual-cased.md`).
+//! Exits non-zero when no profiles are advertised, so a deploy script can gate
+//! on a live analysis server.
 //!
 //!     cargo run --example sidecar_capabilities -- --addr=http://127.0.0.1:50051
 
-use pipestream_search::pb::analysis::analysis_service_client::AnalysisServiceClient;
-use pipestream_search::pb::analysis::GetCapabilitiesRequest;
+use turbo_client::proto::result::analysis_service_client::AnalysisServiceClient;
+use turbo_client::proto::result::CapabilitiesRequest;
 
 fn arg(key: &str, default: &str) -> String {
     let prefix = format!("--{key}=");
@@ -21,28 +20,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = arg("addr", "http://127.0.0.1:50051");
     let mut client = AnalysisServiceClient::connect(addr.clone()).await?;
     let caps = client
-        .get_capabilities(GetCapabilitiesRequest {})
+        .capabilities(CapabilitiesRequest {})
         .await?
         .into_inner();
-    println!("sidecar {addr}");
-    println!("  service_version              {}", caps.service_version);
-    println!("  opennlp_version              {}", caps.opennlp_version);
-    println!("  ner_available                {}", caps.ner_available);
-    println!("  pos_tags_available           {}", caps.pos_tags_available);
-    println!("  embeddings_enabled           {}", caps.embeddings_enabled);
-    println!(
-        "  dual_term_identity_available {}",
-        caps.dual_term_identity_available
-    );
-    println!("  stemmers                     {:?}", caps.stemmers);
-    println!("  normalizer_steps             {:?}", caps.normalizer_steps);
-    if !caps.warnings.is_empty() {
-        println!("  warnings                     {:?}", caps.warnings);
+    let ner_available = caps.profiles.iter().any(|p| {
+        p.layers
+            .iter()
+            .any(|l| l == "turbo:entities" || l == "turbo:geo")
+    });
+    println!("turbo-kserve {addr}");
+    println!("  profiles_count               {}", caps.profiles.len());
+    println!("  ner_available                {ner_available}");
+    for profile in &caps.profiles {
+        println!("  profile {:<20} {:?}", profile.name, profile.layers);
     }
-    if !caps.dual_term_identity_available {
+    if caps.profiles.is_empty() {
         eprintln!(
-            "the sidecar at {addr} does not serve the dual term identity; a cased_field ingest \
-             would be refused (rebuild grpc-opennlp-analysis from main: ./gradlew installDist)"
+            "the turbo-kserve endpoint at {addr} reported no profiles; ingest would be refused"
         );
         std::process::exit(2);
     }

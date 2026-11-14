@@ -114,6 +114,7 @@ async fn serve_product_filter_shard(
     client.add_documents(ReceiverStream::new(rx)).await.unwrap();
     client
         .add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors,
             dim: DIM as u32,
         }]))
@@ -404,6 +405,7 @@ async fn embedded_in_process_and_external_transports_are_bit_exact() {
             floor_prune: None,
             floor_greediness_ppm: None,
             floor_clamp_min: None,
+            include_rerank_candidate: false,
         }),
     )
     .await
@@ -428,6 +430,7 @@ async fn embedded_in_process_and_external_transports_are_bit_exact() {
             floor_prune: None,
             floor_greediness_ppm: None,
             floor_clamp_min: None,
+            include_rerank_candidate: false,
         }),
     )
     .await
@@ -462,6 +465,7 @@ async fn embedded_in_process_and_external_transports_are_bit_exact() {
             floor_prune: None,
             floor_greediness_ppm: None,
             floor_clamp_min: None,
+            include_rerank_candidate: false,
         }),
     )
     .await

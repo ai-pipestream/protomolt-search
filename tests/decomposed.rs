@@ -94,6 +94,7 @@ async fn start_fixture() -> Fixture {
         let feeder = tokio::spawn(async move {
             for text in shard_texts {
                 tx.send(AddDocumentsRequest {
+                    nlp_materialization: String::new(),
                     unsigned_integers: Vec::new(),
                     map_integers: Vec::new(),
                     map_unsigned_integers: Vec::new(),
@@ -132,6 +133,7 @@ async fn start_fixture() -> Fixture {
         feeder.await.unwrap();
         let (tx, rx) = mpsc::channel(4);
         tx.send(AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors: corpus[start * DIM..(start + SHARD_DOCS) * DIM].to_vec(),
             dim: DIM as u32,
         })

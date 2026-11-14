@@ -296,6 +296,7 @@ async fn unsigned_sort_collapse_and_cursors_survive_reopen_and_compaction() {
                     .unwrap();
                 client
                     .add_vectors(tokio_stream::iter([pb::AddVectorsRequest {
+                        materialized_rows: Vec::new(),
                         dim: 8,
                         vectors: common::unit_vectors(1, 8, 57890 + row as u64),
                     }]))

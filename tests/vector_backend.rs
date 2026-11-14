@@ -59,6 +59,7 @@ async fn descriptor_and_opaque_config_round_trip_over_grpc() {
 
     client
         .add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors: unit_vectors(8, DIM, 0xBACC_E002),
             dim: DIM as u32,
         }]))
@@ -77,6 +78,7 @@ async fn coordinator_broadcasts_provider_config_and_reports_partial_failure() {
     let mut occupied = NodeServiceClient::connect(addr_c.clone()).await.unwrap();
     occupied
         .add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors: unit_vectors(4, DIM, 0xBACC_E003),
             dim: DIM as u32,
         }]))
@@ -117,6 +119,7 @@ async fn first_batch_completes_generic_wal_provider_metadata() {
     let mut client = NodeServiceClient::connect(addr).await.unwrap();
     client
         .add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors: unit_vectors(8, DIM, 0xBACC_E004),
             dim: DIM as u32,
         }]))
@@ -180,6 +183,7 @@ async fn a_fleet_calibrated_two_ways_is_refused_before_a_shard_is_asked() {
             .unwrap();
         client
             .add_vectors(tokio_stream::iter(vec![AddVectorsRequest {
+                materialized_rows: Vec::new(),
                 vectors: corpus[from * DIM..(from + 32) * DIM].to_vec(),
                 dim: DIM as u32,
             }]))

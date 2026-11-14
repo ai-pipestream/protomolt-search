@@ -101,6 +101,7 @@ async fn ingest(addr: &str) {
         client.add_documents(ReceiverStream::new(rx)).await.unwrap();
         let (tx, rx) = mpsc::channel(2);
         tx.send(AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors: vectors[start * DIM..end * DIM].to_vec(),
             dim: DIM as u32,
         })

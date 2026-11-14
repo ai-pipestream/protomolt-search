@@ -1,12 +1,12 @@
 # Vocabulary index (Rust side)
 
-The Rust realization of the vocabulary listener designed in
-`grpc-opennlp-analysis/VOCABULARY-LISTENER.md` (the sidecar repo is the
-authoritative design doc). The split by role: the Java sidecar
-**calculates** (term identity is counted exactly as the analysis pipeline
-produced it); pipestream-search **accumulates, stores, and aggregates** —
-inline in the ingest path, from the AnalyzeStream responses the node
-already consumes to build postings. No new gRPC channel, no proto changes.
+Streaming corpus vocabulary sketches accumulated inline in the ingest path
+and persisted under `proto/ai/protomolt/search/storage/v1/vocab_snapshot.proto`
+(preserving byte-identical FNV-1a + splitmix64 sketch layouts from the
+original `grpc-opennlp-analysis/VOCABULARY-LISTENER.md` specification).
+Term identity is counted exactly as `turbo-client` / `protomolt-analyzer`
+produced it; pipestream-search **accumulates, stores, and aggregates**
+inline from ingest analysis responses without an extra pass.
 
 ## What it counts
 
@@ -95,3 +95,17 @@ counts, and — with `--embeddings` — the share of the newer window's token
 mass absent from the model's `vocab.txt` / `tokenizer.json` vocabulary.
 None of these gate anything; they inform the operator's decision to train
 a candidate embedding reweight. Promotion is always decided by live A/B.
+
+## Corpus IDF & Voronoi centroid calibration loop (`TurboVocabularyService`)
+
+Aggregated shard snapshots also feed `turboembed`'s `TurboVocabularyService`
+(`src/vocab.rs`, `src/placement.rs`):
+
+- `vocab::export_corpus_df_entries` & `vocab::push_corpus_idf_to_turbo`:
+  exports `VocabChannel::Terms` document-frequency estimates into
+  `ImportCorpusStatistics` (`TCIDF001` binary artifact) for corpus-calibrated
+  static-embedding IDF weights and `TSUGLEX1` surface-form frequency ranking.
+- `placement::train_voronoi_centroids_via_turbo`: trains spherical k-means
+  Voronoi routing centroids via `TrainVoronoiCentroids` (`TCENT001` binary
+  artifact) and converts the returned row-major centroids directly into a
+  `VoronoiSpec` for locality-aware shard placement.

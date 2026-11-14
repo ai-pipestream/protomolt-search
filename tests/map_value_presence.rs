@@ -334,6 +334,7 @@ async fn empty_value_and_absent_key_stay_distinct_through_rpc_flush_reopen_and_c
                     assert_eq!(documents.first_id, config.slot_offset);
                     let vectors = client
                         .add_vectors(tokio_stream::iter([pb::AddVectorsRequest {
+                            materialized_rows: Vec::new(),
                             vectors: common::unit_vectors(rows, 16, 135),
                             dim: 16,
                         }]))

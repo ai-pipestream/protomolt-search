@@ -1,6 +1,6 @@
 //! Identity resolution against the metadata and eligibility of one scan.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -8,8 +8,8 @@ use prost::Message;
 use tonic::Status;
 
 use crate::pb::{
-    stream_search_response, ResolveStreamIdentities, StreamIdentities, StreamIdentity,
-    StreamIdentityLimits, StreamSearchResponse,
+    stream_search_response, RerankCandidatePayload, ResolveStreamIdentities, StreamIdentities,
+    StreamIdentity, StreamIdentityLimits, StreamSearchResponse,
 };
 use crate::source_archive::IdentitySnapshot;
 
@@ -53,6 +53,7 @@ pub(crate) struct ScanIdentities {
     rows: usize,
     identities: IdentitySnapshot,
     admitted: Option<crate::boolean_bits::Bits>,
+    rerank_candidates: Option<HashMap<u32, RerankCandidatePayload>>,
 }
 
 impl ScanIdentities {
@@ -69,6 +70,7 @@ impl ScanIdentities {
         rows: usize,
         identities: IdentitySnapshot,
         admitted: Option<crate::boolean_bits::Bits>,
+        rerank_candidates: Option<HashMap<u32, RerankCandidatePayload>>,
     ) -> Result<Self, Status> {
         if rows as u128 > u128::from(u32::MAX) + 1
             || (rows > 0 && base.checked_add((rows - 1) as u64).is_none())
@@ -83,6 +85,7 @@ impl ScanIdentities {
             rows,
             identities,
             admitted,
+            rerank_candidates,
         })
     }
 
@@ -143,6 +146,10 @@ impl ScanIdentities {
             let row = StreamIdentity {
                 vector_id: id,
                 identity: self.identities.identity(local),
+                rerank_candidate: self
+                    .rerank_candidates
+                    .as_ref()
+                    .and_then(|map| map.get(&local).cloned()),
             };
             let len = row.encoded_len();
             payload_bytes = payload_bytes
@@ -212,6 +219,7 @@ mod tests {
             3,
             IdentitySnapshot::default(),
             Some(crate::boolean_bits::Bits::from_bools(&[true, false, true])),
+            None,
         )
         .unwrap();
         let limits = StreamIdentityLimits {
@@ -253,19 +261,20 @@ mod tests {
             resolve(vec![100; 4]).unwrap_err().code(),
             tonic::Code::ResourceExhausted
         );
-        assert!(ScanIdentities::new(u64::MAX, 2, IdentitySnapshot::default(), None).is_err());
+        assert!(ScanIdentities::new(u64::MAX, 2, IdentitySnapshot::default(), None, None).is_err());
         assert!(ScanIdentities::new(
             0,
             2,
             IdentitySnapshot::default(),
-            Some(crate::boolean_bits::Bits::from_bools(&[true]))
+            Some(crate::boolean_bits::Bits::from_bools(&[true])),
+            None,
         )
         .is_err());
     }
 
     #[test]
     fn response_budget_includes_the_outer_message_and_empty_selection() {
-        let view = ScanIdentities::new(0, 2, IdentitySnapshot::default(), None).unwrap();
+        let view = ScanIdentities::new(0, 2, IdentitySnapshot::default(), None, None).unwrap();
         let mut limits = StreamIdentityLimits {
             max_rows: 2,
             max_response_bytes: 1024,

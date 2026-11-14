@@ -116,6 +116,7 @@ async fn seeded_node(dir: &Path) -> (NodeServiceImpl, String, Vec<f32>) {
     tokio::spawn(async move {
         let _ = tx
             .send(AddVectorsRequest {
+                materialized_rows: Vec::new(),
                 vectors: batch,
                 dim: DIM as u32,
             })

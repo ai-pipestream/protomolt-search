@@ -52,6 +52,7 @@ async fn add_documents_numeric(
     let (tx, rx) = mpsc::channel(8);
     for (text, numerics) in docs {
         tx.send(AddDocumentsRequest {
+            nlp_materialization: String::new(),
             unsigned_integers: Vec::new(),
             map_integers: Vec::new(),
             map_unsigned_integers: Vec::new(),
@@ -467,6 +468,7 @@ async fn distributed_chain_matches_monolith_and_reorders() {
             prefixes: Vec::new(),
             synonyms: Vec::new(),
             synonyms_off: false,
+            pre_analyzed_terms: Vec::new(),
         }),
     )
     .await
@@ -593,6 +595,7 @@ async fn stage_and_ingest_refusals_are_loud() {
             prefixes: Vec::new(),
             synonyms: Vec::new(),
             synonyms_off: false,
+            pre_analyzed_terms: Vec::new(),
         }),
     )
     .await

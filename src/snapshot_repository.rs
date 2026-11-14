@@ -22,6 +22,8 @@ use crate::sha256::Sha256;
 pub const MANIFEST_FILE: &str = "snapshot-manifest.json";
 /// The manifest format this build writes and reads.
 pub const FORMAT_VERSION: u32 = 1;
+/// Retained vector artifacts require readers that preserve materialized tiers.
+pub const RETAINED_FORMAT_VERSION: u32 = 2;
 /// The `layout` of a repository holding one provider image plus sidecars.
 pub const LAYOUT_SINGLE_IMAGE: &str = "single-image";
 /// The `layout` of a repository holding a segment catalog tree.
@@ -78,9 +80,9 @@ impl RepositoryManifest {
     /// Structural checks every reader applies: the format, a known layout,
     /// artifact paths that stay inside the repository, no repeats.
     pub fn validate(&self) -> Result<(), String> {
-        if self.format_version != FORMAT_VERSION {
+        if !(FORMAT_VERSION..=RETAINED_FORMAT_VERSION).contains(&self.format_version) {
             return Err(format!(
-                "{MANIFEST_FILE} has format_version {}, this build reads {FORMAT_VERSION}",
+                "{MANIFEST_FILE} has format_version {}, this build reads {FORMAT_VERSION}..={RETAINED_FORMAT_VERSION}",
                 self.format_version
             ));
         }
@@ -90,6 +92,20 @@ impl RepositoryManifest {
                  {LAYOUT_SEGMENTS:?}",
                 self.layout
             ));
+        }
+        let has_retained = self.artifacts.iter().any(|artifact| {
+            artifact.file == "vectors.multi" || artifact.file.ends_with("/vectors.multi")
+        });
+        if has_retained && self.format_version < RETAINED_FORMAT_VERSION {
+            return Err("retained vector snapshot requires repository format 2".into());
+        }
+        if self.layout == LAYOUT_SINGLE_IMAGE
+            && (self.artifact("vectors.multi").is_some()
+                != self.artifact("vectors.multi.json").is_some())
+        {
+            return Err(
+                "retained vector snapshot requires payload and declaration together".into(),
+            );
         }
         let mut seen = std::collections::BTreeSet::new();
         for artifact in &self.artifacts {
@@ -413,8 +429,8 @@ mod tests {
         layout.layout = "tar".into();
         assert!(layout.validate().unwrap_err().contains("names layout"));
         let mut format = manifest();
-        format.format_version = 2;
-        assert!(format.validate().unwrap_err().contains("format_version 2"));
+        format.format_version = RETAINED_FORMAT_VERSION + 1;
+        assert!(format.validate().unwrap_err().contains("format_version 3"));
         let mut twice = manifest();
         twice.artifacts.push(twice.artifacts[0].clone());
         assert!(twice.validate().unwrap_err().contains("listed twice"));

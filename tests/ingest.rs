@@ -30,7 +30,11 @@ async fn push_batches(
 }
 
 fn batch(vectors: Vec<f32>) -> AddVectorsRequest {
-    AddVectorsRequest { vectors, dim: 0 }
+    AddVectorsRequest {
+        materialized_rows: Vec::new(),
+        vectors,
+        dim: 0,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -121,6 +125,7 @@ async fn calibration_lifecycle_and_ingest_rules() {
     let wrong_dim = push_batches(
         &mut client,
         vec![AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors: unit_vectors(10, 64, 0xA000_0003),
             dim: 64,
         }],
@@ -140,6 +145,7 @@ async fn unseeded_from_scratch_add_constructs_index() {
     let no_dim = push_batches(
         &mut client,
         vec![AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors: unit_vectors(10, DIM, 0xB0B0_0001),
             dim: 0,
         }],
@@ -156,6 +162,7 @@ async fn unseeded_from_scratch_add_constructs_index() {
     let resp = push_batches(
         &mut client,
         vec![AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors: unit_vectors(2_000, DIM, 0xB0B0_0002),
             dim: DIM as u32,
         }],

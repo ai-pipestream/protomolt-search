@@ -103,6 +103,7 @@ async fn seed_shard(
 
     let (tx, rx) = mpsc::channel(4);
     tx.send(AddVectorsRequest {
+        materialized_rows: Vec::new(),
         vectors,
         dim: DIM as u32,
     })

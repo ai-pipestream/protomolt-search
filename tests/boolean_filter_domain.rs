@@ -175,6 +175,7 @@ async fn ingest(addr: &str, shard: usize, vectors: &[f32]) {
         client.add_documents(ReceiverStream::new(rx)).await.unwrap();
         let (tx, rx) = mpsc::channel(2);
         tx.send(AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors: vectors[start * DIM..end * DIM].to_vec(),
             dim: DIM as u32,
         })
@@ -275,6 +276,7 @@ async fn uneven_fleet(tag: &str) -> Fleet {
     let with_vectors = SHARD_ROWS - VECTORLESS;
     let (tx, rx) = mpsc::channel(2);
     tx.send(AddVectorsRequest {
+        materialized_rows: Vec::new(),
         vectors: vectors[..with_vectors * DIM].to_vec(),
         dim: DIM as u32,
     })
@@ -300,6 +302,7 @@ async fn uneven_fleet(tag: &str) -> Fleet {
     client.set_calibration(calibration).await.unwrap();
     let (tx, rx) = mpsc::channel(2);
     tx.send(AddVectorsRequest {
+        materialized_rows: Vec::new(),
         vectors: vectors[SHARD_ROWS * DIM..(SHARD_ROWS + VECTOR_ONLY) * DIM].to_vec(),
         dim: DIM as u32,
     })

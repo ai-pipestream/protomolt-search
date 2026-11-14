@@ -278,6 +278,7 @@ impl NodeLink {
         resolve_vector_bitmap: VectorBitmapRequest => MembershipBitmapResponse,
         evaluate_boolean: BooleanShardRequest => BooleanShardResponse,
         apply_wal_binding: ApplyWalBindingRequest => ApplyWalBindingResponse,
+        score_splade: ScoreSpladeRequest => ScoreSpladeResponse,
         health: HealthRequest => HealthResponse,
     }
 
