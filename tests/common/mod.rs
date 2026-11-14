@@ -58,7 +58,13 @@ pub fn monolithic_topk(index: &VectorIndex, query: &[f32], k: usize) -> Vec<(u64
         .zip(results.scores_for_query(0))
         .map(|(&i, &s)| (i as u64, s.to_bits()))
         .collect();
-    hits.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    // Keep the original bits for equality checks, but rank signed scores
+    // numerically: negative IEEE-754 bit patterns sort above positive ones.
+    hits.sort_by(|a, b| {
+        f32::from_bits(b.1)
+            .total_cmp(&f32::from_bits(a.1))
+            .then(a.0.cmp(&b.0))
+    });
     hits.truncate(k);
     hits
 }

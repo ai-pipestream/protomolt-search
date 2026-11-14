@@ -321,12 +321,54 @@ fn streaming_a_planes_layout_shard_is_exhaustive() {
             .unwrap();
         assert!(summary.completed, "query {qi}");
         assert_eq!(emitted.len(), rows, "query {qi}: every row emitted");
-        emitted.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        emitted.sort_by(|a, b| {
+            f32::from_bits(b.1)
+                .total_cmp(&f32::from_bits(a.1))
+                .then(a.0.cmp(&b.0))
+        });
         emitted.truncate(K as usize);
         assert_eq!(
             emitted,
             monolithic_topk(&index, &query, K as usize),
             "query {qi}"
+        );
+    }
+}
+
+#[test]
+fn exhaustive_oracle_preserves_signed_scores_and_lower_id_ties() {
+    let dim = 64;
+    let mut query = vec![0.0; dim];
+    query[0] = 1.0;
+    let mut corpus = query.clone();
+    corpus.extend(query.iter().map(|v| -v));
+    corpus.extend_from_slice(&query);
+    let mut index = VectorIndex::create(EMBEDDED_TURBOVEC, dim, BIT_WIDTH).unwrap();
+    index.add(&corpus, dim).unwrap();
+    index.prepare().unwrap();
+
+    let all = index.search_unfiltered(&query, 3);
+    let by_id: std::collections::BTreeMap<_, _> = all
+        .indices_for_query(0)
+        .iter()
+        .copied()
+        .zip(all.scores_for_query(0).iter().copied())
+        .collect();
+    assert_eq!(by_id.len(), 3);
+    assert!(by_id[&0] > 0.0 && by_id[&1] < 0.0);
+    assert_eq!(by_id[&0].to_bits(), by_id[&2].to_bits());
+    // The fixture's required order is independent of the oracle's comparator:
+    // identical positive rows tie by id, then the opposite vector comes last.
+    let expected = [
+        (0, by_id[&0].to_bits()),
+        (2, by_id[&2].to_bits()),
+        (1, by_id[&1].to_bits()),
+    ];
+    for k in [0, 1, 2, 3, 5] {
+        assert_eq!(
+            monolithic_topk(&index, &query, k),
+            expected[..k.min(expected.len())],
+            "k={k} must preserve numeric ranking, ties and score bits"
         );
     }
 }
