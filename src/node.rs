@@ -4231,8 +4231,9 @@ pub fn bm25_build_dir(bm25_path: &std::path::Path) -> PathBuf {
 }
 
 /// Snapshot generation layout, next to the shard's configured index path.
-/// New generations use `vector.index` and `documents.bm25`; readers also
-/// recognize the former `index.tv` pair.
+/// Generations use `vector.index` and `documents.bm25`; a generation that
+/// still holds the retired `index.tv` pair refuses to open
+/// ([`refuse_retired_generation`]).
 pub fn generation_dir(index_path: &Path) -> PathBuf {
     let mut p = index_path.as_os_str().to_owned();
     p.push(".snap");
@@ -4383,6 +4384,31 @@ pub fn recover_generation(index_path: &Path) -> Option<PathBuf> {
     (generation_vector(&snap).exists() || generation_bm25(&snap).exists()).then_some(snap)
 }
 
+/// File names of the retired snapshot generation layout. Nothing reads
+/// them; their presence means the generation was written by an older
+/// binary.
+const RETIRED_GENERATION_FILES: [&str; 2] = ["index.tv", "index.tv.bm25"];
+
+/// Refuse a snapshot generation in the retired layout. Without this check
+/// [`recover_generation`] would report no generation and the shard would
+/// open from its root paths: empty, or from a stale root image, silently
+/// abandoning the installed data. Call after [`recover_generation`], so an
+/// interrupted swap has been settled first.
+pub fn refuse_retired_generation(index_path: &Path) -> Result<(), String> {
+    let snap = generation_dir(index_path);
+    for name in RETIRED_GENERATION_FILES {
+        let retired = snap.join(name);
+        if retired.exists() {
+            return Err(format!(
+                "{} is a snapshot generation in the retired layout ({name}); this binary \
+                 reads only vector.index and documents.bm25 and does not convert it",
+                retired.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn wire_backend_config(config: &VectorBackendConfig) -> WireVectorBackendConfig {
     WireVectorBackendConfig {
         backend_kind: config.backend_kind.clone(),
@@ -4490,6 +4516,11 @@ pub(crate) fn wal_manifest(
 /// depending on attachment order.
 fn persisted_doc_tip(index_path: &Path) -> u64 {
     let generation = recover_generation(index_path);
+    // Panic, like the rest of the WAL open path: a retired generation must
+    // not read as "no documents".
+    if let Err(error) = refuse_retired_generation(index_path) {
+        panic!("{error}");
+    }
     let (_, _, bm25_path) = storage_paths(index_path, generation.as_ref());
     if !bm25_path.exists() {
         return 0;
@@ -5457,10 +5488,14 @@ impl NodeServiceImpl {
                 }
             }
         }
-        let generation = config
-            .index_path
-            .as_ref()
-            .and_then(|path| recover_generation(path));
+        let generation = match config.index_path.as_ref() {
+            Some(path) => {
+                let generation = recover_generation(path);
+                refuse_retired_generation(path)?;
+                generation
+            }
+            None => None,
+        };
 
         let mut index = match config.index_path.as_ref().filter(|_| !declared_generation) {
             Some(index_path) => {

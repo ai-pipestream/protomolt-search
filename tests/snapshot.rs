@@ -601,3 +601,50 @@ fn recover_generation_repairs_interrupted_swaps() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A generation in the retired `index.tv` layout refuses to open instead of
+/// reading as "no generation": the shard must not come up empty, or from a
+/// stale root image, with its installed data abandoned. The current layout
+/// still opens.
+#[test]
+fn a_retired_generation_layout_refuses_to_open() {
+    let dir = tempdir("retired-layout");
+    let image = build_bm25(&dir, "the law of vectors");
+    let open = |index_path: &std::path::Path| {
+        NodeServiceImpl::open(
+            NodeConfig {
+                slot_offset: 0,
+                index_path: Some(index_path.to_path_buf()),
+                ..Default::default()
+            },
+            None,
+            false,
+        )
+        .err()
+    };
+    for (case, stale_root) in [("empty root", false), ("stale root image", true)] {
+        let index_path = dir.join(format!("{}.tv", case.replace(' ', "-")));
+        let snap = generation_dir(&index_path);
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::copy(&image, snap.join("index.tv.bm25")).unwrap();
+        if stale_root {
+            let mut root = index_path.as_os_str().to_owned();
+            root.push(".bm25");
+            std::fs::copy(&image, std::path::PathBuf::from(root)).unwrap();
+        }
+        let error = open(&index_path).unwrap_or_else(|| panic!("{case}: the shard opened"));
+        assert!(error.contains("retired layout"), "{case}: {error}");
+        assert!(
+            snap.join("index.tv.bm25").exists(),
+            "{case}: the refusal must leave the generation in place"
+        );
+    }
+
+    let index_path = dir.join("current.tv");
+    let snap = generation_dir(&index_path);
+    std::fs::create_dir_all(&snap).unwrap();
+    std::fs::copy(&image, generation_bm25(&snap)).unwrap();
+    assert_eq!(open(&index_path), None, "the current layout opens");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
