@@ -637,13 +637,6 @@ impl NodeServiceImpl {
                  catalog without a WAL; this shard compacts from its log",
             ));
         }
-        if wal.has_legacy_clock_records() {
-            return Err(Status::failed_precondition(format!(
-                "WAL generation {} carries legacy unclocked records; compaction needs a fully \
-                 clocked generation (install a snapshot to rotate the log)",
-                wal.generation()
-            )));
-        }
         let manifest = wal.manifest().clone();
         if manifest.preexisting_vectors > 0 || manifest.preexisting_documents > 0 {
             return Err(Status::failed_precondition(format!(

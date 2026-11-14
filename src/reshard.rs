@@ -5583,9 +5583,6 @@ pub fn compact_segments_partitioned(
         vector_backend: String::new(),
         vector_config_format: String::new(),
         vector_config_payload: Vec::new(),
-        bit_width: 0,
-        calibration_shift: Vec::new(),
-        calibration_scale: Vec::new(),
         collection: String::new(),
         slot_offset,
         generation: 0,
@@ -5595,7 +5592,6 @@ pub fn compact_segments_partitioned(
         preexisting_documents: 0,
         format_version: wal::FORMAT_VERSION,
         derived_fingerprint: String::new(),
-        legacy_derived_tag27: false,
         derived: Vec::new(),
         columns: None,
     };

@@ -657,7 +657,7 @@ fn refresh_validity_is_bounded_and_checked_after_waiting_for_admission() {
 }
 
 #[test]
-fn format_two_policy_requires_live_revalidation_and_a_durable_upgrade() {
+fn a_journal_at_another_format_version_is_refused() {
     let dir = Directory::new();
     let journal = ReplayJournal::create(&dir.path(), binding()).unwrap();
     journal.publish_authorization(&policy(1)).unwrap();
@@ -668,43 +668,17 @@ fn format_two_policy_requires_live_revalidation_and_a_durable_upgrade() {
         let mut meta = tx.open_table(META).unwrap();
         let mut header: ReplayJournalHeader =
             decode(meta.get("header").unwrap().unwrap().value()).unwrap();
-        header.format_version = LEGACY_AUTHORIZED_FORMAT;
+        header.format_version = 2;
         meta.insert("header", header.encode_to_vec().as_slice())
             .unwrap();
     }
     tx.commit().unwrap();
     drop(db);
-    let journal = ReplayJournal::open(&dir.path(), binding()).unwrap();
     assert_eq!(
-        journal.head().unwrap().format_version,
-        LEGACY_AUTHORIZED_FORMAT
-    );
-    assert_eq!(
-        journal
-            .accept_inner(&frame(), Some(&[10; 32]))
-            .unwrap_err()
-            .code(),
-        tonic::Code::Unavailable
-    );
-    {
-        let _session = grant_live(&journal, &policy(1));
-        journal.accept_inner(&frame(), Some(&[10; 32])).unwrap();
-    }
-    assert_eq!(journal.head().unwrap().format_version, AUTHORIZED_FORMAT);
-    drop(journal);
-    let journal = ReplayJournal::open(&dir.path(), binding()).unwrap();
-    assert_eq!(
-        journal
-            .accept_inner(&frame(), Some(&[10; 32]))
-            .unwrap_err()
-            .code(),
-        tonic::Code::Unavailable
-    );
-    let _session = grant_live(&journal, &policy(1));
-    assert!(
-        journal
-            .accept_inner(&frame(), Some(&[10; 32]))
+        ReplayJournal::open(&dir.path(), binding())
+            .err()
             .unwrap()
-            .replayed
+            .code(),
+        tonic::Code::FailedPrecondition
     );
 }

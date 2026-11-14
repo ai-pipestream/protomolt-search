@@ -25,12 +25,12 @@ new server without regeneration.
 - `TURBOVEC_*` environment variables remain fallback aliases. New names win
   when both are present.
 - Existing configured `.tv` paths still load through `embedded-turbovec`.
-- Snapshot recovery recognizes legacy `index.tv` and `index.tv.bm25` names;
-  new generations use `vector.index`, optional `vectors.f32`, and
-  `documents.bm25`.
-- WAL manifests without generic provider fields are upgraded in memory from
-  their legacy calibration fields. New manifests carry opaque provider state
-  and retain the legacy embedded-adapter fields for older inspection tools.
+- Snapshot generations use `vector.index`, optional `vectors.f32`, and
+  `documents.bm25`. The old `index.tv` / `index.tv.bm25` names are no longer
+  read.
+- WAL manifests carry opaque provider state only, at one format version (8).
+  Manifests at any other version, and records without a logical clock, are
+  refused.
 - `GetCalibration`, `SetCalibration`, and `BroadcastCalibration` are gone.
   Use `GetVectorBackend`, `ConfigureVectorBackend`, and
   `BroadcastVectorBackend`.

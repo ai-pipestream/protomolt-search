@@ -17,7 +17,6 @@ use crate::pb::{
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("metadata");
 const FRAMES: TableDefinition<u64, &[u8]> = TableDefinition::new("frames");
 const FORMAT: u32 = 1;
-const LEGACY_AUTHORIZED_FORMAT: u32 = 2;
 const AUTHORIZED_FORMAT: u32 = 3;
 
 mod authority;
@@ -232,10 +231,8 @@ impl ReplayJournal {
         frames: &impl ReadableTable<u64, &'static [u8]>,
     ) -> Result<ReplayJournalHeader, Status> {
         let header: ReplayJournalHeader = decode(bytes)?;
-        if !matches!(
-            header.format_version,
-            FORMAT | LEGACY_AUTHORIZED_FORMAT | AUTHORIZED_FORMAT
-        ) || header.binding.as_ref() != Some(&self.binding)
+        if !matches!(header.format_version, FORMAT | AUTHORIZED_FORMAT)
+            || header.binding.as_ref() != Some(&self.binding)
             || header.binding_sha256 != self.digest
         {
             return Err(Status::failed_precondition(
@@ -433,11 +430,7 @@ impl ReplayJournal {
                             "replay policy revision already names another decision",
                         ));
                     }
-                    if header.format_version == AUTHORIZED_FORMAT {
-                        return Ok(());
-                    }
-                    // Identical legacy decisions still need the durable format
-                    // upgrade so older receivers cannot bypass live freshness.
+                    return Ok(());
                 }
             } else if header.accepted_sequence != 0 {
                 return Err(Status::failed_precondition("cannot authorize a journal with unassigned accepted history; start a new assignment"));
@@ -506,7 +499,7 @@ impl ReplayJournal {
         let stored = meta.get("admission").map_err(storage)?;
         match (header.format_version, stored) {
             (FORMAT, None) if !header.admission_fenced => Ok(None),
-            (LEGACY_AUTHORIZED_FORMAT | AUTHORIZED_FORMAT, Some(stored)) => {
+            (AUTHORIZED_FORMAT, Some(stored)) => {
                 // Bound allocation before protobuf decode, including tampered files.
                 if stored.value().len() > 8192 {
                     return Err(Status::data_loss(

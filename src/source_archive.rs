@@ -62,9 +62,6 @@ impl<T: Clone> SharedPages<T> {
     fn len(&self) -> usize {
         self.len
     }
-    fn is_empty(&self) -> bool {
-        self.len == 0
-    }
     fn get(&self, index: usize) -> Option<&T> {
         self.pages
             .get(index / IDENTITY_PAGE_ROWS)?
@@ -494,11 +491,7 @@ impl SourceArchive {
         let mut rows = self.rows.iter().cloned().collect::<Vec<_>>();
         rows.resize_with(row_count as usize, SourceRow::default);
         let mut index = SourceArchiveIndex {
-            format_version: if self.identities.is_empty() {
-                1
-            } else {
-                FORMAT_VERSION
-            },
+            format_version: FORMAT_VERSION,
             descriptors,
             sources,
             rows,
@@ -636,13 +629,15 @@ impl SourceArchiveReader {
         if sha256::digest(encoded_index).as_slice() != &bytes[16..48] {
             return Err(invalid("source index checksum mismatch"));
         }
-        let mut index = SourceArchiveIndex::decode(encoded_index)
+        let index = SourceArchiveIndex::decode(encoded_index)
             .map_err(|e| invalid(format!("source index: {e}")))?;
-        if !(1..=FORMAT_VERSION).contains(&index.format_version)
-            || (index.format_version == 1 && !index.identities.is_empty())
-            || (index.format_version < 3 && index.identity_lookup.is_some())
-        {
+        if index.format_version != FORMAT_VERSION {
             return Err(invalid("unsupported source archive version"));
+        }
+        if index.identities.is_empty() != index.identity_lookup.is_none() {
+            return Err(invalid(
+                "source archive identity lookup must be present exactly when identities are",
+            ));
         }
         if index.rows.len() != row_count as usize {
             return Err(invalid("source archive row count differs from the index"));
@@ -685,10 +680,8 @@ impl SourceArchiveReader {
                 return Err(invalid("invalid or duplicate logical source identity"));
             }
         }
-        if index.format_version == 3 {
+        if index.identity_lookup.is_some() {
             validate_lookup(&index)?;
-        } else if !index.identities.is_empty() {
-            index.identity_lookup = Some(build_lookup(&index));
         }
         let descriptors: BTreeMap<_, _> = index
             .descriptors
@@ -1033,17 +1026,12 @@ mod tests {
     }
 
     #[test]
-    fn exact_key_lookup_survives_sealing_legacy_upgrade_and_builder_reload() {
+    fn exact_key_lookup_survives_sealing_and_builder_reload() {
         let archive = lookup_fixture();
         let mut bytes = Vec::new();
         archive.write(&mut bytes, 9).unwrap();
-        let legacy = rewrite_archive(&bytes, |index| {
-            index.format_version = 2;
-            index.identity_lookup = None;
-        });
         let reader = SourceArchiveReader::open(&bytes, 9).unwrap();
-        let legacy_reader = SourceArchiveReader::open(&legacy, 9).unwrap();
-        let mut loaded = SourceArchive::read(&legacy, 9).unwrap();
+        let mut loaded = SourceArchive::read(&bytes, 9).unwrap();
         for key in [vec![0, 255], vec![0, 255, 0], vec![0], vec![255], vec![]] {
             let mut expected = Vec::new();
             for row in 0..9 {
@@ -1054,7 +1042,7 @@ mod tests {
                     expected.push((row, identity.version, identity.chunk_ordinal));
                 }
             }
-            for variant in 0..4 {
+            for variant in 0..3 {
                 let mut actual = Vec::new();
                 let mut visit = |row, version, ordinal| {
                     actual.push((row, version, ordinal));
@@ -1063,7 +1051,6 @@ mod tests {
                 assert!(match variant {
                     0 => archive.visit_document_rows(&key, &mut visit),
                     1 => reader.visit_document_rows(&key, &mut visit),
-                    2 => legacy_reader.visit_document_rows(&key, &mut visit),
                     _ => loaded.visit_document_rows(&key, &mut visit),
                 });
                 actual.sort_unstable();
@@ -1210,7 +1197,7 @@ mod tests {
         let mut bytes = Vec::new();
         archive.write(&mut bytes, 1).unwrap();
         let reader = SourceArchiveReader::open(&bytes, 1).unwrap();
-        // A format-1 label must not hide identity metadata from an older reader.
+        // Any format label other than the current one is refused.
         let mut index = (*reader.index).clone();
         index.format_version = 1;
         let encoded = index.encode_to_vec();

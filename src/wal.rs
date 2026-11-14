@@ -48,9 +48,6 @@ use crate::reshard::bucket_of;
 #[path = "wal_sources.rs"]
 mod sources;
 
-#[path = "wal_derived.rs"]
-mod derived_wire;
-
 // ---------------------------------------------------------------------------
 // CRC32 (IEEE, table-based; hand-rolled to avoid a crate dependency)
 // ---------------------------------------------------------------------------
@@ -124,23 +121,9 @@ pub fn crc32(data: &[u8]) -> u32 {
 // Layout
 // ---------------------------------------------------------------------------
 
-/// Current on-disk format version (manifest `format_version`).
+/// The on-disk format version (manifest `format_version`). Every generation
+/// is written at this version and any other version is refused.
 pub const FORMAT_VERSION: u32 = 8;
-/// Complete column tables and derived fingerprints require version 8.
-/// Derived fingerprints use document tag 29; prior main used tag 27.
-pub const DERIVED_FORMAT_VERSION: u32 = 8;
-/// Exact integer map entries cannot be replayed by earlier decoders.
-pub const INTEGER_MAP_FORMAT_VERSION: u32 = 7;
-/// Explicit index policies first require format 6.
-pub const INDEX_FORMAT_VERSION: u32 = 6;
-/// Named vector planes first require format 5, independently of index policy.
-pub const VECTOR_FORMAT_VERSION: u32 = 5;
-/// Explicit mapped analysis first requires format 4.
-pub const ANALYSIS_FORMAT_VERSION: u32 = 4;
-/// Logical row identity requires format 3, independently of mapped analysis.
-pub const IDENTITY_FORMAT_VERSION: u32 = 3;
-/// Source references without logical row identity remain readable by format-2 binaries.
-pub const BASE_FORMAT_VERSION: u32 = 2;
 
 /// The WAL directory of a shard: `<index path>.wal/`.
 pub fn wal_dir(index_path: &Path) -> PathBuf {
@@ -205,14 +188,13 @@ pub fn latest_gen(wal_dir: &Path) -> io::Result<Option<(u64, PathBuf)>> {
 
 /// The shard shape of one WAL generation (`manifest.toml`). Resharding a
 /// generation requires complete provider configuration that reproduces its
-/// score semantics. Legacy manifests express embedded TurboVec configuration
-/// through `calibration_shift` and `calibration_scale`.
+/// score semantics.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WalManifest {
     /// Vector dimensionality. 0 while the shard has not committed to one.
     pub dim: u32,
-    /// Provider identifier for the vector generation. Empty in legacy
-    /// manifests, which are interpreted as the embedded TurboVec adapter.
+    /// Provider identifier for the vector generation; empty until the shard
+    /// commits to a provider.
     #[serde(default)]
     pub vector_backend: String,
     /// Media type/version for the opaque provider configuration.
@@ -221,14 +203,6 @@ pub struct WalManifest {
     /// Provider-owned construction state. The product never interprets it.
     #[serde(default)]
     pub vector_config_payload: Vec<u8>,
-    /// Legacy embedded-adapter bit width (2, 3, or 4).
-    pub bit_width: u32,
-    /// Per-coordinate calibration shift (length `dim`).
-    #[serde(default)]
-    pub calibration_shift: Vec<f32>,
-    /// Per-coordinate calibration scale (length `dim`).
-    #[serde(default)]
-    pub calibration_scale: Vec<f32>,
     /// The collection this generation belongs to (`docs/collections.md`);
     /// empty in a manifest written before collections, which the first
     /// open under a named node writes. A node of another collection
@@ -264,10 +238,6 @@ pub struct WalManifest {
     /// log written without derived columns, or before them.
     #[serde(default)]
     pub derived_fingerprint: String,
-    /// This generation contains pre-reconciliation derived fingerprints at tag 27.
-    /// Retained across format upgrades so mixed old/new records reopen safely.
-    #[serde(default)]
-    pub legacy_derived_tag27: bool,
     /// The declaration itself, as a `[[derived]]` table, so a replay
     /// tool can rebuild the columns the records carry and refuse a
     /// declaration that differs.
@@ -390,42 +360,25 @@ pub fn check_manifest_tables(held: &WalManifest, fresh: &WalManifest) -> Result<
 }
 
 impl WalManifest {
-    /// Resolve the generic provider state, including legacy v1 manifests.
+    /// The provider state the generation's vectors were built under.
     pub fn backend_config(&self) -> Result<crate::vector::VectorBackendConfig, String> {
-        if !self.vector_backend.is_empty() && !self.vector_config_format.is_empty() {
-            return Ok(crate::vector::VectorBackendConfig {
-                backend_kind: self.vector_backend.clone(),
-                config_format: self.vector_config_format.clone(),
-                payload: self.vector_config_payload.clone(),
-            });
-        }
-        if !self.vector_backend.is_empty()
-            && self.vector_backend != crate::vector::EMBEDDED_TURBOVEC
-        {
+        if self.vector_backend.is_empty() || self.vector_config_format.is_empty() {
             return Err(format!(
                 "manifest has backend {:?} but no provider configuration",
                 self.vector_backend
             ));
         }
-        crate::vector::embedded_turbovec_config(
-            self.bit_width as usize,
-            &self.calibration_shift,
-            &self.calibration_scale,
-        )
-        .map_err(|e| e.to_string())
+        Ok(crate::vector::VectorBackendConfig {
+            backend_kind: self.vector_backend.clone(),
+            config_format: self.vector_config_format.clone(),
+            payload: self.vector_config_payload.clone(),
+        })
     }
 
-    /// Store provider state and maintain the legacy embedded-adapter fields
-    /// so older tooling can still inspect new manifests during migration.
     pub fn set_backend_config(&mut self, config: crate::vector::VectorBackendConfig) {
-        self.vector_backend = config.backend_kind.clone();
-        self.vector_config_format = config.config_format.clone();
-        self.vector_config_payload = config.payload.clone();
-        if let Ok(Some(legacy)) = crate::vector::legacy_calibration_config(&config) {
-            self.bit_width = legacy.bits_per_dimension as u32;
-            self.calibration_shift = legacy.shift;
-            self.calibration_scale = legacy.scale;
-        }
+        self.vector_backend = config.backend_kind;
+        self.vector_config_format = config.config_format;
+        self.vector_config_payload = config.payload;
     }
 }
 
@@ -463,17 +416,9 @@ pub fn write_manifest(gen_dir: &Path, manifest: &WalManifest) -> io::Result<()> 
 /// Read and validate a generation's manifest.
 pub fn read_manifest(gen_dir: &Path) -> io::Result<WalManifest> {
     let text = std::fs::read_to_string(manifest_path(gen_dir))?;
-    let mut manifest: WalManifest = toml::from_str(&text)
+    let manifest: WalManifest = toml::from_str(&text)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad manifest: {e}")))?;
-    if !(1..=FORMAT_VERSION).contains(&manifest.format_version) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "unsupported WAL format version {} (this build understands 1 through {FORMAT_VERSION})",
-                manifest.format_version
-            ),
-        ));
-    }
+    check_version(&manifest)?;
     if !manifest.bucket_count.is_power_of_two()
         || manifest.bucket_count == 0
         || 1u64 << manifest.bucket_bits != u64::from(manifest.bucket_count)
@@ -486,34 +431,29 @@ pub fn read_manifest(gen_dir: &Path) -> io::Result<WalManifest> {
             ),
         ));
     }
-    validate_derived_profile(&mut manifest, true)?;
+    validate_derived(&manifest)?;
     Ok(manifest)
 }
 
-// Validate before any record mutation; old main used formats at most 6.
-fn validate_derived_profile(manifest: &mut WalManifest, infer_legacy: bool) -> io::Result<()> {
-    let derived = crate::reshard::manifest_derived(manifest)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    if manifest.legacy_derived_tag27 && derived.is_none() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "legacy derived WAL profile requires its declaration",
-        ));
+fn check_version(manifest: &WalManifest) -> io::Result<()> {
+    if manifest.format_version == FORMAT_VERSION {
+        return Ok(());
     }
-    if infer_legacy && manifest.format_version <= INDEX_FORMAT_VERSION && derived.is_some() {
-        manifest.legacy_derived_tag27 = true;
-    }
-    Ok(())
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "unsupported WAL format version {} (this build reads only {FORMAT_VERSION})",
+            manifest.format_version
+        ),
+    ))
 }
 
-fn legacy_derived_for_file(path: &Path) -> io::Result<Option<String>> {
-    match read_manifest(path.parent().unwrap_or_else(|| Path::new("."))) {
-        Ok(manifest) => Ok(manifest
-            .legacy_derived_tag27
-            .then_some(manifest.derived_fingerprint)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
-    }
+/// The manifest's derived declaration must decode; checked before any record
+/// is read or appended.
+fn validate_derived(manifest: &WalManifest) -> io::Result<()> {
+    crate::reshard::manifest_derived(manifest)
+        .map(|_| ())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 // ---------------------------------------------------------------------------
@@ -606,7 +546,6 @@ pub struct RecordReader {
     next_seq: u64,
     done: bool,
     sources: Option<sources::Reader>,
-    legacy_derived_fingerprint: Option<String>,
 }
 
 impl RecordReader {
@@ -618,7 +557,6 @@ impl RecordReader {
             next_seq: 1,
             done: false,
             sources: None,
-            legacy_derived_fingerprint: legacy_derived_for_file(path)?,
         })
     }
 
@@ -636,7 +574,6 @@ impl RecordReader {
             next_seq,
             done: false,
             sources: None,
-            legacy_derived_fingerprint: legacy_derived_for_file(path)?,
         })
     }
 
@@ -669,10 +606,6 @@ impl RecordReader {
                 return Ok(None);
             }
         };
-        let frame = match &self.legacy_derived_fingerprint {
-            Some(fingerprint) => derived_wire::upgrade_record(&frame, fingerprint)?,
-            None => frame,
-        };
         let mut record = WalRecord::decode(frame.as_slice()).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -690,6 +623,15 @@ impl RecordReader {
                     self.path.display(),
                     self.next_seq,
                     record.seq
+                ),
+            ));
+        }
+        if record.clock == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "wal: record at byte offset {frame_start} in {} carries no logical clock",
+                    self.path.display()
                 ),
             ));
         }
@@ -716,8 +658,6 @@ pub struct RecordScan {
     pub valid_len: u64,
     /// Highest generation-wide logical clock in this file.
     pub max_clock: u64,
-    /// True when any intact record predates the logical clock field.
-    pub has_legacy_clock: bool,
 }
 
 /// Scan one file tolerantly for reopen-after-crash. Like [`RecordReader`]
@@ -729,7 +669,6 @@ pub fn scan_records(path: &Path) -> io::Result<RecordScan> {
         last_seq: 0,
         valid_len: 0,
         max_clock: 0,
-        has_legacy_clock: false,
     };
     loop {
         let frame_start = reader.offset;
@@ -737,7 +676,6 @@ pub fn scan_records(path: &Path) -> io::Result<RecordScan> {
             Some(record) => {
                 scan.last_seq = record.seq;
                 scan.max_clock = scan.max_clock.max(record.clock);
-                scan.has_legacy_clock |= record.clock == 0;
                 scan.valid_len = reader.offset;
             }
             None => {
@@ -771,15 +709,6 @@ pub fn read_clocked_records(gen_dir: &Path, after_clock: u64) -> io::Result<Vec<
     for path in paths {
         let mut reader = RecordReader::open(&path)?;
         while let Some(record) = reader.next_record()? {
-            if record.clock == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "{} contains a legacy unclocked WAL record; live catch-up requires a new WAL generation",
-                        path.display()
-                    ),
-                ));
-            }
             records.push(record);
         }
     }
@@ -873,8 +802,7 @@ impl ClockedTail {
     }
 
     /// Records with clocks in `(applied, upto]`, in clock order, and
-    /// advance `applied` to `upto`. Refuses a legacy unclocked record and
-    /// a clock the window should hold but the files do not.
+    /// advance `applied` to `upto`. Refuses a clock the window should hold but the files do not.
     pub fn read_through(&mut self, upto: u64) -> io::Result<Vec<WalRecord>> {
         if upto < self.applied {
             return Err(io::Error::new(
@@ -892,16 +820,6 @@ impl ClockedTail {
                 let frame_start = reader.offset();
                 match reader.next_record()? {
                     Some(record) => {
-                        if record.clock == 0 {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "{} contains a legacy unclocked WAL record; tailing needs a \
-                                     fully clocked generation",
-                                    held.path.display()
-                                ),
-                            ));
-                        }
                         held.offset = reader.offset();
                         held.next_seq = record.seq + 1;
                         if record.clock > self.applied {
@@ -1123,7 +1041,6 @@ pub struct WalWriter {
     markers: BucketWriter,
     records_appended: u64,
     next_clock: u64,
-    legacy_clock_records: bool,
     dirty: bool,
     sources: Option<sources::Writer>,
 }
@@ -1141,10 +1058,8 @@ impl WalWriter {
     /// first-openers on one generation.
     pub fn create(wal_dir: &Path, mut manifest: WalManifest) -> io::Result<Self> {
         check_geometry(&manifest)?;
-        validate_derived_profile(&mut manifest, false)?;
-        if !manifest.derived.is_empty() || manifest.columns.is_some() {
-            manifest.format_version = manifest.format_version.max(DERIVED_FORMAT_VERSION);
-        }
+        validate_derived(&manifest)?;
+        manifest.format_version = FORMAT_VERSION;
         let dir = gen_dir(wal_dir, manifest.generation);
         std::fs::create_dir_all(&dir)?;
         write_manifest(&dir, &manifest)?;
@@ -1155,7 +1070,6 @@ impl WalWriter {
             buckets: HashMap::new(),
             records_appended: 0,
             next_clock: 1,
-            legacy_clock_records: false,
             dirty: false,
             sources: None,
         })
@@ -1177,10 +1091,8 @@ impl WalWriter {
     /// directory is stale state to truncate, not a peer to join.
     pub fn create_or_resume(wal_dir: &Path, mut manifest: WalManifest) -> io::Result<Self> {
         check_geometry(&manifest)?;
-        validate_derived_profile(&mut manifest, false)?;
-        if !manifest.derived.is_empty() || manifest.columns.is_some() {
-            manifest.format_version = manifest.format_version.max(DERIVED_FORMAT_VERSION);
-        }
+        validate_derived(&manifest)?;
+        manifest.format_version = FORMAT_VERSION;
         std::fs::create_dir_all(wal_dir)?;
         let dir = gen_dir(wal_dir, manifest.generation);
         let deadline = Instant::now() + PEER_CREATE_TIMEOUT;
@@ -1205,7 +1117,6 @@ impl WalWriter {
                         buckets: HashMap::new(),
                         records_appended: 0,
                         next_clock: 1,
-                        legacy_clock_records: false,
                         dirty: false,
                         sources: None,
                     });
@@ -1225,17 +1136,11 @@ impl WalWriter {
     /// Resume the generation in `gen_dir` after a restart: adopt its
     /// manifest, and for every existing bucket file and the markers file
     /// truncate any torn tail and continue its sequence.
-    pub fn resume(gen_dir: &Path, mut manifest: WalManifest) -> io::Result<Self> {
-        validate_derived_profile(&mut manifest, true)?;
-        if (!manifest.derived.is_empty() || manifest.columns.is_some())
-            && manifest.format_version < DERIVED_FORMAT_VERSION
-        {
-            manifest.format_version = DERIVED_FORMAT_VERSION;
-            write_manifest(gen_dir, &manifest)?;
-        }
+    pub fn resume(gen_dir: &Path, manifest: WalManifest) -> io::Result<Self> {
+        check_version(&manifest)?;
+        validate_derived(&manifest)?;
         let mut buckets = HashMap::new();
         let mut max_clock = 0u64;
-        let mut legacy_clock_records = false;
         for entry in std::fs::read_dir(gen_dir)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -1243,14 +1148,12 @@ impl WalWriter {
                 let path = entry.path();
                 let scan = scan_records(&path)?;
                 max_clock = max_clock.max(scan.max_clock);
-                legacy_clock_records |= scan.has_legacy_clock;
                 buckets.insert(bucket, BucketWriter::open_append(&path, &scan)?);
             }
         }
         let markers = match scan_records(&markers_path(gen_dir)) {
             Ok(scan) => {
                 max_clock = max_clock.max(scan.max_clock);
-                legacy_clock_records |= scan.has_legacy_clock;
                 BucketWriter::open_append(&markers_path(gen_dir), &scan)?
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -1266,7 +1169,6 @@ impl WalWriter {
             markers,
             records_appended,
             next_clock: max_clock.saturating_add(1).max(1),
-            legacy_clock_records,
             dirty: false,
             sources: None,
         })
@@ -1283,17 +1185,13 @@ impl WalWriter {
         }
         let mut updated = self.manifest.clone();
         update(&mut updated);
-        updated.legacy_derived_tag27 |= self.manifest.legacy_derived_tag27;
-        updated.format_version = updated.format_version.max(self.manifest.format_version);
-        if let Err(error) = validate_derived_profile(&mut updated, false) {
+        updated.format_version = FORMAT_VERSION;
+        if let Err(error) = validate_derived(&updated) {
             eprintln!(
                 "wal: refusing manifest update in {}: {error}",
                 self.dir.display()
             );
             return false;
-        }
-        if !updated.derived.is_empty() || updated.columns.is_some() {
-            updated.format_version = updated.format_version.max(DERIVED_FORMAT_VERSION);
         }
         if updated == self.manifest {
             return true;
@@ -1323,10 +1221,6 @@ impl WalWriter {
 
     pub fn high_watermark(&self) -> u64 {
         self.next_clock.saturating_sub(1)
-    }
-
-    pub fn has_legacy_clock_records(&self) -> bool {
-        self.legacy_clock_records
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -1424,37 +1318,21 @@ impl WalWriter {
                 &binding.body_path,
             )
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-            let vector =
-                crate::mapped_vector::decode(&binding.vector_binding, &binding.plan_fingerprint)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-            let policy = crate::index_contract::validate_binding(
+            crate::mapped_vector::decode(&binding.vector_binding, &binding.plan_fingerprint)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            crate::index_contract::validate_binding(
                 &binding.index_contract,
                 &binding.plan_fingerprint,
                 &binding.vector_binding,
             )
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-            let required_version = if policy.is_some() {
-                INDEX_FORMAT_VERSION
-            } else if vector.is_some() {
-                VECTOR_FORMAT_VERSION
-            } else if !binding.analysis_sha.is_empty() {
-                if !crate::mapped_analysis::valid_digest(&binding.analysis_sha) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "invalid mapped analysis digest",
-                    ));
-                }
-                ANALYSIS_FORMAT_VERSION
-            } else {
-                BASE_FORMAT_VERSION
-            };
-            // Persist the version gate before the record. Older binaries must
-            // refuse instead of discarding analysis, vector or explicit index policy.
-            if self.manifest.format_version < required_version {
-                let mut upgraded = self.manifest.clone();
-                upgraded.format_version = required_version;
-                write_manifest(&self.dir, &upgraded)?;
-                self.manifest = upgraded;
+            if !binding.analysis_sha.is_empty()
+                && !crate::mapped_analysis::valid_digest(&binding.analysis_sha)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid mapped analysis digest",
+                ));
             }
         }
         if let wal_record::Op::AddDocuments(batch) = &mut op {
@@ -1464,19 +1342,12 @@ impl WalWriter {
                     "WAL append requires resolved source references",
                 ));
             }
-            let mut required_version = BASE_FORMAT_VERSION;
             for document in &batch.documents {
                 if document.derived_fingerprint != self.manifest.derived_fingerprint {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         "WAL document derived fingerprint differs from its manifest declaration",
                     ));
-                }
-                if !document.derived_fingerprint.is_empty() {
-                    required_version = required_version.max(DERIVED_FORMAT_VERSION);
-                }
-                if !document.map_integers.is_empty() || !document.map_unsigned_integers.is_empty() {
-                    required_version = required_version.max(INTEGER_MAP_FORMAT_VERSION);
                 }
                 if let Some(identity) = &document.identity {
                     if document.original_source.is_none() {
@@ -1490,15 +1361,7 @@ impl WalWriter {
                         document.source_chunk_ordinal,
                     )
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-                    required_version = required_version.max(IDENTITY_FORMAT_VERSION);
                 }
-            }
-            // Publish the compatibility gate before records or source blobs.
-            if self.manifest.format_version < required_version {
-                let mut upgraded = self.manifest.clone();
-                upgraded.format_version = required_version;
-                write_manifest(&self.dir, &upgraded)?;
-                self.manifest = upgraded;
             }
             if batch
                 .documents
@@ -1599,9 +1462,6 @@ mod tests {
             vector_backend: String::new(),
             vector_config_format: String::new(),
             vector_config_payload: Vec::new(),
-            bit_width: 4,
-            calibration_shift: vec![0.0; 8],
-            calibration_scale: vec![1.0; 8],
             slot_offset: 25_000_000,
             generation: 0,
             bucket_bits: bucket_count.trailing_zeros(),
@@ -1610,7 +1470,6 @@ mod tests {
             preexisting_documents: 0,
             format_version: FORMAT_VERSION,
             derived_fingerprint: String::new(),
-            legacy_derived_tag27: false,
             derived: Vec::new(),
             columns: None,
         }
@@ -1627,15 +1486,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_manifest_fields_upgrade_to_embedded_backend_config() {
-        let manifest = manifest(4);
-        let config = manifest.backend_config().unwrap();
-        assert_eq!(config.backend_kind, crate::vector::EMBEDDED_TURBOVEC);
-        let legacy = crate::vector::legacy_calibration_config(&config)
-            .unwrap()
-            .unwrap();
-        assert_eq!(legacy.shift, vec![0.0; 8]);
-        assert_eq!(legacy.scale, vec![1.0; 8]);
+    fn a_manifest_without_provider_state_has_no_backend_config() {
+        assert!(manifest(4).backend_config().is_err());
     }
 
     fn add_op(id: u64) -> wal_record::Op {
@@ -1733,16 +1585,13 @@ mod tests {
 
         let resumed = WalWriter::resume(&generation, read_manifest(&generation).unwrap()).unwrap();
         assert_eq!(resumed.high_watermark(), 3);
-        assert!(!resumed.has_legacy_clock_records());
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn vector_binding_upgrades_before_append_and_invalid_bindings_leave_no_record() {
+    fn invalid_vector_bindings_leave_no_record() {
         let dir = tempdir("mapped-vector");
-        let mut base = manifest(2);
-        base.format_version = ANALYSIS_FORMAT_VERSION;
-        let mut writer = WalWriter::create(&dir, base).unwrap();
+        let mut writer = WalWriter::create(&dir, manifest(2)).unwrap();
         let plan = crate::mapping::derive_plan(
             include_bytes!("../tests/fixtures/vector-binding/descriptor.bin"),
             "vector_binding.Named",
@@ -1763,23 +1612,23 @@ mod tests {
             }
             assert!(writer.append(wal_record::Op::Bind(invalid)).is_err());
             assert_eq!(writer.high_watermark(), 0);
-            assert_eq!(read_manifest(writer.dir()).unwrap().format_version, 4);
         }
         writer
             .append(wal_record::Op::Bind(binding.clone()))
             .unwrap();
-        // The durable version gate must already be visible before a Flush.
-        assert_eq!(read_manifest(writer.dir()).unwrap().format_version, 5);
         writer.flush().unwrap();
         let generation = writer.dir().to_owned();
         drop(writer);
         let records = read_clocked_records(&generation, 0).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].op, Some(wal_record::Op::Bind(binding)));
-        let mut newer = read_manifest(&generation).unwrap();
-        newer.format_version = FORMAT_VERSION + 1;
-        write_manifest(&generation, &newer).unwrap();
-        assert!(read_manifest(&generation).is_err());
+        let current = read_manifest(&generation).unwrap();
+        for version in [FORMAT_VERSION - 1, FORMAT_VERSION + 1] {
+            let mut other = current.clone();
+            other.format_version = version;
+            write_manifest(&generation, &other).unwrap();
+            assert!(read_manifest(&generation).is_err());
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1793,11 +1642,9 @@ mod tests {
     }
 
     #[test]
-    fn explicit_analysis_upgrades_the_wal_before_appending_the_binding() {
+    fn explicit_analysis_bindings_need_a_valid_digest() {
         let dir = tempdir("mapped-analysis");
-        let mut base = manifest(2);
-        base.format_version = BASE_FORMAT_VERSION;
-        let mut writer = WalWriter::create(&dir, base).unwrap();
+        let mut writer = WalWriter::create(&dir, manifest(2)).unwrap();
         let mut binding = crate::pb::wal::LoggedBinding {
             plan_fingerprint: "plan".into(),
             body_path: "body".into(),
@@ -1807,13 +1654,11 @@ mod tests {
         writer
             .append(wal_record::Op::Bind(binding.clone()))
             .unwrap();
-        assert_eq!(writer.manifest().format_version, BASE_FORMAT_VERSION);
         binding.analysis_sha = "invalid".into();
         assert!(writer
             .append(wal_record::Op::Bind(binding.clone()))
             .is_err());
         assert_eq!(writer.high_watermark(), 1);
-        assert_eq!(writer.manifest().format_version, BASE_FORMAT_VERSION);
         let contract = crate::pb::MappedAnalysisContract {
             fields: vec![crate::pb::MappedAnalysisColumn {
                 path: "body".into(),
@@ -1830,8 +1675,6 @@ mod tests {
         writer
             .append(wal_record::Op::Bind(binding.clone()))
             .unwrap();
-        // The on-disk gate precedes the record, even before Flush.
-        assert_eq!(read_manifest(writer.dir()).unwrap().format_version, 4);
         writer.flush().unwrap();
         let generation = writer.dir().to_owned();
         drop(writer);
@@ -1841,16 +1684,14 @@ mod tests {
     }
 
     #[test]
-    fn identified_rows_upgrade_the_wal_and_survive_replay() {
+    fn identified_rows_survive_replay() {
         let dir = tempdir("identity");
         let source = crate::pb::ProtobufSource {
             descriptor_set: b"original descriptor".to_vec(),
             message_type: "example.Record".into(),
             payload: vec![8, 0x81, 0],
         };
-        let mut base = manifest(2);
-        base.format_version = BASE_FORMAT_VERSION;
-        let mut writer = WalWriter::create(&dir, base).unwrap();
+        let mut writer = WalWriter::create(&dir, manifest(2)).unwrap();
         let mut op = source_op(0, &source);
         let wal_record::Op::AddDocuments(batch) = &mut op else {
             unreachable!()
@@ -1864,7 +1705,6 @@ mod tests {
             writer.append(op.clone()).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
-        assert_eq!(writer.manifest().format_version, BASE_FORMAT_VERSION);
         assert_eq!(writer.high_watermark(), 0);
         let wal_record::Op::AddDocuments(batch) = &mut op else {
             unreachable!()
@@ -1874,7 +1714,6 @@ mod tests {
         writer.flush().unwrap();
         let generation = writer.dir().to_path_buf();
         drop(writer);
-        assert_eq!(read_manifest(&generation).unwrap().format_version, 3);
         let records = read_clocked_records(&generation, 0).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].op, Some(op));
@@ -1889,13 +1728,10 @@ mod tests {
             message_type: "example.Parent".into(),
             payload: vec![0xab; 128 * 1024],
         };
-        let mut old_manifest = manifest(8);
-        old_manifest.format_version = 1;
-        let mut writer = WalWriter::create(&dir, old_manifest).unwrap();
+        let mut writer = WalWriter::create(&dir, manifest(8)).unwrap();
         writer.append(source_op(0, &source)).unwrap();
         writer.flush().unwrap();
         let generation = writer.dir().to_path_buf();
-        assert_eq!(read_manifest(&generation).unwrap().format_version, 2);
         let source_path = generation.join("sources.wal");
         let source_size = std::fs::metadata(&source_path).unwrap().len();
         for id in 1..100 {
@@ -2165,6 +2001,24 @@ mod tests {
         }
         // Markers file intact.
         assert_eq!(read_all(&markers_path(&gen)).unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_record_without_a_logical_clock_is_refused() {
+        let dir = tempdir("unclocked");
+        let path = dir.join("bucket-000.wal");
+        let record = WalRecord {
+            seq: 1,
+            clock: 0,
+            op: Some(add_op(0)),
+        };
+        let mut file = File::create(&path).unwrap();
+        write_frame(&mut file, &record.encode_to_vec()).unwrap();
+        drop(file);
+        let error = read_all(&path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("no logical clock"), "{error}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
