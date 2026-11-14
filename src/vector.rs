@@ -1308,7 +1308,12 @@ mod embedded_turbovec {
             options: VectorSearchOptions<'_>,
             allow: Option<&'a [bool]>,
         ) -> SearchOptions<'a> {
-            let mut native = SearchOptions::new();
+            // This provider advertises `ExhaustiveQuantized`: every top-k
+            // is the whole-index scan's, bit for bit. On a bit-plane cache
+            // (32,768+ rows on aarch64 or AVX-512 VBMI + VNNI hosts) turbovec
+            // would otherwise search in stages, with an approximate id set
+            // that also depends on the caller's thread count.
+            let mut native = SearchOptions::new().with_exhaustive(true);
             if let Some(allow) = allow {
                 native = native.with_mask(allow);
             }
@@ -1810,5 +1815,50 @@ mod tests {
             .row_transcript(0)
             .unwrap_err();
         assert!(error.to_string().contains("cannot certify"), "{error}");
+    }
+
+    /// A sealed image of 32,768+ rows: on hosts whose kernels read
+    /// turbovec's bit-plane layout (aarch64, x86 with AVX-512 VBMI + VNNI)
+    /// it is written as a planes v8 file, which `load_mapped` must still
+    /// serve, since sealed segments map by default (`vector_mmap`).
+    #[test]
+    fn a_sealed_image_past_the_planes_threshold_serves_mapped() {
+        let dim = 64;
+        let n = 40_000;
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let rows: Vec<f32> = (0..n * dim)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((state >> 33) as f32 / (1u64 << 30) as f32) - 1.0
+            })
+            .collect();
+        let dir = std::env::temp_dir().join(format!("planes-mapped-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for bits in [2, 4] {
+            let mut index = VectorIndex::create(EMBEDDED_TURBOVEC, dim, bits).unwrap();
+            index.add(&rows, dim).unwrap();
+            index.prepare().unwrap();
+            let path = dir.join(format!("image-{bits}"));
+            index.write(&path).unwrap();
+            let loaded = VectorIndex::load(EMBEDDED_TURBOVEC, &path).unwrap();
+            let mut mapped = VectorIndex::load_mapped(EMBEDDED_TURBOVEC, &path)
+                .unwrap_or_else(|e| panic!("{bits}-bit image did not map: {e}"));
+            mapped.prepare().unwrap();
+            assert!(mapped.is_mapped());
+            assert_eq!(mapped.len(), n);
+            for r in [0, 31, 32, 20_000, n - 1] {
+                assert_eq!(
+                    mapped.row_transcript(r).unwrap(),
+                    loaded.row_transcript(r).unwrap(),
+                    "{bits}-bit row {r}"
+                );
+            }
+            let hits = mapped.search_unfiltered(&rows[..dim], 10);
+            assert_eq!(hits.slots_for_query(0).len(), 10);
+            assert_eq!(hits.slots_for_query(0)[0], 0, "{bits}-bit self match");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

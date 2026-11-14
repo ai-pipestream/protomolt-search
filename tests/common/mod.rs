@@ -41,15 +41,31 @@ pub const BIT_WIDTH: usize = 4;
 /// Reference top-k from the monolithic index as `(global_id, score_bits)`,
 /// re-sorted into the coordinator's total order (score desc, id asc) so the
 /// comparison is exact, tie-break included.
+///
+/// The reference must be exhaustive. From 32,768 rows turbovec lays a 4-bit
+/// index out in bit planes and answers a small-k search in stages: a
+/// shortlist ranked on the high planes, then an exact rescore of only that
+/// shortlist (`PLANES_MIN_VECTORS`, `planes_shortlist_len`). That is
+/// approximate, so at k=10 a monolithic reference over a 48K or 64K corpus
+/// can miss rows the shards' exhaustive scans find. Asking for every row
+/// makes the shortlist the whole index, so every row gets the exact
+/// rescore, and the best `k` of those is the exact top-k.
 pub fn monolithic_topk(index: &VectorIndex, query: &[f32], k: usize) -> Vec<(u64, u32)> {
-    let results = index.search_unfiltered(query, k);
+    let results = index.search_unfiltered(query, index.len().max(k));
     let mut hits: Vec<(u64, u32)> = results
         .indices_for_query(0)
         .iter()
         .zip(results.scores_for_query(0))
         .map(|(&i, &s)| (i as u64, s.to_bits()))
         .collect();
-    hits.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    // Keep the original bits for equality checks, but rank signed scores
+    // numerically: negative IEEE-754 bit patterns sort above positive ones.
+    hits.sort_by(|a, b| {
+        f32::from_bits(b.1)
+            .total_cmp(&f32::from_bits(a.1))
+            .then(a.0.cmp(&b.0))
+    });
+    hits.truncate(k);
     hits
 }
 

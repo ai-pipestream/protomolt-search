@@ -285,7 +285,10 @@ impl DocumentCatalog {
         let mut builder = Database::builder();
         builder.set_cache_size(CACHE_BYTES);
         let database = builder
-            .create_file(file.try_clone().map_err(storage)?)
+            .create_with_backend(
+                redb::backends::FileBackend::new(file.try_clone().map_err(storage)?)
+                    .map_err(storage)?,
+            )
             .map_err(storage)?;
         let (managed_binding, managed_activation) = resolve_binding(&database)?;
         let catalog = Self {

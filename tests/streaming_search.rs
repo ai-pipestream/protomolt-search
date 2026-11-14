@@ -286,3 +286,89 @@ async fn grpc_stop_returns_an_incomplete_node_certificate() {
         "Stop arrived only after the whole scan completed: {summary:?}"
     );
 }
+
+/// A shard at or above 32,768 rows takes turbovec's bit-planes layout. The
+/// streaming scan over one must neither panic (the fork once sized the
+/// planes regions for 2-bit codes only) nor lose a row: its emissions,
+/// re-sorted, are the exhaustive monolithic top-k bit for bit.
+#[test]
+fn streaming_a_planes_layout_shard_is_exhaustive() {
+    use pipestream_search::vector::{VectorSearchOptions, VectorStreamControl};
+    let rows = 40_000;
+    let corpus = unit_vectors(rows, DIM, 0x5EED_B1A5);
+    let mut index = VectorIndex::create(EMBEDDED_TURBOVEC, DIM, BIT_WIDTH).unwrap();
+    index.add(&corpus, DIM).unwrap();
+    index.prepare().unwrap();
+    for qi in 0..3u64 {
+        let query = unit_vectors(1, DIM, 0x57AE_B1A5 + qi);
+        let mut emitted: Vec<(u64, u32)> = Vec::new();
+        let summary = index
+            .try_search_streaming_controlled(
+                &query,
+                VectorSearchOptions::new(),
+                |batch| {
+                    emitted.extend(
+                        batch
+                            .slots
+                            .iter()
+                            .zip(batch.scores)
+                            .map(|(&slot, &score)| (slot as u64, score.to_bits())),
+                    );
+                    VectorStreamControl::Continue
+                },
+                || VectorStreamControl::Continue,
+            )
+            .unwrap();
+        assert!(summary.completed, "query {qi}");
+        assert_eq!(emitted.len(), rows, "query {qi}: every row emitted");
+        emitted.sort_by(|a, b| {
+            f32::from_bits(b.1)
+                .total_cmp(&f32::from_bits(a.1))
+                .then(a.0.cmp(&b.0))
+        });
+        emitted.truncate(K as usize);
+        assert_eq!(
+            emitted,
+            monolithic_topk(&index, &query, K as usize),
+            "query {qi}"
+        );
+    }
+}
+
+#[test]
+fn exhaustive_oracle_preserves_signed_scores_and_lower_id_ties() {
+    let dim = 64;
+    let mut query = vec![0.0; dim];
+    query[0] = 1.0;
+    let mut corpus = query.clone();
+    corpus.extend(query.iter().map(|v| -v));
+    corpus.extend_from_slice(&query);
+    let mut index = VectorIndex::create(EMBEDDED_TURBOVEC, dim, BIT_WIDTH).unwrap();
+    index.add(&corpus, dim).unwrap();
+    index.prepare().unwrap();
+
+    let all = index.search_unfiltered(&query, 3);
+    let by_id: std::collections::BTreeMap<_, _> = all
+        .indices_for_query(0)
+        .iter()
+        .copied()
+        .zip(all.scores_for_query(0).iter().copied())
+        .collect();
+    assert_eq!(by_id.len(), 3);
+    assert!(by_id[&0] > 0.0 && by_id[&1] < 0.0);
+    assert_eq!(by_id[&0].to_bits(), by_id[&2].to_bits());
+    // The fixture's required order is independent of the oracle's comparator:
+    // identical positive rows tie by id, then the opposite vector comes last.
+    let expected = [
+        (0, by_id[&0].to_bits()),
+        (2, by_id[&2].to_bits()),
+        (1, by_id[&1].to_bits()),
+    ];
+    for k in [0, 1, 2, 3, 5] {
+        assert_eq!(
+            monolithic_topk(&index, &query, k),
+            expected[..k.min(expected.len())],
+            "k={k} must preserve numeric ranking, ties and score bits"
+        );
+    }
+}

@@ -37,6 +37,19 @@ A mapped index is read-only:
 file is refused with the conversion advice `load` gives: converting a file
 forward is a file operation, not a corpus rebuild.
 
+Since upstream 1.1, an index of 32,768 vectors or more whose host kernels
+read the bit-plane layout (aarch64, or x86 with AVX-512 VBMI + VNNI) is
+written as a v8 image with bit-plane units. The `44321a8` fork revision
+pinned here serves those too: the chunk assembler converts each unit's
+canonical, host-independent planes back to sequential-blocked bytes (the
+converter's route) before the shared transform, and the mapped scan keeps
+the classic kernels (ai-pipestream/turbovec#8). The product and ANN
+benchmark lockfiles both track this revision on the fork's `main`. Before
+that change such an image was refused, so a large sealed segment written on
+those hosts could not open mapped.
+`vector::tests::a_sealed_image_past_the_planes_threshold_serves_mapped`
+pins it here at 2 and 4 bits.
+
 The fork's `tests/mapped_image.rs` pins mapped against loaded results bit
 for bit (top-k, oversized k, batched queries, masks, seeded floors, streaming), a synced
 file with pending removal ops and a partial tail block, the read-only
@@ -59,6 +72,20 @@ serve rows by offset, the payload digest runs as rows arrive, and a flush
 finalizes it in place (one header write, one rename), so an ingest of any
 length holds none of its FP32 rows in heap. An in-memory shard keeps a
 heap builder.
+
+**Exactness since turbovec 1.1.** Upstream searches an image whose cache is
+in the bit-plane layout (32,768 rows or more on those hosts, served from
+memory: the tail, a single-image shard, or any sealed image under
+`--vector-mmap=false`) in stages: a sign-plane shortlist, a ranking on the
+lower planes, and an exact rescore of the best. Scores are exact for the ids
+returned, but the id set is approximate, and a single query's shortlist
+differs between one thread and a pool. The embedded provider advertises
+`ExhaustiveQuantized`, so every top-k it runs sets the fork's
+`SearchOptions::exhaustive` (ai-pipestream/turbovec#8): such an image is
+scanned chunk by chunk with every row exactly rescored, bit for bit the
+whole-index scan on any thread count. Mapped images and the streaming
+collector were exhaustive already. Using the staged search for an
+approximate (`ConfiguredAnn`) route is tracked in #68.
 
 `tests/segment_layout.rs` pins a segmented shard served mapped against the
 same shard served from memory (Search and Query hits and scores, bit for
