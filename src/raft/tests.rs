@@ -188,6 +188,16 @@ pub(super) fn config() -> HostConfig {
     }
 }
 
+async fn bootstrap_application_is_ready(host: &RaftHost) {
+    // Bootstrap leadership precedes application of membership at index zero
+    // and the leader's blank at index one. These fixtures measure a lease,
+    // not the startup fsyncs its read barrier would otherwise have to await.
+    host.wait(Some(std::time::Duration::from_secs(30)))
+        .applied_index_at_least(Some(1), "bootstrap membership and leader blank applied")
+        .await
+        .unwrap();
+}
+
 pub(super) fn owner(id: &str) -> LogicalSourceOwner {
     LogicalSourceOwner {
         workspace: "workspace-a".into(),
@@ -1356,6 +1366,7 @@ async fn a_hosted_store_refuses_direct_mutation_and_local_admission() {
     )
     .await
     .unwrap();
+    bootstrap_application_is_ready(&host).await;
     let store = host.store().unwrap();
     let hosted = |result: Result<(), tonic::Status>| {
         let error = result.err().unwrap();
@@ -1483,6 +1494,7 @@ async fn a_lease_taken_on_one_thread_grants_on_another_within_its_interval() {
     )
     .await
     .unwrap();
+    bootstrap_application_is_ready(&host).await;
     let leased = host.lease("alice").await.unwrap();
     assert_eq!(leased.principal(), "alice");
     let granted = tokio::task::spawn_blocking(move || {
@@ -1517,6 +1529,7 @@ async fn a_lease_kept_past_its_interval_is_rejected_at_the_grant() {
     )
     .await
     .unwrap();
+    bootstrap_application_is_ready(&host).await;
     let leased = host.lease("alice").await.unwrap();
     let applied = host.applied_position().unwrap().map(|id| id.index);
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
