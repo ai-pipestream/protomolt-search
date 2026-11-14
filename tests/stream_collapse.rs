@@ -15,7 +15,6 @@ use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService as _;
 use pipestream_search::pb::{
     AddDocumentsRequest, AddVectorsRequest, DocLineage, SearchRequest, SearchResponse,
-    SetCalibrationRequest,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -58,12 +57,9 @@ async fn start_shard(
     .await;
     let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
     client
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: 4,
-            shift: shift.to_vec(),
-            scale: scale.to_vec(),
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, 4, shift, scale,
+        ))
         .await
         .unwrap();
     let (tx, rx) = mpsc::channel(8);
@@ -383,12 +379,9 @@ async fn lineage_free_shards_self_parent() {
     .await;
     let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
     client
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: 4,
-            shift,
-            scale,
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, 4, &shift, &scale,
+        ))
         .await
         .unwrap();
     let (tx, rx) = mpsc::channel(4);

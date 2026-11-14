@@ -166,12 +166,9 @@ async fn large_keyword_values_survive_mapped_ingest_queries_and_persistence() {
     let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
     let (shift, scale) = common::fit_calibration(8, 4, &common::unit_vectors(64, 8, 911));
     client
-        .set_calibration(pb::SetCalibrationRequest {
-            dim: 8,
-            bit_width: 4,
-            shift,
-            scale,
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            8, 4, &shift, &scale,
+        ))
         .await
         .unwrap();
     let values = [0, (1u64 << 53) + 1, i64::MAX as u64, 1u64 << 63, u64::MAX];

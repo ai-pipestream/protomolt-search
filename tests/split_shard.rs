@@ -26,7 +26,7 @@ use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     AddDocumentsRequest, AddVectorsRequest, Bm25SearchRequest, ClusterPlan, FacetValue,
     FlushRequest, HealthRequest, PlacementActionKind, ReconcileClusterRequest, SearchRequest,
-    SetCalibrationRequest, ShardReplicaRole,
+    ShardReplicaRole,
 };
 use tokio::net::TcpListener;
 use tonic::Request;
@@ -210,12 +210,9 @@ async fn a_primary_splits_online_into_two_children_that_tile_its_range() {
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &corpus);
     client(&addr_a)
         .await
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: BIT_WIDTH as u32,
-            shift,
-            scale,
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, BIT_WIDTH, &shift, &scale,
+        ))
         .await
         .unwrap();
     for i in 0..DOCS {

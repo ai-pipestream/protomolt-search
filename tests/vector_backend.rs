@@ -147,9 +147,7 @@ async fn first_batch_completes_generic_wal_provider_metadata() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_fleet_calibrated_two_ways_is_refused_before_a_shard_is_asked() {
     use pipestream_search::pb::search_service_server::SearchService;
-    use pipestream_search::pb::{
-        ClusterHealthRequest, RoutedMappedBind, SearchRequest, SetCalibrationRequest,
-    };
+    use pipestream_search::pb::{ClusterHealthRequest, RoutedMappedBind, SearchRequest};
     use tonic::Request;
 
     let (addr_a, handle_a) = start_empty_node(Default::default()).await;
@@ -170,12 +168,9 @@ async fn a_fleet_calibrated_two_ways_is_refused_before_a_shard_is_asked() {
     ] {
         let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
         client
-            .set_calibration(SetCalibrationRequest {
-                dim: DIM as u32,
-                bit_width: 4,
-                shift: shift.clone(),
-                scale: scale.clone(),
-            })
+            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                DIM, 4, shift, scale,
+            ))
             .await
             .unwrap();
         client

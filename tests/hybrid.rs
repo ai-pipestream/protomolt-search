@@ -21,7 +21,7 @@ mod common;
 use pipestream_search::coordinator::{CoordinatorServiceImpl, HybridLegs};
 use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
-use pipestream_search::pb::{AddDocumentsRequest, AddVectorsRequest, SetCalibrationRequest};
+use pipestream_search::pb::{AddDocumentsRequest, AddVectorsRequest};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -33,15 +33,12 @@ const SHARD_DOCS: usize = 4;
 const N_SHARDS: usize = 3;
 const N_DOCS: usize = SHARD_DOCS * N_SHARDS;
 
-async fn set_calibration(addr: &str, shift: &[f32], scale: &[f32]) {
+async fn configure_backend(addr: &str, shift: &[f32], scale: &[f32]) {
     let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
     client
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: 4,
-            shift: shift.to_vec(),
-            scale: scale.to_vec(),
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, 4, shift, scale,
+        ))
         .await
         .unwrap();
 }
@@ -161,7 +158,7 @@ async fn start_hybrid_shard(
         ..Default::default()
     })
     .await;
-    set_calibration(&addr, shift, scale).await;
+    configure_backend(&addr, shift, scale).await;
     add_documents(&addr, texts).await;
     add_vectors(&addr, vectors).await;
     (addr, handle)
@@ -1135,11 +1132,11 @@ async fn two_level_fallback_is_reachable_and_deterministic() {
     mock.abort();
 }
 
-/// BroadcastCalibration fans one calibration out to every shard;
-/// GetCalibration agrees afterwards, re-broadcast is idempotent, and a
+/// BroadcastVectorBackend fans one calibration out to every shard;
+/// GetVectorBackend agrees afterwards, re-broadcast is idempotent, and a
 /// non-empty shard refuses without breaking the fan-out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn broadcast_calibration_reaches_all_shards() {
+async fn broadcast_vector_backend_reaches_all_shards() {
     let corpus = unit_vectors(2_000, DIM, 0x5555_0001);
     let (shift, scale) = fit_calibration(DIM, 4, &corpus);
 
@@ -1151,22 +1148,22 @@ async fn broadcast_calibration_reaches_all_shards() {
 
     let coordinator =
         CoordinatorServiceImpl::new(vec![addr_a.clone(), addr_b.clone(), addr_c.clone()]);
-    let request = pipestream_search::pb::BroadcastCalibrationRequest {
-        collection: String::new(),
-        dim: DIM as u32,
-        bit_width: 4,
-        shift: shift.clone(),
-        scale: scale.clone(),
-    };
-    let results = coordinator.fanout_calibration(&request).await;
+    let request = pipestream_search::harness::embedded_broadcast_request(
+        DIM,
+        4,
+        &shift,
+        &scale,
+        String::new(),
+    );
+    let results = coordinator.fanout_vector_backend(&request).await;
     assert_eq!(results.len(), 3);
     assert!(
-        results[0].ok && !results[0].already_seeded,
+        results[0].ok && !results[0].already_configured,
         "node A: {:?}",
         results[0].error
     );
     assert!(
-        results[1].ok && !results[1].already_seeded,
+        results[1].ok && !results[1].already_configured,
         "node B: {:?}",
         results[1].error
     );
@@ -1177,20 +1174,22 @@ async fn broadcast_calibration_reaches_all_shards() {
     for addr in [&addr_a, &addr_b] {
         let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
         let cal = client
-            .get_calibration(pipestream_search::pb::GetCalibrationRequest {})
+            .get_vector_backend(pipestream_search::pb::GetVectorBackendRequest {})
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(cal.dim as usize, DIM);
-        assert_eq!(cal.shift, shift);
-        assert_eq!(cal.scale, scale);
+        assert_eq!(cal.descriptor.as_ref().unwrap().dim as usize, DIM);
+        assert_eq!(
+            pipestream_search::harness::reported_calibration(&cal),
+            (shift.clone(), scale.clone())
+        );
     }
 
     // Re-broadcast: idempotent no-op on the seeded nodes, still refused
     // on the non-empty one.
-    let again = coordinator.fanout_calibration(&request).await;
-    assert!(again[0].ok && again[0].already_seeded);
-    assert!(again[1].ok && again[1].already_seeded);
+    let again = coordinator.fanout_vector_backend(&request).await;
+    assert!(again[0].ok && again[0].already_configured);
+    assert!(again[1].ok && again[1].already_configured);
     assert!(!again[2].ok);
 
     handle_a.abort();
@@ -1226,7 +1225,7 @@ async fn hybrid_lexical_leg_matches_between_heap_and_v5_resident() {
         ..Default::default()
     })
     .await;
-    set_calibration(&addr_v5, &shift, &scale).await;
+    configure_backend(&addr_v5, &shift, &scale).await;
     add_documents(&addr_v5, &zebra).await;
     add_vectors(&addr_v5, corpus.clone()).await;
     {

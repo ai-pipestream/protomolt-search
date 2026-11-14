@@ -24,7 +24,6 @@ use pipestream_search::pb::{
     AggregateResponse, Aggregation, BooleanQuery, CompositeSearchStrategy, DeleteDocumentsRequest,
     DenseQuery, FacetValue, FilterQuery, FlushRequest, IntegerValue, LexicalQuery, NumericValue,
     QueryRequest, QueryResponse, SearchQuery, SelectionOperator, SelectionQuery,
-    SetCalibrationRequest,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -155,12 +154,9 @@ async fn ingest(addr: &str, shard: usize, vectors: &[f32]) {
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, sample);
     let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
     client
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: BIT_WIDTH as u32,
-            shift,
-            scale,
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, BIT_WIDTH, &shift, &scale,
+        ))
         .await
         .unwrap();
     let first = shard * SHARD_ROWS;
@@ -250,12 +246,8 @@ async fn uneven_fleet(tag: &str) -> Fleet {
     let vectors = corpus();
     let sample = &vectors[..vectors.len().min(64 * DIM)];
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, sample);
-    let calibration = SetCalibrationRequest {
-        dim: DIM as u32,
-        bit_width: BIT_WIDTH as u32,
-        shift,
-        scale,
-    };
+    let calibration =
+        pipestream_search::harness::embedded_backend_request(DIM, BIT_WIDTH, &shift, &scale);
     let mut addrs = Vec::new();
     let mut handles = Vec::new();
     let (addr, handle) = start_empty_node(NodeConfig {
@@ -265,7 +257,10 @@ async fn uneven_fleet(tag: &str) -> Fleet {
     })
     .await;
     let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
-    client.set_calibration(calibration.clone()).await.unwrap();
+    client
+        .configure_vector_backend(calibration.clone())
+        .await
+        .unwrap();
     let (tx, rx) = mpsc::channel(SHARD_ROWS);
     for i in 0..SHARD_ROWS {
         tx.send(document(i)).await.unwrap();
@@ -297,7 +292,7 @@ async fn uneven_fleet(tag: &str) -> Fleet {
     handles.push(handle);
     let (addr, handle) = start_empty_node(config(dir.join("shard-1.tv"), SHARD_ROWS as u64)).await;
     let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
-    client.set_calibration(calibration).await.unwrap();
+    client.configure_vector_backend(calibration).await.unwrap();
     let (tx, rx) = mpsc::channel(2);
     tx.send(AddVectorsRequest {
         vectors: vectors[SHARD_ROWS * DIM..(SHARD_ROWS + VECTOR_ONLY) * DIM].to_vec(),

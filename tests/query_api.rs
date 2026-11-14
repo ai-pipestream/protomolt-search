@@ -19,8 +19,7 @@ use pipestream_search::pb::{
     HybridSearchRequest, IntegerValue, LexicalQuery, QueryRequest, QueryResponse, QuerySort,
     QueryStreamCompletion, QueryStreamPhase, QueryStreamRequest, QueryStreamResponse,
     QueryStreamRevision, RrfScore, ScoreOp, ScoreStage, SearchQuery, SearchRequest,
-    SelectionOperator, SelectionQuery, SelectionScoreStrategy, SetCalibrationRequest,
-    VectorQualityContract,
+    SelectionOperator, SelectionQuery, SelectionScoreStrategy, VectorQualityContract,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -91,12 +90,9 @@ async fn start_cluster_with_identities(
         .await;
         let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
         client
-            .set_calibration(SetCalibrationRequest {
-                dim: DIM as u32,
-                bit_width: 4,
-                shift: shift.clone(),
-                scale: scale.clone(),
-            })
+            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                DIM, 4, &shift, &scale,
+            ))
             .await
             .unwrap();
         let (tx, rx) = mpsc::channel(16);
@@ -698,12 +694,9 @@ async fn fp32_mode_reranks_a_persisted_mmap_candidate_pool() {
     })
     .await;
     let mut node = NodeServiceClient::connect(addr.clone()).await.unwrap();
-    node.set_calibration(SetCalibrationRequest {
-        dim: DIM as u32,
-        bit_width: 4,
-        shift,
-        scale,
-    })
+    node.configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+        DIM, 4, &shift, &scale,
+    ))
     .await
     .unwrap();
     node.add_vectors(tokio_stream::iter(vec![AddVectorsRequest {

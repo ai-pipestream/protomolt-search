@@ -223,8 +223,7 @@ pub struct WalManifest {
     pub vector_config_payload: Vec<u8>,
     /// Legacy embedded-adapter bit width (2, 3, or 4).
     pub bit_width: u32,
-    /// Per-coordinate calibration shift (length `dim`), matching how
-    /// search.proto carries calibration (`GetCalibrationResponse`).
+    /// Per-coordinate calibration shift (length `dim`).
     #[serde(default)]
     pub calibration_shift: Vec<f32>,
     /// Per-coordinate calibration scale (length `dim`).

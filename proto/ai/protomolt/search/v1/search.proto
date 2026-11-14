@@ -66,27 +66,6 @@ service NodeService {
   // rejected. The named provider must be installed on the node.
   rpc ConfigureVectorBackend(ConfigureVectorBackendRequest) returns (ConfigureVectorBackendResponse);
 
-  // Deprecated compatibility view for the embedded TurboVec adapter.
-  rpc GetCalibration(GetCalibrationRequest) returns (GetCalibrationResponse);
-
-  // Pushes a TQ+ calibration to this shard BEFORE its first vector is
-  // added. The shard constructs (or, while still empty, re-constructs) its
-  // index with `TurboQuantIndex::new_with_calibration`, locking the
-  // calibration for the index's lifetime — the same rule turbovec enforces.
-  //
-  // Rules:
-  // - On an empty shard this locks the calibration; sending the SAME
-  //   calibration again is an idempotent no-op (`already_seeded = true`).
-  // - On a non-empty shard, or with a different calibration than the one
-  //   already locked, it is rejected (FAILED_PRECONDITION): calibration
-  //   can never change once vectors exist.
-  // - Field validation errors (bad dim/bit_width, non-finite shift,
-  //   non-positive scale, wrong lengths) are INVALID_ARGUMENT.
-  //
-  // Deployment order for a from-scratch cluster: fit a calibration on a
-  // representative sample, SetCalibration on every shard, then ingest.
-  rpc SetCalibration(SetCalibrationRequest) returns (SetCalibrationResponse);
-
   // Ingests vectors into this shard. Client-streaming: each message is one
   // flat batch (`vectors.len()` a multiple of the shard dim); batches are
   // applied in stream order under the shard's write lock on the blocking
@@ -98,7 +77,7 @@ service NodeService {
   // scan this service is built around, so client-chosen ids are out of
   // scope; ingestion order defines identity.
   //
-  // If the shard has no index yet (started empty, no SetCalibration), the
+  // If the shard has no index yet (started empty, no ConfigureVectorBackend), the
   // first batch constructs one: with `dim` from the request (required then)
   // and the shard's configured bit width, UNSEEDED — turbovec will fit
   // calibration from that first batch. Mixing unseeded-from-scratch shards
@@ -141,7 +120,7 @@ service NodeService {
   // - When the shard has a calibration locked (seeded or fitted) and the
   //   image's calibration differs, the install is rejected
   //   (FAILED_PRECONDITION): mixed calibrations make scores incomparable
-  //   across shards. Seed first with SetCalibration, or install on an
+  //   across shards. Configure first with ConfigureVectorBackend, or install on an
   //   unseeded shard, which adopts the image's calibration.
   // - Byte counts that overrun or truncate the manifest's declared sizes
   //   are INVALID_ARGUMENT; nothing is installed.
@@ -150,7 +129,7 @@ service NodeService {
   // restart at the shard's slot_offset, and an image WITHOUT a .bm25
   // sidecar replaces any existing postings store with none. Callers
   // rebuilding a cluster (recalibration on data drift) must replace every
-  // shard together, the same rule BroadcastCalibration documents.
+  // shard together, the same rule BroadcastVectorBackend documents.
   rpc InstallSnapshot(stream SnapshotChunk) returns (InstallSnapshotResponse);
 
   // Publishes the shard's current generation as a snapshot repository
@@ -458,9 +437,6 @@ service SearchService {
   // Pushes one provider configuration to every known shard. The scoring
   // fingerprint is the cross-shard comparability identity.
   rpc BroadcastVectorBackend(BroadcastVectorBackendRequest) returns (BroadcastVectorBackendResponse);
-
-  // Deprecated compatibility fan-out for the embedded TurboVec adapter.
-  rpc BroadcastCalibration(BroadcastCalibrationRequest) returns (BroadcastCalibrationResponse);
 
   // Fans NodeService.Health out to every shard (and any configured
   // replica) and reports per-target reachability plus the shard's own
@@ -1865,44 +1841,6 @@ message ConfigureVectorBackendRequest {
 
 message ConfigureVectorBackendResponse {
   bool already_configured = 1;
-}
-
-// Empty: the node reports whatever its loaded index holds.
-message GetCalibrationRequest {}
-
-// The shard index's shape and TQ+ calibration.
-message GetCalibrationResponse {
-  // Vector dimensionality the index was built with.
-  uint32 dim = 1;
-  // Quantization bit width (2, 3, or 4).
-  uint32 bit_width = 2;
-  // Number of vectors in this shard.
-  uint64 num_vectors = 3;
-  // Per-coordinate calibration shift (length `dim`). Absent when the index
-  // has no locked calibration (never added to and not seeded).
-  repeated float shift = 4;
-  // Per-coordinate calibration scale (length `dim`); same presence rule as
-  // `shift`.
-  repeated float scale = 5;
-}
-
-// Pushes a TQ+ calibration to a shard (see `NodeService.SetCalibration`).
-message SetCalibrationRequest {
-  // Vector dimensionality the shard index must have.
-  uint32 dim = 1;
-  // Quantization bit width (2, 3, or 4).
-  uint32 bit_width = 2;
-  // Per-coordinate calibration shift (length `dim`).
-  repeated float shift = 3;
-  // Per-coordinate calibration scale (length `dim`); every entry > 0.
-  repeated float scale = 4;
-}
-
-// Result of a `SetCalibration` call.
-message SetCalibrationResponse {
-  // True when the pushed calibration was already locked on this shard
-  // (idempotent retry); false when this call locked it.
-  bool already_seeded = 1;
 }
 
 // One batch on the `AddVectors` stream.
@@ -4809,44 +4747,6 @@ message ShardLegsResponse {
   repeated bool filter_columns_known = 4;
   // Captured under the same read guard as both raw lists, when requested.
   VectorReadReceipt read_receipt = 5;
-}
-
-// Pushes one TQ+ calibration to every shard (see
-// SearchService.BroadcastCalibration).
-message BroadcastCalibrationRequest {
-  // Vector dimensionality.
-  uint32 dim = 1;
-  // Quantization bit width (2, 3, or 4).
-  uint32 bit_width = 2;
-  // Per-coordinate calibration shift (length `dim`).
-  repeated float shift = 3;
-  // Per-coordinate calibration scale (length `dim`).
-  repeated float scale = 4;
-  // The collection this request addresses (docs/collections.md). Empty
-  // names the coordinator's only, unnamed dataset, or its configured
-  // default; an unknown name, or no name where named collections exist
-  // and no default is configured, refuses by name.
-  string collection = 5;
-}
-
-// One node's outcome of a calibration broadcast.
-message CalibrationApplyResult {
-  // The node address, as configured on the coordinator.
-  string node = 1;
-  // Whether the calibration was applied (or was already locked
-  // identically).
-  bool ok = 2;
-  // True when the node already had this exact calibration locked.
-  bool already_seeded = 3;
-  // The failure reason when `ok` is false (for example a non-empty shard,
-  // which locks calibration for the index lifetime).
-  string error = 4;
-}
-
-// Per-node outcomes of a calibration broadcast, in configured node order.
-message BroadcastCalibrationResponse {
-  // One result per configured node.
-  repeated CalibrationApplyResult results = 1;
 }
 
 message BroadcastVectorBackendRequest {

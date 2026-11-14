@@ -276,12 +276,11 @@ async fn empty_value_and_absent_key_stay_distinct_through_rpc_flush_reopen_and_c
                     let (shift, scale) =
                         common::fit_calibration(16, 4, &common::unit_vectors(64, 16, 134));
                     client
-                        .set_calibration(pb::SetCalibrationRequest {
-                            dim: 16,
-                            bit_width: 4,
-                            shift,
-                            scale,
-                        })
+                        .configure_vector_backend(
+                            pipestream_search::harness::embedded_backend_request(
+                                16, 4, &shift, &scale,
+                            ),
+                        )
                         .await
                         .unwrap();
                     let requests = (0..rows)

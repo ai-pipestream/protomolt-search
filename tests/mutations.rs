@@ -12,7 +12,7 @@ use pipestream_search::pb::{
     BrowseShardRequest, CommitReplacementsRequest, DeleteDocumentsRequest, DenseQuery,
     DenseScoreMode, ExactVectorRescoreRequest, FetchValuesRequest, FlushRequest,
     GetDocumentsRequest, HealthRequest, QueryRequest, Replacement, SearchQuery, SelectionQuery,
-    SetCalibrationRequest, TermStatsRequest,
+    TermStatsRequest,
 };
 use tonic::Request;
 
@@ -36,12 +36,9 @@ async fn descending_deletes_and_replacement_stay_hidden_after_reopen() {
     let (shift, scale) = common::fit_calibration(DIM, 4, &corpus);
     let (addr, handle) = common::start_empty_node(config.clone()).await;
     let mut node = NodeServiceClient::connect(addr.clone()).await.unwrap();
-    node.set_calibration(SetCalibrationRequest {
-        dim: DIM as u32,
-        bit_width: 4,
-        shift,
-        scale,
-    })
+    node.configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+        DIM, 4, &shift, &scale,
+    ))
     .await
     .unwrap();
     node.add_documents(tokio_stream::iter((0..ROWS).map(|id| {
@@ -203,12 +200,9 @@ async fn delete_and_append_then_replace_are_consistent_across_read_paths() {
     })
     .await;
     let mut node = NodeServiceClient::connect(addr.clone()).await.unwrap();
-    node.set_calibration(SetCalibrationRequest {
-        dim: DIM as u32,
-        bit_width: 4,
-        shift,
-        scale,
-    })
+    node.configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+        DIM, 4, &shift, &scale,
+    ))
     .await
     .unwrap();
     node.add_documents(tokio_stream::iter((0..4).map(|id| AddDocumentsRequest {

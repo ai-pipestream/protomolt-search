@@ -659,7 +659,7 @@ async fn in_memory_shards_stay_in_heap_whatever_the_layout_says() {
 /// through Search (docs/mmap-vectors.md).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sealed_segments_serve_mapped_and_equal_the_heap_load_bit_for_bit() {
-    use pipestream_search::pb::{AddVectorsRequest, SearchRequest, SetCalibrationRequest};
+    use pipestream_search::pb::{AddVectorsRequest, SearchRequest};
     use pipestream_search::segments::VectorLoad;
 
     const DIM: usize = 64;
@@ -675,12 +675,9 @@ async fn sealed_segments_serve_mapped_and_equal_the_heap_load_bit_for_bit() {
     let (addr, handle) = start_empty_node(build(true)).await;
     let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
     client
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: 4,
-            shift: shift.clone(),
-            scale: scale.clone(),
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, 4, &shift, &scale,
+        ))
         .await
         .unwrap();
     assert_eq!(ingest(&addr, &docs).await, docs.len() as u64);

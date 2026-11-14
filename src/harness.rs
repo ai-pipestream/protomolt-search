@@ -18,9 +18,13 @@ use tonic::transport::{Error as TransportError, Server};
 
 use crate::coordinator::CoordinatorServiceImpl;
 use crate::node::{NodeConfig, NodeServiceImpl};
-use crate::pb::{ConfigureVectorBackendRequest, VectorBackendConfig as WireVectorBackendConfig};
+use crate::pb::{
+    BroadcastVectorBackendRequest, ConfigureVectorBackendRequest, GetVectorBackendResponse,
+    VectorBackendConfig as WireVectorBackendConfig,
+};
 use crate::vector::{
-    embedded_turbovec_config, legacy_calibration_config, VectorIndex, EMBEDDED_TURBOVEC,
+    embedded_turbovec_config, legacy_calibration_config, VectorBackendConfig, VectorIndex,
+    EMBEDDED_TURBOVEC,
 };
 use crate::MAX_MESSAGE_BYTES;
 
@@ -79,8 +83,8 @@ pub fn seeded_index(dim: usize, bit_width: usize, shift: &[f32], scale: &[f32]) 
         .expect("a fitted calibration pair is valid backend state")
 }
 
-/// Wire request for configuring the shipped embedded provider. Most tests use
-/// this generic RPC; dedicated compatibility tests cover SetCalibration.
+/// Wire request that configures one shard with the shipped embedded provider
+/// and an explicit calibration pair.
 pub fn embedded_backend_request(
     dim: usize,
     bits_per_dimension: usize,
@@ -96,6 +100,40 @@ pub fn embedded_backend_request(
             config_format: config.config_format,
             payload: config.payload,
         }),
+    }
+}
+
+/// The embedded-provider calibration pair a shard reports through
+/// `GetVectorBackend`: empty when the shard has no index or its index has no
+/// locked calibration.
+pub fn reported_calibration(response: &GetVectorBackendResponse) -> (Vec<f32>, Vec<f32>) {
+    let Some(config) = response.config.as_ref() else {
+        return (Vec::new(), Vec::new());
+    };
+    let config = VectorBackendConfig {
+        backend_kind: config.backend_kind.clone(),
+        config_format: config.config_format.clone(),
+        payload: config.payload.clone(),
+    };
+    legacy_calibration_config(&config)
+        .expect("reported backend config must decode")
+        .map_or_else(|| (Vec::new(), Vec::new()), |view| (view.shift, view.scale))
+}
+
+/// [`embedded_backend_request`] for every shard of `collection` (empty names
+/// the coordinator's default dataset).
+pub fn embedded_broadcast_request(
+    dim: usize,
+    bits_per_dimension: usize,
+    shift: &[f32],
+    scale: &[f32],
+    collection: impl Into<String>,
+) -> BroadcastVectorBackendRequest {
+    let request = embedded_backend_request(dim, bits_per_dimension, shift, scale);
+    BroadcastVectorBackendRequest {
+        dim: request.dim,
+        config: request.config,
+        collection: collection.into(),
     }
 }
 
@@ -213,7 +251,7 @@ pub async fn start_node(
 }
 
 /// Start a node server with NO index (the from-scratch state: awaiting
-/// SetCalibration or AddVectors).
+/// ConfigureVectorBackend or AddVectors).
 pub async fn start_empty_node(
     config: NodeConfig,
 ) -> (String, JoinHandle<Result<(), TransportError>>) {

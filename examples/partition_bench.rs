@@ -31,7 +31,6 @@ use pipestream_search::pb::{
     Aggregation, BooleanQuery, CompactShardRequest, CompositeSearchStrategy, DenseQuery,
     FilterQuery, FlushRequest, GetDocumentsRequest, IntegerValue, LexicalQuery, QueryHit,
     QueryRequest, QueryResponse, QuerySort, SearchQuery, SelectionOperator, SelectionQuery,
-    SetCalibrationRequest,
 };
 use pipestream_search::segments::SegmentCatalog;
 use tokio::sync::mpsc;
@@ -145,12 +144,9 @@ async fn ingest(addr: &str, p: &Params, vectors: &[f32]) {
         .max_encoding_message_size(usize::MAX)
         .max_decoding_message_size(usize::MAX);
     client
-        .set_calibration(SetCalibrationRequest {
-            dim: p.dim as u32,
-            bit_width: BIT_WIDTH as u32,
-            shift,
-            scale,
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            p.dim, BIT_WIDTH, &shift, &scale,
+        ))
         .await
         .unwrap();
     let mut seq = 0usize;

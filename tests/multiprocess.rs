@@ -3,7 +3,7 @@
 //!
 //! Scenario: two node processes + one coordinator process (the actual
 //! binary, temp dirs and ports). The test pushes the SAME seeded
-//! calibration to both nodes via SetCalibration, ingests disjoint vector
+//! calibration to both nodes via ConfigureVectorBackend, ingests disjoint vector
 //! sets over AddVectors, and requires the coordinator's top-k to equal the
 //! monolithic reference EXACTLY — losslessness for data that arrived over
 //! the wire, not just prebuilt indexes. Then one node is SIGTERMed (proving
@@ -18,9 +18,7 @@ use std::time::{Duration, Instant};
 
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_client::SearchServiceClient;
-use pipestream_search::pb::{
-    AddVectorsRequest, FlushRequest, SearchRequest, SetCalibrationRequest,
-};
+use pipestream_search::pb::{AddVectorsRequest, FlushRequest, SearchRequest};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -187,16 +185,13 @@ async fn ingest_across_processes_is_lossless_and_persistent() {
             .await
             .unwrap();
         let resp = client
-            .set_calibration(SetCalibrationRequest {
-                dim: DIM as u32,
-                bit_width: BIT_WIDTH as u32,
-                shift: shift.clone(),
-                scale: scale.clone(),
-            })
+            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                DIM, BIT_WIDTH, &shift, &scale,
+            ))
             .await
             .unwrap()
             .into_inner();
-        assert!(!resp.already_seeded, "first seed must lock, not no-op");
+        assert!(!resp.already_configured, "first seed must lock, not no-op");
     }
 
     // Ingest disjoint halves over the wire.
@@ -256,7 +251,7 @@ async fn ingest_across_processes_is_lossless_and_persistent() {
     let cal = NodeServiceClient::connect(format!("http://{node1}"))
         .await
         .unwrap()
-        .get_calibration(pipestream_search::pb::GetCalibrationRequest {})
+        .get_vector_backend(pipestream_search::pb::GetVectorBackendRequest {})
         .await
         .unwrap()
         .into_inner();
@@ -264,7 +259,11 @@ async fn ingest_across_processes_is_lossless_and_persistent() {
         cal.num_vectors, 3_000,
         "restarted node lost vectors (pid was {pid})"
     );
-    assert_eq!(cal.shift, shift, "restarted node lost its calibration");
+    assert_eq!(
+        pipestream_search::harness::reported_calibration(&cal).0,
+        shift,
+        "restarted node lost its calibration"
+    );
 
     let query = unit_vectors(1, DIM, 0x9C33_1000);
     let got = coordinator_topk(&coord_http, &query, 10).await;
@@ -302,12 +301,9 @@ async fn an_interrupted_bm25_build_refuses_to_serve() {
         NodeServiceClient::connect(format!("http://{addr}"))
             .await
             .unwrap()
-            .set_calibration(SetCalibrationRequest {
-                dim: DIM as u32,
-                bit_width: BIT_WIDTH as u32,
-                shift,
-                scale,
-            })
+            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                DIM, BIT_WIDTH, &shift, &scale,
+            ))
             .await
             .unwrap();
         add_vectors(&format!("http://{addr}"), corpus).await;

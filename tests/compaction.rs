@@ -40,8 +40,7 @@ use pipestream_search::pb::{
     CommitReplacementsRequest, CompactShardRequest, CompactShardResponse, DeleteDocumentsRequest,
     DenseQuery, DocLineage, FacetValue, FlushRequest, GetDocumentsRequest, HealthRequest,
     HybridSearchRequest, IntegerValue, QueryRequest, Replacement, ResolveParentsRequest,
-    SearchQuery, SearchRequest, SelectionQuery, SetCalibrationRequest, SnapshotChunk,
-    SnapshotManifest,
+    SearchQuery, SearchRequest, SelectionQuery, SnapshotChunk, SnapshotManifest,
 };
 use pipestream_search::segments::{SegmentCatalog, SegmentMetadata, SegmentSetManifest};
 use tokio::sync::mpsc;
@@ -114,12 +113,9 @@ async fn client(addr: &str) -> NodeServiceClient<Channel> {
 async fn calibrate(addr: &str, shift: &[f32], scale: &[f32]) {
     client(addr)
         .await
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: BIT_WIDTH as u32,
-            shift: shift.to_vec(),
-            scale: scale.to_vec(),
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, BIT_WIDTH, shift, scale,
+        ))
         .await
         .unwrap();
 }

@@ -250,12 +250,9 @@ async fn typed_ranges_match_numeric_oracle_through_nested_relays_and_storage_lif
             let (addr, server) = common::start_empty_node(config.clone()).await;
             let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
             client
-                .set_calibration(pb::SetCalibrationRequest {
-                    dim: 8,
-                    bit_width: 4,
-                    shift: shift.clone(),
-                    scale: scale.clone(),
-                })
+                .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                    8, 4, &shift, &scale,
+                ))
                 .await
                 .unwrap();
             // Direct empty shards must reject malformed edges before reading a store.

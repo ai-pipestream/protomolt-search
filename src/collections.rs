@@ -40,13 +40,12 @@ use crate::pb::cluster_control_server::{ClusterControl, ClusterControlServer};
 use crate::pb::search_service_server::{SearchService, SearchServiceServer};
 use crate::pb::{
     AbortTopologyCutoverRequest, AbortTopologyCutoverResponse, AggregateRequest, AggregateResponse,
-    Bm25SearchRequest, Bm25SearchResponse, BroadcastCalibrationRequest,
-    BroadcastCalibrationResponse, BroadcastVectorBackendRequest, BroadcastVectorBackendResponse,
-    ClusterHealthRequest, ClusterHealthResponse, ClusterPlan, CollectionHealth,
-    CompletePlacementActionRequest, DescribeSchemaRequest, DescribeSchemaResponse,
-    DrainNodeRequest, FreezeTopologyWritesRequest, FreezeTopologyWritesResponse,
-    GetClusterPlanRequest, HybridSearchRequest, HybridSearchResponse, NodeLease,
-    PhraseSearchRequest, PlanBalanceRequest, PlanBalanceResponse, PlanIndexRequest,
+    Bm25SearchRequest, Bm25SearchResponse, BroadcastVectorBackendRequest,
+    BroadcastVectorBackendResponse, ClusterHealthRequest, ClusterHealthResponse, ClusterPlan,
+    CollectionHealth, CompletePlacementActionRequest, DescribeSchemaRequest,
+    DescribeSchemaResponse, DrainNodeRequest, FreezeTopologyWritesRequest,
+    FreezeTopologyWritesResponse, GetClusterPlanRequest, HybridSearchRequest, HybridSearchResponse,
+    NodeLease, PhraseSearchRequest, PlanBalanceRequest, PlanBalanceResponse, PlanIndexRequest,
     PlanIndexResponse, PlanPlacementRequest, PlanPlacementResponse, PublishTopologyRequest,
     PublishTopologyResponse, QueryRequest, QueryResponse, QueryStreamRequest,
     ReconcileClusterRequest, RegisterNodeRequest, RenewNodeLeaseRequest, ReportShardRequest,
@@ -312,7 +311,6 @@ impl RecentFields for TermSuggestResponse {
 impl RecentFields for PlanIndexResponse {}
 impl RecentFields for DescribeSchemaResponse {}
 impl RecentFields for BroadcastVectorBackendResponse {}
-impl RecentFields for BroadcastCalibrationResponse {}
 impl RecentFields for FreezeTopologyWritesResponse {}
 impl RecentFields for PublishTopologyResponse {}
 impl RecentFields for AbortTopologyCutoverResponse {}
@@ -323,7 +321,6 @@ impl RequestK for PlanPlacementRequest {}
 impl RequestK for PlanIndexRequest {}
 impl RequestK for DescribeSchemaRequest {}
 impl RequestK for BroadcastVectorBackendRequest {}
-impl RequestK for BroadcastCalibrationRequest {}
 impl RequestK for FreezeTopologyWritesRequest {}
 impl RequestK for PublishTopologyRequest {}
 impl RequestK for AbortTopologyCutoverRequest {}
@@ -740,7 +737,6 @@ search_service_over_collections! {
     phrase_search [Search]: PhraseSearchRequest => Bm25SearchResponse,
     hybrid_search [Search]: HybridSearchRequest => HybridSearchResponse,
     broadcast_vector_backend [Admin]: BroadcastVectorBackendRequest => BroadcastVectorBackendResponse,
-    broadcast_calibration [Admin]: BroadcastCalibrationRequest => BroadcastCalibrationResponse,
     variant_search [Search]: VariantSearchRequest => VariantSearchResponse,
     query [Search]: QueryRequest => QueryResponse,
     plan_index [Admin]: PlanIndexRequest => PlanIndexResponse,

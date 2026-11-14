@@ -116,12 +116,9 @@ async fn visible_dictionaries_survive_segments_deletes_compaction_and_reopen() {
         let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
         let coordinator = CoordinatorServiceImpl::new(vec![addr]);
         client
-            .set_calibration(SetCalibrationRequest {
-                dim: DIM as u32,
-                bit_width: 4,
-                shift,
-                scale,
-            })
+            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                DIM, 4, &shift, &scale,
+            ))
             .await
             .unwrap();
         for (i, batch) in rows.chunks(2).enumerate() {

@@ -90,7 +90,6 @@ pub enum Route {
     Aggregate,
     ClusterHealth,
     BroadcastVectorBackend,
-    BroadcastCalibration,
     VariantSearch,
     // Cluster control routes.
     RegisterNode,
@@ -134,7 +133,7 @@ pub enum Route {
 /// Route names as they appear in the `rpc` label, parallel to the
 /// counter tables, with whether the route answers with a response
 /// stream (and so reports two latency phases).
-const REQUEST_ROUTES: [(Route, &str, bool); 73] = [
+const REQUEST_ROUTES: [(Route, &str, bool); 72] = [
     (Route::SearchShard, "search_shard", true),
     (Route::StreamSearch, "stream_search", true),
     (Route::BrowseShard, "browse_shard", false),
@@ -185,7 +184,6 @@ const REQUEST_ROUTES: [(Route, &str, bool); 73] = [
         "broadcast_vector_backend",
         false,
     ),
-    (Route::BroadcastCalibration, "broadcast_calibration", false),
     (Route::VariantSearch, "variant_search", false),
     (Route::RegisterNode, "register_node", false),
     (Route::RenewNodeLease, "renew_node_lease", false),

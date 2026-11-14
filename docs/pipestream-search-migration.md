@@ -31,9 +31,9 @@ new server without regeneration.
 - WAL manifests without generic provider fields are upgraded in memory from
   their legacy calibration fields. New manifests carry opaque provider state
   and retain the legacy embedded-adapter fields for older inspection tools.
-- `GetCalibration`, `SetCalibration`, and `BroadcastCalibration` remain as
-  compatibility adapters. New clients should use `GetVectorBackend`,
-  `ConfigureVectorBackend`, and `BroadcastVectorBackend`.
+- `GetCalibration`, `SetCalibration`, and `BroadcastCalibration` are gone.
+  Use `GetVectorBackend`, `ConfigureVectorBackend`, and
+  `BroadcastVectorBackend`.
 - The current mapping fingerprint tag is `pipestream-search.plan.v3`.
   The foundations decoder changes require a source rebuild before binding
   v1/v2 mapped generations for new writes; the namespace reconciliation

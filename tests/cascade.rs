@@ -105,12 +105,9 @@ async fn start_cluster(
         // Seed, ingest docs first (ids 0..), then vectors (slots align).
         let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
         client
-            .set_calibration(pipestream_search::pb::SetCalibrationRequest {
-                dim: DIM as u32,
-                bit_width: 4,
-                shift: shift.to_vec(),
-                scale: scale.to_vec(),
-            })
+            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                DIM, 4, shift, scale,
+            ))
             .await
             .unwrap();
         {
