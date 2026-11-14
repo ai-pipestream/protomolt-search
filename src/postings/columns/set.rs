@@ -2,10 +2,11 @@
 
 use std::io;
 
+use super::map_stores::{MapFacetStore, MapNumericStore};
 use super::metadata::{binding_entry_size, derived_entry_size, StoredBinding, StoredDerived};
 use super::stores::{
-    dictionary_sorted, validate_column_names, FacetStore, GeoStore, IntStore, MapFacetStore,
-    MapNumericStore, NumericStore, UintStore,
+    dictionary_sorted, validate_column_names, FacetStore, GeoStore, IntStore, NumericStore,
+    UintStore,
 };
 
 /// Typed per-document column family stored in a v7/v8 `.bm25` shard.

@@ -295,11 +295,7 @@ pub(super) fn integrity_eager(name: &str) -> bool {
 /// verified here — callers decide eager vs deep.
 pub(super) fn parse_integrity(full: &[u8]) -> io::Result<IntegrityTable> {
     let invalid = |msg: String| io::Error::new(io::ErrorKind::InvalidData, msg);
-    let file_len = full.len() as u64;
-    if file_len < 52 + TRAILER_LEN {
-        return Err(invalid("v8 file shorter than header plus trailer".into()));
-    }
-    let trailer = file_len - TRAILER_LEN;
+    let (trailer, integrity_off, base_v7) = parse_integrity_trailer(full)?;
     let u64_at = |off: u64| -> u64 {
         u64::from_le_bytes(
             full[off as usize..off as usize + 8]
@@ -307,46 +303,21 @@ pub(super) fn parse_integrity(full: &[u8]) -> io::Result<IntegrityTable> {
                 .expect("8 bytes"),
         )
     };
-    if &full[(trailer + 16) as usize..] != TRAILER_MAGIC {
-        return Err(invalid(
-            "v8 trailer magic missing: truncated or overwritten tail".into(),
-        ));
-    }
-    let integrity_off = u64_at(trailer);
-    let base_version = u64_at(trailer + 8);
-    let base_v7 = match base_version {
-        6 => false,
-        7 => true,
-        v => {
-            return Err(invalid(format!(
-                "v8 trailer names base version {v}, not 6 or 7"
-            )))
-        }
-    };
-    if integrity_off < 52 || integrity_off > trailer {
-        return Err(invalid(format!(
-            "v8 integrity section offset {integrity_off} outside [52, {trailer}]"
-        )));
-    }
-    let mut cur = integrity_off;
     let need = |cur: u64, n: u64| -> io::Result<()> {
         if cur + n > trailer {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("v8 integrity table runs past its section at {cur}"),
-            ));
+            return Err(invalid(format!(
+                "v8 integrity table runs past its section at {cur}"
+            )));
         }
         Ok(())
     };
+    let mut cur = integrity_off;
     need(cur, 4)?;
     let n_entries = u32::from_le_bytes(full[cur as usize..cur as usize + 4].try_into().unwrap());
     cur += 4;
     if n_entries == 0 {
         return Err(invalid("v8 integrity table with zero entries".into()));
     }
-    // One entry costs at least 2 + 1 + 20 bytes and the section also
-    // carries the 4-byte count and 4-byte table CRC, so the file bounds
-    // the count before any allocation trusts it.
     let max_entries = (trailer - integrity_off).saturating_sub(8) / 23;
     if u64::from(n_entries) > max_entries {
         return Err(invalid(format!(
@@ -367,8 +338,6 @@ pub(super) fn parse_integrity(full: &[u8]) -> io::Result<IntegrityTable> {
             .map_err(|_| invalid(format!("v8 integrity entry {i}: name is not UTF-8")))?
             .to_string();
         let base = cur + 2 + name_len;
-        let off = u64_at(base);
-        let len = u64_at(base + 8);
         let crc = u32::from_le_bytes(
             full[(base + 16) as usize..(base + 20) as usize]
                 .try_into()
@@ -376,32 +345,85 @@ pub(super) fn parse_integrity(full: &[u8]) -> io::Result<IntegrityTable> {
         );
         entries.push(IntegrityEntry {
             name,
-            off,
-            len,
+            off: u64_at(base),
+            len: u64_at(base + 8),
             crc,
         });
         cur = base + 20;
     }
     need(cur, 4)?;
-    let stored_table_crc =
-        u32::from_le_bytes(full[cur as usize..cur as usize + 4].try_into().unwrap());
-    let computed = crate::wal::crc32(&full[integrity_off as usize..cur as usize]);
+    verify_integrity_crc_and_partition(full, &entries, integrity_off, cur, trailer)?;
+    Ok(IntegrityTable {
+        entries,
+        payload_len: integrity_off,
+        base_v7,
+    })
+}
+
+fn parse_integrity_trailer(full: &[u8]) -> io::Result<(u64, u64, bool)> {
+    let invalid = |msg: String| io::Error::new(io::ErrorKind::InvalidData, msg);
+    let file_len = full.len() as u64;
+    if file_len < 52 + TRAILER_LEN {
+        return Err(invalid("v8 file shorter than header plus trailer".into()));
+    }
+    let trailer = file_len - TRAILER_LEN;
+    if &full[(trailer + 16) as usize..] != TRAILER_MAGIC {
+        return Err(invalid(
+            "v8 trailer magic missing: truncated or overwritten tail".into(),
+        ));
+    }
+    let u64_at = |off: u64| -> u64 {
+        u64::from_le_bytes(
+            full[off as usize..off as usize + 8]
+                .try_into()
+                .expect("8 bytes"),
+        )
+    };
+    let integrity_off = u64_at(trailer);
+    let base_v7 = match u64_at(trailer + 8) {
+        6 => false,
+        7 => true,
+        v => {
+            return Err(invalid(format!(
+                "v8 trailer names base version {v}, not 6 or 7"
+            )))
+        }
+    };
+    if integrity_off < 52 || integrity_off > trailer {
+        return Err(invalid(format!(
+            "v8 integrity section offset {integrity_off} outside [52, {trailer}]"
+        )));
+    }
+    Ok((trailer, integrity_off, base_v7))
+}
+
+fn verify_integrity_crc_and_partition(
+    full: &[u8],
+    entries: &[IntegrityEntry],
+    integrity_off: u64,
+    crc_off: u64,
+    trailer: u64,
+) -> io::Result<()> {
+    let invalid = |msg: String| io::Error::new(io::ErrorKind::InvalidData, msg);
+    let stored_table_crc = u32::from_le_bytes(
+        full[crc_off as usize..crc_off as usize + 4]
+            .try_into()
+            .unwrap(),
+    );
+    let computed = crate::wal::crc32(&full[integrity_off as usize..crc_off as usize]);
     if stored_table_crc != computed {
         return Err(invalid(format!(
             "v8 integrity table CRC mismatch: stored {stored_table_crc:08x}, computed {computed:08x}"
         )));
     }
-    if cur + 4 != trailer {
+    if crc_off + 4 != trailer {
         return Err(invalid(format!(
             "v8 integrity section ends at {} but the trailer starts at {trailer}",
-            cur + 4
+            crc_off + 4
         )));
     }
-    // The entries must partition [0, integrity_off): a gap would be
-    // bytes no checksum covers, which is the disease this format
-    // exists to refuse.
     let mut expected = 0u64;
-    for e in &entries {
+    for e in entries {
         if e.off != expected {
             return Err(invalid(format!(
                 "v8 integrity entry {} starts at {} but the previous section ended at {expected}",
@@ -418,11 +440,7 @@ pub(super) fn parse_integrity(full: &[u8]) -> io::Result<IntegrityTable> {
             "v8 integrity entries cover [0, {expected}) but the payload is [0, {integrity_off})"
         )));
     }
-    Ok(IntegrityTable {
-        entries,
-        payload_len: integrity_off,
-        base_v7,
-    })
+    Ok(())
 }
 
 /// Every section start of a STRUCTURALLY VALIDATED v6/v7 payload, in
@@ -452,93 +470,9 @@ pub(super) fn v6v7_section_starts(map: &[u8], v7: bool) -> io::Result<Vec<(Strin
         let n_columns = u32_at(cursor) as usize;
         cursor += 4;
         for _ in 0..n_columns {
-            let name_len = u16::from_le_bytes(map[cursor..cursor + 2].try_into().unwrap()) as usize;
-            let name =
-                String::from_utf8_lossy(&map[cursor + 2..cursor + 2 + name_len]).into_owned();
-            let kind = map[cursor + 2 + name_len];
-            let base = cursor + 2 + name_len + 1;
-            let kind =
-                compatible_column_kind(kind, name.as_bytes(), &map[base..], map.len() as u64);
-            match kind {
-                COLUMN_KIND_FACET => {
-                    starts.push((format!("column:{name}:dict"), u64_at(base + 4)));
-                    starts.push((format!("column:{name}:ords"), u64_at(base + 12)));
-                    cursor = base + 20;
-                }
-                COLUMN_KIND_F64 => {
-                    starts.push((format!("column:{name}:vals"), u64_at(base + 16)));
-                    cursor = base + 24;
-                }
-                COLUMN_KIND_MAP_FACET => {
-                    starts.push((format!("column:{name}:keys"), u64_at(base + 8)));
-                    starts.push((format!("column:{name}:values"), u64_at(base + 16)));
-                    starts.push((format!("column:{name}:offsets"), u64_at(base + 24)));
-                    starts.push((format!("column:{name}:pairs"), u64_at(base + 32)));
-                    cursor = base + 40;
-                }
-                COLUMN_KIND_MAP_F64 => {
-                    starts.push((format!("column:{name}:keys"), u64_at(base + 4)));
-                    starts.push((format!("column:{name}:offsets"), u64_at(base + 12)));
-                    starts.push((format!("column:{name}:pairs"), u64_at(base + 20)));
-                    cursor = base + 28;
-                }
-                COLUMN_KIND_MAP_I64 | COLUMN_KIND_MAP_U64 => {
-                    starts.push((format!("column:{name}:integer_map"), u64_at(base)));
-                    cursor = base + 16;
-                }
-                COLUMN_KIND_I64 | COLUMN_KIND_I64_PRESENT | COLUMN_KIND_U64 => {
-                    starts.push((format!("column:{name}:vals"), u64_at(base + 16)));
-                    if kind != COLUMN_KIND_I64 {
-                        starts.push((
-                            format!("column:{name}:presence"),
-                            u64_at(base + 16) + 8 * u64::from(u32_at(12)),
-                        ));
-                    }
-                    cursor = base + 24;
-                }
-                COLUMN_KIND_GEO => {
-                    starts.push((format!("column:{name}:vals"), u64_at(base + 32)));
-                    cursor = base + 40;
-                }
-                COLUMN_KIND_POSITIONS | COLUMN_KIND_SENTENCES => {
-                    starts.push((format!("column:{name}:vals"), u64_at(base)));
-                    cursor = base + 16;
-                }
-                COLUMN_KIND_SOURCES => {
-                    starts.push((format!("column:{name}:sources"), u64_at(base)));
-                    cursor = base + 16;
-                }
-                COLUMN_KIND_POS_LENGTHS => {
-                    starts.push((format!("column:{name}:vals"), u64_at(base)));
-                    cursor = base + 16;
-                }
-                COLUMN_KIND_SPLADE => {
-                    starts.push((format!("column:{name}:splade"), u64_at(base)));
-                    cursor = base + 16;
-                }
-                COLUMN_KIND_BINDING
-                | COLUMN_KIND_ANALYSIS_BINDING
-                | COLUMN_KIND_VECTOR_BINDING
-                | COLUMN_KIND_INDEX_BINDING => {
-                    let (_, consumed) = decode_binding_entry(kind, &map[base..])?;
-                    cursor = base + consumed;
-                }
-                COLUMN_KIND_DERIVED => {
-                    let (_, consumed) = decode_derived_entry(&map[base..])?;
-                    cursor = base + consumed;
-                }
-                other => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("column {name}: unknown kind {other}"),
-                    ))
-                }
-            }
+            push_column_section_start(&mut starts, map, &mut cursor)?;
         }
     }
-    // Contiguity belt-and-braces: file order and never descending, or
-    // the derived ranges would be nonsense. Equal starts are one empty
-    // section (a column dictionary with no values yet).
     for pair in starts.windows(2) {
         if pair[1].1 < pair[0].1 {
             return Err(io::Error::new(
@@ -551,6 +485,86 @@ pub(super) fn v6v7_section_starts(map: &[u8], v7: bool) -> io::Result<Vec<(Strin
         }
     }
     Ok(starts)
+}
+
+fn push_column_section_start(
+    starts: &mut Vec<(String, u64)>,
+    map: &[u8],
+    cursor: &mut usize,
+) -> io::Result<()> {
+    let u32_at = |off: usize| u32::from_le_bytes(map[off..off + 4].try_into().expect("4 bytes"));
+    let u64_at = |off: usize| u64::from_le_bytes(map[off..off + 8].try_into().expect("8 bytes"));
+    let name_len = u16::from_le_bytes(map[*cursor..*cursor + 2].try_into().unwrap()) as usize;
+    let name = String::from_utf8_lossy(&map[*cursor + 2..*cursor + 2 + name_len]).into_owned();
+    let kind = map[*cursor + 2 + name_len];
+    let base = *cursor + 2 + name_len + 1;
+    let kind = compatible_column_kind(kind, name.as_bytes(), &map[base..], map.len() as u64);
+    *cursor = match kind {
+        COLUMN_KIND_FACET => {
+            starts.push((format!("column:{name}:dict"), u64_at(base + 4)));
+            starts.push((format!("column:{name}:ords"), u64_at(base + 12)));
+            base + 20
+        }
+        COLUMN_KIND_F64 => {
+            starts.push((format!("column:{name}:vals"), u64_at(base + 16)));
+            base + 24
+        }
+        COLUMN_KIND_MAP_FACET => {
+            starts.push((format!("column:{name}:keys"), u64_at(base + 8)));
+            starts.push((format!("column:{name}:values"), u64_at(base + 16)));
+            starts.push((format!("column:{name}:offsets"), u64_at(base + 24)));
+            starts.push((format!("column:{name}:pairs"), u64_at(base + 32)));
+            base + 40
+        }
+        COLUMN_KIND_MAP_F64 => {
+            starts.push((format!("column:{name}:keys"), u64_at(base + 4)));
+            starts.push((format!("column:{name}:offsets"), u64_at(base + 12)));
+            starts.push((format!("column:{name}:pairs"), u64_at(base + 20)));
+            base + 28
+        }
+        COLUMN_KIND_MAP_I64 | COLUMN_KIND_MAP_U64 => {
+            starts.push((format!("column:{name}:integer_map"), u64_at(base)));
+            base + 16
+        }
+        COLUMN_KIND_I64 | COLUMN_KIND_I64_PRESENT | COLUMN_KIND_U64 => {
+            starts.push((format!("column:{name}:vals"), u64_at(base + 16)));
+            if kind != COLUMN_KIND_I64 {
+                starts.push((
+                    format!("column:{name}:presence"),
+                    u64_at(base + 16) + 8 * u64::from(u32_at(12)),
+                ));
+            }
+            base + 24
+        }
+        COLUMN_KIND_GEO => {
+            starts.push((format!("column:{name}:vals"), u64_at(base + 32)));
+            base + 40
+        }
+        COLUMN_KIND_POSITIONS | COLUMN_KIND_SENTENCES | COLUMN_KIND_POS_LENGTHS => {
+            starts.push((format!("column:{name}:vals"), u64_at(base)));
+            base + 16
+        }
+        COLUMN_KIND_SOURCES => {
+            starts.push((format!("column:{name}:sources"), u64_at(base)));
+            base + 16
+        }
+        COLUMN_KIND_SPLADE => {
+            starts.push((format!("column:{name}:splade"), u64_at(base)));
+            base + 16
+        }
+        COLUMN_KIND_BINDING
+        | COLUMN_KIND_ANALYSIS_BINDING
+        | COLUMN_KIND_VECTOR_BINDING
+        | COLUMN_KIND_INDEX_BINDING => base + decode_binding_entry(kind, &map[base..])?.1,
+        COLUMN_KIND_DERIVED => base + decode_derived_entry(&map[base..])?.1,
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("column {name}: unknown kind {other}"),
+            ))
+        }
+    };
+    Ok(())
 }
 
 /// The v8 post-pass: turn a finished v6/v7 file into a v8 one in

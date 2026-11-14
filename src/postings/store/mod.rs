@@ -14,7 +14,7 @@ use super::columns::{
 };
 #[cfg(doc)]
 use super::Bm25Index;
-use super::{AnalyzedDoc, DocLineage, Posting};
+use super::{clone_parallel_ordinals, AnalyzedDoc, AnalyzedField, DocLineage, Posting};
 
 /// One field's slice of the store: its own postings, per-document
 /// lengths, and running total. Structurally a complete single-field
@@ -804,72 +804,60 @@ impl Bm25Store {
         self.texts[slot] = Some(text);
         self.lineages[slot] = lineage;
         for (fi, analyzed) in doc.fields.into_iter().enumerate() {
-            let field = &mut self.fields[fi];
-            field.doc_lengths[slot] = analyzed.length;
-            field.total_length += u64::from(analyzed.length);
-            if field.sentences {
-                field.doc_sentences[slot] = analyzed.sentences.unwrap_or_else(|| {
-                    panic!(
-                        "field {:?} keeps sentence spans but the document carried none",
-                        field.name
-                    )
-                });
+            self.fields[fi].record_analyzed(doc_id, analyzed);
+        }
+    }
+}
+
+impl FieldStore {
+    fn record_analyzed(&mut self, doc_id: u32, analyzed: AnalyzedField) {
+        let slot = doc_id as usize;
+        self.doc_lengths[slot] = analyzed.length;
+        self.total_length += u64::from(analyzed.length);
+        if self.sentences {
+            self.doc_sentences[slot] = analyzed.sentences.unwrap_or_else(|| {
+                panic!(
+                    "field {:?} keeps sentence spans but the document carried none",
+                    self.name
+                )
+            });
+        }
+        let positions = if self.positions {
+            Some(analyzed.positions.unwrap_or_else(|| {
+                panic!(
+                    "field {:?} keeps positions but the document carried none",
+                    self.name
+                )
+            }))
+        } else {
+            None
+        };
+        let pos_lengths = if self.positions {
+            if analyzed.pos_lengths.is_some() {
+                self.has_lattice = true;
             }
-            let positions = if field.positions {
-                Some(analyzed.positions.unwrap_or_else(|| {
-                    panic!(
-                        "field {:?} keeps positions but the document carried none",
-                        field.name
-                    )
-                }))
-            } else {
-                None
-            };
-            let pos_lengths = if field.positions {
-                if analyzed.pos_lengths.is_some() {
-                    field.has_lattice = true;
-                }
-                analyzed.pos_lengths
-            } else {
-                None
-            };
-            if !analyzed.splade.is_empty() {
-                field
-                    .splade
-                    .get_or_insert_with(Default::default)
-                    .insert_doc(doc_id, analyzed.splade_scale_bits, &analyzed.splade);
-            }
-            for (ti, (term, tf, offsets)) in analyzed.terms.into_iter().enumerate() {
-                let positions = match &positions {
-                    Some(table) => {
-                        assert_eq!(
-                            table[ti].len(),
-                            offsets.len(),
-                            "positions must be parallel to offsets"
-                        );
-                        table[ti].clone()
-                    }
-                    None => Vec::new(),
-                };
-                let pos_lengths = match &pos_lengths {
-                    Some(table) => {
-                        assert_eq!(
-                            table[ti].len(),
-                            offsets.len(),
-                            "pos_lengths must be parallel to offsets"
-                        );
-                        table[ti].clone()
-                    }
-                    None => Vec::new(),
-                };
-                field.postings.entry(term).or_default().push(Posting {
-                    doc_id,
-                    tf,
-                    offsets,
-                    positions,
-                    pos_lengths,
-                });
-            }
+            analyzed.pos_lengths
+        } else {
+            None
+        };
+        if !analyzed.splade.is_empty() {
+            self.splade.get_or_insert_with(Default::default).insert_doc(
+                doc_id,
+                analyzed.splade_scale_bits,
+                &analyzed.splade,
+            );
+        }
+        for (ti, (term, tf, offsets)) in analyzed.terms.into_iter().enumerate() {
+            let positions = clone_parallel_ordinals(&positions, ti, offsets.len(), "positions");
+            let pos_lengths =
+                clone_parallel_ordinals(&pos_lengths, ti, offsets.len(), "pos_lengths");
+            self.postings.entry(term).or_default().push(Posting {
+                doc_id,
+                tf,
+                offsets,
+                positions,
+                pos_lengths,
+            });
         }
     }
 }

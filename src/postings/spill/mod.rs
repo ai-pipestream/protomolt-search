@@ -14,7 +14,7 @@ use super::format::{write_u16, write_u32};
 use super::store::FieldStore;
 #[cfg(doc)]
 use super::Bm25Store;
-use super::{AnalyzedDoc, DocLineage};
+use super::{clone_parallel_ordinals, AnalyzedDoc, AnalyzedField, DocLineage};
 
 type PendingPosting = (String, u32, u32, Vec<(u32, u32)>, Vec<u32>, Vec<u32>);
 type PostingDirectoryEntry = (String, u64, u64, u64, u32);
@@ -569,6 +569,30 @@ impl SpillBuilder {
             slot >= self.fields[0].doc_lengths.len(),
             "doc id {doc_id} already used"
         );
+        self.advance_to_slot(slot, &text, lineage)?;
+        let mut lengths = vec![0u32; self.fields.len()];
+        for (fi, analyzed) in doc.fields.into_iter().enumerate() {
+            lengths[fi] = analyzed.length;
+            self.buf_bytes += Self::append_analyzed_field(&mut self.fields[fi], doc_id, analyzed)?;
+        }
+        if lengths.iter().any(|&l| l > 0) {
+            self.doc_count += 1;
+        }
+        for (field, &length) in self.fields.iter_mut().zip(&lengths) {
+            field.doc_lengths.push(length);
+        }
+        if self.buf_bytes >= self.cap_bytes {
+            self.spill_run()?;
+        }
+        Ok(())
+    }
+
+    fn advance_to_slot(
+        &mut self,
+        slot: usize,
+        text: &str,
+        lineage: Option<DocLineage>,
+    ) -> io::Result<()> {
         for (fi, field) in self.fields.iter_mut().enumerate() {
             if field.sentences && field.sentence_stage.is_none() {
                 let path = self.dir.join(format!("sentences-f{fi:03}.stage"));
@@ -606,91 +630,64 @@ impl SpillBuilder {
                     .push(u32::try_from(stage.total).expect("sentences exceed u32"));
             }
         }
-        let mut lengths = vec![0u32; self.fields.len()];
-        for (fi, analyzed) in doc.fields.into_iter().enumerate() {
-            lengths[fi] = analyzed.length;
-            let field = &mut self.fields[fi];
-            field.total_length += u64::from(analyzed.length);
-            if let Some(stage) = field.sentence_stage.as_mut() {
-                let spans = analyzed.sentences.as_deref().unwrap_or_else(|| {
-                    panic!(
-                        "field {:?} keeps sentence spans but the document carried none",
-                        field.name
-                    )
-                });
-                for &(start, end) in spans {
-                    write_u32(&mut stage.writer, start)?;
-                    write_u32(&mut stage.writer, end)?;
-                }
-                stage.total += spans.len() as u64;
-            }
-            if !analyzed.splade.is_empty() {
-                field
-                    .splade
-                    .get_or_insert_with(crate::turbo_bridge::splade::SpladeFieldIndex::default)
-                    .insert_doc(doc_id, analyzed.splade_scale_bits, &analyzed.splade);
-            }
-            let positions = if field.positions {
-                Some(analyzed.positions.unwrap_or_else(|| {
-                    panic!(
-                        "field {:?} keeps positions but the document carried none",
-                        field.name
-                    )
-                }))
-            } else {
-                None
-            };
-            let pos_lengths = if field.positions {
-                if analyzed.pos_lengths.is_some() {
-                    field.has_lattice = true;
-                }
-                analyzed.pos_lengths
-            } else {
-                None
-            };
-            for (ti, (term, tf, offsets)) in analyzed.terms.into_iter().enumerate() {
-                let positions = match &positions {
-                    Some(table) => {
-                        assert_eq!(
-                            table[ti].len(),
-                            offsets.len(),
-                            "positions must be parallel to offsets"
-                        );
-                        table[ti].clone()
-                    }
-                    None => Vec::new(),
-                };
-                let pos_lengths = match &pos_lengths {
-                    Some(table) => {
-                        assert_eq!(
-                            table[ti].len(),
-                            offsets.len(),
-                            "pos_lengths must be parallel to offsets"
-                        );
-                        table[ti].clone()
-                    }
-                    None => Vec::new(),
-                };
-                self.buf_bytes += term.len()
-                    + 24
-                    + 16 * offsets.len()
-                    + 4 * positions.len()
-                    + 4 * pos_lengths.len();
-                field
-                    .buf
-                    .push((term, doc_id, tf, offsets, positions, pos_lengths));
-            }
-        }
-        if lengths.iter().any(|&l| l > 0) {
-            self.doc_count += 1;
-        }
-        for (field, &length) in self.fields.iter_mut().zip(&lengths) {
-            field.doc_lengths.push(length);
-        }
-        if self.buf_bytes >= self.cap_bytes {
-            self.spill_run()?;
-        }
         Ok(())
+    }
+
+    fn append_analyzed_field(
+        field: &mut FieldSpill,
+        doc_id: u32,
+        analyzed: AnalyzedField,
+    ) -> io::Result<usize> {
+        field.total_length += u64::from(analyzed.length);
+        if let Some(stage) = field.sentence_stage.as_mut() {
+            let spans = analyzed.sentences.as_deref().unwrap_or_else(|| {
+                panic!(
+                    "field {:?} keeps sentence spans but the document carried none",
+                    field.name
+                )
+            });
+            for &(start, end) in spans {
+                write_u32(&mut stage.writer, start)?;
+                write_u32(&mut stage.writer, end)?;
+            }
+            stage.total += spans.len() as u64;
+        }
+        if !analyzed.splade.is_empty() {
+            field
+                .splade
+                .get_or_insert_with(crate::turbo_bridge::splade::SpladeFieldIndex::default)
+                .insert_doc(doc_id, analyzed.splade_scale_bits, &analyzed.splade);
+        }
+        let positions = if field.positions {
+            Some(analyzed.positions.unwrap_or_else(|| {
+                panic!(
+                    "field {:?} keeps positions but the document carried none",
+                    field.name
+                )
+            }))
+        } else {
+            None
+        };
+        let pos_lengths = if field.positions {
+            if analyzed.pos_lengths.is_some() {
+                field.has_lattice = true;
+            }
+            analyzed.pos_lengths
+        } else {
+            None
+        };
+        let mut added_bytes = 0usize;
+        for (ti, (term, tf, offsets)) in analyzed.terms.into_iter().enumerate() {
+            let positions = clone_parallel_ordinals(&positions, ti, offsets.len(), "positions");
+            let pos_lengths =
+                clone_parallel_ordinals(&pos_lengths, ti, offsets.len(), "pos_lengths");
+            added_bytes +=
+                term.len() + 24 + 16 * offsets.len() + 4 * positions.len() + 4 * pos_lengths.len();
+            field
+                .buf
+                .push((term, doc_id, tf, offsets, positions, pos_lengths));
+        }
+        Ok(added_bytes)
     }
 
     /// Sort every field's buffer by `(term, doc_id)` and write each as

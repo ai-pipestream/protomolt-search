@@ -2,6 +2,7 @@
 
 mod columns;
 mod field_view;
+mod open_v6;
 mod transcode;
 mod validate;
 mod validate_v5;
@@ -16,19 +17,12 @@ use std::path::Path;
 use self::validate_v5::validate_structure;
 use super::codec::ImpactCursor;
 use super::columns::{
-    decode_binding_entry, decode_derived_entry, dictionary_sorted, FacetSlice, GeoSlice,
-    IntegerMapSlice, IntegerSlice, MapFacetSlice, MapNumericSlice, NumericSlice, StoredBinding,
-    StoredDerived, UnsignedSlice,
+    FacetSlice, GeoSlice, IntegerMapSlice, IntegerSlice, MapFacetSlice, MapNumericSlice,
+    NumericSlice, StoredBinding, StoredDerived, UnsignedSlice,
 };
 use super::format::{
-    compatible_column_kind, integrity_eager, parse_integrity, IntegrityTable,
-    COLUMN_KIND_ANALYSIS_BINDING, COLUMN_KIND_BINDING, COLUMN_KIND_DERIVED, COLUMN_KIND_F64,
-    COLUMN_KIND_FACET, COLUMN_KIND_GEO, COLUMN_KIND_I64, COLUMN_KIND_I64_PRESENT,
-    COLUMN_KIND_INDEX_BINDING, COLUMN_KIND_MAP_F64, COLUMN_KIND_MAP_FACET, COLUMN_KIND_MAP_I64,
-    COLUMN_KIND_MAP_U64, COLUMN_KIND_POSITIONS, COLUMN_KIND_POS_LENGTHS, COLUMN_KIND_SENTENCES,
-    COLUMN_KIND_SOURCES, COLUMN_KIND_SPLADE, COLUMN_KIND_U64, COLUMN_KIND_VECTOR_BINDING, MAGIC_V3,
-    MAGIC_V4, MAGIC_V5, MAGIC_V6, MAGIC_V7, MAGIC_V8, POSITIONS_ENTRY_PREFIX,
-    POS_LENGTHS_ENTRY_PREFIX, SENTENCES_ENTRY_PREFIX, SPLADE_ENTRY_PREFIX,
+    integrity_eager, parse_integrity, IntegrityTable, MAGIC_V3, MAGIC_V4, MAGIC_V5, MAGIC_V6,
+    MAGIC_V7, MAGIC_V8,
 };
 #[cfg(test)]
 use super::BLOCK;
@@ -344,25 +338,7 @@ impl Bm25Reader {
             return Err(invalid("not a v3/v4/v5/v6/v7/v8 .bm25 file"));
         }
         if &map[..8] == MAGIC_V8 {
-            let table = parse_integrity(&map)?;
-            // Verify every section open reads anyway; the lazily-paged
-            // blobs (texts, per-field postings) wait for
-            // `verify_integrity`, because reading 50 GB at open would
-            // defeat the mmap paging model.
-            for e in table.entries.iter().filter(|e| integrity_eager(&e.name)) {
-                let got = crate::wal::crc32(&map[e.off as usize..(e.off + e.len) as usize]);
-                if got != e.crc {
-                    return Err(invalid(&format!(
-                        "section {} CRC mismatch: stored {:08x}, computed {got:08x} — the bytes are not the ones the build wrote",
-                        e.name, e.crc
-                    )));
-                }
-            }
-            let base_v7 = table.base_v7;
-            let payload_len = table.payload_len as usize;
-            let mut reader = Self::open_v6v7_bounded(map, base_v7, payload_len)?;
-            reader.integrity = Some(table);
-            return Ok(reader);
+            return Self::open_v8(map);
         }
         if &map[..8] == MAGIC_V7 {
             return Self::open_v6v7(map, true);
@@ -373,6 +349,31 @@ impl Bm25Reader {
         if &map[..8] != MAGIC_V5 && &map[..8] != MAGIC_V4 && &map[..8] != MAGIC_V3 {
             return Err(invalid("not a v3/v4/v5/v6/v7/v8 .bm25 file"));
         }
+        Self::open_legacy_v3v5(map)
+    }
+
+    fn open_v8(map: memmap2::Mmap) -> io::Result<Self> {
+        let table = parse_integrity(&map)?;
+        for e in table.entries.iter().filter(|e| integrity_eager(&e.name)) {
+            let got = crate::wal::crc32(&map[e.off as usize..(e.off + e.len) as usize]);
+            if got != e.crc {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "section {} CRC mismatch: stored {:08x}, computed {got:08x} — the bytes are not the ones the build wrote",
+                        e.name, e.crc
+                    ),
+                ));
+            }
+        }
+        let base_v7 = table.base_v7;
+        let payload_len = table.payload_len as usize;
+        let mut reader = Self::open_v6v7_bounded(map, base_v7, payload_len)?;
+        reader.integrity = Some(table);
+        Ok(reader)
+    }
+
+    fn open_legacy_v3v5(map: memmap2::Mmap) -> io::Result<Self> {
         let v5 = &map[..8] == MAGIC_V5;
         let blob_relative = &map[..8] != MAGIC_V3;
         validate_structure(&map, v5, blob_relative)?;
@@ -404,7 +405,6 @@ impl Bm25Reader {
             map,
             fields: vec![FieldSlice {
                 name: "body".to_string(),
-                // v3/v4/v5 carry no field table, so no fingerprint.
                 analysis_fingerprint: 0,
                 doc_lengths,
                 total_length,
@@ -434,324 +434,6 @@ impl Bm25Reader {
             text_base: 0,
             v5_runs: v5,
             blob_relative,
-            lineage_index: std::sync::OnceLock::new(),
-            integrity: None,
-            facet_rows: std::sync::OnceLock::new(),
-            number_rows: SortedNumbers::default(),
-        })
-    }
-
-    /// Open a validated v6 or v7 map, one [`FieldSlice`] per
-    /// field-table entry (plus one [`FacetSlice`] per v7 facet-table
-    /// entry). Every field's sections are v5-shaped, so the entire v5
-    /// read machinery serves each field with run offsets rebased by
-    /// that field's postings section offset.
-    fn open_v6v7(map: memmap2::Mmap, v7: bool) -> io::Result<Self> {
-        let len = map.len();
-        Self::open_v6v7_bounded(map, v7, len)
-    }
-
-    /// [`Self::open_v6v7`] with the payload's byte length made
-    /// explicit: a v8 file carries its integrity section and trailer
-    /// AFTER the payload, and the structural validator derives the
-    /// last section's extent from where the bytes end, so it must see
-    /// the payload's end, not the file's.
-    fn open_v6v7_bounded(map: memmap2::Mmap, v7: bool, payload_len: usize) -> io::Result<Self> {
-        validate_structure_v6(&map[..payload_len], v7)?;
-        let u32_at = |off: usize| u32::from_le_bytes(map[off..off + 4].try_into().unwrap());
-        let u64_at = |off: usize| u64::from_le_bytes(map[off..off + 8].try_into().unwrap());
-        let n_fields = u32_at(8) as usize;
-        let n_slots = u32_at(12) as usize;
-        let texts_off = u64_at(16);
-        let text_index_off = u64_at(24);
-        let lineages_off = u64_at(32);
-        // Field table walk (validation already checked the geometry and
-        // the names).
-        let mut fields = Vec::with_capacity(n_fields);
-        let mut cursor = 40usize;
-        for _ in 0..n_fields {
-            let name_len = u16::from_le_bytes(map[cursor..cursor + 2].try_into().unwrap()) as usize;
-            let name =
-                String::from_utf8_lossy(&map[cursor + 2..cursor + 2 + name_len]).into_owned();
-            let base = cursor + 2 + name_len;
-            let analysis_fingerprint = u64_at(base);
-            let total_length = u64_at(base + 8);
-            let doc_lengths_off = u64_at(base + 16) as usize;
-            let postings_off = u64_at(base + 24);
-            let directory_off = u64_at(base + 32);
-            let mut doc_lengths = Vec::with_capacity(n_slots);
-            for slot in 0..n_slots {
-                doc_lengths.push(u32_at(doc_lengths_off + 4 * slot));
-            }
-            let n_terms = u32_at(directory_off as usize);
-            fields.push(FieldSlice {
-                name,
-                analysis_fingerprint,
-                doc_lengths,
-                total_length,
-                directory_off,
-                n_terms,
-                run_base: postings_off,
-                positions_off: None,
-                pos_lengths_off: None,
-                splade_range: None,
-                sentences_off: None,
-            });
-            cursor = base + 40;
-        }
-        // Column table (v7 only): decode each facet dictionary eagerly
-        // (one entry per distinct value — small) and each numeric
-        // column's min/max metadata; ords and vals sections stay in the
-        // map. Unknown kinds were already refused by validation.
-        let mut facets = Vec::new();
-        let mut numerics = Vec::new();
-        let mut map_facets = Vec::new();
-        let mut map_numerics = Vec::new();
-        let mut map_integers = Vec::new();
-        let mut map_unsigned_integers = Vec::new();
-        let mut integers = Vec::new();
-        let mut unsigned_integers = Vec::new();
-        let mut geos = Vec::new();
-        let mut binding = None;
-        let mut derived = None;
-        let mut source_section = None;
-        if v7 {
-            // Decode a length-prefixed dictionary of `n` entries
-            // starting at `off`, returning (entries, end offset).
-            let read_dict = |off: usize, n: usize| -> (Vec<String>, usize) {
-                let mut entries = Vec::with_capacity(n);
-                let mut cur = off;
-                for _ in 0..n {
-                    let len = u16::from_le_bytes(map[cur..cur + 2].try_into().unwrap()) as usize;
-                    entries
-                        .push(String::from_utf8_lossy(&map[cur + 2..cur + 2 + len]).into_owned());
-                    cur += 2 + len;
-                }
-                (entries, cur)
-            };
-            let n_columns = u32_at(cursor) as usize;
-            cursor += 4;
-            for _ in 0..n_columns {
-                let name_len =
-                    u16::from_le_bytes(map[cursor..cursor + 2].try_into().unwrap()) as usize;
-                let name =
-                    String::from_utf8_lossy(&map[cursor + 2..cursor + 2 + name_len]).into_owned();
-                let kind = map[cursor + 2 + name_len];
-                let base = cursor + 2 + name_len + 1;
-                let kind =
-                    compatible_column_kind(kind, name.as_bytes(), &map[base..], map.len() as u64);
-                match kind {
-                    COLUMN_KIND_FACET => {
-                        let n_values = u32_at(base) as usize;
-                        let dict_off = u64_at(base + 4) as usize;
-                        let ords_off = u64_at(base + 12);
-                        let (dict, _) = read_dict(dict_off, n_values);
-                        let sorted = dictionary_sorted(&dict);
-                        facets.push(FacetSlice {
-                            name,
-                            dict,
-                            sorted,
-                            ords_off,
-                        });
-                        cursor = base + 20;
-                    }
-                    COLUMN_KIND_F64 => {
-                        numerics.push(NumericSlice {
-                            name,
-                            min: f64::from_bits(u64_at(base)),
-                            max: f64::from_bits(u64_at(base + 8)),
-                            vals_off: u64_at(base + 16),
-                        });
-                        cursor = base + 24;
-                    }
-                    COLUMN_KIND_MAP_FACET => {
-                        let n_keys = u32_at(base) as usize;
-                        let n_values = u32_at(base + 4) as usize;
-                        let keys_off = u64_at(base + 8) as usize;
-                        let values_off = u64_at(base + 16) as usize;
-                        let offsets_off = u64_at(base + 24);
-                        let pairs_off = u64_at(base + 32);
-                        let (keys, _) = read_dict(keys_off, n_keys);
-                        let (values, _) = read_dict(values_off, n_values);
-                        let keys_sorted = dictionary_sorted(&keys);
-                        let values_sorted = dictionary_sorted(&values);
-                        map_facets.push(MapFacetSlice {
-                            name,
-                            keys,
-                            values,
-                            keys_sorted,
-                            values_sorted,
-                            offsets_off,
-                            pairs_off,
-                        });
-                        cursor = base + 40;
-                    }
-                    COLUMN_KIND_MAP_F64 => {
-                        let n_keys = u32_at(base) as usize;
-                        let keys_off = u64_at(base + 4) as usize;
-                        let offsets_off = u64_at(base + 12);
-                        let pairs_off = u64_at(base + 20);
-                        // Key entries interleave name and min/max
-                        // metadata, so read_dict does not apply.
-                        let mut keys = Vec::with_capacity(n_keys);
-                        let mut key_min_max = Vec::with_capacity(n_keys);
-                        let mut cur = keys_off;
-                        for _ in 0..n_keys {
-                            let len =
-                                u16::from_le_bytes(map[cur..cur + 2].try_into().unwrap()) as usize;
-                            keys.push(
-                                String::from_utf8_lossy(&map[cur + 2..cur + 2 + len]).into_owned(),
-                            );
-                            key_min_max.push((
-                                f64::from_bits(u64_at(cur + 2 + len)),
-                                f64::from_bits(u64_at(cur + 2 + len + 8)),
-                            ));
-                            cur += 2 + len + 16;
-                        }
-                        map_numerics.push(MapNumericSlice {
-                            name,
-                            keys,
-                            key_min_max,
-                            offsets_off,
-                            pairs_off,
-                        });
-                        cursor = base + 28;
-                    }
-                    COLUMN_KIND_MAP_I64 | COLUMN_KIND_MAP_U64 => {
-                        let off = u64_at(base) as usize;
-                        let len = u64_at(base + 8) as usize;
-                        if kind == COLUMN_KIND_MAP_I64 {
-                            map_integers.push(IntegerMapSlice {
-                                name,
-                                off,
-                                len,
-                                reader: crate::integer_map::Reader::open(
-                                    &map[off..off + len],
-                                    n_slots as u32,
-                                )?,
-                            });
-                        } else {
-                            map_unsigned_integers.push(IntegerMapSlice {
-                                name,
-                                off,
-                                len,
-                                reader: crate::integer_map::Reader::open(
-                                    &map[off..off + len],
-                                    n_slots as u32,
-                                )?,
-                            });
-                        }
-                        cursor = base + 16;
-                    }
-                    COLUMN_KIND_I64 | COLUMN_KIND_I64_PRESENT => {
-                        integers.push(IntegerSlice {
-                            name,
-                            min: u64_at(base) as i64,
-                            max: u64_at(base + 8) as i64,
-                            vals_off: u64_at(base + 16),
-                            presence_off: (kind == COLUMN_KIND_I64_PRESENT)
-                                .then(|| u64_at(base + 16) + 8 * n_slots as u64),
-                        });
-                        cursor = base + 24;
-                    }
-                    COLUMN_KIND_U64 => {
-                        unsigned_integers.push(UnsignedSlice {
-                            name,
-                            min: u64_at(base),
-                            max: u64_at(base + 8),
-                            vals_off: u64_at(base + 16),
-                        });
-                        cursor = base + 24;
-                    }
-                    COLUMN_KIND_GEO => {
-                        geos.push(GeoSlice {
-                            name,
-                            bbox: (
-                                f64::from_bits(u64_at(base)),
-                                f64::from_bits(u64_at(base + 8)),
-                                f64::from_bits(u64_at(base + 16)),
-                                f64::from_bits(u64_at(base + 24)),
-                            ),
-                            vals_off: u64_at(base + 32),
-                        });
-                        cursor = base + 40;
-                    }
-                    COLUMN_KIND_POSITIONS => {
-                        field_by_prefixed_name(&mut fields, &name, POSITIONS_ENTRY_PREFIX, kind)
-                            .positions_off = Some(u64_at(base));
-                        cursor = base + 16;
-                    }
-                    COLUMN_KIND_SENTENCES => {
-                        field_by_prefixed_name(&mut fields, &name, SENTENCES_ENTRY_PREFIX, kind)
-                            .sentences_off = Some(u64_at(base));
-                        cursor = base + 16;
-                    }
-                    COLUMN_KIND_SOURCES => {
-                        let off = u64_at(base);
-                        let len = u64_at(base + 8);
-                        let reader = crate::source_archive::SourceArchiveReader::open(
-                            &map[off as usize..(off + len) as usize],
-                            n_slots as u32,
-                        )?;
-                        source_section = Some((off, len, reader));
-                        cursor = base + 16;
-                    }
-                    COLUMN_KIND_POS_LENGTHS => {
-                        field_by_prefixed_name(
-                            &mut fields,
-                            &name,
-                            POS_LENGTHS_ENTRY_PREFIX,
-                            kind,
-                        )
-                        .pos_lengths_off = Some(u64_at(base));
-                        cursor = base + 16;
-                    }
-                    COLUMN_KIND_SPLADE => {
-                        field_by_prefixed_name(&mut fields, &name, SPLADE_ENTRY_PREFIX, kind)
-                            .splade_range = Some((u64_at(base), u64_at(base + 8)));
-                        cursor = base + 16;
-                    }
-                    COLUMN_KIND_BINDING
-                    | COLUMN_KIND_ANALYSIS_BINDING
-                    | COLUMN_KIND_VECTOR_BINDING
-                    | COLUMN_KIND_INDEX_BINDING => {
-                        let (decoded, used) = decode_binding_entry(kind, &map[base..])?;
-                        binding = Some(decoded);
-                        cursor = base + used;
-                    }
-                    COLUMN_KIND_DERIVED => {
-                        let (decoded, used) = decode_derived_entry(&map[base..])?;
-                        derived = Some(decoded);
-                        cursor = base + used;
-                    }
-                    k => unreachable!("validation refused unknown column kind {k}"),
-                }
-            }
-        }
-        let doc_count = (0..n_slots)
-            .filter(|&slot| fields.iter().any(|f| f.doc_lengths[slot] > 0))
-            .count() as u64;
-        Ok(Self {
-            map,
-            fields,
-            facets,
-            numerics,
-            map_facets,
-            map_numerics,
-            map_integers,
-            map_unsigned_integers,
-            integers,
-            unsigned_integers,
-            geos,
-            doc_count,
-            lineages_off,
-            text_index_off,
-            text_base: texts_off,
-            v5_runs: true,
-            blob_relative: true,
-            binding,
-            derived,
-            source_section,
             lineage_index: std::sync::OnceLock::new(),
             integrity: None,
             facet_rows: std::sync::OnceLock::new(),
@@ -1161,19 +843,4 @@ impl crate::filter_bits::PartNumbers for Bm25Reader {
     fn f64_sorted(&self, column: usize) -> Option<&crate::number_rows::NumberRows<f64>> {
         (column < self.numeric_count()).then(|| self.numeric_rows(column))
     }
-}
-
-fn field_by_prefixed_name<'a>(
-    fields: &'a mut [FieldSlice],
-    name: &str,
-    prefix: &str,
-    kind: u8,
-) -> &'a mut FieldSlice {
-    let field = name
-        .strip_prefix(prefix)
-        .unwrap_or_else(|| panic!("validation checked the kind-{kind} name"));
-    fields
-        .iter_mut()
-        .find(|f| f.name == field)
-        .unwrap_or_else(|| panic!("validation tied the kind-{kind} entry to a field"))
 }

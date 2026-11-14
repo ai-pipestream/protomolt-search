@@ -347,7 +347,7 @@ impl Bm25Store {
         self.write_v4_to(w)
     }
 
-    fn write_v4_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
+    fn validate_v4_store(&self) -> io::Result<()> {
         if !self.columns.map_integers.is_empty() || !self.columns.map_unsigned_integers.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -384,6 +384,11 @@ impl Bm25Store {
                 "v4 carries no columns; column-bearing stores write v7",
             ));
         }
+        Ok(())
+    }
+
+    fn write_v4_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        self.validate_v4_store()?;
         let field = &self.fields[0];
         let n_slots = self.texts.len() as u64;
         let header_size = 8 + 8 + 8 * 4 + 4;
@@ -418,11 +423,19 @@ impl Bm25Store {
         write_u32(w, n_slots as u32)?;
         Self::write_field_doc_lengths(w, field)?;
         self.write_shared_sections(w, texts_off)?;
+        Self::write_v4_postings_and_directory(w, field, &terms, postings_off)
+    }
 
+    fn write_v4_postings_and_directory<W: Write>(
+        w: &mut W,
+        field: &FieldStore,
+        terms: &[&String],
+        postings_off: u64,
+    ) -> io::Result<()> {
         write_u32(w, terms.len() as u32)?;
         let mut directory: Vec<(u64, u32)> = Vec::with_capacity(terms.len());
         let mut cursor = postings_off + 4;
-        for term in &terms {
+        for term in terms {
             let postings = &field.postings[*term];
             directory.push((cursor, postings.len() as u32));
             write_str(w, term)?;
@@ -448,7 +461,7 @@ impl Bm25Store {
             write_u16(w, term.len() as u16)?;
             blob_off += term.len() as u64;
         }
-        for term in &terms {
+        for term in terms {
             w.write_all(term.as_bytes())?;
         }
         Ok(())

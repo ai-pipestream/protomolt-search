@@ -94,15 +94,7 @@ impl SpillBuilder {
         Ok(directory)
     }
 
-    fn finish_v6(&mut self, path: &Path) -> io::Result<()> {
-        self.spill_run()?;
-        self.texts.flush()?;
-        for field in &mut self.fields {
-            if let Some(stage) = field.sentence_stage.as_mut() {
-                stage.writer.flush()?;
-            }
-        }
-
+    fn merge_all_field_stages(&self) -> io::Result<Vec<MergedFieldStage>> {
         let occ_stage_path = self.dir.join("occ.stage");
         let mut merged_fields = Vec::with_capacity(self.fields.len());
         for (fi, field) in self.fields.iter().enumerate() {
@@ -137,7 +129,18 @@ impl SpillBuilder {
                 pos_lengths: len_stage,
             });
         }
+        Ok(merged_fields)
+    }
 
+    fn finish_v6(&mut self, path: &Path) -> io::Result<()> {
+        self.spill_run()?;
+        self.texts.flush()?;
+        for field in &mut self.fields {
+            if let Some(stage) = field.sentence_stage.as_mut() {
+                stage.writer.flush()?;
+            }
+        }
+        let merged_fields = self.merge_all_field_stages()?;
         let field_descs: Vec<FieldSectionDesc<'_>> = self
             .fields
             .iter()
@@ -167,7 +170,6 @@ impl SpillBuilder {
                 }
             })
             .collect();
-
         let params = V6PayloadParams {
             n_slots: self.fields[0].doc_lengths.len() as u64,
             texts_size: self.texts_bytes,
@@ -185,8 +187,51 @@ impl SpillBuilder {
         std::fs::remove_dir_all(&self.dir)
     }
 
-    /// Merge the runs and assemble the v4 file at `path` (benchmarking/migration only).
-    fn finish_v4(&mut self, path: &Path) -> io::Result<()> {
+    fn merge_v4_runs(
+        runs: &[PathBuf],
+        postings_body: &Path,
+    ) -> io::Result<Vec<(String, u64, u32)>> {
+        let mut directory: Vec<(String, u64, u32)> = Vec::new();
+        let mut out = io::BufWriter::new(std::fs::File::create(postings_body)?);
+        let mut heads: Vec<RunHead> = Vec::new();
+        for run in runs {
+            if let Some(head) = RunHead::open(run, false)? {
+                heads.push(head);
+            }
+        }
+        let mut cursor = 0u64;
+        while !heads.is_empty() {
+            let term = heads
+                .iter()
+                .map(|h| h.term.clone())
+                .min()
+                .expect("nonempty heads");
+            let df: u32 = heads
+                .iter()
+                .filter(|h| h.term == term)
+                .map(|h| h.n_postings)
+                .sum();
+            write_str(&mut out, &term)?;
+            write_u32(&mut out, df)?;
+            directory.push((term.clone(), cursor, df));
+            cursor += 4 + term.len() as u64 + 4;
+            let mut idx = 0;
+            while idx < heads.len() {
+                if heads[idx].term == term {
+                    cursor += heads[idx].copy_postings(&mut out)?;
+                    if !heads[idx].advance()? {
+                        heads.remove(idx);
+                        continue;
+                    }
+                }
+                idx += 1;
+            }
+        }
+        out.flush()?;
+        Ok(directory)
+    }
+
+    fn validate_v4_spill(&self) -> io::Result<()> {
         if !self.sources.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -205,49 +250,17 @@ impl SpillBuilder {
                 "the v4 oracle format cannot carry sentence spans",
             ));
         }
+        Ok(())
+    }
+
+    /// Merge the runs and assemble the v4 file at `path` (benchmarking/migration only).
+    fn finish_v4(&mut self, path: &Path) -> io::Result<()> {
+        self.validate_v4_spill()?;
         self.spill_run()?;
         self.texts.flush()?;
 
         let postings_body = self.dir.join("postings.body");
-        let mut directory: Vec<(String, u64, u32)> = Vec::new();
-        {
-            let mut out = io::BufWriter::new(std::fs::File::create(&postings_body)?);
-            let mut heads: Vec<RunHead> = Vec::new();
-            for run in &self.fields[0].runs {
-                if let Some(head) = RunHead::open(run, false)? {
-                    heads.push(head);
-                }
-            }
-            let mut cursor = 0u64;
-            while !heads.is_empty() {
-                let term = heads
-                    .iter()
-                    .map(|h| h.term.clone())
-                    .min()
-                    .expect("nonempty heads");
-                let df: u32 = heads
-                    .iter()
-                    .filter(|h| h.term == term)
-                    .map(|h| h.n_postings)
-                    .sum();
-                write_str(&mut out, &term)?;
-                write_u32(&mut out, df)?;
-                directory.push((term.clone(), cursor, df));
-                cursor += 4 + term.len() as u64 + 4;
-                let mut idx = 0;
-                while idx < heads.len() {
-                    if heads[idx].term == term {
-                        cursor += heads[idx].copy_postings(&mut out)?;
-                        if !heads[idx].advance()? {
-                            heads.remove(idx);
-                            continue;
-                        }
-                    }
-                    idx += 1;
-                }
-            }
-            out.flush()?;
-        }
+        let directory = Self::merge_v4_runs(&self.fields[0].runs, &postings_body)?;
         let postings_body_len = std::fs::metadata(&postings_body)?.len();
 
         let field = &self.fields[0];
@@ -278,13 +291,14 @@ impl SpillBuilder {
             for &len in &field.doc_lengths {
                 write_u32(&mut w, len)?;
             }
-            let mut spill = std::fs::File::open(self.dir.join("texts.spill"))?;
-            io::copy(&mut spill, &mut w)?;
+            io::copy(
+                &mut std::fs::File::open(self.dir.join("texts.spill"))?,
+                &mut w,
+            )?;
             write_text_index_from_lens(&mut w, texts_off, self.text_lens.iter().copied())?;
             write_lineages(&mut w, &self.lineages)?;
             write_u32(&mut w, directory.len() as u32)?;
-            let mut body = std::fs::File::open(&postings_body)?;
-            io::copy(&mut body, &mut w)?;
+            io::copy(&mut std::fs::File::open(&postings_body)?, &mut w)?;
             write_u32(&mut w, directory.len() as u32)?;
             let mut blob_off = 0u64;
             for (term, rel_off, df) in &directory {

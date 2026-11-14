@@ -517,6 +517,25 @@ impl AnalyzedDoc {
     }
 }
 
+fn clone_parallel_ordinals(
+    table: &Option<Vec<Vec<u32>>>,
+    term_idx: usize,
+    expected_len: usize,
+    label: &str,
+) -> Vec<u32> {
+    match table {
+        Some(rows) => {
+            assert_eq!(
+                rows[term_idx].len(),
+                expected_len,
+                "{label} must be parallel to offsets"
+            );
+            rows[term_idx].clone()
+        }
+        None => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod derived_compat_tests;
 #[cfg(test)]

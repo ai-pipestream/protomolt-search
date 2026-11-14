@@ -1,5 +1,6 @@
 //! Typed heap column stores, `ColumnSet`, metadata records, and mmapped column slices.
 
+mod map_stores;
 mod metadata;
 mod set;
 mod slices;
@@ -8,6 +9,10 @@ mod stores;
 pub use self::metadata::{StoredBinding, StoredDerived};
 pub use self::set::ColumnKind;
 
+pub(in crate::postings) use self::map_stores::{
+    integer_map_sections, write_integer_map_entries, write_map_facet_column,
+    write_map_numeric_column, MapFacetStore, MapNumericStore,
+};
 pub(in crate::postings) use self::metadata::{
     decode_binding_entry, decode_derived_entry, write_binding_entry, write_derived_entry,
 };
@@ -19,10 +24,8 @@ pub(in crate::postings) use self::slices::{
     NumericSlice, UnsignedSlice,
 };
 pub(in crate::postings) use self::stores::{
-    dictionary_lookup, dictionary_sorted, integer_map_sections, integer_present,
-    write_facet_column, write_integer_map_entries, write_map_facet_column,
-    write_map_numeric_column, FacetStore, GeoStore, IntStore, MapFacetStore, MapNumericStore,
-    NumericStore, UintStore,
+    dictionary_lookup, dictionary_sorted, integer_present, write_facet_column, FacetStore,
+    GeoStore, IntStore, NumericStore, UintStore,
 };
 
 /// The ordinal marking "this document has no value for this facet
