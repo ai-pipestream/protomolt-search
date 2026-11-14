@@ -230,3 +230,43 @@ async fn node_rust_helper_rejects_oversized_k_before_wire_conversion() {
         [(0, 8.0), (1, 8.0)]
     );
 }
+
+#[tokio::test]
+async fn coordinator_splade_enforces_deadline_before_and_during_remote_fanout() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let coordinator =
+        CoordinatorServiceImpl::new(vec![format!("http://{}", listener.local_addr().unwrap())]);
+    let query = [("a".to_string(), 1.0_f32)];
+
+    let expired = coordinator
+        .score_splade_with_deadline("body", &query, 0.0, 2, "", 1)
+        .await
+        .unwrap_err();
+    assert_eq!(expired.code(), Code::DeadlineExceeded);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), listener.accept())
+            .await
+            .is_err(),
+        "an expired SPLADE deadline must fail before dialing any shard"
+    );
+
+    let deadline = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        + std::time::Duration::from_millis(400))
+    .as_micros() as u64;
+    let inflight = tokio::spawn(async move {
+        coordinator
+            .score_splade_with_deadline("body", &query, 0.0, 2, "", deadline)
+            .await
+    });
+    let (_conn, _) = tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(3), inflight)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.unwrap_err().code(), Code::DeadlineExceeded);
+}

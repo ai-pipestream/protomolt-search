@@ -154,27 +154,56 @@ impl SpladeFieldIndex {
 
     /// Exact serialized byte length of this section (v1 uniform or v2 mixed scale).
     pub fn encoded_len(&self) -> u64 {
-        if self.postings.is_empty() {
-            return 0;
-        }
-        // magic (8) + scale_bits (4) + n_terms (4)
-        let mut size = 16u64;
-        for (term, plist) in &self.postings {
+        self.encoded_len_for_terms(
+            self.postings
+                .iter()
+                .map(|(t, p)| (t.as_str(), p.as_slice())),
+        )
+    }
+
+    fn encoded_len_for_terms<'a>(
+        &self,
+        terms: impl Iterator<Item = (&'a str, &'a [(u32, u16)])>,
+    ) -> u64 {
+        let mut size = 0u64;
+        let mut any = false;
+        let block_stride = if self.scales.is_empty() { 8 } else { 12 };
+        let posting_stride = if self.scales.is_empty() { 6 } else { 10 };
+        for (term, plist) in terms {
+            any = true;
             let n_blocks = plist.len().div_ceil(SPLADE_BLOCK_SIZE) as u64;
-            // term_len (2) + term + df (4) + n_blocks (4) + blocks (n_blocks * 8) + postings (df * 6)
             size += 2
                 + term.len() as u64
                 + 4
                 + 4
-                + n_blocks * if self.scales.is_empty() { 8 } else { 12 }
-                + (plist.len() as u64) * if self.scales.is_empty() { 6 } else { 10 };
+                + n_blocks * block_stride
+                + (plist.len() as u64) * posting_stride;
         }
-        size
+        if any {
+            16 + size
+        } else {
+            0
+        }
     }
 
     /// Writes v1 for uniform scales or lossless v2 for mixed document scales.
     pub fn write<W: Write>(&self, w: &mut W) -> io::Result<()> {
-        if self.postings.is_empty() {
+        self.write_terms(
+            self.postings.len(),
+            self.postings
+                .iter()
+                .map(|(t, p)| (t.as_str(), p.as_slice())),
+            w,
+        )
+    }
+
+    fn write_terms<'a, W: Write>(
+        &self,
+        term_count: usize,
+        terms: impl Iterator<Item = (&'a str, &'a [(u32, u16)])>,
+        w: &mut W,
+    ) -> io::Result<()> {
+        if term_count == 0 {
             return Ok(());
         }
         let mixed = !self.scales.is_empty();
@@ -184,8 +213,8 @@ impl SpladeFieldIndex {
             SPLADE_SECTION_MAGIC
         })?;
         w.write_all(&self.scale_bits.to_le_bytes())?;
-        w.write_all(&(self.postings.len() as u32).to_le_bytes())?;
-        for (term, plist) in &self.postings {
+        w.write_all(&(term_count as u32).to_le_bytes())?;
+        for (term, plist) in terms {
             let term_bytes = term.as_bytes();
             w.write_all(&(term_bytes.len() as u16).to_le_bytes())?;
             w.write_all(term_bytes)?;
@@ -287,9 +316,28 @@ impl SpladeFieldIndex {
         if k == 0 || self.postings.is_empty() || query_weights.is_empty() {
             return (Vec::new(), floor, SpladeTraversalStats::default());
         }
-        let mut buf = Vec::with_capacity(self.encoded_len() as usize);
-        self.write(&mut buf)
-            .expect("in-memory SpladeFieldIndex encode");
+        let mut matched_terms: BTreeMap<&str, &[(u32, u16)]> = BTreeMap::new();
+        for (term, weight) in query_weights {
+            if weight.is_finite() && *weight > 0.0 {
+                if let Some(plist) = self.postings.get(term.as_str()) {
+                    if !plist.is_empty() {
+                        matched_terms.insert(term.as_str(), plist.as_slice());
+                    }
+                }
+            }
+        }
+        if matched_terms.is_empty() {
+            return (Vec::new(), floor, SpladeTraversalStats::default());
+        }
+        let encoded_len =
+            self.encoded_len_for_terms(matched_terms.iter().map(|(&t, &p)| (t, p))) as usize;
+        let mut buf = Vec::with_capacity(encoded_len);
+        self.write_terms(
+            matched_terms.len(),
+            matched_terms.iter().map(|(&t, &p)| (t, p)),
+            &mut buf,
+        )
+        .expect("in-memory SpladeFieldIndex query subset encode");
         let reader = SpladeSectionReader::open(&buf).expect("valid encoded SpladeFieldIndex");
         reader.score_top_k_with_floor(query_weights, query_l1_slack, floor, k, admitted)
     }

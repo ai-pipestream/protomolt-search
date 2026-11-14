@@ -3201,6 +3201,20 @@ impl CoordinatorServiceImpl {
         k: usize,
         filter_cel: &str,
     ) -> Result<Vec<(u64, f32)>, Status> {
+        self.score_splade_with_deadline(field, query_weights, query_l1_slack, k, filter_cel, 0)
+            .await
+    }
+
+    /// Fan out quantized SPLADE scoring bounded by an absolute microsecond deadline (`0` = unbounded).
+    pub async fn score_splade_with_deadline(
+        &self,
+        field: &str,
+        query_weights: &[(String, f32)],
+        query_l1_slack: f32,
+        k: usize,
+        filter_cel: &str,
+        finish_deadline_us: u64,
+    ) -> Result<Vec<(u64, f32)>, Status> {
         let coordinator = self.request_snapshot().unwrap_or_else(|| self.clone());
         let max_k = coordinator.knobs.max_k();
         if k > max_k as usize {
@@ -3210,12 +3224,47 @@ impl CoordinatorServiceImpl {
         }
         let wire_k = u32::try_from(k)
             .map_err(|_| Status::invalid_argument("SPLADE k exceeds the wire range"))?;
+        let remaining = crate::turbo_bridge::remaining_deadline_duration(finish_deadline_us)?;
         if k == 0 || query_weights.is_empty() {
             return Ok(Vec::new());
         }
+        let run = coordinator.score_splade_inner(
+            field,
+            query_weights,
+            query_l1_slack,
+            k,
+            wire_k,
+            filter_cel,
+            finish_deadline_us,
+        );
+        let result = match remaining {
+            Some(remaining) => tokio::time::timeout(remaining, run)
+                .await
+                .map_err(|_| Status::deadline_exceeded("SPLADE query deadline expired"))?,
+            None => run.await,
+        };
+        if matches!(&result, Err(status) if status.code() == tonic::Code::Cancelled)
+            && crate::turbo_bridge::remaining_deadline_duration(finish_deadline_us).is_err()
+        {
+            return Err(Status::deadline_exceeded("SPLADE query deadline expired"));
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn score_splade_inner(
+        &self,
+        field: &str,
+        query_weights: &[(String, f32)],
+        query_l1_slack: f32,
+        k: usize,
+        wire_k: u32,
+        filter_cel: &str,
+        finish_deadline_us: u64,
+    ) -> Result<Vec<(u64, f32)>, Status> {
         let filters = RequestFilters::compile(&[], filter_cel)?;
-        let mask = coordinator.shard_mask(filters.tree.as_ref());
-        let trees = coordinator.shard_filter_trees(&filters, mask.as_ref());
+        let mask = self.shard_mask(filters.tree.as_ref());
+        let trees = self.shard_filter_trees(&filters, mask.as_ref());
         let mut known = Self::filter_known(&filters, mask.as_ref());
         let wire_weights: Vec<crate::pb::SpladeTermWeight> = query_weights
             .iter()
@@ -3226,25 +3275,28 @@ impl CoordinatorServiceImpl {
             .collect();
         let mut merged: Vec<(u64, f32)> = Vec::new();
         let mut running_floor: f32 = 0.0;
-        for (shard, addr) in coordinator.node_addrs.iter().enumerate() {
+        for (shard, addr) in self.node_addrs.iter().enumerate() {
             if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
                 continue;
             }
-            let mut link = coordinator.node_client(addr)?;
-            let resp = link
-                .score_splade(crate::pb::ScoreSpladeRequest {
-                    field: field.to_string(),
-                    query_weights: wire_weights.clone(),
-                    query_l1_slack,
-                    k: wire_k,
-                    filter: trees[shard].clone(),
-                    initial_floor: running_floor,
-                    visibility: coordinator.document_visibility.clone(),
-                    expected_stats_epoch: 0,
-                    expected_stats_incarnation: Vec::new(),
-                })
-                .await?
-                .into_inner();
+            let mut link = self.node_client(addr)?;
+            let mut request = Request::new(crate::pb::ScoreSpladeRequest {
+                field: field.to_string(),
+                query_weights: wire_weights.clone(),
+                query_l1_slack,
+                k: wire_k,
+                filter: trees[shard].clone(),
+                initial_floor: running_floor,
+                visibility: self.document_visibility.clone(),
+                expected_stats_epoch: 0,
+                expected_stats_incarnation: Vec::new(),
+            });
+            if let Some(remaining) =
+                crate::turbo_bridge::remaining_deadline_duration(finish_deadline_us)?
+            {
+                request.set_timeout(remaining);
+            }
+            let resp = link.score_splade(request).await?.into_inner();
             known.merge_shard(shard, &[], &resp.filter_columns_known)?;
             for hit in resp.hits {
                 merged.push((hit.doc_id, hit.score));

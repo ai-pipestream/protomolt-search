@@ -71,3 +71,36 @@ fn pathological_k_on_empty_or_nonmatching_fields_stays_empty() {
         .0
         .is_empty());
 }
+
+#[test]
+fn query_scoped_mutable_tail_encoding_matches_full_section_reader() {
+    let mut field = SpladeFieldIndex::default();
+    for doc in 0..320_u32 {
+        let scale = if doc % 2 == 0 { 1.0_f32 } else { 0.5_f32 };
+        let mut impacts = vec![
+            (format!("noise_vocab_{}", doc % 97), 12),
+            (format!("singleton_{doc}"), 20),
+        ];
+        if doc % 3 == 0 {
+            impacts.push(("alpha".into(), (doc % 50 + 1) as u16));
+        }
+        if doc % 5 == 0 {
+            impacts.push(("beta".into(), (doc % 40 + 2) as u16));
+        }
+        field.insert_doc(doc, scale.to_bits(), &impacts);
+    }
+
+    let mut full_bytes = Vec::new();
+    field.write(&mut full_bytes).unwrap();
+    let full_reader = SpladeSectionReader::open(&full_bytes).unwrap();
+
+    let query = [
+        ("alpha".to_string(), 1.25_f32),
+        ("beta".to_string(), 0.75_f32),
+        ("absent_term".to_string(), 5.0_f32),
+        ("alpha".to_string(), 0.25_f32),
+    ];
+    let expected = full_reader.score_top_k_with_floor(&query, 0.05, 1.0, 10, |d| d % 4 != 0);
+    let actual = field.score_top_k_with_floor(&query, 0.05, 1.0, 10, |d| d % 4 != 0);
+    assert_eq!(actual, expected);
+}
