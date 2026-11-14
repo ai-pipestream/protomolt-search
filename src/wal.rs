@@ -194,6 +194,7 @@ pub fn latest_gen(wal_dir: &Path) -> io::Result<Option<(u64, PathBuf)>> {
 /// generation requires complete provider configuration that reproduces its
 /// score semantics.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WalManifest {
     /// Vector dimensionality. 0 while the shard has not committed to one.
     pub dim: u32,
@@ -259,6 +260,7 @@ pub struct WalManifest {
 /// (`WalManifest::columns`): the names a store declares whether or not
 /// any row carries a value under them.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ColumnTable {
     #[serde(default)]
     pub fields: Vec<String>,
@@ -2335,5 +2337,31 @@ mod tests {
         let err = reader.next_record().unwrap_err();
         assert!(err.to_string().contains("seq gap"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn retired_manifest_keys_are_refused() {
+        for retired_line in [
+            "legacy_derived_tag27 = true",
+            "legacy_derived_tag27 = false",
+            "bit_width = 4",
+            "calibration_shift = [0.0, 0.0, 0.0, 0.0]",
+            "calibration_scale = [1.0, 1.0, 1.0, 1.0]",
+        ] {
+            let dir = tempdir("retired_manifest_keys");
+            write_manifest(&dir, &manifest(4)).unwrap();
+            read_manifest(&dir).expect("current manifest reads cleanly");
+            let path = manifest_path(&dir);
+            let text = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(&path, format!("{retired_line}\n{text}")).unwrap();
+            let err = read_manifest(&dir)
+                .expect_err("manifest carrying a retired key must fail closed");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                err.to_string().contains("unknown field"),
+                "unexpected error for `{retired_line}`: {err}"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 }
