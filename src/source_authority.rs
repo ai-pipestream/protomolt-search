@@ -884,7 +884,10 @@ impl SourceAuthorityStore {
         let mut builder = Database::builder();
         builder.set_cache_size(8 * 1024 * 1024);
         let database = builder
-            .create_file(file.try_clone().map_err(storage)?)
+            .create_with_backend(
+                redb::backends::FileBackend::new(file.try_clone().map_err(storage)?)
+                    .map_err(storage)?,
+            )
             .map_err(storage)?;
         Ok((
             Backing {

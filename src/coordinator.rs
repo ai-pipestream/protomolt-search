@@ -1,6 +1,9 @@
 //! Coordinator side: client-facing [`SearchService`] that fans queries out
 //! to shard nodes, aggregates their floors mid-scan, and merges results.
 
+mod vector_rows;
+pub(crate) use vector_rows::ShardVectorRowProbe;
+
 use crate::stats_identity::StatsClaim;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -8392,52 +8395,7 @@ impl CoordinatorServiceImpl {
     /// unreachable or unconfigured shards are ignored here so the subsequent
     /// RPC surfaces its canonical failure untouched.
     pub(crate) async fn ensure_shard_vector_rows(&self) {
-        if self.has_clustered_vectors() || self.node_addrs.is_empty() {
-            return;
-        }
-        let needs_probe = {
-            let cache = self
-                .shard_vector_rows
-                .lock()
-                .expect("shard vector row cache poisoned");
-            self.node_addrs
-                .iter()
-                .any(|addr| cache.get(addr).copied().unwrap_or(0) == 0)
-        };
-        if !needs_probe {
-            return;
-        }
-        let mut tasks = Vec::with_capacity(self.node_addrs.len());
-        for addr in &self.node_addrs {
-            let Ok(mut client) = self.node_client(addr) else {
-                continue;
-            };
-            let addr = addr.clone();
-            tasks.push(tokio::spawn(async move {
-                client
-                    .get_vector_backend(crate::pb::GetVectorBackendRequest {})
-                    .await
-                    .ok()
-                    .map(|resp| (addr, resp.into_inner()))
-            }));
-        }
-        let mut observed = Vec::with_capacity(tasks.len());
-        for task in tasks {
-            if let Ok(Some((addr, backend))) = task.await {
-                if backend.descriptor.is_some() {
-                    observed.push((addr, backend.num_vectors));
-                }
-            }
-        }
-        if !observed.is_empty() {
-            let mut cache = self
-                .shard_vector_rows
-                .lock()
-                .expect("shard vector row cache poisoned");
-            for (addr, rows) in observed {
-                cache.insert(addr, rows);
-            }
-        }
+        self.shard_vector_row_probe().wait().await;
     }
 
     /// Per-shard proportional share (`0..=1_000_000`) of the parent's
