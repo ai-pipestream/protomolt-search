@@ -16,7 +16,7 @@ turbovec-grpc = { git = "https://github.com/ai-pipestream/turbovec-grpc.git", re
 # Control consensus (docs/raft-control-design.md). Pinned exactly: the
 # storage-v2 contracts are what the log store and state machine implement,
 # and the typed envelopes map to this version's types explicitly.
-openraft = { version = "=0.9.25", default-features = false, features = ["storage-v2"], optional = true }
+openraft = { version = "=0.10.0", default-features = false, features = ["storage-v2"], optional = true }
 # tonic's core (Status, Request, codegen, the prost codec) is all the
 # embedded runtime needs; the HTTP/2 transport rides the `net` feature.
 tonic = { version = "0.14", default-features = false, features = ["codegen"] }

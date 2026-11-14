@@ -13,8 +13,8 @@ pipestream-search = { path = "../..", default-features = false }
 serde_json = "1"
 hnsw_rs = { version = "0.3.5", features = ["simdeez_f"] }
 hnsw = "0.11"
-space = "0.17"
-rand_pcg = "0.3"
+space = "0.19"
+rand_pcg = "0.10"
 hnswlib-rs = "0.10"
 usearch = "2.26"
 flate2 = "1"

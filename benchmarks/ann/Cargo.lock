@@ -570,9 +570,9 @@ checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
 
 [[package]]
 name = "flate2"
-version = "1.1.10"
+version = "1.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb"
+checksum = "626d4928326b646e70f65ed36fc7cf9f206bdb68a0019ee7c6b4709da4e084c4"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
@@ -706,7 +706,7 @@ dependencies = [
  "num-traits",
  "rand_core 0.6.4",
  "smallvec",
- "space",
+ "space 0.17.0",
 ]
 
 [[package]]
@@ -1300,6 +1300,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pgat"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4869dd82b796b9550e24016b4695f63fc5ecf903cae9078e109831532120e48"
+dependencies = [
+ "doc-comment",
+]
+
+[[package]]
 name = "pin-project"
 version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1489,7 +1498,7 @@ dependencies = [
  "pipestream-search",
  "rand_pcg",
  "serde_json",
- "space",
+ "space 0.19.0",
  "usearch",
 ]
 
@@ -1593,11 +1602,11 @@ dependencies = [
 
 [[package]]
 name = "rand_pcg"
-version = "0.3.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59cad018caf63deb318e5a4586d99a24424a364f40f1e5778c29aca23f4fc73e"
+checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
 dependencies = [
- "rand_core 0.6.4",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -1823,6 +1832,17 @@ checksum = "c5ab9701ae895386d13db622abf411989deff7109b13b46b6173bb4ce5c1d123"
 dependencies = [
  "doc-comment",
  "num-traits",
+]
+
+[[package]]
+name = "space"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7324caaf44e7e7bf7465364048c12a50b169b0e4f86821ea37277dc98eb3c4fe"
+dependencies = [
+ "doc-comment",
+ "num-traits",
+ "pgat",
 ]
 
 [[package]]
