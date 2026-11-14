@@ -41,7 +41,7 @@ use pipestream_search::pb::{
     AddDocumentsRequest, AddVectorsRequest, Bm25SearchRequest, BrowseShardRequest, BrowseSort,
     CompactShardRequest, CompactShardResponse, DeleteDocumentsRequest, DocLineage, FacetValue,
     FlushRequest, GetDocumentsRequest, HealthRequest, IntegerValue, NumericValue,
-    ResolveParentsRequest, SearchRequest, SetCalibrationRequest,
+    ResolveParentsRequest, SearchRequest,
 };
 use pipestream_search::postings::{Bm25Index, Bm25Reader, StoredBinding};
 use pipestream_search::reshard::{self, PartitionSpec, SegmentCompactionOptions};
@@ -197,12 +197,9 @@ async fn calibrate(addr: &str) {
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &sample);
     client(addr)
         .await
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: BIT_WIDTH as u32,
-            shift,
-            scale,
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, BIT_WIDTH, &shift, &scale,
+        ))
         .await
         .unwrap();
 }

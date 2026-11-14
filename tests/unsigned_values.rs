@@ -392,12 +392,9 @@ async fn unsigned_materialized_projections_survive_distributed_reopen_and_compac
             let (address, server) = common::start_empty_node(config.clone()).await;
             let mut client = NodeServiceClient::connect(address.clone()).await.unwrap();
             client
-                .set_calibration(pb::SetCalibrationRequest {
-                    dim: 8,
-                    bit_width: 4,
-                    shift: shift.clone(),
-                    scale: scale.clone(),
-                })
+                .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                    8, 4, &shift, &scale,
+                ))
                 .await
                 .unwrap();
             for (row, value) in values

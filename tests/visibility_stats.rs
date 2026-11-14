@@ -366,12 +366,9 @@ async fn visibility_survives_tombstones_flush_compaction_and_reopen() {
         let (addr, handle) = common::start_empty_node(cfg.clone()).await;
         let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
         client
-            .set_calibration(SetCalibrationRequest {
-                dim: DIM as u32,
-                bit_width: 4,
-                shift,
-                scale,
-            })
+            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                DIM, 4, &shift, &scale,
+            ))
             .await
             .unwrap();
         for (i, rows) in ROWS.chunks(2).enumerate() {

@@ -22,11 +22,10 @@ use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     ingest_mapped_request, query_stream_response, search_query, selection_query, AccessAction,
-    AccessPolicy, AddDocumentsRequest, AddVectorsRequest, BroadcastCalibrationRequest,
-    CollectionGrant, CollectionResource, CommitReplacementsRequest, DeleteDocumentsRequest,
-    DenseQuery, IngestMappedRequest, IntegerValue, LexicalQuery, MappedBind, PlanIndexRequest,
-    QueryRequest, QueryStreamRequest, Replacement, SearchQuery, SelectionQuery,
-    SetCalibrationRequest,
+    AccessPolicy, AddDocumentsRequest, AddVectorsRequest, CollectionGrant, CollectionResource,
+    CommitReplacementsRequest, DeleteDocumentsRequest, DenseQuery, IngestMappedRequest,
+    IntegerValue, LexicalQuery, MappedBind, PlanIndexRequest, QueryRequest, QueryStreamRequest,
+    Replacement, SearchQuery, SelectionQuery,
 };
 use pipestream_search::security::{PrincipalConfig, Principals};
 use prost::Message;
@@ -241,13 +240,13 @@ fn authorized<T>(message: T, principal: &str) -> Request<T> {
 async fn populate_embedded(runtime: &EmbeddedSearch, corpus: &[f32]) {
     let (shift, scale) = fit_calibration(DIM, 4, corpus);
     let applied = runtime
-        .broadcast_calibration(BroadcastCalibrationRequest {
-            collection: String::new(),
-            dim: DIM as u32,
-            bit_width: 4,
-            shift,
-            scale,
-        })
+        .broadcast_vector_backend(pipestream_search::harness::embedded_broadcast_request(
+            DIM,
+            4,
+            &shift,
+            &scale,
+            String::new(),
+        ))
         .await
         .unwrap();
     assert!(applied.results.iter().all(|result| result.ok));
@@ -297,12 +296,9 @@ async fn populate_network(addrs: &[String], corpus: &[f32], shift: &[f32], scale
     for (shard, addr) in addrs.iter().enumerate() {
         let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
         client
-            .set_calibration(SetCalibrationRequest {
-                dim: DIM as u32,
-                bit_width: 4,
-                shift: shift.to_vec(),
-                scale: scale.to_vec(),
-            })
+            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                DIM, 4, shift, scale,
+            ))
             .await
             .unwrap();
         client
@@ -466,14 +462,9 @@ async fn local_mutations_and_persistence_survive_reopen() {
     .await
     .unwrap();
     runtime
-        .set_calibration(
+        .configure_vector_backend(
             0,
-            SetCalibrationRequest {
-                dim: DIM as u32,
-                bit_width: 4,
-                shift,
-                scale,
-            },
+            pipestream_search::harness::embedded_backend_request(DIM, 4, &shift, &scale),
         )
         .await
         .unwrap();
@@ -583,14 +574,9 @@ async fn descriptor_plan_and_mapped_ingest_use_the_embedded_schema() {
     let corpus = unit_vectors(1, DIM, 0xB10D_0001);
     let (shift, scale) = fit_calibration(DIM, 4, &unit_vectors(64, DIM, 0xB10D_0002));
     runtime
-        .set_calibration(
+        .configure_vector_backend(
             0,
-            SetCalibrationRequest {
-                dim: DIM as u32,
-                bit_width: 4,
-                shift,
-                scale,
-            },
+            pipestream_search::harness::embedded_backend_request(DIM, 4, &shift, &scale),
         )
         .await
         .unwrap();

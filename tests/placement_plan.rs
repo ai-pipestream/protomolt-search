@@ -18,7 +18,7 @@ use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     AddDocumentsRequest, AddVectorsRequest, AnalysisSpec, FacetValue, FlushRequest, IntegerValue,
-    PlanPlacementRequest, PlanPlacementResponse, SetCalibrationRequest,
+    PlanPlacementRequest, PlanPlacementResponse,
 };
 use pipestream_search::placement::{
     encode, subtree_range, PinnedLeaf, Placement, PlacementNodeConfig, PlacementTreeConfig,
@@ -412,12 +412,9 @@ async fn logged_shard(dir: &Path, analysis_addr: &str, corpus: &[f32]) -> (PathB
     .await;
     let mut client = NodeServiceClient::connect(addr).await.unwrap();
     client
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: BIT_WIDTH as u32,
-            shift,
-            scale,
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, BIT_WIDTH, &shift, &scale,
+        ))
         .await
         .unwrap();
     let (tx, rx) = mpsc::channel(8);
@@ -691,12 +688,9 @@ async fn banded_shard(dir: &Path, corpus: &[f32]) -> PathBuf {
     .await;
     let mut client = NodeServiceClient::connect(addr).await.unwrap();
     client
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: BIT_WIDTH as u32,
-            shift,
-            scale,
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, BIT_WIDTH, &shift, &scale,
+        ))
         .await
         .unwrap();
     let archive = Placement::validate(&old_tree())

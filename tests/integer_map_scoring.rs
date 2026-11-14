@@ -247,12 +247,9 @@ async fn typed_map_score_values_explain_and_fetch_survive_relay_reopen_and_compa
         let (addr, handle) = common::start_empty_node(config.clone()).await;
         let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
         client
-            .set_calibration(pb::SetCalibrationRequest {
-                dim: 8,
-                bit_width: 4,
-                shift: shift.clone(),
-                scale: scale.clone(),
-            })
+            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                8, 4, &shift, &scale,
+            ))
             .await
             .unwrap();
         for row in 0..16 {
@@ -315,12 +312,9 @@ async fn typed_map_score_values_explain_and_fetch_survive_relay_reopen_and_compa
         NodeServiceClient::connect(empty.clone())
             .await
             .unwrap()
-            .set_calibration(pb::SetCalibrationRequest {
-                dim: 8,
-                bit_width: 4,
-                shift: shift.clone(),
-                scale: scale.clone(),
-            })
+            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                8, 4, &shift, &scale,
+            ))
             .await
             .unwrap();
         let (relay, _, rh) = start_relay(vec![addr.clone(), empty]).await;

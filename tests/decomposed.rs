@@ -22,7 +22,7 @@ use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService as _;
 use pipestream_search::pb::{
     AddDocumentsRequest, AddVectorsRequest, FusionMode, HybridHit, HybridLegOptions,
-    HybridSearchRequest, SetCalibrationRequest, VectorRescoreRequest,
+    HybridSearchRequest, VectorRescoreRequest,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -81,12 +81,9 @@ async fn start_fixture() -> Fixture {
         .await;
         let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
         client
-            .set_calibration(SetCalibrationRequest {
-                dim: DIM as u32,
-                bit_width: 4,
-                shift: shift.clone(),
-                scale: scale.clone(),
-            })
+            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                DIM, 4, &shift, &scale,
+            ))
             .await
             .unwrap();
         let (tx, rx) = mpsc::channel(8);

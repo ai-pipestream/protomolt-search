@@ -23,7 +23,7 @@ use pipestream_search::pb::{
     Bm25SearchRequest, BooleanQuery, BrowseShardRequest, CompiledAggregation,
     CompositeSearchStrategy, DenseQuery, FacetValue, FilterQuery, FlushRequest, IntegerValue,
     LexicalQuery, QueryHit, QueryRequest, QueryResponse, SearchQuery, SelectionOperator,
-    SelectionQuery, SetCalibrationRequest, StartStreamSearch, StreamSearchRequest, ValueExpr,
+    SelectionQuery, StartStreamSearch, StreamSearchRequest, ValueExpr,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -104,12 +104,9 @@ async fn ingest(addr: &str) {
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, sample);
     let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
     client
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: BIT_WIDTH as u32,
-            shift,
-            scale,
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, BIT_WIDTH, &shift, &scale,
+        ))
         .await
         .unwrap();
     for (block, chunk) in all.chunks(PER_YEAR).enumerate() {

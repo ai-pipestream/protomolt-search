@@ -22,7 +22,7 @@ use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     AddDocumentsRequest, AddVectorsRequest, FacetValue, FusionMode, HybridSearchRequest,
-    SearchRequest, SetCalibrationRequest,
+    SearchRequest,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -46,15 +46,12 @@ fn court_of(id: usize) -> &'static str {
     }
 }
 
-async fn set_calibration(addr: &str, shift: &[f32], scale: &[f32]) {
+async fn configure_backend(addr: &str, shift: &[f32], scale: &[f32]) {
     let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
     client
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: 4,
-            shift: shift.to_vec(),
-            scale: scale.to_vec(),
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, 4, shift, scale,
+        ))
         .await
         .unwrap();
 }
@@ -80,7 +77,7 @@ async fn seed_shard(
         ..Default::default()
     })
     .await;
-    set_calibration(&addr, shift, scale).await;
+    configure_backend(&addr, shift, scale).await;
 
     let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
     let (tx, rx) = mpsc::channel(8);

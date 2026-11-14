@@ -261,12 +261,9 @@ async fn unsigned_sort_collapse_and_cursors_survive_reopen_and_compaction() {
             let (address, server) = common::start_empty_node(config.clone()).await;
             let mut client = NodeServiceClient::connect(address.clone()).await.unwrap();
             client
-                .set_calibration(pb::SetCalibrationRequest {
-                    dim: 8,
-                    bit_width: 4,
-                    shift: shift.clone(),
-                    scale: scale.clone(),
-                })
+                .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                    8, 4, &shift, &scale,
+                ))
                 .await
                 .unwrap();
             for row in range {

@@ -24,12 +24,9 @@ async fn seed(client: &mut NodeServiceClient<Channel>) {
     let vectors = common::unit_vectors(4, 16, 9991);
     let (shift, scale) = common::fit_calibration(16, 4, &vectors);
     client
-        .set_calibration(SetCalibrationRequest {
-            dim: 16,
-            bit_width: 4,
-            shift,
-            scale,
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            16, 4, &shift, &scale,
+        ))
         .await
         .unwrap();
     for (i, vector) in vectors.chunks(16).enumerate() {
@@ -243,12 +240,9 @@ async fn vector_only_and_empty_shards_cannot_satisfy_a_document_view() {
             let vectors = common::unit_vectors(2, 16, 9992);
             let (shift, scale) = common::fit_calibration(16, 4, &vectors);
             client
-                .set_calibration(SetCalibrationRequest {
-                    dim: 16,
-                    bit_width: 4,
-                    shift,
-                    scale,
-                })
+                .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                    16, 4, &shift, &scale,
+                ))
                 .await
                 .unwrap();
             client

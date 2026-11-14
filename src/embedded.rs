@@ -562,15 +562,6 @@ impl EmbeddedSearch {
             .map(tonic::Response::into_inner)
     }
 
-    pub async fn broadcast_calibration(
-        &self,
-        request: BroadcastCalibrationRequest,
-    ) -> Result<BroadcastCalibrationResponse, Status> {
-        SearchService::broadcast_calibration(&self.coordinator, Request::new(request))
-            .await
-            .map(tonic::Response::into_inner)
-    }
-
     pub async fn configure_vector_backend(
         &self,
         shard: usize,
@@ -579,18 +570,6 @@ impl EmbeddedSearch {
         Ok(self
             .shard_client(shard)?
             .configure_vector_backend(request)
-            .await?
-            .into_inner())
-    }
-
-    pub async fn set_calibration(
-        &self,
-        shard: usize,
-        request: SetCalibrationRequest,
-    ) -> Result<SetCalibrationResponse, EmbeddedError> {
-        Ok(self
-            .shard_client(shard)?
-            .set_calibration(request)
             .await?
             .into_inner())
     }

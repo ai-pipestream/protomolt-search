@@ -19,8 +19,7 @@ use common::fit_calibration;
 use pipestream_search::analyzer::body_spec;
 use pipestream_search::embedded::{EmbeddedSearch, EmbeddedSearchConfig, EmbeddedShardConfig};
 use pipestream_search::pb::{
-    AddDocumentsRequest, AddVectorsRequest, BroadcastCalibrationRequest, FusionMode,
-    HybridLegOptions, HybridSearchRequest,
+    AddDocumentsRequest, AddVectorsRequest, FusionMode, HybridLegOptions, HybridSearchRequest,
 };
 use protomolt_embedder::StaticEmbedder;
 
@@ -125,13 +124,13 @@ async fn embed_ingest_hybrid_loop() {
     // out from coordinator state, so calibration must be broadcast, not
     // set per shard behind the coordinator's back.
     let applied = runtime
-        .broadcast_calibration(BroadcastCalibrationRequest {
-            collection: String::new(),
-            dim: DIM as u32,
-            bit_width: BIT_WIDTH as u32,
-            shift,
-            scale,
-        })
+        .broadcast_vector_backend(pipestream_search::harness::embedded_broadcast_request(
+            DIM,
+            BIT_WIDTH,
+            &shift,
+            &scale,
+            String::new(),
+        ))
         .await
         .unwrap();
     assert!(applied.results.iter().all(|result| result.ok));

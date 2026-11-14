@@ -20,7 +20,7 @@ use pipestream_search::pb::{
     Aggregation, DeleteDocumentsRequest, DenseQuery, DenseScoreMode, DocumentField, FacetValue,
     FilterQuery, FlushRequest, IntegerValue, LexicalQuery, MapIntegerEntry,
     MapUnsignedIntegerEntry, NumericValue, PhraseMatch, QueryRequest, QueryResponse, SearchQuery,
-    SelectionQuery, SetCalibrationRequest,
+    SelectionQuery,
 };
 use pipestream_search::placement::{
     PinnedLeaf, Placement, PlacementNodeConfig, PlacementTreeConfig,
@@ -119,15 +119,10 @@ fn config(index_path: PathBuf) -> NodeConfig {
     }
 }
 
-fn calibration() -> SetCalibrationRequest {
+fn calibration() -> pipestream_search::pb::ConfigureVectorBackendRequest {
     let vectors = corpus();
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &vectors[..64 * DIM]);
-    SetCalibrationRequest {
-        dim: DIM as u32,
-        bit_width: BIT_WIDTH as u32,
-        shift,
-        scale,
-    }
+    pipestream_search::harness::embedded_backend_request(DIM, BIT_WIDTH, &shift, &scale)
 }
 
 fn document(i: usize, archive: i64, with_code: bool) -> AddDocumentsRequest {
@@ -210,7 +205,10 @@ async fn source_shard_at(
     })
     .await;
     let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
-    client.set_calibration(calibration()).await.unwrap();
+    client
+        .configure_vector_backend(calibration())
+        .await
+        .unwrap();
     let archive = Placement::validate(&old_tree())
         .unwrap()
         .leaf_by_name("archive")
@@ -870,7 +868,10 @@ async fn the_transplant_refuses_by_name() {
     })
     .await;
     let mut single = NodeServiceClient::connect(single_addr).await.unwrap();
-    single.set_calibration(calibration()).await.unwrap();
+    single
+        .configure_vector_backend(calibration())
+        .await
+        .unwrap();
     let archive = Placement::validate(&old_tree())
         .unwrap()
         .leaf_by_name("archive")
@@ -1178,7 +1179,10 @@ async fn sources_with_different_analyzers_are_refused() {
     let b_path = b_dir.join("archive.tv");
     let (b_addr, _b) = start_empty_node(config(b_path.clone())).await;
     let mut client = NodeServiceClient::connect(b_addr).await.unwrap();
-    client.set_calibration(calibration()).await.unwrap();
+    client
+        .configure_vector_backend(calibration())
+        .await
+        .unwrap();
     let archive = Placement::validate(&old_tree())
         .unwrap()
         .leaf_by_name("archive")

@@ -31,8 +31,7 @@ use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     AddDocumentsRequest, AddVectorsRequest, Bm25SearchRequest, ClusterNodeState, ClusterPlan,
     DrainNodeRequest, FacetValue, FlushRequest, HealthRequest, HealthResponse, PlacementAction,
-    PlacementActionKind, ReconcileClusterRequest, SearchRequest, SetCalibrationRequest,
-    ShardReplicaRole,
+    PlacementActionKind, ReconcileClusterRequest, SearchRequest, ShardReplicaRole,
 };
 use pipestream_search::snapshot::export_snapshot;
 use tokio::net::TcpListener;
@@ -294,12 +293,9 @@ async fn a_replica_bootstraps_from_the_primary_and_takes_over() {
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &corpus);
     client(&addr_a)
         .await
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: BIT_WIDTH as u32,
-            shift,
-            scale,
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, BIT_WIDTH, &shift, &scale,
+        ))
         .await
         .unwrap();
     ingest(&addr_a, 0, DOCS).await;

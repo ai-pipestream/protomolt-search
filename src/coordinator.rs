@@ -31,18 +31,17 @@ use crate::pb::{
 use crate::pb::{
     search_shard_request, search_shard_response, AbortTopologyCutoverRequest,
     AbortTopologyCutoverResponse, Bm25Hit, Bm25QueryRequest, Bm25RescoreRequest, Bm25SearchRequest,
-    Bm25SearchResponse, BroadcastCalibrationRequest, BroadcastCalibrationResponse,
-    BroadcastVectorBackendRequest, BroadcastVectorBackendResponse, CalibrationApplyResult,
-    CascadeHit, ClusterHealthRequest, ClusterHealthResponse, ClusteredVectorHealth,
+    Bm25SearchResponse, BroadcastVectorBackendRequest, BroadcastVectorBackendResponse, CascadeHit,
+    ClusterHealthRequest, ClusterHealthResponse, ClusteredVectorHealth,
     ConfigureVectorBackendRequest, ExactVectorRescoreRequest, FloorUpdate,
     FreezeTopologyWritesRequest, FreezeTopologyWritesResponse, FusionMode, HealthRequest,
     HybridDebug, HybridHit, HybridSearchRequest, HybridSearchResponse, HybridShardDebug,
     HybridShardRequest, ParentGroup, PublishTopologyRequest, PublishTopologyResponse,
     RoutedIngestMappedRequest, RoutedIngestMappedResponse, RoutedShardIngest, ScoredHit,
     SearchRequest, SearchResponse, SearchShardDone, SearchShardRequest, SearchShardResponse,
-    SetCalibrationRequest, ShardHealth, ShardLegsRequest, ShardScanStats, StartShardSearch,
-    StartStreamSearch, StopStreamSearch, StreamSearchRequest, StreamSearchResponse,
-    StreamSearchSummary, TermStatsRequest, VectorBackendApplyResult, VectorRescoreRequest,
+    ShardHealth, ShardLegsRequest, ShardScanStats, StartShardSearch, StartStreamSearch,
+    StopStreamSearch, StreamSearchRequest, StreamSearchResponse, StreamSearchSummary,
+    TermStatsRequest, VectorBackendApplyResult, VectorRescoreRequest,
 };
 use crate::pb::{
     search_variant, InterleaveTeam, Interleaving, RankedHit, RankingDiff, VariantResult,
@@ -11651,56 +11650,6 @@ impl CoordinatorServiceImpl {
         results
     }
 
-    pub async fn fanout_calibration(
-        &self,
-        req: &BroadcastCalibrationRequest,
-    ) -> Vec<CalibrationApplyResult> {
-        let mut tasks = Vec::with_capacity(self.node_addrs.len());
-        for node in &self.node_addrs {
-            let node = node.clone();
-            let request = SetCalibrationRequest {
-                dim: req.dim,
-                bit_width: req.bit_width,
-                shift: req.shift.clone(),
-                scale: req.scale.clone(),
-            };
-            let client = self.node_client(&node);
-            tasks.push(tokio::spawn(async move {
-                let result = match client {
-                    Ok(mut client) => client.set_calibration(request).await,
-                    Err(e) => Err(e),
-                };
-                match result {
-                    Ok(resp) => CalibrationApplyResult {
-                        node: node.clone(),
-                        ok: true,
-                        already_seeded: resp.into_inner().already_seeded,
-                        error: String::new(),
-                    },
-                    Err(e) => CalibrationApplyResult {
-                        node: node.clone(),
-                        ok: false,
-                        already_seeded: false,
-                        error: e.message().to_string(),
-                    },
-                }
-            }));
-        }
-        let mut results = Vec::with_capacity(tasks.len());
-        for task in tasks {
-            match task.await {
-                Ok(r) => results.push(r),
-                Err(e) => results.push(CalibrationApplyResult {
-                    node: String::new(),
-                    ok: false,
-                    already_seeded: false,
-                    error: format!("task failed: {e}"),
-                }),
-            }
-        }
-        results
-    }
-
     /// Run one A/B arm through the ordinary handler for its kind.
     ///
     /// This dispatches to `bm25_search`/`hybrid_search` rather than
@@ -14444,31 +14393,6 @@ impl SearchService for CoordinatorServiceImpl {
                 Ok(Response::new(BroadcastVectorBackendResponse { results }))
             },
         )
-        .await
-    }
-
-    async fn broadcast_calibration(
-        &self,
-        request: Request<BroadcastCalibrationRequest>,
-    ) -> Result<Response<BroadcastCalibrationResponse>, Status> {
-        crate::metrics::timed(Route::BroadcastCalibration, request, |request| async move {
-            self.admit(&request.get_ref().collection)?;
-            if let Some(snapshot) = self.request_snapshot() {
-                return Box::pin(SearchService::broadcast_calibration(
-                    &snapshot,
-                    crate::metrics::nested(request),
-                ))
-                .await;
-            }
-            let req = request.into_inner();
-            if req.shift.len() != req.dim as usize || req.scale.len() != req.dim as usize {
-                return Err(Status::invalid_argument(
-                    "shift and scale must have length dim",
-                ));
-            }
-            let results = self.fanout_calibration(&req).await;
-            Ok(Response::new(BroadcastCalibrationResponse { results }))
-        })
         .await
     }
 

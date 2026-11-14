@@ -25,7 +25,7 @@ use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     AddDocumentsRequest, AddVectorsRequest, Bm25SearchRequest, ExportSnapshotResponse, FacetValue,
     FlushRequest, HealthRequest, HealthResponse, InstallSnapshotFromRequest,
-    InstallSnapshotResponse, SearchRequest, SetCalibrationRequest,
+    InstallSnapshotResponse, SearchRequest,
 };
 use pipestream_search::replication::{sync_once, ReplicaCursor};
 use pipestream_search::snapshot::{export_snapshot, install_snapshot_from};
@@ -85,12 +85,9 @@ async fn seed(addr: &str) {
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &corpus);
     client(addr)
         .await
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: BIT_WIDTH as u32,
-            shift,
-            scale,
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, BIT_WIDTH, &shift, &scale,
+        ))
         .await
         .unwrap();
 }
@@ -959,12 +956,9 @@ async fn a_foreign_scoring_fingerprint_refuses_by_name() {
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &other);
     client(&target)
         .await
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: BIT_WIDTH as u32,
-            shift,
-            scale,
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, BIT_WIDTH, &shift, &scale,
+        ))
         .await
         .unwrap();
     let serving = health(&target).await.scoring_fingerprint;

@@ -91,8 +91,7 @@ Coordinator public routes:
     search  bm25_search  phrase_search  hybrid_search  query  suggest  term_suggest
     query_stream  plan_index  routed_ingest_mapped
     freeze_topology_writes  publish_topology  abort_topology_cutover
-    aggregate  cluster_health  broadcast_vector_backend
-    broadcast_calibration  variant_search
+    aggregate  cluster_health  broadcast_vector_backend  variant_search
 
 Cluster control routes (`docs/cluster-control.md`):
 

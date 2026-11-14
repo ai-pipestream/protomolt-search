@@ -13,8 +13,8 @@ use pipestream_search::node::{
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::{
     search_shard_request, search_shard_response, snapshot_chunk, ExactVectorRescoreRequest,
-    FlushRequest, GetCalibrationRequest, GetDocumentsRequest, HealthRequest, ScoredHit,
-    SearchShardRequest, SetCalibrationRequest, SnapshotChunk, SnapshotManifest, StartShardSearch,
+    FlushRequest, GetDocumentsRequest, GetVectorBackendRequest, HealthRequest, ScoredHit,
+    SearchShardRequest, SnapshotChunk, SnapshotManifest, StartShardSearch,
 };
 use pipestream_search::postings::{AnalyzedDoc, Bm25Store, DocTerms};
 use pipestream_search::vector::{legacy_calibration_config, VectorIndex, EMBEDDED_TURBOVEC};
@@ -109,12 +109,9 @@ async fn seed(
     scale: &[f32],
 ) {
     client
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: BIT_WIDTH as u32,
-            shift: shift.to_vec(),
-            scale: scale.to_vec(),
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, BIT_WIDTH, shift, scale,
+        ))
         .await
         .unwrap();
 }
@@ -335,7 +332,7 @@ async fn rejects_mismatched_calibration() {
 
     // Nothing installed: shard still empty, no generation, no staging dir.
     let cal = client
-        .get_calibration(GetCalibrationRequest {})
+        .get_vector_backend(GetVectorBackendRequest {})
         .await
         .unwrap()
         .into_inner();
@@ -361,7 +358,7 @@ async fn unseeded_node_adopts_snapshot_calibration() {
     .await;
     let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
 
-    // No SetCalibration: the shard adopts whatever the image carries.
+    // No ConfigureVectorBackend: the shard adopts whatever the image carries.
     let report = pipestream_search::snapshot::install_snapshot(&addr, &src_tv, None)
         .await
         .unwrap();
@@ -369,14 +366,17 @@ async fn unseeded_node_adopts_snapshot_calibration() {
     assert_eq!(report.num_documents, 0);
 
     let cal = client
-        .get_calibration(GetCalibrationRequest {})
+        .get_vector_backend(GetVectorBackendRequest {})
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(cal.dim, DIM as u32);
-    assert_eq!(cal.bit_width, BIT_WIDTH as u32);
-    assert_eq!(cal.shift, shift);
-    assert_eq!(cal.scale, scale);
+    let descriptor = cal.descriptor.clone().unwrap();
+    assert_eq!(descriptor.dim, DIM as u32);
+    assert_eq!(descriptor.bits_per_dimension, BIT_WIDTH as u32);
+    assert_eq!(
+        pipestream_search::harness::reported_calibration(&cal),
+        (shift, scale)
+    );
 
     let query: Vec<f32> = corpus[..DIM].to_vec();
     let hits = search_topk(&mut client, query.clone(), 5).await;

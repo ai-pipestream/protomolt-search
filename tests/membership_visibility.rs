@@ -24,12 +24,9 @@ async fn seed(client: &mut NodeServiceClient<Channel>, rows: usize) {
     let vectors = common::unit_vectors(rows, 16, 9916);
     let (shift, scale) = common::fit_calibration(16, 4, &vectors);
     client
-        .set_calibration(SetCalibrationRequest {
-            dim: 16,
-            bit_width: 4,
-            shift,
-            scale,
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            16, 4, &shift, &scale,
+        ))
         .await
         .unwrap();
     for (i, vector) in vectors.chunks(16).enumerate() {
@@ -241,12 +238,9 @@ async fn vector_only_rows_have_no_authorized_document_membership() {
     let vectors = common::unit_vectors(3, 16, 9917);
     let (shift, scale) = common::fit_calibration(16, 4, &vectors);
     client
-        .set_calibration(SetCalibrationRequest {
-            dim: 16,
-            bit_width: 4,
-            shift,
-            scale,
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            16, 4, &shift, &scale,
+        ))
         .await
         .unwrap();
     client

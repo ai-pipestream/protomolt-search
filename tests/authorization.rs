@@ -189,7 +189,7 @@ async fn each_public_unary_route_enforces_its_declared_action() {
     }
     for principal in ["reader", "writer"] {
         refuses!(principal; broadcast_vector_backend: BroadcastVectorBackendRequest,
-            broadcast_calibration: BroadcastCalibrationRequest, plan_index: PlanIndexRequest,
+            plan_index: PlanIndexRequest,
             describe_schema: DescribeSchemaRequest, plan_placement: PlanPlacementRequest,
             freeze_topology_writes: FreezeTopologyWritesRequest, publish_topology: PublishTopologyRequest,
             abort_topology_cutover: AbortTopologyCutoverRequest, cluster_health: ClusterHealthRequest);

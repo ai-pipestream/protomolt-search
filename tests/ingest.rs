@@ -1,4 +1,4 @@
-//! In-process coverage of the write path rules: SetCalibration lifecycle,
+//! In-process coverage of the write path rules: vector backend lifecycle,
 //! AddVectors validation, Flush persistence, and lossless search over
 //! ingested data.
 
@@ -6,9 +6,7 @@ mod common;
 
 use pipestream_search::node::NodeConfig;
 use pipestream_search::pb::node_service_client::NodeServiceClient;
-use pipestream_search::pb::{
-    AddVectorsRequest, FlushRequest, GetCalibrationRequest, SetCalibrationRequest,
-};
+use pipestream_search::pb::{AddVectorsRequest, FlushRequest, GetVectorBackendRequest};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -40,55 +38,51 @@ async fn calibration_lifecycle_and_ingest_rules() {
 
     // Fresh empty node: no calibration, no dim.
     let cal = client
-        .get_calibration(GetCalibrationRequest {})
+        .get_vector_backend(GetVectorBackendRequest {})
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(cal.dim, 0);
-    assert!(cal.shift.is_empty());
+    assert!(cal.descriptor.is_none());
+    assert!(pipestream_search::harness::reported_calibration(&cal)
+        .0
+        .is_empty());
 
     // Malformed calibrations are INVALID_ARGUMENT.
     let (shift, scale) = fit_calibration(DIM, 4, &unit_vectors(2_000, DIM, 0xCA11_0001));
     let bad = client
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: 4,
-            shift: shift[..DIM - 1].to_vec(),
-            scale: scale.clone(),
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM,
+            4,
+            &shift[..DIM - 1],
+            &scale,
+        ))
         .await;
     assert_eq!(bad.unwrap_err().code(), tonic::Code::InvalidArgument);
 
     // Happy path: seed, then re-seed idempotently, then disagree.
     let first = client
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: 4,
-            shift: shift.clone(),
-            scale: scale.clone(),
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, 4, &shift, &scale,
+        ))
         .await
         .unwrap()
         .into_inner();
-    assert!(!first.already_seeded);
+    assert!(!first.already_configured);
     let second = client
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: 4,
-            shift: shift.clone(),
-            scale: scale.clone(),
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, 4, &shift, &scale,
+        ))
         .await
         .unwrap()
         .into_inner();
-    assert!(second.already_seeded);
+    assert!(second.already_configured);
     let conflicting = client
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: 4,
-            shift: shift.iter().map(|x| x + 1.0).collect(),
-            scale: scale.clone(),
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM,
+            4,
+            &shift.iter().map(|x| x + 1.0).collect::<Vec<_>>(),
+            &scale,
+        ))
         .await;
     assert_eq!(conflicting.unwrap_err().code(), tonic::Code::AlreadyExists);
 
@@ -106,14 +100,11 @@ async fn calibration_lifecycle_and_ingest_rules() {
     assert_eq!(resp.total, 1_200);
     assert_eq!(resp.first_id, 0);
 
-    // Once vectors exist, SetCalibration is locked out entirely.
+    // Once vectors exist, the backend configuration is locked.
     let locked = client
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: 4,
-            shift: shift.clone(),
-            scale: scale.clone(),
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, 4, &shift, &scale,
+        ))
         .await;
     assert_eq!(locked.unwrap_err().code(), tonic::Code::FailedPrecondition);
 
@@ -150,7 +141,7 @@ async fn unseeded_from_scratch_add_constructs_index() {
     // Supplying dim constructs an unseeded index. On the
     // explicit-calibration engine nothing fits on its own: the index
     // stays uncalibrated (plain TurboQuant, order-independent by
-    // construction), and TQ+ arrives only through SetCalibration
+    // construction), and TQ+ arrives only through ConfigureVectorBackend
     // before the first add — which is what keeps a fleet's shards
     // comparable on purpose instead of by first-batch accident.
     let resp = push_batches(
@@ -164,14 +155,15 @@ async fn unseeded_from_scratch_add_constructs_index() {
     .unwrap();
     assert_eq!(resp.added, 2_000);
     let cal = client
-        .get_calibration(GetCalibrationRequest {})
+        .get_vector_backend(GetVectorBackendRequest {})
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(cal.dim as usize, DIM);
+    assert_eq!(cal.descriptor.as_ref().unwrap().dim as usize, DIM);
     assert_eq!(cal.num_vectors, 2_000);
+    let (shift, scale) = pipestream_search::harness::reported_calibration(&cal);
     assert!(
-        cal.shift.is_empty() && cal.scale.is_empty(),
+        shift.is_empty() && scale.is_empty(),
         "an unseeded index stays uncalibrated; nothing fits on its own"
     );
 
@@ -195,12 +187,9 @@ async fn flush_persists_and_reload_matches() {
     .await;
     let mut client = NodeServiceClient::connect(addr).await.unwrap();
     client
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: 4,
-            shift: shift.clone(),
-            scale: scale.clone(),
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, 4, &shift, &scale,
+        ))
         .await
         .unwrap();
     push_batches(&mut client, vec![batch(vectors.clone())])

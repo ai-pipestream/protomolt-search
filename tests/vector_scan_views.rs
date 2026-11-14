@@ -60,12 +60,9 @@ async fn fixture(layout: Layout, coalesce: bool) -> Fixture {
     let vector = vectors[16..32].to_vec(); // the best match is private
     let (shift, scale) = common::fit_calibration(16, 4, &vectors);
     client
-        .set_calibration(SetCalibrationRequest {
-            dim: 16,
-            bit_width: 4,
-            shift,
-            scale,
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            16, 4, &shift, &scale,
+        ))
         .await
         .unwrap();
     client

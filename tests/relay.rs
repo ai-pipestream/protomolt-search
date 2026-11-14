@@ -26,8 +26,8 @@ use pipestream_search::pb::{
     bm25_query_stream_request, bm25_query_stream_response, stream_search_request,
     stream_search_response, AddDocumentsRequest, AddVectorsRequest, Bm25QueryRequest,
     Bm25QueryStreamRequest, Bm25SearchRequest, FacetValue, FieldTerms, FusionMode, HealthRequest,
-    PhraseMatch, ScoredHit, SetCalibrationRequest, StartStreamSearch, StopBm25Query,
-    StopStreamSearch, StreamSearchRequest, TermStatsRequest, TermStatsResponse,
+    PhraseMatch, ScoredHit, StartStreamSearch, StopBm25Query, StopStreamSearch,
+    StreamSearchRequest, TermStatsRequest, TermStatsResponse,
 };
 use pipestream_search::pb::{Bm25Hit, HybridHit};
 use pipestream_search::vector::{VectorIndex, EMBEDDED_TURBOVEC};
@@ -754,16 +754,13 @@ struct LexicalLeaves {
     _mock: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
 }
 
-async fn set_calibration(addr: &str, shift: &[f32], scale: &[f32]) {
+async fn configure_backend(addr: &str, shift: &[f32], scale: &[f32]) {
     NodeServiceClient::connect(addr.to_string())
         .await
         .unwrap()
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: BIT_WIDTH as u32,
-            shift: shift.to_vec(),
-            scale: scale.to_vec(),
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, BIT_WIDTH, shift, scale,
+        ))
         .await
         .unwrap();
 }
@@ -884,7 +881,7 @@ async fn lexical_leaves(positions: &[bool; LEX_LEAVES]) -> LexicalLeaves {
             ..Default::default()
         })
         .await;
-        set_calibration(&addr, &shift, &scale).await;
+        configure_backend(&addr, &shift, &scale).await;
         add_columned_documents(&addr, leaf, &lexical_texts(leaf)).await;
         add_vectors(
             &addr,

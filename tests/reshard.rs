@@ -32,7 +32,7 @@ use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::wal::LoggedAddVectors;
 use pipestream_search::pb::{
     AddDocumentsRequest, AddVectorsRequest, AnalysisSpec, CommitReplacementsRequest,
-    DeleteDocumentsRequest, FlushRequest, Replacement, SetCalibrationRequest,
+    DeleteDocumentsRequest, FlushRequest, Replacement,
 };
 use pipestream_search::phrases::PhraseIndex;
 use pipestream_search::postings::{AnalyzedDoc, Bm25Index, Bm25Reader, Bm25Store};
@@ -127,12 +127,9 @@ async fn start_wal_node_with_layout(
     .await;
     let mut client = NodeServiceClient::connect(addr).await.unwrap();
     client
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: BIT_WIDTH as u32,
-            shift: shift.to_vec(),
-            scale: scale.to_vec(),
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, BIT_WIDTH, shift, scale,
+        ))
         .await
         .unwrap();
     (client, index_path, handle)
@@ -1134,12 +1131,9 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
     .await;
     let mut client = NodeServiceClient::connect(addr).await.unwrap();
     client
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: BIT_WIDTH as u32,
-            shift: shift.to_vec(),
-            scale: scale.to_vec(),
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, BIT_WIDTH, &shift, &scale,
+        ))
         .await
         .unwrap();
 

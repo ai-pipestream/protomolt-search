@@ -661,12 +661,9 @@ async fn wrapper_lifecycle(explicit: bool) {
         let (mut address, mut server) = common::start_empty_node(config.clone()).await;
         let mut client = NodeServiceClient::connect(address.clone()).await.unwrap();
         client
-            .set_calibration(pb::SetCalibrationRequest {
-                dim: 8,
-                bit_width: 4,
-                shift: shift.clone(),
-                scale: scale.clone(),
-            })
+            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                8, 4, &shift, &scale,
+            ))
             .await
             .unwrap();
         if explicit {
@@ -1057,14 +1054,9 @@ async fn embedded_wrappers(explicit: bool) {
         .unwrap();
     let (shift, scale) = common::fit_calibration(8, 4, &common::unit_vectors(64, 8, 94218));
     runtime
-        .set_calibration(
+        .configure_vector_backend(
             0,
-            pb::SetCalibrationRequest {
-                dim: 8,
-                bit_width: 4,
-                shift,
-                scale,
-            },
+            pipestream_search::harness::embedded_backend_request(8, 4, &shift, &scale),
         )
         .await
         .unwrap();

@@ -639,12 +639,9 @@ async fn the_backfill_stores_what_direct_ingest_stores() {
     NodeServiceClient::connect(addr.clone())
         .await
         .unwrap()
-        .set_calibration(pipestream_search::pb::SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: 4,
-            shift,
-            scale,
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, 4, &shift, &scale,
+        ))
         .await
         .unwrap();
     ingest_aligned(&addr, (0..N).map(document).collect()).await;
@@ -1047,12 +1044,9 @@ async fn an_installed_snapshot_keeps_the_declaration_and_tables() {
         NodeServiceClient::connect(addr.to_string())
             .await
             .unwrap()
-            .set_calibration(pipestream_search::pb::SetCalibrationRequest {
-                dim: DIM as u32,
-                bit_width: 4,
-                shift,
-                scale,
-            })
+            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                DIM, 4, &shift, &scale,
+            ))
             .await
             .unwrap();
     }

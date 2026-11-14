@@ -3894,20 +3894,6 @@ impl NodeService for RelayService {
         Err(refused("ConfigureVectorBackend"))
     }
 
-    async fn get_calibration(
-        &self,
-        _request: Request<crate::pb::GetCalibrationRequest>,
-    ) -> Result<Response<crate::pb::GetCalibrationResponse>, Status> {
-        Err(refused("GetCalibration"))
-    }
-
-    async fn set_calibration(
-        &self,
-        _request: Request<crate::pb::SetCalibrationRequest>,
-    ) -> Result<Response<crate::pb::SetCalibrationResponse>, Status> {
-        Err(refused("SetCalibration"))
-    }
-
     async fn flush(
         &self,
         _request: Request<crate::pb::FlushRequest>,

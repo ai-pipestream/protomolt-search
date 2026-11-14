@@ -9,9 +9,7 @@
 //! ```
 //!
 //! Provider configuration locks for the generation's lifetime and can only be
-//! set on an empty shard. The legacy `SetCalibration` RPC adapts to the same
-//! rule for embedded TurboVec. Adds hold the
-//! write lock on the blocking pool; searches hold the read lock for the
+//! set on an empty shard. Adds hold the write lock on the blocking pool; searches hold the read lock for the
 //! duration of their chunked scan, so a search never observes a
 //! half-applied batch.
 
@@ -58,18 +56,17 @@ use crate::pb::{
     CommitReplacementsRequest, CommitReplacementsResponse, ConfigureVectorBackendRequest,
     ConfigureVectorBackendResponse, DeleteDocumentsRequest, DeleteDocumentsResponse,
     ExactVectorRescoreRequest, ExactVectorRescoreResponse, ExportSnapshotRequest,
-    ExportSnapshotResponse, FloorUpdate, FlushRequest, FlushResponse, GetCalibrationRequest,
-    GetCalibrationResponse, GetDocumentsRequest, GetDocumentsResponse, GetVectorBackendRequest,
-    GetVectorBackendResponse, HealthRequest, HealthResponse, HybridLegHit, HybridShardRequest,
-    HybridShardResponse, IngestMappedRequest, IngestMappedResponse, InstallSnapshotFromRequest,
-    InstallSnapshotResponse, LexicalBitmapRequest, MembershipBitmapResponse, OffsetSpan, RawLegHit,
-    ReadWalRequest, ReadWalResponse, Replacement, ResolveParentsRequest, ResolveParentsResponse,
-    ResolvedParent, ScoredHit, SearchShardDone, SearchShardRequest, SearchShardResponse,
-    SetCalibrationRequest, SetCalibrationResponse, ShardLegsRequest, ShardLegsResponse,
-    ShardScanStats, SnapshotChunk, SnapshotManifest, StartShardSearch, StoredDocument,
-    StreamSearchBatch, StreamSearchRequest, StreamSearchResponse, StreamSearchSummary,
-    StreamSnapshotRequest, TermOccurrences, TermStatsRequest, TermStatsResponse,
-    VectorBackendConfig as WireVectorBackendConfig,
+    ExportSnapshotResponse, FloorUpdate, FlushRequest, FlushResponse, GetDocumentsRequest,
+    GetDocumentsResponse, GetVectorBackendRequest, GetVectorBackendResponse, HealthRequest,
+    HealthResponse, HybridLegHit, HybridShardRequest, HybridShardResponse, IngestMappedRequest,
+    IngestMappedResponse, InstallSnapshotFromRequest, InstallSnapshotResponse,
+    LexicalBitmapRequest, MembershipBitmapResponse, OffsetSpan, RawLegHit, ReadWalRequest,
+    ReadWalResponse, Replacement, ResolveParentsRequest, ResolveParentsResponse, ResolvedParent,
+    ScoredHit, SearchShardDone, SearchShardRequest, SearchShardResponse, ShardLegsRequest,
+    ShardLegsResponse, ShardScanStats, SnapshotChunk, SnapshotManifest, StartShardSearch,
+    StoredDocument, StreamSearchBatch, StreamSearchRequest, StreamSearchResponse,
+    StreamSearchSummary, StreamSnapshotRequest, TermOccurrences, TermStatsRequest,
+    TermStatsResponse, VectorBackendConfig as WireVectorBackendConfig,
     VectorBackendDescriptor as WireVectorBackendDescriptor, VectorBitmapRequest,
     VectorQualityContract, VectorRescoreRequest, VectorRescoreResponse, VectorScoreDirection,
 };
@@ -80,9 +77,8 @@ use crate::snapshot_repository::{
     self as repo, RepositoryManifest, CATALOG_DIR, LAYOUT_SEGMENTS, LAYOUT_SINGLE_IMAGE,
 };
 use crate::vector::{
-    embedded_turbovec_config, first_invalid_coordinate, legacy_calibration_config, QualityContract,
-    ScoreDirection, VectorBackendConfig, VectorIndex, VectorSearchOptions, VectorStreamControl,
-    EMBEDDED_TURBOVEC,
+    first_invalid_coordinate, legacy_calibration_config, QualityContract, ScoreDirection,
+    VectorBackendConfig, VectorIndex, VectorSearchOptions, VectorStreamControl, EMBEDDED_TURBOVEC,
 };
 use crate::wal::{self, WalWriter};
 
@@ -8102,25 +8098,6 @@ impl NodeServiceImpl {
         result
     }
 
-    /// Apply one legacy calibration request through the generic provider
-    /// configuration path.
-    fn apply_calibration(&self, req: &SetCalibrationRequest) -> Result<bool, Status> {
-        let dim = req.dim as usize;
-        if req.shift.len() != dim || req.scale.len() != dim {
-            return Err(Status::invalid_argument(format!(
-                "invalid calibration: shift/scale hold {}/{} values for dim {dim}",
-                req.shift.len(),
-                req.scale.len()
-            )));
-        }
-        let config = embedded_turbovec_config(req.bit_width as usize, &req.shift, &req.scale)
-            .map_err(|e| Status::invalid_argument(format!("invalid calibration: {e}")))?;
-        self.apply_backend_config(ConfigureVectorBackendRequest {
-            dim: req.dim,
-            config: Some(wire_backend_config(&config)),
-        })
-    }
-
     /// Apply one ingested batch under the write lock. Returns
     /// `(added, global id of the batch's first vector)`.
     fn apply_batch(
@@ -13749,42 +13726,6 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
         }))
     }
 
-    async fn get_calibration(
-        &self,
-        _request: Request<GetCalibrationRequest>,
-    ) -> Result<Response<GetCalibrationResponse>, Status> {
-        let guard = read_shard(&self.state);
-        let (dim, bit_width, num_vectors, shift, scale) = match guard.index.as_ref() {
-            Some(index) => {
-                let (shift, scale) = calibration_of(index).unwrap_or_default();
-                (
-                    index.dim_opt().unwrap_or(0) as u32,
-                    index.bits_per_dimension().unwrap_or(self.config.bit_width) as u32,
-                    index.len() as u64,
-                    shift,
-                    scale,
-                )
-            }
-            None => (0, 0, 0, Vec::new(), Vec::new()),
-        };
-        Ok(Response::new(GetCalibrationResponse {
-            dim,
-            bit_width,
-            num_vectors,
-            shift,
-            scale,
-        }))
-    }
-
-    async fn set_calibration(
-        &self,
-        request: Request<SetCalibrationRequest>,
-    ) -> Result<Response<SetCalibrationResponse>, Status> {
-        let _mutation = self.mutation_gate.read().await;
-        let already_seeded = self.apply_calibration(&request.into_inner())?;
-        Ok(Response::new(SetCalibrationResponse { already_seeded }))
-    }
-
     async fn add_vectors(
         &self,
         request: Request<Streaming<AddVectorsRequest>>,
@@ -18158,12 +18099,9 @@ mod snapshot_publication_tests {
                 service.flush_index().unwrap();
                 let epoch = read_shard(&service.state).stats_epoch;
                 service
-                    .apply_calibration(&SetCalibrationRequest {
-                        dim: 8,
-                        bit_width: 4,
-                        shift: vec![0.0; 8],
-                        scale: vec![1.0; 8],
-                    })
+                    .apply_backend_config(crate::harness::embedded_backend_request(
+                        8, 4, &[0.0; 8], &[1.0; 8],
+                    ))
                     .unwrap();
                 assert_ne!(read_shard(&service.state).stats_epoch, epoch);
                 let directory = root.join(format!("copy-{wal}-{layout:?}"));

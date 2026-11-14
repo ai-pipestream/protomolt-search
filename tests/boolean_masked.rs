@@ -22,7 +22,6 @@ use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     selection_query, AddDocumentsRequest, AddVectorsRequest, BooleanQuery, DenseQuery,
     FlushRequest, LexicalQuery, QueryHit, QueryRequest, QueryResponse, SearchQuery, SelectionQuery,
-    SetCalibrationRequest,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -76,12 +75,9 @@ async fn ingest(addr: &str) {
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, sample);
     let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
     client
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: BIT_WIDTH as u32,
-            shift,
-            scale,
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, BIT_WIDTH, &shift, &scale,
+        ))
         .await
         .unwrap();
     for block in 0..ROWS.div_ceil(BLOCK) {
