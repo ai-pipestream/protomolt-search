@@ -35,8 +35,7 @@ fn retained_reader_gate_matches_for_cold_and_bitmap_only_reused_segments() {
         if required {
             for result in [cold, warm] {
                 assert!(result
-                    .err()
-                    .expect("undeclared retention accepted")
+                    .expect_err("undeclared retention accepted")
                     .contains("requires a retained vector artifact"));
             }
         } else {
