@@ -37,7 +37,7 @@ impl CoordinatorServiceImpl {
         geo_filters: &[crate::pb::GeoFilter],
         filter: Option<&crate::pb::FilterExpr>,
     ) -> Result<FacetedHits, Status> {
-        self.fanout_bm25_fused_routed(
+        self.fanout_bm25_fused_context(LexicalFanout {
             text,
             k,
             fields,
@@ -47,13 +47,9 @@ impl CoordinatorServiceImpl {
             range_facet_fields,
             geo_filters,
             filter,
-            &mut Vec::new(),
-            None,
-            &mut Vec::new(),
-            false,
-        )
+            ..LexicalFanout::default()
+        })
         .await
-        .map(|((hits, _), _)| hits)
     }
 
     /// [`Self::fanout_bm25_fused_faceted`] that also reports which
@@ -67,22 +63,10 @@ impl CoordinatorServiceImpl {
     /// positions as a shard-side gate, and only when every shard carries
     /// them. Neither being true refuses by name — the query is never
     /// narrowed to "all terms present" and adjacency is never guessed.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn fanout_bm25_fused_routed(
+    pub(super) async fn fanout_bm25_fused_routed(
         &self,
-        text: &str,
-        k: u32,
-        fields: &[crate::pb::QueryField],
-        min_score: f32,
-        facet_fields: &[String],
-        map_facet_fields: &[crate::pb::MapFacetField],
-        range_facet_fields: &[crate::pb::RangeFacetField],
-        geo_filters: &[crate::pb::GeoFilter],
-        filter: Option<&crate::pb::FilterExpr>,
-        expansions: &mut Vec<crate::pb::PrefixExpansion>,
-        highlight: Option<&crate::pb::HighlightSpec>,
-        synonym_expansions: &mut Vec<crate::pb::SynonymExpansion>,
-        explain: bool,
+        query: LexicalFanout<'_>,
+        expansions: LexicalExpansions<'_>,
     ) -> Result<
         (
             (FacetedHits, crate::segment_prune::PruneStats),
@@ -90,13 +74,21 @@ impl CoordinatorServiceImpl {
         ),
         Status,
     > {
-        // Same rule as fanout_bm25_faceted: edge-list validation needs
-        // no shard, so it runs before the all-legs-empty early return.
-        crate::node::validate_range_facet_fields(range_facet_fields)?;
-        crate::node::validate_geo_filters(geo_filters)?;
-        if let Some(f) = filter {
-            crate::filter::validate_filter(f)?;
-        }
+        let query = query.validate()?;
+        let LexicalFanout {
+            text,
+            k,
+            fields,
+            facet_fields,
+            map_facet_fields,
+            range_facet_fields,
+            explain,
+            ..
+        } = query.input();
+        let LexicalExpansions {
+            prefixes: expansions,
+            synonyms: synonym_expansions,
+        } = expansions;
         // Phase timing, off unless PIPESTREAM_SEARCH_TRACE_BM25 is set.
         // route and the single-field route reach the same node scorer,
         // so when they disagree by orders of magnitude the question is
@@ -370,28 +362,22 @@ impl CoordinatorServiceImpl {
                 }
             }
             match self
-                .bm25_fused_round(
-                    k,
-                    &resolved_fields,
-                    &resolved_terms,
-                    &resolved,
-                    &claims,
-                    None,
-                    &phrase_legs,
-                    &fingerprints,
-                    min_score,
-                    facet_fields,
-                    map_facet_fields,
-                    range_facet_fields,
-                    geo_filters,
-                    filter,
-                    highlight,
-                    trace,
-                    t0,
-                    t_analyzed,
-                    t_stats,
-                    explain,
-                )
+                .bm25_fused_round(FusedRound {
+                    query,
+                    fields: &resolved_fields,
+                    field_terms: &resolved_terms,
+                    globals: &resolved,
+                    claims: &claims,
+                    phrase: None,
+                    phrase_legs: &phrase_legs,
+                    fingerprints: &fingerprints,
+                    timing: RoundTiming {
+                        trace,
+                        started: t0,
+                        analyzed: t_analyzed,
+                        stats: t_stats,
+                    },
+                })
                 .await
             {
                 Err(e) if !fresh && is_stale_stats(&e) => {
@@ -401,5 +387,34 @@ impl CoordinatorServiceImpl {
                 other => return other.map(|hits| (hits, routing)),
             }
         }
+    }
+}
+
+impl CoordinatorServiceImpl {
+    pub async fn fanout_bm25_fused_context(
+        &self,
+        query: LexicalFanout<'_>,
+    ) -> Result<FacetedHits, Status> {
+        if query.spec.is_some()
+            || !query.pre_analyzed_terms.is_empty()
+            || !query.prefixes.is_empty()
+            || !query.synonyms.is_empty()
+            || query.synonyms_off
+            || !query.score_stages.is_empty()
+            || !query.projections.is_empty()
+            || !query.stats_fields.is_empty()
+            || !query.cardinality_fields.is_empty()
+        {
+            return Err(Status::invalid_argument("fused lexical context cannot carry flat-only analysis, expansions, score stages, projections, or aggregations; put analysis and expansions on each query field"));
+        }
+        self.fanout_bm25_fused_routed(
+            query,
+            LexicalExpansions {
+                prefixes: &mut Vec::new(),
+                synonyms: &mut Vec::new(),
+            },
+        )
+        .await
+        .map(|((hits, _), _)| hits)
     }
 }

@@ -1,5 +1,6 @@
 //! Hybrid decomposed.
 
+use super::hybrid_context::{HybridQuery, HybridRound};
 use super::*;
 
 /// Total-order f64 wrapper for heap keys.
@@ -63,23 +64,29 @@ impl CoordinatorServiceImpl {
     ///   or from `VectorRescore` (bitwise identical — one kernel, one
     ///   calibration), b from the leg, from `Bm25Rescore`, or exactly
     ///   0 when the unfilled leg proves no further doc matches.
-    #[allow(clippy::too_many_arguments)]
     // Without the network stack the clustered arm is compiled out and
     // its inputs go unread; the exact arm is the whole function then.
     #[cfg_attr(not(feature = "net"), allow(unused_variables, unused_mut))]
     pub(super) async fn fanout_hybrid_decomposed(
         &self,
-        request_id: &str,
-        vector: &[f32],
-        k: u32,
-        terms: &[String],
-        analysis_fingerprint: u64,
-        global: &CorpusStats,
-        claims: &[StatsClaim],
-        legs: HybridLegs,
-        debug: bool,
-        filters: &RequestFilters,
+        round: HybridRound<'_>,
     ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
+        let HybridRound {
+            query,
+            terms,
+            analysis_fingerprint,
+            global,
+            claims,
+        } = round;
+        let HybridQuery {
+            request_id,
+            vector,
+            k,
+            legs,
+            debug,
+            filters,
+            ..
+        } = query;
         let n_nodes = self.node_addrs.len();
         if n_nodes == 0 {
             return Err(Status::failed_precondition("no shard nodes configured"));

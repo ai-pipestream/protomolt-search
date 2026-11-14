@@ -1,5 +1,6 @@
 //! Cascade.
 
+use super::hybrid_context::CascadeQuery;
 use super::*;
 
 impl CoordinatorServiceImpl {
@@ -30,33 +31,43 @@ impl CoordinatorServiceImpl {
         debug: bool,
         filters: &RequestFilters,
     ) -> Result<(Vec<CascadeHit>, Option<HybridDebug>), Status> {
-        self.fanout_cascade_with_terms(
+        self.fanout_cascade_context(CascadeQuery {
             request_id,
             text,
-            &[],
+            pre_analyzed_terms: &[],
             vector,
             k,
             spec,
             min_vector_score,
             debug,
             filters,
-        )
+        })
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn fanout_cascade_with_terms(
+    /// Run a cascade using grouped query inputs.
+    pub async fn fanout_cascade_context(
         &self,
-        request_id: &str,
-        text: &str,
-        pre_analyzed_terms: &[String],
-        vector: &[f32],
-        k: u32,
-        spec: Option<&crate::pb::AnalysisSpec>,
-        min_vector_score: f32,
-        debug: bool,
-        filters: &RequestFilters,
+        query: CascadeQuery<'_>,
     ) -> Result<(Vec<CascadeHit>, Option<HybridDebug>), Status> {
+        self.fanout_cascade_with_terms(query).await
+    }
+
+    pub(super) async fn fanout_cascade_with_terms(
+        &self,
+        query: CascadeQuery<'_>,
+    ) -> Result<(Vec<CascadeHit>, Option<HybridDebug>), Status> {
+        let CascadeQuery {
+            request_id,
+            text,
+            pre_analyzed_terms,
+            vector,
+            k,
+            spec,
+            min_vector_score,
+            debug,
+            filters,
+        } = query;
         let analysis_fingerprint = crate::analyzer::analysis_fingerprint(spec);
         if k == 0 || vector.is_empty() {
             return Ok((Vec::new(), None));

@@ -14,11 +14,18 @@ impl CoordinatorServiceImpl {
         max_weight: f32,
         filter: Option<&crate::pb::FilterExpr>,
     ) -> Result<FacetedHits, Status> {
-        crate::node::validate_range_facet_fields(&base.range_facet_fields)?;
-        crate::node::validate_geo_filters(&base.geo_filters)?;
-        if let Some(filter) = filter {
-            crate::filter::validate_filter(filter)?;
+        let phrase_query = LexicalFanout {
+            k,
+            min_score: base.min_score,
+            facet_fields: &base.facet_fields,
+            map_facet_fields: &base.map_facet_fields,
+            range_facet_fields: &base.range_facet_fields,
+            geo_filters: &base.geo_filters,
+            filter,
+            explain: base.explain,
+            ..LexicalFanout::default()
         }
+        .validate()?;
         let phrase_index = self.phrase_index.as_ref().ok_or_else(|| {
             Status::failed_precondition("this coordinator has no phrase glossary configured")
         })?;
@@ -159,28 +166,22 @@ impl CoordinatorServiceImpl {
                 .collect();
             let phrase_legs: Vec<Option<crate::pb::PhraseLeg>> = vec![None; fields.len()];
             let round = self
-                .bm25_fused_round(
-                    k,
-                    &fields,
-                    &field_terms,
-                    &globals,
-                    &claims,
-                    Some((phrase_leg, &phrase_weights, phrase_index.fingerprint())),
-                    &phrase_legs,
-                    &fingerprints,
-                    base.min_score,
-                    &base.facet_fields,
-                    &base.map_facet_fields,
-                    &base.range_facet_fields,
-                    &base.geo_filters,
-                    filter,
-                    None,
-                    trace,
-                    t0,
-                    t_analyzed,
-                    t_stats,
-                    base.explain,
-                )
+                .bm25_fused_round(FusedRound {
+                    query: phrase_query.with_k(k),
+                    fields: &fields,
+                    field_terms: &field_terms,
+                    globals: &globals,
+                    claims: &claims,
+                    phrase: Some((phrase_leg, &phrase_weights, phrase_index.fingerprint())),
+                    phrase_legs: &phrase_legs,
+                    fingerprints: &fingerprints,
+                    timing: RoundTiming {
+                        trace,
+                        started: t0,
+                        analyzed: t_analyzed,
+                        stats: t_stats,
+                    },
+                })
                 .await;
             match round {
                 Err(error) if !fresh && is_stale_stats(&error) => {

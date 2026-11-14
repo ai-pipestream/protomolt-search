@@ -142,8 +142,7 @@ impl CoordinatorServiceImpl {
             tokio::pin!(deadline);
             let mut scoring_fingerprints = Vec::new();
             let result = {
-                let attempt = runner.query_stream_attempt(query, access, finish_deadline_us, progress_rx, &tx,
-                    &mut revision, &mut scoring_fingerprints, &request_fingerprint);
+                let attempt = runner.query_stream_attempt(query, access, finish_deadline_us, progress_rx, query_progress::QueryStreamOutput { tx: &tx, revision: &mut revision, scoring_fingerprints: &mut scoring_fingerprints, request_fingerprint: &request_fingerprint });
                 tokio::pin!(attempt);
                 tokio::select! {
                     biased;
@@ -529,33 +528,33 @@ impl CoordinatorServiceImpl {
             let (mut hits, mut cascade_hits, mut debug) = match legs.fusion_mode {
                 FusionMode::Cascade | FusionMode::Unspecified => {
                     let (cascade_hits, debug) = self
-                        .fanout_cascade_with_terms(
-                            &request_id,
-                            &req.text,
-                            &req.pre_analyzed_terms,
-                            &req.vector,
+                        .fanout_cascade_with_terms(CascadeQuery {
+                            request_id: &request_id,
+                            text: &req.text,
+                            pre_analyzed_terms: &req.pre_analyzed_terms,
+                            vector: &req.vector,
                             k,
-                            req.analysis.as_ref(),
-                            legs.min_vector_score,
-                            req.debug,
-                            &filters,
-                        )
+                            spec: req.analysis.as_ref(),
+                            min_vector_score: legs.min_vector_score,
+                            debug: req.debug,
+                            filters: &filters,
+                        })
                         .await?;
                     (Vec::new(), cascade_hits, debug)
                 }
                 _ => {
                     let (hits, debug) = self
-                        .fanout_hybrid_with_terms(
-                            &request_id,
-                            &req.text,
-                            &req.pre_analyzed_terms,
-                            &req.vector,
+                        .fanout_hybrid_with_terms(HybridQuery {
+                            request_id: &request_id,
+                            text: &req.text,
+                            pre_analyzed_terms: &req.pre_analyzed_terms,
+                            vector: &req.vector,
                             k,
-                            req.analysis.as_ref(),
+                            spec: req.analysis.as_ref(),
                             legs,
-                            req.debug,
-                            &filters,
-                        )
+                            debug: req.debug,
+                            filters: &filters,
+                        })
                         .await?;
                     (hits, Vec::new(), debug)
                 }
@@ -622,6 +621,32 @@ impl CoordinatorServiceImpl {
             let mut phrase_routing = Vec::new();
             let mut prefix_expansions = Vec::new();
             let mut synonym_expansions = Vec::new();
+            let lexical_query = LexicalFanout {
+                text: &req.text,
+                pre_analyzed_terms: &req.pre_analyzed_terms,
+                k,
+                spec: req.analysis.as_ref(),
+                fields: &req.fields,
+                min_score: req.min_score,
+                facet_fields: &req.facet_fields,
+                map_facet_fields: &req.map_facet_fields,
+                range_facet_fields: &req.range_facet_fields,
+                score_stages: &req.score_stages,
+                geo_filters: &req.geo_filters,
+                filter: filter.as_ref(),
+                stats_fields: &req.stats_fields,
+                cardinality_fields: &req.cardinality_fields,
+                projections: &projections,
+                prefixes: &req.prefixes,
+                highlight: req.highlight.as_ref(),
+                synonyms: &req.synonyms,
+                synonyms_off: req.synonyms_off,
+                explain: req.explain,
+            };
+            let expansions = LexicalExpansions {
+                prefixes: &mut prefix_expansions,
+                synonyms: &mut synonym_expansions,
+            };
             let (hits, facets, range_facets, stats, cardinality, prune) =
                 if req.fields.is_empty() && req.phrase.is_some() {
                     // A phrase on the flat route is the body field's phrase on
@@ -658,48 +683,18 @@ impl CoordinatorServiceImpl {
                     }];
                     let (((hits, facets, ranges), fused_prune), routing) = self
                         .fanout_bm25_fused_routed(
-                            &req.text,
-                            k,
-                            &body,
-                            req.min_score,
-                            &req.facet_fields,
-                            &req.map_facet_fields,
-                            &req.range_facet_fields,
-                            &req.geo_filters,
-                            filter.as_ref(),
-                            &mut prefix_expansions,
-                            req.highlight.as_ref(),
-                            &mut synonym_expansions,
-                            req.explain,
+                            LexicalFanout {
+                                fields: &body,
+                                ..lexical_query
+                            },
+                            expansions,
                         )
                         .await?;
                     phrase_routing = routing;
                     (hits, facets, ranges, Vec::new(), Vec::new(), fused_prune)
                 } else if req.fields.is_empty() {
-                    self.fanout_bm25_aggregated_with_terms(
-                        &req.text,
-                        &req.pre_analyzed_terms,
-                        k,
-                        req.analysis.as_ref(),
-                        req.min_score,
-                        &req.facet_fields,
-                        &req.map_facet_fields,
-                        &req.range_facet_fields,
-                        &req.score_stages,
-                        &req.geo_filters,
-                        filter.as_ref(),
-                        &req.stats_fields,
-                        &req.cardinality_fields,
-                        &projections,
-                        &req.prefixes,
-                        &mut prefix_expansions,
-                        req.highlight.as_ref(),
-                        &req.synonyms,
-                        req.synonyms_off,
-                        &mut synonym_expansions,
-                        req.explain,
-                    )
-                    .await?
+                    self.fanout_bm25_aggregated(lexical_query, expansions)
+                        .await?
                 } else {
                     if !req.score_stages.is_empty() {
                         return Err(Status::invalid_argument(
@@ -747,21 +742,7 @@ impl CoordinatorServiceImpl {
                     ));
                     }
                     let (((hits, facets, ranges), fused_prune), routing) = self
-                        .fanout_bm25_fused_routed(
-                            &req.text,
-                            k,
-                            &req.fields,
-                            req.min_score,
-                            &req.facet_fields,
-                            &req.map_facet_fields,
-                            &req.range_facet_fields,
-                            &req.geo_filters,
-                            filter.as_ref(),
-                            &mut prefix_expansions,
-                            req.highlight.as_ref(),
-                            &mut synonym_expansions,
-                            req.explain,
-                        )
+                        .fanout_bm25_fused_routed(lexical_query, expansions)
                         .await?;
                     phrase_routing = routing;
                     (hits, facets, ranges, Vec::new(), Vec::new(), fused_prune)

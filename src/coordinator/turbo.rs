@@ -2,6 +2,17 @@
 
 use super::*;
 
+/// SPLADE inputs after top-k range and deadline admission.
+pub(super) struct SpladeFanout<'a> {
+    field: &'a str,
+    query_weights: &'a [(String, f32)],
+    query_l1_slack: f32,
+    k: usize,
+    wire_k: u32,
+    filter_cel: &'a str,
+    finish_deadline_us: u64,
+}
+
 impl CoordinatorServiceImpl {
     /// Verify a remote `turbo-kserve` endpoint against an expected index-generation handshake.
     #[cfg(feature = "net")]
@@ -90,7 +101,7 @@ impl CoordinatorServiceImpl {
         if k == 0 || query_weights.is_empty() {
             return Ok(Vec::new());
         }
-        let run = coordinator.score_splade_inner(
+        let run = coordinator.score_splade_inner(SpladeFanout {
             field,
             query_weights,
             query_l1_slack,
@@ -98,7 +109,7 @@ impl CoordinatorServiceImpl {
             wire_k,
             filter_cel,
             finish_deadline_us,
-        );
+        });
         let result = match remaining {
             Some(remaining) => tokio::time::timeout(remaining, run)
                 .await
@@ -113,17 +124,19 @@ impl CoordinatorServiceImpl {
         result
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) async fn score_splade_inner(
         &self,
-        field: &str,
-        query_weights: &[(String, f32)],
-        query_l1_slack: f32,
-        k: usize,
-        wire_k: u32,
-        filter_cel: &str,
-        finish_deadline_us: u64,
+        query: SpladeFanout<'_>,
     ) -> Result<Vec<(u64, f32)>, Status> {
+        let SpladeFanout {
+            field,
+            query_weights,
+            query_l1_slack,
+            k,
+            wire_k,
+            filter_cel,
+            finish_deadline_us,
+        } = query;
         let filters = RequestFilters::compile(&[], filter_cel)?;
         let mask = self.shard_mask(filters.tree.as_ref());
         let trees = self.shard_filter_trees(&filters, mask.as_ref());

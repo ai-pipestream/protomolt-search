@@ -2,6 +2,17 @@
 
 use super::*;
 
+/// Inputs for opening a shard stream fan-out.
+pub(crate) struct StreamOpen<'a> {
+    pub request_id: &'a str,
+    pub vector: &'a [f32],
+    pub initial_floor: Option<f32>,
+    pub candidate_depth: Option<u32>,
+    pub collapse_parents: bool,
+    pub filters: &'a RequestFilters,
+    pub identity_limits: Option<crate::pb::StreamIdentityLimits>,
+}
+
 /// One open `StreamSearch` fan-out: a merged inbound lane plus the
 /// per-shard signal lanes (authoritative stream sender + optional UDP token).
 /// Shared by every streaming consumer — plain top-k, document mode,
@@ -326,6 +337,30 @@ impl CoordinatorServiceImpl {
         filters: &RequestFilters,
         identity_limits: Option<crate::pb::StreamIdentityLimits>,
     ) -> Result<StreamFanout, Status> {
+        self.open_stream_context(StreamOpen {
+            request_id,
+            vector,
+            initial_floor,
+            candidate_depth,
+            collapse_parents,
+            filters,
+            identity_limits,
+        })
+    }
+
+    pub(crate) fn open_stream_context(
+        &self,
+        query: StreamOpen<'_>,
+    ) -> Result<StreamFanout, Status> {
+        let StreamOpen {
+            request_id,
+            vector,
+            initial_floor,
+            candidate_depth,
+            collapse_parents,
+            filters,
+            identity_limits,
+        } = query;
         self.check_vector_scan(filters, collapse_parents)?;
         let admission = self.vector_read_barrier()?;
         let n_nodes = self.node_addrs.len();

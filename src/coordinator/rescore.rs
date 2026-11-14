@@ -154,7 +154,6 @@ impl CoordinatorServiceImpl {
     /// Candidate-scoped lexical scoring shared by decomposed, cascade and
     /// legacy boosts. Admission precedes scoring; every result carries the
     /// authority view and the same physical claim as its global statistics.
-    #[allow(clippy::too_many_arguments)]
     pub(super) async fn bm25_rescore_round(
         &self,
         terms: &[String],

@@ -2,6 +2,14 @@
 
 use super::*;
 
+/// Shared revision state and response sink for one query-stream attempt.
+pub(super) struct QueryStreamOutput<'a> {
+    pub(super) tx: &'a mpsc::Sender<Result<crate::pb::QueryStreamResponse, Status>>,
+    pub(super) revision: &'a mut u64,
+    pub(super) scoring_fingerprints: &'a mut Vec<String>,
+    pub(super) request_fingerprint: &'a str,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct QueryProgress {
     pub(super) phase: crate::pb::QueryStreamPhase,
@@ -408,18 +416,20 @@ impl CoordinatorServiceImpl {
         ))
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) async fn query_stream_attempt(
         &self,
         query: crate::pb::QueryRequest,
         access: Option<crate::pb::AccessDecision>,
         finish_deadline_us: u64,
         mut progress_rx: watch::Receiver<Option<QueryProgress>>,
-        tx: &mpsc::Sender<Result<crate::pb::QueryStreamResponse, Status>>,
-        revision: &mut u64,
-        scoring_fingerprints: &mut Vec<String>,
-        request_fingerprint: &str,
+        output: QueryStreamOutput<'_>,
     ) -> Result<crate::pb::QueryResponse, Status> {
+        let QueryStreamOutput {
+            tx,
+            revision,
+            scoring_fingerprints,
+            request_fingerprint,
+        } = output;
         let runner = self.clone();
         let mut execution = tokio::task::JoinSet::new();
         execution.spawn(async move {

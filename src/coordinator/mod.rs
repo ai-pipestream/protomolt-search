@@ -25,8 +25,6 @@ use crate::fusion::{self, Leg};
 use crate::merge::{cmp_hits, merge_topk, FloorTracker, MergedHit};
 use crate::metrics::Route;
 use crate::pb::search_service_server::{SearchService, SearchServiceServer};
-#[cfg(feature = "net")]
-use crate::pb::HybridLegHit;
 use crate::pb::{
     bm25_query_stream_request, bm25_query_stream_response, Bm25QueryResponse,
     Bm25QueryStreamRequest, Bm25QueryStreamResponse,
@@ -96,9 +94,21 @@ pub use filters::MembershipSet;
 pub(crate) use filters::PercentileScope;
 pub use filters::RequestFilters;
 mod hybrid;
+mod hybrid_context;
+mod hybrid_reduce;
+#[cfg(test)]
+mod hybrid_tests;
+pub use hybrid_context::{CascadeQuery, HybridQuery};
 mod hybrid_decomposed;
 mod ingest;
 mod lexical;
+mod lexical_context;
+mod lexical_round;
+#[cfg(test)]
+mod lexical_round_tests;
+use lexical_context::LexicalExpansions;
+pub use lexical_context::LexicalFanout;
+use lexical_context::{FlatRound, FusedRound, RoundTiming};
 mod lexical_fused;
 mod lexical_stats;
 use lexical_stats::analyze_query;
@@ -146,7 +156,9 @@ mod signals;
 #[cfg(test)]
 mod stream_cancel_tests;
 mod stream_collapse;
+mod stream_run;
 mod stream_search;
+pub(crate) use stream_transport::StreamOpen;
 mod stream_transport;
 pub(crate) use stream_transport::StreamFanout;
 mod suggest;
