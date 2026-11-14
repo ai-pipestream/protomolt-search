@@ -1,31 +1,10 @@
-use super::import_tests::{
-    checkpoint_of, identity, key, legacy, limits, payload, retire, run_import, store, supplement,
-    Directory,
+use super::control_tests::{
+    identity, install, key, limits, state_with_tree, store, tree, Directory,
 };
 use super::*;
-use crate::pb::storage::legacy_control_import_supplement::Placement;
-use crate::pb::{PlacementNode, PlacementTree};
 use tonic::Code;
 
-fn tree() -> PlacementTree {
-    PlacementTree {
-        column: "placement".into(),
-        level_bits: 0,
-        nodes: vec![
-            PlacementNode {
-                name: "old".into(),
-                cel: "year < 2020".into(),
-                ..Default::default()
-            },
-            PlacementNode {
-                name: "rest".into(),
-                ..Default::default()
-            },
-        ],
-    }
-}
-
-pub(super) fn imported(
+pub(super) fn installed(
     name: &str,
 ) -> (
     Directory,
@@ -34,26 +13,9 @@ pub(super) fn imported(
     u64,
 ) {
     let dir = Directory::new(name);
-    let limits = limits(64 << 10, 128);
     let authority = identity(7);
-    let store = store(&dir, 7, &limits);
-    let legacy = legacy(&dir, 2);
-    let (retired, _) = retire(&store, &legacy, 1);
-    let checkpoint = checkpoint_of(&retired);
-    let placement = crate::placement::Placement::validate(
-        &crate::placement::PlacementTreeConfig::from_proto(&tree()),
-    )
-    .unwrap();
-    let mut with_tree = supplement(&checkpoint);
-    with_tree.placement = Some(Placement::Tree(tree()));
-    with_tree.route_codes = ["old", "rest"]
-        .map(|name| PlacementRouteCode {
-            has_placement: true,
-            placement: placement.leaf_by_name(name).unwrap().code as u64,
-        })
-        .to_vec();
-    let payload = payload(&retired, with_tree);
-    let (_, revision, _) = run_import(&store, &authority, &limits, &retired, &payload, 1);
+    let store = store(&dir, 7, &limits(64 << 10, 128));
+    let revision = install(&store, &authority, state_with_tree(), 1).control_revision;
     (dir, authority, store, revision)
 }
 
@@ -88,7 +50,7 @@ pub(super) fn prepare(
 
 #[test]
 fn the_map_is_produced_from_committed_rows_and_the_feed_wakes_per_revision() {
-    let (dir, authority, store, revision) = imported("map");
+    let (dir, authority, store, revision) = installed("map");
     let mut applied = store.subscribe_applied();
     assert_eq!(*applied.borrow_and_update(), revision);
     assert_eq!(
@@ -177,7 +139,7 @@ fn the_map_is_produced_from_committed_rows_and_the_feed_wakes_per_revision() {
 
 #[test]
 fn the_consumer_refuses_forged_stale_and_conflicting_frames() {
-    let (_dir, authority, store, revision) = imported("consumer");
+    let (_dir, authority, store, revision) = installed("consumer");
     let first = store.published_map("alice", &key("books")).unwrap();
     let mut consumer = MapConsumer::new();
     assert!(consumer.offer(first.clone()).unwrap());

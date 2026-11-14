@@ -2,9 +2,9 @@
 //! control revision, produced from committed rows in one read, and the
 //! consumer rules that make a stale or forged frame a named refusal.
 use super::capacity::load_committed;
-use super::import::{hash, prefix_end, read_headers, CONTROL, NODES, REPLICAS, TOPOLOGIES};
+use super::control::{hash, prefix_end, read_headers, CONTROL, NODES, REPLICAS, TOPOLOGIES};
 use super::*;
-use crate::pb::storage::legacy_control_import_supplement::Placement;
+use crate::pb::storage::control_configuration::Placement;
 
 const MAP_DOMAIN: &[u8] = b"protomolt.published-map.v1\0";
 

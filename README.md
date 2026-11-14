@@ -1316,13 +1316,6 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   refuse incomplete, duplicate or out-of-order transcript callbacks. Digest
   budgets below one row refuse. See [proof scope and memory bounds](docs/source-index-maintenance.md).
 
-- **Foundation branch: durable legacy-authority retirement.** A current Admin
-  can retire an exact checkpoint before import, fencing live clones and legacy
-  reopen. A private checksummed record preserves the actor/resource/operation
-  and permits exact authorized recovery after interrupted publication. The
-  destination store remains unchanged. See [retirement and crash recovery](docs/control-retirement.md);
-  transactional import, worker fencing and activation remain separate steps.
-
 - **Foundation branch: a peer's rejection is recorded and named.** A
   rejection a peer answers to a raft RPC is kept at the node that sent it
   (`RaftHost::peer_rejections`), an install rejected at the announce is
@@ -1513,17 +1506,6 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   format. No deactivation or replacement exists yet, so lease expiry can
   activate nothing. See [owner admission](docs/source-owner-admission.md).
 
-- **Foundation branch: administrative import recovery and proposal-time
-  admission (implemented).** `Recover` is the abort-only step any current
-  resource Admin may take on a stranded import: reservation released,
-  references dropped, charged history and the initiating actor retained,
-  the recovering actor named as the terminal command; no transfer, no
-  commit of another actor's import, no touch of the retired file, no
-  writer. Retirement-holder and managed-binding checks now run only at
-  proposal; `replay_control_import` and `replay_command` apply committed
-  commands with no holder or file access, and the replay tests compare
-  every table byte for byte. See [control import](docs/control-import.md).
-
 - **Foundation branch: capacity observations as committed state
   (implemented).** Store format 3 keeps the planner configuration, reporter
   incarnations and observations as rows of the source authority; configure
@@ -1532,8 +1514,8 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   `planner_input` transcribes one read of committed rows into Kimi's
   `TierSnapshotInput` with `TierSnapshot::validated` as the only validator.
   Reopen and crash recovery reproduce identical planner inputs and plans;
-  policy and tier changes move the plan digest. The legacy node residency is
-  now copied exactly on import (it was defaulted). See
+  policy and tier changes move the plan digest. Node residency is copied
+  exactly at install. See
   [capacity observations](docs/capacity-observations.md).
 
 - **Foundation branch: owner admission and readiness (implemented).** The
@@ -1547,31 +1529,18 @@ remain heap-owned. See [Mapped vector images](docs/mmap-vectors.md).
   [owner admission](docs/source-owner-admission.md). Open: writable
   activation and the committed map feed, replacement of a READY owner, Raft.
 
-- **Foundation branch: bounded transactional import (implemented).** Store
-  format 2 adopts format-1 stores at open and adds the unified control rows.
-  The retired record moves through the destination's ordinary command path as
-  retained chunk commands under one workflow, admitted only with the
-  `RetiredLegacyControl` holder, re-validated at commit against the
-  retirement's own digest, actor and destination identity, and applied with
-  allocators preserved, node leases as observations, pending actions
-  unreconciled and the placement tree, derived declaration, geometry and
-  planner policy supplied explicitly. Reservations keep terminal headroom on
-  a full store; recovery recomputes every count. Tested: multi-chunk round
-  trip, admission, capacity bounds, retry/CAS/ownership/revocation rules,
-  headroom, supplement refusals, process exit before and after every phase,
-  byte-identical replay, format adoption. `control_snapshot` is the immutable
-  committed view for observation and planning. See
-  [control import](docs/control-import.md). Open: managed-owner admission
-  through source commit, Raft hosting, trees for historical generations.
-
-- **Foundation branch: typed legacy control checkpoint.** A bounded private
-  protobuf preserves full authority history, lease credentials, allocator and
-  retained retry IDs, with exact optional presence and explicit legacy provenance.
-  Unknown JSON/protobuf fields refuse instead of disappearing. See the
-  [checkpoint contract](docs/control-checkpoint.md); transactional import and
-  owner activation remain separate integration steps. Validation: 739 library
-  tests, 150 integration targets, embedded/mobile and descriptor compatibility
-  gates passed within 8 GiB, with swap and OOM counters zero.
+- **Foundation branch: one bounded control install (implemented).** Store
+  format 3 holds a collection's topology, history, nodes, replicas, pending
+  actions, completed ids and configuration as rows of the source authority,
+  written by one `ControlInstallCommand` in one transaction: actor-scoped,
+  retryable by command id in the shared namespace, a stale install and a
+  second install of a resource recorded as refusals. Node leases are
+  observations and pending actions stay unreconciled; the placement tree,
+  derived declaration, geometry and planner policy are explicit. Under Raft
+  it is `RaftHost::propose_install`. Recovery recomputes every count.
+  `control_snapshot` is the immutable committed view for observation and
+  planning. This replaced the legacy retire/checkpoint/chunked-import path,
+  which had no clients. See [control state](docs/control-state.md).
 
 - **Foundation branch: exclusive control-store ownership.** The JSON authority
   keeps one persistent file lock across state replacements and every service

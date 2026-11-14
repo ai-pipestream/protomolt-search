@@ -1,76 +1,33 @@
 use super::capacity::*;
-use super::import_tests::{
-    checkpoint_of, command as import_command, identity, key, legacy, limits, payload, policy,
-    retire, run_import, store, supplement, Directory,
+use super::control_tests::{
+    command as install_command, identity, install, key, limits, policy, state, state_with_tree,
+    store, Directory,
 };
 use super::*;
 use crate::capacity_tiers::{plan_tiers, FragmentRequest, PartitionIdentity, TierSnapshot};
 use crate::pb::storage::capacity_transition::Action as TransitionAction;
-use crate::pb::storage::control_import_command::Action as ImportAction;
-use crate::pb::storage::legacy_control_import_supplement::Placement;
-use crate::pb::{AccessAction, CollectionGrant, PlacementNode, PlacementTree};
+use crate::pb::{AccessAction, CollectionGrant};
 use crate::test_support::ForkGuarded;
 use std::path::PathBuf;
 use tonic::Code;
 
 const COHORT_MS: u64 = 60_000;
 
-fn tree() -> PlacementTree {
-    PlacementTree {
-        column: "placement".into(),
-        level_bits: 0,
-        nodes: vec![
-            PlacementNode {
-                name: "old".into(),
-                cel: "year < 2020".into(),
-                ..Default::default()
-            },
-            PlacementNode {
-                name: "rest".into(),
-                ..Default::default()
-            },
-        ],
-    }
-}
-
-/// A store holding the two-route legacy import with a placement tree, so
-/// shard-a (routes 0..99, primary node/α, generation 7) sits in leaf "old".
-struct Imported {
+/// A store holding the installed `state_with_tree`.
+struct Installed {
     dir: Directory,
     authority: SourceAuthorityIdentity,
     store: SourceAuthorityStore,
-    /// The control revision after the import.
+    /// The control revision after the install.
     revision: u64,
 }
 
-fn imported(name: &str) -> Imported {
+fn installed(name: &str) -> Installed {
     let dir = Directory::new(name);
-    let limits = limits(64 << 10, 256);
     let authority = identity(7);
-    let store = store(&dir, 7, &limits);
-    let legacy = legacy(&dir, 2);
-    let (retired, _) = retire(&store, &legacy, 1);
-    let checkpoint = checkpoint_of(&retired);
-    let placement = crate::placement::Placement::validate(
-        &crate::placement::PlacementTreeConfig::from_proto(&tree()),
-    )
-    .unwrap();
-    let leaf = |name: &str| placement.leaf_by_name(name).unwrap().code as u64;
-    let mut with_tree = supplement(&checkpoint);
-    with_tree.placement = Some(Placement::Tree(tree()));
-    with_tree.route_codes = vec![
-        PlacementRouteCode {
-            has_placement: true,
-            placement: leaf("old"),
-        },
-        PlacementRouteCode {
-            has_placement: true,
-            placement: leaf("rest"),
-        },
-    ];
-    let payload = payload(&retired, with_tree);
-    let (_, revision, _) = run_import(&store, &authority, &limits, &retired, &payload, 1);
-    Imported {
+    let store = store(&dir, 7, &limits(64 << 10, 256));
+    let revision = install(&store, &authority, state_with_tree(), 1).control_revision;
+    Installed {
         dir,
         authority,
         store,
@@ -249,7 +206,7 @@ fn configure_is_a_retained_control_command_over_applied_state() {
     );
     drop(store);
 
-    let fixture = imported("configure");
+    let fixture = installed("configure");
     let store = &fixture.store;
     let authority = &fixture.authority;
     let revision = fixture.revision;
@@ -320,13 +277,13 @@ fn configure_is_a_retained_control_command_over_applied_state() {
             .code(),
         Code::FailedPrecondition
     );
-    // The shared command_id namespace: an import id cannot be reused here
+    // The shared command_id namespace: an install id cannot be reused here
     // and vice versa.
     assert_eq!(
         store
             .configure_capacity(
                 "alice",
-                &configure(authority, "commit", revision + 2, configuration("x"))
+                &configure(authority, "install", revision + 2, configuration("x"))
             )
             .err()
             .unwrap()
@@ -335,14 +292,9 @@ fn configure_is_a_retained_control_command_over_applied_state() {
     );
     assert_eq!(
         store
-            .execute_control_import(
+            .install_control(
                 "alice",
-                &import_command(
-                    authority,
-                    "c2",
-                    revision + 2,
-                    ImportAction::Abort(AbortControlImport {})
-                ),
+                &install_command(authority, "c2", revision + 2, state(2)),
             )
             .err()
             .unwrap()
@@ -366,7 +318,7 @@ fn configure_is_a_retained_control_command_over_applied_state() {
 
 #[test]
 fn transitions_register_report_expire_and_recover_identically() {
-    let fixture = imported("transitions");
+    let fixture = installed("transitions");
     let store = &fixture.store;
     let authority = &fixture.authority;
     let revision = fixture.revision;
@@ -539,7 +491,7 @@ fn transitions_register_report_expire_and_recover_identically() {
     // Reopen recomputes every count and re-lands every row; the planner
     // sees identical inputs and produces identical outputs.
     drop(fixture.store.clone());
-    let Imported { dir, store, .. } = fixture;
+    let Installed { dir, store, .. } = fixture;
     drop(store);
     let reopened = SourceAuthorityStore::open(&dir.authority(), authority).unwrap();
     let after = planner_view(&reopened, 10 * COHORT_MS);
@@ -564,7 +516,7 @@ fn transitions_register_report_expire_and_recover_identically() {
 
 #[test]
 fn policy_and_configuration_changes_are_bound_into_the_plan_digest() {
-    let fixture = imported("policy-changes");
+    let fixture = installed("policy-changes");
     let store = &fixture.store;
     let authority = &fixture.authority;
     let revision = fixture.revision;
@@ -642,7 +594,7 @@ fn policy_and_configuration_changes_are_bound_into_the_plan_digest() {
         Code::PermissionDenied
     );
     // Reopen reproduces the final view exactly.
-    let Imported { dir, store, .. } = fixture;
+    let Installed { dir, store, .. } = fixture;
     drop(store);
     let reopened = SourceAuthorityStore::open(&dir.authority(), authority).unwrap();
     assert_eq!(planner_view(&reopened, 6 * COHORT_MS), after_policy);
@@ -661,29 +613,7 @@ fn capacity_exit_worker() {
     let authority = identity(7);
     let store =
         SourceAuthorityStore::create(&dir.authority(), &authority, &policy(), &limits).unwrap();
-    let legacy = crate::control_plane::DurableControlPlane::open_existing(
-        dir.legacy(),
-        crate::control_plane::test_fixtures::populated_policy(),
-    )
-    .unwrap()
-    .with_collection("books")
-    .unwrap();
-    let (retired, _) = retire(&store, &legacy, 1);
-    let checkpoint = checkpoint_of(&retired);
-    let placement = crate::placement::Placement::validate(
-        &crate::placement::PlacementTreeConfig::from_proto(&tree()),
-    )
-    .unwrap();
-    let mut with_tree = supplement(&checkpoint);
-    with_tree.placement = Some(Placement::Tree(tree()));
-    with_tree.route_codes = ["old", "rest"]
-        .map(|name| PlacementRouteCode {
-            has_placement: true,
-            placement: placement.leaf_by_name(name).unwrap().code as u64,
-        })
-        .to_vec();
-    let payload = payload(&retired, with_tree);
-    let (_, revision, _) = run_import(&store, &authority, &limits, &retired, &payload, 1);
+    let revision = install(&store, &authority, state_with_tree(), 1).control_revision;
     let arm = |store: &SourceAuthorityStore| {
         *store.inner.fault.lock().unwrap() = Some(match fault {
             "before" => Fault::ExitBeforeCommit,
@@ -718,11 +648,6 @@ fn abrupt_exit_around_capacity_commits_recovers_and_replays() {
     for phase in ["configure", "report"] {
         for fault in ["before", "after"] {
             let dir = Directory::new(&format!("capacity-exit-{phase}-{fault}"));
-            std::fs::write(
-                dir.legacy(),
-                crate::control_plane::test_fixtures::populated_state_json("books", 2),
-            )
-            .unwrap();
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .arg("--exact")
                 .arg("source_authority::capacity_tests::capacity_exit_worker")
@@ -812,7 +737,7 @@ fn abrupt_exit_around_capacity_commits_recovers_and_replays() {
 
 #[test]
 fn rows_that_disagree_with_the_committed_view_refuse_the_open() {
-    let fixture = imported("tamper");
+    let fixture = installed("tamper");
     let store = &fixture.store;
     let authority = &fixture.authority;
     let revision = fixture.revision;
@@ -829,7 +754,7 @@ fn rows_that_disagree_with_the_committed_view_refuse_the_open() {
         .capacity_transition("alice", &report(authority, observation(1, 5, 10)))
         .unwrap();
     let key_bytes = observation_key(&key("books"), &observation(1, 5, 10));
-    let Imported { dir, store, .. } = fixture;
+    let Installed { dir, store, .. } = fixture;
     // A value whose identity differs from its key.
     {
         let tx = store.inner.database().begin_write().unwrap();

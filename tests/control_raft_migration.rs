@@ -1,11 +1,11 @@
 //! The migration and disaster-recovery exercise of
 //! docs/raft-control-design.md, "Implementation sequence and acceptance",
-//! step 5, on disposable state: the fleet's own root map becomes a legacy
-//! control plane, is retired and imported into a bootstrapped three-voter
-//! group, the committed map is what the relay would route on, and the
-//! group then loses its leader with a write in flight, serves a member an
-//! image with changed bytes and replaces a lost member from a prepared
-//! directory, restarts from cold, and recovers its retirement record.
+//! step 5, on disposable state: the fleet's own root map is installed as
+//! collection control state into a bootstrapped three-voter group, the
+//! committed map is what the relay would route on, and the group then loses
+//! its leader with a write in flight, serves a member an image with changed
+//! bytes and replaces a lost member from a prepared directory, and restarts
+//! from cold.
 //! Every step prints a timed line so the run is its own evidence
 //! (docs/raft-migration-exercise.md).
 #![cfg(all(feature = "raft", feature = "tls", feature = "fault-injection"))]
@@ -19,15 +19,15 @@ use std::time::{Duration, Instant};
 use control_adversarial::{kit, raft_kit};
 use pipestream_search::authorization::{AccessPermit, Authorizer, PolicyAuthority};
 use pipestream_search::config::{load_shard_map, RaftManagedCatalog};
-use pipestream_search::control_plane::DurableControlPlane;
 use pipestream_search::coordinator::TopologyRoute;
 use pipestream_search::document_catalog::{
     Acceptance, AccessControlledCatalog, ActiveManagedCatalog,
 };
 use pipestream_search::document_write_service::hosted::recover_catalogs;
-use pipestream_search::pb::storage::legacy_control_import_supplement::Placement;
+use pipestream_search::pb::storage::control_configuration::Placement;
 use pipestream_search::pb::storage::{
-    ConfirmSourceOwnerReady, PlacementRouteCode, SourceAuthorityIdentity, SourceOwnerCompletion,
+    ConfirmSourceOwnerReady, ControlInstallState, ControlRoute, ControlRouteTable,
+    PlacementRouteCode, SourceAuthorityIdentity, SourceOwnerCompletion,
 };
 use pipestream_search::pb::{
     accept_document_request::Mutation, AcceptDocumentRequest, AccessAction, AccessPolicy,
@@ -187,10 +187,10 @@ async fn bridge_active(
         .unwrap()
 }
 
-/// The fleet's root map as a legacy control topology: one route per shard
-/// in file order with its placement code, and stable-key hash ranges tiled
-/// per leaf, since the legacy plane requires ranges and the fleet's map
-/// (slot offsets and codes) carries none.
+/// The fleet's root map as a control topology: one route per shard in file
+/// order with its placement code, and stable-key hash ranges tiled per
+/// leaf, since control routes carry ranges and the fleet's map (slot
+/// offsets and codes) carries none.
 fn fleet_routes() -> (
     Vec<TopologyRoute>,
     pipestream_search::placement::PlacementTreeConfig,
@@ -240,55 +240,12 @@ fn fleet_routes() -> (
     )
 }
 
-/// Every import step through the leader, the revision tracker advanced.
-async fn import(
-    voters: &mut Voters,
-    leader: u64,
-    retired: &pipestream_search::control_plane::RetiredLegacyControl,
-    payload: &[u8],
-) {
-    let authority = voters.group.clone();
-    let (chunk_bytes, chunk_count) = kit::plan_three_chunks(payload.len());
-    let begin = kit::import_command(
-        &authority,
-        "import-begin",
-        voters.revision,
-        kit::WORKFLOW,
-        kit::begin_action(retired, payload, chunk_bytes, chunk_count),
-    );
+/// The install through the leader, the revision tracker advanced.
+async fn install(voters: &mut Voters, leader: u64, state: ControlInstallState) {
+    let command = kit::install_command(&voters.group, "install", voters.revision, state);
     let decision = voters
         .host(leader)
-        .propose_import("alice", &begin, Some(retired))
-        .await
-        .unwrap();
-    assert_eq!(decision.code, 0, "{}", decision.message);
-    voters.revision += 1;
-    for ordinal in 0..chunk_count {
-        let chunk = kit::import_command(
-            &authority,
-            &format!("import-chunk-{ordinal}"),
-            voters.revision,
-            kit::WORKFLOW,
-            kit::chunk_action(payload, chunk_bytes, ordinal),
-        );
-        let decision = voters
-            .host(leader)
-            .propose_import("alice", &chunk, None)
-            .await
-            .unwrap();
-        assert_eq!(decision.code, 0, "{}", decision.message);
-        voters.revision += 1;
-    }
-    let commit = kit::import_command(
-        &authority,
-        "import-commit",
-        voters.revision,
-        kit::WORKFLOW,
-        kit::commit_action(),
-    );
-    let decision = voters
-        .host(leader)
-        .propose_import("alice", &commit, None)
+        .propose_install("alice", &command)
         .await
         .unwrap();
     assert_eq!(decision.code, 0, "{}", decision.message);
@@ -349,7 +306,7 @@ async fn write_through(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_fleet_map_migrates_into_a_group_that_survives_the_exercise() {
+async fn the_fleet_map_installs_into_a_group_that_survives_the_exercise() {
     mark("start");
     let config = {
         let mut config = raft_kit::host_config();
@@ -360,54 +317,43 @@ async fn the_fleet_map_migrates_into_a_group_that_survives_the_exercise() {
     };
     let lease = Duration::from_millis(config.admission_lease_ms);
 
-    // 1. The fleet's map as a legacy control plane, quiesced (nothing serves
-    //    it), and its checkpoint retired under Admin into a group of three.
+    // 1. A group of three, and the fleet's map installed through the leader
+    //    with its placement tree and one code per route.
     let (routes, tree, generation) = fleet_routes();
     assert_eq!(routes.len(), 7, "seven fleet routes");
-    let legacy_dir = kit::TestDir::new("migration-legacy");
-    let plane = DurableControlPlane::open(legacy_dir.legacy(), kit::control_policy())
-        .unwrap()
-        .with_collection(kit::COLLECTION)
-        .unwrap();
-    plane.bootstrap_topology(generation, &routes).unwrap();
-    mark("legacy control plane bootstrapped from the fleet map");
-
     let mut cluster = raft_kit::three_voters_with("migration", &policy(), &config).await;
     let leader = cluster.leader().await;
     mark(&format!("three voters bootstrapped, leader {leader}"));
-    let store = cluster.host(leader).store().unwrap();
-    // Retirement is the legacy side's record; it commits nothing on the
-    // group, so the revision tracker does not move.
-    let (retired, request) = kit::retire(&store, &plane, cluster.revision);
-    drop(store);
-    let checkpoint = kit::checkpoint_of(&retired);
-    let checkpoint_digest = pipestream_search::sha256::digest(retired.checkpoint_bytes());
-    assert_eq!(
-        checkpoint.state().topology.as_ref().unwrap().routes.len(),
-        7
-    );
-    mark("legacy authority retired; the plane's clones are fenced");
-    let plane_again =
-        DurableControlPlane::open_existing(legacy_dir.legacy(), kit::control_policy());
-    assert!(
-        plane_again.is_err(),
-        "a retired legacy path reopens as a writer"
-    );
-    drop(plane);
-
-    // 2. Import with the fleet's placement tree and one code per route.
-    let mut supplement = kit::supplement(&checkpoint);
-    supplement.placement = Some(Placement::Tree(tree.to_proto()));
-    supplement.route_codes = routes
+    let mut configuration = kit::configuration();
+    configuration.placement = Some(Placement::Tree(tree.to_proto()));
+    configuration.route_codes = routes
         .iter()
         .map(|route| PlacementRouteCode {
             has_placement: true,
             placement: route.placement.unwrap() as u64,
         })
         .collect();
-    let payload = kit::payload(&retired, supplement);
-    import(&mut cluster, leader, &retired, &payload).await;
-    mark("import committed");
+    let state = ControlInstallState {
+        topology: Some(ControlRouteTable {
+            generation,
+            routes: routes
+                .iter()
+                .map(|route| {
+                    let (hash_lo, hash_hi) = route.hash_range.unwrap();
+                    ControlRoute {
+                        addr: route.addr.clone(),
+                        replica: route.replica.clone(),
+                        hash_lo,
+                        hash_hi,
+                    }
+                })
+                .collect(),
+        }),
+        configuration: Some(configuration),
+        ..kit::install_state(0)
+    };
+    install(&mut cluster, leader, state).await;
+    mark("install committed");
     let applied = raft_kit::durable_position(cluster.host(leader));
     for node in cluster.nodes() {
         cluster.wait_applied(node, applied).await;
@@ -415,7 +361,7 @@ async fn the_fleet_map_migrates_into_a_group_that_survives_the_exercise() {
     }
     mark("every voter publishes the fleet map with its tree and codes");
 
-    // 3. An owner on the group and a write through the leader and through
+    // 2. An owner on the group and a write through the leader and through
     //    a member that does not lead.
     let catalog_dir = kit::TestDir::new("migration-catalog");
     let catalog = bridge_active(&mut cluster, leader, &catalog_dir).await;
@@ -433,7 +379,7 @@ async fn the_fleet_map_migrates_into_a_group_that_survives_the_exercise() {
     assert_eq!(receipt.accepted_sequence, 3);
     mark("writes admitted on the leader and on a follower under a forwarded lease");
 
-    // 4. The leader is lost with a write in flight: the write is parked
+    // 3. The leader is lost with a write in flight: the write is parked
     //    inside its transaction, the leader is cut off, the survivors elect,
     //    the write commits inside its lease, and after healing its exact
     //    retry replays through the old leader under a forwarded lease.
@@ -537,7 +483,7 @@ async fn the_fleet_map_migrates_into_a_group_that_survives_the_exercise() {
     mark("healed: the in-flight write replays through the old leader under a forwarded lease");
     let _ = lease;
 
-    // 5. A member is lost and replaced from a prepared directory while the
+    // 4. A member is lost and replaced from a prepared directory while the
     //    leader's published image has changed bytes: the first seed is
     //    rejected by name, the leader rebuilds, the second seed installs,
     //    and the member is a voter again.
@@ -647,7 +593,7 @@ async fn the_fleet_map_migrates_into_a_group_that_survives_the_exercise() {
     assert_fleet_map(&cluster, lost, &routes, generation);
     mark(&format!("member {lost} replaced from a prepared directory, seeded from the rebuilt image, a voter again, publishing the fleet map"));
 
-    // 6. Cold restart: every member down, every member up on its directory,
+    // 5. Cold restart: every member down, every member up on its directory,
     //    a leader elected, the map unchanged, a write admitted anywhere.
     let mut addrs = std::collections::BTreeMap::new();
     let mut dirs = std::collections::BTreeMap::new();
@@ -706,21 +652,6 @@ async fn the_fleet_map_migrates_into_a_group_that_survives_the_exercise() {
     mark(&format!(
         "a write admitted through member {any} after the cold restart"
     ));
-
-    // 7. The retirement record is recoverable evidence: with every holder
-    //    dropped, exact Admin recovery returns the same checkpoint.
-    drop(retired);
-    let store = cluster.host(leader).store().unwrap();
-    let recovered = store
-        .recover_legacy_retirement("alice", &request, &legacy_dir.legacy())
-        .unwrap();
-    assert_eq!(
-        pipestream_search::sha256::digest(recovered.checkpoint_bytes()),
-        checkpoint_digest
-    );
-    drop(recovered);
-    drop(store);
-    mark("the retirement record recovered with the same checkpoint digest");
 
     cluster.shutdown().await;
     mark("done");
