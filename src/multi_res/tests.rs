@@ -36,14 +36,12 @@ fn row() -> RetainedVector {
             sentence_vectors: vec![vec![f32::from_bits(0x80000001), 0.0]],
             sha256: hash.finalize(),
         },
-        raw_full: vec![0.0, f32::from_bits(0x80000001), 5.0, -10.0],
     }
 }
 
 fn equal_bits(left: &RetainedVector, right: &RetainedVector) {
     let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
     assert_eq!(bits(&left.output.full), bits(&right.output.full));
-    assert_eq!(bits(&left.raw_full), bits(&right.raw_full));
     assert_eq!(
         left.output.inv_norm.to_bits(),
         right.output.inv_norm.to_bits()
@@ -238,7 +236,7 @@ fn malformed_and_semantically_invalid_payloads_are_refused() {
         match change {
             0 => stored.full[0] = f32::INFINITY,
             1 => stored.inv_norm = None,
-            2 => stored.raw_full.pop().map(|_| ()).unwrap(),
+            2 => stored.full.clear(),
             3 => stored.sha256[0] ^= 1,
             4 => stored.prefixes[0].dim = 1,
             5 => stored.sentences[0].values[0] = f32::NAN,
@@ -277,7 +275,7 @@ fn artifact_binding_rejects_other_generation_and_bad_expected_digest() {
     let target = directory.path("rows");
     let first = framed(&[stored(0)], 1);
     let mut other = stored(0);
-    other.embedding.as_mut().unwrap().raw_full[0] = 42.0;
+    other.embedding.as_mut().unwrap().inv_norm = Some(42.0);
     let second = framed(&[other], 1);
     std::fs::write(&target, &second).unwrap();
     assert!(MultiResVectors::open(&target, 1, &crate::sha256::hex_digest(&first)).is_err());

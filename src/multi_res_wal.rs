@@ -92,7 +92,7 @@ mod tests {
             Vec::new(),
         );
         let vectors = output.tier(8).unwrap().to_vec();
-        let encoded = crate::multi_res::encode(&RetainedVector { output, raw_full }).unwrap();
+        let encoded = crate::multi_res::encode(&RetainedVector { output }).unwrap();
         AddVectorsRequest {
             dim: 8,
             vectors,

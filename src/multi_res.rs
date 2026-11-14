@@ -60,8 +60,6 @@ pub(crate) struct MultiResVectors {
 #[derive(Clone)]
 pub(crate) struct RetainedVector {
     pub(crate) output: MultiResVectorOutput,
-    /// Original input bits retained alongside the already-materialized tiers.
-    pub(crate) raw_full: Vec<f32>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -86,8 +84,7 @@ struct Embedding {
     sentences: Vec<Tier>,
     #[prost(bytes = "vec", tag = "6")]
     sha256: Vec<u8>,
-    #[prost(float, repeated, packed = "true", tag = "7")]
-    raw_full: Vec<f32>,
+    // Tag 7 is reserved; replay carries materialized tiers, never raw inputs.
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -125,7 +122,6 @@ fn embedding(retained: &RetainedVector) -> Embedding {
             })
             .collect(),
         sha256: row.sha256.to_vec(),
-        raw_full: retained.raw_full.clone(),
     }
 }
 
@@ -135,8 +131,6 @@ fn materialized(row: Embedding) -> io::Result<RetainedVector> {
         || row
             .inv_norm
             .is_none_or(|norm| !norm.is_finite() || norm < 0.0)
-        || row.raw_full.len() != row.full.len()
-        || row.raw_full.iter().any(|v| !v.is_finite())
     {
         return Err(invalid("invalid full-resolution vector or norm"));
     }
@@ -164,7 +158,6 @@ fn materialized(row: Embedding) -> io::Result<RetainedVector> {
         return Err(invalid("multi-resolution vector digest mismatch"));
     }
     Ok(RetainedVector {
-        raw_full: row.raw_full,
         output: MultiResVectorOutput {
             full: row.full,
             prefixes: row
@@ -253,7 +246,6 @@ fn finite(values: &[f32]) -> io::Result<()> {
 fn validate_retained(row: &RetainedVector, limits: Limits) -> io::Result<usize> {
     let out = &row.output;
     if out.full.is_empty()
-        || row.raw_full.len() != out.full.len()
         || !out.inv_norm.is_finite()
         || out.inv_norm < 0.0
     {
@@ -262,8 +254,8 @@ fn validate_retained(row: &RetainedVector, limits: Limits) -> io::Result<usize> 
     let mut budget = Budget::new(limits.decoded);
     let mut size = 5 + delimited_size(32); // present inv_norm, full-vector digest
     budget.vector(32)?;
-    for values in [&out.full, &row.raw_full] {
-        let bytes = values
+    {
+        let bytes = out.full
             .len()
             .checked_mul(4)
             .ok_or_else(|| invalid("multi-resolution vector size overflow"))?;
@@ -304,7 +296,6 @@ fn validate_retained(row: &RetainedVector, limits: Limits) -> io::Result<usize> 
     }
     bounded_payload(size, limits)?;
     finite(&out.full)?;
-    finite(&row.raw_full)?;
     for values in out
         .prefixes
         .iter()
@@ -388,7 +379,6 @@ fn scan_embedding(mut bytes: &[u8], limits: Limits) -> io::Result<()> {
     bounded_payload(bytes.len(), limits)?;
     let mut budget = Budget::new(limits.decoded);
     let mut full = 0usize;
-    let mut raw = 0usize;
     let mut largest_prefix = 0usize;
     let mut norm = false;
     while !bytes.is_empty() {
@@ -396,11 +386,6 @@ fn scan_embedding(mut bytes: &[u8], limits: Limits) -> io::Result<()> {
         match tag {
             1 => {
                 full = full
-                    .checked_add(floats(wire, &mut bytes, &mut budget)?)
-                    .ok_or_else(|| invalid("multi-resolution vector size overflow"))?;
-            }
-            7 => {
-                raw = raw
                     .checked_add(floats(wire, &mut bytes, &mut budget)?)
                     .ok_or_else(|| invalid("multi-resolution vector size overflow"))?;
             }
@@ -428,7 +413,7 @@ fn scan_embedding(mut bytes: &[u8], limits: Limits) -> io::Result<()> {
             _ => skip(wire, tag, &mut bytes)?,
         }
     }
-    if full == 0 || full != raw || largest_prefix > full || !norm {
+    if full == 0 || largest_prefix > full || !norm {
         return Err(invalid("invalid full-resolution vector or norm"));
     }
     Ok(())

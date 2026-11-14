@@ -8825,16 +8825,7 @@ impl NodeServiceImpl {
             }
             let retained = rows
                 .into_iter()
-                .zip(batch.vectors.chunks_exact(raw_dim))
-                .map(|((slot, output), raw)| {
-                    (
-                        slot,
-                        crate::multi_res::RetainedVector {
-                            output,
-                            raw_full: raw.to_vec(),
-                        },
-                    )
-                })
+                .map(|(slot, output)| (slot, crate::multi_res::RetainedVector { output }))
                 .collect();
             (vecs, edim, retained)
         } else {
@@ -11284,16 +11275,7 @@ impl NodeServiceImpl {
                         )?;
                     let retained = rows
                         .into_iter()
-                        .zip(v.chunks_exact(raw_dim))
-                        .map(|((slot, output), raw)| {
-                            (
-                                slot,
-                                crate::multi_res::RetainedVector {
-                                    output,
-                                    raw_full: raw.to_vec(),
-                                },
-                            )
-                        })
+                        .map(|(slot, output)| (slot, crate::multi_res::RetainedVector { output }))
                         .collect();
                     (active, dim, retained)
                 } else {

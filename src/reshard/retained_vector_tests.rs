@@ -32,7 +32,6 @@ fn retained(seed: f32) -> RetainedVector {
             Some(vec![0, 255]),
             vec![vec![-0.0, f32::from_bits(1)]],
         ),
-        raw_full,
     }
 }
 fn replay() -> Replay {

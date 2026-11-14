@@ -57,8 +57,8 @@ way to infer completed empty extraction from absent column values.
 ## Retained vector tiers
 
 The provider and its FP32 sidecar contain the active indexing tier. Retained
-full vectors, prefixes, norms, optional codes, sentence vectors, and original
-input floats belong to the same shard generation. They survive flush, restart,
+full vectors, prefixes, norms, optional codes, and sentence vectors belong to
+the same shard generation. They survive flush, restart,
 snapshot installation, source backup/restore, and row renumbering. Recovery
 loads their original float bits; it does not normalize the active tier again
 or invoke an embedder. Tombstones apply before tier rescoring.
