@@ -176,6 +176,64 @@ async fn shutdown_signal() {
 
 async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     pipestream_search::security::install_client_tls(cfg.client_tls.clone());
+    pipestream_search::security::install_client_bearer_token(cfg.turbo_bearer_token.clone());
+    let startup_turbo_handshake = cfg.turbo_model_sha256.as_ref().map(|manifest_sha256| {
+        let model_id = cfg
+            .turbo_rerank_model
+            .clone()
+            .or_else(|| {
+                std::env::var("TURBO_EMBED_MODEL")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .unwrap_or_else(|| "embed".to_string());
+        let dim = cfg
+            .turbo_matryoshka_dims
+            .last()
+            .copied()
+            .or(cfg.turbo_matryoshka_active_dim)
+            .unwrap_or(0) as u32;
+        let bundle_fp = turbo_client::BundleScoringSpec {
+            model_id,
+            revision: String::new(),
+            manifest_sha256: manifest_sha256.clone(),
+            task: "embed".to_string(),
+            dim,
+            pooling: "mean".to_string(),
+            normalize: "l2".to_string(),
+        }
+        .fingerprint();
+        turbo_client::IndexGenerationHandshake {
+            analysis: None,
+            bundle: Some(bundle_fp),
+        }
+    });
+    if let Some(ref hs) = startup_turbo_handshake {
+        let remote_opts = pipestream_search::analyzer::RemoteCallOptions {
+            tls: cfg.client_tls.clone(),
+            bearer_token: cfg.turbo_bearer_token.clone(),
+            interactive: true,
+            timeout: None,
+            expected_handshake: Some(hs.clone()),
+        };
+        for remote_addr in cfg
+            .analysis_addr
+            .iter()
+            .chain(cfg.shards.iter().filter_map(|s| s.analysis_addr.as_ref()))
+            .chain(cfg.turbo_rerank_endpoint.iter())
+            .chain(cfg.turbo_vocab_endpoint.iter())
+        {
+            if remote_addr.starts_with("http://") || remote_addr.starts_with("https://") {
+                pipestream_search::analyzer::connect_verified_turbo_client(
+                    remote_addr,
+                    None,
+                    &remote_opts,
+                    hs.clone(),
+                )
+                .await?;
+            }
+        }
+    }
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         shutdown_signal().await;
@@ -296,6 +354,14 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 position_fields: cfg.position_fields.clone(),
                 bigram_fields: cfg.bigram_fields.clone(),
                 sentence_fields: cfg.sentence_fields.clone(),
+                turbo_handshake: startup_turbo_handshake.clone(),
+                matryoshka_prefix_dims: cfg
+                    .turbo_matryoshka_dims
+                    .iter()
+                    .map(|&d| d as u32)
+                    .collect(),
+                matryoshka_active_dim: cfg.turbo_matryoshka_active_dim.map(|d| d as u32),
+                vocab_kserve_endpoint: cfg.turbo_vocab_endpoint.clone(),
             };
             let mut node = if shard.demo.is_some() {
                 NodeServiceImpl::new(load_shard_index(shard, None)?, node_config)
@@ -304,6 +370,9 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 NodeServiceImpl::open(node_config, phrase_index.clone(), cfg.allow_missing_bm25)?
             }
             .with_flush_notify(std::sync::Arc::clone(&flush_notify));
+            if let Some(ref nlp_spec) = cfg.turbo_nlp_columns {
+                node = node.with_nlp_columns(nlp_spec.clone());
+            }
             if let Some(us) = cfg.stream_poll_delay_us.filter(|&us| us > 0) {
                 node = node.with_stream_poll_delay(std::time::Duration::from_micros(us));
             }
@@ -407,6 +476,14 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             wal_buckets: cfg.shards.first().map_or(64, |s| s.wal_buckets),
             vocab_window_docs: cfg.vocab_window_docs,
             vocab_top_k: cfg.vocab_top_k,
+            turbo_handshake: startup_turbo_handshake.clone(),
+            matryoshka_prefix_dims: cfg
+                .turbo_matryoshka_dims
+                .iter()
+                .map(|&d| d as u32)
+                .collect(),
+            matryoshka_active_dim: cfg.turbo_matryoshka_active_dim.map(|d| d as u32),
+            vocab_kserve_endpoint: cfg.turbo_vocab_endpoint.clone(),
             ..NodeConfig::default()
         };
         let replica_listen = membership.replica_listen.unwrap_or_else(|| {
@@ -633,6 +710,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 floor_prune: None,
                 floor_greediness_ppm: None,
                 floor_clamp_min: None,
+                include_rerank_candidate: false,
             })
             .await?
             .into_inner();
@@ -1411,6 +1489,35 @@ async fn build_corpus(
     }
     if let Some(key) = &cfg.udp_hmac_key {
         coordinator = coordinator.with_udp_hmac_key(key.clone());
+    }
+    if cfg.turbo_one_pass_query {
+        let analyzer = turbo_client::OnePassQueryBuilder::new().build()?;
+        let nlp_spec = cfg.turbo_nlp_columns.clone().unwrap_or_default();
+        coordinator = coordinator.with_one_pass_query(analyzer, nlp_spec);
+    }
+    if let Some(ref ep) = cfg.turbo_rerank_endpoint {
+        let remote_opts = pipestream_search::analyzer::RemoteCallOptions {
+            tls: cfg.client_tls.clone(),
+            bearer_token: cfg.turbo_bearer_token.clone(),
+            interactive: true,
+            timeout: None,
+            expected_handshake: None,
+        };
+        let client = pipestream_search::analyzer::remote_client_for(ep, &remote_opts)?;
+        let rerank_model = cfg
+            .turbo_rerank_model
+            .clone()
+            .unwrap_or_else(|| "reranker".to_string());
+        let spec = pipestream_search::turbo_bridge::rerank::RerankSpec::new(
+            pipestream_search::turbo_bridge::rerank::RerankBackend::Remote {
+                client: Box::new(client),
+                rerank_model,
+                embed_model: String::new(),
+                qa_model: String::new(),
+                temperature: 1.0,
+            },
+        );
+        coordinator = coordinator.with_rerank_spec(spec);
     }
     if let Some(path) = dataset.dense_quality_profile {
         let profile = pipestream_search::quality::DenseQualityProfile::load(path)?;

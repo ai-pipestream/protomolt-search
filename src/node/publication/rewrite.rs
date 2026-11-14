@@ -157,9 +157,21 @@ fn read_batch(
                 terms: Vec::new(),
                 length: field.doc_length(original),
                 positions: reader.field_has_positions(fi).then(Vec::new),
+                pos_lengths: field.has_pos_lengths().then(Vec::new),
                 sentences,
+                ..Default::default()
             };
         }
+        field.visit_splade(start, end, |term, original, impact, scale| {
+            if let Some(row) = &mut rows[(original - start) as usize] {
+                let bytes = std::mem::size_of::<(String, u16)>() + term.len();
+                charge(&mut used, bytes, limit)?;
+                charge(&mut row.bytes, bytes, limit)?;
+                row.fields[fi].splade.push((term.to_owned(), impact));
+                row.fields[fi].splade_scale_bits = scale;
+            }
+            Ok::<(), Status>(())
+        })?;
         for term in field.prefix_iter("") {
             let mut cursor = field
                 .file_impacts(&term)
@@ -177,10 +189,23 @@ fn read_batch(
                         } else {
                             None
                         };
+                        let pos_lengths = if field.has_pos_lengths() {
+                            let expected = positions.as_ref().map_or(0, Vec::len);
+                            Some(
+                                field
+                                    .posting_pos_lengths(&term, original)
+                                    .unwrap_or_else(|| vec![1; expected]),
+                            )
+                        } else {
+                            None
+                        };
                         let bytes = term.len()
                             + std::mem::size_of::<(String, u32, Vec<(u32, u32)>)>()
                             + offsets.len() * 8
                             + positions
+                                .as_ref()
+                                .map_or(0, |p| std::mem::size_of::<Vec<u32>>() + p.len() * 4)
+                            + pos_lengths
                                 .as_ref()
                                 .map_or(0, |p| std::mem::size_of::<Vec<u32>>() + p.len() * 4);
                         charge(&mut used, bytes, limit)?;
@@ -190,6 +215,13 @@ fn read_batch(
                             .push((term.clone(), cursor.tf(), offsets));
                         if let Some(positions) = positions {
                             row.fields[fi].positions.as_mut().unwrap().push(positions);
+                        }
+                        if let Some(pos_lengths) = pos_lengths {
+                            row.fields[fi]
+                                .pos_lengths
+                                .as_mut()
+                                .unwrap()
+                                .push(pos_lengths);
                         }
                     }
                 }

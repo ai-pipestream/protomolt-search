@@ -3,7 +3,7 @@ use crate::pb::{DocumentIdentity, ProtobufSource};
 use crate::segments::{SegmentCatalog, SegmentGenerationDeclaration, SegmentSourceOwner};
 
 #[tokio::test]
-async fn mixed_vectors_typed_values_and_analysis_survive_bounded_rebuilding() {
+async fn mixed_vectors_typed_values_and_lattice_splade_survive_bounded_rebuilding() {
     let directory = Directory::create(&std::env::temp_dir()).unwrap();
     let root = directory.0.join("catalog");
     let catalog = SegmentCatalog::open(&root).unwrap();
@@ -48,7 +48,10 @@ async fn mixed_vectors_typed_values_and_analysis_survive_bounded_rebuilding() {
                         AnalyzedField {
                             terms: vec![("red".into(), 2, vec![(0, 3), (4, 7)])],
                             length: 2,
-                            positions: Some(vec![vec![0, 1]]),
+                            splade: vec![("neural".into(), 200)],
+                            splade_scale_bits: (0.01_f32 * (id + 1) as f32).to_bits(),
+                            positions: Some(vec![vec![0, 2]]),
+                            pos_lengths: Some(vec![vec![2, 1]]),
                             sentences: Some(vec![(0, 7)]),
                         },
                         AnalyzedField::default(),
@@ -222,4 +225,9 @@ async fn mixed_vectors_typed_values_and_analysis_survive_bounded_rebuilding() {
         b"key-8"
     );
     assert!(after.exact_vectors(1).is_none());
+    assert!(before.bm25(0).field(0).has_splade());
+    assert!(
+        after.bm25(0).field(0).has_splade(),
+        "online rebuild erased SPLADE column"
+    );
 }

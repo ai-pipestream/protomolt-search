@@ -1,45 +1,53 @@
-//! Lexical analysis providers and the OpenNLP sidecar client (vendored proto
-//! `ai.pipestream.opennlp.analysis.v1`).
+//! Pure-Rust lexical and one-pass NLP analysis providers backed by
+//! `protomolt-analyzer` (`native`), in-process `turbo-client` (`turbo`), and
+//! pooled `turbo-kserve` gRPC offload (`turbo.result.v1.AnalysisService`).
 //!
-//! `native` runs the same product term contract in-process through the
-//! cross-platform `protomolt-analyzer` crate. HTTP(S) values use the OpenNLP
-//! sidecar. Search configures both to produce original-text UTF-8 byte offsets;
-//! direct users of either analyzer can select UTF-16 if needed. Embeddings and optional
-//! model-backed/structural layers remain sidecar capabilities.
+//! Search configures every backend to persist original-text UTF-8 byte offsets
+//! (`ViewId::SOURCE`), while preserving bidirectional UTF-8 / UTF-16 / Unicode
+//! code-point span projection through `turbo-client`.
+
+#[path = "analyzer_wire.rs"]
+pub(crate) mod wire;
 
 #[cfg(feature = "net")]
 use std::collections::HashMap;
 #[cfg(feature = "net")]
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::Duration;
 
 #[cfg(feature = "net")]
 use tokio_stream::wrappers::ReceiverStream;
 #[cfg(feature = "net")]
 use tonic::transport::Channel;
-use tonic::{Status, Streaming};
-
+use tonic::Status;
 #[cfg(feature = "net")]
-use crate::pb::analysis::analysis_service_client::AnalysisServiceClient;
-use crate::pb::analysis::{
-    analyze_stream_request, analyze_stream_response, AnalysisOptions, AnalyzeRequest,
-    AnalyzeResponse, AnalyzeStreamDoc, AnalyzeStreamRequest, AnalyzeStreamResponse,
-    TermVectorOptions,
-};
+use tonic::Streaming;
+
 use crate::pb::AnalysisSpec;
 use crate::postings::AnalyzedDoc;
 
-/// Matches the sidecar's default text size cap.
+/// Matches `turbo-kserve`'s default per-document text byte cap.
 pub const MAX_TEXT_BYTES: usize = 1024 * 1024;
 
-/// Configuration value selecting the in-process Rust analyzer.
+/// Configuration value selecting the minimal in-process `protomolt-analyzer` backend.
 pub const NATIVE_ANALYSIS_BACKEND: &str = "native";
 
-/// Resolved lexical analysis provider. The string configuration stays
-/// backward-compatible with sidecar addresses while callers that want a
-/// typed boundary can parse it once.
+/// Configuration value selecting the full in-process pure-Rust `turbo-client`
+/// lexical lattice + one-pass NLP backend (zero network, zero JVM).
+pub const TURBO_ANALYSIS_BACKEND: &str = "turbo";
+
+/// Default embedding model name queried by [`embed_text`] when the endpoint URI
+/// does not specify `?model=<name>` and `TURBO_EMBED_MODEL` is unset.
+pub const DEFAULT_EMBED_MODEL: &str = "embed";
+
+/// Resolved analysis provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnalysisBackend {
+    /// Minimal in-process `protomolt-analyzer` lexical provider.
     Native,
+    /// Full in-process `turbo-client` lexical lattice + one-pass NLP provider.
+    Turbo,
+    /// Pooled remote `turbo-kserve` (or `MockAnalysis`) gRPC endpoint.
     Sidecar(String),
 }
 
@@ -47,60 +55,33 @@ impl AnalysisBackend {
     pub fn parse(value: &str) -> Result<Self, Status> {
         match value.trim() {
             "native" | "native://" => Ok(Self::Native),
+            "turbo" | "turbo://" => Ok(Self::Turbo),
             "" => Err(Status::invalid_argument("analysis backend is empty")),
             address => Ok(Self::Sidecar(address.to_string())),
         }
     }
 }
 
+/// Optional per-call remote scheduling, auth, TLS, deadline, and cryptographic
+/// handshake overrides propagated to `turbo-kserve`.
+#[derive(Clone, Debug, Default)]
+pub struct RemoteCallOptions {
+    /// Explicit bearer token (`authorization: Bearer <token>`).
+    pub bearer_token: Option<String>,
+    /// Interactive vs bulk scheduling lane (`x-turbo-priority`).
+    pub interactive: bool,
+    /// Optional per-RPC deadline translated into `grpc-timeout`.
+    pub timeout: Option<Duration>,
+    /// Optional explicit mTLS / server CA configuration (falls back to
+    /// [`crate::security::process_client_tls`]).
+    pub tls: Option<crate::security::ClientTls>,
+    /// Optional expected model/analysis handshake verified against remote
+    /// `ModelMetadata` before inference.
+    pub expected_handshake: Option<turbo_client::IndexGenerationHandshake>,
+}
+
 /// The analysis a body-text corpus is built with, and the ONLY spec that
 /// may be used to query one.
-///
-/// Term identity is decided by the configured analysis provider, so an index
-/// and a query that disagree about this struct do not fail — they silently
-/// score different terms. That has now cost this project twice: once
-/// when a query went out unstemmed against a stemmed index, and once
-/// when the v7 corpus was built under `SOURCE_STEMS` (below). Both times
-/// the spec was written out by hand at the call site, and there were
-/// thirteen such copies. There is now one, and callers take it from
-/// here.
-///
-/// `SOURCE_NORMALIZED_STEMS` (3), not `SOURCE_STEMS` (2). The sidecar's
-/// own proto calls SOURCE_STEMS "a trap for any corpus that is not
-/// already lower case", and it is: stemmers operate on the surface form
-/// and do not fold case, so capitalization survives into term identity.
-/// Measured on the 86.6M-chunk court corpus built that way, `court`,
-/// `Court` and `COURT` were three separate terms with df 36,113,172 /
-/// 22,353,022 / 2,165,891 — a lowercase query reached 60% of them and
-/// scored the term as far rarer than it is. Proper nouns fared worst
-/// (`Dragon` df 4,571 vs `dragon` 508), so a search for "dungeons and
-/// dragons" returned dragon-toy copyright suits and prison dungeons
-/// while every Dungeons & Dragons opinion sat under the capitalized
-/// terms, unreachable.
-///
-/// The char filters run before the stemmer under source 3. STRIP_INVISIBLE and
-/// WHITESPACE are the sidecar's own defaults; FULL_CASE_FOLD is the one
-/// that does the work here.
-///
-/// ACCENT_FOLD is here for the same reason FULL_CASE_FOLD is, and it was
-/// added on measurement rather than principle. Case folding does not
-/// strip diacritics, so an accented spelling stays a separate term.
-/// Sampling 200,000 real chunks: the corpus writes the same surname both
-/// ways, heavily skewed, and neither spelling reaches the other's
-/// documents. `Rodriguez` 1,114 occurrences against `Rodríguez` 21,
-/// `García` 9 against `Garcia` 1,131, `Núñez` 0 against `Nunez` 116.
-/// A litigant's name is the most common thing anyone searches a court
-/// corpus for, and today it cannot be searched reliably in either
-/// spelling. 1,120 word types are split this way in that sample.
-///
-/// Two steps the sidecar now offers are deliberately NOT here, on the
-/// same evidence. DEHYPHENATE (24) repairs line-break hyphenation, which
-/// appears in 0.1% of sampled chunks: this corpus was converted from
-/// XML and HTML sources, so end-of-line hyphens were never introduced,
-/// and it is PDF-derived text that needs that step. NFKC (12) reaches a
-/// similar 0.1%. Neither earns a per-document cost on THIS corpus;
-/// both would on a PDF-sourced one, which is why the step is available
-/// rather than assumed.
 pub fn body_spec() -> AnalysisSpec {
     AnalysisSpec {
         tokenizer: TOKENIZER_WHITESPACE,
@@ -116,9 +97,7 @@ pub fn body_spec() -> AnalysisSpec {
     }
 }
 
-/// Unicode word-boundary variant of [`body_spec`]. This is additive rather
-/// than the default because changing the tokenizer changes persisted term
-/// identity and requires a new index generation.
+/// Unicode word-boundary variant of [`body_spec`].
 pub fn uax29_body_spec() -> AnalysisSpec {
     AnalysisSpec {
         tokenizer: TOKENIZER_UAX29,
@@ -127,37 +106,18 @@ pub fn uax29_body_spec() -> AnalysisSpec {
 }
 
 /// The cased twin of [`body_spec`]: identical tokenizer and stemmer,
-/// but term identity taken from the stem of the SURFACE form, so
-/// capitalization survives into the term.
-///
-/// This is not a mistake repeated; it is the other arm of the
-/// experiment. Folding is right for recall (`court` should find
-/// `Court`), and wrong for the signal that made "Dungeons and Dragons"
-/// findable at all: on this corpus the capitalized form dominates for
-/// proper nouns, and folding destroys the distinction. Which wins is a
-/// question about THIS corpus, so it is measured rather than assumed,
-/// which is what a second column is for.
+/// but term identity taken from the stem of the SURFACE form.
 pub fn cased_body_spec() -> AnalysisSpec {
     AnalysisSpec {
         term_vector_source: SOURCE_STEMS,
-        // SOURCE_STEMS ignores char filters outright, so leaving them
-        // populated here would be a lie about what the column contains.
         char_filters: Vec::new(),
         ..body_spec()
     }
 }
 
-/// The analyzers callers may name, for CLIs and config: one vocabulary
-/// instead of enum triples at every call site.
-///
-/// `Ok(None)` means "send no spec", which leaves the sidecar to apply
-/// its own defaults. That is a real choice and not the same as any named
-/// analyzer, because the sidecar's default does not stem.
+/// Named corpus analyzers for CLIs and configuration.
 pub fn analyzer_by_name(name: &str) -> Result<Option<AnalysisSpec>, String> {
     Ok(match name {
-        // `ingest` is the corpus's own analyzer, whatever that currently
-        // is; the alias exists so callers can say "match the index"
-        // without knowing which one that is today.
         "ingest" | "folded" => Some(body_spec()),
         "cased" => Some(cased_body_spec()),
         "server" => None,
@@ -173,26 +133,7 @@ pub fn analyzer_by_name(name: &str) -> Result<Option<AnalysisSpec>, String> {
 /// Every name [`analyzer_by_name`] accepts.
 pub const ANALYZER_NAMES: &[&str] = &["ingest", "folded", "cased", "server"];
 
-/// Stable 64-bit identity of an [`AnalysisSpec`]: the term-identity
-/// contract reduced to one number a shard can persist and a query can be
-/// checked against.
-///
-/// Field name equality is NOT this check. A column named `body_norm`
-/// built under one analyzer and queried under another matches on name,
-/// scores different terms, and returns a confident wrong ranking with no
-/// error anywhere. That failure has cost this project twice, and the
-/// coming rebuild multiplies the surface by adding a second body column
-/// whose whole purpose is to differ from the first.
-///
-/// Hand-rolled FNV-1a for the same reason [`crate::reshard::fnv1a64`] is:
-/// this value is written into a FILE FORMAT, so it must never change.
-/// `DefaultHasher` is explicitly not stable across Rust releases and
-/// would silently invalidate every shard on a toolchain bump.
-///
-/// `None` is 0, meaning UNKNOWN rather than "the default analyzer": an
-/// absent spec is resolved against the sidecar's own defaults, which
-/// this side cannot see and must not guess at. 0 never enforces, so a
-/// shard written before fingerprints existed keeps answering.
+/// Stable 64-bit FNV-1a identity of an [`AnalysisSpec`] persisted in `.bm25` headers.
 pub fn analysis_fingerprint(spec: Option<&AnalysisSpec>) -> u64 {
     fn eat(hash: &mut u64, bytes: &[u8]) {
         for byte in bytes {
@@ -202,9 +143,6 @@ pub fn analysis_fingerprint(spec: Option<&AnalysisSpec>) -> u64 {
     }
     let Some(spec) = spec else { return 0 };
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    // Domain tag. If AnalysisSpec ever grows a field, bumping this
-    // invalidates old fingerprints LOUDLY (every shard mismatches and
-    // says so) instead of letting two different specs share a number.
     eat(&mut hash, b"turbovec.analysis.v1");
     for value in [
         spec.tokenizer,
@@ -214,14 +152,10 @@ pub fn analysis_fingerprint(spec: Option<&AnalysisSpec>) -> u64 {
     ] {
         eat(&mut hash, &value.to_le_bytes());
     }
-    // Char filter ORDER is semantic (it is a chain applied in sequence),
-    // so it is hashed in order and never sorted. The count goes in
-    // first so [1, 2] and [12] cannot collide.
     eat(&mut hash, &(spec.char_filters.len() as u32).to_le_bytes());
     for filter in &spec.char_filters {
         eat(&mut hash, &filter.to_le_bytes());
     }
-    // 0 is reserved for "unknown"; a real spec must never claim it.
     if hash == 0 {
         1
     } else {
@@ -229,66 +163,64 @@ pub fn analysis_fingerprint(spec: Option<&AnalysisSpec>) -> u64 {
     }
 }
 
-/// `AnalysisOptions.Tokenizer.TOKENIZER_WHITESPACE`.
+/// Cryptographic SHA-256 [`turbo_client::IndexGenerationHandshake`] combining
+/// a field's [`turbo_client::AnalysisFingerprint`] with an optional neural
+/// [`turbo_client::BundleScoringFingerprint`].
+pub fn turbo_handshake(
+    spec: Option<&AnalysisSpec>,
+    bundle: Option<turbo_client::BundleScoringFingerprint>,
+) -> Result<turbo_client::IndexGenerationHandshake, Status> {
+    let cfg = turbo_field_config(spec)?;
+    Ok(turbo_client::IndexGenerationHandshake {
+        analysis: Some(cfg.fingerprint()),
+        bundle,
+    })
+}
+
+/// `Tokenizer.TOKENIZER_WHITESPACE`.
 pub const TOKENIZER_WHITESPACE: i32 = 1;
-/// `AnalysisOptions.Tokenizer.TOKENIZER_UAX29`.
+/// `Tokenizer.TOKENIZER_SIMPLE`.
+pub const TOKENIZER_SIMPLE: i32 = 2;
+/// `Tokenizer.TOKENIZER_UAX29`.
 pub const TOKENIZER_UAX29: i32 = 3;
-/// `AnalysisOptions.Stemmer.STEMMER_NONE`.
+/// `Stemmer.STEMMER_NONE`.
 pub const STEMMER_NONE: i32 = 1;
-/// `AnalysisOptions.Stemmer.STEMMER_PORTER`.
+/// `Stemmer.STEMMER_PORTER`.
 pub const STEMMER_PORTER: i32 = 2;
-/// `TermVectorOptions.Mode.MODE_FULL` (occurrence offsets included).
+/// `TermVectorMode.MODE_FULL` (occurrence offsets included).
 pub const TERM_VECTOR_MODE_FULL: i32 = 1;
-/// `TermVectorOptions.Mode.MODE_SCORING_ONLY` (frequency only).
+/// `TermVectorMode.MODE_SCORING_ONLY` (frequency only).
 pub const TERM_VECTOR_MODE_SCORING_ONLY: i32 = 2;
-/// `TermVectorOptions.Source.SOURCE_TOKENS` (char filters define identity).
+/// `TermVectorSource.SOURCE_TOKENS` (char filters define identity).
 pub const SOURCE_TOKENS: i32 = 1;
-/// `TermVectorOptions.Source.SOURCE_STEMS` (char filters IGNORED; see
-/// [`body_spec`] for why this is the wrong choice for prose).
+/// `TermVectorSource.SOURCE_STEMS` (char filters ignored).
 pub const SOURCE_STEMS: i32 = 2;
-/// `TermVectorOptions.Source.SOURCE_NORMALIZED_STEMS` (char filters, then stem).
+/// `TermVectorSource.SOURCE_NORMALIZED_STEMS` (char filters, then stem).
 pub const SOURCE_NORMALIZED_STEMS: i32 = 3;
-/// Strip invisible controls. Sidecar wire value
-/// `TermVectorOptions.NormalizerStep.NORMALIZER_STEP_STRIP_INVISIBLE`.
+/// Strip invisible controls.
 pub const CHAR_FILTER_STRIP_INVISIBLE: i32 = 1;
-/// Collapse whitespace. Sidecar wire value
-/// `TermVectorOptions.NormalizerStep.NORMALIZER_STEP_WHITESPACE`.
+/// Collapse whitespace.
 pub const CHAR_FILTER_WHITESPACE: i32 = 2;
-/// Full Unicode case fold. Sidecar wire value
-/// `TermVectorOptions.NormalizerStep.NORMALIZER_STEP_FULL_CASE_FOLD`.
+/// Full Unicode case fold.
 pub const CHAR_FILTER_FULL_CASE_FOLD: i32 = 6;
-/// Simple (per-character) case folding; the sidecar's other case step.
-/// A cased twin drops it along with the full fold.
-pub const CHAR_FILTER_CASE_FOLD: i32 = 16;
-/// Unicode NFKC compatibility composition (full-width to ASCII,
-/// superscripts to digits, Roman-numeral codepoints to letters). Sidecar
-/// wire value `NORMALIZER_STEP_NFKC`. Not in [`body_spec`]: measured at
-/// 0.1% of sampled court chunks.
+/// Unicode NFKC compatibility composition.
 pub const CHAR_FILTER_NFKC: i32 = 12;
-/// Strip diacritics, so `Rodríguez` and `Rodriguez` are one term.
-/// Sidecar wire value `NORMALIZER_STEP_ACCENT_FOLD`. See [`body_spec`]
-/// for the measurement that put it there.
+/// Unicode NFC canonical composition.
+pub const CHAR_FILTER_NFC: i32 = 13;
+/// Strip diacritics (`Rodríguez` -> `Rodriguez`).
 pub const CHAR_FILTER_ACCENT_FOLD: i32 = 15;
-/// Rejoin words split by a line-break hyphen. Sidecar wire value
-/// `NORMALIZER_STEP_DEHYPHENATE`. Offset-aware, so it is refused under
-/// `SOURCE_STEMS`. Not in [`body_spec`]: this corpus came from XML and
-/// HTML rather than PDF text, and the pattern appears in 0.1% of
-/// sampled chunks. It is the right step for a PDF-sourced corpus.
+/// Simple (per-character) case folding.
+pub const CHAR_FILTER_CASE_FOLD: i32 = 16;
+/// Strip HTML/XML markup tags while preserving source offsets.
+pub const CHAR_FILTER_HTML_STRIP: i32 = 20;
+/// Decode HTML character entities while preserving source offsets.
+pub const CHAR_FILTER_HTML_ENTITY: i32 = 21;
+/// Repair UTF-8-as-Latin-1 mojibake sequences while preserving source offsets.
+pub const CHAR_FILTER_MOJIBAKE: i32 = 23;
+/// Rejoin words split across line-break hyphens while emitting split+joined lattice arcs.
 pub const CHAR_FILTER_DEHYPHENATE: i32 = 24;
 
-/// Shared h2 channel to a sidecar address. tonic channels multiplex
-/// concurrent calls over one connection and are cheap to clone; opening
-/// a fresh TCP+h2 connection per Analyze (the previous behavior) buried
-/// the sidecar under connection churn — its listener died after ~28k
-/// rapid-fire calls while the process stayed alive.
-/// Bring a term prefix into a field's term identity for dictionary
-/// expansion (`docs/prefix-terms.md`): the spec's normalizer chain, and
-/// never its stemmer. Under `SOURCE_STEMS` the chain is ignored at ingest,
-/// so the prefix is compared as written. An absent spec cannot be
-/// honored — the sidecar's default chain is not known here, and a
-/// prefix normalized under the wrong chain matches the wrong terms — so
-/// it refuses by name, as does a chain the native normalizer does not
-/// implement.
+/// Normalize a term prefix under `spec`'s normalizer chain (never stemming).
 pub fn normalize_prefix(prefix: &str, spec: Option<&AnalysisSpec>) -> Result<String, Status> {
     if prefix.is_empty() {
         return Err(Status::invalid_argument(
@@ -299,14 +231,19 @@ pub fn normalize_prefix(prefix: &str, spec: Option<&AnalysisSpec>) -> Result<Str
         return Err(Status::invalid_argument(
             "term prefixes need an explicit AnalysisSpec: the prefix is normalized under \
              the field's char filters before it is compared against the dictionary, and \
-             the sidecar's default chain is not known to the coordinator",
+             an undeclared chain is not known to the coordinator",
         ));
     };
     if spec.term_vector_source == SOURCE_STEMS {
         return Ok(prefix.to_string());
     }
-    let native = native_spec(Some(spec))?;
-    let normalized = protomolt_analyzer::normalize_term(prefix, &native.normalizers);
+    let normalized = match native_spec(Some(spec)) {
+        Ok(native) => protomolt_analyzer::normalize_term(prefix, &native.normalizers),
+        Err(_) => {
+            let cfg = turbo_field_config(Some(spec))?;
+            turbo_client::LexicalAnalyzer::new(cfg).normalize_prefix(prefix)
+        }
+    };
     if normalized.is_empty() {
         return Err(Status::invalid_argument(format!(
             "term prefix {prefix:?} normalizes to nothing under the field's char filters"
@@ -321,10 +258,156 @@ type AnalysisChannels = Mutex<HashMap<String, Channel>>;
 type RuntimeChannelPools = Mutex<HashMap<tokio::runtime::Id, Weak<AnalysisChannels>>>;
 #[cfg(feature = "net")]
 static CHANNEL_POOLS: OnceLock<RuntimeChannelPools> = OnceLock::new();
+#[cfg(feature = "net")]
+static TURBO_REMOTE_POOL: OnceLock<Mutex<(u64, turbo_client::RemoteChannelPool)>> = OnceLock::new();
 
-/// A tonic channel's worker belongs to the runtime that created it. A weak
-/// registry lets callers share one pool per runtime without keeping retired
-/// pools or their channels alive for the rest of the process.
+#[cfg(feature = "net")]
+pub(crate) fn shared_turbo_pool() -> turbo_client::RemoteChannelPool {
+    let guard = TURBO_REMOTE_POOL
+        .get_or_init(|| Mutex::new((0, turbo_client::RemoteChannelPool::new())))
+        .lock()
+        .expect("turbo remote channel pool poisoned");
+    guard.1.clone()
+}
+
+/// Monotonic generation counter of the pooled `turbo-kserve` HTTP/2 channel
+/// table, incremented whenever an unhealthy channel is evicted.
+#[cfg(feature = "net")]
+pub fn turbo_pool_generation() -> u64 {
+    TURBO_REMOTE_POOL
+        .get_or_init(|| Mutex::new((0, turbo_client::RemoteChannelPool::new())))
+        .lock()
+        .expect("turbo remote channel pool poisoned")
+        .0
+}
+
+/// Evicts cached `turbo-kserve` HTTP/2 channels after a transport reset,
+/// `Unavailable`, `Unknown`, or `DeadlineExceeded` error so subsequent calls
+/// dial a fresh connection.
+#[cfg(feature = "net")]
+pub fn evict_unhealthy_turbo_channel(addr: &str) {
+    {
+        let mut guard = TURBO_REMOTE_POOL
+            .get_or_init(|| Mutex::new((0, turbo_client::RemoteChannelPool::new())))
+            .lock()
+            .expect("turbo remote channel pool poisoned");
+        guard.0 = guard.0.saturating_add(1);
+        guard.1 = turbo_client::RemoteChannelPool::new();
+    }
+    if let Ok(pool) = runtime_channel_pool() {
+        if let Ok(mut map) = pool.lock() {
+            map.remove(addr);
+        }
+    }
+}
+
+#[cfg(feature = "net")]
+pub(crate) fn inspect_remote_status(addr: &str, status: Status) -> Status {
+    if matches!(
+        status.code(),
+        tonic::Code::Unavailable | tonic::Code::Unknown | tonic::Code::DeadlineExceeded
+    ) {
+        evict_unhealthy_turbo_channel(addr);
+    }
+    status
+}
+
+#[cfg(feature = "net")]
+fn inspect_remote_client_err(addr: &str, err: turbo_client::ClientError) -> Status {
+    let status = client_err_to_status(err);
+    inspect_remote_status(addr, status)
+}
+
+/// Build a [`turbo_client::RemoteEndpointConfig`] honoring `options` and
+/// process-wide TLS/bearer settings.
+#[cfg(feature = "net")]
+pub fn remote_endpoint_config_for(
+    addr: &str,
+    options: &RemoteCallOptions,
+) -> Result<turbo_client::RemoteEndpointConfig, Status> {
+    let tls_ref = options
+        .tls
+        .as_ref()
+        .or_else(|| crate::security::process_client_tls());
+    let endpoint_uri = if tls_ref.is_some() {
+        crate::security::secure_url(addr, tls_ref)
+    } else {
+        addr.to_string()
+    };
+    let priority = if options.interactive {
+        turbo_client::RemotePriority::Interactive
+    } else {
+        turbo_client::RemotePriority::Bulk
+    };
+    let mut cfg = turbo_client::RemoteEndpointConfig::new(endpoint_uri).with_priority(priority);
+    if let Some(token) = options
+        .bearer_token
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(crate::security::process_client_bearer_token)
+    {
+        cfg = cfg.with_bearer_token(token);
+    }
+    if let Some(timeout) = options.timeout {
+        cfg = cfg.with_timeout(timeout);
+    }
+    #[cfg(feature = "tls")]
+    if let Some(tls) = tls_ref {
+        cfg = cfg.with_tls(turbo_client::RemoteTlsConfig {
+            server_ca_pem: tls.ca_pem.clone(),
+            client_identity_pem: tls.identity_pem.clone(),
+            domain_name: tls.domain.clone(),
+        });
+    }
+    #[cfg(not(feature = "tls"))]
+    if tls_ref.is_some() {
+        return Err(Status::failed_precondition(
+            "this build has no TLS support (feature `tls` is off)",
+        ));
+    }
+    Ok(cfg)
+}
+
+/// Build a pooled [`turbo_client::RemoteClient`] honoring `options` and
+/// process-wide TLS/bearer settings.
+#[cfg(feature = "net")]
+pub fn remote_client_for(
+    addr: &str,
+    options: &RemoteCallOptions,
+) -> Result<turbo_client::RemoteClient, Status> {
+    let cfg = remote_endpoint_config_for(addr, options)?;
+    Ok(turbo_client::RemoteClient::with_pool(
+        cfg,
+        shared_turbo_pool(),
+    ))
+}
+
+/// Connects and verifies a [`turbo_client::TurboClient`] against both lexical
+/// analysis and remote `turbo-kserve` `ModelMetadata`, failing loudly
+/// with `FAILED_PRECONDITION` at startup/bind on any fingerprint mismatch.
+#[cfg(feature = "net")]
+pub async fn connect_verified_turbo_client(
+    addr: &str,
+    spec: Option<&AnalysisSpec>,
+    options: &RemoteCallOptions,
+    handshake: turbo_client::IndexGenerationHandshake,
+) -> Result<turbo_client::TurboClient, Status> {
+    let (clean_addr, model_name, _) = parse_embed_endpoint(addr);
+    let endpoint_cfg = remote_endpoint_config_for(&clean_addr, options)?;
+    let field_cfg = turbo_field_config(spec)?;
+    let handshake_model = handshake
+        .bundle
+        .as_ref()
+        .map(|_| (model_name, String::new()));
+    turbo_client::TurboClient::builder()
+        .with_default_field(field_cfg)
+        .with_handshake(handshake)
+        .with_remote_endpoint(endpoint_cfg, handshake_model)
+        .connect()
+        .await
+        .map_err(|e| inspect_remote_client_err(&clean_addr, e))
+}
+
 #[cfg(feature = "net")]
 fn runtime_channel_pool() -> Result<Arc<AnalysisChannels>, Status> {
     let handle = tokio::runtime::Handle::try_current().map_err(|_| {
@@ -338,8 +421,6 @@ fn runtime_channel_pool() -> Result<Arc<AnalysisChannels>, Status> {
     }
     let pool = Arc::new(Mutex::new(HashMap::new()));
     pools.insert(handle.id(), Arc::downgrade(&pool));
-    // The runtime owns this strong reference, including when it shuts down
-    // before ever polling the task. Dropping the task releases the pool.
     let owner = Arc::clone(&pool);
     handle.spawn(async move {
         std::future::pending::<()>().await;
@@ -348,8 +429,7 @@ fn runtime_channel_pool() -> Result<Arc<AnalysisChannels>, Status> {
     Ok(pool)
 }
 
-/// Reuse an analysis channel within the current Tokio runtime. Call again
-/// after replacing that runtime; an existing Channel cannot outlive its worker.
+/// Reuse an analysis channel within the current Tokio runtime.
 #[cfg(feature = "net")]
 pub fn shared_channel(addr: &str) -> Result<Channel, Status> {
     let pool = runtime_channel_pool()?;
@@ -357,33 +437,57 @@ pub fn shared_channel(addr: &str) -> Result<Channel, Status> {
     if let Some(channel) = channels.get(addr) {
         return Ok(channel.clone());
     }
-    // Creation is synchronous and remains under the pool lock so concurrent
-    // callers cannot open competing channels for the same address.
-    let channel = Channel::from_shared(addr.to_string())
+    let tls = crate::security::process_client_tls();
+    let url = if tls.is_some() {
+        crate::security::secure_url(addr, tls)
+    } else {
+        addr.to_string()
+    };
+    let endpoint = Channel::from_shared(url)
         .map_err(|error| {
-            Status::invalid_argument(format!("bad sidecar address {addr:?}: {error}"))
+            Status::invalid_argument(format!("bad analysis address {addr:?}: {error}"))
         })?
-        .connect_lazy();
+        .tcp_nodelay(true);
+    let endpoint =
+        crate::security::apply_client_tls(endpoint, tls).map_err(Status::failed_precondition)?;
+    let channel = endpoint.connect_lazy();
     channels.insert(addr.to_string(), channel.clone());
     Ok(channel)
 }
 
-/// Analyze `text` into an [`AnalyzedDoc`] (term, tf, original-text offsets,
-/// and document length) using the sidecar at `addr`.
-///
-/// `spec` maps straight onto the sidecar's `AnalysisOptions`: term vectors
-/// are always requested (FULL mode with occurrence offsets unless the spec
-/// overrides), everything else defaults. INVALID_ARGUMENT for empty or
-/// oversized text; UNAVAILABLE when the sidecar cannot be reached (the
-/// shared channel connects lazily, so transport failures surface from the
-/// call itself, not from client construction).
+/// Analyze `text` into an [`AnalyzedDoc`] (term, tf, original-text UTF-8 offsets,
+/// and document length) using the configured backend at `addr`.
 pub async fn analyze_document(
     addr: &str,
     text: &str,
     spec: Option<&AnalysisSpec>,
 ) -> Result<AnalyzedDoc, Status> {
-    if AnalysisBackend::parse(addr)? == AnalysisBackend::Native {
-        return analyze_document_native(text, spec);
+    analyze_document_with_options(
+        addr,
+        text,
+        spec,
+        SessionLayers::default(),
+        &RemoteCallOptions {
+            interactive: true,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// Analyze `text` with explicit [`SessionLayers`] and [`RemoteCallOptions`]
+/// (propagating mTLS, bearer token, priority lane, and RPC timeout).
+pub async fn analyze_document_with_options(
+    addr: &str,
+    text: &str,
+    spec: Option<&AnalysisSpec>,
+    layers: SessionLayers,
+    options: &RemoteCallOptions,
+) -> Result<AnalyzedDoc, Status> {
+    match AnalysisBackend::parse(addr)? {
+        AnalysisBackend::Native => return analyze_document_native_layers(text, spec, layers),
+        AnalysisBackend::Turbo => return analyze_document_turbo(text, spec, layers),
+        AnalysisBackend::Sidecar(_) => {}
     }
     if text.is_empty() {
         return Err(Status::invalid_argument("empty document text"));
@@ -395,32 +499,78 @@ pub async fn analyze_document(
             MAX_TEXT_BYTES
         )));
     }
-    let request = AnalyzeRequest {
-        text: text.to_string(),
-        options: Some(analysis_options(spec, SessionLayers::default())),
-    };
-    #[cfg(feature = "net")]
-    {
-        let mut client = client(addr)?;
-        // Raw Status passthrough: transport failures keep tonic's
-        // Unavailable (the channel connects lazily, so "sidecar down"
-        // surfaces HERE, not at client construction), server errors keep
-        // their own codes.
-        let response = client.analyze(request).await?.into_inner();
-        analyzed_from(response, SessionLayers::default())
-    }
     #[cfg(not(feature = "net"))]
     {
-        let _ = request;
+        let _ = (spec, layers, options);
         Err(sidecar_needs_net(addr))
+    }
+    #[cfg(feature = "net")]
+    {
+        let remote = remote_client_for(addr, options)?;
+        let ch = remote
+            .pool()
+            .channel(remote.config())
+            .map_err(client_err_to_status)?;
+        let mut client = AnalysisServiceClient::new(ch)
+            .max_decoding_message_size(crate::MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(crate::MAX_MESSAGE_BYTES);
+        let session = wire::WireSessionOptions {
+            spec: spec.cloned(),
+            layers,
+        };
+        let payload = AnalyzePipelineRequest {
+            doc_id: "0".to_string(),
+            text: text.to_string(),
+            offsets: OffsetMode::Utf8 as i32,
+            profile: "default-v1".to_string(),
+            pii_output: Some(PiiOutputOptions {
+                full_text: true,
+                ..Default::default()
+            }),
+            binding: Some(session.to_binding()),
+            ..Default::default()
+        };
+        let prio = if options.interactive {
+            turbo_client::RemotePriority::Interactive
+        } else {
+            turbo_client::RemotePriority::Bulk
+        };
+        let req = remote
+            .prepare_request(payload, Some(prio), options.timeout)
+            .map_err(client_err_to_status)?;
+        let mut stream = client
+            .analyze_document_progressive(req)
+            .await
+            .map_err(|s| inspect_remote_status(addr, s))?
+            .into_inner();
+        let mut graph_resp: Option<DocumentGraphResponse> = None;
+        while let Some(ev) = stream
+            .message()
+            .await
+            .map_err(|s| inspect_remote_status(addr, s))?
+        {
+            if let Some(analyze_progressive_event::Event::Complete(done)) = ev.event {
+                graph_resp = Some(done);
+            }
+        }
+        let done = graph_resp.ok_or_else(|| {
+            Status::internal("AnalyzeDocumentProgressive stream ended without a Complete event")
+        })?;
+        decode_graph_response_remote(
+            addr,
+            &remote,
+            &mut client,
+            done,
+            spec,
+            layers,
+            options.timeout,
+            None,
+        )
+        .await
     }
 }
 
-/// Analyze one document with the in-process Rust provider.
-///
-/// Native analysis requires an explicit spec. The sidecar-only `server`
-/// analyzer has no stable client-visible default to reproduce, so guessing it
-/// here would make the same fingerprint mean different terms.
+/// Analyze one document with the minimal in-process `protomolt-analyzer` provider.
 pub fn analyze_document_native(
     text: &str,
     spec: Option<&AnalysisSpec>,
@@ -428,8 +578,7 @@ pub fn analyze_document_native(
     Ok(native_analysis(text, spec)?.doc)
 }
 
-/// Both identities from one native pass (`docs/dual-cased.md`): the
-/// folded body at field 0 and the cased twin in `cased`.
+/// Both identities from one native pass (`docs/dual-cased.md`).
 pub fn analyze_document_native_dual(
     text: &str,
     spec: Option<&AnalysisSpec>,
@@ -437,6 +586,393 @@ pub fn analyze_document_native_dual(
     validate_dual_cased_spec(spec)?;
     let spec = native_spec(spec)?;
     Ok(native_dual_with_spec(text, &spec)?.doc)
+}
+
+fn analyze_document_native_layers(
+    text: &str,
+    spec: Option<&AnalysisSpec>,
+    layers: SessionLayers,
+) -> Result<AnalyzedDoc, Status> {
+    let unsupported = SessionLayers {
+        sentences: false,
+        dual_cased: false,
+        ..layers
+    };
+    if unsupported != SessionLayers::default() {
+        return Err(Status::failed_precondition(
+            "native lexical analysis does not provide quality, geography, or entities; use --analysis-addr=turbo or turbo-kserve",
+        ));
+    }
+    let mut doc = if layers.dual_cased {
+        analyze_document_native_dual(text, spec)?
+    } else {
+        analyze_document_native(text, spec)?
+    };
+    if !layers.sentences {
+        // Keep native's default behavior (sentences populated) consistent with analyze_document_native.
+        let _ = &mut doc;
+    }
+    Ok(doc)
+}
+
+/// Analyze one document in-process using `turbo-client` (`LexicalAnalyzer` +
+/// optional `OnePassDocumentNlp` layers) with zero network calls and zero JVM.
+pub fn analyze_document_turbo(
+    text: &str,
+    spec: Option<&AnalysisSpec>,
+    layers: SessionLayers,
+) -> Result<AnalyzedDoc, Status> {
+    Ok(turbo_analysis_pass(text, spec, layers)?.doc)
+}
+
+struct TurboPassOutput {
+    doc: AnalyzedDoc,
+    surface_tokens: Vec<String>,
+}
+
+static TURBO_NLP_SINGLETON: std::sync::OnceLock<Result<turbo_client::OnePassDocumentNlp, String>> =
+    std::sync::OnceLock::new();
+
+fn shared_turbo_nlp() -> Result<&'static turbo_client::OnePassDocumentNlp, Status> {
+    TURBO_NLP_SINGLETON
+        .get_or_init(|| {
+            turbo_client::OnePassDocumentNlp::builder()
+                .build()
+                .map_err(|e| e.to_string())
+        })
+        .as_ref()
+        .map_err(|msg| Status::internal(format!("failed to build OnePassDocumentNlp: {msg}")))
+}
+
+fn turbo_analysis_pass(
+    text: &str,
+    spec: Option<&AnalysisSpec>,
+    layers: SessionLayers,
+) -> Result<TurboPassOutput, Status> {
+    if text.is_empty() {
+        return Err(Status::invalid_argument("empty document text"));
+    }
+    if text.len() > MAX_TEXT_BYTES {
+        return Err(Status::invalid_argument(format!(
+            "document of {} bytes exceeds the {}-byte cap",
+            text.len(),
+            MAX_TEXT_BYTES
+        )));
+    }
+    if layers.dual_cased {
+        validate_dual_cased_spec(spec)?;
+    }
+    let effective_spec = spec.cloned().unwrap_or_else(body_spec);
+    let scoring_only = effective_spec.term_vector_mode == TERM_VECTOR_MODE_SCORING_ONLY;
+    let cfg = turbo_field_config(Some(&effective_spec))?;
+    let lex = turbo_client::LexicalAnalyzer::new(cfg);
+    let surface_tokens: Vec<String> = text.split_whitespace().map(str::to_owned).collect();
+
+    let (primary_field, cased_field) = if layers.dual_cased {
+        let dual = lex.analyze_dual(text).map_err(client_err_to_status)?;
+        (
+            turbo_field_to_postings(dual.primary, scoring_only),
+            Some(turbo_field_to_postings(dual.cased, scoring_only)),
+        )
+    } else {
+        let primary = lex.analyze(text).map_err(client_err_to_status)?;
+        (turbo_field_to_postings(primary, scoring_only), None)
+    };
+
+    let (quality, geography, entities, nlp_proj) =
+        if layers.quality || layers.geography || layers.entities || layers.nlp_columns {
+            let nlp = shared_turbo_nlp()?
+                .analyze(text)
+                .map_err(client_err_to_status)?;
+            let (q, g, e) = reduce_nlp_layers(&nlp, layers);
+            (q, g, e, layers.nlp_columns.then(|| Box::new(nlp)))
+        } else {
+            (None, None, Vec::new(), None)
+        };
+
+    Ok(TurboPassOutput {
+        doc: AnalyzedDoc {
+            fields: vec![primary_field],
+            cased: cased_field,
+            quality,
+            geography,
+            entities,
+            nlp: nlp_proj,
+        },
+        surface_tokens,
+    })
+}
+
+fn reduce_nlp_layers(
+    nlp: &turbo_client::DocumentNlpProjection,
+    layers: SessionLayers,
+) -> (
+    Option<crate::postings::DocQuality>,
+    Option<crate::postings::DocGeography>,
+    Vec<crate::phrases::DocEntity>,
+) {
+    let quality = layers.quality.then(|| crate::postings::DocQuality {
+        noise: if nlp.quality.worst_noise_score.is_finite() {
+            nlp.quality.worst_noise_score
+        } else {
+            0.0
+        },
+        noise_chars: nlp.quality.union_noise_chars,
+        artifacts: nlp.quality.artifact_count,
+    });
+    let geography = layers.geography.then(|| {
+        let mut best: Option<&turbo_client::GeoHit> = None;
+        let mut votes: Vec<(String, usize)> = Vec::new();
+        for hit in &nlp.geo {
+            if !hit.confidence.is_finite() {
+                continue;
+            }
+            if best.is_none_or(|b| hit.confidence > b.confidence) {
+                best = Some(hit);
+            }
+            if !hit.country_code.is_empty() {
+                match votes.iter_mut().find(|(c, _)| *c == hit.country_code) {
+                    Some((_, n)) => *n += 1,
+                    None => votes.push((hit.country_code.clone(), 1)),
+                }
+            }
+        }
+        votes.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        crate::postings::DocGeography {
+            point: best.map(|b| (b.latitude, b.longitude)),
+            confidence: best.map_or(0.0, |b| b.confidence),
+            country: votes.first().map(|(c, _)| c.clone()).unwrap_or_default(),
+        }
+    });
+    let entities = if layers.entities {
+        nlp.affirmed_entities
+            .iter()
+            .map(|e| crate::phrases::DocEntity {
+                kind: e.kind.clone(),
+                text: e.surface.clone(),
+                start: e.spans.utf8.0,
+                end: e.spans.utf8.1,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    (quality, geography, entities)
+}
+
+fn turbo_field_to_postings(
+    analyzed: turbo_client::AnalyzedField,
+    scoring_only: bool,
+) -> crate::postings::AnalyzedField {
+    let mut term_indices: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut terms: crate::postings::DocTerms = Vec::new();
+    let mut positions: crate::postings::DocPositions = Vec::new();
+    let mut pos_lengths: crate::postings::DocPositions = Vec::new();
+    let mut seen_ordinals: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut has_lattice = false;
+    let mut primary_len = 0u32;
+    let mut max_tf = 0u32;
+
+    for arc in analyzed.arcs {
+        if arc.term.is_empty() {
+            continue;
+        }
+        let arc_len = arc.pos_len.max(1);
+        if arc_len == 1 {
+            primary_len = primary_len.saturating_add(1);
+        } else {
+            has_lattice = true;
+        }
+        let span = arc.spans.utf8;
+        match term_indices.get(&arc.term).copied() {
+            Some(idx) => {
+                // Keep per-term positions strictly ascending: if a normalized/compound
+                // arc lands on an already-recorded position for the identical term,
+                // keep the wider source span and arc span rather than duplicating the ordinal.
+                if let Some(last_pos) = positions[idx].last().copied() {
+                    if arc.pos <= last_pos {
+                        if arc.pos == last_pos && !scoring_only {
+                            if let Some(last_occ) = terms[idx].2.last_mut() {
+                                last_occ.0 = last_occ.0.min(span.0);
+                                last_occ.1 = last_occ.1.max(span.1);
+                            }
+                            if let Some(last_len) = pos_lengths[idx].last_mut() {
+                                *last_len = (*last_len).max(arc_len);
+                            }
+                        }
+                        continue;
+                    }
+                }
+                if !seen_ordinals.insert(arc.pos) {
+                    has_lattice = true;
+                }
+                terms[idx].1 += 1;
+                max_tf = max_tf.max(terms[idx].1);
+                if !scoring_only {
+                    terms[idx].2.push(span);
+                }
+                positions[idx].push(arc.pos);
+                pos_lengths[idx].push(arc_len);
+            }
+            None => {
+                if !seen_ordinals.insert(arc.pos) {
+                    has_lattice = true;
+                }
+                let idx = terms.len();
+                term_indices.insert(arc.term.clone(), idx);
+                max_tf = max_tf.max(1);
+                let occs = if scoring_only { Vec::new() } else { vec![span] };
+                terms.push((arc.term, 1, occs));
+                positions.push(vec![arc.pos]);
+                pos_lengths.push(vec![arc_len]);
+            }
+        }
+    }
+
+    let mut raw_sentences: Vec<(u32, u32)> = analyzed
+        .sentences
+        .iter()
+        .map(|s| s.spans.utf8)
+        .filter(|&(s, e)| s < e)
+        .collect();
+    // Ensure any multi-line dehyphenated occurrence span bridging two adjacent
+    // sentences is enclosed by a single merged sentence span so `check_sentences`
+    // holds unconditionally.
+    for (_, _, occs) in &terms {
+        for &(os, oe) in occs {
+            if os >= oe {
+                continue;
+            }
+            let first = raw_sentences.partition_point(|&(_, se)| se <= os);
+            let last_excl = raw_sentences.partition_point(|&(ss, _)| ss < oe);
+            if first < raw_sentences.len() && last_excl > first + 1 {
+                let merged_start = raw_sentences[first].0.min(os);
+                let merged_end = raw_sentences[last_excl - 1].1.max(oe);
+                raw_sentences.splice(first..last_excl, [(merged_start, merged_end)]);
+            } else if first < raw_sentences.len() {
+                raw_sentences[first].0 = raw_sentences[first].0.min(os);
+                raw_sentences[first].1 = raw_sentences[first].1.max(oe);
+            } else if os < oe {
+                raw_sentences.push((os, oe));
+            }
+        }
+    }
+
+    crate::postings::AnalyzedField {
+        terms,
+        length: primary_len.max(max_tf),
+        positions: if scoring_only { None } else { Some(positions) },
+        pos_lengths: if !scoring_only && has_lattice {
+            Some(pos_lengths)
+        } else {
+            None
+        },
+        sentences: Some(raw_sentences),
+        ..Default::default()
+    }
+}
+
+/// Translate a `protomolt-search` [`AnalysisSpec`] into a `turbo-client`
+/// [`turbo_client::FieldAnalysisConfig`].
+pub fn turbo_field_config(
+    spec: Option<&AnalysisSpec>,
+) -> Result<turbo_client::FieldAnalysisConfig, Status> {
+    use turbo_client::{NormalizerKind, StemmerKind, TermSourceKind, TokenizerKind};
+
+    let effective = spec.cloned().unwrap_or_else(body_spec);
+    let tokenizer = match effective.tokenizer {
+        0 | TOKENIZER_WHITESPACE => TokenizerKind::Whitespace,
+        TOKENIZER_SIMPLE => TokenizerKind::Simple,
+        TOKENIZER_UAX29 => TokenizerKind::Uax29,
+        other => {
+            return Err(Status::invalid_argument(format!(
+                "unsupported tokenizer {other}; expected WHITESPACE (1), SIMPLE (2), or UAX29 (3)"
+            )))
+        }
+    };
+    let stemmer = match effective.stemmer {
+        0 | STEMMER_NONE => StemmerKind::None,
+        STEMMER_PORTER => StemmerKind::Porter,
+        other => {
+            return Err(Status::invalid_argument(format!(
+                "unsupported stemmer {other}"
+            )))
+        }
+    };
+    let term_source = match effective.term_vector_source {
+        0 | SOURCE_TOKENS => TermSourceKind::Tokens,
+        SOURCE_STEMS => TermSourceKind::Stems,
+        SOURCE_NORMALIZED_STEMS => TermSourceKind::NormalizedStems,
+        other => {
+            return Err(Status::invalid_argument(format!(
+                "unsupported term_vector_source {other}"
+            )))
+        }
+    };
+    if matches!(
+        term_source,
+        TermSourceKind::Stems | TermSourceKind::NormalizedStems
+    ) && stemmer == StemmerKind::None
+    {
+        return Err(Status::invalid_argument(
+            "term vector source STEMS requires a stemmer other than STEMMER_NONE",
+        ));
+    }
+    let mut normalizers = Vec::new();
+    if term_source != TermSourceKind::Stems {
+        for &step in &effective.char_filters {
+            let kind = match step {
+                0 => continue,
+                CHAR_FILTER_STRIP_INVISIBLE => NormalizerKind::StripInvisible,
+                CHAR_FILTER_WHITESPACE => NormalizerKind::Whitespace,
+                CHAR_FILTER_FULL_CASE_FOLD => NormalizerKind::FullCaseFold,
+                CHAR_FILTER_NFKC => NormalizerKind::Nfkc,
+                CHAR_FILTER_NFC => NormalizerKind::Nfc,
+                CHAR_FILTER_ACCENT_FOLD => NormalizerKind::AccentFold,
+                CHAR_FILTER_CASE_FOLD => NormalizerKind::SimpleCaseFold,
+                CHAR_FILTER_HTML_STRIP => NormalizerKind::HtmlTagStrip,
+                CHAR_FILTER_HTML_ENTITY => NormalizerKind::HtmlEntityDecode,
+                CHAR_FILTER_MOJIBAKE => NormalizerKind::Mojibake,
+                CHAR_FILTER_DEHYPHENATE => NormalizerKind::Dehyphenate,
+                unsupported => {
+                    return Err(Status::invalid_argument(format!(
+                        "unsupported normalizer step {unsupported}"
+                    )))
+                }
+            };
+            normalizers.push(kind);
+        }
+    }
+    Ok(turbo_client::FieldAnalysisConfig {
+        tokenizer,
+        normalizers,
+        stemmer,
+        term_source,
+        emit_lattice: true,
+        sentence_language: "eng".to_string(),
+    })
+}
+
+pub(crate) fn client_err_to_status(err: turbo_client::ClientError) -> Status {
+    match err {
+        turbo_client::ClientError::InvalidArgument(m) => Status::invalid_argument(m),
+        turbo_client::ClientError::FailedPrecondition(m) => Status::failed_precondition(m),
+        turbo_client::ClientError::NotFound(m) => Status::not_found(m),
+        turbo_client::ClientError::PermissionDenied(m) => Status::permission_denied(m),
+        turbo_client::ClientError::DeadlineExceeded(m) => Status::deadline_exceeded(m),
+        turbo_client::ClientError::Unauthenticated(m) => Status::unauthenticated(m),
+        turbo_client::ClientError::Unavailable(m) => Status::unavailable(m),
+        turbo_client::ClientError::Internal(m) => Status::internal(m),
+    }
+}
+
+#[cfg(feature = "net")]
+pub(crate) fn remote_client_err_to_status(
+    client: &turbo_client::RemoteClient,
+    err: turbo_client::ClientError,
+) -> Status {
+    inspect_remote_client_err(&client.config().endpoint, err)
 }
 
 #[derive(Debug)]
@@ -460,16 +996,12 @@ fn native_analysis_with_spec(
     Ok(NativeAnalysis {
         doc: AnalyzedDoc {
             fields: vec![native_field(analyzed)],
-            cased: None,
-            quality: None,
-            geography: None,
-            entities: Vec::new(),
+            ..Default::default()
         },
         tokens,
     })
 }
 
-/// Both identities from one native pass (`docs/dual-cased.md`).
 fn native_dual_with_spec(
     text: &str,
     spec: &protomolt_analyzer::AnalysisSpec,
@@ -481,19 +1013,12 @@ fn native_dual_with_spec(
         doc: AnalyzedDoc {
             fields: vec![native_field(dual.folded)],
             cased: Some(native_field(dual.cased)),
-            quality: None,
-            geography: None,
-            entities: Vec::new(),
+            ..Default::default()
         },
         tokens,
     })
 }
 
-/// One native identity stream as an analyzed field. The native
-/// tokenizer numbers its own tokens, so positions come out of the same
-/// pass as the terms (no second walk), and its newline sentence detector
-/// runs in that pass too, so every native analysis carries a sentence
-/// table (docs/highlighting.md).
 fn native_field(analyzed: protomolt_analyzer::AnalyzedDocument) -> crate::postings::AnalyzedField {
     let mut terms = crate::postings::DocTerms::with_capacity(analyzed.term_vectors.len());
     let mut positions = crate::postings::DocPositions::with_capacity(analyzed.term_vectors.len());
@@ -520,6 +1045,7 @@ fn native_field(analyzed: protomolt_analyzer::AnalyzedDocument) -> crate::postin
                 .map(|span| (span.start, span.end))
                 .collect(),
         ),
+        ..Default::default()
     }
 }
 
@@ -610,172 +1136,732 @@ fn native_spec(spec: Option<&AnalysisSpec>) -> Result<protomolt_analyzer::Analys
     Ok(native)
 }
 
-/// The refusal a sidecar address gets from a build without the network
-/// stack: the embedded runtime analyzes natively and dials nothing.
 #[cfg(not(feature = "net"))]
 fn sidecar_needs_net(addr: &str) -> Status {
     Status::failed_precondition(format!(
-        "analysis sidecar {addr:?} is unreachable from this build: the `net` feature is off, so \
-         nothing dials; use --analysis-addr=native"
+        "analysis service {addr:?} is unreachable from this build: the `net` feature is off, so \
+         nothing dials; use --analysis-addr=native or --analysis-addr=turbo"
     ))
 }
 
 #[cfg(feature = "net")]
-fn client(addr: &str) -> Result<AnalysisServiceClient<Channel>, Status> {
-    Ok(AnalysisServiceClient::new(shared_channel(addr)?)
-        .max_decoding_message_size(crate::MAX_MESSAGE_BYTES)
-        .max_encoding_message_size(crate::MAX_MESSAGE_BYTES))
-}
+use turbo_client::proto::result::analysis_service_client::AnalysisServiceClient;
+#[cfg(feature = "net")]
+use turbo_client::proto::result::{
+    analyze_progressive_event, analyze_stream_request, analyze_stream_response, AnalyzeDocument,
+    AnalyzeOrder, AnalyzeOutput, AnalyzePipelineRequest, AnalyzeStreamHeader, AnalyzeStreamRequest,
+    AnalyzeStreamResponse, CapabilitiesRequest, DocumentGraphResponse, OffsetMode,
+    PiiOutputOptions, ProjectSearchDocumentRequest, SearchAssessmentState,
+    SearchDocumentProjection, SearchLexicalToken, SearchSentenceRow,
+};
 
-/// Embed `text` through the sidecar's embedding model (Model2Vec-style,
-/// `EmbeddingOptions` over sentences) into ONE query vector: sentence
-/// embeddings are mean-pooled and L2-normalized, matching the
-/// unit-normalized corpus vectors. Fails FAILED_PRECONDITION when the
-/// sidecar has no embedding model loaded (its warning is passed
-/// through).
-pub async fn embed_text(addr: &str, text: &str) -> Result<Vec<f32>, Status> {
-    use crate::pb::analysis::{embedding_options, EmbeddingOptions};
-    if AnalysisBackend::parse(addr)? == AnalysisBackend::Native {
+#[cfg(feature = "net")]
+#[allow(clippy::too_many_arguments)]
+async fn decode_graph_response_remote(
+    addr: &str,
+    remote: &turbo_client::RemoteClient,
+    client: &mut AnalysisServiceClient<Channel>,
+    response: DocumentGraphResponse,
+    spec: Option<&AnalysisSpec>,
+    layers: SessionLayers,
+    timeout: Option<Duration>,
+    vocab: Option<&Arc<crate::vocab::VocabularyListener>>,
+) -> Result<AnalyzedDoc, Status> {
+    if response.graph.starts_with(wire::MOCK_GRAPH_MAGIC) {
+        let mock = wire::MockAnalyzeResponse::decode_graph(&response.graph)?;
+        if let Some(vocab) = vocab {
+            vocab.feed(
+                mock.term_vectors
+                    .iter()
+                    .map(|tv| (tv.term.as_str(), i64::from(tv.frequency))),
+                mock.tokens.iter().map(|t| t.text.as_str()),
+            );
+        }
+        return wire::analyzed_from_mock(mock, layers);
+    }
+    if !response.graph.is_empty() {
+        let session = wire::WireSessionOptions {
+            spec: spec.cloned(),
+            layers,
+        };
+        let analyzer_config_digest = turbo_handshake(spec, None)
+            .ok()
+            .and_then(|hs| hs.analysis.map(|a| a.sha256.to_vec()))
+            .unwrap_or_default();
+        let proj_payload = ProjectSearchDocumentRequest {
+            doc_id: String::new(),
+            graph: response.graph.to_vec(),
+            view: 0,
+            offsets: OffsetMode::Utf8 as i32,
+            pii_output: Some(PiiOutputOptions {
+                full_text: true,
+                ..Default::default()
+            }),
+            binding: Some(session.to_binding()),
+            analyzer_config_digest,
+        };
+        let prio = remote.config().default_priority;
+        let proj_req = remote
+            .prepare_request(proj_payload, Some(prio), timeout)
+            .map_err(|e| inspect_remote_client_err(addr, e))?;
+        let projected = client
+            .project_search_document(proj_req)
+            .await
+            .map_err(|s| inspect_remote_status(addr, s))?
+            .into_inner();
+        let scoring_only = spec
+            .map(|s| s.term_vector_mode == TERM_VECTOR_MODE_SCORING_ONLY)
+            .unwrap_or(false);
+        let (mut doc, surface_tokens) =
+            analyzed_from_search_projection(projected, scoring_only, layers)?;
+        if layers.dual_cased && doc.cased.is_none() && !response.source_text.is_empty() {
+            validate_dual_cased_spec(spec)?;
+            let effective_spec = spec.cloned().unwrap_or_else(body_spec);
+            let cfg = turbo_field_config(Some(&effective_spec))?.cased_twin();
+            let cased = turbo_client::LexicalAnalyzer::new(cfg)
+                .analyze(&response.source_text)
+                .map_err(client_err_to_status)?;
+            doc.cased = Some(turbo_field_to_postings(cased, scoring_only));
+        }
+        if let Some(vocab) = vocab {
+            let body = &doc.fields[0];
+            vocab.feed(
+                body.terms
+                    .iter()
+                    .map(|(term, freq, _)| (term.as_str(), i64::from(*freq))),
+                surface_tokens.iter().map(String::as_str),
+            );
+        }
+        return Ok(doc);
+    }
+    if response.source_text.is_empty() {
         return Err(Status::failed_precondition(
-            "the native lexical analyzer does not provide embeddings; configure an OpenNLP sidecar or another embedding provider",
+            "turbo-kserve returned an empty DocumentGraphResponse (check PII output disclosure)",
         ));
     }
-    if text.is_empty() {
-        return Err(Status::invalid_argument("empty text"));
+    let out = turbo_analysis_pass(&response.source_text, spec, layers)?;
+    if let Some(vocab) = vocab {
+        let body = &out.doc.fields[0];
+        vocab.feed(
+            body.terms
+                .iter()
+                .map(|(term, freq, _)| (term.as_str(), i64::from(*freq))),
+            out.surface_tokens.iter().map(String::as_str),
+        );
     }
-    let request = AnalyzeRequest {
-        text: text.to_string(),
-        options: Some(AnalysisOptions {
-            embeddings: Some(EmbeddingOptions {
-                source: embedding_options::Source::Sentences as i32,
-            }),
-            ..Default::default()
-        }),
+    Ok(out.doc)
+}
+
+/// Converts a remote `SearchDocumentProjection` directly into an
+/// [`AnalyzedDoc`] and surface token list without re-running local lexical or
+/// NLP analysis.
+#[cfg(feature = "net")]
+pub fn analyzed_from_search_projection(
+    mut proj: SearchDocumentProjection,
+    scoring_only: bool,
+    layers: SessionLayers,
+) -> Result<(AnalyzedDoc, Vec<String>), Status> {
+    if proj.offset_mode != 0 && proj.offset_mode != OffsetMode::Utf8 as i32 {
+        return Err(Status::failed_precondition(
+            "ProjectSearchDocument returned non-UTF-8 offsets for UTF-8 storage request",
+        ));
+    }
+    let mut primary_tokens: Vec<SearchLexicalToken> = Vec::new();
+    let mut cased_tokens: Vec<SearchLexicalToken> = Vec::new();
+    let first_instance = proj.tokens.first().map(|t| t.instance.clone());
+    for tok in std::mem::take(&mut proj.tokens) {
+        if layers.dual_cased
+            && (tok.instance.contains("cased")
+                || first_instance
+                    .as_deref()
+                    .is_some_and(|first| !tok.instance.is_empty() && tok.instance != first))
+        {
+            cased_tokens.push(tok);
+        } else {
+            primary_tokens.push(tok);
+        }
+    }
+    let surface_tokens: Vec<String> = primary_tokens
+        .iter()
+        .filter(|t| t.pos_len <= 1)
+        .map(|t| t.term.clone())
+        .collect();
+    let primary_field = search_tokens_to_postings(&primary_tokens, &proj.sentences, scoring_only);
+    let cased_field = if layers.dual_cased && !cased_tokens.is_empty() {
+        Some(search_tokens_to_postings(
+            &cased_tokens,
+            &proj.sentences,
+            scoring_only,
+        ))
+    } else {
+        None
     };
-    #[cfg(not(feature = "net"))]
-    {
-        let _ = request;
-        Err(sidecar_needs_net(addr))
-    }
-    #[cfg(feature = "net")]
-    {
-        let response = client(addr)?.analyze(request).await?.into_inner();
-        if response.embeddings.is_empty() {
-            return Err(Status::failed_precondition(format!(
-                "sidecar returned no embeddings ({})",
-                if response.warnings.is_empty() {
-                    "no warning given".to_string()
-                } else {
-                    response.warnings.join("; ")
+
+    let (quality, geography, entities, nlp_proj) =
+        if layers.quality || layers.geography || layers.entities || layers.nlp_columns {
+            let nlp = search_projection_to_nlp(&proj);
+            let (q, g, e) = reduce_nlp_layers(&nlp, layers);
+            (q, g, e, layers.nlp_columns.then(|| Box::new(nlp)))
+        } else {
+            (None, None, Vec::new(), None)
+        };
+
+    Ok((
+        AnalyzedDoc {
+            fields: vec![primary_field],
+            cased: cased_field,
+            quality,
+            geography,
+            entities,
+            nlp: nlp_proj,
+        },
+        surface_tokens,
+    ))
+}
+
+#[cfg(feature = "net")]
+fn search_tokens_to_postings(
+    tokens: &[SearchLexicalToken],
+    sentences: &[SearchSentenceRow],
+    scoring_only: bool,
+) -> crate::postings::AnalyzedField {
+    let mut term_indices: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut terms: crate::postings::DocTerms = Vec::new();
+    let mut positions: crate::postings::DocPositions = Vec::new();
+    let mut pos_lengths: crate::postings::DocPositions = Vec::new();
+    let mut seen_ordinals: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut has_lattice = false;
+    let mut primary_len = 0u32;
+    let mut max_tf = 0u32;
+
+    for arc in tokens {
+        if arc.term.is_empty() {
+            EMPTY_TERMS_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
+        let arc_len = arc.pos_len.max(1);
+        if arc_len == 1 {
+            primary_len = primary_len.saturating_add(1);
+        } else {
+            has_lattice = true;
+        }
+        let span = (arc.span_start, arc.span_end);
+        match term_indices.get(&arc.term).copied() {
+            Some(idx) => {
+                if let Some(last_pos) = positions[idx].last().copied() {
+                    if arc.pos <= last_pos {
+                        if arc.pos == last_pos && !scoring_only {
+                            if let Some(last_occ) = terms[idx].2.last_mut() {
+                                last_occ.0 = last_occ.0.min(span.0);
+                                last_occ.1 = last_occ.1.max(span.1);
+                            }
+                            if let Some(last_len) = pos_lengths[idx].last_mut() {
+                                *last_len = (*last_len).max(arc_len);
+                            }
+                        }
+                        continue;
+                    }
                 }
-            )));
-        }
-        let dim = response.embeddings[0].vector.len();
-        let mut pooled = vec![0.0f64; dim];
-        for chunk in &response.embeddings {
-            if chunk.vector.len() != dim {
-                return Err(Status::internal("sidecar embeddings disagree on dim"));
+                if !seen_ordinals.insert(arc.pos) {
+                    has_lattice = true;
+                }
+                terms[idx].1 += 1;
+                max_tf = max_tf.max(terms[idx].1);
+                if !scoring_only {
+                    terms[idx].2.push(span);
+                }
+                positions[idx].push(arc.pos);
+                pos_lengths[idx].push(arc_len);
             }
-            for (acc, &v) in pooled.iter_mut().zip(&chunk.vector) {
-                *acc += f64::from(v);
+            None => {
+                if !seen_ordinals.insert(arc.pos) {
+                    has_lattice = true;
+                }
+                let idx = terms.len();
+                term_indices.insert(arc.term.clone(), idx);
+                max_tf = max_tf.max(1);
+                let occs = if scoring_only { Vec::new() } else { vec![span] };
+                terms.push((arc.term.clone(), 1, occs));
+                positions.push(vec![arc.pos]);
+                pos_lengths.push(vec![arc_len]);
             }
         }
-        let n = response.embeddings.len() as f64;
-        let norm = pooled.iter().map(|v| (v / n).powi(2)).sum::<f64>().sqrt();
-        if norm == 0.0 {
-            return Err(Status::failed_precondition("embedding pooled to zero"));
-        }
-        Ok(pooled.iter().map(|v| ((v / n) / norm) as f32).collect())
     }
-}
 
-/// Which optional sidecar layers an analysis SESSION requests beyond
-/// term identity. A property of the session, not of a document: the
-/// layers ride the options message a stream opens with, so a change
-/// reopens the session exactly as a spec change does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct SessionLayers {
-    /// The noise and artifact scanners (`docs/quality-columns.md`).
-    pub quality: bool,
-    /// The geocoding layer (`docs/geography-columns.md`). Requires the
-    /// sidecar to serve NER; opening preflights that capability.
-    pub geography: bool,
-    /// Named entity mentions for materialization into a product-owned map
-    /// column. Requires a configured sidecar NER model.
-    pub entities: bool,
-    /// The sentence layer (`docs/highlighting.md`): spans in original-text
-    /// coordinates, stored per document for sentence-bounded snippets.
-    /// Model-free by default on the sidecar (its newline detector) and
-    /// one traversal of text it already holds.
-    pub sentences: bool,
-    /// Both term identities from one pass (`docs/dual-cased.md`): the
-    /// sidecar's `dual_cased`, or the native analyzer's twin accumulator.
-    /// Opening a sidecar session preflights
-    /// `GetCapabilities.dual_term_identity_available`.
-    pub dual_cased: bool,
-}
+    let mut raw_sentences: Vec<(u32, u32)> = sentences
+        .iter()
+        .map(|s| (s.span_start, s.span_end))
+        .filter(|&(s, e)| s < e)
+        .collect();
+    for (_, _, occs) in &terms {
+        for &(os, oe) in occs {
+            if os >= oe {
+                continue;
+            }
+            let first = raw_sentences.partition_point(|&(_, se)| se <= os);
+            let last_excl = raw_sentences.partition_point(|&(ss, _)| ss < oe);
+            if first < raw_sentences.len() && last_excl > first + 1 {
+                let merged_start = raw_sentences[first].0.min(os);
+                let merged_end = raw_sentences[last_excl - 1].1.max(oe);
+                raw_sentences.splice(first..last_excl, [(merged_start, merged_end)]);
+            } else if first < raw_sentences.len() {
+                raw_sentences[first].0 = raw_sentences[first].0.min(os);
+                raw_sentences[first].1 = raw_sentences[first].1.max(oe);
+            } else if os < oe {
+                raw_sentences.push((os, oe));
+            }
+        }
+    }
 
-/// Maps `spec` straight onto the sidecar's `AnalysisOptions`: term vectors
-/// are always requested (FULL mode with occurrence offsets unless the spec
-/// overrides), everything else defaults.
-fn analysis_options(spec: Option<&AnalysisSpec>, layers: SessionLayers) -> AnalysisOptions {
-    let (mode, source, char_filters, tokenizer, stemmer) = match spec {
-        Some(s) => (
-            s.term_vector_mode,
-            s.term_vector_source,
-            s.char_filters.clone(),
-            s.tokenizer,
-            s.stemmer,
-        ),
-        None => (0, 0, Vec::new(), 0, 0),
-    };
-    AnalysisOptions {
-        tokenizer,
-        stemmer,
-        term_vectors: Some(TermVectorOptions {
-            enabled: true,
-            mode,
-            // The sidecar calls these normalizer STEPS; Lucene (and so
-            // this side) calls the stage a char filter. Same field
-            // number, same values, different vocabulary.
-            steps: char_filters,
-            source,
-            // One call returning both the folded and the cased term
-            // stream (`docs/dual-cased.md`): on when the ingest names a
-            // cased field, so the A/B pair costs one pass.
-            dual_cased: layers.dual_cased,
-        }),
-        // The quality layers ride the SAME analysis pass as the terms
-        // (docs/quality-columns.md). Both are model-free structural
-        // scanners, so asking for them costs one traversal of text the
-        // sidecar is already holding — and the query path gains nothing
-        // to do, because what comes back becomes an ordinary column.
-        noise: layers.quality,
-        artifacts: layers.quality,
-        // Geocoding consumes the entity layer; explicit entity columns do as
-        // well. Availability was preflighted at session open.
-        ner: layers.entities || layers.geography,
-        geo: layers.geography,
-        // Sentence spans for snippets (docs/highlighting.md) ride the
-        // same pass; the term identity is unchanged by the layer.
-        sentence_detection: layers.sentences,
-        // Search persists native UTF-8 byte offsets across postings, entities,
-        // and sentence tables.
-        offset_unit: crate::pb::analysis::OffsetUnit::Utf8Bytes as i32,
+    crate::postings::AnalyzedField {
+        terms,
+        length: primary_len.max(max_tf),
+        positions: if scoring_only { None } else { Some(positions) },
+        pos_lengths: if !scoring_only && has_lattice {
+            Some(pos_lengths)
+        } else {
+            None
+        },
+        sentences: Some(raw_sentences),
         ..Default::default()
     }
 }
 
-/// Zero-length terms dropped at the analysis boundary since process
-/// start (see [`analyzed_from`]). The log lines are the visibility;
-/// this counter is what keeps them bounded.
-static EMPTY_TERMS_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "net")]
+fn utf8_only_spans(start: u32, end: u32) -> turbo_client::ProjectedSpanSet {
+    turbo_client::ProjectedSpanSet {
+        utf8: (start, end),
+        utf16: (start, end),
+        code_point: (start, end),
+    }
+}
 
-/// The cased twin of an analysis spec (`docs/dual-cased.md`): the same
-/// tokenizer, stemmer, mode, and source, and the same step chain minus
-/// case folding — what the sidecar's `cased_term_vectors` and the native
-/// analyzer's cased accumulator compute. Its fingerprint is the cased
-/// field's fingerprint.
+#[cfg(feature = "net")]
+fn search_projection_to_nlp(
+    proj: &SearchDocumentProjection,
+) -> turbo_client::DocumentNlpProjection {
+    let nt = proj.numeric_temporal.as_ref();
+    let money = nt
+        .map(|n| {
+            n.money
+                .iter()
+                .map(|m| turbo_client::MoneyHit {
+                    spans: utf8_only_spans(m.span_start, m.span_end),
+                    currency: m.currency.clone(),
+                    amount_f64: m.amount_f64,
+                    plain_amount: m.plain_amount.clone(),
+                    per: m.per.clone(),
+                    ecb_converted: m.ecb_converted,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let quantities = nt
+        .map(|n| {
+            n.quantities
+                .iter()
+                .map(|q| turbo_client::QuantityHit {
+                    spans: utf8_only_spans(q.span_start, q.span_end),
+                    unit: q.unit.clone(),
+                    value_f64: q.value_f64,
+                    plain_value: q.plain_value.clone(),
+                    is_percent: q.is_percent,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let document_date =
+        nt.and_then(|n| n.document_date.as_ref())
+            .map(|d| turbo_client::UtcDateSummary {
+                iso: d.iso.clone(),
+                epoch_seconds: d.epoch_seconds,
+                year: d.year,
+                month: d.month,
+                day: d.day,
+            });
+    let temporals = nt
+        .map(|n| {
+            n.temporals
+                .iter()
+                .map(|t| turbo_client::TemporalHit {
+                    spans: utf8_only_spans(t.span_start, t.span_end),
+                    granularity: t.granularity.clone(),
+                    origin: t.origin.clone(),
+                    iso: t.iso.clone(),
+                    start_epoch_seconds: t.start_epoch_seconds,
+                    end_epoch_seconds: t.end_epoch_seconds,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let geo = proj
+        .geo_locations
+        .iter()
+        .map(|g| turbo_client::GeoHit {
+            spans: utf8_only_spans(g.span_start, g.span_end),
+            record_id: g.record_id.clone(),
+            canonical_name: g.canonical_name.clone(),
+            country_code: g.country_code.clone(),
+            latitude: g.latitude,
+            longitude: g.longitude,
+            spine_path: g.spine_path.clone(),
+            confidence: g.confidence,
+        })
+        .collect();
+    let sentiment = proj
+        .categories_sentiment
+        .as_ref()
+        .map(|cs| turbo_client::SentimentSummary {
+            label: cs.sentiment_label.clone(),
+            probability: cs.sentiment_score,
+        })
+        .unwrap_or(turbo_client::SentimentSummary {
+            label: None,
+            probability: None,
+        });
+    let quality = proj
+        .quality
+        .as_ref()
+        .map(|q| turbo_client::QualitySummary {
+            assessed: q.noise_state == SearchAssessmentState::Assessed as i32
+                || q.artifacts_state == SearchAssessmentState::Assessed as i32
+                || q.text_quality_state == SearchAssessmentState::Assessed as i32,
+            worst_noise_score: q.worst_noise_score,
+            union_noise_chars: q.union_noise_chars,
+            artifact_count: q.artifact_count,
+            composite_score: q
+                .metrics
+                .as_ref()
+                .and_then(|m| m.composite_score.map(f64::from)),
+        })
+        .unwrap_or(turbo_client::QualitySummary {
+            assessed: false,
+            worst_noise_score: 0.0,
+            union_noise_chars: 0,
+            artifact_count: 0,
+            composite_score: None,
+        });
+    let map_ent =
+        |e: &turbo_client::proto::result::SearchLinkedEntity| turbo_client::EntityPolarityHit {
+            spans: utf8_only_spans(e.span_start, e.span_end),
+            surface: if e.matched_alias.is_empty() {
+                e.canonical_name.clone()
+            } else {
+                e.matched_alias.clone()
+            },
+            kind: e.entity_kind.clone(),
+            kb_id: e.kb_id.clone(),
+            canonical_name: (!e.canonical_name.is_empty()).then(|| e.canonical_name.clone()),
+            score: e.score,
+            epistemic: e.epistemic.clone(),
+            cue: e.cue.clone(),
+        };
+    let affirmed_entities = proj
+        .entities
+        .as_ref()
+        .map(|ep| ep.affirmed.iter().map(map_ent).collect())
+        .unwrap_or_default();
+    let negated_entities = proj
+        .entities
+        .as_ref()
+        .map(|ep| ep.negated.iter().map(map_ent).collect())
+        .unwrap_or_default();
+    let sketch = proj
+        .document_sketch
+        .as_ref()
+        .map(|sk| turbo_client::DocumentSketch {
+            word_count: sk.words,
+            exact: (u128::from(sk.exact_hi) << 64) | u128::from(sk.exact_lo),
+            shape: sk.shape_hash,
+            simhash: sk.simhash,
+            minhash: sk.minhash.clone(),
+        })
+        .unwrap_or(turbo_client::DocumentSketch {
+            word_count: 0,
+            exact: 0,
+            shape: 0,
+            simhash: 0,
+            minhash: Vec::new(),
+        });
+    turbo_client::DocumentNlpProjection {
+        money,
+        quantities,
+        document_date,
+        temporals,
+        geo,
+        sentiment,
+        quality,
+        affirmed_entities,
+        negated_entities,
+        sketch,
+    }
+}
+
+/// Embed `text` through `turbo-kserve`'s Open Inference Protocol (`ModelInfer`)
+/// into one L2-normalized query vector.
+pub async fn embed_text(addr: &str, text: &str) -> Result<Vec<f32>, Status> {
+    embed_text_with_options(
+        addr,
+        text,
+        &RemoteCallOptions {
+            interactive: true,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// Embed `text` through `turbo-kserve` with explicit [`RemoteCallOptions`]
+/// (mTLS, bearer auth, RPC deadline, and optional [`turbo_client::IndexGenerationHandshake`]
+/// model verification via `ModelMetadata`).
+pub async fn embed_text_with_options(
+    addr: &str,
+    text: &str,
+    options: &RemoteCallOptions,
+) -> Result<Vec<f32>, Status> {
+    match AnalysisBackend::parse(addr)? {
+        AnalysisBackend::Native | AnalysisBackend::Turbo => {
+            return Err(Status::failed_precondition(
+                "in-process lexical analysis does not provide neural embeddings without a configured model bundle; configure a turbo-kserve endpoint or local embedding provider",
+            ));
+        }
+        AnalysisBackend::Sidecar(_) => {}
+    }
+    if text.is_empty() {
+        return Err(Status::invalid_argument("empty text"));
+    }
+    #[cfg(not(feature = "net"))]
+    {
+        let _ = options;
+        Err(sidecar_needs_net(addr))
+    }
+    #[cfg(feature = "net")]
+    {
+        let (clean_addr, model_name, uri_handshake) = parse_embed_endpoint(addr);
+        let remote = remote_client_for(&clean_addr, options)?;
+        if let Some(hs) = options
+            .expected_handshake
+            .as_ref()
+            .or(uri_handshake.as_ref())
+        {
+            if hs.bundle.is_some() {
+                remote
+                    .verify_model_handshake(&model_name, "", hs)
+                    .await
+                    .map_err(|e| inspect_remote_client_err(&clean_addr, e))?;
+            }
+        } else {
+            enforce_tofu_remote_model_handshake(&clean_addr, &model_name, &remote).await?;
+        }
+        let prio = if options.interactive {
+            turbo_client::RemotePriority::Interactive
+        } else {
+            turbo_client::RemotePriority::Bulk
+        };
+        let (mut vec, dim) = remote
+            .embed_texts(
+                &model_name,
+                &[text],
+                Some("query"),
+                Some(prio),
+                options.timeout,
+            )
+            .await
+            .map_err(|e| inspect_remote_client_err(&clean_addr, e))?;
+        if vec.is_empty() || dim == 0 {
+            return Err(Status::failed_precondition(
+                "turbo-kserve returned no embeddings",
+            ));
+        }
+        vec.truncate(dim);
+        let norm = vec
+            .iter()
+            .map(|&v| f64::from(v) * f64::from(v))
+            .sum::<f64>()
+            .sqrt();
+        if norm == 0.0 || !norm.is_finite() {
+            return Err(Status::failed_precondition("embedding pooled to zero"));
+        }
+        for v in &mut vec {
+            *v = (f64::from(*v) / norm) as f32;
+        }
+        Ok(vec)
+    }
+}
+
+#[cfg(feature = "net")]
+static PINNED_REMOTE_MODEL_HANDSHAKES: OnceLock<
+    Mutex<HashMap<(String, String), turbo_client::IndexGenerationHandshake>>,
+> = OnceLock::new();
+
+#[cfg(feature = "net")]
+async fn enforce_tofu_remote_model_handshake(
+    clean_addr: &str,
+    model_name: &str,
+    remote: &turbo_client::RemoteClient,
+) -> Result<(), Status> {
+    let key = (clean_addr.to_string(), model_name.to_string());
+    let pinned = PINNED_REMOTE_MODEL_HANDSHAKES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("pinned remote model handshakes poisoned")
+        .get(&key)
+        .cloned();
+    match pinned {
+        Some(expected) => {
+            remote
+                .verify_model_handshake(model_name, "", &expected)
+                .await
+                .map_err(|e| inspect_remote_client_err(clean_addr, e))?;
+            Ok(())
+        }
+        None => {
+            let probe = turbo_client::IndexGenerationHandshake {
+                analysis: None,
+                bundle: None,
+            };
+            match remote.verify_model_handshake(model_name, "", &probe).await {
+                Ok((_, fp)) => {
+                    if fp.sha256 != [0u8; 32] {
+                        let mut map = PINNED_REMOTE_MODEL_HANDSHAKES
+                            .get_or_init(|| Mutex::new(HashMap::new()))
+                            .lock()
+                            .expect("pinned remote model handshakes poisoned");
+                        match map.get(&key) {
+                            Some(existing) => {
+                                existing.verify_bundle(&fp).map_err(client_err_to_status)?;
+                            }
+                            None => {
+                                map.insert(
+                                    key,
+                                    turbo_client::IndexGenerationHandshake {
+                                        analysis: None,
+                                        bundle: Some(fp),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    let status = client_err_to_status(e);
+                    if status.code() == tonic::Code::Unimplemented {
+                        Ok(())
+                    } else {
+                        Err(inspect_remote_status(clean_addr, status))
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "net")]
+fn parse_embed_endpoint(
+    addr: &str,
+) -> (
+    String,
+    String,
+    Option<turbo_client::IndexGenerationHandshake>,
+) {
+    let mut model = None;
+    let mut sha256 = None;
+    let mut dim = None;
+    let mut revision = String::new();
+    let mut pooling = "mean".to_string();
+    let mut normalize = "l2".to_string();
+
+    let base = if let Some((base, query)) = addr.split_once('?') {
+        for pair in query.split('&') {
+            let Some((k, v)) = pair.split_once('=') else {
+                continue;
+            };
+            let val = v.trim();
+            if val.is_empty() {
+                continue;
+            }
+            match k.trim() {
+                "model" => model = Some(val.to_string()),
+                "sha256" | "manifest_sha256" => sha256 = Some(val.to_string()),
+                "dim" => dim = val.parse::<u32>().ok(),
+                "revision" => revision = val.to_string(),
+                "pooling" => pooling = val.to_string(),
+                "normalize" => normalize = val.to_string(),
+                _ => {}
+            }
+        }
+        base.to_string()
+    } else {
+        addr.to_string()
+    };
+
+    let resolved_model = model.unwrap_or_else(env_embed_model);
+    if sha256.is_none() {
+        sha256 = std::env::var("TURBO_MODEL_SHA256")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+    }
+    if dim.is_none() {
+        dim = std::env::var("TURBO_MODEL_DIM")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+    }
+
+    let hs = sha256.map(|manifest_sha256| {
+        let bundle_fp = turbo_client::BundleScoringSpec {
+            model_id: resolved_model.clone(),
+            revision,
+            manifest_sha256,
+            task: "embed".to_string(),
+            dim: dim.unwrap_or(0),
+            pooling,
+            normalize,
+        }
+        .fingerprint();
+        turbo_client::IndexGenerationHandshake {
+            analysis: None,
+            bundle: Some(bundle_fp),
+        }
+    });
+
+    (base, resolved_model, hs)
+}
+
+#[cfg(feature = "net")]
+fn env_embed_model() -> String {
+    std::env::var("TURBO_EMBED_MODEL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_EMBED_MODEL.to_string())
+}
+
+/// Optional layers an analysis session requests beyond primary term identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SessionLayers {
+    /// Noise and artifact scanners (`docs/quality-columns.md`).
+    pub quality: bool,
+    /// Geocoding layer (`docs/geography-columns.md`).
+    pub geography: bool,
+    /// Named-entity mentions for materialization into a map column.
+    pub entities: bool,
+    /// Sentence spans in original-text UTF-8 coordinates (`docs/highlighting.md`).
+    pub sentences: bool,
+    /// Both folded and cased term identities from one pass (`docs/dual-cased.md`).
+    pub dual_cased: bool,
+    /// Full one-pass `DocumentNlpProjection` retained for pre-WAL typed column materialization.
+    pub nlp_columns: bool,
+}
+
+/// Zero-length terms dropped at the analysis boundary since process start.
+#[cfg(any(feature = "net", test))]
+pub(crate) static EMPTY_TERMS_DROPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Cased twin of an [`AnalysisSpec`]: identical tokenizer, stemmer, mode, and
+/// source with case-folding filters removed (`docs/dual-cased.md`).
 pub fn cased_twin_spec(spec: &AnalysisSpec) -> AnalysisSpec {
     AnalysisSpec {
         char_filters: spec
@@ -788,9 +1874,7 @@ pub fn cased_twin_spec(spec: &AnalysisSpec) -> AnalysisSpec {
     }
 }
 
-/// The body spec a cased field can be derived from: explicit, and with
-/// a step-chain source (`SOURCE_STEMS` ignores the chain, so it has no
-/// folded form to contrast with).
+/// Validate that `spec` can produce a distinct folded/cased twin pair.
 pub fn validate_dual_cased_spec(spec: Option<&AnalysisSpec>) -> Result<(), Status> {
     let Some(spec) = spec else {
         return Err(Status::invalid_argument(
@@ -808,444 +1892,234 @@ pub fn validate_dual_cased_spec(spec: Option<&AnalysisSpec>) -> Result<(), Statu
     Ok(())
 }
 
-/// Term vectors to per-document terms: `(terms, length)`, dropping
-/// zero-frequency and zero-length identities.
-fn terms_of(vectors: Vec<crate::pb::analysis::TermVector>) -> (crate::postings::DocTerms, u32) {
-    let mut terms = crate::postings::DocTerms::new();
-    let mut length = 0u32;
-    for tv in vectors {
-        if tv.frequency <= 0 {
-            continue;
-        }
-        if tv.term.is_empty() {
-            let n = EMPTY_TERMS_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if n <= 20 || n.is_multiple_of(1_000_000) {
-                eprintln!(
-                    "analysis: dropped zero-length term (occurrence {n} this process): a \
-                     token of stripped characters; unqueryable, and refused at index open \
-                     if it were kept"
-                );
-            }
-            continue;
-        }
-        let offsets = tv
-            .occurrences
-            .iter()
-            .map(|s| (s.start.max(0) as u32, s.end.max(0) as u32))
-            .collect();
-        length += tv.frequency as u32;
-        terms.push((tv.term, tv.frequency as u32, offsets));
-    }
-    (terms, length)
-}
-
-/// Folds a response's term vectors into a single-field (body)
-/// [`AnalyzedDoc`] (term, tf, original-text offsets, and document
-/// length).
-///
-/// Zero-length terms are dropped HERE, at the one place every analysis
-/// response passes through. A token made entirely of stripped
-/// characters (invisible and format chars: zero-width spaces, soft
-/// hyphens, bidi controls, all routine in PDF- and HTML-derived text)
-/// normalizes to the empty string under `STRIP_INVISIBLE`, and the
-/// sidecar emits that as a term. An empty term is unqueryable by
-/// construction, and the index refuses it at open ("directory entry N:
-/// empty term") — the wrong moment, hours after a bulk ingest started.
-/// Dropping it at the boundary is the same document the sidecar should
-/// have produced; the dropped token contributes nothing to the
-/// document length either, exactly as if the analyzer had never
-/// emitted it.
-fn analyzed_from(
-    mut response: AnalyzeResponse,
-    layers: SessionLayers,
-) -> Result<AnalyzedDoc, Status> {
-    match crate::pb::analysis::OffsetUnit::try_from(response.offset_unit) {
-        Ok(crate::pb::analysis::OffsetUnit::Unspecified)
-        | Ok(crate::pb::analysis::OffsetUnit::Utf8Bytes) => {}
-        Ok(crate::pb::analysis::OffsetUnit::Utf16CodeUnits) => {
-            return Err(Status::failed_precondition(
-                "analysis sidecar returned UTF-16 offsets after search requested UTF-8; refusing ambiguous persisted spans",
-            ));
-        }
-        Err(value) => {
-            return Err(Status::failed_precondition(format!(
-                "analysis sidecar returned unknown offset unit {value}"
-            )));
-        }
-    }
-    let quality = layers.quality.then(|| doc_quality(&response));
-    let geography = layers.geography.then(|| doc_geography(&response));
-    let entities = if layers.entities {
-        response
-            .entities
-            .iter()
-            .map(|entity| {
-                let span = entity.span.as_ref();
-                crate::phrases::DocEntity {
-                    kind: entity.r#type.clone(),
-                    text: entity.text.clone(),
-                    start: span.map_or(0, |span| span.start.max(0) as u32),
-                    end: span.map_or(0, |span| span.end.max(0) as u32),
-                }
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let (terms, length) = terms_of(std::mem::take(&mut response.term_vectors));
-    let positions = token_positions(&response.tokens, &terms)?;
-    // The sentence layer is the answer only when it was asked for: a
-    // response without it for a session that requested it is a table
-    // of zero sentences, which the sentence field's coverage check
-    // refuses for any document with a term (docs/highlighting.md).
-    let sentences = layers.sentences.then(|| {
-        response
-            .sentences
-            .iter()
-            .map(|s| (s.start.max(0) as u32, s.end.max(0) as u32))
-            .collect::<Vec<(u32, u32)>>()
-    });
-    let mut doc = AnalyzedDoc::body(terms, length);
-    doc.fields[0].positions = positions;
-    doc.fields[0].sentences = sentences.clone();
-    if layers.dual_cased {
-        // The cased identity of the same pass: the same tokens, so the
-        // same token layer derives its ordinals and the same sentences
-        // bound it.
-        let (cased_terms, cased_length) =
-            terms_of(std::mem::take(&mut response.cased_term_vectors));
-        if cased_terms.is_empty() && !doc.fields[0].terms.is_empty() {
-            return Err(Status::failed_precondition(
-                "dual_cased was requested but the analysis sidecar returned no cased term \
-                 identities; the running jar ignores the flag (an open port is not the jar); \
-                 rebuild grpc-opennlp-analysis from main",
-            ));
-        }
-        let cased_positions = token_positions(&response.tokens, &cased_terms)?;
-        doc.cased = Some(crate::postings::AnalyzedField {
-            terms: cased_terms,
-            length: cased_length,
-            positions: cased_positions,
-            sentences,
-        });
-    }
-    doc.quality = quality;
-    doc.geography = geography;
-    doc.entities = entities;
-    Ok(doc)
-}
-
-/// Token ordinals for every occurrence in `terms`, read off the
-/// response's token layer (`docs/phrase-proximity.md`). This is the ONE
-/// sidecar call ingest already makes: the token layer rides the same
-/// response as the term vectors, so positions cost no round trip.
-///
-/// The sidecar's contract makes each occurrence span a token span, and
-/// the ordinal of a token is its index in document order. The match is
-/// a single merge over both lists sorted by start offset (no hashing,
-/// no per-occurrence scan). A response without a token layer yields
-/// `None`; a positional field then refuses the document by name rather
-/// than guessing adjacency from the spans. An occurrence that is not a
-/// token span is a contract break and refuses outright.
-fn token_positions(
-    tokens: &[crate::pb::analysis::Token],
-    terms: &crate::postings::DocTerms,
-) -> Result<Option<crate::postings::DocPositions>, Status> {
-    let occurrences: usize = terms.iter().map(|(_, _, offsets)| offsets.len()).sum();
-    if occurrences == 0 {
-        // Nothing to place: scoring-only vectors, or an empty document.
-        return Ok(Some(terms.iter().map(|_| Vec::new()).collect()));
-    }
-    if tokens.is_empty() {
-        return Ok(None);
-    }
-    // (start, end, term index, occurrence index), sorted by start; ties
-    // cannot happen for distinct tokens, and two terms cannot share one.
-    let mut wanted: Vec<(u32, u32, usize, usize)> = Vec::with_capacity(occurrences);
-    for (ti, (_, _, offsets)) in terms.iter().enumerate() {
-        for (oi, &(start, end)) in offsets.iter().enumerate() {
-            wanted.push((start, end, ti, oi));
-        }
-    }
-    wanted.sort_unstable();
-    let mut positions: crate::postings::DocPositions = terms
-        .iter()
-        .map(|(_, _, offsets)| vec![0u32; offsets.len()])
-        .collect();
-    let mut cursor = 0usize;
-    for (start, end, ti, oi) in wanted {
-        while cursor < tokens.len() {
-            let span = tokens[cursor].span.as_ref();
-            let token_start = span.map_or(0, |s| s.start.max(0) as u32);
-            if token_start >= start {
-                break;
-            }
-            cursor += 1;
-        }
-        let matched = tokens
-            .get(cursor)
-            .and_then(|t| t.span.as_ref())
-            .is_some_and(|s| s.start.max(0) as u32 == start && s.end.max(0) as u32 == end);
-        if !matched {
-            return Err(Status::failed_precondition(format!(
-                "analysis sidecar reported occurrence [{start}, {end}) of {:?} that is not a \
-                 token span; token positions cannot be derived from this response",
-                terms[ti].0
-            )));
-        }
-        positions[ti][oi] = u32::try_from(cursor).expect("token count fits u32 under the text cap");
-        cursor += 1;
-    }
-    Ok(Some(positions))
-}
-
-/// Fold a response's noise and artifact layers into the per-document
-/// scalars the quality columns hold (`docs/quality-columns.md`).
-///
-/// `noise` is the worst finding's score, which the sidecar defines in
-/// (0, 1]; a document with no findings scores exactly 0. `noise_chars`
-/// is the length of the UNION of the findings' spans, computed by a
-/// sweep over the spans sorted by start, so overlapping findings are
-/// counted once and the answer does not depend on the order the
-/// sidecar happened to emit them in. `artifacts` is a count, which is
-/// exact by construction.
-fn doc_quality(response: &AnalyzeResponse) -> crate::postings::DocQuality {
-    let mut worst = 0.0f64;
-    let mut spans: Vec<(i64, i64)> = Vec::with_capacity(response.noise.len());
-    for finding in &response.noise {
-        // A non-finite score would poison the f64 column's min/max
-        // metadata, which score-chain bounds read. Treat it as no
-        // signal rather than propagating a NaN into the ranking.
-        if finding.score.is_finite() && finding.score > worst {
-            worst = finding.score;
-        }
-        if let Some(span) = finding.span.as_ref() {
-            let (start, end) = (i64::from(span.start), i64::from(span.end));
-            if end > start {
-                spans.push((start, end));
-            }
-        }
-    }
-    spans.sort_unstable();
-    let mut covered = 0i64;
-    let mut reach = i64::MIN;
-    for (start, end) in spans {
-        let start = start.max(reach);
-        if end > start {
-            covered += end - start;
-        }
-        reach = reach.max(end);
-    }
-    crate::postings::DocQuality {
-        noise: worst,
-        noise_chars: covered,
-        artifacts: response.artifacts.len() as i64,
-    }
-}
-
-/// Reduce a response's geocoding layer to the per-document scalars the
-/// geography columns hold (`docs/geography-columns.md`).
-///
-/// The point is the highest-confidence location, ties broken by text
-/// order (the sidecar emits locations in text order, and a stable
-/// `>` scan keeps the first). A non-finite confidence is no signal and
-/// cannot be chosen. The country is the top region vote's — the
-/// sidecar ranks votes by share — independent of which location won,
-/// because the vote aggregates ALL the document's evidence while the
-/// point is one best mention. A document with no locations reduces to
-/// an all-absent value, which materializes as no columns at all.
-fn doc_geography(response: &AnalyzeResponse) -> crate::postings::DocGeography {
-    let mut best: Option<&crate::pb::analysis::GeoLocation> = None;
-    for location in &response.locations {
-        if !location.confidence.is_finite() {
-            continue;
-        }
-        if best.is_none_or(|b| location.confidence > b.confidence) {
-            best = Some(location);
-        }
-    }
-    crate::postings::DocGeography {
-        point: best.map(|b| (b.latitude, b.longitude)),
-        confidence: best.map_or(0.0, |b| b.confidence),
-        country: response
-            .regions
-            .first()
-            .map(|r| r.country_code.clone())
-            .unwrap_or_default(),
-    }
-}
-
-/// Client-side submission buffer of an [`AnalyzeStream`]. Pacing is the
-/// server's job (it grants transport credit from its worker capacity);
-/// this only bounds local queuing before `submit` awaits.
+/// Client-side submission buffer of an [`AnalyzeStream`].
 const SUBMIT_BUFFER: usize = 32;
 
-/// A cloneable submission handle for an open [`AnalyzeStream`].
+/// Cloneable submission handle for an open [`AnalyzeStream`].
 #[derive(Clone)]
 pub struct AnalyzeSubmit {
     requests: AnalyzeRequests,
 }
 
-#[cfg_attr(not(feature = "net"), allow(dead_code))]
 #[derive(Clone)]
 enum AnalyzeRequests {
-    Sidecar(tokio::sync::mpsc::Sender<AnalyzeStreamRequest>),
-    Native(tokio::sync::mpsc::Sender<NativeRequest>),
+    #[cfg(feature = "net")]
+    Remote {
+        tx: tokio::sync::mpsc::Sender<AnalyzeStreamRequest>,
+        binding: turbo_client::proto::result::InputBinding,
+    },
+    InProcess(tokio::sync::mpsc::Sender<InProcessRequest>),
 }
 
-struct NativeRequest {
+struct InProcessRequest {
     sequence: u64,
     text: String,
 }
 
-struct NativeResponse {
+struct InProcessResponse {
     sequence: u64,
-    result: Result<NativeAnalysis, Status>,
+    result: Result<InProcessItem, Status>,
+}
+
+struct InProcessItem {
+    doc: AnalyzedDoc,
+    surface_tokens: Vec<String>,
 }
 
 impl AnalyzeSubmit {
-    /// Queue one document, tagged with a caller-chosen sequence that the
-    /// matching result echoes. Awaits only when the local buffer is full,
-    /// which means the server has not granted credit yet: the await IS
-    /// the backpressure. UNAVAILABLE when the stream is gone.
+    /// Queue one document tagged with `sequence`.
     pub async fn submit(&self, sequence: u64, text: &str) -> Result<(), Status> {
         match &self.requests {
-            AnalyzeRequests::Sidecar(requests) => requests
+            #[cfg(feature = "net")]
+            AnalyzeRequests::Remote { tx, binding } => tx
                 .send(AnalyzeStreamRequest {
-                    msg: Some(analyze_stream_request::Msg::Doc(AnalyzeStreamDoc {
-                        sequence,
-                        text: text.to_string(),
+                    kind: Some(analyze_stream_request::Kind::Document(AnalyzeDocument {
+                        id: sequence.to_string(),
+                        model: String::new(),
+                        text: text.as_bytes().to_vec(),
+                        options: None,
+                        output: AnalyzeOutput::DocumentGraph as i32,
+                        offsets: OffsetMode::Utf8 as i32,
+                        binding: Some(binding.clone()),
+                        vocabulary: None,
                     })),
                 })
                 .await
                 .map_err(|_| Status::unavailable("analysis stream closed")),
-            AnalyzeRequests::Native(requests) => requests
-                .send(NativeRequest {
+            AnalyzeRequests::InProcess(requests) => requests
+                .send(InProcessRequest {
                     sequence,
                     text: text.to_string(),
                 })
                 .await
-                .map_err(|_| Status::unavailable("native analysis stream closed")),
+                .map_err(|_| Status::unavailable("in-process analysis stream closed")),
         }
     }
 }
 
-/// One AnalyzeStream call: many documents over one bidi RPC for one
-/// analysis spec, paced end to end by the sidecar's server-side flow
-/// control. Results arrive in COMPLETION order, tagged with the
-/// submitted sequence; callers that need arrival order reorder.
+/// Streaming bulk document analysis session (`turbo.result.v1.AnalysisService.AnalyzeStream`
+/// or in-process `native` / `turbo` worker stream).
 pub struct AnalyzeStream {
     submit: Option<AnalyzeSubmit>,
     responses: AnalyzeResponses,
-    /// The shard's vocabulary listener, when vocabulary accumulation is
-    /// enabled (`None` costs one branch per response). Feeding happens
-    /// HERE — the only layer where the raw response's `tokens` (surface
-    /// forms, dropped by `analyzed_from`) and `term_vectors` both still
-    /// exist — and only on this bulk path: unary `Analyze` is the query
-    /// path, and query text never enters corpus statistics.
     vocab: Option<std::sync::Arc<crate::vocab::VocabularyListener>>,
-    /// Which optional layers this session asked for, which decides
-    /// whether a response's empty `noise` or `locations` list means
-    /// "measured, found nothing" or "not requested". Fixed for the
-    /// session's lifetime, like the options message that set it.
+    spec: Option<AnalysisSpec>,
     layers: SessionLayers,
 }
 
-#[cfg_attr(not(feature = "net"), allow(dead_code))]
+#[cfg(feature = "net")]
+struct RemoteStreamState {
+    addr: String,
+    remote: turbo_client::RemoteClient,
+    client: AnalysisServiceClient<Channel>,
+    timeout: Option<Duration>,
+    responses: Streaming<AnalyzeStreamResponse>,
+}
+
 enum AnalyzeResponses {
-    Sidecar(Box<Streaming<AnalyzeStreamResponse>>),
-    Native(tokio::sync::mpsc::Receiver<NativeResponse>),
+    #[cfg(feature = "net")]
+    Remote(Box<RemoteStreamState>),
+    InProcess(tokio::sync::mpsc::Receiver<InProcessResponse>),
 }
 
 impl AnalyzeStream {
-    /// Opens a stream and sends its options message. UNIMPLEMENTED means
-    /// the sidecar predates the RPC and must be rebuilt; there is no
-    /// unary fallback (see [`analyze_batch`] for why it was removed).
-    ///
-    /// The await resolves on call ACCEPTANCE, not on any result: the
-    /// sidecar sends response headers eagerly (its
-    /// EagerHeadersInterceptor, pinned by its own test) precisely so
-    /// open-then-submit cannot deadlock on a first result that would
-    /// only exist after the first submission.
+    /// Opens an [`AnalyzeStream`] session with default [`SessionLayers`].
     pub async fn open(addr: &str, spec: Option<&AnalysisSpec>) -> Result<Self, Status> {
         Self::open_with_vocab(addr, spec, None, SessionLayers::default()).await
     }
 
-    /// [`open`](Self::open) with the shard's vocabulary listener attached:
-    /// every successfully analyzed response feeds its term vectors (TERMS
-    /// channel) and raw token texts (TOKENS channel) before the response
-    /// is folded into an [`AnalyzedDoc`].
-    /// `layers` asks the sidecar for its optional layers on the same
-    /// pass (`docs/quality-columns.md`, `docs/geography-columns.md`).
-    /// They are a property of the SESSION, not of a document, because
-    /// they are requested in the options message a stream opens with —
-    /// which is why a mid-stream change reopens the session, exactly
-    /// as a spec change does.
-    ///
-    /// A session asking for geography preflights the sidecar's NER
-    /// capability and REFUSES when it has none: the sidecar's own
-    /// behavior on that state — empty layers plus a free-form warning
-    /// per response — is indistinguishable from "no locations found",
-    /// and would silently ingest an entire corpus as place-less.
+    /// Opens an [`AnalyzeStream`] session with optional [`crate::vocab::VocabularyListener`]
+    /// and [`SessionLayers`], preflighting remote server capabilities when needed.
     pub async fn open_with_vocab(
         addr: &str,
         spec: Option<&AnalysisSpec>,
         vocab: Option<std::sync::Arc<crate::vocab::VocabularyListener>>,
         layers: SessionLayers,
     ) -> Result<Self, Status> {
-        if AnalysisBackend::parse(addr)? == AnalysisBackend::Native {
-            return Self::open_native(spec, vocab, layers);
+        Self::open_with_options(
+            addr,
+            spec,
+            vocab,
+            layers,
+            &RemoteCallOptions {
+                interactive: false,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Opens an [`AnalyzeStream`] session with explicit [`RemoteCallOptions`]
+    /// (defaulting to `RemotePriority::Bulk` for ingest/replay streams).
+    pub async fn open_with_options(
+        addr: &str,
+        spec: Option<&AnalysisSpec>,
+        vocab: Option<std::sync::Arc<crate::vocab::VocabularyListener>>,
+        layers: SessionLayers,
+        options: &RemoteCallOptions,
+    ) -> Result<Self, Status> {
+        match AnalysisBackend::parse(addr)? {
+            AnalysisBackend::Native => return Self::open_native(spec, vocab, layers),
+            AnalysisBackend::Turbo => return Self::open_turbo(spec, vocab, layers),
+            AnalysisBackend::Sidecar(_) => {}
         }
         #[cfg(not(feature = "net"))]
         {
-            let _ = (spec, vocab, layers);
+            let _ = (spec, vocab, layers, options);
             Err(sidecar_needs_net(addr))
         }
         #[cfg(feature = "net")]
         {
-            let mut client = client(addr)?;
             if layers.dual_cased {
                 validate_dual_cased_spec(spec)?;
             }
+            let remote = remote_client_for(addr, options)?;
+            let ch = remote
+                .pool()
+                .channel(remote.config())
+                .map_err(client_err_to_status)?;
+            let mut client = AnalysisServiceClient::new(ch)
+                .max_decoding_message_size(crate::MAX_MESSAGE_BYTES)
+                .max_encoding_message_size(crate::MAX_MESSAGE_BYTES);
+
             if layers.geography || layers.entities || layers.dual_cased {
+                let cap_req = remote
+                    .prepare_request(
+                        CapabilitiesRequest {},
+                        Some(turbo_client::RemotePriority::Interactive),
+                        options.timeout,
+                    )
+                    .map_err(client_err_to_status)?;
                 let capabilities = client
-                    .get_capabilities(crate::pb::analysis::GetCapabilitiesRequest {})
-                    .await?
+                    .capabilities(cap_req)
+                    .await
+                    .map_err(|s| inspect_remote_status(addr, s))?
                     .into_inner();
-                if (layers.geography || layers.entities) && !capabilities.ner_available {
+                let ner_available = capabilities.profiles.iter().any(|p| {
+                    p.layers
+                        .iter()
+                        .any(|l| l == "turbo:entities" || l == "turbo:geo")
+                });
+                if (layers.geography || layers.entities) && !ner_available {
                     return Err(Status::failed_precondition(
-                        "entity or geography columns were requested but this sidecar has no NER model configured (GetCapabilities.ner_available = false); configure an NER model or disable those columns",
+                        "entity or geography columns were requested but this analysis server has no NER model configured (Capabilities.ner_available = false); configure an NER model or disable those columns",
                     ));
                 }
-                // An open port is not the jar: the running sidecar must say
-                // it serves both identities before ingest depends on it.
-                if layers.dual_cased && !capabilities.dual_term_identity_available {
+                let dual_available = !capabilities
+                    .profiles
+                    .iter()
+                    .any(|p| p.name == wire::NO_DUAL_CASED_PROFILE);
+                if layers.dual_cased && !dual_available {
                     return Err(Status::failed_precondition(format!(
-                        "a cased field was requested but the sidecar at {addr} does not serve the \
-                         dual term identity (GetCapabilities.dual_term_identity_available = false); \
-                         rebuild grpc-opennlp-analysis from main (./gradlew installDist) or drop \
-                         cased_field"
+                        "a cased field was requested but the analysis server at {addr} does not serve the \
+                         dual term identity (dual_term_identity_available = false); \
+                         upgrade turbo-kserve or drop cased_field"
                     )));
                 }
             }
-            let (requests, feed) = tokio::sync::mpsc::channel(SUBMIT_BUFFER);
-            requests
-                .try_send(AnalyzeStreamRequest {
-                    msg: Some(analyze_stream_request::Msg::Options(analysis_options(
-                        spec, layers,
-                    ))),
-                })
-                .expect("fresh channel has capacity");
+
+            let session = wire::WireSessionOptions {
+                spec: spec.cloned(),
+                layers,
+            };
+            let binding = session.to_binding();
+            let (tx, feed) = tokio::sync::mpsc::channel(SUBMIT_BUFFER);
+            tx.try_send(AnalyzeStreamRequest {
+                kind: Some(analyze_stream_request::Kind::Header(AnalyzeStreamHeader {
+                    order: AnalyzeOrder::Completion as i32,
+                    max_inflight: 0,
+                    batch_linger_ms: 0,
+                })),
+            })
+            .expect("fresh channel has capacity");
+
+            let prio = if options.interactive {
+                turbo_client::RemotePriority::Interactive
+            } else {
+                turbo_client::RemotePriority::Bulk
+            };
+            let stream_req = remote
+                .prepare_request(ReceiverStream::new(feed), Some(prio), options.timeout)
+                .map_err(|e| inspect_remote_client_err(addr, e))?;
+            let proj_client = client.clone();
             let responses = client
-                .analyze_stream(ReceiverStream::new(feed))
-                .await?
+                .analyze_stream(stream_req)
+                .await
+                .map_err(|s| inspect_remote_status(addr, s))?
                 .into_inner();
             Ok(Self {
                 submit: Some(AnalyzeSubmit {
-                    requests: AnalyzeRequests::Sidecar(requests),
+                    requests: AnalyzeRequests::Remote { tx, binding },
                 }),
-                responses: AnalyzeResponses::Sidecar(Box::new(responses)),
+                responses: AnalyzeResponses::Remote(Box::new(RemoteStreamState {
+                    addr: addr.to_string(),
+                    remote,
+                    client: proj_client,
+                    timeout: options.timeout,
+                    responses,
+                })),
                 vocab,
+                spec: spec.cloned(),
                 layers,
             })
         }
@@ -1256,9 +2130,6 @@ impl AnalyzeStream {
         vocab: Option<std::sync::Arc<crate::vocab::VocabularyListener>>,
         layers: SessionLayers,
     ) -> Result<Self, Status> {
-        // The native analyzer serves the sentence layer itself (its
-        // newline detector runs in the same pass, docs/highlighting.md);
-        // every other optional layer needs the sidecar.
         let sidecar_only = SessionLayers {
             sentences: false,
             dual_cased: false,
@@ -1276,7 +2147,7 @@ impl AnalyzeStream {
                 requested.push("entities");
             }
             return Err(Status::failed_precondition(format!(
-                "native lexical analysis does not provide {} layers; configure an OpenNLP sidecar for this ingest",
+                "native lexical analysis does not provide {} layers; configure --analysis-addr=turbo or turbo-kserve for this ingest",
                 requested.join(", ")
             )));
         }
@@ -1284,19 +2155,23 @@ impl AnalyzeStream {
             validate_dual_cased_spec(spec)?;
         }
         let dual_cased = layers.dual_cased;
-        let spec = std::sync::Arc::new(native_spec(spec)?);
-        let (requests, mut feed) = tokio::sync::mpsc::channel::<NativeRequest>(SUBMIT_BUFFER);
-        let (emit, responses) = tokio::sync::mpsc::channel::<NativeResponse>(SUBMIT_BUFFER);
+        let parsed_spec = std::sync::Arc::new(native_spec(spec)?);
+        let (requests, mut feed) = tokio::sync::mpsc::channel::<InProcessRequest>(SUBMIT_BUFFER);
+        let (emit, responses) = tokio::sync::mpsc::channel::<InProcessResponse>(SUBMIT_BUFFER);
         tokio::spawn(async move {
             while let Some(request) = feed.recv().await {
                 let sequence = request.sequence;
-                let spec = spec.clone();
+                let spec_clone = parsed_spec.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    if dual_cased {
-                        native_dual_with_spec(&request.text, &spec)
+                    let native = if dual_cased {
+                        native_dual_with_spec(&request.text, &spec_clone)?
                     } else {
-                        native_analysis_with_spec(&request.text, &spec)
-                    }
+                        native_analysis_with_spec(&request.text, &spec_clone)?
+                    };
+                    Ok(InProcessItem {
+                        doc: native.doc,
+                        surface_tokens: native.tokens,
+                    })
                 })
                 .await
                 .unwrap_or_else(|error| {
@@ -1305,7 +2180,7 @@ impl AnalyzeStream {
                     )))
                 });
                 if emit
-                    .send(NativeResponse { sequence, result })
+                    .send(InProcessResponse { sequence, result })
                     .await
                     .is_err()
                 {
@@ -1315,30 +2190,74 @@ impl AnalyzeStream {
         });
         Ok(Self {
             submit: Some(AnalyzeSubmit {
-                requests: AnalyzeRequests::Native(requests),
+                requests: AnalyzeRequests::InProcess(requests),
             }),
-            responses: AnalyzeResponses::Native(responses),
+            responses: AnalyzeResponses::InProcess(responses),
             vocab,
+            spec: spec.cloned(),
             layers,
         })
     }
 
-    /// A cloneable submission handle, so submission can race result
-    /// consumption in a `select` without borrowing the session twice.
+    fn open_turbo(
+        spec: Option<&AnalysisSpec>,
+        vocab: Option<std::sync::Arc<crate::vocab::VocabularyListener>>,
+        layers: SessionLayers,
+    ) -> Result<Self, Status> {
+        if layers.dual_cased {
+            validate_dual_cased_spec(spec)?;
+        }
+        let _ = turbo_field_config(spec)?;
+        if layers.quality || layers.geography || layers.entities {
+            let _ = shared_turbo_nlp()?;
+        }
+        let owned_spec = spec.cloned();
+        let (requests, mut feed) = tokio::sync::mpsc::channel::<InProcessRequest>(SUBMIT_BUFFER);
+        let (emit, responses) = tokio::sync::mpsc::channel::<InProcessResponse>(SUBMIT_BUFFER);
+        tokio::spawn(async move {
+            while let Some(request) = feed.recv().await {
+                let sequence = request.sequence;
+                let spec_clone = owned_spec.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    let out = turbo_analysis_pass(&request.text, spec_clone.as_ref(), layers)?;
+                    Ok(InProcessItem {
+                        doc: out.doc,
+                        surface_tokens: out.surface_tokens,
+                    })
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    Err(Status::internal(format!(
+                        "turbo in-process analysis worker failed: {error}"
+                    )))
+                });
+                if emit
+                    .send(InProcessResponse { sequence, result })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        Ok(Self {
+            submit: Some(AnalyzeSubmit {
+                requests: AnalyzeRequests::InProcess(requests),
+            }),
+            responses: AnalyzeResponses::InProcess(responses),
+            vocab,
+            spec: spec.cloned(),
+            layers,
+        })
+    }
+
+    /// Returns a cloneable submission handle.
     pub fn submitter(&self) -> AnalyzeSubmit {
         self.submit
             .clone()
             .expect("finished stream has no submitter")
     }
 
-    /// Submit `indices` (as sequences) through this one stream and
-    /// collect every result, racing submission against consumption so a
-    /// full local buffer never stalls the drain.
-    ///
-    /// Extracted so the multi-stream path runs the SAME loop N times
-    /// rather than a second implementation of it: the pacing here is
-    /// subtle (the await in `submit` is the backpressure), and two
-    /// versions of it would drift.
     async fn run_to_completion(
         mut self,
         items: &[(u64, &str)],
@@ -1380,14 +2299,8 @@ impl AnalyzeStream {
         Ok(out)
     }
 
-    /// Read the server's end of the stream once every result is in
-    /// hand. A stream dropped with its trailers unread is a
-    /// RST_STREAM on the wire, and a bulk replay that ends thousands
-    /// of batch streams a minute that way trips the sidecar's
-    /// rapid-reset guard: the archive split of 2026-09-06 died twenty
-    /// minutes in with ENHANCE_YOUR_CALM (RESOURCE_EXHAUSTED at the
-    /// client) after about 600 stream resets a second. A result after
-    /// the last expected one is a protocol error, named.
+    /// Reads the server's clean end-of-stream so trailers are drained without
+    /// emitting HTTP/2 `RST_STREAM`.
     pub async fn drain_to_end(&mut self) -> Result<(), Status> {
         match self.next().await? {
             None => Ok(()),
@@ -1398,77 +2311,83 @@ impl AnalyzeStream {
         }
     }
 
-    /// Half-close the submission side. Once every [`submitter`] clone
-    /// drops too, the server drains in-flight documents and completes.
-    ///
-    /// [`submitter`]: Self::submitter
+    /// Half-closes the client submission side.
     pub fn finish(&mut self) {
         self.submit = None;
     }
 
-    /// The next per-document result, in completion order. `Ok(None)` is
-    /// normal completion (after [`finish`](Self::finish)); the outer
-    /// error is the stream itself failing, an inner error is one
-    /// document failing on its own while the stream lives on.
+    /// Next per-document result in completion order.
     pub async fn next(&mut self) -> Result<Option<(u64, Result<AnalyzedDoc, Status>)>, Status> {
         match &mut self.responses {
-            AnalyzeResponses::Sidecar(responses) => match responses.message().await? {
-                Some(response) => {
-                    let sequence = response.sequence;
-                    let result = match response.result {
-                        Some(analyze_stream_response::Result::Ok(ok)) => {
-                            // Vocabulary feed BEFORE the fold: `analyzed_from`
-                            // drops the raw token texts the TOKENS channel
-                            // counts. The feed never fails ingest.
+            #[cfg(feature = "net")]
+            AnalyzeResponses::Remote(state) => {
+                match state
+                    .responses
+                    .message()
+                    .await
+                    .map_err(|s| inspect_remote_status(&state.addr, s))?
+                {
+                    Some(response) => {
+                        let sequence = response.id.parse::<u64>().map_err(|_| {
+                            Status::internal(format!(
+                                "analysis stream returned non-numeric correlation id {:?}",
+                                response.id
+                            ))
+                        })?;
+                        let result = match response.outcome {
+                            Some(analyze_stream_response::Outcome::DocumentGraph(graph)) => {
+                                decode_graph_response_remote(
+                                    &state.addr,
+                                    &state.remote,
+                                    &mut state.client,
+                                    graph,
+                                    self.spec.as_ref(),
+                                    self.layers,
+                                    state.timeout,
+                                    self.vocab.as_ref(),
+                                )
+                                .await
+                            }
+                            Some(analyze_stream_response::Outcome::Failure(failure)) => {
+                                Err(wire::status_from_analyze_failure(failure))
+                            }
+                            Some(_) => Err(Status::internal(
+                                "analysis stream returned unexpected non-graph outcome",
+                            )),
+                            None => Err(Status::internal("stream response carries no outcome")),
+                        };
+                        Ok(Some((sequence, result)))
+                    }
+                    None => Ok(None),
+                }
+            }
+            AnalyzeResponses::InProcess(responses) => {
+                let _ = &self.spec;
+                let _ = &self.layers;
+                match responses.recv().await {
+                    Some(response) => {
+                        let result = response.result.map(|item| {
                             if let Some(vocab) = &self.vocab {
+                                let body = &item.doc.fields[0];
                                 vocab.feed(
-                                    ok.term_vectors
-                                        .iter()
-                                        .map(|tv| (tv.term.as_str(), i64::from(tv.frequency))),
-                                    ok.tokens.iter().map(|t| t.text.as_str()),
+                                    body.terms.iter().map(|(term, frequency, _)| {
+                                        (term.as_str(), i64::from(*frequency))
+                                    }),
+                                    item.surface_tokens.iter().map(String::as_str),
                                 );
                             }
-                            analyzed_from(ok, self.layers)
-                        }
-                        Some(analyze_stream_response::Result::Error(error)) => {
-                            Err(Status::new(tonic::Code::from(error.code), error.message))
-                        }
-                        None => Err(Status::internal(
-                            "stream response carries neither ok nor error",
-                        )),
-                    };
-                    Ok(Some((sequence, result)))
+                            item.doc
+                        });
+                        Ok(Some((response.sequence, result)))
+                    }
+                    None => Ok(None),
                 }
-                None => Ok(None),
-            },
-            AnalyzeResponses::Native(responses) => match responses.recv().await {
-                Some(response) => {
-                    let result = response.result.map(|analysis| {
-                        if let Some(vocab) = &self.vocab {
-                            let body = &analysis.doc.fields[0];
-                            vocab.feed(
-                                body.terms.iter().map(|(term, frequency, _)| {
-                                    (term.as_str(), i64::from(*frequency))
-                                }),
-                                analysis.tokens.iter().map(String::as_str),
-                            );
-                        }
-                        analysis.doc
-                    });
-                    Ok(Some((response.sequence, result)))
-                }
-                None => Ok(None),
-            },
+            }
         }
     }
 }
 
-/// Analyze a batch through [`AnalyzeStream`], returning results in INPUT
-/// order. Any per-document failure fails the whole batch, the contract
-/// the reshard replay tools rely on.
-///
-/// One stream per distinct spec (almost always exactly one). For more
-/// than one stream per spec see [`analyze_batch_streams`].
+/// Analyze a batch through [`AnalyzeStream`], returning results in input order.
 pub async fn analyze_batch(
     addr: &str,
     docs: &[(&str, Option<&AnalysisSpec>, SessionLayers)],
@@ -1476,29 +2395,9 @@ pub async fn analyze_batch(
     analyze_batch_streams(addr, docs, 1).await
 }
 
-/// [`analyze_batch`] over `streams` concurrent AnalyzeStreams per spec.
-///
-/// One stream is a pipeline, not a parallel: the sidecar paces it with
-/// its own flow control, so a single stream can leave analysis workers
-/// idle while it waits on the wire. Since analysis is the ceiling on
-/// bulk ingest (shard parallelism is not), opening several lets the
-/// sidecar work on several documents at once. The right number is a
-/// property of the sidecar's worker pool, not of this client, which is
-/// why it is a parameter rather than a constant.
-///
-/// Results are keyed by the caller's sequence and land in their input
-/// slots, so the OUTPUT IS BYTE-IDENTICAL whatever `streams` is set to.
-/// Analysis is a pure function of (text, spec); splitting the work
-/// changes only who waits. That is pinned by test, because a throughput
-/// knob that quietly perturbed term identity would corrupt an index
-/// rather than slow one down.
-///
-/// `streams` is clamped to at least 1 and to the number of documents in
-/// a group; more streams than documents would open connections that
-/// immediately close.
-/// One batch session's key (spec and layers) and the input indices it serves.
 type SessionGroup<'a> = ((Option<&'a AnalysisSpec>, SessionLayers), Vec<usize>);
 
+/// [`analyze_batch`] striped across `streams` concurrent [`AnalyzeStream`]s per `(spec, layers)`.
 pub async fn analyze_batch_streams(
     addr: &str,
     docs: &[(&str, Option<&AnalysisSpec>, SessionLayers)],
@@ -1506,11 +2405,6 @@ pub async fn analyze_batch_streams(
 ) -> Result<Vec<AnalyzedDoc>, Status> {
     let mut out: Vec<Option<AnalyzedDoc>> = Vec::new();
     out.resize_with(docs.len(), || None);
-    // Group indices by spec, preserving first-seen order; the global doc
-    // index is the sequence, so results land in their input slots no
-    // matter which group or which stream answered.
-    // One session per (spec, layers) pair: the layers a replayed record
-    // needs (sentence spans, the cased identity) come from that one call.
     let mut groups: Vec<SessionGroup<'_>> = Vec::new();
     for (i, (_, spec, layers)) in docs.iter().enumerate() {
         match groups.iter_mut().find(|(key, _)| *key == (*spec, *layers)) {
@@ -1523,9 +2417,6 @@ pub async fn analyze_batch_streams(
         if want == 0 {
             continue;
         }
-        // Contiguous chunks, not round-robin: consecutive documents in a
-        // bulk replay tend to be similar in size, so contiguity keeps the
-        // per-stream loads even without knowing anything about them.
         let per = indices.len().div_ceil(want);
         let chunks: Vec<Vec<(u64, &str)>> = indices
             .chunks(per)
@@ -1541,9 +2432,6 @@ pub async fn analyze_batch_streams(
         for _ in 0..chunks.len() {
             sessions.push(open_stream(addr, spec, layers).await?);
         }
-        // Drive every stream from this one task: the work being
-        // overlapped is the sidecar's, and these futures only wait on
-        // I/O. No spawn, so nothing has to be cloned to satisfy 'static.
         let mut running: Vec<_> = sessions
             .into_iter()
             .zip(&chunks)
@@ -1564,14 +2452,6 @@ pub async fn analyze_batch_streams(
         .collect())
 }
 
-/// Open one stream, naming a version skew rather than degrading.
-///
-/// No quiet downgrade to per-document unary calls. That fallback existed
-/// and cost real debugging time: this is a BULK path (reshard and WAL
-/// replay), and the unary transport opens one h2 stream per document, so
-/// a sidecar predating AnalyzeStream GOAWAYs after ~70 of them. The
-/// "fallback" did not degrade gracefully, it failed obscurely thousands
-/// of documents later.
 async fn open_stream(
     addr: &str,
     spec: Option<&AnalysisSpec>,
@@ -1581,22 +2461,14 @@ async fn open_stream(
         Ok(session) => Ok(session),
         Err(status) if status.code() == tonic::Code::Unimplemented => {
             Err(Status::failed_precondition(format!(
-                "analysis sidecar at {addr} does not implement AnalyzeStream; \
-                 it predates the RPC and must be rebuilt (./gradlew installDist \
-                 in grpc-opennlp-analysis)"
+                "analysis service at {addr} does not implement AnalyzeStream; \
+                 upgrade turbo-kserve to a build with AnalyzeStream support"
             )))
         }
         Err(status) => Err(status),
     }
 }
 
-/// Await every future to completion, returning results in input order.
-///
-/// Hand-rolled because the crate does not depend on `futures`, and this
-/// is the whole of what it would be used for: poll each in turn, yield
-/// when none is ready. The waker is shared, so a wake from any one
-/// re-polls all of them, which is correct if slightly eager for the
-/// handful of streams this ever holds.
 async fn join_all<F: std::future::Future>(futures: &mut [std::pin::Pin<Box<F>>]) -> Vec<F::Output> {
     let mut done: Vec<Option<F::Output>> = (0..futures.len()).map(|_| None).collect();
     let mut remaining = futures.len();
@@ -1624,25 +2496,23 @@ async fn join_all<F: std::future::Future>(futures: &mut [std::pin::Pin<Box<F>>])
 
 #[cfg(test)]
 mod tests {
+    use super::wire::{
+        analyzed_from_mock, doc_geography, doc_quality, MockAnalyzeResponse, WireGeoLocation,
+        WireNoiseSpan, WireRegionVote, WireSpan, WireTermVector, WIRE_OFFSET_UTF16,
+    };
     use super::*;
 
-    fn noise_span(start: i32, end: i32, score: f64) -> crate::pb::analysis::NoiseSpan {
-        crate::pb::analysis::NoiseSpan {
-            span: Some(crate::pb::analysis::Span { start, end }),
+    fn noise_span(start: i32, end: i32, score: f64) -> WireNoiseSpan {
+        WireNoiseSpan {
+            span: Some(WireSpan { start, end }),
             severity: "gibberish".to_string(),
             score,
         }
     }
 
-    /// Overlapping and duplicate findings must count each damaged
-    /// character once, in any emission order: `noise_chars` is the
-    /// union's length, not the sum of the spans.
     #[test]
     fn noise_chars_is_the_union_not_the_sum() {
-        let response = AnalyzeResponse {
-            // [10,20) and [15,25) overlap; [15,25) repeats; [30,32) is
-            // disjoint; [5,5) is empty and contributes nothing. Emitted
-            // deliberately out of start order.
+        let response = MockAnalyzeResponse {
             noise: vec![
                 noise_span(30, 32, 0.2),
                 noise_span(15, 25, 0.4),
@@ -1658,11 +2528,9 @@ mod tests {
         assert_eq!(q.artifacts, 0);
     }
 
-    /// A non-finite score is no signal, not the worst signal: it must
-    /// not become the column value and poison min/max metadata.
     #[test]
     fn non_finite_noise_scores_are_ignored() {
-        let response = AnalyzeResponse {
+        let response = MockAnalyzeResponse {
             noise: vec![noise_span(0, 4, f64::NAN), noise_span(4, 8, 0.5)],
             ..Default::default()
         };
@@ -1671,9 +2539,9 @@ mod tests {
         assert_eq!(q.noise_chars, 8, "the NaN finding's SPAN still counts");
     }
 
-    fn location(start: i32, confidence: f64, country: &str) -> crate::pb::analysis::GeoLocation {
-        crate::pb::analysis::GeoLocation {
-            span: Some(crate::pb::analysis::Span {
+    fn location(start: i32, confidence: f64, country: &str) -> WireGeoLocation {
+        WireGeoLocation {
+            span: Some(WireSpan {
                 start,
                 end: start + 5,
             }),
@@ -1685,24 +2553,20 @@ mod tests {
         }
     }
 
-    /// The point is the highest-confidence location; a tie keeps the
-    /// FIRST in text order, so the reduction cannot depend on how the
-    /// scan iterates. The country comes from the top region vote, not
-    /// from the winning location.
     #[test]
     fn geography_picks_best_confidence_first_on_ties() {
-        let response = AnalyzeResponse {
+        let response = MockAnalyzeResponse {
             locations: vec![
                 location(0, 0.9, "FR"),
                 location(10, 0.9, "DE"),
                 location(20, 0.4, "US"),
             ],
             regions: vec![
-                crate::pb::analysis::RegionVote {
+                WireRegionVote {
                     country_code: "DE".to_string(),
                     share: 0.6,
                 },
-                crate::pb::analysis::RegionVote {
+                WireRegionVote {
                     country_code: "FR".to_string(),
                     share: 0.4,
                 },
@@ -1718,50 +2582,36 @@ mod tests {
         );
     }
 
-    /// A non-finite confidence is no signal and cannot be chosen; a
-    /// layer with ONLY such findings reduces to no point at all.
     #[test]
     fn non_finite_confidence_cannot_win() {
-        let response = AnalyzeResponse {
+        let response = MockAnalyzeResponse {
             locations: vec![location(0, f64::NAN, "FR"), location(10, 0.3, "DE")],
             ..Default::default()
         };
         assert_eq!(doc_geography(&response).point, Some((10.0, -10.0)));
 
-        let only_nan = AnalyzeResponse {
+        let only_nan = MockAnalyzeResponse {
             locations: vec![location(0, f64::NAN, "FR")],
             ..Default::default()
         };
         assert_eq!(doc_geography(&only_nan).point, None);
     }
 
-    /// No locations reduces to the all-absent value: no point, no
-    /// country, confidence meaningless — the caller writes NOTHING,
-    /// never a fabricated (0,0).
     #[test]
     fn no_locations_reduce_to_absence() {
-        let g = doc_geography(&AnalyzeResponse::default());
+        let g = doc_geography(&MockAnalyzeResponse::default());
         assert_eq!(g.point, None);
         assert_eq!(g.country, "");
     }
 
-    /// A response with no findings measures exactly zero on every
-    /// axis: "clean" is a measurement, distinct from "not measured"
-    /// (which is `AnalyzedDoc::quality == None` and never reaches
-    /// here).
     #[test]
     fn a_clean_response_measures_zero() {
-        let q = doc_quality(&AnalyzeResponse::default());
+        let q = doc_quality(&MockAnalyzeResponse::default());
         assert_eq!(q.noise, 0.0);
         assert_eq!(q.noise_chars, 0);
         assert_eq!(q.artifacts, 0);
     }
 
-    /// The two named body analyzers must differ in TERM IDENTITY, not
-    /// merely in name. If they ever resolved to the same spec the A/B
-    /// they exist for would compare a column with itself and report
-    /// "no difference", which is the most expensive possible way to be
-    /// wrong: it looks like an answer.
     #[test]
     fn folded_and_cased_are_actually_different_analyzers() {
         let folded = analyzer_by_name("folded").expect("known name").unwrap();
@@ -1769,36 +2619,23 @@ mod tests {
         assert_ne!(folded.term_vector_source, cased.term_vector_source);
         assert_eq!(folded.term_vector_source, SOURCE_NORMALIZED_STEMS);
         assert_eq!(cased.term_vector_source, SOURCE_STEMS);
-        // Same tokenizer and stemmer: the comparison isolates case
-        // folding, so anything else differing would confound it.
         assert_eq!(folded.tokenizer, cased.tokenizer);
         assert_eq!(folded.stemmer, cased.stemmer);
-        // SOURCE_STEMS ignores char filters, so carrying them on the
-        // cased spec would misdescribe what the column holds.
         assert!(cased.char_filters.is_empty());
         assert!(folded.char_filters.contains(&CHAR_FILTER_FULL_CASE_FOLD));
     }
 
-    /// `ingest` tracks the corpus spec rather than restating it, so the
-    /// alias cannot rot when `body_spec` changes.
     #[test]
     fn ingest_is_the_corpus_analyzer() {
         assert_eq!(analyzer_by_name("ingest").unwrap(), Some(body_spec()));
         assert_eq!(analyzer_by_name("folded").unwrap(), Some(body_spec()));
     }
 
-    /// `server` is a real choice (leave the spec unset), not a missing
-    /// answer, and it is NOT the same as any named analyzer: the
-    /// sidecar's default does not stem.
     #[test]
     fn server_means_no_spec() {
         assert_eq!(analyzer_by_name("server").unwrap(), None);
     }
 
-    /// An unknown name is refused and NAMES the alternatives. A silent
-    /// fallback to the default here would query a stemmed index with an
-    /// unstemmed spec and report the ranking of whatever fragment
-    /// happened to match.
     #[test]
     fn an_unknown_analyzer_is_refused_and_lists_the_known_ones() {
         let err = analyzer_by_name("porter").expect_err("not a known name");
@@ -1808,8 +2645,6 @@ mod tests {
         }
     }
 
-    /// The fingerprint must separate the two analyzers an A/B compares,
-    /// and must survive a round trip through the file format unchanged.
     #[test]
     fn the_fingerprint_separates_the_analyzers_it_exists_to_separate() {
         let folded = analysis_fingerprint(Some(&body_spec()));
@@ -1817,22 +2652,14 @@ mod tests {
         assert_ne!(folded, cased);
         assert_ne!(folded, 0);
         assert_ne!(cased, 0);
-        // Stable: same spec, same number, every call.
         assert_eq!(folded, analysis_fingerprint(Some(&body_spec())));
     }
 
-    /// An absent spec is UNKNOWN, not "the default analyzer". The
-    /// sidecar resolves an absent spec against its own defaults, which
-    /// this side cannot see, so claiming a number here would assert
-    /// something we do not know.
     #[test]
     fn an_absent_spec_is_unknown_not_a_default() {
         assert_eq!(analysis_fingerprint(None), 0);
     }
 
-    /// Char filter ORDER is semantic, and the count is hashed so a
-    /// two-filter chain cannot collide with a one-filter chain whose
-    /// value happens to concatenate.
     #[test]
     fn char_filter_order_and_arity_both_change_the_fingerprint() {
         let base = body_spec();
@@ -1860,9 +2687,6 @@ mod tests {
         );
     }
 
-    /// Every scalar of the spec participates. A field that did not would
-    /// be a hole in the contract exactly where someone would eventually
-    /// vary it.
     #[test]
     fn every_field_of_the_spec_changes_the_fingerprint() {
         let base = body_spec();
@@ -1890,83 +2714,56 @@ mod tests {
         }
     }
 
-    /// The value is written into a FILE FORMAT, so it is pinned to a
-    /// literal. A change here silently invalidates every shard on disk,
-    /// so it must be a deliberate edit to this test and not a drive-by
-    /// refactor of the hash.
     #[test]
     fn the_corpus_fingerprint_is_pinned() {
         assert_eq!(
             analysis_fingerprint(Some(&body_spec())),
             0x55eb_d3a6_febd_2ac3,
-            "the corpus analyzer fingerprint changed; any shard built under \
-             the old value will refuse every query against this spec, so \
-             changing it commits to a rebuild"
+            "the corpus analyzer fingerprint changed"
         );
     }
 
-    /// The steps measurement said to skip are skipped, and the one it
-    /// said to adopt is adopted. Pinned because the argument for each is
-    /// a corpus measurement recorded in `body_spec`'s docs, not a
-    /// preference: a later edit that quietly adds DEHYPHENATE or NFKC to
-    /// the corpus analyzer should have to change this test and say why.
     #[test]
     fn the_corpus_analyzer_folds_accents_and_skips_the_pdf_steps() {
         let filters = body_spec().char_filters;
-        assert!(
-            filters.contains(&CHAR_FILTER_ACCENT_FOLD),
-            "accent folding is what makes Rodriguez and Rodríguez one term"
-        );
-        assert!(
-            !filters.contains(&CHAR_FILTER_DEHYPHENATE),
-            "this corpus is XML/HTML-derived; line-break hyphens are 0.1% of chunks"
-        );
+        assert!(filters.contains(&CHAR_FILTER_ACCENT_FOLD));
+        assert!(!filters.contains(&CHAR_FILTER_DEHYPHENATE));
         assert!(!filters.contains(&CHAR_FILTER_NFKC));
-        // Folding must not disturb the cased arm: it takes identity from
-        // the surface stem and ignores char filters outright.
         assert!(cased_body_spec().char_filters.is_empty());
         assert_ne!(
             analysis_fingerprint(Some(&body_spec())),
             analysis_fingerprint(Some(&cased_body_spec())),
-            "the two A/B arms must stay distinguishable on the wire"
         );
     }
 
-    /// A token made entirely of stripped characters normalizes to the
-    /// empty string, which the sidecar emits as a term; the boundary
-    /// drops it, and its tf never reaches the document length. The
-    /// result is exactly the document the analyzer should have
-    /// produced.
     #[test]
     fn zero_length_terms_are_dropped_at_the_boundary() {
-        use crate::pb::analysis::{Span, TermVector};
-        let tv = |term: &str, tf: i32| TermVector {
+        let tv = |term: &str, tf: i32| WireTermVector {
             term: term.to_string(),
             frequency: tf,
-            occurrences: vec![Span { start: 0, end: 5 }],
+            occurrences: vec![WireSpan { start: 0, end: 5 }],
         };
-        let with_empty = AnalyzeResponse {
+        let with_empty = MockAnalyzeResponse {
             term_vectors: vec![tv("court", 2), tv("", 3), tv("appeal", 1)],
             ..Default::default()
         };
-        let without = AnalyzeResponse {
+        let without = MockAnalyzeResponse {
             term_vectors: vec![tv("court", 2), tv("appeal", 1)],
             ..Default::default()
         };
         assert_eq!(
-            analyzed_from(with_empty, SessionLayers::default()).unwrap(),
-            analyzed_from(without, SessionLayers::default()).unwrap(),
-            "the empty term must vanish as if the analyzer never emitted it"
+            analyzed_from_mock(with_empty, SessionLayers::default()).unwrap(),
+            analyzed_from_mock(without, SessionLayers::default()).unwrap(),
         );
     }
 
     #[test]
     fn search_refuses_a_sidecar_that_violates_its_utf8_storage_request() {
-        let response = AnalyzeResponse {
-            offset_unit: crate::pb::analysis::OffsetUnit::Utf16CodeUnits as i32,
+        let response = MockAnalyzeResponse {
+            offset_unit: WIRE_OFFSET_UTF16,
             ..Default::default()
         };
-        let error = analyzed_from(response, SessionLayers::default()).unwrap_err();
+        let error = analyzed_from_mock(response, SessionLayers::default()).unwrap_err();
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         assert!(error.message().contains("ambiguous persisted spans"));
     }
@@ -1993,6 +2790,46 @@ mod tests {
                 ("Run".to_string(), 1, vec![(0, 7)]),
                 ("run".to_string(), 1, vec![(8, 15)]),
             ]
+        );
+    }
+
+    #[test]
+    fn turbo_inprocess_provider_projects_dehyphenated_utf8_offsets_and_nlp_layers() {
+        let mut pdf_spec = body_spec();
+        pdf_spec.char_filters.insert(0, CHAR_FILTER_DEHYPHENATE);
+        let text = "The re-\nentered order in Paris cost $120.00.";
+        let doc = analyze_document_turbo(
+            text,
+            Some(&pdf_spec),
+            SessionLayers {
+                quality: true,
+                geography: true,
+                entities: true,
+                sentences: true,
+                dual_cased: true,
+                nlp_columns: false,
+            },
+        )
+        .unwrap();
+        let body = &doc.fields[0];
+        body.check_positions().expect("valid ascending positions");
+        body.check_sentences()
+            .expect("sentences cover every occurrence");
+        let reenter = body
+            .terms
+            .iter()
+            .find(|(t, _, _)| t == "reenter")
+            .expect("dehyphenated joined term present");
+        assert_eq!(
+            &text[reenter.2[0].0 as usize..reenter.2[0].1 as usize],
+            "re-\nentered"
+        );
+        assert!(doc.cased.is_some(), "dual_cased twin populated in one pass");
+        assert!(doc.quality.is_some(), "quality layer populated in-process");
+        assert_eq!(
+            doc.geography.as_ref().map(|g| g.country.as_str()),
+            Some("FR"),
+            "BundledGazetteer resolves Paris -> FR in-process"
         );
     }
 
@@ -2065,11 +2902,12 @@ mod tests {
                 quality: true,
                 geography: false,
                 entities: false,
+                nlp_columns: false,
             },
         )
         .await
         .err()
-        .expect("quality must remain an OpenNLP capability");
+        .expect("quality is not served by minimal native backend");
         assert_eq!(layer.code(), tonic::Code::FailedPrecondition);
     }
 }

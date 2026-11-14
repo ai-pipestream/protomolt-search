@@ -37,6 +37,7 @@ async fn add_documents(
     let (tx, rx) = mpsc::channel(8);
     for text in texts {
         tx.send(AddDocumentsRequest {
+            nlp_materialization: String::new(),
             unsigned_integers: Vec::new(),
             map_integers: Vec::new(),
             map_unsigned_integers: Vec::new(),

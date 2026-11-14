@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Court end-to-end pipeline driver (runs inside the pipeline container):
 # pull the bulk snapshot from rustfs, extract the opinions sample (Rust),
-# chunk + embed through the OpenNLP analysis sidecar, ingest into the
+# chunk + embed through turbo-kserve, ingest into the
 # shard nodes (calibration broadcast + AddDocuments/AddVectors + Flush),
 # then gate on court_verify.
 set -euo pipefail
@@ -54,7 +54,7 @@ court_extract \
   --min-chars="$EXTRACT_MIN_CHARS" \
   --prefix-gb="$EXTRACT_PREFIX_GB"
 
-echo "== stage 1: chunk + embed (static embeddings via OpenNLP sidecar) =="
+echo "== stage 1: chunk + embed (static embeddings via turbo-kserve) =="
 court_chunks \
   --input="$WORK/opinions-sample.ndjson" \
   --output="$WORK/chunks.ndjson" \

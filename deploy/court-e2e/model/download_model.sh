@@ -1,12 +1,11 @@
 #!/bin/sh
-# Download a Model2Vec static embedding table from HuggingFace into the
-# models volume. The OpenNLP analysis sidecar reads the Model2Vec layout
-# natively (OPENNLP_EMBEDDINGS_DIR points at MODEL_OUT), so this is a
-# plain file fetch — no distillation, no Python.
+# Download a Model2Vec static embedding bundle from HuggingFace into the
+# models volume. turbo-kserve mounts /models via TURBO_KSERVE_BUNDLE_DIR,
+# so this is a plain file fetch — no distillation, no JVM, no Python.
 #
 # Default table: minishlab/potion-retrieval-32M (256d WordPiece static
-# embedder, MIT). Override MODEL_REPO/MODEL_FILES for another table —
-# e.g. a bge-m3 distillation once the Java distiller produces it.
+# embedder, MIT). Override MODEL_REPO/MODEL_FILES for another bundle —
+# e.g. a distilled bge-m3 turboembed bundle.
 set -eu
 
 : "${MODEL_REPO:=minishlab/potion-retrieval-32M}"

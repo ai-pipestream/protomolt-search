@@ -690,6 +690,18 @@ pub struct NodeConfig {
     /// sizes from the machine, capped at four to avoid competing with vector
     /// scans by default.
     pub rerank_parallel: usize,
+    /// Optional index-generation cryptographic handshake verified at shard
+    /// startup/bind and during ingest.
+    pub turbo_handshake: Option<turbo_client::IndexGenerationHandshake>,
+    /// Optional Matryoshka prefix tiers (e.g. `[128, 256]`) sliced from full
+    /// embeddings on ingest via [`crate::turbo_bridge::MultiResVectorOutput`].
+    pub matryoshka_prefix_dims: Vec<u32>,
+    /// Optional active Matryoshka prefix tier indexed into the primary shard
+    /// vector index while full/higher tiers remain retained on the shard.
+    pub matryoshka_active_dim: Option<u32>,
+    /// Optional `turbo-kserve` gRPC endpoint receiving live corpus vocabulary
+    /// feedback snapshots on `Flush`.
+    pub vocab_kserve_endpoint: Option<String>,
 }
 
 impl NodeConfig {
@@ -748,6 +760,10 @@ impl Default for NodeConfig {
             coalesce: true,
             scan_parallel: 0,
             rerank_parallel: 0,
+            turbo_handshake: None,
+            matryoshka_prefix_dims: Vec::new(),
+            matryoshka_active_dim: None,
+            vocab_kserve_endpoint: None,
         }
     }
 }
@@ -774,6 +790,7 @@ struct LegResults {
     geo_columns_known: Vec<bool>,
     filter_columns_known: Vec<bool>,
     read_receipt: Option<crate::pb::VectorReadReceipt>,
+    rerank_candidates: HashMap<u64, crate::pb::RerankCandidatePayload>,
 }
 
 /// The BM25 half's two storage shapes: the heap builder used during
@@ -4817,6 +4834,14 @@ pub struct NodeServiceImpl {
     /// Optional per-poll sleep injected on streaming scans for deterministic
     /// straggler simulation in multi-shard tests and benchmarks.
     stream_poll_delay: Option<std::time::Duration>,
+    /// Optional one-pass `DocumentNlpProjection` -> native typed column spec.
+    nlp_columns: Option<Arc<crate::turbo_bridge::NlpColumnSpec>>,
+    /// Optional index-generation cryptographic handshake verified against analyzer / bundle fingerprints.
+    turbo_handshake: Option<Arc<turbo_client::IndexGenerationHandshake>>,
+    /// Automatically pinned first-document lexical handshake on this shard.
+    auto_turbo_handshake: Arc<std::sync::Mutex<Option<turbo_client::IndexGenerationHandshake>>>,
+    /// Multi-resolution Matryoshka + sentence vectors retained per local slot.
+    multi_res_vectors: Arc<RwLock<HashMap<u32, crate::turbo_bridge::MultiResVectorOutput>>>,
 }
 
 /// One compiled MaterializeSpec, cached against spec equality.
@@ -4833,7 +4858,7 @@ struct CompiledMaterialize {
 /// degrades the shard to uncounted with a loud warning — ingest itself
 /// is unaffected.
 fn open_vocab(config: &NodeConfig) -> Option<Arc<crate::vocab::VocabularyListener>> {
-    if !config.vocab {
+    if !config.vocab && config.vocab_kserve_endpoint.is_none() {
         return None;
     }
     let index_path = config.index_path.as_ref()?;
@@ -5136,6 +5161,7 @@ pub fn scan_batch_counters() -> (u64, u64) {
 struct ScanOutcome {
     hits: Vec<ChunkHit>,
     identities: crate::source_archive::IdentitySnapshot,
+    rerank_candidates: HashMap<u32, crate::pb::RerankCandidatePayload>,
     stats: ScanStats,
     geo_columns_known: Vec<bool>,
     filter_columns_known: Vec<bool>,
@@ -5147,6 +5173,7 @@ struct ScanJob {
     vector: Vec<f32>,
     k: usize,
     tie_complete: bool,
+    include_rerank_candidate: bool,
     /// The request's filters, resolved into an allowlist by the batch
     /// runner under the SAME read guard the scan holds, so the columns
     /// and the index a scan sees are one snapshot.
@@ -5215,10 +5242,45 @@ async fn scan_scheduler(
     }
 }
 
+impl ShardState {
+    /// Materializes a single-pass [`crate::pb::RerankCandidatePayload`] (stored
+    /// document text, lineage, and stored sentence spans) for `local_slot` under
+    /// the caller's existing shard read guard, avoiding any Stage-2
+    /// `GetDocuments` round-trip.
+    pub(crate) fn rerank_candidate_for(
+        &self,
+        local_slot: u32,
+    ) -> Option<crate::pb::RerankCandidatePayload> {
+        if self.live_docs.is_deleted(local_slot as usize) {
+            return None;
+        }
+        let store = self.bm25.as_ref()?.as_index()?;
+        let text = store.text(local_slot)?;
+        let lineage = store.lineage(local_slot).map(|l| crate::pb::DocLineage {
+            parent_id: l.parent_id,
+            group_id: l.group_id,
+            span_start: l.span_start,
+            span_end: l.span_end,
+        });
+        let sentence_spans = store
+            .doc_sentences(local_slot)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(start, end)| crate::pb::OffsetSpan { start, end })
+            .collect();
+        Some(crate::pb::RerankCandidatePayload {
+            text,
+            lineage,
+            sentence_spans,
+        })
+    }
+}
+
 struct QueuedQuerySpec {
     vector: Vec<f32>,
     k: usize,
     keep_ties: bool,
+    include_rerank_candidate: bool,
     enumerate_max_rows: Option<usize>,
     patience: Option<crate::vector::PatienceSpec>,
     floor_prune: Option<crate::vector::FloorPruneSpec>,
@@ -5331,6 +5393,7 @@ fn run_scan_batch(
             vector: job.vector,
             k: job.k,
             keep_ties: job.tie_complete,
+            include_rerank_candidate: job.include_rerank_candidate,
             enumerate_max_rows: job.enumerate_max_rows.map(|rows| rows as usize),
             patience,
             floor_prune,
@@ -5385,15 +5448,29 @@ fn run_scan_batch(
     // One sample for the batched scan, whatever the batch size: the
     // pass over the shard happened once (docs/bandwidth-budget.md).
     observe_scan(pass_bytes, pass_nanos);
-    for (((done, (hits, mut stats)), (geo_columns_known, filter_columns_known)), prune) in
-        dones.into_iter().zip(results).zip(knowns).zip(prunes)
+    for ((((done, (hits, mut stats)), (geo_columns_known, filter_columns_known)), prune), spec) in
+        dones
+            .into_iter()
+            .zip(results)
+            .zip(knowns)
+            .zip(prunes)
+            .zip(specs)
     {
         stats.segments_total = prune.segments_total;
         stats.segments_skipped = prune.segments_skipped;
         crate::metrics::record_scan(&stats);
+        let mut rerank_candidates = HashMap::new();
+        if spec.include_rerank_candidate {
+            for h in &hits {
+                if let Some(payload) = guard.rerank_candidate_for(h.slot) {
+                    rerank_candidates.insert(h.slot, payload);
+                }
+            }
+        }
         let _ = done.send(Ok(ScanOutcome {
             hits,
             identities: identities.clone(),
+            rerank_candidates,
             stats,
             geo_columns_known,
             filter_columns_known,
@@ -5731,6 +5808,20 @@ impl NodeServiceImpl {
         // returned error here; `open_wal`'s panic stays the backstop
         // for the direct constructor.
         check_wal_tables(index.as_ref(), &config)?;
+        if let Some(idx) = index.as_ref() {
+            if let Some(expected_dim) = config
+                .matryoshka_active_dim
+                .or_else(|| config.matryoshka_prefix_dims.last().copied())
+            {
+                if expected_dim > 0 && idx.dim_opt().is_some_and(|d| d != expected_dim as usize) {
+                    return Err(format!(
+                        "persisted vector index dim {:?} disagrees with configured matryoshka dim {}",
+                        idx.dim_opt(),
+                        expected_dim
+                    ));
+                }
+            }
+        }
         let service = Self::new(index, config)
             .with_bm25(bm25)
             .with_exact_vectors(exact_vectors)?
@@ -5756,6 +5847,7 @@ impl NodeServiceImpl {
         let vocab = open_vocab(&config);
         let rerank_parallel = resolved_rerank_parallel(config.rerank_parallel);
         let knobs = Arc::new(node_knobs(&config));
+        let configured_handshake = config.turbo_handshake.clone().map(Arc::new);
         Self {
             knobs,
             state: Arc::new(RwLock::new(ShardState {
@@ -5786,6 +5878,10 @@ impl NodeServiceImpl {
             phrase_index: None,
             flush_notify: None,
             stream_poll_delay: None,
+            nlp_columns: None,
+            turbo_handshake: configured_handshake,
+            auto_turbo_handshake: Arc::new(std::sync::Mutex::new(None)),
+            multi_res_vectors: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -5815,6 +5911,314 @@ impl NodeServiceImpl {
     ) -> Self {
         self.phrase_index = phrase_index;
         self
+    }
+
+    /// Configure pre-WAL materialization of first-class one-pass NLP typed
+    /// columns (`money`, `quantity`, `date`, `geo_spine`, `sentiment`,
+    /// `affirmed`/`negated` entities, `simhash`).
+    pub fn with_nlp_columns(mut self, spec: crate::turbo_bridge::NlpColumnSpec) -> Self {
+        self.nlp_columns = Some(Arc::new(spec));
+        self
+    }
+
+    /// Pin an [`turbo_client::IndexGenerationHandshake`] verified against
+    /// field analysis and neural bundle scoring fingerprints.
+    pub fn with_turbo_handshake(
+        mut self,
+        handshake: turbo_client::IndexGenerationHandshake,
+    ) -> Self {
+        self.turbo_handshake = Some(Arc::new(handshake));
+        self
+    }
+
+    /// Verify a loaded neural bundle's scoring fingerprint against this
+    /// shard's pinned [`turbo_client::IndexGenerationHandshake`], refusing
+    /// with `FAILED_PRECONDITION` on drift.
+    pub fn verify_turbo_bundle_handshake(
+        &self,
+        actual: &turbo_client::BundleScoringFingerprint,
+    ) -> Result<(), Status> {
+        if let Some(hs) = self.turbo_handshake.as_deref() {
+            hs.verify_bundle(actual)
+                .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Score quantized SPLADE 128-doc Block-Max postings on `field` with
+    /// live-doc and CEL filter admission.
+    pub fn score_splade_field(
+        &self,
+        field: &str,
+        query_weights: &[(String, f32)],
+        query_l1_slack: f32,
+        k: usize,
+        filter: Option<&crate::pb::FilterExpr>,
+    ) -> Result<Vec<(u64, f32)>, Status> {
+        let resp = self.run_score_splade(crate::pb::ScoreSpladeRequest {
+            field: field.to_string(),
+            query_weights: query_weights
+                .iter()
+                .map(|(term, weight)| crate::pb::SpladeTermWeight {
+                    term: term.clone(),
+                    weight: *weight,
+                })
+                .collect(),
+            query_l1_slack,
+            k: k as u32,
+            filter: filter.cloned(),
+            initial_floor: 0.0,
+            visibility: None,
+            expected_stats_epoch: 0,
+            expected_stats_incarnation: Vec::new(),
+        })?;
+        Ok(resp.hits.into_iter().map(|h| (h.doc_id, h.score)).collect())
+    }
+
+    pub(crate) fn run_score_splade(
+        &self,
+        req: crate::pb::ScoreSpladeRequest,
+    ) -> Result<crate::pb::ScoreSpladeResponse, Status> {
+        if let Some(f) = req.filter.as_ref() {
+            crate::filter::validate_filter(f)?;
+        }
+        let scope = crate::visibility::VisibilityScope::new(req.visibility.as_ref())?;
+        let visibility = req
+            .visibility
+            .as_ref()
+            .and_then(|view| view.filter.as_ref());
+        let field = if req.field.is_empty() {
+            "body"
+        } else {
+            req.field.as_str()
+        };
+        let guard = read_shard(&self.state);
+        guard.check_stats_epoch(req.expected_stats_epoch, &req.expected_stats_incarnation)?;
+        let (_, filter_columns_known) =
+            filter_known_flags(guard.bm25.as_ref(), &[], req.filter.as_ref());
+        let (_, visibility_columns_known) =
+            filter_known_flags(guard.bm25.as_ref(), &[], visibility);
+        let stats_epoch = guard.stats_epoch;
+        let stats_incarnation = guard.stats_incarnation.bytes()?;
+        let visibility_fingerprint = scope.fingerprint().to_vec();
+        let Some(store) = guard.bm25.as_ref() else {
+            return Ok(crate::pb::ScoreSpladeResponse {
+                hits: Vec::new(),
+                filter_columns_known,
+                field_known: false,
+                blocks_visited: 0,
+                blocks_skipped: 0,
+                postings_scored: 0,
+                final_floor: req.initial_floor.max(0.0),
+                stats_epoch,
+                stats_incarnation,
+                visibility_fingerprint,
+                visibility_columns_known,
+            });
+        };
+        if store.as_index().is_none() {
+            return Err(Status::failed_precondition(
+                "bm25 bulk build in progress; Flush first",
+            ));
+        }
+        let Some(fi) = store.field_index(field) else {
+            return Ok(crate::pb::ScoreSpladeResponse {
+                hits: Vec::new(),
+                filter_columns_known,
+                field_known: false,
+                blocks_visited: 0,
+                blocks_skipped: 0,
+                postings_scored: 0,
+                final_floor: req.initial_floor.max(0.0),
+                stats_epoch,
+                stats_incarnation,
+                visibility_fingerprint,
+                visibility_columns_known,
+            });
+        };
+        let index = store.field_view(fi).expect("searchability checked above");
+        if !index.has_splade() {
+            return Ok(crate::pb::ScoreSpladeResponse {
+                hits: Vec::new(),
+                filter_columns_known,
+                field_known: true,
+                blocks_visited: 0,
+                blocks_skipped: 0,
+                postings_scored: 0,
+                final_floor: req.initial_floor.max(0.0),
+                stats_epoch,
+                stats_incarnation,
+                visibility_fingerprint,
+                visibility_columns_known,
+            });
+        }
+        let rows = store.next_doc_id() as usize;
+        let allow = if req.filter.is_some() {
+            let (_, allow, _) = resolve_shard_filters(
+                Some(store),
+                None,
+                rows,
+                &[],
+                &[],
+                req.filter.as_ref(),
+                self.knobs.segment_pruning(),
+                None,
+            )?;
+            allow
+        } else {
+            None
+        };
+        let vis_allow = if visibility.is_some() {
+            let (_, allow, _) = resolve_shard_filters(
+                Some(store),
+                None,
+                rows,
+                &[],
+                &[],
+                visibility,
+                self.knobs.segment_pruning(),
+                None,
+            )?;
+            allow
+        } else {
+            None
+        };
+        let weights: Vec<(String, f32)> = req
+            .query_weights
+            .into_iter()
+            .map(|tw| (tw.term, tw.weight))
+            .collect();
+        let admitted = |doc: u32| {
+            !guard.live_docs.is_deleted(doc as usize)
+                && allow.as_ref().is_none_or(|mask| mask.test(doc as usize))
+                && vis_allow
+                    .as_ref()
+                    .is_none_or(|mask| mask.test(doc as usize))
+        };
+        let k = req.k as usize;
+        let initial_floor = req.initial_floor.max(0.0);
+        let (raw_hits, final_floor, stats) = index.score_splade_with_floor(
+            &weights,
+            req.query_l1_slack,
+            initial_floor,
+            k,
+            &admitted,
+        );
+        let offset = self.config.slot_offset;
+        let hits: Vec<crate::pb::SpladeHit> = raw_hits
+            .into_iter()
+            .map(|(doc_id, score)| crate::pb::SpladeHit {
+                doc_id: offset + u64::from(doc_id),
+                score,
+            })
+            .collect();
+        Ok(crate::pb::ScoreSpladeResponse {
+            hits,
+            filter_columns_known,
+            field_known: true,
+            blocks_visited: stats.blocks_visited,
+            blocks_skipped: stats.blocks_skipped,
+            postings_scored: stats.postings_scored,
+            final_floor,
+            stats_epoch,
+            stats_incarnation,
+            visibility_fingerprint,
+            visibility_columns_known,
+        })
+    }
+
+    /// Stored body sentence spans `(start_utf8, end_utf8)` for `global_id` on
+    /// this shard when live and present.
+    pub(crate) fn doc_sentence_spans(&self, global_id: u64) -> Option<Vec<(u32, u32)>> {
+        if global_id < self.config.slot_offset {
+            return None;
+        }
+        let local = u32::try_from(global_id - self.config.slot_offset).ok()?;
+        let guard = read_shard(&self.state);
+        if guard.live_docs.is_deleted(local as usize) {
+            return None;
+        }
+        let store = guard.bm25.as_ref()?.as_index()?;
+        store.doc_sentences(local)
+    }
+
+    /// Returns the retained [`crate::turbo_bridge::MultiResVectorOutput`] for `local_slot`.
+    pub fn multi_res_row(
+        &self,
+        local_slot: u32,
+    ) -> Option<crate::turbo_bridge::MultiResVectorOutput> {
+        self.multi_res_vectors
+            .read()
+            .expect("multi_res_vectors lock poisoned")
+            .get(&local_slot)
+            .cloned()
+    }
+
+    /// Rescores `candidate_global_ids` on this shard against retained Matryoshka
+    /// `tier_dim` (prefix or full) vectors using normalized dot-product similarity.
+    pub fn rescore_matryoshka_tier(
+        &self,
+        tier_dim: u32,
+        query_full_or_tier: &[f32],
+        candidate_global_ids: &[u64],
+    ) -> Result<Vec<(u64, f32)>, Status> {
+        if tier_dim == 0 || query_full_or_tier.len() < tier_dim as usize {
+            return Err(Status::invalid_argument(format!(
+                "query vector len {} is shorter than matryoshka tier_dim {tier_dim}",
+                query_full_or_tier.len()
+            )));
+        }
+        let q_multi = crate::turbo_bridge::MultiResVectorOutput::from_full_and_sentences(
+            query_full_or_tier,
+            &[tier_dim],
+            None,
+            Vec::new(),
+        );
+        let q_slice = q_multi.tier(tier_dim).ok_or_else(|| {
+            Status::invalid_argument(format!("cannot slice query vector to tier_dim {tier_dim}"))
+        })?;
+        let guard = read_shard(&self.state);
+        let rows = self
+            .multi_res_vectors
+            .read()
+            .expect("multi_res_vectors lock poisoned");
+        let offset = self.config.slot_offset;
+        let mut out = Vec::with_capacity(candidate_global_ids.len());
+        for &gid in candidate_global_ids {
+            if gid < offset {
+                continue;
+            }
+            let Ok(local) = u32::try_from(gid - offset) else {
+                continue;
+            };
+            if guard.live_docs.is_deleted(local as usize) {
+                continue;
+            }
+            if let Some(doc_tier) = rows.get(&local).and_then(|r| r.tier(tier_dim)) {
+                let dot: f32 = q_slice
+                    .iter()
+                    .zip(doc_tier.iter())
+                    .map(|(a, b)| a * b)
+                    .sum();
+                out.push((gid, dot));
+            }
+        }
+        out.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(out)
+    }
+
+    fn doc_session_layers(&self, doc: &AddDocumentsRequest) -> crate::analyzer::SessionLayers {
+        let mut layers = session_layers(
+            doc,
+            self.phrase_index.as_deref(),
+            &self.config.sentence_fields,
+        );
+        layers.nlp_columns = doc.nlp_materialization.is_empty()
+            && self
+                .nlp_columns
+                .as_deref()
+                .is_some_and(crate::turbo_bridge::NlpColumnSpec::is_enabled);
+        layers
     }
 
     /// The shard's vocabulary listener, when accumulation is enabled.
@@ -8249,14 +8653,18 @@ impl NodeServiceImpl {
         if batch.vectors.is_empty() {
             return Ok((0, 0));
         }
+        let matryoshka_enabled = !self.config.matryoshka_prefix_dims.is_empty()
+            || self.config.matryoshka_active_dim.is_some();
         let known_dim = guard.index.as_ref().and_then(|i| i.dim_opt());
-        let dim = if batch.dim != 0 {
+        let raw_dim = if batch.dim != 0 {
             let d = batch.dim as usize;
-            if let Some(known) = known_dim {
-                if known != d {
-                    return Err(Status::invalid_argument(format!(
-                        "batch dim {d} does not match shard dim {known}"
-                    )));
+            if !matryoshka_enabled {
+                if let Some(known) = known_dim {
+                    if known != d {
+                        return Err(Status::invalid_argument(format!(
+                            "batch dim {d} does not match shard dim {known}"
+                        )));
+                    }
                 }
             }
             d
@@ -8267,22 +8675,46 @@ impl NodeServiceImpl {
                 )
             })?
         };
-        if !batch.vectors.len().is_multiple_of(dim) {
+        if !batch.vectors.len().is_multiple_of(raw_dim) {
             return Err(Status::invalid_argument(format!(
-                "batch of {} floats is not a multiple of dim {dim}",
+                "batch of {} floats is not a multiple of dim {raw_dim}",
                 batch.vectors.len()
             )));
         }
-        if stable_routing_key.is_some() && batch.vectors.len() / dim != 1 {
+        if stable_routing_key.is_some() && batch.vectors.len() / raw_dim != 1 {
             return Err(Status::invalid_argument(
                 "a replication stable-key metadata value may carry exactly one vector",
             ));
         }
-        if let Some((vi, ci, v)) = first_invalid_coordinate(&batch.vectors, dim) {
+        if let Some((vi, ci, v)) = first_invalid_coordinate(&batch.vectors, raw_dim) {
             return Err(Status::invalid_argument(format!(
                 "invalid input value at vector {vi}, coord {ci}: {v}"
             )));
         }
+        let start_slot = guard.index.as_ref().map_or(0, VectorIndex::len);
+        let (effective_vectors, dim, multi_rows) = if matryoshka_enabled {
+            let active_target = self
+                .config
+                .matryoshka_active_dim
+                .filter(|&ad| (ad as usize) <= raw_dim);
+            let (vecs, edim, rows) = crate::turbo_bridge::MultiResVectorOutput::project_batch(
+                &batch.vectors,
+                raw_dim,
+                &self.config.matryoshka_prefix_dims,
+                active_target,
+                start_slot,
+            )?;
+            if let Some(known) = known_dim {
+                if known != edim {
+                    return Err(Status::invalid_argument(format!(
+                        "projected matryoshka dim {edim} does not match shard dim {known}"
+                    )));
+                }
+            }
+            (vecs, edim, rows)
+        } else {
+            (batch.vectors, raw_dim, Vec::new())
+        };
         // Invalidate before the first mutation, including failures after a
         // provider commit. Neither snapshot copy nor admitted physical reads
         // may keep using the pre-append generation claim.
@@ -8351,19 +8783,28 @@ impl NodeServiceImpl {
             .index
             .as_mut()
             .expect("constructed or present above")
-            .add(&batch.vectors, dim)
+            .add(&effective_vectors, dim)
             .map_err(|e| Status::invalid_argument(format!("{e}")))?;
         guard
             .exact_vectors
             .as_mut()
             .expect("validated above")
-            .append(&batch.vectors, dim)
+            .append(&effective_vectors, dim)
             .map_err(|e| {
                 Status::internal(format!(
                     "exact-vector append failed after provider commit: {e}; refuse further \
                      ingest and rebuild this generation"
                 ))
             })?;
+        if !multi_rows.is_empty() {
+            let mut mres = self
+                .multi_res_vectors
+                .write()
+                .expect("multi_res_vectors lock poisoned");
+            for (slot, row) in multi_rows {
+                mres.insert(slot, row);
+            }
+        }
         let committed_config = guard
             .index
             .as_ref()
@@ -8383,7 +8824,7 @@ impl NodeServiceImpl {
                 m.set_backend_config(committed_config.clone());
             });
         }
-        for (i, vector) in batch.vectors.chunks_exact(dim).enumerate() {
+        for (i, vector) in effective_vectors.chunks_exact(dim).enumerate() {
             wal_append_or_degrade(
                 &mut guard.wal,
                 wal_record::Op::AddVectors(LoggedAddVectors {
@@ -8396,7 +8837,7 @@ impl NodeServiceImpl {
                 }),
             );
         }
-        Ok(((batch.vectors.len() / dim) as u64, first_id))
+        Ok(((effective_vectors.len() / dim) as u64, first_id))
     }
 
     /// Compute both raw legs for a hybrid query: `(vector_leg, bm25_leg)`
@@ -8553,23 +8994,17 @@ impl NodeServiceImpl {
                             leg.field, leg.field
                         )));
                     }
-                    if phrase.sequence.len() < 2
-                        || phrase
-                            .sequence
-                            .iter()
-                            .any(|&i| i as usize >= leg.terms.len())
-                    {
-                        return Err(Status::invalid_argument(format!(
-                            "field {:?}: phrase sequence must name at least two of the leg's {} \
-                             terms",
-                            leg.field,
-                            leg.terms.len()
-                        )));
-                    }
+                    crate::proximity::validate_leg(phrase, leg.terms.len())
+                        .map_err(Status::invalid_argument)?;
                     phrase_gates.push(crate::filter::PhraseGate {
                         index: views[vi].as_ref(),
                         terms: &leg.terms,
                         sequence: phrase.sequence.iter().map(|&i| i as usize).collect(),
+                        alternatives: phrase
+                            .alternatives
+                            .iter()
+                            .map(|p| p.terms.iter().map(|&i| i as usize).collect())
+                            .collect(),
                         slop: phrase.slop,
                     });
                 }
@@ -8861,6 +9296,7 @@ impl NodeServiceImpl {
         expected_stats_incarnation: &[u8],
         filters: &LegFilters<'_>,
         read_context: Option<&crate::pb::VectorReadContext>,
+        include_rerank_candidate: bool,
     ) -> Result<LegResults, Status> {
         let guard = read_shard(&self.state);
         if !terms.is_empty() {
@@ -8979,12 +9415,28 @@ impl NodeServiceImpl {
             }
         }
 
+        let mut rerank_candidates = HashMap::new();
+        if include_rerank_candidate {
+            let offset = self.config.slot_offset;
+            for &(doc_id, _) in vector_leg.iter().chain(bm25_leg.iter()) {
+                if rerank_candidates.contains_key(&doc_id) || doc_id < offset {
+                    continue;
+                }
+                if let Ok(local) = u32::try_from(doc_id - offset) {
+                    if let Some(payload) = guard.rerank_candidate_for(local) {
+                        rerank_candidates.insert(doc_id, payload);
+                    }
+                }
+            }
+        }
+
         Ok(LegResults {
             vector: vector_leg,
             bm25: bm25_leg,
             geo_columns_known,
             filter_columns_known,
             read_receipt,
+            rerank_candidates,
         })
     }
 
@@ -9012,7 +9464,7 @@ impl NodeServiceImpl {
         if let Some(f) = req.filter.as_ref() {
             crate::filter::validate_filter(f)?;
         }
-        let legs = self.compute_legs(
+        let mut legs = self.compute_legs(
             &req.vector,
             &req.terms,
             req.analysis_fingerprint,
@@ -9029,6 +9481,7 @@ impl NodeServiceImpl {
                 tree: req.filter.as_ref(),
             },
             req.read_context.as_ref(),
+            req.include_rerank_candidate,
         )?;
         let geo_columns_known = legs.geo_columns_known;
         let filter_columns_known = legs.filter_columns_known;
@@ -9057,6 +9510,7 @@ impl NodeServiceImpl {
                     vector_score: h.leg_scores[0].unwrap_or(0.0) as f32,
                     bm25_rank: h.leg_ranks[1],
                     bm25_score: h.leg_scores[1].unwrap_or(0.0) as f32,
+                    rerank_candidate: legs.rerank_candidates.remove(&h.doc_id),
                 })
                 .collect(),
             geo_columns_known,
@@ -9199,9 +9653,8 @@ impl FieldStreams {
                     .map_err(|status| {
                         if status.code() == tonic::Code::Unimplemented {
                             Status::failed_precondition(format!(
-                                "analysis sidecar at {} does not implement AnalyzeStream; \
-                                 it predates the RPC and must be rebuilt (./gradlew installDist \
-                                 in grpc-opennlp-analysis). Refusing to analyze fields on the \
+                                "analysis server at {} does not implement AnalyzeStream; \
+                                 rebuild turbo-kserve from main. Refusing to analyze fields on the \
                                  removed unary path.",
                                 self.addr
                             ))
@@ -9507,6 +9960,7 @@ pub(crate) fn join_fields(
     let quality = body.quality;
     let geography = body.geography.clone();
     let entities = body.entities.clone();
+    let nlp = body.nlp.take();
     fields[0] = body.into_body();
     for (fi, analyzed) in extras {
         fields[fi] = analyzed.ok_or_else(|| {
@@ -9525,6 +9979,7 @@ pub(crate) fn join_fields(
         quality,
         geography,
         entities,
+        nlp,
     })
 }
 
@@ -9726,6 +10181,7 @@ pub(crate) fn session_layers(
         // from that configuration only after analysis is requested.
         sentences: !sentence_fields.is_empty(),
         dual_cased: !doc.cased_field.is_empty(),
+        nlp_columns: false,
     }
 }
 
@@ -10516,10 +10972,43 @@ impl NodeServiceImpl {
         analyzed: crate::postings::AnalyzedDoc,
         stable_key: Option<&[u8]>,
     ) -> Result<(AddDocumentsRequest, crate::postings::AnalyzedDoc), Status> {
+        if let Some(hs) = self.turbo_handshake.as_deref() {
+            let cfg = crate::analyzer::turbo_field_config(doc.analysis.as_ref())?;
+            hs.verify_analysis(&cfg.fingerprint()).map_err(|e| {
+                Status::failed_precondition(format!("analyzer fingerprint handshake mismatch: {e}"))
+            })?;
+        } else if doc.analysis.is_some() {
+            let cfg = crate::analyzer::turbo_field_config(doc.analysis.as_ref())?;
+            let fp = cfg.fingerprint();
+            let mut auto = self
+                .auto_turbo_handshake
+                .lock()
+                .expect("auto_turbo_handshake lock poisoned");
+            match auto.as_ref() {
+                Some(pinned) => {
+                    pinned.verify_analysis(&fp).map_err(|e| {
+                        Status::failed_precondition(format!(
+                            "analyzer fingerprint handshake mismatch: {e}"
+                        ))
+                    })?;
+                }
+                None => {
+                    *auto = Some(turbo_client::IndexGenerationHandshake {
+                        analysis: Some(fp),
+                        bundle: None,
+                    });
+                }
+            }
+        }
         let (doc, analyzed) = self.materialize_proximity(doc, analyzed)?;
         let (doc, analyzed) = self.materialize_phrases(doc, analyzed)?;
         let doc = materialize_quality(doc, &analyzed)?;
         let doc = materialize_geography(doc, &analyzed)?;
+        let doc = crate::turbo_bridge::materialize_nlp_columns(
+            doc,
+            analyzed.nlp.as_deref(),
+            self.nlp_columns.as_deref(),
+        )?;
         let doc = self.materialize_columns(doc, stable_key)?;
         let doc = self.place_document(doc)?;
         Ok((doc, analyzed))
@@ -10633,20 +11122,37 @@ impl NodeServiceImpl {
         // coordinates finite, and — after doc_id is known — the tips in
         // agreement, so a document that fails never half-enters either
         // leg.
-        let vector_dim = match vector.as_deref() {
+        let matryoshka_enabled = !self.config.matryoshka_prefix_dims.is_empty()
+            || self.config.matryoshka_active_dim.is_some();
+        let (projected_vector, vector_dim, mapped_multi_rows) = match vector {
             Some(v) => {
-                let dim = v.len();
+                let raw_dim = v.len();
+                if let Some((_, ci, value)) = first_invalid_coordinate(&v, raw_dim) {
+                    return Err(Status::invalid_argument(format!(
+                        "mapped vector coordinate {ci} is {value}; vectors must be finite"
+                    )));
+                }
+                let (eff_vec, dim, mrows) = if matryoshka_enabled {
+                    let active_target = self
+                        .config
+                        .matryoshka_active_dim
+                        .filter(|&ad| (ad as usize) <= raw_dim);
+                    crate::turbo_bridge::MultiResVectorOutput::project_batch(
+                        &v,
+                        raw_dim,
+                        &self.config.matryoshka_prefix_dims,
+                        active_target,
+                        vector_tip as usize,
+                    )?
+                } else {
+                    (v, raw_dim, Vec::new())
+                };
                 if let Some(known) = guard.index.as_ref().and_then(|i| i.dim_opt()) {
                     if known != dim {
                         return Err(Status::invalid_argument(format!(
                             "mapped vector has {dim} floats but the shard's index is dim {known}"
                         )));
                     }
-                }
-                if let Some((_, ci, value)) = first_invalid_coordinate(v, dim) {
-                    return Err(Status::invalid_argument(format!(
-                        "mapped vector coordinate {ci} is {value}; vectors must be finite"
-                    )));
                 }
                 if guard.index.is_none() {
                     // From-scratch: same single-shard convenience the
@@ -10673,9 +11179,9 @@ impl NodeServiceImpl {
                         exact.len()
                     )));
                 }
-                Some(dim)
+                (Some(eff_vec), Some(dim), mrows)
             }
-            None => None,
+            None => (None, None, Vec::new()),
         };
         if guard.bm25.is_none() {
             let builder = self.new_builder(guard.generation.as_ref())?;
@@ -10714,7 +11220,7 @@ impl NodeServiceImpl {
         // leg ingest history) cannot take mapped documents — the vector
         // would land below its document and silently corrupt every
         // hybrid result, so it refuses by name instead.
-        if vector.is_some() && u64::from(doc_id) != u64::from(vector_tip) {
+        if projected_vector.is_some() && u64::from(doc_id) != u64::from(vector_tip) {
             return Err(Status::failed_precondition(format!(
                 "the shard's document leg is ahead of its vector leg ({} documents, \
                  {vector_tip} vectors); mapped ingest appends both legs in lockstep — \
@@ -11342,7 +11848,7 @@ impl NodeServiceImpl {
         // ruled out by the validation above; if it happens anyway the
         // legs have diverged by one and the next mapped document
         // refuses on the lockstep check, loudly.
-        if let Some(v) = vector {
+        if let Some(v) = projected_vector {
             let dim = vector_dim.expect("validated alongside the vector");
             let index = guard.index.as_mut().expect("ensured during validation");
             index.add(&v, dim).map_err(|e| {
@@ -11362,6 +11868,15 @@ impl NodeServiceImpl {
                          ingest and rebuild this generation"
                     ))
                 })?;
+            if !mapped_multi_rows.is_empty() {
+                let mut mr = self
+                    .multi_res_vectors
+                    .write()
+                    .expect("multi-res vector lock poisoned");
+                for (slot, out) in mapped_multi_rows {
+                    mr.insert(slot, out);
+                }
+            }
             let index = guard
                 .index
                 .as_ref()
@@ -11725,6 +12240,7 @@ impl NodeServiceImpl {
         let mut quality = first.quality.clone();
         let mut geography = first.geography.clone();
         let mut cased_field = first.cased_field.clone();
+        let mut nlp_layers = self.doc_session_layers(&first).nlp_columns;
         let mut submit = Some(session.submitter());
         // The body session covers the BODY only; extra fields ride their
         // own per-spec sessions, and a document applies once its body and
@@ -11807,6 +12323,7 @@ impl NodeServiceImpl {
                         || doc.quality != quality
                         || doc.geography != geography
                         || doc.cased_field != cased_field
+                        || self.doc_session_layers(&doc).nlp_columns != nlp_layers
                     {
                         // A mid-stream BODY spec change (rare): collect
                         // what the current session still owes so nothing
@@ -11841,17 +12358,14 @@ impl NodeServiceImpl {
                             addr,
                             doc.analysis.as_ref(),
                             self.vocab.clone(),
-                            session_layers(
-                                &doc,
-                                self.phrase_index.as_deref(),
-                                &self.config.sentence_fields,
-                            ),
+                            self.doc_session_layers(&doc),
                         )
                         .await?;
                         spec = doc.analysis.clone();
                         quality = doc.quality.clone();
                         geography = doc.geography.clone();
                         cased_field = doc.cased_field.clone();
+                        nlp_layers = self.doc_session_layers(&doc).nlp_columns;
                         submit = Some(session.submitter());
                     }
                     submit
@@ -12163,7 +12677,17 @@ impl NodeService for NodeServiceImpl {
                             .transpose()
                             .map_err(Status::internal)?
                             .unwrap_or_default();
-                        Ok((hits, stats, known, identities))
+                        let rerank_candidates: HashMap<u32, crate::pb::RerankCandidatePayload> =
+                            if start.include_rerank_candidate {
+                                hits.iter()
+                                    .filter_map(|h| {
+                                        guard.rerank_candidate_for(h.slot).map(|c| (h.slot, c))
+                                    })
+                                    .collect()
+                            } else {
+                                HashMap::new()
+                            };
+                        Ok((hits, stats, known, identities, rerank_candidates))
                     });
                     let outcome = match scan.await {
                         Ok(result) => result,
@@ -12175,6 +12699,7 @@ impl NodeService for NodeServiceImpl {
                             stats,
                             (geo_columns_known, filter_columns_known),
                             identities,
+                            mut rerank_candidates,
                         )) => {
                             let done = SearchShardDone {
                                 hits: hits
@@ -12184,6 +12709,7 @@ impl NodeService for NodeServiceImpl {
                                         score: h.score,
                                         parent_id: h.parent,
                                         identity: identities.identity(h.slot),
+                                        rerank_candidate: rerank_candidates.remove(&h.slot),
                                     })
                                     .collect(),
                                 stats: Some(ShardScanStats {
@@ -12239,6 +12765,7 @@ impl NodeService for NodeServiceImpl {
                                     vector: start.vector.clone(),
                                     k: start.k as usize,
                                     tie_complete: start.tie_complete,
+                                    include_rerank_candidate: start.include_rerank_candidate,
                                     geo_filters: start.geo_filters.clone(),
                                     geo_regions: geo_regions.clone(),
                                     filter: start.filter.clone(),
@@ -12345,6 +12872,16 @@ impl NodeService for NodeServiceImpl {
                             stats.segments_skipped = prune.segments_skipped;
                             crate::metrics::record_scan(&stats);
                             observe_scan(stats.bytes_scanned, stats.scan_nanos);
+                            let rerank_candidates: HashMap<u32, crate::pb::RerankCandidatePayload> =
+                                if start.include_rerank_candidate {
+                                    hits.iter()
+                                        .filter_map(|h| {
+                                            guard.rerank_candidate_for(h.slot).map(|c| (h.slot, c))
+                                        })
+                                        .collect()
+                                } else {
+                                    HashMap::new()
+                                };
                             Ok(ScanOutcome {
                                 hits,
                                 identities: guard
@@ -12354,6 +12891,7 @@ impl NodeService for NodeServiceImpl {
                                     .transpose()
                                     .map_err(Status::internal)?
                                     .unwrap_or_default(),
+                                rerank_candidates,
                                 stats,
                                 geo_columns_known,
                                 filter_columns_known,
@@ -12370,6 +12908,7 @@ impl NodeService for NodeServiceImpl {
                     Ok(ScanOutcome {
                         hits,
                         identities,
+                        mut rerank_candidates,
                         stats,
                         geo_columns_known,
                         filter_columns_known,
@@ -12382,6 +12921,7 @@ impl NodeService for NodeServiceImpl {
                                     score: h.score,
                                     parent_id: 0,
                                     identity: identities.identity(h.slot),
+                                    rerank_candidate: rerank_candidates.remove(&h.slot),
                                 })
                                 .collect(),
                             stats: Some(ShardScanStats {
@@ -13743,6 +14283,7 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                         }
                         let mut raises = 0u64;
                         let stride = if parents.is_some() { 20 } else { 12 };
+                        let mut emitted_slots: Vec<u32> = Vec::new();
                         let summary = index
                             .try_search_streaming_controlled(
                                 &start.vector,
@@ -13761,6 +14302,9 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                                     for (&slot, &score) in batch.slots.iter().zip(batch.scores) {
                                         if slot < 0 {
                                             continue;
+                                        }
+                                        if start.include_rerank_candidate {
+                                            emitted_slots.push(slot as u32);
                                         }
                                         hits.extend_from_slice(
                                             &(slot_offset + slot as u64).to_le_bytes(),
@@ -13816,8 +14360,24 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                             let identities = guard.bm25.as_ref()
                                 .map(Bm25Shard::identity_snapshot).transpose()
                                 .map_err(Status::internal)?.unwrap_or_default();
+                            let rerank_candidates = if start.include_rerank_candidate {
+                                Some(
+                                    emitted_slots
+                                        .into_iter()
+                                        .filter_map(|slot| {
+                                            guard.rerank_candidate_for(slot).map(|c| (slot, c))
+                                        })
+                                        .collect(),
+                                )
+                            } else {
+                                None
+                            };
                             Some(crate::query_identity::ScanIdentities::new(
-                                slot_offset, index.len(), identities, allow,
+                                slot_offset,
+                                index.len(),
+                                identities,
+                                allow,
+                                rerank_candidates,
                             )?)
                         } else { None };
                         let cancelled_now = scan_signals
@@ -14039,13 +14599,56 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
     ) -> Result<Response<FlushResponse>, Status> {
         let service = self.clone();
         let mutation = self.mutation_gate.clone().read_owned().await;
-        tokio::task::spawn_blocking(move || {
+        let resp = tokio::task::spawn_blocking(move || {
             let _mutation = mutation;
             service.flush_index()
         })
         .await
-        .map_err(|e| Status::internal(format!("flush task failed: {e}")))?
-        .map(Response::new)
+        .map_err(|e| Status::internal(format!("flush task failed: {e}")))??;
+        #[cfg(feature = "net")]
+        if let Some(endpoint) = self.config.vocab_kserve_endpoint.as_deref() {
+            let export_batch = {
+                let guard = read_shard(&self.state);
+                let bm25_view = guard.bm25.as_ref().and_then(|s| s.field_view(0));
+                let shard_docs = guard.bm25.as_ref().map_or(0, |s| s.doc_count());
+                self.vocab.as_ref().and_then(|vocab| {
+                    let stats = vocab.live_stats();
+                    let terms_ch = stats
+                        .into_iter()
+                        .find(|c| c.channel == crate::pb::storage::VocabChannel::Terms as i32)?;
+                    let doc_count = shard_docs.max(terms_ch.documents);
+                    if doc_count == 0 || terms_ch.heavy_hitters.is_empty() {
+                        return None;
+                    }
+                    let freqs: Vec<(String, u64)> = terms_ch
+                        .heavy_hitters
+                        .into_iter()
+                        .filter_map(|hh| {
+                            let df = bm25_view
+                                .as_ref()
+                                .map(|v| u64::from(v.df(&hh.term)))
+                                .unwrap_or(hh.count)
+                                .min(doc_count);
+                            (df > 0).then_some((hh.term, df))
+                        })
+                        .collect();
+                    (!freqs.is_empty()).then_some((doc_count, freqs))
+                })
+            };
+            if let Some((doc_count, freqs)) = export_batch {
+                let remote = crate::analyzer::remote_client_for(endpoint, &Default::default())?;
+                crate::vocab::export_corpus_statistics_to_kserve(
+                    &remote,
+                    "eng",
+                    "shard-vocab",
+                    doc_count,
+                    &freqs,
+                    0,
+                )
+                .await?;
+            }
+        }
+        Ok(Response::new(resp))
     }
 
     async fn install_snapshot(
@@ -14262,11 +14865,7 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                     &addr,
                     first.req.analysis.as_ref(),
                     self.vocab.clone(),
-                    session_layers(
-                        &first.req,
-                        self.phrase_index.as_deref(),
-                        &self.config.sentence_fields,
-                    ),
+                    self.doc_session_layers(&first.req),
                 )
                 .await
                 {
@@ -14283,9 +14882,8 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                     }
                     Err(status) if status.code() == tonic::Code::Unimplemented => {
                         return Err(Status::failed_precondition(format!(
-                            "analysis sidecar at {addr} does not implement AnalyzeStream; \
-                         it predates the RPC and must be rebuilt (./gradlew installDist \
-                         in grpc-opennlp-analysis). Refusing to ingest on the removed \
+                            "analysis server at {addr} does not implement AnalyzeStream; \
+                         rebuild turbo-kserve from main. Refusing to ingest on the removed \
                          unary path."
                         )));
                     }
@@ -14395,11 +14993,7 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                     &addr,
                     first.req.analysis.as_ref(),
                     self.vocab.clone(),
-                    session_layers(
-                        &first.req,
-                        self.phrase_index.as_deref(),
-                        &self.config.sentence_fields,
-                    ),
+                    self.doc_session_layers(&first.req),
                 )
                 .await
                 {
@@ -14416,9 +15010,8 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                     }
                     Err(status) if status.code() == tonic::Code::Unimplemented => {
                         return Err(Status::failed_precondition(format!(
-                            "analysis sidecar at {addr} does not implement AnalyzeStream; \
-                         it predates the RPC and must be rebuilt (./gradlew installDist \
-                         in grpc-opennlp-analysis). Refusing to ingest on the removed \
+                            "analysis server at {addr} does not implement AnalyzeStream; \
+                         rebuild turbo-kserve from main. Refusing to ingest on the removed \
                          unary path."
                         )));
                     }
@@ -15157,6 +15750,7 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                         .map(|(&slot, &score)| RawLegHit {
                             doc_id: offset + slot as u64,
                             score,
+                            rerank_candidate: None,
                         })
                         .collect();
                     response.hits = hits;
@@ -15258,9 +15852,10 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                     .rows
                     .into_iter()
                     .map(|(slot, score)| RawLegHit {
-                            doc_id: offset + slot as u64,
-                            score,
-                        })
+                        doc_id: offset + slot as u64,
+                        score,
+                        rerank_candidate: None,
+                    })
                     .collect(),
                 logical_bytes: scored.logical_bytes,
                 pages_touched: scored.pages_touched,
@@ -15454,7 +16049,7 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
             }
             let service = self.clone();
             tokio::task::spawn_blocking(move || {
-                let legs = service.compute_legs(
+                let mut legs = service.compute_legs(
                     &req.vector,
                     &req.terms,
                     req.analysis_fingerprint,
@@ -15471,6 +16066,7 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                         tree: req.filter.as_ref(),
                     },
                     req.read_context.as_ref(),
+                    req.include_rerank_candidate,
                 )?;
                 Ok(ShardLegsResponse {
                     vector_hits: legs
@@ -15479,6 +16075,7 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                         .map(|(doc_id, score)| RawLegHit {
                             doc_id,
                             score: score as f32,
+                            rerank_candidate: legs.rerank_candidates.get(&doc_id).cloned(),
                         })
                         .collect(),
                     bm25_hits: legs
@@ -15487,6 +16084,7 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                         .map(|(doc_id, score)| RawLegHit {
                             doc_id,
                             score: score as f32,
+                            rerank_candidate: legs.rerank_candidates.remove(&doc_id),
                         })
                         .collect(),
                     geo_columns_known: legs.geo_columns_known,
@@ -15497,6 +16095,20 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
             .await
             .map_err(|e| Status::internal(format!("shard legs task failed: {e}")))?
             .map(Response::new)
+        })
+        .await
+    }
+
+    async fn score_splade(
+        &self,
+        request: Request<crate::pb::ScoreSpladeRequest>,
+    ) -> Result<Response<crate::pb::ScoreSpladeResponse>, Status> {
+        crate::metrics::timed(Route::ScoreSplade, request, |request| async move {
+            let service = self.clone();
+            tokio::task::spawn_blocking(move || service.run_score_splade(request.into_inner()))
+                .await
+                .map_err(|e| Status::internal(format!("score splade task failed: {e}")))?
+                .map(Response::new)
         })
         .await
     }
@@ -15841,21 +16453,17 @@ impl NodeServiceImpl {
                              slop query needs --position-fields=body and a rebuilt generation",
                         ));
                     }
-                    if constraint.sequence.len() < 2
-                        || constraint
-                            .sequence
-                            .iter()
-                            .any(|&i| i as usize >= req.terms.len())
-                    {
-                        return Err(Status::invalid_argument(format!(
-                            "phrase sequence must name at least two of the query's {} terms",
-                            req.terms.len()
-                        )));
-                    }
+                    crate::proximity::validate_leg(constraint, req.terms.len())
+                        .map_err(Status::invalid_argument)?;
                     phrase.push(crate::filter::PhraseGate {
                         index,
                         terms: &req.terms,
                         sequence: constraint.sequence.iter().map(|&i| i as usize).collect(),
+                        alternatives: constraint
+                            .alternatives
+                            .iter()
+                            .map(|p| p.terms.iter().map(|&i| i as usize).collect())
+                            .collect(),
                         slop: constraint.slop,
                     });
                 }
@@ -18803,6 +19411,7 @@ mod vector_scan_view_tests {
                 floor_share_ppm: None,
                 floor_greediness_ppm: None,
                 floor_clamp_min: None,
+                include_rerank_candidate: false,
                 external: Box::new(|| None),
                 publish: Box::new(|_| false),
                 done,

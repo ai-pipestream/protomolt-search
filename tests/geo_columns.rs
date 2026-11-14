@@ -78,6 +78,7 @@ async fn add_documents_geo(
     let (tx, rx) = mpsc::channel(64);
     for (text, points) in docs {
         tx.send(AddDocumentsRequest {
+            nlp_materialization: String::new(),
             unsigned_integers: Vec::new(),
             map_integers: Vec::new(),
             map_unsigned_integers: Vec::new(),
@@ -887,6 +888,7 @@ async fn distributed_geo_filters_are_exact_and_boundary_correct() {
             prefixes: Vec::new(),
             synonyms: Vec::new(),
             synonyms_off: false,
+            pre_analyzed_terms: Vec::new(),
         }),
     )
     .await

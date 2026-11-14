@@ -62,6 +62,7 @@ async fn add_documents_mapped(
     let (tx, rx) = mpsc::channel(8);
     for (text, strs, nums) in docs {
         tx.send(AddDocumentsRequest {
+            nlp_materialization: String::new(),
             unsigned_integers: Vec::new(),
             map_integers: Vec::new(),
             map_unsigned_integers: Vec::new(),
@@ -372,6 +373,7 @@ async fn map_facet_counts_are_exact_with_key_level_typo_rules() {
             prefixes: Vec::new(),
             synonyms: Vec::new(),
             synonyms_off: false,
+            pre_analyzed_terms: Vec::new(),
         }),
     )
     .await
@@ -609,6 +611,7 @@ async fn distributed_map_stages_and_ingest_refusals() {
     // Ingest refusals: repeated (column, key), unknown
     // column, non-finite numeric value. Empty string values are present.
     let bad_facet = |field: &str, key: &str, value: &str| AddDocumentsRequest {
+        nlp_materialization: String::new(),
         unsigned_integers: Vec::new(),
         map_integers: Vec::new(),
         map_unsigned_integers: Vec::new(),

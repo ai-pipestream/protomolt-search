@@ -57,9 +57,9 @@ pub(super) fn validate_maintenance(
         })
         // Format 1 certified stored content and exact FP32 rows; format 2
         // adds the provider's own encoded rows (docs/source-index-maintenance.md).
-        // Journals written under format 1 stay readable; only a format-2
-        // certificate says anything about the dense image.
-        || !matches!(proof.format_version, 1 | 2)
+        // Format 3 additionally covers lattice lengths and SPLADE scales/impacts.
+        // Older journals remain readable with their original coverage.
+        || !matches!(proof.format_version, 1..=3)
         || proof.owner.as_ref() != Some(owner)
         || proof.schema_sha256.len() != 32
         || proof.identity_content_sha256.len() != 32

@@ -1236,3 +1236,129 @@ fn an_interrupted_walless_cutover_rolls_back_at_open() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn partitioned_compaction_preserves_lattice_and_per_document_sparse_scales() {
+    use pipestream_search::exact_vectors::ExactVectorStore;
+    use pipestream_search::postings::{AnalyzedDoc, AnalyzedField, Bm25Store};
+    use pipestream_search::segments::SegmentSource;
+    use pipestream_search::vector::{VectorIndex, EMBEDDED_TURBOVEC};
+    let dir = tempdir("lattice-sparse");
+    let catalog = SegmentCatalog::open(dir.join("catalog")).unwrap();
+    let binding = binding();
+    catalog.publish_binding(&binding).unwrap();
+    let sample: Vec<_> = (0..64).map(|i| (i as f32 * 0.3).sin()).collect();
+    let backend = VectorIndex::fit_backend_config(EMBEDDED_TURBOVEC, 8, 4, &sample).unwrap();
+    for segment in 0..2 {
+        let source = dir.join(format!("source-{segment}"));
+        std::fs::create_dir(&source).unwrap();
+        let mut store = Bm25Store::with_fields(&["body"])
+            .with_positions(&["body"])
+            .with_integers(&["num"]);
+        store.set_binding(Some(binding.clone()));
+        let mut vectors = Vec::new();
+        let mut live = LiveDocs::default();
+        for row in 0..3 {
+            let id = segment * 3 + row;
+            store.add_document(
+                row,
+                format!("row{id}"),
+                AnalyzedDoc {
+                    fields: vec![AnalyzedField {
+                        terms: vec![
+                            ("joined".into(), 1, vec![(0, 3)]),
+                            ("word".into(), 1, vec![(4, 8)]),
+                        ],
+                        length: 3,
+                        positions: Some(vec![vec![0], vec![2]]),
+                        pos_lengths: Some(vec![vec![2], vec![1]]),
+                        splade: vec![("neural".into(), 65535)],
+                        splade_scale_bits: (0.00001_f32 * (id + 1) as f32).to_bits(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            );
+            store.set_integer(0, row, (5 - id) as i64);
+            vectors.extend((0..8).map(|d| (id as f32 + d as f32) / 8.0));
+            if id == 1 {
+                live.delete(row as usize);
+            }
+        }
+        let bp = source.join("bm25");
+        store.save(&bp).unwrap();
+        let vp = source.join("vector");
+        let mut vector = VectorIndex::from_backend_config(8, &backend).unwrap();
+        vector.add(&vectors, 8).unwrap();
+        vector.prepare().unwrap();
+        vector.write(&vp).unwrap();
+        let ep = source.join("exact");
+        ExactVectorStore::from_values(8, vectors)
+            .unwrap()
+            .write(&ep)
+            .unwrap();
+        let lp = source.join("live");
+        live.write(&lp, 3).unwrap();
+        catalog
+            .append(SegmentSource {
+                segment_id: &format!("source-{segment}"),
+                generation: 1,
+                base_label: (segment * 3) as u64,
+                backend_kind: EMBEDDED_TURBOVEC,
+                vector_path: Some(&vp),
+                exact_vector_path: Some(&ep),
+                bm25_path: &bp,
+                live_docs_path: &lp,
+                partition_column: None,
+            })
+            .unwrap();
+    }
+    let mut overlay = LiveDocs::default();
+    overlay.delete(4);
+    let mut serial = Vec::new();
+    for threads in [1, 2] {
+        let built = reshard::compact_segments_partitioned(
+            &catalog.snapshot(),
+            &overlay,
+            0,
+            &dir.join(format!("cut-{threads}")),
+            PartitionSpec {
+                column: "num",
+                bound: 2,
+            },
+            &SegmentCompactionOptions {
+                build_threads: threads,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(built.rows_before, 6);
+        assert_eq!(built.tombstones, 2);
+        assert_eq!(
+            built.id_map.keys().copied().collect::<Vec<_>>(),
+            vec![0, 2, 3, 5]
+        );
+        let mut payloads = Vec::new();
+        for image in built.images {
+            let reader = Bm25Reader::open(image.bm25_path.as_ref().unwrap()).unwrap();
+            reader.verify_integrity().unwrap();
+            let transposed = reader.field(0).transpose().unwrap();
+            for (row, id) in image.row_parent_ids.into_iter().enumerate() {
+                let field = transposed.field(row as u32).unwrap();
+                assert_eq!(field.pos_lengths, Some(vec![vec![2], vec![1]]));
+                assert_eq!(field.splade, vec![("neural".into(), 65535)]);
+                assert_eq!(
+                    field.splade_scale_bits,
+                    (0.00001_f32 * (id + 1) as f32).to_bits()
+                );
+                payloads.push((id, field));
+            }
+        }
+        payloads.sort_by_key(|(id, _)| *id);
+        if threads == 1 {
+            serial = payloads;
+        } else {
+            assert_eq!(serial, payloads);
+        }
+    }
+}

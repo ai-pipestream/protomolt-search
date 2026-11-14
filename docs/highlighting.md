@@ -147,9 +147,11 @@ other than the body ("snippets are cut from stored text, and only the
 body's text is stored"). The coordinator checks the spec before any
 shard is asked, so an empty fleet refuses like a full one.
 `FAILED_PRECONDITION`: sentence mode over a field whose storage declares
-no sentence spans. On `Query`, any shape but the single lexical
-selection refuses by name: only that leg carries the occurrence spans
-snippets are cut around.
+no sentence spans. On `Query`, any shape other than the single lexical
+selection refuses by name **unless** Stage-2 calibrated
+`RerankAndHighlight` (`CoordinatorServiceImpl::with_rerank_spec`, `#105`)
+is installed on the coordinator, which attributes source-projected
+semantic snippets (`QueryHit.snippets`) over dense and hybrid shortlists.
 
 ### Multi-field
 
@@ -178,11 +180,13 @@ pins both.
 - No sentence inference at query time: a field without stored spans
   gets the named window cut or a refusal, never guessed sentences.
 - No stored text for non-body fields; that is a separate cost decision.
-- Sentence-level snippets for dense hits are not served: the engine
-  holds one vector per document, and which sentence a vector matched is
-  not a fact it has. `sentence_index` exists so a pipeline that keeps
-  per-sentence embeddings can name the sentence it matched against the
-  same table.
+- Without Stage-2 `RerankAndHighlight` (`with_rerank_spec`), sentence-level
+  snippets for pure dense hits are not served because Stage-1 vector search
+  holds one vector per document. When `RerankSpec` (`#105` / `turboembed`
+  `#2342`) is configured on the coordinator, top-`C` dense and hybrid hits
+  receive calibrated `[0, 1]` relevance probabilities and source-projected
+  (`ViewId::SOURCE`) semantic snippets, with optional `DocLineage.span_start`
+  parent-document offset composition (`compose_parent_lineage_offsets`).
 
 ## Tests
 

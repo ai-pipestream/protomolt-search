@@ -151,6 +151,7 @@ async fn ingest(
     tokio::spawn(async move {
         for i in 0..docs {
             tx.send(AddDocumentsRequest {
+                nlp_materialization: String::new(),
                 unsigned_integers: Vec::new(),
                 map_integers: Vec::new(),
                 map_unsigned_integers: Vec::new(),
@@ -1160,6 +1161,7 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
     tokio::spawn(async move {
         for (i, name) in names_feed.iter().enumerate() {
             tx.send(AddDocumentsRequest {
+                nlp_materialization: String::new(),
                 unsigned_integers: Vec::new(),
                 map_integers: Vec::new(),
                 map_unsigned_integers: Vec::new(),

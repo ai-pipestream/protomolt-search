@@ -56,6 +56,7 @@ async fn add_documents(addr: &str, texts: &[String]) {
     let feeder = tokio::spawn(async move {
         for text in texts {
             tx.send(AddDocumentsRequest {
+                nlp_materialization: String::new(),
                 unsigned_integers: Vec::new(),
                 map_integers: Vec::new(),
                 map_unsigned_integers: Vec::new(),

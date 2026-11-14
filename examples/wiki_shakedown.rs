@@ -1,7 +1,7 @@
 //! Real-data shakedown: ingest the Lucene-era wikipedia corpus (bge-m3
 //! embeddings + Simple English Wikipedia sentences) into a 4-shard
-//! pipestream-search cluster on loopback, using the REAL OpenNLP analysis
-//! sidecar for BM25, then run hybrid queries end-to-end.
+//! pipestream-search cluster on loopback, using `turbo-kserve`
+//! for BM25, then run hybrid queries end-to-end.
 //!
 //! The corpus stays at its absolute path (NOT copied into the repo);
 //! `--data-dir` points at it. The 4 parts are the pre-existing shard
@@ -43,8 +43,7 @@ use pipestream_search::pb::{
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-const SIDECAR_BIN: &str =
-    "/work/main/grpc-services/grpc-opennlp-analysis/build/native/nativeCompile/grpc-opennlp-analysis";
+const SIDECAR_BIN: &str = "turbo-kserve";
 const DEFAULT_DATA_DIR: &str = "/work/opensearch-grpc-knn/distributed_test_data/wikipedia";
 const VECTOR_BATCH: usize = 512;
 
@@ -80,6 +79,7 @@ async fn add_documents(addr: &str, texts: Vec<String>, spec: &AnalysisSpec, shar
                 map_integers: Vec::new(),
                 map_unsigned_integers: Vec::new(),
                 derived_fingerprint: String::new(),
+                nlp_materialization: String::new(),
                 original_source: None,
                 source_chunk_ordinal: None,
                 identity: None,

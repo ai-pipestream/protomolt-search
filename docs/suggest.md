@@ -63,15 +63,16 @@ the prefix is compared as written: `Cou` completes to `Court`, `cou` to
 `court`, `COU` to `COURT`.
 
 The stemmer is never applied because the dictionary holds stems and a
-prefix of a stem is what the caller typed. The consequence is worth
-stating plainly: **a stemmed field suggests stems.** On the body,
-`courtes` completes to `courtesi`, and `courtesy` — the surface word, which
-Porter would have stemmed to `courtesi` — completes to nothing, because no
-dictionary term starts with `courtesy`. Surface-form completion needs a
-field indexed without a stemmer: the cased twin (whose stems keep case but
-are still stems), a `SOURCE_TOKENS` field, or a per-field column declared
-for the purpose. The engine does not re-stem the prefix or un-stem the
-dictionary; either would be a guess about the analyzer.
+prefix of a stem is what the caller typed. Without a surface lexicon, **a
+stemmed field suggests stems:** on the body, `courtes` completes to
+`courtesi`, and `courtesy` completes to nothing because no dictionary stem
+starts with `courtesy`. To serve genuine surface completions over stemmed
+fields without duplicating postings, attach a memory-mapped
+`turbo_client::MappedSurfaceLexicon` (`CoordinatorServiceImpl::with_surface_lexicon`,
+`#104` / `turboembed` `#2341`), which resolves normalized prefixes and shard
+stems back to corpus-observed surface forms in zero-copy FST memory. Without
+`with_surface_lexicon`, surface-form completion requires an unstemmed field
+(`SOURCE_TOKENS` or the cased twin).
 
 ## Ranking
 

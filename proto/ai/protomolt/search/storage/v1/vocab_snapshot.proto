@@ -1,0 +1,45 @@
+syntax = "proto3";
+package ai.protomolt.search.storage.v1;
+
+// On-disk vocabulary window snapshots (`<index>.vocab/snapshot-<seq>-<millis>.pb`),
+// accumulated inline during ingest (`src/vocab.rs`).
+
+enum VocabChannel {
+  VOCAB_CHANNEL_UNSPECIFIED = 0;
+  // Term-vector entries (folded BM25 index identity) with frequencies.
+  VOCAB_CHANNEL_TERMS = 1;
+  // Raw pre-normalization token surface forms.
+  VOCAB_CHANNEL_TOKENS = 2;
+}
+
+message VocabHeavyHitter {
+  string term = 1;
+  uint64 count = 2;
+}
+
+message VocabChannelStats {
+  VocabChannel channel = 1;
+  uint64 documents = 2;
+  uint64 term_occurrences = 3;
+  double cardinality_estimate = 4;
+  repeated VocabHeavyHitter heavy_hitters = 5;
+}
+
+message VocabChannelSnapshot {
+  VocabChannel channel = 1;
+  uint64 documents = 2;
+  uint64 term_occurrences = 3;
+  uint32 hll_precision = 4;
+  bytes hll_registers = 5;
+  uint32 cms_depth = 6;
+  uint32 cms_width = 7;
+  bytes cms_table = 8;
+  repeated VocabHeavyHitter heavy_hitters = 9;
+}
+
+message VocabSnapshot {
+  uint64 sequence = 1;
+  int64 started_epoch_millis = 2;
+  int64 sealed_epoch_millis = 3;
+  repeated VocabChannelSnapshot channels = 4;
+}

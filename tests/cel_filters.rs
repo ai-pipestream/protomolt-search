@@ -153,6 +153,7 @@ fn timestamp_of(rfc3339: &str) -> prost_types::Timestamp {
 
 fn ingest_request(doc: &Doc) -> AddDocumentsRequest {
     AddDocumentsRequest {
+        nlp_materialization: String::new(),
         unsigned_integers: Vec::new(),
         map_integers: Vec::new(),
         map_unsigned_integers: Vec::new(),

@@ -12,7 +12,8 @@ resolver = "2"
 
 [dependencies]
 turbovec = { git = "https://github.com/ai-pipestream/turbovec.git", branch = "main" }
-turbovec-grpc = { git = "https://github.com/ai-pipestream/turbovec-grpc.git", rev = "c1a973e84047653ba9a3be77f2e9049cc1ca193b", optional = true }
+turbovec-grpc = { git = "https://github.com/ai-pipestream/turbovec-grpc.git", rev = "2cbab637a03d9ffeb5bcc3e40118c48c974a51d6", optional = true }
+turbo-client = { git = "https://github.com/ai-pipestream/turboembed.git", rev = "31e9857d37e14c3f5985d882f1a7b0815d198527", default-features = false }
 # Control consensus (docs/raft-control-design.md). Pinned exactly: the
 # storage-v2 contracts are what the log store and state machine implement,
 # and the typed envelopes map to this version's types explicitly.
@@ -69,6 +70,8 @@ redb = "4"
 getrandom = "0.4"
 
 [features]
+# Explicit alias for the transport-free library; use with --no-default-features.
+embedded = []
 # Raft hosting of the source authority (docs/raft-control-design.md): the
 # redb log store, the state machine over the committed-replay paths and the
 # in-process host. Transport needs `net` as well.
@@ -105,8 +108,12 @@ net = [
     "dep:hyper",
     "dep:http-body-util",
     "dep:turbovec-grpc",
+    "turbo-client/grpc",
+    "turbo-client/server-stubs",
     "prost-reflect/serde",
 ]
+# Optional in-process libturbo hardware inference (`turbo-client/local-core`).
+local-core = ["turbo-client/local-core"]
 # TLS/mTLS on the gRPC listeners and the cluster-internal channels
 # (docs/security.md): rustls through tonic. On by default for the serving
 # binary; the embedded runtime turns it off, because it reaches its nodes
@@ -115,6 +122,7 @@ default = ["net", "tls"]
 tls = [
     "net",
     "tonic/tls-ring",
+    "turbo-client/tls",
     "dep:hyper-rustls",
     "dep:webpki-roots",
     "dep:rustls",

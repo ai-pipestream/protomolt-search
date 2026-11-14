@@ -1,8 +1,8 @@
 //! Live-interop demo: ingest documents into a pipestream-search node through
-//! the OpenNLP analysis sidecar, then run distributed BM25 queries
+//! `turbo-client` / `turbo-kserve`, then run distributed BM25 queries
 //! and fetch raw texts for highlighting.
 //!
-//! Usage (sidecar and a pipestream-search node+coordinator already running):
+//! Usage (`turbo-kserve` or `--analysis-addr=turbo` and a pipestream-search node+coordinator running):
 //!
 //! ```text
 //! cargo run --example ingest_demo -- \
@@ -11,7 +11,7 @@
 //!
 //! The analysis spec is WHITESPACE tokenizer + PORTER stemmer + term
 //! vectors in MODE_FULL with SOURCE_STEMS — so the terms landing in the
-//! postings are real OpenNLP Porter stems, and every occurrence keeps its
+//! postings are pure-Rust Porter stems, and every occurrence keeps its
 //! original-text span for highlighting.
 
 use pipestream_search::pb::node_service_client::NodeServiceClient;
@@ -58,6 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             map_integers: Vec::new(),
             map_unsigned_integers: Vec::new(),
             derived_fingerprint: String::new(),
+            nlp_materialization: String::new(),
             original_source: None,
             source_chunk_ordinal: None,
             identity: None,
@@ -147,6 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 prefixes: Vec::new(),
                 synonyms: Vec::new(),
                 synonyms_off: false,
+                pre_analyzed_terms: Vec::new(),
             })
             .await?
             .into_inner();

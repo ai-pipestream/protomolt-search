@@ -611,6 +611,7 @@ pub fn top_k_exhaustive_chained_filtered(
                 tf,
                 offsets: offsets.to_vec(),
                 positions: Vec::new(),
+                pos_lengths: Vec::new(),
             };
             let contribution = score_posting(params, stats, ti, &posting, doc_len);
             let entry = scores.entry(doc_id).or_default();
@@ -2159,17 +2160,17 @@ mod tests {
                         ],
                         length: 3,
                         positions: None,
+                        ..Default::default()
                     },
                     AnalyzedField {
                         sentences: None,
                         terms: vec![("smith".into(), 1, vec![(0, 5)])],
                         length: 1,
                         positions: None,
+                        ..Default::default()
                     },
                 ],
-                quality: None,
-                geography: None,
-                entities: Vec::new(),
+                ..Default::default()
             },
         );
         // doc1: body "rust vector vector", no name
@@ -2193,6 +2194,7 @@ mod tests {
                         terms: vec![("search".into(), 1, vec![])],
                         length: 1,
                         positions: None,
+                        ..Default::default()
                     },
                     AnalyzedField {
                         sentences: None,
@@ -2202,11 +2204,10 @@ mod tests {
                         ],
                         length: 2,
                         positions: None,
+                        ..Default::default()
                     },
                 ],
-                quality: None,
-                geography: None,
-                entities: Vec::new(),
+                ..Default::default()
             },
         );
 
@@ -2298,6 +2299,7 @@ mod tests {
                 terms: body,
                 length: body_len,
                 positions: None,
+                ..Default::default()
             }];
             if g % 3 != 1 {
                 fields.push(AnalyzedField {
@@ -2308,14 +2310,12 @@ mod tests {
                     ],
                     length: 2,
                     positions: None,
+                    ..Default::default()
                 });
             }
             AnalyzedDoc {
-                cased: None,
                 fields,
-                quality: None,
-                geography: None,
-                entities: Vec::new(),
+                ..Default::default()
             }
         }
         fn build(range: std::ops::Range<u32>, offset: u32) -> Bm25Store {
@@ -2429,6 +2429,7 @@ mod tests {
                         ],
                         length: 3,
                         positions: None,
+                        ..Default::default()
                     },
                     AnalyzedField {
                         sentences: None,
@@ -2438,11 +2439,10 @@ mod tests {
                         ],
                         length: 2,
                         positions: None,
+                        ..Default::default()
                     },
                 ],
-                quality: None,
-                geography: None,
-                entities: Vec::new(),
+                ..Default::default()
             },
         );
         let body_terms = vec!["new".to_string(), "york".to_string(), "city".to_string()];
