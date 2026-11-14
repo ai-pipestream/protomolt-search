@@ -361,6 +361,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             prefixes: Vec::new(),
             synonyms: Vec::new(),
             synonyms_off: false,
+            pre_analyzed_terms: Vec::new(),
         })
         .await?
         .into_inner();
@@ -410,6 +411,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             prefixes: Vec::new(),
             synonyms: Vec::new(),
             synonyms_off: false,
+            pre_analyzed_terms: Vec::new(),
         })
         .await?
         .into_inner();
@@ -472,6 +474,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             prefixes: Vec::new(),
             synonyms: Vec::new(),
             synonyms_off: false,
+            pre_analyzed_terms: Vec::new(),
         })
         .await?
         .into_inner();
@@ -634,6 +637,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             prefixes: Vec::new(),
             synonyms: Vec::new(),
             synonyms_off: false,
+            pre_analyzed_terms: Vec::new(),
         })),
     };
     let body_field = || QueryField {

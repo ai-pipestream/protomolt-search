@@ -62,8 +62,8 @@ impl AnalysisBackend {
     }
 }
 
-/// Optional per-call remote scheduling, auth, TLS, and deadline overrides
-/// propagated to `turbo-kserve` (`#105`).
+/// Optional per-call remote scheduling, auth, TLS, deadline, and cryptographic
+/// handshake overrides propagated to `turbo-kserve`.
 #[derive(Clone, Debug, Default)]
 pub struct RemoteCallOptions {
     /// Explicit bearer token (`authorization: Bearer <token>`).
@@ -75,6 +75,9 @@ pub struct RemoteCallOptions {
     /// Optional explicit mTLS / server CA configuration (falls back to
     /// [`crate::security::process_client_tls`]).
     pub tls: Option<crate::security::ClientTls>,
+    /// Optional expected model/analysis handshake verified against remote
+    /// `ModelMetadata` before inference.
+    pub expected_handshake: Option<turbo_client::IndexGenerationHandshake>,
 }
 
 /// The analysis a body-text corpus is built with, and the ONLY spec that
@@ -256,22 +259,72 @@ type RuntimeChannelPools = Mutex<HashMap<tokio::runtime::Id, Weak<AnalysisChanne
 #[cfg(feature = "net")]
 static CHANNEL_POOLS: OnceLock<RuntimeChannelPools> = OnceLock::new();
 #[cfg(feature = "net")]
-static TURBO_REMOTE_POOL: OnceLock<turbo_client::RemoteChannelPool> = OnceLock::new();
+static TURBO_REMOTE_POOL: OnceLock<Mutex<(u64, turbo_client::RemoteChannelPool)>> = OnceLock::new();
 
 #[cfg(feature = "net")]
 pub(crate) fn shared_turbo_pool() -> turbo_client::RemoteChannelPool {
-    TURBO_REMOTE_POOL
-        .get_or_init(turbo_client::RemoteChannelPool::new)
-        .clone()
+    let guard = TURBO_REMOTE_POOL
+        .get_or_init(|| Mutex::new((0, turbo_client::RemoteChannelPool::new())))
+        .lock()
+        .expect("turbo remote channel pool poisoned");
+    guard.1.clone()
 }
 
-/// Build a pooled [`turbo_client::RemoteClient`] honoring `options` and
+/// Monotonic generation counter of the pooled `turbo-kserve` HTTP/2 channel
+/// table, incremented whenever an unhealthy channel is evicted.
+#[cfg(feature = "net")]
+pub fn turbo_pool_generation() -> u64 {
+    TURBO_REMOTE_POOL
+        .get_or_init(|| Mutex::new((0, turbo_client::RemoteChannelPool::new())))
+        .lock()
+        .expect("turbo remote channel pool poisoned")
+        .0
+}
+
+/// Evicts cached `turbo-kserve` HTTP/2 channels after a transport reset,
+/// `Unavailable`, `Unknown`, or `DeadlineExceeded` error so subsequent calls
+/// dial a fresh connection.
+#[cfg(feature = "net")]
+pub fn evict_unhealthy_turbo_channel(addr: &str) {
+    {
+        let mut guard = TURBO_REMOTE_POOL
+            .get_or_init(|| Mutex::new((0, turbo_client::RemoteChannelPool::new())))
+            .lock()
+            .expect("turbo remote channel pool poisoned");
+        guard.0 = guard.0.saturating_add(1);
+        guard.1 = turbo_client::RemoteChannelPool::new();
+    }
+    if let Ok(pool) = runtime_channel_pool() {
+        if let Ok(mut map) = pool.lock() {
+            map.remove(addr);
+        }
+    }
+}
+
+#[cfg(feature = "net")]
+pub(crate) fn inspect_remote_status(addr: &str, status: Status) -> Status {
+    if matches!(
+        status.code(),
+        tonic::Code::Unavailable | tonic::Code::Unknown | tonic::Code::DeadlineExceeded
+    ) {
+        evict_unhealthy_turbo_channel(addr);
+    }
+    status
+}
+
+#[cfg(feature = "net")]
+fn inspect_remote_client_err(addr: &str, err: turbo_client::ClientError) -> Status {
+    let status = client_err_to_status(err);
+    inspect_remote_status(addr, status)
+}
+
+/// Build a [`turbo_client::RemoteEndpointConfig`] honoring `options` and
 /// process-wide TLS/bearer settings.
 #[cfg(feature = "net")]
-pub fn remote_client_for(
+pub fn remote_endpoint_config_for(
     addr: &str,
     options: &RemoteCallOptions,
-) -> Result<turbo_client::RemoteClient, Status> {
+) -> Result<turbo_client::RemoteEndpointConfig, Status> {
     let tls_ref = options
         .tls
         .as_ref()
@@ -287,11 +340,12 @@ pub fn remote_client_for(
         turbo_client::RemotePriority::Bulk
     };
     let mut cfg = turbo_client::RemoteEndpointConfig::new(endpoint_uri).with_priority(priority);
-    if let Some(token) = options.bearer_token.clone().or_else(|| {
-        std::env::var("TURBO_BEARER_TOKEN")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-    }) {
+    if let Some(token) = options
+        .bearer_token
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(crate::security::process_client_bearer_token)
+    {
         cfg = cfg.with_bearer_token(token);
     }
     if let Some(timeout) = options.timeout {
@@ -311,10 +365,47 @@ pub fn remote_client_for(
             "this build has no TLS support (feature `tls` is off)",
         ));
     }
+    Ok(cfg)
+}
+
+/// Build a pooled [`turbo_client::RemoteClient`] honoring `options` and
+/// process-wide TLS/bearer settings.
+#[cfg(feature = "net")]
+pub fn remote_client_for(
+    addr: &str,
+    options: &RemoteCallOptions,
+) -> Result<turbo_client::RemoteClient, Status> {
+    let cfg = remote_endpoint_config_for(addr, options)?;
     Ok(turbo_client::RemoteClient::with_pool(
         cfg,
         shared_turbo_pool(),
     ))
+}
+
+/// Connects and verifies a [`turbo_client::TurboClient`] against both lexical
+/// analysis and remote `turbo-kserve` `ModelMetadata`, failing loudly
+/// with `FAILED_PRECONDITION` at startup/bind on any fingerprint mismatch.
+#[cfg(feature = "net")]
+pub async fn connect_verified_turbo_client(
+    addr: &str,
+    spec: Option<&AnalysisSpec>,
+    options: &RemoteCallOptions,
+    handshake: turbo_client::IndexGenerationHandshake,
+) -> Result<turbo_client::TurboClient, Status> {
+    let (clean_addr, model_name, _) = parse_embed_endpoint(addr);
+    let endpoint_cfg = remote_endpoint_config_for(&clean_addr, options)?;
+    let field_cfg = turbo_field_config(spec)?;
+    let handshake_model = handshake
+        .bundle
+        .as_ref()
+        .map(|_| (model_name, String::new()));
+    turbo_client::TurboClient::builder()
+        .with_default_field(field_cfg)
+        .with_handshake(handshake)
+        .with_remote_endpoint(endpoint_cfg, handshake_model)
+        .connect()
+        .await
+        .map_err(|e| inspect_remote_client_err(&clean_addr, e))
 }
 
 #[cfg(feature = "net")]
@@ -447,9 +538,17 @@ pub async fn analyze_document_with_options(
         let req = remote
             .prepare_request(payload, Some(prio), options.timeout)
             .map_err(client_err_to_status)?;
-        let mut stream = client.analyze_document_progressive(req).await?.into_inner();
+        let mut stream = client
+            .analyze_document_progressive(req)
+            .await
+            .map_err(|s| inspect_remote_status(addr, s))?
+            .into_inner();
         let mut graph_resp: Option<DocumentGraphResponse> = None;
-        while let Some(ev) = stream.message().await? {
+        while let Some(ev) = stream
+            .message()
+            .await
+            .map_err(|s| inspect_remote_status(addr, s))?
+        {
             if let Some(analyze_progressive_event::Event::Complete(done)) = ev.event {
                 graph_resp = Some(done);
             }
@@ -457,7 +556,17 @@ pub async fn analyze_document_with_options(
         let done = graph_resp.ok_or_else(|| {
             Status::internal("AnalyzeDocumentProgressive stream ended without a Complete event")
         })?;
-        decode_graph_response(done, spec, layers, None)
+        decode_graph_response_remote(
+            addr,
+            &remote,
+            &mut client,
+            done,
+            spec,
+            layers,
+            options.timeout,
+            None,
+        )
+        .await
     }
 }
 
@@ -845,7 +954,7 @@ pub fn turbo_field_config(
     })
 }
 
-fn client_err_to_status(err: turbo_client::ClientError) -> Status {
+pub(crate) fn client_err_to_status(err: turbo_client::ClientError) -> Status {
     match err {
         turbo_client::ClientError::InvalidArgument(m) => Status::invalid_argument(m),
         turbo_client::ClientError::FailedPrecondition(m) => Status::failed_precondition(m),
@@ -856,6 +965,14 @@ fn client_err_to_status(err: turbo_client::ClientError) -> Status {
         turbo_client::ClientError::Unavailable(m) => Status::unavailable(m),
         turbo_client::ClientError::Internal(m) => Status::internal(m),
     }
+}
+
+#[cfg(feature = "net")]
+pub(crate) fn remote_client_err_to_status(
+    client: &turbo_client::RemoteClient,
+    err: turbo_client::ClientError,
+) -> Status {
+    inspect_remote_client_err(&client.config().endpoint, err)
 }
 
 #[derive(Debug)]
@@ -1034,14 +1151,20 @@ use turbo_client::proto::result::{
     analyze_progressive_event, analyze_stream_request, analyze_stream_response, AnalyzeDocument,
     AnalyzeOrder, AnalyzeOutput, AnalyzePipelineRequest, AnalyzeStreamHeader, AnalyzeStreamRequest,
     AnalyzeStreamResponse, CapabilitiesRequest, DocumentGraphResponse, OffsetMode,
-    PiiOutputOptions,
+    PiiOutputOptions, ProjectSearchDocumentRequest, SearchAssessmentState,
+    SearchDocumentProjection, SearchLexicalToken, SearchSentenceRow,
 };
 
 #[cfg(feature = "net")]
-fn decode_graph_response(
+#[allow(clippy::too_many_arguments)]
+async fn decode_graph_response_remote(
+    addr: &str,
+    remote: &turbo_client::RemoteClient,
+    client: &mut AnalysisServiceClient<Channel>,
     response: DocumentGraphResponse,
     spec: Option<&AnalysisSpec>,
     layers: SessionLayers,
+    timeout: Option<Duration>,
     vocab: Option<&Arc<crate::vocab::VocabularyListener>>,
 ) -> Result<AnalyzedDoc, Status> {
     if response.graph.starts_with(wire::MOCK_GRAPH_MAGIC) {
@@ -1056,7 +1179,62 @@ fn decode_graph_response(
         }
         return wire::analyzed_from_mock(mock, layers);
     }
-    if response.source_text.is_empty() && response.graph.is_empty() {
+    if !response.graph.is_empty() {
+        let session = wire::WireSessionOptions {
+            spec: spec.cloned(),
+            layers,
+        };
+        let analyzer_config_digest = turbo_handshake(spec, None)
+            .ok()
+            .and_then(|hs| hs.analysis.map(|a| a.sha256.to_vec()))
+            .unwrap_or_default();
+        let proj_payload = ProjectSearchDocumentRequest {
+            doc_id: String::new(),
+            graph: response.graph.to_vec(),
+            view: 0,
+            offsets: OffsetMode::Utf8 as i32,
+            pii_output: Some(PiiOutputOptions {
+                full_text: true,
+                ..Default::default()
+            }),
+            binding: Some(session.to_binding()),
+            analyzer_config_digest,
+        };
+        let prio = remote.config().default_priority;
+        let proj_req = remote
+            .prepare_request(proj_payload, Some(prio), timeout)
+            .map_err(|e| inspect_remote_client_err(addr, e))?;
+        let projected = client
+            .project_search_document(proj_req)
+            .await
+            .map_err(|s| inspect_remote_status(addr, s))?
+            .into_inner();
+        let scoring_only = spec
+            .map(|s| s.term_vector_mode == TERM_VECTOR_MODE_SCORING_ONLY)
+            .unwrap_or(false);
+        let (mut doc, surface_tokens) =
+            analyzed_from_search_projection(projected, scoring_only, layers)?;
+        if layers.dual_cased && doc.cased.is_none() && !response.source_text.is_empty() {
+            validate_dual_cased_spec(spec)?;
+            let effective_spec = spec.cloned().unwrap_or_else(body_spec);
+            let cfg = turbo_field_config(Some(&effective_spec))?.cased_twin();
+            let cased = turbo_client::LexicalAnalyzer::new(cfg)
+                .analyze(&response.source_text)
+                .map_err(client_err_to_status)?;
+            doc.cased = Some(turbo_field_to_postings(cased, scoring_only));
+        }
+        if let Some(vocab) = vocab {
+            let body = &doc.fields[0];
+            vocab.feed(
+                body.terms
+                    .iter()
+                    .map(|(term, freq, _)| (term.as_str(), i64::from(*freq))),
+                surface_tokens.iter().map(String::as_str),
+            );
+        }
+        return Ok(doc);
+    }
+    if response.source_text.is_empty() {
         return Err(Status::failed_precondition(
             "turbo-kserve returned an empty DocumentGraphResponse (check PII output disclosure)",
         ));
@@ -1074,9 +1252,374 @@ fn decode_graph_response(
     Ok(out.doc)
 }
 
+/// Converts a remote `SearchDocumentProjection` directly into an
+/// [`AnalyzedDoc`] and surface token list without re-running local lexical or
+/// NLP analysis.
+#[cfg(feature = "net")]
+pub fn analyzed_from_search_projection(
+    mut proj: SearchDocumentProjection,
+    scoring_only: bool,
+    layers: SessionLayers,
+) -> Result<(AnalyzedDoc, Vec<String>), Status> {
+    if proj.offset_mode != 0 && proj.offset_mode != OffsetMode::Utf8 as i32 {
+        return Err(Status::failed_precondition(
+            "ProjectSearchDocument returned non-UTF-8 offsets for UTF-8 storage request",
+        ));
+    }
+    let mut primary_tokens: Vec<SearchLexicalToken> = Vec::new();
+    let mut cased_tokens: Vec<SearchLexicalToken> = Vec::new();
+    let first_instance = proj.tokens.first().map(|t| t.instance.clone());
+    for tok in std::mem::take(&mut proj.tokens) {
+        if layers.dual_cased
+            && (tok.instance.contains("cased")
+                || first_instance
+                    .as_deref()
+                    .is_some_and(|first| !tok.instance.is_empty() && tok.instance != first))
+        {
+            cased_tokens.push(tok);
+        } else {
+            primary_tokens.push(tok);
+        }
+    }
+    let surface_tokens: Vec<String> = primary_tokens
+        .iter()
+        .filter(|t| t.pos_len <= 1)
+        .map(|t| t.term.clone())
+        .collect();
+    let primary_field = search_tokens_to_postings(&primary_tokens, &proj.sentences, scoring_only);
+    let cased_field = if layers.dual_cased && !cased_tokens.is_empty() {
+        Some(search_tokens_to_postings(
+            &cased_tokens,
+            &proj.sentences,
+            scoring_only,
+        ))
+    } else {
+        None
+    };
+
+    let (quality, geography, entities, nlp_proj) =
+        if layers.quality || layers.geography || layers.entities || layers.nlp_columns {
+            let nlp = search_projection_to_nlp(&proj);
+            let (q, g, e) = reduce_nlp_layers(&nlp, layers);
+            (q, g, e, layers.nlp_columns.then(|| Box::new(nlp)))
+        } else {
+            (None, None, Vec::new(), None)
+        };
+
+    Ok((
+        AnalyzedDoc {
+            fields: vec![primary_field],
+            cased: cased_field,
+            quality,
+            geography,
+            entities,
+            nlp: nlp_proj,
+        },
+        surface_tokens,
+    ))
+}
+
+#[cfg(feature = "net")]
+fn search_tokens_to_postings(
+    tokens: &[SearchLexicalToken],
+    sentences: &[SearchSentenceRow],
+    scoring_only: bool,
+) -> crate::postings::AnalyzedField {
+    let mut term_indices: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut terms: crate::postings::DocTerms = Vec::new();
+    let mut positions: crate::postings::DocPositions = Vec::new();
+    let mut pos_lengths: crate::postings::DocPositions = Vec::new();
+    let mut seen_ordinals: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut has_lattice = false;
+    let mut primary_len = 0u32;
+    let mut max_tf = 0u32;
+
+    for arc in tokens {
+        if arc.term.is_empty() {
+            EMPTY_TERMS_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
+        let arc_len = arc.pos_len.max(1);
+        if arc_len == 1 {
+            primary_len = primary_len.saturating_add(1);
+        } else {
+            has_lattice = true;
+        }
+        let span = (arc.span_start, arc.span_end);
+        match term_indices.get(&arc.term).copied() {
+            Some(idx) => {
+                if let Some(last_pos) = positions[idx].last().copied() {
+                    if arc.pos <= last_pos {
+                        if arc.pos == last_pos && !scoring_only {
+                            if let Some(last_occ) = terms[idx].2.last_mut() {
+                                last_occ.0 = last_occ.0.min(span.0);
+                                last_occ.1 = last_occ.1.max(span.1);
+                            }
+                            if let Some(last_len) = pos_lengths[idx].last_mut() {
+                                *last_len = (*last_len).max(arc_len);
+                            }
+                        }
+                        continue;
+                    }
+                }
+                if !seen_ordinals.insert(arc.pos) {
+                    has_lattice = true;
+                }
+                terms[idx].1 += 1;
+                max_tf = max_tf.max(terms[idx].1);
+                if !scoring_only {
+                    terms[idx].2.push(span);
+                }
+                positions[idx].push(arc.pos);
+                pos_lengths[idx].push(arc_len);
+            }
+            None => {
+                if !seen_ordinals.insert(arc.pos) {
+                    has_lattice = true;
+                }
+                let idx = terms.len();
+                term_indices.insert(arc.term.clone(), idx);
+                max_tf = max_tf.max(1);
+                let occs = if scoring_only { Vec::new() } else { vec![span] };
+                terms.push((arc.term.clone(), 1, occs));
+                positions.push(vec![arc.pos]);
+                pos_lengths.push(vec![arc_len]);
+            }
+        }
+    }
+
+    let mut raw_sentences: Vec<(u32, u32)> = sentences
+        .iter()
+        .map(|s| (s.span_start, s.span_end))
+        .filter(|&(s, e)| s < e)
+        .collect();
+    for (_, _, occs) in &terms {
+        for &(os, oe) in occs {
+            if os >= oe {
+                continue;
+            }
+            let first = raw_sentences.partition_point(|&(_, se)| se <= os);
+            let last_excl = raw_sentences.partition_point(|&(ss, _)| ss < oe);
+            if first < raw_sentences.len() && last_excl > first + 1 {
+                let merged_start = raw_sentences[first].0.min(os);
+                let merged_end = raw_sentences[last_excl - 1].1.max(oe);
+                raw_sentences.splice(first..last_excl, [(merged_start, merged_end)]);
+            } else if first < raw_sentences.len() {
+                raw_sentences[first].0 = raw_sentences[first].0.min(os);
+                raw_sentences[first].1 = raw_sentences[first].1.max(oe);
+            } else if os < oe {
+                raw_sentences.push((os, oe));
+            }
+        }
+    }
+
+    crate::postings::AnalyzedField {
+        terms,
+        length: primary_len.max(max_tf),
+        positions: if scoring_only { None } else { Some(positions) },
+        pos_lengths: if !scoring_only && has_lattice {
+            Some(pos_lengths)
+        } else {
+            None
+        },
+        sentences: Some(raw_sentences),
+        ..Default::default()
+    }
+}
+
+#[cfg(feature = "net")]
+fn utf8_only_spans(start: u32, end: u32) -> turbo_client::ProjectedSpanSet {
+    turbo_client::ProjectedSpanSet {
+        utf8: (start, end),
+        utf16: (start, end),
+        code_point: (start, end),
+    }
+}
+
+#[cfg(feature = "net")]
+fn search_projection_to_nlp(
+    proj: &SearchDocumentProjection,
+) -> turbo_client::DocumentNlpProjection {
+    let nt = proj.numeric_temporal.as_ref();
+    let money = nt
+        .map(|n| {
+            n.money
+                .iter()
+                .map(|m| turbo_client::MoneyHit {
+                    spans: utf8_only_spans(m.span_start, m.span_end),
+                    currency: m.currency.clone(),
+                    amount_f64: m.amount_f64,
+                    plain_amount: m.plain_amount.clone(),
+                    per: m.per.clone(),
+                    ecb_converted: m.ecb_converted,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let quantities = nt
+        .map(|n| {
+            n.quantities
+                .iter()
+                .map(|q| turbo_client::QuantityHit {
+                    spans: utf8_only_spans(q.span_start, q.span_end),
+                    unit: q.unit.clone(),
+                    value_f64: q.value_f64,
+                    plain_value: q.plain_value.clone(),
+                    is_percent: q.is_percent,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let document_date =
+        nt.and_then(|n| n.document_date.as_ref())
+            .map(|d| turbo_client::UtcDateSummary {
+                iso: d.iso.clone(),
+                epoch_seconds: d.epoch_seconds,
+                year: d.year,
+                month: d.month,
+                day: d.day,
+            });
+    let temporals = nt
+        .map(|n| {
+            n.temporals
+                .iter()
+                .map(|t| turbo_client::TemporalHit {
+                    spans: utf8_only_spans(t.span_start, t.span_end),
+                    granularity: t.granularity.clone(),
+                    origin: t.origin.clone(),
+                    iso: t.iso.clone(),
+                    start_epoch_seconds: t.start_epoch_seconds,
+                    end_epoch_seconds: t.end_epoch_seconds,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let geo = proj
+        .geo_locations
+        .iter()
+        .map(|g| turbo_client::GeoHit {
+            spans: utf8_only_spans(g.span_start, g.span_end),
+            record_id: g.record_id.clone(),
+            canonical_name: g.canonical_name.clone(),
+            country_code: g.country_code.clone(),
+            latitude: g.latitude,
+            longitude: g.longitude,
+            spine_path: g.spine_path.clone(),
+            confidence: g.confidence,
+        })
+        .collect();
+    let sentiment = proj
+        .categories_sentiment
+        .as_ref()
+        .map(|cs| turbo_client::SentimentSummary {
+            label: cs.sentiment_label.clone(),
+            probability: cs.sentiment_score,
+        })
+        .unwrap_or(turbo_client::SentimentSummary {
+            label: None,
+            probability: None,
+        });
+    let quality = proj
+        .quality
+        .as_ref()
+        .map(|q| turbo_client::QualitySummary {
+            assessed: q.noise_state == SearchAssessmentState::Assessed as i32
+                || q.artifacts_state == SearchAssessmentState::Assessed as i32
+                || q.text_quality_state == SearchAssessmentState::Assessed as i32,
+            worst_noise_score: q.worst_noise_score,
+            union_noise_chars: q.union_noise_chars,
+            artifact_count: q.artifact_count,
+            composite_score: q
+                .metrics
+                .as_ref()
+                .and_then(|m| m.composite_score.map(f64::from)),
+        })
+        .unwrap_or(turbo_client::QualitySummary {
+            assessed: false,
+            worst_noise_score: 0.0,
+            union_noise_chars: 0,
+            artifact_count: 0,
+            composite_score: None,
+        });
+    let map_ent =
+        |e: &turbo_client::proto::result::SearchLinkedEntity| turbo_client::EntityPolarityHit {
+            spans: utf8_only_spans(e.span_start, e.span_end),
+            surface: if e.matched_alias.is_empty() {
+                e.canonical_name.clone()
+            } else {
+                e.matched_alias.clone()
+            },
+            kind: e.entity_kind.clone(),
+            kb_id: e.kb_id.clone(),
+            canonical_name: (!e.canonical_name.is_empty()).then(|| e.canonical_name.clone()),
+            score: e.score,
+            epistemic: e.epistemic.clone(),
+            cue: e.cue.clone(),
+        };
+    let affirmed_entities = proj
+        .entities
+        .as_ref()
+        .map(|ep| ep.affirmed.iter().map(map_ent).collect())
+        .unwrap_or_default();
+    let negated_entities = proj
+        .entities
+        .as_ref()
+        .map(|ep| ep.negated.iter().map(map_ent).collect())
+        .unwrap_or_default();
+    let sketch = proj
+        .document_sketch
+        .as_ref()
+        .map(|sk| turbo_client::DocumentSketch {
+            word_count: sk.words,
+            exact: (u128::from(sk.exact_hi) << 64) | u128::from(sk.exact_lo),
+            shape: sk.shape_hash,
+            simhash: sk.simhash,
+            minhash: sk.minhash.clone(),
+        })
+        .unwrap_or(turbo_client::DocumentSketch {
+            word_count: 0,
+            exact: 0,
+            shape: 0,
+            simhash: 0,
+            minhash: Vec::new(),
+        });
+    turbo_client::DocumentNlpProjection {
+        money,
+        quantities,
+        document_date,
+        temporals,
+        geo,
+        sentiment,
+        quality,
+        affirmed_entities,
+        negated_entities,
+        sketch,
+    }
+}
+
 /// Embed `text` through `turbo-kserve`'s Open Inference Protocol (`ModelInfer`)
 /// into one L2-normalized query vector.
 pub async fn embed_text(addr: &str, text: &str) -> Result<Vec<f32>, Status> {
+    embed_text_with_options(
+        addr,
+        text,
+        &RemoteCallOptions {
+            interactive: true,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// Embed `text` through `turbo-kserve` with explicit [`RemoteCallOptions`]
+/// (mTLS, bearer auth, RPC deadline, and optional [`turbo_client::IndexGenerationHandshake`]
+/// model verification via `ModelMetadata`).
+pub async fn embed_text_with_options(
+    addr: &str,
+    text: &str,
+    options: &RemoteCallOptions,
+) -> Result<Vec<f32>, Status> {
     match AnalysisBackend::parse(addr)? {
         AnalysisBackend::Native | AnalysisBackend::Turbo => {
             return Err(Status::failed_precondition(
@@ -1090,28 +1633,42 @@ pub async fn embed_text(addr: &str, text: &str) -> Result<Vec<f32>, Status> {
     }
     #[cfg(not(feature = "net"))]
     {
+        let _ = options;
         Err(sidecar_needs_net(addr))
     }
     #[cfg(feature = "net")]
     {
-        let (clean_addr, model_name) = split_model_query_param(addr);
-        let remote = remote_client_for(
-            &clean_addr,
-            &RemoteCallOptions {
-                interactive: true,
-                ..Default::default()
-            },
-        )?;
+        let (clean_addr, model_name, uri_handshake) = parse_embed_endpoint(addr);
+        let remote = remote_client_for(&clean_addr, options)?;
+        if let Some(hs) = options
+            .expected_handshake
+            .as_ref()
+            .or(uri_handshake.as_ref())
+        {
+            if hs.bundle.is_some() {
+                remote
+                    .verify_model_handshake(&model_name, "", hs)
+                    .await
+                    .map_err(|e| inspect_remote_client_err(&clean_addr, e))?;
+            }
+        } else {
+            enforce_tofu_remote_model_handshake(&clean_addr, &model_name, &remote).await?;
+        }
+        let prio = if options.interactive {
+            turbo_client::RemotePriority::Interactive
+        } else {
+            turbo_client::RemotePriority::Bulk
+        };
         let (mut vec, dim) = remote
             .embed_texts(
                 &model_name,
                 &[text],
                 Some("query"),
-                Some(turbo_client::RemotePriority::Interactive),
-                None,
+                Some(prio),
+                options.timeout,
             )
             .await
-            .map_err(client_err_to_status)?;
+            .map_err(|e| inspect_remote_client_err(&clean_addr, e))?;
         if vec.is_empty() || dim == 0 {
             return Err(Status::failed_precondition(
                 "turbo-kserve returned no embeddings",
@@ -1134,18 +1691,143 @@ pub async fn embed_text(addr: &str, text: &str) -> Result<Vec<f32>, Status> {
 }
 
 #[cfg(feature = "net")]
-fn split_model_query_param(addr: &str) -> (String, String) {
-    if let Some((base, query)) = addr.split_once('?') {
-        for pair in query.split('&') {
-            if let Some(("model", value)) = pair.split_once('=') {
-                if !value.trim().is_empty() {
-                    return (base.to_string(), value.trim().to_string());
+static PINNED_REMOTE_MODEL_HANDSHAKES: OnceLock<
+    Mutex<HashMap<(String, String), turbo_client::IndexGenerationHandshake>>,
+> = OnceLock::new();
+
+#[cfg(feature = "net")]
+async fn enforce_tofu_remote_model_handshake(
+    clean_addr: &str,
+    model_name: &str,
+    remote: &turbo_client::RemoteClient,
+) -> Result<(), Status> {
+    let key = (clean_addr.to_string(), model_name.to_string());
+    let pinned = PINNED_REMOTE_MODEL_HANDSHAKES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("pinned remote model handshakes poisoned")
+        .get(&key)
+        .cloned();
+    match pinned {
+        Some(expected) => {
+            remote
+                .verify_model_handshake(model_name, "", &expected)
+                .await
+                .map_err(|e| inspect_remote_client_err(clean_addr, e))?;
+            Ok(())
+        }
+        None => {
+            let probe = turbo_client::IndexGenerationHandshake {
+                analysis: None,
+                bundle: None,
+            };
+            match remote.verify_model_handshake(model_name, "", &probe).await {
+                Ok((_, fp)) => {
+                    if fp.sha256 != [0u8; 32] {
+                        let mut map = PINNED_REMOTE_MODEL_HANDSHAKES
+                            .get_or_init(|| Mutex::new(HashMap::new()))
+                            .lock()
+                            .expect("pinned remote model handshakes poisoned");
+                        match map.get(&key) {
+                            Some(existing) => {
+                                existing.verify_bundle(&fp).map_err(client_err_to_status)?;
+                            }
+                            None => {
+                                map.insert(
+                                    key,
+                                    turbo_client::IndexGenerationHandshake {
+                                        analysis: None,
+                                        bundle: Some(fp),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    let status = client_err_to_status(e);
+                    if status.code() == tonic::Code::Unimplemented {
+                        Ok(())
+                    } else {
+                        Err(inspect_remote_status(clean_addr, status))
+                    }
                 }
             }
         }
-        return (base.to_string(), env_embed_model());
     }
-    (addr.to_string(), env_embed_model())
+}
+
+#[cfg(feature = "net")]
+fn parse_embed_endpoint(
+    addr: &str,
+) -> (
+    String,
+    String,
+    Option<turbo_client::IndexGenerationHandshake>,
+) {
+    let mut model = None;
+    let mut sha256 = None;
+    let mut dim = None;
+    let mut revision = String::new();
+    let mut pooling = "mean".to_string();
+    let mut normalize = "l2".to_string();
+
+    let base = if let Some((base, query)) = addr.split_once('?') {
+        for pair in query.split('&') {
+            let Some((k, v)) = pair.split_once('=') else {
+                continue;
+            };
+            let val = v.trim();
+            if val.is_empty() {
+                continue;
+            }
+            match k.trim() {
+                "model" => model = Some(val.to_string()),
+                "sha256" | "manifest_sha256" => sha256 = Some(val.to_string()),
+                "dim" => dim = val.parse::<u32>().ok(),
+                "revision" => revision = val.to_string(),
+                "pooling" => pooling = val.to_string(),
+                "normalize" => normalize = val.to_string(),
+                _ => {}
+            }
+        }
+        base.to_string()
+    } else {
+        addr.to_string()
+    };
+
+    let resolved_model = model.unwrap_or_else(env_embed_model);
+    if sha256.is_none() {
+        sha256 = std::env::var("TURBO_MODEL_SHA256")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+    }
+    if dim.is_none() {
+        dim = std::env::var("TURBO_MODEL_DIM")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+    }
+
+    let hs = sha256.map(|manifest_sha256| {
+        let bundle_fp = turbo_client::BundleScoringSpec {
+            model_id: resolved_model.clone(),
+            revision,
+            manifest_sha256,
+            task: "embed".to_string(),
+            dim: dim.unwrap_or(0),
+            pooling,
+            normalize,
+        }
+        .fingerprint();
+        turbo_client::IndexGenerationHandshake {
+            analysis: None,
+            bundle: Some(bundle_fp),
+        }
+    });
+
+    (base, resolved_model, hs)
 }
 
 #[cfg(feature = "net")]
@@ -1169,7 +1851,7 @@ pub struct SessionLayers {
     pub sentences: bool,
     /// Both folded and cased term identities from one pass (`docs/dual-cased.md`).
     pub dual_cased: bool,
-    /// Full one-pass `DocumentNlpProjection` retained for pre-WAL typed column materialization (`#103`).
+    /// Full one-pass `DocumentNlpProjection` retained for pre-WAL typed column materialization.
     pub nlp_columns: bool,
 }
 
@@ -1285,9 +1967,18 @@ pub struct AnalyzeStream {
     layers: SessionLayers,
 }
 
+#[cfg(feature = "net")]
+struct RemoteStreamState {
+    addr: String,
+    remote: turbo_client::RemoteClient,
+    client: AnalysisServiceClient<Channel>,
+    timeout: Option<Duration>,
+    responses: Streaming<AnalyzeStreamResponse>,
+}
+
 enum AnalyzeResponses {
     #[cfg(feature = "net")]
-    Remote(Box<Streaming<AnalyzeStreamResponse>>),
+    Remote(Box<RemoteStreamState>),
     InProcess(tokio::sync::mpsc::Receiver<InProcessResponse>),
 }
 
@@ -1359,7 +2050,11 @@ impl AnalyzeStream {
                         options.timeout,
                     )
                     .map_err(client_err_to_status)?;
-                let capabilities = client.capabilities(cap_req).await?.into_inner();
+                let capabilities = client
+                    .capabilities(cap_req)
+                    .await
+                    .map_err(|s| inspect_remote_status(addr, s))?
+                    .into_inner();
                 let ner_available = capabilities.profiles.iter().any(|p| {
                     p.layers
                         .iter()
@@ -1405,13 +2100,24 @@ impl AnalyzeStream {
             };
             let stream_req = remote
                 .prepare_request(ReceiverStream::new(feed), Some(prio), options.timeout)
-                .map_err(client_err_to_status)?;
-            let responses = client.analyze_stream(stream_req).await?.into_inner();
+                .map_err(|e| inspect_remote_client_err(addr, e))?;
+            let proj_client = client.clone();
+            let responses = client
+                .analyze_stream(stream_req)
+                .await
+                .map_err(|s| inspect_remote_status(addr, s))?
+                .into_inner();
             Ok(Self {
                 submit: Some(AnalyzeSubmit {
                     requests: AnalyzeRequests::Remote { tx, binding },
                 }),
-                responses: AnalyzeResponses::Remote(Box::new(responses)),
+                responses: AnalyzeResponses::Remote(Box::new(RemoteStreamState {
+                    addr: addr.to_string(),
+                    remote,
+                    client: proj_client,
+                    timeout: options.timeout,
+                    responses,
+                })),
                 vocab,
                 spec: spec.cloned(),
                 layers,
@@ -1614,35 +2320,47 @@ impl AnalyzeStream {
     pub async fn next(&mut self) -> Result<Option<(u64, Result<AnalyzedDoc, Status>)>, Status> {
         match &mut self.responses {
             #[cfg(feature = "net")]
-            AnalyzeResponses::Remote(responses) => match responses.message().await? {
-                Some(response) => {
-                    let sequence = response.id.parse::<u64>().map_err(|_| {
-                        Status::internal(format!(
-                            "analysis stream returned non-numeric correlation id {:?}",
-                            response.id
-                        ))
-                    })?;
-                    let result = match response.outcome {
-                        Some(analyze_stream_response::Outcome::DocumentGraph(graph)) => {
-                            decode_graph_response(
-                                graph,
-                                self.spec.as_ref(),
-                                self.layers,
-                                self.vocab.as_ref(),
-                            )
-                        }
-                        Some(analyze_stream_response::Outcome::Failure(failure)) => {
-                            Err(wire::status_from_analyze_failure(failure))
-                        }
-                        Some(_) => Err(Status::internal(
-                            "analysis stream returned unexpected non-graph outcome",
-                        )),
-                        None => Err(Status::internal("stream response carries no outcome")),
-                    };
-                    Ok(Some((sequence, result)))
+            AnalyzeResponses::Remote(state) => {
+                match state
+                    .responses
+                    .message()
+                    .await
+                    .map_err(|s| inspect_remote_status(&state.addr, s))?
+                {
+                    Some(response) => {
+                        let sequence = response.id.parse::<u64>().map_err(|_| {
+                            Status::internal(format!(
+                                "analysis stream returned non-numeric correlation id {:?}",
+                                response.id
+                            ))
+                        })?;
+                        let result = match response.outcome {
+                            Some(analyze_stream_response::Outcome::DocumentGraph(graph)) => {
+                                decode_graph_response_remote(
+                                    &state.addr,
+                                    &state.remote,
+                                    &mut state.client,
+                                    graph,
+                                    self.spec.as_ref(),
+                                    self.layers,
+                                    state.timeout,
+                                    self.vocab.as_ref(),
+                                )
+                                .await
+                            }
+                            Some(analyze_stream_response::Outcome::Failure(failure)) => {
+                                Err(wire::status_from_analyze_failure(failure))
+                            }
+                            Some(_) => Err(Status::internal(
+                                "analysis stream returned unexpected non-graph outcome",
+                            )),
+                            None => Err(Status::internal("stream response carries no outcome")),
+                        };
+                        Ok(Some((sequence, result)))
+                    }
+                    None => Ok(None),
                 }
-                None => Ok(None),
-            },
+            }
             AnalyzeResponses::InProcess(responses) => {
                 let _ = &self.spec;
                 let _ = &self.layers;

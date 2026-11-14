@@ -774,7 +774,7 @@ fn apply_datagram(
 }
 
 /// The gRPC deadline of a request, from its `grpc-timeout` header.
-fn grpc_timeout(metadata: &tonic::metadata::MetadataMap) -> Option<Duration> {
+pub(crate) fn grpc_timeout(metadata: &tonic::metadata::MetadataMap) -> Option<Duration> {
     let text = metadata.get("grpc-timeout")?.to_str().ok()?;
     let (digits, unit) = text.split_at(text.len().checked_sub(1)?);
     let value: u64 = digits.parse().ok()?;
@@ -1567,16 +1567,23 @@ async fn relay_stream(
                     score: 0.0,
                 });
             }
-            let mut identities = fanout
-                .resolve_identities(&hits, &summaries, &mut terminal, &limits)
+            let (mut resolved_identities, mut resolved_candidates) = fanout
+                .resolve_identities_and_candidates(&hits, &summaries, &mut terminal, &limits)
                 .await?;
             let rows = hits
                 .into_iter()
-                .map(|hit| crate::pb::StreamIdentity {
-                    vector_id: hit.vector_id,
-                    identity: identities
+                .map(|hit| {
+                    let identity = resolved_identities
                         .remove(&(hit.shard, hit.vector_id))
-                        .expect("validated child response"),
+                        .expect("validated child response");
+                    let rerank_candidate = resolved_candidates
+                        .remove(&(hit.shard, hit.vector_id))
+                        .flatten();
+                    crate::pb::StreamIdentity {
+                        vector_id: hit.vector_id,
+                        identity,
+                        rerank_candidate,
+                    }
                 })
                 .collect();
             let response = StreamSearchResponse {
@@ -2808,6 +2815,7 @@ async fn relay_shard_search(
             floor_share_ppm: child_floor_shares.get(child).copied().flatten(),
             floor_greediness_ppm: filters.floor_greediness_ppm,
             floor_clamp_min: filters.floor_clamp_min,
+            include_rerank_candidate: start.include_rerank_candidate,
         };
         req_tx
             .try_send(SearchShardRequest {
@@ -3609,6 +3617,7 @@ impl NodeService for RelayService {
                 parent_floor_share_ppm: start.floor_share_ppm,
                 floor_greediness_ppm: start.floor_greediness_ppm,
                 floor_clamp_min: start.floor_clamp_min,
+                include_rerank_candidate: start.include_rerank_candidate,
             };
             let signals = Arc::new(RelaySignals::new(
                 start.initial_floor.unwrap_or(f32::NEG_INFINITY),
@@ -3829,6 +3838,7 @@ impl NodeService for RelayService {
                 parent_floor_share_ppm: start.floor_share_ppm,
                 floor_greediness_ppm: start.floor_greediness_ppm,
                 floor_clamp_min: start.floor_clamp_min,
+                include_rerank_candidate: start.include_rerank_candidate,
             };
             let (tx, rx) = mpsc::channel::<Result<SearchShardResponse, Status>>(64);
             let (pinned, frozen) = self.pin();
@@ -5187,6 +5197,7 @@ impl NodeService for RelayService {
                 parent_floor_share_ppm: None,
                 floor_greediness_ppm: None,
                 floor_clamp_min: None,
+                include_rerank_candidate: false,
             };
             let (pinned, frozen) = self.pin();
             let children = frozen.node_addresses().to_vec();
@@ -5603,6 +5614,98 @@ impl NodeService for RelayService {
         _request: Request<crate::pb::CompactShardRequest>,
     ) -> Result<Response<crate::pb::CompactShardResponse>, Status> {
         Err(refused("CompactShard"))
+    }
+
+    async fn score_splade(
+        &self,
+        request: Request<crate::pb::ScoreSpladeRequest>,
+    ) -> Result<Response<crate::pb::ScoreSpladeResponse>, Status> {
+        crate::metrics::timed(Route::ScoreSplade, request, |request| async move {
+            let timeout = grpc_timeout(request.metadata());
+            let req = request.into_inner();
+            if let Some(f) = req.filter.as_ref() {
+                crate::filter::validate_filter(f)?;
+            }
+            let (pinned, frozen, children, claims) = self.open_children(
+                "ScoreSplade",
+                req.visibility.as_ref(),
+                req.expected_stats_epoch,
+                &req.expected_stats_incarnation,
+            )?;
+            let requests = claims
+                .iter()
+                .map(|claim| {
+                    let mut child_req = req.clone();
+                    child_req.expected_stats_epoch = claim.epoch;
+                    child_req.expected_stats_incarnation = claim.incarnation();
+                    Some(child_req)
+                })
+                .collect();
+            let shares: Vec<crate::pb::ScoreSpladeResponse> = fan_out(
+                &frozen,
+                &children,
+                requests,
+                timeout,
+                "score_splade",
+                |mut link, request| async move { link.score_splade(request).await },
+            )
+            .await?
+            .into_iter()
+            .map(|(_, share)| share)
+            .collect();
+            let mut merged = crate::pb::ScoreSpladeResponse::default();
+            let mut filter_known = None;
+            let k = req.k as usize;
+            for (shard, share) in shares.iter().enumerate() {
+                merge_known(
+                    "filter-leaf",
+                    shard,
+                    &mut filter_known,
+                    &share.filter_columns_known,
+                )?;
+                merged.field_known |= share.field_known;
+                merged.blocks_visited = merged.blocks_visited.saturating_add(share.blocks_visited);
+                merged.blocks_skipped = merged.blocks_skipped.saturating_add(share.blocks_skipped);
+                merged.postings_scored =
+                    merged.postings_scored.saturating_add(share.postings_scored);
+                merged.hits.extend(share.hits.iter().copied());
+            }
+            merged.hits.sort_unstable_by(|a, b| {
+                b.score
+                    .total_cmp(&a.score)
+                    .then_with(|| a.doc_id.cmp(&b.doc_id))
+            });
+            if k > 0 && merged.hits.len() > k {
+                merged.hits.truncate(k);
+            } else if k == 0 {
+                merged.hits.clear();
+            }
+            merged.final_floor = if k > 0 && merged.hits.len() == k {
+                merged
+                    .hits
+                    .last()
+                    .unwrap()
+                    .score
+                    .max(req.initial_floor.max(0.0))
+            } else {
+                req.initial_floor.max(0.0)
+            };
+            merged.filter_columns_known = filter_known.unwrap_or_default();
+            let receipt = self.read_receipt(
+                &pinned,
+                children,
+                req.visibility.as_ref(),
+                Some(&claims),
+                &shares,
+            )?;
+            merged.stats_epoch = receipt.stats_epoch;
+            merged.stats_incarnation = receipt.stats_incarnation;
+            merged.visibility_fingerprint = receipt.visibility_fingerprint;
+            merged.visibility_columns_known = receipt.visibility_columns_known;
+            self.still_current(&pinned, "ScoreSplade")?;
+            Ok(Response::new(merged))
+        })
+        .await
     }
 }
 

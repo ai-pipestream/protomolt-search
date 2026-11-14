@@ -175,6 +175,7 @@ fn body_only(text: &str) -> SearchVariant {
             prefixes: Vec::new(),
             synonyms: Vec::new(),
             synonyms_off: false,
+            pre_analyzed_terms: Vec::new(),
         })),
     }
 }
@@ -228,6 +229,7 @@ fn with_case_name(label: &str, text: &str, w_name: f32) -> SearchVariant {
             prefixes: Vec::new(),
             synonyms: Vec::new(),
             synonyms_off: false,
+            pre_analyzed_terms: Vec::new(),
         })),
     }
 }
@@ -574,6 +576,7 @@ async fn k_is_optional_and_the_cap_refuses_rather_than_clamps() {
         prefixes: Vec::new(),
         synonyms: Vec::new(),
         synonyms_off: false,
+        pre_analyzed_terms: Vec::new(),
     };
 
     // Omitted k runs at the default cap: deep enough to find every

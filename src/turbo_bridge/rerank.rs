@@ -1,4 +1,4 @@
-//! Stage-2 calibrated `RerankAndHighlight` integration (`#105` / `turboembed` `#2342`).
+//! Stage-2 calibrated `RerankAndHighlight` integration.
 //!
 //! Reranks a top-`C` Stage-1 shortlist into calibrated `[0.0, 1.0]` relevance
 //! probabilities while attributing semantic highlight spans (`QueryHit.snippets`)
@@ -15,7 +15,7 @@ use tonic::Status;
 use crate::pb::{OffsetSpan, Snippet, SnippetCut};
 use crate::turbo_bridge::remaining_deadline_duration;
 
-/// Execution backend for Stage-2 calibrated reranking and semantic highlighting (`#105`).
+/// Execution backend for Stage-2 calibrated reranking and semantic highlighting.
 #[derive(Clone)]
 pub enum RerankBackend {
     /// Remote `turbo-kserve` `AnalysisService::RerankAndHighlight` execution over
@@ -74,7 +74,7 @@ impl std::fmt::Debug for RerankBackend {
 }
 
 /// Stage-2 reranking and semantic highlight policy attached to a coordinator
-/// or query execution plan (`#105`).
+/// or query execution plan.
 #[derive(Clone, Debug)]
 pub struct RerankSpec {
     /// Maximum Stage-1 shortlist depth `C` sent to the cross-encoder (`>= 1`).
@@ -147,7 +147,7 @@ pub struct RerankedHit {
 
 /// Reranks up to `spec.shortlist_size` candidates in descending order of
 /// calibrated `[0.0, 1.0]` relevance probability and attributes semantic
-/// highlight snippets (`#105`).
+/// highlight snippets.
 pub async fn rerank_and_highlight_shortlist(
     spec: &RerankSpec,
     query_text: &str,
@@ -217,7 +217,7 @@ pub async fn rerank_and_highlight_shortlist(
             let resp = client
                 .rerank_and_highlight(req, _timeout)
                 .await
-                .map_err(|e| Status::from_error(Box::new(e)))?;
+                .map_err(|e| crate::analyzer::remote_client_err_to_status(client, e))?;
 
             let mut out = Vec::with_capacity(resp.results.len());
             for item in resp.results {

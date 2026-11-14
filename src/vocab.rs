@@ -1306,7 +1306,7 @@ fn scan_snapshots(vocab_dir: &Path) -> io::Result<(Vec<SnapshotMeta>, HashMap<u6
 }
 
 /// Streams collection-wide `(term, doc_freq)` statistics to `turbo-kserve`'s
-/// `TurboVocabularyService::ImportCorpusStatistics` (`#105` / `turboembed` `#2346`),
+/// `TurboVocabularyService::ImportCorpusStatistics`,
 /// compiling a deterministic `TCIDF001` corpus IDF artifact under `Bulk` priority.
 #[cfg(feature = "net")]
 pub async fn export_corpus_statistics_to_kserve(
@@ -1347,18 +1347,19 @@ pub async fn export_corpus_statistics_to_kserve(
 
     let mut vocab = client
         .vocabulary_client()
-        .map_err(|e| tonic::Status::from_error(Box::new(e)))?;
+        .map_err(|e| crate::analyzer::remote_client_err_to_status(client, e))?;
     let req = client
         .prepare_request(
             tokio_stream::iter(frames),
             Some(turbo_client::RemotePriority::Bulk),
             timeout,
         )
-        .map_err(|e| tonic::Status::from_error(Box::new(e)))?;
+        .map_err(|e| crate::analyzer::remote_client_err_to_status(client, e))?;
     vocab
         .import_corpus_statistics(req)
         .await
         .map(|r| r.into_inner())
+        .map_err(|s| crate::analyzer::inspect_remote_status(&client.config().endpoint, s))
 }
 
 #[cfg(test)]

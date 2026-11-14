@@ -888,6 +888,7 @@ async fn distributed_geo_filters_are_exact_and_boundary_correct() {
             prefixes: Vec::new(),
             synonyms: Vec::new(),
             synonyms_off: false,
+            pre_analyzed_terms: Vec::new(),
         }),
     )
     .await

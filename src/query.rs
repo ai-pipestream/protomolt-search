@@ -18,7 +18,7 @@
 //! unsupported construct and, where one exists, the supported way to
 //! ask for the same thing.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -865,10 +865,11 @@ enum Shape<'a> {
     },
 }
 
-/// Execute one public query by delegating to the ordinary routes.
+/// Execute one public query with an explicit Stage-2 deadline (epoch microseconds; `0` = unbounded).
 pub(crate) async fn execute(
     coordinator: &CoordinatorServiceImpl,
     req: QueryRequest,
+    finish_deadline_us: u64,
 ) -> Result<QueryResponse, Status> {
     let t_total = std::time::Instant::now();
     // Purely observational: the same request with profile off returns
@@ -984,7 +985,7 @@ pub(crate) async fn execute(
             // The policy key AUTO is judged on: k as sent, the named
             // candidate depth, and the request's filters (their live
             // selectivity is measured only when a policy is consulted).
-            let filters = (!plan.geo_filters.is_empty() || !plan.cel.is_empty())
+            let filters = (!plan.geo_filters.is_empty() || !filter.is_empty())
                 .then(|| crate::coordinator::RequestFilters::compile(&plan.geo_filters, &filter))
                 .transpose()?;
             Some(
@@ -1005,16 +1006,37 @@ pub(crate) async fn execute(
     };
     // A policy point fixes the candidate depth AUTO runs at; it is the
     // depth that was measured, reported back, and never widened.
-    let policy_depth: Option<u32> = dense_execution
+    let mut policy_depth: Option<u32> = dense_execution
         .as_ref()
         .filter(|o| o.resolved_mode == DenseExecutionMode::Ann as i32 && o.policy_point.is_some())
         .map(|o| o.candidate_depth);
     // And the enumerate threshold the shards answer the filter under
     // (docs/dense-execution-policy.md, "Filter regimes").
-    let policy_enumerate_max_rows: Option<u32> = dense_execution
+    let mut policy_enumerate_max_rows: Option<u32> = dense_execution
         .as_ref()
         .and_then(|o| o.policy_point.as_ref())
         .and_then(|point| point.enumerate_max_rows);
+    if let (Some(outcome), Some(bound)) = (dense_execution.as_mut(), one_pass_bound.as_ref()) {
+        if outcome.resolved_mode == DenseExecutionMode::Ann as i32
+            && outcome.policy_point.is_none()
+            && bound.estimated_selectivity < 1.0
+        {
+            match crate::turbo_bridge::query_plan::select_filtered_ann_strategy(
+                outcome.candidate_depth.max(req.k),
+                req.k,
+                50_000,
+                bound.estimated_selectivity,
+            ) {
+                crate::turbo_bridge::query_plan::FilteredAnnStrategy::PrefilteredExact => {
+                    policy_enumerate_max_rows = Some(req.k.saturating_mul(8).max(256));
+                }
+                crate::turbo_bridge::query_plan::FilteredAnnStrategy::Graph { ef_search } => {
+                    policy_depth = Some(ef_search);
+                    outcome.candidate_depth = ef_search;
+                }
+            }
+        }
+    }
     let (policy_patience_saturation_ppm, policy_patience_hops) = dense_execution
         .as_ref()
         .and_then(|o| o.policy_point.as_ref())
@@ -1366,9 +1388,22 @@ pub(crate) async fn execute(
             // column order (validated above: no relevance shape rides
             // along). Analysis happens once here; the shards read the
             // same postings the bitmap route would.
-            let terms = coordinator
-                .analyze_terms(&query.text, query.analysis.as_ref())
-                .await?;
+            let pre_terms: Vec<String> = one_pass_bound
+                .as_ref()
+                .filter(|b| {
+                    !b.residual_terms.is_empty()
+                        && (query.analysis.is_none()
+                            || query.analysis.as_ref() == Some(&crate::analyzer::body_spec()))
+                })
+                .map(|b| b.residual_terms.iter().map(|(t, _)| t.clone()).collect())
+                .unwrap_or_default();
+            let terms = if !pre_terms.is_empty() {
+                pre_terms
+            } else {
+                coordinator
+                    .analyze_terms(&query.text, query.analysis.as_ref())
+                    .await?
+            };
             if terms.is_empty() {
                 let mut response = done(
                     req.request_id.clone(),
@@ -1402,6 +1437,17 @@ pub(crate) async fn execute(
                 .as_ref()
                 .filter(|b| !b.synthesized_cel.is_empty() && !b.residual_text.trim().is_empty())
                 .map_or_else(|| query.text.clone(), |b| b.residual_text.clone());
+            let pre_analyzed_terms: Vec<String> = one_pass_bound
+                .as_ref()
+                .filter(|b| {
+                    !b.residual_terms.is_empty()
+                        && query.phrase.is_none()
+                        && query.prefixes.is_empty()
+                        && (query.analysis.is_none()
+                            || query.analysis.as_ref() == Some(&crate::analyzer::body_spec()))
+                })
+                .map(|b| b.residual_terms.iter().map(|(t, _)| t.clone()).collect())
+                .unwrap_or_default();
             let response = coordinator
                 .bm25_search(crate::metrics::nested(Request::new(Bm25SearchRequest {
                     text: effective_text,
@@ -1417,6 +1463,7 @@ pub(crate) async fn execute(
                     synonyms: query.synonyms.clone(),
                     synonyms_off: query.synonyms_off,
                     explain: req.explain,
+                    pre_analyzed_terms,
                     ..Default::default()
                 })))
                 .await?
@@ -1462,9 +1509,26 @@ pub(crate) async fn execute(
                     )?);
                 }
             }
+            let mut route = "bm25_search";
+            if let Some(rerank_spec) = coordinator.rerank_spec() {
+                let q_text = rerank_spec
+                    .query_text_override
+                    .as_deref()
+                    .unwrap_or(&query.text);
+                let empty_inline = HashMap::new();
+                apply_turbo_rerank(
+                    coordinator,
+                    rerank_spec,
+                    q_text,
+                    &empty_inline,
+                    finish_deadline_us,
+                    &mut hits,
+                )
+                .await?;
+                route = "bm25_search:turbo_rerank";
+            }
             apply_boosts(coordinator, &boosts, &mut hits, scorer.is_some(), &mut prof).await?;
-            let executed =
-                apply_scorer(coordinator, &scorer, &mut hits, "bm25_search", &mut prof).await?;
+            let executed = apply_scorer(coordinator, &scorer, &mut hits, route, &mut prof).await?;
             let pool_ids: Vec<u64> = hits.iter().map(|h| h.doc_id).collect();
             if req.explain {
                 crate::explain::finish(&mut hits, &window_boosts, scorer_name.as_deref())?;
@@ -1481,7 +1545,9 @@ pub(crate) async fn execute(
             )
             .await?
             {
-                Paged::Deepen(depth) => return deepen(coordinator, &req, depth).await,
+                Paged::Deepen(depth) => {
+                    return deepen(coordinator, &req, depth, finish_deadline_us).await
+                }
                 Paged::Done(hits, groups, next, executed) => (hits, groups, next, executed),
             };
             fill_projected_groups(coordinator, &compiled_projections, &mut groups, &mut prof)
@@ -1502,6 +1568,7 @@ pub(crate) async fn execute(
         }
         Shape::Dense { id, query } => {
             let t_sel = std::time::Instant::now();
+            let want_rerank_candidates = coordinator.rerank_spec().is_some();
             let response = coordinator
                 .search(crate::metrics::nested(Request::new(SearchRequest {
                     request_id: req.request_id.clone(),
@@ -1516,6 +1583,7 @@ pub(crate) async fn execute(
                     floor_prune: policy_floor_prune,
                     floor_greediness_ppm: policy_floor_greediness_ppm,
                     floor_clamp_min: policy_floor_clamp_min,
+                    include_rerank_candidate: want_rerank_candidates,
                     ..Default::default()
                 })))
                 .await?
@@ -1533,6 +1601,15 @@ pub(crate) async fn execute(
                 outcome.patience_stopped = response.patience_stopped;
                 outcome.shards_finished_early = response.shards_finished_early;
                 outcome.shards_floor_pruned = response.shards_floor_pruned;
+            }
+            let mut inline_candidates: HashMap<u64, crate::pb::RerankCandidatePayload> =
+                HashMap::new();
+            for h in &response.hits {
+                if let Some(cand) = h.rerank_candidate.as_ref() {
+                    inline_candidates
+                        .entry(h.vector_id)
+                        .or_insert_with(|| cand.clone());
+                }
             }
             let mut hits: Vec<QueryHit> = response
                 .hits
@@ -1606,7 +1683,15 @@ pub(crate) async fn execute(
                     .query_text_override
                     .as_deref()
                     .unwrap_or(&req.request_id);
-                apply_turbo_rerank(coordinator, rerank_spec, q_text, &mut hits).await?;
+                apply_turbo_rerank(
+                    coordinator,
+                    rerank_spec,
+                    q_text,
+                    &inline_candidates,
+                    finish_deadline_us,
+                    &mut hits,
+                )
+                .await?;
                 route = "search:turbo_rerank";
             }
             apply_boosts(coordinator, &boosts, &mut hits, scorer.is_some(), &mut prof).await?;
@@ -1627,7 +1712,9 @@ pub(crate) async fn execute(
             )
             .await?
             {
-                Paged::Deepen(depth) => return deepen(coordinator, &req, depth).await,
+                Paged::Deepen(depth) => {
+                    return deepen(coordinator, &req, depth, finish_deadline_us).await
+                }
                 Paged::Done(hits, groups, next, executed) => (hits, groups, next, executed),
             };
             fill_projected(coordinator, &compiled_projections, &mut hits, &mut prof).await?;
@@ -1698,6 +1785,18 @@ pub(crate) async fn execute(
                 .as_ref()
                 .filter(|b| !b.synthesized_cel.is_empty() && !b.residual_text.trim().is_empty())
                 .map_or_else(|| lexical.text.clone(), |b| b.residual_text.clone());
+            let pre_analyzed_terms: Vec<String> = one_pass_bound
+                .as_ref()
+                .filter(|b| {
+                    !b.residual_terms.is_empty()
+                        && lexical.phrase.is_none()
+                        && lexical.prefixes.is_empty()
+                        && (lexical.analysis.is_none()
+                            || lexical.analysis.as_ref() == Some(&crate::analyzer::body_spec()))
+                })
+                .map(|b| b.residual_terms.iter().map(|(t, _)| t.clone()).collect())
+                .unwrap_or_default();
+            let want_rerank_candidates = coordinator.rerank_spec().is_some();
             let response = coordinator
                 .hybrid_search(crate::metrics::nested(Request::new(HybridSearchRequest {
                     request_id: req.request_id.clone(),
@@ -1720,12 +1819,30 @@ pub(crate) async fn execute(
                     floor_prune: policy_floor_prune,
                     floor_greediness_ppm: policy_floor_greediness_ppm,
                     floor_clamp_min: policy_floor_clamp_min,
+                    include_rerank_candidate: want_rerank_candidates,
+                    pre_analyzed_terms,
                     ..Default::default()
                 })))
                 .await?
                 .into_inner();
             if let Some(p) = prof.as_mut() {
                 p.selection_ms = ms(t_sel);
+            }
+            let mut inline_candidates: HashMap<u64, crate::pb::RerankCandidatePayload> =
+                HashMap::new();
+            for h in &response.cascade_hits {
+                if let Some(cand) = h.rerank_candidate.as_ref() {
+                    inline_candidates
+                        .entry(h.doc_id)
+                        .or_insert_with(|| cand.clone());
+                }
+            }
+            for h in &response.hits {
+                if let Some(cand) = h.rerank_candidate.as_ref() {
+                    inline_candidates
+                        .entry(h.doc_id)
+                        .or_insert_with(|| cand.clone());
+                }
             }
             let mut hits: Vec<QueryHit> = if matches!(strategy, Strategy::Cascade) {
                 response
@@ -1872,7 +1989,15 @@ pub(crate) async fn execute(
                     .query_text_override
                     .as_deref()
                     .unwrap_or(&lexical.text);
-                apply_turbo_rerank(coordinator, rerank_spec, q_text, &mut hits).await?;
+                apply_turbo_rerank(
+                    coordinator,
+                    rerank_spec,
+                    q_text,
+                    &inline_candidates,
+                    finish_deadline_us,
+                    &mut hits,
+                )
+                .await?;
                 route = "hybrid_search:turbo_rerank";
             }
             apply_boosts(coordinator, &boosts, &mut hits, scorer.is_some(), &mut prof).await?;
@@ -1893,7 +2018,9 @@ pub(crate) async fn execute(
             )
             .await?
             {
-                Paged::Deepen(depth) => return deepen(coordinator, &req, depth).await,
+                Paged::Deepen(depth) => {
+                    return deepen(coordinator, &req, depth, finish_deadline_us).await
+                }
                 Paged::Done(hits, groups, next, executed) => (hits, groups, next, executed),
             };
             fill_projected(coordinator, &compiled_projections, &mut hits, &mut prof).await?;
@@ -1979,32 +2106,71 @@ async fn apply_scorer(
     }
 }
 
-/// Fill the paged hits' projected values through the FetchValues seam
-/// (non-lexical shapes; the lexical route carries projections
-/// natively). A hit whose shard holds no column tables projects
-/// all-absent — exact, its document holds no such values.
+/// Rerank and highlight the Stage-1 shortlist using inline candidate payloads when carried by shards.
 async fn apply_turbo_rerank(
     coordinator: &CoordinatorServiceImpl,
     spec: &crate::turbo_bridge::rerank::RerankSpec,
     query_text: &str,
+    inline_candidates: &HashMap<u64, crate::pb::RerankCandidatePayload>,
+    finish_deadline_us: u64,
     hits: &mut Vec<QueryHit>,
 ) -> Result<(), Status> {
     if hits.is_empty() || spec.shortlist_size == 0 {
         return Ok(());
     }
+    crate::turbo_bridge::remaining_deadline_duration(finish_deadline_us)?;
     let limit = hits.len().min(spec.shortlist_size);
     let shortlist_pairs: Vec<(u64, f64)> = hits[..limit]
         .iter()
         .map(|h| (h.doc_id, f64::from(h.score)))
         .collect();
-    let candidates = coordinator
-        .fetch_rerank_candidates(&shortlist_pairs)
-        .await?;
+    let missing_pairs: Vec<(u64, f64)> = shortlist_pairs
+        .iter()
+        .copied()
+        .filter(|(doc_id, _)| !inline_candidates.contains_key(doc_id))
+        .collect();
+    let fallback_map: HashMap<u64, crate::turbo_bridge::rerank::RerankCandidate> =
+        if missing_pairs.is_empty() {
+            HashMap::new()
+        } else {
+            coordinator
+                .fetch_rerank_candidates(&missing_pairs)
+                .await?
+                .into_iter()
+                .map(|c| (c.doc_id, c))
+                .collect()
+        };
+    let mut candidates = Vec::with_capacity(shortlist_pairs.len());
+    for &(doc_id, prior_score) in &shortlist_pairs {
+        if let Some(inline) = inline_candidates.get(&doc_id) {
+            candidates.push(crate::turbo_bridge::rerank::RerankCandidate {
+                doc_id,
+                prior_score,
+                text: inline.text.clone(),
+                sentence_spans: inline
+                    .sentence_spans
+                    .iter()
+                    .map(|s| (s.start, s.end))
+                    .collect(),
+                lineage_span_start: inline.lineage.as_ref().map_or(0, |l| l.span_start),
+            });
+        } else if let Some(fetched) = fallback_map.get(&doc_id) {
+            candidates.push(fetched.clone());
+        } else {
+            candidates.push(crate::turbo_bridge::rerank::RerankCandidate {
+                doc_id,
+                prior_score,
+                text: String::new(),
+                sentence_spans: Vec::new(),
+                lineage_span_start: 0,
+            });
+        }
+    }
     let reranked = crate::turbo_bridge::rerank::rerank_and_highlight_shortlist(
         spec,
         query_text,
         &candidates,
-        0,
+        finish_deadline_us,
     )
     .await?;
     let mut reordered = Vec::with_capacity(hits.len());
@@ -2031,6 +2197,10 @@ async fn apply_turbo_rerank(
     Ok(())
 }
 
+/// Fill the paged hits' projected values through the FetchValues seam
+/// (non-lexical shapes; the lexical route carries projections
+/// natively). A hit whose shard holds no column tables projects
+/// all-absent — exact, its document holds no such values.
 async fn fill_projected(
     coordinator: &CoordinatorServiceImpl,
     compiled: &[crate::pb::CompiledProjection],
@@ -2116,7 +2286,7 @@ async fn execute_browse(
     t_total: std::time::Instant,
 ) -> Result<QueryResponse, Status> {
     {
-        if plan.geo_filters.is_empty() && plan.cel.is_empty() && lexical_terms.is_empty() {
+        if plan.geo_filters.is_empty() && filter.is_empty() && lexical_terms.is_empty() {
             return Err(refuse(
                 "an empty browse (no filter at all) would page the whole corpus in id \
                      order; name at least one filter",
@@ -2252,10 +2422,11 @@ async fn deepen(
     coordinator: &CoordinatorServiceImpl,
     req: &QueryRequest,
     depth: u32,
+    finish_deadline_us: u64,
 ) -> Result<QueryResponse, Status> {
     let mut again = req.clone();
     again.selection_k = depth;
-    Box::pin(execute(coordinator, again)).await
+    Box::pin(execute(coordinator, again, finish_deadline_us)).await
 }
 
 /// A collapse group's identity: an integer or a facet term.

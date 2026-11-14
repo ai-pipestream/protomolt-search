@@ -1,7 +1,7 @@
 //! One-pass `AnalyzeQuery` filter binding (`Money`, `Quantity`, `Temporal`,
-//! `Place`, `Entity` -> native CEL / `FilterExpr`), `#94` filter-selectivity
+//! `Place`, `Entity` -> native CEL / `FilterExpr`), filter-selectivity
 //! HNSW budget selection, `MappedSurfaceLexicon` stem-to-surface completion,
-//! and `QuerySpellchecker` contextual multi-word spellcheck (`#104`).
+//! and `QuerySpellchecker` contextual multi-word spellcheck.
 
 use std::collections::BTreeMap;
 
@@ -10,7 +10,7 @@ use tonic::Status;
 use super::{NlpColumnSpec, MICROS_PER_SECOND};
 use crate::pb::{FilterExpr, Suggestion, SynonymExpansion, TermCandidate, TermSuggestion};
 
-/// HNSW filtered search execution strategy (`#94`, `#104`).
+/// HNSW filtered search execution strategy.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum FilteredAnnStrategy {
     /// Graph traversal with escalated `ef_search` proportional to `1 / selectivity`.
@@ -22,7 +22,7 @@ pub enum FilteredAnnStrategy {
 
 /// Selects the filtered HNSW visit budget (`ef_search` vs prefiltered exact scan)
 /// from `base_ef`, `k`, `shard_docs`, and `estimated_selectivity` in `(0.0, 1.0]`
-/// (`#94`, `#104`).
+///.
 pub fn select_filtered_ann_strategy(
     base_ef: u32,
     k: u32,
@@ -63,7 +63,7 @@ pub struct BoundOnePassQuery {
     pub synthesized_cel: String,
     /// Conjoined native [`FilterExpr`] combining `caller_cel` and `synthesized_cel`.
     pub filter_expr: Option<FilterExpr>,
-    /// Heuristic selectivity estimate in `(0.0, 1.0]` for `#94` HNSW budget escalation.
+    /// Heuristic selectivity estimate in `(0.0, 1.0]` for HNSW budget escalation.
     pub estimated_selectivity: f64,
 }
 
@@ -115,6 +115,7 @@ pub fn bind_one_pass_query(
 ) -> Result<BoundOnePassQuery, Status> {
     use turbo_client::{QueryComparisonOp as Op, StructuredFilterPayload as P};
 
+    columns.validate()?;
     let mut clauses: Vec<String> = Vec::new();
     let mut selectivity = 1.0_f64;
 
@@ -292,7 +293,7 @@ pub fn bind_one_pass_query(
     })
 }
 
-/// Owned or OS-memory-mapped `TSUGLEX1` surface lexicon (`#104`, `#2341`) with
+/// Owned or OS-memory-mapped `TSUGLEX1` surface lexicon with
 /// guaranteed 8-byte alignment so [`turbo_client::MappedSurfaceLexicon`] can
 /// borrow its `u32` FST/posting tables with zero heap allocation on lookup.
 #[derive(Debug)]
@@ -361,7 +362,7 @@ impl SharedSurfaceLexicon {
 }
 
 /// Rewrites stemmed dictionary prefix matches into genuine surface completions
-/// using [`turbo_client::MappedSurfaceLexicon`] (`#104`, `#2341`).
+/// using [`turbo_client::MappedSurfaceLexicon`].
 ///
 /// Preserves shard presence metadata when a surface's stem also matched on shards,
 /// and surfaces lexicon prefix completions whose stems were truncated shorter
@@ -414,7 +415,7 @@ pub fn resolve_stemmed_suggestions(
         .collect()
 }
 
-/// Evaluates contextual multi-word bigram spellcheck (`#104`, `#2341`), returning
+/// Evaluates contextual multi-word bigram spellcheck, returning
 /// [`TermSuggestion`] entries for corrected tokens in query order.
 pub fn spellcheck_query_terms(
     checker: &turbo_client::QuerySpellchecker,

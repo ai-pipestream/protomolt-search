@@ -1,18 +1,18 @@
 //! Unified pure-Rust `turboembed` (`turbo-client` / `turbo-kserve`) integration
-//! surface for Epic `#102` (`#103`, `#104`, `#105`).
+//! surface.
 //!
 //! Encapsulates:
 //! - Pre-WAL materialization of one-pass NLP typed columns ([`NlpColumnSpec`],
 //!   [`materialize_nlp_columns`]) and single-pass multi-resolution / sentence
-//!   vectors ([`MultiResVectorOutput`]) (`#103`).
+//!   vectors ([`MultiResVectorOutput`]).
 //! - Quantized `u8`/`u16` SPLADE 128-doc Block-Max postings and L1 rounding
-//!   slack pruning ([`splade`]) (`#104`).
-//! - One-pass `AnalyzeQuery` structured filter binding, HNSW `#94` visit-budget
+//!   slack pruning ([`splade`]).
+//! - One-pass `AnalyzeQuery` structured filter binding, HNSW visit-budget
 //!   selection, `MappedSurfaceLexicon` stem-to-surface completion, and
-//!   `QuerySpellchecker` contextual spellcheck ([`query_plan`]) (`#104`).
+//!   `QuerySpellchecker` contextual spellcheck ([`query_plan`]).
 //! - Stage-2 calibrated `RerankAndHighlight` over top-`C` candidates with
 //!   `DocLineage.span_start` chunk-to-parent offset composition, plus mTLS,
-//!   bearer auth, priority lanes, and deadline propagation ([`rerank`]) (`#105`).
+//!   bearer auth, priority lanes, and deadline propagation ([`rerank`]).
 
 pub mod query_plan;
 pub mod rerank;
@@ -25,15 +25,39 @@ use tonic::Status;
 
 use crate::pb::{
     AddDocumentsRequest, FacetValue, GeoPointValue, IntegerValue, MapFacetEntry, MapNumericEntry,
-    NumericValue, UnsignedIntegerValue,
+    MapUnsignedIntegerEntry, NumericValue, UnsignedIntegerValue,
 };
 
 /// Microseconds per second, matching `src/cel.rs` (`timestamp(...)`) and
 /// `docs/range-facets.md` epoch-microsecond `i64` columns.
 pub const MICROS_PER_SECOND: i64 = 1_000_000;
 
+/// Validates that a configured column identifier is a strict ASCII CEL
+/// identifier (`^[A-Za-z_][A-Za-z0-9_]*$`) and not a CEL reserved word,
+/// preventing CEL predicate injection when synthesizing structured query
+/// filters.
+pub fn validate_cel_identifier(slot: &str, name: &str) -> Result<(), Status> {
+    if name.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "NlpColumnSpec.{slot} must not be empty when validated"
+        )));
+    }
+    let mut chars = name.chars();
+    let first = chars.next().expect("non-empty");
+    let valid_start = first.is_ascii_alphabetic() || first == '_';
+    let valid_rest = chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let reserved = matches!(name, "true" | "false" | "null" | "in");
+    if !valid_start || !valid_rest || reserved {
+        return Err(Status::invalid_argument(format!(
+            "invalid CEL column identifier in NlpColumnSpec.{slot}: {name:?} \
+             (must match ^[A-Za-z_][A-Za-z0-9_]*$ and not be a CEL reserved word)"
+        )));
+    }
+    Ok(())
+}
+
 /// Declarative mapping from one-pass [`turbo_client::DocumentNlpProjection`]
-/// outputs onto native shard typed columns (`#103`).
+/// outputs onto native shard typed columns.
 ///
 /// Materialized in `NodeServiceImpl::materialize_document` **before** WAL
 /// logging and column indexing so WAL replay is deterministic and never
@@ -70,6 +94,9 @@ pub struct NlpColumnSpec {
     /// `u64` unsigned integer column storing the 64-bit `SimHash` near-duplicate sketch.
     #[serde(default)]
     pub simhash_column: String,
+    /// `map<string, u64>` column storing `MinHash` signature lanes (`"h00"`, ...) and 64-bit LSH bands (`"b0"`, ...).
+    #[serde(default)]
+    pub minhash_column: String,
 }
 
 impl NlpColumnSpec {
@@ -93,20 +120,52 @@ impl NlpColumnSpec {
             || !self.affirmed_entity_column.is_empty()
             || !self.negated_entity_column.is_empty()
             || !self.simhash_column.is_empty()
+            || !self.minhash_column.is_empty()
+    }
+
+    /// Validates every non-empty column name against strict CEL identifier syntax.
+    pub fn validate(&self) -> Result<(), Status> {
+        for (slot, name) in [
+            ("money_column", self.money_column.as_str()),
+            ("quantity_column", self.quantity_column.as_str()),
+            ("date_column", self.date_column.as_str()),
+            ("geo_spine_column", self.geo_spine_column.as_str()),
+            ("geo_point_column", self.geo_point_column.as_str()),
+            ("sentiment_column", self.sentiment_column.as_str()),
+            (
+                "sentiment_label_column",
+                self.sentiment_label_column.as_str(),
+            ),
+            (
+                "affirmed_entity_column",
+                self.affirmed_entity_column.as_str(),
+            ),
+            ("negated_entity_column", self.negated_entity_column.as_str()),
+            ("simhash_column", self.simhash_column.as_str()),
+            ("minhash_column", self.minhash_column.as_str()),
+        ] {
+            if !name.is_empty() {
+                validate_cel_identifier(slot, name)?;
+            }
+        }
+        Ok(())
     }
 }
 
 /// Materializes [`turbo_client::DocumentNlpProjection`] findings onto `doc`
-/// prior to WAL persistence (`#103`).
+/// prior to WAL persistence.
 ///
-/// Idempotent on WAL replay: if `nlp` is `None` (for example on a replayed WAL
-/// record whose values were already materialized onto `doc`), `doc` is returned
-/// unchanged.
+/// Idempotent on WAL replay: if `doc.nlp_materialization` is already populated
+/// (with matching mapping fingerprint) or `nlp` is `None`, `doc` is returned
+/// unchanged without re-running or mutating typed columns.
 pub fn materialize_nlp_columns(
     mut doc: AddDocumentsRequest,
     nlp: Option<&turbo_client::DocumentNlpProjection>,
     spec: Option<&NlpColumnSpec>,
 ) -> Result<AddDocumentsRequest, Status> {
+    if let Some(s) = spec.filter(|s| s.is_enabled()) {
+        s.validate()?;
+    }
     if !doc.nlp_materialization.is_empty() {
         if !doc.nlp_materialization.starts_with("v1:")
             || doc.nlp_materialization.len() != 67
@@ -324,6 +383,45 @@ pub fn materialize_nlp_columns(
         });
     }
 
+    if !spec.minhash_column.is_empty()
+        && nlp.sketch.word_count > 0
+        && !nlp.sketch.minhash.is_empty()
+    {
+        for (idx, &lane) in nlp.sketch.minhash.iter().enumerate() {
+            let key = format!("h{idx:02}");
+            if !doc
+                .map_unsigned_integers
+                .iter()
+                .any(|m| m.field == spec.minhash_column && m.key == key)
+            {
+                doc.map_unsigned_integers.push(MapUnsignedIntegerEntry {
+                    field: spec.minhash_column.clone(),
+                    key,
+                    value: u64::from(lane),
+                });
+            }
+        }
+        for (band_idx, pair) in nlp.sketch.minhash.chunks(2).enumerate() {
+            let packed = match pair {
+                [lo, hi] => (u64::from(*hi) << 32) | u64::from(*lo),
+                [only] => u64::from(*only),
+                _ => continue,
+            };
+            let key = format!("b{band_idx}");
+            if !doc
+                .map_unsigned_integers
+                .iter()
+                .any(|m| m.field == spec.minhash_column && m.key == key)
+            {
+                doc.map_unsigned_integers.push(MapUnsignedIntegerEntry {
+                    field: spec.minhash_column.clone(),
+                    key,
+                    value: packed,
+                });
+            }
+        }
+    }
+
     doc.nlp_materialization = spec.materialization_id();
     Ok(doc)
 }
@@ -370,7 +468,7 @@ fn materialize_entity_map(
     }
 }
 
-/// Single-pass multi-resolution document embedding output (`#103`, `#2344`).
+/// Single-pass multi-resolution document embedding output.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MultiResVectorOutput {
     /// Matryoshka L2-normalized prefix slices `(prefix_dim, values)`.
@@ -386,6 +484,10 @@ pub struct MultiResVectorOutput {
     /// Deterministic SHA-256 digest of the canonical little-endian `full` vector bytes.
     pub sha256: [u8; 32],
 }
+
+/// Active-tier flat vectors, active dimension, and retained per-slot
+/// [`MultiResVectorOutput`] rows produced from a multi-row ingest batch.
+pub type MatryoshkaBatchOutput = (Vec<f32>, usize, Vec<(u32, MultiResVectorOutput)>);
 
 impl MultiResVectorOutput {
     /// Derives a multi-resolution output from a single full vector and optional
@@ -437,11 +539,61 @@ impl MultiResVectorOutput {
             sha256,
         }
     }
+
+    /// Returns the L2-normalized slice for `target_dim` (matching either a
+    /// precomputed prefix tier or the full vector).
+    pub fn tier(&self, target_dim: u32) -> Option<&[f32]> {
+        if self.full.len() == target_dim as usize {
+            return Some(&self.full);
+        }
+        self.prefixes
+            .iter()
+            .find(|(d, _)| *d == target_dim)
+            .map(|(_, v)| v.as_slice())
+    }
+
+    /// Slices a flat row-major embedding batch of `raw_dim` into per-row
+    /// [`MultiResVectorOutput`] records and extracts the active indexing tier.
+    pub fn project_batch(
+        vectors: &[f32],
+        raw_dim: usize,
+        prefix_dims: &[u32],
+        active_dim: Option<u32>,
+        start_slot: usize,
+    ) -> Result<MatryoshkaBatchOutput, Status> {
+        let mut all_prefixes = prefix_dims.to_vec();
+        if let Some(ad) = active_dim {
+            if ad == 0 || ad as usize > raw_dim {
+                return Err(Status::invalid_argument(format!(
+                    "matryoshka_active_dim {ad} exceeds input vector dim {raw_dim}"
+                )));
+            }
+            if !all_prefixes.contains(&ad) && (ad as usize) < raw_dim {
+                all_prefixes.push(ad);
+            }
+        }
+        let effective_dim = active_dim.map_or(raw_dim, |d| d as usize);
+        let row_count = vectors.len() / raw_dim;
+        let mut active_flat = Vec::with_capacity(row_count * effective_dim);
+        let mut multi_rows = Vec::with_capacity(row_count);
+        for (i, row) in vectors.chunks_exact(raw_dim).enumerate() {
+            let slot = u32::try_from(start_slot + i)
+                .map_err(|_| Status::resource_exhausted("shard local slot overflow"))?;
+            let out = Self::from_full_and_sentences(row, &all_prefixes, None, Vec::new());
+            let tier = out.tier(effective_dim as u32).ok_or_else(|| {
+                Status::invalid_argument(format!(
+                    "matryoshka active tier {effective_dim} missing from row"
+                ))
+            })?;
+            active_flat.extend_from_slice(tier);
+            multi_rows.push((slot, out));
+        }
+        Ok((active_flat, effective_dim, multi_rows))
+    }
 }
 
 /// Converts an absolute Unix-epoch microsecond `finish_deadline_us` into a
-/// remaining [`Duration`] for outgoing `turbo-kserve` `grpc-timeout` propagation
-/// (`#105`, `#2346`). Returns `Err(Status::deadline_exceeded)` when already expired.
+/// remaining [`Duration`] for outgoing `grpc-timeout` propagation.
 pub fn remaining_deadline_duration(finish_deadline_us: u64) -> Result<Option<Duration>, Status> {
     if finish_deadline_us == 0 {
         return Ok(None);
@@ -458,7 +610,7 @@ pub fn remaining_deadline_duration(finish_deadline_us: u64) -> Result<Option<Dur
     Ok(Some(Duration::from_micros(finish_deadline_us - now_us)))
 }
 
-/// Client mTLS and server CA material for `turbo-kserve` channels (`#105`, `#2346`).
+/// Client mTLS and server CA material for `turbo-kserve` channels.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MtlsClientMaterial {
     /// PEM-encoded root CA bundle used to verify `turbo-kserve`.
@@ -469,7 +621,7 @@ pub struct MtlsClientMaterial {
     pub domain_name: Option<String>,
 }
 
-/// Remote `turbo-kserve` security, priority lane, and deadline policy (`#105`, `#2346`).
+/// Remote `turbo-kserve` security, priority lane, and deadline policy.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KserveCallPolicy {
     /// Bearer credential (`authorization: Bearer <token>`).

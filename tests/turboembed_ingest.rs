@@ -317,6 +317,7 @@ async fn pre_wal_nlp_columns_materialize_and_replay_deterministically_without_re
         affirmed_entity_column: "affirmed_ent".into(),
         negated_entity_column: "negated_ent".into(),
         simhash_column: "simhash".into(),
+        minhash_column: "minhash".into(),
     };
 
     let nlp_node_config = |path: PathBuf, analysis_addr: Option<String>, wal_on: bool| NodeConfig {
@@ -335,6 +336,7 @@ async fn pre_wal_nlp_columns_materialize_and_replay_deterministically_without_re
             "negated_ent".into(),
         ],
         unsigned_integer_fields: vec!["simhash".into()],
+        map_unsigned_integer_fields: vec!["minhash".into()],
         ..Default::default()
     };
 
@@ -395,8 +397,10 @@ async fn pre_wal_nlp_columns_materialize_and_replay_deterministically_without_re
             && !logged_docs[0].1.integers.is_empty()
             && !logged_docs[0].1.map_facets.is_empty()
             && !logged_docs[0].1.geo_points.is_empty()
-            && !logged_docs[0].1.unsigned_integers.is_empty(),
-        "WAL record must carry pre-materialized NLP typed columns"
+            && !logged_docs[0].1.unsigned_integers.is_empty()
+            && !logged_docs[0].1.map_unsigned_integers.is_empty()
+            && logged_docs[0].1.nlp_materialization.starts_with("v1:"),
+        "WAL record must carry pre-materialized NLP typed columns (including minhash) and nlp_materialization"
     );
 
     // 3. Replay those exact WAL `AddDocumentsRequest` records onto a lexical-only `native` node

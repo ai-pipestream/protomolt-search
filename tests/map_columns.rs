@@ -373,6 +373,7 @@ async fn map_facet_counts_are_exact_with_key_level_typo_rules() {
             prefixes: Vec::new(),
             synonyms: Vec::new(),
             synonyms_off: false,
+            pre_analyzed_terms: Vec::new(),
         }),
     )
     .await

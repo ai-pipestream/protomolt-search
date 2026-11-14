@@ -1,4 +1,4 @@
-//! End-to-end hardware benchmark for Epic `#102` (`#103`, `#104`, `#105`).
+//! End-to-end hardware benchmark.
 //!
 //! Measures single-host release performance across all three unification pillars:
 //! 1. `#103`: One-pass `turbo` lexical lattice + NLP extraction + pre-WAL typed
@@ -96,6 +96,7 @@ fn nlp_spec() -> NlpColumnSpec {
         affirmed_entity_column: "affirmed_ent".into(),
         negated_entity_column: "negated_ent".into(),
         simhash_column: "simhash".into(),
+        minhash_column: "minhash".into(),
     }
 }
 

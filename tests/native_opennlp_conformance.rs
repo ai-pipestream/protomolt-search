@@ -18,24 +18,61 @@ use turbo_client::{
     TokenizerKind,
 };
 
-/// Verifies that no legacy JVM OpenNLP sidecar dependency or proto namespace
-/// remains in `Cargo.toml` or `src/`.
+/// Verifies that no legacy JVM OpenNLP sidecar dependency, environment knob,
+/// or container build reference remains in `Cargo.toml`, `src/`, `examples/`,
+/// `deploy/court-e2e/`, or `deploy/v7-rebuild/`.
 #[test]
 fn legacy_jvm_opennlp_sidecar_is_completely_retired() {
+    fn collect_files(path: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        if path.is_file() {
+            out.push(path.to_path_buf());
+        } else if path.is_dir() {
+            let mut entries: Vec<_> = std::fs::read_dir(path)
+                .unwrap_or_else(|e| panic!("read_dir {}: {e}", path.display()))
+                .map(|r| r.unwrap().path())
+                .collect();
+            entries.sort();
+            for entry in entries {
+                collect_files(&entry, out);
+            }
+        }
+    }
+
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let cargo_toml = std::fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
-    assert!(
-        !cargo_toml.contains("grpc-opennlp-analysis"),
-        "Cargo.toml must not reference grpc-opennlp-analysis"
-    );
-    assert!(
-        !cargo_toml.contains("opennlp-sidecar"),
-        "Cargo.toml must not reference opennlp-sidecar"
-    );
     assert!(
         cargo_toml.contains("turbo-client"),
         "Cargo.toml must depend on turbo-client"
     );
+
+    let mut files = vec![
+        manifest_dir.join("Cargo.toml"),
+        manifest_dir.join("Dockerfile"),
+    ];
+    for rel in ["src", "examples", "deploy/court-e2e", "deploy/v7-rebuild"] {
+        collect_files(&manifest_dir.join(rel), &mut files);
+    }
+
+    const BANNED: &[&str] = &[
+        "grpc-opennlp-analysis",
+        "opennlp-sidecar",
+        "OPENNLP_ANALYSIS_REPO",
+        "OPENNLP_EMBEDDINGS_DIR",
+        "JAVA_OPTS",
+        "gradlew",
+    ];
+    for file in files {
+        let Ok(contents) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        for needle in BANNED {
+            assert!(
+                !contents.contains(needle),
+                "{} still contains retired JVM sidecar token {needle:?}",
+                file.display()
+            );
+        }
+    }
 }
 
 /// Verifies `native`, in-process `turbo`, and remote `AnalysisService` produce

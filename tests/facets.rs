@@ -380,6 +380,7 @@ async fn bm25_search_rpc_carries_facets_and_refuses_unknown_fields() {
             prefixes: Vec::new(),
             synonyms: Vec::new(),
             synonyms_off: false,
+            pre_analyzed_terms: Vec::new(),
         }),
     )
     .await
@@ -414,6 +415,7 @@ async fn bm25_search_rpc_carries_facets_and_refuses_unknown_fields() {
             prefixes: Vec::new(),
             synonyms: Vec::new(),
             synonyms_off: false,
+            pre_analyzed_terms: Vec::new(),
         }),
     )
     .await

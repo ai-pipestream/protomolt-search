@@ -77,6 +77,7 @@ fn full_nlp_spec() -> NlpColumnSpec {
         affirmed_entity_column: "affirmed_ent".into(),
         negated_entity_column: "negated_ent".into(),
         simhash_column: "simhash".into(),
+        minhash_column: "minhash".into(),
     }
 }
 
@@ -96,6 +97,7 @@ fn nlp_node_config(slot_offset: u64) -> NodeConfig {
             "negated_ent".into(),
         ],
         unsigned_integer_fields: vec!["simhash".into()],
+        map_unsigned_integer_fields: vec!["minhash".into()],
         ..Default::default()
     }
 }

@@ -731,6 +731,7 @@ async fn request_level_analysis_with_fields_is_refused_not_ignored() {
             prefixes: Vec::new(),
             synonyms: Vec::new(),
             synonyms_off: false,
+            pre_analyzed_terms: Vec::new(),
         }),
     )
     .await
@@ -762,6 +763,7 @@ async fn request_level_analysis_with_fields_is_refused_not_ignored() {
             prefixes: Vec::new(),
             synonyms: Vec::new(),
             synonyms_off: false,
+            pre_analyzed_terms: Vec::new(),
         }),
     )
     .await

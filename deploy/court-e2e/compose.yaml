@@ -1,5 +1,5 @@
 # Court end-to-end demo/test: CourtListener bulk data -> rustfs (S3) ->
-# chunk+embed (OpenNLP analysis sidecar, static MiniLM) -> 4-shard
+# chunk+embed (turbo-kserve analysis + embedding server) -> 4-shard
 # pipestream-search cluster -> verification gate.
 #
 #   docker compose --env-file .env up --build --abort-on-container-exit --exit-code-from pipeline
@@ -53,9 +53,11 @@ services:
 
   analysis:
     build:
-      context: ${OPENNLP_ANALYSIS_REPO:-../../../grpc-opennlp-analysis}
+      context: ${TURBOEMBED_REPO:-../../../turboembed}
+      dockerfile: server/Dockerfile
     environment:
-      OPENNLP_EMBEDDINGS_DIR: /models/${MODEL_NAME:-potion-retrieval-32M}
+      TURBO_KSERVE_LISTEN: 0.0.0.0:50051
+      TURBO_KSERVE_BUNDLE_DIR: /models
     volumes:
       - models:/models:ro
     depends_on:

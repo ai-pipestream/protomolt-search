@@ -119,22 +119,16 @@ VOCAB_TOP_K=${VOCAB_TOP_K:-}
 PORT_BASE=${PORT_BASE:-59300}
 COORD_PORT=${COORD_PORT:-59291}
 SIDECAR_PORT=${SIDECAR_PORT:-59202}
-# The analysis sidecar MUST implement AnalyzeStream. Without it the node
-# falls back to one unary call per document, and the sidecar's server
-# GOAWAYs the connection after ~70 streams, which reaches the bulk driver
-# as an opaque "h2 protocol error" mid-ingest. The JVM distribution is
-# built straight from the repo (./gradlew installDist); the checked-in
-# native image may predate the RPC -- `strings <bin> | grep AnalyzeStream`
-# is the check.
-SIDECAR_BIN=${SIDECAR_BIN:-/work/worktrees/turbovec-workspace/grpc-opennlp-analysis/build/install/grpc-opennlp-analysis/bin/grpc-opennlp-analysis}
-# Bounded sidecar heap: the default max heap is a quarter of RAM, which is
-# tens of GB on this box, and ingest runs it alongside N shard nodes.
-export JAVA_OPTS=${JAVA_OPTS:--Xmx4g}
-# The static (Model2Vec) embedding model the sidecar serves query
-# embeddings from. Ingest does not need it -- vectors come from the
-# embeddings file -- but every query path does, so the serve stage would
+# The pure-Rust turbo-kserve server (`cargo build --release -p turbo-kserve`
+# in `ai-pipestream/turboembed`) serves both `AnalysisService` and KServe v2
+# embeddings. Alternatively set `SIDECAR_ADDR=turbo` for in-process lexical
+# analysis on each node.
+SIDECAR_BIN=${SIDECAR_BIN:-/work/worktrees/turboembed/turboembed/target/release/turbo-kserve}
+# The bundle directory turbo-kserve serves query embeddings from
+# (`TURBO_KSERVE_BUNDLE_DIR`). Ingest does not need it -- vectors come from
+# the embeddings file -- but every query path does, so the serve stage would
 # otherwise come up unable to embed a query.
-EMBEDDINGS_DIR=${EMBEDDINGS_DIR:-/work/court-corpus/models/minilm-l6-v2-static}
+EMBEDDINGS_DIR=${EMBEDDINGS_DIR:-/work/court-corpus/models}
 BIN=${BIN:-$REPO/target/release/pipestream-search}
 INGEST=${INGEST:-$REPO/target/release/examples/court_ingest}
 PROBE=${PROBE:-$REPO/target/release/examples/analyze_probe}
@@ -465,11 +459,9 @@ sidecar_up() {
       say "reusing healthy sidecar on :$SIDECAR_PORT"
       return
     fi
-    # Most likely its jars were replaced under it: a running JVM loads
-    # classes lazily, so a rebuild mid-session leaves the process serving
-    # everything it had already touched and unable to load anything it
-    # had not. Ingest keeps working; embedding, which ingest never calls,
-    # does not.
+    # Most likely the server was started without TURBO_KSERVE_BUNDLE_DIR
+    # pointing at a loaded TASK_EMBED bundle: lexical analysis still
+    # answers, while embedding fails.
     say "sidecar on :$SIDECAR_PORT answers but CANNOT EMBED; restarting it"
     if [[ -f $RUN/sidecar.pid ]]; then
       kill "$(cat "$RUN/sidecar.pid")" 2>/dev/null || true
@@ -479,10 +471,10 @@ sidecar_up() {
     port_open "$SIDECAR_PORT" &&
       die "sidecar on :$SIDECAR_PORT will not stop; kill it and re-run"
   fi
-  [[ -x $SIDECAR_BIN ]] || die "no analysis sidecar binary at $SIDECAR_BIN"
-  [[ -d $EMBEDDINGS_DIR ]] || die "no embedding model at EMBEDDINGS_DIR=$EMBEDDINGS_DIR"
+  [[ -x $SIDECAR_BIN ]] || die "no turbo-kserve binary at $SIDECAR_BIN"
+  [[ -d $EMBEDDINGS_DIR ]] || die "no embedding bundle dir at EMBEDDINGS_DIR=$EMBEDDINGS_DIR"
   mkdir -p "$RUN" "$LOGS"
-  PORT="$SIDECAR_PORT" OPENNLP_EMBEDDINGS_DIR="$EMBEDDINGS_DIR" \
+  TURBO_KSERVE_LISTEN="127.0.0.1:$SIDECAR_PORT" TURBO_KSERVE_BUNDLE_DIR="$EMBEDDINGS_DIR" \
     "$SIDECAR_BIN" >>"$LOGS/sidecar.log" 2>&1 &
   echo $! >"$RUN/sidecar.pid"
   wait_port "$SIDECAR_PORT" "analysis sidecar"

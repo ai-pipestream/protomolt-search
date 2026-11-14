@@ -419,6 +419,11 @@ service NodeService {
   // doc count, and whether an ingest stream currently holds the shard's
   // single-writer slot. Cheap enough to poll.
   rpc Health(HealthRequest) returns (HealthResponse);
+
+  // Scores quantized u8/u16 SPLADE postings (section kind 19) on one field
+  // using 128-doc Block-Max WAND pruning under this shard's live-row overlay
+  // and compiled filter predicate (#104).
+  rpc ScoreSplade(ScoreSpladeRequest) returns (ScoreSpladeResponse);
 }
 
 // SearchService is the client-facing API served by the coordinator.
@@ -1547,6 +1552,10 @@ message StartShardSearch {
   optional uint32 floor_share_ppm = 14;
   optional uint32 floor_greediness_ppm = 15;
   optional uint32 floor_clamp_min = 16;
+  // When true, each returned ScoredHit carries inline stored text, lineage,
+  // and stored sentence spans so Stage-2 reranking and highlighting run in a
+  // single retrieval pass without a follow-up GetDocuments RPC (#105).
+  bool include_rerank_candidate = 17;
 }
 
 // A score floor: a lower bound on the global k-th best score. Flows both
@@ -1639,6 +1648,15 @@ message ShardScanStats {
   uint32 floor_pruned = 11;
 }
 
+// Inline candidate payload captured under the Stage-1 shard read lock so
+// coordinator Stage-2 reranking and snippet extraction require no second
+// GetDocuments pass (#105).
+message RerankCandidatePayload {
+  string text = 1;
+  DocLineage lineage = 2;
+  repeated OffsetSpan sentence_spans = 3;
+}
+
 // One scored vector. Ids are global across the cluster (see
 // `SearchShardDone.hits`).
 message ScoredHit {
@@ -1654,6 +1672,8 @@ message ScoredHit {
   // Exact source identity captured with this score. Absent for rows without
   // imported identity and execution paths that do not yet carry it.
   DocumentIdentity identity = 4;
+  // Present when requested via `include_rerank_candidate`.
+  RerankCandidatePayload rerank_candidate = 5;
 }
 
 // One message on the client-to-shard leg of `StreamSearch`.
@@ -1748,6 +1768,9 @@ message StartStreamSearch {
   optional uint32 floor_share_ppm = 16;
   optional uint32 floor_greediness_ppm = 17;
   optional uint32 floor_clamp_min = 18;
+  // When true, `StreamIdentity` responses also carry `rerank_candidate` for
+  // each selected winner (#105).
+  bool include_rerank_candidate = 19;
 }
 
 // Bounds for the post-scan identity exchange. All fields must be positive.
@@ -1792,6 +1815,8 @@ message StreamIdentity {
   uint64 vector_id = 1;
   // Absent explicitly means this captured row has no imported identity.
   DocumentIdentity identity = 2;
+  // Present when `StartStreamSearch.include_rerank_candidate` was set.
+  RerankCandidatePayload rerank_candidate = 3;
 }
 
 message StreamIdentities {
@@ -2311,6 +2336,9 @@ message SearchRequest {
   optional bool floor_prune = 14;
   optional uint32 floor_greediness_ppm = 15;
   optional uint32 floor_clamp_min = 16;
+  // Requests inline Stage-1 `RerankCandidatePayload` on each returned `ScoredHit`
+  // so coordinator Stage-2 reranking and highlighting run in a single pass (#105).
+  bool include_rerank_candidate = 17;
 }
 
 // Client-facing search response.
@@ -4198,6 +4226,11 @@ message Bm25SearchRequest {
   bool synonyms_off = 20;
   // When true, each hit carries `Bm25Hit.explain` (docs/explain.md).
   bool explain = 21;
+  // Optional pre-analyzed query terms produced by one-pass query planning
+  // (`AnalyzeQuery`, #104). When non-empty on the flat route without a
+  // multi-token phrase lattice, the coordinator consumes these terms directly
+  // instead of running a second text-analysis pass.
+  repeated string pre_analyzed_terms = 22;
 }
 
 // A prefix over a field's term dictionary (docs/prefix-terms.md): every
@@ -4756,6 +4789,8 @@ message HybridShardRequest {
   bytes expected_stats_incarnation = 17;
   // Same opt-in read contract as ShardLegsRequest; both legs share the view.
   VectorReadContext read_context = 18;
+  // When true, each returned `HybridLegHit` carries inline `rerank_candidate` (#105).
+  bool include_rerank_candidate = 19;
 }
 
 // One fused hit in a shard's hybrid result, with per-leg provenance.
@@ -4774,6 +4809,8 @@ message HybridLegHit {
   optional uint32 bm25_rank = 5;
   // Raw BM25 score (computed with global stats; comparable across shards).
   float bm25_score = 6;
+  // Present when `HybridShardRequest.include_rerank_candidate` was set.
+  RerankCandidatePayload rerank_candidate = 7;
 }
 
 // A shard's fused hybrid top-k.
@@ -4883,6 +4920,10 @@ message HybridSearchRequest {
   optional bool floor_prune = 17;
   optional uint32 floor_greediness_ppm = 18;
   optional uint32 floor_clamp_min = 19;
+  // Requests inline Stage-1 `RerankCandidatePayload` on each returned hybrid/cascade hit (#105).
+  bool include_rerank_candidate = 20;
+  // Optional pre-analyzed BM25 leg terms from one-pass query planning (#104).
+  repeated string pre_analyzed_terms = 21;
 }
 
 // Profile of one hybrid query; populated only when the request set
@@ -4958,6 +4999,8 @@ message HybridHit {
   // Absent for the other fusion modes and for a leg the doc is not in.
   optional double vector_normalized = 9;
   optional double bm25_normalized = 10;
+  // Present when `HybridSearchRequest.include_rerank_candidate` was set.
+  RerankCandidatePayload rerank_candidate = 11;
 }
 
 // Client-facing hybrid search response.
@@ -5017,6 +5060,8 @@ message ShardLegsRequest {
   // Applies to both legs, including empty or disabled legs. An opt-in caller
   // must validate read_receipt before consuming the response.
   VectorReadContext read_context = 15;
+  // When true, each returned `RawLegHit` carries inline `rerank_candidate` (#105).
+  bool include_rerank_candidate = 16;
 }
 
 // One raw leg hit.
@@ -5026,6 +5071,8 @@ message RawLegHit {
   // Raw leg score; globally comparable per leg by the caller's
   // construction (shared calibration / global BM25 stats).
   float score = 2;
+  // Present when `ShardLegsRequest.include_rerank_candidate` was set.
+  RerankCandidatePayload rerank_candidate = 3;
 }
 
 // A shard's unfused legs, each score-descending.
@@ -5318,6 +5365,8 @@ message CascadeHit {
   // base_weight * bm25_score + boost_weight * boost_score, and `rank`
   // reflects the final order).
   float boost_score = 6;
+  // Present when `HybridSearchRequest.include_rerank_candidate` was set.
+  RerankCandidatePayload rerank_candidate = 7;
 }
 
 // One labelled query configuration to evaluate.
@@ -8337,4 +8386,48 @@ message BooleanShardResponse {
   repeated BooleanStagesKnown stages_known = 7;
   // The fold, when the request asked for one.
   AggregateShardResponse aggregate = 8;
+}
+
+// One query-side SPLADE term weight.
+message SpladeTermWeight {
+  string term = 1;
+  float weight = 2;
+}
+
+// Shard-side quantized u8/u16 SPLADE 128-doc Block-Max scoring request.
+message ScoreSpladeRequest {
+  // Indexed BM25/SPLADE field name ("body" when empty).
+  string field = 1;
+  repeated SpladeTermWeight query_weights = 2;
+  float query_l1_slack = 3;
+  uint32 k = 4;
+  // Compiled filter predicate evaluated before heap admission.
+  FilterExpr filter = 5;
+  // Monotone global k-th score floor relayed from prior/completed shards.
+  float initial_floor = 6;
+  // Trusted-planner document visibility predicate when configured.
+  DocumentVisibility visibility = 7;
+  uint64 expected_stats_epoch = 8;
+  bytes expected_stats_incarnation = 9;
+}
+
+// One scored SPLADE hit on a shard.
+message SpladeHit {
+  uint64 doc_id = 1;
+  float score = 2;
+}
+
+// Shard-side quantized SPLADE response.
+message ScoreSpladeResponse {
+  repeated SpladeHit hits = 1;
+  repeated bool filter_columns_known = 2;
+  bool field_known = 3;
+  uint64 blocks_visited = 4;
+  uint64 blocks_skipped = 5;
+  uint64 postings_scored = 6;
+  float final_floor = 7;
+  uint64 stats_epoch = 8;
+  bytes stats_incarnation = 9;
+  bytes visibility_fingerprint = 10;
+  repeated bool visibility_columns_known = 11;
 }

@@ -1,7 +1,7 @@
 //! Real-data shakedown: ingest the Lucene-era wikipedia corpus (bge-m3
 //! embeddings + Simple English Wikipedia sentences) into a 4-shard
-//! pipestream-search cluster on loopback, using the REAL OpenNLP analysis
-//! sidecar for BM25, then run hybrid queries end-to-end.
+//! pipestream-search cluster on loopback, using `turbo-kserve`
+//! for BM25, then run hybrid queries end-to-end.
 //!
 //! The corpus stays at its absolute path (NOT copied into the repo);
 //! `--data-dir` points at it. The 4 parts are the pre-existing shard

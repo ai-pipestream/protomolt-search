@@ -262,14 +262,36 @@ impl SpladeFieldIndex {
     where
         F: Fn(u32) -> bool,
     {
+        let (hits, _, stats) =
+            self.score_top_k_with_floor(query_weights, query_l1_slack, 0.0, k, admitted);
+        (hits, stats)
+    }
+
+    /// Evaluates top-`k` documents seeded with a monotonic cross-shard `initial_floor`.
+    pub fn score_top_k_with_floor<F>(
+        &self,
+        query_weights: &[(String, f32)],
+        query_l1_slack: f32,
+        initial_floor: f32,
+        k: usize,
+        admitted: F,
+    ) -> (Vec<(u32, f32)>, f32, SpladeTraversalStats)
+    where
+        F: Fn(u32) -> bool,
+    {
+        let floor = if initial_floor.is_finite() && initial_floor > 0.0 {
+            initial_floor
+        } else {
+            0.0
+        };
         if k == 0 || self.postings.is_empty() || query_weights.is_empty() {
-            return (Vec::new(), SpladeTraversalStats::default());
+            return (Vec::new(), floor, SpladeTraversalStats::default());
         }
         let mut buf = Vec::with_capacity(self.encoded_len() as usize);
         self.write(&mut buf)
             .expect("in-memory SpladeFieldIndex encode");
         let reader = SpladeSectionReader::open(&buf).expect("valid encoded SpladeFieldIndex");
-        reader.score_top_k(query_weights, query_l1_slack, k, admitted)
+        reader.score_top_k_with_floor(query_weights, query_l1_slack, floor, k, admitted)
     }
 }
 
@@ -475,10 +497,33 @@ impl<'a> SpladeSectionReader<'a> {
     where
         F: Fn(u32) -> bool,
     {
+        let (hits, _, stats) =
+            self.score_top_k_with_floor(query_weights, query_l1_slack, 0.0, k, admitted);
+        (hits, stats)
+    }
+
+    /// Document-at-a-time Block-Max MaxScore / WAND top-`k` traversal seeded with
+    /// a monotonic cross-shard `initial_floor`.
+    pub fn score_top_k_with_floor<F>(
+        &self,
+        query_weights: &[(String, f32)],
+        query_l1_slack: f32,
+        initial_floor: f32,
+        k: usize,
+        admitted: F,
+    ) -> (Vec<(u32, f32)>, f32, SpladeTraversalStats)
+    where
+        F: Fn(u32) -> bool,
+    {
         let mut stats = SpladeTraversalStats::default();
+        let floor = if initial_floor.is_finite() && initial_floor > 0.0 {
+            initial_floor
+        } else {
+            0.0
+        };
         let doc_scale = f32::from_bits(self.scale_bits);
         if k == 0 || doc_scale <= 0.0 || !doc_scale.is_finite() {
-            return (Vec::new(), stats);
+            return (Vec::new(), floor, stats);
         }
         let slack = if query_l1_slack.is_finite() && query_l1_slack > 0.0 {
             query_l1_slack
@@ -660,13 +705,13 @@ impl<'a> SpladeSectionReader<'a> {
             }
         }
         if cursors.is_empty() {
-            return (Vec::new(), stats);
+            return (Vec::new(), floor, stats);
         }
 
         // Min-heap of top-k `(score_bits_ordered, doc_id)` kept in a small sorted Vec
         // (k is typically 10..1000; binary-search insert is cache-hot and exact).
         let mut heap: Vec<(u32, f32)> = Vec::with_capacity(k + 1);
-        let mut threshold = 0.0_f32;
+        let mut threshold = floor;
 
         loop {
             // Sort active cursors by current doc_id ascending, breaking ties in canonical term order.
@@ -749,9 +794,11 @@ impl<'a> SpladeSectionReader<'a> {
                         score += c.current_impact(self.bytes, doc_scale);
                         stats.postings_scored += 1;
                     }
-                    if heap.len() < k
+                    if (heap.len() < k && score >= floor)
                         || score > threshold
-                        || (score == threshold && pivot_doc < heap.last().unwrap().0)
+                        || (heap.len() == k
+                            && score == threshold
+                            && pivot_doc < heap.last().unwrap().0)
                     {
                         let pos = heap
                             .partition_point(|&(d, s)| s > score || (s == score && d < pivot_doc));
@@ -760,7 +807,7 @@ impl<'a> SpladeSectionReader<'a> {
                             heap.pop();
                         }
                         if heap.len() == k {
-                            threshold = heap.last().unwrap().1;
+                            threshold = threshold.max(heap.last().unwrap().1);
                         }
                     }
                 }
@@ -775,6 +822,6 @@ impl<'a> SpladeSectionReader<'a> {
             }
         }
 
-        (heap, stats)
+        (heap, threshold, stats)
     }
 }

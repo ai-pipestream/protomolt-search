@@ -190,6 +190,7 @@ impl Arm {
                 prefixes: Vec::new(),
                 synonyms: Vec::new(),
                 synonyms_off: false,
+                pre_analyzed_terms: Vec::new(),
             }),
         };
         SearchVariant {

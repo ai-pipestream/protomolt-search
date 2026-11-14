@@ -768,7 +768,7 @@ pub trait Bm25Index {
         false
     }
     /// Score top-`k` documents against quantized SPLADE Block-Max postings with
-    /// L1 query rounding slack (`#104`, `#2343`).
+    /// L1 query rounding slack.
     fn score_splade(
         &self,
         query_weights: &[(String, f32)],
@@ -779,8 +779,26 @@ pub trait Bm25Index {
         Vec<(u32, f32)>,
         crate::turbo_bridge::splade::SpladeTraversalStats,
     ) {
+        let (hits, _floor, stats) =
+            self.score_splade_with_floor(query_weights, query_l1_slack, 0.0, k, admitted);
+        (hits, stats)
+    }
+    /// Score top-`k` documents against quantized SPLADE Block-Max postings
+    /// seeded with an initial dynamic pruning floor, returning `(hits, final_floor, stats)`.
+    fn score_splade_with_floor(
+        &self,
+        query_weights: &[(String, f32)],
+        query_l1_slack: f32,
+        initial_floor: f32,
+        k: usize,
+        admitted: &dyn Fn(u32) -> bool,
+    ) -> (
+        Vec<(u32, f32)>,
+        f32,
+        crate::turbo_bridge::splade::SpladeTraversalStats,
+    ) {
         let _ = (query_weights, query_l1_slack, k, admitted);
-        (Vec::new(), Default::default())
+        (Vec::new(), initial_floor.max(0.0), Default::default())
     }
     /// Whether this field stores sentence spans per document
     /// (`docs/highlighting.md`). Sentence-mode snippets over a field
@@ -4646,19 +4664,27 @@ impl Bm25Index for StoreFieldView<'_> {
     fn has_splade(&self) -> bool {
         self.field.splade.as_ref().is_some_and(|s| !s.is_empty())
     }
-    fn score_splade(
+    fn score_splade_with_floor(
         &self,
         query_weights: &[(String, f32)],
         query_l1_slack: f32,
+        initial_floor: f32,
         k: usize,
         admitted: &dyn Fn(u32) -> bool,
     ) -> (
         Vec<(u32, f32)>,
+        f32,
         crate::turbo_bridge::splade::SpladeTraversalStats,
     ) {
         match self.field.splade.as_ref() {
-            Some(splade) => splade.score_top_k(query_weights, query_l1_slack, k, admitted),
-            None => (Vec::new(), Default::default()),
+            Some(splade) => splade.score_top_k_with_floor(
+                query_weights,
+                query_l1_slack,
+                initial_floor,
+                k,
+                admitted,
+            ),
+            None => (Vec::new(), initial_floor.max(0.0), Default::default()),
         }
     }
     fn has_sentences(&self) -> bool {
@@ -4760,18 +4786,25 @@ impl Bm25Index for Bm25Store {
     fn has_splade(&self) -> bool {
         self.field(0).has_splade()
     }
-    fn score_splade(
+    fn score_splade_with_floor(
         &self,
         query_weights: &[(String, f32)],
         query_l1_slack: f32,
+        initial_floor: f32,
         k: usize,
         admitted: &dyn Fn(u32) -> bool,
     ) -> (
         Vec<(u32, f32)>,
+        f32,
         crate::turbo_bridge::splade::SpladeTraversalStats,
     ) {
-        self.field(0)
-            .score_splade(query_weights, query_l1_slack, k, admitted)
+        self.field(0).score_splade_with_floor(
+            query_weights,
+            query_l1_slack,
+            initial_floor,
+            k,
+            admitted,
+        )
     }
     fn has_sentences(&self) -> bool {
         self.field(0).has_sentences()
@@ -11664,23 +11697,31 @@ impl Bm25Index for FieldView<'_> {
     fn has_splade(&self) -> bool {
         self.field.splade_range.is_some()
     }
-    fn score_splade(
+    fn score_splade_with_floor(
         &self,
         query_weights: &[(String, f32)],
         query_l1_slack: f32,
+        initial_floor: f32,
         k: usize,
         admitted: &dyn Fn(u32) -> bool,
     ) -> (
         Vec<(u32, f32)>,
+        f32,
         crate::turbo_bridge::splade::SpladeTraversalStats,
     ) {
         let Some((off, len)) = self.field.splade_range else {
-            return (Vec::new(), Default::default());
+            return (Vec::new(), initial_floor.max(0.0), Default::default());
         };
         let bytes = &self.reader.map[off as usize..(off + len) as usize];
         match crate::turbo_bridge::splade::SpladeSectionReader::open(bytes) {
-            Ok(reader) => reader.score_top_k(query_weights, query_l1_slack, k, admitted),
-            Err(_) => (Vec::new(), Default::default()),
+            Ok(reader) => reader.score_top_k_with_floor(
+                query_weights,
+                query_l1_slack,
+                initial_floor,
+                k,
+                admitted,
+            ),
+            Err(_) => (Vec::new(), initial_floor.max(0.0), Default::default()),
         }
     }
     fn prefix_terms(&self, prefix: &str) -> Box<dyn Iterator<Item = String> + '_> {
@@ -12100,18 +12141,25 @@ impl Bm25Index for Bm25Reader {
     fn has_splade(&self) -> bool {
         self.field(0).has_splade()
     }
-    fn score_splade(
+    fn score_splade_with_floor(
         &self,
         query_weights: &[(String, f32)],
         query_l1_slack: f32,
+        initial_floor: f32,
         k: usize,
         admitted: &dyn Fn(u32) -> bool,
     ) -> (
         Vec<(u32, f32)>,
+        f32,
         crate::turbo_bridge::splade::SpladeTraversalStats,
     ) {
-        self.field(0)
-            .score_splade(query_weights, query_l1_slack, k, admitted)
+        self.field(0).score_splade_with_floor(
+            query_weights,
+            query_l1_slack,
+            initial_floor,
+            k,
+            admitted,
+        )
     }
     fn has_sentences(&self) -> bool {
         self.field(0).has_sentences()

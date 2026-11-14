@@ -40,7 +40,7 @@ successful `serve` readiness probe alone is not acceptance.
 | chunk texts | `/work/court-corpus/chunks-full.ndjson` | one JSON record per chunk, file order == id order |
 | embeddings | `/work/court-corpus/embeddings-full.bin` | 12-byte header + fixed-stride records; its length defines the corpus size |
 | case names | `/work/court-corpus/case-names.tsv` | `<cluster_id>\t<name>`, see below |
-| analysis sidecar | `grpc-opennlp-analysis`, JVM dist | **must implement `AnalyzeStream`** |
+| analysis sidecar | `turbo-kserve` (`ai-pipestream/turboembed`), Rust binary | **serves `AnalysisService` + KServe `GRPCInferenceService`** |
 | embedding model | `/work/court-corpus/models/minilm-l6-v2-static` | query-side embeddings only |
 
 Export the case-name table straight from the CourtListener clusters table
@@ -163,16 +163,13 @@ shared analysis sidecar is the throughput ceiling, not shard parallelism.
 
 ## Four things that will bite you
 
-**A stale analysis sidecar.** If the sidecar predates the `AnalyzeStream`
-RPC, the node silently falls back to one unary call per document; its gRPC
-server then GOAWAYs the connection after ~70 streams and the bulk driver
-dies with an opaque `h2 protocol error` a few seconds in, while the node
-logs nothing and stays healthy. Check with
-`strings <sidecar-bin> | grep AnalyzeStream` and rebuild with
-`./gradlew installDist` if it is missing. The general lesson: a driver
-that is still streaming when the server aborts sees only the h2 reset, so
-reproduce with `examples/ingest_probe.rs`, which closes its send side
-first and gets the real status back.
+**A stale analysis sidecar.** Ensure `SIDECAR_BIN` points to a current
+`turbo-kserve` release binary (`cargo build --release -p turbo-kserve` in
+`ai-pipestream/turboembed`) or configure `--analysis-addr=turbo` on the
+nodes to run `turbo-client` in-process without a network hop. If a remote
+server aborts mid-stream, a driver that is still streaming when the server
+aborts sees only the h2 reset, so reproduce with `examples/ingest_probe.rs`,
+which closes its send side first and gets the real status back.
 
 **Node ports are inside the ephemeral range.** `ip_local_port_range` is
 32768-60999 here, which covers 59300-59307, so an unrelated outbound
@@ -181,22 +178,16 @@ with `AddrInUse` while its siblings come up fine. `rebuild.sh` retries the
 bind; the permanent fix is
 `sysctl -w net.ipv4.ip_local_reserved_ports=59290-59310`.
 
-**The sidecar needs its embedding model for queries, not for ingest.**
-Ingest takes vectors from the embeddings file, so a sidecar started
-without `OPENNLP_EMBEDDINGS_DIR` builds a perfectly good index and then
-cannot embed a single query. `rebuild.sh` always sets it.
+**`turbo-kserve` needs its embedding bundle directory for queries, not for ingest.**
+Ingest takes vectors from the embeddings file, so `turbo-kserve` started
+without `TURBO_KSERVE_BUNDLE_DIR` builds a perfectly good lexical index and
+then cannot embed a single query. `rebuild.sh` always sets
+`TURBO_KSERVE_BUNDLE_DIR="$EMBEDDINGS_DIR"`.
 
-**Do not rebuild the sidecar's jars while it is running.** This one was
-self-inflicted mid-rebuild and is worth the warning. A JVM loads classes
-lazily, so `./gradlew installDist` against a live sidecar leaves the
-process serving everything it had already touched and unable to load
-anything it had not. Ingest kept working for hours across six shards
-because the analysis path's classes were all resident; embedding, which
-ingest never calls, died with
-`ClassNotFoundException: EmbeddingOptions$1` — a *classpath* error, even
-though `OPENNLP_EMBEDDINGS_DIR` was correctly set and the jar on disk was
-perfectly good. The failure is invisible until the first query, which is
-after the rebuild has finished.
+**Do not replace `turbo-kserve` bundles underneath a running server without reloading.**
+`turbo-kserve` verifies bundle manifests and SHA-256 digests at load time;
+replacing files in `TURBO_KSERVE_BUNDLE_DIR` mid-run without restarting or
+calling model reload leaves the running session out of sync with disk.
 
 An open port therefore does not mean a working sidecar: analysis and
 embedding are separate capabilities of one process, and ingest exercises
@@ -355,9 +346,9 @@ v7_verify --coord=192.168.1.195:19291 --shards=8 \
   --bearer-token-file=$T/bearer.token
 ```
 
-`ssh host cmd` runs a non-login shell: on krick-1 Java lives under
-`~/.sdkman/candidates/java/current/bin` and `protoc` under `~/.local/bin`,
-so remote launches export `PATH` or use absolute paths. Each node must be
+`ssh host cmd` runs a non-login shell: on krick-1 `protoc` lives under
+`~/.local/bin` and Cargo binaries under `~/.cargo/bin`, so remote launches
+export `PATH` or use absolute paths. Each node must be
 up before `calibrate` and `ingest` run on the driver host; the `down` and `serve` stages run per host. The disk gate in
 `ingest` counts only the wave's shards that build on the driver host's
 disk; the other hosts' `plan` output is their gate. A node writes shard files under the host's

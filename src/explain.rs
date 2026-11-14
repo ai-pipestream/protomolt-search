@@ -661,6 +661,7 @@ mod tests {
             boost_score: 0.0,
             vector_normalized: None,
             bm25_normalized: None,
+            rerank_candidate: None,
         };
         let tree = composite(&hit, &fusion, "d", "l", None).unwrap();
         let sum: f64 = tree.details.iter().map(|n| n.value).sum();
