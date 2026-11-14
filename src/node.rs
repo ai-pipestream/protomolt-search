@@ -4399,12 +4399,21 @@ pub fn refuse_retired_generation(index_path: &Path) -> Result<(), String> {
     for generation in [generation_dir(index_path), generation_old_dir(index_path)] {
         for name in RETIRED_GENERATION_FILES {
             let retired = generation.join(name);
-            if retired.exists() {
-                return Err(format!(
-                    "{} is a snapshot generation in the retired layout ({name}); this binary \
-                     reads only vector.index and documents.bm25 and does not convert it",
-                    retired.display()
-                ));
+            match std::fs::symlink_metadata(&retired) {
+                Ok(_) => {
+                    return Err(format!(
+                        "{} is a snapshot generation in the retired layout ({name}); this binary \
+                         reads only vector.index and documents.bm25 and does not convert it",
+                        retired.display()
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "cannot inspect snapshot generation entry {} before recovery: {error}",
+                        retired.display()
+                    ));
+                }
             }
         }
     }

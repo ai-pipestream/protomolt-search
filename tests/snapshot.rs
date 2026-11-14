@@ -649,22 +649,35 @@ fn a_retired_generation_layout_refuses_to_open() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum RecoveryFile {
+    Directory,
+    Bytes(Vec<u8>),
+    Symlink(std::path::PathBuf),
+}
+
 fn recovery_files(
     root: &std::path::Path,
-) -> std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+) -> std::collections::BTreeMap<std::path::PathBuf, RecoveryFile> {
     fn walk(
         root: &std::path::Path,
         dir: &std::path::Path,
-        files: &mut std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>>,
+        files: &mut std::collections::BTreeMap<std::path::PathBuf, RecoveryFile>,
     ) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
             let relative = path.strip_prefix(root).unwrap().to_path_buf();
-            if path.is_dir() {
-                files.insert(relative, None);
+            let kind = std::fs::symlink_metadata(&path).unwrap().file_type();
+            if kind.is_symlink() {
+                files.insert(
+                    relative,
+                    RecoveryFile::Symlink(std::fs::read_link(path).unwrap()),
+                );
+            } else if kind.is_dir() {
+                files.insert(relative, RecoveryFile::Directory);
                 walk(root, &path, files);
             } else {
-                files.insert(relative, Some(std::fs::read(path).unwrap()));
+                files.insert(relative, RecoveryFile::Bytes(std::fs::read(path).unwrap()));
             }
         }
     }
@@ -831,5 +844,70 @@ fn a_current_generation_still_rolls_back_before_open() {
     assert!(!marker.exists());
     assert!(pipestream_search::wal::gen_dir(&wal, 0).exists());
     assert!(!pipestream_search::wal::gen_dir(&wal, 1).exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_broken_retired_symlink_preserves_recovery_files() {
+    for name in ["index.tv", "index.tv.bm25"] {
+        for suffix in [".snap", ".snap-old"] {
+            let dir = tempdir(&format!("broken-link-{name}-{suffix}"));
+            let image = build_bm25(&dir, "preserved document");
+            let index_path = dir.join("shard.idx");
+            for generation in [".snap", ".snap-old", ".snap-tmp"] {
+                let path = dir.join(format!("shard.idx{generation}"));
+                std::fs::create_dir_all(&path).unwrap();
+                std::fs::copy(&image, generation_bm25(&path)).unwrap();
+            }
+            let retired = dir.join(format!("shard.idx{suffix}")).join(name);
+            std::os::unix::fs::symlink("missing-retired-image", &retired).unwrap();
+            let before = recovery_files(&dir);
+            let error = NodeServiceImpl::open(
+                NodeConfig {
+                    index_path: Some(index_path),
+                    ..Default::default()
+                },
+                None,
+                false,
+            )
+            .err()
+            .expect("broken retired-name symlink must not be ignored");
+            assert!(error.contains("retired layout"), "{name}/{suffix}: {error}");
+            assert!(
+                recovery_files(&dir) == before,
+                "{name}/{suffix}: open changed files or symlink text"
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_generation_metadata_error_preserves_recovery_files() {
+    let dir = tempdir("metadata-error");
+    let index_path = dir.join("shard.idx");
+    std::fs::write(generation_dir(&index_path), b"not a directory").unwrap();
+    for suffix in [".snap-old", ".snap-tmp"] {
+        let path = dir.join(format!("shard.idx{suffix}"));
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("evidence"), suffix).unwrap();
+    }
+    let before = recovery_files(&dir);
+    let error = NodeServiceImpl::open(
+        NodeConfig {
+            index_path: Some(index_path),
+            ..Default::default()
+        },
+        None,
+        false,
+    )
+    .err()
+    .expect("an unreadable generation path must not be treated as absent");
+    assert!(error.contains("cannot inspect"), "{error}");
+    assert!(
+        recovery_files(&dir) == before,
+        "metadata error must leave recovery files untouched"
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }
