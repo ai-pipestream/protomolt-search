@@ -276,14 +276,17 @@ impl Default for SegmentSetManifest {
 }
 
 impl SegmentSetManifest {
+    /// Promote only after the final artifact inventory is assembled. Source
+    /// publication establishes its binding before it appends staged segments.
+    fn update_retained_format(&mut self) {
+        if self.segments.iter().any(|segment| segment.multi_res.is_some()) {
+            self.format = RETAINED_SET_FORMAT;
+        }
+    }
+
     pub fn with_binding(mut self, binding: Option<&StoredBinding>) -> Result<Self, String> {
         self.binding = binding.map(SegmentBinding::encode).transpose()?;
-        self.format = if self
-            .segments
-            .iter()
-            .any(|segment| segment.multi_res.is_some())
-            || self.format == RETAINED_SET_FORMAT
-        {
+        self.format = if self.format == RETAINED_SET_FORMAT {
             RETAINED_SET_FORMAT
         } else if self.generation_declaration.is_some() {
             DECLARED_SET_FORMAT
@@ -294,6 +297,7 @@ impl SegmentSetManifest {
         } else {
             BASE_SET_FORMAT
         };
+        self.update_retained_format();
         Ok(self)
     }
 }
@@ -497,7 +501,10 @@ impl OpenedSegmentSet {
                     let live_docs = LiveDocs::open(&directory.join(&metadata.live_docs.file))
                         .map_err(|error| format!("open retired segment bitmap: {error}"))?;
                     if live_docs.requires_retained_vectors() && metadata.multi_res.is_none() {
-                        return Err(format!("segment {:?} requires a retained vector artifact", metadata.segment_id));
+                        return Err(format!(
+                            "segment {:?} requires a retained vector artifact",
+                            metadata.segment_id
+                        ));
                     }
                     if live_docs.persisted_rows() != metadata.rows
                         || metadata.rows.checked_sub(live_docs.deleted_count())
@@ -582,7 +589,10 @@ impl OpenedSegmentSet {
                     format!("open live-doc segment {:?}: {error}", metadata.segment_id)
                 })?;
             if live_docs.requires_retained_vectors() && metadata.multi_res.is_none() {
-                return Err(format!("segment {:?} requires a retained vector artifact", metadata.segment_id));
+                return Err(format!(
+                    "segment {:?} requires a retained vector artifact",
+                    metadata.segment_id
+                ));
             }
             let rows = usize::try_from(metadata.rows)
                 .map_err(|_| format!("segment {:?} rows do not fit usize", metadata.segment_id))?;
@@ -1272,13 +1282,7 @@ impl SegmentCatalog {
             .ok_or("segment catalog epoch overflow")?;
         manifest.segments.push(metadata.clone());
         manifest.segments.sort_by_key(|segment| segment.base_label);
-        if manifest
-            .segments
-            .iter()
-            .any(|segment| segment.multi_res.is_some())
-        {
-            manifest.format = RETAINED_SET_FORMAT;
-        }
+        manifest.update_retained_format();
         let published = self.publish(manifest);
         if published.is_err() {
             cleanup_staged(&self.root, std::slice::from_ref(&metadata));
@@ -1396,13 +1400,7 @@ impl SegmentCatalog {
         manifest.segments.extend(outputs.iter().cloned());
         manifest.segments.sort_by_key(|segment| segment.base_label);
         manifest.partition_key = partition_key;
-        if manifest
-            .segments
-            .iter()
-            .any(|segment| segment.multi_res.is_some())
-        {
-            manifest.format = RETAINED_SET_FORMAT;
-        }
+        manifest.update_retained_format();
         let published = self.publish(manifest);
         if published.is_err() {
             cleanup_staged(&self.root, &outputs);

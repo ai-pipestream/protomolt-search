@@ -52,22 +52,30 @@ fn raw(row: usize) -> Vec<f32> {
     values
 }
 
+fn active_index() -> pipestream_search::vector::VectorIndex {
+    // Compaction requires a fitted, locked provider configuration; the identity
+    // pair (zero shift/unit scale) denotes an uncalibrated TurboVec index.
+    let sample = pipestream_search::harness::unit_vectors(128, 8, 0x151);
+    let (shift, scale) = pipestream_search::harness::fit_calibration(8, 4, &sample);
+    pipestream_search::harness::seeded_index(8, 4, &shift, &scale)
+}
+
 async fn seed(cfg: &NodeConfig) -> Arc<NodeServiceImpl> {
-    let index = pipestream_search::harness::seeded_index(8, 4, &[0.0; 8], &[1.0; 8]);
+    let index = active_index();
     let node = Arc::new(NodeServiceImpl::new(Some(index), cfg.clone()));
     let mut link = NodeLink::local(Arc::clone(&node));
-    link.add_vectors(tokio_stream::iter([AddVectorsRequest {
-        vectors: (0..3).flat_map(raw).collect(),
-        dim: 16,
-        ..Default::default()
-    }]))
-    .await
-    .unwrap();
     link.add_documents(tokio_stream::iter((0..3).map(|i| AddDocumentsRequest {
         text: format!("retained document {i}"),
         analysis: Some(body_spec()),
         ..Default::default()
     })))
+    .await
+    .unwrap();
+    link.add_vectors(tokio_stream::iter([AddVectorsRequest {
+        vectors: (0..3).flat_map(raw).collect(),
+        dim: 16,
+        ..Default::default()
+    }]))
     .await
     .unwrap();
     node
@@ -328,7 +336,7 @@ async fn wal_replication_preserves_materialized_bits_and_retry_is_idempotent() {
         .await
         .unwrap();
     let cfg = config(&dir.0.join("target"), Layout::SingleImage);
-    let index = pipestream_search::harness::seeded_index(8, 4, &[0.0; 8], &[1.0; 8]);
+    let index = active_index();
     let target = NodeServiceImpl::new(Some(index), cfg.clone());
     let target_view = target.clone();
     let (primary, source_task) = pipestream_search::harness::serve_node((*source).clone()).await;
@@ -367,7 +375,8 @@ async fn wal_disabled_retention_has_an_old_reader_gate_and_cannot_lose_its_decla
     let before = node.multi_res_row(0).unwrap();
     let mut link = NodeLink::local(Arc::clone(&node));
     link.flush(FlushRequest {}).await.unwrap();
-    drop(link); drop(node);
+    drop(link);
+    drop(node);
     let live = std::fs::read(pipestream_search::node::live_docs_sidecar_path(&path)).unwrap();
     assert_eq!(u32::from_le_bytes(live[8..12].try_into().unwrap()), 2);
     let reopened = NodeServiceImpl::open(cfg.clone(), None, false).unwrap();
@@ -375,15 +384,25 @@ async fn wal_disabled_retention_has_an_old_reader_gate_and_cannot_lose_its_decla
     drop(reopened);
     let live_path = pipestream_search::node::live_docs_sidecar_path(&path);
     std::fs::remove_file(&live_path).unwrap();
-    let error = NodeServiceImpl::open(cfg.clone(), None, false).err().expect("missing reader gate accepted");
-    assert!(error.contains("requires its live-doc reader gate"), "{error}");
+    let error = NodeServiceImpl::open(cfg.clone(), None, false)
+        .err()
+        .expect("missing reader gate accepted");
+    assert!(
+        error.contains("requires its live-doc reader gate"),
+        "{error}"
+    );
     let mut legacy = live.clone();
     legacy[8..12].copy_from_slice(&1u32.to_le_bytes());
     let crc = pipestream_search::wal::crc32(&legacy[..72]);
     legacy[72..76].copy_from_slice(&crc.to_le_bytes());
     std::fs::write(&live_path, &legacy).unwrap();
-    let error = NodeServiceImpl::open(cfg.clone(), None, false).err().expect("downgraded reader gate accepted");
-    assert!(error.contains("requires its live-doc reader gate"), "{error}");
+    let error = NodeServiceImpl::open(cfg.clone(), None, false)
+        .err()
+        .expect("downgraded reader gate accepted");
+    assert!(
+        error.contains("requires its live-doc reader gate"),
+        "{error}"
+    );
     assert_eq!(legacy, std::fs::read(&live_path).unwrap());
     std::fs::write(&live_path, &live).unwrap();
     std::fs::remove_file(dir.0.join("index.multi")).unwrap();
@@ -392,7 +411,15 @@ async fn wal_disabled_retention_has_an_old_reader_gate_and_cannot_lose_its_decla
     // the persisted reader gate must still require the declared artifact.
     cfg.matryoshka_prefix_dims.clear();
     cfg.matryoshka_active_dim = None;
-    let error = NodeServiceImpl::open(cfg, None, false).err().expect("missing retention accepted");
-    assert!(error.contains("requires a retained vector declaration"), "{error}");
-    assert_eq!(live, std::fs::read(pipestream_search::node::live_docs_sidecar_path(&path)).unwrap());
+    let error = NodeServiceImpl::open(cfg, None, false)
+        .err()
+        .expect("missing retention accepted");
+    assert!(
+        error.contains("requires a retained vector declaration"),
+        "{error}"
+    );
+    assert_eq!(
+        live,
+        std::fs::read(pipestream_search::node::live_docs_sidecar_path(&path)).unwrap()
+    );
 }

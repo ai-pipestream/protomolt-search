@@ -60,13 +60,21 @@ pub(crate) fn export_declaration(payload: &Path) -> io::Result<Option<Vec<u8>>> 
     Ok(Some(bytes))
 }
 
-pub(crate) fn open_generation(payload: &Path, physical_rows: u64, live: &crate::live_docs::LiveDocs) -> io::Result<MultiResVectors> {
+pub(crate) fn open_generation(
+    payload: &Path,
+    physical_rows: u64,
+    live: &crate::live_docs::LiveDocs,
+) -> io::Result<MultiResVectors> {
     if live.requires_retained_vectors() && !declaration_path(payload).try_exists()? {
-        return Err(invalid("live generation requires a retained vector declaration"));
+        return Err(invalid(
+            "live generation requires a retained vector declaration",
+        ));
     }
     let rows = open(payload, physical_rows)?;
     if !rows.is_empty() && !live.requires_retained_vectors() {
-        return Err(invalid("retained vector generation requires its live-doc reader gate"));
+        return Err(invalid(
+            "retained vector generation requires its live-doc reader gate",
+        ));
     }
     Ok(rows)
 }
@@ -111,10 +119,19 @@ pub(crate) fn open(payload: &Path, physical_rows: u64) -> io::Result<MultiResVec
     Ok(rows)
 }
 
-pub(crate) fn write(rows: &MultiResVectors, payload: &Path, physical_rows: u64, required: bool) -> io::Result<()> {
+pub(crate) fn write(
+    rows: &MultiResVectors,
+    payload: &Path,
+    physical_rows: u64,
+    required: bool,
+) -> io::Result<()> {
     // Ordinary legacy generations remain unchanged. Reusing a retained path,
     // however, must publish even an empty map to retire the prior rows.
-    if rows.is_empty() && !required && !payload.try_exists()? && !declaration_path(payload).try_exists()? {
+    if rows.is_empty()
+        && !required
+        && !payload.try_exists()?
+        && !declaration_path(payload).try_exists()?
+    {
         return Ok(());
     }
     let (bytes, sha256) = rows.write(payload, physical_rows)?;

@@ -37,7 +37,9 @@ impl LiveDocs {
                 path.display()
             )));
         }
-        if !matches!(read_u32(&bytes, 8), VERSION | RETAINED_VECTOR_VERSION) || read_u32(&bytes, 12) as usize != HEADER_BYTES {
+        if !matches!(read_u32(&bytes, 8), VERSION | RETAINED_VECTOR_VERSION)
+            || read_u32(&bytes, 12) as usize != HEADER_BYTES
+        {
             return Err(invalid(format!(
                 "{} has unsupported live-doc version",
                 path.display()
@@ -196,7 +198,11 @@ impl LiveDocs {
         let hash = crate::sha256::digest(&payload);
         let mut header = [0u8; HEADER_BYTES];
         header[..8].copy_from_slice(MAGIC);
-        let version = if self.retained_vectors { RETAINED_VECTOR_VERSION } else { VERSION };
+        let version = if self.retained_vectors {
+            RETAINED_VECTOR_VERSION
+        } else {
+            VERSION
+        };
         header[8..12].copy_from_slice(&version.to_le_bytes());
         header[12..16].copy_from_slice(&(HEADER_BYTES as u32).to_le_bytes());
         header[16..24].copy_from_slice(&rows.to_le_bytes());

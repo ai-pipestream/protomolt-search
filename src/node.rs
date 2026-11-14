@@ -5832,9 +5832,10 @@ impl NodeServiceImpl {
                 if let Some(provider) = index.as_ref().and_then(VectorIndex::as_segmented) {
                     provider.snapshot().retained_vectors()?
                 } else {
-                    crate::multi_res_storage::open_generation(&payload, physical as u64, &live_docs).map_err(|error| {
-                        format!("load retained vectors {}: {error}", payload.display())
-                    })?
+                    crate::multi_res_storage::open_generation(&payload, physical as u64, &live_docs)
+                        .map_err(|error| {
+                            format!("load retained vectors {}: {error}", payload.display())
+                        })?
                 };
             crate::multi_res_wal::require_coverage(
                 &multi_res_vectors,
@@ -7352,10 +7353,20 @@ impl NodeServiceImpl {
         // become durable, including when this shard deliberately has no WAL.
         if !guard.multi_res_vectors.is_empty()
             && !guard.live_docs.requires_retained_vectors()
-            && guard.index.as_ref().and_then(VectorIndex::as_segmented).is_none() {
-            guard.live_docs = guard.live_docs.clone().with_retained_vectors()
+            && guard
+                .index
+                .as_ref()
+                .and_then(VectorIndex::as_segmented)
+                .is_none()
+        {
+            guard.live_docs = guard
+                .live_docs
+                .clone()
+                .with_retained_vectors()
                 .write(&live_docs_path, physical_rows(&guard))
-                .map_err(|error| Status::internal(format!("publish retained reader gate: {error}")))?;
+                .map_err(|error| {
+                    Status::internal(format!("publish retained reader gate: {error}"))
+                })?;
         }
         if let Some(index) = guard.index.as_mut() {
             if let Some(provider) = index.as_segmented() {
@@ -7415,11 +7426,21 @@ impl NodeServiceImpl {
             .is_none()
         {
             let payload = crate::multi_res::storage_path(&config_path, guard.generation.as_ref());
-            crate::multi_res_storage::write(&guard.multi_res_vectors, &payload, physical_rows, guard.live_docs.requires_retained_vectors())
-                .map_err(|error| Status::internal(format!("persist retained vectors: {error}")))?;
+            crate::multi_res_storage::write(
+                &guard.multi_res_vectors,
+                &payload,
+                physical_rows,
+                guard.live_docs.requires_retained_vectors(),
+            )
+            .map_err(|error| Status::internal(format!("persist retained vectors: {error}")))?;
         }
         if !guard.multi_res_vectors.is_empty()
-            && guard.index.as_ref().and_then(VectorIndex::as_segmented).is_none() {
+            && guard
+                .index
+                .as_ref()
+                .and_then(VectorIndex::as_segmented)
+                .is_none()
+        {
             guard.live_docs = guard.live_docs.clone().with_retained_vectors();
         }
         guard.live_docs = guard
@@ -8442,10 +8463,14 @@ impl NodeServiceImpl {
                 .retained_vectors()
                 .map_err(Status::invalid_argument)?
         } else {
-            crate::multi_res_storage::open_generation(&tmp_dir.join(crate::multi_res::FILE_NAME), staged_rows, &incoming_live)
-                .map_err(|error| {
-                    Status::invalid_argument(format!("snapshot retained vectors: {error}"))
-                })?
+            crate::multi_res_storage::open_generation(
+                &tmp_dir.join(crate::multi_res::FILE_NAME),
+                staged_rows,
+                &incoming_live,
+            )
+            .map_err(|error| {
+                Status::invalid_argument(format!("snapshot retained vectors: {error}"))
+            })?
         };
         let vector_ranges: Vec<_> = if has_sealed_vectors {
             staged

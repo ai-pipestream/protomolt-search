@@ -671,6 +671,14 @@ async fn retained_vector_artifacts_survive_source_backup_and_verified_restore() 
         before.len(),
         "backup must inventory each retained artifact"
     );
+    // Retention must also survive source-owned maintenance, whose staged
+    // manifest is assembled separately from ordinary shard compaction.
+    compact(&f).await;
+    let compacted = f.node.document_backup_catalog(&f.source, INDEX).unwrap().snapshot();
+    assert_eq!(compacted.manifest().segments.iter().map(|s| s.rows).sum::<u64>(), 2);
+    assert!(compacted.manifest().segments.iter().all(|s| s.multi_res.is_some()));
+    before.verify_source_rewrite(&compacted, &f.root.join("retained-maintenance-proof"), 2).unwrap();
+
     let destination = f.root.join("retained-restore");
     let header = manifest.source.as_ref().unwrap().header.as_ref().unwrap();
     let request = crate::pb::storage::SourceRestoreRequest {
@@ -688,7 +696,7 @@ async fn retained_vector_artifacts_survive_source_backup_and_verified_restore() 
             crate::multi_res::encode(restored.retained_segment(segment).retained(row).unwrap())
                 .unwrap(),
             bytes,
-            "full/prefix/raw/norm/code/sentence bits changed at segment {segment}, row {row}"
+            "full/prefix/norm/code/sentence bits changed at segment {segment}, row {row}"
         );
     }
     before

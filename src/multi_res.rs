@@ -245,17 +245,15 @@ fn finite(values: &[f32]) -> io::Result<()> {
 /// which the sidecar's enclosing Row would subsequently reject.
 fn validate_retained(row: &RetainedVector, limits: Limits) -> io::Result<usize> {
     let out = &row.output;
-    if out.full.is_empty()
-        || !out.inv_norm.is_finite()
-        || out.inv_norm < 0.0
-    {
+    if out.full.is_empty() || !out.inv_norm.is_finite() || out.inv_norm < 0.0 {
         return Err(invalid("invalid full-resolution vector or norm"));
     }
     let mut budget = Budget::new(limits.decoded);
     let mut size = 5 + delimited_size(32); // present inv_norm, full-vector digest
     budget.vector(32)?;
     {
-        let bytes = out.full
+        let bytes = out
+            .full
             .len()
             .checked_mul(4)
             .ok_or_else(|| invalid("multi-resolution vector size overflow"))?;
