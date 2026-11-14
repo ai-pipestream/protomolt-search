@@ -1,3 +1,9 @@
+use std::path::PathBuf;
+
+use crate::pb::{NodeCapacity, RegisterNodeRequest};
+
+use super::state::now_ms;
+
 use super::*;
 use crate::test_support::ForkGuarded;
 
