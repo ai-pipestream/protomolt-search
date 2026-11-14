@@ -47,7 +47,6 @@ const RATCHET: &[(&str, usize)] = &[
     ("src/segmented.rs", 2_236 + RATCHET_HEADROOM),
     ("src/placement.rs", 2_122 + RATCHET_HEADROOM),
     ("src/values.rs", 2_117 + RATCHET_HEADROOM),
-    ("src/hnsw/graph.rs", 2_017 + RATCHET_HEADROOM),
     ("src/main.rs", 2_010 + RATCHET_HEADROOM),
     ("src/vocab.rs", 1_989 + RATCHET_HEADROOM),
     ("src/node_agent.rs", 1_964 + RATCHET_HEADROOM),
