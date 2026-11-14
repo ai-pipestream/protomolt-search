@@ -4375,6 +4375,27 @@ pub(crate) fn storage_paths(
     }
 }
 
+fn probe_path_exists(path: &Path, context: &str) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                std::fs::metadata(path).map_err(|error| {
+                    format!(
+                        "cannot inspect {context} {} (broken or unreadable symlink target): {error}",
+                        path.display()
+                    )
+                })?;
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "cannot inspect {context} {}: {error}",
+            path.display()
+        )),
+    }
+}
+
 /// Crash recovery for the generation swap, and the startup answer to
 /// "does this shard have an installed snapshot?". Every interleave of the
 /// two swap renames has a defined outcome:
@@ -4388,6 +4409,9 @@ pub(crate) fn storage_paths(
 ///
 /// Returns the active generation directory when it holds an index.
 pub fn recover_generation(index_path: &Path) -> Option<PathBuf> {
+    if refuse_retired_generation(index_path).is_err() {
+        return None;
+    }
     // A compaction cutover that never reached its closing flush rolls
     // back to the generation it replaced BEFORE the swap rules below
     // run, or they would retire the very files the rollback restores
@@ -4397,14 +4421,16 @@ pub fn recover_generation(index_path: &Path) -> Option<PathBuf> {
     let old = generation_old_dir(index_path);
     let tmp = generation_tmp_dir(index_path);
     let _ = std::fs::remove_dir_all(&tmp);
-    if old.exists() {
-        if snap.exists() {
+    if probe_path_exists(&old, "snapshot backup").ok()? {
+        if probe_path_exists(&snap, "snapshot generation").ok()? {
             let _ = std::fs::remove_dir_all(&old);
         } else {
             let _ = std::fs::rename(&old, &snap);
         }
     }
-    (generation_vector(&snap).exists() || generation_bm25(&snap).exists()).then_some(snap)
+    let has_vector = probe_path_exists(&generation_vector(&snap), "snapshot vector").ok()?;
+    let has_bm25 = probe_path_exists(&generation_bm25(&snap), "snapshot bm25").ok()?;
+    (has_vector || has_bm25).then_some(snap)
 }
 
 /// File names of the retired snapshot generation layout. Nothing reads
@@ -4412,12 +4438,13 @@ pub fn recover_generation(index_path: &Path) -> Option<PathBuf> {
 /// binary.
 const RETIRED_GENERATION_FILES: [&str; 2] = ["index.tv", "index.tv.bm25"];
 
-/// Refuse a snapshot generation in the retired layout. Without this check
-/// [`recover_generation`] would report no generation and the shard would
-/// open from its root paths: empty, or from a stale root image, silently
-/// abandoning the installed data. Check both the active and backup generation
-/// before any recovery cleanup: the backup may be a rollback source, and an
-/// unsupported format must leave all recovery files for the operator.
+/// Refuse a snapshot generation in the retired layout or with unreadable or
+/// dangling entries. Without this check [`recover_generation`] would report no
+/// generation and the shard would open from its root paths: empty, or from a
+/// stale root image, silently abandoning the installed data. Check both the
+/// active and backup generation before any recovery cleanup: the backup may be
+/// a rollback source, and an unsupported or damaged path must leave all
+/// recovery files for the operator.
 pub fn refuse_retired_generation(index_path: &Path) -> Result<(), String> {
     for generation in [generation_dir(index_path), generation_old_dir(index_path)] {
         for name in RETIRED_GENERATION_FILES {
@@ -4438,6 +4465,36 @@ pub fn refuse_retired_generation(index_path: &Path) -> Result<(), String> {
                     ));
                 }
             }
+        }
+        if !probe_path_exists(&generation, "snapshot generation before recovery")? {
+            continue;
+        }
+        let meta = std::fs::metadata(&generation).map_err(|error| {
+            format!(
+                "cannot inspect snapshot generation {} before recovery: {error}",
+                generation.display()
+            )
+        })?;
+        if !meta.is_dir() {
+            return Err(format!(
+                "cannot inspect snapshot generation {} before recovery: not a directory",
+                generation.display()
+            ));
+        }
+        let entries = std::fs::read_dir(&generation).map_err(|error| {
+            format!(
+                "cannot inspect snapshot generation {} before recovery: {error}",
+                generation.display()
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "cannot inspect snapshot generation {} before recovery: {error}",
+                    generation.display()
+                )
+            })?;
+            probe_path_exists(&entry.path(), "snapshot generation entry before recovery")?;
         }
     }
     Ok(())
@@ -4556,8 +4613,10 @@ fn persisted_doc_tip(index_path: &Path) -> u64 {
     }
     let generation = recover_generation(index_path);
     let (_, _, bm25_path) = storage_paths(index_path, generation.as_ref());
-    if !bm25_path.exists() {
-        return 0;
+    match probe_path_exists(&bm25_path, "persisted BM25 sidecar") {
+        Ok(false) => return 0,
+        Ok(true) => {}
+        Err(error) => panic!("wal reconciliation: {error}"),
     }
     match Bm25Shard::open(&bm25_path) {
         Ok(store) => u64::from(store.next_doc_id()),
@@ -5654,8 +5713,8 @@ impl NodeServiceImpl {
                     if owner.collection != config.collection
                         || config.wal
                         || config.layout != Layout::Segments
-                        || generation_dir(path).exists()
-                        || generation_old_dir(path).exists()
+                        || probe_path_exists(&generation_dir(path), "snapshot generation")?
+                        || probe_path_exists(&generation_old_dir(path), "snapshot backup")?
                     {
                         return Err("source-managed index requires its original collection, segmented layout, WAL disabled and no competing snapshot generation".into());
                     }
@@ -5672,7 +5731,7 @@ impl NodeServiceImpl {
                 let path = generation
                     .as_ref()
                     .map_or_else(|| index_path.clone(), |dir| generation_vector(dir));
-                if path.exists() {
+                if probe_path_exists(&path, "vector index")? {
                     let mut loaded = VectorIndex::load(&config.vector_backend, &path)
                         .map_err(|error| format!("load {}: {error}", path.display()))?;
                     loaded
@@ -5692,16 +5751,21 @@ impl NodeServiceImpl {
         if let Some(index_path) = config.index_path.as_ref() {
             let (_, exact_path, bm25_path) = storage_paths(index_path, generation.as_ref());
             let root = segments_root(index_path);
-            let catalog_exists = root.join("segments.json").exists();
+            let catalog_exists =
+                probe_path_exists(&root.join("segments.json"), "segment catalog manifest")?;
             // A segment catalog owns its sealed FP32 files. Legacy sidecars
             // cannot override that view, even when their row counts agree.
-            if exact_path.exists() && (!catalog_exists || generation.is_some()) {
+            if probe_path_exists(&exact_path, "exact vector sidecar")?
+                && (!catalog_exists || generation.is_some())
+            {
                 exact_vectors = Some(
                     ExactVectorStore::open(&exact_path)
                         .map_err(|error| format!("load {}: {error}", exact_path.display()))?,
                 );
             }
-            if bm25_path.exists() {
+            let build_dir = bm25_build_dir(&bm25_path);
+            let build_dir_exists = probe_path_exists(&build_dir, "BM25 build directory")?;
+            if probe_path_exists(&bm25_path, "BM25 sidecar")? {
                 if catalog_exists && generation.is_none() {
                     return Err(format!(
                         "{} has both a single-image file and a segment catalog at {}; a shard has \
@@ -5716,9 +5780,7 @@ impl NodeServiceImpl {
                 );
             } else if generation.is_none()
                 && (catalog_exists
-                    || (config.layout == Layout::Segments
-                        && !bm25_build_dir(&bm25_path).exists()
-                        && index.is_none()))
+                    || (config.layout == Layout::Segments && !build_dir_exists && index.is_none()))
             {
                 // The segment layout: an existing catalog, or a fresh
                 // persisted shard under the default. Never a conversion —
@@ -5774,7 +5836,7 @@ impl NodeServiceImpl {
                     exact_vectors = Some(ExactVectorStore::empty(
                         index.as_ref().and_then(VectorIndex::dim_opt),
                     ));
-                } else if exact_path.exists() {
+                } else if probe_path_exists(&exact_path, "exact vector sidecar")? {
                     // Product-owned exact rows can accompany a remote provider.
                     exact_vectors = Some(
                         ExactVectorStore::open(&exact_path)
@@ -5782,25 +5844,22 @@ impl NodeServiceImpl {
                     );
                 }
                 bm25 = Some(Bm25Shard::Segmented(shard));
-            } else {
-                let build_dir = bm25_build_dir(&bm25_path);
-                if build_dir.exists() && !allow_missing_bm25 {
-                    return Err(format!(
-                        "BM25 build directory {} exists but {} does not. The bulk build was \
-                         interrupted; this shard would answer lexical queries with silence, \
-                         which is indistinguishable from a corpus that genuinely lacks those \
-                         terms. Re-run ingest for this shard, or pass --allow-missing-bm25 to \
-                         serve it vector-only on purpose.",
-                        build_dir.display(),
-                        bm25_path.display()
-                    ));
-                }
+            } else if build_dir_exists && !allow_missing_bm25 {
+                return Err(format!(
+                    "BM25 build directory {} exists but {} does not. The bulk build was \
+                     interrupted; this shard would answer lexical queries with silence, \
+                     which is indistinguishable from a corpus that genuinely lacks those \
+                     terms. Re-run ingest for this shard, or pass --allow-missing-bm25 to \
+                     serve it vector-only on purpose.",
+                    build_dir.display(),
+                    bm25_path.display()
+                ));
             }
             let live_path = generation.as_ref().map_or_else(
                 || live_docs_sidecar_path(index_path),
                 |dir| generation_live_docs(dir),
             );
-            if live_path.exists() {
+            if probe_path_exists(&live_path, "live-docs sidecar")? {
                 live_docs = LiveDocs::open(&live_path)
                     .map_err(|error| format!("load {}: {error}", live_path.display()))?;
             }

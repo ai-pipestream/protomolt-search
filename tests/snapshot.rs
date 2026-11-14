@@ -784,9 +784,17 @@ fn a_wal_open_checks_retired_generations_before_recovery() {
             },
         )
     });
+    let panic_err = opened
+        .err()
+        .expect("direct WAL constructor must reject the unsupported format");
+    let panic_msg = panic_err
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic_err.downcast_ref::<&str>().copied())
+        .unwrap_or("");
     assert!(
-        opened.is_err(),
-        "direct WAL constructor must reject the unsupported format"
+        panic_msg.contains("retired layout"),
+        "unexpected WAL constructor panic: {panic_msg}"
     );
     assert!(
         recovery_files(&dir) == before,
@@ -911,5 +919,181 @@ fn a_generation_metadata_error_preserves_recovery_files() {
         recovery_files(&dir) == before,
         "metadata error must leave recovery files untouched"
     );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dangling_active_generation_entry_refuses_open_and_preserves_files() {
+    for entry_name in ["documents.bm25", "vector.index"] {
+        for dangling in [false, true] {
+            let dir = tempdir(&format!(
+                "active-entry-{}-{entry_name}",
+                if dangling { "dangling" } else { "valid" }
+            ));
+            let image = build_bm25(&dir, "persisted document");
+            let index_path = dir.join("shard.idx");
+            let snap = generation_dir(&index_path);
+            std::fs::create_dir_all(&snap).unwrap();
+            let real_bm25 = dir.join("mounted.bm25");
+            std::fs::copy(&image, &real_bm25).unwrap();
+            if dangling {
+                if entry_name == "vector.index" {
+                    std::fs::copy(&image, generation_bm25(&snap)).unwrap();
+                }
+                std::os::unix::fs::symlink(
+                    dir.join("unmounted").join(entry_name),
+                    snap.join(entry_name),
+                )
+                .unwrap();
+            } else {
+                std::os::unix::fs::symlink(&real_bm25, generation_bm25(&snap)).unwrap();
+            }
+            let before = recovery_files(&dir);
+            let recovered = recover_generation(&index_path);
+            let opened = NodeServiceImpl::open(
+                NodeConfig {
+                    index_path: Some(index_path),
+                    ..Default::default()
+                },
+                None,
+                false,
+            );
+            if dangling {
+                let error = opened
+                    .err()
+                    .expect("dangling active generation entry must not open");
+                assert!(error.contains("cannot inspect"), "{entry_name}: {error}");
+                assert!(recovered.is_none());
+                assert!(
+                    recovery_files(&dir) == before,
+                    "{entry_name}: recovery mutated files on a dangling entry"
+                );
+            } else {
+                assert_eq!(recovered.as_deref(), Some(snap.as_path()));
+                assert!(
+                    opened.is_ok(),
+                    "valid symlinked generation entry must open: {:?}",
+                    opened.err()
+                );
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dangling_generation_directory_symlink_refuses_instead_of_falling_back() {
+    // Case A: stale root image present while `.snap` is a dangling symlink.
+    let dir_root = tempdir("dangling-snap-stale-root");
+    let stale = build_bm25(&dir_root, "stale root document");
+    let index_path = dir_root.join("shard.idx");
+    std::fs::copy(&stale, dir_root.join("shard.idx.bm25")).unwrap();
+    std::os::unix::fs::symlink(
+        dir_root.join("unmounted-snap"),
+        generation_dir(&index_path),
+    )
+    .unwrap();
+    let before = recovery_files(&dir_root);
+    let err = NodeServiceImpl::open(
+        NodeConfig {
+            index_path: Some(index_path),
+            ..Default::default()
+        },
+        None,
+        false,
+    )
+    .err()
+    .expect("dangling .snap directory must not fall back to stale root image");
+    assert!(err.contains("cannot inspect"), "{err}");
+    assert!(recovery_files(&dir_root) == before);
+    std::fs::remove_dir_all(dir_root).unwrap();
+
+    // Case B: `.snap-old` holds valid data while `.snap` is a dangling symlink.
+    let dir_backup = tempdir("dangling-snap-with-backup");
+    let image = build_bm25(&dir_backup, "backup generation document");
+    let index_path = dir_backup.join("shard.idx");
+    let old = dir_backup.join("shard.idx.snap-old");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::copy(&image, generation_bm25(&old)).unwrap();
+    std::os::unix::fs::symlink(
+        dir_backup.join("unmounted-snap"),
+        generation_dir(&index_path),
+    )
+    .unwrap();
+    let before = recovery_files(&dir_backup);
+    let err = NodeServiceImpl::open(
+        NodeConfig {
+            index_path: Some(index_path),
+            ..Default::default()
+        },
+        None,
+        false,
+    )
+    .err()
+    .expect("dangling .snap directory with .snap-old backup must not open empty");
+    assert!(err.contains("cannot inspect"), "{err}");
+    assert!(recovery_files(&dir_backup) == before);
+    std::fs::remove_dir_all(dir_backup).unwrap();
+
+    // Positive control: `.snap` symlinked to a valid mounted directory opens cleanly.
+    let dir_valid = tempdir("valid-snap-dir-symlink");
+    let image = build_bm25(&dir_valid, "mounted generation document");
+    let mounted = dir_valid.join("mounted-generation");
+    std::fs::create_dir_all(&mounted).unwrap();
+    std::fs::copy(&image, generation_bm25(&mounted)).unwrap();
+    let index_path = dir_valid.join("shard.idx");
+    std::os::unix::fs::symlink(&mounted, generation_dir(&index_path)).unwrap();
+    let opened = NodeServiceImpl::open(
+        NodeConfig {
+            index_path: Some(index_path),
+            ..Default::default()
+        },
+        None,
+        false,
+    );
+    assert!(
+        opened.is_ok(),
+        "valid generation directory symlink must open: {:?}",
+        opened.err()
+    );
+    std::fs::remove_dir_all(dir_valid).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dangling_bm25_sidecar_refuses_wal_doc_tip_instead_of_truncating() {
+    let dir = tempdir("dangling-wal-doc-tip");
+    let index_path = dir.join("shard.idx");
+    std::os::unix::fs::symlink(
+        dir.join("unmounted/shard.idx.bm25"),
+        dir.join("shard.idx.bm25"),
+    )
+    .unwrap();
+    let before = recovery_files(&dir);
+    let opened = std::panic::catch_unwind(|| {
+        NodeServiceImpl::new(
+            None,
+            NodeConfig {
+                index_path: Some(index_path),
+                wal: true,
+                ..Default::default()
+            },
+        )
+    });
+    let panic_err = opened
+        .err()
+        .expect("dangling BM25 sidecar must not guess doc tip 0");
+    let panic_msg = panic_err
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic_err.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        panic_msg.contains("cannot inspect"),
+        "unexpected panic message: {panic_msg}"
+    );
+    assert!(recovery_files(&dir) == before);
     std::fs::remove_dir_all(dir).unwrap();
 }
