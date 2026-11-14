@@ -1,3 +1,10 @@
+use crate::pb::{NodeResidency, PlacementActionKind};
+
+use super::state::{
+    now_ms, StoredAction, StoredCapacity, StoredNode, StoredNodeState, StoredReplica, StoredRole,
+    StoredRoute, StoredState, StoredTopology,
+};
+
 use super::*;
 
 /// A complete nondefault state.

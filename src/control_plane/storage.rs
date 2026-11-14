@@ -1,5 +1,9 @@
 //! File ownership survives replacement of the JSON state inode.
-use super::*;
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 
