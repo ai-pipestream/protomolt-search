@@ -16,8 +16,9 @@ use std::path::Path;
 use self::validate_v5::validate_structure;
 use super::codec::ImpactCursor;
 use super::columns::{
-    dictionary_sorted, FacetSlice, GeoSlice, IntegerMapSlice, IntegerSlice, MapFacetSlice,
-    MapNumericSlice, NumericSlice, StoredBinding, StoredDerived, UnsignedSlice,
+    decode_binding_entry, decode_derived_entry, dictionary_sorted, FacetSlice, GeoSlice,
+    IntegerMapSlice, IntegerSlice, MapFacetSlice, MapNumericSlice, NumericSlice, StoredBinding,
+    StoredDerived, UnsignedSlice,
 };
 use super::format::{
     compatible_column_kind, integrity_eager, parse_integrity, IntegrityTable,
@@ -330,7 +331,7 @@ impl Bm25Reader {
     }
 
     /// Open a v3/v4/v5/v6 `.bm25` file read-only after full structural
-    /// validation (see [`validate_structure`] / [`validate_structure_v6`]
+    /// validation (see `validate_structure` / `validate_structure_v6`
     /// — malformed files error, never panic). Touches only the header,
     /// the doc-length table, the directory, and the skip runs — no
     /// postings or text pages beyond those are faulted in until queries
@@ -676,27 +677,13 @@ impl Bm25Reader {
                         cursor = base + 40;
                     }
                     COLUMN_KIND_POSITIONS => {
-                        // Validation tied the entry to a field of this
-                        // table and checked the section's geometry.
-                        let field = name
-                            .strip_prefix(POSITIONS_ENTRY_PREFIX)
-                            .expect("validation checked the kind-7 name");
-                        let fi = fields
-                            .iter()
-                            .position(|f| f.name == field)
-                            .expect("validation tied the kind-7 entry to a field");
-                        fields[fi].positions_off = Some(u64_at(base));
+                        field_by_prefixed_name(&mut fields, &name, POSITIONS_ENTRY_PREFIX, kind)
+                            .positions_off = Some(u64_at(base));
                         cursor = base + 16;
                     }
                     COLUMN_KIND_SENTENCES => {
-                        let field = name
-                            .strip_prefix(SENTENCES_ENTRY_PREFIX)
-                            .expect("validation checked the kind-8 name");
-                        let fi = fields
-                            .iter()
-                            .position(|f| f.name == field)
-                            .expect("validation tied the kind-8 entry to a field");
-                        fields[fi].sentences_off = Some(u64_at(base));
+                        field_by_prefixed_name(&mut fields, &name, SENTENCES_ENTRY_PREFIX, kind)
+                            .sentences_off = Some(u64_at(base));
                         cursor = base + 16;
                     }
                     COLUMN_KIND_SOURCES => {
@@ -710,99 +697,32 @@ impl Bm25Reader {
                         cursor = base + 16;
                     }
                     COLUMN_KIND_POS_LENGTHS => {
-                        let field = name
-                            .strip_prefix(POS_LENGTHS_ENTRY_PREFIX)
-                            .expect("validation checked the kind-18 name");
-                        let fi = fields
-                            .iter()
-                            .position(|f| f.name == field)
-                            .expect("validation tied the kind-18 entry to a field");
-                        fields[fi].pos_lengths_off = Some(u64_at(base));
+                        field_by_prefixed_name(
+                            &mut fields,
+                            &name,
+                            POS_LENGTHS_ENTRY_PREFIX,
+                            kind,
+                        )
+                        .pos_lengths_off = Some(u64_at(base));
                         cursor = base + 16;
                     }
                     COLUMN_KIND_SPLADE => {
-                        let field = name
-                            .strip_prefix(SPLADE_ENTRY_PREFIX)
-                            .expect("validation checked the kind-19 name");
-                        let fi = fields
-                            .iter()
-                            .position(|f| f.name == field)
-                            .expect("validation tied the kind-19 entry to a field");
-                        fields[fi].splade_range = Some((u64_at(base), u64_at(base + 8)));
+                        field_by_prefixed_name(&mut fields, &name, SPLADE_ENTRY_PREFIX, kind)
+                            .splade_range = Some((u64_at(base), u64_at(base + 8)));
                         cursor = base + 16;
                     }
                     COLUMN_KIND_BINDING
                     | COLUMN_KIND_ANALYSIS_BINDING
                     | COLUMN_KIND_VECTOR_BINDING
                     | COLUMN_KIND_INDEX_BINDING => {
-                        let mut vals: Vec<String> = Vec::with_capacity(3);
-                        let mut cur = base;
-                        for _ in 0..if kind != COLUMN_KIND_BINDING { 4 } else { 3 } {
-                            let len =
-                                u16::from_le_bytes(map[cur..cur + 2].try_into().unwrap()) as usize;
-                            vals.push(
-                                String::from_utf8_lossy(&map[cur + 2..cur + 2 + len]).into_owned(),
-                            );
-                            cur += 2 + len;
-                        }
-                        let analysis_contract = if kind != COLUMN_KIND_BINDING {
-                            let len =
-                                u32::from_le_bytes(map[cur..cur + 4].try_into().unwrap()) as usize;
-                            let bytes = map[cur + 4..cur + 4 + len].to_vec();
-                            cur += 4 + len;
-                            bytes
-                        } else {
-                            Vec::new()
-                        };
-                        let vector_binding = if matches!(
-                            kind,
-                            COLUMN_KIND_VECTOR_BINDING | COLUMN_KIND_INDEX_BINDING
-                        ) {
-                            let len =
-                                u32::from_le_bytes(map[cur..cur + 4].try_into().unwrap()) as usize;
-                            let bytes = map[cur + 4..cur + 4 + len].to_vec();
-                            cur += 4 + len;
-                            bytes
-                        } else {
-                            Vec::new()
-                        };
-                        let index_contract = if kind == COLUMN_KIND_INDEX_BINDING {
-                            let len =
-                                u32::from_le_bytes(map[cur..cur + 4].try_into().unwrap()) as usize;
-                            let bytes = map[cur + 4..cur + 4 + len].to_vec();
-                            cur += 4 + len;
-                            bytes
-                        } else {
-                            Vec::new()
-                        };
-                        let mut it = vals.into_iter();
-                        binding = Some(StoredBinding {
-                            plan_fingerprint: it.next().expect("three strings"),
-                            body_path: it.next().expect("three strings"),
-                            materialize_sha: it.next().expect("three strings"),
-                            analysis_sha: it.next().unwrap_or_default(),
-                            analysis_contract,
-                            vector_binding,
-                            index_contract,
-                        });
-                        cursor = cur;
+                        let (decoded, used) = decode_binding_entry(kind, &map[base..])?;
+                        binding = Some(decoded);
+                        cursor = base + used;
                     }
                     COLUMN_KIND_DERIVED => {
-                        let mut cur = base;
-                        let len =
-                            u16::from_le_bytes(map[cur..cur + 2].try_into().unwrap()) as usize;
-                        let fingerprint =
-                            String::from_utf8_lossy(&map[cur + 2..cur + 2 + len]).into_owned();
-                        cur += 2 + len;
-                        let len =
-                            u32::from_le_bytes(map[cur..cur + 4].try_into().unwrap()) as usize;
-                        let declaration = map[cur + 4..cur + 4 + len].to_vec();
-                        cur += 4 + len;
-                        derived = Some(StoredDerived {
-                            fingerprint,
-                            declaration,
-                        });
-                        cursor = cur;
+                        let (decoded, used) = decode_derived_entry(&map[base..])?;
+                        derived = Some(decoded);
+                        cursor = base + used;
                     }
                     k => unreachable!("validation refused unknown column kind {k}"),
                 }
@@ -1241,4 +1161,19 @@ impl crate::filter_bits::PartNumbers for Bm25Reader {
     fn f64_sorted(&self, column: usize) -> Option<&crate::number_rows::NumberRows<f64>> {
         (column < self.numeric_count()).then(|| self.numeric_rows(column))
     }
+}
+
+fn field_by_prefixed_name<'a>(
+    fields: &'a mut [FieldSlice],
+    name: &str,
+    prefix: &str,
+    kind: u8,
+) -> &'a mut FieldSlice {
+    let field = name
+        .strip_prefix(prefix)
+        .unwrap_or_else(|| panic!("validation checked the kind-{kind} name"));
+    fields
+        .iter_mut()
+        .find(|f| f.name == field)
+        .unwrap_or_else(|| panic!("validation tied the kind-{kind} entry to a field"))
 }

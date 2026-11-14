@@ -30,11 +30,14 @@ mod codec;
 mod columns;
 mod format;
 mod reader;
+mod section_writer;
 mod spill;
 mod store;
 
 pub use self::codec::{FileImpacts, ImpactCursor};
-pub use self::columns::{StoredBinding, StoredDerived, FACET_ABSENT, GEO_ABSENT, INTEGER_ABSENT};
+pub use self::columns::{
+    ColumnKind, StoredBinding, StoredDerived, FACET_ABSENT, GEO_ABSENT, INTEGER_ABSENT,
+};
 pub(crate) use self::format::fsync_parent;
 pub use self::reader::{transcode_to_v5, Bm25Reader, FieldTranspose, FieldView, TranscodeStats};
 pub use self::spill::SpillBuilder;

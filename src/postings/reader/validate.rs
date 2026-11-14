@@ -2,7 +2,9 @@
 
 use std::io;
 
-use super::super::columns::{integer_present, StoredDerived, FACET_ABSENT, INTEGER_ABSENT};
+use super::super::columns::{
+    decode_binding_entry, decode_derived_entry, integer_present, FACET_ABSENT, INTEGER_ABSENT,
+};
 use super::super::format::{
     compatible_column_kind, positions_section_size, sentences_section_size, u16_at,
     BINDING_ENTRY_NAME, COLUMN_KIND_ANALYSIS_BINDING, COLUMN_KIND_BINDING, COLUMN_KIND_DERIVED,
@@ -233,58 +235,33 @@ pub(in crate::postings) fn validate_structure_v6(map: &[u8], v7: bool) -> io::Re
                     cursor = base + 40;
                 }
                 COLUMN_KIND_POSITIONS => {
-                    // The entry names a field of THIS file's table; a
-                    // positions section for a field that does not exist
-                    // is bytes nobody can read, refused here by name.
-                    let name = column_names.last().expect("pushed above");
-                    let field = name
-                        .strip_prefix(POSITIONS_ENTRY_PREFIX.as_bytes())
-                        .ok_or_else(|| {
-                            invalid(format!(
-                                "column {i}: kind {COLUMN_KIND_POSITIONS} must be named \
-                                 {POSITIONS_ENTRY_PREFIX}<field>"
-                            ))
-                        })?;
-                    if !names.iter().any(|n| n == field) {
-                        return Err(invalid(format!(
-                            "column {i}: positions for field {:?}, which the field table lacks",
-                            String::from_utf8_lossy(field)
-                        )));
-                    }
-                    if positions.iter().any(|(f, _, _)| f == field) {
-                        return Err(invalid(format!(
-                            "column {i}: field {:?} has two positions entries",
-                            String::from_utf8_lossy(field)
-                        )));
-                    }
-                    positions.push((field.to_vec(), u64_at(base)?, u64_at(base + 8)?));
+                    push_prefixed_field_entry(
+                        &mut positions,
+                        &names,
+                        column_names.last().expect("pushed above"),
+                        (u64_at(base)?, u64_at(base + 8)?),
+                        PrefixedEntrySpec {
+                            col_idx: i,
+                            kind,
+                            prefix: POSITIONS_ENTRY_PREFIX,
+                            label: "positions",
+                        },
+                    )?;
                     cursor = base + 16;
                 }
                 COLUMN_KIND_SENTENCES => {
-                    // Same rule as kind 7: the entry names a field of
-                    // THIS file's table, once.
-                    let name = column_names.last().expect("pushed above");
-                    let field = name
-                        .strip_prefix(SENTENCES_ENTRY_PREFIX.as_bytes())
-                        .ok_or_else(|| {
-                            invalid(format!(
-                                "column {i}: kind {COLUMN_KIND_SENTENCES} must be named \
-                                 {SENTENCES_ENTRY_PREFIX}<field>"
-                            ))
-                        })?;
-                    if !names.iter().any(|n| n == field) {
-                        return Err(invalid(format!(
-                            "column {i}: sentences for field {:?}, which the field table lacks",
-                            String::from_utf8_lossy(field)
-                        )));
-                    }
-                    if sentences.iter().any(|(f, _, _)| f == field) {
-                        return Err(invalid(format!(
-                            "column {i}: field {:?} has two sentences entries",
-                            String::from_utf8_lossy(field)
-                        )));
-                    }
-                    sentences.push((field.to_vec(), u64_at(base)?, u64_at(base + 8)?));
+                    push_prefixed_field_entry(
+                        &mut sentences,
+                        &names,
+                        column_names.last().expect("pushed above"),
+                        (u64_at(base)?, u64_at(base + 8)?),
+                        PrefixedEntrySpec {
+                            col_idx: i,
+                            kind,
+                            prefix: SENTENCES_ENTRY_PREFIX,
+                            label: "sentences",
+                        },
+                    )?;
                     cursor = base + 16;
                 }
                 COLUMN_KIND_SOURCES => {
@@ -299,9 +276,6 @@ pub(in crate::postings) fn validate_structure_v6(map: &[u8], v7: bool) -> io::Re
                 | COLUMN_KIND_ANALYSIS_BINDING
                 | COLUMN_KIND_VECTOR_BINDING
                 | COLUMN_KIND_INDEX_BINDING => {
-                    // The reserved binding record: pinned name, inline
-                    // payload, no sections. Duplicates fall to the
-                    // table's name-uniqueness rule above.
                     if column_names.last().map(Vec::as_slice) != Some(BINDING_ENTRY_NAME.as_bytes())
                     {
                         return Err(invalid(format!(
@@ -309,60 +283,8 @@ pub(in crate::postings) fn validate_structure_v6(map: &[u8], v7: bool) -> io::Re
                              {BINDING_ENTRY_NAME:?}"
                         )));
                     }
-                    let mut cur = base;
-                    let mut values = Vec::new();
-                    for part in 0..if kind != COLUMN_KIND_BINDING { 4 } else { 3 } {
-                        let len = u64::from(u16_at(bytes_at(cur, 2)?));
-                        let value = std::str::from_utf8(bytes_at(cur + 2, len)?)
-                            .map_err(|_| invalid("invalid utf-8 in binding record".into()))?;
-                        if part == 3
-                            && (kind == COLUMN_KIND_ANALYSIS_BINDING || !value.is_empty())
-                            && !crate::mapped_analysis::valid_digest(value)
-                        {
-                            return Err(invalid("invalid mapped analysis digest".into()));
-                        }
-                        values.push(value);
-                        cur += 2 + len;
-                    }
-                    if kind != COLUMN_KIND_BINDING {
-                        let len = u32::from_le_bytes(bytes_at(cur, 4)?.try_into().unwrap()) as u64;
-                        crate::mapped_analysis::decode_contract(
-                            values[3],
-                            bytes_at(cur + 4, len)?,
-                            values[1],
-                        )
-                        .map_err(invalid)?;
-                        cur += 4 + len;
-                    }
-                    let mut vector_bytes = &[][..];
-                    if matches!(kind, COLUMN_KIND_VECTOR_BINDING | COLUMN_KIND_INDEX_BINDING) {
-                        let len = u32::from_le_bytes(bytes_at(cur, 4)?.try_into().unwrap()) as u64;
-                        vector_bytes = bytes_at(cur + 4, len)?;
-                        if crate::mapped_vector::decode(vector_bytes, values[0])
-                            .map_err(|e| invalid(e.to_string()))?
-                            .is_none()
-                        {
-                            return Err(invalid(
-                                "empty vector binding in vector/index entry".into(),
-                            ));
-                        }
-                        cur += 4 + len;
-                    }
-                    if kind == COLUMN_KIND_INDEX_BINDING {
-                        let len = u32::from_le_bytes(bytes_at(cur, 4)?.try_into().unwrap()) as u64;
-                        if crate::index_contract::validate_binding(
-                            bytes_at(cur + 4, len)?,
-                            values[0],
-                            vector_bytes,
-                        )
-                        .map_err(|e| invalid(e.to_string()))?
-                        .is_none()
-                        {
-                            return Err(invalid("empty index contract in kind-14 entry".into()));
-                        }
-                        cur += 4 + len;
-                    }
-                    cursor = cur;
+                    let (_, used) = decode_binding_entry(kind, &map[base as usize..])?;
+                    cursor = base + used as u64;
                 }
                 COLUMN_KIND_DERIVED => {
                     if column_names.last().map(Vec::as_slice) != Some(DERIVED_ENTRY_NAME.as_bytes())
@@ -372,70 +294,37 @@ pub(in crate::postings) fn validate_structure_v6(map: &[u8], v7: bool) -> io::Re
                              {DERIVED_ENTRY_NAME:?}"
                         )));
                     }
-                    let mut cur = base;
-                    let len = u64::from(u16_at(bytes_at(cur, 2)?));
-                    let fingerprint = std::str::from_utf8(bytes_at(cur + 2, len)?)
-                        .map_err(|_| invalid("invalid utf-8 in derived-columns record".into()))?
-                        .to_string();
-                    cur += 2 + len;
-                    let len = u32::from_le_bytes(bytes_at(cur, 4)?.try_into().unwrap()) as u64;
-                    StoredDerived {
-                        fingerprint,
-                        declaration: bytes_at(cur + 4, len)?.to_vec(),
-                    }
-                    .validate()
-                    .map_err(invalid)?;
-                    cur += 4 + len;
-                    cursor = cur;
+                    let (_, used) = decode_derived_entry(&map[base as usize..])?;
+                    cursor = base + used as u64;
                 }
                 COLUMN_KIND_POS_LENGTHS => {
-                    let name = column_names.last().expect("pushed above");
-                    let field = name
-                        .strip_prefix(POS_LENGTHS_ENTRY_PREFIX.as_bytes())
-                        .ok_or_else(|| {
-                            invalid(format!(
-                                "column {i}: kind {COLUMN_KIND_POS_LENGTHS} must be named \
-                                 {POS_LENGTHS_ENTRY_PREFIX}<field>"
-                            ))
-                        })?;
-                    if !names.iter().any(|n| n == field) {
-                        return Err(invalid(format!(
-                            "column {i}: pos_lengths for field {:?}, which the field table lacks",
-                            String::from_utf8_lossy(field)
-                        )));
-                    }
-                    if pos_lengths.iter().any(|(f, _, _)| f == field) {
-                        return Err(invalid(format!(
-                            "column {i}: field {:?} has two pos_lengths entries",
-                            String::from_utf8_lossy(field)
-                        )));
-                    }
-                    pos_lengths.push((field.to_vec(), u64_at(base)?, u64_at(base + 8)?));
+                    push_prefixed_field_entry(
+                        &mut pos_lengths,
+                        &names,
+                        column_names.last().expect("pushed above"),
+                        (u64_at(base)?, u64_at(base + 8)?),
+                        PrefixedEntrySpec {
+                            col_idx: i,
+                            kind,
+                            prefix: POS_LENGTHS_ENTRY_PREFIX,
+                            label: "pos_lengths",
+                        },
+                    )?;
                     cursor = base + 16;
                 }
                 COLUMN_KIND_SPLADE => {
-                    let name = column_names.last().expect("pushed above");
-                    let field = name
-                        .strip_prefix(SPLADE_ENTRY_PREFIX.as_bytes())
-                        .ok_or_else(|| {
-                            invalid(format!(
-                                "column {i}: kind {COLUMN_KIND_SPLADE} must be named \
-                                 {SPLADE_ENTRY_PREFIX}<field>"
-                            ))
-                        })?;
-                    if !names.iter().any(|n| n == field) {
-                        return Err(invalid(format!(
-                            "column {i}: splade for field {:?}, which the field table lacks",
-                            String::from_utf8_lossy(field)
-                        )));
-                    }
-                    if splades.iter().any(|(f, _, _)| f == field) {
-                        return Err(invalid(format!(
-                            "column {i}: field {:?} has two splade entries",
-                            String::from_utf8_lossy(field)
-                        )));
-                    }
-                    splades.push((field.to_vec(), u64_at(base)?, u64_at(base + 8)?));
+                    push_prefixed_field_entry(
+                        &mut splades,
+                        &names,
+                        column_names.last().expect("pushed above"),
+                        (u64_at(base)?, u64_at(base + 8)?),
+                        PrefixedEntrySpec {
+                            col_idx: i,
+                            kind,
+                            prefix: SPLADE_ENTRY_PREFIX,
+                            label: "splade",
+                        },
+                    )?;
                     cursor = base + 16;
                 }
                 k => {
@@ -941,50 +830,28 @@ pub(in crate::postings) fn validate_structure_v6(map: &[u8], v7: bool) -> io::Re
     // of them at open would fault in the whole section, which is the
     // paging model this file exists to preserve.
     for (i, (field_name, off, total)) in positions.iter().enumerate() {
-        if *off != expected_start {
-            return Err(invalid(format!(
-                "positions {i}: section does not start at the previous section's end"
-            )));
-        }
         let fi = names
             .iter()
             .position(|n| n == field_name)
             .expect("kind-7 entries were tied to a field above");
-        let (_, _, _, directory_off) = fields[fi];
-        let n_terms = u64::from(u32_at(directory_off)?);
-        if u64::from(u32_at(*off)?) != n_terms {
-            return Err(invalid(format!(
-                "positions {i}: term count disagrees with field {:?}'s directory",
-                String::from_utf8_lossy(field_name)
-            )));
-        }
-        let mut prev = 0u64;
-        for t in 0..=n_terms {
-            let base = u64::from(u32_at(off + 4 + 4 * t)?);
-            if base < prev {
-                return Err(invalid(format!(
-                    "positions {i}: base table not monotone at term {t}"
-                )));
-            }
-            prev = base;
-        }
-        if prev != *total {
-            return Err(invalid(format!(
-                "positions {i}: base table ends at {prev} but the entry declares {total}"
-            )));
-        }
-        let group_end = off + positions_section_size(n_terms, *total);
+        let n_terms = u64::from(u32_at(fields[fi].3)?);
         let expected_end = positions
             .get(i + 1)
             .map(|p| p.1)
             .or_else(|| sentences.first().map(|s| s.1))
             .unwrap_or(columns_end);
-        if group_end != expected_end {
-            return Err(invalid(format!(
-                "positions {i}: section does not end at the next section's start"
-            )));
-        }
-        expected_start = group_end;
+        expected_start = validate_term_base_section(
+            map,
+            TermSectionCheck {
+                label: "positions",
+                index: i,
+                field_name,
+                off: *off,
+                total: *total,
+                n_terms,
+                bounds: (expected_start, expected_end),
+            },
+        )?;
     }
     // Sentence groups (docs/highlighting.md) after the positions groups,
     // tiling to EOF: slot count equals the file's, base table monotone
@@ -1099,50 +966,28 @@ pub(in crate::postings) fn validate_structure_v6(map: &[u8], v7: bool) -> io::Re
                 String::from_utf8_lossy(field_name)
             )));
         }
-        if *off != expected_start {
-            return Err(invalid(format!(
-                "pos_lengths {i}: section does not start at the previous section's end"
-            )));
-        }
         let fi = names
             .iter()
             .position(|n| n == field_name)
             .expect("kind-18 entries were tied to a field above");
-        let (_, _, _, directory_off) = fields[fi];
-        let n_terms = u64::from(u32_at(directory_off)?);
-        if u64::from(u32_at(*off)?) != n_terms {
-            return Err(invalid(format!(
-                "pos_lengths {i}: term count disagrees with field {:?}'s directory",
-                String::from_utf8_lossy(field_name)
-            )));
-        }
-        let mut prev = 0u64;
-        for t in 0..=n_terms {
-            let base = u64::from(u32_at(off + 4 + 4 * t)?);
-            if base < prev {
-                return Err(invalid(format!(
-                    "pos_lengths {i}: base table not monotone at term {t}"
-                )));
-            }
-            prev = base;
-        }
-        if prev != *total {
-            return Err(invalid(format!(
-                "pos_lengths {i}: base table ends at {prev} but the entry declares {total}"
-            )));
-        }
-        let group_end = off + positions_section_size(n_terms, *total);
+        let n_terms = u64::from(u32_at(fields[fi].3)?);
         let expected_end = pos_lengths
             .get(i + 1)
             .map(|p| p.1)
             .or_else(|| splades.first().map(|s| s.1))
             .unwrap_or(file_len);
-        if group_end != expected_end {
-            return Err(invalid(format!(
-                "pos_lengths {i}: section does not end at the next section's start"
-            )));
-        }
-        expected_start = group_end;
+        expected_start = validate_term_base_section(
+            map,
+            TermSectionCheck {
+                label: "pos_lengths",
+                index: i,
+                field_name,
+                off: *off,
+                total: *total,
+                n_terms,
+                bounds: (expected_start, expected_end),
+            },
+        )?;
     }
     for (i, (_field_name, off, len)) in splades.iter().enumerate() {
         let end = off
@@ -1161,4 +1006,103 @@ pub(in crate::postings) fn validate_structure_v6(map: &[u8], v7: bool) -> io::Re
         return Err(invalid("sections leave trailing bytes before EOF".into()));
     }
     Ok(())
+}
+
+struct PrefixedEntrySpec<'a> {
+    col_idx: u64,
+    kind: u8,
+    prefix: &'a str,
+    label: &'a str,
+}
+
+fn push_prefixed_field_entry(
+    out: &mut Vec<(Vec<u8>, u64, u64)>,
+    names: &[Vec<u8>],
+    col_name: &[u8],
+    payload: (u64, u64),
+    spec: PrefixedEntrySpec<'_>,
+) -> io::Result<()> {
+    let invalid = |msg: String| io::Error::new(io::ErrorKind::InvalidData, msg);
+    let field = col_name
+        .strip_prefix(spec.prefix.as_bytes())
+        .ok_or_else(|| {
+            invalid(format!(
+                "column {}: kind {} must be named {}<field>",
+                spec.col_idx, spec.kind, spec.prefix
+            ))
+        })?;
+    if !names.iter().any(|n| n == field) {
+        return Err(invalid(format!(
+            "column {}: {} for field {:?}, which the field table lacks",
+            spec.col_idx,
+            spec.label,
+            String::from_utf8_lossy(field)
+        )));
+    }
+    if out.iter().any(|(f, _, _)| f == field) {
+        return Err(invalid(format!(
+            "column {}: field {:?} has two {} entries",
+            spec.col_idx,
+            String::from_utf8_lossy(field),
+            spec.label
+        )));
+    }
+    out.push((field.to_vec(), payload.0, payload.1));
+    Ok(())
+}
+
+struct TermSectionCheck<'a> {
+    label: &'a str,
+    index: usize,
+    field_name: &'a [u8],
+    off: u64,
+    total: u64,
+    n_terms: u64,
+    bounds: (u64, u64),
+}
+
+fn validate_term_base_section(map: &[u8], check: TermSectionCheck<'_>) -> io::Result<u64> {
+    let invalid = |msg: String| io::Error::new(io::ErrorKind::InvalidData, msg);
+    let u32_at = |off: u64| -> io::Result<u32> {
+        let b = map
+            .get(off as usize..off as usize + 4)
+            .ok_or_else(|| invalid(format!("read past end at {off}")))?;
+        Ok(u32::from_le_bytes(b.try_into().expect("4 bytes")))
+    };
+    let (expected_start, expected_end) = check.bounds;
+    let (label, i) = (check.label, check.index);
+    if check.off != expected_start {
+        return Err(invalid(format!(
+            "{label} {i}: section does not start at the previous section's end"
+        )));
+    }
+    if u64::from(u32_at(check.off)?) != check.n_terms {
+        return Err(invalid(format!(
+            "{label} {i}: term count disagrees with field {:?}'s directory",
+            String::from_utf8_lossy(check.field_name)
+        )));
+    }
+    let mut prev = 0u64;
+    for t in 0..=check.n_terms {
+        let base = u64::from(u32_at(check.off + 4 + 4 * t)?);
+        if base < prev {
+            return Err(invalid(format!(
+                "{label} {i}: base table not monotone at term {t}"
+            )));
+        }
+        prev = base;
+    }
+    if prev != check.total {
+        return Err(invalid(format!(
+            "{label} {i}: base table ends at {prev} but the entry declares {}",
+            check.total
+        )));
+    }
+    let group_end = check.off + positions_section_size(check.n_terms, check.total);
+    if group_end != expected_end {
+        return Err(invalid(format!(
+            "{label} {i}: section does not end at the next section's start"
+        )));
+    }
+    Ok(group_end)
 }

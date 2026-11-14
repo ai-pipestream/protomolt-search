@@ -9,8 +9,8 @@ pub use self::view::StoreFieldView;
 use std::io;
 
 use super::columns::{
-    dictionary_sorted, validate_facet_names, FacetStore, GeoStore, IntStore, MapFacetStore,
-    MapNumericStore, NumericStore, StoredBinding, StoredDerived, UintStore,
+    merge_analysis_fingerprint, validate_text_field_names, ColumnKind, ColumnSet, StoredBinding,
+    StoredDerived,
 };
 #[cfg(doc)]
 use super::Bm25Index;
@@ -23,7 +23,7 @@ use super::{AnalyzedDoc, DocLineage, Posting};
 pub(in crate::postings) struct FieldStore {
     /// Field name from the schema ("body" for field 0).
     pub(in crate::postings) name: String,
-    /// Hash of the field's AnalysisSpec, persisted in the v6 field
+    /// Hash of the field's `AnalysisSpec`, persisted in the v6 field
     /// table. 0 until the ingest layer wires real fingerprints.
     analysis_fingerprint: u64,
     /// term → postings, kept ascending by doc id (append-only), in a
@@ -74,7 +74,7 @@ impl FieldStore {
 }
 
 /// The shard's lexical half: per-field postings and corpus stats over a
-/// shared slot space, plus the raw texts.
+/// shared slot space, plus raw texts and typed per-document columns.
 #[derive(Debug)]
 pub struct Bm25Store {
     /// Per-field indexes; field 0 is the body (the stored text). The
@@ -85,28 +85,8 @@ pub struct Bm25Store {
     /// Per-document lineage, parallel to `texts` (`None` when the
     /// document was ingested without lineage).
     pub(in crate::postings) lineages: Vec<Option<DocLineage>>,
-    /// Facet columns in facet-id order.
-    facets: Vec<FacetStore>,
-    /// Numeric columns in numeric-id order.
-    numerics: Vec<NumericStore>,
-    /// map<string, string> columns in map-facet-id order.
-    map_facets: Vec<MapFacetStore>,
-    /// map<string, f64> columns in map-numeric-id order.
-    map_numerics: Vec<MapNumericStore>,
-    map_integers: Vec<crate::integer_map::Store<i64>>,
-    map_unsigned_integers: Vec<crate::integer_map::Store<u64>>,
-    /// i64 columns in integer-id order.
-    integers: Vec<IntStore>,
-    unsigned_integers: Vec<UintStore>,
-    /// Geo-point columns in geo-id order (`docs/geo-columns.md`). A
-    /// store with no columns of any kind persists as v6.
-    geos: Vec<GeoStore>,
-    /// The mapped-plan binding, persisted as the kind-6 table entry.
-    /// `Some` forces v7 even with no columns.
-    binding: Option<StoredBinding>,
-    /// The derived-column declaration, persisted as the kind-15 entry.
-    /// `Some` forces v7 like the binding.
-    derived: Option<StoredDerived>,
+    /// Per-document typed column tables and inline binding/derived metadata.
+    pub(in crate::postings) columns: ColumnSet,
     sources: crate::source_archive::SourceArchive,
 }
 
@@ -116,17 +96,7 @@ impl Default for Bm25Store {
             fields: vec![FieldStore::new("body")],
             texts: Vec::new(),
             lineages: Vec::new(),
-            facets: Vec::new(),
-            numerics: Vec::new(),
-            map_facets: Vec::new(),
-            map_numerics: Vec::new(),
-            map_integers: Vec::new(),
-            map_unsigned_integers: Vec::new(),
-            integers: Vec::new(),
-            unsigned_integers: Vec::new(),
-            geos: Vec::new(),
-            binding: None,
-            derived: None,
+            columns: ColumnSet::default(),
             sources: Default::default(),
         }
     }
@@ -163,25 +133,25 @@ impl Bm25Store {
 
     /// The mapped-plan binding this store was written under, if any.
     pub fn binding(&self) -> Option<&StoredBinding> {
-        self.binding.as_ref()
+        self.columns.binding.as_ref()
     }
 
     /// Set the binding persisted by the next save. The caller (the
     /// shard's flush path) owns the no-contradiction rule; this is
     /// plain storage.
     pub fn set_binding(&mut self, binding: Option<StoredBinding>) {
-        self.binding = binding;
+        self.columns.binding = binding;
     }
 
     /// The derived-column declaration this store was written under.
     pub fn derived(&self) -> Option<&StoredDerived> {
-        self.derived.as_ref()
+        self.columns.derived.as_ref()
     }
 
     /// Set the declaration persisted by the next save. Plain storage,
     /// like [`Self::set_binding`].
     pub fn set_derived(&mut self, derived: Option<StoredDerived>) {
-        self.derived = derived;
+        self.columns.derived = derived;
     }
 
     /// An empty store.
@@ -194,41 +164,49 @@ impl Bm25Store {
     /// `with_fields(&["body"])`. Names must be non-empty and unique
     /// (the v6 reader validates the same on open).
     pub fn with_fields(names: &[&str]) -> Self {
-        assert!(!names.is_empty(), "a store needs at least one field");
-        for (i, name) in names.iter().enumerate() {
-            assert!(!name.is_empty(), "field {i} has an empty name");
-            assert!(
-                u16::try_from(name.len()).is_ok(),
-                "field name exceeds u16 length"
-            );
-            assert!(!names[..i].contains(name), "duplicate field name {name:?}");
-        }
+        validate_text_field_names(names, "store");
         Self {
             fields: names.iter().map(|n| FieldStore::new(n)).collect(),
             texts: Vec::new(),
             lineages: Vec::new(),
-            facets: Vec::new(),
-            numerics: Vec::new(),
-            map_facets: Vec::new(),
-            map_numerics: Vec::new(),
-            map_integers: Vec::new(),
-            map_unsigned_integers: Vec::new(),
-            integers: Vec::new(),
-            unsigned_integers: Vec::new(),
-            geos: Vec::new(),
-            binding: None,
-            derived: None,
+            columns: ColumnSet::default(),
             sources: Default::default(),
         }
     }
 
-    /// Declare which fields keep token positions
-    /// (`docs/phrase-proximity.md`). Must precede any document: a field
-    /// that changes its mind mid-corpus would hold a phrase index over
-    /// half its documents. Every name must be in the field table, and a
-    /// positional store persists as v7 (the kind-7 entry lives in the
-    /// column table). Panics on either violation, like the other
-    /// declaration builders.
+    /// Unified text-field table constructor matching [`Self::with_fields`].
+    pub fn with_text_fields(names: &[&str]) -> Self {
+        Self::with_fields(names)
+    }
+
+    /// Declare a typed column table for `kind` before any documents are added.
+    pub fn with_columns(mut self, kind: ColumnKind, names: &[&str]) -> Self {
+        assert!(
+            self.texts.is_empty(),
+            "{} must be declared before documents are added",
+            kind.plural_label()
+        );
+        self.columns.configure(kind, names);
+        self
+    }
+
+    /// Number of columns declared for `kind`.
+    pub fn column_count(&self, kind: ColumnKind) -> usize {
+        self.columns.count(kind)
+    }
+
+    /// Name of column `index` within `kind`. Panics when out of range.
+    pub fn column_name(&self, kind: ColumnKind, index: usize) -> &str {
+        self.columns.name(kind, index)
+    }
+
+    /// Index of column `name` within `kind`, if declared.
+    pub fn column_index(&self, kind: ColumnKind, name: &str) -> Option<usize> {
+        self.columns.index(kind, name)
+    }
+
+    /// Declare which fields keep token positions (`docs/phrase-proximity.md`).
+    /// Must precede any document, and every name must be in the field table.
     pub fn with_positions(mut self, names: &[&str]) -> Self {
         assert!(
             self.texts.is_empty(),
@@ -259,9 +237,7 @@ impl Bm25Store {
 
     /// Declare the fields that keep sentence spans per document
     /// (`docs/highlighting.md`). Must precede any document, and every
-    /// name must be in the field table; a sentence store persists as v7
-    /// (the kind-8 entry lives in the column table). Panics on either
-    /// violation, like the other declaration builders.
+    /// name must be in the field table.
     pub fn with_sentences(mut self, names: &[&str]) -> Self {
         assert!(
             self.texts.is_empty(),
@@ -305,18 +281,9 @@ impl Bm25Store {
         )
     }
 
-    /// Declare the facet field table, in facet-id order (builder style:
-    /// `Bm25Store::with_fields(&["body"]).with_facets(&["court"])`).
-    /// Must be called before any document is added. A store with facet
-    /// fields persists as v7; without, as v6.
-    pub fn with_facets(mut self, names: &[&str]) -> Self {
-        assert!(
-            self.texts.is_empty(),
-            "facet fields must be declared before documents are added"
-        );
-        validate_facet_names(names);
-        self.facets = names.iter().map(|n| FacetStore::new(n)).collect();
-        self
+    /// Declare the facet field table, in facet-id order.
+    pub fn with_facets(self, names: &[&str]) -> Self {
+        self.with_columns(ColumnKind::Facet, names)
     }
 
     /// Number of fields in the field table.
@@ -326,299 +293,229 @@ impl Bm25Store {
 
     /// Number of facet fields in the facet table.
     pub fn facet_count(&self) -> usize {
-        self.facets.len()
+        self.column_count(ColumnKind::Facet)
     }
 
     /// The name of facet field `fi`. Panics when out of range.
     pub fn facet_name(&self, fi: usize) -> &str {
-        &self.facets[fi].name
+        self.column_name(ColumnKind::Facet, fi)
     }
 
     /// The index of the facet field named `name`, if the table has it.
     pub fn facet_index(&self, name: &str) -> Option<usize> {
-        self.facets.iter().position(|f| f.name == name)
+        self.column_index(ColumnKind::Facet, name)
     }
 
     /// Number of distinct values facet field `fi` holds.
     pub fn facet_value_count(&self, fi: usize) -> usize {
-        self.facets[fi].dict.len()
+        self.columns.facets[fi].dict.len()
     }
 
-    /// The value of facet field `fi` at ordinal `ord`. Panics when out
-    /// of range.
+    /// The value of facet field `fi` at ordinal `ord`. Panics when out of range.
     pub fn facet_value(&self, fi: usize, ord: u32) -> &str {
-        &self.facets[fi].dict[ord as usize]
+        &self.columns.facets[fi].dict[ord as usize]
     }
 
-    /// The ordinal of `doc_id`'s value for facet field `fi`, `None`
-    /// when the document has no value.
+    /// The ordinal of `doc_id`'s value for facet field `fi`, `None` when absent.
     pub fn facet_ord(&self, fi: usize, doc_id: u32) -> Option<u32> {
-        self.facets[fi].ord(doc_id as usize)
+        self.columns.facets[fi].ord(doc_id as usize)
     }
 
-    /// The ordinal of `value` in facet field `fi`'s dictionary, `None`
-    /// when this store never ingested it — the value then matches none
-    /// of its documents, which is the exact answer, not a refusal
-    /// (`docs/cel-filters.md`: the typo rule guards structure, not
-    /// data).
+    /// The ordinal of `value` in facet field `fi`'s dictionary, `None` when absent.
     pub fn facet_value_ord_of(&self, fi: usize, value: &str) -> Option<u32> {
-        self.facets[fi].index.get(value).copied()
+        self.columns.facets[fi].index.get(value).copied()
     }
 
     /// Facet field `fi`'s dictionary in ordinal (first-seen) order.
     pub fn facet_dictionary(&self, fi: usize) -> &[String] {
-        &self.facets[fi].dict
+        &self.columns.facets[fi].dict
     }
 
-    /// Whether facet field `fi`'s first-seen dictionary happens to be in
-    /// byte order (it is after a reload of a file this writer produced).
+    /// Whether facet field `fi`'s first-seen dictionary is in strict byte order.
     pub fn facet_dictionary_sorted(&self, fi: usize) -> bool {
-        dictionary_sorted(&self.facets[fi].dict)
+        self.columns.facet_dictionary_sorted(fi)
     }
 
     /// Map-facet column `ci`'s value dictionary in ordinal order.
     pub fn map_facet_values(&self, ci: usize) -> &[String] {
-        &self.map_facets[ci].values
+        &self.columns.map_facets[ci].values
     }
 
-    /// Whether map-facet column `ci`'s value dictionary is in byte order.
+    /// Whether map-facet column `ci`'s value dictionary is in strict byte order.
     pub fn map_facet_values_sorted(&self, ci: usize) -> bool {
-        dictionary_sorted(&self.map_facets[ci].values)
+        self.columns.map_facet_values_sorted(ci)
     }
 
-    /// Record `doc_id`'s value for facet field `fi`, interning it in
-    /// the dictionary; see [`FacetStore::set`] for the contract.
+    /// Record `doc_id`'s value for facet field `fi`, interning it in the dictionary.
     pub fn set_facet(&mut self, fi: usize, doc_id: u32, value: &str) {
-        self.facets[fi].set(doc_id, value);
+        self.columns.set_facet(fi, doc_id, value);
     }
 
-    /// Declare the numeric field table, in numeric-id order (builder
-    /// style, like [`Self::with_facets`]). Must be called before any
-    /// document is added; a store with columns persists as v7.
-    pub fn with_numerics(mut self, names: &[&str]) -> Self {
-        assert!(
-            self.texts.is_empty(),
-            "numeric fields must be declared before documents are added"
-        );
-        validate_facet_names(names);
-        self.numerics = names.iter().map(|n| NumericStore::new(n)).collect();
-        self
+    /// Declare the numeric field table, in numeric-id order.
+    pub fn with_numerics(self, names: &[&str]) -> Self {
+        self.with_columns(ColumnKind::Numeric, names)
     }
 
     /// Number of numeric fields in the numeric table.
     pub fn numeric_count(&self) -> usize {
-        self.numerics.len()
+        self.column_count(ColumnKind::Numeric)
     }
 
     /// The name of numeric field `ni`. Panics when out of range.
     pub fn numeric_name(&self, ni: usize) -> &str {
-        &self.numerics[ni].name
+        self.column_name(ColumnKind::Numeric, ni)
     }
 
     /// The index of the numeric field named `name`, if the table has it.
     pub fn numeric_index(&self, name: &str) -> Option<usize> {
-        self.numerics.iter().position(|n| n.name == name)
+        self.column_index(ColumnKind::Numeric, name)
     }
 
     /// `doc_id`'s value for numeric field `ni`, `None` when absent.
     pub fn numeric_value(&self, ni: usize, doc_id: u32) -> Option<f64> {
-        self.numerics[ni].value(doc_id as usize)
+        self.columns.numerics[ni].value(doc_id as usize)
     }
 
-    /// (min, max) of numeric field `ni` over present values; (NaN, NaN)
-    /// when no document has one.
+    /// `(min, max)` of numeric field `ni` over present values; `(NaN, NaN)` when empty.
     pub fn numeric_min_max(&self, ni: usize) -> (f64, f64) {
-        self.numerics[ni].min_max()
+        self.columns.numerics[ni].min_max()
     }
 
-    /// Record `doc_id`'s value for numeric field `ni`; see
-    /// [`NumericStore::set`] for the contract (finite values only).
+    /// Record `doc_id`'s finite value for numeric field `ni`.
     pub fn set_numeric(&mut self, ni: usize, doc_id: u32, value: f64) {
-        self.numerics[ni].set(doc_id, value);
+        self.columns.set_numeric(ni, doc_id, value);
     }
 
-    /// Declare the i64 field table, in integer-id order (builder
-    /// style, like [`Self::with_numerics`]). Must be called before any
-    /// document is added; a store with columns persists as v7.
-    pub fn with_integers(mut self, names: &[&str]) -> Self {
-        assert!(
-            self.texts.is_empty(),
-            "integer fields must be declared before documents are added"
-        );
-        validate_facet_names(names);
-        self.integers = names.iter().map(|n| IntStore::new(n)).collect();
-        self
+    /// Declare the `i64` field table, in integer-id order.
+    pub fn with_integers(self, names: &[&str]) -> Self {
+        self.with_columns(ColumnKind::Integer, names)
     }
 
-    /// Number of i64 fields in the integer table.
+    /// Number of `i64` fields in the integer table.
     pub fn integer_count(&self) -> usize {
-        self.integers.len()
+        self.column_count(ColumnKind::Integer)
     }
 
     /// The name of integer field `ii`. Panics when out of range.
     pub fn integer_name(&self, ii: usize) -> &str {
-        &self.integers[ii].name
+        self.column_name(ColumnKind::Integer, ii)
     }
 
     /// The index of the integer field named `name`, if the table has it.
     pub fn integer_index(&self, name: &str) -> Option<usize> {
-        self.integers.iter().position(|n| n.name == name)
+        self.column_index(ColumnKind::Integer, name)
     }
 
     /// `doc_id`'s value for integer field `ii`, `None` when absent.
     pub fn integer_value(&self, ii: usize, doc_id: u32) -> Option<i64> {
-        self.integers[ii].value(doc_id as usize)
+        self.columns.integers[ii].value(doc_id as usize)
     }
 
-    /// (min, max) of integer field `ii` over present values; the empty
-    /// range `(i64::MAX, i64::MIN)` when no document has one (see
-    /// [`IntStore::min_max`]).
+    /// `(min, max)` of integer field `ii` over present values; `(i64::MAX, i64::MIN)` when empty.
     pub fn integer_min_max(&self, ii: usize) -> (i64, i64) {
-        self.integers[ii].min_max()
+        self.columns.integers[ii].min_max()
     }
 
-    /// Record `doc_id`'s value for integer field `ii`; see
-    /// [`IntStore::set`] for the contract.
+    /// Record `doc_id`'s value for integer field `ii`.
     pub fn set_integer(&mut self, ii: usize, doc_id: u32, value: i64) {
-        self.integers[ii].set(doc_id, value);
+        self.columns.set_integer(ii, doc_id, value);
     }
 
-    /// Declare the unsigned column table before adding documents. The v8
-    /// writer records kind 11 columns with explicit presence.
-    pub fn with_unsigned_integers(mut self, names: &[&str]) -> Self {
-        assert!(
-            self.texts.is_empty(),
-            "integer fields must be declared before documents are added"
-        );
-        validate_facet_names(names);
-        self.unsigned_integers = names.iter().map(|n| UintStore::new(n)).collect();
-        self
+    /// Declare the unsigned `u64` column table before adding documents.
+    pub fn with_unsigned_integers(self, names: &[&str]) -> Self {
+        self.with_columns(ColumnKind::UnsignedInteger, names)
     }
 
-    /// Number of u64 fields in the integer table.
+    /// Number of `u64` fields in the unsigned integer table.
     pub fn unsigned_integer_count(&self) -> usize {
-        self.unsigned_integers.len()
+        self.column_count(ColumnKind::UnsignedInteger)
     }
 
-    /// The name of integer field `ii`. Panics when out of range.
+    /// The name of unsigned integer field `ii`. Panics when out of range.
     pub fn unsigned_integer_name(&self, ii: usize) -> &str {
-        &self.unsigned_integers[ii].name
+        self.column_name(ColumnKind::UnsignedInteger, ii)
     }
 
-    /// The index of the integer field named `name`, if the table has it.
+    /// The index of the unsigned integer field named `name`, if the table has it.
     pub fn unsigned_integer_index(&self, name: &str) -> Option<usize> {
-        self.unsigned_integers.iter().position(|n| n.name == name)
+        self.column_index(ColumnKind::UnsignedInteger, name)
     }
 
-    /// `doc_id`'s value for integer field `ii`, `None` when absent.
+    /// `doc_id`'s value for unsigned integer field `ii`, `None` when absent.
     pub fn unsigned_integer_value(&self, ii: usize, doc_id: u32) -> Option<u64> {
-        self.unsigned_integers[ii].value(doc_id as usize)
+        self.columns.unsigned_integers[ii].value(doc_id as usize)
     }
 
-    /// (min, max) of integer field `ii` over present values; the empty
-    /// range `(u64::MAX, u64::MIN)` when no document has one (see
-    /// [`UintStore::min_max`]).
+    /// `(min, max)` of unsigned integer field `ii` over present values; `(u64::MAX, u64::MIN)` when empty.
     pub fn unsigned_integer_min_max(&self, ii: usize) -> (u64, u64) {
-        self.unsigned_integers[ii].min_max()
+        self.columns.unsigned_integers[ii].min_max()
     }
 
-    /// Record `doc_id`'s value for integer field `ii`; see
-    /// [`UintStore::set`] for the contract.
+    /// Record `doc_id`'s value for unsigned integer field `ii`.
     pub fn set_unsigned_integer(&mut self, ii: usize, doc_id: u32, value: u64) {
-        self.unsigned_integers[ii].set(doc_id, value);
+        self.columns.set_unsigned_integer(ii, doc_id, value);
     }
 
-    /// Declare the geo-point column table, in geo-id order (builder
-    /// style, like [`Self::with_numerics`]). Must be called before any
-    /// document is added; a store with columns persists as v7.
-    pub fn with_geos(mut self, names: &[&str]) -> Self {
-        assert!(
-            self.texts.is_empty(),
-            "geo fields must be declared before documents are added"
-        );
-        validate_facet_names(names);
-        self.geos = names.iter().map(|n| GeoStore::new(n)).collect();
-        self
+    /// Declare the geo-point column table, in geo-id order.
+    pub fn with_geos(self, names: &[&str]) -> Self {
+        self.with_columns(ColumnKind::Geo, names)
     }
 
     /// Number of geo fields in the geo table.
     pub fn geo_count(&self) -> usize {
-        self.geos.len()
+        self.column_count(ColumnKind::Geo)
     }
 
     /// The name of geo field `gi`. Panics when out of range.
     pub fn geo_name(&self, gi: usize) -> &str {
-        &self.geos[gi].name
+        self.column_name(ColumnKind::Geo, gi)
     }
 
     /// The index of the geo field named `name`, if the table has it.
     pub fn geo_index(&self, name: &str) -> Option<usize> {
-        self.geos.iter().position(|n| n.name == name)
+        self.column_index(ColumnKind::Geo, name)
     }
 
-    /// `doc_id`'s (lat, lon) for geo field `gi`, `None` when absent.
+    /// `doc_id`'s `(lat, lon)` for geo field `gi`, `None` when absent.
     pub fn geo_value(&self, gi: usize, doc_id: u32) -> Option<(f64, f64)> {
-        self.geos[gi].value(doc_id as usize)
+        self.columns.geos[gi].value(doc_id as usize)
     }
 
-    /// Geo field `gi`'s bounding box `(min_lat, max_lat, min_lon,
-    /// max_lon)` over present points; all four NaN when there are none.
+    /// Geo field `gi`'s bounding box `(min_lat, max_lat, min_lon, max_lon)` over present points.
     pub fn geo_bbox(&self, gi: usize) -> (f64, f64, f64, f64) {
-        self.geos[gi].bbox()
+        self.columns.geos[gi].bbox()
     }
 
-    /// Record `doc_id`'s point for geo field `gi`; see [`GeoStore::set`]
-    /// for the contract (finite degrees on the globe, one per document).
+    /// Record `doc_id`'s finite WGS-84 point for geo field `gi`.
     pub fn set_geo(&mut self, gi: usize, doc_id: u32, lat: f64, lon: f64) {
-        self.geos[gi].set(doc_id, lat, lon);
+        self.columns.set_geo(gi, doc_id, lat, lon);
     }
 
-    /// Declare the map<string, string> column table (builder style,
-    /// like [`Self::with_facets`]); columns make the store persist v7.
-    pub fn with_map_facets(mut self, names: &[&str]) -> Self {
-        assert!(
-            self.texts.is_empty(),
-            "map columns must be declared before documents are added"
-        );
-        validate_facet_names(names);
-        self.map_facets = names.iter().map(|n| MapFacetStore::new(n)).collect();
-        self
+    /// Declare the `map<string, string>` column table.
+    pub fn with_map_facets(self, names: &[&str]) -> Self {
+        self.with_columns(ColumnKind::MapFacet, names)
     }
 
-    /// Declare the map<string, f64> column table (builder style).
-    pub fn with_map_numerics(mut self, names: &[&str]) -> Self {
-        assert!(
-            self.texts.is_empty(),
-            "map columns must be declared before documents are added"
-        );
-        validate_facet_names(names);
-        self.map_numerics = names.iter().map(|n| MapNumericStore::new(n)).collect();
-        self
+    /// Declare the `map<string, f64>` column table.
+    pub fn with_map_numerics(self, names: &[&str]) -> Self {
+        self.with_columns(ColumnKind::MapNumeric, names)
     }
 
-    /// Number of map<string, string> columns.
+    /// Number of `map<string, string>` columns.
     pub fn map_facet_count(&self) -> usize {
-        self.map_facets.len()
+        self.column_count(ColumnKind::MapFacet)
     }
 
     /// The name of map-facet column `ci`. Panics when out of range.
     pub fn map_facet_name(&self, ci: usize) -> &str {
-        &self.map_facets[ci].name
+        self.column_name(ColumnKind::MapFacet, ci)
     }
 
-    /// Configure exact i64 map columns before adding documents.
-    pub fn with_map_integers(mut self, names: &[&str]) -> Self {
-        assert!(
-            self.fields[0].doc_lengths.is_empty(),
-            "map columns must be configured before documents"
-        );
-        validate_facet_names(names);
-        self.map_integers = names
-            .iter()
-            .map(|name| crate::integer_map::Store::new(name))
-            .collect();
-        self
+    /// Configure exact `i64` map columns before adding documents.
+    pub fn with_map_integers(self, names: &[&str]) -> Self {
+        self.with_columns(ColumnKind::MapInteger, names)
     }
+
     /// Set an exact value in an existing document slot. Duplicate keys return an error.
     pub fn set_map_integer(
         &mut self,
@@ -627,64 +524,50 @@ impl Bm25Store {
         key: &str,
         value: i64,
     ) -> io::Result<()> {
-        if doc_id as usize >= self.fields[0].doc_lengths.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "integer map document slot does not exist",
-            ));
-        }
-        self.map_integers
-            .get_mut(ci)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "integer map column does not exist",
-                )
-            })?
-            .set(doc_id, key, value)
-    }
-    /// Number of exact i64 map columns.
-    pub fn map_integer_count(&self) -> usize {
-        self.map_integers.len()
-    }
-    /// Column name at `ci`; panics for an invalid column index.
-    pub fn map_integer_name(&self, ci: usize) -> &str {
-        &self.map_integers[ci].name
-    }
-    /// Look up an exact i64 map column by name.
-    pub fn map_integer_index(&self, name: &str) -> Option<usize> {
-        self.map_integers.iter().position(|c| c.name == name)
-    }
-    /// Map keys in this reader's ordinal order.
-    pub fn map_integer_keys(&self, ci: usize) -> &[String] {
-        &self.map_integers[ci].keys
-    }
-    /// Find a key, including the empty string.
-    pub fn map_integer_key_ord(&self, ci: usize, key: &str) -> Option<u32> {
-        self.map_integers[ci].key_ord(key)
-    }
-    /// Exact bounds, or `None` when the key has no entries.
-    pub fn map_integer_key_min_max(&self, ci: usize, key: u32) -> Option<(i64, i64)> {
-        self.map_integers[ci].bounds(key)
-    }
-    /// Exact value; an absent entry or out-of-range key or row returns `None`.
-    pub fn map_integer_value(&self, ci: usize, key: u32, row: u32) -> Option<i64> {
-        self.map_integers[ci].value(key, row)
+        self.columns
+            .set_map_integer(self.texts.len(), ci, doc_id, key, value)
     }
 
-    /// Configure exact u64 map columns before adding documents.
-    pub fn with_map_unsigned_integers(mut self, names: &[&str]) -> Self {
-        assert!(
-            self.fields[0].doc_lengths.is_empty(),
-            "map columns must be configured before documents"
-        );
-        validate_facet_names(names);
-        self.map_unsigned_integers = names
-            .iter()
-            .map(|name| crate::integer_map::Store::new(name))
-            .collect();
-        self
+    /// Number of exact `i64` map columns.
+    pub fn map_integer_count(&self) -> usize {
+        self.column_count(ColumnKind::MapInteger)
     }
+
+    /// Column name at `ci`; panics for an invalid column index.
+    pub fn map_integer_name(&self, ci: usize) -> &str {
+        self.column_name(ColumnKind::MapInteger, ci)
+    }
+
+    /// Look up an exact `i64` map column by name.
+    pub fn map_integer_index(&self, name: &str) -> Option<usize> {
+        self.column_index(ColumnKind::MapInteger, name)
+    }
+
+    /// Map keys in this store's ordinal order.
+    pub fn map_integer_keys(&self, ci: usize) -> &[String] {
+        &self.columns.map_integers[ci].keys
+    }
+
+    /// Find a key, including the empty string.
+    pub fn map_integer_key_ord(&self, ci: usize, key: &str) -> Option<u32> {
+        self.columns.map_integers[ci].key_ord(key)
+    }
+
+    /// Exact bounds, or `None` when the key has no entries.
+    pub fn map_integer_key_min_max(&self, ci: usize, key: u32) -> Option<(i64, i64)> {
+        self.columns.map_integers[ci].bounds(key)
+    }
+
+    /// Exact value; an absent entry or out-of-range key or row returns `None`.
+    pub fn map_integer_value(&self, ci: usize, key: u32, row: u32) -> Option<i64> {
+        self.columns.map_integers[ci].value(key, row)
+    }
+
+    /// Configure exact `u64` map columns before adding documents.
+    pub fn with_map_unsigned_integers(self, names: &[&str]) -> Self {
+        self.with_columns(ColumnKind::MapUnsignedInteger, names)
+    }
+
     /// Set an exact value in an existing document slot. Duplicate keys return an error.
     pub fn set_map_unsigned_integer(
         &mut self,
@@ -693,135 +576,123 @@ impl Bm25Store {
         key: &str,
         value: u64,
     ) -> io::Result<()> {
-        if doc_id as usize >= self.fields[0].doc_lengths.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "integer map document slot does not exist",
-            ));
-        }
-        self.map_unsigned_integers
-            .get_mut(ci)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "integer map column does not exist",
-                )
-            })?
-            .set(doc_id, key, value)
+        self.columns
+            .set_map_unsigned_integer(self.texts.len(), ci, doc_id, key, value)
     }
-    /// Number of exact u64 map columns.
+
+    /// Number of exact `u64` map columns.
     pub fn map_unsigned_integer_count(&self) -> usize {
-        self.map_unsigned_integers.len()
+        self.column_count(ColumnKind::MapUnsignedInteger)
     }
+
     /// Column name at `ci`; panics for an invalid column index.
     pub fn map_unsigned_integer_name(&self, ci: usize) -> &str {
-        &self.map_unsigned_integers[ci].name
+        self.column_name(ColumnKind::MapUnsignedInteger, ci)
     }
-    /// Look up an exact u64 map column by name.
+
+    /// Look up an exact `u64` map column by name.
     pub fn map_unsigned_integer_index(&self, name: &str) -> Option<usize> {
-        self.map_unsigned_integers
-            .iter()
-            .position(|c| c.name == name)
+        self.column_index(ColumnKind::MapUnsignedInteger, name)
     }
-    /// Map keys in this reader's ordinal order.
+
+    /// Map keys in this store's ordinal order.
     pub fn map_unsigned_integer_keys(&self, ci: usize) -> &[String] {
-        &self.map_unsigned_integers[ci].keys
+        &self.columns.map_unsigned_integers[ci].keys
     }
+
     /// Find a key, including the empty string.
     pub fn map_unsigned_integer_key_ord(&self, ci: usize, key: &str) -> Option<u32> {
-        self.map_unsigned_integers[ci].key_ord(key)
+        self.columns.map_unsigned_integers[ci].key_ord(key)
     }
+
     /// Exact bounds, or `None` when the key has no entries.
     pub fn map_unsigned_integer_key_min_max(&self, ci: usize, key: u32) -> Option<(u64, u64)> {
-        self.map_unsigned_integers[ci].bounds(key)
+        self.columns.map_unsigned_integers[ci].bounds(key)
     }
+
     /// Exact value; an absent entry or out-of-range key or row returns `None`.
     pub fn map_unsigned_integer_value(&self, ci: usize, key: u32, row: u32) -> Option<u64> {
-        self.map_unsigned_integers[ci].value(key, row)
+        self.columns.map_unsigned_integers[ci].value(key, row)
     }
 
     /// The index of the map-facet column named `name`.
     pub fn map_facet_index(&self, name: &str) -> Option<usize> {
-        self.map_facets.iter().position(|c| c.name == name)
+        self.column_index(ColumnKind::MapFacet, name)
     }
 
-    /// The key ordinal of `key` in map-facet column `ci`, if any
-    /// document ever carried it.
+    /// The key ordinal of `key` in map-facet column `ci`, if any document carried it.
     pub fn map_facet_key_ord(&self, ci: usize, key: &str) -> Option<u32> {
-        self.map_facets[ci].key_index.get(key).copied()
+        self.columns.map_facets[ci].key_index.get(key).copied()
     }
 
     /// The keys of map-facet column `ci`, in ordinal order.
     pub fn map_facet_keys(&self, ci: usize) -> &[String] {
-        &self.map_facets[ci].keys
+        &self.columns.map_facets[ci].keys
     }
 
     /// The keys of map-numeric column `ci`, in ordinal order.
     pub fn map_numeric_keys(&self, ci: usize) -> &[String] {
-        &self.map_numerics[ci].keys
+        &self.columns.map_numerics[ci].keys
     }
 
     /// Number of distinct values map-facet column `ci` holds.
     pub fn map_facet_value_count(&self, ci: usize) -> usize {
-        self.map_facets[ci].values.len()
+        self.columns.map_facets[ci].values.len()
     }
 
     /// The value of map-facet column `ci` at ordinal `ord`.
     pub fn map_facet_value(&self, ci: usize, ord: u32) -> &str {
-        &self.map_facets[ci].values[ord as usize]
+        &self.columns.map_facets[ci].values[ord as usize]
     }
 
-    /// The ordinal of `value` in map-facet column `ci`'s value
-    /// dictionary, `None` when never ingested — the exact
-    /// matches-nothing answer, like [`Self::facet_value_ord_of`].
+    /// The ordinal of `value` in map-facet column `ci`'s value dictionary, `None` when absent.
     pub fn map_facet_value_ord_of(&self, ci: usize, value: &str) -> Option<u32> {
-        self.map_facets[ci].value_index.get(value).copied()
+        self.columns.map_facets[ci].value_index.get(value).copied()
     }
 
-    /// The value ordinal of `doc_id`'s entry under `key_ord` in
-    /// map-facet column `ci`, `None` when absent.
+    /// The value ordinal of `doc_id`'s entry under `key_ord` in map-facet column `ci`.
     pub fn map_facet_value_ord(&self, ci: usize, key_ord: u32, doc_id: u32) -> Option<u32> {
-        self.map_facets[ci].value_ord(doc_id as usize, key_ord)
+        self.columns.map_facets[ci].value_ord(doc_id as usize, key_ord)
     }
 
-    /// Record `doc_id`'s map-facet entry; see [`MapFacetStore::set`].
+    /// Record `doc_id`'s map-facet entry.
     pub fn set_map_facet(&mut self, ci: usize, doc_id: u32, key: &str, value: &str) {
-        self.map_facets[ci].set(doc_id, key, value);
+        self.columns.set_map_facet(ci, doc_id, key, value);
     }
 
-    /// Number of map<string, f64> columns.
+    /// Number of `map<string, f64>` columns.
     pub fn map_numeric_count(&self) -> usize {
-        self.map_numerics.len()
+        self.column_count(ColumnKind::MapNumeric)
     }
 
     /// The name of map-numeric column `ci`. Panics when out of range.
     pub fn map_numeric_name(&self, ci: usize) -> &str {
-        &self.map_numerics[ci].name
+        self.column_name(ColumnKind::MapNumeric, ci)
     }
 
     /// The index of the map-numeric column named `name`.
     pub fn map_numeric_index(&self, name: &str) -> Option<usize> {
-        self.map_numerics.iter().position(|c| c.name == name)
+        self.column_index(ColumnKind::MapNumeric, name)
     }
 
     /// The key ordinal of `key` in map-numeric column `ci`.
     pub fn map_numeric_key_ord(&self, ci: usize, key: &str) -> Option<u32> {
-        self.map_numerics[ci].key_index.get(key).copied()
+        self.columns.map_numerics[ci].key_index.get(key).copied()
     }
 
-    /// (min, max) of map-numeric column `ci` under `key_ord`.
+    /// `(min, max)` of map-numeric column `ci` under `key_ord`.
     pub fn map_numeric_key_min_max(&self, ci: usize, key_ord: u32) -> (f64, f64) {
-        self.map_numerics[ci].key_min_max()[key_ord as usize]
+        self.columns.map_numerics[ci].key_min_max()[key_ord as usize]
     }
 
     /// `doc_id`'s value under `key_ord` in map-numeric column `ci`.
     pub fn map_numeric_value(&self, ci: usize, key_ord: u32, doc_id: u32) -> Option<f64> {
-        self.map_numerics[ci].value(doc_id as usize, key_ord)
+        self.columns.map_numerics[ci].value(doc_id as usize, key_ord)
     }
 
-    /// Record `doc_id`'s map-numeric entry; see [`MapNumericStore::set`].
+    /// Record `doc_id`'s finite map-numeric entry.
     pub fn set_map_numeric(&mut self, ci: usize, doc_id: u32, key: &str, value: f64) {
-        self.map_numerics[ci].set(doc_id, key, value);
+        self.columns.set_map_numeric(ci, doc_id, key, value);
     }
 
     /// The name of field `f`. Panics when out of range.
@@ -831,30 +702,9 @@ impl Bm25Store {
 
     /// Record field `f`'s analyzer fingerprint, or refuse if it
     /// contradicts what the field already holds.
-    ///
-    /// A fingerprint is written once, by the first document that carries
-    /// one, and is immutable after. A LATER document analyzed differently
-    /// into the same column is exactly the drift this exists to catch:
-    /// the two halves of the column would hold different term identities
-    /// and every score over it would silently mix them. 0 means the
-    /// caller does not know its own spec, which neither sets nor checks.
     pub fn set_analysis_fingerprint(&mut self, f: usize, fingerprint: u64) -> Result<(), String> {
-        if fingerprint == 0 {
-            return Ok(());
-        }
         let field = &mut self.fields[f];
-        match field.analysis_fingerprint {
-            0 => {
-                field.analysis_fingerprint = fingerprint;
-                Ok(())
-            }
-            held if held == fingerprint => Ok(()),
-            held => Err(format!(
-                "field {:?} was built with analyzer fingerprint {held:#x} but this \
-                 document carries {fingerprint:#x}; one column holds one term identity",
-                field.name
-            )),
-        }
+        merge_analysis_fingerprint(&mut field.analysis_fingerprint, &field.name, fingerprint)
     }
 
     /// Field `f`'s analyzer fingerprint (0 = unknown).
@@ -868,9 +718,8 @@ impl Bm25Store {
     }
 
     /// Field `f` as its own [`Bm25Index`]: per-field postings, lengths,
-    /// and total; shared texts, lineages, and doc count. Every scorer
-    /// runs against one of these views (`docs/multi-field.md`). Panics
-    /// when `f` is out of range.
+    /// and total; shared texts, lineages, and doc count. Panics when `f`
+    /// is out of range.
     pub fn field(&self, f: usize) -> StoreFieldView<'_> {
         StoreFieldView {
             store: self,
@@ -958,9 +807,6 @@ impl Bm25Store {
             let field = &mut self.fields[fi];
             field.doc_lengths[slot] = analyzed.length;
             field.total_length += u64::from(analyzed.length);
-            // A sentence field takes the document's table verbatim under
-            // the same opt-in rule as positions; the node checked its
-            // shape and refused a sentence-less document upstream.
             if field.sentences {
                 field.doc_sentences[slot] = analyzed.sentences.unwrap_or_else(|| {
                     panic!(
@@ -969,12 +815,6 @@ impl Bm25Store {
                     )
                 });
             }
-            // A positional field takes the document's ordinals verbatim;
-            // every other field drops them, which is the whole opt-in:
-            // the payload exists only where it was asked for. The shape
-            // check and the refusal of a positionless document into a
-            // positional field happened upstream (the node), so here a
-            // violation is a programming error, not an input error.
             let positions = if field.positions {
                 Some(analyzed.positions.unwrap_or_else(|| {
                     panic!(

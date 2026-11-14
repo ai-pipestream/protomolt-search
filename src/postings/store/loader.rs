@@ -5,8 +5,9 @@ use std::io;
 use std::path::Path;
 
 use super::super::columns::{
-    integer_present, FacetStore, GeoStore, IntStore, MapFacetStore, MapNumericStore, NumericStore,
-    StoredBinding, StoredDerived, UintStore, FACET_ABSENT, INTEGER_ABSENT,
+    decode_binding_entry, decode_derived_entry, integer_present, ColumnSet, FacetStore, GeoStore,
+    IntStore, MapFacetStore, MapNumericStore, NumericStore, StoredBinding, StoredDerived,
+    UintStore, FACET_ABSENT, INTEGER_ABSENT,
 };
 use super::super::format::{
     compatible_column_kind, parse_integrity, read_u32, read_u64, take, u16_at,
@@ -53,17 +54,7 @@ impl Bm25Store {
             }],
             texts,
             lineages,
-            facets: Vec::new(),
-            numerics: Vec::new(),
-            map_facets: Vec::new(),
-            map_numerics: Vec::new(),
-            map_integers: Vec::new(),
-            map_unsigned_integers: Vec::new(),
-            integers: Vec::new(),
-            unsigned_integers: Vec::new(),
-            geos: Vec::new(),
-            binding: None,
-            derived: None,
+            columns: ColumnSet::default(),
             sources: Default::default(),
         }
     }
@@ -646,100 +637,15 @@ impl Bm25Store {
                     | COLUMN_KIND_ANALYSIS_BINDING
                     | COLUMN_KIND_VECTOR_BINDING
                     | COLUMN_KIND_INDEX_BINDING => {
-                        let mut vals: Vec<String> = Vec::with_capacity(3);
-                        let mut cur = base;
-                        for _ in 0..if kind != COLUMN_KIND_BINDING { 4 } else { 3 } {
-                            let len = u64::from(u16_at(at(cur, 2)?));
-                            vals.push(
-                                String::from_utf8(at(cur + 2, len)?.to_vec())
-                                    .map_err(|_| invalid("invalid utf-8 in binding record"))?,
-                            );
-                            cur += 2 + len;
-                        }
-                        if kind != COLUMN_KIND_BINDING
-                            && (kind == COLUMN_KIND_ANALYSIS_BINDING || !vals[3].is_empty())
-                            && !crate::mapped_analysis::valid_digest(&vals[3])
-                        {
-                            return Err(invalid("invalid mapped analysis digest"));
-                        }
-                        let analysis_contract = if kind != COLUMN_KIND_BINDING {
-                            let len = u32::from_le_bytes(at(cur, 4)?.try_into().unwrap()) as u64;
-                            let bytes = at(cur + 4, len)?.to_vec();
-                            cur += 4 + len;
-                            bytes
-                        } else {
-                            Vec::new()
-                        };
-                        let vector_binding = if matches!(
-                            kind,
-                            COLUMN_KIND_VECTOR_BINDING | COLUMN_KIND_INDEX_BINDING
-                        ) {
-                            let len = u32::from_le_bytes(at(cur, 4)?.try_into().unwrap()) as u64;
-                            let bytes = at(cur + 4, len)?.to_vec();
-                            cur += 4 + len;
-                            if crate::mapped_vector::decode(&bytes, &vals[0])
-                                .map_err(|e| invalid(&e.to_string()))?
-                                .is_none()
-                            {
-                                return Err(invalid("empty vector binding in vector/index entry"));
-                            }
-                            bytes
-                        } else {
-                            Vec::new()
-                        };
-                        let index_contract = if kind == COLUMN_KIND_INDEX_BINDING {
-                            let len = u32::from_le_bytes(at(cur, 4)?.try_into().unwrap()) as u64;
-                            let bytes = at(cur + 4, len)?.to_vec();
-                            cur += 4 + len;
-                            if crate::index_contract::validate_binding(
-                                &bytes,
-                                &vals[0],
-                                &vector_binding,
-                            )
-                            .map_err(|e| invalid(&e.to_string()))?
-                            .is_none()
-                            {
-                                return Err(invalid("empty index contract in kind-14 entry"));
-                            }
-                            bytes
-                        } else {
-                            Vec::new()
-                        };
-                        let mut it = vals.into_iter();
-                        binding_meta = Some(StoredBinding {
-                            plan_fingerprint: it.next().expect("three strings"),
-                            body_path: it.next().expect("three strings"),
-                            materialize_sha: it.next().expect("three strings"),
-                            analysis_sha: it.next().unwrap_or_default(),
-                            analysis_contract,
-                            vector_binding,
-                            index_contract,
-                        });
-                        let bound = binding_meta.as_ref().unwrap();
-                        crate::mapped_analysis::decode_contract(
-                            &bound.analysis_sha,
-                            &bound.analysis_contract,
-                            &bound.body_path,
-                        )
-                        .map_err(|e| invalid(&e))?;
-                        cursor = cur;
+                        let (bound, consumed) =
+                            decode_binding_entry(kind, &all[base as usize - 8..])?;
+                        binding_meta = Some(bound);
+                        cursor = base + consumed as u64;
                     }
                     COLUMN_KIND_DERIVED => {
-                        let mut cur = base;
-                        let len = u64::from(u16_at(at(cur, 2)?));
-                        let fingerprint = String::from_utf8(at(cur + 2, len)?.to_vec())
-                            .map_err(|_| invalid("invalid utf-8 in derived-columns record"))?;
-                        cur += 2 + len;
-                        let len = u32::from_le_bytes(at(cur, 4)?.try_into().unwrap()) as u64;
-                        let declaration = at(cur + 4, len)?.to_vec();
-                        cur += 4 + len;
-                        let stored = StoredDerived {
-                            fingerprint,
-                            declaration,
-                        };
-                        stored.validate().map_err(|e| invalid(&e))?;
+                        let (stored, consumed) = decode_derived_entry(&all[base as usize - 8..])?;
                         derived_meta = Some(stored);
-                        cursor = cur;
+                        cursor = base + consumed as u64;
                     }
                     k => {
                         return Err(io::Error::new(
@@ -842,20 +748,24 @@ impl Bm25Store {
                 doc_sentences,
             });
         }
-        // Facet columns (v7 only): dict then per-slot ordinals.
+        let read_dict =
+            |off: u64, n: u32, err_msg: &str| -> io::Result<(Vec<String>, HashMap<String, u32>)> {
+                let mut dict = Vec::with_capacity(n as usize);
+                let mut index = HashMap::with_capacity(n as usize);
+                let mut cur = off;
+                for ord in 0..n {
+                    let len = u64::from(u16_at(at(cur, 2)?));
+                    let entry = String::from_utf8(at(cur + 2, len)?.to_vec())
+                        .map_err(|_| invalid(err_msg))?;
+                    index.insert(entry.clone(), ord);
+                    dict.push(entry);
+                    cur += 2 + len;
+                }
+                Ok((dict, index))
+            };
         let mut facets = Vec::with_capacity(facet_metas.len());
         for (name, n_values, dict_off, ords_off) in facet_metas {
-            let mut dict = Vec::with_capacity(n_values as usize);
-            let mut index = HashMap::with_capacity(n_values as usize);
-            let mut dcur = dict_off;
-            for ord in 0..n_values {
-                let len = u64::from(u16_at(at(dcur, 2)?));
-                let value = String::from_utf8(at(dcur + 2, len)?.to_vec())
-                    .map_err(|_| invalid("invalid utf-8 in facet value"))?;
-                index.insert(value.clone(), ord);
-                dict.push(value);
-                dcur = dcur + 2 + len;
-            }
+            let (dict, index) = read_dict(dict_off, n_values, "invalid utf-8 in facet value")?;
             let mut ords = Vec::with_capacity(n_slots);
             for slot in 0..n_slots as u64 {
                 let ord = u32_at(ords_off + 4 * slot)?;
@@ -883,20 +793,6 @@ impl Bm25Store {
         // Map columns (v7 only): decode dictionaries, then split the
         // pairs section back into per-slot lists via the offsets
         // section's prefix sums.
-        let read_dict = |off: u64, n: u32| -> io::Result<(Vec<String>, HashMap<String, u32>)> {
-            let mut dict = Vec::with_capacity(n as usize);
-            let mut index = HashMap::with_capacity(n as usize);
-            let mut cur = off;
-            for ord in 0..n {
-                let len = u64::from(u16_at(at(cur, 2)?));
-                let entry = String::from_utf8(at(cur + 2, len)?.to_vec())
-                    .map_err(|_| invalid("invalid utf-8 in map dictionary"))?;
-                index.insert(entry.clone(), ord);
-                dict.push(entry);
-                cur += 2 + len;
-            }
-            Ok((dict, index))
-        };
         let pair_range = |offsets_off: u64, slot: usize| -> io::Result<(u64, u64)> {
             Ok((
                 u64::from(u32_at(offsets_off + 4 * slot as u64)?),
@@ -907,8 +803,9 @@ impl Bm25Store {
         for (name, n_keys, n_values, keys_off, values_off, offsets_off, pairs_off) in
             map_facet_metas
         {
-            let (keys, key_index) = read_dict(keys_off, n_keys)?;
-            let (values, value_index) = read_dict(values_off, n_values)?;
+            let (keys, key_index) = read_dict(keys_off, n_keys, "invalid utf-8 in map dictionary")?;
+            let (values, value_index) =
+                read_dict(values_off, n_values, "invalid utf-8 in map dictionary")?;
             let mut pairs = Vec::with_capacity(n_slots);
             for slot in 0..n_slots {
                 let (start, end) = pair_range(offsets_off, slot)?;
@@ -1027,17 +924,19 @@ impl Bm25Store {
             fields,
             texts,
             lineages,
-            facets,
-            numerics,
-            map_facets,
-            map_numerics,
-            map_integers,
-            map_unsigned_integers,
-            integers,
-            unsigned_integers,
-            geos,
-            binding: binding_meta,
-            derived: derived_meta,
+            columns: ColumnSet {
+                facets,
+                numerics,
+                map_facets,
+                map_numerics,
+                map_integers,
+                map_unsigned_integers,
+                integers,
+                unsigned_integers,
+                geos,
+                binding: binding_meta,
+                derived: derived_meta,
+            },
             sources: match sources_meta {
                 Some((offset, length)) => {
                     crate::source_archive::SourceArchive::read(at(offset, length)?, n_slots as u32)?

@@ -3,6 +3,7 @@
 use std::io::{self, Write};
 use std::path::Path;
 
+use super::columns::{decode_binding_entry, decode_derived_entry};
 use super::reader::validate_structure_v6;
 #[cfg(doc)]
 use super::Bm25Reader;
@@ -519,39 +520,12 @@ pub(super) fn v6v7_section_starts(map: &[u8], v7: bool) -> io::Result<Vec<(Strin
                 | COLUMN_KIND_ANALYSIS_BINDING
                 | COLUMN_KIND_VECTOR_BINDING
                 | COLUMN_KIND_INDEX_BINDING => {
-                    // Inline payload only: three or four length-prefixed
-                    // strings, no sections to name.
-                    let mut skip = base;
-                    for _ in 0..if kind != COLUMN_KIND_BINDING { 4 } else { 3 } {
-                        let len =
-                            u16::from_le_bytes(map[skip..skip + 2].try_into().unwrap()) as usize;
-                        skip += 2 + len;
-                    }
-                    if kind != COLUMN_KIND_BINDING {
-                        let len =
-                            u32::from_le_bytes(map[skip..skip + 4].try_into().unwrap()) as usize;
-                        skip += 4 + len;
-                    }
-                    if matches!(kind, COLUMN_KIND_VECTOR_BINDING | COLUMN_KIND_INDEX_BINDING) {
-                        let len =
-                            u32::from_le_bytes(map[skip..skip + 4].try_into().unwrap()) as usize;
-                        skip += 4 + len;
-                    }
-                    if kind == COLUMN_KIND_INDEX_BINDING {
-                        let len =
-                            u32::from_le_bytes(map[skip..skip + 4].try_into().unwrap()) as usize;
-                        skip += 4 + len;
-                    }
-                    cursor = skip;
+                    let (_, consumed) = decode_binding_entry(kind, &map[base..])?;
+                    cursor = base + consumed;
                 }
                 COLUMN_KIND_DERIVED => {
-                    // Inline payload only: the fingerprint and the
-                    // canonical declaration, no sections to name.
-                    let len = u16::from_le_bytes(map[base..base + 2].try_into().unwrap()) as usize;
-                    let mut skip = base + 2 + len;
-                    let len = u32::from_le_bytes(map[skip..skip + 4].try_into().unwrap()) as usize;
-                    skip += 4 + len;
-                    cursor = skip;
+                    let (_, consumed) = decode_derived_entry(&map[base..])?;
+                    cursor = base + consumed;
                 }
                 other => {
                     return Err(io::Error::new(
