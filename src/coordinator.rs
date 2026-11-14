@@ -3198,10 +3198,18 @@ impl CoordinatorServiceImpl {
         k: usize,
         filter_cel: &str,
     ) -> Result<Vec<(u64, f32)>, Status> {
+        let coordinator = self.request_snapshot().unwrap_or_else(|| self.clone());
+        let max_k = coordinator.knobs.max_k();
+        if k > max_k as usize {
+            return Err(Status::invalid_argument(format!(
+                "k={k} exceeds this coordinator's max_k={max_k}; lower k or raise --max-k"
+            )));
+        }
+        let wire_k = u32::try_from(k)
+            .map_err(|_| Status::invalid_argument("SPLADE k exceeds the wire range"))?;
         if k == 0 || query_weights.is_empty() {
             return Ok(Vec::new());
         }
-        let coordinator = self.request_snapshot().unwrap_or_else(|| self.clone());
         let filters = RequestFilters::compile(&[], filter_cel)?;
         let mask = coordinator.shard_mask(filters.tree.as_ref());
         let trees = coordinator.shard_filter_trees(&filters, mask.as_ref());
@@ -3225,7 +3233,7 @@ impl CoordinatorServiceImpl {
                     field: field.to_string(),
                     query_weights: wire_weights.clone(),
                     query_l1_slack,
-                    k: k as u32,
+                    k: wire_k,
                     filter: trees[shard].clone(),
                     initial_floor: running_floor,
                     visibility: coordinator.document_visibility.clone(),

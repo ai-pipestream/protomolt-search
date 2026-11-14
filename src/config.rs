@@ -400,9 +400,10 @@ pub struct Config {
     /// completion certificate. Enabled by default; false retains the
     /// unary path as the correctness/performance baseline.
     pub bm25_stream: bool,
-    /// Coordinator: hard cap on any client-facing `k`. Requests above it
-    /// are refused (never clamped); a request omitting `k` runs at this
-    /// depth. Must be at least 1.
+    /// Coordinator: hard cap on any client-facing `k`; node: admission cap
+    /// for `ScoreSplade.k`. Requests above it are refused, never clamped.
+    /// Omitted coordinator search k selects this depth; SPLADE k=0 still
+    /// returns no hits. Must be at least 1.
     pub max_k: u32,
     /// Coordinator: candidate ids per rescore call when a boolean group
     /// scores a clause over its surviving ids (`--signal-batch`,

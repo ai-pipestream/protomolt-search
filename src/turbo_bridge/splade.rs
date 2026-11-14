@@ -710,7 +710,15 @@ impl<'a> SpladeSectionReader<'a> {
 
         // Min-heap of top-k `(score_bits_ordered, doc_id)` kept in a small sorted Vec
         // (k is typically 10..1000; binary-search insert is cache-hot and exact).
-        let mut heap: Vec<(u32, f32)> = Vec::with_capacity(k + 1);
+        // The query's posting counts bound its possible unique matches, even
+        // before admission. Reserve only that much, including an insertion's
+        // spare slot when k is smaller. Keep the requested k for threshold
+        // semantics; huge k must not overflow or reserve caller-sized memory.
+        let possible_matches = cursors.iter().fold(0usize, |total, cursor| {
+            total.saturating_add(cursor.meta.df as usize)
+        });
+        let mut heap: Vec<(u32, f32)> =
+            Vec::with_capacity(k.saturating_add(1).min(possible_matches));
         let mut threshold = floor;
 
         loop {
@@ -825,3 +833,7 @@ impl<'a> SpladeSectionReader<'a> {
         (heap, threshold, stats)
     }
 }
+
+#[cfg(test)]
+#[path = "splade_limits_tests.rs"]
+mod limits_tests;

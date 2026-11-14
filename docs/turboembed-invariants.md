@@ -32,6 +32,15 @@ Rewrite certificate format 3 hashes sparse impacts/scales and positional arc
 lengths, treating an absent length column as unit arcs. It certifies live rows
 independently of physical order and segment boundaries.
 
+SPLADE requests above the configured `--max-k` are refused before field or
+query-term shortcuts, both by the coordinator and by `NodeService.ScoreSplade`.
+The coordinator retains its live `max_k` knob; a node's startup `NodeConfig.max_k`
+is exposed as the fixed `score_splade_max_k` diagnostic. Other node RPC limits
+are unchanged. SPLADE `k=0` still returns no hits. The low-level reader bounds
+heap reservation by the matching query terms' posting counts, using saturating
+arithmetic even for `usize::MAX`; admission and lower-document-id ties retain
+their existing behavior.
+
 ## Phrase queries
 
 A query lattice is expanded into complete alternative term sequences, capped

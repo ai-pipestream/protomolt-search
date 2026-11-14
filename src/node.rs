@@ -322,6 +322,12 @@ fn node_knobs(config: &NodeConfig) -> crate::diagnostics::Knobs {
     let process = format!("node:{}", config.slot_offset);
     let fixed = vec![
         FixedKnob {
+            name: "score_splade_max_k",
+            kind: KnobKind::Int,
+            value: config.max_k.to_string(),
+            description: "Largest ScoreSplade k admitted by this node (--max-k).",
+        },
+        FixedKnob {
             name: "chunk_blocks",
             kind: KnobKind::Int,
             value: config.chunk_blocks.to_string(),
@@ -509,6 +515,9 @@ pub enum Layout {
 /// How a node scans and whether it participates in floor sharing.
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
+    /// Admission cap for `ScoreSplade.k` (--max-k). Other node RPCs keep
+    /// their existing limits; coordinator max_k remains a live knob.
+    pub max_k: u32,
     /// Vector backend used for new and loaded generations. File extensions
     /// never select a backend.
     pub vector_backend: String,
@@ -718,6 +727,7 @@ impl NodeConfig {
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
+            max_k: crate::coordinator::DEFAULT_MAX_K,
             vector_backend: EMBEDDED_TURBOVEC.to_string(),
             slot_offset: 0,
             chunk_blocks: DEFAULT_CHUNK_BLOCKS,
@@ -5973,6 +5983,16 @@ impl NodeServiceImpl {
         Ok(())
     }
 
+    fn checked_splade_k(&self, k: usize) -> Result<u32, Status> {
+        if k > self.config.max_k as usize {
+            return Err(Status::invalid_argument(format!(
+                "k={k} exceeds this node's ScoreSplade max_k={}; lower k or raise --max-k",
+                self.config.max_k
+            )));
+        }
+        u32::try_from(k).map_err(|_| Status::invalid_argument("SPLADE k exceeds the wire range"))
+    }
+
     /// Score quantized SPLADE 128-doc Block-Max postings on `field` with
     /// live-doc and CEL filter admission.
     pub fn score_splade_field(
@@ -5983,6 +6003,7 @@ impl NodeServiceImpl {
         k: usize,
         filter: Option<&crate::pb::FilterExpr>,
     ) -> Result<Vec<(u64, f32)>, Status> {
+        let k = self.checked_splade_k(k)?;
         let resp = self.run_score_splade(crate::pb::ScoreSpladeRequest {
             field: field.to_string(),
             query_weights: query_weights
@@ -5993,7 +6014,7 @@ impl NodeServiceImpl {
                 })
                 .collect(),
             query_l1_slack,
-            k: k as u32,
+            k,
             filter: filter.cloned(),
             initial_floor: 0.0,
             visibility: None,
@@ -6007,6 +6028,7 @@ impl NodeServiceImpl {
         &self,
         req: crate::pb::ScoreSpladeRequest,
     ) -> Result<crate::pb::ScoreSpladeResponse, Status> {
+        self.checked_splade_k(req.k as usize)?;
         if let Some(f) = req.filter.as_ref() {
             crate::filter::validate_filter(f)?;
         }

@@ -312,6 +312,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     if matches!(cfg.role, Role::Node | Role::Both) {
         for shard in &cfg.shards {
             let node_config = NodeConfig {
+                max_k: cfg.max_k,
                 collection: shard.collection.clone(),
                 udp_hmac_key: cfg.udp_hmac_key.clone(),
                 layout: cfg.layout,
@@ -431,6 +432,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             by_collection.insert(String::new(), Vec::new());
         }
         let template = NodeConfig {
+            max_k: cfg.max_k,
             udp_hmac_key: cfg.udp_hmac_key.clone(),
             layout: cfg.layout,
             vector_mmap: cfg.vector_mmap,
