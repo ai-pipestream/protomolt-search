@@ -35,7 +35,9 @@ $B gate --results=rust.json,faiss.json,lucene.json --calibration=calibration.jso
 `RUSTC_BOOTSTRAP=corenn_kernels` is needed because CoreNN's kernel crate uses
 `#![feature(f16)]`; the value enables unstable features for that one crate
 only. FAISS needs `pip install faiss-cpu numpy`. Lucene needs JDK 21 and
-Maven.
+Maven 3.6.3 or newer. The POM pins a compiler plugin that honors
+`maven.compiler.release=21`; the plain `mvn package` command needs no compiler
+overrides and writes both the runner JAR and `lucene/target/classpath.txt`.
 
 ## Fixtures (`ann_bench fixture`)
 
