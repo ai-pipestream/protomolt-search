@@ -719,19 +719,32 @@ impl SourceAuthorityStore {
                     residency: row.residency,
                 });
             }
-            let replicas = range(REPLICAS)?
+            nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+            let mut replicas = range(REPLICAS)?
                 .iter()
-                .map(|(_, v)| contract::decode::<ControlReplica>(v))
-                .collect::<Result<Vec<_>, _>>()?;
+                .map(|(k, v)| {
+                    Ok((
+                        contract::decode::<ControlReplicaKey>(k)?.replica_key,
+                        contract::decode::<ControlReplica>(v)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, Status>>()?;
+            replicas.sort_by(|a, b| a.0.cmp(&b.0));
             let mut actions = range(ACTIONS)?
                 .iter()
-                .map(|(_, v)| contract::decode::<ControlAction>(v))
-                .collect::<Result<Vec<_>, _>>()?;
-            actions.sort_by_key(|a| a.order);
-            let completed_actions = range(COMPLETED)?
+                .map(|(k, v)| {
+                    Ok((
+                        contract::decode::<ControlActionKey>(k)?.action_id,
+                        contract::decode::<ControlAction>(v)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, Status>>()?;
+            actions.sort_by_key(|a| a.0);
+            let mut completed_actions = range(COMPLETED)?
                 .iter()
                 .map(|(k, _)| contract::decode::<ControlActionKey>(k).map(|k| k.action_id))
                 .collect::<Result<Vec<_>, _>>()?;
+            completed_actions.sort_unstable();
             let mut snapshot = ControlCollectionSnapshot {
                 format_version: 1,
                 authority: Some(self.inner.identity.clone()),
@@ -741,8 +754,8 @@ impl SourceAuthorityStore {
                 state: Some(state),
                 topology: Some(topology),
                 nodes,
-                replicas,
-                actions,
+                replicas: replicas.into_iter().map(|(_, row)| row).collect(),
+                actions: actions.into_iter().map(|(_, row)| row).collect(),
                 completed_actions,
                 digest: Vec::new(),
             };

@@ -229,7 +229,10 @@ pub(super) fn validate(
             ));
         }
     }
-    if counts.len() > installed.len() {
+    if counts
+        .keys()
+        .any(|resource| !installed.contains_key(resource))
+    {
         return Err(corrupt("installed facts exist without a control row"));
     }
     if totals
