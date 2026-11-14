@@ -6,11 +6,10 @@ use super::log_store::RaftLogStore;
 use super::reasons;
 use super::state_machine::{ControlStateMachine, SharedStore};
 use super::types::{validate_proposal, ControlRaft, NodeId};
-use crate::control_plane::RetiredLegacyControl;
 use crate::pb::storage::{
     raft_proposal::Command, raft_reply::Reply, CapacityConfigureCommand, CapacityTransition,
-    ControlImportCommand, RaftProposal, RaftReply, SourceAuthorityCommand, SourceAuthorityIdentity,
-    SourceAuthorityLimits,
+    ControlInstallCommand, RaftProposal, RaftReply, SourceAuthorityCommand,
+    SourceAuthorityIdentity, SourceAuthorityLimits,
 };
 use crate::pb::AccessPolicy;
 use crate::source_authority::{AdmissionLease, LeasedAdmission, SourceAdmission};
@@ -727,6 +726,29 @@ impl RaftHost {
         self.raft.metrics()
     }
 
+    /// Confirm fixture leadership without taking an application admission or
+    /// extending its vote hold. Lease-hold tests must exercise that separately.
+    #[cfg(all(test, feature = "tls"))]
+    pub(crate) async fn test_leader_readiness(&self) -> Result<(), Status> {
+        tokio::time::timeout(self.read_timeout, self.raft.ensure_linearizable())
+            .await
+            .map_err(|_| Status::unavailable("test leader read barrier timed out"))?
+            .map(|_| ())
+            .map_err(|error| match error {
+                RaftError::APIError(error) => {
+                    Status::unavailable(format!("test leader read barrier: {error}"))
+                }
+                RaftError::Fatal(error) => {
+                    Status::internal(format!("test leader core stopped: {error}"))
+                }
+            })
+    }
+
+    #[cfg(all(test, feature = "tls"))]
+    pub(crate) fn test_application_lease_held(&self) -> bool {
+        self.hold.holds(std::time::Instant::now())
+    }
+
     /// Wait for a metrics condition (state, applied index, snapshot).
     pub fn wait(
         &self,
@@ -1152,24 +1174,21 @@ impl RaftHost {
         control_reply(reply)
     }
 
-    /// Import steps through the log; a Begin needs the retirement holder.
-    pub async fn propose_import(
+    /// A collection control-state install through the log.
+    pub async fn propose_install(
         &self,
         principal: &str,
-        command: &ControlImportCommand,
-        retired: Option<&RetiredLegacyControl>,
-    ) -> Result<crate::pb::storage::ControlImportDecision, Status> {
-        self.store()?
-            .proposal_admits_import(principal, command, retired)?;
+        command: &ControlInstallCommand,
+    ) -> Result<crate::pb::storage::ControlInstallDecision, Status> {
         let reply = self
             .propose(RaftProposal {
                 format_version: 1,
                 principal: principal.into(),
-                command: Some(Command::Import(command.clone())),
+                command: Some(Command::Install(command.clone())),
             })
             .await?;
         match reply.reply {
-            Some(Reply::Import(decision)) => Ok(decision),
+            Some(Reply::Install(decision)) => Ok(decision),
             Some(Reply::Refusal(refusal)) => Err(refusal_status(refusal)),
             _ => Err(Status::internal(
                 "raft reply kind differs from the proposal",

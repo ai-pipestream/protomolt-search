@@ -1,12 +1,12 @@
-use super::import_tests::key;
-use super::map_feed_tests::{imported, prepare};
+use super::control_tests::key;
+use super::map_feed_tests::{installed, prepare};
 use super::*;
 use crate::relay::MapSource;
 use tonic::Code;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_relay_map_follows_committed_revisions_and_refuses_no_state() {
-    let (_dir, authority, store, revision) = imported("relay-map");
+    let (_dir, authority, store, revision) = installed("relay-map");
     // A resource with no applied control state is a named refusal at
     // attach, never an empty map.
     let absent = {

@@ -1,29 +1,21 @@
 //! Independent reference model of the source-authority control rules,
 //! written from `docs/source-authority-storage.md` and
-//! `docs/control-import.md` ONLY (docs/control-import.md names
-//! `src/source_authority/import.rs`, but this model is deliberately not
-//! derived from that code). Where a doc does not name an exact gRPC code,
-//! the most defensible reading is chosen and marked `AMBIGUOUS`; a fuzz
-//! mismatch on such a point is a reportable finding, not a model fix.
+//! `docs/control-state.md` ONLY (this model is deliberately not derived from
+//! `src/source_authority/control.rs`). Where a doc does not name an exact
+//! gRPC code, the most defensible reading is chosen and marked `AMBIGUOUS`;
+//! a fuzz mismatch on such a point is a reportable finding, not a model fix.
 //!
 //! Scope: the vocabulary the differential fuzzer exercises — Prepare, Cancel,
-//! ReplaceGrants on owner/collection keys, and the staged import
-//! Begin/Chunk/Commit/Abort on one collection. Capacity accounting, malformed
-//! envelopes, supplement validation and cross-resource rules are out of
-//! scope (the generator only emits well-formed envelopes).
+//! Activate, ReplaceGrants on owner/collection keys, and the control-state
+//! Install on one collection. Capacity accounting, malformed envelopes,
+//! state validation and cross-resource rules are out of scope (the
+//! generator only emits well-formed envelopes).
 //!
 //! Shared between the harness targets, each of which uses a subset.
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
 use tonic::Code;
-
-/// The actor the retirement holder binds Begin to (the kit retires as alice);
-/// docs/control-import.md Begin row: "the holder's operation must name this
-/// actor".
-pub const RETIREMENT_ACTOR: &str = "alice";
-/// Every import in the harness declares three chunks.
-pub const CHUNK_COUNT: u32 = 3;
 
 #[derive(Debug)]
 pub enum ModelOutcome {
@@ -64,25 +56,9 @@ pub enum ModelCommand {
     ReplaceGrants {
         admins: Vec<String>,
     },
-    Begin {
-        workflow: Vec<u8>,
-    },
-    Chunk {
-        workflow: Vec<u8>,
-        ordinal: u32,
-        bytes: Vec<u8>,
-    },
-    Commit {
-        workflow: Vec<u8>,
-    },
-    Abort {
-        workflow: Vec<u8>,
-    },
-    /// Administrative recovery: abort-only, admissible by ANY current Admin
-    /// (docs/control-import.md, "Administrative recovery").
-    Recover {
-        workflow: Vec<u8>,
-    },
+    /// The collection's one control-state install
+    /// (docs/control-state.md, "The install command").
+    Install,
     /// Owner activation through `execute`
     /// (docs/source-owner-admission.md, "Activation: the committed fence").
     /// From tests only the refusal paths are reachable: READY requires the
@@ -93,18 +69,11 @@ pub enum ModelCommand {
 }
 
 impl ModelCommand {
-    /// Import commands live in the import namespace; the docs say a command
-    /// id "used by one path cannot be reused by the other"
-    /// (docs/control-import.md, "The staged protocol").
-    pub fn is_import(&self) -> bool {
-        matches!(
-            self,
-            ModelCommand::Begin { .. }
-                | ModelCommand::Chunk { .. }
-                | ModelCommand::Commit { .. }
-                | ModelCommand::Abort { .. }
-                | ModelCommand::Recover { .. }
-        )
+    /// Installs keep their own retry records; the docs say a command id
+    /// "used by one path cannot be reused by the other"
+    /// (docs/control-state.md, "The install command").
+    pub fn is_install(&self) -> bool {
+        matches!(self, ModelCommand::Install)
     }
 }
 
@@ -136,13 +105,6 @@ struct Owner {
     prepared: bool,
 }
 
-#[derive(Clone, PartialEq, Eq)]
-struct Import {
-    actor: String,
-    /// `Some` while staging (ordinal -> staged bytes); `None` once terminal.
-    staging: Option<HashMap<u32, Vec<u8>>>,
-}
-
 /// One recorded decision for the verification probes: actor, key, id,
 /// namespace, code and revisions at record time.
 #[derive(Clone, Debug)]
@@ -150,7 +112,7 @@ pub struct JournalView {
     pub actor: String,
     pub owner_id: Vec<u8>,
     pub command_id: Vec<u8>,
-    pub import: bool,
+    pub install: bool,
     pub code: u32,
     pub control_revision: u64,
     pub policy_revision: u64,
@@ -160,14 +122,13 @@ pub struct Model {
     admins: HashSet<String>,
     policy_revision: u64,
     control_revision: u64,
-    /// (actor, owner_id, command_id, import_namespace).
+    /// (actor, owner_id, command_id, install_namespace).
     journal: HashMap<(String, Vec<u8>, Vec<u8>, bool), JournalEntry>,
     owners: HashMap<Vec<u8>, Owner>,
     /// (owner_id, workflow): owner workflows are never reusable.
     used_workflows: HashSet<(Vec<u8>, Vec<u8>)>,
-    /// workflow id -> import state (single collection).
-    imports: HashMap<Vec<u8>, Import>,
-    applied_import: bool,
+    /// Whether the collection holds installed control state.
+    installed: bool,
 }
 
 impl Model {
@@ -181,8 +142,7 @@ impl Model {
             journal: HashMap::new(),
             owners: HashMap::new(),
             used_workflows: HashSet::new(),
-            imports: HashMap::new(),
-            applied_import: false,
+            installed: false,
         }
     }
 
@@ -219,26 +179,19 @@ impl Model {
             .map(|o| (o.generation, o.workflow.clone(), o.prepared))
     }
 
-    pub fn staging_workflow(&self) -> Option<Vec<u8>> {
-        self.imports
-            .iter()
-            .find(|(_, i)| i.staging.is_some())
-            .map(|(wf, _)| wf.clone())
-    }
-
     pub fn journal_lookup(
         &self,
         actor: &str,
         owner_id: &[u8],
         command_id: &[u8],
-        import: bool,
+        install: bool,
     ) -> Option<(u32, u64, u64)> {
         self.journal
             .get(&(
                 actor.to_owned(),
                 owner_id.to_vec(),
                 command_id.to_vec(),
-                import,
+                install,
             ))
             .map(|e| (e.code, e.control_revision, e.policy_revision))
     }
@@ -246,11 +199,11 @@ impl Model {
     pub fn journal_entries(&self) -> Vec<JournalView> {
         self.journal
             .iter()
-            .map(|((actor, owner_id, command_id, import), e)| JournalView {
+            .map(|((actor, owner_id, command_id, install), e)| JournalView {
                 actor: actor.clone(),
                 owner_id: owner_id.clone(),
                 command_id: command_id.clone(),
-                import: *import,
+                install: *install,
                 code: e.code,
                 control_revision: e.control_revision,
                 policy_revision: e.policy_revision,
@@ -265,7 +218,7 @@ impl Model {
                 op.actor.clone(),
                 op.owner_id.clone(),
                 op.command_id.clone(),
-                op.command.is_import(),
+                op.command.is_install(),
             ),
             JournalEntry {
                 content: op.content.clone(),
@@ -282,24 +235,14 @@ impl Model {
     }
 
     pub fn apply(&mut self, op: &ModelOp) -> ModelOutcome {
-        let import = op.command.is_import();
+        let install = op.command.is_install();
         // 1. Current permission first (docs/source-authority-storage.md:
-        // "Every operation checks that actor's current explicit Admin grant";
-        // docs/control-import.md: "every step, including an exact retry,
-        // requires current resource Admin"). This also gates retry
+        // "Every operation checks that actor's current explicit Admin grant",
+        // an install and its exact retry included). This also gates retry
         // disclosure: "Current permission is checked before looking up a
         // retry. Revocation therefore prevents disclosure of its saved
         // result."
         if !self.admins.contains(&op.actor) {
-            return ModelOutcome::Status(Code::PermissionDenied);
-        }
-
-        // The Begin holder binds the retiring actor
-        // (docs/control-import.md: "its operation must name this actor").
-        if import
-            && matches!(&op.command, ModelCommand::Begin { .. })
-            && op.actor != RETIREMENT_ACTOR
-        {
             return ModelOutcome::Status(Code::PermissionDenied);
         }
 
@@ -311,7 +254,7 @@ impl Model {
             op.actor.clone(),
             op.owner_id.clone(),
             op.command_id.clone(),
-            !import,
+            !install,
         )) {
             return ModelOutcome::Status(Code::FailedPrecondition);
         }
@@ -326,7 +269,7 @@ impl Model {
             op.actor.clone(),
             op.owner_id.clone(),
             op.command_id.clone(),
-            import,
+            install,
         )) {
             if saved.content == op.content {
                 return ModelOutcome::Decision {
@@ -340,7 +283,7 @@ impl Model {
 
         // 3. CAS: every step carries expected revisions against the current
         // values; a stale step is a RECORDED refusal
-        // (docs/control-import.md: "a stale step is a recorded refusal").
+        // (docs/control-state.md: "a stale install is a recorded refusal").
         // AMBIGUOUS: the docs never name the code; FailedPrecondition is the
         // canonical stale-precondition code.
         if op.expected_control != self.control_revision
@@ -364,7 +307,7 @@ impl Model {
                 // "A new preparation after cancellation advances the
                 // generation and needs a new workflow ID. Used workflows are
                 // never released for reuse." AMBIGUOUS: the reuse code;
-                // AlreadyExists matches the import workflow tombstones.
+                // AlreadyExists matches the second-install refusal.
                 if self
                     .used_workflows
                     .contains(&(op.owner_id.clone(), workflow.clone()))
@@ -430,7 +373,7 @@ impl Model {
                             op.actor.clone(),
                             op.owner_id.clone(),
                             op.command_id.clone(),
-                            import,
+                            install,
                         ),
                         JournalEntry {
                             content: op.content.clone(),
@@ -445,142 +388,13 @@ impl Model {
                     }
                 }
             }
-            ModelCommand::Begin { workflow } => {
-                // Begin refusals, docs/control-import.md Begin row: used
-                // workflow id, resource already holds an applied import,
-                // another workflow is pending, in that order of specificity.
-                // AMBIGUOUS: only the first two read naturally as
-                // AlreadyExists ("a second applied import" parallels the
-                // recorded AlreadyExists of slice 1); the pending-workflow
-                // refusal is a precondition conflict: FailedPrecondition.
-                if self.imports.contains_key(workflow) {
+            ModelCommand::Install => {
+                // "A resource is installed once; a second install is a
+                // recorded AlreadyExists" (docs/control-state.md).
+                if self.installed {
                     return self.record(op, Code::AlreadyExists as u32);
                 }
-                if self.applied_import {
-                    return self.record(op, Code::AlreadyExists as u32);
-                }
-                if self.imports.values().any(|i| i.staging.is_some()) {
-                    return self.record(op, Code::FailedPrecondition as u32);
-                }
-                self.imports.insert(
-                    workflow.clone(),
-                    Import {
-                        actor: op.actor.clone(),
-                        staging: Some(HashMap::new()),
-                    },
-                );
-                self.control_revision += 1;
-                self.record(op, 0)
-            }
-            ModelCommand::Chunk {
-                workflow,
-                ordinal,
-                bytes,
-            } => {
-                let Some(import) = self.imports.get(workflow) else {
-                    // AMBIGUOUS: the docs name no code for an unknown
-                    // workflow; NotFound is the canonical choice.
-                    return self.record(op, Code::NotFound as u32);
-                };
-                // "Another Admin cannot stage, commit or abort it (recorded
-                // FailedPrecondition)" — named in the doc.
-                if import.actor != op.actor {
-                    return self.record(op, Code::FailedPrecondition as u32);
-                }
-                let Some(staging) = import.staging.clone() else {
-                    // "a late chunk, a second commit and an abort after a
-                    // terminal step are recorded refusals" — FailedPrecondition
-                    // per the slice-1 gate.
-                    return self.record(op, Code::FailedPrecondition as u32);
-                };
-                if let Some(staged) = staging.get(ordinal) {
-                    // "An identical restage under the same ordinal is a
-                    // recorded AlreadyExists; different content under a
-                    // staged ordinal is a recorded FailedPrecondition."
-                    if staged == bytes {
-                        return self.record(op, Code::AlreadyExists as u32);
-                    }
-                    return self.record(op, Code::FailedPrecondition as u32);
-                }
-                let import = self.imports.get_mut(workflow).expect("checked above");
-                import
-                    .staging
-                    .as_mut()
-                    .expect("staging checked above")
-                    .insert(*ordinal, bytes.clone());
-                self.control_revision += 1;
-                self.record(op, 0)
-            }
-            ModelCommand::Commit { workflow } => {
-                let Some(import) = self.imports.get(workflow) else {
-                    return self.record(op, Code::NotFound as u32); // AMBIGUOUS, as Chunk.
-                };
-                if import.actor != op.actor {
-                    return self.record(op, Code::FailedPrecondition as u32);
-                }
-                let Some(staging) = &import.staging else {
-                    return self.record(op, Code::FailedPrecondition as u32); // terminal
-                };
-                if staging.len() < CHUNK_COUNT as usize {
-                    // "Requires every chunk." AMBIGUOUS: code unnamed;
-                    // FailedPrecondition.
-                    return self.record(op, Code::FailedPrecondition as u32);
-                }
-                let import = self.imports.get_mut(workflow).expect("checked above");
-                import.staging = None;
-                self.applied_import = true;
-                self.control_revision += 1;
-                self.record(op, 0)
-            }
-            ModelCommand::Abort { workflow } => {
-                let staging = match self.imports.get(workflow) {
-                    None => {
-                        // AMBIGUOUS: the docs name no code for an unknown
-                        // workflow; NotFound is the canonical choice.
-                        return self.record(op, Code::NotFound as u32);
-                    }
-                    // "Another Admin cannot stage, commit or abort it
-                    // (recorded FailedPrecondition)" — named in the doc.
-                    Some(import) if import.actor != op.actor => {
-                        return self.record(op, Code::FailedPrecondition as u32);
-                    }
-                    Some(import) => import.staging.is_some(),
-                };
-                if !staging {
-                    // "a late chunk, a second commit and an abort after a
-                    // terminal step are recorded refusals".
-                    return self.record(op, Code::FailedPrecondition as u32);
-                }
-                self.imports
-                    .get_mut(workflow)
-                    .expect("checked above")
-                    .staging = None;
-                self.control_revision += 1;
-                self.record(op, 0)
-            }
-            ModelCommand::Recover { workflow } => {
-                // Administrative recovery (docs/control-import.md,
-                // "Administrative recovery"): "any current Admin of the
-                // resource may terminate a staging workflow into phase
-                // RECOVERED under the same revision CAS and actor-scoped
-                // retry rules". Unlike stage/commit/abort there is NO
-                // initiator check — the recovery actor need not be the
-                // initiating principal. A concurrent Commit and Recover
-                // "serialize ...: exactly one becomes the terminal decision,
-                // the other is a recorded refusal" — AMBIGUOUS: the doc
-                // names no code; FailedPrecondition (the implementation's
-                // "import workflow is already terminal"). An unknown
-                // workflow is NotFound, as for the other steps.
-                let Some(import) = self.imports.get(workflow) else {
-                    return self.record(op, Code::NotFound as u32); // AMBIGUOUS, as Chunk.
-                };
-                if import.staging.is_none() {
-                    return self.record(op, Code::FailedPrecondition as u32);
-                }
-                // The row keeps its initiating principal and its charged
-                // history; the workflow id stays spent; no import applies.
-                let import = self.imports.get_mut(workflow).expect("checked above");
-                import.staging = None;
+                self.installed = true;
                 self.control_revision += 1;
                 self.record(op, 0)
             }

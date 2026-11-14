@@ -1,0 +1,293 @@
+syntax = "proto3";
+package ai.protomolt.search.storage.v1;
+
+import "ai/protomolt/search/v1/search.proto";
+import "ai/protomolt/search/storage/v1/source_authority.proto";
+
+// Collection control state held by the transactional source authority
+// (docs/control-state.md): the install command that writes it and the rows
+// it is kept as. Internal durable records: not RPCs, not credentials, not a
+// published map, not an activated owner.
+
+// Control-store header, kept under the meta key "control". Every count is
+// recomputed and compared at open; a missing table or header refuses.
+message ControlStoreHeader {
+  uint32 format_version = 1; // 3
+  uint64 install_decision_count = 2;
+  uint64 control_count = 3;
+  uint64 topology_count = 4;
+  uint64 node_count = 5;
+  uint64 replica_count = 6;
+  uint64 action_count = 7;
+  uint64 completed_count = 8;
+}
+
+// Install a collection's control state in one bounded command. Actor-scoped
+// and retryable by command_id exactly like a SourceAuthorityCommand, in the
+// same command_id namespace. A resource is installed once.
+message ControlInstallCommand {
+  uint32 format_version = 1; // 1
+  SourceAuthorityIdentity authority = 2;
+  LogicalSourceOwner key = 3; // the collection resource; owner_id empty
+  bytes command_id = 4; // 1..1024 bytes
+  uint64 expected_control_revision = 5;
+  uint64 expected_policy_revision = 6;
+  ControlInstallState state = 7;
+}
+
+// The control facts of one collection. The whole command is bounded by the
+// store's max_command_bytes.
+message ControlInstallState {
+  uint64 next_token = 1; // lease token allocator, above every node's token
+  uint64 next_action = 2; // action id allocator, above every action id
+  ControlRouteTable topology = 3; // current
+  repeated ControlRouteTable history = 4; // retained generations, in order
+  repeated ControlNodeRecord nodes = 5; // node_id order, unique
+  repeated ControlReplicaRecord replicas = 6; // (shard_id, node_id) order, unique
+  repeated ControlActionRecord actions = 7; // pending order
+  repeated uint64 completed_actions = 8; // ascending, unique
+  ControlConfiguration configuration = 9;
+}
+
+message ControlRouteTable {
+  uint64 generation = 1;
+  repeated ControlRoute routes = 2; // route order
+}
+
+message ControlRoute {
+  string addr = 1;
+  optional string replica = 2; // absent and present-empty are different
+  uint64 hash_lo = 3;
+  uint64 hash_hi = 4;
+}
+
+message ControlNodeRecord {
+  string node_id = 1;
+  string addr = 2;
+  ai.protomolt.search.v1.ClusterNodeState state = 3;
+  uint64 lease_token = 4;
+  uint64 expires_unix_ms = 5;
+  ai.protomolt.search.v1.NodeCapacity capacity = 6;
+}
+
+message ControlReplicaRecord {
+  string shard_id = 1;
+  string node_id = 2;
+  string addr = 3;
+  uint64 generation = 4;
+  uint64 hash_lo = 5;
+  uint64 hash_hi = 6;
+  uint64 slot_offset = 7;
+  uint64 rows = 8;
+  uint64 bytes = 9;
+  ai.protomolt.search.v1.ShardReplicaRole role = 10;
+  bool ready = 11;
+  string scoring_fingerprint = 12;
+  string analysis_fingerprint = 13;
+  uint32 immutable_segments = 14;
+  uint64 tombstones = 15;
+}
+
+message ControlActionRecord {
+  uint64 action_id = 1;
+  ai.protomolt.search.v1.PlacementActionKind kind = 2;
+  string shard_id = 3;
+  string peer_shard_id = 4;
+  uint64 peer_source_generation = 5;
+  string source_node_id = 6;
+  string target_node_id = 7;
+  uint64 source_generation = 8;
+  uint64 target_generation = 9;
+  uint64 hash_lo = 10;
+  uint64 hash_hi = 11;
+  string reason = 12;
+}
+
+// Placement, derived columns, provider geometry and planner policy of the
+// collection. Every choice is explicit; nothing is defaulted.
+message ControlConfiguration {
+  uint32 format_version = 1; // 1
+  // A tree requires one code per current route; no_placement requires none.
+  oneof placement {
+    ai.protomolt.search.v1.PlacementTree tree = 2;
+    bool no_placement = 3;
+  }
+  repeated PlacementRouteCode route_codes = 4; // current topology, route order
+  oneof derived {
+    ai.protomolt.search.v1.DerivedColumns declaration = 5;
+    bool no_derived = 6;
+  }
+  // Required with a declaration; must equal the declaration's fingerprint.
+  string derived_fingerprint = 7;
+  oneof provider {
+    ControlProviderGeometry geometry = 8;
+    bool no_provider = 9;
+  }
+  ControlPlannerPolicy policy = 10;
+}
+
+message PlacementRouteCode {
+  bool has_placement = 1;
+  uint64 placement = 2;
+}
+
+// Backend identity and construction state of the collection's vector rows.
+message ControlProviderGeometry {
+  uint32 format_version = 1; // 1
+  string backend_kind = 2;
+  string backend_version = 3;
+  string config_format = 4;
+  bytes config_payload = 5;
+  uint64 dimension = 6;
+  uint32 bits_per_component = 7;
+  uint32 row_bytes_formula_version = 8; // 1: bits * dimension / 8
+  string scoring_fingerprint = 9;
+}
+
+message ControlPlannerPolicy {
+  uint32 format_version = 1; // 1
+  uint32 planner_version = 2;
+  ControlReconcilePolicy reconcile = 3;
+}
+
+message ControlReconcilePolicy {
+  uint64 lease_ms = 1;
+  uint64 replication_factor = 2;
+  uint64 split_rows = 3;
+  uint64 merge_rows = 4;
+  uint32 compact_segments = 5;
+  uint32 compact_tombstone_ppm = 6;
+  uint64 history_limit = 7;
+}
+
+message ControlInstallDecision {
+  uint32 format_version = 1; // 1
+  uint32 code = 2; // canonical gRPC status; zero is an accepted install
+  string message = 3;
+  uint64 control_revision = 4;
+  uint64 policy_revision = 5;
+  ControlInstallReceipt receipt = 6; // only on an accepted install
+}
+
+// What an accepted install wrote; recovery recounts the rows against it.
+message ControlInstallReceipt {
+  uint32 format_version = 1; // 1
+  uint64 control_revision = 2;
+  uint64 generation = 3;
+  uint64 routes = 4;
+  uint64 history = 5;
+  uint64 nodes = 6;
+  uint64 replicas = 7;
+  uint64 actions = 8;
+  uint64 completed_actions = 9;
+}
+
+message ControlInstallOperation {
+  uint32 format_version = 1; // 1
+  bytes request_sha256 = 2;
+  ControlInstallCommand command = 3;
+  ControlInstallDecision decision = 4;
+}
+
+// Applied collection control state, one row per resource.
+message ControlCollectionState {
+  uint32 format_version = 1; // 1
+  LogicalSourceOwner key = 2;
+  ControlInstallReceipt install = 3;
+  uint64 control_revision = 4;
+  uint64 next_token = 5;
+  uint64 next_action = 6;
+  uint64 topology_generation = 7;
+  repeated uint64 history_generations = 8; // install order
+  ControlConfiguration configuration = 9;
+}
+
+message ControlTopologyKey {
+  LogicalSourceOwner key = 1;
+  uint64 generation = 2;
+}
+
+message ControlTopology {
+  uint32 format_version = 1; // 1
+  uint64 generation = 2;
+  repeated ControlRoute routes = 3;
+  bool codes_available = 4; // true only for the current generation with a tree
+  repeated PlacementRouteCode codes = 5;
+  bool current = 6;
+  uint32 history_index = 7; // position in history when not current
+}
+
+message ControlNodeKey {
+  LogicalSourceOwner key = 1;
+  string node_id = 2;
+}
+
+// Installed registrations are observations. A lease here authorizes nothing;
+// readiness and replacement need their own committed facts.
+message ControlNode {
+  uint32 format_version = 1; // 1
+  ControlNodeRecord node = 2;
+  // Copied from the node's capacity report; UNSPECIFIED when it declared none.
+  SourceResidency residency = 3;
+}
+
+message ControlReplicaKey {
+  LogicalSourceOwner key = 1;
+  string replica_key = 2; // shard_id + NUL + node_id
+}
+
+message ControlReplica {
+  uint32 format_version = 1; // 1
+  ControlReplicaRecord replica = 2;
+}
+
+enum ControlActionState {
+  CONTROL_ACTION_STATE_UNSPECIFIED = 0;
+  // No worker consumes it until reconciliation runs under this authority.
+  CONTROL_ACTION_STATE_UNRECONCILED = 1;
+}
+
+message ControlActionKey {
+  LogicalSourceOwner key = 1;
+  uint64 action_id = 2;
+}
+
+message ControlAction {
+  uint32 format_version = 1; // 1
+  ControlActionRecord action = 2;
+  uint32 order = 3; // pending order
+  ControlActionState state = 4;
+}
+
+// A completed action id. It has no request fingerprint, so it is never a
+// verified retry receipt.
+message ControlCompletedAction {
+  uint32 format_version = 1; // 1
+}
+
+// Immutable committed view for planners and observers. Lease tokens are
+// omitted; nothing here grants ownership or authorizes a move.
+message ControlCollectionSnapshot {
+  uint32 format_version = 1; // 1
+  SourceAuthorityIdentity authority = 2;
+  LogicalSourceOwner key = 3;
+  uint64 control_revision = 4;
+  uint64 policy_revision = 5;
+  ControlCollectionState state = 6;
+  ControlTopology topology = 7;
+  repeated ControlNodeSnapshot nodes = 8; // node_id order
+  repeated ControlReplica replicas = 9; // replica_key order
+  repeated ControlAction actions = 10; // action_id order
+  repeated uint64 completed_actions = 11; // ascending
+  // SHA-256 over the canonical snapshot with this field empty.
+  bytes digest = 12;
+}
+
+message ControlNodeSnapshot {
+  string node_id = 1;
+  string addr = 2;
+  ai.protomolt.search.v1.ClusterNodeState state = 3;
+  uint64 expires_unix_ms = 4;
+  ai.protomolt.search.v1.NodeCapacity capacity = 5;
+  SourceResidency residency = 6;
+}

@@ -20,7 +20,7 @@ openraft::declare_raft_types!(
         NodeId = u64,
         Node = BasicNode,
         Entry = Entry<ControlRaft>,
-        SnapshotData = tokio::fs::File,
+        SnapshotData = super::state_machine::SnapshotFile,
 );
 
 pub type NodeId = u64;

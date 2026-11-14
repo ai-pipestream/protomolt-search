@@ -3,8 +3,7 @@ package ai.protomolt.search.storage.v1;
 
 import "ai/protomolt/search/v1/search.proto";
 import "ai/protomolt/search/storage/v1/source_authority.proto";
-import "ai/protomolt/search/storage/v1/control_checkpoint.proto";
-import "ai/protomolt/search/storage/v1/control_import.proto";
+import "ai/protomolt/search/storage/v1/control_state.proto";
 
 // The committed map at the consumer boundary (docs/map-feed.md): one value
 // per applied control revision of one resource, produced from committed
@@ -20,12 +19,12 @@ message PublishedMap {
   // Advances only when a different map is published; one generation never
   // names two different maps.
   uint64 topology_generation = 5;
-  repeated LegacyControlRoute routes = 6; // committed order
+  repeated ControlRoute routes = 6; // committed order
   bool codes_available = 7;
   repeated PlacementRouteCode codes = 8;
   ai.protomolt.search.v1.PlacementTree tree = 9; // absent for no_placement
   repeated uint64 history_generations = 10;
-  repeated LegacyControlReplica replicas = 11; // replica_key order
+  repeated ControlReplicaRecord replicas = 11; // replica_key order
   repeated PublishedNode nodes = 12; // node_id order
   repeated PublishedOwner owners = 13; // owner_id order
   // SHA-256 over the canonical value with this field empty.

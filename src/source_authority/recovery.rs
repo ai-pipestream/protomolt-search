@@ -38,9 +38,9 @@ pub(super) fn header(
 }
 
 pub(super) fn control_header(value: &ControlStoreHeader) -> Result<(), Status> {
-    if value.format_version != import::STORE_FORMAT {
+    if value.format_version != super::control::STORE_FORMAT {
         return Err(corrupt(
-            "unsupported control store format; this reader serves format 2 only",
+            "unsupported control store format; this reader serves format 3 only",
         ));
     }
     Ok(())
@@ -187,7 +187,7 @@ pub(super) fn validate(
     identity: &SourceAuthorityIdentity,
 ) -> Result<(), Status> {
     let tx = database.begin_read().map_err(storage)?;
-    if tx.list_tables().map_err(storage)?.count() != capacity::FORMAT_3_TABLES
+    if tx.list_tables().map_err(storage)?.count() != STORE_TABLES
         || tx.list_multimap_tables().map_err(storage)?.next().is_some()
     {
         return Err(corrupt("unexpected or missing control tables"));
@@ -215,7 +215,7 @@ pub(super) fn validate(
         }
     }
     let control: ControlStoreHeader = contract::decode(
-        meta.get(import::CONTROL_HEADER)
+        meta.get(super::control::CONTROL_HEADER)
             .map_err(storage)?
             .ok_or_else(|| missing("control header"))?
             .value(),
@@ -264,14 +264,14 @@ pub(super) fn validate(
             key_bytes.value().len() + value_bytes.value().len(),
         )?;
     }
-    let (accepted_imports, control_payload) =
+    let (accepted_installs, control_payload) =
         control::validate(&tx, &state, &control, &policy, &decisions)?;
     payload = payload_change(payload, 0, control_payload)?;
     let (accepted_configures, capacity_payload) =
         capacity::validate(&tx, &meta, &state, &policy, &decisions)?;
     payload = payload_change(payload, 0, capacity_payload)?;
     if accepted
-        .checked_add(accepted_imports)
+        .checked_add(accepted_installs)
         .and_then(|n| n.checked_add(accepted_configures))
         .and_then(|n| n.checked_add(1))
         != Some(state.control_revision)

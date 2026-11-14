@@ -59,7 +59,7 @@ candidate committed.
 This is cooperative ownership of one configured store in its operator-owned
 container. It does not fence a copied state file, a noncooperating older binary,
 or a separate distributed owner. Stop the old control writer before upgrading
-or importing it into the transactional authority. Source residency and managed
+it. Source residency and managed
 activation still require their own committed enforcement protocol.
 
 Ownership validation (2026-09-08, working tree above `60525ae`): the initial

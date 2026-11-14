@@ -8,14 +8,12 @@
 //! transition, and transcribes one consistent read into a
 //! `TierSnapshotInput`. It never repairs an input: `TierSnapshot::validated`
 //! is the only validator of what it hands over.
-use super::import::{hash, prefix_end, read_headers, resource_prefix};
-use super::import::{CONTROL, NODES, REPLICAS, TOPOLOGIES};
+use super::control::{self, hash, prefix_end, read_headers, resource_prefix};
+use super::control::{CONTROL, NODES, REPLICAS, TOPOLOGIES};
 use super::*;
 use crate::capacity_tiers as tiers;
 use crate::pb::storage::capacity_transition::Action as TransitionAction;
-use crate::pb::storage::legacy_control_import_supplement::{
-    Derived as DerivedChoice, Placement, Provider,
-};
+use crate::pb::storage::control_configuration::{Derived as DerivedChoice, Placement, Provider};
 use std::collections::BTreeMap;
 
 pub(super) const CAPACITY_HEADER: &str = "capacity";
@@ -26,9 +24,6 @@ pub(super) const REPORTERS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("capacity_reporters");
 pub(super) const OBSERVATIONS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("capacity_observations");
-/// Format 3: the format-2 tables plus the four capacity tables.
-pub(super) const FORMAT_3_TABLES: usize = 17;
-
 /// Bounds a configuration may declare; they keep the per-command rebuild of
 /// the observation store bounded.
 pub const MAX_CAPACITY_RECORDS: u64 = 65_536;
@@ -503,7 +498,7 @@ pub(super) fn derive(committed: &Committed, key: &LogicalSourceOwner) -> Result<
     // generation is the shard's source generation. A shard with no primary
     // or several is an impossible committed state, reported by name.
     let mut shards: BTreeMap<String, tiers::CommittedShard> = BTreeMap::new();
-    let mut by_shard: BTreeMap<String, Vec<&LegacyControlReplica>> = BTreeMap::new();
+    let mut by_shard: BTreeMap<String, Vec<&ControlReplicaRecord>> = BTreeMap::new();
     for row in &committed.replicas {
         let replica = row
             .replica
@@ -515,7 +510,7 @@ pub(super) fn derive(committed: &Committed, key: &LogicalSourceOwner) -> Result<
             .push(replica);
     }
     for (shard_id, replicas) in by_shard {
-        let primaries: Vec<&&LegacyControlReplica> = replicas
+        let primaries: Vec<&&ControlReplicaRecord> = replicas
             .iter()
             .filter(|r| r.role == crate::pb::ShardReplicaRole::Primary as i32)
             .collect();
@@ -532,7 +527,7 @@ pub(super) fn derive(committed: &Committed, key: &LogicalSourceOwner) -> Result<
             .iter()
             .map(|r| tiers::CommittedCopy {
                 node_id: r.node_id.clone(),
-                // Legacy replicas carry no storage incarnation or coverage
+                // Installed replicas carry no storage incarnation or coverage
                 // evidence: partial evidence, never a complete replica.
                 storage_incarnation: [0u8; 16],
                 failure_domain: committed
@@ -584,7 +579,7 @@ pub(super) fn derive(committed: &Committed, key: &LogicalSourceOwner) -> Result<
             tiers::CommittedShard {
                 source_generation: primary.generation,
                 // No committed ownership transition has happened since the
-                // import; the counter starts here and the map feed publishes it.
+                // install; the counter starts here and the map feed publishes it.
                 ownership_epoch: 0,
                 leaves,
             },
@@ -619,7 +614,7 @@ fn node_records(
         };
         // Eligibility is a transcription of committed facts at the planning
         // instant: an active, server-resident node whose committed lease has
-        // not expired. Imported leases are observations; this grants nothing.
+        // not expired. Installed leases are observations; this grants nothing.
         let eligible = node.state == crate::pb::ClusterNodeState::Active as i32
             && residency == tiers::NodeResidency::Server
             && node.expires_unix_ms > planning_instant_unix_ms;
@@ -790,7 +785,7 @@ impl SourceAuthorityStore {
                 .map_err(storage)?
                 .is_some()
                 || tx
-                    .open_table(import::IMPORT_OPERATIONS)
+                    .open_table(control::INSTALL_OPERATIONS)
                     .map_err(storage)?
                     .get(operation_bytes.as_slice())
                     .map_err(storage)?
@@ -822,13 +817,8 @@ impl SourceAuthorityStore {
                 self.write_pending_applied(&mut meta)?;
                 break 'apply;
             }
-            let (reserved_bytes, reserved_decisions, retained) = import::reserved(&meta)?;
-            if header
-                .source
-                .decision_count
-                .saturating_add(retained)
-                .saturating_add(reserved_decisions)
-                >= header.limits.max_decisions
+            let retained = control::retained_decisions(&meta)?;
+            if header.source.decision_count.saturating_add(retained) >= header.limits.max_decisions
             {
                 return Err(Status::resource_exhausted(
                     "source authority decision capacity is full; retry history is never evicted",
@@ -970,9 +960,7 @@ impl SourceAuthorityStore {
                     .map_err(storage)?;
                 header.source.control_revision = revision;
             }
-            if header.source.payload_bytes.saturating_add(reserved_bytes)
-                > header.limits.max_payload_bytes
-            {
+            if header.source.payload_bytes > header.limits.max_payload_bytes {
                 return Err(Status::resource_exhausted(
                     "source authority payload capacity is full; retry history is never evicted",
                 ));
@@ -1196,12 +1184,7 @@ impl SourceAuthorityStore {
                     .map_err(storage)?;
                 header.source.payload_bytes =
                     payload_change(header.source.payload_bytes, removed_bytes, added_bytes)?;
-                if header
-                    .source
-                    .payload_bytes
-                    .saturating_add(header.control.reserved_bytes)
-                    > header.limits.max_payload_bytes
-                {
+                if header.source.payload_bytes > header.limits.max_payload_bytes {
                     return Err(Status::resource_exhausted(
                         "source authority payload capacity is full; retry history is never evicted",
                     ));
@@ -1380,7 +1363,9 @@ pub(super) fn validate(
         .as_ref()
         .ok_or_else(|| missing("identity"))?;
     let limits = source.limits.as_ref().ok_or_else(|| missing("limits"))?;
-    let imports = tx.open_table(import::IMPORT_OPERATIONS).map_err(corrupt)?;
+    let installs = tx
+        .open_table(control::INSTALL_OPERATIONS)
+        .map_err(corrupt)?;
     let mut payload = 0usize;
     let mut accepted = 0u64;
     let mut decisions = 0u64;
@@ -1403,7 +1388,7 @@ pub(super) fn validate(
             || key.command_id != command.command_id
             || value.request_sha256 != command_digest(command)
             || regular.get(k.value()).map_err(storage)?.is_some()
-            || imports.get(k.value()).map_err(storage)?.is_some()
+            || installs.get(k.value()).map_err(storage)?.is_some()
         {
             return Err(corrupt(
                 "capacity operation key, digest or namespace differs",

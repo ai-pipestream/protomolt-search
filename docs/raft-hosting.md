@@ -15,7 +15,7 @@ it holds to is in that section and in
 ## Envelopes
 
 `raft_control.proto` types everything the consensus layer stores or moves:
-`RaftProposal { principal, command }` (control, import, capacity configure or
+`RaftProposal { principal, command }` (control, install, capacity configure or
 observation transition), `RaftReply` (the matching decision, or a
 `RaftRefusal` for an envelope or admission refusal at application),
 `RaftLogId`, `RaftVote`, `RaftMembership` (joint configs and nodes),
@@ -40,7 +40,7 @@ saved, so a crash between commit and apply replays on restart.
 ## State machine
 
 `ControlStateMachine` wraps the authority store and marks it Raft-hosted:
-the direct command paths (`execute`, import steps, capacity commands) refuse
+the direct command paths (`execute`, `install_control`, capacity commands) refuse
 with "propose through the host"; only the committed-replay paths apply. For
 each entry the applied position (`RaftApplied`: last log id and the stored
 membership) is written in the same transaction as the command's effect —
@@ -155,6 +155,29 @@ library a validated image only (`RaftTransportService::stage`,
   store's locks, so a held handle neither blocks nor refuses it; only a
   real storage failure in that swap is fatal, as the library's contract
   requires.
+  The file handed to the library owns its exact incoming directory until
+  installation or discard, including when the RPC caller cancels. A new
+  transfer cannot remove those bytes or substitute its own directory.
+  At most two images may be owned by the library, allowing one successor
+  while an older install runs; a third hand-off refuses with
+  `ResourceExhausted`. Together with the one partial transfer, incoming
+  image bytes are bounded by three times `max_snapshot_bytes`; the one
+  verification probe can use another `max_snapshot_bytes`. Existing
+  published generations and the live-store replacement are separate.
+  No transport lock or detached task waits for a core installation.
+  Synchronous disk verification still holds the transfer and receipt
+  locks until validation and hand-off end; a higher-vote transfer can
+  stage during an older core installation, not preempt disk validation.
+- **Final retries.** One receipt binds the authenticated peer, vote, full
+  metadata, final offset, byte length and SHA-256 of the final chunk.
+  Repeating that exact final RPC waits for its installation outcome and
+  reads the core's current vote through its request queue, rather than a
+  cached reply or the metrics watch. Conflicting bytes or identity do
+  not reuse the receipt, and a transfer restarted at offset zero must
+  validate its received bytes again. A retry waits at most the existing
+  `snapshot_idle_timeout_ms`; a failed or discarded receive records no
+  successful installation. This does not bypass OpenRaft's own safe
+  decline rules for an old vote or position.
 
 Evidence (`tests/control_raft_snapshots.rs`, "snapshot admission refuses
 invalid transfers without stopping the core"): oversized, foreign,
@@ -279,8 +302,8 @@ member, listening), `prepare_member` (the durable state of a member that
 will join, see below) and `start_member` (a prepared member, or any member
 restarting, listening on its recorded address). The host MUST admit proposals
 the way the direct paths did — a `ConfirmReady` needs the managed binding
-(`propose_confirm_ready`), a `Begin` needs the retirement holder
-(`propose_import`) — then write them through `Raft::client_write` and
+(`propose_confirm_ready`); a control install is pure data and needs no
+holder (`propose_install`) — then write them through `Raft::client_write` and
 return the committed reply. (`src/raft/tests.rs`, "the general proposal
 path refuses a readiness confirmation" and "stale and unauthorized
 proposals are recorded outcomes", fail if an unbound proposal applies.)
@@ -782,11 +805,10 @@ in `src/raft/tests.rs`.
 The migration and disaster-recovery exercise of the design's step 5 runs
 against the fleet's own root map on disposable state
 (`tests/control_raft_migration.rs`; [the exercise](raft-migration-exercise.md)):
-the map becomes a legacy control plane, is retired and imported into a
-bootstrapped group whose every voter then publishes it for the relay; the
-group loses its leader with a write in flight, replaces a lost member
-while the leader's image has changed bytes, restarts from cold, serves a
-write on every path, and recovers its retirement record.
+the map is installed into a bootstrapped group whose every voter then
+publishes it for the relay; the group loses its leader with a write in
+flight, replaces a lost member while the leader's image has changed bytes,
+restarts from cold and serves a write on every path.
 
 Single node (`src/raft/tests.rs`):
 

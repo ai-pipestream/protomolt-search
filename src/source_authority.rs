@@ -23,12 +23,11 @@ use tonic::{Code, Status};
 
 mod capacity;
 mod contract;
-mod import;
+mod control;
 mod map_feed;
 mod recovery;
 #[cfg(feature = "net")]
 mod relay_map;
-mod retirement;
 mod transition;
 
 #[cfg(any(test, feature = "fault-injection"))]
@@ -36,15 +35,14 @@ pub use self::ExitFault as SourceExitFault;
 pub use capacity::{
     PlanningContext, MAX_CAPACITY_BYTES, MAX_CAPACITY_RECORDS, MAX_CAPACITY_REPORTERS,
 };
-pub use import::{
-    chunk_capacity, chunk_digest, payload_digest, plan_chunks, retirement_digest,
-    MAX_IMPORT_CHUNKS, MAX_IMPORT_PAYLOAD_BYTES, MAX_SUPPLEMENT_BYTES, MIN_CHUNK_CAPACITY,
-};
 pub use map_feed::MapConsumer;
 #[cfg(feature = "net")]
 pub use relay_map::AuthorityMapSource;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("source_authority_meta");
+/// Every table of a store: meta, owners, decisions and workflows, the seven
+/// control tables and the four capacity tables.
+const STORE_TABLES: usize = 15;
 /// Meta key of the Raft applied position (docs/raft-hosting.md).
 pub(crate) const RAFT_META: &str = "raft";
 /// Present only in a store prepared for a member that has not received its
@@ -776,7 +774,7 @@ impl SourceAuthorityStore {
             tx.open_table(DECISIONS).map_err(storage)?;
             tx.open_table(WORKFLOWS).map_err(storage)?;
         }
-        import::create_tables(&tx)?;
+        control::create_tables(&tx)?;
         capacity::create_tables(&tx)?;
         tx.commit().map_err(storage)?;
         parent.sync_all().map_err(storage)?;
@@ -824,7 +822,6 @@ impl SourceAuthorityStore {
         let (store, _) = Self::open_file(path, expected_identity, false)?;
         {
             let backing = store.inner.database();
-            import::adopt(&backing)?;
             recovery::validate(&backing, expected_identity)?;
         }
         let (revision, applied) = {
@@ -1032,9 +1029,9 @@ impl SourceAuthorityStore {
             let operation_key = contract::operation_key(principal, key, &command.command_id);
             let operation_bytes = operation_key.encode_to_vec();
             let request_sha256 = digest(command);
-            let (reserved_bytes, reserved_decisions, import_decisions) = import::reserved(&meta)?;
+            let retained = control::retained_decisions(&meta)?;
             if tx
-                .open_table(import::IMPORT_OPERATIONS)
+                .open_table(control::INSTALL_OPERATIONS)
                 .map_err(storage)?
                 .get(operation_bytes.as_slice())
                 .map_err(storage)?
@@ -1047,7 +1044,7 @@ impl SourceAuthorityStore {
                     .is_some()
             {
                 return Err(Status::failed_precondition(
-                    "command_id was already used by a control import or capacity command",
+                    "command_id was already used by a control install or capacity command",
                 ));
             }
             let mut decisions = tx.open_table(DECISIONS).map_err(storage)?;
@@ -1070,12 +1067,7 @@ impl SourceAuthorityStore {
                 self.write_pending_applied(&mut meta)?;
                 break 'apply;
             }
-            if header
-                .decision_count
-                .saturating_add(import_decisions)
-                .saturating_add(reserved_decisions)
-                >= limits.max_decisions
-            {
+            if header.decision_count.saturating_add(retained) >= limits.max_decisions {
                 return Err(Status::resource_exhausted(
                     "source authority decision capacity is full; retry history is never evicted",
                 ));
@@ -1211,7 +1203,7 @@ impl SourceAuthorityStore {
                     payload_change(header.payload_bytes, policy.encoded_len(), bytes.len())?;
                 meta.insert("policy", bytes.as_slice()).map_err(storage)?;
             }
-            if header.payload_bytes.saturating_add(reserved_bytes) > limits.max_payload_bytes {
+            if header.payload_bytes > limits.max_payload_bytes {
                 return Err(Status::resource_exhausted(
                     "source authority payload capacity is full; retry history is never evicted",
                 ));
@@ -1455,7 +1447,6 @@ impl SourceAuthorityStore {
             ));
         }
         let (backing, _directory) = Self::open_backing(staged, false)?;
-        import::adopt(&backing)?;
         recovery::validate(&backing, &self.inner.identity)?;
         let (revision, control_revision) = Self::revisions_of(&backing)?;
         std::fs::rename(staged, &self.inner.path).map_err(storage)?;
@@ -1637,10 +1628,8 @@ mod admission_tests;
 #[cfg(test)]
 mod capacity_tests;
 #[cfg(test)]
-mod import_tests;
+pub(crate) mod control_tests;
 #[cfg(test)]
 mod map_feed_tests;
 #[cfg(all(test, feature = "net"))]
 mod relay_map_tests;
-#[cfg(test)]
-mod retirement_tests;

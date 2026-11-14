@@ -9,13 +9,13 @@ that input. The adapter transcribes; it repairs nothing.
 
 ## Rows (store format 3)
 
-Format 3 adds four tables and a `capacity` header to the format-2 store and
-is adopted at open from format 1 or 2 in one transaction that creates only
-the missing tables and headers. Any other table set or header refuses.
+Format 3 holds four capacity tables and a `capacity` header beside the
+control rows ([control state](control-state.md)). A store is created at
+format 3; any other format, table set or header refuses at open.
 
 | Table | Key | Value |
 |---|---|---|
-| `capacity_configure_operations` | actor-scoped operation key (shared `command_id` namespace with control and import commands) | `CapacityConfigureOperation`: command, digest, decision |
+| `capacity_configure_operations` | actor-scoped operation key (shared `command_id` namespace with source and install commands) | `CapacityConfigureOperation`: command, digest, decision |
 | `capacity_state` | resource | `CapacityConfiguration`, observation epoch, configuring revision, counts |
 | `capacity_reporters` | resource + node id | current process incarnation |
 | `capacity_observations` | resource + the planner's canonical identity tuple | the `CapacityObservation` exactly as validated |
@@ -71,18 +71,18 @@ planner's `CommittedView`:
   refuses as "covers no rows in leaf";
 - pool = the shard's replica nodes; copies = one per replica with the node's
   committed failure domain, `complete = false`, zero storage incarnation and
-  coverage digest: legacy replicas carry no verification evidence, and the
+  coverage digest: installed replicas carry no verification evidence, and the
   planner counts them as partial;
 - ownership epoch 0: no committed ownership transition has happened since
-  the import;
+  the install;
 - derived fingerprint from the committed declaration (`no_derived` is the
   zero fingerprint), placement tree and provider geometry digests over their
   canonical bytes (zero when explicitly absent).
 
-Node records: residency as committed (the legacy node's own declaration),
+Node records: residency as committed (the node's own declaration),
 eligible iff active, server-resident and the committed lease is unexpired at
 the planning instant, failure domain and capacity from the committed report.
-Imported leases are observations; eligibility here grants nothing.
+Installed leases are observations; eligibility here grants nothing.
 
 ## Planner input
 

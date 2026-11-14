@@ -11,7 +11,7 @@
 //! reproduction (`docs/control-authority-test-harness.md`).
 //!
 //! The raw proposal path is private; every public entry admits its command
-//! first (`propose_command`, `propose_confirm_ready`, `propose_import`,
+//! first (`propose_command`, `propose_confirm_ready`, `propose_install`,
 //! `propose_capacity_configure`, `propose_capacity_transition`):
 //!
 //! ```compile_fail
@@ -44,10 +44,10 @@
 //! ```
 //!
 //! ```compile_fail
-//! use pipestream_search::pb::storage::ControlImportCommand;
+//! use pipestream_search::pb::storage::ControlInstallCommand;
 //! use pipestream_search::source_authority::SourceAuthorityStore;
-//! fn replay(store: &SourceAuthorityStore, command: &ControlImportCommand) {
-//!     let _ = store.replay_control_import("alice", command);
+//! fn replay(store: &SourceAuthorityStore, command: &ControlInstallCommand) {
+//!     let _ = store.replay_control_install("alice", command);
 //! }
 //! ```
 //!

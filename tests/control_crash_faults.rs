@@ -2,8 +2,8 @@
 //! `docs/control-authority-test-harness.md`).
 //!
 //! Process-exit fault injection around the durable commit boundaries the
-//! review calls out: capacity configure/report, import administrative
-//! recovery, and the managed-catalog bind/activate fences. Every case runs a
+//! review calls out: capacity configure/report and the managed-catalog
+//! bind/activate fences. Every case runs a
 //! worker process that arms one exit fault (`ExitFault::{BeforeCommit,
 //! AfterCommit}`, process exit code 87) immediately before the commit under
 //! test; the parent first computes a NO-CRASH baseline in a twin directory,
@@ -13,7 +13,7 @@
 //! These are the behavioral contract pinned by
 //! `docs/source-owner-admission.md`'s crash windows and by the in-crate
 //! reference tests (`src/source_authority/capacity_tests.rs`,
-//! `src/source_authority/import_tests.rs`,
+//! `src/source_authority/control_tests.rs`,
 //! `src/document_catalog/managed/tests.rs`), re-driven through the public
 //! adversarial-kit surface. At the frozen checkpoint `331c18f` every case
 //! PASSES — they are the control group for the R3/R5 reproductions, proving
@@ -34,7 +34,7 @@ use pipestream_search::document_catalog::{
     AccessControlledCatalog, ActiveManagedCatalog, PreparedManagedCatalog,
 };
 use pipestream_search::pb::storage::source_authority_command::Action;
-use pipestream_search::pb::storage::{CapacityTransitionOutcome, ControlImportPhase};
+use pipestream_search::pb::storage::CapacityTransitionOutcome;
 use pipestream_search::pb::storage::{
     ConfirmSourceOwnerReady, LogicalSourceOwner, PrepareSourceOwner, PreparedSourceOwner,
     PreparedSourceOwnerPhase, SourceAuthorityCommand, SourceAuthorityIdentity,
@@ -70,14 +70,10 @@ fn fault_must_fire() -> ! {
 // ---- capacity family --------------------------------------------------------
 
 /// Build the deterministic capacity state the configure crash point needs:
-/// cluster legacy plane, retirement, placement import — everything through
-/// the import commit (control revision 6), no capacity commands.
-fn capacity_import_only(dir: &kit::TestDir) -> (SourceAuthorityStore, SourceAuthorityIdentity) {
+/// the cluster state installed (control revision 2), no capacity commands.
+fn capacity_install_only(dir: &kit::TestDir) -> (SourceAuthorityStore, SourceAuthorityIdentity) {
     let (store, authority) = kit::create_store(dir);
-    let legacy = kit::legacy_plane_with_cluster(dir);
-    let (retired, _request) = kit::retire(&store, &legacy, 1);
-    let payload = kit::import_payload_placement(&retired);
-    kit::run_import_staged(&store, &authority, &retired, &payload, false);
+    kit::run_install(&store, &authority, kit::cluster_state());
     (store, authority)
 }
 
@@ -143,7 +139,7 @@ fn crash_worker_capacity() {
     let dir = kit::TestDir::from_env();
     let family = std::env::var(CRASH_FAMILY_ENV).unwrap();
     let fault = parse_fault();
-    let (store, authority) = capacity_import_only(&dir);
+    let (store, authority) = capacity_install_only(&dir);
     let generation = kit::committed_generation(&store);
     match family.as_str() {
         "configure" => {
@@ -154,7 +150,7 @@ fn crash_worker_capacity() {
                     &kit::configure_command(
                         &authority,
                         "cfg",
-                        6,
+                        2,
                         1,
                         kit::capacity_configuration(1_000_000_000_000),
                     ),
@@ -170,7 +166,7 @@ fn crash_worker_capacity() {
                     &kit::configure_command(
                         &authority,
                         "cfg",
-                        6,
+                        2,
                         1,
                         kit::capacity_configuration(1_000_000_000_000),
                     ),
@@ -380,177 +376,6 @@ fn crash_capacity_report_before_and_after_commit() {
             "report:{fault} final control revision"
         );
         drop(store);
-        drop(dir);
-    }
-}
-
-// ---- import-recovery family -------------------------------------------------
-
-/// Worker: stage a begin + two chunks, arm, then Recover as bob.
-#[test]
-fn crash_worker_recover() {
-    if std::env::var_os(CRASH_ENV).is_none() {
-        return;
-    }
-    let dir = kit::TestDir::from_env();
-    let fault = parse_fault();
-    let (store, authority) = kit::create_store(&dir);
-    let legacy = kit::legacy_plane_with_cluster(&dir);
-    let (retired, _request) = kit::retire(&store, &legacy, 1);
-    let payload = kit::import_payload(&retired);
-    let (chunk_bytes, chunk_count) = kit::plan_three_chunks(payload.len());
-    let begin = store
-        .begin_control_import(
-            "alice",
-            &kit::import_command(
-                &authority,
-                "begin",
-                1,
-                kit::WORKFLOW,
-                kit::begin_action(&retired, &payload, chunk_bytes, chunk_count),
-            ),
-            &retired,
-        )
-        .unwrap();
-    assert_eq!(begin.code, 0, "{}", begin.message);
-    for (ordinal, revision) in [(0u32, 2u64), (1, 3)] {
-        let decision = store
-            .execute_control_import(
-                "alice",
-                &kit::import_command(
-                    &authority,
-                    &format!("chunk-{ordinal}"),
-                    revision,
-                    kit::WORKFLOW,
-                    kit::chunk_action(&payload, chunk_bytes, ordinal),
-                ),
-            )
-            .unwrap();
-        assert_eq!(decision.code, 0, "{}", decision.message);
-    }
-    store.arm_exit_fault(fault);
-    store
-        .execute_control_import(
-            "bob",
-            &kit::import_command(
-                &authority,
-                "bob-recover",
-                4,
-                kit::WORKFLOW,
-                kit::recover_action(),
-            ),
-        )
-        .unwrap();
-    fault_must_fire();
-}
-
-/// Crash matrix: exit immediately before/after the administrative recovery
-/// commit. Before -> the workflow is still `Staging` with its reservation
-/// held and no recovery decision recorded; after -> `Recovered` with the
-/// reservation released. Both accept the exact recovery retry (stored
-/// decision, control revision 5) and record a refusal for a later Commit
-/// attempt. (A fresh import after recovery is covered by the slice-3b
-/// SIGKILL recovery matrix, which re-runs the whole import.)
-#[test]
-fn crash_recover_before_and_after_commit() {
-    for fault in ["before", "after"] {
-        let dir = kit::TestDir::new(&format!("crash-recover-{fault}"));
-        let mut worker = spawn_crash_worker("crash_worker_recover", &dir, "recover", fault);
-        let status = worker.child().wait().unwrap();
-        assert_eq!(status.code(), Some(87), "recover:{fault} exit code");
-
-        let store = kit::open_store(&dir, &kit::identity(kit::SEED));
-        let authority = kit::identity(kit::SEED);
-        let workflow = store
-            .control_import_workflow("bob", &kit::key(), kit::WORKFLOW)
-            .unwrap();
-        if fault == "before" {
-            assert_eq!(
-                workflow.phase,
-                ControlImportPhase::Staging as i32,
-                "recover:before keeps the workflow staging"
-            );
-            assert!(
-                workflow.reserved_bytes > 0,
-                "recover:before keeps the reservation held"
-            );
-            assert_eq!(
-                store
-                    .control_import_decision("bob", &kit::key(), b"bob-recover")
-                    .err()
-                    .unwrap()
-                    .code(),
-                Code::NotFound,
-                "recover:before records no recovery decision"
-            );
-        } else {
-            assert_eq!(
-                workflow.phase,
-                ControlImportPhase::Recovered as i32,
-                "recover:after leaves the workflow recovered"
-            );
-            assert_eq!(
-                workflow.reserved_bytes, 0,
-                "recover:after releases the reservation"
-            );
-        }
-        // The exact recovery retry is a normal idempotent command: it lands
-        // (before) or replays the stored decision (after).
-        let decision = store
-            .execute_control_import(
-                "bob",
-                &kit::import_command(
-                    &authority,
-                    "bob-recover",
-                    4,
-                    kit::WORKFLOW,
-                    kit::recover_action(),
-                ),
-            )
-            .unwrap();
-        assert_eq!(decision.code, 0, "recover:{fault}: {}", decision.message);
-        assert_eq!(
-            decision.control_revision, 5,
-            "recover:{fault} committed recovery revision"
-        );
-        assert_eq!(
-            store
-                .control_import_workflow("bob", &kit::key(), kit::WORKFLOW)
-                .unwrap()
-                .phase,
-            ControlImportPhase::Recovered as i32
-        );
-        // A Commit attempt against the recovered workflow records a refusal
-        // and cannot resurrect the staging workflow.
-        let commit = store
-            .execute_control_import(
-                "alice",
-                &kit::import_command(&authority, "commit", 5, kit::WORKFLOW, kit::commit_action()),
-            )
-            .unwrap();
-        assert_ne!(
-            commit.code, 0,
-            "recover:{fault}: a commit after recovery must record a refusal"
-        );
-        assert_eq!(
-            store
-                .control_import_workflow("bob", &kit::key(), kit::WORKFLOW)
-                .unwrap()
-                .phase,
-            ControlImportPhase::Recovered as i32,
-            "recover:{fault}: the refusal must not change the terminal workflow"
-        );
-        drop(store);
-        // Reopen proves the recorded state is durable, not in-memory.
-        let reopened = kit::open_store(&dir, &kit::identity(kit::SEED));
-        assert_eq!(
-            reopened
-                .control_import_workflow("bob", &kit::key(), kit::WORKFLOW)
-                .unwrap()
-                .phase,
-            ControlImportPhase::Recovered as i32
-        );
-        drop(reopened);
         drop(dir);
     }
 }

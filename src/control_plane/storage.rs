@@ -210,22 +210,57 @@ impl Candidate {
     }
 }
 
-#[cfg(feature = "net")]
-pub(super) fn read_bounded(path: &Path, max: usize) -> Result<(Vec<u8>, File), std::io::Error> {
-    let mut file = private_options().read(true).open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "control state must be a regular file",
-        ));
+// JSON objects are maps, but serde's default BTreeMap visitor replaces duplicate
+// keys. Control state files must reject this ambiguity instead.
+pub(super) fn unique_map<'de, D, T>(deserializer: D) -> Result<BTreeMap<String, T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    struct Visitor<T>(std::marker::PhantomData<T>);
+    impl<'de, T: serde::Deserialize<'de>> serde::de::Visitor<'de> for Visitor<T> {
+        type Value = BTreeMap<String, T>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a control map with unique keys")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut access: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut map = BTreeMap::new();
+            while let Some((key, value)) = access.next_entry::<String, T>()? {
+                if map.insert(key, value).is_some() {
+                    return Err(serde::de::Error::custom("duplicate control map key"));
+                }
+            }
+            Ok(map)
+        }
     }
-    let mut bytes = Vec::new();
-    (&mut file).take(max as u64 + 1).read_to_end(&mut bytes)?;
-    if bytes.len() > max {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "retired control record exceeds 17MiB",
-        ));
+    deserializer.deserialize_map(Visitor(std::marker::PhantomData))
+}
+pub(super) fn unique_set<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeSet<u64>, D::Error> {
+    struct Visitor;
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+        type Value = BTreeSet<u64>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("unique completed control action IDs")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut access: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut ids = BTreeSet::new();
+            while let Some(id) = access.next_element::<u64>()? {
+                if !ids.insert(id) {
+                    return Err(serde::de::Error::custom(
+                        "duplicate completed control action ID",
+                    ));
+                }
+            }
+            Ok(ids)
+        }
     }
-    Ok((bytes, file))
+    deserializer.deserialize_seq(Visitor)
 }

@@ -7,13 +7,7 @@
 //! node-to-node WAL/snapshot paths; this module owns decisions, validated
 //! action completion, and complete topology publication.
 
-mod checkpoint;
-#[cfg(feature = "net")]
-pub(crate) mod retirement;
 mod storage;
-pub use checkpoint::LegacyControlCheckpoint;
-#[cfg(feature = "net")]
-pub use retirement::RetiredLegacyControl;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -218,12 +212,12 @@ struct StoredState {
     next_action: u64,
     topology: StoredTopology,
     history: Vec<StoredTopology>,
-    #[serde(deserialize_with = "checkpoint::unique_map")]
+    #[serde(deserialize_with = "storage::unique_map")]
     nodes: BTreeMap<String, StoredNode>,
-    #[serde(deserialize_with = "checkpoint::unique_map")]
+    #[serde(deserialize_with = "storage::unique_map")]
     replicas: BTreeMap<String, StoredReplica>,
     actions: Vec<StoredAction>,
-    #[serde(default, deserialize_with = "checkpoint::unique_set")]
+    #[serde(default, deserialize_with = "storage::unique_set")]
     completed_actions: BTreeSet<u64>,
 }
 
@@ -589,9 +583,6 @@ pub(crate) enum StateWriteFault {
     BeforeRename,
     AfterRename,
     AfterSync,
-    ExitBeforeRename,
-    ExitAfterRename,
-    ExitAfterSync,
 }
 
 #[cfg(test)]
@@ -600,21 +591,6 @@ fn inject_state_write_fault(
     boundary: StateWriteFault,
 ) -> Result<(), String> {
     let mut selected = fault.lock().unwrap();
-    if matches!(
-        (*selected, boundary),
-        (
-            Some(StateWriteFault::ExitBeforeRename),
-            StateWriteFault::BeforeRename
-        ) | (
-            Some(StateWriteFault::ExitAfterRename),
-            StateWriteFault::AfterRename
-        ) | (
-            Some(StateWriteFault::ExitAfterSync),
-            StateWriteFault::AfterSync
-        )
-    ) {
-        std::process::exit(87);
-    }
     if *selected == Some(boundary) {
         *selected = None;
         return Err(format!(
@@ -646,9 +622,6 @@ impl StateWriteError {
         }
     }
 }
-
-const RETIRED_CONTROL_MAGIC: &[u8; 8] = b"PCTRLRET";
-const RETIRED_CONTROL_STATE: &str = "legacy control authority is durably retired for import; recover its retirement record, never restart it as a writer";
 
 const UNCERTAIN_CONTROL_STATE: &str =
     "control state persistence outcome is uncertain; close every clone and reopen existing durable state before continuing";
@@ -711,16 +684,9 @@ pub struct DurableControlPlane {
     write_fault: Arc<Mutex<Option<StateWriteFault>>>,
     // Every clone retains the same open lock file through its lifetime.
     _ownership_lock: Option<Arc<std::fs::File>>,
-    #[cfg(feature = "net")]
-    retirement: Arc<std::sync::OnceLock<Arc<crate::pb::storage::LegacyControlRetirement>>>,
 }
 
 impl DurableControlPlane {
-    #[cfg(test)]
-    pub(crate) fn arm_state_write_fault(&self, fault: StateWriteFault) {
-        *self.write_fault.lock().unwrap() = Some(fault);
-    }
-
     pub fn open(path: impl Into<PathBuf>, policy: ControlPolicy) -> Result<Self, String> {
         Self::open_state(path.into(), policy, true)
     }
@@ -740,9 +706,6 @@ impl DurableControlPlane {
         let (path, ownership_lock) = storage::acquire(&path, allow_create)?;
         let state = match storage::read(&path) {
             Ok(bytes) => {
-                if bytes.starts_with(RETIRED_CONTROL_MAGIC) {
-                    return Err(RETIRED_CONTROL_STATE.to_string());
-                }
                 let state: StoredState = serde_json::from_slice(&bytes)
                     .map_err(|error| format!("parse control state {}: {error}", path.display()))?;
                 if state.format != 1 {
@@ -772,8 +735,6 @@ impl DurableControlPlane {
             #[cfg(test)]
             write_fault: Arc::new(Mutex::new(None)),
             _ownership_lock: Some(ownership_lock),
-            #[cfg(feature = "net")]
-            retirement: Arc::new(std::sync::OnceLock::new()),
         };
         this.persist()?;
         Ok(this)
@@ -788,8 +749,6 @@ impl DurableControlPlane {
             #[cfg(test)]
             write_fault: Arc::new(Mutex::new(None)),
             _ownership_lock: None,
-            #[cfg(feature = "net")]
-            retirement: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -883,10 +842,6 @@ impl DurableControlPlane {
         if self.persistence_uncertain.load(Ordering::Acquire) {
             return Err(Status::failed_precondition(UNCERTAIN_CONTROL_STATE));
         }
-        #[cfg(feature = "net")]
-        if self.retirement.get().is_some() {
-            return Err(Status::failed_precondition(RETIRED_CONTROL_STATE));
-        }
         Ok(state)
     }
 
@@ -896,10 +851,6 @@ impl DurableControlPlane {
     fn persist_locked(&self, state: &StoredState) -> Result<(), String> {
         if self.persistence_uncertain.load(Ordering::Acquire) {
             return Err(UNCERTAIN_CONTROL_STATE.to_string());
-        }
-        #[cfg(feature = "net")]
-        if self.retirement.get().is_some() {
-            return Err(RETIRED_CONTROL_STATE.to_string());
         }
         match &self.path {
             Some(path) => write_state(
@@ -2506,26 +2457,9 @@ impl ClusterControl for ClusterControlService {
 }
 
 #[cfg(test)]
-mod checkpoint_tests;
-#[cfg(test)]
-pub(crate) mod test_fixtures {
-    //! Legacy state files for tests in other modules.
-    /// A populated legacy state file body under `collection`, with `routes`
-    /// current routes (at least 2).
-    pub(crate) fn populated_state_json(collection: &str, routes: usize) -> String {
-        serde_json::to_string(&super::checkpoint_tests::complete_state_with(
-            collection, routes,
-        ))
-        .unwrap()
-    }
-    /// The policy that state was captured under.
-    pub(crate) fn populated_policy() -> super::ControlPolicy {
-        super::checkpoint_tests::complete_policy()
-    }
-}
-
-#[cfg(test)]
 mod ownership_tests;
+#[cfg(test)]
+mod state_json_tests;
 
 #[cfg(test)]
 mod persistence_tests;

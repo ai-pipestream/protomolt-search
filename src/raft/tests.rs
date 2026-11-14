@@ -1,7 +1,7 @@
 use super::log_store::RaftLogStore;
 use super::state_machine::{
     format_snapshot_id, parse_snapshot_id, published_generation, ControlStateMachine,
-    ImageSignature,
+    ImageSignature, SnapshotCompletion,
 };
 use super::types::*;
 use super::{HostConfig, RaftHost};
@@ -17,7 +17,7 @@ use openraft::storage::{RaftLogStorage, RaftStateMachine};
 use openraft::{BasicNode, Entry, EntryPayload, LeaderId, LogId, Membership, RaftLogReader, Vote};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tonic::Code;
 
 pub(super) struct Directory(pub(super) PathBuf);
@@ -41,6 +41,122 @@ impl Drop for Directory {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+#[tokio::test]
+async fn r153_receive_ownership_follows_the_file_across_a_second_receive() {
+    use openraft::RaftSnapshotBuilder;
+    let source = Directory::new("r153-source");
+    let group = identity(7);
+    let store = crate::source_authority::SourceAuthorityStore::create(
+        &source.0.join("source.redb"),
+        &group,
+        &policy(),
+        &limits(),
+    )
+    .unwrap();
+    let mut source_machine =
+        ControlStateMachine::new(store, &source.0.join("snapshots"), 64 << 20).unwrap();
+    source_machine
+        .apply([Entry {
+            log_id: log_id(1, 1, 1),
+            payload: EntryPayload::Blank,
+        }])
+        .await
+        .unwrap();
+    let mut snapshot = source_machine
+        .get_snapshot_builder()
+        .await
+        .build_snapshot()
+        .await
+        .unwrap();
+    let mut image = Vec::new();
+    snapshot.snapshot.read_to_end(&mut image).await.unwrap();
+    let replica = Directory::new("r153-replica");
+    let store = crate::source_authority::SourceAuthorityStore::create(
+        &replica.0.join("replica.redb"),
+        &group,
+        &policy(),
+        &limits(),
+    )
+    .unwrap();
+    let snapshots = replica.0.join("snapshots");
+    let mut machine = ControlStateMachine::new(store, &snapshots, 64 << 20).unwrap();
+    let mut first = machine.begin_receiving_snapshot().await.unwrap();
+    let completed = std::sync::Arc::new(SnapshotCompletion::new());
+    first.set_completion(std::sync::Arc::clone(&completed));
+    first.write_all(&image).await.unwrap();
+    let mut second = machine.begin_receiving_snapshot().await.unwrap();
+    let rejected = std::sync::Arc::new(SnapshotCompletion::new());
+    second.set_completion(std::sync::Arc::clone(&rejected));
+    second.write_all(b"another receive's bytes").await.unwrap();
+    machine
+        .install_snapshot(&snapshot.meta, first)
+        .await
+        .expect("the first install consumes its own receive, never the newest receive");
+    completed
+        .wait()
+        .await
+        .expect("discard on Drop cannot overwrite durable installation success");
+    assert_eq!(
+        machine.applied_state().await.unwrap().0,
+        snapshot.meta.last_log_id
+    );
+    assert!(machine
+        .install_snapshot(&snapshot.meta, second)
+        .await
+        .is_err());
+    assert!(
+        rejected.wait().await.is_err(),
+        "a failed owned install cannot record successful completion"
+    );
+    assert_eq!(
+        machine.get_current_snapshot().await.unwrap().unwrap().meta,
+        snapshot.meta
+    );
+    assert!(!std::fs::read_dir(&snapshots).unwrap().any(|entry| entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with("incoming-")));
+}
+
+#[tokio::test]
+async fn r153_owned_receives_have_a_fixed_count_bound_and_release_it_on_drop() {
+    let dir = Directory::new("r153-receive-bound");
+    let store = crate::source_authority::SourceAuthorityStore::create(
+        &dir.0.join("replica.redb"),
+        &identity(7),
+        &policy(),
+        &limits(),
+    )
+    .unwrap();
+    let snapshots = dir.0.join("snapshots");
+    let mut machine = ControlStateMachine::new(store, &snapshots, 64 << 20).unwrap();
+    let mut first = machine.begin_receiving_snapshot().await.unwrap();
+    let cancelled = std::sync::Arc::new(SnapshotCompletion::new());
+    first.set_completion(std::sync::Arc::clone(&cancelled));
+    let second = machine.begin_receiving_snapshot().await.unwrap();
+    assert!(
+        machine.begin_receiving_snapshot().await.is_err(),
+        "two owned receives exhaust the fixed finalization bound"
+    );
+    drop(first);
+    assert!(
+        cancelled.wait().await.is_err(),
+        "dropping an uninstalled owned receive cannot record success"
+    );
+    let successor = machine
+        .begin_receiving_snapshot()
+        .await
+        .expect("dropping an uninstalled receive releases its slot");
+    drop(second);
+    drop(successor);
+    assert!(!std::fs::read_dir(snapshots).unwrap().any(|entry| entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with("incoming-")));
 }
 
 pub(super) fn identity(seed: u8) -> SourceAuthorityIdentity {
@@ -88,6 +204,16 @@ pub(super) fn config() -> HostConfig {
         clock_skew_ms: 50,
         ..HostConfig::default()
     }
+}
+
+async fn bootstrap_application_is_ready(host: &RaftHost) {
+    // Bootstrap leadership precedes application of membership at index zero
+    // and the leader's blank at index one. These fixtures measure a lease,
+    // not the startup fsyncs its read barrier would otherwise have to await.
+    host.wait(Some(std::time::Duration::from_secs(30)))
+        .applied_index_at_least(Some(1), "bootstrap membership and leader blank applied")
+        .await
+        .unwrap();
 }
 
 pub(super) fn owner(id: &str) -> LogicalSourceOwner {
@@ -376,9 +502,16 @@ async fn a_single_node_host_applies_through_the_log_and_restarts_in_place() {
     let applied = store.raft_applied().unwrap().unwrap();
     let last = applied.last_applied.unwrap();
     assert!(last.index >= 5, "{last:?}");
-    let metrics = host.metrics().borrow().clone();
-    assert_eq!(metrics.last_applied.map(|l| l.index), Some(last.index));
-    // No control state was imported into this group; the map is absent.
+    // The metrics channel publishes after the store commits; wait for it.
+    let mut metrics = host.metrics();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        metrics.wait_for(|m| m.last_applied.map(|l| l.index) == Some(last.index)),
+    )
+    .await
+    .expect("the metrics reach the store's applied position")
+    .unwrap();
+    // No control state was installed in this group; the map is absent.
     assert_eq!(
         store
             .published_map("alice", &owner("phone"))
@@ -1140,30 +1273,16 @@ async fn exact_retries_advance_the_applied_position_in_every_command_family() {
     let again = host.propose_command("alice", &command).await.unwrap();
     assert_eq!(first, again);
     assert_eq!(applied_index(&host), last_index(&host));
-    // Import: a recorded rejection (no workflow), then its exact retry.
-    let chunk = crate::pb::storage::ControlImportCommand {
-        format_version: 1,
-        authority: Some(group.clone()),
-        key: Some(LogicalSourceOwner {
-            workspace: "workspace-a".into(),
-            collection: "books".into(),
-            owner_id: Vec::new(),
-        }),
-        command_id: b"chunk".to_vec(),
-        expected_control_revision: 2,
-        expected_policy_revision: 1,
-        workflow_id: b"import-1".to_vec(),
-        action: Some(crate::pb::storage::control_import_command::Action::Chunk(
-            crate::pb::storage::ControlImportChunk {
-                ordinal: 0,
-                bytes: vec![1, 2, 3],
-                sha256: crate::source_authority::chunk_digest(&[1, 2, 3]),
-            },
-        )),
-    };
-    let first = host.propose_import("alice", &chunk, None).await.unwrap();
-    assert_eq!(first.code, Code::NotFound as u32);
-    let again = host.propose_import("alice", &chunk, None).await.unwrap();
+    // Install: a recorded rejection (stale revision), then its exact retry.
+    let install = crate::source_authority::control_tests::command(
+        &group,
+        "install",
+        9,
+        crate::source_authority::control_tests::state(2),
+    );
+    let first = host.propose_install("alice", &install).await.unwrap();
+    assert_eq!(first.code, Code::FailedPrecondition as u32);
+    let again = host.propose_install("alice", &install).await.unwrap();
     assert_eq!(first, again);
     assert_eq!(applied_index(&host), last_index(&host));
     // Capacity configure: a recorded rejection (no applied control state),
@@ -1171,7 +1290,7 @@ async fn exact_retries_advance_the_applied_position_in_every_command_family() {
     let configure = crate::pb::storage::CapacityConfigureCommand {
         format_version: 1,
         authority: Some(group.clone()),
-        key: chunk.key.clone(),
+        key: install.key.clone(),
         command_id: b"configure".to_vec(),
         expected_control_revision: 2,
         expected_policy_revision: 1,
@@ -1211,7 +1330,7 @@ async fn exact_retries_advance_the_applied_position_in_every_command_family() {
     let transition = crate::pb::storage::CapacityTransition {
         format_version: 1,
         authority: Some(group.clone()),
-        key: chunk.key.clone(),
+        key: install.key.clone(),
         action: Some(crate::pb::storage::capacity_transition::Action::Register(
             crate::pb::storage::RegisterCapacityReporter {
                 node_id: "server-a".into(),
@@ -1265,6 +1384,7 @@ async fn a_hosted_store_refuses_direct_mutation_and_local_admission() {
     )
     .await
     .unwrap();
+    bootstrap_application_is_ready(&host).await;
     let store = host.store().unwrap();
     let hosted = |result: Result<(), tonic::Status>| {
         let error = result.err().unwrap();
@@ -1283,20 +1403,14 @@ async fn a_hosted_store_refuses_direct_mutation_and_local_admission() {
     };
     hosted(
         store
-            .execute_control_import(
+            .install_control(
                 "alice",
-                &crate::pb::storage::ControlImportCommand {
-                    format_version: 1,
-                    authority: Some(group.clone()),
-                    key: Some(key.clone()),
-                    command_id: b"abort".to_vec(),
-                    expected_control_revision: 1,
-                    expected_policy_revision: 1,
-                    workflow_id: b"import-1".to_vec(),
-                    action: Some(crate::pb::storage::control_import_command::Action::Abort(
-                        crate::pb::storage::AbortControlImport {},
-                    )),
-                },
+                &crate::source_authority::control_tests::command(
+                    &group,
+                    "install",
+                    1,
+                    crate::source_authority::control_tests::state(2),
+                ),
             )
             .map(|_| ()),
     );
@@ -1398,6 +1512,7 @@ async fn a_lease_taken_on_one_thread_grants_on_another_within_its_interval() {
     )
     .await
     .unwrap();
+    bootstrap_application_is_ready(&host).await;
     let leased = host.lease("alice").await.unwrap();
     assert_eq!(leased.principal(), "alice");
     let granted = tokio::task::spawn_blocking(move || {
@@ -1432,6 +1547,7 @@ async fn a_lease_kept_past_its_interval_is_rejected_at_the_grant() {
     )
     .await
     .unwrap();
+    bootstrap_application_is_ready(&host).await;
     let leased = host.lease("alice").await.unwrap();
     let applied = host.applied_position().unwrap().map(|id| id.index);
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
