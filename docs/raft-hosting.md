@@ -165,9 +165,9 @@ library a validated image only (`RaftTransportService::stage`,
   verification probe can use another `max_snapshot_bytes`. Existing
   published generations and the live-store replacement are separate.
   No transport lock or detached task waits for a core installation.
-  Synchronous disk verification still holds the transfer and receipt
-  locks until validation and hand-off end; a higher-vote transfer can
-  stage during an older core installation, not preempt disk validation.
+  Disk sync and verification run on Tokio's blocking pool under async
+  transfer and receipt coordination, so concurrent retries and heartbeats
+  never block Tokio worker threads while validation and hand-off complete.
 - **Final retries.** One receipt binds the authenticated peer, vote, full
   metadata, final offset, byte length and SHA-256 of the final chunk.
   Repeating that exact final RPC waits for its installation outcome and

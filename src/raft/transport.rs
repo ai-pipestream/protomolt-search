@@ -242,8 +242,8 @@ pub struct RaftTransportService {
     hold: LeaseHold,
     staging: Arc<SnapshotStaging>,
     rejections: Arc<SnapshotRejections>,
-    transfer: Mutex<Option<Transfer>>,
-    final_receipt: Mutex<Option<FinalReceipt>>,
+    transfer: tokio::sync::Mutex<Option<Transfer>>,
+    final_receipt: tokio::sync::Mutex<Option<FinalReceipt>>,
     idle: Duration,
     /// The bound on the read barrier a forwarded lease runs here.
     read_timeout: Duration,
@@ -334,8 +334,8 @@ impl RaftTransportService {
             hold,
             staging,
             rejections,
-            transfer: Mutex::new(None),
-            final_receipt: Mutex::new(None),
+            transfer: tokio::sync::Mutex::new(None),
+            final_receipt: tokio::sync::Mutex::new(None),
             idle: Duration::from_millis(limits.snapshot_idle_timeout_ms),
             read_timeout,
         }
@@ -351,7 +351,7 @@ impl RaftTransportService {
     /// the complete image is validated (length, digest, store identity,
     /// applied position, membership on a probe copy); an invalid image is
     /// refused here, by name, and never reaches the library.
-    fn stage(
+    async fn stage(
         &self,
         from: NodeId,
         rpc: InstallSnapshotRequest<ControlRaft>,
@@ -375,10 +375,7 @@ impl RaftTransportService {
             ));
         }
         let now = std::time::Instant::now();
-        let mut guard = self
-            .transfer
-            .lock()
-            .map_err(|_| Status::internal("snapshot transfer lock poisoned"))?;
+        let mut guard = self.transfer.lock().await;
         if guard
             .as_ref()
             .is_some_and(|active| now.duration_since(active.last_chunk) > self.idle)
@@ -504,19 +501,19 @@ impl RaftTransportService {
                 reasons::TRANSPORT_SNAPSHOT_OVER_ANNOUNCED,
             ));
         }
-        if let Err(error) = complete.file.sync_all() {
-            self.staging.discard(&complete.dir);
-            return Err(Status::internal(format!("snapshot receive: {error}")));
-        }
-        if let Err(error) = self.staging.verify(&complete.dir, &complete.meta) {
-            drop(complete.file);
-            self.staging.discard(&complete.dir);
-            return Err(error);
-        }
-        // Keep the synchronous transfer lock through verification and the
-        // ownership handoff. A later start may discard only the mutable
-        // receiving slot, never this core-owned image. No lock crosses await.
-        let mut snapshot = self.staging.own(&complete.dir, complete.file)?;
+        // Claim ownership of the incoming directory before yielding to the
+        // blocking pool so caller cancellation or a later transfer start can
+        // neither delete nor leak this image while disk verification runs.
+        let claimed = self.staging.claim(&complete.dir, complete.file)?;
+        let staging = Arc::clone(&self.staging);
+        let verify_meta = complete.meta.clone();
+        let mut snapshot = tokio::task::spawn_blocking(move || {
+            claimed.verify_and_into_snapshot(&staging, &verify_meta)
+        })
+        .await
+        .map_err(|error| {
+            Status::internal(format!("snapshot verification task failed: {error}"))
+        })??;
         drop(guard);
         let completion = Arc::new(SnapshotCompletion::new());
         snapshot.set_completion(Arc::clone(&completion));
@@ -528,30 +525,28 @@ impl RaftTransportService {
         })
     }
 
-    fn stage_or_replay(
+    async fn stage_or_replay(
         &self,
         from: NodeId,
         rpc: InstallSnapshotRequest<ControlRaft>,
     ) -> Result<Staged, Status> {
         let final_chunk = rpc.done.then(|| FinalChunk::new(from, &rpc));
-        let mut receipt = self
-            .final_receipt
-            .lock()
-            .map_err(|_| Status::internal("snapshot receipt lock poisoned"))?;
+        let mut receipt = self.final_receipt.lock().await;
+        if receipt
+            .as_ref()
+            .is_some_and(|previous| previous.completion.failed())
+        {
+            *receipt = None;
+        }
         if let (Some(chunk), Some(previous)) = (&final_chunk, receipt.as_ref()) {
-            let restarted = self
-                .transfer
-                .lock()
-                .map_err(|_| Status::internal("snapshot transfer lock poisoned"))?
-                .as_ref()
-                .is_some_and(|active| {
-                    active.peer == from && active.vote == rpc.vote && active.meta == rpc.meta
-                });
+            let restarted = self.transfer.lock().await.as_ref().is_some_and(|active| {
+                active.peer == from && active.vote == rpc.vote && active.meta == rpc.meta
+            });
             if !restarted && previous.chunk == *chunk {
                 return Ok(Staged::Replay(Arc::clone(&previous.completion)));
             }
         }
-        let staged = self.stage(from, rpc)?;
+        let staged = self.stage(from, rpc).await?;
         if let Staged::Complete { completion, .. } = &staged {
             *receipt = Some(FinalReceipt {
                 chunk: final_chunk.expect("a completed transfer has a final chunk"),
@@ -749,7 +744,7 @@ impl RaftTransportService {
         let rpc = install_request_from_proto(self.directory.group(), request.into_inner())?;
         let snapshot_id = rpc.meta.snapshot_id.clone();
         let offset = rpc.offset;
-        let outcome = match self.stage_or_replay(from, rpc)? {
+        let outcome = match self.stage_or_replay(from, rpc).await? {
             Staged::Partial => {
                 InstallOutcome::Vote(vote_to_proto(&self.raft.metrics().borrow().vote))
             }
@@ -783,6 +778,27 @@ impl RaftTransportService {
                 snapshot,
                 completion,
             } => {
+                #[cfg(any(test, feature = "fault-injection"))]
+                struct FinalHandlerDropGuard<'a> {
+                    staging: &'a SnapshotStaging,
+                    armed: bool,
+                }
+                #[cfg(any(test, feature = "fault-injection"))]
+                impl Drop for FinalHandlerDropGuard<'_> {
+                    fn drop(&mut self) {
+                        if self.armed {
+                            self.staging.gates().record_final_handler_drop();
+                        }
+                    }
+                }
+                #[cfg(any(test, feature = "fault-injection"))]
+                let mut drop_guard = FinalHandlerDropGuard {
+                    staging: &self.staging,
+                    armed: true,
+                };
+                #[cfg(any(test, feature = "fault-injection"))]
+                self.staging.gates().pause_handoff().await;
+
                 // The image is validated; the library applies its own term
                 // and position rules and may decline it (an older vote, a
                 // position it already holds). Only a storage failure in the
@@ -792,6 +808,10 @@ impl RaftTransportService {
                     .install_full_snapshot(vote, Snapshot { meta, snapshot })
                     .await
                     .map_err(|e| Status::unavailable(format!("raft core: {e}")));
+                #[cfg(any(test, feature = "fault-injection"))]
+                {
+                    drop_guard.armed = false;
+                }
                 completion.finish(response.as_ref().map(|_| ()).map_err(Clone::clone));
                 let response = response?;
                 InstallOutcome::Vote(vote_to_proto(&response.vote))

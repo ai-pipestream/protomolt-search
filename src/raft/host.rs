@@ -1027,6 +1027,34 @@ impl RaftHost {
         self.snapshot_gates.arm_install()
     }
 
+    /// Arm a pause inside blocking snapshot image verification before the
+    /// probe store is opened.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn arm_snapshot_verify_gate(&self) -> Arc<super::state_machine::SnapshotGate> {
+        self.snapshot_gates.arm_verify()
+    }
+
+    /// Arm an async pause after transport verification completes and before
+    /// `install_full_snapshot` is polled on the Raft core handle.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn arm_snapshot_handoff_gate(&self) -> Arc<super::state_machine::AsyncSnapshotGate> {
+        self.snapshot_gates.arm_handoff()
+    }
+
+    /// Number of server-side final-chunk `InstallSnapshot` handlers dropped
+    /// before returning a reply.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn final_snapshot_handler_drops(&self) -> usize {
+        self.snapshot_gates.final_handler_drops()
+    }
+
+    /// Wait until at least `at_least` server-side final-chunk `InstallSnapshot`
+    /// handlers have been dropped before returning a reply.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub async fn wait_final_snapshot_handler_drops(&self, at_least: usize) {
+        self.snapshot_gates.wait_final_handler_drops(at_least).await;
+    }
+
     /// Arm one process-exit fault (code 87) for the next purge transaction
     /// of this node's log: before it commits or right after.
     #[cfg(any(test, feature = "fault-injection"))]

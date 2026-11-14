@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 use tokio::io::AsyncWriteExt;
@@ -142,6 +142,10 @@ impl SnapshotCompletion {
         });
     }
 
+    pub(crate) fn failed(&self) -> bool {
+        self.outcome.borrow().as_ref().is_some_and(Result::is_err)
+    }
+
     pub(crate) async fn wait(&self) -> Result<(), Status> {
         let mut outcome = self.outcome.subscribe();
         loop {
@@ -211,6 +215,32 @@ impl tokio::io::AsyncSeek for SnapshotFile {
     }
 }
 
+/// An incoming receive claimed from `SnapshotStaging::receiving` before
+/// blocking sync and redb verification run, so dropping the caller or starting
+/// another transfer can neither leak nor delete its directory.
+pub(crate) struct ClaimedReceive {
+    file: std::fs::File,
+    receive: OwnedReceive,
+}
+
+impl ClaimedReceive {
+    pub(crate) fn verify_and_into_snapshot(
+        mut self,
+        staging: &SnapshotStaging,
+        meta: &SnapshotMeta<NodeId, BasicNode>,
+    ) -> Result<SnapshotFile, Status> {
+        self.file
+            .sync_all()
+            .map_err(|error| Status::internal(format!("snapshot receive: {error}")))?;
+        staging.verify(&self.receive.receive.dir, meta)?;
+        self.receive.receive.verified = Some(meta.snapshot_id.clone());
+        Ok(SnapshotFile {
+            file: tokio::fs::File::from_std(self.file),
+            receive: Some(self.receive),
+        })
+    }
+}
+
 /// Staging of incoming snapshot bytes, shared by the transport (which
 /// receives and validates the complete image before the library sees it)
 /// and the state machine (which swaps a validated image in). One receive
@@ -223,11 +253,18 @@ pub(crate) struct SnapshotStaging {
     receiving: Mutex<Option<Receive>>,
     counter: AtomicU64,
     owned: Arc<tokio::sync::Semaphore>,
+    #[cfg(any(test, feature = "fault-injection"))]
+    gates: Arc<SnapshotGates>,
 }
 
 impl SnapshotStaging {
     pub(crate) fn max_image_bytes(&self) -> u64 {
         self.max_image_bytes
+    }
+
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub(crate) fn gates(&self) -> &Arc<SnapshotGates> {
+        &self.gates
     }
 
     fn reserve(&self) -> Result<tokio::sync::OwnedSemaphorePermit, Status> {
@@ -236,7 +273,7 @@ impl SnapshotStaging {
         )))
     }
 
-    pub(crate) fn own(&self, dir: &Path, file: std::fs::File) -> Result<SnapshotFile, Status> {
+    pub(crate) fn claim(&self, dir: &Path, file: std::fs::File) -> Result<ClaimedReceive, Status> {
         let permit = match self.reserve() {
             Ok(permit) => permit,
             Err(error) => {
@@ -245,7 +282,21 @@ impl SnapshotStaging {
                 return Err(error);
             }
         };
-        self.own_reserved(dir, file, permit)
+        let mut receiving = self.receiving.lock().unwrap();
+        if !receiving.as_ref().is_some_and(|receive| receive.dir == dir) {
+            return Err(Status::failed_precondition(
+                "the snapshot no longer owns its receive",
+            ));
+        }
+        let receive = receiving.take().expect("the exact receive was checked");
+        Ok(ClaimedReceive {
+            file,
+            receive: OwnedReceive {
+                receive,
+                _permit: permit,
+                completion: None,
+            },
+        })
     }
 
     fn own_reserved(
@@ -321,6 +372,8 @@ impl SnapshotStaging {
         verify_image(&image, &signature, self.max_image_bytes)?;
         // Probe a separate copy: a redb open may rewrite recovery state, and
         // the received bytes must stay identical to their checksum.
+        #[cfg(any(test, feature = "fault-injection"))]
+        self.gates.pause_verify();
         let probe = dir.join(PROBE);
         std::fs::copy(&image, &probe).map_err(io)?;
         let checked = (|| -> Result<(), Status> {
@@ -417,12 +470,52 @@ impl SnapshotGate {
     }
 }
 
+/// Async fault-injection gate for non-blocking transport handoff boundaries.
+#[cfg(any(test, feature = "fault-injection"))]
+pub struct AsyncSnapshotGate {
+    reached: tokio::sync::watch::Sender<bool>,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+impl AsyncSnapshotGate {
+    fn new() -> Self {
+        Self {
+            reached: tokio::sync::watch::Sender::new(false),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Resolves once the paused async handler reaches the gate.
+    pub async fn reached(&self) {
+        let mut receiver = self.reached.subscribe();
+        let _ = receiver.wait_for(|reached| *reached).await;
+    }
+
+    /// Releases the paused async handler.
+    pub fn release(&self) {
+        self.release.notify_waiters();
+    }
+
+    async fn pause(&self) {
+        let notified = self.release.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        self.reached.send_replace(true);
+        notified.await;
+    }
+}
+
 #[cfg(any(test, feature = "fault-injection"))]
 #[derive(Default)]
 pub(crate) struct SnapshotGates {
     build: Mutex<Option<Arc<SnapshotGate>>>,
     serve: Mutex<Option<Arc<SnapshotGate>>>,
+    verify: Mutex<Option<Arc<SnapshotGate>>>,
     install: Mutex<Option<Arc<SnapshotGate>>>,
+    handoff: Mutex<Option<Arc<AsyncSnapshotGate>>>,
+    final_handler_drops: AtomicUsize,
+    final_handler_drop_notify: tokio::sync::Notify,
 }
 
 #[cfg(any(test, feature = "fault-injection"))]
@@ -435,8 +528,46 @@ impl SnapshotGates {
         Self::arm(&self.serve)
     }
 
+    pub(crate) fn arm_verify(&self) -> Arc<SnapshotGate> {
+        Self::arm(&self.verify)
+    }
+
     pub(crate) fn arm_install(&self) -> Arc<SnapshotGate> {
         Self::arm(&self.install)
+    }
+
+    pub(crate) fn arm_handoff(&self) -> Arc<AsyncSnapshotGate> {
+        let gate = Arc::new(AsyncSnapshotGate::new());
+        *self.handoff.lock().unwrap() = Some(Arc::clone(&gate));
+        gate
+    }
+
+    pub(crate) fn record_final_handler_drop(&self) {
+        self.final_handler_drops.fetch_add(1, Ordering::SeqCst);
+        self.final_handler_drop_notify.notify_waiters();
+    }
+
+    pub(crate) fn final_handler_drops(&self) -> usize {
+        self.final_handler_drops.load(Ordering::SeqCst)
+    }
+
+    pub(crate) async fn wait_final_handler_drops(&self, at_least: usize) {
+        loop {
+            let notified = self.final_handler_drop_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.final_handler_drops.load(Ordering::SeqCst) >= at_least {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) async fn pause_handoff(&self) {
+        let gate = self.handoff.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.pause().await;
+        }
     }
 
     fn pause_build(&self) {
@@ -445,6 +576,10 @@ impl SnapshotGates {
 
     fn pause_serve(&self) {
         Self::pause(&self.serve)
+    }
+
+    fn pause_verify(&self) {
+        Self::pause(&self.verify)
     }
 
     fn pause_install(&self) {
@@ -530,6 +665,8 @@ impl ControlStateMachine {
             None => StoredMembership::new(None, Membership::new(Vec::new(), BTreeMap::new())),
         };
         let store_identity = store.identity().clone();
+        #[cfg(any(test, feature = "fault-injection"))]
+        let gates = Arc::new(SnapshotGates::default());
         let machine = Self {
             identity: store.identity().clone(),
             store: Arc::new(RwLock::new(Some(store))),
@@ -542,12 +679,14 @@ impl ControlStateMachine {
                 receiving: Mutex::new(None),
                 counter: AtomicU64::new(0),
                 owned: Arc::new(tokio::sync::Semaphore::new(MAX_OWNED_RECEIVES)),
+                #[cfg(any(test, feature = "fault-injection"))]
+                gates: Arc::clone(&gates),
             }),
             last_build: Arc::new(Mutex::new(None)),
             snapshot_lock: Arc::new(Mutex::new(())),
             pointer_lock: Arc::new(Mutex::new(())),
             #[cfg(any(test, feature = "fault-injection"))]
-            gates: Arc::new(SnapshotGates::default()),
+            gates,
             #[cfg(any(test, feature = "fault-injection"))]
             install_fault: Arc::new(Mutex::new(None)),
         };
