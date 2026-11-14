@@ -166,9 +166,9 @@ async fn search_service_over_loopback_matches_monolithic() {
 /// The calibration handshake: every node must report the calibration the
 /// cluster was seeded with, plus consistent shape metadata.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn get_calibration_reports_seeded_values() {
+async fn every_shard_reports_the_seeded_calibration() {
     use pipestream_search::pb::node_service_client::NodeServiceClient;
-    use pipestream_search::pb::GetCalibrationRequest;
+    use pipestream_search::pb::GetVectorBackendRequest;
 
     // Sub-block shards: before any block seals, every shard's reported
     // calibration IS the seed, so cross-shard equality is exactly the
@@ -180,18 +180,20 @@ async fn get_calibration_reports_seeded_values() {
     for addr in &cluster.node_addrs {
         let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
         let cal = client
-            .get_calibration(GetCalibrationRequest {})
+            .get_vector_backend(GetVectorBackendRequest {})
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(cal.dim as usize, DIM);
-        assert_eq!(cal.bit_width as usize, BIT_WIDTH);
+        let descriptor = cal.descriptor.clone().unwrap();
+        assert_eq!(descriptor.dim as usize, DIM);
+        assert_eq!(descriptor.bits_per_dimension as usize, BIT_WIDTH);
         assert!(cal.num_vectors > 0);
+        let (cal_shift, cal_scale) = pipestream_search::harness::reported_calibration(&cal);
         match &reference {
-            None => reference = Some((cal.shift, cal.scale)),
+            None => reference = Some((cal_shift, cal_scale)),
             Some((shift, scale)) => {
-                assert_eq!(*shift, cal.shift, "shards disagree on shift");
-                assert_eq!(*scale, cal.scale, "shards disagree on scale");
+                assert_eq!(*shift, cal_shift, "shards disagree on shift");
+                assert_eq!(*scale, cal_scale, "shards disagree on scale");
             }
         }
     }

@@ -252,8 +252,6 @@ impl NodeLink {
     unary! {
         get_vector_backend: GetVectorBackendRequest => GetVectorBackendResponse,
         configure_vector_backend: ConfigureVectorBackendRequest => ConfigureVectorBackendResponse,
-        get_calibration: GetCalibrationRequest => GetCalibrationResponse,
-        set_calibration: SetCalibrationRequest => SetCalibrationResponse,
         flush: FlushRequest => FlushResponse,
         delete_documents: DeleteDocumentsRequest => DeleteDocumentsResponse,
         commit_replacements: CommitReplacementsRequest => CommitReplacementsResponse,

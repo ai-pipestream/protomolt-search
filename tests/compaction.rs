@@ -40,8 +40,7 @@ use pipestream_search::pb::{
     CommitReplacementsRequest, CompactShardRequest, CompactShardResponse, DeleteDocumentsRequest,
     DenseQuery, DocLineage, FacetValue, FlushRequest, GetDocumentsRequest, HealthRequest,
     HybridSearchRequest, IntegerValue, QueryRequest, Replacement, ResolveParentsRequest,
-    SearchQuery, SearchRequest, SelectionQuery, SetCalibrationRequest, SnapshotChunk,
-    SnapshotManifest,
+    SearchQuery, SearchRequest, SelectionQuery, SnapshotChunk, SnapshotManifest,
 };
 use pipestream_search::segments::{SegmentCatalog, SegmentMetadata, SegmentSetManifest};
 use tokio::sync::mpsc;
@@ -114,12 +113,9 @@ async fn client(addr: &str) -> NodeServiceClient<Channel> {
 async fn calibrate(addr: &str, shift: &[f32], scale: &[f32]) {
     client(addr)
         .await
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: BIT_WIDTH as u32,
-            shift: shift.to_vec(),
-            scale: scale.to_vec(),
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, BIT_WIDTH, shift, scale,
+        ))
         .await
         .unwrap();
 }
@@ -1261,81 +1257,6 @@ async fn refusals_name_the_cause_and_a_dry_run_writes_nothing() {
     );
     building_handle.abort();
 
-    // Legacy unclocked records: a frame with clock 0 appended to a
-    // flushed generation's bucket file is what a pre-clock log looks
-    // like on resume.
-    let legacy_path = dir.join("legacy.vector");
-    let (legacy, legacy_handle) = start_empty_node(config(
-        Some(legacy_path.clone()),
-        Layout::SingleImage,
-        &analysis,
-    ))
-    .await;
-    calibrate(&legacy, &shift, &scale).await;
-    {
-        let mut client = client(&legacy).await;
-        append(&mut client, &row(3, false)).await;
-        client.flush(FlushRequest {}).await.unwrap();
-    }
-    legacy_handle.abort();
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    {
-        use prost::Message;
-        use std::io::Write;
-        let gen = wal_gen(&legacy_path, 0);
-        let bucket = pipestream_search::wal::bucket_path(
-            &gen,
-            pipestream_search::reshard::bucket_of(0, 8) as u32,
-        );
-        let existing = pipestream_search::wal::scan_records(&bucket).unwrap();
-        let record = pipestream_search::pb::wal::WalRecord {
-            seq: existing.last_seq + 1,
-            clock: 0,
-            op: Some(pipestream_search::pb::wal::wal_record::Op::AddVectors(
-                pipestream_search::pb::wal::LoggedAddVectors {
-                    first_id: 0,
-                    batch: Some(AddVectorsRequest {
-                        materialized_rows: Vec::new(),
-                        vectors: vec![0.0; DIM],
-                        dim: DIM as u32,
-                    }),
-                    stable_routing_keys: Vec::new(),
-                },
-            )),
-        };
-        let payload = record.encode_to_vec();
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&bucket)
-            .unwrap();
-        file.write_all(&(payload.len() as u32).to_le_bytes())
-            .unwrap();
-        file.write_all(&pipestream_search::wal::crc32(&payload).to_le_bytes())
-            .unwrap();
-        file.write_all(&payload).unwrap();
-    }
-    let (legacy, legacy_handle) = start_opened_node(config(
-        Some(legacy_path.clone()),
-        Layout::SingleImage,
-        &analysis,
-    ))
-    .await;
-    assert!(
-        !client(&legacy)
-            .await
-            .health(HealthRequest {})
-            .await
-            .unwrap()
-            .into_inner()
-            .wal_clocked
-    );
-    expect_refusal(
-        compact(&legacy, CompactShardRequest::default()).await,
-        tonic::Code::FailedPrecondition,
-        "legacy unclocked records",
-    )
-    .await;
-    legacy_handle.abort();
     let _ = std::fs::remove_dir_all(&dir);
 }
 

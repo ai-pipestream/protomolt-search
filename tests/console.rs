@@ -17,7 +17,7 @@ use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_client::SearchServiceClient;
 use pipestream_search::pb::{
     search_query, selection_query, AddDocumentsRequest, AddVectorsRequest, FacetValue,
-    IntegerValue, LexicalQuery, QueryRequest, SearchQuery, SelectionQuery, SetCalibrationRequest,
+    IntegerValue, LexicalQuery, QueryRequest, SearchQuery, SelectionQuery,
 };
 use pipestream_search::security::ToolClient;
 use pipestream_search::MAX_MESSAGE_BYTES;
@@ -62,12 +62,9 @@ async fn start() -> Cluster {
         .await;
         let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
         client
-            .set_calibration(SetCalibrationRequest {
-                dim: DIM as u32,
-                bit_width: 4,
-                shift: shift.clone(),
-                scale: scale.clone(),
-            })
+            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                DIM, 4, &shift, &scale,
+            ))
             .await
             .unwrap();
         let (tx, rx) = mpsc::channel(16);

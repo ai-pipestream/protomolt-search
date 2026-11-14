@@ -487,12 +487,9 @@ async fn staging_keeps_provider_calibration_and_refuses_a_changed_analysis_contr
     let fixture = Fixture::new();
     let receipt = fixture.accept(1, Some(source(2, false)));
     let node = NodeServiceImpl::open(fixture.config.clone(), None, false).unwrap();
-    node.set_calibration(Request::new(SetCalibrationRequest {
-        dim: 8,
-        bit_width: 4,
-        shift: vec![-1.0; 8],
-        scale: vec![0.5; 8],
-    }))
+    node.configure_vector_backend(Request::new(
+        pipestream_search::harness::embedded_backend_request(8, 4, &[-1.0; 8], &[0.5; 8]),
+    ))
     .await
     .unwrap();
     let health = node

@@ -150,12 +150,9 @@ async fn mapped_numeric_presence_survives_reopen_and_compaction_replay() {
         let (addr, server) = common::start_empty_node(config.clone()).await;
         let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
         client
-            .set_calibration(pb::SetCalibrationRequest {
-                dim: 8,
-                bit_width: 4,
-                shift: shift.clone(),
-                scale: scale.clone(),
-            })
+            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                8, 4, &shift, &scale,
+            ))
             .await
             .unwrap();
         let bind = pb::MappedBind {
@@ -356,12 +353,9 @@ async fn old_integer_materialization_hashes_refuse_but_float_hashes_still_match(
         let mut client = NodeServiceClient::connect(addr).await.unwrap();
         let (shift, scale) = common::fit_calibration(8, 4, &common::unit_vectors(64, 8, 13533));
         client
-            .set_calibration(pb::SetCalibrationRequest {
-                dim: 8,
-                bit_width: 4,
-                shift,
-                scale,
-            })
+            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                8, 4, &shift, &scale,
+            ))
             .await
             .unwrap();
         client

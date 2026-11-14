@@ -20,9 +20,6 @@ fn manifest() -> WalManifest {
         vector_backend: String::new(),
         vector_config_format: String::new(),
         vector_config_payload: vec![],
-        bit_width: 4,
-        calibration_shift: vec![],
-        calibration_scale: vec![],
         collection: String::new(),
         slot_offset: 0,
         generation: 0,
@@ -30,9 +27,8 @@ fn manifest() -> WalManifest {
         bucket_count: 1,
         preexisting_vectors: 0,
         preexisting_documents: 0,
-        format_version: 6,
+        format_version: wal::FORMAT_VERSION,
         derived_fingerprint: String::new(),
-        legacy_derived_tag27: false,
         derived: vec![],
         columns: None,
     }
@@ -62,8 +58,8 @@ fn operation(documents: Vec<pb::AddDocumentsRequest>) -> wal_record::Op {
 }
 
 #[test]
-fn wal_publishes_integer_map_version_before_records_and_replays_exact_bytes() {
-    let dir = directory("upgrade");
+fn wal_replays_integer_map_values_exactly() {
+    let dir = directory("replay");
     let mut writer = WalWriter::create(&dir, manifest()).unwrap();
     let mut with_identity = document();
     with_identity.original_source = Some(pb::ProtobufSource {
@@ -78,8 +74,6 @@ fn wal_publishes_integer_map_version_before_records_and_replays_exact_bytes() {
     });
     let documents = vec![document(), with_identity];
     writer.append(operation(documents.clone())).unwrap();
-    // This observation precedes Flush: old decoders must already refuse the generation.
-    assert_eq!(wal::read_manifest(writer.dir()).unwrap().format_version, 7);
     writer.flush().unwrap();
     let records = wal::read_clocked_records(writer.dir(), 0).unwrap();
     let Some(wal_record::Op::AddDocuments(batch)) = &records[0].op else {
@@ -88,28 +82,7 @@ fn wal_publishes_integer_map_version_before_records_and_replays_exact_bytes() {
     assert_eq!(batch.documents, documents);
     let reopened =
         WalWriter::resume(writer.dir(), wal::read_manifest(writer.dir()).unwrap()).unwrap();
-    assert_eq!(reopened.manifest().format_version, 7);
     drop(reopened);
-    drop(writer);
-    std::fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
-fn failed_wal_version_publication_does_not_append_a_typed_record() {
-    let dir = directory("failed-upgrade");
-    let mut writer = WalWriter::create(&dir, manifest()).unwrap();
-    let path = wal::manifest_path(writer.dir());
-    std::fs::remove_file(&path).unwrap();
-    std::fs::create_dir(&path).unwrap();
-    assert!(writer.append(operation(vec![document()])).is_err());
-    assert_eq!(writer.high_watermark(), 0);
-    assert_eq!(writer.manifest().format_version, 6);
-    std::fs::remove_dir(&path).unwrap();
-    wal::write_manifest(writer.dir(), &manifest()).unwrap();
-    writer.flush().unwrap();
-    assert!(wal::read_clocked_records(writer.dir(), 0)
-        .unwrap()
-        .is_empty());
     drop(writer);
     std::fs::remove_dir_all(dir).unwrap();
 }

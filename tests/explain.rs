@@ -18,7 +18,7 @@ use pipestream_search::pb::{
     DocLineage, Explanation, FacetValue, FilterQuery, IntegerValue, LexicalQuery, QueryHit,
     QueryRequest, QueryResponse, QuerySort, QueryStreamRequest, RrfScore, ScoreDimension, ScoreOp,
     ScoreSignal, ScoreStage, SearchQuery, SelectionOperator, SelectionQuery,
-    SelectionScoreStrategy, SetCalibrationRequest, TermPrefix,
+    SelectionScoreStrategy, TermPrefix,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -56,12 +56,9 @@ async fn start_cluster() -> (
         .await;
         let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
         client
-            .set_calibration(SetCalibrationRequest {
-                dim: DIM as u32,
-                bit_width: 4,
-                shift: shift.clone(),
-                scale: scale.clone(),
-            })
+            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                DIM, 4, &shift, &scale,
+            ))
             .await
             .unwrap();
         let (tx, rx) = mpsc::channel(16);

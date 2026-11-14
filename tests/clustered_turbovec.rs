@@ -12,7 +12,7 @@ use pipestream_search::pb::{
     search_query, selection_query, AddDocumentsRequest, AddVectorsRequest, ClusterHealthRequest,
     DenseQualityPolicy, DenseQuery, DenseScoreMode, DocLineage, FacetValue, FusionMode,
     HybridLegOptions, HybridSearchRequest, QueryRequest, SearchQuery, SearchRequest,
-    SelectionQuery, SetCalibrationRequest,
+    SelectionQuery,
 };
 use pipestream_search::vector::{VectorIndex, VectorSearchOptions, EMBEDDED_TURBOVEC};
 use tokio::sync::mpsc;
@@ -78,12 +78,9 @@ async fn serve_product_filter_shard(
     .await;
     let mut client = NodeServiceClient::connect(address.clone()).await.unwrap();
     client
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: BITS as u32,
-            shift: shift.to_vec(),
-            scale: scale.to_vec(),
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, BITS, shift, scale,
+        ))
         .await
         .unwrap();
     let (tx, rx) = mpsc::channel(16);

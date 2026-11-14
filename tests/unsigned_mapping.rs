@@ -343,12 +343,9 @@ async fn unsigned_mapped_queries_sources_and_keys_survive_reopen_and_compaction(
         let (mut addr, mut server) = common::start_empty_node(config.clone()).await;
         let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
         client
-            .set_calibration(pb::SetCalibrationRequest {
-                dim: 8,
-                bit_width: 4,
-                shift: shift.clone(),
-                scale: scale.clone(),
-            })
+            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                8, 4, &shift, &scale,
+            ))
             .await
             .unwrap();
         let mut expected = std::collections::BTreeMap::new();
@@ -541,12 +538,9 @@ async fn unsigned_materialization_rejects_wrong_target_even_when_input_is_absent
     let mut client = NodeServiceClient::connect(addr).await.unwrap();
     let (shift, scale) = common::fit_calibration(8, 4, &common::unit_vectors(64, 8, 81569));
     client
-        .set_calibration(pb::SetCalibrationRequest {
-            dim: 8,
-            bit_width: 4,
-            shift,
-            scale,
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            8, 4, &shift, &scale,
+        ))
         .await
         .unwrap();
     let spec = pb::MaterializeSpec {

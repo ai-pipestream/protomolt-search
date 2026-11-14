@@ -359,12 +359,9 @@ async fn explicit_policy_crosses_rpc_bind_and_persistent_source_boundaries() {
     let mut client = NodeServiceClient::connect(address.clone()).await.unwrap();
     let (shift, scale) = common::fit_calibration(8, 4, &common::unit_vectors(64, 8, 911));
     client
-        .set_calibration(pb::SetCalibrationRequest {
-            dim: 8,
-            bit_width: 4,
-            shift,
-            scale,
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            8, 4, &shift, &scale,
+        ))
         .await
         .unwrap();
     let frames = |bind| {

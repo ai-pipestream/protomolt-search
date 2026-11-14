@@ -22,7 +22,7 @@ use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     AddDocumentsRequest, AnalysisSpec, Bm25SearchRequest, Bm25SearchResponse, DocumentField,
-    FlushRequest, QueryField, SetCalibrationRequest,
+    FlushRequest, QueryField,
 };
 use pipestream_search::postings::{Bm25Index, Bm25Reader};
 use tokio::sync::mpsc;
@@ -352,12 +352,9 @@ async fn wal_replay_analyzes_each_document_once_and_keeps_the_pair() {
     let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &unit_vectors(8, DIM, 0xD0A1_0001));
     client
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: BIT_WIDTH as u32,
-            shift,
-            scale,
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, BIT_WIDTH, &shift, &scale,
+        ))
         .await
         .unwrap();
     ingest(&addr, DOCS.iter().map(|t| doc(t)).collect())

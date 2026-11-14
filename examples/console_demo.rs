@@ -31,7 +31,7 @@ use pipestream_search::pb::analysis::{
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::{
     AddDocumentsRequest, AddVectorsRequest, DocLineage, FacetValue, IntegerValue, NumericValue,
-    SetCalibrationRequest, TimestampValue,
+    TimestampValue,
 };
 use pipestream_search::security::ToolClient;
 use pipestream_search::MAX_MESSAGE_BYTES;
@@ -381,12 +381,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
         let mut client = NodeServiceClient::connect(addr.clone()).await?;
         client
-            .set_calibration(SetCalibrationRequest {
-                dim: DIM as u32,
-                bit_width: 4,
-                shift: shift.clone(),
-                scale: scale.clone(),
-            })
+            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                DIM, 4, &shift, &scale,
+            ))
             .await?;
         let start = shard * SHARD_DOCS;
         let (tx, rx) = mpsc::channel(SHARD_DOCS);

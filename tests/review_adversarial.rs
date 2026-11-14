@@ -30,7 +30,7 @@ use pipestream_search::pb::{
     search_query, selection_query, selection_score_strategy, AddDocumentsRequest,
     AddVectorsRequest, CompositeSearchStrategy, DenseQuery, DocLineage, HighlightSpec,
     LexicalQuery, QueryRequest, RrfScore, SearchQuery, SelectionOperator, SelectionQuery,
-    SelectionScoreStrategy, SetCalibrationRequest,
+    SelectionScoreStrategy,
 };
 use pipestream_search::placement::VoronoiRouter;
 use pipestream_search::postings::{AnalyzedDoc, AnalyzedField, Bm25Index, Bm25Reader, Bm25Store};
@@ -339,12 +339,9 @@ async fn single_pass_dense_and_hybrid_rerank_emit_snippets_with_zero_get_documen
     ];
     let vecs = unit_vectors(2, DIM, 77);
     let (shift, scale) = fit_calibration(DIM, 4, &vecs);
-    link.set_calibration(SetCalibrationRequest {
-        dim: DIM as u32,
-        bit_width: 4,
-        shift,
-        scale,
-    })
+    link.configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+        DIM, 4, &shift, &scale,
+    ))
     .await
     .unwrap();
     link.add_documents(tokio_stream::iter(docs.into_iter().map(
@@ -563,12 +560,9 @@ async fn matryoshka_active_tier_indexes_compact_prefix_and_rescores_higher_tier_
     raw_vectors[24] = 0.8; // doc 1: dim 8 = 0.8
     let cal_sample = unit_vectors(8, 8, 99);
     let (shift, scale) = fit_calibration(8, 4, &cal_sample);
-    link.set_calibration(SetCalibrationRequest {
-        dim: 8,
-        bit_width: 4,
-        shift,
-        scale,
-    })
+    link.configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+        8, 4, &shift, &scale,
+    ))
     .await
     .unwrap();
     link.add_vectors(tokio_stream::iter(vec![AddVectorsRequest {

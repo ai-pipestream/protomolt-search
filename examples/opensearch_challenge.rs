@@ -21,7 +21,7 @@ use pipestream_search::pb::{
     AddDocumentsRequest, AddVectorsRequest, ClusterHealthRequest, DenseQuery, DocLineage,
     FacetValue, FilterQuery, HealthRequest, IntegerValue, LexicalQuery, QueryRequest,
     QueryStreamPhase, QueryStreamRequest, RrfScore, SearchQuery, SearchRequest, SelectionOperator,
-    SelectionQuery, SelectionScoreStrategy, SetCalibrationRequest,
+    SelectionQuery, SelectionScoreStrategy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -389,12 +389,9 @@ async fn ingest_protomolt() -> Result<(), Error> {
     let (shift, scale) = pipestream_search::harness::fit_calibration(dim, 4, &vectors);
     let mut client = NodeServiceClient::connect(node).await?;
     client
-        .set_calibration(SetCalibrationRequest {
-            dim: dim as u32,
-            bit_width: 4,
-            shift,
-            scale,
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            dim, 4, &shift, &scale,
+        ))
         .await?;
 
     let (doc_tx, doc_rx) = mpsc::channel(32);

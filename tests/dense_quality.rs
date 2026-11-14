@@ -21,7 +21,7 @@ use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     search_query, selection_query, AddVectorsRequest, DeleteDocumentsRequest, DenseExecutionMode,
     DenseQualityPolicy, DenseQuery, DenseScoreMode, FlushRequest, HealthRequest, QueryRequest,
-    QueryResponse, SearchQuery, SelectionQuery, SetCalibrationRequest,
+    QueryResponse, SearchQuery, SelectionQuery,
 };
 use pipestream_search::quality::measure::{
     ladder_table, measure, GroundTruth, MeasureSpec, MeasuredProfile,
@@ -87,12 +87,9 @@ async fn start_fixture(tag: &str, rows_per_shard: &[usize]) -> Fixture {
         })
         .await;
         let mut node = NodeServiceClient::connect(addr.clone()).await.unwrap();
-        node.set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: 4,
-            shift: shift.clone(),
-            scale: scale.clone(),
-        })
+        node.configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, 4, &shift, &scale,
+        ))
         .await
         .unwrap();
         node.add_vectors(tokio_stream::iter(vec![AddVectorsRequest {

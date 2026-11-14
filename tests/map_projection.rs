@@ -902,12 +902,9 @@ async fn mapped_maps_cross_rpc_binding_reopen_and_compaction() {
         let mut client = NodeServiceClient::connect(address.clone()).await.unwrap();
         let (shift, scale) = common::fit_calibration(8, 4, &common::unit_vectors(64, 8, 178));
         client
-            .set_calibration(pb::SetCalibrationRequest {
-                dim: 8,
-                bit_width: 4,
-                shift,
-                scale,
-            })
+            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                8, 4, &shift, &scale,
+            ))
             .await
             .unwrap();
         let sources = vec![source(&schema, 1), source(&schema, 2)];
@@ -1396,12 +1393,9 @@ async fn mapped_integer_maps_bind_persist_and_compact_without_rounding() {
         let mut client = NodeServiceClient::connect(address).await.unwrap();
         let (shift, scale) = common::fit_calibration(8, 4, &common::unit_vectors(64, 8, 712));
         client
-            .set_calibration(pb::SetCalibrationRequest {
-                dim: 8,
-                bit_width: 4,
-                shift,
-                scale,
-            })
+            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                8, 4, &shift, &scale,
+            ))
             .await
             .unwrap();
         for docs in [sources[..2].to_vec(), sources[2..].to_vec()] {

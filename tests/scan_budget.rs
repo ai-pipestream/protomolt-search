@@ -20,7 +20,7 @@ use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     AddVectorsRequest, ClusterPlan, GetClusterPlanRequest, NodeCapacity, NodeResidency,
-    PlanBalanceRequest, RegisterNodeRequest, SearchRequest, SetCalibrationRequest,
+    PlanBalanceRequest, RegisterNodeRequest, SearchRequest,
 };
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -103,12 +103,9 @@ async fn seeded_node(dir: &Path) -> (NodeServiceImpl, String, Vec<f32>) {
     let corpus = unit_vectors(ROWS, DIM, 0xB0D6_0001);
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &corpus[..2_048 * DIM]);
     let mut c = client(&addr).await;
-    c.set_calibration(SetCalibrationRequest {
-        dim: DIM as u32,
-        bit_width: BIT_WIDTH as u32,
-        shift,
-        scale,
-    })
+    c.configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+        DIM, BIT_WIDTH, &shift, &scale,
+    ))
     .await
     .unwrap();
     let (tx, rx) = mpsc::channel(8);

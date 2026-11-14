@@ -147,8 +147,7 @@ log is rewritten.
 Refused by name: an in-memory shard; a shard without a WAL whose catalog
 does not qualify for the from-segments path (the single-image layout, no
 sealed segments, or no generation binding — `docs/replay-from-segments.md`
-has the path and its qualification); a generation with legacy unclocked
-records; a generation that began with preexisting
+has the path and its qualification); a generation that began with preexisting
 state its log does not hold (a snapshot install's; compaction would drop the
 image); a compaction already running on the shard; a bulk BM25 build in
 progress; no analysis backend; a non-empty work directory or a leftover

@@ -107,12 +107,9 @@ async fn check_topologies(second: pb::ScalarValueType) {
         .await;
         let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
         client
-            .set_calibration(pb::SetCalibrationRequest {
-                dim: 8,
-                bit_width: 4,
-                shift: shift.clone(),
-                scale: scale.clone(),
-            })
+            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                8, 4, &shift, &scale,
+            ))
             .await
             .unwrap();
         client

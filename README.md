@@ -773,8 +773,7 @@ Use only when shards cannot share a calibration.
 configuration to every shard. Configure before ingest and verify matching
 `scoring_fingerprint` values with `GetVectorBackend`. Provider configuration
 is locked for a generation, so a scoring-identity change is a coordinated
-rebuild and cutover event. The old calibration RPCs remain compatibility
-adapters for existing embedded-TurboVec clients.
+rebuild and cutover event.
 
 Fork caveats (read from the turbovec source, pinned in
 `tests/score_layout.rs`): with a shared calibration, encoding is a pure

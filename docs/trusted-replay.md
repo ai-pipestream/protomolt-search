@@ -149,10 +149,9 @@ again before commit or retry acknowledgment. An admitted storage commit may
 finish after its admission decision; this is not an index writer lease or a
 promise that I/O can be interrupted at the deadline.
 
-Format-2 policies remain readable for recovery, but accepting a peer frame
-requires format 3 and a live refresh. Republishing the exact legacy decision
-under a verified refresh upgrades the format durably. Older receivers therefore
-cannot reopen the upgraded journal and restore the former permissive behavior.
+A journal is format 1 until its first policy is published and format 3 after;
+any other format is refused on open. Accepting a peer frame requires format 3
+and a live refresh.
 Freshness itself is process-local and never restored from disk.
 
 The session/refresh handles are local capabilities for a trusted publisher,
@@ -243,7 +242,7 @@ Cargo build jobs.
 A controllable monotonic test clock verifies delayed-response expiry and time
 spent waiting for admission without sleeps. Tests also cover restart, session
 drop, disconnect, late or superseded replies, failed publication, bounded
-validity, unchanged-policy renewal, and format-2 recovery/upgrade. The mTLS
+validity, unchanged-policy renewal, and refusal of other formats. The mTLS
 fixture now proves that suspending authority rejects retries on the existing
 connection until a new verified local refresh is installed. It still does not
 expose a production replay RPC or establish a live-fleet result.

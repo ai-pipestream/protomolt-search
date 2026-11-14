@@ -21,7 +21,7 @@ use pipestream_search::pb::{
     CompositeSearchStrategy, DenseQuery, FacetValue, FilterQuery, FlushRequest, HealthRequest,
     IntegerValue, LexicalQuery, MappedBind, QueryHit, QueryRequest, QueryResponse,
     RoutedIngestMappedRequest, RoutedMappedBind, RoutedMappedDocument, SearchQuery,
-    SelectionOperator, SelectionQuery, SetCalibrationRequest,
+    SelectionOperator, SelectionQuery,
 };
 use pipestream_search::placement::{Placement, PlacementNodeConfig, PlacementTreeConfig};
 use prost::Message as _;
@@ -224,12 +224,9 @@ async fn calibrate(addr: &str) {
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &all);
     let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
     client
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: BIT_WIDTH as u32,
-            shift,
-            scale,
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, BIT_WIDTH, &shift, &scale,
+        ))
         .await
         .unwrap();
 }

@@ -35,7 +35,7 @@ use pipestream_search::pb::{
     search_query, selection_query, selection_score_strategy, AddDocumentsRequest,
     AddVectorsRequest, CompositeSearchStrategy, DenseQuery, DocLineage, HighlightSpec,
     LexicalQuery, QueryRequest, RrfScore, SearchQuery, SelectionOperator, SelectionQuery,
-    SelectionScoreStrategy, SetCalibrationRequest,
+    SelectionScoreStrategy,
 };
 use pipestream_search::placement::{train_voronoi_centroids_on_kserve, VoronoiTrainingSpec};
 use pipestream_search::turbo_bridge::rerank::{
@@ -130,12 +130,9 @@ async fn stage2_rerank_and_highlight_reorders_dense_and_composite_and_composes_l
             },
         ));
         let mut link = NodeLink::local(Arc::clone(&node));
-        link.set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: 4,
-            shift: shift.clone(),
-            scale: scale.clone(),
-        })
+        link.configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, 4, &shift, &scale,
+        ))
         .await
         .unwrap();
 

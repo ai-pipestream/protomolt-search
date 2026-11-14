@@ -48,12 +48,9 @@ impl Fixture {
         let vectors = unit_vectors(DOCS as usize, DIM, 0xABCDEF);
         let (shift, scale) = fit_calibration(DIM, 4, &vectors);
         client
-            .set_calibration(SetCalibrationRequest {
-                dim: DIM as u32,
-                bit_width: 4,
-                shift,
-                scale,
-            })
+            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                DIM, 4, &shift, &scale,
+            ))
             .await
             .unwrap();
         if explicit {

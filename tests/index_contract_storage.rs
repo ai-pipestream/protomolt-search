@@ -251,18 +251,14 @@ async fn empty_binding_recovers_from_synced_wal_without_an_index_image() {
                 vector_backend: String::new(),
                 vector_config_format: String::new(),
                 vector_config_payload: Vec::new(),
-                bit_width: 4,
-                calibration_shift: vec![0.0; 16],
-                calibration_scale: vec![1.0; 16],
                 slot_offset: 0,
                 generation: 0,
                 bucket_bits: 2,
                 bucket_count: 4,
                 preexisting_vectors: 0,
                 preexisting_documents: 0,
-                format_version: 5,
+                format_version: wal::FORMAT_VERSION,
                 derived_fingerprint: String::new(),
-                legacy_derived_tag27: false,
                 derived: Vec::new(),
                 columns: None,
             },
@@ -291,7 +287,6 @@ async fn empty_binding_recovers_from_synced_wal_without_an_index_image() {
         assert!(writer
             .append(pb::wal::wal_record::Op::Bind(invalid))
             .is_err());
-        assert_eq!(wal::read_manifest(&generation).unwrap().format_version, 5);
         writer.flush().unwrap();
         assert!(wal::read_clocked_records(&generation, 0)
             .unwrap()
@@ -299,7 +294,6 @@ async fn empty_binding_recovers_from_synced_wal_without_an_index_image() {
         writer
             .append(pb::wal::wal_record::Op::Bind(logged))
             .unwrap();
-        assert_eq!(wal::read_manifest(&generation).unwrap().format_version, 6);
         // Sync only the WAL: no node Flush and no index image may mask recovery.
         writer.flush().unwrap();
         drop(writer);

@@ -32,7 +32,7 @@ use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::wal::LoggedAddVectors;
 use pipestream_search::pb::{
     AddDocumentsRequest, AddVectorsRequest, AnalysisSpec, CommitReplacementsRequest,
-    DeleteDocumentsRequest, FlushRequest, Replacement, SetCalibrationRequest,
+    DeleteDocumentsRequest, FlushRequest, Replacement,
 };
 use pipestream_search::phrases::PhraseIndex;
 use pipestream_search::postings::{AnalyzedDoc, Bm25Index, Bm25Reader, Bm25Store};
@@ -127,12 +127,9 @@ async fn start_wal_node_with_layout(
     .await;
     let mut client = NodeServiceClient::connect(addr).await.unwrap();
     client
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: BIT_WIDTH as u32,
-            shift: shift.to_vec(),
-            scale: scale.to_vec(),
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, BIT_WIDTH, shift, scale,
+        ))
         .await
         .unwrap();
     (client, index_path, handle)
@@ -475,19 +472,12 @@ async fn merge_reproduces_monolithic() {
     // different bucket count (cheap proxies for differently-built shards).
     let craft_gen = |name: &str, bucket_count: u32, perturb: bool| {
         let wal_root = dir.join(name);
-        let manifest = pipestream_search::wal::WalManifest {
+        let mut manifest = pipestream_search::wal::WalManifest {
             collection: String::new(),
             dim: DIM as u32,
             vector_backend: String::new(),
             vector_config_format: String::new(),
             vector_config_payload: Vec::new(),
-            bit_width: BIT_WIDTH as u32,
-            calibration_shift: if perturb {
-                shift.iter().map(|x| x + 1.0).collect()
-            } else {
-                shift.clone()
-            },
-            calibration_scale: scale.clone(),
             slot_offset: 0,
             generation: 0,
             bucket_bits: bucket_count.trailing_zeros(),
@@ -496,10 +486,17 @@ async fn merge_reproduces_monolithic() {
             preexisting_documents: 0,
             format_version: pipestream_search::wal::FORMAT_VERSION,
             derived_fingerprint: String::new(),
-            legacy_derived_tag27: false,
             derived: Vec::new(),
             columns: None,
         };
+        let shift: Vec<f32> = if perturb {
+            shift.iter().map(|x| x + 1.0).collect()
+        } else {
+            shift.clone()
+        };
+        manifest.set_backend_config(
+            pipestream_search::vector::embedded_turbovec_config(BIT_WIDTH, &shift, &scale).unwrap(),
+        );
         let mut writer = pipestream_search::wal::WalWriter::create(&wal_root, manifest).unwrap();
         writer
             .append(pipestream_search::pb::wal::wal_record::Op::Flush(
@@ -710,15 +707,12 @@ async fn split_finer_than_buckets_repartitions() {
 #[test]
 fn reshard_refuses_a_log_with_preexisting_state() {
     let dir = tempdir("preexisting");
-    let manifest = pipestream_search::wal::WalManifest {
+    let mut manifest = pipestream_search::wal::WalManifest {
         collection: String::new(),
         dim: DIM as u32,
         vector_backend: String::new(),
         vector_config_format: String::new(),
         vector_config_payload: Vec::new(),
-        bit_width: BIT_WIDTH as u32,
-        calibration_shift: vec![0.0; DIM],
-        calibration_scale: vec![1.0; DIM],
         slot_offset: 0,
         generation: 1,
         bucket_bits: 2,
@@ -727,10 +721,13 @@ fn reshard_refuses_a_log_with_preexisting_state() {
         preexisting_documents: 0,
         format_version: pipestream_search::wal::FORMAT_VERSION,
         derived_fingerprint: String::new(),
-        legacy_derived_tag27: false,
         derived: Vec::new(),
         columns: None,
     };
+    manifest.set_backend_config(
+        pipestream_search::vector::embedded_turbovec_config(BIT_WIDTH, &[0.0; DIM], &[1.0; DIM])
+            .unwrap(),
+    );
     let writer = pipestream_search::wal::WalWriter::create(&dir, manifest).unwrap();
     let gen = writer.dir().to_path_buf();
     drop(writer);
@@ -772,9 +769,6 @@ fn segmented_replay_refuses_a_foreign_batch_that_straddles_buckets() {
         vector_backend: String::new(),
         vector_config_format: String::new(),
         vector_config_payload: Vec::new(),
-        bit_width: 0,
-        calibration_shift: Vec::new(),
-        calibration_scale: Vec::new(),
         slot_offset: 0,
         generation: 0,
         bucket_bits: 2,
@@ -783,7 +777,6 @@ fn segmented_replay_refuses_a_foreign_batch_that_straddles_buckets() {
         preexisting_documents: 0,
         format_version: pipestream_search::wal::FORMAT_VERSION,
         derived_fingerprint: String::new(),
-        legacy_derived_tag27: false,
         derived: Vec::new(),
         columns: None,
     };
@@ -1138,12 +1131,9 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
     .await;
     let mut client = NodeServiceClient::connect(addr).await.unwrap();
     client
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: BIT_WIDTH as u32,
-            shift: shift.to_vec(),
-            scale: scale.to_vec(),
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, BIT_WIDTH, &shift, &scale,
+        ))
         .await
         .unwrap();
 

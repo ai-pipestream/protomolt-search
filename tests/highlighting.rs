@@ -23,8 +23,7 @@ use pipestream_search::pb::search_service_server::SearchService;
 use pipestream_search::pb::{
     search_query, selection_query, AddDocumentsRequest, AnalysisSpec, Bm25Hit, Bm25SearchRequest,
     Bm25SearchResponse, BooleanQuery, DocumentField, FlushRequest, HighlightMode, HighlightSpec,
-    LexicalQuery, QueryField, QueryRequest, SearchQuery, SelectionQuery, SetCalibrationRequest,
-    Snippet, SnippetCut,
+    LexicalQuery, QueryField, QueryRequest, SearchQuery, SelectionQuery, Snippet, SnippetCut,
 };
 use pipestream_search::postings::{AnalyzedDoc, Bm25Index, Bm25Reader, Bm25Store, SpillBuilder};
 use pipestream_search::reshard;
@@ -895,12 +894,12 @@ async fn snippets_survive_flush_reopen_and_wal_replay() {
         let (shift, scale) = common::fit_calibration(common::DIM, common::BIT_WIDTH, &sample);
         let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
         client
-            .set_calibration(SetCalibrationRequest {
-                dim: common::DIM as u32,
-                bit_width: common::BIT_WIDTH as u32,
-                shift,
-                scale,
-            })
+            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+                common::DIM,
+                common::BIT_WIDTH,
+                &shift,
+                &scale,
+            ))
             .await
             .unwrap();
     }

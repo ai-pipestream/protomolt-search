@@ -30,8 +30,7 @@ use pipestream_search::pb::{
     search_query, selection_query, selection_score_strategy, AddDocumentsRequest,
     AddVectorsRequest, Bm25SearchRequest, CompositeSearchStrategy, DenseQuery, IntegerValue,
     LexicalQuery, QueryRequest, RrfScore, SearchQuery, SelectionOperator, SelectionQuery,
-    SelectionScoreStrategy, SetCalibrationRequest, SuggestRequest, SynonymRule, TermSuggestMode,
-    TermSuggestRequest,
+    SelectionScoreStrategy, SuggestRequest, SynonymRule, TermSuggestMode, TermSuggestRequest,
 };
 use pipestream_search::postings::{
     AnalyzedDoc, AnalyzedField, Bm25Index, Bm25Reader, Bm25Store, SpillBuilder,
@@ -178,12 +177,9 @@ async fn one_pass_analyze_query_binds_structured_filters_across_lexical_dense_an
                 .with_nlp_columns(nlp_spec.clone()),
         );
         let mut link = NodeLink::local(Arc::clone(&node));
-        link.set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: 4,
-            shift: shift.clone(),
-            scale: scale.clone(),
-        })
+        link.configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, 4, &shift, &scale,
+        ))
         .await
         .unwrap();
 

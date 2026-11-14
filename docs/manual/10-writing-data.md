@@ -120,8 +120,8 @@ afterwards.
 It is unary and long-running, because it re-analyzes every live document. Set a
 deadline in minutes.
 
-It is rejected by name on an in-memory shard, a shard with no log, a log with
-legacy unclocked records, a generation that began from a snapshot install (its
+It is rejected by name on an in-memory shard, a shard with no log, a generation
+that began from a snapshot install (its
 log does not hold that history), a compaction or bulk build already running, no
 analysis backend, a non-empty work directory, or a work directory on another
 filesystem.

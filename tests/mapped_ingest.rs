@@ -26,7 +26,7 @@ use pipestream_search::pb::{
     Bm25SearchRequest, FreezeTopologyWritesRequest, HealthRequest, IngestMappedRequest,
     IngestMappedResponse, MappedBind, MaterializeKind, MaterializeSpec, MaterializedColumn,
     NamedProjection, PublishTopologyRequest, PublishedTopologyShard, RoutedIngestMappedRequest,
-    RoutedMappedBind, RoutedMappedDocument, SearchRequest, SetCalibrationRequest,
+    RoutedMappedBind, RoutedMappedDocument, SearchRequest,
 };
 use prost::Message as _;
 use prost_types::field_descriptor_proto::{Label, Type};
@@ -301,12 +301,9 @@ async fn seed_calibration(addr: &str) {
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &sample);
     let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
     client
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: BIT_WIDTH as u32,
-            shift,
-            scale,
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, BIT_WIDTH, &shift, &scale,
+        ))
         .await
         .unwrap();
 }

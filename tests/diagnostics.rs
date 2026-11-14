@@ -23,8 +23,8 @@ use pipestream_search::pb::{
     selection_query, AddDocumentsRequest, AddVectorsRequest, CompositeSearchStrategy, DenseQuery,
     FacetValue, FilterQuery, FlushRequest, GetRuntimeKnobsRequest, IntegerValue, KnobScope,
     MetricsSnapshot, MetricsSnapshotRequest, QueryRequest, QueryResponse, RecentQueriesRequest,
-    SearchQuery, SelectionOperator, SelectionQuery, SetCalibrationRequest, SetRuntimeKnobRequest,
-    ShardDiagnosticsRequest, StreamMetricsRequest,
+    SearchQuery, SelectionOperator, SelectionQuery, SetRuntimeKnobRequest, ShardDiagnosticsRequest,
+    StreamMetricsRequest,
 };
 use pipestream_search::security::{PrincipalConfig, Principals};
 use tokio::net::TcpListener;
@@ -84,12 +84,9 @@ async fn ingest(addr: &str) {
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, sample);
     let mut client = NodeServiceClient::connect(addr.to_string()).await.unwrap();
     client
-        .set_calibration(SetCalibrationRequest {
-            dim: DIM as u32,
-            bit_width: BIT_WIDTH as u32,
-            shift,
-            scale,
-        })
+        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
+            DIM, BIT_WIDTH, &shift, &scale,
+        ))
         .await
         .unwrap();
     for (block, chunk) in all.chunks(PER_YEAR).enumerate() {
