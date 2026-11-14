@@ -1516,11 +1516,13 @@ pub(crate) async fn execute(
                     .as_deref()
                     .unwrap_or(&query.text);
                 let empty_inline = HashMap::new();
+                let empty_owners = HashMap::new();
                 apply_turbo_rerank(
                     coordinator,
                     rerank_spec,
                     q_text,
                     &empty_inline,
+                    &empty_owners,
                     finish_deadline_us,
                     &mut hits,
                 )
@@ -1683,11 +1685,13 @@ pub(crate) async fn execute(
                     .query_text_override
                     .as_deref()
                     .unwrap_or(&req.request_id);
+                let empty_owners = HashMap::new();
                 apply_turbo_rerank(
                     coordinator,
                     rerank_spec,
                     q_text,
                     &inline_candidates,
+                    &empty_owners,
                     finish_deadline_us,
                     &mut hits,
                 )
@@ -1830,7 +1834,9 @@ pub(crate) async fn execute(
             }
             let mut inline_candidates: HashMap<u64, crate::pb::RerankCandidatePayload> =
                 HashMap::new();
+            let mut shard_owners: HashMap<u64, usize> = HashMap::new();
             for h in &response.cascade_hits {
+                shard_owners.entry(h.doc_id).or_insert(h.shard as usize);
                 if let Some(cand) = h.rerank_candidate.as_ref() {
                     inline_candidates
                         .entry(h.doc_id)
@@ -1838,6 +1844,7 @@ pub(crate) async fn execute(
                 }
             }
             for h in &response.hits {
+                shard_owners.entry(h.doc_id).or_insert(h.shard as usize);
                 if let Some(cand) = h.rerank_candidate.as_ref() {
                     inline_candidates
                         .entry(h.doc_id)
@@ -1994,6 +2001,7 @@ pub(crate) async fn execute(
                     rerank_spec,
                     q_text,
                     &inline_candidates,
+                    &shard_owners,
                     finish_deadline_us,
                     &mut hits,
                 )
@@ -2112,6 +2120,7 @@ async fn apply_turbo_rerank(
     spec: &crate::turbo_bridge::rerank::RerankSpec,
     query_text: &str,
     inline_candidates: &HashMap<u64, crate::pb::RerankCandidatePayload>,
+    shard_owners: &HashMap<u64, usize>,
     finish_deadline_us: u64,
     hits: &mut Vec<QueryHit>,
 ) -> Result<(), Status> {
@@ -2129,17 +2138,33 @@ async fn apply_turbo_rerank(
         .copied()
         .filter(|(doc_id, _)| !inline_candidates.contains_key(doc_id))
         .collect();
-    let fallback_map: HashMap<u64, crate::turbo_bridge::rerank::RerankCandidate> =
-        if missing_pairs.is_empty() {
-            HashMap::new()
-        } else {
-            coordinator
-                .fetch_rerank_candidates_with_deadline(&missing_pairs, finish_deadline_us)
-                .await?
-                .into_iter()
-                .map(|c| (c.doc_id, c))
-                .collect()
-        };
+    let fallback_map: HashMap<u64, crate::turbo_bridge::rerank::RerankCandidate> = if missing_pairs
+        .is_empty()
+    {
+        HashMap::new()
+    } else {
+        let mut resolved_owners = shard_owners.clone();
+        for hit in &hits[..limit] {
+            if inline_candidates.contains_key(&hit.doc_id)
+                || resolved_owners.contains_key(&hit.doc_id)
+            {
+                continue;
+            }
+            if let Some(identity) = hit.identity.as_ref() {
+                if !identity.document_key.is_empty() {
+                    if let Ok((_, shard)) = coordinator.route_stable_key(&identity.document_key) {
+                        resolved_owners.insert(hit.doc_id, shard);
+                    }
+                }
+            }
+        }
+        coordinator
+            .fetch_rerank_candidates_routed(&missing_pairs, &resolved_owners, finish_deadline_us)
+            .await?
+            .into_iter()
+            .map(|c| (c.doc_id, c))
+            .collect()
+    };
     let mut candidates = Vec::with_capacity(shortlist_pairs.len());
     for &(doc_id, prior_score) in &shortlist_pairs {
         if let Some(inline) = inline_candidates.get(&doc_id) {

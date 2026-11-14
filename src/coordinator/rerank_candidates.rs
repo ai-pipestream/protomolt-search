@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use tonic::{Request, Status};
 
@@ -17,15 +17,30 @@ impl CoordinatorServiceImpl {
     }
 
     /// Bound fallback document reads by the same absolute deadline as reranking.
-    /// Dropping this future also drops the outstanding RPC; no work is spawned.
+    /// Dropping this future aborts every in-flight shard RPC via its `JoinSet`.
     pub async fn fetch_rerank_candidates_with_deadline(
         &self,
         hit_scores: &[(u64, f64)],
         finish_deadline_us: u64,
     ) -> Result<Vec<RerankCandidate>, Status> {
+        let empty_owners = HashMap::new();
+        self.fetch_rerank_candidates_routed(hit_scores, &empty_owners, finish_deadline_us)
+            .await
+    }
+
+    /// Fetch shortlist candidates bounded by `finish_deadline_us`, routing each
+    /// candidate to its known owning shard in `shard_owners` and broadcasting
+    /// only candidates whose shard owner is unknown.
+    pub async fn fetch_rerank_candidates_routed(
+        &self,
+        hit_scores: &[(u64, f64)],
+        shard_owners: &HashMap<u64, usize>,
+        finish_deadline_us: u64,
+    ) -> Result<Vec<RerankCandidate>, Status> {
         let remaining = crate::turbo_bridge::remaining_deadline_duration(finish_deadline_us)?;
         let coordinator = self.request_snapshot().unwrap_or_else(|| self.clone());
-        let fetch = coordinator.fetch_rerank_candidates_inner(hit_scores, finish_deadline_us);
+        let fetch =
+            coordinator.fetch_rerank_candidates_inner(hit_scores, shard_owners, finish_deadline_us);
         let result = match remaining {
             Some(remaining) => tokio::time::timeout(remaining, fetch).await.map_err(|_| {
                 Status::deadline_exceeded("rerank candidate fetch deadline expired")
@@ -48,24 +63,66 @@ impl CoordinatorServiceImpl {
     async fn fetch_rerank_candidates_inner(
         &self,
         hit_scores: &[(u64, f64)],
+        shard_owners: &HashMap<u64, usize>,
         finish_deadline_us: u64,
     ) -> Result<Vec<RerankCandidate>, Status> {
         if hit_scores.is_empty() {
             return Ok(Vec::new());
         }
-        let ids: Vec<u64> = hit_scores.iter().map(|&(id, _)| id).collect();
-        let mut docs_by_id = HashMap::with_capacity(ids.len());
-        for addr in &self.node_addrs {
-            let mut client = self.node_client(addr)?;
-            let mut request = Request::new(GetDocumentsRequest {
-                doc_ids: ids.clone(),
-            });
+        let shard_count = self.node_addrs.len();
+        let mut per_shard: Vec<Vec<u64>> = vec![Vec::new(); shard_count];
+        let mut seen_per_shard: Vec<HashSet<u64>> = vec![HashSet::new(); shard_count];
+        for &(doc_id, _) in hit_scores {
+            if let Some(&owner) = shard_owners
+                .get(&doc_id)
+                .filter(|&&shard| shard < shard_count)
+            {
+                if seen_per_shard[owner].insert(doc_id) {
+                    per_shard[owner].push(doc_id);
+                }
+            } else {
+                for shard in 0..shard_count {
+                    if seen_per_shard[shard].insert(doc_id) {
+                        per_shard[shard].push(doc_id);
+                    }
+                }
+            }
+        }
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for (shard, doc_ids) in per_shard.into_iter().enumerate() {
+            if doc_ids.is_empty() {
+                continue;
+            }
+            let mut client = self.node_client(&self.node_addrs[shard])?;
+            let mut request = Request::new(GetDocumentsRequest { doc_ids });
             if let Some(remaining) =
                 crate::turbo_bridge::remaining_deadline_duration(finish_deadline_us)?
             {
                 request.set_timeout(remaining);
             }
-            for doc in client.get_documents(request).await?.into_inner().documents {
+            tasks.spawn(async move {
+                (
+                    shard,
+                    client
+                        .get_documents(request)
+                        .await
+                        .map(|resp| resp.into_inner().documents),
+                )
+            });
+        }
+
+        let mut responses = BTreeMap::new();
+        while let Some(joined) = tasks.join_next().await {
+            let (shard, response) = joined.map_err(|err| {
+                Status::internal(format!("rerank candidate fetch task failed: {err}"))
+            })?;
+            responses.insert(shard, response?);
+        }
+
+        let mut docs_by_id = HashMap::with_capacity(hit_scores.len());
+        for (_shard, documents) in responses {
+            for doc in documents {
                 docs_by_id.insert(doc.doc_id, doc);
             }
         }

@@ -126,3 +126,154 @@ async fn expired_fallback_refuses_before_contacting_any_node() {
             .is_err()
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn routed_fallback_contacts_only_owning_shards_and_skips_unowned_siblings() {
+    let owner_node = Arc::new(NodeServiceImpl::new(
+        None,
+        NodeConfig {
+            slot_offset: 100,
+            analysis_addr: Some(TURBO_ANALYSIS_BACKEND.into()),
+            sentence_fields: vec!["body".into()],
+            ..Default::default()
+        },
+    ));
+    let mut link = NodeLink::local(Arc::clone(&owner_node));
+    link.add_documents(tokio_stream::iter([
+        AddDocumentsRequest {
+            text: "First sentence. Second sentence.".into(),
+            analysis: Some(body_spec()),
+            lineage: Some(DocLineage {
+                parent_id: 11,
+                group_id: 1,
+                span_start: 500,
+                span_end: 532,
+            }),
+            ..Default::default()
+        },
+        AddDocumentsRequest {
+            text: "Alpha lead. Beta conclusion.".into(),
+            analysis: Some(body_spec()),
+            lineage: Some(DocLineage {
+                parent_id: 12,
+                group_id: 1,
+                span_start: 600,
+                span_end: 628,
+            }),
+            ..Default::default()
+        },
+    ]))
+    .await
+    .unwrap();
+
+    let (owner_addr, owner_server) =
+        pipestream_search::harness::serve_node((*owner_node).clone()).await;
+    // Sibling shard never answers HTTP/2; any broadcast RPC to it would stall until deadline.
+    let stalled_sibling = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sibling_addr = format!("http://{}", stalled_sibling.local_addr().unwrap());
+
+    let coordinator = CoordinatorServiceImpl::new(vec![owner_addr, sibling_addr]);
+    let shortlist = [(101, 2.5), (100, 1.5), (101, 0.5)];
+    let shard_owners = std::collections::HashMap::from([(100_u64, 0_usize), (101_u64, 0_usize)]);
+    let deadline = (SystemTime::now().duration_since(UNIX_EPOCH).unwrap()
+        + Duration::from_millis(500))
+    .as_micros() as u64;
+
+    let rows = coordinator
+        .fetch_rerank_candidates_routed(&shortlist, &shard_owners, deadline)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].doc_id, 101);
+    assert_eq!(rows[0].lineage_span_start, 600);
+    assert_eq!(rows[0].sentence_spans.len(), 2);
+    assert_eq!(rows[1].doc_id, 100);
+    assert_eq!(rows[1].lineage_span_start, 500);
+    assert_eq!(rows[1].sentence_spans.len(), 2);
+    assert_eq!(rows[2].doc_id, 101);
+    assert_eq!(rows[2].sentence_spans, rows[0].sentence_spans);
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), stalled_sibling.accept())
+            .await
+            .is_err(),
+        "unowned sibling shard must not be dialed when shard owners are known"
+    );
+
+    owner_server.abort();
+    let _ = owner_server.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unrouted_fallback_merges_candidates_across_multiple_remote_shards() {
+    let shard0 = Arc::new(NodeServiceImpl::new(
+        None,
+        NodeConfig {
+            slot_offset: 100,
+            analysis_addr: Some(TURBO_ANALYSIS_BACKEND.into()),
+            sentence_fields: vec!["body".into()],
+            ..Default::default()
+        },
+    ));
+    let shard1 = Arc::new(NodeServiceImpl::new(
+        None,
+        NodeConfig {
+            slot_offset: 200,
+            analysis_addr: Some(TURBO_ANALYSIS_BACKEND.into()),
+            sentence_fields: vec!["body".into()],
+            ..Default::default()
+        },
+    ));
+    NodeLink::local(Arc::clone(&shard0))
+        .add_documents(tokio_stream::iter([AddDocumentsRequest {
+            text: "Shard zero opening. Shard zero closing.".into(),
+            analysis: Some(body_spec()),
+            lineage: Some(DocLineage {
+                parent_id: 1,
+                group_id: 0,
+                span_start: 10,
+                span_end: 49,
+            }),
+            ..Default::default()
+        }]))
+        .await
+        .unwrap();
+    NodeLink::local(Arc::clone(&shard1))
+        .add_documents(tokio_stream::iter([AddDocumentsRequest {
+            text: "Shard one opening. Shard one closing.".into(),
+            analysis: Some(body_spec()),
+            lineage: Some(DocLineage {
+                parent_id: 2,
+                group_id: 0,
+                span_start: 20,
+                span_end: 57,
+            }),
+            ..Default::default()
+        }]))
+        .await
+        .unwrap();
+
+    let (addr0, srv0) = pipestream_search::harness::serve_node((*shard0).clone()).await;
+    let (addr1, srv1) = pipestream_search::harness::serve_node((*shard1).clone()).await;
+    let coordinator = CoordinatorServiceImpl::new(vec![addr0, addr1]);
+
+    let shortlist = [(200, 4.0), (100, 2.0), (404, 1.0)];
+    let rows = coordinator
+        .fetch_rerank_candidates(&shortlist)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].doc_id, 200);
+    assert_eq!(rows[0].lineage_span_start, 20);
+    assert_eq!(rows[0].sentence_spans.len(), 2);
+    assert_eq!(rows[1].doc_id, 100);
+    assert_eq!(rows[1].lineage_span_start, 10);
+    assert_eq!(rows[1].sentence_spans.len(), 2);
+    assert!(rows[2].text.is_empty());
+    assert!(rows[2].sentence_spans.is_empty());
+
+    srv0.abort();
+    srv1.abort();
+    let _ = srv0.await;
+    let _ = srv1.await;
+}
