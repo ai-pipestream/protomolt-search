@@ -1,0 +1,3 @@
+run: hnsw BuildParams { m: 16, ef_construction: 200, bits: 0 } built in 15.8s
+run: hnsw m=16 efc=200 none k=10: 1 points
+run: wrote <scratch>/a-none-k10-ef96.json

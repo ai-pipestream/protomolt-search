@@ -1,0 +1,16 @@
+fixture: OpenSearch challenge fixture: 100000 x 64 unit vectors, 16 topics, seed 0xC0DE51A7 (examples/opensearch_challenge.rs generate); 500 queries, the first 16 are the challenge's vector workloads (100000 rows, 500 queries)
+fixture: k-means 200 cells in 0.1s
+fixture: uncorrelated-50 truth in 0.1s (allows 50.05% on average)
+fixture: uncorrelated-10 truth in 0.0s (allows 10.08% on average)
+fixture: uncorrelated-1 truth in 0.0s (allows 1.05% on average)
+fixture: near-50 truth in 0.1s (allows 50.28% on average)
+fixture: near-10 truth in 0.0s (allows 10.25% on average)
+fixture: near-1 truth in 0.0s (allows 1.27% on average)
+fixture: far-50 truth in 0.1s (allows 50.27% on average)
+fixture: far-10 truth in 0.0s (allows 10.28% on average)
+fixture: far-1 truth in 0.0s (allows 1.31% on average)
+fixture: wrote /tmp/fx107
+
+real	0m0.825s
+user	0m2.863s
+sys	0m0.039s

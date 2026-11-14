@@ -9,14 +9,14 @@ grid as the Rust runner, and writes a results file in the same
 Timing:
 - Latency percentiles always come from one query per call on one OpenMP
   thread.
-- Throughput for unfiltered cells and shared (uncorrelated) filters uses
-  FAISS's batch search: one OpenMP thread for the one-core figure, all
-  threads for the all-cores figure. The shared mask is built once per batch
-  inside the timed region.
-- Per-query (correlated) filters cannot share one selector, so throughput
-  is one query per call: sequential for one core, and for all cores one
-  forked worker process per core (the per-query mask is numpy work under
-  the GIL, so threads would measure the GIL, not FAISS).
+- Throughput for unfiltered cells uses FAISS's batch search: one OpenMP
+  thread for the one-core figure, all threads for the all-cores figure.
+- Filtered cells, shared (uncorrelated) masks included, are timed one query
+  per call with the mask built inside the timed region, as the Rust runner
+  does: sequential for one core, and for all cores one forked worker process
+  per core (the mask is numpy work under the GIL, so threads would measure
+  the GIL, not FAISS). A shared mask is still rebuilt per query, so every
+  filtered QPS is a measurement, never a modelled mask charge.
 - The filter is FAISS's native IDSelectorBitmap, built from the column
   postings inside the timed region, as the Rust engines do.
 
@@ -47,8 +47,9 @@ def ints(s):
 
 def load(dirpath):
     m = json.load(open(os.path.join(dirpath, "manifest.json")))
-    assert m["format"] == "protomolt-ann-fixture-v1", m["format"]
-    n, d, qn, kt = m["rows"], m["dim"], m["queries"], m["k_truth"]
+    if m["format"] != "protomolt-ann-fixture-v2":
+        sys.exit(f"faiss: {dirpath} is a {m['format']} fixture, not protomolt-ann-fixture-v2; rebuild it")
+    n, d, qn, kt, kt_none = m["rows"], m["dim"], m["queries"], m["k_truth"], m["k_truth_none"]
     base = np.fromfile(os.path.join(dirpath, "base.f32"), dtype="<f4").reshape(n, d)
     queries = np.fromfile(os.path.join(dirpath, "queries.f32"), dtype="<f4").reshape(qn, d)
     bucket = np.fromfile(os.path.join(dirpath, "bucket.u8"), dtype=np.uint8)
@@ -58,7 +59,7 @@ def load(dirpath):
         "cell": [np.flatnonzero(cell == v) for v in range(m["cells"])],
     }
     filters = [("none", None, None, None)]
-    truth = {"none": np.fromfile(os.path.join(dirpath, "truth/none.u32"), dtype="<u4").reshape(qn, kt)}
+    truth = {"none": np.fromfile(os.path.join(dirpath, "truth/none.u32"), dtype="<u4").reshape(qn, kt_none)}
     for f in m["filters"]:
         body = json.load(open(os.path.join(dirpath, "filters", f["name"] + ".json")))
         shared = body.get("shared")
@@ -164,7 +165,7 @@ def _worker(tid):
         shape.search(queries[q % qn : q % qn + 1], k, ef, bits_for(q % qn))
         local += 1
         q += threads
-    return local
+    return local, time.perf_counter() - start
 
 
 def mask_bits(postings, column, values, n):
@@ -188,9 +189,13 @@ def measure(shape, queries, postings, filt, truth, k, ef, min_time, threads):
     # Recall pass and per-query latency on one thread.
     faiss.omp_set_num_threads(1)
     recalls = []
+    faiss.cvar.hnsw_stats.reset()
     for q in range(qn):
         _, I = shape.search(queries[q : q + 1], k, ef, bits_for(q))
         recalls.append(recall(I[0], truth[q], k))
+    hstats = faiss.cvar.hnsw_stats
+    hops_mean = hstats.nhops / qn
+    scored_mean = hstats.ndis / qn
     lat = []
     pred = 0.0
     done = 0
@@ -208,14 +213,13 @@ def measure(shape, queries, postings, filt, truth, k, ef, min_time, threads):
         done += 1
     per_query_one_core = done / (time.perf_counter() - t0)
 
-    batch = per_query is None
-    if batch:
+    if column is None:
         def run_batch(nthreads):
             faiss.omp_set_num_threads(nthreads)
             count = 0
             start = time.perf_counter()
             while count == 0 or time.perf_counter() - start < min_time:
-                shape.search(queries, k, ef, bits_for(0))
+                shape.search(queries, k, ef, None)
                 count += qn
             return count / (time.perf_counter() - start)
 
@@ -231,10 +235,9 @@ def measure(shape, queries, postings, filt, truth, k, ef, min_time, threads):
         global _STATE
         _STATE = (shape, queries, bits_for, k, ef, min_time, threads, qn)
         ctx = multiprocessing.get_context("fork")
-        start = time.perf_counter()
+        # Each worker times its own loop, so pool start-up is not charged.
         with ctx.Pool(threads) as pool:
-            total = sum(pool.map(_worker, range(threads)))
-        qps_all = total / (time.perf_counter() - start)
+            qps_all = sum(n / s for n, s in pool.map(_worker, range(threads)))
         timing = "per-query"
     lat.sort()
     pct = lambda f: lat[int(round((len(lat) - 1) * f))]
@@ -249,8 +252,8 @@ def measure(shape, queries, postings, filt, truth, k, ef, min_time, threads):
         "p50_ms": pct(0.5),
         "p99_ms": pct(0.99),
         "predicate_ms_mean": pred * 1e3 / done,
-        "hops_mean": None,
-        "exact_scores_mean": None,
+        "hops_mean": hops_mean,
+        "exact_scores_mean": scored_mean,
         "timing": timing,
     }
 
@@ -293,6 +296,12 @@ def main():
     only = [f for f in a.filters.split(",") if f]
     if only:
         filters = [f for f in filters if f[0] in only]
+    # Recall at a k deeper than the truth cannot be judged; refuse it.
+    for filt in filters:
+        depth = truth[filt[0]].shape[1]
+        for k in ints(a.k):
+            if k > depth:
+                sys.exit(f"faiss: k={k} exceeds the fixture's truth depth {depth} for {filt[0]}")
     report = {
         "format": FORMAT,
         "fixture": {

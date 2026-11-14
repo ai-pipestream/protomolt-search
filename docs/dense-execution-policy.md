@@ -142,7 +142,19 @@ of the point, not a constant of the build:
 
 A request whose view and filters admit every row carries no mask, and an
 unfiltered point names no threshold. Explicit `ANN` never consults a policy
-and runs under the provider's own threshold.
+and runs under the provider's own routing.
+
+Speed or exact. Since 2026-11-13 the `hnsw` provider's own routing is
+`FilterRouting::Speed`: it enumerates a mask outright only where that is
+cheaper than any walk (`ef · 2M` rows) and walks larger masks, plain where
+the rows around the query are mostly allowed, so a mask under the old
+threshold can get an approximate answer at a fixed beam. A point's
+`enumerate_max_rows` is still served as measured, which is the
+`FilterRouting::Exact` guarantee up to that threshold. Above it the provider
+now walks plain where the probe says so, so a point measured before
+2026-11-13 is re-measured before it is trusted for filtered bands. The
+trade-off, with numbers, and who selects which mode: `docs/hnsw.md`,
+"Speed or exact".
 
 ## Patience early stop
 

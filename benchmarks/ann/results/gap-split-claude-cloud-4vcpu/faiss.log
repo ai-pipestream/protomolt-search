@@ -1,0 +1,9 @@
+faiss: M=16 efc=200 built in 7.2s
+faiss: M=16 efc=200 none k=10: 7 points
+faiss: M=16 efc=200 none k=100: 2 points
+faiss: M=16 efc=200 none k=1000: 1 points
+faiss: M=32 efc=200 built in 7.4s
+faiss: M=32 efc=200 none k=10: 6 points
+faiss: M=32 efc=200 none k=100: 1 points
+faiss: M=32 efc=200 none k=1000: 1 points
+faiss: wrote /tmp/claude-0/-home-user/d40cf145-34f9-576e-b2f2-6aa94f80d994/scratchpad/res/faiss.json

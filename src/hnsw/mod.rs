@@ -51,15 +51,17 @@ pub use reorder::NodeMap;
 pub use rows::{RowSource, RowSourceIdentity};
 
 use crate::vector::{
-    first_invalid_coordinate, FilterRegime, FloorPruneSpec, Mask, PatienceSpec, PatienceWindow,
-    QualityContract, ScoreDirection, VectorBackendConfig, VectorBackendDescriptor,
+    first_invalid_coordinate, FilterRegime, FilterRouting, FloorPruneSpec, Mask, PatienceSpec,
+    PatienceWindow, QualityContract, ScoreDirection, VectorBackendConfig, VectorBackendDescriptor,
     VectorCapability, VectorError, VectorIndex, VectorProvider, VectorSearchOptions,
     VectorSearchResults, VectorStreamBatch, VectorStreamControl, VectorStreamEndReason,
     VectorStreamSummary,
 };
 
 use distance::prefetch;
-use graph::{with_scratch, Filter, FloorHook, FloorPrune, Hook, Patience, Scored, Store, Walk};
+use graph::{
+    with_scratch, Filter, FloorHook, FloorPrune, Hook, Patience, Route, Scored, Store, Walk,
+};
 
 /// Stable identifier of the backend, as `vector_backend` names it.
 pub const HNSW: &str = "hnsw";
@@ -91,12 +93,27 @@ const STREAM_FIRST_FLUSH_ROWS: usize = 8;
 /// Rows the enumerate regime streams between polls of the control.
 const STREAM_POLL_ROWS: usize = 16;
 /// Enumerate wins while the allowed rows cost less to score in row order
-/// than a walk costs. A walk scores on the order of `ef · m0` rows, each
-/// behind a cache miss; a row scored in mask order costs a fraction of
-/// that. The factor is the measured ratio on the challenge fixture
-/// (`docs/hnsw.md`, "Filters"); a dense execution policy will carry the
-/// thresholds measured per host class (#55).
+/// than a walk costs. A filter-aware walk scores on the order of `ef · m0`
+/// rows, each behind a cache miss, and bridges through the disallowed ones;
+/// a row scored in mask order costs a fraction of that. The factor is the
+/// measured ratio on the challenge fixture (`docs/hnsw.md`, "Filters"); a
+/// dense execution policy will carry the thresholds measured per host
+/// class (#55).
 const ENUMERATE_ROWS_PER_WALK_ROW: usize = 4;
+/// A plain walk does not bridge: on the challenge fixture (M = 16, d = 64)
+/// it costs about `1.2 · ef · m0` mask-ordered rows (near-10 at ef 96:
+/// 106 µs walking plain, 295 µs enumerating its 10,252 allowed rows). Up to
+/// `ef · m0` allowed rows enumerate before the far probe runs; above that
+/// the probe decides (`ENUMERATE_ROWS_PER_WALK_ROW`, `PLAIN_LOCAL_SHARE`).
+const ENUMERATE_ROWS_PER_PLAIN_ROW: usize = 1;
+/// The far probe walks plain when at least this share of the rows around
+/// the query is allowed. Measured on the challenge fixture with pinned
+/// regimes (uncorrelated masks, M = 16): the filter-aware walk wins at a
+/// 10% share (1.4x at k = 10, 1.08x at k = 100), plain wins from 20% at
+/// k = 100 (1.4x at 20%, 1.8x at 30%, 2.15x at 50%) and is level at k = 10.
+/// A mask gathered around the query (near-10, near-50) is mostly allowed
+/// locally whatever its global share, and plain wins there too.
+const PLAIN_LOCAL_SHARE: f64 = 0.2;
 /// Measured mask-order `enumerate` rows per layer-0 walk work unit
 /// (`layer0_scored + bridges`, `docs/hnsw.md`, "Filters"): across
 /// AVX2/AVX-512F and NEON (`d = 64` and `d = 256`), one random walk or bridge
@@ -134,9 +151,9 @@ struct Plan<'a> {
     allow: Option<Mask<'a>>,
     /// Rows the mask allows.
     allowed: usize,
-    /// The provider chose the regime, so a filter-aware walk may hand the
-    /// query to enumerate; a pinned regime runs as pinned.
-    adaptive: bool,
+    /// The provider chose the regime, so the far probe routes a filter-aware
+    /// plan to plain or enumerate; a pinned regime runs as pinned (`None`).
+    route: Option<Route>,
     /// Work-unit cap before a filter-aware walk hands the remaining allowed
     /// rows to enumerate (`None` when pinned).
     budget: Option<u64>,
@@ -150,7 +167,7 @@ impl Plan<'_> {
         regime: None,
         allow: None,
         allowed: 0,
-        adaptive: false,
+        route: None,
         budget: None,
         patience: PatienceSpec::OFF,
         floor_prune_gate: None,
@@ -161,7 +178,7 @@ impl Plan<'_> {
             (Some(FilterRegime::FilterAware), Some(allow)) => Filter::Aware {
                 allow,
                 allowed: self.allowed,
-                adaptive: self.adaptive,
+                route: self.route,
                 budget: self.budget,
             },
             (Some(FilterRegime::Plain), Some(allow)) => Filter::Plain(allow),
@@ -624,16 +641,18 @@ impl HnswIndex {
     /// the caller pinned, or the one the mask's cardinality calls for.
     ///
     /// - no mask, or a mask that allows every row: an unfiltered walk;
-    /// - at most the enumerate threshold of allowed rows: enumerate. The
-    ///   threshold is the request's (`enumerate_max_rows`, which a dense
-    ///   execution policy point carries from its measurement) or, without
-    ///   one, `ENUMERATE_ROWS_PER_WALK_ROW · ef · m0`;
-    /// - otherwise the filter-aware walk, which hands a query whose
-    ///   neighborhood the mask leaves empty to enumerate (`graph::Walk`).
-    ///
-    /// The plain walk is never chosen: at every measured selectivity the
-    /// filter-aware walk reaches the same recall for less work
-    /// (`docs/hnsw.md`, "Filters"). It stays pinnable for measurement.
+    /// - at most the enumerate threshold under `FilterRouting::Exact` or a
+    ///   request's `enumerate_max_rows` (which a dense execution policy
+    ///   point carries from its measurement), and otherwise at most
+    ///   `ENUMERATE_ROWS_PER_PLAIN_ROW · ef · m0` allowed rows: enumerate.
+    ///   The enumerate threshold is the request's `enumerate_max_rows` or,
+    ///   without one, `ENUMERATE_ROWS_PER_WALK_ROW · ef · m0`;
+    /// - otherwise a routed walk: the far probe samples the rows around
+    ///   where the descent landed and walks plain when at least
+    ///   `PLAIN_LOCAL_SHARE` of them are allowed, enumerates when the
+    ///   neighborhood is all but empty of allowed rows or the mask allows at
+    ///   most the enumerate threshold, and otherwise walks filter-aware,
+    ///   which may still hand the query to enumerate (`graph::Walk`).
     fn check_patience(patience: Option<PatienceSpec>) -> Result<PatienceSpec, VectorError> {
         let Some(spec) = patience else {
             return Ok(PatienceSpec::OFF);
@@ -717,6 +736,7 @@ impl HnswIndex {
         let walk_units = ef * self.m0();
         let default_threshold = ENUMERATE_ROWS_PER_WALK_ROW * walk_units;
         let mut budget = None;
+        let mut route = None;
         let regime = match options.filter_regime {
             Some(regime) => regime,
             None if allowed == allow.len() => {
@@ -735,9 +755,23 @@ impl HnswIndex {
             }
             None => {
                 let threshold = options.enumerate_max_rows.unwrap_or(default_threshold);
-                if allowed <= threshold {
+                // A policy point's threshold was measured as the line below
+                // which it enumerates, and is served as measured, as is the
+                // threshold under exact routing; otherwise only a mask
+                // cheaper than a plain walk enumerates before the probe
+                // looks.
+                let outright = match (options.enumerate_max_rows, options.filter_routing) {
+                    (Some(rows), _) => rows,
+                    (None, FilterRouting::Exact) => threshold,
+                    (None, FilterRouting::Speed) => ENUMERATE_ROWS_PER_PLAIN_ROW * walk_units,
+                };
+                if allowed <= outright {
                     FilterRegime::Enumerate
                 } else {
+                    route = Some(Route {
+                        plain_share: PLAIN_LOCAL_SHARE,
+                        enumerate_rows: threshold,
+                    });
                     if threshold > 0 && default_threshold > 0 {
                         // Scale the measured enumerate-rows-per-walk-unit
                         // ratio by the policy's `enumerate_max_rows`, bounded
@@ -761,7 +795,7 @@ impl HnswIndex {
             regime: Some(regime),
             allow: Some(allow),
             allowed,
-            adaptive: options.filter_regime.is_none(),
+            route,
             budget,
             patience,
             floor_prune_gate,
@@ -926,10 +960,15 @@ impl HnswIndex {
         }
         let n2r = self.node_to_row_slice();
         let hits = self.with_row_source(|rows| Self::report(hits, query, rows, floor, k, n2r));
+        let regime = if scratch.walked_plain() {
+            Some(FilterRegime::Plain)
+        } else {
+            plan.regime
+        };
         (
             hits,
             Answer {
-                regime: plan.regime,
+                regime,
                 stats,
                 budget_handoff: false,
                 patience_stopped: walk == Walk::Patience,
@@ -1583,6 +1622,9 @@ impl VectorProvider for HnswIndex {
                                     (walked + rows, done, VectorStreamEndReason::Exhausted)
                                 }
                                 (walk, _) => {
+                                    if scratch.walked_plain() {
+                                        answered = Some(FilterRegime::Plain);
+                                    }
                                     if walk == Walk::Patience {
                                         patience_stopped = patience_stopped.saturating_add(1);
                                     }

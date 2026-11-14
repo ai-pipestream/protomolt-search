@@ -1,0 +1,11 @@
+perf (cpu-clock sampling, 2 kHz, call graphs) of `run --engines=hnsw --m=16
+--ef-construction=200 --k=10 --ef=64 --filters=none --min-time-ms=20000
+--threads=1`, self time by symbol. Build is included (insert/select ~3%).
+
+35.5%  hnsw::graph::View<[AtomicU32]>::search_layer   (beam loop: visited set, heap pushes, prefetch, bookkeeping)
+35.4%  hnsw::distance::x86::dot_avx512f               (one call per scored row, d=64)
+11.3%  hnsw::graph::View<[AtomicU32]>::copy_links     (reads a node's layer-0 list: the adjacency cache miss)
+ 7.5%  BinaryHeap<Scored>::pop (result 5.6% + candidate 1.9%)
+ 3.2%  HnswIndex::report (scalar rescore + collect of the k results)
+ 1.5%  Scratch::drain_results sort
+ 2.9%  build (insert, select, greedy)
