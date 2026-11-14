@@ -60,11 +60,15 @@ pub(crate) fn export_declaration(payload: &Path) -> io::Result<Option<Vec<u8>>> 
     Ok(Some(bytes))
 }
 
-pub(crate) fn require_declaration(payload: &Path, live: &crate::live_docs::LiveDocs) -> io::Result<()> {
+pub(crate) fn open_generation(payload: &Path, physical_rows: u64, live: &crate::live_docs::LiveDocs) -> io::Result<MultiResVectors> {
     if live.requires_retained_vectors() && !declaration_path(payload).try_exists()? {
         return Err(invalid("live generation requires a retained vector declaration"));
     }
-    Ok(())
+    let rows = open(payload, physical_rows)?;
+    if !rows.is_empty() && !live.requires_retained_vectors() {
+        return Err(invalid("retained vector generation requires its live-doc reader gate"));
+    }
+    Ok(rows)
 }
 
 pub(crate) fn open(payload: &Path, physical_rows: u64) -> io::Result<MultiResVectors> {
