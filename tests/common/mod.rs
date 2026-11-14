@@ -26,7 +26,7 @@ pub fn protobuf_source(text: &str, key: &str) -> pipestream_search::pb::Protobuf
 
 use pipestream_search::harness::{self, build_monolithic, build_shards};
 use pipestream_search::node::NodeConfig;
-use pipestream_search::vector::VectorIndex;
+use pipestream_search::vector::{VectorIndex, EMBEDDED_TURBOVEC};
 use tokio::task::JoinHandle;
 use tonic::transport::Error as TransportError;
 
@@ -42,7 +42,7 @@ pub const BIT_WIDTH: usize = 4;
 /// re-sorted into the coordinator's total order (score desc, id asc) so the
 /// comparison is exact, tie-break included.
 ///
-/// The reference must be exhaustive. From 32,768 rows turbovec lays a 4-bit
+/// The TurboVec reference must be exhaustive. From 32,768 rows turbovec lays a 4-bit
 /// index out in bit planes and answers a small-k search in stages: a
 /// shortlist ranked on the high planes, then an exact rescore of only that
 /// shortlist (`PLANES_MIN_VECTORS`, `planes_shortlist_len`). That is
@@ -50,8 +50,15 @@ pub const BIT_WIDTH: usize = 4;
 /// can miss rows the shards' exhaustive scans find. Asking for every row
 /// makes the shortlist the whole index, so every row gets the exact
 /// rescore, and the best `k` of those is the exact top-k.
+/// ANN references keep the caller's k: changing candidate depth can change
+/// their answer, so lifecycle comparisons must run the same graph traversal.
 pub fn monolithic_topk(index: &VectorIndex, query: &[f32], k: usize) -> Vec<(u64, u32)> {
-    let results = index.search_unfiltered(query, index.len().max(k));
+    let depth = if index.descriptor().backend_kind == EMBEDDED_TURBOVEC {
+        index.len().max(k)
+    } else {
+        k
+    };
+    let results = index.search_unfiltered(query, depth);
     let mut hits: Vec<(u64, u32)> = results
         .indices_for_query(0)
         .iter()

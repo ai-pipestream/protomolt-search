@@ -32,8 +32,11 @@ impl ShardVectorRowProbe {
     }
 
     pub(crate) async fn shutdown(&mut self) {
-        self.tasks.shutdown().await;
-        self.observed.clear();
+        // JoinSet::shutdown discards successful outputs too. Abort unfinished
+        // RPCs, then collect ready results and publish all observations through
+        // the same path as a completed wait before releasing the request.
+        self.tasks.abort_all();
+        self.wait().await;
     }
 }
 
@@ -109,9 +112,11 @@ mod tests {
         .await
         .expect("successful probe must become observable");
         assert_eq!(probe.observed.len(), 1);
-        // Finish the pending task without dropping the accumulated successful observation.
-        probe.tasks.abort_all();
-        probe.wait().await;
+        probe.shutdown().await;
+        assert!(
+            probe.tasks.is_empty(),
+            "shutdown must drain every owned task"
+        );
         assert_eq!(
             coordinator.shard_vector_rows.lock().unwrap()["http://127.0.0.1:1"],
             42
@@ -121,5 +126,47 @@ mod tests {
             cached.tasks.is_empty(),
             "positive cached rows must skip new RPCs"
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_caches_completed_results_that_wait_has_not_consumed() {
+        let coordinator = CoordinatorServiceImpl::new(vec!["http://127.0.0.1:1".into()]);
+        let mut probe = ShardVectorRowProbe {
+            tasks: JoinSet::new(),
+            observed: Vec::new(),
+            cache: Arc::clone(&coordinator.shard_vector_rows),
+        };
+        let completed = probe.tasks.spawn(async {
+            Some((
+                "http://127.0.0.1:1".into(),
+                crate::pb::GetVectorBackendResponse {
+                    descriptor: Some(Default::default()),
+                    num_vectors: 42,
+                    ..Default::default()
+                },
+            ))
+        });
+        probe.tasks.spawn(std::future::pending());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !completed.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("successful RPC must complete before shutdown");
+        assert!(
+            probe.observed.is_empty(),
+            "wait has not consumed the queued result"
+        );
+        probe.shutdown().await;
+        assert!(
+            probe.tasks.is_empty(),
+            "pending RPC must be aborted and drained"
+        );
+        assert_eq!(
+            coordinator.shard_vector_rows.lock().unwrap()["http://127.0.0.1:1"],
+            42
+        );
+        assert!(coordinator.shard_vector_row_probe().tasks.is_empty());
     }
 }
