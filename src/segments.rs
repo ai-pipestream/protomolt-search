@@ -496,6 +496,9 @@ impl OpenedSegmentSet {
                     verify_artifact(&directory, &metadata.live_docs)?;
                     let live_docs = LiveDocs::open(&directory.join(&metadata.live_docs.file))
                         .map_err(|error| format!("open retired segment bitmap: {error}"))?;
+                    if live_docs.requires_retained_vectors() && metadata.multi_res.is_none() {
+                        return Err(format!("segment {:?} requires a retained vector artifact", metadata.segment_id));
+                    }
                     if live_docs.persisted_rows() != metadata.rows
                         || metadata.rows.checked_sub(live_docs.deleted_count())
                             != Some(metadata.live_rows)
@@ -2230,6 +2233,7 @@ pub(crate) fn summarize_columns(bm25: &Bm25Reader, rows: u32) -> SegmentSummary 
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod retained_tests;
 
     #[test]
     fn source_owner_metadata_rejects_downgrade_corruption_and_noncanonical_protobuf() {
