@@ -2406,10 +2406,9 @@ message ParentGroup {
   repeated ScoredHit chunks = 2;
 }
 
-// Passthrough for the analysis sidecar's pipeline options (vendored proto
-// ai.pipestream.opennlp.analysis.v1). Values are the NUMERIC values of the
-// sidecar's enums; 0 always means "sidecar default". Mirroring the enums
-// here would just duplicate the vendored definitions.
+// Stable numeric analysis options interpreted by the turbo-client adapter.
+// Existing values retain their historical meaning; 0 selects the backend
+// default. Ingest and query must use compatible options.
 message AnalysisSpec {
   // AnalysisOptions.Tokenizer value (1 = WHITESPACE, 2 = SIMPLE,
   // 3 = UAX29).
@@ -2426,9 +2425,8 @@ message AnalysisSpec {
   // Character filters applied before tokenization, in order, defining
   // term identity (IGNORED when source is STEMS; applied before the
   // stemmer under NORMALIZED_STEMS). "Char filter" is
-  // Lucene's name for this stage and OpenNLP implements them as
-  // CharSequenceNormalizer; the sidecar's wire enum spells them
-  // TermVectorOptions.NormalizerStep, whose values these are.
+  // Lucene's name for this stage. Numeric normalizer-step values retain
+  // their existing meaning in the turbo-client adapter.
   repeated int32 char_filters = 5;
 }
 
@@ -4072,6 +4070,8 @@ message StoredDocument {
   optional DocLineage lineage = 3;
   // Present only for rows explicitly bound to a logical source version.
   DocumentIdentity identity = 4;
+  // Stored body sentence boundaries in original-text UTF-8 byte offsets.
+  repeated OffsetSpan sentence_spans = 5;
 }
 
 // Stored documents, in request order, omitting unknown ids.

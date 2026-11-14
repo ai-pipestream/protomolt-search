@@ -104,8 +104,8 @@ listener.
 A one-command installer that syncs real data and exercises the whole stack:
 CourtListener bulk opinions (public S3) → [rustfs](https://rustfs.com)
 object store → Rust extraction → chunk + static-embedding via the
-[grpc-opennlp-analysis](https://github.com/ai-pipestream/grpc-opennlp-analysis)
-sidecar (GraalVM native, Model2Vec table) → a 4-shard pipestream-search
+[turbo-kserve](https://github.com/ai-pipestream/turboembed)
+(Rust, Model2Vec bundle) → a 4-shard pipestream-search
 cluster → an automated search-verification gate. No Python anywhere.
 
 ```bash

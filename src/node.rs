@@ -6177,21 +6177,6 @@ impl NodeServiceImpl {
         })
     }
 
-    /// Stored body sentence spans `(start_utf8, end_utf8)` for `global_id` on
-    /// this shard when live and present.
-    pub(crate) fn doc_sentence_spans(&self, global_id: u64) -> Option<Vec<(u32, u32)>> {
-        if global_id < self.config.slot_offset {
-            return None;
-        }
-        let local = u32::try_from(global_id - self.config.slot_offset).ok()?;
-        let guard = read_shard(&self.state);
-        if guard.live_docs.is_deleted(local as usize) {
-            return None;
-        }
-        let store = guard.bm25.as_ref()?.as_index()?;
-        store.doc_sentences(local)
-    }
-
     /// Returns the retained [`crate::turbo_bridge::MultiResVectorOutput`] for `local_slot`.
     pub fn multi_res_row(
         &self,
@@ -16107,6 +16092,12 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
                         documents.push(StoredDocument {
                             doc_id: id,
                             identity: source_metadata.document_identity(local),
+                            sentence_spans: store
+                                .doc_sentences(local)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|(start, end)| crate::pb::OffsetSpan { start, end })
+                                .collect(),
                             text,
                             lineage: store.lineage(local).map(|l| crate::pb::DocLineage {
                                 parent_id: l.parent_id,

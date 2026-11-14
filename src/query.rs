@@ -2134,7 +2134,7 @@ async fn apply_turbo_rerank(
             HashMap::new()
         } else {
             coordinator
-                .fetch_rerank_candidates(&missing_pairs)
+                .fetch_rerank_candidates_with_deadline(&missing_pairs, finish_deadline_us)
                 .await?
                 .into_iter()
                 .map(|c| (c.doc_id, c))

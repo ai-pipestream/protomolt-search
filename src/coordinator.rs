@@ -1,6 +1,7 @@
 //! Coordinator side: client-facing [`SearchService`] that fans queries out
 //! to shard nodes, aggregates their floors mid-scan, and merges results.
 
+mod rerank_candidates;
 mod vector_rows;
 pub(crate) use vector_rows::ShardVectorRowProbe;
 
@@ -3259,67 +3260,6 @@ impl CoordinatorServiceImpl {
         }
         known.refuse_unknown(&filters)?;
         Ok(merged)
-    }
-
-    /// Fetch stored text, optional sentence spans, and `DocLineage.span_start`
-    /// for a Stage-1 shortlist in shortlist order.
-    pub async fn fetch_rerank_candidates(
-        &self,
-        hit_scores: &[(u64, f64)],
-    ) -> Result<Vec<crate::turbo_bridge::rerank::RerankCandidate>, Status> {
-        #[derive(Default)]
-        struct FetchedRerankDoc {
-            text: String,
-            sentence_spans: Vec<(u32, u32)>,
-            lineage_span_start: u32,
-        }
-
-        if hit_scores.is_empty() {
-            return Ok(Vec::new());
-        }
-        let ids: Vec<u64> = hit_scores.iter().map(|&(id, _)| id).collect();
-        let mut docs_by_id: HashMap<u64, FetchedRerankDoc> = HashMap::with_capacity(ids.len());
-        for addr in &self.node_addrs {
-            let mut client = self.node_client(addr)?;
-            let local_node = match &client {
-                crate::link::NodeLink::Local(node) => Some(Arc::clone(node)),
-                #[cfg(feature = "net")]
-                crate::link::NodeLink::Remote(_) => None,
-            };
-            let resp = client
-                .get_documents(crate::pb::GetDocumentsRequest {
-                    doc_ids: ids.clone(),
-                })
-                .await?
-                .into_inner();
-            for doc in resp.documents {
-                let sentence_spans = local_node
-                    .as_ref()
-                    .and_then(|n| n.doc_sentence_spans(doc.doc_id))
-                    .unwrap_or_default();
-                let lineage_span_start = doc.lineage.map_or(0, |l| l.span_start);
-                docs_by_id.insert(
-                    doc.doc_id,
-                    FetchedRerankDoc {
-                        text: doc.text,
-                        sentence_spans,
-                        lineage_span_start,
-                    },
-                );
-            }
-        }
-        let mut out = Vec::with_capacity(hit_scores.len());
-        for &(doc_id, prior_score) in hit_scores {
-            let fetched = docs_by_id.remove(&doc_id).unwrap_or_default();
-            out.push(crate::turbo_bridge::rerank::RerankCandidate {
-                doc_id,
-                prior_score,
-                text: fetched.text,
-                sentence_spans: fetched.sentence_spans,
-                lineage_span_start: fetched.lineage_span_start,
-            });
-        }
-        Ok(out)
     }
 
     /// Expand one field's analyzed query terms under the table (unless
