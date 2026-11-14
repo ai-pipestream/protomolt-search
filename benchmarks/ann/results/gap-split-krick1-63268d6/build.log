@@ -1,0 +1,286 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.27
+   Compiling quote v1.0.47
+   Compiling libc v0.2.191
+   Compiling cfg-if v1.0.5
+   Compiling autocfg v1.5.1
+   Compiling libm v0.2.16
+   Compiling num-traits v0.2.19
+   Compiling anyhow v1.0.104
+   Compiling syn v3.0.9
+   Compiling syn v2.0.119
+   Compiling bytes v1.12.1
+   Compiling find-msvc-tools v0.1.15
+   Compiling shlex v2.0.1
+   Compiling zerocopy v0.8.63
+   Compiling cc v1.10.0
+   Compiling getrandom v0.2.17
+   Compiling stable_deref_trait v1.2.1
+   Compiling hashbrown v0.17.1
+   Compiling synstructure v0.14.0
+   Compiling equivalent v1.0.3
+   Compiling either v1.19.0
+   Compiling itertools v0.14.0
+   Compiling indexmap v2.14.2
+   Compiling zerocopy-derive v0.8.63
+   Compiling zerofrom-derive v0.1.8
+   Compiling yoke-derive v0.8.4
+   Compiling crossbeam-utils v0.8.23
+   Compiling memchr v2.8.3
+   Compiling zerofrom v0.1.8
+   Compiling prost-derive v0.14.4
+   Compiling yoke v0.8.4
+   Compiling zerovec-derive v0.11.7
+   Compiling bytemuck_derive v1.12.1
+   Compiling once_cell v1.21.4
+   Compiling serde_core v1.0.229
+   Compiling zerovec v0.11.9
+   Compiling bytemuck v1.25.2
+   Compiling displaydoc v0.2.7
+   Compiling rand_core v0.6.4
+   Compiling num-integer v0.1.47
+   Compiling paste v1.0.15
+   Compiling pin-project-lite v0.2.17
+   Compiling writeable v0.6.4
+   Compiling crossbeam-epoch v0.9.21
+   Compiling smallvec v1.16.4
+   Compiling bitflags v2.13.2
+   Compiling heck v0.5.0
+   Compiling version_check v0.9.5
+   Compiling num-bigint v0.4.8
+   Compiling ppv-lite86 v0.2.21
+   Compiling aho-corasick v1.1.5
+   Compiling num-complex v0.4.6
+   Compiling getrandom v0.4.3
+   Compiling utf_types v1.0.0
+   Compiling crossbeam-deque v0.8.8
+   Compiling pulldown-cmark v0.13.6
+   Compiling prettyplease v0.2.37
+   Compiling rustix v1.1.6
+   Compiling num-rational v0.4.2
+   Compiling rand_chacha v0.3.1
+   Compiling tinystr v0.8.5
+   Compiling rayon-core v1.13.0
+   Compiling foldhash v0.1.5
+   Compiling litemap v0.8.3
+   Compiling regex-syntax v0.8.11
+   Compiling itoa v1.0.18
+   Compiling linux-raw-sys v0.12.1
+   Compiling unicase v2.10.0
+   Compiling regex-automata v0.4.18
+   Compiling icu_locale_core v2.4.0
+   Compiling prost v0.14.4
+   Compiling hashbrown v0.15.5
+   Compiling rand v0.8.8
+   Compiling utf8_iter v1.1.0
+   Compiling potential_utf v0.1.6
+   Compiling zerotrie v0.2.5
+   Compiling safe_arch v0.7.4
+   Compiling tokio-macros v2.7.2
+   Compiling link-cplusplus v1.0.12
+   Compiling matrixmultiply v0.3.11
+   Compiling parking_lot_core v0.9.12
+   Compiling futures-core v0.3.34
+   Compiling icu_properties_data v2.4.0
+   Compiling fastrand v2.5.0
+   Compiling fixedbitset v0.5.7
+   Compiling scratch v1.0.9
+   Compiling serde v1.0.229
+   Compiling tempfile v3.27.0
+   Compiling petgraph v0.8.3
+   Compiling tokio v1.54.1
+   Compiling wide v0.7.33
+   Compiling icu_provider v2.4.0
+   Compiling icu_collections v2.4.0
+   Compiling prost-types v0.14.4
+   Compiling regex v1.13.1
+   Compiling pulldown-cmark-to-cmark v22.0.3
+   Compiling http v1.5.0
+   Compiling tracing-core v0.1.36
+   Compiling async-trait v0.1.92
+   Compiling serde_derive v1.0.229
+   Compiling tracing-attributes v0.1.31
+   Compiling approx v0.5.1
+   Compiling cfg_aliases v0.2.2
+   Compiling futures-sink v0.3.34
+   Compiling log v0.4.35
+   Compiling termcolor v1.4.1
+   Compiling rand_core v0.10.1
+   Compiling rawpointer v0.2.1
+   Compiling utf8parse v0.2.2
+   Compiling scopeguard v1.2.0
+   Compiling cxxbridge-flags v1.0.205
+   Compiling icu_casemap_data v2.4.0
+   Compiling multimap v0.10.1
+   Compiling icu_normalizer_data v2.4.0
+   Compiling thiserror v2.0.21
+   Compiling unicode-width v0.2.3
+   Compiling thiserror v1.0.69
+   Compiling codespan-reporting v0.13.1
+   Compiling prost-build v0.14.4
+   Compiling rayon v1.12.0
+   Compiling cxx v1.0.205
+   Compiling lock_api v0.4.14
+   Compiling anstyle-parse v1.0.0
+   Compiling tracing v0.1.44
+   Compiling tokio-util v0.7.20
+   Compiling nix v0.30.1
+   Compiling simba v0.8.1
+   Compiling http-body v1.1.0
+   Compiling rand_distr v0.4.3
+   Compiling tonic-build v0.14.9
+   Compiling ahash v0.7.8
+   Compiling thiserror-impl v2.0.21
+   Compiling thiserror-impl v1.0.69
+   Compiling pin-project-internal v1.1.13
+   Compiling nalgebra-macros v0.2.2
+   Compiling numkong v7.8.7
+   Compiling typenum v1.20.1
+   Compiling colorchoice v1.0.5
+   Compiling getrandom v0.3.4
+   Compiling doc-comment v0.3.4
+   Compiling anstyle v1.0.14
+   Compiling zmij v1.0.23
+   Compiling anstyle-query v1.1.5
+   Compiling rustversion v1.0.23
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling jiff-core v0.1.1
+   Compiling same-file v1.0.6
+   Compiling env_filter v2.0.0
+   Compiling walkdir v2.5.0
+   Compiling nalgebra v0.32.6
+   Compiling jiff v0.2.38
+   Compiling anstream v1.0.0
+   Compiling pin-project v1.1.13
+   Compiling tonic-prost-build v0.14.9
+   Compiling cxx-build v1.0.205
+   Compiling icu_properties v2.4.0
+   Compiling http-body-util v0.1.5
+   Compiling tokio-stream v0.1.19
+   Compiling utf16_iter v1.1.0
+   Compiling ahash v0.8.12
+   Compiling enum-as-inner v0.6.1
+   Compiling num-iter v0.1.46
+   Compiling ordered-float v4.6.0
+   Compiling tower-service v0.3.3
+   Compiling cpufeatures v0.3.1
+   Compiling percent-encoding v2.3.2
+   Compiling crc32fast v1.5.3
+   Compiling base64 v0.22.1
+   Compiling winnow v1.0.4
+   Compiling redb v4.4.0
+   Compiling sync_wrapper v1.0.2
+   Compiling tower-layer v0.3.3
+   Compiling write16 v1.0.0
+   Compiling serde_json v1.0.154
+   Compiling byteorder v1.5.0
+   Compiling sysctl v0.6.0
+   Compiling icu_normalizer v2.4.0
+   Compiling tonic v0.14.9
+   Compiling toml_parser v1.1.5+spec-1.1.0
+   Compiling chacha20 v0.10.2
+   Compiling num v0.4.3
+   Compiling icu_casemap v2.4.0
+   Compiling statrs v0.17.1
+   Compiling usearch v2.26.6
+   Compiling env_logger v0.11.11
+   Compiling pipestream-search v0.1.0 (/work/worktrees/psearch-wt-speed107)
+   Compiling parking_lot v0.12.5
+   Compiling serde_spanned v1.1.2
+   Compiling toml_datetime v1.1.2+spec-1.1.0
+   Compiling simdeez v3.0.1
+   Compiling half v2.7.1
+   Compiling combine v4.6.9
+   Compiling cxxbridge-macro v1.0.205
+   Compiling num_cpus v1.17.0
+   Compiling memmap2 v0.9.12
+   Compiling cpu-time v1.0.0
+   Compiling lazy_static v1.5.1
+   Compiling foldhash v0.2.0
+   Compiling simd-adler32 v0.3.10
+   Compiling hashbrown v0.14.5
+   Compiling unicode-segmentation v1.13.3
+   Compiling toml_writer v1.1.3+spec-1.1.0
+   Compiling allocator-api2 v0.2.21
+   Compiling adler2 v2.0.1
+   Compiling miniz_oxide v0.9.1
+   Compiling protomolt-analyzer v0.1.0 (/work/worktrees/psearch-wt-speed107/crates/protomolt-analyzer)
+   Compiling dashmap v6.2.1
+   Compiling toml v1.1.8+spec-1.1.0
+   Compiling mmap-rs v0.7.0
+   Compiling anndists v0.1.5
+   Compiling turbovec v1.1.2 (https://github.com/ai-pipestream/turbovec.git?branch=main#e518ff4c)
+   Compiling corenn-kernels v0.1.1
+   Compiling prost-reflect v0.16.5
+   Compiling arc-swap v1.9.3
+   Compiling space v0.17.0
+   Compiling hashbrown v0.11.2
+   Compiling off64 v0.9.0
+   Compiling rand v0.10.3
+   Compiling tonic-prost v0.14.9
+   Compiling bincode v1.3.3
+   Compiling hnswlib-rs v0.10.0
+   Compiling flate2 v1.1.10
+   Compiling hnsw_rs v0.3.5
+   Compiling hnsw v0.11.0
+   Compiling rand_pcg v0.3.1
+warning: method `udp_key` is never used
+    --> /work/worktrees/psearch-wt-speed107/src/coordinator.rs:3653:19
+     |
+2037 | impl CoordinatorServiceImpl {
+     | --------------------------- method in this implementation
+...
+3653 |     pub(crate) fn udp_key(&self) -> Option<&crate::security::UdpKey> {
+     |                   ^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: enum `Settled` is never used
+  --> /work/worktrees/psearch-wt-speed107/src/document_catalog/outcome.rs:16:17
+   |
+16 | pub(crate) enum Settled {
+   |                 ^^^^^^^
+
+warning: methods `mark_unconfirmed`, `settle_outcome`, `recorded_operation`, and `move_outcome` are never used
+  --> /work/worktrees/psearch-wt-speed107/src/document_catalog/outcome.rs:29:19
+   |
+23 | impl DocumentCatalog {
+   | -------------------- methods in this implementation
+...
+29 |     pub(crate) fn mark_unconfirmed(
+   |                   ^^^^^^^^^^^^^^^^
+...
+44 |     pub(crate) fn settle_outcome(
+   |                   ^^^^^^^^^^^^^^
+...
+64 |     pub(crate) fn recorded_operation(
+   |                   ^^^^^^^^^^^^^^^^^^
+...
+81 |     fn move_outcome(
+   |        ^^^^^^^^^^^^
+
+warning: field `last_seq` is never read
+   --> /work/worktrees/psearch-wt-speed107/src/relay.rs:134:5
+    |
+126 | struct RelaySignals {
+    |        ------------ field in this struct
+...
+134 |     last_seq: AtomicU32,
+    |     ^^^^^^^^
+
+warning: method `accept_seq` is never used
+   --> /work/worktrees/psearch-wt-speed107/src/relay.rs:185:8
+    |
+137 | impl RelaySignals {
+    | ----------------- method in this implementation
+...
+185 |     fn accept_seq(&self, seq: u32) -> bool {
+    |        ^^^^^^^^^^
+
+warning: `pipestream-search` (lib) generated 5 warnings
+   Compiling protomolt-ann-bench v0.1.0 (/work/worktrees/psearch-wt-speed107/benchmarks/ann)
+    Finished `release` profile [optimized + debuginfo] target(s) in 2m 09s
+
+real	2m9.211s
+user	7m30.849s
+sys	0m16.588s

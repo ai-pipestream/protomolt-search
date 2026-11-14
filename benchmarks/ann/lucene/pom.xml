@@ -3,8 +3,9 @@
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
-  <!-- Dev tooling for the #53 ANN gate: stock Lucene HNSW over the shared
-       fixture directory. Never a product dependency. -->
+  <!-- Dev tooling for the #53 ANN gate: Lucene HNSW (stock, or another
+       locally installed build) over the shared fixture directory. Never a
+       product dependency. -->
   <groupId>ai.pipestream</groupId>
   <artifactId>protomolt-ann-bench-lucene</artifactId>
   <version>0.1.0</version>
@@ -13,9 +14,15 @@
   <properties>
     <maven.compiler.release>21</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <!-- Override with -Dlucene.version=... to run a sandbox build, e.g. the
-         collaborative-floor branch of apache/lucene#16958 installed locally. -->
-    <lucene.version>10.6.0</lucene.version>
+    <!-- The stock Lucene release the harness measures as lucene-hnsw. -->
+    <lucene.stock.version>10.6.0</lucene.stock.version>
+    <!-- Override with -Dlucene.version=... to run another locally installed
+         build, such as the shared-floor code of apache/lucene PR #16357 (for
+         apache/lucene issue #16958), and name it with -Dlucene.engine=...,
+         such as lucene-hnsw-16357. The runner refuses a non-stock version
+         under the stock name and the stock version under another name. -->
+    <lucene.version>${lucene.stock.version}</lucene.version>
+    <lucene.engine>lucene-hnsw</lucene.engine>
   </properties>
 
   <dependencies>
@@ -32,6 +39,12 @@
   </dependencies>
 
   <build>
+    <resources>
+      <resource>
+        <directory>src/main/resources</directory>
+        <filtering>true</filtering>
+      </resource>
+    </resources>
     <plugins>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>

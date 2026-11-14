@@ -247,22 +247,33 @@ regime ran (`hnsw::Answer`).
   the exact top `k` of the mask. The traversal kernel scores them all; the
   scalar scorer then settles every row the kernel cannot rule out (a row
   whose kernel score plus its error bound is below the k-th largest score
-  minus its bound cannot be in the top `k`). Chosen when the mask allows at
-  most the enumerate threshold: the request's `enumerate_max_rows` when a
-  dense execution policy point carries one ("Through the product"), else
-  `ENUMERATE_ROWS_PER_WALK_ROW · ef · 2M` rows, which is fewer rows than a
-  walk would score, read in order instead of behind a cache miss each.
+  minus its bound cannot be in the top `k`). Chosen outright when the mask
+  allows at most the request's `enumerate_max_rows`, which a dense execution
+  policy point carries from its measurement ("Through the product"). Without
+  one it is chosen outright up to `ENUMERATE_ROWS_PER_PLAIN_ROW · ef · 2M`
+  rows, fewer rows than even a plain walk scores (about `1.2 · ef · 2M` on
+  the challenge fixture), and up to `ENUMERATE_ROWS_PER_WALK_ROW · ef · 2M`
+  rows when the far probe finds the rows around the query too thinly
+  allowed for the plain walk: fewer rows than a bridging walk would score,
+  read in order instead of behind a cache miss each.
 - **Filter-aware walk.** The layer-0 beam scores allowed rows only, and
   only they enter the candidate and result heaps. A disallowed neighbor is
   a bridge: it is not scored, its own allowed neighbors are scored in its
   place, until the expansion has scored one neighbor list (`2M` rows). This
   is the predicate-subgraph idea of ACORN-1 (Patel et al.,
-  arXiv:2403.04871) on an unmodified graph. Chosen for every larger mask.
+  arXiv:2403.04871) on an unmodified graph. Chosen for a larger mask whose
+  rows around the query are less than `PLAIN_LOCAL_SHARE` (20%) allowed.
 - **Plain walk.** The unfiltered walk with the mask gating results:
-  disallowed rows are scored and routed through. The provider never chooses
-  it, since the filter-aware walk reached the same recall for less work at
-  every selectivity measured; it can be pinned
-  (`VectorSearchOptions::filter_regime`) so a measurement can compare.
+  disallowed rows are scored and routed through. Chosen when the far probe
+  finds at least 20% of the rows around the query allowed: there a
+  disallowed row is cheaper to score and route through than to bridge
+  around, and a bridging walk reads a whole neighbor list per bridge (914
+  bridges a query on uncorrelated 50% at k 100). A mask gathered around the
+  query is mostly allowed there whatever its global share, so near masks
+  walk plain too.
+
+Any regime can be pinned (`VectorSearchOptions::filter_regime`) so a
+measurement can compare.
 
 A mask can sit where the graph cannot serve it, or cost more to walk through
 than to scan in mask order: one court, one tenant, a region away from the
@@ -273,8 +284,10 @@ hand such a query to enumerate, so the answer is exact and bounded in work:
 - **The far probe**, before the walk. The sample is the landing row's
   layer-0 neighbors and theirs, read from the links alone. When the mask's
   share of the rows predicts at least 8 allowed rows in the sample and
-  fewer than a quarter of them are there, the query is enumerated.
-- **The visit budget**, during the walk (`#94`). Each expansion of the
+  fewer than a quarter of them are there, the query is enumerated. The same
+  sample routes the rest: at least 20% allowed walks plain, and below that
+  a mask of at most the enumerate threshold is enumerated.
+- **The visit budget**, during a filter-aware walk (`#94`). Each expansion of the
   filter-aware walk counts layer-0 work units `layer0_scored + bridges`
   (one unit per layer-0 scored row plus one unit per disallowed bridge
   neighbor list read and probed). Across AVX2/AVX-512F and NEON (`d = 64` and
@@ -290,6 +303,9 @@ hand such a query to enumerate, so the answer is exact and bounded in work:
   unfilled while the mask allows more rows reached an island; the query is
   finished by enumerating the unvisited allowed rows on both the unary and
   streaming paths, scoring and emitting no row twice.
+
+A plain walk needs neither the budget nor the stranded check: its beam
+fills from the rows it routes through.
 
 None of the three applies to a pinned regime, which runs as pinned. All
 three apply under a request's threshold: they only ever move a query to the
@@ -327,6 +343,67 @@ the rules above are what they are:
 | far from the query 50% | recall 0.50 | recall 0.94 | 827 | 678 (probe, enumerate) |
 | far from the query 10% | recall 0.17 | 130 | 2704 | 2208 (probe, enumerate) |
 | far from the query 1% | recall 0.03 | 81 | 14549 | 13940 (enumerate) |
+
+That table predates the bulk kernel (`#96`) and the plain routing. The
+routing comes from a later sweep on the same fixture and host class
+(M 16, ef_construction 200, queries per second at the first beam reaching
+the recall, `--hnsw-regime` pinned; the uncorrelated 20% and 30% masks are
+`bucket < 20` and `bucket < 30`, built for the sweep):
+
+| filter | k | recall | filter-aware | plain | plain / filter-aware |
+|---|---|---|---|---|---|
+| uncorrelated 10% | 10 | 0.95 | 10774 | 7655 | 0.71 |
+| uncorrelated 10% | 100 | 0.95 | 2162 | 2008 | 0.93 |
+| uncorrelated 20% | 10 | 0.95 | 9071 | 11082 | 1.22 |
+| uncorrelated 20% | 100 | 0.95 | 1978 | 2787 | 1.41 |
+| uncorrelated 30% | 10 | 0.99 | 4813 | 6256 | 1.30 |
+| uncorrelated 30% | 100 | 0.95 | 1919 | 3482 | 1.81 |
+| uncorrelated 50% | 10 | 0.99 | 6288 | 6772 | 1.08 |
+| uncorrelated 50% | 100 | 0.95 | 1833 | 3945 | 2.15 |
+| near the query 10% | 10 | 0.99 | 3386 (enumerated) | 9432 | 2.79 |
+| near the query 10% | 100 | 0.95 | 6978 | 7320 | 1.05 |
+
+At ef 96 the old rule enumerated near-10's 10,252 allowed rows (under
+`4 · 96 · 32 = 12,288`) where the plain walk was 2.8 times faster; that is
+why only `ef · 2M` rows enumerate before the probe looks.
+
+### Speed or exact
+
+A provider that chooses the regime does so for one of two goals,
+`VectorSearchOptions::filter_routing` (`vector::FilterRouting`):
+
+- **`Speed`, the default.** The routing above: a mask enumerates outright
+  only up to `ef · 2M` rows, where that is cheaper than any walk, and the
+  probe walks the rest, plain or filter-aware. A mask between `ef · 2M`
+  rows and the enumerate threshold that the probe walks gets an
+  approximate answer at the request's beam.
+- **`Exact`.** Every mask of at most the enumerate threshold
+  (`ENUMERATE_ROWS_PER_WALK_ROW · ef · 2M`, or the request's
+  `enumerate_max_rows`) is enumerated, so it gets the exact top `k` of the
+  mask, as before the probe routing. Larger masks are routed as under
+  `Speed`; their answer is approximate under either.
+
+What the trade costs, measured on krick-1 (challenge fixture) when the
+default moved from the exact rule to speed: near-10 at k 10, M 48, ef 32
+went from recall 1.0 to about 0.94, and the mean recall over its sweep fell
+by 0.014 (uncorrelated 50%: 0.012). At matched recall speed is faster
+everywhere it moved: near-10 at k 10 and recall 0.99 went from 7,922 to
+18,772 queries per second on one core, and near-10 at k 100 from 6,777 to
+14,773 at 0.95.
+
+Who selects which:
+
+| caller | routing | how |
+|---|---|---|
+| the provider API | either | `VectorSearchOptions::with_filter_routing` |
+| explicit `ANN` through the product | speed | the default; a request field for exact is #124 |
+| `AUTO` at a policy point | exact up to the point's threshold | the point's `enumerate_max_rows` is served as measured: every mask at or under it enumerates |
+| `EXACT` through the product | exhaustive | not a graph walk at all |
+| the harness | either | `--hnsw-routing=speed` (default) or `--hnsw-routing=exact` |
+
+`--hnsw-regime=enumerate` (or `VectorSearchOptions::filter_regime`) pins
+every filtered search to enumerate whatever the mask's size, which is
+neither mode: it is the exact answer at the cost of scoring the whole mask.
 
 `minimum_score` and a floor raised during a stream filter what is returned or
 emitted; when shared floor pruning is enabled (`floor_prune = true` on the scan,
@@ -413,9 +490,10 @@ per-hop heap allocations (#95):
 - **Boolean dense leaves** run pinned to enumerate, as "What it may serve"
   says.
 
-There is no second threshold. The issue that planned these regimes (#55)
-expected a plain walk above some selectivity; the table above is why it is
-never chosen, and a threshold nothing would cross is not stored.
+The plain share is the provider's constant, not a policy field: it is a
+property of the graph's walks, measured above, not of a recall claim. A
+policy point's `enumerate_max_rows` is served as measured: every mask at or
+below it enumerates, and the probe routes only the larger ones.
 
 ## Streaming
 

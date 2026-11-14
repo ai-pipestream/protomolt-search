@@ -1,0 +1,36 @@
+== k=10 recall>=0.95
+  faiss-hnsw       M=16 ef=   64 rec=0.970 qps1=   12919 qpsAll=   42066 us/q=   77.4 hops=   72.5 scored=  1445.5 ns/scored=  53.5
+  hnsw             M=16 ef=   64 rec=0.973 qps1=    9296 qpsAll=   31947 us/q=  107.6 hops=   75.2 scored=  1626.7 ns/scored=  66.1
+  usearch          M=16 ef=   64 rec=0.951 qps1=    7798 qpsAll=   25057 us/q=  128.2 hops=    0.0 scored=     0.0 ns/scored=   0.0
+  corenn-hnswlib   M=16 ef=   64 rec=0.952 qps1=    3343 qpsAll=   13620 us/q=  299.1 hops=    0.0 scored=     0.0 ns/scored=   0.0
+  hnsw_rs          M=32 ef=   32 rec=0.962 qps1=    2031 qpsAll=    7566 us/q=  492.3 hops=    0.0 scored=     0.0 ns/scored=   0.0
+== k=10 recall>=0.99
+  faiss-hnsw       M=16 ef=  128 rec=0.997 qps1=    8166 qpsAll=   25043 us/q=  122.5 hops=  135.9 scored=  2306.8 ns/scored=  53.1
+  hnsw             M=16 ef=   96 rec=0.996 qps1=    6435 qpsAll=   22624 us/q=  155.4 hops=  107.3 scored=  2146.8 ns/scored=  72.4
+  usearch          M=16 ef=  128 rec=0.991 qps1=    4230 qpsAll=   16182 us/q=  236.4 hops=    0.0 scored=     0.0 ns/scored=   0.0
+  corenn-hnswlib   M=16 ef=  128 rec=0.991 qps1=    2330 qpsAll=    7608 us/q=  429.1 hops=    0.0 scored=     0.0 ns/scored=   0.0
+  hnsw_rs          M=32 ef=   48 rec=0.991 qps1=    1309 qpsAll=    6223 us/q=  763.8 hops=    0.0 scored=     0.0 ns/scored=   0.0
+== k=100 recall>=0.95
+  faiss-hnsw       M=16 ef=  128 rec=0.980 qps1=    5859 qpsAll=   19969 us/q=  170.7 hops=  135.9 scored=  2306.8 ns/scored=  74.0
+  hnsw             M=16 ef=  128 rec=0.987 qps1=    3821 qpsAll=   20216 us/q=  261.7 hops=  139.3 scored=  2571.7 ns/scored= 101.8
+  usearch          M=16 ef=  128 rec=0.970 qps1=    3375 qpsAll=   15898 us/q=  296.3 hops=    0.0 scored=     0.0 ns/scored=   0.0
+  corenn-hnswlib   M=16 ef=  128 rec=0.970 qps1=    2262 qpsAll=    9668 us/q=  442.1 hops=    0.0 scored=     0.0 ns/scored=   0.0
+  hnsw_rs          M=16 ef=  128 rec=0.983 qps1=     887 qpsAll=    4637 us/q= 1127.2 hops=    0.0 scored=     0.0 ns/scored=   0.0
+== k=100 recall>=0.99
+  faiss-hnsw       M=16 ef=  192 rec=0.996 qps1=    4030 qpsAll=   15316 us/q=  248.1 hops=  199.7 scored=  2938.3 ns/scored=  84.4
+  hnsw             M=16 ef=  192 rec=0.998 qps1=    3642 qpsAll=   13811 us/q=  274.6 hops=  203.1 scored=  3245.5 ns/scored=  84.6
+  usearch          M=16 ef=  192 rec=0.992 qps1=    2909 qpsAll=    9650 us/q=  343.8 hops=    0.0 scored=     0.0 ns/scored=   0.0
+  corenn-hnswlib   M=16 ef=  192 rec=0.992 qps1=    1664 qpsAll=    6911 us/q=  600.9 hops=    0.0 scored=     0.0 ns/scored=   0.0
+  hnsw_rs          M=32 ef=  128 rec=0.999 qps1=     580 qpsAll=    2657 us/q= 1723.3 hops=    0.0 scored=     0.0 ns/scored=   0.0
+== k=1000 recall>=0.95
+  hnsw             M=32 ef= 1024 rec=1.000 qps1=    1052 qpsAll=    4513 us/q=  950.6 hops= 1031.3 scored=  6319.6 ns/scored= 150.4
+  faiss-hnsw       M=16 ef= 1024 rec=1.000 qps1=     777 qpsAll=    3297 us/q= 1286.5 hops= 1031.6 scored=  5625.1 ns/scored= 228.7
+  usearch          M=16 ef= 1024 rec=1.000 qps1=     643 qpsAll=    2836 us/q= 1554.7 hops=    0.0 scored=     0.0 ns/scored=   0.0
+  corenn-hnswlib   M=16 ef= 1024 rec=1.000 qps1=     437 qpsAll=    2439 us/q= 2288.6 hops=    0.0 scored=     0.0 ns/scored=   0.0
+  hnsw_rs          M=16 ef= 1024 rec=0.992 qps1=     194 qpsAll=     815 us/q= 5164.1 hops=    0.0 scored=     0.0 ns/scored=   0.0
+== k=1000 recall>=0.99
+  hnsw             M=32 ef= 1024 rec=1.000 qps1=    1052 qpsAll=    4513 us/q=  950.6 hops= 1031.3 scored=  6319.6 ns/scored= 150.4
+  faiss-hnsw       M=16 ef= 1024 rec=1.000 qps1=     777 qpsAll=    3297 us/q= 1286.5 hops= 1031.6 scored=  5625.1 ns/scored= 228.7
+  usearch          M=16 ef= 1024 rec=1.000 qps1=     643 qpsAll=    2836 us/q= 1554.7 hops=    0.0 scored=     0.0 ns/scored=   0.0
+  corenn-hnswlib   M=16 ef= 1024 rec=1.000 qps1=     437 qpsAll=    2439 us/q= 2288.6 hops=    0.0 scored=     0.0 ns/scored=   0.0
+  hnsw_rs          M=16 ef= 1024 rec=0.992 qps1=     194 qpsAll=     815 us/q= 5164.1 hops=    0.0 scored=     0.0 ns/scored=   0.0

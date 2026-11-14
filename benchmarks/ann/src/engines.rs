@@ -1,8 +1,9 @@
 //! In-process engines behind one seam. Every engine indexes a contiguous
-//! run of fixture rows (a whole fixture, or one segment of it) and returns
-//! `(local row, similarity)` best first, where similarity is the inner
-//! product (or a monotone function of the engine's own distance on unit
-//! vectors, mapped back to the inner product) so segment results merge.
+//! run of rows (a whole fixture, one segment of it, or one shard's rows
+//! gathered into their own copy) and returns `(local row, similarity)` best
+//! first, where similarity is the inner product (or a monotone function of
+//! the engine's own distance on unit vectors, mapped back to the inner
+//! product) so segment and shard results merge.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -25,6 +26,29 @@ pub struct QueryStats {
     pub exact: u64,
     pub bridges: u64,
     pub budget_handoffs: u64,
+    /// Searches answered by each filter regime: enumerate, filter-aware,
+    /// plain. Unfiltered searches count in none.
+    pub regimes: [u64; 3],
+}
+
+impl QueryStats {
+    /// Adds every counter of `other`, so a sum over parts loses none.
+    pub fn add(&mut self, other: &QueryStats) {
+        let QueryStats {
+            hops,
+            exact,
+            bridges,
+            budget_handoffs,
+            regimes,
+        } = *other;
+        self.hops += hops;
+        self.exact += exact;
+        self.bridges += bridges;
+        self.budget_handoffs += budget_handoffs;
+        for (sum, n) in self.regimes.iter_mut().zip(regimes) {
+            *sum += n;
+        }
+    }
 }
 
 /// Build parameters of one sweep point.
@@ -392,6 +416,9 @@ pub struct Hnsw {
     /// provider chooses under, as a dense execution policy point carries
     /// it; unset, the provider's own.
     enumerate_max_rows: Option<usize>,
+    /// `--hnsw-routing=speed|exact` is what the provider optimizes for when
+    /// it chooses the regime; unset, speed.
+    routing: pipestream_search::vector::FilterRouting,
 }
 
 impl Hnsw {
@@ -428,6 +455,17 @@ impl Hnsw {
                 format!("--hnsw-enumerate-max-rows={raw:?} is not a row count: {error}")
             })?),
         };
+        use pipestream_search::vector::FilterRouting;
+        let routing = match crate::util::arg("hnsw-routing", "").as_str() {
+            "" | "speed" => FilterRouting::Speed,
+            "exact" => FilterRouting::Exact,
+            other => return Err(format!("--hnsw-routing={other:?} must be speed or exact").into()),
+        };
+        if regime.is_some() && routing != FilterRouting::Speed {
+            return Err(
+                "--hnsw-regime pins the regime and --hnsw-routing chooses it; give one".into(),
+            );
+        }
         if regime.is_some() && enumerate_max_rows.is_some() {
             return Err(
                 "--hnsw-regime pins the regime and --hnsw-enumerate-max-rows chooses it; give one"
@@ -440,6 +478,7 @@ impl Hnsw {
             disk,
             regime,
             enumerate_max_rows,
+            routing,
         })
     }
 }
@@ -471,7 +510,9 @@ impl Index for Hnsw {
         });
         let options = match bits.as_ref() {
             Some(bits) => {
-                let options = VectorSearchOptions::new().with_bits(bits);
+                let options = VectorSearchOptions::new()
+                    .with_bits(bits)
+                    .with_filter_routing(self.routing);
                 match (self.regime, self.enumerate_max_rows) {
                     (Some(regime), _) => options.with_filter_regime(regime),
                     (None, Some(rows)) => options.with_enumerate_max_rows(rows),
@@ -488,6 +529,14 @@ impl Index for Hnsw {
         stats.exact += answer.stats.scored;
         stats.bridges += answer.stats.bridges;
         stats.budget_handoffs += u64::from(answer.budget_handoff);
+        if let Some(regime) = answer.regime {
+            use pipestream_search::vector::FilterRegime;
+            stats.regimes[match regime {
+                FilterRegime::Enumerate => 0,
+                FilterRegime::FilterAware => 1,
+                FilterRegime::Plain => 2,
+            }] += 1;
+        }
         hits
     }
 

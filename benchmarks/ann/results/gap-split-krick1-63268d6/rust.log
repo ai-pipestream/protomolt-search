@@ -1,0 +1,33 @@
+run: hnsw BuildParams { m: 16, ef_construction: 200, bits: 0 } built in 2.4s
+run: hnsw m=16 efc=200 none k=10: 7 points
+run: hnsw m=16 efc=200 none k=100: 2 points
+run: hnsw m=16 efc=200 uncorrelated-50 k=10: 5 points
+run: hnsw m=16 efc=200 uncorrelated-50 k=100: 1 points
+run: hnsw m=16 efc=200 near-10 k=10: 6 points
+run: hnsw m=16 efc=200 near-10 k=100: 1 points
+run: hnsw BuildParams { m: 32, ef_construction: 200, bits: 0 } built in 2.5s
+run: hnsw m=32 efc=200 none k=10: 6 points
+run: hnsw m=32 efc=200 none k=100: 1 points
+run: hnsw m=32 efc=200 uncorrelated-50 k=10: 3 points
+run: hnsw m=32 efc=200 uncorrelated-50 k=100: 1 points
+run: hnsw m=32 efc=200 near-10 k=10: 4 points
+run: hnsw m=32 efc=200 near-10 k=100: 1 points
+run: usearch BuildParams { m: 16, ef_construction: 200, bits: 0 } built in 3.5s
+run: usearch m=16 efc=200 none k=10: 8 points
+run: usearch m=16 efc=200 none k=100: 3 points
+run: usearch m=16 efc=200 uncorrelated-50 k=10: 6 points
+run: usearch m=16 efc=200 uncorrelated-50 k=100: 2 points
+run: usearch m=16 efc=200 near-10 k=10: 8 points
+run: usearch m=16 efc=200 near-10 k=100: 3 points
+run: usearch BuildParams { m: 32, ef_construction: 200, bits: 0 } built in 4.3s
+run: usearch m=32 efc=200 none k=10: 6 points
+run: usearch m=32 efc=200 none k=100: 2 points
+run: usearch m=32 efc=200 uncorrelated-50 k=10: 4 points
+run: usearch m=32 efc=200 uncorrelated-50 k=100: 1 points
+run: usearch m=32 efc=200 near-10 k=10: 6 points
+run: usearch m=32 efc=200 near-10 k=100: 2 points
+run: wrote results/gap-split-krick1-63268d6/rust.json
+
+real	1m11.121s
+user	3m6.699s
+sys	0m0.176s

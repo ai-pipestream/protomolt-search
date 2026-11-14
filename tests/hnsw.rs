@@ -613,8 +613,9 @@ async fn a_filtered_ann_query_reports_its_regime_and_keeps_recall() {
         for (court, regimes, floor) in [
             (
                 "wide",
+                // Half the rows allowed: the far probe routes it plain.
                 DenseFilterRegimes {
-                    filter_aware: SHARDS as u32,
+                    plain: SHARDS as u32,
                     ..Default::default()
                 },
                 // A beam of 20 over uniform random vectors: measured 0.88 to
@@ -832,7 +833,7 @@ async fn a_policy_point_serves_a_filter_under_its_measured_threshold() {
         assert_eq!(
             outcome.filter_regimes,
             Some(DenseFilterRegimes {
-                filter_aware: SHARDS as u32,
+                plain: SHARDS as u32,
                 ..Default::default()
             }),
             "streaming={streaming}"

@@ -1,0 +1,85 @@
+Best one-core QPS point per engine (qps_one_core = 1 / mean single-thread latency;
+qpsAll at --threads=4). ns/scored = 1e9 / (qps1 * exact_scores_mean).
+vs faiss = hnsw (or usearch) qps1 / faiss qps1.
+
+== filter=none k=10 recall>=0.95
+  faiss-hnsw  M=16 ef=  64 rec=0.970 qps1=   24678 qpsAll=  120253 hops=   72.5 scored= 1445.5 ns/scored=  28.0
+  hnsw        M=16 ef=  64 rec=0.976 qps1=   32148 qpsAll=  126626 hops=   73.6 scored= 1599.1 bridges=    0.0 ns/scored=  19.5 vs faiss= 1.30
+  usearch     M=32 ef=  48 rec=0.964 qps1=   14226 qpsAll=   61136 hops=    0.0 scored=    0.0 ns/scored=   0.0 vs faiss= 0.58
+
+== filter=none k=10 recall>=0.99
+  faiss-hnsw  M=16 ef=  96 rec=0.991 qps1=   19004 qpsAll=   85418 hops=  104.0 scored= 1912.5 ns/scored=  27.5
+  hnsw        M=16 ef=  96 rec=0.995 qps1=   21266 qpsAll=   83969 hops=  105.3 scored= 2108.7 bridges=    0.0 ns/scored=  22.3 vs faiss= 1.12
+  usearch     M=16 ef= 128 rec=0.990 qps1=    9266 qpsAll=   39996 hops=    0.0 scored=    0.0 ns/scored=   0.0 vs faiss= 0.49
+
+== filter=none k=100 recall>=0.95
+  faiss-hnsw  M=16 ef= 128 rec=0.980 qps1=   13619 qpsAll=   54888 hops=  135.9 scored= 2306.8 ns/scored=  31.8
+  hnsw        M=16 ef= 128 rec=0.986 qps1=   16540 qpsAll=   64145 hops=  137.2 scored= 2534.4 bridges=    0.0 ns/scored=  23.9 vs faiss= 1.21
+  usearch     M=16 ef= 128 rec=0.969 qps1=    5735 qpsAll=   34674 hops=    0.0 scored=    0.0 ns/scored=   0.0 vs faiss= 0.42
+
+== filter=none k=100 recall>=0.99
+  faiss-hnsw  M=16 ef= 192 rec=0.996 qps1=    9396 qpsAll=   39209 hops=  199.7 scored= 2938.3 ns/scored=  36.2
+  hnsw        M=16 ef= 192 rec=0.997 qps1=   11063 qpsAll=   44136 hops=  201.1 scored= 3207.4 bridges=    0.0 ns/scored=  28.2 vs faiss= 1.18
+  usearch     M=16 ef= 192 rec=0.992 qps1=    5096 qpsAll=   13165 hops=    0.0 scored=    0.0 ns/scored=   0.0 vs faiss= 0.54
+
+== filter=uncorrelated-50 k=10 recall>=0.95
+  faiss-hnsw  M=16 ef=  64 rec=0.952 qps1=   25846 qpsAll=  107407 hops=   72.5 scored= 1445.5 ns/scored=  26.8
+  hnsw        M=16 ef=  32 rec=0.959 qps1=   17138 qpsAll=   67501 hops=   42.3 scored= 1152.5 bridges=   81.8 ns/scored=  50.6 vs faiss= 0.66
+  usearch     M=32 ef=  24 rec=0.953 qps1=   10952 qpsAll=   45170 hops=    0.0 scored=    0.0 ns/scored=   0.0 vs faiss= 0.42
+
+== filter=uncorrelated-50 k=10 recall>=0.99
+  faiss-hnsw  M=16 ef= 128 rec=0.996 qps1=   13291 qpsAll=   54067 hops=  135.9 scored= 2306.8 ns/scored=  32.6
+  hnsw        M=16 ef=  48 rec=0.994 qps1=   11649 qpsAll=   46498 hops=   57.7 scored= 1647.9 bridges=  149.8 ns/scored=  52.1 vs faiss= 0.88
+  usearch     M=32 ef=  48 rec=0.995 qps1=    6134 qpsAll=   26240 hops=    0.0 scored=    0.0 ns/scored=   0.0 vs faiss= 0.46
+
+== filter=uncorrelated-50 k=100 recall>=0.95
+  faiss-hnsw  M=16 ef= 128 rec=0.961 qps1=   12369 qpsAll=   49020 hops=  135.9 scored= 2306.8 ns/scored=  35.0
+  hnsw        M=16 ef= 128 rec=1.000 qps1=    3640 qpsAll=   14067 hops=  137.4 scored= 3058.3 bridges=  913.8 ns/scored=  89.8 vs faiss= 0.29
+  usearch     M=32 ef= 128 rec=1.000 qps1=    3227 qpsAll=   12313 hops=    0.0 scored=    0.0 ns/scored=   0.0 vs faiss= 0.26
+
+== filter=uncorrelated-50 k=100 recall>=0.99
+  faiss-hnsw  M=32 ef= 128 rec=0.991 qps1=    7752 qpsAll=   31519 hops=  135.2 scored= 3857.1 ns/scored=  33.4
+  hnsw        M=16 ef= 128 rec=1.000 qps1=    3640 qpsAll=   14067 hops=  137.4 scored= 3058.3 bridges=  913.8 ns/scored=  89.8 vs faiss= 0.47
+  usearch     M=32 ef= 128 rec=1.000 qps1=    3227 qpsAll=   12313 hops=    0.0 scored=    0.0 ns/scored=   0.0 vs faiss= 0.42
+
+== filter=near-10 k=10 recall>=0.95
+  faiss-hnsw  M=16 ef=  64 rec=0.970 qps1=   17552 qpsAll=   71479 hops=   72.5 scored= 1445.5 ns/scored=  39.4
+  hnsw        M=16 ef=  64 rec=0.976 qps1=   24256 qpsAll=   96801 hops=   73.6 scored= 1599.1 bridges=    0.0 ns/scored=  25.8 vs faiss= 1.38
+  usearch     M=16 ef=  64 rec=0.951 qps1=   15003 qpsAll=   59200 hops=    0.0 scored=    0.0 ns/scored=   0.0 vs faiss= 0.85
+
+== filter=near-10 k=10 recall>=0.99
+  faiss-hnsw  M=16 ef=  96 rec=0.991 qps1=   13103 qpsAll=   53672 hops=  104.0 scored= 1912.5 ns/scored=  39.9
+  hnsw        M=16 ef=  96 rec=1.000 qps1=    7562 qpsAll=   29511 hops=    0.0 scored=10251.7 bridges=    0.0 ns/scored=  12.9 vs faiss= 0.58
+  usearch     M=16 ef= 128 rec=0.990 qps1=    8402 qpsAll=   36521 hops=    0.0 scored=    0.0 ns/scored=   0.0 vs faiss= 0.64
+
+== filter=near-10 k=100 recall>=0.95
+  faiss-hnsw  M=16 ef= 128 rec=0.980 qps1=    9639 qpsAll=   38692 hops=  135.9 scored= 2306.8 ns/scored=  45.0
+  hnsw        M=16 ef= 128 rec=1.000 qps1=    6377 qpsAll=   23391 hops=    0.0 scored=10251.7 bridges=    0.0 ns/scored=  15.3 vs faiss= 0.66
+  usearch     M=16 ef= 128 rec=0.969 qps1=    7474 qpsAll=   12193 hops=    0.0 scored=    0.0 ns/scored=   0.0 vs faiss= 0.78
+
+== filter=near-10 k=100 recall>=0.99
+  faiss-hnsw  M=16 ef= 192 rec=0.996 qps1=    7341 qpsAll=   28987 hops=  199.7 scored= 2938.3 ns/scored=  46.4
+  hnsw        M=16 ef= 128 rec=1.000 qps1=    6377 qpsAll=   23391 hops=    0.0 scored=10251.7 bridges=    0.0 ns/scored=  15.3 vs faiss= 0.87
+  usearch     M=32 ef= 128 rec=0.995 qps1=    5889 qpsAll=   23939 hops=    0.0 scored=    0.0 ns/scored=   0.0 vs faiss= 0.80
+
+== Profiles (one CPU, taskset -c 15, --threads=1, --min-time-ms=20000, hnsw M=16 efc=200)
+perf is unavailable on krick-1 (kernel.perf_event_paranoid=4 refuses even -e cpu-clock), so these come
+from sampler/sampler.c: an LD_PRELOAD ITIMER_PROF sampler (~1 kHz of process CPU time, started 11 s in,
+after the 8.7 s one-CPU build) whose instruction pointers sampler/symbolize.py maps through
+addr2line -i. A sample goes to the first bucket that matches on its inline chain, walking outward.
+This is self time only, with no call graph. Full tables: profile-*.txt. The sampler costs throughput
+(qps1 under it: a 13.9k, b 2.7k, c 6.6k), so read the shares, not the rates.
+
+(a) none k=10 ef=96 (44.9k samples): kernel 40.0% (dot_batch8 fmadd 19.2%, prefetch_range loop 9.0%),
+    heap 19.6%, visited set + retain 13.6%, links 13.6% (AtomicU32 cell loads 7.1%, extend 3.0%),
+    search_layer body 5.8%, rescore/results 5.2%.
+(b) uncorrelated-50 k=100 ef=128 (40.2k samples): links 22.1% (AtomicU32 loads 14.8%; 917 bridges/query
+    each re-copy a list), search_layer_aware body 21.4% (loop-end compares 10.3%, which mostly reflects
+    mispredicts on the test/visit branches), visited set 19.8%, kernel 12.4%, mask tests 10.5%
+    (Bitset::test), harness mask build 6.5% (also timed for FAISS), heap 4.8%, rescore 1.7%.
+(c) near-10 k=10 ef=96 (enumerate regime: hops 0, 10,252 rows scored) (44k samples): kernel 54.5%
+    (fmadd 32.2%, prefetch_range 7.4%), enumerate_skipping body (consider/bar/survives) 31.1%,
+    mask iteration 7.3%, harness mask build 4.2%, heap 1.1%.
+
+Note: unpinned turbo CI work (rustc and nextest) briefly ran on CPUs 13 and 15 at the start of
+profile (b). Load was ~8 at the sweep start and ~16 later, so treat QPS as +/- a few percent.

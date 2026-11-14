@@ -4,8 +4,8 @@
   "issue": "#55",
   "note": "Filter-aware traversal: three filter sets at 50%, 10% and 1% on both fixtures. rust-cv-hnsw has no predicate filter; enumerate is a reported column, not a baseline.",
   "candidate": "hnsw",
-  "unfiltered_margin": 0.2,
-  "unfiltered_margin_provisional": true,
+  "unfiltered_margin": 0.1,
+  "unfiltered_margin_provisional": false,
   "cells": [
     {
       "fixture": "challenge-100000x64",
