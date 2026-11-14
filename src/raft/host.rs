@@ -726,6 +726,29 @@ impl RaftHost {
         self.raft.metrics()
     }
 
+    /// Confirm fixture leadership without taking an application admission or
+    /// extending its vote hold. Lease-hold tests must exercise that separately.
+    #[cfg(all(test, feature = "tls"))]
+    pub(crate) async fn test_leader_readiness(&self) -> Result<(), Status> {
+        tokio::time::timeout(self.read_timeout, self.raft.ensure_linearizable())
+            .await
+            .map_err(|_| Status::unavailable("test leader read barrier timed out"))?
+            .map(|_| ())
+            .map_err(|error| match error {
+                RaftError::APIError(error) => {
+                    Status::unavailable(format!("test leader read barrier: {error}"))
+                }
+                RaftError::Fatal(error) => {
+                    Status::internal(format!("test leader core stopped: {error}"))
+                }
+            })
+    }
+
+    #[cfg(all(test, feature = "tls"))]
+    pub(crate) fn test_application_lease_held(&self) -> bool {
+        self.hold.holds(std::time::Instant::now())
+    }
+
     /// Wait for a metrics condition (state, applied index, snapshot).
     pub fn wait(
         &self,

@@ -106,44 +106,46 @@ impl Cluster {
     }
 
     async fn leader(&self) -> NodeId {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            for host in self.hosts.values() {
-                if host.metrics().borrow().state == openraft::ServerState::Leader {
-                    return host.node_id();
-                }
-            }
-            assert!(Instant::now() < deadline, "no leader within 10 s");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        self.leader_excluding(None).await
     }
 
-    /// Wait until some running host other than `not` believes in a leader
-    /// that is not `not`; returns that leader.
-    async fn leader_other_than(&self, not: NodeId) -> NodeId {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            for (id, host) in &self.hosts {
-                if *id == not {
-                    continue;
-                }
-                if let Some(leader) = host.believed_leader() {
-                    if leader != not
-                        && self.hosts[&leader].metrics().borrow().state
-                            == openraft::ServerState::Leader
+    async fn leader_excluding(&self, excluded: Option<NodeId>) -> NodeId {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                for host in self.hosts.values() {
+                    if Some(host.node_id()) == excluded
+                        || host.metrics().borrow().state != openraft::ServerState::Leader
                     {
-                        return leader;
+                        continue;
+                    }
+                    match host.test_leader_readiness().await {
+                        Ok(())
+                            if host.metrics().borrow().state == openraft::ServerState::Leader =>
+                        {
+                            return host.node_id()
+                        }
+                        Ok(()) => {}
+                        Err(error) if error.code() == Code::Unavailable => {}
+                        Err(error) => panic!("leader readiness failed: {error}"),
                     }
                 }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            assert!(Instant::now() < deadline, "no other leader within 10 s");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        })
+        .await
+        .expect("no quorum-confirmed leader within 10 s")
+    }
+
+    /// Find a quorum-confirmed leader among the surviving hosts, without
+    /// granting any application lease on it.
+    async fn leader_other_than(&self, not: NodeId) -> NodeId {
+        self.leader_excluding(Some(not)).await
     }
 
     /// Propose a Prepare on the leader; the command expects the current
     /// control revision and the owner id doubles as the command id.
-    async fn propose_prepare(&mut self, leader: NodeId, owner_id: &str) -> u64 {
+    async fn propose_prepare(&mut self, owner_id: &str) -> u64 {
+        let leader = self.leader().await;
         let command = prepare(&self.group, owner_id, owner_id, self.revision);
         let decision = self
             .host(leader)
@@ -164,7 +166,7 @@ impl Cluster {
             .unwrap();
     }
 
-    async fn join(&mut self, node: NodeId, leader: NodeId) {
+    async fn join(&mut self, node: NodeId) {
         let dir = Directory::new(&format!("member-{node}"));
         RaftHost::prepare_member(&dir.0, &self.group, node, &policy(), &limits()).unwrap();
         let host = RaftHost::start_member(
@@ -180,6 +182,8 @@ impl Cluster {
         let addr = host.advertised_addr().unwrap().to_string();
         self.dirs.insert(node, dir);
         self.hosts.insert(node, host);
+        // Preparing and starting a member may outlast an election interval.
+        let leader = self.leader().await;
         self.host(leader).add_learner(node, &addr).await.unwrap();
     }
 
@@ -238,9 +242,9 @@ async fn three_voters(name: &str) -> Cluster {
         hosts: BTreeMap::from([(1, host)]),
         revision: 1,
     };
-    cluster.propose_prepare(1, "phone-a").await;
-    cluster.join(2, 1).await;
-    cluster.join(3, 1).await;
+    cluster.propose_prepare("phone-a").await;
+    cluster.join(2).await;
+    cluster.join(3).await;
     cluster
         .host(1)
         .promote(BTreeSet::from([2, 3]))
@@ -524,8 +528,7 @@ async fn three_voters_replicate_and_learners_are_seeded_by_snapshot() {
     }
     // Entries proposed on the leader apply on every voter with the same
     // position and rows.
-    let leader = cluster.leader().await;
-    let index = cluster.propose_prepare(leader, "phone-b").await;
+    let index = cluster.propose_prepare("phone-b").await;
     for node in [1, 2, 3] {
         cluster.wait_applied(node, index).await;
         let store = cluster.host(node).store().unwrap();
@@ -548,6 +551,7 @@ async fn three_voters_replicate_and_learners_are_seeded_by_snapshot() {
         );
     }
     // A follower does not propose; it names the leader.
+    let leader = cluster.leader().await;
     let follower = if leader == 1 { 2 } else { 1 };
     let error = cluster
         .host(follower)
@@ -697,11 +701,28 @@ async fn an_isolated_leader_admits_nothing_and_the_surviving_quorum_revokes() {
         .await
         .unwrap_err();
     assert_eq!(error.code(), Code::Unavailable, "{error}");
+    // Confirm the surviving leader before healing. Applied bytes alone do
+    // not establish that the healed replica knows where to forward a read.
+    let successor = cluster.leader_other_than(leader).await;
     // Heal: the old leader catches up and is a follower of the successor.
     for host in cluster.hosts.values() {
         host.heal();
     }
-    cluster.wait_applied(leader, revoked_at).await;
+    cluster
+        .host(leader)
+        .wait(Some(Duration::from_secs(30)))
+        .metrics(
+            |metrics| {
+                metrics
+                    .last_applied
+                    .is_some_and(|id| id.index >= revoked_at)
+                    && metrics.current_leader == Some(successor)
+                    && metrics.state == openraft::ServerState::Follower
+            },
+            "healed follower applied revocation and knows the confirmed leader",
+        )
+        .await
+        .unwrap();
     let healed = cluster.host(leader).store().unwrap();
     assert_eq!(
         healed
@@ -722,6 +743,7 @@ async fn an_isolated_leader_admits_nothing_and_the_surviving_quorum_revokes() {
         .unwrap_err();
     assert_eq!(error.code(), Code::PermissionDenied, "{error}");
     // On the current leader the revocation is what a fresh admission sees.
+    let successor = cluster.leader().await;
     let error = cluster
         .host(successor)
         .with_admission("alice", |admission| {
@@ -741,8 +763,8 @@ async fn a_member_restarts_and_replays_the_entries_it_missed() {
     let host = cluster.hosts.remove(&absent).unwrap();
     let listen = host.listen_addr().unwrap();
     host.shutdown().await.unwrap();
-    cluster.propose_prepare(leader, "phone-b").await;
-    let index = cluster.propose_prepare(leader, "phone-c").await;
+    cluster.propose_prepare("phone-b").await;
+    let index = cluster.propose_prepare("phone-c").await;
     cluster.start(absent, listen).await;
     cluster.wait_applied(absent, index).await;
     let store = cluster.host(absent).store().unwrap();
@@ -755,9 +777,9 @@ async fn a_member_restarts_and_replays_the_entries_it_missed() {
     drop(store);
     // The restarted member takes part again: a leader restart elects a
     // successor among the three and proposals continue.
-    cluster.restart(leader).await;
     let leader = cluster.leader().await;
-    let index = cluster.propose_prepare(leader, "phone-d").await;
+    cluster.restart(leader).await;
+    let index = cluster.propose_prepare("phone-d").await;
     for node in [1, 2, 3] {
         cluster.wait_applied(node, index).await;
     }
@@ -771,13 +793,15 @@ async fn a_voter_is_replaced_through_membership() {
     let retiring = if leader == 3 { 2 } else { 3 };
     // Node 4 joins as a learner seeded by snapshot, becomes a voter, and
     // the retiring voter leaves through the same joint procedure.
-    cluster.join(4, leader).await;
+    cluster.join(4).await;
     assert!(!cluster.host(4).awaiting_snapshot().unwrap());
+    let leader = cluster.leader().await;
     cluster
         .host(leader)
         .promote(BTreeSet::from([4]))
         .await
         .unwrap();
+    let leader = cluster.leader().await;
     cluster.host(leader).remove_member(retiring).await.unwrap();
     let voters: BTreeSet<NodeId> = [1, 2, 3, 4]
         .into_iter()
@@ -789,7 +813,7 @@ async fn a_voter_is_replaced_through_membership() {
         .voter_ids(voters.iter().copied(), "replaced voter")
         .await
         .unwrap();
-    let index = cluster.propose_prepare(leader, "phone-b").await;
+    let index = cluster.propose_prepare("phone-b").await;
     for node in &voters {
         cluster.wait_applied(*node, index).await;
     }
@@ -950,6 +974,10 @@ async fn a_leader_withholds_its_vote_while_an_admission_interval_may_be_open() {
 async fn a_leader_withholds_its_vote_for_a_lease_it_forwarded() {
     let cluster = three_voters("vote-hold-forwarded").await;
     let leader = cluster.leader().await;
+    assert!(
+        !cluster.host(leader).test_application_lease_held(),
+        "fixture readiness must not supply the application lease hold being tested"
+    );
     let member = if leader == 1 { 2 } else { 1 };
     let candidate = [1, 2, 3]
         .into_iter()
