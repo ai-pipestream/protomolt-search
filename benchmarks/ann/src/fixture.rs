@@ -558,8 +558,10 @@ impl Fixture {
         }
         let bytes = std::fs::read(self.dir.join(format!("placements/{name}.u16")))?;
         let shard: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         if shard.len() != self.rows.rows() || shard.iter().any(|s| *s as usize >= shards) {
             return Err(format!(
