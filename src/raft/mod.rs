@@ -102,6 +102,8 @@ pub mod operator_service;
 pub mod reasons;
 #[cfg(feature = "tls")]
 pub mod rejection_log;
+#[cfg(any(test, feature = "fault-injection"))]
+mod snapshot_gates;
 pub mod state_machine;
 #[cfg(feature = "tls")]
 pub mod transport;

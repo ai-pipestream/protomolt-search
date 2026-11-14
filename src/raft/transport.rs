@@ -503,8 +503,11 @@ impl RaftTransportService {
         }
         // Claim ownership of the incoming directory before yielding to the
         // blocking pool so caller cancellation or a later transfer start can
-        // neither delete nor leak this image while disk verification runs.
+        // neither delete nor leak this image while disk verification runs, and
+        // release the transfer slot lock so higher-vote transfers never wait on
+        // blocking image verification.
         let claimed = self.staging.claim(&complete.dir, complete.file)?;
+        drop(guard);
         let staging = Arc::clone(&self.staging);
         let verify_meta = complete.meta.clone();
         let mut snapshot = tokio::task::spawn_blocking(move || {
@@ -514,7 +517,6 @@ impl RaftTransportService {
         .map_err(|error| {
             Status::internal(format!("snapshot verification task failed: {error}"))
         })??;
-        drop(guard);
         let completion = Arc::new(SnapshotCompletion::new());
         snapshot.set_completion(Arc::clone(&completion));
         Ok(Staged::Complete {
@@ -530,7 +532,9 @@ impl RaftTransportService {
         from: NodeId,
         rpc: InstallSnapshotRequest<ControlRaft>,
     ) -> Result<Staged, Status> {
-        let final_chunk = rpc.done.then(|| FinalChunk::new(from, &rpc));
+        let Some(chunk) = rpc.done.then(|| FinalChunk::new(from, &rpc)) else {
+            return self.stage(from, rpc).await;
+        };
         let mut receipt = self.final_receipt.lock().await;
         if receipt
             .as_ref()
@@ -538,18 +542,18 @@ impl RaftTransportService {
         {
             *receipt = None;
         }
-        if let (Some(chunk), Some(previous)) = (&final_chunk, receipt.as_ref()) {
+        if let Some(previous) = receipt.as_ref() {
             let restarted = self.transfer.lock().await.as_ref().is_some_and(|active| {
                 active.peer == from && active.vote == rpc.vote && active.meta == rpc.meta
             });
-            if !restarted && previous.chunk == *chunk {
+            if !restarted && previous.chunk == chunk {
                 return Ok(Staged::Replay(Arc::clone(&previous.completion)));
             }
         }
         let staged = self.stage(from, rpc).await?;
         if let Staged::Complete { completion, .. } = &staged {
             *receipt = Some(FinalReceipt {
-                chunk: final_chunk.expect("a completed transfer has a final chunk"),
+                chunk,
                 completion: Arc::clone(completion),
             });
         }
@@ -781,11 +785,13 @@ impl RaftTransportService {
                 #[cfg(any(test, feature = "fault-injection"))]
                 struct FinalHandlerDropGuard<'a> {
                     staging: &'a SnapshotStaging,
+                    snapshot: Option<Box<SnapshotFile>>,
                     armed: bool,
                 }
                 #[cfg(any(test, feature = "fault-injection"))]
                 impl Drop for FinalHandlerDropGuard<'_> {
                     fn drop(&mut self) {
+                        drop(self.snapshot.take());
                         if self.armed {
                             self.staging.gates().record_final_handler_drop();
                         }
@@ -794,10 +800,14 @@ impl RaftTransportService {
                 #[cfg(any(test, feature = "fault-injection"))]
                 let mut drop_guard = FinalHandlerDropGuard {
                     staging: &self.staging,
+                    snapshot: Some(snapshot),
                     armed: true,
                 };
                 #[cfg(any(test, feature = "fault-injection"))]
-                self.staging.gates().pause_handoff().await;
+                let snapshot = {
+                    self.staging.gates().pause_handoff().await;
+                    drop_guard.snapshot.take().expect("snapshot still held")
+                };
 
                 // The image is validated; the library applies its own term
                 // and position rules and may decline it (an older vote, a

@@ -51,8 +51,8 @@ pub const MEMBER_ID: u64 = 2;
 /// peer of the R3/R5 reproductions.
 pub const PEER_ID: u64 = 3;
 pub const NODE_ADDR: &str = "127.0.0.1:9917";
-/// One chunk on the wire; a store image crosses several.
-pub const CHUNK_BYTES: usize = 256 << 10;
+/// One chunk on the wire; a store image (~72 KiB on redb 4) crosses several.
+pub const CHUNK_BYTES: usize = 16 << 10;
 
 /// The in-crate recipe: fast heartbeats, snapshots on demand only, a lease
 /// within the election floor, small snapshot chunks.
