@@ -33,6 +33,12 @@
 
   <build>
     <plugins>
+      <!-- Pin a release-aware compiler; Maven 3 defaults can ignore release. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.16.0</version>
+      </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-dependency-plugin</artifactId>
