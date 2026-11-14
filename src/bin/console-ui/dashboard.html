@@ -18,7 +18,7 @@
   </div>
   <div id="tiles" class="grid"></div>
   <div class="two">
-    <div class="panel"><h2>Routes</h2><div class="muted small">Per route: requests per second and p50 / p99 from the latency histogram, over the stream's window.</div><table id="routes"><thead><tr><th>route</th><th class="num">req/s</th><th class="num">p50</th><th class="num">p99</th><th class="num">errors</th><th>rate</th></tr></thead><tbody></tbody></table></div>
+    <div class="panel"><div class="toolbar"><h2>Routes</h2><span class="spacer"></span><button id="routes-all" class="quiet hidden"></button></div><div class="muted small">Per route: requests per second and p50 / p99 from the latency histogram, over the stream's window. Routes that have served a request since this page opened, or carry errors; a column heading sorts, and a click on a route draws its latency distribution.</div><table id="routes"><thead><tr><th data-sort="rpc">route</th><th class="num" data-sort="rate">req/s</th><th class="num" data-sort="p50">p50</th><th class="num" data-sort="p99">p99</th><th class="num" data-sort="errors">errors</th><th>rate</th></tr></thead><tbody></tbody></table><div id="routes-empty" class="muted small hidden">No route has served a request since this page opened.</div><div id="route-latency" class="route-latency hidden"></div></div>
     <div class="panel"><h2>Runtime knobs</h2><div id="knobs" class="muted small">waiting for GetRuntimeKnobs</div></div>
   </div>
   <div class="two">

@@ -198,10 +198,46 @@ export function mountHeader(current) {
     el('nav', {}, [
       el('a', { href: '/', class: current === 'search' ? 'current' : '', text: 'Search' }),
       el('a', { href: '/dashboard', class: current === 'dashboard' ? 'current' : '', text: 'Dashboard' }),
+      el('a', { href: '/explorer', class: current === 'api' ? 'current' : '', text: 'API' }),
     ]),
     el('span', { class: 'status', id: 'cluster-status', text: 'connecting' }),
+    themeButton(),
   );
   refreshStatus();
+}
+
+// The colour scheme: the system's unless the viewer chose one, which is
+// kept per browser. The stylesheet reads `data-theme` on the root.
+const THEME_KEY = 'pipestream.console.theme';
+const THEMES = ['system', 'light', 'dark'];
+
+function storedTheme() {
+  try {
+    const theme = localStorage.getItem(THEME_KEY);
+    return THEMES.includes(theme) ? theme : 'system';
+  } catch {
+    return 'system';
+  }
+}
+
+function applyTheme(theme) {
+  if (theme === 'system') delete document.documentElement.dataset.theme;
+  else document.documentElement.dataset.theme = theme;
+}
+
+applyTheme(storedTheme());
+
+function themeButton() {
+  const button = el('button', { class: 'quiet theme', title: 'colour scheme: system, light, dark' });
+  const show = (theme) => { button.textContent = `theme: ${theme}`; };
+  show(storedTheme());
+  button.addEventListener('click', () => {
+    const next = THEMES[(THEMES.indexOf(storedTheme()) + 1) % THEMES.length];
+    try { localStorage.setItem(THEME_KEY, next); } catch { /* the choice lasts for the page then */ }
+    applyTheme(next);
+    show(next);
+  });
+  return button;
 }
 
 export async function refreshStatus() {

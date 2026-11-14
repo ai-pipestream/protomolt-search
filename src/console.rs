@@ -31,7 +31,8 @@ use std::time::{Duration, Instant};
 use bytes::{Buf, BufMut, Bytes};
 use prost::Message as _;
 use prost_reflect::{
-    DescriptorPool, DynamicMessage, MessageDescriptor, MethodDescriptor, SerializeOptions,
+    DescriptorPool, DynamicMessage, EnumDescriptor, Kind, MessageDescriptor, MethodDescriptor,
+    SerializeOptions,
 };
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -89,12 +90,17 @@ fn exposed_summary() -> String {
 const MAX_BODY_BYTES: usize = 8 << 20;
 /// `ClusterHealth` is re-read at most this often for document routing.
 const HEALTH_TTL: Duration = Duration::from_secs(5);
+/// How long a stream's client may take to accept one frame.
+const STREAM_WRITE_DEADLINE: Duration = Duration::from_secs(10);
 
 const INDEX_HTML: &str = include_str!("bin/console-ui/index.html");
 const DASHBOARD_HTML: &str = include_str!("bin/console-ui/dashboard.html");
+const EXPLORER_HTML: &str = include_str!("bin/console-ui/explorer.html");
+const EXPLORER_JS: &str = include_str!("bin/console-ui/explorer.js");
 const APP_CSS: &str = include_str!("bin/console-ui/app.css");
 const COMMON_JS: &str = include_str!("bin/console-ui/common.js");
 const SEARCH_JS: &str = include_str!("bin/console-ui/search.js");
+const QUERY_STATE_JS: &str = include_str!("bin/console-ui/query-state.js");
 const DASHBOARD_JS: &str = include_str!("bin/console-ui/dashboard.js");
 const SPARKLINE_JS: &str = include_str!("bin/console-ui/sparkline.js");
 
@@ -372,6 +378,113 @@ fn resolve_method(service: &str, method: &str) -> Result<MethodDescriptor, Reply
         ));
     }
     Ok(found)
+}
+
+/// The comment written above a descriptor in its `.proto`, when the
+/// compiled set kept source info: the location whose path is the
+/// descriptor's own.
+fn leading_comment(file: &prost_types::FileDescriptorProto, path: &[i32]) -> String {
+    file.source_code_info
+        .as_ref()
+        .and_then(|info| info.location.iter().find(|l| l.path == path))
+        .and_then(|l| l.leading_comments.as_deref())
+        .map(|c| {
+            c.lines()
+                .map(str::trim)
+                .collect::<Vec<_>>()
+                .join(" ")
+                .trim()
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+fn kind_name(kind: &Kind) -> String {
+    match kind {
+        Kind::Message(m) => m.full_name().to_string(),
+        Kind::Enum(e) => e.full_name().to_string(),
+        scalar => format!("{scalar:?}").to_lowercase(),
+    }
+}
+
+/// Add `message` and every message and enum its fields reach to the
+/// two maps, each once.
+fn describe_message(
+    message: &MessageDescriptor,
+    messages: &mut serde_json::Map<String, Value>,
+    enums: &mut serde_json::Map<String, Value>,
+) {
+    if messages.contains_key(message.full_name()) {
+        return;
+    }
+    // Reserve the name first: a message that reaches itself stops here.
+    messages.insert(message.full_name().to_string(), Value::Null);
+    let file = message.parent_file_descriptor_proto();
+    let mut fields = Vec::new();
+    for field in message.fields() {
+        let mut entry = json!({
+            "name": field.name(),
+            "json_name": field.json_name(),
+            "number": field.number(),
+            "type": kind_name(&field.kind()),
+            "repeated": field.is_list(),
+            "comment": leading_comment(file, field.path()),
+        });
+        if let Some(oneof) = field.containing_oneof().filter(|o| !o.is_synthetic()) {
+            entry["oneof"] = json!(oneof.name());
+        }
+        if field.is_map() {
+            if let Kind::Message(pair) = field.kind() {
+                let (key, value) = (pair.map_entry_key_field(), pair.map_entry_value_field());
+                entry["map"] =
+                    json!({ "key": kind_name(&key.kind()), "value": kind_name(&value.kind()) });
+                entry["type"] = json!(kind_name(&value.kind()));
+                match value.kind() {
+                    Kind::Message(m) => describe_message(&m, messages, enums),
+                    Kind::Enum(e) => describe_enum(&e, enums),
+                    _ => {}
+                }
+            }
+        } else {
+            match field.kind() {
+                Kind::Message(m) => describe_message(&m, messages, enums),
+                Kind::Enum(e) => describe_enum(&e, enums),
+                _ => {}
+            }
+        }
+        fields.push(entry);
+    }
+    messages.insert(
+        message.full_name().to_string(),
+        json!({ "comment": leading_comment(file, message.path()), "fields": fields }),
+    );
+}
+
+fn describe_enum(desc: &EnumDescriptor, enums: &mut serde_json::Map<String, Value>) {
+    if !enums.contains_key(desc.full_name()) {
+        let values: Vec<Value> = desc.values().map(|v| json!(v.name())).collect();
+        enums.insert(desc.full_name().to_string(), Value::Array(values));
+    }
+}
+
+/// `GET /api/describe/<Service>/<Method>`: the shapes of an exposed
+/// method's request and response messages, from the descriptor set the
+/// transcoder reads, with the comments the `.proto` carries.
+fn describe(service: &str, method: &str) -> Result<Value, Reply> {
+    let found = resolve_method(service, method)?;
+    let (mut messages, mut enums) = (serde_json::Map::new(), serde_json::Map::new());
+    describe_message(&found.input(), &mut messages, &mut enums);
+    describe_message(&found.output(), &mut messages, &mut enums);
+    Ok(json!({
+        "service": service,
+        "method": method,
+        "server_streaming": found.is_server_streaming(),
+        "comment": leading_comment(found.parent_service().parent_file_descriptor_proto(), found.path()),
+        "request": found.input().full_name(),
+        "response": found.output().full_name(),
+        "messages": messages,
+        "enums": enums,
+    }))
 }
 
 /// A codec that moves message bytes untouched: the facade encodes and
@@ -744,10 +857,13 @@ fn asset(path: &str) -> Option<(&'static str, &'static str)> {
     Some(match path {
         "/" | "/index.html" => ("text/html; charset=utf-8", INDEX_HTML),
         "/dashboard" | "/dashboard.html" => ("text/html; charset=utf-8", DASHBOARD_HTML),
+        "/explorer" | "/explorer.html" => ("text/html; charset=utf-8", EXPLORER_HTML),
+        "/explorer.js" => ("text/javascript; charset=utf-8", EXPLORER_JS),
         "/app.css" => ("text/css; charset=utf-8", APP_CSS),
         "/common.js" => ("text/javascript; charset=utf-8", COMMON_JS),
         "/search.js" => ("text/javascript; charset=utf-8", SEARCH_JS),
         "/dashboard.js" => ("text/javascript; charset=utf-8", DASHBOARD_JS),
+        "/query-state.js" => ("text/javascript; charset=utf-8", QUERY_STATE_JS),
         "/sparkline.js" => ("text/javascript; charset=utf-8", SPARKLINE_JS),
         _ => return None,
     })
@@ -764,6 +880,10 @@ async fn route(ctx: &Ctx, request: &HttpRequest, segments: &[&str]) -> Reply {
             Err(e) => Reply::error(502, "UNAVAILABLE", e),
         },
         ("GET", ["api", "config"]) => Reply::json(200, config_json(ctx)),
+        ("GET", ["api", "describe", service, method]) => match describe(service, method) {
+            Ok(v) => Reply::json(200, v),
+            Err(reply) => reply,
+        },
         ("POST", ["api", "embed"]) => embed(ctx, &request.body).await,
         ("POST", ["api", "documents"]) => documents(ctx, &request.body).await,
         ("POST", ["api", "rpc", service, method]) => unary_rpc(ctx, service, method, request).await,
@@ -928,45 +1048,50 @@ async fn stream_rpc(
             return write_reply(stream, call_status_reply(&status, &method, &addr)).await
         }
     };
-    stream
-        .write_all(
-            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-        )
-        .await?;
-    stream.flush().await?;
+    let head = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
+    write_frame(stream, &[head]).await?;
     loop {
         match messages.message().await {
             Ok(Some(bytes)) => match decode_response(&method, bytes) {
-                Ok(json) => {
-                    stream.write_all(b"data: ").await?;
-                    stream.write_all(&json).await?;
-                    stream.write_all(b"\n\n").await?;
-                    stream.flush().await?;
-                }
+                Ok(json) => write_frame(stream, &[b"data: ", &json, b"\n\n"]).await?,
                 Err(reply) => {
-                    let frame = format!(
-                        "event: error\ndata: {}\n\n",
-                        String::from_utf8_lossy(&reply.body)
-                    );
-                    stream.write_all(frame.as_bytes()).await?;
-                    break;
+                    return write_frame(stream, &[b"event: error\ndata: ", &reply.body, b"\n\n"])
+                        .await;
                 }
             },
-            Ok(None) => {
-                stream.write_all(b"event: end\ndata: {}\n\n").await?;
-                break;
-            }
+            Ok(None) => return write_frame(stream, &[b"event: end\ndata: {}\n\n"]).await,
             Err(status) => {
-                let frame = format!(
-                    "event: error\ndata: {}\n\n",
-                    json!({ "error": status.message(), "code": code_name(status.code()) })
-                );
-                stream.write_all(frame.as_bytes()).await?;
-                break;
+                let error = json!({ "error": status.message(), "code": code_name(status.code()) })
+                    .to_string();
+                return write_frame(
+                    stream,
+                    &[b"event: error\ndata: ", error.as_bytes(), b"\n\n"],
+                )
+                .await;
             }
         }
     }
-    stream.flush().await
+}
+
+/// One server-sent frame, written and flushed within
+/// [`STREAM_WRITE_DEADLINE`]. A client that holds its connection open
+/// without reading would otherwise park this task on the write for
+/// good; the gRPC stream behind it then goes unread and its data holds
+/// flow-control window on the channel every other call shares.
+async fn write_frame(stream: &mut TcpStream, parts: &[&[u8]]) -> std::io::Result<()> {
+    let write = async {
+        for part in parts {
+            stream.write_all(part).await?;
+        }
+        stream.flush().await
+    };
+    match tokio::time::timeout(STREAM_WRITE_DEADLINE, write).await {
+        Ok(written) => written,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "the stream's client stopped reading",
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
