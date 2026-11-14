@@ -142,26 +142,18 @@ impl SnapshotCompletion {
         });
     }
 
-    pub(crate) async fn wait(&self, bound: std::time::Duration) -> Result<(), Status> {
+    pub(crate) async fn wait(&self) -> Result<(), Status> {
         let mut outcome = self.outcome.subscribe();
-        tokio::time::timeout(bound, async {
-            loop {
-                let ready = outcome.borrow_and_update().clone();
-                if let Some(ready) = ready {
-                    return ready;
-                }
-                outcome
-                    .changed()
-                    .await
-                    .map_err(|_| Status::unavailable("snapshot finalization closed"))?;
+        loop {
+            let ready = outcome.borrow_and_update().clone();
+            if let Some(ready) = ready {
+                return ready;
             }
-        })
-        .await
-        .map_err(|_| {
-            Status::unavailable(
-                "snapshot finalization has not completed within the receive idle interval",
-            )
-        })?
+            outcome
+                .changed()
+                .await
+                .map_err(|_| Status::unavailable("snapshot finalization closed"))?;
+        }
     }
 }
 

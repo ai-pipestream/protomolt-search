@@ -165,10 +165,14 @@ library a validated image only (`RaftTransportService::stage`,
   verification probe can use another `max_snapshot_bytes`. Existing
   published generations and the live-store replacement are separate.
   No transport lock or detached task waits for a core installation.
+  Synchronous disk verification still holds the transfer and receipt
+  locks until validation and hand-off end; a higher-vote transfer can
+  stage during an older core installation, not preempt disk validation.
 - **Final retries.** One receipt binds the authenticated peer, vote, full
   metadata, final offset, byte length and SHA-256 of the final chunk.
   Repeating that exact final RPC waits for its installation outcome and
-  answers with the core's current vote. Conflicting bytes or identity do
+  reads the core's current vote through its request queue, rather than a
+  cached reply or the metrics watch. Conflicting bytes or identity do
   not reuse the receipt, and a transfer restarted at offset zero must
   validate its received bytes again. A retry waits at most the existing
   `snapshot_idle_timeout_ms`; a failed or discarded receive records no

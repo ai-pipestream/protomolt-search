@@ -760,10 +760,22 @@ impl RaftTransportService {
                 got_offset: offset,
             }),
             Staged::Replay(completion) => {
-                completion.wait(self.idle).await?;
                 // A replay observes the current term; an old cached vote
-                // must never hide a vote that advanced since installation.
-                InstallOutcome::Vote(vote_to_proto(&self.raft.metrics().borrow().vote))
+                // or a lagging metrics watch must never hide a later vote.
+                let vote = tokio::time::timeout(self.idle, async {
+                    completion.wait().await?;
+                    self.raft
+                        .with_raft_state(|state| *state.vote_ref())
+                        .await
+                        .map_err(|error| Status::unavailable(format!("raft core: {error}")))
+                })
+                .await
+                .map_err(|_| {
+                    Status::unavailable(
+                        "snapshot finalization has not completed within the receive idle interval",
+                    )
+                })??;
+                InstallOutcome::Vote(vote_to_proto(&vote))
             }
             Staged::Complete {
                 meta,

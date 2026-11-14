@@ -1,7 +1,7 @@
 use super::log_store::RaftLogStore;
 use super::state_machine::{
     format_snapshot_id, parse_snapshot_id, published_generation, ControlStateMachine,
-    ImageSignature,
+    ImageSignature, SnapshotCompletion,
 };
 use super::types::*;
 use super::{HostConfig, RaftHost};
@@ -83,13 +83,21 @@ async fn r153_receive_ownership_follows_the_file_across_a_second_receive() {
     let snapshots = replica.0.join("snapshots");
     let mut machine = ControlStateMachine::new(store, &snapshots, 64 << 20).unwrap();
     let mut first = machine.begin_receiving_snapshot().await.unwrap();
+    let completed = std::sync::Arc::new(SnapshotCompletion::new());
+    first.set_completion(std::sync::Arc::clone(&completed));
     first.write_all(&image).await.unwrap();
     let mut second = machine.begin_receiving_snapshot().await.unwrap();
+    let rejected = std::sync::Arc::new(SnapshotCompletion::new());
+    second.set_completion(std::sync::Arc::clone(&rejected));
     second.write_all(b"another receive's bytes").await.unwrap();
     machine
         .install_snapshot(&snapshot.meta, first)
         .await
         .expect("the first install consumes its own receive, never the newest receive");
+    completed
+        .wait()
+        .await
+        .expect("discard on Drop cannot overwrite durable installation success");
     assert_eq!(
         machine.applied_state().await.unwrap().0,
         snapshot.meta.last_log_id
@@ -98,6 +106,10 @@ async fn r153_receive_ownership_follows_the_file_across_a_second_receive() {
         .install_snapshot(&snapshot.meta, second)
         .await
         .is_err());
+    assert!(
+        rejected.wait().await.is_err(),
+        "a failed owned install cannot record successful completion"
+    );
     assert_eq!(
         machine.get_current_snapshot().await.unwrap().unwrap().meta,
         snapshot.meta
@@ -121,13 +133,19 @@ async fn r153_owned_receives_have_a_fixed_count_bound_and_release_it_on_drop() {
     .unwrap();
     let snapshots = dir.0.join("snapshots");
     let mut machine = ControlStateMachine::new(store, &snapshots, 64 << 20).unwrap();
-    let first = machine.begin_receiving_snapshot().await.unwrap();
+    let mut first = machine.begin_receiving_snapshot().await.unwrap();
+    let cancelled = std::sync::Arc::new(SnapshotCompletion::new());
+    first.set_completion(std::sync::Arc::clone(&cancelled));
     let second = machine.begin_receiving_snapshot().await.unwrap();
     assert!(
         machine.begin_receiving_snapshot().await.is_err(),
         "two owned receives exhaust the fixed finalization bound"
     );
     drop(first);
+    assert!(
+        cancelled.wait().await.is_err(),
+        "dropping an uninstalled owned receive cannot record success"
+    );
     let successor = machine
         .begin_receiving_snapshot()
         .await

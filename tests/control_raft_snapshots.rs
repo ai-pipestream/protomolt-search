@@ -174,6 +174,31 @@ async fn r153_a_completed_final_chunk_replays_only_its_exact_authenticated_conte
             .await
             .expect_err("a conflicting final RPC must not replay a successful reply");
     }
+    // Starting again at zero creates a new receive. Even an unchanged final
+    // chunk must validate all its earlier bytes instead of using the receipt.
+    for (index, bytes) in image[..offset].chunks(raft_kit::CHUNK_BYTES).enumerate() {
+        let mut bytes = bytes.to_vec();
+        if index == 0 {
+            bytes[0] ^= 1;
+        }
+        peer.install_snapshot(raft_kit::timed(raft_kit::chunk_request(
+            &group,
+            raft_kit::PEER_ID,
+            raft_kit::MEMBER_ID,
+            &vote,
+            &meta,
+            index * raft_kit::CHUNK_BYTES,
+            &bytes,
+            false,
+        )))
+        .await
+        .unwrap();
+    }
+    let corrupt_restart = peer
+        .install_snapshot(raft_kit::timed(final_chunk.clone()))
+        .await
+        .expect_err("a matching final chunk must not acknowledge corrupted earlier bytes");
+    assert_eq!(corrupt_restart.code(), Code::DataLoss, "{corrupt_restart}");
     let mut other =
         raft_kit::peer_client(cluster.member().listen_addr().unwrap(), raft_kit::NODE_ID).await;
     let mut changed = final_chunk.clone();
@@ -326,6 +351,36 @@ async fn r153_a_higher_vote_can_stage_while_an_earlier_install_is_stalled() {
     .await
     .expect("the higher-vote transfer completes once the store worker can advance");
     assert!(replies.last().unwrap().outcome.as_ref().is_some_and(|outcome| matches!(outcome, pipestream_search::pb::storage::raft_install_snapshot_response::Outcome::Vote(v) if v.term == newer_vote.term)));
+    // Advance the vote after the completion was cached. An exact replay
+    // must read the core's new vote, not the receipt's earlier reply.
+    let advanced = pipestream_search::pb::storage::RaftVote {
+        term: newer_vote.term + 1,
+        node_id: raft_kit::NODE_ID,
+        committed: true,
+    };
+    // A Vote request is refused while the prior leader lease is fresh.
+    // A committed heartbeat advances the term without waiting out that lease.
+    let advanced_reply = successor
+        .append_entries(raft_kit::timed(
+            pipestream_search::pb::storage::RaftAppendEntriesRequest {
+                header: Some(raft_kit::header(
+                    &group,
+                    raft_kit::NODE_ID,
+                    raft_kit::MEMBER_ID,
+                )),
+                vote: Some(advanced),
+                prev_log_id: meta.last_log_id,
+                entries: Vec::new(),
+                leader_commit: meta.last_log_id,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(matches!(
+        advanced_reply.outcome,
+        Some(pipestream_search::pb::storage::raft_append_entries_response::Outcome::Success(true))
+    ));
     let offset = (image.len() - 1) / raft_kit::CHUNK_BYTES * raft_kit::CHUNK_BYTES;
     let replay = successor
         .install_snapshot(raft_kit::timed(raft_kit::chunk_request(
@@ -342,7 +397,7 @@ async fn r153_a_higher_vote_can_stage_while_an_earlier_install_is_stalled() {
         .expect("the latest exact completion is replayable after the vote advanced")
         .into_inner();
     assert!(
-        matches!(replay.outcome, Some(pipestream_search::pb::storage::raft_install_snapshot_response::Outcome::Vote(v)) if v.term == newer_vote.term)
+        matches!(replay.outcome, Some(pipestream_search::pb::storage::raft_install_snapshot_response::Outcome::Vote(v)) if v == advanced)
     );
     assert!(raft_kit::core_running(cluster.member()));
     assert!(raft_kit::incoming_dirs(cluster.member_dir.path()).is_empty());
