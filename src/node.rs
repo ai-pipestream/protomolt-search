@@ -77,8 +77,8 @@ use crate::snapshot_repository::{
     self as repo, RepositoryManifest, CATALOG_DIR, LAYOUT_SEGMENTS, LAYOUT_SINGLE_IMAGE,
 };
 use crate::vector::{
-    first_invalid_coordinate, legacy_calibration_config, QualityContract, ScoreDirection,
-    VectorBackendConfig, VectorIndex, VectorSearchOptions, VectorStreamControl, EMBEDDED_TURBOVEC,
+    first_invalid_coordinate, QualityContract, ScoreDirection, VectorBackendConfig, VectorIndex,
+    VectorSearchOptions, VectorStreamControl, EMBEDDED_TURBOVEC,
 };
 use crate::wal::{self, WalWriter};
 
@@ -4239,16 +4239,9 @@ pub fn generation_dir(index_path: &Path) -> PathBuf {
     PathBuf::from(p)
 }
 
-/// The provider image inside a generation directory. Existing generations
-/// written before the provider abstraction keep their legacy filename.
+/// The provider image inside a generation directory.
 pub fn generation_vector(dir: &Path) -> PathBuf {
-    let current = dir.join("vector.index");
-    let legacy = dir.join("index.tv");
-    if current.exists() || !legacy.exists() {
-        current
-    } else {
-        legacy
-    }
+    dir.join("vector.index")
 }
 /// The product-owned FP32 sidecar inside a generation directory.
 pub fn generation_exact_vectors(dir: &Path) -> PathBuf {
@@ -4256,13 +4249,7 @@ pub fn generation_exact_vectors(dir: &Path) -> PathBuf {
 }
 /// The BM25 sidecar path inside a generation directory.
 pub fn generation_bm25(dir: &Path) -> PathBuf {
-    let current = dir.join("documents.bm25");
-    let legacy = dir.join("index.tv.bm25");
-    if current.exists() || !legacy.exists() {
-        current
-    } else {
-        legacy
-    }
+    dir.join("documents.bm25")
 }
 
 /// Product-owned live-row overlay inside a snapshot generation.
@@ -4396,25 +4383,6 @@ pub fn recover_generation(index_path: &Path) -> Option<PathBuf> {
     (generation_vector(&snap).exists() || generation_bm25(&snap).exists()).then_some(snap)
 }
 
-/// Build the manifest describing the shard's current provider state and
-/// dimension. An empty shard completes it lazily through backend configuration
-/// or its first batch, before any records make the manifest immutable.
-///
-/// `preexisting` is the (vectors, documents) the shard already holds
-/// that this generation's log will NOT contain — the installed image on
-/// a snapshot rotation, or the whole shard when logging is enabled on an
-/// already-populated index. Nonzero preexisting state marks the log as
-/// partial history, which the reshard tool refuses (a log-only replay
-/// would silently drop that state).
-/// The index's committed TQ+ pair, `None` when uncalibrated — the
-/// shape the fork's former `calibration()` getter returned, read here
-/// through upstream's explicit-calibration accessors (#474).
-fn calibration_of(index: &VectorIndex) -> Option<(Vec<f32>, Vec<f32>)> {
-    let config = index.backend_config().ok()?;
-    let legacy = legacy_calibration_config(&config).ok()??;
-    (!legacy.shift.is_empty()).then_some((legacy.shift, legacy.scale))
-}
-
 fn wire_backend_config(config: &VectorBackendConfig) -> WireVectorBackendConfig {
     WireVectorBackendConfig {
         backend_kind: config.backend_kind.clone(),
@@ -4467,6 +4435,16 @@ fn wire_backend_descriptor(index: &VectorIndex) -> WireVectorBackendDescriptor {
     }
 }
 
+/// Build the manifest describing the shard's current provider state and
+/// dimension. An empty shard completes it lazily through backend configuration
+/// or its first batch, before any records make the manifest immutable.
+///
+/// `preexisting` is the (vectors, documents) the shard already holds
+/// that this generation's log will NOT contain — the installed image on
+/// a snapshot rotation, or the whole shard when logging is enabled on an
+/// already-populated index. Nonzero preexisting state marks the log as
+/// partial history, which the reshard tool refuses (a log-only replay
+/// would silently drop that state).
 pub(crate) fn wal_manifest(
     index: Option<&VectorIndex>,
     config: &NodeConfig,
@@ -4474,20 +4452,8 @@ pub(crate) fn wal_manifest(
     preexisting: (u64, u64),
 ) -> wal::WalManifest {
     let backend_config = index.and_then(|index| index.backend_config().ok());
-    let (dim, bit_width, shift, scale) = match index {
-        Some(index) => {
-            let (shift, scale) = calibration_of(index).unwrap_or_default();
-            (
-                index.dim_opt().unwrap_or(0) as u32,
-                index.bits_per_dimension().unwrap_or(config.bit_width) as u32,
-                shift,
-                scale,
-            )
-        }
-        None => (0, config.bit_width as u32, Vec::new(), Vec::new()),
-    };
     wal::WalManifest {
-        dim,
+        dim: index.map_or(0, |index| index.dim_opt().unwrap_or(0) as u32),
         vector_backend: backend_config
             .as_ref()
             .map_or_else(|| config.vector_backend.clone(), |c| c.backend_kind.clone()),
@@ -4495,9 +4461,6 @@ pub(crate) fn wal_manifest(
             .as_ref()
             .map_or_else(String::new, |c| c.config_format.clone()),
         vector_config_payload: backend_config.map_or_else(Vec::new, |c| c.payload),
-        bit_width,
-        calibration_shift: shift,
-        calibration_scale: scale,
         collection: config.collection.clone(),
         slot_offset: config.slot_offset,
         generation,
@@ -4505,8 +4468,7 @@ pub(crate) fn wal_manifest(
         bucket_count: config.wal_buckets,
         preexisting_vectors: preexisting.0,
         preexisting_documents: preexisting.1,
-        format_version: wal::BASE_FORMAT_VERSION,
-        legacy_derived_tag27: false,
+        format_version: wal::FORMAT_VERSION,
         derived_fingerprint: config
             .derived
             .as_ref()
@@ -4659,12 +4621,7 @@ fn open_wal(index: Option<&VectorIndex>, config: &NodeConfig) -> Option<WalWrite
         let fresh = wal_manifest(index, config, m.generation, (0, 0));
         if m.dim == 0 {
             m.dim = fresh.dim;
-            m.bit_width = fresh.bit_width;
             m.slot_offset = fresh.slot_offset;
-        }
-        if m.calibration_shift.is_empty() {
-            m.calibration_shift = fresh.calibration_shift;
-            m.calibration_scale = fresh.calibration_scale;
         }
         if m.vector_config_format.is_empty() && !fresh.vector_config_format.is_empty() {
             m.vector_backend = fresh.vector_backend;
@@ -7553,11 +7510,7 @@ impl NodeServiceImpl {
         let deleted = guard.live_docs.deleted_count().min(physical);
         let (wal_generation, wal_high_watermark, wal_clocked) =
             guard.wal.as_ref().map_or((0, 0, false), |wal| {
-                (
-                    wal.generation(),
-                    wal.high_watermark(),
-                    !wal.has_legacy_clock_records(),
-                )
+                (wal.generation(), wal.high_watermark(), true)
             });
         Ok((
             RepositoryManifest {
@@ -8162,7 +8115,7 @@ impl NodeServiceImpl {
         // provider commit. Neither snapshot copy nor admitted physical reads
         // may keep using the pre-append generation claim.
         guard.advance_stats_epoch();
-        let (first_id, index_bit_width, index_len) = {
+        let (first_id, index_len) = {
             let index = match guard.index.as_mut() {
                 Some(index) => index,
                 None => {
@@ -8174,11 +8127,7 @@ impl NodeServiceImpl {
                     guard.index.as_mut().expect("just constructed")
                 }
             };
-            (
-                self.config.slot_offset + index.len() as u64,
-                index.bits_per_dimension().unwrap_or(self.config.bit_width),
-                index.len(),
-            )
+            (self.config.slot_offset + index.len() as u64, index.len())
         };
         if guard.exact_vectors.is_none() {
             if index_len != 0 {
@@ -8254,7 +8203,6 @@ impl NodeServiceImpl {
                 if m.dim == 0 {
                     m.dim = dim as u32;
                 }
-                m.bit_width = index_bit_width as u32;
                 m.set_backend_config(committed_config.clone());
             });
         }
@@ -11241,7 +11189,6 @@ impl NodeServiceImpl {
                 .index
                 .as_ref()
                 .expect("provider index remains present");
-            let bit_width = index.bits_per_dimension().unwrap_or(self.config.bit_width);
             let committed_config = index.backend_config().map_err(|e| {
                 Status::internal(format!(
                     "read vector backend config after mapped ingest: {e}"
@@ -11252,7 +11199,6 @@ impl NodeServiceImpl {
                     if m.dim == 0 {
                         m.dim = dim as u32;
                     }
-                    m.bit_width = bit_width as u32;
                     m.set_backend_config(committed_config.clone());
                 });
             }
@@ -13298,11 +13244,7 @@ sort_contract_version: crate::sortkeys::MAP_SORT_CONTRACT_VERSION,
         let deleted_docs = guard.live_docs.deleted_count().min(physical_docs);
         let (wal_generation, wal_high_watermark, wal_clocked) =
             guard.wal.as_ref().map_or((0, 0, false), |wal| {
-                (
-                    wal.generation(),
-                    wal.high_watermark(),
-                    !wal.has_legacy_clock_records(),
-                )
+                (wal.generation(), wal.high_watermark(), true)
             });
         Ok(Response::new(HealthResponse {
             document_contract_version: crate::document_contract::VERSION,

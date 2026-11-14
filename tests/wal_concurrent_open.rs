@@ -49,9 +49,6 @@ fn manifest() -> WalManifest {
         vector_backend: String::new(),
         vector_config_format: String::new(),
         vector_config_payload: Vec::new(),
-        bit_width: 4,
-        calibration_shift: vec![0.0; 8],
-        calibration_scale: vec![1.0; 8],
         slot_offset: 25_000_000,
         generation: 0,
         bucket_bits: 2,
@@ -60,7 +57,6 @@ fn manifest() -> WalManifest {
         preexisting_documents: 10_829_824,
         format_version: wal::FORMAT_VERSION,
         derived_fingerprint: String::new(),
-        legacy_derived_tag27: false,
         derived: Vec::new(),
         columns: None,
     }

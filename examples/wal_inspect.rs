@@ -108,20 +108,23 @@ fn inspect_file(path: &Path, records: bool) -> Result<(u64, u64), String> {
 
 fn inspect_gen(gen: &Path, records: bool) -> Result<(), String> {
     let manifest = wal::read_manifest(gen).map_err(|e| format!("{}: {e}", gen.display()))?;
-    let calibrated = !manifest.calibration_shift.is_empty();
     println!("{}", gen.display());
     println!(
-        "  manifest: dim={} bit_width={} slot_offset={} generation={} buckets={} \
-         calibration={} format v{}",
+        "  manifest: dim={} backend={} slot_offset={} generation={} buckets={} \
+         provider state={} format v{}",
         manifest.dim,
-        manifest.bit_width,
+        if manifest.vector_backend.is_empty() {
+            "(none)"
+        } else {
+            &manifest.vector_backend
+        },
         manifest.slot_offset,
         manifest.generation,
         manifest.bucket_count,
-        if calibrated {
+        if manifest.backend_config().is_ok() {
             "locked"
         } else {
-            "NONE (unseeded; not reshardable)"
+            "NONE (unconfigured; not reshardable)"
         },
         manifest.format_version,
     );

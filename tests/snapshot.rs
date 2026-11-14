@@ -588,7 +588,7 @@ fn recover_generation_repairs_interrupted_swaps() {
     // Crashed between the swap renames: snap-old without snap is the
     // whole previous generation — rename it back.
     std::fs::create_dir_all(&old).unwrap();
-    std::fs::write(old.join("index.tv"), b"x").unwrap();
+    std::fs::write(old.join("vector.index"), b"x").unwrap();
     assert_eq!(recover_generation(&index_path), Some(snap.clone()));
     assert!(generation_vector(&snap).exists());
     assert!(!old.exists());
