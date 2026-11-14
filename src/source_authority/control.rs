@@ -803,12 +803,78 @@ fn write_rows(tx: &redb::WriteTransaction, rows: &Rows) -> Result<ControlStoreHe
     Ok(delta)
 }
 
-/// Lay out a validated state as bounded rows. Pure over its inputs.
+/// Recovery reconstructs one bounded canonical row at a time from the retained
+/// accepted command. No corpus-sized expected-row map or new stored digest is
+/// needed; the existing audit separately checks table counts and payload bytes.
+pub(super) fn verify_installed(
+    tx: &redb::ReadTransaction,
+    command: &ControlInstallCommand,
+    receipt: &ControlInstallReceipt,
+) -> Result<(), Status> {
+    let definitions = [CONTROL, TOPOLOGIES, NODES, REPLICAS, ACTIONS, COMPLETED];
+    let tables = definitions
+        .into_iter()
+        .map(|definition| tx.open_table(definition).map_err(corrupt))
+        .collect::<Result<Vec<_>, _>>()?;
+    let expected = visit_rows(
+        command
+            .key
+            .as_ref()
+            .ok_or_else(|| missing("install command key"))?,
+        command
+            .state
+            .as_ref()
+            .ok_or_else(|| missing("install command state"))?,
+        receipt.control_revision,
+        |table, (key, value)| {
+            let stored = tables[table]
+                .get(key.as_slice())
+                .map_err(storage)?
+                .ok_or_else(|| corrupt("accepted install row is missing or its key changed"))?;
+            if stored.value() != value.as_slice() {
+                return Err(corrupt(
+                    "installed control row differs from its accepted install command",
+                ));
+            }
+            Ok(())
+        },
+    )
+    .map_err(corrupt)?;
+    if expected != *receipt {
+        return Err(corrupt("install receipt differs from its accepted command"));
+    }
+    Ok(())
+}
+
 fn rows(
     key: &LogicalSourceOwner,
     state: &ControlInstallState,
     revision: u64,
 ) -> Result<Rows, Status> {
+    let mut groups: [RawRows; 6] = Default::default();
+    let receipt = visit_rows(key, state, revision, |group, row| {
+        groups[group].push(row);
+        Ok(())
+    })?;
+    let [mut control, topologies, nodes, replicas, actions, completed] = groups;
+    Ok(Rows {
+        receipt,
+        control: control.pop().expect("one canonical control row"),
+        topologies,
+        nodes,
+        replicas,
+        actions,
+        completed,
+    })
+}
+
+/// Lay out a validated state as bounded rows. Pure over its inputs.
+fn visit_rows(
+    key: &LogicalSourceOwner,
+    state: &ControlInstallState,
+    revision: u64,
+    mut visit: impl FnMut(usize, (Vec<u8>, Vec<u8>)) -> Result<(), Status>,
+) -> Result<ControlInstallReceipt, Status> {
     let current = state.topology.as_ref().expect("validated topology");
     let configuration = state
         .configuration
@@ -818,34 +884,38 @@ fn rows(
         Some(control_configuration::Placement::Tree(_)) => configuration.route_codes.clone(),
         _ => Vec::new(),
     };
-    let mut topologies = Vec::with_capacity(1 + state.history.len());
-    topologies.push(topology_row(
-        key,
-        ControlTopology {
-            format_version: 1,
-            generation: current.generation,
-            routes: current.routes.clone(),
-            codes_available: !codes.is_empty(),
-            codes,
-            current: true,
-            history_index: 0,
-        },
-    )?);
-    for (index, table) in state.history.iter().enumerate() {
-        topologies.push(topology_row(
+    visit(
+        1,
+        topology_row(
             key,
             ControlTopology {
                 format_version: 1,
-                generation: table.generation,
-                routes: table.routes.clone(),
-                codes_available: false,
-                codes: Vec::new(),
-                current: false,
-                history_index: index as u32,
+                generation: current.generation,
+                routes: current.routes.clone(),
+                codes_available: !codes.is_empty(),
+                codes,
+                current: true,
+                history_index: 0,
             },
-        )?);
+        )?,
+    )?;
+    for (index, table) in state.history.iter().enumerate() {
+        visit(
+            1,
+            topology_row(
+                key,
+                ControlTopology {
+                    format_version: 1,
+                    generation: table.generation,
+                    routes: table.routes.clone(),
+                    codes_available: false,
+                    codes: Vec::new(),
+                    current: false,
+                    history_index: index as u32,
+                },
+            )?,
+        )?;
     }
-    let mut nodes = Vec::with_capacity(state.nodes.len());
     for node in &state.nodes {
         let k = ControlNodeKey {
             key: Some(key.clone()),
@@ -870,9 +940,8 @@ fn rows(
         }
         .encode_to_vec();
         bounded_record(&v, "installed node")?;
-        nodes.push((k, v));
+        visit(2, (k, v))?;
     }
-    let mut replicas = Vec::with_capacity(state.replicas.len());
     for replica in &state.replicas {
         let k = ControlReplicaKey {
             key: Some(key.clone()),
@@ -885,9 +954,8 @@ fn rows(
         }
         .encode_to_vec();
         bounded_record(&v, "installed replica")?;
-        replicas.push((k, v));
+        visit(3, (k, v))?;
     }
-    let mut actions = Vec::with_capacity(state.actions.len());
     for (order, action) in state.actions.iter().enumerate() {
         let k = ControlActionKey {
             key: Some(key.clone()),
@@ -902,12 +970,11 @@ fn rows(
         }
         .encode_to_vec();
         bounded_record(&v, "installed action")?;
-        actions.push((k, v));
+        visit(4, (k, v))?;
     }
-    let completed = state
-        .completed_actions
-        .iter()
-        .map(|id| {
+    for id in &state.completed_actions {
+        visit(
+            5,
             (
                 ControlActionKey {
                     key: Some(key.clone()),
@@ -915,19 +982,19 @@ fn rows(
                 }
                 .encode_to_vec(),
                 ControlCompletedAction { format_version: 1 }.encode_to_vec(),
-            )
-        })
-        .collect::<Vec<_>>();
+            ),
+        )?;
+    }
     let receipt = ControlInstallReceipt {
         format_version: 1,
         control_revision: revision,
         generation: current.generation,
         routes: current.routes.len() as u64,
         history: state.history.len() as u64,
-        nodes: nodes.len() as u64,
-        replicas: replicas.len() as u64,
-        actions: actions.len() as u64,
-        completed_actions: completed.len() as u64,
+        nodes: state.nodes.len() as u64,
+        replicas: state.replicas.len() as u64,
+        actions: state.actions.len() as u64,
+        completed_actions: state.completed_actions.len() as u64,
     };
     let control_value = ControlCollectionState {
         format_version: 1,
@@ -942,15 +1009,8 @@ fn rows(
     }
     .encode_to_vec();
     bounded_record(&control_value, "installed control state")?;
-    Ok(Rows {
-        receipt,
-        control: (key.encode_to_vec(), control_value),
-        topologies,
-        nodes,
-        replicas,
-        actions,
-        completed,
-    })
+    visit(0, (key.encode_to_vec(), control_value))?;
+    Ok(receipt)
 }
 
 fn topology_row(

@@ -87,6 +87,7 @@ pub(super) fn validate(
                     "accepted install decision differs from its command",
                 ));
             }
+            control::verify_installed(tx, command, receipt)?;
             let resource = command.key.as_ref().expect("validated key").encode_to_vec();
             if installed.insert(resource, *receipt).is_some() {
                 return Err(corrupt("two accepted installs for one resource"));
