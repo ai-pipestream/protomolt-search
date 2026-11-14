@@ -1039,6 +1039,31 @@ impl NodeServiceImpl {
         tail_bound: usize,
         analyze: &mut Analyze<'_>,
     ) -> Result<CompactShardResponse, Status> {
+        self.build_and_cut_over_with_shadow_flush(
+            pre,
+            tail_bound,
+            analyze,
+            &mut Self::flush_compaction_shadow,
+        )
+    }
+
+    fn flush_compaction_shadow(shadow: &mut Shadow) -> Result<(), Status> {
+        shadow
+            .state
+            .wal
+            .as_mut()
+            .expect("checked after every apply")
+            .flush()
+            .map_err(|e| Status::internal(format!("fsync the rewritten generation: {e}")))
+    }
+
+    fn build_and_cut_over_with_shadow_flush(
+        &self,
+        pre: &Preflight,
+        tail_bound: usize,
+        analyze: &mut Analyze<'_>,
+        flush_shadow: &mut dyn FnMut(&mut Shadow) -> Result<(), Status>,
+    ) -> Result<CompactShardResponse, Status> {
         let slot_offset = self.config.slot_offset;
         // The rewritten generation: the source manifest one generation
         // on, full history (nothing preexisting), same geometry.
@@ -1152,7 +1177,7 @@ impl NodeServiceImpl {
         };
         shadow.id_map = build.id_map;
         let dense_rows = build.rows_before - build.tombstones;
-        let outcome = self.tail_and_cut_over(pre, &mut shadow, tail_bound, analyze);
+        let outcome = self.tail_and_cut_over(pre, &mut shadow, tail_bound, analyze, flush_shadow);
         match outcome {
             Ok((locked_records, write_lock_ms, tail_passes)) => {
                 let closing = Instant::now();
@@ -1854,6 +1879,7 @@ impl NodeServiceImpl {
         shadow: &mut Shadow,
         tail_bound: usize,
         analyze: &mut Analyze<'_>,
+        flush_shadow: &mut dyn FnMut(&mut Shadow) -> Result<(), Status>,
     ) -> Result<(u64, u64, u64), Status> {
         let mut tail = ClockedTail::start(&pre.gen_dir, pre.cutoff_clock);
         let mut passes = 0u64;
@@ -1908,6 +1934,12 @@ impl NodeServiceImpl {
             // can block the runtime workers needed to complete that I/O.
             self.apply_pass(shadow, records, analyze)?;
             passes += 1;
+            // The shadow is private and the mutation/seal fences still exclude
+            // ordinary commits. Sync it without blocking live readers, then
+            // validate the live generation and watermark before installing it.
+            // Defer this result so a rotated generation, live-WAL error or
+            // watermark retry retains the same precedence as before.
+            let shadow_sync = flush_shadow(shadow);
             let mut guard = crate::node::write_shard(&self.state);
             let started = Instant::now();
             if Self::flush_live_wal_locked(&mut guard, pre)? != watermark {
@@ -1920,13 +1952,7 @@ impl NodeServiceImpl {
                 }
                 continue;
             }
-            shadow
-                .state
-                .wal
-                .as_mut()
-                .expect("checked after every apply")
-                .flush()
-                .map_err(|e| Status::internal(format!("fsync the rewritten generation: {e}")))?;
+            shadow_sync?;
             self.install(pre, shadow, &guard)?;
             shadow.state.stats_epoch = guard.stats_epoch;
             shadow.state.advance_stats_epoch();
@@ -2853,7 +2879,34 @@ mod tests {
         cutover_with_writes_during_analysis(true).await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn private_shadow_flush_allows_reads_under_the_cutover_fences() {
+        cutover_with_shadow_flush(false, ShadowFlushCase::ReadsAvailable).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn private_shadow_flush_error_waits_for_a_matching_live_fence() {
+        cutover_with_shadow_flush(false, ShadowFlushCase::IoError).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rotated_live_generation_takes_priority_over_private_shadow_flush_error() {
+        cutover_with_shadow_flush(false, ShadowFlushCase::RotatedGeneration).await;
+    }
+
+    #[derive(Clone, Copy)]
+    enum ShadowFlushCase {
+        Real,
+        ReadsAvailable,
+        IoError,
+        RotatedGeneration,
+    }
+
     async fn cutover_with_writes_during_analysis(always_advance: bool) {
+        cutover_with_shadow_flush(always_advance, ShadowFlushCase::Real).await;
+    }
+
+    async fn cutover_with_shadow_flush(always_advance: bool, flush_case: ShadowFlushCase) {
         tokio::task::spawn_blocking(move || {
             let nonce = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2940,8 +2993,70 @@ mod tests {
                     ))
                     .map_err(|error| error.to_string())
             };
-            let result = node.build_and_cut_over(&pre, 256, &mut analyze);
-            let expected = if always_advance {
+            let mut flush_calls = 0;
+            let mut flush_shadow = |shadow: &mut Shadow| {
+                flush_calls += 1;
+                {
+                    let live = node
+                        .state
+                        .try_read()
+                        .expect("private shadow flush ran while the live shard was write-locked");
+                    assert_eq!(live.wal.as_ref().unwrap().generation(), 0);
+                    assert!(node.mutation_gate.try_read().is_err());
+                    assert!(node.seal_lock.try_lock().is_err());
+                }
+                match flush_case {
+                    ShadowFlushCase::Real | ShadowFlushCase::ReadsAvailable => {
+                        NodeServiceImpl::flush_compaction_shadow(shadow)
+                    }
+                    ShadowFlushCase::IoError => {
+                        Err(Status::internal("fsync the rewritten generation: injected"))
+                    }
+                    ShadowFlushCase::RotatedGeneration => {
+                        let mut live = node.state.write().unwrap();
+                        let mut manifest = live.wal.as_ref().unwrap().manifest().clone();
+                        manifest.generation += 1;
+                        live.wal = Some(
+                            WalWriter::create(&wal::wal_dir(&pre.index_path), manifest).unwrap(),
+                        );
+                        Err(Status::internal("fsync the rewritten generation: injected"))
+                    }
+                }
+            };
+            let result = match flush_case {
+                ShadowFlushCase::Real => node.build_and_cut_over(&pre, 256, &mut analyze),
+                _ => node.build_and_cut_over_with_shadow_flush(
+                    &pre,
+                    256,
+                    &mut analyze,
+                    &mut flush_shadow,
+                ),
+            };
+            let expected = if matches!(
+                flush_case,
+                ShadowFlushCase::IoError | ShadowFlushCase::RotatedGeneration
+            ) {
+                let error = result.unwrap_err();
+                let live = node.state.read().unwrap();
+                if matches!(flush_case, ShadowFlushCase::IoError) {
+                    assert_eq!(error.code(), tonic::Code::Internal);
+                    assert_eq!(error.message(), "fsync the rewritten generation: injected");
+                    // The first attempt advanced during analysis: its sync
+                    // error must not replace the original watermark retry.
+                    assert_eq!(flush_calls, 2);
+                    assert_eq!(calls, 4);
+                    assert_eq!(live.wal.as_ref().unwrap().generation(), 0);
+                    assert!(!wal::gen_dir(&wal::wal_dir(&pre.index_path), 1).exists());
+                } else {
+                    assert_eq!(error.code(), tonic::Code::Aborted);
+                    assert!(error.message().contains("snapshot was installed"));
+                    assert_eq!(flush_calls, 1);
+                    assert_eq!(calls, 3);
+                    assert_eq!(live.wal.as_ref().unwrap().generation(), 1);
+                }
+                assert!(!marker_path(&pre.index_path).exists());
+                texts.to_vec()
+            } else if always_advance {
                 let error = result.unwrap_err();
                 assert_eq!(error.code(), tonic::Code::ResourceExhausted);
                 assert!(error.message().contains("writes outpace compaction"));
@@ -2955,6 +3070,9 @@ mod tests {
                 assert_eq!(calls, 4);
                 assert_eq!(response.rows_after, 4);
                 assert_eq!(response.locked_tail_records, 0);
+                if matches!(flush_case, ShadowFlushCase::ReadsAvailable) {
+                    assert_eq!(flush_calls, 2);
+                }
                 texts.to_vec()
             };
             let fetched = handle
