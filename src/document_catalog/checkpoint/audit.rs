@@ -202,7 +202,10 @@ impl CatalogCheckpoint<'_> {
         let mut builder = Database::builder();
         builder.set_cache_size(CACHE_BYTES);
         let proof = builder
-            .create_file(file.try_clone().map_err(storage)?)
+            .create_with_backend(
+                redb::backends::FileBackend::new(file.try_clone().map_err(storage)?)
+                    .map_err(storage)?,
+            )
             .map_err(storage)?;
         let within_budget = || {
             if file.metadata().map_err(storage)?.len() > scratch_bytes {
