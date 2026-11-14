@@ -648,3 +648,188 @@ fn a_retired_generation_layout_refuses_to_open() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn recovery_files(
+    root: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+    fn walk(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        files: &mut std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>>,
+    ) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let relative = path.strip_prefix(root).unwrap().to_path_buf();
+            if path.is_dir() {
+                files.insert(relative, None);
+                walk(root, &path, files);
+            } else {
+                files.insert(relative, Some(std::fs::read(path).unwrap()));
+            }
+        }
+    }
+    let mut files = std::collections::BTreeMap::new();
+    walk(root, root, &mut files);
+    files
+}
+
+#[test]
+fn a_retired_generation_refusal_preserves_recovery_files() {
+    for name in ["index.tv", "index.tv.bm25"] {
+        for (case, active_legacy, old_legacy, active_current, old_current, pending) in [
+            ("both", true, true, false, false, false),
+            ("old-only", false, true, false, false, false),
+            ("mixed-active", true, false, true, false, false),
+            ("current-backup", true, false, false, true, false),
+            ("current-active", false, true, true, false, false),
+            ("pending-rollback", false, true, true, false, true),
+        ] {
+            let dir = tempdir(&format!("refusal-files-{name}-{case}"));
+            let image = build_bm25(&dir, "preserved document");
+            let index_path = dir.join("shard.idx");
+            let snap = generation_dir(&index_path);
+            let old = dir.join("shard.idx.snap-old");
+            for (path, legacy, current) in [
+                (&snap, active_legacy, active_current),
+                (&old, old_legacy, old_current),
+            ] {
+                if legacy || current {
+                    std::fs::create_dir_all(path).unwrap();
+                }
+                if legacy {
+                    std::fs::copy(&image, path.join(name)).unwrap();
+                }
+                if current {
+                    std::fs::copy(&image, generation_bm25(path)).unwrap();
+                }
+            }
+            for suffix in [".snap-tmp", ".segments.snap-old", ".snap-export-evidence"] {
+                let path = dir.join(format!("shard.idx{suffix}"));
+                std::fs::create_dir_all(&path).unwrap();
+                std::fs::write(path.join("evidence"), suffix).unwrap();
+            }
+            if pending {
+                let wal = pipestream_search::wal::wal_dir(&index_path);
+                for generation in [0, 1] {
+                    let path = pipestream_search::wal::gen_dir(&wal, generation);
+                    std::fs::create_dir_all(&path).unwrap();
+                    std::fs::write(path.join("evidence"), generation.to_string()).unwrap();
+                }
+                std::fs::write(
+                    pipestream_search::compaction::marker_path(&index_path),
+                    serde_json::json!({
+                        "format": 1, "layout": "single-image",
+                        "old_wal_generation": 0, "new_wal_generation": 1,
+                        "work_dir": dir.join("work"), "previous_snapshot": true,
+                        "legacy_files": [], "staged_segments": [], "replaced_segments": []
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+            }
+            let before = recovery_files(&dir);
+            let error = NodeServiceImpl::open(
+                NodeConfig {
+                    index_path: Some(index_path),
+                    ..Default::default()
+                },
+                None,
+                false,
+            )
+            .err()
+            .expect("unsupported generation must not open");
+            assert!(error.contains("retired layout"), "{name}/{case}: {error}");
+            assert!(
+                recovery_files(&dir) == before,
+                "{name}/{case}: open changed recovery files before rejecting their format"
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_wal_open_checks_retired_generations_before_recovery() {
+    let dir = tempdir("wal-refusal-files");
+    let image = build_bm25(&dir, "preserved WAL document");
+    let index_path = dir.join("shard.idx");
+    for suffix in [".snap", ".snap-old", ".snap-tmp"] {
+        let path = dir.join(format!("shard.idx{suffix}"));
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::copy(&image, path.join("index.tv.bm25")).unwrap();
+    }
+    let before = recovery_files(&dir);
+    let opened = std::panic::catch_unwind(|| {
+        NodeServiceImpl::new(
+            None,
+            NodeConfig {
+                index_path: Some(index_path),
+                wal: true,
+                ..Default::default()
+            },
+        )
+    });
+    assert!(
+        opened.is_err(),
+        "direct WAL constructor must reject the unsupported format"
+    );
+    assert!(
+        recovery_files(&dir) == before,
+        "WAL open changed files before rejecting their format"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_current_generation_still_rolls_back_before_open() {
+    let dir = tempdir("current-rollback-open");
+    let image = build_bm25(&dir, "previous document");
+    let original = std::fs::read(&image).unwrap();
+    let index_path = dir.join("shard.idx");
+    let snap = generation_dir(&index_path);
+    let old = dir.join("shard.idx.snap-old");
+    let tmp = dir.join("shard.idx.snap-tmp");
+    for path in [&snap, &old, &tmp] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let replacement = build_bm25(&dir, "replacement document");
+    std::fs::copy(replacement, generation_bm25(&snap)).unwrap();
+    std::fs::write(generation_bm25(&old), &original).unwrap();
+    std::fs::write(tmp.join("incomplete"), b"staged").unwrap();
+    let wal = pipestream_search::wal::wal_dir(&index_path);
+    for generation in [0, 1] {
+        std::fs::create_dir_all(pipestream_search::wal::gen_dir(&wal, generation)).unwrap();
+    }
+    let marker = pipestream_search::compaction::marker_path(&index_path);
+    std::fs::write(
+        &marker,
+        serde_json::json!({
+            "format": 1, "layout": "single-image",
+            "old_wal_generation": 0, "new_wal_generation": 1,
+            "work_dir": dir.join("work"), "previous_snapshot": true,
+            "legacy_files": [], "staged_segments": [], "replaced_segments": []
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let opened = NodeServiceImpl::open(
+        NodeConfig {
+            index_path: Some(index_path),
+            ..Default::default()
+        },
+        None,
+        false,
+    );
+    assert!(
+        opened.is_ok(),
+        "current-format rollback must still open: {:?}",
+        opened.err()
+    );
+    assert_eq!(std::fs::read(generation_bm25(&snap)).unwrap(), original);
+    assert!(!old.exists());
+    assert!(!tmp.exists());
+    assert!(!marker.exists());
+    assert!(pipestream_search::wal::gen_dir(&wal, 0).exists());
+    assert!(!pipestream_search::wal::gen_dir(&wal, 1).exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}

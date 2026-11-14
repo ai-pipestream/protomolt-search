@@ -4392,18 +4392,20 @@ const RETIRED_GENERATION_FILES: [&str; 2] = ["index.tv", "index.tv.bm25"];
 /// Refuse a snapshot generation in the retired layout. Without this check
 /// [`recover_generation`] would report no generation and the shard would
 /// open from its root paths: empty, or from a stale root image, silently
-/// abandoning the installed data. Call after [`recover_generation`], so an
-/// interrupted swap has been settled first.
+/// abandoning the installed data. Check both the active and backup generation
+/// before any recovery cleanup: the backup may be a rollback source, and an
+/// unsupported format must leave all recovery files for the operator.
 pub fn refuse_retired_generation(index_path: &Path) -> Result<(), String> {
-    let snap = generation_dir(index_path);
-    for name in RETIRED_GENERATION_FILES {
-        let retired = snap.join(name);
-        if retired.exists() {
-            return Err(format!(
-                "{} is a snapshot generation in the retired layout ({name}); this binary \
-                 reads only vector.index and documents.bm25 and does not convert it",
-                retired.display()
-            ));
+    for generation in [generation_dir(index_path), generation_old_dir(index_path)] {
+        for name in RETIRED_GENERATION_FILES {
+            let retired = generation.join(name);
+            if retired.exists() {
+                return Err(format!(
+                    "{} is a snapshot generation in the retired layout ({name}); this binary \
+                     reads only vector.index and documents.bm25 and does not convert it",
+                    retired.display()
+                ));
+            }
         }
     }
     Ok(())
@@ -4515,12 +4517,12 @@ pub(crate) fn wal_manifest(
 /// this exists so WAL reconciliation can know the applied tip without
 /// depending on attachment order.
 fn persisted_doc_tip(index_path: &Path) -> u64 {
-    let generation = recover_generation(index_path);
     // Panic, like the rest of the WAL open path: a retired generation must
-    // not read as "no documents".
+    // not read as "no documents". Check before recovery can remove its files.
     if let Err(error) = refuse_retired_generation(index_path) {
         panic!("{error}");
     }
+    let generation = recover_generation(index_path);
     let (_, _, bm25_path) = storage_paths(index_path, generation.as_ref());
     if !bm25_path.exists() {
         return 0;
@@ -5470,6 +5472,7 @@ impl NodeServiceImpl {
         validate_column_tables(&config)?;
         let mut declared_generation = false;
         if let Some(path) = config.index_path.as_ref() {
+            refuse_retired_generation(path)?;
             recover_segments_swap(path);
             if let Some(manifest) =
                 crate::segments::SegmentCatalog::read_manifest(&segments_root(path))?
@@ -5489,11 +5492,7 @@ impl NodeServiceImpl {
             }
         }
         let generation = match config.index_path.as_ref() {
-            Some(path) => {
-                let generation = recover_generation(path);
-                refuse_retired_generation(path)?;
-                generation
-            }
+            Some(path) => recover_generation(path),
             None => None,
         };
 
