@@ -10,6 +10,8 @@
 //! outside the scope refuses by name, a child error fails the attempt,
 //! and a map move refuses the decisions pinned under the older map.
 
+#[path = "relay/capability_probe.rs"]
+mod capability_probe;
 mod common;
 
 use common::mock::start_mock_analysis;
@@ -474,8 +476,8 @@ async fn a_map_move_refuses_the_decisions_pinned_under_the_older_map() {
 
     // A stream opened under one map and still waiting on a child when
     // the map moves is refused by name, not completed under the old map.
-    let hold = holding_child().await;
-    let hot = CoordinatorServiceImpl::new(vec![l0.clone(), hold])
+    let hold = capability_probe::Peer::start("StreamSearch").await;
+    let hot = CoordinatorServiceImpl::new(vec![l0.clone(), hold.addr.clone()])
         .with_hot_topology(vec![None, None])
         .unwrap();
     let (relay_addr, relay, _handle) = start_relay_over(hot).await;
@@ -497,7 +499,11 @@ async fn a_map_move_refuses_the_decisions_pinned_under_the_older_map() {
         .into_inner();
     // The live leaf's first batch arrives through the relay while the
     // holding child keeps the attempt open.
-    let first = inbound.message().await.unwrap().expect("a batch");
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), inbound.message())
+        .await
+        .expect("live child batch must arrive after capability discovery")
+        .unwrap()
+        .expect("a batch");
     assert!(matches!(
         first.payload,
         Some(stream_search_response::Payload::Batch(_))
@@ -515,7 +521,13 @@ async fn a_map_move_refuses_the_decisions_pinned_under_the_older_map() {
             None,
         )
         .unwrap();
-    let refused = read_until_summary_or_error(&mut inbound).await.unwrap_err();
+    let refused = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_until_summary_or_error(&mut inbound),
+    )
+    .await
+    .expect("map movement must interrupt established fanout")
+    .unwrap_err();
     assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
     assert!(
         refused.message().contains("moved from revision 0"),

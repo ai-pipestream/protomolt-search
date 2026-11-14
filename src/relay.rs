@@ -101,7 +101,9 @@ use tokio::sync::{mpsc, watch, Notify};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::coordinator::{CoordinatorServiceImpl, RequestFilters, StreamFanout, TopologyRoute};
+use crate::coordinator::{
+    CoordinatorServiceImpl, RequestFilters, ShardVectorRowProbe, StreamFanout, TopologyRoute,
+};
 use crate::metrics::Route;
 use crate::node::STALE_STATS_EPOCH;
 use crate::pb::node_service_server::{NodeService, NodeServiceServer};
@@ -165,6 +167,18 @@ impl RelaySignals {
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
         self.cancel.notify_one();
+    }
+
+    async fn wait_cancelled(&self) {
+        while !self.cancelled.load(Ordering::Acquire) {
+            self.cancel.notified().await;
+        }
+    }
+
+    async fn wait_finish(&self) {
+        while self.finish_state_raw() == 0 {
+            self.finish.notified().await;
+        }
     }
 
     fn request_finish(&self, deadline: bool) {
@@ -1154,6 +1168,55 @@ enum StreamEvent {
     MapMoved(u64),
 }
 
+/// Discovery has no independent timeout: the parent request owns its
+/// lifetime. A closed map source leaves the pinned reading authoritative.
+async fn await_vector_rows(
+    probe: &mut ShardVectorRowProbe,
+    pinned: &MapSnapshot,
+    map_changes: &mut watch::Receiver<u64>,
+    map_open: &mut bool,
+    signals: Option<&RelaySignals>,
+    route: &str,
+) -> Result<Option<crate::pb::StreamEndReason>, Status> {
+    loop {
+        tokio::select! {
+            biased;
+            _ = async { signals.expect("guarded").wait_cancelled().await }, if signals.is_some() => {
+                probe.shutdown().await;
+                return Ok(Some(crate::pb::StreamEndReason::Abandoned));
+            }
+            _ = async { signals.expect("guarded").wait_finish().await }, if signals.is_some() => {
+                probe.shutdown().await;
+                let signals = signals.expect("guarded");
+                // Preserve a Stop or deadline escalation received while draining.
+                let reason = if signals.cancelled.load(Ordering::Acquire) {
+                    crate::pb::StreamEndReason::Abandoned
+                } else if signals.finish_state_raw() >= 2 {
+                    crate::pb::StreamEndReason::Deadline
+                } else {
+                    crate::pb::StreamEndReason::FinishRequested
+                };
+                return Ok(Some(reason));
+            }
+            moved = map_changes.changed(), if *map_open => match moved {
+                Ok(()) => {
+                    let revision = *map_changes.borrow_and_update();
+                    if revision != pinned.control_revision {
+                        return Err(Status::failed_precondition(format!(
+                            "relay: the shard map moved from revision {} (generation {}) to \
+                             revision {revision} during {route} capability discovery; the attempt \
+                             is not completed; retry under the current one",
+                            pinned.control_revision, pinned.topology_generation
+                        )));
+                    }
+                }
+                Err(_) => *map_open = false,
+            },
+            _ = probe.wait() => return Ok(None),
+        }
+    }
+}
+
 /// The forwarding loop of one relayed `StreamSearch`: children's batches
 /// go up untouched, the parent's floor and cancel go down, and the
 /// relay's summary follows the last child's.
@@ -1169,6 +1232,7 @@ async fn relay_stream(
     deadline: Option<tokio::time::Instant>,
     mut input: tokio::task::JoinHandle<Result<Option<crate::pb::ResolveStreamIdentities>, Status>>,
     identity_ready: Arc<AtomicBool>,
+    probe: &mut ShardVectorRowProbe,
 ) -> Result<(), Status> {
     // A publication racing the pin: the receiver may already hold a newer
     // value than the reading, which the first poll below reports.
@@ -1187,7 +1251,34 @@ async fn relay_stream(
         crate::query_identity::validate_limits(limits)?;
     }
     let stride = if start.collapse_parents { 20 } else { 12 };
-    coordinator.ensure_shard_vector_rows().await;
+    let mut map_open = true;
+    if let Some(end_reason) = await_vector_rows(
+        probe,
+        &pinned,
+        &mut map_changes,
+        &mut map_open,
+        Some(&signals),
+        "StreamSearch",
+    )
+    .await?
+    {
+        let summary = StreamSearchSummary {
+            completed: false,
+            geo_columns_known: vec![false; filters.geo.len()],
+            filter_columns_known: vec![
+                false;
+                filters.tree.as_ref().map_or(0, crate::filter::leaf_count)
+            ],
+            end_reason: end_reason as i32,
+            ..Default::default()
+        };
+        let _ = tx
+            .send(Ok(StreamSearchResponse {
+                payload: Some(stream_search_response::Payload::Summary(summary)),
+            }))
+            .await;
+        return Ok(());
+    }
     let mask = coordinator.shard_mask(filters.tree.as_ref());
     let mut fanout: StreamFanout = coordinator.open_stream_fanout_with_identities(
         &start.request_id,
@@ -1246,12 +1337,12 @@ async fn relay_stream(
                 StreamEvent::Finish(signals.finish_state_raw() >= 2)
             },
             _ = async { sleep.as_mut().expect("guarded").await }, if sleep.is_some() => StreamEvent::Deadline,
-            moved = map_changes.changed() => match moved {
+            moved = map_changes.changed(), if map_open => match moved {
                 Ok(()) => StreamEvent::MapMoved(*map_changes.borrow_and_update()),
                 Err(_) => {
                     // The source is gone with its authority; nothing
                     // will move again, and the pinned reading stands.
-                    map_changes = watch::channel(pinned.control_revision).1;
+                    map_open = false;
                     continue;
                 }
             },
@@ -2757,6 +2848,7 @@ async fn relay_shard_search(
     mut inbound: Streaming<SearchShardRequest>,
     tx: mpsc::Sender<Result<SearchShardResponse, Status>>,
     deadline: Option<tokio::time::Instant>,
+    probe: &mut ShardVectorRowProbe,
 ) -> Result<(), Status> {
     map_changes.mark_unchanged();
     if *map_changes.borrow() != pinned.control_revision {
@@ -2769,7 +2861,16 @@ async fn relay_shard_search(
             "relay: a relay coordinator has no children",
         ));
     }
-    coordinator.ensure_shard_vector_rows().await;
+    let mut map_open = true;
+    let _ = await_vector_rows(
+        probe,
+        &pinned,
+        &mut map_changes,
+        &mut map_open,
+        None,
+        "SearchShard",
+    )
+    .await?;
     let mask = coordinator.shard_mask(filters.tree.as_ref());
     let child_floor_shares = coordinator.shard_floor_share_ppms(&filters, mask.as_ref());
     let mut known = KnownFlags::new(&filters, mask.as_ref());
@@ -2881,7 +2982,7 @@ async fn relay_shard_search(
                     "relay: the parent's deadline passed before every child completed",
                 ));
             }
-            moved = map_changes.changed() => match moved {
+            moved = map_changes.changed(), if map_open => match moved {
                 Ok(()) => {
                     let revision = *map_changes.borrow_and_update();
                     if revision == pinned.control_revision {
@@ -2895,7 +2996,7 @@ async fn relay_shard_search(
                     )));
                 }
                 Err(_) => {
-                    map_changes = watch::channel(pinned.control_revision).1;
+                    map_open = false;
                     continue;
                 }
             },
@@ -3668,24 +3769,29 @@ impl NodeService for RelayService {
             let loop_signals = Arc::clone(&signals);
             let input_abort = input.abort_handle();
             tokio::spawn(async move {
-                let work = relay_stream(
-                    frozen,
-                    pinned,
-                    map_changes,
-                    start,
-                    filters,
-                    loop_signals,
-                    tx.clone(),
-                    deadline,
-                    input,
-                    identity_ready,
-                );
-                let result = tokio::select! {
-                    _ = tx.closed() => Err(Status::cancelled("relay: parent response closed")),
-                    _ = async { tokio::time::sleep_until(deadline.expect("guarded")).await }, if deadline.is_some() =>
-                        Err(Status::deadline_exceeded("relay: parent deadline passed")),
-                    result = work => result,
+                let mut probe = frozen.shard_vector_row_probe();
+                let result = {
+                    let work = relay_stream(
+                        frozen,
+                        pinned,
+                        map_changes,
+                        start,
+                        filters,
+                        loop_signals,
+                        tx.clone(),
+                        deadline,
+                        input,
+                        identity_ready,
+                        &mut probe,
+                    );
+                    tokio::select! {
+                        _ = tx.closed() => Err(Status::cancelled("relay: parent response closed")),
+                        _ = async { tokio::time::sleep_until(deadline.expect("guarded")).await }, if deadline.is_some() =>
+                            Err(Status::deadline_exceeded("relay: parent deadline passed")),
+                        result = work => result,
+                    }
                 };
+                probe.shutdown().await;
                 input_abort.abort();
                 if let Some(token) = token {
                     registry
@@ -3829,20 +3935,27 @@ impl NodeService for RelayService {
             let (pinned, frozen) = self.pin();
             let map_changes = self.inner.map.changes();
             tokio::spawn(async move {
-                let work = relay_shard_search(
-                    frozen,
-                    pinned,
-                    map_changes,
-                    start,
-                    filters,
-                    inbound,
-                    tx.clone(),
-                    deadline,
-                );
-                let result = tokio::select! {
-                    _ = tx.closed() => Err(Status::cancelled("relay: parent response closed")),
-                    result = work => result,
+                let mut probe = frozen.shard_vector_row_probe();
+                let result = {
+                    let work = relay_shard_search(
+                        frozen,
+                        pinned,
+                        map_changes,
+                        start,
+                        filters,
+                        inbound,
+                        tx.clone(),
+                        deadline,
+                        &mut probe,
+                    );
+                    tokio::select! {
+                        _ = tx.closed() => Err(Status::cancelled("relay: parent response closed")),
+                        _ = async { tokio::time::sleep_until(deadline.expect("guarded")).await }, if deadline.is_some() =>
+                            Err(Status::deadline_exceeded("relay: the parent's deadline passed before every child completed")),
+                        result = work => result,
+                    }
                 };
+                probe.shutdown().await;
                 if let Err(status) = result {
                     let _ = tokio::time::timeout(Duration::from_millis(250), tx.send(Err(status)))
                         .await;
