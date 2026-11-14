@@ -1,45 +1,232 @@
-//! Hybrid query inputs and validated statistics rounds.
+//! Validated hybrid inputs and statistics bound to each fan-out round.
 
 use super::*;
 
-/// Inputs shared by the hybrid fusion routes.
 #[derive(Clone, Copy)]
-pub struct HybridQuery<'a> {
-    pub request_id: &'a str,
-    pub text: &'a str,
-    pub pre_analyzed_terms: &'a [String],
-    pub vector: &'a [f32],
-    pub k: u32,
-    pub spec: Option<&'a crate::pb::AnalysisSpec>,
-    pub legs: HybridLegs,
-    pub debug: bool,
-    pub filters: &'a RequestFilters,
+pub(super) struct HybridInput<'a> {
+    request_id: &'a str,
+    text: &'a str,
+    pre_analyzed_terms: &'a [String],
+    vector: &'a [f32],
+    k: u32,
+    spec: Option<&'a crate::pb::AnalysisSpec>,
+    filters: &'a RequestFilters,
 }
 
-/// Inputs for vector candidate generation followed by lexical reranking.
+impl<'a> HybridInput<'a> {
+    pub(super) fn new(
+        request_id: &'a str,
+        text: &'a str,
+        vector: &'a [f32],
+        k: u32,
+        spec: Option<&'a crate::pb::AnalysisSpec>,
+        filters: &'a RequestFilters,
+    ) -> Result<Self, Status> {
+        if vector.iter().any(|value| !value.is_finite()) {
+            return Err(Status::invalid_argument(
+                "query vector has non-finite coordinates",
+            ));
+        }
+        crate::node::validate_geo_filters(&filters.geo)?;
+        if let Some(filter) = &filters.tree {
+            crate::filter::validate_filter(filter)?;
+        }
+        Ok(Self {
+            request_id,
+            text,
+            pre_analyzed_terms: &[],
+            vector,
+            k,
+            spec,
+            filters,
+        })
+    }
+    pub(super) fn request_id(self) -> &'a str {
+        self.request_id
+    }
+    pub(super) fn text(self) -> &'a str {
+        self.text
+    }
+    pub(super) fn pre_analyzed_terms(self) -> &'a [String] {
+        self.pre_analyzed_terms
+    }
+    pub(super) fn vector(self) -> &'a [f32] {
+        self.vector
+    }
+    pub(super) fn k(self) -> u32 {
+        self.k
+    }
+    pub(super) fn spec(self) -> Option<&'a crate::pb::AnalysisSpec> {
+        self.spec
+    }
+    pub(super) fn filters(self) -> &'a RequestFilters {
+        self.filters
+    }
+}
+
 #[derive(Clone, Copy)]
-pub struct CascadeQuery<'a> {
-    pub request_id: &'a str,
-    pub text: &'a str,
-    pub pre_analyzed_terms: &'a [String],
-    pub vector: &'a [f32],
-    pub k: u32,
-    pub spec: Option<&'a crate::pb::AnalysisSpec>,
-    pub min_vector_score: f32,
-    pub debug: bool,
-    pub filters: &'a RequestFilters,
+pub(crate) struct HybridQuery<'a> {
+    input: HybridInput<'a>,
+    legs: HybridLegs,
+    debug: bool,
+}
+impl<'a> HybridQuery<'a> {
+    pub(super) fn new(
+        input: HybridInput<'a>,
+        legs: HybridLegs,
+        debug: bool,
+    ) -> Result<Self, Status> {
+        validate_legs(legs)?;
+        Ok(Self { input, legs, debug })
+    }
+    pub(crate) fn from_request(
+        request_id: &'a str,
+        request: &'a HybridSearchRequest,
+        k: u32,
+        legs: HybridLegs,
+        filters: &'a RequestFilters,
+    ) -> Result<Self, Status> {
+        let mut input = HybridInput::new(
+            request_id,
+            &request.text,
+            &request.vector,
+            k,
+            request.analysis.as_ref(),
+            filters,
+        )?;
+        input.pre_analyzed_terms = &request.pre_analyzed_terms;
+        Self::new(input, legs, request.debug)
+    }
+    pub(super) fn input(self) -> HybridInput<'a> {
+        self.input
+    }
+    pub(super) fn legs(self) -> HybridLegs {
+        self.legs
+    }
+    pub(super) fn debug(self) -> bool {
+        self.debug
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CascadeQuery<'a> {
+    input: HybridInput<'a>,
+    min_vector_score: f32,
+    debug: bool,
+}
+impl<'a> CascadeQuery<'a> {
+    pub(super) fn new(
+        input: HybridInput<'a>,
+        min_vector_score: f32,
+        debug: bool,
+    ) -> Result<Self, Status> {
+        validate_vector_floor(min_vector_score)?;
+        Ok(Self {
+            input,
+            min_vector_score,
+            debug,
+        })
+    }
+    pub(crate) fn from_request(
+        request_id: &'a str,
+        request: &'a HybridSearchRequest,
+        k: u32,
+        min_vector_score: f32,
+        filters: &'a RequestFilters,
+    ) -> Result<Self, Status> {
+        let mut input = HybridInput::new(
+            request_id,
+            &request.text,
+            &request.vector,
+            k,
+            request.analysis.as_ref(),
+            filters,
+        )?;
+        input.pre_analyzed_terms = &request.pre_analyzed_terms;
+        Self::new(input, min_vector_score, request.debug)
+    }
+    pub(super) fn input(self) -> HybridInput<'a> {
+        self.input
+    }
+    pub(super) fn min_vector_score(self) -> f32 {
+        self.min_vector_score
+    }
+    pub(super) fn debug(self) -> bool {
+        self.debug
+    }
+}
+
+fn validate_vector_floor(floor: f32) -> Result<(), Status> {
+    if floor.is_nan() {
+        return Err(Status::invalid_argument("min_vector_score must not be NaN"));
+    }
+    Ok(())
+}
+
+fn validate_legs(legs: HybridLegs) -> Result<(), Status> {
+    validate_vector_floor(legs.min_vector_score)?;
+    if legs.rrf_k <= 0.0 || legs.rrf_k.is_nan() {
+        return Err(Status::invalid_argument("rrf_k must be > 0"));
+    }
+    if legs.vector_weight < 0.0
+        || legs.vector_weight.is_nan()
+        || legs.bm25_weight < 0.0
+        || legs.bm25_weight.is_nan()
+    {
+        return Err(Status::invalid_argument("hybrid leg weights must be >= 0"));
+    }
+    if legs.vector_weight == 0.0 && legs.bm25_weight == 0.0 {
+        return Err(Status::invalid_argument(
+            "both legs disabled: at least one of vector_weight/bm25_weight must be nonzero",
+        ));
+    }
+    if legs.fusion_mode == FusionMode::TwoLevel
+        && (legs.vector_weight == 0.0 || legs.bm25_weight == 0.0)
+    {
+        return Err(Status::invalid_argument("TWO_LEVEL cannot disable a leg (its node wire format cannot distinguish 0 from unset); use GLOBAL_RANK or SCORE_BLEND"));
+    }
+    if legs.fusion_mode == FusionMode::Decomposed
+        && !(legs.vector_weight > 0.0
+            && legs.vector_weight.is_finite()
+            && legs.bm25_weight > 0.0
+            && legs.bm25_weight.is_finite())
+    {
+        return Err(Status::invalid_argument(
+            "DECOMPOSED requires finite leg weights > 0 for both legs",
+        ));
+    }
+    if legs.min_vector_score > 0.0 && legs.vector_weight == 0.0 {
+        return Err(Status::invalid_argument("min_vector_score is set but the vector leg is disabled (vector_weight 0); no hit can carry a qualifying vector score"));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct HybridRound<'a> {
-    pub(super) query: HybridQuery<'a>,
-    pub(super) terms: &'a [String],
-    pub(super) analysis_fingerprint: u64,
-    pub(super) global: &'a CorpusStats,
-    pub(super) claims: &'a [StatsClaim],
+    query: HybridQuery<'a>,
+    terms: &'a [String],
+    analysis_fingerprint: u64,
+    global: &'a CorpusStats,
+    claims: &'a [StatsClaim],
 }
 
 impl<'a> HybridRound<'a> {
+    pub(super) fn query(self) -> HybridQuery<'a> {
+        self.query
+    }
+    pub(super) fn terms(self) -> &'a [String] {
+        self.terms
+    }
+    pub(super) fn analysis_fingerprint(self) -> u64 {
+        self.analysis_fingerprint
+    }
+    pub(super) fn global(self) -> &'a CorpusStats {
+        self.global
+    }
+    pub(super) fn claims(self) -> &'a [StatsClaim] {
+        self.claims
+    }
+
     pub(super) fn new(
         query: HybridQuery<'a>,
         terms: &'a [String],
@@ -71,13 +258,17 @@ impl<'a> HybridRound<'a> {
         clustered: bool,
         two_level: bool,
     ) -> ShardLegsRequest {
-        let (vector, terms, dfs) =
-            leg_payloads(self.query.vector, self.terms, self.global, self.query.legs);
+        let (vector, terms, dfs) = leg_payloads(
+            self.query.input.vector,
+            self.terms,
+            self.global,
+            self.query.legs,
+        );
         ShardLegsRequest {
             read_context,
             analysis_fingerprint: self.analysis_fingerprint,
             request_id: if clustered || two_level {
-                self.query.request_id.to_string()
+                self.query.input.request_id.to_string()
             } else {
                 String::new()
             },
@@ -91,9 +282,9 @@ impl<'a> HybridRound<'a> {
             b: params.b as f32,
             expected_stats_epoch: self.claims[shard].epoch,
             expected_stats_incarnation: self.claims[shard].incarnation(),
-            geo_filters: self.query.filters.geo.clone(),
+            geo_filters: self.query.input.filters.geo.clone(),
             filter,
-            include_rerank_candidate: self.query.filters.include_rerank_candidate,
+            include_rerank_candidate: self.query.input.filters.include_rerank_candidate,
         }
     }
 }

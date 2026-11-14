@@ -1,4 +1,4 @@
-//! Dense execution.
+//! Dense provider selection, quality checks, and exact rescoring.
 
 use super::*;
 

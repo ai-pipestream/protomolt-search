@@ -1,4 +1,4 @@
-//! Stream collapse.
+//! Parent grouping and the public collapsed streaming search entrypoint.
 
 use super::*;
 

@@ -1,4 +1,4 @@
-//! Clustered.
+//! Clustered vector routing and product-local result assembly.
 
 use super::*;
 

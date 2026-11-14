@@ -1,4 +1,4 @@
-//! Lineage.
+//! Lineage retrieval under document and field permissions.
 
 use super::*;
 

@@ -1,4 +1,4 @@
-//! Filters.
+//! Compiled filters and shard capability checks.
 
 use super::*;
 

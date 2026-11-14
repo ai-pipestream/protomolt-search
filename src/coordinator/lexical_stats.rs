@@ -1,4 +1,4 @@
-//! Lexical stats.
+//! Global term statistics, prefix expansion, and synonym expansion.
 
 use super::*;
 
@@ -81,17 +81,6 @@ impl CoordinatorServiceImpl {
         .await
     }
 
-    /// Per-field global stats for a fused query, merged over per-node
-    /// shares served from the stats cache (`fresh` bypasses it; see
-    /// [`Self::body_stats`]). Shares merge elementwise per field, N
-    /// summed once (it is shared — a document is a document).
-    ///
-    /// A partially-known field is tolerated: that is a real
-    /// heterogeneous fleet, and the shards that have it still
-    /// contribute. A field NO shard has is a typo, not a query —
-    /// scoring it as "contributes nothing" would silently return the
-    /// ranking of the REMAINING fields, so a misspelled arm of an A/B
-    /// reads as "no difference". Refused instead.
     /// Expand every [`crate::pb::TermPrefix`] of `field` across the fleet
     /// (`docs/prefix-terms.md`) and add the expansions to `terms`. The
     /// prefix is normalized under the field's char filters (never
@@ -201,6 +190,17 @@ impl CoordinatorServiceImpl {
         Ok(out)
     }
 
+    /// Per-field global stats for a fused query, merged over per-node
+    /// shares served from the stats cache (`fresh` bypasses it; see
+    /// [`Self::body_stats`]). Shares merge elementwise per field, N
+    /// summed once (it is shared — a document is a document).
+    ///
+    /// A partially-known field is tolerated: that is a real
+    /// heterogeneous fleet, and the shards that have it still
+    /// contribute. A field NO shard has is a typo, not a query —
+    /// scoring it as "contributes nothing" would silently return the
+    /// ranking of the REMAINING fields, so a misspelled arm of an A/B
+    /// reads as "no difference". Refused instead.
     pub(super) async fn fused_stats(
         &self,
         stats_fields: &[crate::pb::FieldTerms],

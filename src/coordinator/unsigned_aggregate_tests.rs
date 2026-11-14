@@ -1,4 +1,4 @@
-//! Unsigned aggregate tests.
+//! Unsigned aggregation and percentile precision checks.
 
 use super::*;
 use crate::pb::{AggregateOp as O, AggregateValueType as T};

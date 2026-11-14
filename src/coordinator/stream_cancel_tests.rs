@@ -1,4 +1,4 @@
-//! Stream cancel tests.
+//! Stream cancellation, topology, and identity exchange checks.
 
 use super::*;
 

@@ -1,4 +1,4 @@
-//! Vector collapse.
+//! Parent-document vector result aggregation.
 
 use super::*;
 

@@ -1,4 +1,4 @@
-//! Builders.
+//! Coordinator construction and configuration methods.
 
 use super::*;
 

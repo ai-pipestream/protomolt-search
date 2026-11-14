@@ -36,7 +36,7 @@ impl GlobalHybrid {
     }
 
     pub(super) fn finish(mut self, query: HybridQuery<'_>) -> Vec<HybridHit> {
-        let legs = query.legs;
+        let legs = query.legs();
         let mut vector = fusion::merge_legs_by_score(self.vector);
         let mut bm25 = fusion::merge_legs_by_score(self.bm25);
         if legs.min_vector_score > 0.0 {
@@ -61,10 +61,10 @@ impl GlobalHybrid {
                 legs.leg_k as usize,
                 legs.normalization,
                 legs.combination,
-                query.k as usize,
+                query.input().k() as usize,
             )
         } else {
-            fusion::rrf_fuse(&inputs, legs.rrf_k, query.k as usize)
+            fusion::rrf_fuse(&inputs, legs.rrf_k, query.input().k() as usize)
         };
         fused
             .into_iter()
@@ -141,7 +141,7 @@ pub(super) fn finish_two_level(
             weight: 1.0,
         })
         .collect();
-    fusion::rrf_fuse(&legs, query.legs.rrf_k, query.k as usize)
+    fusion::rrf_fuse(&legs, query.legs().rrf_k, query.input().k() as usize)
         .into_iter()
         .map(|hit| {
             let (shard, source) = lists
@@ -175,15 +175,15 @@ pub(super) fn hybrid_debug(
     legs_ms: f32,
     fusion_started: std::time::Instant,
 ) -> Option<HybridDebug> {
-    query.debug.then(|| {
+    query.debug().then(|| {
         shards.sort_by_key(|shard| shard.shard);
         HybridDebug {
-            fusion_mode: match query.legs.fusion_mode {
+            fusion_mode: match query.legs().fusion_mode {
                 FusionMode::TwoLevel => FusionMode::TwoLevel as i32,
                 FusionMode::ScoreBlend => FusionMode::ScoreBlend as i32,
                 _ => FusionMode::GlobalRank as i32,
             },
-            leg_k: query.legs.leg_k,
+            leg_k: query.legs().leg_k,
             terms: Vec::new(),
             analysis_ms: 0.0,
             stats_ms: 0.0,

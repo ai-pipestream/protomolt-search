@@ -1,4 +1,4 @@
-//! Values.
+//! Projected value retrieval and typed response validation.
 
 use super::*;
 

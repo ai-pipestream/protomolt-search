@@ -1,4 +1,4 @@
-//! Topology.
+//! Validated routing maps and topology cutover barriers.
 
 use super::*;
 

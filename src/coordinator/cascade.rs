@@ -1,24 +1,25 @@
-//! Cascade.
+//! Tie-complete vector candidate selection followed by lexical cascade reranking.
 
-use super::hybrid_context::CascadeQuery;
+use super::hybrid_context::{CascadeQuery, HybridInput};
 use super::*;
 
+type CascadePool = Vec<(u64, u32, f64)>;
+
+struct CascadeRescore {
+    stats_ms: f32,
+    started: std::time::Instant,
+    scores: HashMap<u64, f64>,
+    shards: HashMap<u32, (f32, u32)>,
+}
+
+struct CascadeTiming {
+    total: std::time::Instant,
+    fusion: std::time::Instant,
+    analysis_ms: f32,
+    legs_ms: f32,
+}
+
 impl CoordinatorServiceImpl {
-    /// Cascade hybrid (FUSION_MODE_CASCADE): no score fusion.
-    ///
-    /// Phase 1 — candidate generation through the EXISTING floor-sharing
-    /// bidi vector path with the tie-complete option: cross-shard early
-    /// termination applies (the cutoff is the savings), and every doc
-    /// tied at the boundary score survives on every shard. The pool is
-    /// `{score >= s_k}` where `s_k` is the global k-th vector score, so
-    /// it can exceed k by the boundary tie-group size — score-defined,
-    /// hence layout-invariant.
-    ///
-    /// Phase 2 — BM25 rerank behind the rescore seam: analyze the query,
-    /// route each candidate to its owning shard (Bm25Rescore with the
-    /// global stats), then rerank the pool by BM25 desc, vector desc,
-    /// doc id asc, and return the top `k`. More rankers plug in behind
-    /// this same seam later (one stage, no framework).
     #[allow(clippy::too_many_arguments)]
     pub async fn fanout_cascade(
         &self,
@@ -31,22 +32,12 @@ impl CoordinatorServiceImpl {
         debug: bool,
         filters: &RequestFilters,
     ) -> Result<(Vec<CascadeHit>, Option<HybridDebug>), Status> {
-        self.fanout_cascade_context(CascadeQuery {
-            request_id,
-            text,
-            pre_analyzed_terms: &[],
-            vector,
-            k,
-            spec,
-            min_vector_score,
-            debug,
-            filters,
-        })
-        .await
+        let input = HybridInput::new(request_id, text, vector, k, spec, filters)?;
+        self.fanout_cascade_context(CascadeQuery::new(input, min_vector_score, debug)?)
+            .await
     }
 
-    /// Run a cascade using grouped query inputs.
-    pub async fn fanout_cascade_context(
+    pub(crate) async fn fanout_cascade_context(
         &self,
         query: CascadeQuery<'_>,
     ) -> Result<(Vec<CascadeHit>, Option<HybridDebug>), Status> {
@@ -57,220 +48,218 @@ impl CoordinatorServiceImpl {
         &self,
         query: CascadeQuery<'_>,
     ) -> Result<(Vec<CascadeHit>, Option<HybridDebug>), Status> {
-        let CascadeQuery {
-            request_id,
-            text,
-            pre_analyzed_terms,
-            vector,
-            k,
-            spec,
-            min_vector_score,
-            debug,
-            filters,
-        } = query;
-        let analysis_fingerprint = crate::analyzer::analysis_fingerprint(spec);
-        if k == 0 || vector.is_empty() {
+        let input = query.input();
+        if input.k() == 0 || input.vector().is_empty() {
             return Ok((Vec::new(), None));
         }
-        let t_total = std::time::Instant::now();
-        // Phase 1: floor-shared, tie-complete vector candidates.
-        let t_legs = std::time::Instant::now();
-        // Phase 1 carries the filters, so the candidate gate is the
-        // filtered corpus; phase 2 reranks that pool and never widens
-        // it, so no unfiltered document can reappear.
-        #[cfg(feature = "net")]
-        let clustered_phase1: Option<FanoutResult> = if self.clustered_vectors.is_some() {
-            Some({
-                let candidates = self
-                    .clustered_vector_candidates(request_id, vector, k, None, true, filters)
-                    .await?;
-                let ranges = self.product_label_ranges().await?;
-                let mut shard_hits: Vec<(u32, Vec<(u64, f32)>)> = (0..self.node_addrs.len())
-                    .map(|shard| (shard as u32, Vec::new()))
-                    .collect();
-                for (doc_id, score) in candidates.hits {
-                    let owner = Self::product_owner(&ranges, doc_id)?;
-                    shard_hits[owner as usize].1.push((doc_id, score));
-                }
-                FanoutResult {
-                    shard_stats: vec![None; self.node_addrs.len()],
-                    shard_wall_ms: (0..self.node_addrs.len())
-                        .map(|shard| (shard as u32, 0.0))
-                        .collect(),
-                    shard_hits,
-                    hits: Vec::new(),
-                    hedges_fired: 0,
-                    hedge_wins: 0,
-                    rerank_candidates: HashMap::new(),
-                }
-            })
-        } else {
-            None
-        };
-        #[cfg(not(feature = "net"))]
-        let clustered_phase1: Option<FanoutResult> = None;
-        let mut phase1 = match clustered_phase1 {
-            Some(phase1) => phase1,
-            None => {
-                self.fanout_search(request_id, vector, k, true, filters)
-                    .await?
-            }
-        };
-        let phase1_ms = t_legs.elapsed().as_secs_f32() * 1e3;
-        let mut all: Vec<(u64, u32, f64)> = Vec::new(); // (doc_id, shard, score)
-        for (shard, hits) in &phase1.shard_hits {
-            for &(doc_id, score) in hits {
-                all.push((doc_id, *shard, f64::from(score)));
-            }
-        }
-        all.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
-        let boundary = if all.len() >= k as usize {
-            all[k as usize - 1].2
-        } else {
-            f64::NEG_INFINITY
-        };
-        // The vector-score floor tightens the gate: the effective cutoff
-        // is max(k-th score, floor), applied before the rescore fan-out
-        // so filtered-out candidates cost nothing in phase 2.
-        let boundary = boundary.max(if min_vector_score > 0.0 {
-            f64::from(min_vector_score)
-        } else {
-            f64::NEG_INFINITY
-        });
-        let pool: Vec<(u64, u32, f64)> = all.into_iter().filter(|h| h.2 >= boundary).collect();
+        let total = std::time::Instant::now();
+        let legs_started = std::time::Instant::now();
+        let mut candidates = self.cascade_candidates(input).await?;
+        let phase1_ms = legs_started.elapsed().as_secs_f32() * 1e3;
+        let pool = cascade_pool(&candidates, query);
+        let (terms, analysis_ms) = self.analyze_hybrid_input(input, false).await?;
+        let rescore = self.cascade_rescore(&pool, &terms, input).await?;
+        let legs_ms = phase1_ms + rescore.started.elapsed().as_secs_f32() * 1e3;
+        let fusion = std::time::Instant::now();
+        let hits = rank_cascade(
+            pool,
+            &rescore.scores,
+            &mut candidates.rerank_candidates,
+            input.k(),
+        );
+        let debug = cascade_debug(
+            query,
+            &candidates,
+            &rescore,
+            terms,
+            CascadeTiming {
+                total,
+                fusion,
+                analysis_ms,
+                legs_ms,
+            },
+        );
+        Ok((hits, debug))
+    }
 
-        // Query analysis + global BM25 stats for phase 2.
-        let (terms, analysis_ms) = if !pre_analyzed_terms.is_empty() {
-            let mut terms: Vec<String> = Vec::new();
-            for term in pre_analyzed_terms {
-                if !terms.contains(term) {
-                    terms.push(term.clone());
-                }
-            }
-            (terms, 0.0f32)
-        } else {
-            let addr = self.analysis_addr.clone().ok_or_else(|| {
-                Status::unavailable(
-                    "no analysis backend configured on the coordinator (analysis_addr)",
+    async fn cascade_candidates(&self, input: HybridInput<'_>) -> Result<FanoutResult, Status> {
+        #[cfg(feature = "net")]
+        if self.clustered_vectors.is_some() {
+            let candidates = self
+                .clustered_vector_candidates(
+                    input.request_id(),
+                    input.vector(),
+                    input.k(),
+                    None,
+                    true,
+                    input.filters(),
                 )
-            })?;
-            let t = std::time::Instant::now();
-            let analyzed = crate::analyzer::analyze_document(&addr, text, spec).await?;
-            let analysis_ms = t.elapsed().as_secs_f32() * 1e3;
-            let mut terms: Vec<String> = Vec::new();
-            for (term, _, _) in analyzed.into_body().terms {
-                if !terms.contains(&term) {
-                    terms.push(term);
-                }
+                .await?;
+            let ranges = self.product_label_ranges().await?;
+            let mut shard_hits: Vec<(u32, Vec<(u64, f32)>)> = (0..self.node_addrs.len())
+                .map(|shard| (shard as u32, Vec::new()))
+                .collect();
+            for (doc_id, score) in candidates.hits {
+                let owner = Self::product_owner(&ranges, doc_id)?;
+                shard_hits[owner as usize].1.push((doc_id, score));
             }
-            (terms, analysis_ms)
-        };
-        // Phase 2: route candidates to their owning shards for
-        // rescoring. Stats + rescore run as a round (a stale-stats
-        // refusal reruns them once with fresh stats and a new fenced claim).
-        let t = std::time::Instant::now();
-        let mut by_shard: std::collections::HashMap<u32, Vec<u64>> =
-            std::collections::HashMap::new();
-        for (doc_id, shard, _) in &pool {
+            return Ok(FanoutResult {
+                shard_stats: vec![None; self.node_addrs.len()],
+                shard_wall_ms: (0..self.node_addrs.len())
+                    .map(|shard| (shard as u32, 0.0))
+                    .collect(),
+                shard_hits,
+                hits: Vec::new(),
+                hedges_fired: 0,
+                hedge_wins: 0,
+                rerank_candidates: HashMap::new(),
+            });
+        }
+        self.fanout_search(
+            input.request_id(),
+            input.vector(),
+            input.k(),
+            true,
+            input.filters(),
+        )
+        .await
+    }
+
+    async fn cascade_rescore(
+        &self,
+        pool: &[(u64, u32, f64)],
+        terms: &[String],
+        input: HybridInput<'_>,
+    ) -> Result<CascadeRescore, Status> {
+        let started = std::time::Instant::now();
+        let mut by_shard: HashMap<u32, Vec<u64>> = HashMap::new();
+        for (doc_id, shard, _) in pool {
             by_shard.entry(*shard).or_default().push(*doc_id);
         }
+        let fingerprint = crate::analyzer::analysis_fingerprint(input.spec());
         let mut fresh = false;
-        let (stats_ms, t_rescore, bm25_of, rescore_debug) = loop {
-            let (global, epochs) = self.body_stats(&terms, fresh).await?;
-            let claims = epochs;
-            let stats_ms = t.elapsed().as_secs_f32() * 1e3;
-            let t_rescore = std::time::Instant::now();
+        loop {
+            let (global, claims) = self.body_stats(terms, fresh).await?;
+            let stats_ms = started.elapsed().as_secs_f32() * 1e3;
+            let rescoring = std::time::Instant::now();
             match self
-                .bm25_rescore_round(
-                    &terms,
-                    analysis_fingerprint,
-                    &global,
-                    &claims,
-                    &by_shard,
-                    &[],
-                )
+                .bm25_rescore_round(terms, fingerprint, &global, &claims, &by_shard, &[])
                 .await
             {
-                Err(e) if !fresh && is_stale_stats(&e) => {
+                Err(error) if !fresh && is_stale_stats(&error) => {
                     self.stats_cache.invalidate_all();
                     fresh = true;
                 }
-                Err(e) => return Err(e),
-                Ok((bm25_of, rescore_debug)) => {
-                    break (stats_ms, t_rescore, bm25_of, rescore_debug);
+                Err(error) => return Err(error),
+                Ok((scores, shards)) => {
+                    return Ok(CascadeRescore {
+                        stats_ms,
+                        started: rescoring,
+                        scores,
+                        shards,
+                    })
                 }
             }
-        };
-        let rescore_ms = t_rescore.elapsed().as_secs_f32() * 1e3;
+        }
+    }
+}
 
-        // Rerank: BM25 desc, vector score desc, doc id asc. Top k of the
-        // (possibly larger) tie-extended pool.
-        let t_fusion = std::time::Instant::now();
-        let mut ranked: Vec<CascadeHit> = pool
-            .into_iter()
-            .map(|(doc_id, shard, vector_score)| CascadeHit {
-                doc_id,
-                rank: 0,
-                shard,
-                vector_score: vector_score as f32,
-                bm25_score: bm25_of.get(&doc_id).copied().unwrap_or(0.0) as f32,
-                boost_score: 0.0,
-                rerank_candidate: phase1.rerank_candidates.remove(&doc_id),
+pub(super) fn cascade_pool(candidates: &FanoutResult, query: CascadeQuery<'_>) -> CascadePool {
+    let k = query.input().k();
+    let mut all = Vec::new();
+    for (shard, hits) in &candidates.shard_hits {
+        for &(doc, score) in hits {
+            all.push((doc, *shard, f64::from(score)));
+        }
+    }
+    all.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    let boundary = if all.len() >= k as usize {
+        all[k as usize - 1].2
+    } else {
+        f64::NEG_INFINITY
+    };
+    let boundary = boundary.max(if query.min_vector_score() > 0.0 {
+        f64::from(query.min_vector_score())
+    } else {
+        f64::NEG_INFINITY
+    });
+    all.into_iter().filter(|hit| hit.2 >= boundary).collect()
+}
+
+pub(super) fn rank_cascade(
+    pool: CascadePool,
+    scores: &HashMap<u64, f64>,
+    candidates: &mut HashMap<u64, crate::pb::RerankCandidatePayload>,
+    k: u32,
+) -> Vec<CascadeHit> {
+    let mut ranked: Vec<CascadeHit> = pool
+        .into_iter()
+        .map(|(doc_id, shard, vector_score)| CascadeHit {
+            doc_id,
+            rank: 0,
+            shard,
+            vector_score: vector_score as f32,
+            bm25_score: scores.get(&doc_id).copied().unwrap_or(0.0) as f32,
+            boost_score: 0.0,
+            rerank_candidate: candidates.remove(&doc_id),
+        })
+        .collect();
+    ranked.sort_by(|a, b| {
+        b.bm25_score
+            .total_cmp(&a.bm25_score)
+            .then_with(|| b.vector_score.total_cmp(&a.vector_score))
+            .then_with(|| a.doc_id.cmp(&b.doc_id))
+    });
+    ranked.truncate(k as usize);
+    for (index, hit) in ranked.iter_mut().enumerate() {
+        hit.rank = index as u32 + 1;
+    }
+    ranked
+}
+
+fn cascade_debug(
+    query: CascadeQuery<'_>,
+    candidates: &FanoutResult,
+    rescore: &CascadeRescore,
+    terms: Vec<String>,
+    timing: CascadeTiming,
+) -> Option<HybridDebug> {
+    query.debug().then(|| {
+        let mut walls: HashMap<u32, f32> = candidates.shard_wall_ms.iter().copied().collect();
+        let mut scans: HashMap<u32, Option<ShardScanStats>> = candidates
+            .shard_hits
+            .iter()
+            .zip(&candidates.shard_stats)
+            .map(|((shard, _), stats)| (*shard, *stats))
+            .collect();
+        let mut shards: Vec<HybridShardDebug> = candidates
+            .shard_hits
+            .iter()
+            .map(|(shard, hits)| {
+                let (rescore_wall, rescored) =
+                    rescore.shards.get(shard).copied().unwrap_or((0.0, 0));
+                HybridShardDebug {
+                    shard: *shard,
+                    rpc_ms: walls.remove(shard).unwrap_or(0.0) + rescore_wall,
+                    vector_hits: hits.len() as u32,
+                    bm25_hits: rescored,
+                    scan: scans.remove(shard).flatten(),
+                }
             })
             .collect();
-        ranked.sort_by(|a, b| {
-            b.bm25_score
-                .total_cmp(&a.bm25_score)
-                .then_with(|| b.vector_score.total_cmp(&a.vector_score))
-                .then_with(|| a.doc_id.cmp(&b.doc_id))
-        });
-        ranked.truncate(k as usize);
-        for (i, hit) in ranked.iter_mut().enumerate() {
-            hit.rank = i as u32 + 1;
+        shards.sort_by_key(|shard| shard.shard);
+        HybridDebug {
+            fusion_mode: FusionMode::Cascade as i32,
+            leg_k: query.input().k(),
+            terms,
+            analysis_ms: timing.analysis_ms,
+            stats_ms: rescore.stats_ms,
+            legs_ms: timing.legs_ms,
+            fusion_ms: timing.fusion.elapsed().as_secs_f32() * 1e3,
+            total_ms: timing.total.elapsed().as_secs_f32() * 1e3,
+            shards,
+            boost_ms: 0.0,
+            boost_terms: Vec::new(),
         }
-        let dbg = debug.then(|| {
-            // Per-shard: phase-1 wall + this shard's rescore wall, the
-            // phase-1 candidate count, the rescored count, and the vector
-            // scan's stats. Vectors from fanout_search are in completion
-            // order; re-key by shard.
-            let mut walls: std::collections::HashMap<u32, f32> =
-                phase1.shard_wall_ms.iter().copied().collect();
-            let mut scans: std::collections::HashMap<u32, Option<ShardScanStats>> = phase1
-                .shard_hits
-                .iter()
-                .zip(&phase1.shard_stats)
-                .map(|((shard, _), stats)| (*shard, *stats))
-                .collect();
-            let mut shards: Vec<HybridShardDebug> = phase1
-                .shard_hits
-                .iter()
-                .map(|(shard, hits)| {
-                    let (rescore_wall, rescored) =
-                        rescore_debug.get(shard).copied().unwrap_or((0.0, 0));
-                    HybridShardDebug {
-                        shard: *shard,
-                        rpc_ms: walls.remove(shard).unwrap_or(0.0) + rescore_wall,
-                        vector_hits: hits.len() as u32,
-                        bm25_hits: rescored,
-                        scan: scans.remove(shard).flatten(),
-                    }
-                })
-                .collect();
-            shards.sort_by_key(|s| s.shard);
-            HybridDebug {
-                fusion_mode: FusionMode::Cascade as i32,
-                leg_k: k,
-                terms,
-                analysis_ms,
-                stats_ms,
-                legs_ms: phase1_ms + rescore_ms,
-                fusion_ms: t_fusion.elapsed().as_secs_f32() * 1e3,
-                total_ms: t_total.elapsed().as_secs_f32() * 1e3,
-                shards,
-                boost_ms: 0.0,
-                boost_terms: Vec::new(),
-            }
-        });
-        Ok((ranked, dbg))
-    }
+    })
 }

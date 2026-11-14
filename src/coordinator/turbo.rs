@@ -1,4 +1,4 @@
-//! Turbo.
+//! Embedding backend checks and bounded SPLADE fan-out.
 
 use super::*;
 

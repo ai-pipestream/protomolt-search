@@ -1,4 +1,4 @@
-//! Browse.
+//! Ordered document browsing across shards.
 
 use super::*;
 

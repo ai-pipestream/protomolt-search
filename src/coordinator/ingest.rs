@@ -1,4 +1,4 @@
-//! Ingest.
+//! Mapped document ingestion under topology and write barriers.
 
 use super::*;
 

@@ -1,4 +1,4 @@
-//! Query stream identity tests.
+//! Revision fingerprint and identity disclosure checks.
 
 use super::*;
 use crate::pb::{DocumentIdentity, QueryStreamIdentityState as State, QueryStreamPhase as Phase};

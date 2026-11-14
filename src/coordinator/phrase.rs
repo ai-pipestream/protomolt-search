@@ -1,189 +1,88 @@
-//! Phrase.
+//! Glossary phrase analysis and fenced field-round execution.
 
+use super::lexical_context::ValidatedLexicalQuery;
 use super::*;
 
+struct PhrasePlan {
+    fields: Vec<crate::pb::QueryField>,
+    terms: Vec<Vec<String>>,
+    weights: Vec<f32>,
+    leg: usize,
+    stats_fields: Vec<crate::pb::FieldTerms>,
+}
+
 impl CoordinatorServiceImpl {
-    /// Phrase-aware BM25 orchestration. Ordinary fields are analyzed exactly
-    /// as on the fused route; the final field is populated directly from the
-    /// product glossary and scored as a max-group on every shard.
     pub(super) async fn fanout_phrase(
         &self,
-        base: &crate::pb::Bm25SearchRequest,
+        base: &Bm25SearchRequest,
         k: u32,
         weight_per_token: f32,
         max_weight: f32,
         filter: Option<&crate::pb::FilterExpr>,
     ) -> Result<FacetedHits, Status> {
-        let phrase_query = LexicalFanout {
-            k,
-            min_score: base.min_score,
-            facet_fields: &base.facet_fields,
-            map_facet_fields: &base.map_facet_fields,
-            range_facet_fields: &base.range_facet_fields,
-            geo_filters: &base.geo_filters,
-            filter,
-            explain: base.explain,
-            ..LexicalFanout::default()
-        }
-        .validate()?;
-        let phrase_index = self.phrase_index.as_ref().ok_or_else(|| {
+        let query = ValidatedLexicalQuery::new(base, k, filter)?.without_highlight();
+        let index = self.phrase_index.as_ref().ok_or_else(|| {
             Status::failed_precondition("this coordinator has no phrase glossary configured")
         })?;
-        if !weight_per_token.is_finite() || weight_per_token <= 0.0 {
-            return Err(Status::invalid_argument(
-                "phrase weight_per_token must be finite and greater than zero",
-            ));
-        }
-        if !max_weight.is_finite() || max_weight <= 0.0 {
-            return Err(Status::invalid_argument(
-                "phrase max_weight must be finite and greater than zero",
-            ));
-        }
-        let mut fields = if base.fields.is_empty() {
-            vec![crate::pb::QueryField {
-                field: "body".to_string(),
-                analysis: base.analysis.clone(),
-                weight: 1.0,
-                k1: 0.0,
-                b: 0.0,
-                phrase: None,
-                prefixes: Vec::new(),
-                synonyms: Vec::new(),
-                synonyms_off: false,
-            }]
-        } else {
-            if base.analysis.is_some() {
-                return Err(Status::invalid_argument(
-                    "PhraseSearch base.analysis is ignored when base.fields is set; move the spec onto each QueryField.analysis",
-                ));
-            }
-            base.fields.clone()
-        };
-        let mut seen = std::collections::HashSet::new();
-        for field in &fields {
-            if field.field.is_empty() || !seen.insert(field.field.as_str()) {
-                return Err(Status::invalid_argument(
-                    "phrase search base fields must be named and unique",
-                ));
-            }
-            if field.phrase.is_some() || !field.prefixes.is_empty() {
-                return Err(Status::invalid_argument(format!(
-                    "field {:?}: PhraseSearch scores glossary concepts; PhraseMatch and \
-                     TermPrefix constraints are served by Bm25Search",
-                    field.field
-                )));
-            }
-            if field.field == phrase_index.phrase_field() {
-                return Err(Status::invalid_argument(format!(
-                    "phrase field {:?} is derived by PhraseSearch and must not appear in base.fields",
-                    phrase_index.phrase_field()
-                )));
-            }
-            if field.weight < 0.0 || field.weight.is_nan() {
-                return Err(Status::invalid_argument(format!(
-                    "field {:?}: weight must be non-negative",
-                    field.field
-                )));
-            }
-        }
+        validate_phrase_weights(weight_per_token, max_weight)?;
+        let fields = phrase_fields(base, index)?;
         let addr = self.analysis_addr.clone().ok_or_else(|| {
             Status::unavailable("no analysis backend configured on the coordinator (analysis_addr)")
         })?;
         let trace = std::env::var_os("PIPESTREAM_SEARCH_TRACE_BM25").is_some()
             || std::env::var_os("TURBOVEC_TRACE_BM25").is_some();
-        let t0 = std::time::Instant::now();
-        let mut field_terms = Vec::with_capacity(fields.len() + 1);
-        for field in &fields {
-            let analyzed =
-                crate::analyzer::analyze_document(&addr, &base.text, field.analysis.as_ref())
-                    .await?;
-            let mut terms = Vec::new();
-            for (term, _, _) in analyzed.into_body().terms {
-                if !terms.contains(&term) {
-                    terms.push(term);
-                }
-            }
-            field_terms.push(terms);
-        }
-        let phrase_pairs = phrase_index.query_terms(&base.text);
-        let phrase_terms: Vec<String> = phrase_pairs.iter().map(|(term, _)| term.clone()).collect();
-        let phrase_weights: Vec<f32> = phrase_pairs
-            .iter()
-            .map(|(_, token_count)| ((*token_count as f32) * weight_per_token).min(max_weight))
-            .collect();
-        let phrase_leg = fields.len();
-        fields.push(crate::pb::QueryField {
-            field: phrase_index.phrase_field().to_string(),
-            analysis: None,
-            weight: 1.0,
-            k1: 0.0,
-            b: 0.0,
-            phrase: None,
-            prefixes: Vec::new(),
-            synonyms: Vec::new(),
-            synonyms_off: false,
-        });
-        field_terms.push(phrase_terms);
-        if (k == 0 || field_terms.iter().all(Vec::is_empty))
+        let started = std::time::Instant::now();
+        let plan =
+            PhrasePlan::analyze(fields, base, index, &addr, weight_per_token, max_weight).await?;
+        if (k == 0 || plan.terms.iter().all(Vec::is_empty))
             && base.facet_fields.is_empty()
             && base.map_facet_fields.is_empty()
             && base.range_facet_fields.is_empty()
         {
             return Ok((Vec::new(), Vec::new(), Vec::new()));
         }
-        let t_analyzed = t0.elapsed();
-        let stats_fields: Vec<crate::pb::FieldTerms> = fields
-            .iter()
-            .zip(&field_terms)
-            .map(|(field, terms)| crate::pb::FieldTerms {
-                field: field.field.clone(),
-                terms: terms.clone(),
-            })
-            .collect();
+        let timing = RoundTiming {
+            trace,
+            started,
+            analyzed: started.elapsed(),
+            stats: Default::default(),
+        };
+        self.phrase_rounds(query, plan, index, timing).await
+    }
+
+    async fn phrase_rounds(
+        &self,
+        query: ValidatedLexicalQuery<'_>,
+        plan: PhrasePlan,
+        index: &crate::phrases::PhraseIndex,
+        timing: RoundTiming,
+    ) -> Result<FacetedHits, Status> {
         let mut fresh = false;
         loop {
-            let globals = self.fused_stats(&stats_fields, fresh).await?;
-            if globals.known_shards[phrase_leg] != self.node_addrs.len() {
+            let globals = self.fused_stats(&plan.stats_fields, fresh).await?;
+            if globals.known_shards[plan.leg] != self.node_addrs.len() {
                 return Err(Status::failed_precondition(format!(
                     "phrase field {:?} exists on only {}/{} shards; phrase search requires a complete rebuilt generation",
-                    phrase_index.phrase_field(),
-                    globals.known_shards[phrase_leg],
-                    self.node_addrs.len()
-                )));
+                    index.phrase_field(), globals.known_shards[plan.leg], self.node_addrs.len())));
             }
             let claims = globals.epochs.clone();
-            let t_stats = t0.elapsed();
-            let fingerprints: Vec<u64> = fields
-                .iter()
-                .enumerate()
-                .map(|(fi, f)| {
-                    if fi == phrase_leg {
-                        phrase_index.fingerprint()
-                    } else {
-                        crate::analyzer::analysis_fingerprint(f.analysis.as_ref())
-                    }
-                })
-                .collect();
-            let phrase_legs: Vec<Option<crate::pb::PhraseLeg>> = vec![None; fields.len()];
-            let round = self
+            let stats = timing.started.elapsed();
+            let fingerprints = plan.fingerprints(index);
+            let phrase_legs = vec![None; plan.fields.len()];
+            let result = self
                 .bm25_fused_round(FusedRound {
-                    query: phrase_query.with_k(k),
-                    fields: &fields,
-                    field_terms: &field_terms,
+                    query,
+                    fields: &plan.fields,
+                    field_terms: &plan.terms,
                     globals: &globals,
                     claims: &claims,
-                    phrase: Some((phrase_leg, &phrase_weights, phrase_index.fingerprint())),
+                    phrase: Some((plan.leg, &plan.weights, index.fingerprint())),
                     phrase_legs: &phrase_legs,
                     fingerprints: &fingerprints,
-                    timing: RoundTiming {
-                        trace,
-                        started: t0,
-                        analyzed: t_analyzed,
-                        stats: t_stats,
-                    },
+                    timing: RoundTiming { stats, ..timing },
                 })
                 .await;
-            match round {
+            match result {
                 Err(error) if !fresh && is_stale_stats(&error) => {
                     self.stats_cache.invalidate_all();
                     fresh = true;
@@ -192,4 +91,127 @@ impl CoordinatorServiceImpl {
             }
         }
     }
+}
+
+impl PhrasePlan {
+    async fn analyze(
+        mut fields: Vec<crate::pb::QueryField>,
+        base: &Bm25SearchRequest,
+        index: &crate::phrases::PhraseIndex,
+        addr: &str,
+        weight_per_token: f32,
+        max_weight: f32,
+    ) -> Result<Self, Status> {
+        let mut terms = Vec::with_capacity(fields.len() + 1);
+        for field in &fields {
+            let analyzed =
+                crate::analyzer::analyze_document(addr, &base.text, field.analysis.as_ref())
+                    .await?;
+            let mut unique = Vec::new();
+            for (term, _, _) in analyzed.into_body().terms {
+                if !unique.contains(&term) {
+                    unique.push(term);
+                }
+            }
+            terms.push(unique);
+        }
+        let pairs = index.query_terms(&base.text);
+        let weights = pairs
+            .iter()
+            .map(|(_, count)| ((*count as f32) * weight_per_token).min(max_weight))
+            .collect();
+        let leg = fields.len();
+        fields.push(crate::pb::QueryField {
+            field: index.phrase_field().into(),
+            weight: 1.0,
+            ..Default::default()
+        });
+        terms.push(pairs.iter().map(|(term, _)| term.clone()).collect());
+        let stats_fields = fields
+            .iter()
+            .zip(&terms)
+            .map(|(field, terms)| crate::pb::FieldTerms {
+                field: field.field.clone(),
+                terms: terms.clone(),
+            })
+            .collect();
+        Ok(Self {
+            fields,
+            terms,
+            weights,
+            leg,
+            stats_fields,
+        })
+    }
+
+    fn fingerprints(&self, index: &crate::phrases::PhraseIndex) -> Vec<u64> {
+        self.fields
+            .iter()
+            .enumerate()
+            .map(|(i, field)| {
+                if i == self.leg {
+                    index.fingerprint()
+                } else {
+                    crate::analyzer::analysis_fingerprint(field.analysis.as_ref())
+                }
+            })
+            .collect()
+    }
+}
+
+fn validate_phrase_weights(weight_per_token: f32, max_weight: f32) -> Result<(), Status> {
+    if !weight_per_token.is_finite() || weight_per_token <= 0.0 {
+        return Err(Status::invalid_argument(
+            "phrase weight_per_token must be finite and greater than zero",
+        ));
+    }
+    if !max_weight.is_finite() || max_weight <= 0.0 {
+        return Err(Status::invalid_argument(
+            "phrase max_weight must be finite and greater than zero",
+        ));
+    }
+    Ok(())
+}
+
+fn phrase_fields(
+    base: &Bm25SearchRequest,
+    index: &crate::phrases::PhraseIndex,
+) -> Result<Vec<crate::pb::QueryField>, Status> {
+    let fields = if base.fields.is_empty() {
+        vec![crate::pb::QueryField {
+            field: "body".into(),
+            analysis: base.analysis.clone(),
+            weight: 1.0,
+            ..Default::default()
+        }]
+    } else {
+        if base.analysis.is_some() {
+            return Err(Status::invalid_argument("PhraseSearch base.analysis is ignored when base.fields is set; move the spec onto each QueryField.analysis"));
+        }
+        base.fields.clone()
+    };
+    let mut seen = std::collections::HashSet::new();
+    for field in &fields {
+        if field.field.is_empty() || !seen.insert(field.field.as_str()) {
+            return Err(Status::invalid_argument(
+                "phrase search base fields must be named and unique",
+            ));
+        }
+        if field.phrase.is_some() || !field.prefixes.is_empty() {
+            return Err(Status::invalid_argument(format!("field {:?}: PhraseSearch scores glossary concepts; PhraseMatch and TermPrefix constraints are served by Bm25Search", field.field)));
+        }
+        if field.field == index.phrase_field() {
+            return Err(Status::invalid_argument(format!(
+                "phrase field {:?} is derived by PhraseSearch and must not appear in base.fields",
+                field.field
+            )));
+        }
+        if field.weight < 0.0 || field.weight.is_nan() {
+            return Err(Status::invalid_argument(format!(
+                "field {:?}: weight must be non-negative",
+                field.field
+            )));
+        }
+    }
+    Ok(fields)
 }

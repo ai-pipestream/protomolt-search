@@ -1,4 +1,4 @@
-//! Signals.
+//! Shard floor delivery and cancellation signals.
 
 use super::*;
 

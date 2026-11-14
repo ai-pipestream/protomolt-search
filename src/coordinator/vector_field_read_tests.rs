@@ -1,4 +1,4 @@
-//! Vector field read tests.
+//! Vector field authorization and pinned read-set checks.
 
 use super::*;
 use crate::pb::node_service_server::NodeService;

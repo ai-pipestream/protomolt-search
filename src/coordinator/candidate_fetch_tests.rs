@@ -1,4 +1,4 @@
-//! Candidate fetch tests.
+//! Authorization checks for membership and candidate retrieval.
 
 use super::*;
 use crate::pb::*;

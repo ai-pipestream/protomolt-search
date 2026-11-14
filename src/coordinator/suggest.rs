@@ -1,4 +1,4 @@
-//! Suggest.
+//! Distributed query suggestions and prefix dictionary limits.
 
 use super::*;
 

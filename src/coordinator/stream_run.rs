@@ -202,6 +202,38 @@ impl StreamCompletion {
     }
 }
 
+struct StreamRun<'a> {
+    query: StreamQuery<'a>,
+    fanout: StreamFanout,
+    collector: StreamCollector,
+    completion: StreamCompletion,
+    known: FilterKnown,
+    identity_limits: Option<crate::pb::StreamIdentityLimits>,
+    scoring_fingerprint: Option<String>,
+}
+
+impl StreamQuery<'_> {
+    fn identity_limits(&self) -> Option<crate::pb::StreamIdentityLimits> {
+        (!self.collapse).then_some(crate::pb::StreamIdentityLimits {
+            max_rows: self.k,
+            max_response_bytes: 32 * 1024 * 1024,
+            timeout_ms: 60_000,
+        })
+    }
+
+    fn open_context(&self) -> Result<StreamOpen<'_>, Status> {
+        StreamOpen::new(
+            self.request_id,
+            self.vector,
+            self.initial_floor,
+            Some(self.k),
+            self.collapse,
+            self.filters,
+            self.identity_limits(),
+        )
+    }
+}
+
 impl CoordinatorServiceImpl {
     pub(super) async fn run_stream_query(
         &self,
@@ -214,189 +246,217 @@ impl CoordinatorServiceImpl {
             pinned.validate_read_versions(&reads).await?;
             return result;
         }
-        let n_nodes = self.node_addrs.len();
-        if n_nodes == 0 {
+        let windows = self.validate_stream_query(query)?;
+        if query.k == 0 {
+            return Ok(StreamRunResult::empty());
+        }
+        let open = query.open_context()?;
+        self.ensure_shard_vector_rows().await;
+        let mask = self.vector_scan_mask(query.filters.tree.as_ref());
+        let known = Self::filter_known(query.filters, mask.as_ref());
+        let fanout = self.open_stream_context(open)?;
+        let collector = StreamCollector::new(query.k, query.collapse);
+        let completion = StreamCompletion::new(
+            self.node_addrs.len(),
+            mask.as_ref().map(|mask| mask.skipped.as_slice()),
+            windows,
+            query.initial_floor,
+        );
+        let mut run = StreamRun {
+            query,
+            fanout,
+            collector,
+            completion,
+            known,
+            identity_limits: query.identity_limits(),
+            scoring_fingerprint: None,
+        };
+        run.collect(self).await?;
+        run.finish(self).await
+    }
+
+    fn validate_stream_query(
+        &self,
+        query: StreamQuery<'_>,
+    ) -> Result<(Option<Duration>, Option<Duration>), Status> {
+        if self.node_addrs.is_empty() {
             return Err(Status::failed_precondition("no shard nodes configured"));
         }
         if query.initial_floor.is_some_and(f32::is_nan) {
             return Err(Status::invalid_argument("initial_floor must not be NaN"));
         }
         let windows = self.resolve_finish_windows(query.filters)?;
-        if query.k == 0 {
-            if self.scoped_vector_scan() {
-                return Err(Status::invalid_argument(
-                    "a scoped vector scan requires positive k",
-                ));
-            }
-            return Ok(StreamRunResult::empty());
+        if query.k == 0 && self.scoped_vector_scan() {
+            return Err(Status::invalid_argument(
+                "a scoped vector scan requires positive k",
+            ));
         }
-        self.ensure_shard_vector_rows().await;
-        let mask = self.vector_scan_mask(query.filters.tree.as_ref());
-        let mut known = Self::filter_known(query.filters, mask.as_ref());
-        let identity_limits = if query.collapse {
-            None
-        } else {
-            let limits = crate::pb::StreamIdentityLimits {
-                max_rows: query.k,
-                max_response_bytes: 32 * 1024 * 1024,
-                timeout_ms: 60_000,
-            };
-            crate::query_identity::validate_limits(&limits)?;
-            Some(limits)
-        };
-        let mut fanout = if query.collapse {
-            self.open_stream_fanout(
-                query.request_id,
-                query.vector,
-                query.initial_floor,
-                Some(query.k),
-                true,
-                query.filters,
-            )
-        } else {
-            self.open_stream_context(StreamOpen {
-                request_id: query.request_id,
-                vector: query.vector,
-                initial_floor: query.initial_floor,
-                candidate_depth: Some(query.k),
-                collapse_parents: query.collapse,
-                filters: query.filters,
-                identity_limits,
-            })
-        }?;
-        let mut collector = StreamCollector::new(query.k, query.collapse);
-        let mut completion = StreamCompletion::new(
-            n_nodes,
-            mask.as_ref().map(|mask| mask.skipped.as_slice()),
-            windows,
-            query.initial_floor,
-        );
-        let mut scoring_fingerprint: Option<String> = None;
-        while completion.remaining > 0 {
-            let (shard, msg) = match completion.next_step(&mut fanout, query.collapse).await {
+        Ok(windows)
+    }
+}
+
+impl StreamRun<'_> {
+    async fn collect(&mut self, coordinator: &CoordinatorServiceImpl) -> Result<(), Status> {
+        while self.completion.remaining > 0 {
+            let step = self
+                .completion
+                .next_step(&mut self.fanout, self.query.collapse)
+                .await;
+            let message = match step {
                 StreamLoopStep::Deadline => {
-                    completion.deadline_at = None;
-                    completion.settle_at = None;
-                    completion.finish_sent = true;
-                    self.push_stream_finish(&fanout, &completion.summaries, true)
+                    self.completion.deadline_at = None;
+                    self.completion.settle_at = None;
+                    self.completion.finish_sent = true;
+                    coordinator
+                        .push_stream_finish(&self.fanout, &self.completion.summaries, true)
                         .await;
                     continue;
                 }
                 StreamLoopStep::Settle => {
-                    completion.settle_at = None;
-                    if !completion.finish_sent {
-                        completion.finish_sent = true;
-                        self.push_stream_finish(&fanout, &completion.summaries, false)
+                    self.completion.settle_at = None;
+                    if !self.completion.finish_sent {
+                        self.completion.finish_sent = true;
+                        coordinator
+                            .push_stream_finish(&self.fanout, &self.completion.summaries, false)
                             .await;
                     }
                     continue;
                 }
-                StreamLoopStep::Message(Ok(Some(pair))) => pair,
-                StreamLoopStep::Message(Ok(None)) => continue,
-                StreamLoopStep::Message(Err(status)) => return fanout.cancel_with(status).await,
+                StreamLoopStep::Message(message) => message,
             };
-            let summary = match msg.payload {
-                Some(stream_search_response::Payload::Batch(batch)) => {
-                    if !query.collapse && completion.summaries[shard].is_some() {
-                        return fanout
-                            .cancel_with(Status::internal("candidate batch after IdentityReady"))
-                            .await;
-                    }
-                    let update = match collector.batch(shard, &batch.hits, query.k) {
-                        Ok(update) => update,
-                        Err(status) => return fanout.cancel_with(status).await,
-                    };
-                    if let Some(floor) = completion.batch(update) {
-                        self.push_stream_floor(&fanout, floor);
-                    }
-                    collector.publish(self, scoring_fingerprint.as_deref().unwrap_or_default());
-                    continue;
-                }
-                Some(stream_search_response::Payload::IdentityReady(ready)) if !query.collapse => {
-                    if completion.summaries[shard].is_some() {
-                        return fanout
-                            .cancel_with(Status::internal("duplicate IdentityReady"))
-                            .await;
-                    }
-                    let Some(summary) = ready.scan else {
-                        return fanout
-                            .cancel_with(Status::internal("IdentityReady has no scan certificate"))
-                            .await;
-                    };
-                    summary
-                }
-                Some(stream_search_response::Payload::Summary(summary)) if query.collapse => {
-                    summary
-                }
-                Some(stream_search_response::Payload::Summary(_)) => {
-                    return fanout
-                        .cancel_with(Status::failed_precondition(
-                            "stream ended without snapshot-bound identity support or completion",
-                        ))
-                        .await;
-                }
-                None if query.collapse => continue,
-                _ => {
-                    let message = if query.collapse {
-                        "unexpected identity exchange on a legacy stream"
-                    } else {
-                        "unexpected message before IdentityReady"
-                    };
-                    return fanout.cancel_with(Status::internal(message)).await;
-                }
+            let result = match message {
+                Ok(Some((shard, message))) => self.message(coordinator, shard, message),
+                Ok(None) => continue,
+                Err(status) => Err(status),
             };
-            if !summary.completed {
-                return fanout
-                    .cancel_with(Status::internal(format!(
-                        "shard {shard} stopped before completing its scan"
-                    )))
-                    .await;
-            }
-            if !query.collapse {
-                if summary.scoring_fingerprint.is_empty() {
-                    return fanout
-                        .cancel_with(Status::failed_precondition(format!(
-                            "shard {shard} completed without a vector scoring fingerprint"
-                        )))
-                        .await;
-                }
-                match scoring_fingerprint.as_ref() {
-                    Some(expected) if expected != &summary.scoring_fingerprint => {
-                        return fanout
-                            .cancel_with(Status::failed_precondition(format!(
-                            "shard {shard} vector scoring fingerprint {} differs from {expected}",
-                            summary.scoring_fingerprint
-                        )))
-                            .await;
-                    }
-                    None => scoring_fingerprint = Some(summary.scoring_fingerprint.clone()),
-                    _ => {}
-                }
-            }
-            if let Err(error) = known.merge_shard(
-                shard,
-                &summary.geo_columns_known,
-                &summary.filter_columns_known,
-            ) {
-                return fanout.cancel_with(error).await;
-            }
-            completion.completed(shard, summary, collector.is_full(query.k));
-            if query.collapse {
-                fanout.mark_completed(shard);
+            if let Err(status) = result {
+                return self.fanout.cancel_with(status).await;
             }
         }
-        known.refuse_unknown(query.filters)?;
-        collector.publish(self, scoring_fingerprint.as_deref().unwrap_or_default());
+        Ok(())
+    }
+
+    fn message(
+        &mut self,
+        coordinator: &CoordinatorServiceImpl,
+        shard: usize,
+        message: StreamSearchResponse,
+    ) -> Result<(), Status> {
+        let summary = match message.payload {
+            Some(stream_search_response::Payload::Batch(batch)) => {
+                return self.batch(coordinator, shard, &batch.hits);
+            }
+            Some(stream_search_response::Payload::IdentityReady(ready)) if !self.query.collapse => {
+                if self.completion.summaries[shard].is_some() {
+                    return Err(Status::internal("duplicate IdentityReady"));
+                }
+                ready
+                    .scan
+                    .ok_or_else(|| Status::internal("IdentityReady has no scan certificate"))?
+            }
+            Some(stream_search_response::Payload::Summary(summary)) if self.query.collapse => {
+                summary
+            }
+            Some(stream_search_response::Payload::Summary(_)) => {
+                return Err(Status::failed_precondition(
+                    "stream ended without snapshot-bound identity support or completion",
+                ));
+            }
+            None if self.query.collapse => return Ok(()),
+            _ => {
+                return Err(Status::internal(if self.query.collapse {
+                    "unexpected identity exchange on a legacy stream"
+                } else {
+                    "unexpected message before IdentityReady"
+                }))
+            }
+        };
+        self.validate_summary(shard, &summary)?;
+        self.known.merge_shard(
+            shard,
+            &summary.geo_columns_known,
+            &summary.filter_columns_known,
+        )?;
+        self.completion
+            .completed(shard, summary, self.collector.is_full(self.query.k));
+        if self.query.collapse {
+            self.fanout.mark_completed(shard);
+        }
+        Ok(())
+    }
+
+    fn batch(
+        &mut self,
+        coordinator: &CoordinatorServiceImpl,
+        shard: usize,
+        bytes: &[u8],
+    ) -> Result<(), Status> {
+        if !self.query.collapse && self.completion.summaries[shard].is_some() {
+            return Err(Status::internal("candidate batch after IdentityReady"));
+        }
+        let update = self.collector.batch(shard, bytes, self.query.k)?;
+        if let Some(floor) = self.completion.batch(update) {
+            coordinator.push_stream_floor(&self.fanout, floor);
+        }
+        self.collector.publish(
+            coordinator,
+            self.scoring_fingerprint.as_deref().unwrap_or_default(),
+        );
+        Ok(())
+    }
+
+    fn validate_summary(
+        &mut self,
+        shard: usize,
+        summary: &StreamSearchSummary,
+    ) -> Result<(), Status> {
+        if !summary.completed {
+            return Err(Status::internal(format!(
+                "shard {shard} stopped before completing its scan"
+            )));
+        }
+        if !self.query.collapse {
+            if summary.scoring_fingerprint.is_empty() {
+                return Err(Status::failed_precondition(format!(
+                    "shard {shard} completed without a vector scoring fingerprint"
+                )));
+            }
+            match self.scoring_fingerprint.as_ref() {
+                Some(expected) if expected != &summary.scoring_fingerprint => {
+                    return Err(Status::failed_precondition(format!(
+                        "shard {shard} vector scoring fingerprint {} differs from {expected}",
+                        summary.scoring_fingerprint
+                    )));
+                }
+                None => self.scoring_fingerprint = Some(summary.scoring_fingerprint.clone()),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    async fn finish(
+        mut self,
+        coordinator: &CoordinatorServiceImpl,
+    ) -> Result<StreamRunResult, Status> {
+        self.known.refuse_unknown(self.query.filters)?;
+        self.collector.publish(
+            coordinator,
+            self.scoring_fingerprint.as_deref().unwrap_or_default(),
+        );
         let mut result = StreamRunResult::empty();
-        match collector {
+        match self.collector {
             StreamCollector::Rows(rows) => {
                 let all = rows.finish();
-                let (identities, candidates) = fanout
+                let (identities, candidates) = self
+                    .fanout
                     .resolve_identities_and_candidates(
                         &all,
-                        &completion.summaries,
-                        &mut completion.terminal,
-                        &identity_limits.expect("row collector requests identities"),
+                        &self.completion.summaries,
+                        &mut self.completion.terminal,
+                        &self
+                            .identity_limits
+                            .expect("row collector requests identities"),
                     )
                     .await?;
                 result.hits = all
@@ -414,10 +474,10 @@ impl CoordinatorServiceImpl {
                     .collect();
             }
             StreamCollector::Parents(parents) => {
-                (result.hits, result.groups, result.chunk_floor) = parents.finish(query.k);
+                (result.hits, result.groups, result.chunk_floor) = parents.finish(self.query.k);
             }
         }
-        Ok(completion.finish(result))
+        Ok(self.completion.finish(result))
     }
 }
 

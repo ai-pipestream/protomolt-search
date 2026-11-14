@@ -1,6 +1,6 @@
-//! Hybrid.
+//! Validated hybrid execution with shared shard dispatch and ranked fusion.
 
-use super::hybrid_context::{local_fusion_request, HybridQuery, HybridRound};
+use super::hybrid_context::{local_fusion_request, HybridInput, HybridQuery, HybridRound};
 use super::hybrid_reduce::{finish_two_level, fuse_clustered_shard, hybrid_debug, GlobalHybrid};
 use super::*;
 
@@ -35,22 +35,13 @@ impl CoordinatorServiceImpl {
         debug: bool,
         filters: &RequestFilters,
     ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
-        self.fanout_hybrid_context(HybridQuery {
-            request_id,
-            text,
-            pre_analyzed_terms: &[],
-            vector,
-            k,
-            spec,
-            legs,
-            debug,
-            filters,
-        })
-        .await
+        let input = HybridInput::new(request_id, text, vector, k, spec, filters)?;
+        self.fanout_hybrid_context(HybridQuery::new(input, legs, debug)?)
+            .await
     }
 
     /// Run hybrid search using grouped query inputs.
-    pub async fn fanout_hybrid_context(
+    pub(crate) async fn fanout_hybrid_context(
         &self,
         query: HybridQuery<'_>,
     ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
@@ -61,91 +52,91 @@ impl CoordinatorServiceImpl {
         &self,
         query: HybridQuery<'_>,
     ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
-        let HybridQuery {
-            text,
-            pre_analyzed_terms,
-            vector,
-            k,
-            spec,
-            legs,
-            filters,
-            ..
-        } = query;
-        self.check_vector_scan(filters, false)?;
+        let input = query.input();
+        self.check_vector_scan(input.filters(), false)?;
         if self.scoped_vector_scan() && self.query_read_versions.is_none() {
             let (pinned, reads) = self.pin_read_versions().await?;
             let result = Box::pin(pinned.fanout_hybrid_with_terms(query)).await;
             pinned.validate_read_versions(&reads).await?;
             return result;
         }
-        let analysis_fingerprint = crate::analyzer::analysis_fingerprint(spec);
-        if k == 0 || vector.is_empty() {
+        if input.k() == 0 || input.vector().is_empty() {
             return Ok((Vec::new(), None));
         }
-        let t_total = std::time::Instant::now();
-        let mut terms: Vec<String> = Vec::new();
-        let analysis_ms = if !pre_analyzed_terms.is_empty() {
-            for term in pre_analyzed_terms {
-                if !term.is_empty() && !terms.contains(term) {
+        let total_started = std::time::Instant::now();
+        let (terms, analysis_ms) = self.analyze_hybrid_input(input, true).await?;
+        let (hits, mut debug, stats_ms) = self.hybrid_stats_rounds(query, &terms).await?;
+        if let Some(debug) = debug.as_mut() {
+            debug.terms = terms;
+            debug.analysis_ms = analysis_ms;
+            debug.stats_ms = stats_ms;
+            debug.total_ms = total_started.elapsed().as_secs_f32() * 1e3;
+        }
+        Ok((hits, debug))
+    }
+
+    pub(super) async fn analyze_hybrid_input(
+        &self,
+        input: HybridInput<'_>,
+        omit_empty: bool,
+    ) -> Result<(Vec<String>, f32), Status> {
+        let mut terms = Vec::new();
+        if !input.pre_analyzed_terms().is_empty() {
+            for term in input.pre_analyzed_terms() {
+                if !(terms.contains(term) || omit_empty && term.is_empty()) {
                     terms.push(term.clone());
                 }
             }
-            0.0
-        } else {
-            // Query analysis for the BM25 leg (same options as ingest).
-            let addr = self.analysis_addr.clone().ok_or_else(|| {
-                Status::unavailable(
-                    "no analysis backend configured on the coordinator (analysis_addr)",
-                )
-            })?;
-            let t = std::time::Instant::now();
-            let analyzed = crate::analyzer::analyze_document(&addr, text, spec).await?;
-            let ms = t.elapsed().as_secs_f32() * 1e3;
-            for (term, _, _) in analyzed.into_body().terms {
-                if !terms.contains(&term) {
-                    terms.push(term);
-                }
+            return Ok((terms, 0.0));
+        }
+        let address = self.analysis_addr.clone().ok_or_else(|| {
+            Status::unavailable("no analysis backend configured on the coordinator (analysis_addr)")
+        })?;
+        let started = std::time::Instant::now();
+        let analyzed =
+            crate::analyzer::analyze_document(&address, input.text(), input.spec()).await?;
+        let ms = started.elapsed().as_secs_f32() * 1e3;
+        for (term, _, _) in analyzed.into_body().terms {
+            if !terms.contains(&term) {
+                terms.push(term);
             }
-            ms
-        };
+        }
+        Ok((terms, ms))
+    }
 
-        let t = std::time::Instant::now();
-        // Stats + fusion run as a round: a stale-stats refusal from any
-        // shard reruns them once against fresh stats with a new fenced claim.
+    async fn hybrid_stats_rounds(
+        &self,
+        query: HybridQuery<'_>,
+        terms: &[String],
+    ) -> Result<(Vec<HybridHit>, Option<HybridDebug>, f32), Status> {
+        let started = std::time::Instant::now();
+        let fingerprint = crate::analyzer::analysis_fingerprint(query.input().spec());
         let mut fresh = false;
-        let (hits, mut dbg, stats_ms) = loop {
-            let (global, epochs) = self.body_stats(&terms, fresh).await?;
-            let claims = epochs;
-            let stats_ms = t.elapsed().as_secs_f32() * 1e3;
-            let context = HybridRound::new(
+        loop {
+            let (global, claims) = self.body_stats(terms, fresh).await?;
+            let stats_ms = started.elapsed().as_secs_f32() * 1e3;
+            let round = HybridRound::new(
                 query,
-                &terms,
-                analysis_fingerprint,
+                terms,
+                fingerprint,
                 &global,
                 &claims,
                 self.node_addrs.len(),
             )?;
-            let round = match legs.fusion_mode {
-                FusionMode::TwoLevel => self.fanout_hybrid_two_level(context).await,
-                FusionMode::Decomposed => self.fanout_hybrid_decomposed(context).await,
-                _ => self.fanout_hybrid_global_rank(context).await,
+            let result = match query.legs().fusion_mode {
+                FusionMode::TwoLevel => self.fanout_hybrid_two_level(round).await,
+                FusionMode::Decomposed => self.fanout_hybrid_decomposed(round).await,
+                _ => self.fanout_hybrid_global_rank(round).await,
             };
-            match round {
-                Err(e) if !fresh && is_stale_stats(&e) => {
+            match result {
+                Err(error) if !fresh && is_stale_stats(&error) => {
                     self.stats_cache.invalidate_all();
                     fresh = true;
                 }
-                Err(e) => return Err(e),
-                Ok((hits, dbg)) => break (hits, dbg, stats_ms),
+                Err(error) => return Err(error),
+                Ok((hits, debug)) => return Ok((hits, debug, stats_ms)),
             }
-        };
-        if let Some(d) = dbg.as_mut() {
-            d.terms = terms;
-            d.analysis_ms = analysis_ms;
-            d.stats_ms = stats_ms;
-            d.total_ms = t_total.elapsed().as_secs_f32() * 1e3;
         }
-        Ok((hits, dbg))
     }
 }
 
@@ -169,15 +160,15 @@ impl CoordinatorServiceImpl {
         #[cfg(feature = "net")]
         {
             let ranges = self.product_label_ranges().await?;
-            let query = round.query;
-            if !two_level && query.legs.vector_weight == 0.0 {
+            let query = round.query();
+            if !two_level && query.legs().vector_weight == 0.0 {
                 return Ok(vec![Vec::new(); self.node_addrs.len()]);
             }
             self.clustered_local_vector_legs(
-                query.request_id,
-                query.vector,
-                query.legs.leg_k,
-                query.filters,
+                query.input().request_id(),
+                query.input().vector(),
+                query.legs().leg_k,
+                query.input().filters(),
                 &ranges,
             )
             .await
@@ -194,7 +185,7 @@ impl CoordinatorServiceImpl {
         round: HybridRound<'_>,
     ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
         let started = std::time::Instant::now();
-        let query = round.query;
+        let query = round.query();
         let clustered = self.hybrid_is_clustered();
         let mut merged = GlobalHybrid::default();
         let mut vector_counts = vec![0u32; self.node_addrs.len()];
@@ -218,39 +209,12 @@ impl CoordinatorServiceImpl {
             self.vector_read_barrier()?
         };
         let mask = if clustered {
-            self.shard_mask(query.filters.tree.as_ref())
+            self.shard_mask(query.input().filters().tree.as_ref())
         } else {
-            self.vector_scan_mask(query.filters.tree.as_ref())
+            self.vector_scan_mask(query.input().filters().tree.as_ref())
         };
-        let mut tasks = Vec::with_capacity(self.node_addrs.len());
-        for (shard, node) in self.node_addrs.iter().enumerate() {
-            if mask.as_ref().is_some_and(|mask| mask.skipped[shard]) {
-                continue;
-            }
-            let request = round.shard_request(
-                self.bm25_params,
-                shard,
-                admission
-                    .as_ref()
-                    .map(|barrier| barrier.context(shard))
-                    .transpose()?,
-                Self::shard_filter_tree(query.filters, mask.as_ref(), shard),
-                clustered,
-                false,
-            );
-            let mut client = self.node_client(node)?;
-            tasks.push(tokio::spawn(async move {
-                let started = std::time::Instant::now();
-                client.shard_legs(request).await.map(|response| {
-                    (
-                        shard as u32,
-                        started.elapsed().as_secs_f32() * 1e3,
-                        response.into_inner(),
-                    )
-                })
-            }));
-        }
-        let mut known = Self::filter_known(query.filters, mask.as_ref());
+        let tasks = self.spawn_global_hybrid(round, mask.as_ref(), &admission, clustered)?;
+        let mut known = Self::filter_known(query.input().filters(), mask.as_ref());
         let mut shard_debug = Vec::new();
         for task in tasks {
             let (shard, rpc_ms, response) = task
@@ -269,7 +233,7 @@ impl CoordinatorServiceImpl {
                 &response.geo_columns_known,
                 &response.filter_columns_known,
             )?;
-            if query.debug {
+            if query.debug() {
                 shard_debug.push(HybridShardDebug {
                     shard,
                     rpc_ms,
@@ -290,7 +254,7 @@ impl CoordinatorServiceImpl {
         if let Some(admission) = &admission {
             admission.wait().await?;
         }
-        known.refuse_unknown(query.filters)?;
+        known.refuse_unknown(query.input().filters())?;
         let legs_ms = started.elapsed().as_secs_f32() * 1e3;
         let fusion_started = std::time::Instant::now();
         let hits = merged.finish(query);
@@ -305,7 +269,7 @@ impl CoordinatorServiceImpl {
         round: HybridRound<'_>,
     ) -> Result<(Vec<HybridHit>, Option<HybridDebug>), Status> {
         let started = std::time::Instant::now();
-        let query = round.query;
+        let query = round.query();
         let clustered = self.hybrid_is_clustered();
         let vector_legs = if clustered {
             self.hybrid_clustered_vectors(round, true).await?
@@ -318,52 +282,13 @@ impl CoordinatorServiceImpl {
             self.vector_read_barrier()?
         };
         let mask = if clustered {
-            self.shard_mask(query.filters.tree.as_ref())
+            self.shard_mask(query.input().filters().tree.as_ref())
         } else {
-            self.vector_scan_mask(query.filters.tree.as_ref())
+            self.vector_scan_mask(query.input().filters().tree.as_ref())
         };
-        let mut tasks = Vec::with_capacity(self.node_addrs.len());
-        for (shard, node) in self.node_addrs.iter().enumerate() {
-            if mask.as_ref().is_some_and(|mask| mask.skipped[shard]) {
-                continue;
-            }
-            let request = round.shard_request(
-                self.bm25_params,
-                shard,
-                admission
-                    .as_ref()
-                    .map(|barrier| barrier.context(shard))
-                    .transpose()?,
-                Self::shard_filter_tree(query.filters, mask.as_ref(), shard),
-                clustered,
-                true,
-            );
-            let mut client = self.node_client(node)?;
-            let local_vectors = clustered.then(|| vector_legs[shard].clone());
-            tasks.push(tokio::spawn(async move {
-                let started = std::time::Instant::now();
-                if let Some(vector) = local_vectors {
-                    let response = client.shard_legs(request).await?.into_inner();
-                    let elapsed = started.elapsed().as_secs_f32() * 1e3;
-                    Ok((
-                        shard as u32,
-                        elapsed,
-                        LocalHybridReply::Clustered { response, vector },
-                    ))
-                } else {
-                    let response = client
-                        .hybrid_shard(local_fusion_request(request, query.legs))
-                        .await?
-                        .into_inner();
-                    Ok::<_, Status>((
-                        shard as u32,
-                        started.elapsed().as_secs_f32() * 1e3,
-                        LocalHybridReply::Plain(response),
-                    ))
-                }
-            }));
-        }
-        let mut known = Self::filter_known(query.filters, mask.as_ref());
+        let tasks =
+            self.spawn_local_hybrid(round, mask.as_ref(), &admission, clustered, &vector_legs)?;
+        let mut known = Self::filter_known(query.input().filters(), mask.as_ref());
         let mut shard_debug = Vec::new();
         let mut lists = Vec::new();
         for task in tasks {
@@ -382,7 +307,7 @@ impl CoordinatorServiceImpl {
                         &response.geo_columns_known,
                         &response.filter_columns_known,
                     )?;
-                    fuse_clustered_shard(vector, response.bm25_hits, query.legs)
+                    fuse_clustered_shard(vector, response.bm25_hits, query.legs())
                 }
                 LocalHybridReply::Plain(response) => {
                     accept_hybrid_receipt(
@@ -395,12 +320,12 @@ impl CoordinatorServiceImpl {
                     response.hits
                 }
             };
-            if query.legs.min_vector_score > 0.0 {
+            if query.legs().min_vector_score > 0.0 {
                 hits.retain(|hit| {
-                    hit.vector_rank.is_some() && hit.vector_score >= query.legs.min_vector_score
+                    hit.vector_rank.is_some() && hit.vector_score >= query.legs().min_vector_score
                 });
             }
-            if query.debug {
+            if query.debug() {
                 shard_debug.push(HybridShardDebug {
                     shard,
                     rpc_ms,
@@ -414,7 +339,7 @@ impl CoordinatorServiceImpl {
         if let Some(admission) = &admission {
             admission.wait().await?;
         }
-        known.refuse_unknown(query.filters)?;
+        known.refuse_unknown(query.input().filters())?;
         let legs_ms = started.elapsed().as_secs_f32() * 1e3;
         let fusion_started = std::time::Instant::now();
         let hits = finish_two_level(lists, query);
@@ -422,6 +347,102 @@ impl CoordinatorServiceImpl {
             hits,
             hybrid_debug(query, shard_debug, legs_ms, fusion_started),
         ))
+    }
+}
+
+type HybridTask<T> = tokio::task::JoinHandle<Result<(u32, f32, T), Status>>;
+
+impl CoordinatorServiceImpl {
+    fn spawn_global_hybrid(
+        &self,
+        round: HybridRound<'_>,
+        mask: Option<&crate::placement::ShardMask>,
+        admission: &Option<Arc<crate::vector_read::VectorReadBarrier>>,
+        clustered: bool,
+    ) -> Result<Vec<HybridTask<crate::pb::ShardLegsResponse>>, Status> {
+        let query = round.query();
+        let mut tasks = Vec::with_capacity(self.node_addrs.len());
+        for (shard, node) in self.node_addrs.iter().enumerate() {
+            if mask.is_some_and(|mask| mask.skipped[shard]) {
+                continue;
+            }
+            let request = round.shard_request(
+                self.bm25_params,
+                shard,
+                admission
+                    .as_ref()
+                    .map(|barrier| barrier.context(shard))
+                    .transpose()?,
+                Self::shard_filter_tree(query.input().filters(), mask, shard),
+                clustered,
+                false,
+            );
+            let mut client = self.node_client(node)?;
+            tasks.push(tokio::spawn(async move {
+                let started = std::time::Instant::now();
+                client.shard_legs(request).await.map(|response| {
+                    (
+                        shard as u32,
+                        started.elapsed().as_secs_f32() * 1e3,
+                        response.into_inner(),
+                    )
+                })
+            }));
+        }
+        Ok(tasks)
+    }
+    fn spawn_local_hybrid(
+        &self,
+        round: HybridRound<'_>,
+        mask: Option<&crate::placement::ShardMask>,
+        admission: &Option<Arc<crate::vector_read::VectorReadBarrier>>,
+        clustered: bool,
+        vector_legs: &[Vec<(u64, f64)>],
+    ) -> Result<Vec<HybridTask<LocalHybridReply>>, Status> {
+        let query = round.query();
+        let mut tasks = Vec::with_capacity(self.node_addrs.len());
+        for (shard, node) in self.node_addrs.iter().enumerate() {
+            if mask.is_some_and(|mask| mask.skipped[shard]) {
+                continue;
+            }
+            let request = round.shard_request(
+                self.bm25_params,
+                shard,
+                admission
+                    .as_ref()
+                    .map(|barrier| barrier.context(shard))
+                    .transpose()?,
+                Self::shard_filter_tree(query.input().filters(), mask, shard),
+                clustered,
+                true,
+            );
+            let mut client = self.node_client(node)?;
+            let local_vectors = clustered.then(|| vector_legs[shard].clone());
+            let legs = query.legs();
+            tasks.push(tokio::spawn(async move {
+                let started = std::time::Instant::now();
+                if let Some(vector) = local_vectors {
+                    let response = client.shard_legs(request).await?.into_inner();
+                    let elapsed = started.elapsed().as_secs_f32() * 1e3;
+                    Ok((
+                        shard as u32,
+                        elapsed,
+                        LocalHybridReply::Clustered { response, vector },
+                    ))
+                } else {
+                    let response = client
+                        .hybrid_shard(local_fusion_request(request, legs))
+                        .await?
+                        .into_inner();
+                    Ok::<_, Status>((
+                        shard as u32,
+                        started.elapsed().as_secs_f32() * 1e3,
+                        LocalHybridReply::Plain(response),
+                    ))
+                }
+            }));
+        }
+        Ok(tasks)
     }
 }
 

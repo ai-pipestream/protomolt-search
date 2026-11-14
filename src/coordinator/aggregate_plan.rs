@@ -1,4 +1,4 @@
-//! Aggregate plan.
+//! Compiled aggregation plans and typed result merging.
 
 use super::*;
 
@@ -78,8 +78,6 @@ pub(crate) fn compile_projections(
 
 /// The compiled aggregate request: everything the fan-out sends and
 /// the merge needs.
-/// The distinct-value cap a CARDINALITY aggregation gets when the
-/// request names none (docs/aggregations.md "Cardinality").
 
 #[derive(Clone)]
 pub(crate) struct CompiledAggregate {

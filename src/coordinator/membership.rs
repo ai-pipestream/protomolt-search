@@ -1,4 +1,4 @@
-//! Membership.
+//! Distributed document membership and lexical selection.
 
 use super::*;
 

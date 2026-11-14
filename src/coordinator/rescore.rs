@@ -1,4 +1,4 @@
-//! Rescore.
+//! Vector and BM25 rescoring over selected documents.
 
 use super::*;
 

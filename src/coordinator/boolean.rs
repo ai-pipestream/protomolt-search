@@ -1,4 +1,4 @@
-//! Boolean.
+//! Boolean query execution and membership composition.
 
 use super::*;
 

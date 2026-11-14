@@ -1,4 +1,4 @@
-//! Scoped fold tests.
+//! Aggregate authorization and response metadata checks.
 
 use super::*;
 use crate::pb::*;

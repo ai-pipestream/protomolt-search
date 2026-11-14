@@ -16,11 +16,11 @@ struct FusedTiming {
     fields: usize,
     terms: usize,
 }
-struct Bm25Reply {
-    shard: u32,
-    response: Bm25QueryResponse,
-    fingerprint: Option<String>,
-    millis: f64,
+pub(super) struct Bm25Reply {
+    pub(super) shard: u32,
+    pub(super) response: Bm25QueryResponse,
+    pub(super) fingerprint: Option<String>,
+    pub(super) millis: f64,
 }
 
 impl CoordinatorServiceImpl {
@@ -35,13 +35,11 @@ impl CoordinatorServiceImpl {
             global,
             claims,
         } = round;
-        let LexicalFanout {
-            score_stages,
-            stats_fields,
-            cardinality_fields,
-            projections,
-            ..
-        } = query.input();
+        let input = query.input();
+        let score_stages = &input.score_stages;
+        let stats_fields = &input.stats_fields;
+        let cardinality_fields = &input.cardinality_fields;
+        let projections = query.projections();
         if self.node_addrs.is_empty() {
             return Err(Status::failed_precondition("no shard nodes configured"));
         }
@@ -57,7 +55,7 @@ impl CoordinatorServiceImpl {
             score_stages: score_stages.to_vec(),
             stats_fields: stats_fields.to_vec(),
             cardinality_fields: cardinality_fields.to_vec(),
-            ..query.request()
+            ..query.options().request()
         };
         self.execute_bm25_round(PreparedRound {
             request,
@@ -83,7 +81,8 @@ impl CoordinatorServiceImpl {
             fingerprints,
             timing,
         } = round;
-        let LexicalFanout { k, min_score, .. } = query.input();
+        let k = query.k();
+        let min_score = query.request().min_score;
         let trace = timing.trace;
 
         let doc_count = globals.doc_count;
@@ -158,283 +157,92 @@ impl CoordinatorServiceImpl {
         Ok(((result.0, result.1, result.2), result.5))
     }
     async fn execute_bm25_round(&self, round: PreparedRound<'_>) -> Result<AggregatedHits, Status> {
-        let k = round.request.k;
-        let min_score = round.request.min_score;
-        let facet_fields = round.request.facet_fields.as_slice();
-        let map_facet_fields = round.request.map_facet_fields.as_slice();
-        let range_facet_fields = round.request.range_facet_fields.as_slice();
-        let score_stages = round.request.score_stages.as_slice();
-        let geo_filters = round.request.geo_filters.as_slice();
-        let filter = round.request.filter.as_ref();
-        let stats_fields = round.request.stats_fields.as_slice();
-        let cardinality_fields = round.request.cardinality_fields.as_slice();
-        let projections = round.request.projections.as_slice();
-        let mut query_tasks = tokio::task::JoinSet::new();
         let stream_enabled = self.bm25_stream && round.phrase.is_none();
         let relay = stream_enabled
-            .then(|| watch::channel(min_score))
+            .then(|| watch::channel(round.request.min_score))
             .map(|(tx, rx)| (Arc::new(tx), rx));
         let stream_heap = stream_enabled.then(|| {
             Arc::new(Mutex::new(Bm25StreamHeap {
-                heap: std::collections::BinaryHeap::with_capacity(k as usize + 1),
+                heap: std::collections::BinaryHeap::with_capacity(round.request.k as usize + 1),
                 floors_sent: 0,
                 progress: self.query_progress.clone(),
             }))
         });
-        let mask = self.shard_mask(filter);
-        for (shard, node) in self.node_addrs.iter().enumerate() {
-            if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
-                continue;
-            }
-            let mut request = round.request.clone();
-            request.expected_stats_epoch = round.claims[shard].epoch;
-            request.expected_stats_incarnation = round.claims[shard].incarnation();
-            let mut client = self.node_client(node)?;
-            let phrase_request =
-                round.phrase.map(
-                    |(phrase_leg, weights, _)| crate::pb::Bm25PhraseQueryRequest {
-                        query: Some(request.clone()),
-                        phrase_leg: phrase_leg as u32,
-                        phrase_term_weights: weights.to_vec(),
-                    },
-                );
-            let relay = relay.clone();
-            let stream_heap = stream_heap.clone();
-            let deadline = self.limits.shard_deadline;
-            query_tasks.spawn(async move {
-                let started = std::time::Instant::now();
-                let (response, fingerprint) = if let Some((floor_tx, floor_rx)) = relay {
-                    let run = stream_bm25_shard(
-                        shard as u32,
-                        k as usize,
-                        client,
-                        request,
-                        floor_tx,
-                        floor_rx,
-                        stream_heap.expect("relay has heap"),
-                    );
-                    let result = match deadline {
-                        Some(limit) => tokio::time::timeout(limit, run).await.map_err(|_| {
-                            Status::deadline_exceeded(format!(
-                                "BM25 shard {shard} exceeded its {}ms deadline",
-                                limit.as_millis()
-                            ))
-                        })?,
-                        None => run.await,
-                    }?;
-                    (result.response, Some(result.scoring_fingerprint))
-                } else {
-                    let response = match phrase_request {
-                        Some(request) => client.bm25_phrase_query(request).await,
-                        None => client.bm25_query(request).await,
-                    }?;
-                    (response.into_inner(), None)
-                };
-                Ok::<_, Status>(Bm25Reply {
-                    shard: shard as u32,
-                    response,
-                    fingerprint,
-                    millis: started.elapsed().as_secs_f64() * 1000.0,
-                })
-            });
-        }
-        let mut all: Vec<(u32, Bm25Hit)> = Vec::new();
-        let mut prune = crate::segment_prune::PruneStats::default();
-        let mut shard_facets: Vec<Vec<crate::pb::FacetFieldCounts>> = Vec::new();
-        let mut shard_ranges: Vec<Vec<crate::pb::RangeFacetCounts>> = Vec::new();
-        let mut stage_known = vec![false; score_stages.len()];
-        let mut geo_known = vec![false; geo_filters.len()];
-        let filter_leaves = filter.map_or(0, crate::filter::leaf_count);
-        let mut filter_known = vec![false; filter_leaves];
-        // Projection column-read leaves, in the wire's flag order
-        // (docs/cel-values.md).
-        let projection_leaves: Vec<crate::values::ValueLeaf> = {
-            let mut leaves = Vec::new();
-            for p in projections {
-                if let Some(expr) = p.expr.as_ref() {
-                    crate::values::column_leaves(expr, &mut leaves);
-                }
-            }
-            leaves
-        };
-        let mut projection_known = vec![false; projection_leaves.len()];
-        let mut projection_types = vec![crate::pb::ScalarValueType::Unspecified; projections.len()];
-        let mut shard_stats: Vec<Vec<crate::pb::ColumnStats>> = Vec::new();
-        let mut shard_distinct: Vec<Vec<crate::pb::FacetDistinct>> = Vec::new();
-        let mut scoring_fingerprint: Option<String> = None;
-        let mut per_shard = Vec::new();
+        let mask = self.shard_mask(round.request.filter.as_ref());
+        let mut tasks = self.spawn_bm25_round(&round, mask.as_ref(), relay, stream_heap.clone())?;
         let mut responses = Vec::new();
-        while let Some(joined) = query_tasks.join_next().await {
+        while let Some(joined) = tasks.join_next().await {
             responses.push(
                 joined.map_err(|e| Status::internal(format!("bm25 query task failed: {e}")))??,
             );
         }
         responses.sort_by_key(|response| response.shard);
+        let mut merged = super::lexical_reduce::RoundMerge::new(&round.request, round.flat);
         for response in responses {
-            let Bm25Reply {
-                shard,
-                response,
-                fingerprint,
-                millis,
-            } = response;
-            per_shard.push((shard, millis));
-            let Bm25QueryResponse {
-                hits,
-                facets,
-                range_facets: ranges,
-                stage_columns_known: known,
-                geo_columns_known: geo,
-                filter_columns_known: fknown,
-                stats: sstats,
-                distinct: sdistinct,
-                projection_leaves_known: pknown,
-                projection_types: ptypes,
-                segments_total,
-                segments_skipped,
-                ..
-            } = response;
-            let sprune = (segments_total, segments_skipped);
-            if let Some(fingerprint) = fingerprint {
-                match scoring_fingerprint.as_ref() {
-                    Some(expected) if expected != &fingerprint => {
-                        return Err(Status::failed_precondition(format!(
-                            "BM25 shard {shard} scoring fingerprint {fingerprint} differs from {expected}"
-                        )));
-                    }
-                    None => scoring_fingerprint = Some(fingerprint),
-                    _ => {}
-                }
-            }
-            if round.flat {
-                if pknown.len() != projection_leaves.len() {
-                    return Err(Status::internal(format!(
-                        "shard answered {} projection-leaf flags for {} leaves",
-                        pknown.len(),
-                        projection_leaves.len()
-                    )));
-                }
-                for (acc, k) in projection_known.iter_mut().zip(&pknown) {
-                    *acc |= *k;
-                }
-                crate::values::merge_projection_types(projections, &mut projection_types, &ptypes)?;
-                for hit in &hits {
-                    crate::values::validate_projection_row(&hit.projected, &ptypes)?;
-                }
-            }
-            all.extend(hits.into_iter().map(|h| (shard, h)));
-            shard_facets.push(facets);
-            shard_ranges.push(ranges);
-            shard_stats.push(sstats);
-            shard_distinct.push(sdistinct);
-            prune.add(crate::segment_prune::PruneStats {
-                segments_total: sprune.0,
-                segments_skipped: sprune.1,
-            });
-            if geo.len() != geo_filters.len() {
-                return Err(Status::internal(format!(
-                    "shard answered {} geo-column flags for {} filters",
-                    geo.len(),
-                    geo_filters.len()
-                )));
-            }
-            for (acc, k) in geo_known.iter_mut().zip(&geo) {
-                *acc |= *k;
-            }
-            if fknown.len() != filter_leaves {
-                return Err(Status::internal(format!(
-                    "shard answered {} filter-leaf flags for {} leaves",
-                    fknown.len(),
-                    filter_leaves
-                )));
-            }
-            for (acc, k) in filter_known.iter_mut().zip(&fknown) {
-                *acc |= *k;
-            }
-            if round.flat {
-                if known.len() != score_stages.len() {
-                    return Err(Status::internal(format!(
-                        "shard answered {} stage-column flags for {} stages",
-                        known.len(),
-                        score_stages.len()
-                    )));
-                }
-                for (acc, k) in stage_known.iter_mut().zip(known) {
-                    *acc |= k;
-                }
-            }
+            merged.accept(response)?;
         }
-        // A stage column NO shard knows is a typo wearing an identity
-        // chain — the whole request would be a silent no-op. Refuse,
-        // naming the column and the knob; a partially-known column is
-        // the heterogeneous fleet and is exact (absent = identity).
-        let unknown: Vec<String> = score_stages
-            .iter()
-            .zip(&stage_known)
-            .filter(|(_, known)| !**known)
-            .map(|(s, _)| match s.map_key() {
-                None => format!("{:?}", s.column),
-                Some(key) => format!("{:?}[{:?}]", s.column, key),
-            })
-            .collect();
-        if !unknown.is_empty() {
-            // A geo decay stage reads a geo column, so pointing the
-            // caller at --numeric-fields alone would send them looking
-            // in the wrong table for a name they spelled wrong.
-            let any_geo = score_stages.iter().zip(&stage_known).any(|(s, known)| {
-                !known
-                    && matches!(
-                        crate::pb::ScoreOp::try_from(s.operation_code()),
-                        Ok(crate::pb::ScoreOp::MultGeoDecayHaversine
-                            | crate::pb::ScoreOp::MultGeoDecayManhattan)
-                    )
-            });
-            let knobs = if any_geo {
-                "--numeric-fields / --integer-fields / --map-numeric-fields / --geo-fields"
-            } else {
-                "--numeric-fields / --map-numeric-fields"
+        merged.validate_columns(mask.as_ref())?;
+        let summaries = merged.summaries()?;
+        self.publish_bm25_snapshot(stream_heap.as_ref(), merged.fingerprint());
+        let t_query = round.timing.map(|t| t.timing.started.elapsed());
+        if round.timing.is_some_and(|t| t.timing.trace) {
+            merged.trace_shards();
+        }
+        let prune = merged.prune();
+        let hits = finish_bm25_hits(merged.into_hits(), stream_heap, round.request.k)?;
+        trace_fused_timing(round.timing, t_query);
+        Ok((
+            hits,
+            summaries.0,
+            summaries.1,
+            summaries.2,
+            summaries.3,
+            prune,
+        ))
+    }
+
+    fn spawn_bm25_round(
+        &self,
+        round: &PreparedRound<'_>,
+        mask: Option<&crate::placement::ShardMask>,
+        relay: Option<FloorRelay>,
+        heap: Option<Arc<Mutex<Bm25StreamHeap>>>,
+    ) -> Result<tokio::task::JoinSet<Result<Bm25Reply, Status>>, Status> {
+        let mut tasks = tokio::task::JoinSet::new();
+        for (shard, node) in self.node_addrs.iter().enumerate() {
+            if mask.is_some_and(|m| m.skipped[shard]) {
+                continue;
+            }
+            let mut request = round.request.clone();
+            request.expected_stats_epoch = round.claims[shard].epoch;
+            request.expected_stats_incarnation = round.claims[shard].incarnation();
+            let phrase = round
+                .phrase
+                .map(|(leg, weights, _)| crate::pb::Bm25PhraseQueryRequest {
+                    query: Some(request.clone()),
+                    phrase_leg: leg as u32,
+                    phrase_term_weights: weights.to_vec(),
+                });
+            let transport = ShardRound {
+                shard: shard as u32,
+                request,
+                phrase,
+                client: self.node_client(node)?,
+                relay: relay.clone(),
+                heap: heap.clone(),
+                deadline: self.limits.shard_deadline,
             };
-            return Err(Status::invalid_argument(format!(
-                "no shard has numeric column {}: the chain would be a silent no-op. \
-                 Check the spelling, or the nodes' {knobs}.",
-                unknown.join(", ")
-            )));
+            tasks.spawn(transport.run());
         }
-        refuse_unknown_geo_columns(geo_filters, &geo_known)?;
-        if let Some(mask) = mask.as_ref() {
-            mark_known(&mut filter_known, &mask.known);
-        }
-        refuse_unknown_filter_leaves(filter, &filter_known)?;
-        // A projection column NO shard knows is a typo answering
-        // all-absent — refuse it by name. A partially-known column is
-        // the heterogeneous fleet and is exact (absent documents hold
-        // nothing).
-        let unknown_projection: Vec<String> = projection_leaves
-            .iter()
-            .zip(&projection_known)
-            .filter(|(_, known)| !**known)
-            .map(|(leaf, _)| leaf.describe())
-            .collect();
-        if !unknown_projection.is_empty() {
-            return Err(Status::invalid_argument(format!(
-                "projection: no shard has column {}: every value would be absent. \
-                 Check the spelling, or the nodes' --numeric-fields / --integer-fields \
-                 / --facet-fields / --map-numeric-fields / --map-facet-fields.",
-                unknown_projection.join(", ")
-            )));
-        }
-        let facets = merge_facet_counts(facet_fields, map_facet_fields, &shard_facets, true)?;
-        let ranges = merge_range_counts(range_facet_fields, &shard_ranges)?;
-        let stats = if round.flat {
-            merge_column_stats(stats_fields, &shard_stats)?
-        } else {
-            Vec::new()
-        };
-        let cardinality = if round.flat {
-            merge_cardinality(cardinality_fields, &shard_distinct)?
-        } else {
-            Vec::new()
-        };
-        if let (Some(heap), Some(fingerprint)) = (&stream_heap, scoring_fingerprint.as_ref()) {
+        Ok(tasks)
+    }
+
+    fn publish_bm25_snapshot(
+        &self,
+        heap: Option<&Arc<Mutex<Bm25StreamHeap>>>,
+        fingerprint: Option<&String>,
+    ) {
+        if let (Some(heap), Some(fingerprint)) = (heap, fingerprint) {
             let snapshot = heap
                 .lock()
                 .expect("BM25 stream heap poisoned")
@@ -448,24 +256,65 @@ impl CoordinatorServiceImpl {
                 fingerprint.clone(),
             );
         }
-        let t_query = round.timing.map(|t| t.timing.started.elapsed());
-        if round.timing.is_some_and(|t| t.timing.trace) {
-            eprintln!(
-                "bm25-fused per-shard ms: {}",
-                per_shard
-                    .iter()
-                    .map(|(s, ms)| format!("{s}:{ms:.0}"))
-                    .collect::<Vec<_>>()
-                    .join(" ")
+    }
+}
+
+type FloorRelay = (Arc<watch::Sender<f32>>, watch::Receiver<f32>);
+struct ShardRound {
+    shard: u32,
+    request: Bm25QueryRequest,
+    phrase: Option<crate::pb::Bm25PhraseQueryRequest>,
+    client: crate::link::NodeLink,
+    relay: Option<FloorRelay>,
+    heap: Option<Arc<Mutex<Bm25StreamHeap>>>,
+    deadline: Option<Duration>,
+}
+
+impl ShardRound {
+    async fn run(mut self) -> Result<Bm25Reply, Status> {
+        let started = std::time::Instant::now();
+        let (response, fingerprint) = if let Some((tx, rx)) = self.relay {
+            let run = stream_bm25_shard(
+                self.shard,
+                self.request.k as usize,
+                self.client,
+                self.request,
+                tx,
+                rx,
+                self.heap.expect("relay has heap"),
             );
-        }
-        let hits = finish_bm25_hits(all, stream_heap, k)?;
-        if let Some(t) = round.timing.filter(|t| t.timing.trace) {
-            let t_query = t_query.expect("fused round has timing");
-            let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
-            eprintln!("bm25-fused: analyze {:.1} ms, term-stats {:.1} ms, query fan-out {:.1} ms, merge {:.1} ms  ({} fields, {} terms)", ms(t.timing.analyzed), ms(t.timing.stats - t.timing.analyzed), ms(t_query - t.timing.stats), ms(t.timing.started.elapsed() - t_query), t.fields, t.terms);
-        }
-        Ok((hits, facets, ranges, stats, cardinality, prune))
+            let result = match self.deadline {
+                Some(limit) => tokio::time::timeout(limit, run).await.map_err(|_| {
+                    Status::deadline_exceeded(format!(
+                        "BM25 shard {} exceeded its {}ms deadline",
+                        self.shard,
+                        limit.as_millis()
+                    ))
+                })?,
+                None => run.await,
+            }?;
+            (result.response, Some(result.scoring_fingerprint))
+        } else {
+            let response = match self.phrase {
+                Some(request) => self.client.bm25_phrase_query(request).await,
+                None => self.client.bm25_query(self.request).await,
+            }?;
+            (response.into_inner(), None)
+        };
+        Ok(Bm25Reply {
+            shard: self.shard,
+            response,
+            fingerprint,
+            millis: started.elapsed().as_secs_f64() * 1000.0,
+        })
+    }
+}
+
+fn trace_fused_timing(timing: Option<FusedTiming>, query_elapsed: Option<Duration>) {
+    if let Some(t) = timing.filter(|t| t.timing.trace) {
+        let t_query = query_elapsed.expect("fused round has timing");
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        eprintln!("bm25-fused: analyze {:.1} ms, term-stats {:.1} ms, query fan-out {:.1} ms, merge {:.1} ms  ({} fields, {} terms)", ms(t.timing.analyzed), ms(t.timing.stats - t.timing.analyzed), ms(t_query - t.timing.stats), ms(t.timing.started.elapsed() - t_query), t.fields, t.terms);
     }
 }
 

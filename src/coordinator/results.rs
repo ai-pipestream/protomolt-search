@@ -1,4 +1,4 @@
-//! Results.
+//! Fan-out result types and completion statistics.
 
 use super::*;
 
@@ -140,7 +140,6 @@ pub struct FanoutResult {
     pub rerank_candidates: HashMap<u64, crate::pb::RerankCandidatePayload>,
 }
 
-/// Result of [`CoordinatorServiceImpl::fanout_stream_search`].
 /// What a document-mode streaming fan-out returns (see
 /// [`CoordinatorServiceImpl::fanout_stream_search_collapse`]).
 pub struct CollapseStreamResult {
@@ -165,6 +164,7 @@ pub struct CollapseStreamResult {
     pub shards_floor_pruned: u32,
 }
 
+/// Result of [`CoordinatorServiceImpl::fanout_stream_search`].
 pub struct StreamFanoutResult {
     /// Merged global top-k, in the same total order as
     /// [`FanoutResult::hits`].

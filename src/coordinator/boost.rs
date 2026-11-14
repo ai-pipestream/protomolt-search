@@ -1,4 +1,4 @@
-//! Boost.
+//! Post-fusion query boosting and signal retrieval.
 
 use super::*;
 

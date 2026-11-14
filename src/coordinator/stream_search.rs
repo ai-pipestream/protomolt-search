@@ -1,4 +1,4 @@
-//! Stream search.
+//! Row top-k collection and the public streaming search entrypoint.
 
 use super::*;
 

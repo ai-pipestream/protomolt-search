@@ -1,4 +1,4 @@
-//! Lineage read tests.
+//! Lineage authorization and pinned-version checks.
 
 use super::*;
 use crate::pb::*;

@@ -1,16 +1,157 @@
-//! Stream transport.
+//! Validated shard stream setup, signaling, and identity exchange.
 
 use super::*;
 
-/// Inputs for opening a shard stream fan-out.
+/// Validated inputs for opening a shard stream fan-out.
 pub(crate) struct StreamOpen<'a> {
-    pub request_id: &'a str,
-    pub vector: &'a [f32],
-    pub initial_floor: Option<f32>,
-    pub candidate_depth: Option<u32>,
-    pub collapse_parents: bool,
-    pub filters: &'a RequestFilters,
-    pub identity_limits: Option<crate::pb::StreamIdentityLimits>,
+    request_id: &'a str,
+    vector: &'a [f32],
+    initial_floor: Option<f32>,
+    candidate_depth: Option<u32>,
+    collapse_parents: bool,
+    filters: &'a RequestFilters,
+    identity_limits: Option<crate::pb::StreamIdentityLimits>,
+}
+
+impl<'a> StreamOpen<'a> {
+    pub(crate) fn new(
+        request_id: &'a str,
+        vector: &'a [f32],
+        initial_floor: Option<f32>,
+        candidate_depth: Option<u32>,
+        collapse_parents: bool,
+        filters: &'a RequestFilters,
+        identity_limits: Option<crate::pb::StreamIdentityLimits>,
+    ) -> Result<Self, Status> {
+        if initial_floor.is_some_and(f32::is_nan) {
+            return Err(Status::invalid_argument("initial_floor must not be NaN"));
+        }
+        if let Some(limits) = &identity_limits {
+            crate::query_identity::validate_limits(limits)?;
+            if collapse_parents {
+                return Err(Status::invalid_argument(
+                    "collapse streams do not support identity limits",
+                ));
+            }
+        }
+        Ok(Self {
+            request_id,
+            vector,
+            initial_floor,
+            candidate_depth,
+            collapse_parents,
+            filters,
+            identity_limits,
+        })
+    }
+
+    fn start(
+        &self,
+        read_context: Option<crate::pb::VectorReadContext>,
+        floor_token: u64,
+        filter: Option<crate::pb::FilterExpr>,
+        floor_share_ppm: Option<u32>,
+    ) -> StreamSearchRequest {
+        let filters = self.filters;
+        StreamSearchRequest {
+            payload: Some(stream_search_request::Payload::Start(StartStreamSearch {
+                read_context,
+                request_id: self.request_id.to_string(),
+                vector: self.vector.to_vec(),
+                initial_floor: self.initial_floor,
+                candidate_depth: self.candidate_depth,
+                enumerate_max_rows: filters.enumerate_max_rows,
+                patience_saturation_ppm: filters.patience_saturation_ppm,
+                patience_hops: filters.patience_hops,
+                floor_token,
+                collapse_parents: self.collapse_parents,
+                geo_filters: filters.geo.clone(),
+                filter,
+                identity_limits: self.identity_limits,
+                floor_prune: filters.floor_prune,
+                floor_k: filters.floor_k.or(self.candidate_depth),
+                floor_share_ppm,
+                floor_greediness_ppm: filters.floor_greediness_ppm,
+                floor_clamp_min: filters.floor_clamp_min,
+                include_rerank_candidate: filters.include_rerank_candidate,
+            })),
+        }
+    }
+}
+
+type StreamInboundSender = mpsc::Sender<(usize, Result<Option<StreamSearchResponse>, Status>)>;
+
+struct StreamReader {
+    shard: usize,
+    client: crate::link::NodeLink,
+    requests: mpsc::Receiver<StreamSearchRequest>,
+    merged: StreamInboundSender,
+    admission: Option<Arc<crate::vector_read::VectorReadBarrier>>,
+    deadline: Option<Duration>,
+}
+
+impl StreamReader {
+    async fn run(self) {
+        let Self {
+            shard,
+            mut client,
+            requests,
+            merged,
+            admission,
+            deadline,
+        } = self;
+        let result = {
+            let read =
+                forward_stream_reader(&mut client, shard, requests, &merged, admission.as_deref());
+            if let Some(deadline) = deadline {
+                tokio::time::timeout(deadline, read)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(Status::deadline_exceeded(
+                            "vector stream exceeded shard deadline",
+                        ))
+                    })
+            } else {
+                read.await
+            }
+        };
+        if let Err(error) = result {
+            if let Some(admission) = &admission {
+                admission.fail(error.clone());
+            }
+            let _ = merged.send((shard, Err(error))).await;
+        }
+    }
+}
+
+async fn forward_stream_reader(
+    client: &mut crate::link::NodeLink,
+    shard: usize,
+    requests: mpsc::Receiver<StreamSearchRequest>,
+    merged: &StreamInboundSender,
+    admission: Option<&crate::vector_read::VectorReadBarrier>,
+) -> Result<(), Status> {
+    let mut inbound = client
+        .stream_search(Request::new(ReceiverStream::new(requests)))
+        .await?
+        .into_inner();
+    if let Some(admission) = admission {
+        admission.admit(shard, &mut inbound).await?;
+    }
+    loop {
+        match crate::vector_read::next(&mut inbound).await {
+            Ok(Some(message)) => {
+                if merged.send((shard, Ok(Some(message)))).await.is_err() {
+                    return Ok(());
+                }
+            }
+            Ok(None) => {
+                let _ = merged.send((shard, Ok(None))).await;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// One open `StreamSearch` fan-out: a merged inbound lane plus the
@@ -312,7 +453,7 @@ impl CoordinatorServiceImpl {
         collapse_parents: bool,
         filters: &RequestFilters,
     ) -> Result<StreamFanout, Status> {
-        self.open_stream_fanout_with_identities(
+        self.open_validated_stream(StreamOpen::new(
             request_id,
             vector,
             initial_floor,
@@ -320,7 +461,7 @@ impl CoordinatorServiceImpl {
             collapse_parents,
             filters,
             None,
-        )
+        )?)
     }
 
     /// `candidate_depth` is how many candidates the shard should consider
@@ -337,7 +478,7 @@ impl CoordinatorServiceImpl {
         filters: &RequestFilters,
         identity_limits: Option<crate::pb::StreamIdentityLimits>,
     ) -> Result<StreamFanout, Status> {
-        self.open_stream_context(StreamOpen {
+        self.open_stream_context(StreamOpen::new(
             request_id,
             vector,
             initial_floor,
@@ -345,121 +486,77 @@ impl CoordinatorServiceImpl {
             collapse_parents,
             filters,
             identity_limits,
-        })
+        )?)
     }
 
     pub(crate) fn open_stream_context(
         &self,
         query: StreamOpen<'_>,
     ) -> Result<StreamFanout, Status> {
-        let StreamOpen {
-            request_id,
-            vector,
-            initial_floor,
-            candidate_depth,
-            collapse_parents,
-            filters,
-            identity_limits,
-        } = query;
-        self.check_vector_scan(filters, collapse_parents)?;
-        let admission = self.vector_read_barrier()?;
+        if query.identity_limits.is_none() {
+            return self.open_stream_fanout(
+                query.request_id,
+                query.vector,
+                query.initial_floor,
+                query.candidate_depth,
+                query.collapse_parents,
+                query.filters,
+            );
+        }
+        self.open_validated_stream(query)
+    }
+
+    fn open_validated_stream(&self, query: StreamOpen<'_>) -> Result<StreamFanout, Status> {
         let n_nodes = self.node_addrs.len();
+        if n_nodes == 0 {
+            return Err(Status::failed_precondition("no shard nodes configured"));
+        }
+        self.check_vector_scan(query.filters, query.collapse_parents)?;
+        let admission = self.vector_read_barrier()?;
         let udp_socket = self.floor_socket().cloned();
-        let (merged_tx, merged_rx) =
-            mpsc::channel::<(usize, Result<Option<StreamSearchResponse>, Status>)>(4 * n_nodes);
-        let mut floor_txs: Vec<Option<mpsc::Sender<StreamSearchRequest>>> =
-            Vec::with_capacity(n_nodes);
-        let mut udp_lanes: Vec<Option<(u64, std::net::SocketAddr)>> = Vec::with_capacity(n_nodes);
+        let (merged_tx, merged_rx) = mpsc::channel(4 * n_nodes);
+        let mut floor_txs = Vec::with_capacity(n_nodes);
+        let mut udp_lanes = Vec::with_capacity(n_nodes);
         let mut readers = tokio::task::JoinSet::new();
-        let mask = self.vector_scan_mask(filters.tree.as_ref());
-        let floor_shares = self.shard_floor_share_ppms(filters, mask.as_ref());
-        let floor_k = filters.floor_k.or(candidate_depth);
+        let mask = self.vector_scan_mask(query.filters.tree.as_ref());
+        let floor_shares = self.shard_floor_share_ppms(query.filters, mask.as_ref());
         for shard in 0..n_nodes {
             if mask.as_ref().is_some_and(|m| m.skipped[shard]) {
                 floor_txs.push(None);
                 udp_lanes.push(None);
                 continue;
             }
-            let mut client = self.node_client(&self.node_addrs[shard])?;
+            let client = self.node_client(&self.node_addrs[shard])?;
             let lane = self
                 .floor_target(&self.node_addrs[shard])
                 .map(|target| (floor_token(), target));
-            let (req_tx, req_rx) = mpsc::channel::<StreamSearchRequest>(64);
+            let (req_tx, req_rx) = mpsc::channel(64);
             req_tx
-                .try_send(StreamSearchRequest {
-                    payload: Some(stream_search_request::Payload::Start(StartStreamSearch {
-                        read_context: admission
+                .try_send(
+                    query.start(
+                        admission
                             .as_ref()
                             .map(|barrier| barrier.context(shard))
                             .transpose()?,
-                        request_id: request_id.to_string(),
-                        vector: vector.to_vec(),
-                        initial_floor,
-                        candidate_depth,
-                        enumerate_max_rows: filters.enumerate_max_rows,
-                        patience_saturation_ppm: filters.patience_saturation_ppm,
-                        patience_hops: filters.patience_hops,
-                        floor_token: lane.map_or(0, |(token, _)| token),
-                        collapse_parents,
-                        geo_filters: filters.geo.clone(),
-                        filter: Self::shard_filter_tree(filters, mask.as_ref(), shard),
-                        identity_limits,
-                        floor_prune: filters.floor_prune,
-                        floor_k,
-                        floor_share_ppm: floor_shares.get(shard).copied().flatten(),
-                        floor_greediness_ppm: filters.floor_greediness_ppm,
-                        floor_clamp_min: filters.floor_clamp_min,
-                        include_rerank_candidate: filters.include_rerank_candidate,
-                    })),
-                })
+                        lane.map_or(0, |(token, _)| token),
+                        Self::shard_filter_tree(query.filters, mask.as_ref(), shard),
+                        floor_shares.get(shard).copied().flatten(),
+                    ),
+                )
                 .expect("fresh channel accepts the Start message");
             floor_txs.push(Some(req_tx));
             udp_lanes.push(lane);
-            let merged_tx = merged_tx.clone();
-            let admission = admission.clone();
-            let deadline = self.limits().shard_deadline.filter(|_| admission.is_some());
-            readers.spawn(async move {
-                let read = async {
-                    let mut inbound = client
-                        .stream_search(Request::new(ReceiverStream::new(req_rx)))
-                        .await?
-                        .into_inner();
-                    if let Some(admission) = &admission {
-                        admission.admit(shard, &mut inbound).await?;
-                    }
-                    loop {
-                        match crate::vector_read::next(&mut inbound).await {
-                            Ok(Some(msg)) => {
-                                if merged_tx.send((shard, Ok(Some(msg)))).await.is_err() {
-                                    return Ok(());
-                                }
-                            }
-                            Ok(None) => {
-                                let _ = merged_tx.send((shard, Ok(None))).await;
-                                return Ok(());
-                            }
-                            Err(e) => return Err(e),
-                        }
-                    }
-                };
-                let result = if let Some(deadline) = deadline {
-                    tokio::time::timeout(deadline, read)
-                        .await
-                        .unwrap_or_else(|_| {
-                            Err(Status::deadline_exceeded(
-                                "vector stream exceeded shard deadline",
-                            ))
-                        })
-                } else {
-                    read.await
-                };
-                if let Err(error) = result {
-                    if let Some(admission) = &admission {
-                        admission.fail(error.clone());
-                    }
-                    let _ = merged_tx.send((shard, Err(error))).await;
+            readers.spawn(
+                StreamReader {
+                    shard,
+                    client,
+                    requests: req_rx,
+                    merged: merged_tx.clone(),
+                    admission: admission.clone(),
+                    deadline: self.limits().shard_deadline.filter(|_| admission.is_some()),
                 }
-            });
+                .run(),
+            );
         }
         Ok(StreamFanout {
             scoped: admission.is_some(),

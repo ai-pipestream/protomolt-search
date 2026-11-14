@@ -1,4 +1,4 @@
-//! Query progress.
+//! Query revisions, progress delivery, and stream completion.
 
 use super::*;
 

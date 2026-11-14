@@ -1,4 +1,4 @@
-//! Aggregate fanout.
+//! Distributed aggregation and percentile reduction.
 
 use super::*;
 

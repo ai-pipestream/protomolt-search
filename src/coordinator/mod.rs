@@ -1,7 +1,74 @@
 //! Coordinator service and public query interfaces.
 
+mod access;
+mod aggregate_fanout;
+mod aggregate_plan;
+mod boolean;
+mod boost;
+mod browse;
+mod builders;
+#[cfg(test)]
+mod candidate_fetch_tests;
+mod cascade;
+mod clustered;
+mod dense_execution;
+mod filters;
+mod hybrid;
+mod hybrid_context;
+mod hybrid_decomposed;
+mod hybrid_reduce;
+#[cfg(test)]
+mod hybrid_tests;
+mod ingest;
+mod lexical;
+mod lexical_context;
+mod lexical_fused;
+mod lexical_fused_plan;
+mod lexical_reduce;
+mod lexical_round;
+#[cfg(test)]
+mod lexical_round_tests;
+mod lexical_stats;
+mod lexical_stream;
+mod lineage;
+#[cfg(test)]
+mod lineage_read_tests;
+mod membership;
+mod phrase;
+mod placement;
+mod query_progress;
+#[cfg(test)]
+mod query_stream_identity_tests;
 mod rerank_candidates;
+mod rescore;
+mod results;
+mod rpc;
+mod rpc_hybrid;
+mod rpc_lexical;
+mod rpc_query;
+mod rpc_query_stream;
+#[cfg(test)]
+mod scoped_fold_tests;
+mod signals;
+#[cfg(test)]
+mod stream_cancel_tests;
+mod stream_collapse;
+mod stream_run;
+mod stream_search;
+mod stream_transport;
+mod suggest;
+mod topology;
+mod turbo;
+#[cfg(test)]
+mod unsigned_aggregate_tests;
+mod values;
+mod variants;
+mod vector_collapse;
+mod vector_fanout;
+#[cfg(test)]
+mod vector_field_read_tests;
 mod vector_rows;
+
 pub(crate) use vector_rows::ShardVectorRowProbe;
 
 use crate::stats_identity::StatsClaim;
@@ -51,41 +118,27 @@ use crate::pb::{
 use crate::pb::{stream_search_request, stream_search_response};
 use crate::rankdiff;
 
-mod access;
-mod aggregate_fanout;
-use aggregate_plan::merge_cardinality;
-use aggregate_plan::merge_column_stats;
-use aggregate_plan::nearest_percentile_rank;
-pub(crate) use aggregate_plan::AggMerge;
-pub(crate) use aggregate_plan::PctMerge;
-mod aggregate_plan;
 pub(crate) use aggregate_plan::compile_aggregations;
 pub(crate) use aggregate_plan::compile_projections;
+use aggregate_plan::merge_cardinality;
+use aggregate_plan::merge_column_stats;
+pub(crate) use aggregate_plan::merge_facet_counts;
+use aggregate_plan::merge_range_counts;
+use aggregate_plan::nearest_percentile_rank;
+use aggregate_plan::refuse_unknown_filter_leaves;
+use aggregate_plan::refuse_unknown_geo_columns;
+pub(crate) use aggregate_plan::AggMerge;
 use aggregate_plan::AggregatedHits;
 pub(crate) use aggregate_plan::CompiledAggregate;
 use aggregate_plan::FacetedHits;
 pub use aggregate_plan::FetchedValues;
-pub(crate) const DEFAULT_MAX_DISTINCT: u32 = 100_000;
-mod boolean;
-mod boost;
-mod browse;
+pub(crate) use aggregate_plan::PctMerge;
 pub use browse::BrowseAfter;
 pub use browse::BrowseRows;
-mod builders;
-#[cfg(test)]
-mod candidate_fetch_tests;
-mod cascade;
-mod clustered;
-mod dense_execution;
-pub(crate) use aggregate_plan::merge_facet_counts;
-use aggregate_plan::merge_range_counts;
-use aggregate_plan::refuse_unknown_filter_leaves;
-use aggregate_plan::refuse_unknown_geo_columns;
 use dense_execution::provider_mismatch_of;
 pub use dense_execution::DenseRequestKey;
 pub(crate) use dense_execution::ExactRerankScores;
 pub use dense_execution::FleetVectorIdentity;
-mod filters;
 use filters::mark_known;
 pub(crate) use filters::BooleanFanout;
 pub(crate) use filters::BooleanFanoutPlan;
@@ -93,49 +146,23 @@ use filters::FilterKnown;
 pub use filters::MembershipSet;
 pub(crate) use filters::PercentileScope;
 pub use filters::RequestFilters;
-mod hybrid;
-mod hybrid_context;
-mod hybrid_reduce;
-#[cfg(test)]
-mod hybrid_tests;
-pub use hybrid_context::{CascadeQuery, HybridQuery};
-mod hybrid_decomposed;
-mod ingest;
-mod lexical;
-mod lexical_context;
-mod lexical_round;
-#[cfg(test)]
-mod lexical_round_tests;
+pub(crate) use hybrid_context::{CascadeQuery, HybridQuery};
 use lexical_context::LexicalExpansions;
-pub use lexical_context::LexicalFanout;
+pub(crate) use lexical_context::{FlatLexicalQuery, FusedLexicalQuery};
 use lexical_context::{FlatRound, FusedRound, RoundTiming};
-mod lexical_fused;
-mod lexical_stats;
 use lexical_stats::analyze_query;
 use lexical_stats::FusedGlobals;
-mod lexical_stream;
 use lexical_stream::floor_token;
 pub(crate) use lexical_stream::is_stale_stats;
 use lexical_stream::stream_bm25_shard;
 use lexical_stream::Bm25StreamHeap;
-mod lineage;
-#[cfg(test)]
-mod lineage_read_tests;
-mod membership;
-mod phrase;
-mod placement;
 use placement::PlacementRouter;
 use placement::PlanCounter;
-mod query_progress;
 #[cfg(test)]
 use query_progress::query_stream_content_fingerprint;
 use query_progress::query_stream_revision;
 use query_progress::QueryProgress;
 use query_progress::QueryProgressPublisher;
-#[cfg(test)]
-mod query_stream_identity_tests;
-mod rescore;
-mod results;
 use results::count_shards_finished_early;
 use results::count_shards_floor_pruned;
 use results::finish_quorum;
@@ -148,20 +175,8 @@ pub use results::FanoutResult;
 pub use results::HybridLegs;
 pub use results::StreamFanoutResult;
 use results::StreamHeapEntry;
-mod rpc;
-mod rpc_query;
-#[cfg(test)]
-mod scoped_fold_tests;
-mod signals;
-#[cfg(test)]
-mod stream_cancel_tests;
-mod stream_collapse;
-mod stream_run;
-mod stream_search;
-pub(crate) use stream_transport::StreamOpen;
-mod stream_transport;
 pub(crate) use stream_transport::StreamFanout;
-mod suggest;
+pub(crate) use stream_transport::StreamOpen;
 pub use suggest::DEFAULT_PREFIX_EXPANSIONS;
 pub use suggest::DEFAULT_SUGGEST_LIMIT;
 pub use suggest::DEFAULT_SUGGEST_SCAN;
@@ -170,25 +185,19 @@ pub use suggest::MAX_PREFIX_EXPANSIONS;
 pub use suggest::MAX_SUGGEST_LIMIT;
 pub use suggest::MAX_SUGGEST_SCAN;
 pub use suggest::MAX_TERM_SUGGEST_EDITS;
-mod topology;
 #[cfg(test)]
 use topology::build_topology;
 pub use topology::stable_routing_hash;
 use topology::CoordinatorTopology;
 pub use topology::TopologyRoute;
-mod turbo;
-#[cfg(test)]
-mod unsigned_aggregate_tests;
-mod values;
-mod variants;
 use variants::diff_against;
 use variants::variant_text;
-mod vector_collapse;
-mod vector_fanout;
 use vector_fanout::run_shard_with_hedge;
 use vector_fanout::ShardQueryCtx;
-#[cfg(test)]
-mod vector_field_read_tests;
+
+/// The distinct-value cap a CARDINALITY aggregation gets when the
+/// request names none (docs/aggregations.md "Cardinality").
+pub(crate) const DEFAULT_MAX_DISTINCT: u32 = 100_000;
 
 /// Process-unique request id counter for coordinator-assigned ids.
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);

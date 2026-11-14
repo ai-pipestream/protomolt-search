@@ -1,4 +1,4 @@
-//! Variants.
+//! Query variant execution and ranking comparisons.
 
 use super::*;
 

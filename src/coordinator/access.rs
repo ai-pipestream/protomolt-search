@@ -1,4 +1,4 @@
-//! Access.
+//! Request admission, topology checks, and node client access.
 
 use super::*;
 

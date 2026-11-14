@@ -1,4 +1,4 @@
-//! Vector fanout.
+//! Vector shard dispatch, hedging, and top-k merging.
 
 use super::*;
 

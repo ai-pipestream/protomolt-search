@@ -1,4 +1,4 @@
-//! Placement.
+//! Placement planning and shard assignment.
 
 use super::*;
 

@@ -1,4 +1,4 @@
-//! Lexical stream.
+//! BM25 candidate streams and certified shard responses.
 
 use super::*;
 

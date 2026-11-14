@@ -1,4 +1,4 @@
-//! Rpc.
+//! SearchService transport delegation and administrative handlers.
 
 use super::*;
 
