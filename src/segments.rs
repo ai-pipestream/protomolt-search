@@ -578,6 +578,9 @@ impl OpenedSegmentSet {
                 LiveDocs::open(&directory.join(&metadata.live_docs.file)).map_err(|error| {
                     format!("open live-doc segment {:?}: {error}", metadata.segment_id)
                 })?;
+            if live_docs.requires_retained_vectors() && metadata.multi_res.is_none() {
+                return Err(format!("segment {:?} requires a retained vector artifact", metadata.segment_id));
+            }
             let rows = usize::try_from(metadata.rows)
                 .map_err(|_| format!("segment {:?} rows do not fit usize", metadata.segment_id))?;
             // Row alignment (docs/immutable-segments.md): every artifact

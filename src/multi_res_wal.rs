@@ -154,7 +154,7 @@ mod tests {
             writer.manifest().format_version,
             crate::wal::MULTI_RES_FORMAT_VERSION
         );
-        let persisted = std::fs::read_to_string(crate::wal::manifest_path(&path)).unwrap();
+        let persisted = std::fs::read_to_string(crate::wal::manifest_path(writer.dir())).unwrap();
         assert!(persisted.contains("format_version = 9"));
         drop(writer);
         std::fs::remove_dir_all(path).unwrap();

@@ -1284,8 +1284,8 @@ impl NodeServiceImpl {
             crate::multi_res_storage::open(&retained_path, rows).map_err(|error| {
                 Status::internal(format!("open compacted retained vectors: {error}"))
             })?;
-        LiveDocs::default()
-            .write(&live_path, rows)
+        let live = if multi_res_vectors.is_empty() { LiveDocs::default() } else { LiveDocs::default().with_retained_vectors() };
+        live.write(&live_path, rows)
             .map_err(|e| Status::internal(format!("write {}: {e}", live_path.display())))?;
         crate::postings::fsync_parent(&live_path)
             .map_err(|e| Status::internal(format!("fsync {}: {e}", gen.display())))?;

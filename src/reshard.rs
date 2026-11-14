@@ -796,6 +796,11 @@ fn build_child(
             }
         }
     };
+    if !remapped.is_empty() {
+        crate::live_docs::LiveDocs::default().with_retained_vectors()
+            .write(&crate::node::live_docs_sidecar_path(vector_path), vectors.len() as u64)
+            .map_err(|error| format!("publish retained child reader gate: {error}"))?;
+    }
     index
         .write(vector_path)
         .map_err(|e| format!("write {}: {e}", vector_path.display()))?;
@@ -1555,8 +1560,13 @@ fn build_child(
     let payload = crate::multi_res::sidecar_path(vector_path);
     // An empty publication also retires stale retention when an output path
     // is reused. Segment metadata omits the artifact for an empty map.
-    crate::multi_res_storage::write(&remapped, &payload, row_parent_ids.len() as u64)
+    crate::multi_res_storage::write(&remapped, &payload, row_parent_ids.len() as u64, false)
         .map_err(|error| format!("write {}: {error}", payload.display()))?;
+    if payload.try_exists().map_err(|error| error.to_string())? {
+        crate::live_docs::LiveDocs::default().with_retained_vectors()
+            .write(&crate::node::live_docs_sidecar_path(vector_path), row_parent_ids.len() as u64)
+            .map_err(|error| format!("write retained generation reader gate: {error}"))?;
+    }
     let multi_res_path = (!remapped.is_empty()).then_some(payload);
     Ok(ChildImage {
         multi_res_path,

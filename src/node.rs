@@ -5832,7 +5832,9 @@ impl NodeServiceImpl {
                 if let Some(provider) = index.as_ref().and_then(VectorIndex::as_segmented) {
                     provider.snapshot().retained_vectors()?
                 } else {
-                    crate::multi_res_storage::open(&payload, physical as u64).map_err(|error| {
+                    crate::multi_res_storage::require_declaration(&payload, &live_docs)
+                    .map_err(|error| format!("load retained vectors {}: {error}", payload.display()))?;
+                crate::multi_res_storage::open(&payload, physical as u64).map_err(|error| {
                         format!("load retained vectors {}: {error}", payload.display())
                     })?
                 };
@@ -7348,6 +7350,15 @@ impl NodeServiceImpl {
                 ));
             }
         }
+        // Publish the old-reader refusal before the first retained image can
+        // become durable, including when this shard deliberately has no WAL.
+        if !guard.multi_res_vectors.is_empty()
+            && !guard.live_docs.requires_retained_vectors()
+            && guard.index.as_ref().and_then(VectorIndex::as_segmented).is_none() {
+            guard.live_docs = guard.live_docs.clone().with_retained_vectors()
+                .write(&live_docs_path, physical_rows(&guard))
+                .map_err(|error| Status::internal(format!("publish retained reader gate: {error}")))?;
+        }
         if let Some(index) = guard.index.as_mut() {
             if let Some(provider) = index.as_segmented() {
                 // With no rows, no sealed image carries the provider state.
@@ -7406,8 +7417,12 @@ impl NodeServiceImpl {
             .is_none()
         {
             let payload = crate::multi_res::storage_path(&config_path, guard.generation.as_ref());
-            crate::multi_res_storage::write(&guard.multi_res_vectors, &payload, physical_rows)
+            crate::multi_res_storage::write(&guard.multi_res_vectors, &payload, physical_rows, guard.live_docs.requires_retained_vectors())
                 .map_err(|error| Status::internal(format!("persist retained vectors: {error}")))?;
+        }
+        if !guard.multi_res_vectors.is_empty()
+            && guard.index.as_ref().and_then(VectorIndex::as_segmented).is_none() {
+            guard.live_docs = guard.live_docs.clone().with_retained_vectors();
         }
         guard.live_docs = guard
             .live_docs
@@ -7727,11 +7742,16 @@ impl NodeServiceImpl {
             .as_ref()
             .map_or(0, |index| index.len() as u64)
             .max(incoming_doc_rows);
+        crate::multi_res_storage::require_declaration(&tmp_dir.join(crate::multi_res::FILE_NAME), &incoming_live_docs)
+            .map_err(|error| Status::invalid_argument(format!("snapshot retained vectors: {error}")))?;
         let retained = crate::multi_res_storage::open(
             &tmp_dir.join(crate::multi_res::FILE_NAME),
             incoming_rows,
         )
         .map_err(|error| Status::invalid_argument(format!("snapshot retained vectors: {error}")))?;
+        if !retained.is_empty() && !incoming_live_docs.requires_retained_vectors() {
+            return Err(Status::failed_precondition("retained snapshot requires its live-doc reader gate"));
+        }
         crate::multi_res_wal::require_coverage(
             &retained,
             0..loaded.as_ref().map_or(0, VectorIndex::len),
@@ -8428,11 +8448,16 @@ impl NodeServiceImpl {
                 .retained_vectors()
                 .map_err(Status::invalid_argument)?
         } else {
+            crate::multi_res_storage::require_declaration(&tmp_dir.join(crate::multi_res::FILE_NAME), &incoming_live)
+                .map_err(|error| Status::invalid_argument(format!("snapshot retained vectors: {error}")))?;
             crate::multi_res_storage::open(&tmp_dir.join(crate::multi_res::FILE_NAME), staged_rows)
                 .map_err(|error| {
                     Status::invalid_argument(format!("snapshot retained vectors: {error}"))
                 })?
         };
+        if !has_sealed_vectors && !retained.is_empty() && !incoming_live.requires_retained_vectors() {
+            return Err(Status::failed_precondition("retained snapshot requires its live-doc reader gate"));
+        }
         let vector_ranges: Vec<_> = if has_sealed_vectors {
             staged
                 .manifest()
