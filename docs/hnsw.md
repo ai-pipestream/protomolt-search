@@ -193,8 +193,11 @@ per-core MSHR budgets), while heuristic `select` prefetches upcoming pool
 candidates and scores already-selected cache-resident neighbors in 4-row batches
 without redundant prefetches.
 
-**Parallel build.** `build_mode = PARALLEL` inserts a batch of at least 256
-rows from every thread of the rayon pool. Link cells are `AtomicU32`, written
+**Parallel build.** `build_mode = PARALLEL` builds batches of at least 256 rows:
+when starting from an empty graph (`entry = NO_NODE`), one thread first inserts
+a sequential prefix of `max(ef_construction, 4·M)` rows to establish a connected
+entry neighborhood and upper-layer skeleton, then the rayon pool inserts the
+remaining rows in chunks of at least 64 rows. Link cells are `AtomicU32`, written
 under striped per-node locks (16,384 stripes; one node lock held at a time,
 so striping cannot deadlock); reads during a build take the node's lock too.
 A node publishes its own lists by merging them with the back-links other

@@ -15,8 +15,8 @@ fn pathological_k_reserves_only_possible_matches_without_changing_floor() {
     let mut bytes = Vec::new();
     field.write(&mut bytes).unwrap();
     let reader = SpladeSectionReader::open(&bytes).unwrap();
-    // usize::MAX previously overflowed k+1 before allocation. Neither API
-    // should reserve caller-sized storage for these three possible matches.
+    // Pathological `k` values (including `usize::MAX`, where `k + 1` would
+    // overflow) must cap reservation to the three possible matches.
     for k in [u32::MAX as usize, usize::MAX] {
         let (hits, floor, _) = reader.score_top_k_with_floor(&query, 0.0, 3.0, k, |_| true);
         assert_eq!(hits, [(2, 8.0), (5, 8.0), (7, 4.0)]);
