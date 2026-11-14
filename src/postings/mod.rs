@@ -30,11 +30,14 @@ mod codec;
 mod columns;
 mod format;
 mod reader;
+mod section_writer;
 mod spill;
 mod store;
 
 pub use self::codec::{FileImpacts, ImpactCursor};
-pub use self::columns::{StoredBinding, StoredDerived, FACET_ABSENT, GEO_ABSENT, INTEGER_ABSENT};
+pub use self::columns::{
+    ColumnKind, StoredBinding, StoredDerived, FACET_ABSENT, GEO_ABSENT, INTEGER_ABSENT,
+};
 pub(crate) use self::format::fsync_parent;
 pub use self::reader::{transcode_to_v5, Bm25Reader, FieldTranspose, FieldView, TranscodeStats};
 pub use self::spill::SpillBuilder;
@@ -511,6 +514,25 @@ impl AnalyzedDoc {
     /// when the document carried no fields).
     pub fn into_body(self) -> AnalyzedField {
         self.fields.into_iter().next().unwrap_or_default()
+    }
+}
+
+fn clone_parallel_ordinals(
+    table: &Option<Vec<Vec<u32>>>,
+    term_idx: usize,
+    expected_len: usize,
+    label: &str,
+) -> Vec<u32> {
+    match table {
+        Some(rows) => {
+            assert_eq!(
+                rows[term_idx].len(),
+                expected_len,
+                "{label} must be parallel to offsets"
+            );
+            rows[term_idx].clone()
+        }
+        None => Vec::new(),
     }
 }
 
