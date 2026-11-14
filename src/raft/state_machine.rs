@@ -22,8 +22,10 @@ use prost::Message;
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::task::{Context, Poll};
 use tokio::io::AsyncWriteExt;
 use tonic::{Code, Status};
 
@@ -34,6 +36,9 @@ const META: &str = "meta";
 const PROBE: &str = "probe.redb";
 const STAGED: &str = "staged.redb";
 const STREAM_BUFFER: usize = 1024 * 1024;
+// One install and one successor may be owned by the core. A separate
+// partial transfer may be staged, but it cannot hand off a third image.
+const MAX_OWNED_RECEIVES: usize = 2;
 
 /// The store behind the state machine. Set once at construction; a
 /// snapshot install swaps the database in place under the store's own
@@ -80,6 +85,140 @@ struct Receive {
     verified: Option<String>,
 }
 
+/// A snapshot streams through a file. Incoming files additionally own their
+/// exact directory until installation or discard; a later receive cannot
+/// delete or select it. Published files own no removable directory.
+pub struct SnapshotFile {
+    file: tokio::fs::File,
+    receive: Option<OwnedReceive>,
+}
+
+struct OwnedReceive {
+    receive: Receive,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    completion: Option<Arc<SnapshotCompletion>>,
+}
+
+impl Drop for OwnedReceive {
+    fn drop(&mut self) {
+        // Installation renames this unique incoming path into generations.
+        // This path never names the published generation or live store.
+        let _ = std::fs::remove_dir_all(&self.receive.dir);
+        if let Some(completion) = &self.completion {
+            completion.finish(Err(Status::unavailable(
+                "the snapshot receive was discarded before installation completed",
+            )));
+        }
+    }
+}
+
+/// The one retained final-RPC receipt can observe installation even when its
+/// caller cancelled. The core-owned file signals a real install or discard;
+/// the ordinary core reply also handles snapshots the core declines safely.
+pub(crate) struct SnapshotCompletion {
+    outcome: tokio::sync::watch::Sender<Option<Result<(), Status>>>,
+}
+
+impl SnapshotCompletion {
+    pub(crate) fn new() -> Self {
+        Self {
+            outcome: tokio::sync::watch::channel(None).0,
+        }
+    }
+
+    pub(crate) fn finish(&self, result: Result<(), Status>) {
+        self.outcome.send_if_modified(|previous| {
+            // A durable installation stays successful if the core reply is
+            // subsequently lost. A normal core reply may acknowledge a
+            // safely declined image after its file was dropped.
+            if previous.as_ref().is_some_and(Result::is_ok) {
+                return false;
+            }
+            if previous.is_some() && result.is_err() {
+                return false;
+            }
+            *previous = Some(result);
+            true
+        });
+    }
+
+    pub(crate) async fn wait(&self, bound: std::time::Duration) -> Result<(), Status> {
+        let mut outcome = self.outcome.subscribe();
+        tokio::time::timeout(bound, async {
+            loop {
+                let ready = outcome.borrow_and_update().clone();
+                if let Some(ready) = ready {
+                    return ready;
+                }
+                outcome
+                    .changed()
+                    .await
+                    .map_err(|_| Status::unavailable("snapshot finalization closed"))?;
+            }
+        })
+        .await
+        .map_err(|_| {
+            Status::unavailable(
+                "snapshot finalization has not completed within the receive idle interval",
+            )
+        })?
+    }
+}
+
+impl SnapshotFile {
+    fn published(file: std::fs::File) -> Self {
+        Self {
+            file: tokio::fs::File::from_std(file),
+            receive: None,
+        }
+    }
+
+    pub(crate) fn set_completion(&mut self, completion: Arc<SnapshotCompletion>) {
+        self.receive
+            .as_mut()
+            .expect("an incoming snapshot owns its receive")
+            .completion = Some(completion);
+    }
+}
+
+impl tokio::io::AsyncRead for SnapshotFile {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        tokio::io::AsyncRead::poll_read(Pin::new(&mut self.file), cx, buffer)
+    }
+}
+
+impl tokio::io::AsyncWrite for SnapshotFile {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        tokio::io::AsyncWrite::poll_write(Pin::new(&mut self.file), cx, buffer)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        tokio::io::AsyncWrite::poll_flush(Pin::new(&mut self.file), cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        tokio::io::AsyncWrite::poll_shutdown(Pin::new(&mut self.file), cx)
+    }
+}
+
+impl tokio::io::AsyncSeek for SnapshotFile {
+    fn start_seek(mut self: Pin<&mut Self>, position: std::io::SeekFrom) -> std::io::Result<()> {
+        tokio::io::AsyncSeek::start_seek(Pin::new(&mut self.file), position)
+    }
+
+    fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<u64>> {
+        tokio::io::AsyncSeek::poll_complete(Pin::new(&mut self.file), cx)
+    }
+}
+
 /// Staging of incoming snapshot bytes, shared by the transport (which
 /// receives and validates the complete image before the library sees it)
 /// and the state machine (which swaps a validated image in). One receive
@@ -91,6 +230,7 @@ pub(crate) struct SnapshotStaging {
     max_image_bytes: u64,
     receiving: Mutex<Option<Receive>>,
     counter: AtomicU64,
+    owned: Arc<tokio::sync::Semaphore>,
 }
 
 impl SnapshotStaging {
@@ -98,8 +238,45 @@ impl SnapshotStaging {
         self.max_image_bytes
     }
 
-    pub(crate) fn image_path(dir: &Path) -> PathBuf {
-        dir.join(IMAGE)
+    fn reserve(&self) -> Result<tokio::sync::OwnedSemaphorePermit, Status> {
+        Arc::clone(&self.owned).try_acquire_owned().map_err(|_| Status::resource_exhausted(format!(
+            "snapshot finalization is at its {MAX_OWNED_RECEIVES} image bound; retry after an owned receive completes"
+        )))
+    }
+
+    pub(crate) fn own(&self, dir: &Path, file: std::fs::File) -> Result<SnapshotFile, Status> {
+        let permit = match self.reserve() {
+            Ok(permit) => permit,
+            Err(error) => {
+                drop(file);
+                self.discard(dir);
+                return Err(error);
+            }
+        };
+        self.own_reserved(dir, file, permit)
+    }
+
+    fn own_reserved(
+        &self,
+        dir: &Path,
+        file: std::fs::File,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<SnapshotFile, Status> {
+        let mut receiving = self.receiving.lock().unwrap();
+        if !receiving.as_ref().is_some_and(|receive| receive.dir == dir) {
+            return Err(Status::failed_precondition(
+                "the snapshot no longer owns its receive",
+            ));
+        }
+        let receive = receiving.take().expect("the exact receive was checked");
+        Ok(SnapshotFile {
+            file: tokio::fs::File::from_std(file),
+            receive: Some(OwnedReceive {
+                receive,
+                _permit: permit,
+                completion: None,
+            }),
+        })
     }
 
     /// Begin a receive: a fresh directory with an empty image file. A
@@ -129,15 +306,6 @@ impl SnapshotStaging {
             verified: None,
         });
         Ok((dir, file))
-    }
-
-    /// Whether `dir` is the current receive.
-    pub(crate) fn is_current(&self, dir: &Path) -> bool {
-        self.receiving
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|r| r.dir == dir)
     }
 
     /// Validate the complete image in `dir` against `meta`: the announced
@@ -208,10 +376,6 @@ impl SnapshotStaging {
             *receiving = None;
         }
         let _ = std::fs::remove_dir_all(dir);
-    }
-
-    fn take(&self) -> Option<Receive> {
-        self.receiving.lock().unwrap().take()
     }
 }
 
@@ -385,6 +549,7 @@ impl ControlStateMachine {
                 max_image_bytes,
                 receiving: Mutex::new(None),
                 counter: AtomicU64::new(0),
+                owned: Arc::new(tokio::sync::Semaphore::new(MAX_OWNED_RECEIVES)),
             }),
             last_build: Arc::new(Mutex::new(None)),
             snapshot_lock: Arc::new(Mutex::new(())),
@@ -649,35 +814,44 @@ impl RaftStateMachine<ControlRaft> for ControlStateMachine {
 
     async fn begin_receiving_snapshot(
         &mut self,
-    ) -> Result<Box<tokio::fs::File>, StorageError<NodeId>> {
-        let (_, file) = self
+    ) -> Result<Box<SnapshotFile>, StorageError<NodeId>> {
+        let permit = self
+            .staging
+            .reserve()
+            .map_err(|e| snapshot_error(ErrorVerb::Write, e))?;
+        let (dir, file) = self
             .staging
             .begin()
             .map_err(|e| snapshot_error(ErrorVerb::Write, e))?;
-        Ok(Box::new(tokio::fs::File::from_std(file)))
+        self.staging
+            .own_reserved(&dir, file, permit)
+            .map(Box::new)
+            .map_err(|e| snapshot_error(ErrorVerb::Write, e))
     }
 
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMeta<NodeId, BasicNode>,
-        mut snapshot: Box<tokio::fs::File>,
+        mut snapshot: Box<SnapshotFile>,
     ) -> Result<(), StorageError<NodeId>> {
         snapshot
+            .file
             .flush()
             .await
             .map_err(|e| snapshot_error(ErrorVerb::Write, e))?;
         snapshot
+            .file
             .sync_all()
             .await
             .map_err(|e| snapshot_error(ErrorVerb::Write, e))?;
-        drop(snapshot);
-        let receive = self
-            .staging
+        let receive = snapshot
+            .receive
             .take()
             .ok_or_else(|| snapshot_error(ErrorVerb::Read, "no receive is in progress"))?;
-        let result = self.install_received(meta, &receive);
-        if result.is_err() {
-            let _ = std::fs::remove_dir_all(&receive.dir);
+        drop(snapshot);
+        let result = self.install_received(meta, &receive.receive);
+        if let Some(completion) = &receive.completion {
+            completion.finish(result.clone());
         }
         result.map_err(|e| snapshot_error(ErrorVerb::Write, e))
     }
@@ -712,7 +886,7 @@ impl RaftStateMachine<ControlRaft> for ControlStateMachine {
             std::fs::File::open(dir.join(IMAGE)).map_err(|e| snapshot_error(ErrorVerb::Read, e))?;
         Ok(Some(Snapshot {
             meta,
-            snapshot: Box::new(tokio::fs::File::from_std(file)),
+            snapshot: Box::new(SnapshotFile::published(file)),
         }))
     }
 }
@@ -863,7 +1037,7 @@ impl ControlSnapshotBuilder {
             let file = std::fs::File::open(target.join(IMAGE)).map_err(io)?;
             Ok(Snapshot {
                 meta,
-                snapshot: Box::new(tokio::fs::File::from_std(file)),
+                snapshot: Box::new(SnapshotFile::published(file)),
             })
         })();
         if outcome.is_err() {

@@ -95,6 +95,260 @@ fn peak_bytes() -> usize {
     PEAK.load(Ordering::Relaxed)
 }
 
+/// A final RPC can lose its response after the receiver installed its bytes.
+/// Retrying that exact RPC must acknowledge the completed operation, while
+/// altered bytes, identity, offset, vote or metadata must never use its reply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r153_a_completed_final_chunk_replays_only_its_exact_authenticated_content() {
+    let _serial = serial();
+    let group = kit::identity(kit::SEED);
+    let mut cluster =
+        Cluster::bootstrap("r153-final-replay", &group, &kit::policy(), &kit::limits()).await;
+    propose_ok(cluster.leader(), &prepare_command(&group, 1)).await;
+    let (image, meta) = raft_kit::snapshot_image(&cluster.leader_dir, cluster.leader()).await;
+    cluster.start_member().await;
+    let mut peer =
+        raft_kit::peer_client(cluster.member().listen_addr().unwrap(), raft_kit::PEER_ID).await;
+    let vote = raft_kit::current_vote(cluster.leader());
+    raft_kit::install_chunks(
+        &mut peer,
+        &group,
+        raft_kit::PEER_ID,
+        raft_kit::MEMBER_ID,
+        &vote,
+        &meta,
+        &image,
+    )
+    .await
+    .unwrap();
+    let offset = (image.len() - 1) / raft_kit::CHUNK_BYTES * raft_kit::CHUNK_BYTES;
+    assert!(offset > 0, "the replay must be a nonzero final chunk");
+    let final_chunk = raft_kit::chunk_request(
+        &group,
+        raft_kit::PEER_ID,
+        raft_kit::MEMBER_ID,
+        &vote,
+        &meta,
+        offset,
+        &image[offset..],
+        true,
+    );
+    let before = raft_kit::published_pair(cluster.member_dir.path()).unwrap();
+    let replay = peer
+        .install_snapshot(raft_kit::timed(final_chunk.clone()))
+        .await
+        .expect("the exact completed final RPC is acknowledged")
+        .into_inner();
+    assert!(matches!(
+        replay.outcome,
+        Some(pipestream_search::pb::storage::raft_install_snapshot_response::Outcome::Vote(_))
+    ));
+    let mut conflicts = Vec::new();
+    let mut changed = final_chunk.clone();
+    changed.data[0] ^= 1;
+    conflicts.push(changed);
+    let mut changed = final_chunk.clone();
+    changed.data.pop();
+    conflicts.push(changed);
+    let mut changed = final_chunk.clone();
+    changed.offset -= 1;
+    conflicts.push(changed);
+    let mut changed = final_chunk.clone();
+    changed.vote.as_mut().unwrap().term += 1;
+    conflicts.push(changed);
+    let mut changed = final_chunk.clone();
+    changed
+        .meta
+        .as_mut()
+        .unwrap()
+        .membership
+        .as_mut()
+        .unwrap()
+        .log_id = None;
+    conflicts.push(changed);
+    let mut changed = final_chunk.clone();
+    changed.done = false;
+    conflicts.push(changed);
+    for changed in conflicts {
+        peer.install_snapshot(raft_kit::timed(changed))
+            .await
+            .expect_err("a conflicting final RPC must not replay a successful reply");
+    }
+    let mut other =
+        raft_kit::peer_client(cluster.member().listen_addr().unwrap(), raft_kit::NODE_ID).await;
+    let mut changed = final_chunk.clone();
+    changed.header.as_mut().unwrap().from_node_id = raft_kit::NODE_ID;
+    other
+        .install_snapshot(raft_kit::timed(changed))
+        .await
+        .expect_err("a different authenticated peer must not replay the reply");
+    peer.install_snapshot(raft_kit::timed(final_chunk))
+        .await
+        .expect("conflicting requests do not erase the exact completion");
+    assert_eq!(
+        raft_kit::published_pair(cluster.member_dir.path()).unwrap(),
+        before
+    );
+    assert!(raft_kit::incoming_dirs(cluster.member_dir.path()).is_empty());
+    assert!(raft_kit::core_running(cluster.member()));
+    cluster.shutdown().await;
+}
+
+/// The finalizer must own its receive even after its RPC caller disappears.
+/// The existing store-install gate pins the first RPC in flight while an
+/// identical retry is issued on a fresh connection.
+#[cfg(feature = "fault-injection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r153_a_cancelled_final_rpc_keeps_ownership_until_its_retry_can_complete() {
+    let _serial = serial();
+    let group = kit::identity(kit::SEED);
+    let mut cluster =
+        Cluster::bootstrap("r153-final-cancel", &group, &kit::policy(), &kit::limits()).await;
+    propose_ok(cluster.leader(), &prepare_command(&group, 1)).await;
+    let (image, meta) = raft_kit::snapshot_image(&cluster.leader_dir, cluster.leader()).await;
+    cluster.start_member().await;
+    let mut peer =
+        raft_kit::peer_client(cluster.member().listen_addr().unwrap(), raft_kit::PEER_ID).await;
+    let vote = raft_kit::current_vote(cluster.leader());
+    let offset = (image.len() - 1) / raft_kit::CHUNK_BYTES * raft_kit::CHUNK_BYTES;
+    for (index, chunk) in image[..offset].chunks(raft_kit::CHUNK_BYTES).enumerate() {
+        peer.install_snapshot(raft_kit::timed(raft_kit::chunk_request(
+            &group,
+            raft_kit::PEER_ID,
+            raft_kit::MEMBER_ID,
+            &vote,
+            &meta,
+            index * raft_kit::CHUNK_BYTES,
+            chunk,
+            false,
+        )))
+        .await
+        .unwrap();
+    }
+    let final_chunk = raft_kit::chunk_request(
+        &group,
+        raft_kit::PEER_ID,
+        raft_kit::MEMBER_ID,
+        &vote,
+        &meta,
+        offset,
+        &image[offset..],
+        true,
+    );
+    let gate = cluster.member().arm_snapshot_install_gate();
+    let first = final_chunk.clone();
+    let sending = tokio::spawn(async move { peer.install_snapshot(raft_kit::timed(first)).await });
+    gate.reached().await;
+    sending.abort();
+    let _ = sending.await;
+    let mut retry =
+        raft_kit::peer_client(cluster.member().listen_addr().unwrap(), raft_kit::PEER_ID).await;
+    let (reply, ()) = tokio::join!(
+        retry.install_snapshot(raft_kit::timed(final_chunk)),
+        async {
+            tokio::task::yield_now().await;
+            gate.release();
+        },
+    );
+    reply.expect("a retry joins the owned finalization after caller cancellation");
+    assert_eq!(
+        raft_kit::durable_position(cluster.member()),
+        meta.last_log_id.unwrap().index
+    );
+    assert!(raft_kit::incoming_dirs(cluster.member_dir.path()).is_empty());
+    assert!(raft_kit::core_running(cluster.member()));
+    cluster.shutdown().await;
+}
+
+#[cfg(feature = "fault-injection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r153_a_higher_vote_can_stage_while_an_earlier_install_is_stalled() {
+    let _serial = serial();
+    let group = kit::identity(kit::SEED);
+    let mut cluster =
+        Cluster::bootstrap("r153-higher-vote", &group, &kit::policy(), &kit::limits()).await;
+    propose_ok(cluster.leader(), &prepare_command(&group, 1)).await;
+    let (image, meta) = raft_kit::snapshot_image(&cluster.leader_dir, cluster.leader()).await;
+    cluster.start_member().await;
+    let addr = cluster.member().listen_addr().unwrap();
+    let mut peer = raft_kit::peer_client(addr, raft_kit::PEER_ID).await;
+    let vote = raft_kit::current_vote(cluster.leader());
+    let gate = cluster.member().arm_snapshot_install_gate();
+    let (first_image, first_meta, first_group) = (image.clone(), meta.clone(), group.clone());
+    let first = tokio::spawn(async move {
+        raft_kit::install_chunks(
+            &mut peer,
+            &first_group,
+            raft_kit::PEER_ID,
+            raft_kit::MEMBER_ID,
+            &vote,
+            &first_meta,
+            &first_image,
+        )
+        .await
+    });
+    gate.reached().await;
+    let mut successor = raft_kit::peer_client(addr, raft_kit::NODE_ID).await;
+    let newer_vote = pipestream_search::pb::storage::RaftVote {
+        term: vote.term + 1,
+        ..vote
+    };
+    // The ordinary chunk deadline bounds this control; no enlarged timeout.
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(raft_kit::host_config().install_snapshot_timeout_ms),
+        successor.install_snapshot(raft_kit::timed(raft_kit::chunk_request(
+            &group,
+            raft_kit::NODE_ID,
+            raft_kit::MEMBER_ID,
+            &newer_vote,
+            &meta,
+            0,
+            &image[..raft_kit::CHUNK_BYTES],
+            false,
+        ))),
+    )
+    .await;
+    gate.release();
+    let first_result = first.await.unwrap();
+    result
+        .expect("a higher-vote transfer can stage while the old install is stalled")
+        .expect("the superseding transfer begins");
+    first_result.expect("the earlier install retained its own bytes");
+    let replies = raft_kit::install_chunks(
+        &mut successor,
+        &group,
+        raft_kit::NODE_ID,
+        raft_kit::MEMBER_ID,
+        &newer_vote,
+        &meta,
+        &image,
+    )
+    .await
+    .expect("the higher-vote transfer completes once the store worker can advance");
+    assert!(replies.last().unwrap().outcome.as_ref().is_some_and(|outcome| matches!(outcome, pipestream_search::pb::storage::raft_install_snapshot_response::Outcome::Vote(v) if v.term == newer_vote.term)));
+    let offset = (image.len() - 1) / raft_kit::CHUNK_BYTES * raft_kit::CHUNK_BYTES;
+    let replay = successor
+        .install_snapshot(raft_kit::timed(raft_kit::chunk_request(
+            &group,
+            raft_kit::NODE_ID,
+            raft_kit::MEMBER_ID,
+            &newer_vote,
+            &meta,
+            offset,
+            &image[offset..],
+            true,
+        )))
+        .await
+        .expect("the latest exact completion is replayable after the vote advanced")
+        .into_inner();
+    assert!(
+        matches!(replay.outcome, Some(pipestream_search::pb::storage::raft_install_snapshot_response::Outcome::Vote(v)) if v.term == newer_vote.term)
+    );
+    assert!(raft_kit::core_running(cluster.member()));
+    assert!(raft_kit::incoming_dirs(cluster.member_dir.path()).is_empty());
+    cluster.shutdown().await;
+}
+
 const OWNER_WORKFLOW: &[u8] = b"installation-one";
 
 fn prepare_command(group: &SourceAuthorityIdentity, revision: u64) -> SourceAuthorityCommand {

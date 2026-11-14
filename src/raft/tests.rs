@@ -17,7 +17,7 @@ use openraft::storage::{RaftLogStorage, RaftStateMachine};
 use openraft::{BasicNode, Entry, EntryPayload, LeaderId, LogId, Membership, RaftLogReader, Vote};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tonic::Code;
 
 pub(super) struct Directory(pub(super) PathBuf);
@@ -41,6 +41,104 @@ impl Drop for Directory {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+#[tokio::test]
+async fn r153_receive_ownership_follows_the_file_across_a_second_receive() {
+    use openraft::RaftSnapshotBuilder;
+    let source = Directory::new("r153-source");
+    let group = identity(7);
+    let store = crate::source_authority::SourceAuthorityStore::create(
+        &source.0.join("source.redb"),
+        &group,
+        &policy(),
+        &limits(),
+    )
+    .unwrap();
+    let mut source_machine =
+        ControlStateMachine::new(store, &source.0.join("snapshots"), 64 << 20).unwrap();
+    source_machine
+        .apply([Entry {
+            log_id: log_id(1, 1, 1),
+            payload: EntryPayload::Blank,
+        }])
+        .await
+        .unwrap();
+    let mut snapshot = source_machine
+        .get_snapshot_builder()
+        .await
+        .build_snapshot()
+        .await
+        .unwrap();
+    let mut image = Vec::new();
+    snapshot.snapshot.read_to_end(&mut image).await.unwrap();
+    let replica = Directory::new("r153-replica");
+    let store = crate::source_authority::SourceAuthorityStore::create(
+        &replica.0.join("replica.redb"),
+        &group,
+        &policy(),
+        &limits(),
+    )
+    .unwrap();
+    let snapshots = replica.0.join("snapshots");
+    let mut machine = ControlStateMachine::new(store, &snapshots, 64 << 20).unwrap();
+    let mut first = machine.begin_receiving_snapshot().await.unwrap();
+    first.write_all(&image).await.unwrap();
+    let mut second = machine.begin_receiving_snapshot().await.unwrap();
+    second.write_all(b"another receive's bytes").await.unwrap();
+    machine
+        .install_snapshot(&snapshot.meta, first)
+        .await
+        .expect("the first install consumes its own receive, never the newest receive");
+    assert_eq!(
+        machine.applied_state().await.unwrap().0,
+        snapshot.meta.last_log_id
+    );
+    assert!(machine
+        .install_snapshot(&snapshot.meta, second)
+        .await
+        .is_err());
+    assert_eq!(
+        machine.get_current_snapshot().await.unwrap().unwrap().meta,
+        snapshot.meta
+    );
+    assert!(!std::fs::read_dir(&snapshots).unwrap().any(|entry| entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with("incoming-")));
+}
+
+#[tokio::test]
+async fn r153_owned_receives_have_a_fixed_count_bound_and_release_it_on_drop() {
+    let dir = Directory::new("r153-receive-bound");
+    let store = crate::source_authority::SourceAuthorityStore::create(
+        &dir.0.join("replica.redb"),
+        &identity(7),
+        &policy(),
+        &limits(),
+    )
+    .unwrap();
+    let snapshots = dir.0.join("snapshots");
+    let mut machine = ControlStateMachine::new(store, &snapshots, 64 << 20).unwrap();
+    let first = machine.begin_receiving_snapshot().await.unwrap();
+    let second = machine.begin_receiving_snapshot().await.unwrap();
+    assert!(
+        machine.begin_receiving_snapshot().await.is_err(),
+        "two owned receives exhaust the fixed finalization bound"
+    );
+    drop(first);
+    let successor = machine
+        .begin_receiving_snapshot()
+        .await
+        .expect("dropping an uninstalled receive releases its slot");
+    drop(second);
+    drop(successor);
+    assert!(!std::fs::read_dir(snapshots).unwrap().any(|entry| entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with("incoming-")));
 }
 
 pub(super) fn identity(seed: u8) -> SourceAuthorityIdentity {

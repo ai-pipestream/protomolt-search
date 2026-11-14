@@ -10,7 +10,7 @@
 //! request and checks the responder named in every reply. An address is
 //! where a node is dialed, never who it is.
 use super::reasons;
-use super::state_machine::SnapshotStaging;
+use super::state_machine::{SnapshotCompletion, SnapshotFile, SnapshotStaging};
 use super::types::{
     entry_from_proto, entry_to_proto, log_id_from_proto, log_id_to_proto,
     stored_membership_from_proto, stored_membership_to_proto, vote_from_proto, vote_to_proto,
@@ -243,6 +243,7 @@ pub struct RaftTransportService {
     staging: Arc<SnapshotStaging>,
     rejections: Arc<SnapshotRejections>,
     transfer: Mutex<Option<Transfer>>,
+    final_receipt: Mutex<Option<FinalReceipt>>,
     idle: Duration,
     /// The bound on the read barrier a forwarded lease runs here.
     read_timeout: Duration,
@@ -263,19 +264,51 @@ struct Transfer {
     last_chunk: std::time::Instant,
 }
 
+#[derive(PartialEq, Eq)]
+struct FinalChunk {
+    peer: NodeId,
+    vote: openraft::Vote<NodeId>,
+    meta: SnapshotMeta<NodeId, BasicNode>,
+    offset: u64,
+    length: usize,
+    sha256: [u8; 32],
+}
+
+impl FinalChunk {
+    fn new(peer: NodeId, rpc: &InstallSnapshotRequest<ControlRaft>) -> Self {
+        Self {
+            peer,
+            vote: rpc.vote,
+            meta: rpc.meta.clone(),
+            offset: rpc.offset,
+            length: rpc.data.len(),
+            sha256: crate::sha256::digest(&rpc.data),
+        }
+    }
+}
+
+struct FinalReceipt {
+    chunk: FinalChunk,
+    completion: Arc<SnapshotCompletion>,
+}
+
 /// What staging one chunk led to.
 enum Staged {
     /// The chunk was appended; more to come.
     Partial,
     /// The chunk is out of order: the sender restarts from `expect_offset`.
-    Mismatch { expect_offset: u64 },
+    Mismatch {
+        expect_offset: u64,
+    },
     /// The transfer is complete and the image validated; hand it to the
     /// library.
     Complete {
         meta: SnapshotMeta<NodeId, BasicNode>,
         vote: openraft::Vote<NodeId>,
-        dir: PathBuf,
+        snapshot: Box<SnapshotFile>,
+        completion: Arc<SnapshotCompletion>,
     },
+    Replay(Arc<SnapshotCompletion>),
 }
 
 impl RaftTransportService {
@@ -302,6 +335,7 @@ impl RaftTransportService {
             staging,
             rejections,
             transfer: Mutex::new(None),
+            final_receipt: Mutex::new(None),
             idle: Duration::from_millis(limits.snapshot_idle_timeout_ms),
             read_timeout,
         }
@@ -460,7 +494,6 @@ impl RaftTransportService {
             return Ok(Staged::Partial);
         }
         let complete = guard.take().expect("checked");
-        drop(guard);
         if complete.received != complete.announced {
             self.staging.discard(&complete.dir);
             return Err(reasons::reason(
@@ -475,16 +508,57 @@ impl RaftTransportService {
             self.staging.discard(&complete.dir);
             return Err(Status::internal(format!("snapshot receive: {error}")));
         }
-        drop(complete.file);
         if let Err(error) = self.staging.verify(&complete.dir, &complete.meta) {
+            drop(complete.file);
             self.staging.discard(&complete.dir);
             return Err(error);
         }
+        // Keep the synchronous transfer lock through verification and the
+        // ownership handoff. A later start may discard only the mutable
+        // receiving slot, never this core-owned image. No lock crosses await.
+        let mut snapshot = self.staging.own(&complete.dir, complete.file)?;
+        drop(guard);
+        let completion = Arc::new(SnapshotCompletion::new());
+        snapshot.set_completion(Arc::clone(&completion));
         Ok(Staged::Complete {
             meta: complete.meta,
             vote: complete.vote,
-            dir: complete.dir,
+            snapshot: Box::new(snapshot),
+            completion,
         })
+    }
+
+    fn stage_or_replay(
+        &self,
+        from: NodeId,
+        rpc: InstallSnapshotRequest<ControlRaft>,
+    ) -> Result<Staged, Status> {
+        let final_chunk = rpc.done.then(|| FinalChunk::new(from, &rpc));
+        let mut receipt = self
+            .final_receipt
+            .lock()
+            .map_err(|_| Status::internal("snapshot receipt lock poisoned"))?;
+        if let (Some(chunk), Some(previous)) = (&final_chunk, receipt.as_ref()) {
+            let restarted = self
+                .transfer
+                .lock()
+                .map_err(|_| Status::internal("snapshot transfer lock poisoned"))?
+                .as_ref()
+                .is_some_and(|active| {
+                    active.peer == from && active.vote == rpc.vote && active.meta == rpc.meta
+                });
+            if !restarted && previous.chunk == *chunk {
+                return Ok(Staged::Replay(Arc::clone(&previous.completion)));
+            }
+        }
+        let staged = self.stage(from, rpc)?;
+        if let Staged::Complete { completion, .. } = &staged {
+            *receipt = Some(FinalReceipt {
+                chunk: final_chunk.expect("a completed transfer has a final chunk"),
+                completion: Arc::clone(completion),
+            });
+        }
+        Ok(staged)
     }
 
     pub(crate) fn into_server(self, limits: &TransportLimits) -> RaftTransportServer<Self> {
@@ -675,7 +749,7 @@ impl RaftTransportService {
         let rpc = install_request_from_proto(self.directory.group(), request.into_inner())?;
         let snapshot_id = rpc.meta.snapshot_id.clone();
         let offset = rpc.offset;
-        let outcome = match self.stage(from, rpc)? {
+        let outcome = match self.stage_or_replay(from, rpc)? {
             Staged::Partial => {
                 InstallOutcome::Vote(vote_to_proto(&self.raft.metrics().borrow().vote))
             }
@@ -685,34 +759,29 @@ impl RaftTransportService {
                 got_id: snapshot_id,
                 got_offset: offset,
             }),
-            Staged::Complete { meta, vote, dir } => {
+            Staged::Replay(completion) => {
+                completion.wait(self.idle).await?;
+                // A replay observes the current term; an old cached vote
+                // must never hide a vote that advanced since installation.
+                InstallOutcome::Vote(vote_to_proto(&self.raft.metrics().borrow().vote))
+            }
+            Staged::Complete {
+                meta,
+                vote,
+                snapshot,
+                completion,
+            } => {
                 // The image is validated; the library applies its own term
                 // and position rules and may decline it (an older vote, a
                 // position it already holds). Only a storage failure in the
                 // swap is fatal, as before.
-                let file = match tokio::fs::File::open(SnapshotStaging::image_path(&dir)).await {
-                    Ok(file) => file,
-                    Err(error) => {
-                        self.staging.discard(&dir);
-                        return Err(Status::internal(format!("snapshot receive: {error}")));
-                    }
-                };
                 let response = self
                     .raft
-                    .install_full_snapshot(
-                        vote,
-                        Snapshot {
-                            meta,
-                            snapshot: Box::new(file),
-                        },
-                    )
+                    .install_full_snapshot(vote, Snapshot { meta, snapshot })
                     .await
-                    .map_err(|e| Status::unavailable(format!("raft core: {e}")))?;
-                if self.staging.is_current(&dir) {
-                    // Declined by the library: the validated bytes are of no
-                    // further use.
-                    self.staging.discard(&dir);
-                }
+                    .map_err(|e| Status::unavailable(format!("raft core: {e}")));
+                completion.finish(response.as_ref().map(|_| ()).map_err(Clone::clone));
+                let response = response?;
                 InstallOutcome::Vote(vote_to_proto(&response.vote))
             }
         };

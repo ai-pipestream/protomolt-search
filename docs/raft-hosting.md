@@ -155,6 +155,25 @@ library a validated image only (`RaftTransportService::stage`,
   store's locks, so a held handle neither blocks nor refuses it; only a
   real storage failure in that swap is fatal, as the library's contract
   requires.
+  The file handed to the library owns its exact incoming directory until
+  installation or discard, including when the RPC caller cancels. A new
+  transfer cannot remove those bytes or substitute its own directory.
+  At most two images may be owned by the library, allowing one successor
+  while an older install runs; a third hand-off refuses with
+  `ResourceExhausted`. Together with the one partial transfer, incoming
+  image bytes are bounded by three times `max_snapshot_bytes`; the one
+  verification probe can use another `max_snapshot_bytes`. Existing
+  published generations and the live-store replacement are separate.
+  No transport lock or detached task waits for a core installation.
+- **Final retries.** One receipt binds the authenticated peer, vote, full
+  metadata, final offset, byte length and SHA-256 of the final chunk.
+  Repeating that exact final RPC waits for its installation outcome and
+  answers with the core's current vote. Conflicting bytes or identity do
+  not reuse the receipt, and a transfer restarted at offset zero must
+  validate its received bytes again. A retry waits at most the existing
+  `snapshot_idle_timeout_ms`; a failed or discarded receive records no
+  successful installation. This does not bypass OpenRaft's own safe
+  decline rules for an old vote or position.
 
 Evidence (`tests/control_raft_snapshots.rs`, "snapshot admission refuses
 invalid transfers without stopping the core"): oversized, foreign,
