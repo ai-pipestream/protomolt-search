@@ -1173,8 +1173,9 @@ enum StreamEvent {
     MapMoved(u64),
 }
 
-/// Discovery has no independent timeout: the parent request owns its
-/// lifetime. A closed map source leaves the pinned reading authoritative.
+/// Discovery bounds each best-effort child probe and interrupts immediately on
+/// parent cancellation, deadline, or shard-map movement. A closed map source
+/// leaves the pinned reading authoritative.
 async fn await_vector_rows(
     probe: &mut ShardVectorRowProbe,
     pinned: &MapSnapshot,

@@ -534,6 +534,67 @@ async fn a_map_move_refuses_the_decisions_pinned_under_the_older_map() {
         "{}",
         refused.message()
     );
+
+    // A transport-hung sibling (accepts TCP, never speaks HTTP/2) must also
+    // time out best-effort capability discovery so the healthy leaf streams its
+    // first batch before a mid-stream map move refuses the attempt.
+    let raw_hold = holding_child().await;
+    let hot = CoordinatorServiceImpl::new(vec![l0.clone(), raw_hold])
+        .with_hot_topology(vec![None, None])
+        .unwrap();
+    let (relay_addr, relay, server) = start_relay_over(hot).await;
+    let mut client = NodeServiceClient::connect(relay_addr).await.unwrap();
+    let (tx, rx) = mpsc::channel(4);
+    tx.send(StreamSearchRequest {
+        payload: Some(stream_search_request::Payload::Start(StartStreamSearch {
+            request_id: "moved-raw-tcp".into(),
+            vector: unit_vectors(1, DIM, 0x0C0D_E001),
+            ..Default::default()
+        })),
+    })
+    .await
+    .unwrap();
+    let mut inbound = client
+        .stream_search(ReceiverStream::new(rx))
+        .await
+        .unwrap()
+        .into_inner();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), inbound.message())
+        .await
+        .expect("transport-hung sibling must not block live child stream past discovery bound")
+        .unwrap()
+        .expect("a batch");
+    assert!(matches!(
+        first.payload,
+        Some(stream_search_response::Payload::Batch(_))
+    ));
+    relay
+        .base()
+        .reload_topology(
+            1,
+            vec![TopologyRoute {
+                addr: l0.clone(),
+                replica: None,
+                hash_range: None,
+                placement: None,
+            }],
+            None,
+        )
+        .unwrap();
+    let refused = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_until_summary_or_error(&mut inbound),
+    )
+    .await
+    .expect("map movement must interrupt established fanout with a transport-hung sibling")
+    .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        refused.message().contains("moved from revision 0"),
+        "{}",
+        refused.message()
+    );
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

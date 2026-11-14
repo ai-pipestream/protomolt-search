@@ -2,7 +2,13 @@
 use super::CoordinatorServiceImpl;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::task::JoinSet;
+
+/// Bound per-shard best-effort capability discovery so a transport-hung sibling
+/// cannot stall healthy stream fanout indefinitely, while staying above short
+/// request-level deadline envelopes.
+const CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_millis(1_500);
 
 /// Dropping the owner aborts outstanding RPCs. Relay request owners also
 /// explicitly drain them before publishing a terminal result.
@@ -50,26 +56,28 @@ impl CoordinatorServiceImpl {
         if self.has_clustered_vectors() || self.node_addrs.is_empty() {
             return probe;
         }
-        let needs_probe = {
+        let uncached: Vec<String> = {
             let cache = probe.cache.lock().expect("shard vector row cache poisoned");
             self.node_addrs
                 .iter()
-                .any(|addr| cache.get(addr).copied().unwrap_or(0) == 0)
+                .filter(|addr| cache.get(*addr).copied().unwrap_or(0) == 0)
+                .cloned()
+                .collect()
         };
-        if needs_probe {
-            for addr in &self.node_addrs {
-                let Ok(mut client) = self.node_client(addr) else {
-                    continue;
-                };
-                let addr = addr.clone();
-                probe.tasks.spawn(async move {
-                    client
-                        .get_vector_backend(crate::pb::GetVectorBackendRequest {})
-                        .await
-                        .ok()
-                        .map(|resp| (addr, resp.into_inner()))
-                });
-            }
+        for addr in uncached {
+            let Ok(mut client) = self.node_client(&addr) else {
+                continue;
+            };
+            probe.tasks.spawn(async move {
+                tokio::time::timeout(
+                    CAPABILITY_PROBE_TIMEOUT,
+                    client.get_vector_backend(crate::pb::GetVectorBackendRequest {}),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .map(|resp| (addr, resp.into_inner()))
+            });
         }
         probe
     }
