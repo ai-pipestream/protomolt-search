@@ -202,8 +202,7 @@ impl NodeServiceImpl {
                     .catalog()
                     .commit_current(epoch)
                     .map_err(|e| Status::internal(format!("publish the compacted set: {e}")))?;
-                // Publication returns a new immutable view. Adopt it in both
-                // legs; previously an in-place epoch mutation hid this step.
+                // Publication returns a new immutable view; adopt it in both legs.
                 if let Some(Bm25Shard::Segmented(shard)) = shadow.state.bm25.as_mut() {
                     shard
                         .republish(published.clone())
