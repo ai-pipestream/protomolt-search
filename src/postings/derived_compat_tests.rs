@@ -1,3 +1,4 @@
+use super::format::finalize_v8;
 use super::*;
 
 fn declaration() -> StoredDerived {
