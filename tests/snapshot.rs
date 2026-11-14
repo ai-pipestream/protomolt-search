@@ -990,11 +990,8 @@ fn a_dangling_generation_directory_symlink_refuses_instead_of_falling_back() {
     let stale = build_bm25(&dir_root, "stale root document");
     let index_path = dir_root.join("shard.idx");
     std::fs::copy(&stale, dir_root.join("shard.idx.bm25")).unwrap();
-    std::os::unix::fs::symlink(
-        dir_root.join("unmounted-snap"),
-        generation_dir(&index_path),
-    )
-    .unwrap();
+    std::os::unix::fs::symlink(dir_root.join("unmounted-snap"), generation_dir(&index_path))
+        .unwrap();
     let before = recovery_files(&dir_root);
     let err = NodeServiceImpl::open(
         NodeConfig {

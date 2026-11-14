@@ -10,6 +10,7 @@
 //! words. It exists so the dense, hybrid and A/B paths of the UI have
 //! something to run against; it says nothing about retrieval quality.
 
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -20,14 +21,6 @@ use pipestream_search::coordinator::CoordinatorServiceImpl;
 use pipestream_search::harness::mock_analysis::{toy_stem, MockAnalysis};
 use pipestream_search::harness::{fit_calibration, nodelay_incoming, start_empty_node};
 use pipestream_search::node::NodeConfig;
-use pipestream_search::pb::analysis::analysis_service_server::{
-    AnalysisService, AnalysisServiceServer,
-};
-use pipestream_search::pb::analysis::{
-    analyze_stream_request, analyze_stream_response, AnalyzeRequest, AnalyzeResponse,
-    AnalyzeStreamError, AnalyzeStreamRequest, AnalyzeStreamResponse, ChunkEmbedding,
-    GetCapabilitiesRequest, GetCapabilitiesResponse, Span,
-};
 use pipestream_search::pb::node_service_client::NodeServiceClient;
 use pipestream_search::pb::{
     AddDocumentsRequest, AddVectorsRequest, DocLineage, FacetValue, IntegerValue, NumericValue,
@@ -38,9 +31,34 @@ use pipestream_search::MAX_MESSAGE_BYTES;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_stream::Stream;
+use tokio_stream::{Stream, StreamExt};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
+use turbo_client::proto::grpc_inference_service_server::{
+    GrpcInferenceService, GrpcInferenceServiceServer,
+};
+use turbo_client::proto::model_infer_response::InferOutputTensor;
+use turbo_client::proto::result::analysis_service_server::{
+    AnalysisService, AnalysisServiceServer,
+};
+use turbo_client::proto::result::{
+    analyze_progressive_event, analyze_stream_request, analyze_stream_response, AnalyzeFailure,
+    AnalyzePipelineRequest, AnalyzeProgressiveEvent, AnalyzeQueryRequest, AnalyzeQueryResponse,
+    AnalyzeStreamRequest, AnalyzeStreamResponse, CapabilitiesRequest, CapabilitiesResponse,
+    ChunkLevelsResult, DocumentGraphRequest, DocumentGraphResponse, DocumentWindowRequest,
+    DocumentWindowResponse, ExtractionResult, FormatDocumentRequest, FormatDocumentResponse,
+    InspectDocumentGraphRequest, ListOutputFormatsRequest, ListOutputFormatsResponse,
+    LoadBundleRequest, LoadBundleResponse, MultiResVectorsResult, ProjectChunksRequest,
+    ProjectChunksResponse, ProjectSearchDocumentRequest, RecordsResult, RerankAndHighlightRequest,
+    RerankAndHighlightResponse, RerankScoresResult, SearchDocumentProjection, SparseTermsResult,
+    TokenVectorsResult, TypedDocumentResult, UnloadBundleRequest, UnloadBundleResponse,
+};
+use turbo_client::proto::{
+    InferTensorContents, ModelInferRequest, ModelInferResponse, ModelMetadataRequest,
+    ModelMetadataResponse, ModelReadyRequest, ModelReadyResponse, ServerLiveRequest,
+    ServerLiveResponse, ServerMetadataRequest, ServerMetadataResponse, ServerReadyRequest,
+    ServerReadyResponse,
+};
 
 const DIM: usize = 64;
 const SHARDS: usize = 4;
@@ -243,11 +261,11 @@ fn embed(text: &str) -> Vec<f32> {
     v
 }
 
-/// The mock sidecar with two additions: the demo embedding on the unary
-/// call (the call the console's `/api/embed` makes), and punctuation
-/// blanked before the mock sees the text. The mock splits on whitespace
-/// only, so the prose's "…a seaworthy ship." would index `ship.` and a
-/// query for `ship` would find nothing.
+/// The mock analysis sidecar with ASCII punctuation blanked before the mock
+/// sees the text (the mock splits on whitespace only, so the prose's
+/// "…a seaworthy ship." would otherwise index `ship.` and a query for `ship`
+/// would find nothing), paired on the same loopback listener with
+/// [`DemoInference`] for the console's `/api/embed` Open Inference call.
 struct DemoAnalysis(Arc<MockAnalysis>);
 
 /// `text` with each ASCII punctuation byte as a space: the same length,
@@ -258,37 +276,84 @@ fn unpunctuated(text: &str) -> String {
         .collect()
 }
 
+fn failure_from_status(status: Status) -> AnalyzeFailure {
+    AnalyzeFailure {
+        turbo_code: status.code() as i32,
+        field: 0,
+        message: status.message().to_string(),
+    }
+}
+
+async fn analyze_one(
+    mock: &MockAnalysis,
+    source_text: String,
+    binding: Option<turbo_client::proto::result::InputBinding>,
+) -> Result<DocumentGraphResponse, Status> {
+    let mut stream = mock
+        .analyze_document_progressive(Request::new(AnalyzePipelineRequest {
+            text: unpunctuated(&source_text),
+            binding,
+            ..Default::default()
+        }))
+        .await?
+        .into_inner();
+    while let Some(event) = stream.next().await {
+        if let Some(analyze_progressive_event::Event::Complete(mut graph)) = event?.event {
+            graph.source_text = source_text;
+            return Ok(graph);
+        }
+    }
+    Err(Status::internal(
+        "mock progressive analysis ended without Complete",
+    ))
+}
+
 #[tonic::async_trait]
 impl AnalysisService for DemoAnalysis {
-    async fn analyze(
-        &self,
-        mut request: Request<AnalyzeRequest>,
-    ) -> Result<Response<AnalyzeResponse>, Status> {
-        let text = std::mem::take(&mut request.get_mut().text);
-        request.get_mut().text = unpunctuated(&text);
-        let wants_embedding = request
-            .get_ref()
-            .options
-            .as_ref()
-            .is_some_and(|o| o.embeddings.is_some());
-        let mut response = self.0.analyze(request).await?.into_inner();
-        if wants_embedding {
-            response.embeddings = vec![ChunkEmbedding {
-                span: Some(Span {
-                    start: 0,
-                    end: text.len() as i32,
-                }),
-                vector: embed(&text),
-                text,
-            }];
-        }
-        Ok(Response::new(response))
-    }
-
     type AnalyzeStreamStream =
         Pin<Box<dyn Stream<Item = Result<AnalyzeStreamResponse, Status>> + Send>>;
+    type AnalyzeDocumentProgressiveStream =
+        Pin<Box<dyn Stream<Item = Result<AnalyzeProgressiveEvent, Status>> + Send>>;
 
-    /// Each document through the mock's unary call, answered in order.
+    async fn capabilities(
+        &self,
+        request: Request<CapabilitiesRequest>,
+    ) -> Result<Response<CapabilitiesResponse>, Status> {
+        self.0.capabilities(request).await
+    }
+
+    async fn analyze_document_progressive(
+        &self,
+        mut request: Request<AnalyzePipelineRequest>,
+    ) -> Result<Response<Self::AnalyzeDocumentProgressiveStream>, Status> {
+        let original = std::mem::take(&mut request.get_mut().text);
+        request.get_mut().text = unpunctuated(&original);
+        let mut inner = self
+            .0
+            .analyze_document_progressive(request)
+            .await?
+            .into_inner();
+        let (tx, rx) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let mut source = Some(original);
+            while let Some(item) = inner.next().await {
+                let mapped = item.map(|mut ev| {
+                    if let Some(analyze_progressive_event::Event::Complete(ref mut g)) = ev.event {
+                        if let Some(s) = source.take() {
+                            g.source_text = s;
+                        }
+                    }
+                    ev
+                });
+                if tx.send(mapped).await.is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+
+    /// Each document through the mock's progressive call, answered in order.
     async fn analyze_stream(
         &self,
         request: Request<Streaming<AnalyzeStreamRequest>>,
@@ -297,32 +362,52 @@ impl AnalysisService for DemoAnalysis {
         let mock = self.0.clone();
         let (tx, rx) = mpsc::channel(16);
         tokio::spawn(async move {
-            let mut options = None;
+            let mut saw_header = false;
             while let Ok(Some(message)) = inbound.message().await {
-                let doc = match message.msg {
-                    Some(analyze_stream_request::Msg::Options(o)) => {
-                        options = Some(o);
+                let doc = match message.kind {
+                    Some(analyze_stream_request::Kind::Header(_)) => {
+                        if saw_header {
+                            let _ = tx
+                                .send(Err(Status::invalid_argument(
+                                    "header may only be the first message of the stream",
+                                )))
+                                .await;
+                            return;
+                        }
+                        saw_header = true;
                         continue;
                     }
-                    Some(analyze_stream_request::Msg::Doc(doc)) => doc,
+                    Some(analyze_stream_request::Kind::Document(doc)) => {
+                        if !saw_header {
+                            let _ = tx
+                                .send(Err(Status::invalid_argument(
+                                    "the first message of the stream must carry a header",
+                                )))
+                                .await;
+                            return;
+                        }
+                        doc
+                    }
                     None => continue,
                 };
-                let analyzed = mock
-                    .analyze(Request::new(AnalyzeRequest {
-                        text: unpunctuated(&doc.text),
-                        options: options.clone(),
-                    }))
-                    .await;
-                let result = match analyzed {
-                    Ok(ok) => analyze_stream_response::Result::Ok(ok.into_inner()),
-                    Err(status) => analyze_stream_response::Result::Error(AnalyzeStreamError {
-                        code: status.code() as i32,
-                        message: status.message().to_string(),
-                    }),
+                let outcome = match String::from_utf8(doc.text)
+                    .map_err(|_| Status::invalid_argument("document text is not UTF-8"))
+                    .map(|text| (text, doc.binding.clone()))
+                {
+                    Ok((text, binding)) => match analyze_one(&mock, text, binding).await {
+                        Ok(graph) => analyze_stream_response::Outcome::DocumentGraph(graph),
+                        Err(status) => {
+                            analyze_stream_response::Outcome::Failure(failure_from_status(status))
+                        }
+                    },
+                    Err(status) => {
+                        analyze_stream_response::Outcome::Failure(failure_from_status(status))
+                    }
                 };
                 let response = AnalyzeStreamResponse {
-                    sequence: doc.sequence,
-                    result: Some(result),
+                    id: doc.id,
+                    outcome: Some(outcome),
+                    binding: doc.binding,
                 };
                 if tx.send(Ok(response)).await.is_err() {
                     return;
@@ -332,11 +417,240 @@ impl AnalysisService for DemoAnalysis {
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
-    async fn get_capabilities(
+    async fn load_bundle(
         &self,
-        request: Request<GetCapabilitiesRequest>,
-    ) -> Result<Response<GetCapabilitiesResponse>, Status> {
-        self.0.get_capabilities(request).await
+        request: Request<LoadBundleRequest>,
+    ) -> Result<Response<LoadBundleResponse>, Status> {
+        self.0.load_bundle(request).await
+    }
+
+    async fn unload_bundle(
+        &self,
+        request: Request<UnloadBundleRequest>,
+    ) -> Result<Response<UnloadBundleResponse>, Status> {
+        self.0.unload_bundle(request).await
+    }
+
+    async fn round_trip_sparse_terms(
+        &self,
+        req: Request<SparseTermsResult>,
+    ) -> Result<Response<SparseTermsResult>, Status> {
+        self.0.round_trip_sparse_terms(req).await
+    }
+
+    async fn round_trip_token_vectors(
+        &self,
+        req: Request<TokenVectorsResult>,
+    ) -> Result<Response<TokenVectorsResult>, Status> {
+        self.0.round_trip_token_vectors(req).await
+    }
+
+    async fn round_trip_multi_res_vectors(
+        &self,
+        req: Request<MultiResVectorsResult>,
+    ) -> Result<Response<MultiResVectorsResult>, Status> {
+        self.0.round_trip_multi_res_vectors(req).await
+    }
+
+    async fn round_trip_rerank_scores(
+        &self,
+        req: Request<RerankScoresResult>,
+    ) -> Result<Response<RerankScoresResult>, Status> {
+        self.0.round_trip_rerank_scores(req).await
+    }
+
+    async fn round_trip_extraction(
+        &self,
+        req: Request<ExtractionResult>,
+    ) -> Result<Response<ExtractionResult>, Status> {
+        self.0.round_trip_extraction(req).await
+    }
+
+    async fn round_trip_records(
+        &self,
+        req: Request<RecordsResult>,
+    ) -> Result<Response<RecordsResult>, Status> {
+        self.0.round_trip_records(req).await
+    }
+
+    async fn round_trip_chunk_levels(
+        &self,
+        req: Request<ChunkLevelsResult>,
+    ) -> Result<Response<ChunkLevelsResult>, Status> {
+        self.0.round_trip_chunk_levels(req).await
+    }
+
+    async fn round_trip_document_graph(
+        &self,
+        req: Request<DocumentGraphRequest>,
+    ) -> Result<Response<DocumentGraphResponse>, Status> {
+        self.0.round_trip_document_graph(req).await
+    }
+
+    async fn inspect_document_graph(
+        &self,
+        req: Request<InspectDocumentGraphRequest>,
+    ) -> Result<Response<TypedDocumentResult>, Status> {
+        self.0.inspect_document_graph(req).await
+    }
+
+    async fn round_trip_typed_document(
+        &self,
+        req: Request<TypedDocumentResult>,
+    ) -> Result<Response<TypedDocumentResult>, Status> {
+        self.0.round_trip_typed_document(req).await
+    }
+
+    async fn project_search_document(
+        &self,
+        req: Request<ProjectSearchDocumentRequest>,
+    ) -> Result<Response<SearchDocumentProjection>, Status> {
+        self.0.project_search_document(req).await
+    }
+
+    async fn round_trip_search_projection(
+        &self,
+        req: Request<SearchDocumentProjection>,
+    ) -> Result<Response<SearchDocumentProjection>, Status> {
+        self.0.round_trip_search_projection(req).await
+    }
+
+    async fn analyze_query(
+        &self,
+        req: Request<AnalyzeQueryRequest>,
+    ) -> Result<Response<AnalyzeQueryResponse>, Status> {
+        self.0.analyze_query(req).await
+    }
+
+    async fn round_trip_analyze_query(
+        &self,
+        req: Request<AnalyzeQueryResponse>,
+    ) -> Result<Response<AnalyzeQueryResponse>, Status> {
+        self.0.round_trip_analyze_query(req).await
+    }
+
+    async fn rerank_and_highlight(
+        &self,
+        req: Request<RerankAndHighlightRequest>,
+    ) -> Result<Response<RerankAndHighlightResponse>, Status> {
+        self.0.rerank_and_highlight(req).await
+    }
+
+    async fn round_trip_rerank_and_highlight(
+        &self,
+        req: Request<RerankAndHighlightResponse>,
+    ) -> Result<Response<RerankAndHighlightResponse>, Status> {
+        self.0.round_trip_rerank_and_highlight(req).await
+    }
+
+    async fn inspect_document_window(
+        &self,
+        req: Request<DocumentWindowRequest>,
+    ) -> Result<Response<DocumentWindowResponse>, Status> {
+        self.0.inspect_document_window(req).await
+    }
+
+    async fn project_chunks(
+        &self,
+        req: Request<ProjectChunksRequest>,
+    ) -> Result<Response<ProjectChunksResponse>, Status> {
+        self.0.project_chunks(req).await
+    }
+
+    async fn list_output_formats(
+        &self,
+        req: Request<ListOutputFormatsRequest>,
+    ) -> Result<Response<ListOutputFormatsResponse>, Status> {
+        self.0.list_output_formats(req).await
+    }
+
+    async fn format_document(
+        &self,
+        req: Request<FormatDocumentRequest>,
+    ) -> Result<Response<FormatDocumentResponse>, Status> {
+        self.0.format_document(req).await
+    }
+}
+
+struct DemoInference;
+
+#[tonic::async_trait]
+impl GrpcInferenceService for DemoInference {
+    async fn server_live(
+        &self,
+        _request: Request<ServerLiveRequest>,
+    ) -> Result<Response<ServerLiveResponse>, Status> {
+        Ok(Response::new(ServerLiveResponse { live: true }))
+    }
+
+    async fn server_ready(
+        &self,
+        _request: Request<ServerReadyRequest>,
+    ) -> Result<Response<ServerReadyResponse>, Status> {
+        Ok(Response::new(ServerReadyResponse { ready: true }))
+    }
+
+    async fn model_ready(
+        &self,
+        _request: Request<ModelReadyRequest>,
+    ) -> Result<Response<ModelReadyResponse>, Status> {
+        Ok(Response::new(ModelReadyResponse { ready: true }))
+    }
+
+    async fn server_metadata(
+        &self,
+        _request: Request<ServerMetadataRequest>,
+    ) -> Result<Response<ServerMetadataResponse>, Status> {
+        Err(Status::unimplemented("demo inference server"))
+    }
+
+    async fn model_metadata(
+        &self,
+        _request: Request<ModelMetadataRequest>,
+    ) -> Result<Response<ModelMetadataResponse>, Status> {
+        Err(Status::unimplemented("demo inference server"))
+    }
+
+    async fn model_infer(
+        &self,
+        request: Request<ModelInferRequest>,
+    ) -> Result<Response<ModelInferResponse>, Status> {
+        let inner = request.into_inner();
+        let input = inner
+            .inputs
+            .first()
+            .ok_or_else(|| Status::invalid_argument("missing texts input tensor"))?;
+        let raw_texts = input
+            .contents
+            .as_ref()
+            .map(|c| c.bytes_contents.as_slice())
+            .unwrap_or(&[]);
+        if raw_texts.is_empty() {
+            return Err(Status::invalid_argument("empty texts input tensor"));
+        }
+        let mut fp32_contents = Vec::with_capacity(raw_texts.len() * DIM);
+        for raw in raw_texts {
+            let text = std::str::from_utf8(raw)
+                .map_err(|_| Status::invalid_argument("input text is not UTF-8"))?;
+            fp32_contents.extend(embed(text));
+        }
+        Ok(Response::new(ModelInferResponse {
+            model_name: inner.model_name,
+            model_version: inner.model_version,
+            id: inner.id,
+            parameters: HashMap::new(),
+            outputs: vec![InferOutputTensor {
+                name: "embeddings".into(),
+                datatype: "FP32".into(),
+                shape: vec![raw_texts.len() as i64, DIM as i64],
+                parameters: HashMap::new(),
+                contents: Some(InferTensorContents {
+                    fp32_contents,
+                    ..Default::default()
+                }),
+            }],
+            raw_output_contents: Vec::new(),
+        }))
     }
 }
 
@@ -347,6 +661,11 @@ async fn serve_analysis() -> String {
         Server::builder()
             .add_service(
                 AnalysisServiceServer::new(DemoAnalysis(Arc::new(MockAnalysis::default())))
+                    .max_decoding_message_size(MAX_MESSAGE_BYTES)
+                    .max_encoding_message_size(MAX_MESSAGE_BYTES),
+            )
+            .add_service(
+                GrpcInferenceServiceServer::new(DemoInference)
                     .max_decoding_message_size(MAX_MESSAGE_BYTES)
                     .max_encoding_message_size(MAX_MESSAGE_BYTES),
             )
@@ -428,6 +747,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client.add_documents(ReceiverStream::new(rx)).await?;
         let (vtx, vrx) = mpsc::channel(1);
         vtx.send(AddVectorsRequest {
+            materialized_rows: Vec::new(),
             vectors: vectors[start * DIM..(start + SHARD_DOCS) * DIM].to_vec(),
             dim: DIM as u32,
         })

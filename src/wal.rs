@@ -2354,8 +2354,8 @@ mod tests {
             let path = manifest_path(&dir);
             let text = std::fs::read_to_string(&path).unwrap();
             std::fs::write(&path, format!("{retired_line}\n{text}")).unwrap();
-            let err = read_manifest(&dir)
-                .expect_err("manifest carrying a retired key must fail closed");
+            let err =
+                read_manifest(&dir).expect_err("manifest carrying a retired key must fail closed");
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
             assert!(
                 err.to_string().contains("unknown field"),
