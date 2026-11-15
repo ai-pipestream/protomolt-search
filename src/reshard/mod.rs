@@ -37,6 +37,7 @@ mod placement_split;
 mod replay;
 mod segment_compaction;
 mod segment_sources;
+mod source_agreement;
 mod tree_logs;
 mod tree_split;
 

@@ -344,10 +344,13 @@ pub(super) fn require_complete_history(manifest: &WalManifest, what: &Path) -> R
 /// across every input must agree, because the children are ONE corpus
 /// under ONE plan — contradictory bindings mean the inputs were mapped
 /// under different plans and their columns must not merge. `None` when
-/// no input was ever bound (hand-built columns bind nothing).
+/// no input was ever bound (hand-built columns bind nothing). Every split,
+/// merge and compaction reads its inputs' binding here before it replays,
+/// so the inputs are first held to one derived-column declaration.
 pub(super) fn read_gens_binding(
     gens: &[PathBuf],
 ) -> Result<Option<crate::postings::StoredBinding>, String> {
+    super::merge_inputs::require_one_declaration(gens)?;
     let mut bound: Option<(crate::postings::StoredBinding, PathBuf)> = None;
     for gen in gens {
         let path = wal::markers_path(gen);

@@ -4,14 +4,17 @@
 mod common;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use common::start_empty_node;
 use pipestream_search::analyzer::{body_spec, SessionLayers, NATIVE_ANALYSIS_BACKEND};
 use pipestream_search::derived::{spec_from_config, Declaration, DerivedColumnConfig};
 use pipestream_search::node::{Layout, NodeConfig};
 use pipestream_search::pb::node_service_client::NodeServiceClient;
-use pipestream_search::pb::wal::{wal_record, FlushMarker, LoggedAddVectors};
-use pipestream_search::pb::{AddDocumentsRequest, AddVectorsRequest, AnalysisSpec, FlushRequest};
+use pipestream_search::pb::wal::{wal_record, FlushMarker, LoggedAddDocuments, LoggedAddVectors};
+use pipestream_search::pb::{
+    AddDocumentsRequest, AddVectorsRequest, AnalysisSpec, FlushRequest, IntegerValue,
+};
 use pipestream_search::placement::{PlacementNodeConfig, PlacementTreeConfig};
 use pipestream_search::postings::AnalyzedDoc;
 use pipestream_search::reshard;
@@ -22,11 +25,29 @@ use tokio_stream::wrappers::ReceiverStream;
 const DIM: usize = 16;
 const BITS: usize = 4;
 
-fn tempdir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("wave2-reshard-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// A scratch directory removed when the test ends, pass or fail.
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("wave2-reshard-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+}
+
+impl std::ops::Deref for TempDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 fn derived(expression: &str) -> Vec<DerivedColumnConfig> {
@@ -65,7 +86,11 @@ fn generation(dir: &Path, name: &str, id: u64, declaration: &[DerivedColumnConfi
         format_version: wal::FORMAT_VERSION,
         derived_fingerprint: fingerprint,
         derived: declaration.to_vec(),
-        columns: None,
+        columns: Some(wal::ColumnTable {
+            fields: vec!["body".into()],
+            integers: vec!["placement".into(), "bucket".into()],
+            ..Default::default()
+        }),
     };
     manifest.set_backend_config(
         pipestream_search::vector::embedded_turbovec_config(BITS, &shift, &scale).unwrap(),
@@ -81,6 +106,24 @@ fn generation(dir: &Path, name: &str, id: u64, declaration: &[DerivedColumnConfi
                 materialized_rows: Vec::new(),
             }),
             stable_routing_keys: Vec::new(),
+        }))
+        .unwrap();
+    // One document already derived under this log's declaration.
+    let mut row = document(id as usize);
+    if !declaration.is_empty() {
+        row.integers.push(IntegerValue {
+            field: "bucket".into(),
+            value: 7,
+        });
+        row.derived_fingerprint = wal::read_manifest(&wal::gen_dir(&root, 0))
+            .unwrap()
+            .derived_fingerprint;
+    }
+    writer
+        .append(wal_record::Op::AddDocuments(LoggedAddDocuments {
+            first_id: id,
+            documents: vec![row],
+            ..Default::default()
         }))
         .unwrap();
     writer
@@ -129,13 +172,13 @@ fn merge(dir: &Path, out: &str, gens: &[PathBuf]) -> Result<reshard::ReshardOutp
 
 #[test]
 fn merge_refuses_inputs_under_different_derived_declarations_in_either_order() {
-    let dir = tempdir("merge-derived");
-    let year = generation(&dir, "year.wal", 0, &derived("calendar.year(decided)"));
-    let month = generation(&dir, "month.wal", 1, &derived("calendar.month(decided)"));
+    let dir = TempDir::new("merge-derived");
+    let year = generation(&dir, "year.wal", 0, &derived("calendar.year(placement)"));
+    let month = generation(&dir, "month.wal", 1, &derived("calendar.month(placement)"));
     let plain = generation(&dir, "plain.wal", 2, &[]);
 
     // The fixture is sound: inputs under one declaration merge.
-    let same = generation(&dir, "same.wal", 3, &derived("calendar.year(decided)"));
+    let same = generation(&dir, "same.wal", 3, &derived("calendar.year(placement)"));
     merge(&dir, "ok", &[year.clone(), same]).unwrap();
 
     for (out, pair) in [
@@ -148,25 +191,78 @@ fn merge_refuses_inputs_under_different_derived_declarations_in_either_order() {
             Ok(_) => panic!("{out}: a merge across derived declarations was published"),
             Err(err) => err,
         };
-        assert!(err.contains("derived-column declaration"), "{out}: {err}");
+        assert!(err.contains("must share one declaration"), "{out}: {err}");
         assert!(
             !dir.join(out).join("shard-0.tv").exists(),
             "{out}: the refused merge left an image"
         );
     }
-    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The declared-against-declared and declared-against-none pairs, both
+/// ways round; `run` is one multi-input entry point over the pair.
+fn refuses_mixed_declarations(tag: &str, run: impl Fn(&Path, &[PathBuf]) -> Result<(), String>) {
+    let dir = TempDir::new(tag);
+    let year = generation(&dir, "year.wal", 0, &derived("calendar.year(placement)"));
+    let month = generation(&dir, "month.wal", 1, &derived("calendar.month(placement)"));
+    let plain = generation(&dir, "plain.wal", 2, &[]);
+    for (out, pair) in [
+        ("year-month", [year.clone(), month.clone()]),
+        ("month-year", [month, year.clone()]),
+        ("year-plain", [year.clone(), plain.clone()]),
+        ("plain-year", [plain, year]),
+    ] {
+        let err = match run(&dir.join(out), &pair) {
+            Ok(()) => panic!("{tag} {out}: children were published across declarations"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("must share one declaration"),
+            "{tag} {out}: {err}"
+        );
+    }
+}
+
+#[test]
+fn a_hash_split_refuses_inputs_under_different_derived_declarations() {
+    refuses_mixed_declarations("split-logs", |out, gens| {
+        reshard::split_logs(gens, 1, out, 0, 1 << 20, true, None, &mut analyzer(false)).map(|_| ())
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tree_split_refuses_inputs_under_different_derived_declarations() {
+    refuses_mixed_declarations("split-tree", |out, gens| {
+        let options = reshard::TreeSplitOptions::default();
+        let mut analyze = analyzer(true);
+        reshard::split_placement_tree_logs(
+            gens,
+            &one_leaf(),
+            out,
+            &[0],
+            None,
+            options,
+            &mut analyze,
+        )
+        .map(|_| ())
+    });
 }
 
 fn document(i: usize) -> AddDocumentsRequest {
     AddDocumentsRequest {
         text: format!("opinion {i} about search and retrieval"),
         analysis: Some(body_spec()),
+        integers: vec![IntegerValue {
+            field: "placement".into(),
+            value: 1_700_000_000_000 + i as i64,
+        }],
         ..Default::default()
     }
 }
 
-/// A sealed, flushed segmented shard of `n` aligned rows; its generation.
-async fn sealed_source(dir: &Path, n: usize) -> PathBuf {
+/// A sealed, flushed segmented shard of `n` aligned rows written under
+/// `derived`; its generation.
+async fn sealed_source(dir: &Path, n: usize, derived: Option<Arc<Declaration>>) -> PathBuf {
     let index_path = dir.join("source.tv");
     let (addr, handle) = start_empty_node(NodeConfig {
         index_path: Some(index_path.clone()),
@@ -176,6 +272,7 @@ async fn sealed_source(dir: &Path, n: usize) -> PathBuf {
         wal: true,
         wal_buckets: 4,
         integer_fields: vec!["placement".into()],
+        derived,
         ..Default::default()
     })
     .await;
@@ -249,8 +346,8 @@ fn split_from_segments(gen: &Path, out: &Path) -> Result<reshard::TreeReshardOut
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_from_segments_split_refuses_a_spill_bucket_whose_analysis_sidecar_is_empty() {
-    let dir = tempdir("sidecar");
-    let gen = sealed_source(&dir, 24).await;
+    let dir = TempDir::new("sidecar");
+    let gen = sealed_source(&dir, 24, None).await;
     let source_generation = wal::read_manifest(&gen).unwrap().generation;
 
     // The fixture is sound: the same split with its sidecar intact
@@ -272,5 +369,32 @@ async fn a_from_segments_split_refuses_a_spill_bucket_whose_analysis_sidecar_is_
         err.contains("analysis sidecar is missing or truncated"),
         "{err}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_from_segments_split_refuses_segments_whose_declaration_differs_from_the_log() {
+    let dir = TempDir::new("segment-declaration");
+    let compile = |expression: &str| {
+        Declaration::compile(&spec_from_config(&derived(expression)).unwrap()).unwrap()
+    };
+    let sealed_under = Arc::new(compile("calendar.year(placement)"));
+    let gen = sealed_source(&dir, 24, Some(sealed_under)).await;
+
+    // The sealed rows hold years; the log's manifest now names the same
+    // column as a month, as it would after its shard was redeclared.
+    let mut manifest = wal::read_manifest(&gen).unwrap();
+    manifest.derived_fingerprint = compile("calendar.month(placement)")
+        .fingerprint()
+        .to_string();
+    manifest.derived = derived("calendar.month(placement)");
+    wal::write_manifest(&gen, &manifest).unwrap();
+
+    let err = match split_from_segments(&gen, &dir.join("restamped")) {
+        Ok(_) => panic!("rows derived as years were published under the month declaration"),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("derived-column declaration") && err.contains("log manifest"),
+        "{err}"
+    );
 }

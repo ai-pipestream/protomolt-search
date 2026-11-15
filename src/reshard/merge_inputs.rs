@@ -1,4 +1,4 @@
-//! The inputs of a WAL merge, checked to share one configuration before any replay.
+//! Multi-input reshard checks: one configuration and one derived declaration before any replay.
 
 use std::path::{Path, PathBuf};
 
@@ -52,17 +52,43 @@ fn require_same_inputs(
             first.bucket_count
         ));
     }
-    if first.derived_fingerprint != manifest.derived_fingerprint {
-        return Err(format!(
-            "{} records derived-column declaration {} and {} records {}; merge inputs must \
-             share one declaration, or none",
-            first_gen.display(),
-            declaration_name(first),
-            gen.display(),
-            declaration_name(manifest)
-        ));
+    require_same_declaration(first, first_gen, manifest, gen)?;
+    Ok(())
+}
+
+/// Every input generation records one derived-column declaration, or
+/// none: a child is stamped with the first input's, so an input under
+/// another would be republished under a meaning it was not computed with.
+pub(super) fn require_one_declaration(gens: &[PathBuf]) -> Result<(), String> {
+    let mut first: Option<WalManifest> = None;
+    for gen in gens {
+        let manifest = read_gen_manifest(gen)?;
+        manifest_derived(&manifest).map_err(|e| format!("{}: {e}", gen.display()))?;
+        match &first {
+            Some(first) => require_same_declaration(first, &gens[0], &manifest, gen)?,
+            None => first = Some(manifest),
+        }
     }
     Ok(())
+}
+
+fn require_same_declaration(
+    first: &WalManifest,
+    first_gen: &Path,
+    manifest: &WalManifest,
+    gen: &Path,
+) -> Result<(), String> {
+    if first.derived_fingerprint == manifest.derived_fingerprint {
+        return Ok(());
+    }
+    Err(format!(
+        "{} records derived-column declaration {} and {} records {}; inputs must share one \
+         declaration, or none",
+        first_gen.display(),
+        declaration_name(first),
+        gen.display(),
+        declaration_name(manifest)
+    ))
 }
 
 fn declaration_name(manifest: &WalManifest) -> String {
