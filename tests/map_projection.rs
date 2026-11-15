@@ -1,8 +1,19 @@
 mod common;
 
+use std::path::{Path, PathBuf};
+
+use pb::node_service_client::NodeServiceClient;
 use pipestream_search::{
+    analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND},
+    harness::embedded_backend_request,
+    index_contract::decode as decode_contract,
     mapping::{derive_plan, derive_plan_with_definition, Extractor},
+    node::{self, Layout, NodeConfig},
     pb,
+    postings::Bm25Reader,
+    reshard,
+    segments::OpenedSegmentSet,
+    wal,
 };
 use prost::Message;
 use prost_types::field_descriptor_proto::{Label, Type};
@@ -1230,64 +1241,98 @@ fn integer_maps_source(schema: &[u8], id: u64) -> Vec<u8> {
     bytes
 }
 
-#[tokio::test]
-async fn mapped_integer_maps_bind_persist_and_compact_without_rounding() {
-    use pb::node_service_client::NodeServiceClient;
-    use pipestream_search::{
-        node::{self, Layout, NodeConfig},
-        postings::Bm25Reader,
-        segments::OpenedSegmentSet,
+struct IntMapFixture {
+    schema: Vec<u8>,
+    plan: pb::MappedPlan,
+    bind: pb::MappedBind,
+    sources: Vec<Vec<u8>>,
+}
+
+fn mapped_frames(bind: pb::MappedBind, docs: Vec<Vec<u8>>) -> Vec<pb::IngestMappedRequest> {
+    use pb::ingest_mapped_request::Payload;
+    let head = pb::IngestMappedRequest {
+        payload: Some(Payload::Bind(bind)),
     };
-    let schema = integer_maps_schema();
-    let policy = integer_maps_policy();
-    let (planner, planner_task) = common::start_coordinator(Vec::new()).await;
-    let mut planner = pb::search_service_client::SearchServiceClient::connect(planner)
-        .await
-        .unwrap();
-    let plan = planner
-        .plan_index(pb::PlanIndexRequest {
-            descriptor_set: schema.clone(),
-            message_type: "map_projection.Record".into(),
-            index_definition: Some(policy.clone()),
-            ..Default::default()
-        })
-        .await
+    let tail = docs.into_iter().map(|d| pb::IngestMappedRequest {
+        payload: Some(Payload::Document(d)),
+    });
+    std::iter::once(head).chain(tail).collect()
+}
+
+fn inspect_integer_map_reader(reader: &Bm25Reader, fx: &IntMapFixture, ids: &mut Vec<u64>) {
+    reader.verify_integrity().unwrap();
+    let stored = reader.binding().unwrap();
+    assert_eq!(stored.plan_fingerprint, fx.plan.fingerprint);
+    let contract = decode_contract(&stored.index_contract, &fx.plan.fingerprint)
         .unwrap()
-        .into_inner()
-        .plan
         .unwrap();
-    let bind = pb::MappedBind {
-        descriptor_set: schema.clone(),
-        message_type: "map_projection.Record".into(),
-        expected_fingerprint: plan.fingerprint.clone(),
-        index_definition: Some(policy.clone()),
-        analysis: Some(pipestream_search::analyzer::body_spec()),
-        ..Default::default()
-    };
-    let frames = |bind: pb::MappedBind, docs: Vec<Vec<u8>>| {
-        std::iter::once(pb::IngestMappedRequest {
-            payload: Some(pb::ingest_mapped_request::Payload::Bind(bind)),
-        })
-        .chain(docs.into_iter().map(|data| pb::IngestMappedRequest {
-            payload: Some(pb::ingest_mapped_request::Payload::Document(data)),
-        }))
-        .collect::<Vec<_>>()
-    };
+    assert_eq!(
+        contract.index_definition.as_ref(),
+        fx.plan.index_definition.as_ref()
+    );
+    let id_col = reader.unsigned_integer_index("id").unwrap();
+    let signed = reader.map_integer_index("attrs").unwrap();
+    let unsigned = reader.map_unsigned_integer_index("weights").unwrap();
+    let u64_max_key = u64::MAX.to_string();
+    for row in 0..reader.next_doc_id() {
+        let id = reader.unsigned_integer_value(id_col, row).unwrap();
+        ids.push(id);
+        let actual_i64 = reader
+            .map_integer_key_ord(signed, "")
+            .and_then(|k| reader.map_integer_value(signed, k, row));
+        let exp_i64 = (id == 1)
+            .then_some(i64::MIN)
+            .or_else(|| (id == 2).then_some(-((1 << 53) + 1)));
+        assert_eq!(actual_i64, exp_i64);
+        let actual_u64 = reader
+            .map_unsigned_integer_key_ord(unsigned, &u64_max_key)
+            .and_then(|k| reader.map_unsigned_integer_value(unsigned, k, row));
+        let exp_u64 = (id == 1)
+            .then_some(u64::MAX)
+            .or_else(|| (id == 2).then_some((1 << 53) + 1));
+        assert_eq!(actual_u64, exp_u64);
+        let (source, ordinal) = reader.protobuf_source(row).unwrap().unwrap();
+        assert_eq!(
+            (&source.descriptor_set, &source.payload, ordinal),
+            (&fx.schema, &fx.sources[id as usize - 1], None)
+        );
+    }
+}
+
+fn verify_integer_map_layout(layout: Layout, path: &Path, fx: &IntMapFixture, exp: &[u64]) {
+    let mut ids = Vec::new();
+    if layout == Layout::Segments {
+        let set = OpenedSegmentSet::open(node::segments_root(path)).unwrap();
+        for segment in 0..set.len() {
+            inspect_integer_map_reader(set.bm25(segment), fx, &mut ids);
+        }
+    } else {
+        let gen_dir = node::generation_dir(path);
+        let file = if gen_dir.exists() {
+            node::generation_bm25(&gen_dir)
+        } else {
+            node::bm25_sidecar_path(path)
+        };
+        inspect_integer_map_reader(&Bm25Reader::open(&file).unwrap(), fx, &mut ids);
+    }
+    ids.sort();
+    assert_eq!(ids, exp);
+}
+
+async fn assert_wrong_integer_map_family_refused(fx: &IntMapFixture) {
     // A wrong-family declaration must fail at bind, before accepting rows or
     // installing a durable binding on the receiver.
     let (wrong, wrong_task) = common::start_empty_node(NodeConfig {
         unsigned_integer_fields: vec!["id".into()],
         map_numeric_fields: vec!["attrs".into(), "weights".into()],
-        analysis_addr: Some(pipestream_search::analyzer::NATIVE_ANALYSIS_BACKEND.into()),
+        analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
         ..Default::default()
     })
     .await;
     let mut wrong = NodeServiceClient::connect(wrong).await.unwrap();
+    let batch = mapped_frames(fx.bind.clone(), vec![integer_maps_source(&fx.schema, 1)]);
     let error = wrong
-        .ingest_mapped(tokio_stream::iter(frames(
-            bind.clone(),
-            vec![integer_maps_source(&schema, 1)],
-        )))
+        .ingest_mapped(tokio_stream::iter(batch))
         .await
         .unwrap_err();
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
@@ -1296,171 +1341,120 @@ async fn mapped_integer_maps_bind_persist_and_compact_without_rounding() {
         error.message().contains("--map-unsigned-integer-fields"),
         "{error}"
     );
-    assert_eq!(
-        wrong
-            .health(pb::HealthRequest {})
-            .await
-            .unwrap()
-            .into_inner()
-            .document_slots,
-        0
-    );
+    let health = wrong.health(pb::HealthRequest {}).await.unwrap();
+    assert_eq!(health.into_inner().document_slots, 0);
     wrong_task.abort();
     let _ = wrong_task.await;
-    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+}
+
+async fn seed_and_verify_integer_map_wal(cfg: &NodeConfig, fx: &IntMapFixture) {
+    let path = cfg.index_path.as_deref().unwrap();
+    let (address, server) = common::start_empty_node(cfg.clone()).await;
+    let mut client = NodeServiceClient::connect(address).await.unwrap();
+    let (shift, scale) = common::fit_calibration(8, 4, &common::unit_vectors(64, 8, 712));
+    client
+        .configure_vector_backend(embedded_backend_request(8, 4, &shift, &scale))
+        .await
+        .unwrap();
+    for docs in [fx.sources[..2].to_vec(), fx.sources[2..].to_vec()] {
+        let count = docs.len() as u64;
+        let stream = tokio_stream::iter(mapped_frames(fx.bind.clone(), docs));
+        let resp = client.ingest_mapped(stream).await.unwrap().into_inner();
+        assert_eq!(resp.added, count);
+        client.flush(pb::FlushRequest {}).await.unwrap();
+    }
+    verify_integer_map_layout(cfg.layout, path, fx, &[1, 2, 3]);
+    let manifest = wal::read_manifest(&reshard::resolve_gen(&wal::wal_dir(path)).unwrap()).unwrap();
+    assert_eq!(manifest.format_version, wal::FORMAT_VERSION);
+    assert!(manifest.columns.is_some());
+    drop(client);
+    server.abort();
+    let _ = server.await;
+}
+
+async fn reopen_refuse_and_compact_integer_maps(cfg: NodeConfig, root: &Path, fx: &IntMapFixture) {
+    let (layout, path) = (cfg.layout, cfg.index_path.clone().unwrap());
+    let (address, server) = common::start_opened_node(cfg).await;
+    let mut client = NodeServiceClient::connect(address).await.unwrap();
+    verify_integer_map_layout(layout, &path, fx, &[1, 2, 3]);
+    // A valid alternative projection cannot silently reinterpret the file.
+    let mut changed = fx.bind.clone();
+    changed.index_definition.as_mut().unwrap().projections[3].kind = pb::MappedKind::Int32 as i32;
+    changed.expected_fingerprint = derive_plan_with_definition(
+        &fx.schema,
+        "map_projection.Record",
+        changed.index_definition.as_ref(),
+    )
+    .unwrap()
+    .fingerprint;
+    let stream = tokio_stream::iter(mapped_frames(changed, Vec::new()));
+    let error = client.ingest_mapped(stream).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(error.message().contains("durably bound"), "{error}");
+    let del = pb::DeleteDocumentsRequest {
+        doc_ids: vec![0],
+        ..Default::default()
+    };
+    client.delete_documents(del).await.unwrap();
+    let work_dir = format!("{}/compact-{layout:?}", root.display());
+    let compact = pb::CompactShardRequest {
+        work_dir,
+        ..Default::default()
+    };
+    client.compact_shard(compact).await.unwrap();
+    verify_integer_map_layout(layout, &path, fx, &[2, 3]);
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn mapped_integer_maps_bind_persist_and_compact_without_rounding() {
+    let (schema, policy) = (integer_maps_schema(), integer_maps_policy());
+    let (planner, planner_task) = common::start_coordinator(Vec::new()).await;
+    let mut planner = pb::search_service_client::SearchServiceClient::connect(planner)
+        .await
+        .unwrap();
+    let req = pb::PlanIndexRequest {
+        descriptor_set: schema.clone(),
+        message_type: "map_projection.Record".into(),
+        index_definition: Some(policy.clone()),
+        ..Default::default()
+    };
+    let resp = planner.plan_index(req).await.unwrap().into_inner();
+    let plan = resp.plan.unwrap();
+    let bind = pb::MappedBind {
+        descriptor_set: schema.clone(),
+        message_type: "map_projection.Record".into(),
+        expected_fingerprint: plan.fingerprint.clone(),
+        index_definition: Some(policy),
+        analysis: Some(body_spec()),
+        ..Default::default()
+    };
+    let sources = (1..=3).map(|id| integer_maps_source(&schema, id)).collect();
+    let fx = IntMapFixture {
+        schema,
+        plan,
+        bind,
+        sources,
+    };
+    assert_wrong_integer_map_family_refused(&fx).await;
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("mapped-integer-maps-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
-    let sources: Vec<_> = (1..=3).map(|id| integer_maps_source(&schema, id)).collect();
     for layout in [Layout::SingleImage, Layout::Segments] {
-        let path = root.join(format!("{layout:?}.tv"));
         let config = NodeConfig {
-            index_path: Some(path.clone()),
+            index_path: Some(root.join(format!("{layout:?}.tv"))),
             layout,
             wal: true,
             wal_buckets: 2,
             unsigned_integer_fields: vec!["id".into()],
             map_integer_fields: vec!["attrs".into()],
             map_unsigned_integer_fields: vec!["weights".into()],
-            analysis_addr: Some(pipestream_search::analyzer::NATIVE_ANALYSIS_BACKEND.into()),
+            analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
             ..Default::default()
         };
-        let verify = |expected: &[u64]| {
-            let mut ids = Vec::new();
-            let mut inspect = |reader: &Bm25Reader| {
-                reader.verify_integrity().unwrap();
-                let stored = reader.binding().unwrap();
-                assert_eq!(stored.plan_fingerprint, plan.fingerprint);
-                let contract = pipestream_search::index_contract::decode(
-                    &stored.index_contract,
-                    &plan.fingerprint,
-                )
-                .unwrap()
-                .unwrap();
-                assert_eq!(
-                    contract.index_definition.as_ref(),
-                    plan.index_definition.as_ref()
-                );
-                let id_column = reader.unsigned_integer_index("id").unwrap();
-                let signed = reader.map_integer_index("attrs").unwrap();
-                let unsigned = reader.map_unsigned_integer_index("weights").unwrap();
-                for row in 0..reader.next_doc_id() {
-                    let id = reader.unsigned_integer_value(id_column, row).unwrap();
-                    ids.push(id);
-                    assert_eq!(
-                        reader
-                            .map_integer_key_ord(signed, "")
-                            .and_then(|key| reader.map_integer_value(signed, key, row)),
-                        match id {
-                            1 => Some(i64::MIN),
-                            2 => Some(-((1 << 53) + 1)),
-                            _ => None,
-                        }
-                    );
-                    assert_eq!(
-                        reader
-                            .map_unsigned_integer_key_ord(unsigned, &u64::MAX.to_string())
-                            .and_then(|key| reader.map_unsigned_integer_value(unsigned, key, row)),
-                        match id {
-                            1 => Some(u64::MAX),
-                            2 => Some((1 << 53) + 1),
-                            _ => None,
-                        }
-                    );
-                    let (source, ordinal) = reader.protobuf_source(row).unwrap().unwrap();
-                    assert_eq!(source.descriptor_set, schema);
-                    assert_eq!(source.payload, sources[id as usize - 1]);
-                    assert_eq!(ordinal, None);
-                }
-            };
-            if layout == Layout::Segments {
-                let set = OpenedSegmentSet::open(node::segments_root(&path)).unwrap();
-                for segment in 0..set.len() {
-                    inspect(set.bm25(segment));
-                }
-            } else {
-                let generation = node::generation_dir(&path);
-                let file = if generation.exists() {
-                    node::generation_bm25(&generation)
-                } else {
-                    node::bm25_sidecar_path(&path)
-                };
-                inspect(&Bm25Reader::open(&file).unwrap());
-            }
-            ids.sort();
-            assert_eq!(ids, expected);
-        };
-        let (address, server) = common::start_empty_node(config.clone()).await;
-        let mut client = NodeServiceClient::connect(address).await.unwrap();
-        let (shift, scale) = common::fit_calibration(8, 4, &common::unit_vectors(64, 8, 712));
-        client
-            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
-                8, 4, &shift, &scale,
-            ))
-            .await
-            .unwrap();
-        for docs in [sources[..2].to_vec(), sources[2..].to_vec()] {
-            let count = docs.len() as u64;
-            let response = client
-                .ingest_mapped(tokio_stream::iter(frames(bind.clone(), docs)))
-                .await
-                .unwrap()
-                .into_inner();
-            assert_eq!(response.added, count);
-            client.flush(pb::FlushRequest {}).await.unwrap();
-        }
-        verify(&[1, 2, 3]);
-        let generation =
-            pipestream_search::reshard::resolve_gen(&pipestream_search::wal::wal_dir(&path))
-                .unwrap();
-        let manifest = pipestream_search::wal::read_manifest(&generation).unwrap();
-        assert_eq!(manifest.format_version, 8);
-        assert!(
-            manifest.columns.is_some(),
-            "complete column tables require the new format"
-        );
-        drop(client);
-        server.abort();
-        let _ = server.await;
-        let (address, server) = common::start_opened_node(config).await;
-        let mut client = NodeServiceClient::connect(address).await.unwrap();
-        verify(&[1, 2, 3]);
-        // A valid alternative projection cannot silently reinterpret the file.
-        let mut changed = bind.clone();
-        changed.index_definition.as_mut().unwrap().projections[3].kind =
-            pb::MappedKind::Int32 as i32;
-        changed.expected_fingerprint = derive_plan_with_definition(
-            &schema,
-            "map_projection.Record",
-            changed.index_definition.as_ref(),
-        )
-        .unwrap()
-        .fingerprint;
-        let error = client
-            .ingest_mapped(tokio_stream::iter(frames(changed, Vec::new())))
-            .await
-            .unwrap_err();
-        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-        assert!(error.message().contains("durably bound"), "{error}");
-        client
-            .delete_documents(pb::DeleteDocumentsRequest {
-                doc_ids: vec![0],
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        client
-            .compact_shard(pb::CompactShardRequest {
-                work_dir: root
-                    .join(format!("compact-{layout:?}"))
-                    .display()
-                    .to_string(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        verify(&[2, 3]);
-        server.abort();
-        let _ = server.await;
+        seed_and_verify_integer_map_wal(&config, &fx).await;
+        reopen_refuse_and_compact_integer_maps(config, &root, &fx).await;
     }
     planner_task.abort();
     let _ = planner_task.await;

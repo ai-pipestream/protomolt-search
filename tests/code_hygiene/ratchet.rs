@@ -101,51 +101,33 @@ const fn base(module: &'static str) -> ModuleAllowance {
 pub(crate) const RATCHET: &[ModuleAllowance] = &[
     base("crates/protomolt-search-embedded/tests/dependency_gate").comments(1, 0),
     base("crates/protomolt-search-embedded/tests/document_grants").test_fn_lines(126, 1),
-    base("src/analyzer_wire").fn_lines(90, 1),
     base("src/bin/console").comments(1, 0),
     base("src/boolean_bits").comments(3, 0),
     base("src/calendar").comments(1, 0),
-    base("src/capacity_tiers")
-        .fn_lines(366, 4)
-        .allows(1, 0)
-        .comments(1, 2),
+    base("src/capacity_tiers").comments(1, 1),
     base("src/chunked").params(8, 2).allows(2, 0),
     base("src/column_stats").fn_lines(109, 1),
     base("src/compaction")
         .fn_lines(211, 3)
         .test_fn_lines(188, 1),
     base("src/control_plane")
-        .fn_lines(299, 5)
-        .test_fn_lines(144, 2)
-        .allows(1, 0)
+        .fn_lines(299, 4)
+        .test_fn_lines(130, 1)
         .comments(8, 0),
     base("src/coordinator")
         .fn_lines(455, 37)
         .test_fn_lines(177, 4)
         .params(11, 5)
         .allows(5, 0),
-    base("src/demo").fn_lines(112, 1).comments(1, 0),
-    base("src/dense_policy").fn_lines(191, 1).comments(5, 0),
+    base("src/demo").comments(1, 0),
     base("src/document_catalog")
-        .fn_lines(275, 19)
-        .test_fn_lines(253, 6)
-        .comments(9, 0),
-    base("src/embedded").fn_lines(90, 1),
-    base("src/explain").fn_lines(140, 3).comments(1, 0),
+        .fn_lines(275, 6)
+        .test_fn_lines(253, 3)
+        .comments(3, 0),
     base("src/facet_rows").comments(1, 0),
-    base("src/field_permissions")
-        .fn_lines(100, 2)
-        .comments(1, 0),
-    base("src/filter_bits")
-        .params(8, 1)
-        .allows(1, 0)
-        .comments(1, 0),
-    base("src/fusion").fn_lines(98, 1).comments(1, 0),
     base("src/geo").comments(3, 0),
-    base("src/highlight").fn_lines(138, 1).comments(1, 0),
     base("src/hnsw")
-        .fn_lines(409, 17)
-        .test_fn_lines(339, 13)
+        .fn_lines(409, 11)
         .params(14, 7)
         .allows(7, 1)
         .comments(9, 0),
@@ -154,7 +136,6 @@ pub(crate) const RATCHET: &[ModuleAllowance] = &[
     base("src/link").comments(1, 0),
     base("src/live_docs").comments(1, 0),
     base("src/main").fn_lines(602, 3).comments(10, 0),
-    base("src/multi_res").fn_lines(91, 1),
     base("src/node")
         .fn_lines(854, 35)
         .test_fn_lines(230, 1)
@@ -164,13 +145,6 @@ pub(crate) const RATCHET: &[ModuleAllowance] = &[
     base("src/number_rows").comments(1, 0),
     base("src/pb").comments(1, 0),
     base("src/placement_plan").comments(1, 0),
-    base("src/protobuf").fn_lines(125, 1),
-    base("src/proximity").fn_lines(109, 2).comments(1, 0),
-    base("src/query")
-        .fn_lines(1188, 8)
-        .params(12, 2)
-        .allows(2, 0)
-        .comments(13, 0),
     base("src/query_disclosure")
         .fn_lines(115, 1)
         .test_fn_lines(151, 1),
@@ -180,9 +154,6 @@ pub(crate) const RATCHET: &[ModuleAllowance] = &[
         .allows(1, 0)
         .comments(2, 0),
     base("src/schema_report").fn_lines(118, 3),
-    base("src/scorefn").comments(10, 0),
-    base("src/security").comments(2, 0),
-    base("src/segment_prune").comments(1, 0),
     base("src/segmented").fn_lines(125, 2).comments(6, 0),
     base("src/segmented_vectors").comments(1, 0),
     base("src/segments")
@@ -192,8 +163,6 @@ pub(crate) const RATCHET: &[ModuleAllowance] = &[
         .allows(2, 0)
         .comments(12, 0),
     base("src/sha256").comments(1, 0),
-    base("src/snapshot").fn_lines(106, 3).comments(2, 0),
-    base("src/snapshot_repository").comments(1, 0),
     base("src/sortkeys").comments(1, 0),
     base("src/source_authority")
         .fn_lines(233, 15)
@@ -204,6 +173,5 @@ pub(crate) const RATCHET: &[ModuleAllowance] = &[
     base("src/stats_cache").comments(1, 0),
     base("src/stream_signal").comments(1, 0),
     base("src/synonyms").fn_lines(107, 1).comments(1, 0),
-    base("src/turbo_bridge").fn_lines(267, 4).comments(1, 0),
-    base("src/vector").comments(6, 0),
+    base("src/turbo_bridge").fn_lines(184, 1),
 ];
