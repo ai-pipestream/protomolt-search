@@ -389,11 +389,8 @@ impl<'a> LinkBuilder<'a> {
         }
     }
 
-    /// Seed an initial navigable skeleton sequentially when `self.links` is
-    /// empty (`entry == NO_NODE`), returning the prefix count to insert on one
-    /// thread before forking across Rayon workers. Without a connected entry
-    /// neighborhood and upper-layer skeleton, dozens of worker threads racing
-    /// at cold start search a near-empty graph and contend on `entry_lock`.
+    /// Prefix length to insert sequentially on cold start (`entry == NO_NODE`)
+    /// before forking across Rayon workers.
     pub(super) fn bootstrap_prefix_len(&self, total: usize) -> usize {
         if self.links.entry_state().0 != NO_NODE {
             return 0;
@@ -409,13 +406,16 @@ impl<'a> LinkBuilder<'a> {
         });
     }
 
-    fn run_waves(&self, total: usize, mut step: impl FnMut(usize, usize, Option<&Locks>)) {
-        let boot = self.bootstrap_prefix_len(total);
+    /// Insert `all` in doubling waves: each wave links layer-0 nodes in parallel
+    /// over immutable upper layers, then links `level > 0` hubs sequentially so
+    /// upper layers and `(entry, top)` stay deterministic with full layer-0 reach.
+    fn insert_waves(&self, all: &[u32]) {
+        use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+        let boot = self.bootstrap_prefix_len(all.len());
         if boot > 0 {
-            step(0, boot, None);
+            with_scratch(|s| all[..boot].iter().for_each(|&n| self.insert(n, None, s)));
         }
-        let mut at = boot;
-        if at >= total {
+        if boot >= all.len() {
             return;
         }
         let locks = Locks::default();
@@ -424,35 +424,39 @@ impl<'a> LinkBuilder<'a> {
         } else {
             super::super::repair::linked_node_count(self).max(1)
         };
-        while at < total {
-            let end = total.min(at + wave);
-            step(
-                at,
-                end,
-                (end - at >= PARALLEL_MIN_TASK_LEN).then_some(&locks),
-            );
+        let (mut at, mut zero, mut upper) = (boot, Vec::new(), Vec::new());
+        while at < all.len() {
+            let end = all.len().min(at + wave);
+            zero.clear();
+            upper.clear();
+            for &n in &all[at..end] {
+                if self.links.level[n as usize] > 0 {
+                    upper.push(n);
+                } else {
+                    zero.push(n);
+                }
+            }
+            if zero.len() < PARALLEL_MIN_TASK_LEN {
+                with_scratch(|s| zero.iter().for_each(|&n| self.insert(n, None, s)));
+            } else {
+                zero.par_iter()
+                    .with_min_len(PARALLEL_MIN_TASK_LEN)
+                    .for_each(|&n| with_scratch(|s| self.insert(n, Some(&locks), s)));
+            }
+            if !upper.is_empty() {
+                with_scratch(|s| upper.iter().for_each(|&n| self.insert(n, None, s)));
+            }
             at = end;
             wave = wave.saturating_mul(2);
         }
     }
 
     fn insert_parallel(&self, range: std::ops::Range<u32>) {
-        use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
-        let base = range.start;
-        self.run_waves(range.len(), |lo, hi, locks| {
-            let sub = base + lo as u32..base + hi as u32;
-            match locks {
-                None => self.insert_sequential(sub),
-                Some(locks) => sub
-                    .into_par_iter()
-                    .with_min_len(PARALLEL_MIN_TASK_LEN)
-                    .for_each(|n| with_scratch(|s| self.insert(n, Some(locks), s))),
-            }
-        });
+        let nodes: Vec<u32> = range.collect();
+        self.insert_waves(&nodes);
     }
 
     pub(in crate::hnsw) fn insert_slice(&self, nodes: &[u32], parallel: bool) {
-        use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
         if nodes.is_empty() {
             return;
         }
@@ -460,13 +464,7 @@ impl<'a> LinkBuilder<'a> {
             with_scratch(|s| nodes.iter().for_each(|&n| self.insert(n, None, s)));
             return;
         }
-        self.run_waves(nodes.len(), |lo, hi, locks| match locks {
-            None => with_scratch(|s| nodes[lo..hi].iter().for_each(|&n| self.insert(n, None, s))),
-            Some(locks) => nodes[lo..hi]
-                .par_iter()
-                .with_min_len(PARALLEL_MIN_TASK_LEN)
-                .for_each(|&n| with_scratch(|s| self.insert(n, Some(locks), s))),
-        });
+        self.insert_waves(nodes);
         super::super::repair::repair_slice_connectivity(self, nodes);
     }
 

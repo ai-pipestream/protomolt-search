@@ -3,7 +3,7 @@
 use super::hybrid::accept_hybrid_receipt;
 use super::hybrid_context::HybridRound;
 use super::*;
-use crate::hnsw::distance::{dot_underflow_slack, simd_score_floor};
+use crate::hnsw::distance::dot_underflow_slack;
 
 /// Total-order f64 wrapper for heap keys.
 #[derive(PartialEq)]
@@ -324,7 +324,7 @@ impl<'a> DecomposedRun<'a> {
 
     #[cfg(feature = "net")]
     fn stream_floor(&self, floor: f32) -> f32 {
-        simd_score_floor(self.round.query().input().vector().len(), floor)
+        crate::hnsw::distance::simd_score_floor(self.round.query().input().vector().len(), floor)
     }
 
     #[cfg(feature = "net")]

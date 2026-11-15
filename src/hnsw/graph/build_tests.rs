@@ -182,3 +182,42 @@ fn parallel_cold_start_keeps_reachability_and_recall_across_repeated_builds() {
         );
     }
 }
+
+#[test]
+fn parallel_waves_keep_upper_layers_deterministic_under_contention() {
+    const DIM: usize = 24;
+    const ROWS: usize = 1_100;
+    let corpus = unit_vectors(ROWS, DIM, 0x4A5E_9922);
+
+    let mut store = Store::new(DIM, 16, 200, 42, Kernel::detect());
+    store.append_unlinked(&corpus).unwrap();
+
+    let baseline = store.build_links(true).unwrap();
+    let base_entry = baseline.entry_state();
+    let base_upper: Vec<u32> = baseline
+        .upper
+        .iter()
+        .map(|c| c.load(Atomic::Relaxed))
+        .collect();
+    assert!(!base_upper.is_empty());
+
+    std::thread::scope(|s| {
+        for _ in 0..4 {
+            let store_ref = &store;
+            let want_upper = &base_upper;
+            s.spawn(move || {
+                for _ in 0..4 {
+                    let links = store_ref.build_links(true).unwrap();
+                    assert_eq!(links.entry_state(), base_entry);
+                    let got: Vec<u32> = links
+                        .upper
+                        .iter()
+                        .map(|c| c.load(Atomic::Relaxed))
+                        .collect();
+                    assert_eq!(&got, want_upper);
+                    assert_eq!(reachable_layer0_count(store_ref, &links), ROWS);
+                }
+            });
+        }
+    });
+}

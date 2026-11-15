@@ -1065,8 +1065,8 @@ pub(crate) fn kernel_row_slack(dim: usize, slack_per_norm: f64, inv_norm: f32) -
     slack_per_norm / f64::from(inv_norm) + dot_underflow_slack(dim)
 }
 
-/// Conservative `f32` pre-filter floor for a `dim`-coordinate SIMD inner-product
-/// stream when exact scalar scores `>= exact_floor` must survive.
+/// Conservative `f32` pre-filter floor keeping every exact score `>= exact_floor`.
+#[cfg(any(feature = "net", test))]
 #[inline]
 pub(crate) fn simd_score_floor(dim: usize, exact_floor: f32) -> f32 {
     if !exact_floor.is_finite() {
