@@ -243,15 +243,11 @@ impl CoordinatorServiceImpl {
         fingerprint: Option<&String>,
     ) {
         if let (Some(heap), Some(fingerprint)) = (heap, fingerprint) {
-            let snapshot = heap
-                .lock()
-                .expect("BM25 stream heap poisoned")
-                .heap
-                .iter()
-                .map(|entry| (entry.0.vector_id, entry.0.score))
-                .collect();
-            self.publish_progress(
-                crate::pb::QueryStreamPhase::Lexical,
+            let snapshot = super::lexical_stream::lexical_snapshot(
+                &heap.lock().expect("BM25 stream heap poisoned"),
+            );
+            super::lexical_stream::publish_lexical_progress(
+                self.query_progress.as_deref(),
                 snapshot,
                 fingerprint.clone(),
             );
@@ -327,7 +323,7 @@ pub(super) fn finish_bm25_hits(
         let winners: Vec<MergedHit> = {
             let state = stream_heap.lock().expect("BM25 stream heap poisoned");
             let mut winners: Vec<MergedHit> = state.heap.iter().map(|entry| entry.0).collect();
-            winners.sort_by(cmp_hits);
+            winners.sort_by(crate::merge::cmp_lexical_hits);
             winners
         };
         let mut details: HashMap<(u32, u64), Bm25Hit> = all

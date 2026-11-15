@@ -25,6 +25,37 @@ pub(crate) fn cmp_hits(a: &MergedHit, b: &MergedHit) -> Ordering {
         .then_with(|| a.shard.cmp(&b.shard))
 }
 
+/// BM25's public order is score descending, shard ascending, then document id.
+pub(crate) fn cmp_lexical_hits(a: &MergedHit, b: &MergedHit) -> Ordering {
+    b.score
+        .total_cmp(&a.score)
+        .then_with(|| a.shard.cmp(&b.shard))
+        .then_with(|| a.vector_id.cmp(&b.vector_id))
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LexicalHeapEntry(pub MergedHit);
+
+impl PartialEq for LexicalHeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for LexicalHeapEntry {}
+
+impl Ord for LexicalHeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        cmp_lexical_hits(&self.0, &other.0)
+    }
+}
+
+impl PartialOrd for LexicalHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// Merge per-shard top-k lists into the global top-k.
 ///
 /// `shard_hits` yields `(shard_index, hits)` pairs where each hit is

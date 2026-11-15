@@ -9,6 +9,12 @@
 
 use crate::postings::{Bm25Index, Posting};
 
+mod exhaustive;
+mod pruned;
+mod pruned_cursor;
+mod pruned_scan;
+mod ranking;
+
 /// A resolved score-function chain plus this shard's numeric-column
 /// read surface (`docs/score-functions.md`); `None` = no chain, and
 /// every chained scorer is then bit-identical to its unchained twin
@@ -456,7 +462,6 @@ pub fn top_k_chained(
 /// the exhaustive-in-heap-shape twin of the filtered pruned scorer and
 /// its fallback. With `filter` `None`, bit-identical to
 /// [`top_k_chained`].
-#[allow(clippy::too_many_arguments)]
 pub fn top_k_chained_filtered(
     store: &dyn Bm25Index,
     terms: &[String],
@@ -466,93 +471,15 @@ pub fn top_k_chained_filtered(
     chain: ChainCtx,
     filter: FilterCtx,
 ) -> Vec<ScoredDoc> {
-    debug_assert_eq!(terms.len(), stats.dfs.len());
-    let avgdl = stats.avgdl();
-    let finish = |score: f64, doc_id: u32| match chain {
-        Some((c, cols)) => c.eval(score, doc_id, cols),
-        None => score,
-    };
-    fn sort_truncate<T>(docs: &mut Vec<(u32, f64, T)>, k: usize) {
-        docs.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.0.cmp(&b.0))
-        });
-        docs.truncate(k);
+    ScoringQuery {
+        store,
+        terms,
+        stats,
+        params,
+        chain,
+        filter,
     }
-    if terms.len() <= 64 {
-        // Accumulate per-doc (score, term-membership bitmask). Query
-        // workloads here are small (a handful of terms, postings lists
-        // walked once), so a HashMap merge is fine.
-        let mut scores: std::collections::HashMap<u32, (f64, u64)> =
-            std::collections::HashMap::new();
-        for (ti, term) in terms.iter().enumerate() {
-            if stats.dfs[ti] == 0 {
-                continue;
-            }
-            let idf = idf(stats.doc_count, stats.dfs[ti]);
-            store.for_each_doc_tf(term, &mut |doc_id, tf| {
-                let contribution = idf * tf_norm(params, tf, store.doc_length(doc_id), avgdl);
-                let entry = scores.entry(doc_id).or_default();
-                entry.0 += contribution;
-                entry.1 |= 1u64 << ti;
-            });
-        }
-        let mut docs: Vec<(u32, f64, u64)> = scores
-            .into_iter()
-            .filter(|&(doc_id, _)| passes(filter, doc_id))
-            .map(|(doc_id, (score, mask))| (doc_id, finish(score, doc_id), mask))
-            .collect();
-        sort_truncate(&mut docs, k);
-        // Occurrences are fetched for the k survivors only — on a v5
-        // reader this is a binary search plus one occurrence-slice
-        // decode per surviving (term, doc), instead of a decode per
-        // posting.
-        docs.into_iter()
-            .map(|(doc_id, score, mask)| ScoredDoc {
-                doc_id,
-                score,
-                term_offsets: (0..terms.len())
-                    .filter(|&ti| mask >> ti & 1 == 1)
-                    .map(|ti| (ti, store.posting_offsets(&terms[ti], doc_id)))
-                    .collect(),
-            })
-            .collect()
-    } else {
-        // More than 64 query terms: same shape with a Vec membership
-        // list (one allocation per doc-term hit; correctness fallback,
-        // not a path anyone should time).
-        let mut scores: std::collections::HashMap<u32, (f64, Vec<usize>)> =
-            std::collections::HashMap::new();
-        for (ti, term) in terms.iter().enumerate() {
-            if stats.dfs[ti] == 0 {
-                continue;
-            }
-            let idf = idf(stats.doc_count, stats.dfs[ti]);
-            store.for_each_doc_tf(term, &mut |doc_id, tf| {
-                let contribution = idf * tf_norm(params, tf, store.doc_length(doc_id), avgdl);
-                let entry = scores.entry(doc_id).or_default();
-                entry.0 += contribution;
-                entry.1.push(ti);
-            });
-        }
-        let mut docs: Vec<(u32, f64, Vec<usize>)> = scores
-            .into_iter()
-            .filter(|&(doc_id, _)| passes(filter, doc_id))
-            .map(|(doc_id, (score, tis))| (doc_id, finish(score, doc_id), tis))
-            .collect();
-        sort_truncate(&mut docs, k);
-        docs.into_iter()
-            .map(|(doc_id, score, tis)| ScoredDoc {
-                doc_id,
-                score,
-                term_offsets: tis
-                    .into_iter()
-                    .map(|ti| (ti, store.posting_offsets(&terms[ti], doc_id)))
-                    .collect(),
-            })
-            .collect()
-    }
+    .run(k)
 }
 
 /// The pre-v5 exhaustive scorer: walks every posting WITH its occurrence
@@ -586,7 +513,6 @@ pub fn top_k_exhaustive_chained(
 /// for the filtered pruned scorer. The filter is applied at exactly one
 /// place here too (before ranking), so "pruned == exhaustive bitwise"
 /// is a statement about the same predicate on both sides.
-#[allow(clippy::too_many_arguments)]
 pub fn top_k_exhaustive_chained_filtered(
     store: &dyn Bm25Index,
     terms: &[String],
@@ -631,12 +557,7 @@ pub fn top_k_exhaustive_chained_filtered(
             term_offsets,
         })
         .collect();
-    docs.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.doc_id.cmp(&b.doc_id))
-    });
+    docs.sort_by(|a, b| ranking::compare((a.doc_id, a.score), (b.doc_id, b.score)));
     docs.truncate(k);
     docs
 }
@@ -698,42 +619,7 @@ pub fn top_k_fused_exhaustive_filtered(
     k: usize,
     filter: FilterCtx,
 ) -> Vec<FusedDoc> {
-    type Hits = Vec<(usize, usize, Vec<(u32, u32)>)>;
-    let mut scores: std::collections::HashMap<u32, (f64, Hits)> = std::collections::HashMap::new();
-    for (fi, fq) in fields.iter().enumerate() {
-        debug_assert_eq!(fq.terms.len(), fq.stats.dfs.len());
-        let avgdl = fq.stats.avgdl();
-        for (ti, term) in fq.terms.iter().enumerate() {
-            if fq.stats.dfs[ti] == 0 {
-                continue;
-            }
-            let idf = idf(fq.stats.doc_count, fq.stats.dfs[ti]);
-            fq.index.for_each_posting(term, &mut |doc_id, tf, offsets| {
-                let contribution =
-                    fq.weight * idf * tf_norm(fq.params, tf, fq.index.doc_length(doc_id), avgdl);
-                let entry = scores.entry(doc_id).or_default();
-                entry.0 += contribution;
-                entry.1.push((fi, ti, offsets.to_vec()));
-            });
-        }
-    }
-    let mut docs: Vec<FusedDoc> = scores
-        .into_iter()
-        .filter(|&(doc_id, _)| passes(filter, doc_id))
-        .map(|(doc_id, (score, term_offsets))| FusedDoc {
-            doc_id,
-            score,
-            term_offsets,
-        })
-        .collect();
-    docs.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.doc_id.cmp(&b.doc_id))
-    });
-    docs.truncate(k);
-    docs
+    exhaustive::fused(fields, k, filter, None)
 }
 
 /// Exact phrase-aware fused scorer. Every non-phrase field contributes its
@@ -752,6 +638,25 @@ pub fn top_k_phrase_exhaustive_filtered(
     phrase_term_weights: &[f64],
     k: usize,
     filter: FilterCtx,
+) -> Vec<FusedDoc> {
+    top_k_phrase_exhaustive_filtered_above(
+        fields,
+        phrase_field,
+        phrase_term_weights,
+        k,
+        filter,
+        f64::NEG_INFINITY,
+    )
+}
+
+/// Phrase ranking applies a finite raw score floor before truncating rounded-score ties.
+pub fn top_k_phrase_exhaustive_filtered_above(
+    fields: &[FieldQuery],
+    phrase_field: usize,
+    phrase_term_weights: &[f64],
+    k: usize,
+    filter: FilterCtx,
+    floor: f64,
 ) -> Vec<FusedDoc> {
     assert!(
         phrase_field < fields.len(),
@@ -795,12 +700,8 @@ pub fn top_k_phrase_exhaustive_filtered(
             term_offsets,
         })
         .collect();
-    docs.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.doc_id.cmp(&b.doc_id))
-    });
+    docs.retain(|doc| !floor.is_finite() || doc.score >= floor);
+    docs.sort_by(|a, b| ranking::compare((a.doc_id, a.score), (b.doc_id, b.score)));
     docs.truncate(k);
     docs
 }
@@ -843,36 +744,6 @@ pub type LiveFloorHook<'a> = &'a mut dyn FnMut(Option<f32>) -> Option<f32>;
 /// offsets and projections without putting those values on the hot stream.
 pub type CandidateHook<'a> = &'a mut dyn FnMut(u32, f32);
 
-/// One heap entry: a candidate and the query-term membership mask.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct HeapEntry {
-    score: f64,
-    doc_id: u32,
-    /// Bitmask of the query terms present in this doc (ti < 128).
-    mask: u128,
-}
-
-impl Eq for HeapEntry {}
-
-/// Max-heap whose TOP is the current k-th best (worst survivor): lowest
-/// score, and among equal scores the LARGEST doc id — the entry a
-/// strictly-better candidate displaces.
-impl Ord for HeapEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other
-            .score
-            .partial_cmp(&self.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(self.doc_id.cmp(&other.doc_id))
-    }
-}
-
-impl PartialOrd for HeapEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
 /// Block-max top-k over the v5 skip run (`docs/block-max.md`, stage 2).
 ///
 /// Per term, a cursor holds the current 128-posting block's frontier —
@@ -901,14 +772,10 @@ impl PartialOrd for HeapEntry {
 ///    cursor advances to it inside the window), scored in term order,
 ///    and inserted into the heap.
 ///
-/// EXACTNESS CONTRACT (load-bearing): the skip test is `bound <=
-/// cutoff`; candidates are evaluated in doc-id order; the heap replaces
-/// only on a strictly greater score, so at a tie the incumbent is always
-/// the smaller doc id. A seeded floor keeps only docs with `score >=
-/// floor` (ties at the floor survive). All bound sums are accumulated in
-/// term-index order so they dominate the true (term-ordered) score in
-/// IEEE arithmetic exactly. The result is bit-identical to
-/// [`top_k_exhaustive`] (with the seed filter applied).
+/// Ranking compares rounded f32 scores, then document ids; accumulation and
+/// returned scores remain f64. Bounds use the same rounding, and monotonically
+/// increasing document ids preserve the incumbent on a rounded tie. Finite
+/// raw floors filter candidates before ranking; term-order bounds remain sound.
 ///
 /// Falls back to [`top_k`] when any query term lacks impacts (heap
 /// store, v3/v4 files, or more than 128 query terms — the membership
@@ -1030,443 +897,52 @@ pub fn top_k_pruned_chained_filtered_stats_live(
     live: Option<LiveFloorHook>,
 ) -> Vec<ScoredDoc> {
     top_k_pruned_chained_filtered_stats_streaming(
-        store, terms, stats, params, k, floor, chain, filter, prune, live, None,
+        ScoringQuery {
+            store,
+            terms,
+            stats,
+            params,
+            chain,
+            filter,
+        },
+        TopKOptions {
+            k,
+            floor,
+            block_max: true,
+        },
+        prune,
+        live,
+        None,
     )
 }
 
-/// [`top_k_pruned_chained_filtered_stats_live`] plus compact candidate
-/// emission for the coordinator-owned global heap. Candidate delivery does
-/// not participate in scoring or cursor movement, so a silent sink is
-/// bit-identical to the ordinary live scorer.
-#[allow(clippy::too_many_arguments)]
+/// Borrowed inputs for a single-field lexical scoring run.
+pub struct ScoringQuery<'a> {
+    pub store: &'a dyn Bm25Index,
+    pub terms: &'a [String],
+    pub stats: &'a CorpusStats,
+    pub params: Bm25Params,
+    pub chain: ChainCtx<'a>,
+    pub filter: FilterCtx<'a>,
+}
+
+/// Ranking depth, inclusive raw floor, and permission to use impact pruning.
+#[derive(Clone, Copy)]
+pub struct TopKOptions {
+    pub k: usize,
+    pub floor: f64,
+    pub block_max: bool,
+}
+
+/// Score compact candidates and retain the same rounded-score local frontier.
 pub fn top_k_pruned_chained_filtered_stats_streaming(
-    store: &dyn Bm25Index,
-    terms: &[String],
-    stats: &CorpusStats,
-    params: Bm25Params,
-    k: usize,
-    floor: f64,
-    chain: ChainCtx,
-    filter: FilterCtx,
+    query: ScoringQuery<'_>,
+    options: TopKOptions,
     prune: &mut PruneStats,
-    mut live: Option<LiveFloorHook>,
-    mut candidate: Option<CandidateHook>,
+    live: Option<LiveFloorHook>,
+    candidate: Option<CandidateHook>,
 ) -> Vec<ScoredDoc> {
-    debug_assert_eq!(terms.len(), stats.dfs.len());
-    let mut floor = floor;
-    let avgdl = stats.avgdl();
-    // Lift a bound to the final-score scale / finish a true score.
-    // With no chain both are identity, so every float op below is
-    // exactly the unchained scorer's.
-    let lift = |b: f64| match chain {
-        Some((c, _)) => c.bound(b),
-        None => b,
-    };
-    let finish = |score: f64, doc_id: u32| match chain {
-        Some((c, cols)) => c.eval(score, doc_id, cols),
-        None => score,
-    };
-
-    // One cursor per scored term. Any missing impact surface falls the
-    // whole query back to the exhaustive-in-heap-shape scorer.
-    struct TermState<'a> {
-        ti: usize,
-        idf: f64,
-        cursor: crate::postings::ImpactCursor<'a>,
-        /// idf-scaled upper bound of the current level-0 block.
-        block_max: f64,
-        block: u32,
-        /// idf-scaled upper bound of the current level-1 group.
-        l1_max: f64,
-        l1_group: u32,
-        /// idf-scaled upper bound over the whole term (from level-1
-        /// records; static, so always a valid remainder bound).
-        term_max: f64,
-    }
-    impl TermState<'_> {
-        /// Re-derive bounds after the cursor moved (no-op when it stayed
-        /// inside the current block).
-        fn refresh(&mut self, params: Bm25Params, avgdl: f64) {
-            if self.cursor.block() == self.block {
-                return;
-            }
-            self.block = self.cursor.block();
-            self.block_max = block_max(&self.cursor, self.idf, params, avgdl);
-            if self.cursor.l1_group() != self.l1_group {
-                self.l1_group = self.cursor.l1_group();
-                self.l1_max = self.idf
-                    * self
-                        .cursor
-                        .l1_frontier()
-                        .iter()
-                        .map(|&(tf, dl)| tf_norm(params, tf, dl, avgdl))
-                        .fold(0.0, f64::max);
-            }
-        }
-    }
-    /// Drop exhausted cursors, harvesting their skip counters.
-    fn retain_live(state: &mut Vec<TermState>, skips: &mut (u64, u64)) {
-        state.retain(|ts| {
-            if ts.cursor.exhausted() {
-                skips.0 += ts.cursor.blocks_skipped();
-                skips.1 += ts.cursor.l1_groups_skipped();
-                false
-            } else {
-                true
-            }
-        });
-    }
-    let mut state: Vec<TermState> = Vec::new();
-    if terms.len() > 128 {
-        let docs = filter_to_floor(
-            top_k_chained_filtered(store, terms, stats, params, k, chain, filter),
-            floor,
-        );
-        if let Some(sink) = candidate.as_mut() {
-            for doc in &docs {
-                sink(doc.doc_id, doc.score as f32);
-            }
-        }
-        return docs;
-    }
-    for (ti, term) in terms.iter().enumerate() {
-        // A term absent from THIS shard contributes 0 to every document
-        // here, so it is skipped rather than scored. `stats.dfs` is the
-        // GLOBAL df, which is non-zero for a term that merely lives on
-        // another shard: checking only that sent every such query down
-        // the exhaustive path below, because a locally-absent term has no
-        // impact surface to open. On a sharded corpus that is the common
-        // case for exactly the rare, discriminative terms worth pruning
-        // with -- measured at 2710 ms vs 9 ms for "of 12b6" on the 86.6M
-        // corpus, where 7 of 8 shards lacked the rare term and each one
-        // then walked all 83.7M postings of "of" exhaustively.
-        if stats.dfs[ti] == 0 || store.df(term) == 0 {
-            continue;
-        }
-        let Some(cursor) = store.impacts(term) else {
-            // Present here but no impact surface: a genuine format
-            // limitation, and the only case that still forfeits pruning.
-            let docs = filter_to_floor(
-                top_k_chained_filtered(store, terms, stats, params, k, chain, filter),
-                floor,
-            );
-            if let Some(sink) = candidate.as_mut() {
-                for doc in &docs {
-                    sink(doc.doc_id, doc.score as f32);
-                }
-            }
-            return docs;
-        };
-        let idf = idf(stats.doc_count, stats.dfs[ti]);
-        let l1_max = idf
-            * cursor
-                .l1_frontier()
-                .iter()
-                .map(|&(tf, dl)| tf_norm(params, tf, dl, avgdl))
-                .fold(0.0, f64::max);
-        let term_max = idf
-            * cursor
-                .term_frontier()
-                .iter()
-                .map(|&(tf, dl)| tf_norm(params, tf, dl, avgdl))
-                .fold(0.0, f64::max);
-        prune.blocks_total += u64::from(cursor.n_blocks());
-        state.push(TermState {
-            ti,
-            idf,
-            block: cursor.block(),
-            block_max: block_max(&cursor, idf, params, avgdl),
-            l1_group: cursor.l1_group(),
-            l1_max,
-            cursor,
-            term_max,
-        });
-    }
-
-    let mut heap: std::collections::BinaryHeap<HeapEntry> = std::collections::BinaryHeap::new();
-    if k == 0 {
-        return Vec::new();
-    }
-    // Reusable per-candidate accumulation: contributions by term index,
-    // summed in term order so the float op sequence matches the
-    // exhaustive scorer bit for bit. The partition buffers are reused
-    // across iterations (they would otherwise dominate allocations).
-    let mut contrib: Vec<f64> = vec![0.0; terms.len()];
-    let mut touched: Vec<usize> = Vec::new();
-    let mut order: Vec<usize> = Vec::new();
-    let mut nonessential: Vec<bool> = Vec::new();
-    let mut prefix: Vec<usize> = Vec::new();
-    // Skip counts (level-0 blocks, level-1 groups) of retired cursors.
-    let mut finished: (u64, u64) = (0, 0);
-    // Last processed candidate doc id (doc-order invariant witness).
-    let mut last_selected: Option<u32> = None;
-
-    while !state.is_empty() {
-        let heap_full = heap.len() >= k;
-        let kth = if heap_full {
-            heap.peek().expect("full heap").score
-        } else {
-            f64::NEG_INFINITY
-        };
-        // Mid-scan floor exchange: offer the running k-th best (as the
-        // emission-safe f32 seed the wire carries) and adopt any higher
-        // external floor before this iteration's bound tests. Floors
-        // only rise, and `inert` is monotone in the floor, so a raise
-        // here can only skip candidates a proven global lower bound
-        // already excludes.
-        if let Some(hook) = live.as_mut() {
-            let seed = heap_full.then(|| floor_seed(kth as f32));
-            if let Some(external) = hook(seed) {
-                let external = f64::from(external);
-                if external > floor {
-                    floor = external;
-                }
-            }
-        }
-        // Inert = cannot enter the heap: below the seed, or (once the
-        // heap is full) not strictly above the k-th best. Every bound
-        // test below mirrors the insertion rule exactly, and every bound
-        // sum is accumulated in term-index order (see the contract).
-        let inert = |acc: f64| acc < floor || (heap_full && acc <= kth);
-        let mut static_sum = 0.0;
-        let mut l1_sum = 0.0;
-        let mut block_sum = 0.0;
-        for ti in 0..terms.len() {
-            if let Some(ts) = state.iter().find(|ts| ts.ti == ti) {
-                static_sum += ts.term_max;
-                l1_sum += ts.l1_max;
-                block_sum += ts.block_max;
-            }
-        }
-        // 1. Termination on the static whole-term bounds.
-        if inert(lift(static_sum)) {
-            break;
-        }
-        // 2a. Level-1 skip: whole 4096-posting groups at one test.
-        if inert(lift(l1_sum)) {
-            let d = state
-                .iter()
-                .map(|ts| ts.cursor.l1_last_doc())
-                .min()
-                .expect("nonempty state");
-            for ts in state.iter_mut() {
-                ts.cursor.advance_shallow(d.saturating_add(1));
-                ts.refresh(params, avgdl);
-            }
-            retain_live(&mut state, &mut finished);
-            continue;
-        }
-        // 2b. Level-0 range skip.
-        if inert(lift(block_sum)) {
-            let d = state
-                .iter()
-                .map(|ts| ts.cursor.block_last_doc())
-                .min()
-                .expect("nonempty state");
-            for ts in state.iter_mut() {
-                ts.cursor.advance_shallow(d.saturating_add(1));
-                ts.refresh(params, avgdl);
-            }
-            retain_live(&mut state, &mut finished);
-            continue;
-        }
-        // 3. Competitive window [_, window_end]: MaxScore partition.
-        // window_end is the shallowest block end, so every term's block
-        // bound is valid over the whole window. Sorted by block max
-        // ascending, greedily grow the non-essential prefix while its
-        // ti-order bound sum stays inert: docs formed only of those
-        // terms can never enter the heap. At least one essential term
-        // remains, because block_sum is not inert.
-        let window_end = state
-            .iter()
-            .map(|ts| ts.cursor.block_last_doc())
-            .min()
-            .expect("nonempty state");
-        order.clear();
-        order.extend(0..state.len());
-        order.sort_by(|&a, &b| {
-            state[a]
-                .block_max
-                .partial_cmp(&state[b].block_max)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        nonessential.clear();
-        nonessential.resize(state.len(), false);
-        prefix.clear();
-        for &j in &order {
-            let mut acc = 0.0;
-            for ti in 0..terms.len() {
-                if let Some(pos) = state.iter().position(|ts| ts.ti == ti) {
-                    if pos == j || prefix.contains(&pos) {
-                        acc += state[pos].block_max;
-                    }
-                }
-            }
-            if inert(lift(acc)) {
-                prefix.push(j);
-            } else {
-                break;
-            }
-        }
-        for &j in &prefix {
-            nonessential[j] = true;
-        }
-        // 4. The next candidate is the smallest current doc over the
-        // essential terms only.
-        let Some(doc) = state
-            .iter()
-            .zip(&nonessential)
-            .filter(|&(_, &ne)| !ne)
-            .map(|(ts, _)| ts.cursor.doc_id())
-            .min()
-        else {
-            unreachable!("block_sum not inert but every term non-essential");
-        };
-        if doc > window_end {
-            // The shallowest term is necessarily non-essential (an
-            // essential one would place doc <= window_end), so its docs
-            // up to window_end are either formed of non-essential terms
-            // alone (inert by the partition) or already evaluated.
-            // Advancing it past the window end is safe.
-            for ts in state.iter_mut() {
-                if ts.cursor.block_last_doc() == window_end {
-                    ts.cursor.advance_shallow(window_end.saturating_add(1));
-                    ts.refresh(params, avgdl);
-                }
-            }
-            retain_live(&mut state, &mut finished);
-            continue;
-        }
-        // 5. Candidate test with an exact bound: essential terms
-        // contribute their TRUE value when present (zero when absent —
-        // their cursor proves it), non-essential terms their block max.
-        // Every candidate is processed exactly once and strictly in
-        // doc-id order: the inert-drop path below advances ALL cursors
-        // past the doc, so no cursor can lag the wavefront.
-        if let Some(prev) = last_selected {
-            debug_assert!(
-                doc > prev,
-                "candidate selection out of doc order: {doc} after {prev}"
-            );
-        }
-        last_selected = Some(doc);
-        let doc_len = store.doc_length(doc);
-        let mut bound = 0.0;
-        for ti in 0..terms.len() {
-            if let Some(pos) = state.iter().position(|ts| ts.ti == ti) {
-                let ts = &state[pos];
-                if nonessential[pos] {
-                    bound += ts.block_max;
-                } else if ts.cursor.doc_id() == doc {
-                    bound += ts.idf * tf_norm(params, ts.cursor.tf(), doc_len, avgdl);
-                }
-            }
-        }
-        if inert(lift(bound)) {
-            // Not insertable now, and the floor only rises: drop it.
-            // Advance EVERY cursor past the doc — essential and
-            // non-essential alike — so candidate selection stays
-            // strictly doc-id ordered. Sound: an unconsumed doc behind
-            // the wavefront has postings only in currently
-            // non-essential terms (every essential cursor sits at or
-            // past the wavefront, so its earlier postings are already
-            // consumed), the partition just proved the sum of those
-            // terms' block bounds inert — valid over the whole window,
-            // which covers the wavefront — and inertness only
-            // strengthens as the floor and the k-th best rise
-            // (`inert` is monotone in both). Such docs can never become
-            // insertable later, so skipping them changes nothing.
-            for ts in state.iter_mut() {
-                ts.cursor.advance_shallow(doc);
-                if ts.cursor.doc_id() == doc {
-                    ts.cursor.next_posting();
-                }
-                ts.refresh(params, avgdl);
-            }
-            retain_live(&mut state, &mut finished);
-            continue;
-        }
-        // 6. Full evaluation: every cursor to the doc (within-block —
-        // the window covers it), contributions in term order, insert on
-        // the exact contract, advance.
-        touched.clear();
-        let mut mask: u128 = 0;
-        for ts in state.iter_mut() {
-            ts.cursor.advance_shallow(doc);
-            if ts.cursor.doc_id() == doc {
-                contrib[ts.ti] = ts.idf * tf_norm(params, ts.cursor.tf(), doc_len, avgdl);
-                touched.push(ts.ti);
-                mask |= 1u128 << ts.ti;
-            }
-        }
-        touched.sort_unstable();
-        let mut score = 0.0;
-        for &ti in &touched {
-            score += contrib[ti];
-        }
-        // The FINAL score: chain applied after the pinned-order sum,
-        // before the floor test and insertion, so the heap and kth are
-        // on the same scale the lifted bounds are.
-        let score = finish(score, doc);
-        prune.candidates_evaluated += 1;
-        prune.postings_scored += touched.len() as u64;
-        // Insert on the exact contract: ties at the seed survive,
-        // displacement is strictly-greater — and, first, the document
-        // must survive every geo filter. A filtered document is still a
-        // fully evaluated candidate (it was scored, and the counters
-        // above say so); it simply never enters the heap, and the
-        // cursor advance below runs for it unchanged.
-        if passes(filter, doc) && score >= floor {
-            if let Some(sink) = candidate.as_mut() {
-                sink(doc, score as f32);
-            }
-            if !heap_full || score > kth {
-                if heap_full {
-                    heap.pop();
-                }
-                heap.push(HeapEntry {
-                    score,
-                    doc_id: doc,
-                    mask,
-                });
-            }
-        }
-        for ts in state.iter_mut() {
-            if ts.cursor.doc_id() == doc {
-                ts.cursor.next_posting();
-                ts.refresh(params, avgdl);
-            }
-        }
-        retain_live(&mut state, &mut finished);
-    }
-    prune.blocks_skipped = finished.0
-        + state
-            .iter()
-            .map(|ts| ts.cursor.blocks_skipped())
-            .sum::<u64>();
-    prune.l1_groups_skipped = finished.1
-        + state
-            .iter()
-            .map(|ts| ts.cursor.l1_groups_skipped())
-            .sum::<u64>();
-
-    let mut out: Vec<HeapEntry> = heap.into_vec();
-    out.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.doc_id.cmp(&b.doc_id))
-    });
-    out.into_iter()
-        .map(|e| ScoredDoc {
-            doc_id: e.doc_id,
-            score: e.score,
-            term_offsets: (0..terms.len())
-                .filter(|&ti| e.mask >> ti & 1 == 1)
-                .map(|ti| (ti, store.posting_offsets(&terms[ti], e.doc_id)))
-                .collect(),
-        })
-        .collect()
+    pruned::flat(query, options, prune, live, candidate)
 }
 
 /// `scale * max over the block frontier of tf_norm(..)` — the term's
@@ -1536,417 +1012,30 @@ pub fn top_k_fused_pruned_filtered_stats(
     filter: FilterCtx,
     prune: &mut PruneStats,
 ) -> Vec<FusedDoc> {
-    top_k_fused_pruned_filtered_stats_streaming(fields, k, floor, filter, prune, None, None)
+    top_k_fused_pruned_filtered_stats_streaming(
+        fields,
+        TopKOptions {
+            k,
+            floor,
+            block_max: true,
+        },
+        filter,
+        prune,
+        None,
+        None,
+    )
 }
 
-/// Fused multi-field block-max scoring with the same live floor exchange and
-/// compact candidate stream as the flat scorer. Every floor and score is on
-/// the fused final scale; the pinned field/term accumulation order remains
-/// unchanged.
-#[allow(clippy::too_many_arguments)]
+/// Fused scoring shares the flat scorer's floor and rounded-score ranking contract.
 pub fn top_k_fused_pruned_filtered_stats_streaming(
     fields: &[FieldQuery],
-    k: usize,
-    floor: f64,
+    options: TopKOptions,
     filter: FilterCtx,
     prune: &mut PruneStats,
-    mut live: Option<LiveFloorHook>,
-    mut candidate: Option<CandidateHook>,
+    live: Option<LiveFloorHook>,
+    candidate: Option<CandidateHook>,
 ) -> Vec<FusedDoc> {
-    // The pinned accumulation order: oi enumerates (field id, term
-    // index) lexicographically.
-    let pair_meta: Vec<(usize, usize)> = fields
-        .iter()
-        .enumerate()
-        .flat_map(|(fi, fq)| (0..fq.terms.len()).map(move |ti| (fi, ti)))
-        .collect();
-    let n_pairs = pair_meta.len();
-    if n_pairs > 128
-        || fields
-            .iter()
-            .any(|fq| fq.weight < 0.0 || fq.weight.is_nan())
-    {
-        let docs = filter_fused_to_floor(top_k_fused_exhaustive_filtered(fields, k, filter), floor);
-        if let Some(sink) = candidate.as_mut() {
-            for doc in &docs {
-                sink(doc.doc_id, doc.score as f32);
-            }
-        }
-        return docs;
-    }
-
-    // One cursor per scored pair. Any missing impact surface falls the
-    // whole query back to the exhaustive scorer.
-    struct PairState<'a> {
-        /// Position in the pinned (field, term) accumulation order.
-        oi: usize,
-        /// `w_f * idf`: the scale on every tf_norm from this pair.
-        widf: f64,
-        /// The pair's field k1/b and avgdl (bounds and contributions
-        /// are per-field functions).
-        params: Bm25Params,
-        avgdl: f64,
-        cursor: crate::postings::ImpactCursor<'a>,
-        /// widf-scaled upper bound of the current level-0 block.
-        block_max: f64,
-        block: u32,
-        /// widf-scaled upper bound of the current level-1 group.
-        l1_max: f64,
-        l1_group: u32,
-        /// widf-scaled upper bound over the whole pair (from level-1
-        /// records; static, so always a valid remainder bound).
-        term_max: f64,
-    }
-    impl PairState<'_> {
-        /// Re-derive bounds after the cursor moved (no-op when it
-        /// stayed inside the current block).
-        fn refresh(&mut self) {
-            if self.cursor.block() == self.block {
-                return;
-            }
-            self.block = self.cursor.block();
-            self.block_max = block_max(&self.cursor, self.widf, self.params, self.avgdl);
-            if self.cursor.l1_group() != self.l1_group {
-                self.l1_group = self.cursor.l1_group();
-                self.l1_max = self.widf
-                    * self
-                        .cursor
-                        .l1_frontier()
-                        .iter()
-                        .map(|&(tf, dl)| tf_norm(self.params, tf, dl, self.avgdl))
-                        .fold(0.0, f64::max);
-            }
-        }
-    }
-    /// Drop exhausted cursors, harvesting their skip counters.
-    fn retain_live(state: &mut Vec<PairState>, skips: &mut (u64, u64)) {
-        state.retain(|ps| {
-            if ps.cursor.exhausted() {
-                skips.0 += ps.cursor.blocks_skipped();
-                skips.1 += ps.cursor.l1_groups_skipped();
-                false
-            } else {
-                true
-            }
-        });
-    }
-    let mut state: Vec<PairState> = Vec::new();
-    for (oi, &(fi, ti)) in pair_meta.iter().enumerate() {
-        let fq = &fields[fi];
-        debug_assert_eq!(fq.terms.len(), fq.stats.dfs.len());
-        // A (field, term) pair absent from THIS shard contributes 0 to
-        // every document here, so it is skipped rather than scored.
-        // `fq.stats.dfs` is the GLOBAL df, which is non-zero for a term
-        // that merely lives on another shard; checking it alone sends
-        // every such query down the exhaustive path.
-        if fq.stats.dfs[ti] == 0 || fq.index.df(&fq.terms[ti]) == 0 {
-            continue;
-        }
-        let Some(cursor) = fq.index.impacts(&fq.terms[ti]) else {
-            // Present here but no impact surface: a genuine format
-            // limitation, and the only case that still forfeits pruning.
-            let docs =
-                filter_fused_to_floor(top_k_fused_exhaustive_filtered(fields, k, filter), floor);
-            if let Some(sink) = candidate.as_mut() {
-                for doc in &docs {
-                    sink(doc.doc_id, doc.score as f32);
-                }
-            }
-            return docs;
-        };
-        let avgdl = fq.stats.avgdl();
-        let widf = fq.weight * idf(fq.stats.doc_count, fq.stats.dfs[ti]);
-        let l1_max = widf
-            * cursor
-                .l1_frontier()
-                .iter()
-                .map(|&(tf, dl)| tf_norm(fq.params, tf, dl, avgdl))
-                .fold(0.0, f64::max);
-        let term_max = widf
-            * cursor
-                .term_frontier()
-                .iter()
-                .map(|&(tf, dl)| tf_norm(fq.params, tf, dl, avgdl))
-                .fold(0.0, f64::max);
-        prune.blocks_total += u64::from(cursor.n_blocks());
-        state.push(PairState {
-            oi,
-            widf,
-            params: fq.params,
-            avgdl,
-            block: cursor.block(),
-            block_max: block_max(&cursor, widf, fq.params, avgdl),
-            l1_group: cursor.l1_group(),
-            l1_max,
-            cursor,
-            term_max,
-        });
-    }
-
-    let mut floor = floor;
-    let mut heap: std::collections::BinaryHeap<HeapEntry> = std::collections::BinaryHeap::new();
-    if k == 0 {
-        return Vec::new();
-    }
-    // Reusable per-candidate accumulation, indexed by oi so the sum
-    // runs in the pinned pair order (see [`top_k_pruned_stats`]; the
-    // loop below is that function pair-generalized, step for step).
-    let mut contrib: Vec<f64> = vec![0.0; n_pairs];
-    let mut touched: Vec<usize> = Vec::new();
-    let mut order: Vec<usize> = Vec::new();
-    let mut nonessential: Vec<bool> = Vec::new();
-    let mut prefix: Vec<usize> = Vec::new();
-    // Per-candidate document length by field id (dl is per field).
-    let mut dls: Vec<u32> = Vec::new();
-    // Skip counts (level-0 blocks, level-1 groups) of retired cursors.
-    let mut finished: (u64, u64) = (0, 0);
-    // Last processed candidate doc id (doc-order invariant witness).
-    let mut last_selected: Option<u32> = None;
-
-    while !state.is_empty() {
-        let heap_full = heap.len() >= k;
-        let kth = if heap_full {
-            heap.peek().expect("full heap").score
-        } else {
-            f64::NEG_INFINITY
-        };
-        if let Some(hook) = live.as_mut() {
-            let seed = heap_full.then(|| floor_seed(kth as f32));
-            if let Some(external) = hook(seed) {
-                let external = f64::from(external);
-                if external > floor {
-                    floor = external;
-                }
-            }
-        }
-        // Inert = cannot enter the heap; every bound sum below runs in
-        // pinned pair order (see the contract).
-        let inert = |acc: f64| acc < floor || (heap_full && acc <= kth);
-        let mut static_sum = 0.0;
-        let mut l1_sum = 0.0;
-        let mut block_sum = 0.0;
-        for oi in 0..n_pairs {
-            if let Some(ps) = state.iter().find(|ps| ps.oi == oi) {
-                static_sum += ps.term_max;
-                l1_sum += ps.l1_max;
-                block_sum += ps.block_max;
-            }
-        }
-        // 1. Termination on the static whole-pair bounds.
-        if inert(static_sum) {
-            break;
-        }
-        // 2a. Level-1 skip: whole 4096-posting groups at one test.
-        if inert(l1_sum) {
-            let d = state
-                .iter()
-                .map(|ps| ps.cursor.l1_last_doc())
-                .min()
-                .expect("nonempty state");
-            for ps in state.iter_mut() {
-                ps.cursor.advance_shallow(d.saturating_add(1));
-                ps.refresh();
-            }
-            retain_live(&mut state, &mut finished);
-            continue;
-        }
-        // 2b. Level-0 range skip.
-        if inert(block_sum) {
-            let d = state
-                .iter()
-                .map(|ps| ps.cursor.block_last_doc())
-                .min()
-                .expect("nonempty state");
-            for ps in state.iter_mut() {
-                ps.cursor.advance_shallow(d.saturating_add(1));
-                ps.refresh();
-            }
-            retain_live(&mut state, &mut finished);
-            continue;
-        }
-        // 3. Competitive window [_, window_end]: MaxScore partition
-        // over pairs, exactly the single-field step 3 with ti -> oi.
-        let window_end = state
-            .iter()
-            .map(|ps| ps.cursor.block_last_doc())
-            .min()
-            .expect("nonempty state");
-        order.clear();
-        order.extend(0..state.len());
-        order.sort_by(|&a, &b| {
-            state[a]
-                .block_max
-                .partial_cmp(&state[b].block_max)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        nonessential.clear();
-        nonessential.resize(state.len(), false);
-        prefix.clear();
-        for &j in &order {
-            let mut acc = 0.0;
-            for oi in 0..n_pairs {
-                if let Some(pos) = state.iter().position(|ps| ps.oi == oi) {
-                    if pos == j || prefix.contains(&pos) {
-                        acc += state[pos].block_max;
-                    }
-                }
-            }
-            if inert(acc) {
-                prefix.push(j);
-            } else {
-                break;
-            }
-        }
-        for &j in &prefix {
-            nonessential[j] = true;
-        }
-        // 4. The next candidate is the smallest current doc over the
-        // essential pairs only.
-        let Some(doc) = state
-            .iter()
-            .zip(&nonessential)
-            .filter(|&(_, &ne)| !ne)
-            .map(|(ps, _)| ps.cursor.doc_id())
-            .min()
-        else {
-            unreachable!("block_sum not inert but every pair non-essential");
-        };
-        if doc > window_end {
-            // The shallowest pair is necessarily non-essential (an
-            // essential one would place doc <= window_end); advancing
-            // it past the window end is safe (see the single-field
-            // step 4 argument, which is per cursor and field-blind).
-            for ps in state.iter_mut() {
-                if ps.cursor.block_last_doc() == window_end {
-                    ps.cursor.advance_shallow(window_end.saturating_add(1));
-                    ps.refresh();
-                }
-            }
-            retain_live(&mut state, &mut finished);
-            continue;
-        }
-        // 5. Candidate test with an exact bound: essential pairs their
-        // TRUE contribution when present, non-essential their block
-        // max. Doc-order and soundness arguments are the single-field
-        // step 5's, per cursor and field-blind.
-        if let Some(prev) = last_selected {
-            debug_assert!(
-                doc > prev,
-                "candidate selection out of doc order: {doc} after {prev}"
-            );
-        }
-        last_selected = Some(doc);
-        dls.clear();
-        dls.extend(fields.iter().map(|fq| fq.index.doc_length(doc)));
-        let mut bound = 0.0;
-        for oi in 0..n_pairs {
-            if let Some(pos) = state.iter().position(|ps| ps.oi == oi) {
-                let ps = &state[pos];
-                if nonessential[pos] {
-                    bound += ps.block_max;
-                } else if ps.cursor.doc_id() == doc {
-                    bound += ps.widf
-                        * tf_norm(ps.params, ps.cursor.tf(), dls[pair_meta[oi].0], ps.avgdl);
-                }
-            }
-        }
-        if inert(bound) {
-            // Not insertable now, and the floor only rises: drop it,
-            // advancing EVERY cursor past the doc (the single-field
-            // step 5 soundness proof, applied to pairs).
-            for ps in state.iter_mut() {
-                ps.cursor.advance_shallow(doc);
-                if ps.cursor.doc_id() == doc {
-                    ps.cursor.next_posting();
-                }
-                ps.refresh();
-            }
-            retain_live(&mut state, &mut finished);
-            continue;
-        }
-        // 6. Full evaluation: every cursor to the doc, contributions
-        // summed in pinned pair order, insert on the exact contract.
-        touched.clear();
-        let mut mask: u128 = 0;
-        for ps in state.iter_mut() {
-            ps.cursor.advance_shallow(doc);
-            if ps.cursor.doc_id() == doc {
-                contrib[ps.oi] =
-                    ps.widf * tf_norm(ps.params, ps.cursor.tf(), dls[pair_meta[ps.oi].0], ps.avgdl);
-                touched.push(ps.oi);
-                mask |= 1u128 << ps.oi;
-            }
-        }
-        touched.sort_unstable();
-        let mut score = 0.0;
-        for &oi in &touched {
-            score += contrib[oi];
-        }
-        prune.candidates_evaluated += 1;
-        prune.postings_scored += touched.len() as u64;
-        // Insert on the exact contract: ties at the seed survive,
-        // displacement is strictly-greater, and the document must
-        // survive every geo filter first (see the flat scorer).
-        if passes(filter, doc) && score >= floor {
-            if let Some(sink) = candidate.as_mut() {
-                sink(doc, score as f32);
-            }
-            if !heap_full || score > kth {
-                if heap_full {
-                    heap.pop();
-                }
-                heap.push(HeapEntry {
-                    score,
-                    doc_id: doc,
-                    mask,
-                });
-            }
-        }
-        for ps in state.iter_mut() {
-            if ps.cursor.doc_id() == doc {
-                ps.cursor.next_posting();
-                ps.refresh();
-            }
-        }
-        retain_live(&mut state, &mut finished);
-    }
-    prune.blocks_skipped = finished.0
-        + state
-            .iter()
-            .map(|ps| ps.cursor.blocks_skipped())
-            .sum::<u64>();
-    prune.l1_groups_skipped = finished.1
-        + state
-            .iter()
-            .map(|ps| ps.cursor.l1_groups_skipped())
-            .sum::<u64>();
-
-    let mut out: Vec<HeapEntry> = heap.into_vec();
-    out.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.doc_id.cmp(&b.doc_id))
-    });
-    out.into_iter()
-        .map(|e| FusedDoc {
-            doc_id: e.doc_id,
-            score: e.score,
-            term_offsets: (0..n_pairs)
-                .filter(|&oi| e.mask >> oi & 1 == 1)
-                .map(|oi| {
-                    let (fi, ti) = pair_meta[oi];
-                    (
-                        fi,
-                        ti,
-                        fields[fi]
-                            .index
-                            .posting_offsets(&fields[fi].terms[ti], e.doc_id),
-                    )
-                })
-                .collect(),
-        })
-        .collect()
+    pruned::fused(fields, options, filter, prune, live, candidate)
 }
 
 /// The seeded-floor contract applied to a fused fallback result: keep

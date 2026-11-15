@@ -17,7 +17,7 @@ fn certified(winners: &[(u32, u64, f32)]) -> Option<Arc<Mutex<Bm25StreamHeap>>> 
         heap: winners
             .iter()
             .map(|&(shard, vector_id, score)| {
-                StreamHeapEntry(MergedHit {
+                crate::merge::LexicalHeapEntry(MergedHit {
                     shard,
                     vector_id,
                     score,
@@ -44,7 +44,7 @@ fn certified_winners_require_the_same_shard_and_exact_score_bits() {
 }
 
 #[test]
-fn certified_and_unary_winners_preserve_their_existing_tie_orders() {
+fn certified_and_unary_winners_share_the_lexical_tie_order() {
     let mut detail = hit(9, 1.0);
     detail.snippets = vec![crate::pb::Snippet {
         field: "body".into(),
@@ -64,12 +64,12 @@ fn certified_and_unary_winners_preserve_their_existing_tie_orders() {
         3,
     )
     .unwrap();
-    // The existing unary route orders shard before id; certified winners use cmp_hits.
+    // Both routes use the public lexical order: score, shard, document id.
     assert_eq!(
         streamed.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(),
-        [2, 4, 9]
+        [4, 9, 2]
     );
-    assert_eq!(streamed[2].snippets[0].text, "certified payload");
+    assert_eq!(streamed[1].snippets[0].text, "certified payload");
     assert_eq!(
         unary.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(),
         [4, 9, 2]
