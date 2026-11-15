@@ -2,14 +2,14 @@
 
 use std::path::PathBuf;
 
-use super::args::opt;
 use super::file::FileConfig;
+use super::option::Options;
 
 /// The security surface (`docs/security.md`): the listener TLS and the
 /// client material. Files are read here so a missing certificate
 /// refuses at startup, not at the first connection.
 pub(super) fn parse_tls(
-    args: &[String],
+    o: Options<'_>,
     file: &FileConfig,
 ) -> Result<
     (
@@ -18,26 +18,10 @@ pub(super) fn parse_tls(
     ),
     String,
 > {
-    // The security surface (docs/security.md). Files are read here so a
-    // missing certificate refuses at startup, not at the first connection.
-    let path_opt = |key: &str, env: &str, file_value: Option<&str>| {
-        opt(args, key, env, file_value).map(PathBuf::from)
-    };
-    let tls_cert = path_opt(
-        "tls-cert",
-        "PIPESTREAM_SEARCH_TLS_CERT",
-        file.tls_cert.as_deref(),
-    );
-    let tls_key = path_opt(
-        "tls-key",
-        "PIPESTREAM_SEARCH_TLS_KEY",
-        file.tls_key.as_deref(),
-    );
-    let tls_client_ca = path_opt(
-        "tls-client-ca",
-        "PIPESTREAM_SEARCH_TLS_CLIENT_CA",
-        file.tls_client_ca.as_deref(),
-    );
+    let path = |flag: &str, file_value: Option<&str>| o.text(flag, file_value).map(PathBuf::from);
+    let tls_cert = path("tls-cert", file.tls_cert.as_deref());
+    let tls_key = path("tls-key", file.tls_key.as_deref());
+    let tls_client_ca = path("tls-client-ca", file.tls_client_ca.as_deref());
     let tls = match (tls_cert, tls_key) {
         (Some(cert), Some(key)) => Some(crate::security::ServerTls::load(
             &cert,
@@ -52,23 +36,10 @@ pub(super) fn parse_tls(
         }
         _ => return Err("TLS needs both --tls-cert and --tls-key".to_string()),
     };
-    let tls_ca = path_opt("tls-ca", "PIPESTREAM_SEARCH_TLS_CA", file.tls_ca.as_deref());
-    let tls_client_cert = path_opt(
-        "tls-client-cert",
-        "PIPESTREAM_SEARCH_TLS_CLIENT_CERT",
-        file.tls_client_cert.as_deref(),
-    );
-    let tls_client_key = path_opt(
-        "tls-client-key",
-        "PIPESTREAM_SEARCH_TLS_CLIENT_KEY",
-        file.tls_client_key.as_deref(),
-    );
-    let tls_domain = opt(
-        args,
-        "tls-domain",
-        "PIPESTREAM_SEARCH_TLS_DOMAIN",
-        file.tls_domain.as_deref(),
-    );
+    let tls_ca = path("tls-ca", file.tls_ca.as_deref());
+    let tls_client_cert = path("tls-client-cert", file.tls_client_cert.as_deref());
+    let tls_client_key = path("tls-client-key", file.tls_client_key.as_deref());
+    let tls_domain = o.text("tls-domain", file.tls_domain.as_deref());
     let client_tls = match tls_ca {
         Some(ca) => Some(crate::security::ClientTls::load(
             &ca,
@@ -86,4 +57,32 @@ pub(super) fn parse_tls(
         }
     };
     Ok((tls, client_tls))
+}
+
+/// TLS material, the plaintext override, bearer principals, and the UDP key.
+pub(super) struct Security {
+    pub(super) tls: Option<crate::security::ServerTls>,
+    pub(super) client_tls: Option<crate::security::ClientTls>,
+    pub(super) allow_plaintext: bool,
+    pub(super) principals: Option<std::sync::Arc<crate::security::Principals>>,
+    pub(super) udp_hmac_key: Option<crate::security::UdpKey>,
+}
+
+pub(super) fn resolve_security(o: Options<'_>, file: &FileConfig) -> Result<Security, String> {
+    let (tls, client_tls) = parse_tls(o, file)?;
+    Ok(Security {
+        tls,
+        client_tls,
+        allow_plaintext: o.raised("allow-plaintext", file.allow_plaintext),
+        principals: o
+            .text("bearer-tokens", file.bearer_tokens.as_deref())
+            .map(|path| {
+                crate::security::Principals::load(&PathBuf::from(path)).map(std::sync::Arc::new)
+            })
+            .transpose()?,
+        udp_hmac_key: o
+            .text("udp-hmac-key", file.udp_hmac_key.as_deref())
+            .map(|path| crate::security::UdpKey::load(&PathBuf::from(path)))
+            .transpose()?,
+    })
 }

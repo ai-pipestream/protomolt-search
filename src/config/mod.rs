@@ -28,16 +28,23 @@
 
 mod args;
 mod columns;
+mod dataset;
 mod file;
 mod membership;
+mod option;
+#[cfg(test)]
+mod option_tests;
 mod parse;
 mod raft;
+mod scan;
 mod shard_map;
 mod shards;
 #[cfg(test)]
 mod tests;
 mod tls;
+mod topology;
 mod turbo;
+mod validate;
 
 pub use self::args::normalize_addr;
 pub use self::parse::parse;
