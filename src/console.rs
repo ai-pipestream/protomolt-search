@@ -1,5 +1,5 @@
 //! The console: a JSON facade over the cluster's gRPC plus the web UI it
-//! serves (`docs/console-facade.md`).
+//! serves.
 //!
 //! The facade is a client of a running cluster and never part of it. It
 //! holds the TLS material and the bearer token, so a browser carries
@@ -134,7 +134,7 @@ impl ConsoleConfig {
     /// `--coordinator` (default `http://127.0.0.1:50050`), `--nodes`
     /// (comma-separated, in shard order), `--analysis` (the sidecar,
     /// for embeddings), `--allow-remote`, and the tool security flags
-    /// `ToolClient` reads (`docs/security.md`).
+    /// `ToolClient` reads.
     pub fn from_args(args: &[String]) -> Result<Self, String> {
         let security = ToolClient::from_args(args.iter().cloned())?;
         let coordinator = security.url(
@@ -152,7 +152,7 @@ impl ConsoleConfig {
             listen: flag(args, "listen").unwrap_or_else(|| "127.0.0.1:8600".to_string()),
             coordinator,
             nodes,
-            // The sidecar has no TLS (docs/security.md); its address
+            // The sidecar has no TLS; its address
             // keeps its own scheme.
             analysis: flag(args, "analysis").map(|a| grpc_addr(&a)),
             security,

@@ -4,6 +4,7 @@
 mod documents;
 mod streams;
 
+use super::android;
 use super::bridge::{lock_registry, runtime, OpenStream, QueryReceiver};
 use super::config::node_config;
 use super::ffi::*;
@@ -269,4 +270,36 @@ fn c_buffer_round_trip() {
     assert_eq!(actual, expected);
     // SAFETY: this buffer came from the bridge and has not been freed.
     unsafe { protomolt_search_buffer_free(buffer) };
+}
+
+/// Every JNI entry point the Android AAR binds to exists, compiles on
+/// the host, and is a distinct symbol.
+#[test]
+fn every_jni_entry_point_is_a_distinct_symbol() {
+    let symbols = [
+        android::Java_ai_pipestream_search_mobile_ProtomoltSearch_nativeOpen as *const () as usize,
+        android::Java_ai_pipestream_search_mobile_ProtomoltSearch_nativeIngestMapped as *const ()
+            as usize,
+        android::Java_ai_pipestream_search_mobile_ProtomoltSearch_nativeAcceptDocument as *const ()
+            as usize,
+        android::Java_ai_pipestream_search_mobile_ProtomoltSearch_nativeDescribeSchema as *const ()
+            as usize,
+        android::Java_ai_pipestream_search_mobile_ProtomoltSearch_nativePlanIndex as *const ()
+            as usize,
+        android::Java_ai_pipestream_search_mobile_ProtomoltSearch_nativeReadAcceptedDocuments
+            as *const () as usize,
+        android::Java_ai_pipestream_search_mobile_ProtomoltSearch_nativeQuery as *const () as usize,
+        android::Java_ai_pipestream_search_mobile_ProtomoltSearch_nativeQueryStreamOpen as *const ()
+            as usize,
+        android::Java_ai_pipestream_search_mobile_ProtomoltSearch_nativeQueryStreamNext as *const ()
+            as usize,
+        android::Java_ai_pipestream_search_mobile_ProtomoltSearch_nativeQueryStreamClose
+            as *const () as usize,
+        android::Java_ai_pipestream_search_mobile_ProtomoltSearch_nativeFlush as *const () as usize,
+        android::Java_ai_pipestream_search_mobile_ProtomoltSearch_nativeClose as *const () as usize,
+    ];
+    assert_eq!(symbols.len(), 12);
+    assert!(symbols.iter().all(|&address| address != 0));
+    let distinct: std::collections::HashSet<usize> = symbols.iter().copied().collect();
+    assert_eq!(distinct.len(), symbols.len());
 }

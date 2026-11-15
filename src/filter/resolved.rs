@@ -133,8 +133,7 @@ pub enum ResolvedLeaf {
         region: crate::geo::GeoRegion,
     },
     /// A string range or prefix over a facet column resolved to the
-    /// ordinal range `[lo, hi)` of a byte-sorted dictionary
-    /// (`docs/prefix-terms.md`); `lo >= hi` is the empty range.
+    /// ordinal range `[lo, hi)` of a byte-sorted dictionary; `lo >= hi` is the empty range.
     FacetOrdRange {
         /// Index into the shard's facet table.
         column: Option<usize>,
@@ -319,11 +318,11 @@ impl ResolvedFilter {
 pub struct DocFilter<'a> {
     /// Generation tombstones. A set bit is rejected before any column work.
     pub deleted: Option<std::sync::Arc<Vec<u64>>>,
-    /// The `geo_filters` field, resolved (`docs/geo-columns.md`).
+    /// The `geo_filters` field, resolved.
     pub geo: crate::geo::GeoFilters,
     /// The `filter` tree, resolved; `None` when the request sent none.
     pub pred: Option<ResolvedFilter>,
-    /// Ordered-window phrase constraints (`docs/phrase-proximity.md`),
+    /// Ordered-window phrase constraints,
     /// one per constrained field, all of which must hold. Evaluated
     /// last: the cheaper predicates above reject most documents before
     /// a positions read is paid. Empty when the request carried none.

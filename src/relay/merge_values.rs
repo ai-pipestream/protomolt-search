@@ -41,7 +41,7 @@ fn fresh_merges(aggregations: &[CompiledAggregation]) -> Vec<AggMerge> {
 
 /// The children's `AggregateShard` answers folded into one shard's
 /// answer, in child order: each partial folds through the root's own
-/// fold ([`crate::coordinator::AggMerge`]) and comes back out as a
+/// fold (`crate::coordinator::AggMerge`) and comes back out as a
 /// partial, groups join by value, histograms sum by bucket, percentile
 /// partials fold, the match counts add with a check, and the known
 /// flags OR as every child sizes them. The caps a root applies

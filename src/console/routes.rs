@@ -76,8 +76,6 @@ pub(super) struct DocumentsBody {
     pub(super) doc_ids: Vec<Value>,
 }
 
-/// Stored text for global document ids, from the owning nodes: an id
-/// belongs to the shard whose slot range holds it.
 /// The request's ids as unsigned integers, numbers or decimal strings.
 fn parse_doc_ids(values: &[Value]) -> Result<Vec<u64>, Reply> {
     let mut ids = Vec::with_capacity(values.len());
@@ -168,6 +166,8 @@ async fn shard_documents(
         .collect())
 }
 
+/// Stored text for global document ids, from the owning nodes: an id
+/// belongs to the shard whose slot range holds it.
 pub(super) async fn documents(ctx: &Ctx, body: &[u8]) -> Reply {
     let parsed: DocumentsBody = match serde_json::from_slice(body) {
         Ok(b) => b,

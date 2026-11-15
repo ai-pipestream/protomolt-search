@@ -73,9 +73,7 @@ pub fn fit_calibration(dim: usize, bit_width: usize, sample: &[f32]) -> (Vec<f32
 /// upstream's `from_parts` with zero rows. Every index built from the
 /// same pair encodes a given vector byte-identically regardless of
 /// build history, which is what makes per-shard scores mergeable into
-/// an exact global top-k. (This replaces the fork's former
-/// `new_with_calibration` patch; upstream #474 made the property
-/// expressible with stock API.)
+/// an exact global top-k.
 pub fn seeded_index(dim: usize, bit_width: usize, shift: &[f32], scale: &[f32]) -> VectorIndex {
     let config = embedded_turbovec_config(bit_width, shift, scale)
         .expect("a fitted calibration pair is valid backend state");
@@ -258,7 +256,6 @@ pub async fn start_empty_node(
     start_node_inner(None, config, None).await
 }
 
-/// Start an empty node with the product-owned phrase vocabulary attached.
 /// Reopen a persisted shard through [`NodeServiceImpl::open`] — the
 /// recovery path the serving binary and the embedded runtime take — and
 /// serve it. `start_empty_node` constructs a fresh shard instead.
@@ -281,6 +278,7 @@ pub async fn start_opened_node(
     (format!("http://{addr}"), handle)
 }
 
+/// Start an empty node with the product-owned phrase vocabulary attached.
 pub async fn start_empty_phrase_node(
     config: NodeConfig,
     phrases: std::sync::Arc<crate::phrases::PhraseIndex>,
@@ -315,7 +313,7 @@ pub async fn serve_node(node: NodeServiceImpl) -> (String, JoinHandle<Result<(),
     (format!("http://{addr}"), handle)
 }
 
-/// Start a relay coordinator (`docs/relay-coordinators.md`) over
+/// Start a relay coordinator over
 /// `children` on 127.0.0.1:0, its parent-facing UDP lane on the same
 /// port, and return the relay handle beside the address so a test can
 /// read its token registry. The children are not checked here: a test

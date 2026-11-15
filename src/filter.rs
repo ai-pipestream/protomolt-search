@@ -1,8 +1,8 @@
-//! Compiled filter predicates (`docs/cel-filters.md`): validation of
+//! Compiled filter predicates: validation of
 //! the wire [`crate::pb::FilterExpr`] tree, the per-shard resolved
 //! form, and its three-valued evaluation.
 //!
-//! The division of labor is the one `docs/score-functions.md` pinned:
+//! The division of labor:
 //! CEL is the SURFACE syntax (`src/cel.rs` compiles it at the
 //! coordinator), this module is the predicate ENGINE, and nothing here
 //! ever sees CEL text. The coordinator compiles once; every shard then

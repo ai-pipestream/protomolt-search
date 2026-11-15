@@ -1,4 +1,4 @@
-//! The diagnostics service (`docs/diagnostics.md`): runtime knobs that
+//! The diagnostics service: runtime knobs that
 //! flip without a restart, structured metrics snapshots and a stream
 //! of them, per-shard layout diagnostics, and the coordinator's ring of
 //! recent public requests.

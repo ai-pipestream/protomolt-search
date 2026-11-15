@@ -1,6 +1,6 @@
 //! Stable byte-oriented ABI used by the Android AAR and Apple XCFramework.
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 mod android;
 mod bridge;
 mod config;

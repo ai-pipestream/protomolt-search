@@ -1,4 +1,4 @@
-//! The generic named-dimension composite scorer (`docs/query-api.md`).
+//! The generic named-dimension composite scorer.
 //!
 //! This is the engine's learning-to-rank surface: named signals in,
 //! explicit weights and normalizations, one deterministic combination,

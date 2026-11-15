@@ -1,5 +1,4 @@
-//! Producing a dense quality profile from measurement
-//! (`docs/dense-quality-profile.md`).
+//! Producing a dense quality profile from measurement.
 //!
 //! Everything here goes through the public `Query` route the profile
 //! will later serve: for every `k` and every candidate depth on the

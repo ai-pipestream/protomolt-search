@@ -4,7 +4,7 @@
 use super::*;
 
 /// The `k` a public request asks for, when it has one: the field a
-/// principal's `max_k` quota is checked against (`docs/security.md`).
+/// principal's `max_k` quota is checked against.
 pub(super) trait RequestK {
     fn k(&self) -> Option<u32> {
         None
@@ -37,8 +37,8 @@ impl RequestK for QueryStreamRequest {
     }
 }
 
-/// The figures a public response contributes to its ring entry
-/// (docs/diagnostics.md), read without cloning the response.
+/// The figures a public response contributes to its ring entry, read
+/// without cloning the response.
 pub(super) trait RecentFields {
     fn figures(&self) -> crate::diagnostics::RecentFigures {
         Default::default()
@@ -166,9 +166,9 @@ impl RequestK for FreezeTopologyWritesRequest {}
 impl RequestK for PublishTopologyRequest {}
 impl RequestK for AbortTopologyCutoverRequest {}
 impl RequestK for ClusterHealthRequest {}
-// `limit` is not a `k`: it is capped absolutely at MAX_SUGGEST_LIMIT
-// (`docs/suggest.md`), so only the concurrency quota applies.
+// `limit` is not a `k`: it is capped absolutely at MAX_SUGGEST_LIMIT,
+// so only the concurrency quota applies.
 impl RequestK for SuggestRequest {}
-// `limit` is per term and capped absolutely too (docs/synonyms.md).
+// `limit` is per term and capped absolutely too.
 impl RequestK for TermSuggestRequest {}
 impl RequestK for Streaming<RoutedIngestMappedRequest> {}

@@ -240,7 +240,7 @@ impl Knobs {
     }
 
     /// Coordinator: whether a filter skips shards from their placement
-    /// leaf (docs/placement.md). A node answers `true`; it holds no
+    /// leaf. A node answers `true`; it holds no
     /// topology.
     pub fn shard_pruning(&self) -> bool {
         match &self.live {

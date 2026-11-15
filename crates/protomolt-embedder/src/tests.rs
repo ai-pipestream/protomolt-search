@@ -162,7 +162,7 @@ fn embed_applies_per_token_weights_but_divides_by_token_count() {
 
 #[test]
 fn load_rejects_malformed_content_instead_of_panicking() {
-    // One-dimensional shape: previously an index-out-of-bounds panic.
+    // One-dimensional shape is rejected as a format error without panicking.
     let dir = std::env::temp_dir().join(format!("pm-embedder-bad-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let tokenizer = serde_json::json!({

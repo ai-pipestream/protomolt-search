@@ -1,5 +1,4 @@
-//! Generation-bound candidate-depth profiles for FP32 vector reranking
-//! (`docs/dense-quality-profile.md`).
+//! Generation-bound candidate-depth profiles for FP32 vector reranking.
 //!
 //! A profile is measured data, not an engine default. It binds a set of
 //! `(k, recall target) -> candidate depth` observations to the provider score

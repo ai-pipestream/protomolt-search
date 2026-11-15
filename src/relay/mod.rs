@@ -5,7 +5,7 @@
 //! them on a node, and the relay answers the read routes by fanning out
 //! to its children (shard nodes or further relays) and merging their
 //! answers exactly. Every write, administration, and per-shard fusion
-//! route refuses UNIMPLEMENTED by name ([`refused`]). Each decision pins
+//! route refuses UNIMPLEMENTED by name (`refused`). Each decision pins
 //! the [`MapSource`] reading it was made under and refuses by name when
 //! that reading is no longer current.
 

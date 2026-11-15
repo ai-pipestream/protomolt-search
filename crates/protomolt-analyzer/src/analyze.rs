@@ -37,8 +37,8 @@ pub fn analyze_with_offset_unit(
     Ok(vectors.finish(sentences, tokens, offset_unit))
 }
 
-/// Both term identities of one text from ONE tokenization
-/// (`docs/dual-cased.md`): `folded` under `spec`, `cased` under the same
+/// Both term identities of one text from ONE tokenization:
+/// `folded` under `spec`, `cased` under the same
 /// chain without case folding ([`cased_twin`]). Vector for vector the
 /// occurrence spans and token ordinals coincide, because the tokens are
 /// the same tokens; only the identity each token maps to differs.

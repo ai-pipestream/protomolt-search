@@ -1,4 +1,4 @@
-//! Collections (`docs/collections.md`): one cluster, many datasets, no
+//! Collections: one cluster, many datasets, no
 //! bleed between them.
 //!
 //! A [`CoordinatorServiceImpl`] already owns everything one dataset needs

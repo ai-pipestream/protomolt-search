@@ -7,11 +7,10 @@ use super::*;
 #[derive(Clone)]
 pub struct CollectionSet {
     pub(super) members: Members<CoordinatorServiceImpl>,
-    /// Bearer principals (`docs/security.md`); `None` serves anonymous
+    /// Bearer principals; `None` serves anonymous
     /// callers with no quotas.
     pub(super) principals: Option<Arc<Principals>>,
-    /// The recent-request ring the diagnostics service reads
-    /// (docs/diagnostics.md).
+    /// The recent-request ring the diagnostics service reads.
     pub(super) ring: Arc<crate::diagnostics::RecentRing>,
 }
 
@@ -26,7 +25,7 @@ impl CollectionSet {
     }
 
     /// Require a bearer token on every public call and apply each
-    /// principal's quotas (`docs/security.md`).
+    /// principal's quotas.
     pub fn with_principals(mut self, principals: Arc<Principals>) -> Self {
         self.principals = Some(principals);
         self
@@ -174,11 +173,7 @@ impl CollectionSet {
         out
     }
 
-    /// Ask every node of every collection which collection it serves and
-    /// refuse the set when any answer disagrees with the coordinator that
-    /// lists it. Run at startup so a misconfigured fleet never serves.
-    /// The diagnostics service over this set (docs/diagnostics.md):
-    /// the members' knobs and layouts, this set's principals for the
+    /// The diagnostics service over this set: the members' knobs and layouts, this set's principals for the
     /// admin rule, and the ring of recent requests.
     pub fn diagnostics(&self) -> crate::diagnostics::CoordinatorDiagnostics {
         let members = self
@@ -240,6 +235,9 @@ impl CollectionSet {
         });
     }
 
+    /// Ask every node of every collection which collection it serves and
+    /// refuse the set when any answer disagrees with the coordinator that
+    /// lists it. Run at startup so a misconfigured fleet never serves.
     pub async fn verify_membership(&self) -> Result<(), Status> {
         for (_, member) in self.members() {
             member.verify_collection_membership().await?;
