@@ -92,21 +92,32 @@ fn generation(dir: &Path, name: &str, id: u64, declaration: &[DerivedColumnConfi
 
 type Batch<'a, 'b> = [(&'a str, Option<&'b AnalysisSpec>, SessionLayers)];
 
-/// The native analyzer when `working`; otherwise one that refuses any call.
+/// The native analyzer under the body spec when `working`, as a serving
+/// sidecar with a default analysis would answer; otherwise one that
+/// refuses any call.
 fn analyzer(working: bool) -> impl FnMut(&Batch<'_, '_>) -> Result<Vec<AnalyzedDoc>, String> {
     let handle = tokio::runtime::Handle::try_current().ok();
     move |docs| {
         if !working {
             return Err("this run analyzes nothing".to_string());
         }
+        let spec = body_spec();
+        let docs: Vec<_> = docs
+            .iter()
+            .map(|(text, given, layers)| (*text, Some(given.unwrap_or(&spec)), *layers))
+            .collect();
         let handle = handle
             .as_ref()
             .expect("a working analyzer runs under tokio");
         tokio::task::block_in_place(|| {
             handle.block_on(async {
-                pipestream_search::analyzer::analyze_batch_streams(NATIVE_ANALYSIS_BACKEND, docs, 1)
-                    .await
-                    .map_err(|e| e.to_string())
+                pipestream_search::analyzer::analyze_batch_streams(
+                    NATIVE_ANALYSIS_BACKEND,
+                    &docs,
+                    1,
+                )
+                .await
+                .map_err(|e| e.to_string())
             })
         })
     }
