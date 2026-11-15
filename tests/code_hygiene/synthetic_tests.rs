@@ -99,7 +99,7 @@ fn detects_unconditional_allows_and_permits_conditional_dead_code() {
 fn feature_gated_helper() {}
 
 #[allow(clippy::too_many_arguments)]
-fn legacy_wide() {}
+fn wide_callee() {}
 
 #[cfg_attr(not(test), allow(clippy::too_many_arguments))]
 fn disguised_wide() {}
@@ -170,4 +170,28 @@ fn string_raw_string_char_and_lifetime_tokens_do_not_false_positive() {
     assert!(report.comments.doc_breadcrumbs.is_empty());
     assert!(report.comments.slop_phrases.is_empty());
     assert!(report.comments.ai_slop_refs.is_empty());
+    assert!(report.comments.issue_breadcrumbs.is_empty());
+}
+
+#[test]
+fn detects_issue_breadcrumbs_in_comments_and_ignores_strings_and_hex() {
+    let ref_a = concat!("#", "42");
+    let ref_b = concat!("#", "0");
+    let str_ref = concat!("\"see (", "#", "99, ", "#", "7)\"");
+    let src = format!(
+        "// Tracked under ({ref_a}) and Gate {ref_b}; color #1a2b3c and entity &#39; ok.\n\
+         pub fn sample() -> &'static str {{\n\
+             let _raw = r#\"raw string\"#;\n\
+             {str_ref}\n\
+         }}\n"
+    );
+
+    let report = analyze_source("src/issues.rs", &src);
+    let issues: Vec<&str> = report
+        .comments
+        .issue_breadcrumbs
+        .iter()
+        .map(|(_, tag)| tag.as_str())
+        .collect();
+    assert_eq!(issues, vec![ref_a, ref_b]);
 }

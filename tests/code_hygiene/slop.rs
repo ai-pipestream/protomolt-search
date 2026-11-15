@@ -1,5 +1,6 @@
 //! Comment and markdown detectors for inline documentation breadcrumbs,
-//! past-state narration, war-story markers, and retired research directories.
+//! diff-narration phrases, war-story markers, issue breadcrumbs, and retired
+//! research directories.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -42,6 +43,7 @@ pub(crate) struct CommentFindings {
     pub(crate) doc_breadcrumbs: Vec<(usize, String)>,
     pub(crate) slop_phrases: Vec<(usize, &'static str)>,
     pub(crate) ai_slop_refs: Vec<(usize, String)>,
+    pub(crate) issue_breadcrumbs: Vec<(usize, String)>,
 }
 
 pub(crate) fn scan_comment(comment: &str, start_line: usize, out: &mut CommentFindings) {
@@ -49,6 +51,9 @@ pub(crate) fn scan_comment(comment: &str, start_line: usize, out: &mut CommentFi
         let line = start_line + idx;
         for crumb in extract_doc_breadcrumbs(raw_line) {
             out.doc_breadcrumbs.push((line, crumb));
+        }
+        for issue in extract_issue_breadcrumbs(raw_line) {
+            out.issue_breadcrumbs.push((line, issue));
         }
         let lower = raw_line.to_ascii_lowercase();
         for &phrase in SLOP_PHRASES {
@@ -207,4 +212,32 @@ fn contains_word_bounded(haystack: &str, needle: &str) -> bool {
 
 fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn extract_issue_breadcrumbs(line: &str) -> Vec<String> {
+    let bytes = line.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'#'
+            && bytes[i + 1].is_ascii_digit()
+            && (i == 0 || !is_issue_prefix_blocker(bytes[i - 1]))
+        {
+            let mut end = i + 2;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end == bytes.len() || !is_word_byte(bytes[end]) {
+                out.push(line[i..end].to_owned());
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+fn is_issue_prefix_blocker(b: u8) -> bool {
+    is_word_byte(b) || b == b'&' || b == b'#'
 }

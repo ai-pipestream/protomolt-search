@@ -1,22 +1,22 @@
-//! Baseline module allowances for `code_hygiene` (Wave 2 Gate #0).
+//! Stabilization-baseline module allowances for `code_hygiene`.
 //!
 //! Allowances are keyed by canonical top-level module path (for example, both
 //! `src/analyzer.rs` and `src/analyzer/**` map to `"src/analyzer"`). Every
-//! ceiling is non-increasing (`actual <= allowance`): modularizing a monolith
-//! into submodules or eliminating legacy violations passes without merge
-//! conflicts, while any module at default (`0` violations) or any new module
-//! is locked strictly at the Paper 1 defaults.
+//! ceiling is non-increasing (`actual <= allowance`): modularizing a file into
+//! submodules or reducing existing counts passes without merge conflicts, while
+//! any module at default (`0` allowance) or any new module is locked strictly
+//! at the default ceilings.
 
 pub(crate) const DEFAULT_FN_LINES: usize = 80;
 pub(crate) const DEFAULT_TEST_FN_LINES: usize = 120;
 pub(crate) const DEFAULT_MAX_PARAMS: usize = 7;
 
-/// Legacy file count in the retired `docs/` research dump directory on
-/// `86afe129` prior to `#146` removal; non-increasing so deletion drops to `0`.
+/// Non-increasing file ceiling for the retired `docs/` research dump directory
+/// on the stabilization baseline; shrinks to `0` once removed.
 pub(crate) const MAX_DOCS_RETIRED_DUMP_FILES: usize = 22;
 
-/// Legacy `docs/` markdown files on `86afe129` that still link into the
-/// retired research dump prior to `#146`; all other files are locked at `0`.
+/// Files in `docs/` on the stabilization baseline with remaining links into the
+/// retired research dump; every other file is locked strictly at `0`.
 pub(crate) const DOCS_RETIRED_LINK_RATCHET: &[(&str, usize)] = &[
     ("docs/dense-quality-profile.md", 2),
     ("docs/query-api.md", 1),
@@ -99,8 +99,8 @@ const fn base(module: &'static str) -> ModuleAllowance {
     ModuleAllowance::base(module)
 }
 
-/// Non-increasing per-module legacy allowances measured on `86afe129`.
-/// Modules with zero legacy violations are omitted and locked at defaults.
+/// Non-increasing per-module allowances on the stabilization baseline.
+/// Modules already within every default ceiling are omitted.
 pub(crate) const RATCHET: &[ModuleAllowance] = &[
     base("crates/protomolt-analyzer/src/lib").comments(1, 0),
     base("crates/protomolt-embedder/src/lib")

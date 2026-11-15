@@ -1,21 +1,21 @@
-//! Source-code hygiene gate (`Wave 2 Gate #0`, issues #138, #144, #145, #146).
+//! Source-code structural and documentation hygiene gate.
 //!
-//! Mechanically enforces Paper 1 structural and documentation invariants over
-//! every `.rs` file under `src/` and `crates/` (plus retired-directory hygiene
-//! over `docs/`) using a real Rust token/comment lexer (`code_hygiene/lexer.rs`):
+//! Enforces structural and documentation invariants over every `.rs` file under
+//! `src/` and `crates/` (plus retired-directory hygiene over `docs/`) using a
+//! Rust token and comment lexer (`code_hygiene/lexer.rs`):
 //!
 //! 1. Non-test function length (`signature..=closing_brace`) `<= 80` lines,
 //!    and test function length `<= 120` lines.
 //! 2. Non-test function parameter count `<= 7` parameters.
 //! 3. Zero new unconditional `#[allow(clippy::too_many_arguments)]` or
 //!    unconditional `#[allow(dead_code)]` attributes.
-//! 4. Zero new `docs/*.md` inline comment breadcrumbs, past-state / war-story
-//!    comment narration phrases, or retired research-dump references.
+//! 4. Zero new `docs/*.md` inline comment breadcrumbs, diff-narration or
+//!    war-story comment phrases, or retired research-dump references.
 //!
-//! Legacy modules above the defaults on `86afe129` are recorded in
-//! `code_hygiene/ratchet.rs` keyed by top-level module path (`src/foo.rs` and
-//! `src/foo/**` both map to `"src/foo"`), with non-increasing `actual <= limit`
-//! checks so concurrent file splits and violation reductions merge cleanly.
+//! Modules above the default ceilings on the stabilization baseline are listed
+//! in `code_hygiene/ratchet.rs` keyed by top-level module path (`src/foo.rs`
+//! and `src/foo/**` both map to `"src/foo"`), with non-increasing
+//! `actual <= limit` checks so modular splits and reductions merge cleanly.
 
 #[path = "code_hygiene/analyzer.rs"]
 mod analyzer;
@@ -46,8 +46,7 @@ use scan::{
 };
 use slop::collect_docs_retired_violations;
 
-const SELF_MAX_ENTRY_LINES: usize = 400;
-const SELF_MAX_SUBMODULE_LINES: usize = 350;
+const SELF_MAX_FILE_LINES: usize = 350;
 const SELF_MAX_FN_LINES: usize = 75;
 const SELF_MAX_FN_PARAMS: usize = 6;
 
@@ -258,15 +257,10 @@ fn code_hygiene_suite_obeys_strict_paper1_limits() {
     for path in own_files {
         let rel = relative_path(&root, &path);
         let src = read_utf8(&path);
-        let line_cap = if rel == "tests/code_hygiene.rs" {
-            SELF_MAX_ENTRY_LINES
-        } else {
-            SELF_MAX_SUBMODULE_LINES
-        };
         let total_lines = src.lines().count();
         assert!(
-            total_lines <= line_cap,
-            "{rel}: {total_lines} lines exceeds self-ceiling {line_cap}"
+            total_lines <= SELF_MAX_FILE_LINES,
+            "{rel}: {total_lines} lines exceeds self-ceiling {SELF_MAX_FILE_LINES}"
         );
         let allows = find_any_allow_lines(&src);
         assert!(allows.is_empty(), "{rel}: #[allow] at lines {allows:?}");
@@ -274,6 +268,11 @@ fn code_hygiene_suite_obeys_strict_paper1_limits() {
         assert!(report.comments.doc_breadcrumbs.is_empty(), "{rel}: crumbs");
         assert!(report.comments.slop_phrases.is_empty(), "{rel}: slop");
         assert!(report.comments.ai_slop_refs.is_empty(), "{rel}: dump ref");
+        assert!(
+            report.comments.issue_breadcrumbs.is_empty(),
+            "{rel}: issue breadcrumbs {:?}",
+            report.comments.issue_breadcrumbs
+        );
         for func in report.functions {
             assert!(
                 func.lines.unwrap_or(0) <= SELF_MAX_FN_LINES,
