@@ -565,72 +565,8 @@ fn native_replay_analyzer() -> impl FnMut(
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn positions_and_bigrams_survive_flush_reopen_and_wal_replay() {
-    let dir = tempdir("durable");
-    let index_path = dir.join("shard.tv");
-    let config = NodeConfig {
-        index_path: Some(index_path.clone()),
-        layout: pipestream_search::node::Layout::SingleImage,
-        wal: true,
-        wal_buckets: 8,
-        ..proximity_config(0, NATIVE_ANALYSIS_BACKEND)
-    };
-    let (addr, handle) = start_empty_node(config.clone()).await;
-    // Resharding replays a WAL only under locked provider state (child
-    // scores must be byte-comparable), so seed the calibration first,
-    // as every resharded shard is.
-    {
-        let sample = common::unit_vectors(256, common::DIM, 0x5EED_CA11);
-        let (shift, scale) = common::fit_calibration(common::DIM, common::BIT_WIDTH, &sample);
-        let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
-        client
-            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
-                common::DIM,
-                common::BIT_WIDTH,
-                &shift,
-                &scale,
-            ))
-            .await
-            .unwrap();
-    }
-    ingest(&addr, &CORPUS, Some(body_spec())).await;
-    let coordinator = CoordinatorServiceImpl::new(vec![addr.clone()]).with_bm25(
-        Some(NATIVE_ANALYSIS_BACKEND.to_string()),
-        Default::default(),
-    );
-    let probes = [
-        ("new york", 0u32),
-        ("new york", 1),
-        ("new york city", 0),
-        ("york new", 5),
-    ];
-    // A persisted shard bulk-builds through the spill builder and is
-    // not searchable until flushed; the flushed (mmap) shard is the
-    // baseline every later reopen and replay must match bitwise.
-    let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
-    assert!(
-        client
-            .flush(FlushRequest {})
-            .await
-            .unwrap()
-            .into_inner()
-            .written
-    );
-    let mut live = Vec::new();
-    for (text, slop) in probes {
-        live.push(signature(
-            &bm25(&coordinator, phrase_request(text, slop)).await.hits,
-        ));
-    }
-    assert_eq!(live[0].len(), 3);
-    assert_eq!(live[1].len(), 5);
-    handle.abort();
-
-    // The file itself: kind-7 positions on the body, the bigram column
-    // as an ordinary field, nothing on the title.
-    let bm25_path = bm25_sidecar_path(&index_path);
-    let reader = Bm25Reader::open(&bm25_path).unwrap();
+fn verify_persisted_positions_sidecar(bm25_path: &Path) {
+    let reader = Bm25Reader::open(bm25_path).unwrap();
     assert!(reader.field_has_positions(0));
     let bigrams = reader
         .field_index("body.bigrams")
@@ -643,48 +579,14 @@ async fn positions_and_bigrams_survive_flush_reopen_and_wal_replay() {
         reader.field(0).posting_positions("new", 5),
         Some(vec![0, 2])
     );
-    drop(reader);
+}
 
-    // Restart from disk: no in-memory state carried over.
-    let shard = Bm25Shard::open(&bm25_path).unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr2 = format!("http://{}", listener.local_addr().unwrap());
-    let service = NodeServiceImpl::new(None, config.clone()).with_bm25(Some(shard));
-    let handle2 = tokio::spawn(
-        tonic::transport::Server::builder()
-            .add_service(service.into_server(pipestream_search::MAX_MESSAGE_BYTES))
-            .serve_with_incoming(pipestream_search::harness::nodelay_incoming(listener)),
-    );
-    let reopened = CoordinatorServiceImpl::new(vec![addr2]).with_bm25(
-        Some(NATIVE_ANALYSIS_BACKEND.to_string()),
-        Default::default(),
-    );
-    for (i, (text, slop)) in probes.iter().enumerate() {
-        let after = bm25(&reopened, phrase_request(text, *slop)).await;
-        assert_eq!(
-            signature(&after.hits),
-            live[i],
-            "{text:?} slop {slop} after reopen"
-        );
-    }
-    handle2.abort();
-
-    // WAL replay: split 1 -> 2 through the native replay analyzer. The
-    // children carry positions and the derived column from the record
-    // alone — no node configuration is handed to the replay.
-    let out_dir = dir.join("split");
-    let output = reshard::split(
-        &reshard::resolve_gen(&pipestream_search::wal::wal_dir(&index_path)).unwrap(),
-        2,
-        &out_dir,
-        0,
-        25_000_000,
-        false,
-        None,
-        &mut native_replay_analyzer(),
-    )
-    .unwrap();
-    let parent = Bm25Reader::open(&bm25_path).unwrap();
+fn verify_replayed_positions_and_bigrams(index_path: &Path, bm25_path: &Path, out_dir: &Path) {
+    let gen = reshard::resolve_gen(&pipestream_search::wal::wal_dir(index_path)).unwrap();
+    let req =
+        reshard::SplitRequest::new(std::slice::from_ref(&gen), 2, out_dir).slot_stride(25_000_000);
+    let output = reshard::split_logs_with(&req, &mut native_replay_analyzer()).unwrap();
+    let parent = Bm25Reader::open(bm25_path).unwrap();
     let mut seen_docs = 0usize;
     let mut bigram_df = 0u32;
     for child in &output.children {
@@ -718,6 +620,86 @@ async fn positions_and_bigrams_survive_flush_reopen_and_wal_replay() {
     }
     assert_eq!(seen_docs, CORPUS.len());
     assert_eq!(bigram_df, 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn positions_and_bigrams_survive_flush_reopen_and_wal_replay() {
+    let dir = tempdir("durable");
+    let index_path = dir.join("shard.tv");
+    let config = NodeConfig {
+        index_path: Some(index_path.clone()),
+        layout: pipestream_search::node::Layout::SingleImage,
+        wal: true,
+        wal_buckets: 8,
+        ..proximity_config(0, NATIVE_ANALYSIS_BACKEND)
+    };
+    let (addr, handle) = start_empty_node(config.clone()).await;
+    let sample = common::unit_vectors(256, common::DIM, 0x5EED_CA11);
+    let (shift, scale) = common::fit_calibration(common::DIM, common::BIT_WIDTH, &sample);
+    let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+    let backend_req = pipestream_search::harness::embedded_backend_request(
+        common::DIM,
+        common::BIT_WIDTH,
+        &shift,
+        &scale,
+    );
+    client.configure_vector_backend(backend_req).await.unwrap();
+    ingest(&addr, &CORPUS, Some(body_spec())).await;
+    let coordinator = CoordinatorServiceImpl::new(vec![addr.clone()]).with_bm25(
+        Some(NATIVE_ANALYSIS_BACKEND.to_string()),
+        Default::default(),
+    );
+    let probes = [
+        ("new york", 0u32),
+        ("new york", 1),
+        ("new york city", 0),
+        ("york new", 5),
+    ];
+    assert!(
+        client
+            .flush(FlushRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .written
+    );
+    let mut live = Vec::new();
+    for (text, slop) in probes {
+        live.push(signature(
+            &bm25(&coordinator, phrase_request(text, slop)).await.hits,
+        ));
+    }
+    assert_eq!(live[0].len(), 3);
+    assert_eq!(live[1].len(), 5);
+    handle.abort();
+
+    let bm25_path = bm25_sidecar_path(&index_path);
+    verify_persisted_positions_sidecar(&bm25_path);
+
+    let shard = Bm25Shard::open(&bm25_path).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr2 = format!("http://{}", listener.local_addr().unwrap());
+    let service = NodeServiceImpl::new(None, config.clone()).with_bm25(Some(shard));
+    let handle2 = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(service.into_server(pipestream_search::MAX_MESSAGE_BYTES))
+            .serve_with_incoming(pipestream_search::harness::nodelay_incoming(listener)),
+    );
+    let reopened = CoordinatorServiceImpl::new(vec![addr2]).with_bm25(
+        Some(NATIVE_ANALYSIS_BACKEND.to_string()),
+        Default::default(),
+    );
+    for (i, (text, slop)) in probes.iter().enumerate() {
+        let after = bm25(&reopened, phrase_request(text, *slop)).await;
+        assert_eq!(
+            signature(&after.hits),
+            live[i],
+            "{text:?} slop {slop} after reopen"
+        );
+    }
+    handle2.abort();
+
+    verify_replayed_positions_and_bigrams(&index_path, &bm25_path, &dir.join("split"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

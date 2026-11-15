@@ -30,7 +30,6 @@ mod analysis_sidecar;
 mod bucket_replay;
 mod child_build;
 mod compact_log;
-mod compat;
 mod cuts;
 mod hash_split;
 mod hnsw_sources;
@@ -51,10 +50,6 @@ mod tree_split;
 pub use self::child_build::manifest_derived;
 pub use self::compact_log::{
     compact_log, CompactedRow, CompactionBuild, CompactionRequest, RowSink,
-};
-pub(crate) use self::compat::{compact_log_partitioned_with_sources, compact_log_with_sources};
-pub use self::compat::{
-    split, split_logs, split_logs_segmented, split_placement_logs, split_stable_logs,
 };
 pub use self::hash_split::{
     merge, split_logs_with, split_stable_logs_ranged, split_stable_logs_with, SplitRequest,

@@ -59,8 +59,8 @@ use std::time::Duration;
 use tonic::Status;
 
 use crate::coordinator::CoordinatorServiceImpl;
-use crate::node::STALE_STATS_EPOCH;
 use crate::pb::node_service_server::NodeServiceServer;
+use crate::stats_identity::stale_stats_epoch_status;
 use crate::stats_identity::{StatsClaim, StatsIncarnation};
 
 use self::signals::RelaySignals;
@@ -187,17 +187,17 @@ impl RelayService {
             registry.lookup(token).cloned()
         }
         .ok_or_else(|| {
-            Status::failed_precondition(format!(
-                "{STALE_STATS_EPOCH}: relay token {token} is not one this relay issued and \
-                 still retains (a child's statistics moved, the token is older than the \
-                 {RETAINED_TOKENS} newest, or the relay restarted); refetch TermStats"
+            stale_stats_epoch_status(format!(
+                "relay token {token} is not one this relay issued and still retains (a child's \
+                 statistics moved, the token is older than the {RETAINED_TOKENS} newest, or the \
+                 relay restarted); refetch TermStats"
             ))
         })?;
         let now = self.map();
         if now.control_revision != tuple.control_revision {
-            return Err(Status::failed_precondition(format!(
-                "{STALE_STATS_EPOCH}: relay token {token} was issued under map revision {} and \
-                 the map is at revision {} now; refetch TermStats",
+            return Err(stale_stats_epoch_status(format!(
+                "relay token {token} was issued under map revision {} and the map is at revision \
+                 {} now; refetch TermStats",
                 tuple.control_revision, now.control_revision
             )));
         }
@@ -227,9 +227,9 @@ impl RelayService {
         self.stats_incarnation.check(token, token, incarnation)?;
         let claims = self.translate_epoch(token)?;
         if claims.len() != children {
-            return Err(Status::failed_precondition(format!(
-                "{STALE_STATS_EPOCH}: relay token {token} names {} children and the map has \
-                 {children}; refetch TermStats",
+            return Err(stale_stats_epoch_status(format!(
+                "relay token {token} names {} children and the map has {children}; refetch \
+                 TermStats",
                 claims.len()
             )));
         }

@@ -36,7 +36,7 @@ use pipestream_search::pb::{
 };
 use pipestream_search::phrases::PhraseIndex;
 use pipestream_search::postings::{AnalyzedDoc, Bm25Index, Bm25Reader, Bm25Store};
-use pipestream_search::segments::{SegmentCatalog, SegmentSource};
+use pipestream_search::segments::{SegmentCatalog, SegmentSource, WalCompactionRequest};
 use pipestream_search::vector::{VectorIndex, EMBEDDED_TURBOVEC};
 use pipestream_search::{analyzer, reshard};
 use tokio::sync::mpsc;
@@ -276,6 +276,35 @@ fn topk(
     hits
 }
 
+fn assert_children_reconstruct_topk(
+    parent: &VectorIndex,
+    child_images: &[reshard::ChildImage],
+    queries: u64,
+    k: usize,
+) {
+    let children: Vec<(&reshard::ChildImage, VectorIndex)> = child_images
+        .iter()
+        .map(|c| {
+            let mut index = VectorIndex::load(EMBEDDED_TURBOVEC, &c.vector_path).unwrap();
+            index.prepare().unwrap();
+            (c, index)
+        })
+        .collect();
+    for q in 0..queries {
+        let query = unit_vectors(1, DIM, 0xB0B0_0000 + q);
+        let expected = topk(parent, &query, k, |id| id);
+        let mut merged: Vec<(u64, u32)> = children
+            .iter()
+            .flat_map(|(child, index)| {
+                topk(index, &query, k, |local| child.parent_ids[local as usize])
+            })
+            .collect();
+        merged.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        merged.truncate(k);
+        assert_eq!(merged, expected, "query {q}: split changed the top-k");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn split_reconstructs_parent_topk() {
     let dir = tempdir("split");
@@ -288,38 +317,26 @@ async fn split_reconstructs_parent_topk() {
         start_wal_node(&dir, "shard.tv", 0, 64, &analysis_addr, &shift, &scale).await;
     ingest(&mut client, &corpus, N, DOCS).await;
 
-    // Parent reference: the flushed image.
     let mut parent = VectorIndex::load(EMBEDDED_TURBOVEC, &index_path).unwrap();
     parent.prepare().unwrap();
 
-    // Split the node's WAL 1 -> 2 (cheap path: 2 <= 64 buckets, each
-    // child owns a contiguous bucket range).
     let out_dir = dir.join("split");
-    let output = reshard::split(
-        &reshard::resolve_gen(&pipestream_search::wal::wal_dir(&index_path)).unwrap(),
-        2,
-        &out_dir,
-        0,
-        25_000_000,
-        false,
-        None,
-        &mut replay_analyzer(&analysis_addr),
-    )
-    .unwrap();
+    let gen = reshard::resolve_gen(&pipestream_search::wal::wal_dir(&index_path)).unwrap();
+    let req =
+        reshard::SplitRequest::new(std::slice::from_ref(&gen), 2, &out_dir).slot_stride(25_000_000);
+    let output = reshard::split_logs_with(&req, &mut replay_analyzer(&analysis_addr)).unwrap();
 
     assert_eq!(output.generation, 1);
     assert_eq!(output.children.len(), 2);
     let total_vectors: u64 = output.children.iter().map(|c| c.num_vectors).sum();
     let total_docs: u64 = output.children.iter().map(|c| c.num_documents).sum();
-    assert_eq!(total_vectors, N as u64);
-    assert_eq!(total_docs, DOCS as u64);
-    // The hash ranges tile the full u64 space.
-    assert_eq!(output.children[0].hash_lo, 0);
-    assert_eq!(output.children[1].hash_hi, u64::MAX);
+    assert_eq!((total_vectors, total_docs), (N as u64, DOCS as u64));
+    assert_eq!(
+        (output.children[0].hash_lo, output.children[1].hash_hi),
+        (0, u64::MAX)
+    );
     assert_eq!(output.children[0].hash_hi + 1, output.children[1].hash_lo);
-    // Slot offsets follow base + i * stride.
     assert_eq!(output.children[1].slot_offset, 25_000_000);
-    // Cheap split: child i owns exactly bucket range [i*32, (i+1)*32).
     for (i, child) in output.children.iter().enumerate() {
         assert!(
             child
@@ -328,18 +345,6 @@ async fn split_reconstructs_parent_topk() {
                 .all(|&id| reshard::bucket_of(id, 64) / 32 == i),
             "child {i} holds ids outside its bucket range"
         );
-    }
-
-    let children: Vec<(&reshard::ChildImage, VectorIndex)> = output
-        .children
-        .iter()
-        .map(|c| {
-            let mut index = VectorIndex::load(EMBEDDED_TURBOVEC, &c.vector_path).unwrap();
-            index.prepare().unwrap();
-            (c, index)
-        })
-        .collect();
-    for (child, _) in &children {
         let exact =
             pipestream_search::exact_vectors::ExactVectorStore::open(&child.exact_vector_path)
                 .unwrap();
@@ -354,22 +359,7 @@ async fn split_reconstructs_parent_topk() {
         }
     }
 
-    // Union of child top-k == parent top-k, bitwise (see the module docs
-    // for the invariant).
-    for q in 0..8u64 {
-        let query = unit_vectors(1, DIM, 0xB0B0_0000 + q);
-        let k = 10;
-        let expected = topk(&parent, &query, k, |id| id);
-        let mut merged: Vec<(u64, u32)> = children
-            .iter()
-            .flat_map(|(child, index)| {
-                topk(index, &query, k, |local| child.parent_ids[local as usize])
-            })
-            .collect();
-        merged.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        merged.truncate(k);
-        assert_eq!(merged, expected, "query {q}: split changed the top-k");
-    }
+    assert_children_reconstruct_topk(&parent, &output.children, 8, 10);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -559,17 +549,11 @@ async fn split_consumes_each_bucket_once() {
     let mut parent = VectorIndex::load(EMBEDDED_TURBOVEC, &index_path).unwrap();
     parent.prepare().unwrap();
 
-    let output = reshard::split(
-        &reshard::resolve_gen(&pipestream_search::wal::wal_dir(&index_path)).unwrap(),
-        BUCKETS,
-        &dir.join("split"),
-        0,
-        25_000_000,
-        false,
-        None,
-        &mut replay_analyzer(&analysis_addr),
-    )
-    .unwrap();
+    let gen = reshard::resolve_gen(&pipestream_search::wal::wal_dir(&index_path)).unwrap();
+    let split_dir = dir.join("split");
+    let req = reshard::SplitRequest::new(std::slice::from_ref(&gen), BUCKETS, &split_dir)
+        .slot_stride(25_000_000);
+    let output = reshard::split_logs_with(&req, &mut replay_analyzer(&analysis_addr)).unwrap();
     assert_eq!(output.children.len(), BUCKETS);
     assert_eq!(
         output.children.iter().map(|c| c.num_vectors).sum::<u64>(),
@@ -580,7 +564,6 @@ async fn split_consumes_each_bucket_once() {
             !child.parent_ids.is_empty(),
             "bucket {i} was never consumed"
         );
-        // Child i's ids are exactly bucket i's — each bucket consumed once.
         assert!(
             child
                 .parent_ids
@@ -589,7 +572,6 @@ async fn split_consumes_each_bucket_once() {
             "child {i} holds ids outside bucket {i}"
         );
         assert_eq!(child.slot_offset, i as u64 * 25_000_000);
-        // Hash ranges tile the u64 space in bucket order.
         assert_eq!(child.hash_lo, (i as u64) << 62);
         assert_eq!(
             child.hash_hi,
@@ -600,30 +582,7 @@ async fn split_consumes_each_bucket_once() {
             }
         );
     }
-    // The top-k invariant holds per child pair too (union == parent).
-    let children: Vec<(&reshard::ChildImage, VectorIndex)> = output
-        .children
-        .iter()
-        .map(|c| {
-            let mut index = VectorIndex::load(EMBEDDED_TURBOVEC, &c.vector_path).unwrap();
-            index.prepare().unwrap();
-            (c, index)
-        })
-        .collect();
-    for q in 0..4u64 {
-        let query = unit_vectors(1, DIM, 0xB0B0_0000 + q);
-        let k = 10;
-        let expected = topk(&parent, &query, k, |id| id);
-        let mut merged: Vec<(u64, u32)> = children
-            .iter()
-            .flat_map(|(child, index)| {
-                topk(index, &query, k, |local| child.parent_ids[local as usize])
-            })
-            .collect();
-        merged.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        merged.truncate(k);
-        assert_eq!(merged, expected, "query {q}: split changed the top-k");
-    }
+    assert_children_reconstruct_topk(&parent, &output.children, 4, 10);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -644,19 +603,11 @@ async fn split_finer_than_buckets_repartitions() {
     let mut parent = VectorIndex::load(EMBEDDED_TURBOVEC, &index_path).unwrap();
     parent.prepare().unwrap();
 
-    // 2 bucket files, split=4: the WAL bucket count caps cheap splits at
-    // 2, so this exercises the re-partitioning fallback.
-    let output = reshard::split(
-        &reshard::resolve_gen(&pipestream_search::wal::wal_dir(&index_path)).unwrap(),
-        4,
-        &dir.join("split"),
-        0,
-        25_000_000,
-        false,
-        None,
-        &mut replay_analyzer(&analysis_addr),
-    )
-    .unwrap();
+    let gen = reshard::resolve_gen(&pipestream_search::wal::wal_dir(&index_path)).unwrap();
+    let split_dir = dir.join("split");
+    let req = reshard::SplitRequest::new(std::slice::from_ref(&gen), 4, &split_dir)
+        .slot_stride(25_000_000);
+    let output = reshard::split_logs_with(&req, &mut replay_analyzer(&analysis_addr)).unwrap();
     assert_eq!(output.children.len(), 4);
     assert_eq!(
         output.children.iter().map(|c| c.num_vectors).sum::<u64>(),
@@ -671,32 +622,7 @@ async fn split_finer_than_buckets_repartitions() {
             "child {i} holds ids outside its repartitioned range"
         );
     }
-    let children: Vec<(&reshard::ChildImage, VectorIndex)> = output
-        .children
-        .iter()
-        .map(|c| {
-            let mut index = VectorIndex::load(EMBEDDED_TURBOVEC, &c.vector_path).unwrap();
-            index.prepare().unwrap();
-            (c, index)
-        })
-        .collect();
-    for q in 0..4u64 {
-        let query = unit_vectors(1, DIM, 0xB0B0_0000 + q);
-        let k = 10;
-        let expected = topk(&parent, &query, k, |id| id);
-        let mut merged: Vec<(u64, u32)> = children
-            .iter()
-            .flat_map(|(child, index)| {
-                topk(index, &query, k, |local| child.parent_ids[local as usize])
-            })
-            .collect();
-        merged.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        merged.truncate(k);
-        assert_eq!(
-            merged, expected,
-            "query {q}: fallback split changed the top-k"
-        );
-    }
+    assert_children_reconstruct_topk(&parent, &output.children, 4, 10);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -740,19 +666,13 @@ fn reshard_refuses_a_log_with_preexisting_state() {
      -> Result<Vec<AnalyzedDoc>, String> {
         unreachable!("reshard must refuse before analyzing anything")
     };
-    let err = reshard::split(
-        &gen,
-        2,
-        &dir.join("out"),
-        0,
-        25_000_000,
-        false,
-        None,
-        &mut analyze,
-    )
-    .expect_err("split must refuse preexisting state");
+    let out_dir = dir.join("out");
+    let req =
+        reshard::SplitRequest::new(std::slice::from_ref(&gen), 2, &out_dir).slot_stride(25_000_000);
+    let err = reshard::split_logs_with(&req, &mut analyze)
+        .expect_err("split must refuse preexisting state");
     assert!(err.contains("preexisting"), "{err}");
-    let err = reshard::merge(&[gen], &dir.join("out"), None, false, None, &mut analyze)
+    let err = reshard::merge(&[gen], &out_dir, None, false, None, &mut analyze)
         .expect_err("merge must refuse preexisting state");
     assert!(err.contains("preexisting"), "{err}");
 }
@@ -809,19 +729,110 @@ fn segmented_replay_refuses_a_foreign_batch_that_straddles_buckets() {
      -> Result<Vec<AnalyzedDoc>, String> {
         unreachable!("invalid WAL must fail before analysis")
     };
-    let error = reshard::split_logs_segmented(
-        &[generation],
-        1,
-        &dir.join("out"),
-        0,
-        1_000,
-        true,
-        None,
-        &mut analyze,
-    )
-    .unwrap_err();
+    let out_dir = dir.join("out");
+    let req = reshard::SplitRequest::new(std::slice::from_ref(&generation), 1, &out_dir)
+        .slot_stride(1_000)
+        .vectors_only(true);
+    let error = reshard::split_logs_segmented_with(&req, &mut analyze).unwrap_err();
     assert!(error.contains("straddles WAL buckets"), "{error}");
     std::fs::remove_dir_all(dir).ok();
+}
+
+fn assert_segmented_topk_matches_compacted(
+    child: &reshard::ChildImage,
+    segments: &[reshard::SegmentedChildImage],
+) {
+    let mut compacted = VectorIndex::load(EMBEDDED_TURBOVEC, &child.vector_path).unwrap();
+    compacted.prepare().unwrap();
+    let physical: Vec<(&reshard::ChildImage, VectorIndex)> = segments
+        .iter()
+        .map(|s| {
+            let mut idx = VectorIndex::load(EMBEDDED_TURBOVEC, &s.image.vector_path).unwrap();
+            idx.prepare().unwrap();
+            (&s.image, idx)
+        })
+        .collect();
+    for q in 0..4u64 {
+        let query = unit_vectors(1, DIM, 0x5E61_0000 + q);
+        let expected = topk(&compacted, &query, 10, |local| {
+            child.parent_ids[local as usize]
+        });
+        let mut got: Vec<(u64, u32)> = physical
+            .iter()
+            .flat_map(|(image, index)| {
+                topk(index, &query, 10, |local| image.parent_ids[local as usize])
+            })
+            .collect();
+        got.sort_by(|l, r| r.1.cmp(&l.1).then(l.0.cmp(&r.0)));
+        got.truncate(10);
+        assert_eq!(
+            got, expected,
+            "query {q}: segmented compaction changed top-k"
+        );
+    }
+}
+
+fn verify_segmented_wal_compaction_tombstones(
+    dir: &Path,
+    index_path: &Path,
+    gen: &PathBuf,
+    child: &reshard::ChildImage,
+    rows: usize,
+    analysis_addr: &str,
+) {
+    let catalog = SegmentCatalog::open(dir.join("catalog")).unwrap();
+    catalog
+        .append(SegmentSource {
+            multi_res_path: None,
+            segment_id: "parent",
+            generation: 0,
+            base_label: 0,
+            backend_kind: EMBEDDED_TURBOVEC,
+            vector_path: Some(index_path),
+            exact_vector_path: Some(&pipestream_search::node::exact_vector_sidecar_path(
+                index_path,
+            )),
+            bm25_path: &pipestream_search::node::bm25_sidecar_path(index_path),
+            live_docs_path: &pipestream_search::node::live_docs_sidecar_path(index_path),
+            partition_column: None,
+        })
+        .unwrap();
+    let input_ids = ["parent".to_string()];
+    let work_dir = dir.join("compacted-segments");
+    let published = catalog
+        .compact_wal_generations(
+            &WalCompactionRequest {
+                input_ids: &input_ids,
+                generations: std::slice::from_ref(gen),
+                work_dir: &work_dir,
+                backend_kind: EMBEDDED_TURBOVEC,
+                slot_base: 0,
+                slot_capacity: 1_000,
+                bm25_fields: None,
+                partition: None,
+            },
+            &mut replay_analyzer(analysis_addr),
+        )
+        .unwrap();
+    let segmented = published.output;
+    assert_eq!(published.snapshot.manifest().segments.len(), 8);
+    let live_sum: u64 = published
+        .snapshot
+        .manifest()
+        .segments
+        .iter()
+        .map(|s| s.live_rows)
+        .sum();
+    assert_eq!(live_sum, (rows - 2) as u64);
+    assert!(segmented.segments.len() > 1);
+    assert!(segmented.peak_replay_rows < rows as u64);
+    let vec_sum: u64 = segmented.segments.iter().map(|s| s.image.num_vectors).sum();
+    assert_eq!(vec_sum, (rows - 2) as u64);
+    assert!(segmented
+        .segments
+        .iter()
+        .all(|s| !s.image.parent_ids.contains(&3) && !s.image.parent_ids.contains(&7)));
+    assert_segmented_topk_matches_compacted(child, &segmented.segments);
 }
 
 /// A one-child reshard is compaction: delete and replacement records remove
@@ -835,7 +846,6 @@ async fn one_child_reshard_compacts_generation_tombstones() {
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &corpus);
     let (analysis_addr, analysis) = mock_analysis::start_mock_analysis().await;
     std::mem::forget(analysis);
-    // The parent's single image is what this test appends into a catalog.
     let (mut client, index_path, _node) = start_wal_node_with_layout(
         pipestream_search::node::Layout::SingleImage,
         &dir,
@@ -871,121 +881,31 @@ async fn one_child_reshard_compacts_generation_tombstones() {
         .unwrap()
         .unwrap()
         .1;
-    let output = reshard::split(
-        &gen,
-        1,
-        &dir.join("compacted"),
-        0,
-        1_000,
-        false,
-        None,
-        &mut replay_analyzer(&analysis_addr),
-    )
-    .unwrap();
+    let compacted_dir = dir.join("compacted");
+    let req = reshard::SplitRequest::new(std::slice::from_ref(&gen), 1, &compacted_dir)
+        .slot_stride(1_000);
+    let output = reshard::split_logs_with(&req, &mut replay_analyzer(&analysis_addr)).unwrap();
     let child = &output.children[0];
-    assert_eq!(child.num_vectors, (rows - 2) as u64);
-    assert_eq!(child.num_documents, (rows - 2) as u64);
-    assert!(!child.parent_ids.contains(&3));
-    assert!(!child.parent_ids.contains(&7));
+    assert_eq!(
+        (child.num_vectors, child.num_documents),
+        ((rows - 2) as u64, (rows - 2) as u64)
+    );
+    assert!(!child.parent_ids.contains(&3) && !child.parent_ids.contains(&7));
     assert!(child.parent_ids.contains(&31));
 
-    // The segmented path seals one WAL bucket at a time. The node logs one row
-    // per routed record, so each delete is applied in the same bucket as the
-    // row it retires.
-    let catalog = SegmentCatalog::open(dir.join("catalog")).unwrap();
-    catalog
-        .append(SegmentSource {
-            multi_res_path: None,
-            segment_id: "parent",
-            generation: 0,
-            base_label: 0,
-            backend_kind: EMBEDDED_TURBOVEC,
-            vector_path: Some(&index_path),
-            exact_vector_path: Some(&pipestream_search::node::exact_vector_sidecar_path(
-                &index_path,
-            )),
-            bm25_path: &pipestream_search::node::bm25_sidecar_path(&index_path),
-            live_docs_path: &pipestream_search::node::live_docs_sidecar_path(&index_path),
-            partition_column: None,
-        })
-        .unwrap();
-    let published = catalog
-        .compact_wal_generations(
-            &["parent".into()],
-            std::slice::from_ref(&gen),
-            &dir.join("compacted-segments"),
-            EMBEDDED_TURBOVEC,
-            0,
-            1_000,
-            None,
-            None,
-            &mut replay_analyzer(&analysis_addr),
-        )
-        .unwrap();
-    let segmented = published.output;
-    assert_eq!(published.snapshot.manifest().segments.len(), 8);
-    assert_eq!(
-        published
-            .snapshot
-            .manifest()
-            .segments
-            .iter()
-            .map(|segment| segment.live_rows)
-            .sum::<u64>(),
-        (rows - 2) as u64
+    verify_segmented_wal_compaction_tombstones(
+        &dir,
+        &index_path,
+        &gen,
+        child,
+        rows,
+        &analysis_addr,
     );
-    assert!(segmented.segments.len() > 1);
-    assert!(segmented.peak_replay_rows < rows as u64);
-    assert_eq!(
-        segmented
-            .segments
-            .iter()
-            .map(|segment| segment.image.num_vectors)
-            .sum::<u64>(),
-        (rows - 2) as u64
-    );
-    assert!(segmented.segments.iter().all(|segment| {
-        !segment.image.parent_ids.contains(&3) && !segment.image.parent_ids.contains(&7)
-    }));
-    let mut compacted = VectorIndex::load(EMBEDDED_TURBOVEC, &child.vector_path).unwrap();
-    compacted.prepare().unwrap();
-    let physical: Vec<(&reshard::ChildImage, VectorIndex)> = segmented
-        .segments
-        .iter()
-        .map(|segment| {
-            let mut index =
-                VectorIndex::load(EMBEDDED_TURBOVEC, &segment.image.vector_path).unwrap();
-            index.prepare().unwrap();
-            (&segment.image, index)
-        })
-        .collect();
-    for q in 0..4u64 {
-        let query = unit_vectors(1, DIM, 0x5E61_0000 + q);
-        let expected = topk(&compacted, &query, 10, |local| {
-            child.parent_ids[local as usize]
-        });
-        let mut got: Vec<(u64, u32)> = physical
-            .iter()
-            .flat_map(|(image, index)| {
-                topk(index, &query, 10, |local| image.parent_ids[local as usize])
-            })
-            .collect();
-        got.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
-        got.truncate(10);
-        assert_eq!(
-            got, expected,
-            "query {q}: segmented compaction changed top-k"
-        );
-    }
     std::fs::remove_dir_all(dir).ok();
 }
 
 /// The general N -> M reshard: two block-routed shards' logs
-/// redistributed across four children with no intermediate merge. The
-/// union of the children IS the corpus (conservation), every id lands in
-/// its bucket-range child (partition — this is what makes the result
-/// hash-uniform), and the union of child top-k reconstructs the
-/// monolithic reference bitwise (the same lossless argument as split).
+/// redistributed across four children with no intermediate merge.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn split_logs_redistributes_two_shards_into_four() {
     let dir = tempdir("split_logs");
@@ -1015,26 +935,14 @@ async fn split_logs_redistributes_two_shards_into_four() {
         .map(|p| reshard::resolve_gen(&pipestream_search::wal::wal_dir(p)).unwrap())
         .collect::<Vec<_>>();
     let out_dir = dir.join("redistributed");
-    let output = reshard::split_logs(
-        &generations,
-        4,
-        &out_dir,
-        0,
-        25_000_000,
-        false,
-        None,
-        &mut replay_analyzer(&analysis_addr),
-    )
-    .unwrap();
+    let req = reshard::SplitRequest::new(&generations, 4, &out_dir).slot_stride(25_000_000);
+    let output = reshard::split_logs_with(&req, &mut replay_analyzer(&analysis_addr)).unwrap();
     assert_eq!(output.children.len(), 4);
 
-    // Conservation across the union of both inputs.
     let total_vectors: u64 = output.children.iter().map(|c| c.num_vectors).sum();
     let total_docs: u64 = output.children.iter().map(|c| c.num_documents).sum();
-    assert_eq!(total_vectors, N as u64);
-    assert_eq!(total_docs, DOCS as u64);
+    assert_eq!((total_vectors, total_docs), (N as u64, DOCS as u64));
 
-    // Partition: child i holds exactly bucket range [i*16, (i+1)*16).
     for (i, child) in output.children.iter().enumerate() {
         assert!(
             child
@@ -1046,34 +954,8 @@ async fn split_logs_redistributes_two_shards_into_four() {
         assert_eq!(child.slot_offset, i as u64 * 25_000_000);
     }
 
-    // Union of child top-k == monolithic reference, bitwise.
     let reference = build_monolithic(&corpus, DIM, BIT_WIDTH, &shift, &scale);
-    let children: Vec<(&reshard::ChildImage, VectorIndex)> = output
-        .children
-        .iter()
-        .map(|c| {
-            let mut index = VectorIndex::load(EMBEDDED_TURBOVEC, &c.vector_path).unwrap();
-            index.prepare().unwrap();
-            (c, index)
-        })
-        .collect();
-    for q in 0..8u64 {
-        let query = unit_vectors(1, DIM, 0xB0B0_0000 + q);
-        let k = 10;
-        let expected = topk(&reference, &query, k, |id| id);
-        let mut merged: Vec<(u64, u32)> = children
-            .iter()
-            .flat_map(|(child, index)| {
-                topk(index, &query, k, |local| child.parent_ids[local as usize])
-            })
-            .collect();
-        merged.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        merged.truncate(k);
-        assert_eq!(
-            merged, expected,
-            "query {q}: redistribution changed the top-k"
-        );
-    }
+    assert_children_reconstruct_topk(&reference, &output.children, 8, 10);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -1126,17 +1008,11 @@ async fn split_preserves_multi_field_postings_and_fused_ranking() {
     assert_eq!(parent.field_name(2), "phrases");
     assert_eq!(parent.analysis_fingerprint(2), phrases.fingerprint());
 
-    let output = reshard::split(
-        &reshard::resolve_gen(&pipestream_search::wal::wal_dir(&index_path)).unwrap(),
-        2,
-        &dir.join("split"),
-        0,
-        25_000_000,
-        false,
-        None,
-        &mut replay_analyzer(&analysis_addr),
-    )
-    .unwrap();
+    let gen = reshard::resolve_gen(&pipestream_search::wal::wal_dir(&index_path)).unwrap();
+    let split_dir = dir.join("split");
+    let req = reshard::SplitRequest::new(std::slice::from_ref(&gen), 2, &split_dir)
+        .slot_stride(25_000_000);
+    let output = reshard::split_logs_with(&req, &mut replay_analyzer(&analysis_addr)).unwrap();
     assert_eq!(output.children.len(), 2);
 
     let children = verify_multifield_children(&parent, &output.children, phrases.fingerprint());

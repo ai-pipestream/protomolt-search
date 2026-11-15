@@ -360,6 +360,18 @@ pub struct WalCompactionResult {
     pub output: crate::reshard::SegmentedReshardOutput,
 }
 
+/// Parameters for [`SegmentCatalog::compact_wal_generations`].
+pub struct WalCompactionRequest<'a> {
+    pub input_ids: &'a [String],
+    pub generations: &'a [PathBuf],
+    pub work_dir: &'a Path,
+    pub backend_kind: &'a str,
+    pub slot_base: u64,
+    pub slot_capacity: u64,
+    pub bm25_fields: Option<&'a [String]>,
+    pub partition: Option<crate::reshard::PartitionSpec<'a>>,
+}
+
 struct OpenedSegment {
     metadata: SegmentMetadata,
     /// `None` for a documents-only segment (an empty `vector` artifact).
@@ -1359,126 +1371,28 @@ impl SegmentCatalog {
     /// and publish them as one atomic compaction. This blocking method is
     /// intended for a background worker. The work directory must be empty and
     /// remains available for audit or retry after publication.
-    #[allow(clippy::too_many_arguments)]
     pub fn compact_wal_generations(
         &self,
-        input_ids: &[String],
-        generations: &[PathBuf],
-        work_dir: &Path,
-        backend_kind: &str,
-        slot_base: u64,
-        slot_capacity: u64,
-        bm25_fields: Option<&[String]>,
-        partition: Option<crate::reshard::PartitionSpec<'_>>,
+        req: &WalCompactionRequest<'_>,
         analyze: &mut crate::reshard::Analyzer,
     ) -> Result<WalCompactionResult, String> {
-        if work_dir.exists()
-            && std::fs::read_dir(work_dir)
-                .map_err(|error| {
-                    format!("read compaction work dir {}: {error}", work_dir.display())
-                })?
+        if req.work_dir.exists()
+            && std::fs::read_dir(req.work_dir)
+                .map_err(|e| format!("read compaction work dir {}: {e}", req.work_dir.display()))?
                 .next()
                 .is_some()
         {
             return Err(format!(
                 "compaction work directory {} is not empty",
-                work_dir.display()
+                req.work_dir.display()
             ));
         }
-        let output = match partition {
-            None => crate::reshard::split_logs_segmented(
-                generations,
-                1,
-                work_dir,
-                slot_base,
-                slot_capacity,
-                false,
-                bm25_fields,
-                analyze,
-            )?,
-            Some(spec) => {
-                let [gen] = generations else {
-                    return Err(format!(
-                        "a partitioned compaction takes one WAL generation, not {}",
-                        generations.len()
-                    ));
-                };
-                let mut sink = |_row: crate::reshard::CompactedRow<'_>| Ok(());
-                // The outputs keep the declaration the log's manifest
-                // records (docs/derived-columns.md).
-                let derived = crate::reshard::manifest_derived(
-                    &crate::wal::read_manifest(gen)
-                        .map_err(|e| format!("read manifest of {}: {e}", gen.display()))?,
-                )?;
-                let hnsw_sources = (backend_kind == crate::hnsw::HNSW)
-                    .then(|| {
-                        crate::reshard::HnswCompactionSources::from_segment_set(
-                            slot_base,
-                            &self.snapshot(),
-                        )
-                    })
-                    .flatten();
-                let build = crate::reshard::compact_log_partitioned_with_sources(
-                    gen,
-                    u64::MAX,
-                    work_dir,
-                    spec,
-                    bm25_fields,
-                    None,
-                    None,
-                    derived.as_ref(),
-                    hnsw_sources.as_ref(),
-                    analyze,
-                    &mut sink,
-                )?;
-                let images: Vec<crate::reshard::ChildImage> = build
-                    .images
-                    .into_iter()
-                    .map(|mut image| {
-                        image.slot_offset += slot_base;
-                        image
-                    })
-                    .collect();
-                crate::reshard::SegmentedReshardOutput::from_images(build.generation, images)
-            }
-        };
+        let output = self.build_wal_compaction_segments(req, analyze)?;
         if output.segments.is_empty() {
             return Err("compaction produced no live segments".into());
         }
-        let ids = output
-            .segments
-            .iter()
-            .map(|segment| {
-                format!(
-                    "g{}-s{}-p{}",
-                    output.generation, segment.logical_shard, segment.segment_ordinal
-                )
-            })
-            .collect::<Vec<_>>();
-        let mut live_paths = Vec::with_capacity(output.segments.len());
-        for segment in &output.segments {
-            if segment.image.num_vectors != segment.image.num_documents {
-                return Err(format!(
-                    "compaction segment {} has {} vectors but {} documents; aligned publication requires one document per vector",
-                    segment.segment_ordinal,
-                    segment.image.num_vectors,
-                    segment.image.num_documents
-                ));
-            }
-            if segment.image.bm25_path.is_none() {
-                return Err(format!(
-                    "compaction segment {} has no BM25 image",
-                    segment.segment_ordinal
-                ));
-            }
-            let path = crate::node::live_docs_sidecar_path(&segment.image.vector_path);
-            LiveDocs::default()
-                .write(&path, segment.image.num_vectors)
-                .map_err(|error| {
-                    format!("write compacted live docs {}: {error}", path.display())
-                })?;
-            live_paths.push(path);
-        }
+        let (ids, live_paths) = stage_compacted_segment_live_docs(&output)?;
+        let partition_col = req.partition.map(|spec| spec.column);
         let sources = output
             .segments
             .iter()
@@ -1489,21 +1403,104 @@ impl SegmentCatalog {
                 segment_id: id,
                 generation: output.generation,
                 base_label: segment.image.slot_offset,
-                backend_kind,
+                backend_kind: req.backend_kind,
                 vector_path: Some(&segment.image.vector_path),
                 exact_vector_path: Some(&segment.image.exact_vector_path),
                 bm25_path: segment.image.bm25_path.as_deref().expect("validated above"),
                 live_docs_path,
-                partition_column: partition.map(|spec| spec.column),
+                partition_column: partition_col,
             })
             .collect();
         let snapshot = self.replace_many_for_compaction(
-            input_ids,
+            req.input_ids,
             sources,
-            partition.map(|spec| spec.column.to_string()),
+            partition_col.map(str::to_string),
         )?;
         Ok(WalCompactionResult { snapshot, output })
     }
+
+    fn build_wal_compaction_segments(
+        &self,
+        req: &WalCompactionRequest<'_>,
+        analyze: &mut crate::reshard::Analyzer,
+    ) -> Result<crate::reshard::SegmentedReshardOutput, String> {
+        match req.partition {
+            None => crate::reshard::split_logs_segmented_with(
+                &crate::reshard::SplitRequest::new(req.generations, 1, req.work_dir)
+                    .slot_base(req.slot_base)
+                    .slot_stride(req.slot_capacity)
+                    .bm25_fields(req.bm25_fields),
+                analyze,
+            ),
+            Some(spec) => {
+                let [gen] = req.generations else {
+                    return Err(format!(
+                        "a partitioned compaction takes one WAL generation, not {}",
+                        req.generations.len()
+                    ));
+                };
+                let mut sink = |_row: crate::reshard::CompactedRow<'_>| Ok(());
+                let manifest = crate::wal::read_manifest(gen)
+                    .map_err(|e| format!("read manifest of {}: {e}", gen.display()))?;
+                let derived = crate::reshard::manifest_derived(&manifest)?;
+                let hnsw_sources = (req.backend_kind == crate::hnsw::HNSW)
+                    .then(|| {
+                        crate::reshard::HnswCompactionSources::from_segment_set(
+                            req.slot_base,
+                            &self.snapshot(),
+                        )
+                    })
+                    .flatten();
+                let comp_req = crate::reshard::CompactionRequest {
+                    bm25_fields: req.bm25_fields,
+                    derived: derived.as_ref(),
+                    hnsw_sources: hnsw_sources.as_ref(),
+                    ..crate::reshard::CompactionRequest::new(gen, u64::MAX, req.work_dir)
+                };
+                let build =
+                    crate::reshard::compact_log_partitioned(&comp_req, spec, analyze, &mut sink)?;
+                let mut images = build.images;
+                for image in &mut images {
+                    image.slot_offset += req.slot_base;
+                }
+                Ok(crate::reshard::SegmentedReshardOutput::from_images(
+                    build.generation,
+                    images,
+                ))
+            }
+        }
+    }
+}
+
+fn stage_compacted_segment_live_docs(
+    output: &crate::reshard::SegmentedReshardOutput,
+) -> Result<(Vec<String>, Vec<PathBuf>), String> {
+    let mut ids = Vec::with_capacity(output.segments.len());
+    let mut live_paths = Vec::with_capacity(output.segments.len());
+    for seg in &output.segments {
+        if seg.image.num_vectors != seg.image.num_documents {
+            return Err(format!(
+                "compaction segment {} has {} vectors but {} documents; aligned publication requires one document per vector",
+                seg.segment_ordinal, seg.image.num_vectors, seg.image.num_documents
+            ));
+        }
+        if seg.image.bm25_path.is_none() {
+            return Err(format!(
+                "compaction segment {} has no BM25 image",
+                seg.segment_ordinal
+            ));
+        }
+        let path = crate::node::live_docs_sidecar_path(&seg.image.vector_path);
+        LiveDocs::default()
+            .write(&path, seg.image.num_vectors)
+            .map_err(|e| format!("write compacted live docs {}: {e}", path.display()))?;
+        ids.push(format!(
+            "g{}-s{}-p{}",
+            output.generation, seg.logical_shard, seg.segment_ordinal
+        ));
+        live_paths.push(path);
+    }
+    Ok((ids, live_paths))
 }
 
 /// Stage `sources` under `root/segments/` — copied, hashed, opened,

@@ -130,11 +130,6 @@ pub(crate) struct ShardState {
     pub(crate) pending_compaction: Option<crate::compaction::PendingCommit>,
 }
 
-/// Message prefix of a stats-epoch refusal. The coordinator's retry
-/// distinguishes this refusal from every other `FAILED_PRECONDITION` by
-/// this prefix, so it and [`ShardState::check_stats_epoch`] move together.
-pub(crate) const STALE_STATS_EPOCH: &str = "stale stats epoch";
-
 #[derive(Clone)]
 pub(crate) struct ParentMap {
     pub(in crate::node) claim: crate::stats_identity::StatsClaim,

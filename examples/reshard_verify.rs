@@ -46,7 +46,78 @@ fn topk(index: &VectorIndex, query: &[f32], k: usize, map: impl Fn(u64) -> u64) 
     hits
 }
 
-#[allow(clippy::result_large_err)]
+fn verify_split_children(
+    parent: &VectorIndex,
+    output: &reshard::ReshardOutput,
+    n: usize,
+    probes_path: &Path,
+    queries: usize,
+    k: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let total_vectors: u64 = output.children.iter().map(|c| c.num_vectors).sum();
+    let total_docs: u64 = output.children.iter().map(|c| c.num_documents).sum();
+    if total_vectors != parent.len() as u64 {
+        return Err(format!(
+            "conservation FAILED: children hold {total_vectors} vectors, parent holds {}",
+            parent.len()
+        )
+        .into());
+    }
+    eprintln!(
+        "conservation OK: {total_vectors} vectors / {total_docs} documents across {n} children"
+    );
+
+    let bucket_count = 64usize;
+    let per_child = bucket_count / n;
+    for (i, child) in output.children.iter().enumerate() {
+        if let Some(&bad) = child
+            .parent_ids
+            .iter()
+            .find(|&&id| reshard::bucket_of(id, bucket_count) / per_child != i)
+        {
+            return Err(format!("partition FAILED: id {bad} outside child {i}'s range").into());
+        }
+    }
+    eprintln!("partition OK: every id in its child's bucket range");
+
+    let (dim, reader) = court::EmbeddingReader::open(probes_path)?;
+    let mut probes: Vec<Vec<f32>> = Vec::with_capacity(queries);
+    for record in reader {
+        probes.push(record?.vector);
+        if probes.len() >= queries {
+            break;
+        }
+    }
+    eprintln!("{} probes of dim {dim}", probes.len());
+
+    let children: Vec<(&reshard::ChildImage, VectorIndex)> = output
+        .children
+        .iter()
+        .map(|c| {
+            let mut index =
+                VectorIndex::load(EMBEDDED_TURBOVEC, &c.vector_path).expect("load child");
+            index.prepare().expect("prepare child");
+            (c, index)
+        })
+        .collect();
+
+    for (qi, query) in probes.iter().enumerate() {
+        let expected = topk(parent, query, k, |slot| slot);
+        let mut merged: Vec<(u64, u32)> = children
+            .iter()
+            .flat_map(|(child, index)| {
+                topk(index, query, k, |local| child.parent_ids[local as usize])
+            })
+            .collect();
+        merged.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        merged.truncate(expected.len());
+        if merged != expected {
+            return Err(format!("reconstruction FAILED at probe {qi} (k={k})").into());
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let log = arg("log", "");
@@ -79,80 +150,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gen = reshard::resolve_gen(Path::new(&log))?;
     eprintln!("splitting {} {n} ways...", gen.display());
     let t0 = std::time::Instant::now();
-    let output = reshard::split(&gen, n, &out_dir, 0, 25_000_000, false, None, &mut analyze)?;
+    let req =
+        reshard::SplitRequest::new(std::slice::from_ref(&gen), n, &out_dir).slot_stride(25_000_000);
+    let output = reshard::split_logs_with(&req, &mut analyze)?;
     eprintln!("split done in {:?}", t0.elapsed());
 
     let mut parent = VectorIndex::load(EMBEDDED_TURBOVEC, Path::new(&parent_path))?;
     parent.prepare()?;
-
-    // 1. Conservation.
-    let total_vectors: u64 = output.children.iter().map(|c| c.num_vectors).sum();
-    let total_docs: u64 = output.children.iter().map(|c| c.num_documents).sum();
-    if total_vectors != parent.len() as u64 {
-        return Err(format!(
-            "conservation FAILED: children hold {total_vectors} vectors, parent holds {}",
-            parent.len()
-        )
-        .into());
-    }
-    eprintln!(
-        "conservation OK: {total_vectors} vectors / {total_docs} documents across {n} children"
-    );
-
-    // 2. Partition: every child id in its bucket range.
-    let bucket_count = 64usize;
-    let per_child = bucket_count / n;
-    for (i, child) in output.children.iter().enumerate() {
-        if let Some(&bad) = child
-            .parent_ids
-            .iter()
-            .find(|&&id| reshard::bucket_of(id, bucket_count) / per_child != i)
-        {
-            return Err(format!("partition FAILED: id {bad} outside child {i}'s range").into());
-        }
-    }
-    eprintln!("partition OK: every id in its child's bucket range");
-
-    // 3. Bitwise reconstruction over real probe vectors.
-    let (dim, reader) = court::EmbeddingReader::open(Path::new(&probes_path))?;
-    let mut probes: Vec<Vec<f32>> = Vec::with_capacity(queries);
-    for record in reader {
-        probes.push(record?.vector);
-        if probes.len() >= queries {
-            break;
-        }
-    }
-    eprintln!("{} probes of dim {dim}", probes.len());
-
-    let children: Vec<(&reshard::ChildImage, VectorIndex)> = output
-        .children
-        .iter()
-        .map(|c| {
-            let mut index =
-                VectorIndex::load(EMBEDDED_TURBOVEC, &c.vector_path).expect("load child");
-            index.prepare().expect("prepare child");
-            (c, index)
-        })
-        .collect();
-
-    for (qi, query) in probes.iter().enumerate() {
-        let expected = topk(&parent, query, k, |slot| slot);
-        let mut merged: Vec<(u64, u32)> = children
-            .iter()
-            .flat_map(|(child, index)| {
-                topk(index, query, k, |local| child.parent_ids[local as usize])
-            })
-            .collect();
-        merged.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        merged.truncate(expected.len());
-        if merged != expected {
-            return Err(format!("reconstruction FAILED at probe {qi} (k={k})").into());
-        }
-    }
+    verify_split_children(&parent, &output, n, Path::new(&probes_path), queries, k)?;
     println!(
-        "PASS: {n}-way split of {} reconstructs the parent top-{k} bitwise over {} probes",
-        gen.display(),
-        probes.len()
+        "PASS: {n}-way split of {} reconstructs the parent top-{k} bitwise over {queries} probes",
+        gen.display()
     );
     Ok(())
 }

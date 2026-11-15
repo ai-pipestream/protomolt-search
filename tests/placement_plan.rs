@@ -477,6 +477,61 @@ async fn logged_shard(dir: &Path, analysis_addr: &str, corpus: &[f32]) -> (PathB
     (index_path, parent)
 }
 
+fn assert_placement_split_refusals(
+    gen: &Path,
+    dir: &Path,
+    children: &[reshard::PlacementChild],
+    analysis_addr: &str,
+) {
+    let mut analyze = replay_analyzer(analysis_addr);
+    let gens = [gen.to_path_buf()];
+    let no_def_dir = dir.join("no-default");
+    let no_def = reshard::PlacementSplitRequest::new(
+        &gens,
+        "placement",
+        &children[..2],
+        &no_def_dir,
+        &[0, 1_000],
+    );
+    let err = reshard::split_placement_logs_with(&no_def, &mut analyze).unwrap_err();
+    assert!(
+        err.contains("live source id") && err.contains("no default"),
+        "{err}"
+    );
+
+    let overlap = [
+        reshard::PlacementChild { lo: 0, hi: 10 },
+        reshard::PlacementChild { lo: 10, hi: 20 },
+    ];
+    let err = reshard::validate_placement_children(&overlap, None).unwrap_err();
+    assert!(err.contains("overlap"), "{err}");
+
+    let non_default_none = [
+        reshard::PlacementChild::NONE,
+        reshard::PlacementChild { lo: 0, hi: 0 },
+    ];
+    let err = reshard::validate_placement_children(&non_default_none, Some(1)).unwrap_err();
+    assert!(err.contains("not the default child"), "{err}");
+
+    let err =
+        reshard::validate_placement_children(&[reshard::PlacementChild { lo: 0, hi: 0 }], Some(3))
+            .unwrap_err();
+    assert!(err.contains("outside"), "{err}");
+
+    let no_col_dir = dir.join("no-column");
+    let no_col = reshard::PlacementSplitRequest::new(&gens, " ", children, &no_col_dir, &[0, 1, 2])
+        .default_child(Some(2));
+    let err = reshard::split_placement_logs_with(&no_col, &mut analyze).unwrap_err();
+    assert!(err.contains("column"), "{err}");
+
+    let off_dir = dir.join("offsets");
+    let bad_off =
+        reshard::PlacementSplitRequest::new(&gens, "placement", children, &off_dir, &[0, 1])
+            .default_child(Some(2));
+    let err = reshard::split_placement_logs_with(&bad_off, &mut analyze).unwrap_err();
+    assert!(err.contains("slot offset"), "{err}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_placement_split_routes_by_code_and_reconstructs_the_parent() {
     let dir = tempdir("split");
@@ -485,26 +540,23 @@ async fn a_placement_split_routes_by_code_and_reconstructs_the_parent() {
     let (index_path, parent) = logged_shard(&dir, &analysis_addr, &corpus).await;
     let gen = reshard::resolve_gen(&pipestream_search::wal::wal_dir(&index_path)).unwrap();
 
-    // Child 0 takes one code, child 1 the subtree under root index 1,
-    // child 2 (the default) the rows with no code.
     let (lo, hi) = subtree_range(&[1], BITS);
     let children = [
         reshard::PlacementChild { lo: 0, hi: 0 },
         reshard::PlacementChild { lo, hi },
         reshard::PlacementChild::NONE,
     ];
-    let out = reshard::split_placement_logs(
+    let split_dir = dir.join("split");
+    let req = reshard::PlacementSplitRequest::new(
         std::slice::from_ref(&gen),
         "placement",
         &children,
-        Some(2),
-        &dir.join("split"),
+        &split_dir,
         &[0, 1_000, 2_000],
-        false,
-        None,
-        &mut replay_analyzer(&analysis_addr),
     )
-    .unwrap();
+    .default_child(Some(2));
+    let out =
+        reshard::split_placement_logs_with(&req, &mut replay_analyzer(&analysis_addr)).unwrap();
     assert_eq!(out.images.children.len(), 3);
     assert_eq!(out.ranges.to_vec(), children.to_vec());
     assert_eq!(out.default_child, Some(2));
@@ -512,8 +564,7 @@ async fn a_placement_split_routes_by_code_and_reconstructs_the_parent() {
     let total: u64 = out.images.children.iter().map(|c| c.num_documents).sum();
     assert_eq!(total as usize, N);
     for (i, child) in out.images.children.iter().enumerate() {
-        assert_eq!(child.hash_lo, 0);
-        assert_eq!(child.hash_hi, u64::MAX);
+        assert_eq!((child.hash_lo, child.hash_hi), (0, u64::MAX));
         assert_eq!(child.slot_offset, i as u64 * 1_000);
         assert!(child.num_documents > 0, "child {i} is empty");
         for &parent_id in &child.row_parent_ids {
@@ -531,7 +582,6 @@ async fn a_placement_split_routes_by_code_and_reconstructs_the_parent() {
     assert!(map.contains(&format!("codes {lo}..={hi}")), "{map}");
     assert!(map.contains("default child"), "{map}");
 
-    // The union of the children's top-k equals the parent's, bitwise.
     let images: Vec<(&reshard::ChildImage, VectorIndex)> = out
         .images
         .children
@@ -556,74 +606,7 @@ async fn a_placement_split_routes_by_code_and_reconstructs_the_parent() {
         assert_eq!(merged, expected, "query {q}");
     }
 
-    // Refusals name the cause: an uncovered row without a default child,
-    // an overlap, a rangeless child that is not the default, a missing
-    // column name, and the wrong number of slot offsets.
-    let mut analyze = replay_analyzer(&analysis_addr);
-    let err = reshard::split_placement_logs(
-        std::slice::from_ref(&gen),
-        "placement",
-        &children[..2],
-        None,
-        &dir.join("no-default"),
-        &[0, 1_000],
-        false,
-        None,
-        &mut analyze,
-    )
-    .unwrap_err();
-    assert!(
-        err.contains("live source id") && err.contains("no default"),
-        "{err}"
-    );
-    let err = reshard::validate_placement_children(
-        &[
-            reshard::PlacementChild { lo: 0, hi: 10 },
-            reshard::PlacementChild { lo: 10, hi: 20 },
-        ],
-        None,
-    )
-    .unwrap_err();
-    assert!(err.contains("overlap"), "{err}");
-    let err = reshard::validate_placement_children(
-        &[
-            reshard::PlacementChild::NONE,
-            reshard::PlacementChild { lo: 0, hi: 0 },
-        ],
-        Some(1),
-    )
-    .unwrap_err();
-    assert!(err.contains("not the default child"), "{err}");
-    let err =
-        reshard::validate_placement_children(&[reshard::PlacementChild { lo: 0, hi: 0 }], Some(3))
-            .unwrap_err();
-    assert!(err.contains("outside"), "{err}");
-    let err = reshard::split_placement_logs(
-        std::slice::from_ref(&gen),
-        " ",
-        &children,
-        Some(2),
-        &dir.join("no-column"),
-        &[0, 1, 2],
-        false,
-        None,
-        &mut analyze,
-    )
-    .unwrap_err();
-    assert!(err.contains("column"), "{err}");
-    let err = reshard::split_placement_logs(
-        &[gen],
-        "placement",
-        &children,
-        Some(2),
-        &dir.join("offsets"),
-        &[0, 1],
-        false,
-        None,
-        &mut analyze,
-    )
-    .unwrap_err();
-    assert!(err.contains("slot offset"), "{err}");
+    assert_placement_split_refusals(&gen, &dir, &children, &analysis_addr);
     std::fs::remove_dir_all(&dir).ok();
 }
 

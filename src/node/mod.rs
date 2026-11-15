@@ -65,7 +65,7 @@ pub(crate) use self::shard::{
     f64_from_order_bits, f64_order_bits, i64_from_order_bits, i64_order_bits, parse_score_stages,
     physical_rows, read_shard, timestamp_to_epoch_micros, validate_geo_filter,
     validate_geo_filters, validate_range_facet_fields, write_shard, ParentMap, ScoreStageSpec,
-    ShardState, STALE_STATS_EPOCH,
+    ShardState,
 };
 pub(crate) use self::storage::{
     generation_old_dir, generation_tmp_dir, heap_store, live_docs_storage_path, storage_paths,

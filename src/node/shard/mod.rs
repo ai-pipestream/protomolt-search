@@ -25,9 +25,7 @@ pub(in crate::node) use self::filters::{
 pub(in crate::node) use self::state::{
     active_artifact_rows, live_document_count, live_field_stats, IngestGuard,
 };
-pub(crate) use self::state::{
-    physical_rows, read_shard, write_shard, ParentMap, ShardState, STALE_STATS_EPOCH,
-};
+pub(crate) use self::state::{physical_rows, read_shard, write_shard, ParentMap, ShardState};
 
 pub(in crate::node) struct DocPassSpec<'a> {
     pub geo_filters: &'a [crate::pb::GeoFilter],

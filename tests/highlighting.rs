@@ -877,62 +877,8 @@ fn snippets_of(resp: &Bm25SearchResponse) -> Vec<(u64, Vec<Snippet>)> {
         .collect()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn snippets_survive_flush_reopen_and_wal_replay() {
-    let dir = tempdir("durable");
-    let index_path = dir.join("shard.tv");
-    let config = NodeConfig {
-        index_path: Some(index_path.clone()),
-        layout: pipestream_search::node::Layout::SingleImage,
-        wal: true,
-        wal_buckets: 8,
-        ..config(0, true)
-    };
-    let (addr, handle) = start_empty_node(config.clone()).await;
-    {
-        let sample = common::unit_vectors(256, common::DIM, 0x5EED_CA11);
-        let (shift, scale) = common::fit_calibration(common::DIM, common::BIT_WIDTH, &sample);
-        let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
-        client
-            .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
-                common::DIM,
-                common::BIT_WIDTH,
-                &shift,
-                &scale,
-            ))
-            .await
-            .unwrap();
-    }
-    ingest(&addr, &CORPUS).await.unwrap();
-    let c = coordinator(vec![addr.clone()], NATIVE_ANALYSIS_BACKEND);
-    let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
-    assert!(
-        client
-            .flush(FlushRequest {})
-            .await
-            .unwrap()
-            .into_inner()
-            .written
-    );
-    let probes = [
-        ("court appeal", spec(HighlightMode::Sentence, 0, 0)),
-        ("court", spec(HighlightMode::Sentence, 1, 64)),
-        ("court appeal", spec(HighlightMode::Window, 2, 40)),
-    ];
-    let mut baseline = Vec::new();
-    for (text, spec) in &probes {
-        let resp = bm25(&c, request(text, Some(spec.clone()))).await;
-        for h in &resp.hits {
-            check_contract(CORPUS[h.doc_id as usize], h);
-        }
-        baseline.push(snippets_of(&resp));
-    }
-    handle.abort();
-
-    // The file itself: a kind-8 section, readable by the mmap reader,
-    // whose per-document tables are the analyzer's.
-    let bm25_path = bm25_sidecar_path(&index_path);
-    let reader = Bm25Reader::open(&bm25_path).unwrap();
+fn verify_sentence_sidecar(bm25_path: &std::path::Path) -> Bm25Reader {
+    let reader = Bm25Reader::open(bm25_path).unwrap();
     assert!(reader.field_has_sentences(0));
     assert!(reader
         .integrity_section_names()
@@ -951,8 +897,7 @@ async fn snippets_survive_flush_reopen_and_wal_replay() {
             "{text:?}"
         );
     }
-    // Reload into heap: the same tables.
-    let loaded = Bm25Store::load(&bm25_path).unwrap();
+    let loaded = Bm25Store::load(bm25_path).unwrap();
     assert!(loaded.field_has_sentences(0));
     for i in 0..CORPUS.len() as u32 {
         assert_eq!(
@@ -960,38 +905,18 @@ async fn snippets_survive_flush_reopen_and_wal_replay() {
             reader.field_doc_sentences(0, i)
         );
     }
+    reader
+}
 
-    // Reopen the file under a fresh node: bitwise the same snippets.
-    let shard = Bm25Shard::open(&bm25_path).unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr2 = format!("http://{}", listener.local_addr().unwrap());
-    let service = NodeServiceImpl::new(None, config.clone()).with_bm25(Some(shard));
-    let handle2 = tokio::spawn(
-        tonic::transport::Server::builder()
-            .add_service(service.into_server(pipestream_search::MAX_MESSAGE_BYTES))
-            .serve_with_incoming(pipestream_search::harness::nodelay_incoming(listener)),
-    );
-    let reopened = coordinator(vec![addr2], NATIVE_ANALYSIS_BACKEND);
-    for ((text, spec), want) in probes.iter().zip(&baseline) {
-        let resp = bm25(&reopened, request(text, Some(spec.clone()))).await;
-        assert_eq!(&snippets_of(&resp), want, "{text:?} after reopen");
-    }
-    handle2.abort();
-
-    // WAL replay: split 1 -> 2 through the native replay analyzer. The
-    // children carry sentence spans from the record alone.
-    let out_dir = dir.join("split");
-    let output = reshard::split(
-        &reshard::resolve_gen(&pipestream_search::wal::wal_dir(&index_path)).unwrap(),
-        2,
-        &out_dir,
-        0,
-        25_000_000,
-        false,
-        None,
-        &mut native_replay_analyzer(),
-    )
-    .unwrap();
+fn verify_replayed_sentence_split(
+    index_path: &std::path::Path,
+    out_dir: &std::path::Path,
+    reader: &Bm25Reader,
+) {
+    let gen = reshard::resolve_gen(&pipestream_search::wal::wal_dir(index_path)).unwrap();
+    let req =
+        reshard::SplitRequest::new(std::slice::from_ref(&gen), 2, out_dir).slot_stride(25_000_000);
+    let output = reshard::split_logs_with(&req, &mut native_replay_analyzer()).unwrap();
     let mut seen = 0usize;
     for child in &output.children {
         let path = child.bm25_path.as_ref().expect("children hold documents");
@@ -1015,6 +940,75 @@ async fn snippets_survive_flush_reopen_and_wal_replay() {
         }
     }
     assert_eq!(seen, CORPUS.len());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snippets_survive_flush_reopen_and_wal_replay() {
+    let dir = tempdir("durable");
+    let index_path = dir.join("shard.tv");
+    let config = NodeConfig {
+        index_path: Some(index_path.clone()),
+        layout: pipestream_search::node::Layout::SingleImage,
+        wal: true,
+        wal_buckets: 8,
+        ..config(0, true)
+    };
+    let (addr, handle) = start_empty_node(config.clone()).await;
+    let sample = common::unit_vectors(256, common::DIM, 0x5EED_CA11);
+    let (shift, scale) = common::fit_calibration(common::DIM, common::BIT_WIDTH, &sample);
+    let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+    let backend_req = pipestream_search::harness::embedded_backend_request(
+        common::DIM,
+        common::BIT_WIDTH,
+        &shift,
+        &scale,
+    );
+    client.configure_vector_backend(backend_req).await.unwrap();
+    ingest(&addr, &CORPUS).await.unwrap();
+    let c = coordinator(vec![addr.clone()], NATIVE_ANALYSIS_BACKEND);
+    assert!(
+        client
+            .flush(FlushRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .written
+    );
+    let probes = [
+        ("court appeal", spec(HighlightMode::Sentence, 0, 0)),
+        ("court", spec(HighlightMode::Sentence, 1, 64)),
+        ("court appeal", spec(HighlightMode::Window, 2, 40)),
+    ];
+    let mut baseline = Vec::new();
+    for (text, spec) in &probes {
+        let resp = bm25(&c, request(text, Some(spec.clone()))).await;
+        for h in &resp.hits {
+            check_contract(CORPUS[h.doc_id as usize], h);
+        }
+        baseline.push(snippets_of(&resp));
+    }
+    handle.abort();
+
+    let bm25_path = bm25_sidecar_path(&index_path);
+    let reader = verify_sentence_sidecar(&bm25_path);
+
+    let shard = Bm25Shard::open(&bm25_path).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr2 = format!("http://{}", listener.local_addr().unwrap());
+    let service = NodeServiceImpl::new(None, config.clone()).with_bm25(Some(shard));
+    let handle2 = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(service.into_server(pipestream_search::MAX_MESSAGE_BYTES))
+            .serve_with_incoming(pipestream_search::harness::nodelay_incoming(listener)),
+    );
+    let reopened = coordinator(vec![addr2], NATIVE_ANALYSIS_BACKEND);
+    for ((text, spec), want) in probes.iter().zip(&baseline) {
+        let resp = bm25(&reopened, request(text, Some(spec.clone()))).await;
+        assert_eq!(&snippets_of(&resp), want, "{text:?} after reopen");
+    }
+    handle2.abort();
+
+    verify_replayed_sentence_split(&index_path, &dir.join("split"), &reader);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

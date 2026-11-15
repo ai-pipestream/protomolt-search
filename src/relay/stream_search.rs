@@ -10,9 +10,9 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::coordinator::{RequestFilters, ShardVectorRowProbe};
 use crate::metrics::Route;
-use crate::node::STALE_STATS_EPOCH;
 use crate::pb::node_service_server::NodeService;
 use crate::pb::{stream_search_request, StreamSearchRequest, StreamSearchResponse};
+use crate::stats_identity::{is_stale_stats_epoch, stale_stats_epoch_status};
 
 use super::map::MapSnapshot;
 use super::signals::RelaySignals;
@@ -79,19 +79,17 @@ pub(super) async fn await_vector_rows(
     }
 }
 
-/// A child's error as the parent must read it. The stale-epoch prefix
-/// stays at the front so the parent's retry rule fires; everything else
-/// gets the child named after the code.
+/// A child's error as the parent must read it. Structured stale-stats
+/// refusals preserve their refusal-reason metadata header so the parent's
+/// retry rule fires; all other errors preserve metadata and name the child.
 pub(super) fn child_error(shard: usize, addr: &str, route: &str, status: Status) -> Status {
-    let message = status.message();
-    let text = match message.strip_prefix(STALE_STATS_EPOCH) {
-        Some(rest) => format!(
-            "{STALE_STATS_EPOCH}: relay child {shard} ({addr}) {route}{}",
-            rest
-        ),
-        None => format!("relay child {shard} ({addr}) {route}: {message}"),
-    };
-    Status::new(status.code(), text)
+    let detail = format!("relay child {shard} ({addr}) {route}: {}", status.message());
+    if is_stale_stats_epoch(&status) {
+        let mut out = stale_stats_epoch_status(detail);
+        *out.metadata_mut() = status.metadata().clone();
+        return out;
+    }
+    Status::with_metadata(status.code(), detail, status.metadata().clone())
 }
 /// The first frame of a `StreamSearch`, validated: it must be the start,
 /// carry no scoped read context, and name a valid floor and filters.

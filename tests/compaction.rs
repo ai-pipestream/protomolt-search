@@ -722,391 +722,362 @@ async fn reference_shard(
     (addr, handle)
 }
 
+use pipestream_search::compaction::{default_work_dir, marker_path};
+use pipestream_search::node::{generation_bm25, generation_dir, segments_root};
+use pipestream_search::postings::{Bm25Index, Bm25Reader};
+use pipestream_search::reshard::{split_logs_with, SplitRequest};
+use pipestream_search::segments::OpenedSegmentSet;
+
 fn wal_gen(index_path: &Path, generation: u64) -> PathBuf {
     pipestream_search::wal::gen_dir(&pipestream_search::wal::wal_dir(index_path), generation)
 }
 
-async fn run_online_compaction(layout: Layout) {
-    let (analysis, _mock) = start_mock_analysis().await;
-    let tag = match layout {
-        Layout::Segments => "segments",
-        Layout::SingleImage => "single",
-    };
-    let dir = tempdir(tag);
-    let sample = unit_vectors(256, DIM, SEED);
-    let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &sample);
-    let index_path = dir.join("shard.vector");
-    let (addr, mut handle) =
-        start_empty_node(config(Some(index_path.clone()), layout, &analysis)).await;
-    let tracked = Arc::new(Mutex::new(seed_shard(&addr, &shift, &scale).await));
-    let queries: Vec<Vec<f32>> = (0..3)
-        .map(|q| unit_vectors(1, DIM, 0x5E61_0000 + q))
-        .collect();
-
-    // A cursor minted before the cutover; its boundary is the top hit
-    // for row 700's own vector, which the renumbering moves. Keep the test
-    // signing key stable across coordinator instances so the refusal below
-    // proves the physical read-version check rather than key rotation.
-    let coordinator = CoordinatorServiceImpl::new(vec![addr.clone()])
-        .with_cursor_signing_key([0x43; 32])
-        .with_bm25(Some(analysis.clone()), Default::default());
-    let cursor_probe = row(700, false).vector.clone();
-    let first_page = SearchService::query(
-        &coordinator,
-        Request::new(QueryRequest {
-            k: 1,
-            selection: Some(SelectionQuery {
-                node: Some(selection_query::Node::Search(SearchQuery {
-                    id: "dense".into(),
-                    query: Some(search_query::Query::Dense(DenseQuery {
-                        vector: cursor_probe.clone(),
-                        ..Default::default()
-                    })),
-                })),
-            }),
-            ..Default::default()
-        }),
-    )
-    .await
-    .unwrap()
-    .into_inner();
-    assert!(!first_page.next_cursor.is_empty());
-
-    // Health before: tombstones present.
-    let before = client(&addr)
+async fn shard_health(addr: &str) -> pipestream_search::pb::HealthResponse {
+    client(addr)
         .await
         .health(HealthRequest {})
         .await
         .unwrap()
-        .into_inner();
-    assert!(before.deleted_docs > 0);
-    assert_eq!(before.wal_generation, 0);
+        .into_inner()
+}
 
-    // Compaction with a concurrent writer.
-    let stop = Arc::new(AtomicBool::new(false));
-    let writer_task = tokio::spawn(writer(
-        addr.clone(),
-        Arc::clone(&tracked),
-        Arc::clone(&stop),
-        N + 100,
-    ));
-    let started = Instant::now();
-    let first = compact(&addr, CompactShardRequest::default())
-        .await
-        .unwrap();
-    let elapsed = started.elapsed();
-    stop.store(true, Ordering::Release);
-    let stats = writer_task.await.unwrap();
-    eprintln!("compaction[{tag}] #1: {first:?} in {elapsed:?}; writer {stats:?}");
+fn dense_cursor_query(probe: Vec<f32>, cursor: String) -> QueryRequest {
+    let dense = search_query::Query::Dense(DenseQuery {
+        vector: probe,
+        ..Default::default()
+    });
+    let node = selection_query::Node::Search(SearchQuery {
+        id: "dense".into(),
+        query: Some(dense),
+    });
+    QueryRequest {
+        k: 1,
+        selection: Some(SelectionQuery { node: Some(node) }),
+        cursor,
+        ..Default::default()
+    }
+}
 
-    // Writes were not frozen: the writer completed calls during the
-    // compaction, none of which waited for anything like the whole run
-    // (a call can wait out the closing flush, which on the single-image
-    // layout rewrites the image under the lock as every flush there does;
-    // the tail count below is the lock-free evidence).
+fn assert_first_compaction_postconditions(
+    layout: Layout,
+    tag: &str,
+    dir: &Path,
+    index_path: &Path,
+    first: &CompactShardResponse,
+    stats: &WriterStats,
+    elapsed: Duration,
+) {
     assert!(stats.calls > 0, "the concurrent writer completed no calls");
-    assert!(
-        stats.max_call < elapsed / 2,
-        "a write waited {:?} of a {:?} compaction",
-        stats.max_call,
-        elapsed
-    );
-    assert!(!first.dry_run);
+    assert!(stats.max_call < elapsed / 2, "{stats:?} vs {elapsed:?}");
+    assert!(!first.dry_run && first.wal_generation == 1);
     assert_eq!(first.layout, tag.replace("single", "single-image"));
-    assert_eq!(first.wal_generation, 1);
     assert!(first.rows_before >= (N + 5) as u64);
     assert!(first.tombstones_reclaimed >= (N.div_ceil(7) + 5) as u64);
     assert!(
-        first.tail_records_applied > 0,
-        "the tail applied nothing although writes ran"
+        first.tail_records_applied > 0 && first.locked_tail_records == 0,
+        "{first:?}"
     );
-    assert_eq!(first.locked_tail_records, 0);
-    assert!(
-        first.write_lock_ms < 500,
-        "write lock held {} ms",
-        first.write_lock_ms
-    );
-    assert!(!pipestream_search::compaction::default_work_dir(&index_path).exists());
-    assert!(!pipestream_search::compaction::marker_path(&index_path).exists());
-    assert!(wal_gen(&index_path, 0).exists(), "history is kept");
-    assert!(wal_gen(&index_path, 1).exists());
+    assert!(first.write_lock_ms < 500, "lock {} ms", first.write_lock_ms);
+    assert!(!default_work_dir(index_path).exists() && !marker_path(index_path).exists());
+    assert!(wal_gen(index_path, 0).exists() && wal_gen(index_path, 1).exists());
     match layout {
         Layout::SingleImage => {
-            assert!(!dir.join("shard.vector.snap-old").exists());
-            assert!(!index_path.exists(), "the legacy image is retired");
-            assert!(pipestream_search::node::generation_dir(&index_path).exists());
+            assert!(!dir.join("shard.vector.snap-old").exists() && !index_path.exists());
+            assert!(generation_dir(index_path).exists());
         }
         Layout::Segments => {
-            let root = pipestream_search::node::segments_root(&index_path);
-            let manifest = pipestream_search::segments::SegmentCatalog::read_manifest(&root)
-                .unwrap()
-                .unwrap();
-            assert!(manifest.segments.iter().all(
-                |s| s.segment_id.starts_with("cmp-000001-") || s.segment_id.starts_with("seg-")
-            ));
+            let root = segments_root(index_path);
+            let manifest = SegmentCatalog::read_manifest(&root).unwrap().unwrap();
+            assert!(manifest.segments.iter().all(|s| {
+                s.segment_id.starts_with("cmp-000001-") || s.segment_id.starts_with("seg-")
+            }));
             for entry in std::fs::read_dir(root.join("segments")).unwrap() {
                 let name = entry.unwrap().file_name().to_string_lossy().into_owned();
-                assert!(
-                    manifest.segments.iter().any(|s| s.segment_id == name),
-                    "replaced segment {name} was not retired"
-                );
+                assert!(manifest.segments.iter().any(|s| s.segment_id == name));
             }
         }
     }
+}
 
-    // Ids issued under the old generation refuse by name; the same ids
-    // without a claim would name whichever rows carry them now.
-    let stale_id = *tracked
-        .lock()
-        .unwrap()
-        .ids
-        .values()
-        .next()
-        .map(|(id, _)| id)
-        .unwrap();
-    let err = client(&addr)
-        .await
-        .delete_documents(DeleteDocumentsRequest {
-            doc_ids: vec![stale_id],
-            expected_wal_generation: Some(0),
-        })
-        .await
-        .unwrap_err();
+async fn assert_stale_gen_and_cursor_refusals(
+    addr: &str,
+    analysis: &str,
+    stale_id: u64,
+    cursor_probe: Vec<f32>,
+    cursor: String,
+) {
+    let del = DeleteDocumentsRequest {
+        doc_ids: vec![stale_id],
+        expected_wal_generation: Some(0),
+    };
+    let err = client(addr).await.delete_documents(del).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-    assert!(
-        err.message().contains("stale WAL generation"),
-        "{}",
-        err.message()
-    );
+    assert!(err.message().contains("stale WAL generation"), "{err}");
 
-    // The cursor from the old generation refuses by name.
-    let coordinator = CoordinatorServiceImpl::new(vec![addr.clone()])
+    let coord = CoordinatorServiceImpl::new(vec![addr.to_string()])
         .with_cursor_signing_key([0x43; 32])
-        .with_bm25(Some(analysis.clone()), Default::default());
-    let err = SearchService::query(
-        &coordinator,
-        Request::new(QueryRequest {
-            k: 1,
-            selection: Some(SelectionQuery {
-                node: Some(selection_query::Node::Search(SearchQuery {
-                    id: "dense".into(),
-                    query: Some(search_query::Query::Dense(DenseQuery {
-                        vector: cursor_probe,
-                        ..Default::default()
-                    })),
-                })),
-            }),
-            cursor: first_page.next_cursor,
-            ..Default::default()
-        }),
-    )
-    .await
-    .unwrap_err();
+        .with_bm25(Some(analysis.to_string()), Default::default());
+    let req = Request::new(dense_cursor_query(cursor_probe, cursor));
+    let err = SearchService::query(&coord, req).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(
         err.message().contains("cursor data context changed"),
-        "{}",
-        err.message()
+        "{err}"
     );
+}
 
-    // A quiescent second compaction reclaims what the tail tombstoned
-    // and proves the rewritten generation is full history.
-    let second = compact(&addr, CompactShardRequest::default())
-        .await
-        .unwrap();
-    eprintln!("compaction[{tag}] #2: {second:?}");
-    assert_eq!(second.wal_generation, 2);
-    assert_eq!(second.tail_records_applied, 0);
-    // The writer may land a row between the first response and the
-    // stop flag; nothing else touched the shard.
-    assert!(second.rows_before >= first.rows_after);
-    let live_rows = tracked.lock().unwrap().live.len() as u64;
-    assert_eq!(second.rows_after, live_rows);
-    let health = client(&addr)
-        .await
-        .health(HealthRequest {})
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(health.deleted_docs, 0);
-    assert_eq!(health.live_docs, live_rows);
-    assert_eq!(health.document_slots, live_rows);
-    assert_eq!(health.num_vectors, live_rows);
-    assert_eq!(health.wal_generation, 2);
-    assert!(health.wal_clocked);
+fn verify_compacted_reader_sources(reader: &Bm25Reader, final_rows: &[Row]) {
+    type KeyedRows = BTreeMap<Vec<u8>, Vec<(u32, u64, Option<u32>)>>;
+    let mut keyed = KeyedRows::new();
+    for local in 0..reader.next_doc_id() {
+        let text = reader.text(local).unwrap();
+        let row = final_rows.iter().find(|r| r.text == text).unwrap();
+        assert_eq!(
+            reader.protobuf_source(local).unwrap(),
+            Some(original_source(row))
+        );
+        let id = logical_identity(row);
+        assert_eq!(reader.document_identity(local), Some(id.clone()));
+        keyed
+            .entry(id.document_key)
+            .or_default()
+            .push((local, id.version, id.chunk_ordinal));
+    }
+    for (key, expected) in keyed {
+        let mut actual = Vec::new();
+        assert!(reader.visit_document_rows(&key, &mut |r, v, o| {
+            actual.push((r, v, o));
+            true
+        }));
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+    }
+}
 
-    // Every read path equals a shard built fresh from the final set.
-    let final_rows: Vec<Row> = tracked.lock().unwrap().live.values().cloned().collect();
-    let verify_sources = |reader: &pipestream_search::postings::Bm25Reader| {
-        use pipestream_search::postings::Bm25Index;
-        #[allow(clippy::type_complexity)]
-        let mut keyed: BTreeMap<Vec<u8>, Vec<(u32, u64, Option<u32>)>> = BTreeMap::new();
-        for local in 0..reader.next_doc_id() {
-            let text = reader.text(local).unwrap();
-            let row = final_rows.iter().find(|r| r.text == text).unwrap();
-            assert_eq!(
-                reader.protobuf_source(local).unwrap(),
-                Some(original_source(row))
-            );
-            let identity = logical_identity(row);
-            assert_eq!(reader.document_identity(local), Some(identity.clone()));
-            keyed.entry(identity.document_key).or_default().push((
-                local,
-                identity.version,
-                identity.chunk_ordinal,
-            ));
-        }
-        // Reverse lookup must refer to the new positions after compaction,
-        // including keys whose chunks span several output segments.
-        for (key, expected) in keyed {
-            let mut actual = Vec::new();
-            assert!(
-                reader.visit_document_rows(&key, &mut |row, version, ordinal| {
-                    actual.push((row, version, ordinal));
-                    true
-                })
-            );
-            actual.sort_unstable();
-            assert_eq!(actual, expected);
-        }
-    };
+fn verify_layout_bm25_sources(layout: Layout, index_path: &Path, final_rows: &[Row]) {
     match layout {
         Layout::SingleImage => {
-            let generation = pipestream_search::node::generation_dir(&index_path);
-            let reader = pipestream_search::postings::Bm25Reader::open(
-                &pipestream_search::node::generation_bm25(&generation),
-            )
-            .unwrap();
-            verify_sources(&reader);
+            let bm25 = generation_bm25(&generation_dir(index_path));
+            verify_compacted_reader_sources(&Bm25Reader::open(&bm25).unwrap(), final_rows);
         }
         Layout::Segments => {
-            let set = pipestream_search::segments::OpenedSegmentSet::open(
-                pipestream_search::node::segments_root(&index_path),
-            )
-            .unwrap();
+            let set = OpenedSegmentSet::open(segments_root(index_path)).unwrap();
             for part in 0..set.manifest().segments.len() {
-                verify_sources(set.bm25(part));
+                verify_compacted_reader_sources(set.bm25(part), final_rows);
             }
         }
     }
-    let (reference, reference_handle) = reference_shard(
-        &dir,
-        "reference.vector",
-        layout,
-        &analysis,
-        &shift,
-        &scale,
-        &final_rows,
-    )
-    .await;
-    let expected = observe(std::slice::from_ref(&reference), &analysis, &queries).await;
-    assert_eq!(expected.browse_by_num.len(), final_rows.len());
-    let got = observe(std::slice::from_ref(&addr), &analysis, &queries).await;
-    assert_eq!(got, expected, "compacted shard differs from the reference");
+}
 
-    // Reopen from disk: the same.
-    handle.abort();
-    let _ = (&mut handle).await;
-    let (reopened, reopened_handle) =
-        start_opened_node(config(Some(index_path.clone()), layout, &analysis)).await;
-    let health = client(&reopened)
-        .await
-        .health(HealthRequest {})
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!((health.live_docs, health.deleted_docs), (live_rows, 0));
-    assert_eq!(health.wal_generation, 2);
-    let got = observe(std::slice::from_ref(&reopened), &analysis, &queries).await;
-    assert_eq!(got, expected, "reopened shard differs from the reference");
+struct ReplayCheck<'a> {
+    dir: &'a Path,
+    index_path: &'a Path,
+    layout: Layout,
+    analysis: &'a str,
+    cal: (&'a [f32], &'a [f32]),
+    addr: &'a str,
+    final_rows: &'a [Row],
+    queries: &'a [Vec<f32>],
+}
 
-    // The rewritten generation replays to the same shard.
-    let handle_rt = tokio::runtime::Handle::current();
-    let replay_addr = analysis.clone();
+async fn verify_compacted_wal_replay(
+    check: &ReplayCheck<'_>,
+    expected: &Reads,
+) -> tokio::task::JoinHandle<Result<(), tonic::transport::Error>> {
+    let rt = tokio::runtime::Handle::current();
+    let addr = check.analysis.to_string();
     let mut replay = move |docs: &[(
         &str,
         Option<&pipestream_search::pb::AnalysisSpec>,
         pipestream_search::analyzer::SessionLayers,
     )]| {
         tokio::task::block_in_place(|| {
-            handle_rt
-                .block_on(pipestream_search::analyzer::analyze_batch_streams(
-                    &replay_addr,
-                    docs,
-                    1,
-                ))
-                .map_err(|e| e.to_string())
+            rt.block_on(pipestream_search::analyzer::analyze_batch_streams(
+                &addr, docs, 1,
+            ))
+            .map_err(|e| e.to_string())
         })
     };
-    let replayed = pipestream_search::reshard::split(
-        &wal_gen(&index_path, 2),
-        1,
-        &dir.join("replayed"),
-        0,
-        1_000_000,
-        false,
-        Some(&["body".to_string()]),
-        &mut replay,
-    )
-    .unwrap();
-    let child = &replayed.children[0];
-    assert_eq!(child.num_vectors, live_rows);
-    assert_eq!(child.num_documents, live_rows);
-    verify_sources(
-        &pipestream_search::postings::Bm25Reader::open(child.bm25_path.as_ref().unwrap()).unwrap(),
+    let (gen2, out_dir, fields) = (
+        wal_gen(check.index_path, 2),
+        check.dir.join("replayed"),
+        ["body".to_string()],
     );
-    let (replayed_addr, replayed_handle) = start_opened_node(config(
+    let req = SplitRequest::new(std::slice::from_ref(&gen2), 1, &out_dir)
+        .slot_stride(1_000_000)
+        .bm25_fields(Some(&fields));
+    let replayed = split_logs_with(&req, &mut replay).unwrap();
+    let child = &replayed.children[0];
+    let live = check.final_rows.len() as u64;
+    assert_eq!((child.num_vectors, child.num_documents), (live, live));
+    let reader = Bm25Reader::open(child.bm25_path.as_ref().unwrap()).unwrap();
+    verify_compacted_reader_sources(&reader, check.final_rows);
+    let cfg = config(
         Some(child.vector_path.clone()),
         Layout::SingleImage,
-        &analysis,
-    ))
-    .await;
-    let got = observe(std::slice::from_ref(&replayed_addr), &analysis, &queries).await;
-    assert_eq!(
-        got, expected,
-        "the rewritten WAL generation replays differently"
+        check.analysis,
     );
+    let (r_addr, r_handle) = start_opened_node(cfg).await;
+    let got = observe(std::slice::from_ref(&r_addr), check.analysis, check.queries).await;
+    assert_eq!(&got, expected, "rewritten WAL replays differently");
+    r_handle
+}
 
-    // Distributed equals monolithic: the compacted shard beside an
-    // untouched one, against one shard holding both corpora.
+async fn verify_distributed_matches_monolithic(check: &ReplayCheck<'_>, reopened: &str) {
     let other_rows: Vec<Row> = (5_000..5_300).map(|i| row(i, false)).collect();
-    let (other, other_handle) = start_empty_node(NodeConfig {
+    let other_cfg = config(
+        Some(check.dir.join("other.vector")),
+        check.layout,
+        check.analysis,
+    );
+    let (other, other_h) = start_empty_node(NodeConfig {
         slot_offset: 1_000_000,
-        ..config(Some(dir.join("other.vector")), layout, &analysis)
+        ..other_cfg
     })
     .await;
-    calibrate(&other, &shift, &scale).await;
+    calibrate(&other, check.cal.0, check.cal.1).await;
     {
-        let mut client = client(&other).await;
-        for row in &other_rows {
-            append(&mut client, row).await;
+        let mut c = client(&other).await;
+        for r in &other_rows {
+            append(&mut c, r).await;
         }
-        client.flush(FlushRequest {}).await.unwrap();
+        c.flush(FlushRequest {}).await.unwrap();
     }
-    let mut union_rows = final_rows.clone();
-    union_rows.extend(other_rows.iter().cloned());
-    let (monolithic, monolithic_handle) = reference_shard(
-        &dir,
+    let mut union = check.final_rows.to_vec();
+    union.extend(other_rows);
+    let (mono, mono_h) = reference_shard(
+        check.dir,
         "monolithic.vector",
-        layout,
-        &analysis,
-        &shift,
-        &scale,
-        &union_rows,
+        check.layout,
+        check.analysis,
+        check.cal.0,
+        check.cal.1,
+        &union,
     )
     .await;
-    let distributed = observe(&[reopened.clone(), other.clone()], &analysis, &queries).await;
-    let expected_union = observe(std::slice::from_ref(&monolithic), &analysis, &queries).await;
-    assert_eq!(distributed.lexical, expected_union.lexical);
-    assert_eq!(distributed.facets, expected_union.facets);
-    assert_eq!(distributed.dense, expected_union.dense);
-    assert_eq!(distributed.hybrid, expected_union.hybrid);
+    let shards = [reopened.to_string(), other];
+    let dist = observe(&shards, check.analysis, check.queries).await;
+    let exp = observe(std::slice::from_ref(&mono), check.analysis, check.queries).await;
+    assert_eq!(
+        (&dist.lexical, &dist.facets, &dist.dense, &dist.hybrid),
+        (&exp.lexical, &exp.facets, &exp.dense, &exp.hybrid)
+    );
+    other_h.abort();
+    mono_h.abort();
+}
 
-    reference_handle.abort();
-    reopened_handle.abort();
-    replayed_handle.abort();
-    other_handle.abort();
-    monolithic_handle.abort();
+async fn verify_reopened_and_replayed_equivalence(
+    ctx: ReplayCheck<'_>,
+    mut handle: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+) {
+    let live_rows = ctx.final_rows.len() as u64;
+    verify_layout_bm25_sources(ctx.layout, ctx.index_path, ctx.final_rows);
+    let (ref_addr, ref_h) = reference_shard(
+        ctx.dir,
+        "reference.vector",
+        ctx.layout,
+        ctx.analysis,
+        ctx.cal.0,
+        ctx.cal.1,
+        ctx.final_rows,
+    )
+    .await;
+    let expected = observe(std::slice::from_ref(&ref_addr), ctx.analysis, ctx.queries).await;
+    assert_eq!(expected.browse_by_num.len(), ctx.final_rows.len());
+    let live_obs = observe(&[ctx.addr.to_string()], ctx.analysis, ctx.queries).await;
+    assert_eq!(live_obs, expected);
+
+    handle.abort();
+    let _ = (&mut handle).await;
+    let cfg = config(Some(ctx.index_path.to_path_buf()), ctx.layout, ctx.analysis);
+    let (reopened, reopened_h) = start_opened_node(cfg).await;
+    let h = shard_health(&reopened).await;
+    assert_eq!(
+        (h.live_docs, h.deleted_docs, h.wal_generation),
+        (live_rows, 0, 2)
+    );
+    assert_eq!(
+        observe(std::slice::from_ref(&reopened), ctx.analysis, ctx.queries).await,
+        expected
+    );
+
+    let replayed_h = verify_compacted_wal_replay(&ctx, &expected).await;
+    verify_distributed_matches_monolithic(&ctx, &reopened).await;
+    ref_h.abort();
+    reopened_h.abort();
+    replayed_h.abort();
+}
+
+async fn run_online_compaction(layout: Layout) {
+    let (analysis, _mock) = start_mock_analysis().await;
+    let tag = if matches!(layout, Layout::Segments) {
+        "segments"
+    } else {
+        "single"
+    };
+    let dir = tempdir(tag);
+    let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &unit_vectors(256, DIM, SEED));
+    let index_path = dir.join("shard.vector");
+    let (addr, handle) =
+        start_empty_node(config(Some(index_path.clone()), layout, &analysis)).await;
+    let tracked = Arc::new(Mutex::new(seed_shard(&addr, &shift, &scale).await));
+    let queries: Vec<Vec<f32>> = (0..3)
+        .map(|q| unit_vectors(1, DIM, 0x5E61_0000 + q))
+        .collect();
+
+    let coord = CoordinatorServiceImpl::new(vec![addr.clone()])
+        .with_cursor_signing_key([0x43; 32])
+        .with_bm25(Some(analysis.clone()), Default::default());
+    let probe = row(700, false).vector.clone();
+    let req = Request::new(dense_cursor_query(probe.clone(), String::new()));
+    let page1 = SearchService::query(&coord, req)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!page1.next_cursor.is_empty());
+
+    let before = shard_health(&addr).await;
+    assert!(before.deleted_docs > 0 && before.wal_generation == 0);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let w_task = tokio::spawn(writer(addr.clone(), tracked.clone(), stop.clone(), N + 100));
+    let started = Instant::now();
+    let first = compact(&addr, Default::default()).await.unwrap();
+    let elapsed = started.elapsed();
+    stop.store(true, Ordering::Release);
+    let stats = w_task.await.unwrap();
+    assert_first_compaction_postconditions(layout, tag, &dir, &index_path, &first, &stats, elapsed);
+
+    let stale_id = tracked.lock().unwrap().ids.values().next().unwrap().0;
+    assert_stale_gen_and_cursor_refusals(&addr, &analysis, stale_id, probe, page1.next_cursor)
+        .await;
+
+    let second = compact(&addr, Default::default()).await.unwrap();
+    assert_eq!((second.wal_generation, second.tail_records_applied), (2, 0));
+    let final_rows: Vec<Row> = tracked.lock().unwrap().live.values().cloned().collect();
+    let live = final_rows.len() as u64;
+    assert!(second.rows_before >= first.rows_after && second.rows_after == live);
+    let h = shard_health(&addr).await;
+    assert_eq!(
+        (h.deleted_docs, h.live_docs, h.wal_generation),
+        (0, live, 2)
+    );
+    assert_eq!(
+        (h.document_slots, h.num_vectors, h.wal_clocked),
+        (live, live, true)
+    );
+
+    let ctx = ReplayCheck {
+        dir: &dir,
+        index_path: &index_path,
+        layout,
+        analysis: &analysis,
+        cal: (&shift, &scale),
+        addr: &addr,
+        final_rows: &final_rows,
+        queries: &queries,
+    };
+    verify_reopened_and_replayed_equivalence(ctx, handle).await;
     let _ = std::fs::remove_dir_all(&dir);
 }
 

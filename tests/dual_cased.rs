@@ -337,6 +337,25 @@ async fn the_native_analyzer_produces_the_pair_from_one_pass() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+fn verify_replayed_cased_child(child_bm25: &std::path::Path, index_path: &std::path::Path) {
+    let child = Bm25Reader::open(child_bm25).unwrap();
+    let parent = Bm25Reader::open(&bm25_sidecar_path(index_path)).unwrap();
+    assert_eq!(child.field_index("body_cased"), Some(1));
+    assert_eq!(
+        child.analysis_fingerprint(1),
+        parent.analysis_fingerprint(1)
+    );
+    for term in ["COURT", "Court", "court", "appeal", "APPEAL"] {
+        assert_eq!(child.field(1).df(term), parent.field(1).df(term), "{term}");
+        assert_eq!(child.field(0).df(term), parent.field(0).df(term), "{term}");
+    }
+    let mut a = parent.field(1).posting_offsets("Court", 1);
+    let mut b = child.field(1).posting_offsets("Court", 1);
+    a.sort_unstable();
+    b.sort_unstable();
+    assert_eq!(a, b);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wal_replay_analyzes_each_document_once_and_keeps_the_pair() {
     let (analysis, mock, calls) = start_mock_analysis_metered().await;
@@ -347,16 +366,11 @@ async fn wal_replay_analyzes_each_document_once_and_keeps_the_pair() {
         ..config(&analysis, Some(index_path.clone()))
     })
     .await;
-    // Reshard replays a WAL with a locked vector backend; lock one the
-    // way the reshard fixtures do, documents-only otherwise.
     let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
     let (shift, scale) = fit_calibration(DIM, BIT_WIDTH, &unit_vectors(8, DIM, 0xD0A1_0001));
-    client
-        .configure_vector_backend(pipestream_search::harness::embedded_backend_request(
-            DIM, BIT_WIDTH, &shift, &scale,
-        ))
-        .await
-        .unwrap();
+    let backend_req =
+        pipestream_search::harness::embedded_backend_request(DIM, BIT_WIDTH, &shift, &scale);
+    client.configure_vector_backend(backend_req).await.unwrap();
     ingest(&addr, DOCS.iter().map(|t| doc(t)).collect())
         .await
         .unwrap();
@@ -388,39 +402,22 @@ async fn wal_replay_analyzes_each_document_once_and_keeps_the_pair() {
         })
     };
     let before = calls.load(std::sync::atomic::Ordering::SeqCst);
-    let output = pipestream_search::reshard::split(
-        &pipestream_search::reshard::resolve_gen(&pipestream_search::wal::wal_dir(&index_path))
-            .unwrap(),
-        1,
-        &dir.join("child"),
-        0,
-        25_000_000,
-        false,
-        Some(&["body".to_string(), "body_cased".to_string()]),
-        &mut analyze,
-    )
-    .unwrap();
+    let gen =
+        pipestream_search::reshard::resolve_gen(&pipestream_search::wal::wal_dir(&index_path))
+            .unwrap();
+    let fields = ["body".to_string(), "body_cased".to_string()];
+    let child_dir = dir.join("child");
+    let req =
+        pipestream_search::reshard::SplitRequest::new(std::slice::from_ref(&gen), 1, &child_dir)
+            .slot_stride(25_000_000)
+            .bm25_fields(Some(&fields));
+    let output = pipestream_search::reshard::split_logs_with(&req, &mut analyze).unwrap();
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::SeqCst) - before,
         4,
         "replay analyzed each document once; the cased field rode that pass"
     );
-    let child = Bm25Reader::open(output.children[0].bm25_path.as_ref().unwrap()).unwrap();
-    let parent = Bm25Reader::open(&bm25_sidecar_path(&index_path)).unwrap();
-    assert_eq!(child.field_index("body_cased"), Some(1));
-    assert_eq!(
-        child.analysis_fingerprint(1),
-        parent.analysis_fingerprint(1)
-    );
-    for term in ["COURT", "Court", "court", "appeal", "APPEAL"] {
-        assert_eq!(child.field(1).df(term), parent.field(1).df(term), "{term}");
-        assert_eq!(child.field(0).df(term), parent.field(0).df(term), "{term}");
-    }
-    let mut a = parent.field(1).posting_offsets("Court", 1);
-    let mut b = child.field(1).posting_offsets("Court", 1);
-    a.sort_unstable();
-    b.sort_unstable();
-    assert_eq!(a, b);
+    verify_replayed_cased_child(output.children[0].bm25_path.as_ref().unwrap(), &index_path);
     mock.abort();
     let _ = std::fs::remove_dir_all(&dir);
 }
