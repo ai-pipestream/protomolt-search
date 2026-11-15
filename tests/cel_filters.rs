@@ -769,19 +769,7 @@ impl NumericRead for ReaderCols<'_> {
     }
 }
 
-/// The scorer seam, locally and at scale: a compound resolved tree
-/// (AND over OR, NOT, i64 and f64 ranges, facet membership, map-key
-/// presence) gates the pruned scorer and the exhaustive oracle to
-/// bitwise-identical answers on a v5-impacted reader, seeded floors
-/// included, with survivors verified against a direct per-document
-/// evaluation.
-#[test]
-fn cel_filtered_pruned_matches_exhaustive_bitwise() {
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("cel_pruned_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-
-    let n = 3000u32;
+fn build_cel_pruned_corpus(n: u32, path: &std::path::Path) -> CorpusStats {
     let tf_a = |d: u32| 1 + (u64::from(d) * 2654435761 % 7) as u32;
     let mut store = Bm25Store::with_fields(&["body"])
         .with_facets(&["court"])
@@ -799,9 +787,6 @@ fn cel_filtered_pruned_matches_exhaustive_bitwise() {
         }
         let len: u32 = terms.iter().map(|(_, tf, _)| tf).sum();
         store.add_document(doc, ".".to_string(), AnalyzedDoc::body(terms, len));
-        // Deterministic value spread with holes: every 5th document
-        // has no court, every 7th no year, every 4th no score, every
-        // 3rd no tag — absence at every leaf.
         if doc % 5 != 0 {
             store.set_facet(0, doc, courts[doc as usize % 4]);
         }
@@ -815,13 +800,8 @@ fn cel_filtered_pruned_matches_exhaustive_bitwise() {
             store.set_map_facet(0, doc, "status", if doc % 2 == 0 { "live" } else { "dead" });
         }
     }
-    let path = dir.join("cel.bm25");
-    store.save(&path).unwrap();
-    let reader = Bm25Reader::open(&path).unwrap();
-    let body = reader.field(0);
-    let cols = ReaderCols(&reader);
-
-    let stats = CorpusStats {
+    store.save(path).unwrap();
+    CorpusStats {
         doc_count: u64::from(n),
         total_doc_length: (0..n).map(|d| u64::from(tf_a(d))).sum::<u64>()
             + (0..n)
@@ -830,30 +810,22 @@ fn cel_filtered_pruned_matches_exhaustive_bitwise() {
                 .sum::<u64>()
             + (0..n).filter(|d| d % 61 == 0).count() as u64,
         dfs: vec![n, n.div_ceil(3), n.div_ceil(61)],
-    };
-    let terms: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
-    let params = Bm25Params::default();
-    let signature = |docs: &[bm25::ScoredDoc]| -> Vec<(u32, u64)> {
-        docs.iter().map(|d| (d.doc_id, d.score.to_bits())).collect()
-    };
+    }
+}
 
-    // court in {scotus, ca9} OR year in [1950, 2000) — NOT (score < 3)
-    // — AND "status" in tags. Ordinals resolved by hand against the
-    // store this test built: first-seen order makes scotus 0 and ca9 2.
-    let scotus_ord = (0..n)
-        .filter_map(|d| reader.facet_ord(0, d).map(|o| (d, o)))
-        .find(|(d, _)| courts[*d as usize % 4] == "scotus")
-        .map(|(_, o)| o)
-        .unwrap();
-    let ca9_ord = (0..n)
-        .filter_map(|d| reader.facet_ord(0, d).map(|o| (d, o)))
-        .find(|(d, _)| courts[*d as usize % 4] == "ca9")
-        .map(|(_, o)| o)
-        .unwrap();
-    let status_key = reader.map_facet_key_ord(0, "status").unwrap();
-    let mut ords = vec![scotus_ord, ca9_ord];
+fn build_cel_pruned_predicate(reader: &Bm25Reader, n: u32) -> ResolvedFilter {
+    let courts = ["scotus", "ca5", "ca9", "dcc"];
+    let find_ord = |target: &str| {
+        (0..n)
+            .filter_map(|d| reader.facet_ord(0, d).map(|o| (d, o)))
+            .find(|(d, _)| courts[*d as usize % 4] == target)
+            .map(|(_, o)| o)
+            .unwrap()
+    };
+    let mut ords = vec![find_ord("scotus"), find_ord("ca9")];
     ords.sort_unstable();
-    let pred = ResolvedFilter::And(vec![
+    let status_key = reader.map_facet_key_ord(0, "status").unwrap();
+    ResolvedFilter::And(vec![
         ResolvedFilter::Or(vec![
             ResolvedFilter::Leaf(ResolvedLeaf::Facet {
                 column: Some(0),
@@ -879,7 +851,22 @@ fn cel_filtered_pruned_matches_exhaustive_bitwise() {
                 key_ord: Some(status_key),
             },
         )),
-    ]);
+    ])
+}
+
+#[test]
+fn cel_filtered_pruned_matches_exhaustive_bitwise() {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("cel_pruned_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let n = 3000u32;
+    let path = dir.join("cel.bm25");
+    let stats = build_cel_pruned_corpus(n, &path);
+    let reader = Bm25Reader::open(&path).unwrap();
+    let body = reader.field(0);
+    let cols = ReaderCols(&reader);
+    let pred = build_cel_pruned_predicate(&reader, n);
     let doc_filter = DocFilter {
         deleted: None,
         geo: Default::default(),
@@ -887,73 +874,36 @@ fn cel_filtered_pruned_matches_exhaustive_bitwise() {
         phrase: Vec::new(),
     };
     let filter_ctx: bm25::FilterCtx = Some((&doc_filter, &cols as &dyn NumericRead));
+    let terms: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+    let params = Bm25Params::default();
+    let signature = |docs: &[bm25::ScoredDoc]| -> Vec<(u32, u64)> {
+        docs.iter().map(|d| (d.doc_id, d.score.to_bits())).collect()
+    };
 
     for k in [1usize, 5, 50] {
-        let exhaustive = bm25::top_k_exhaustive_chained_filtered(
-            &body, &terms, &stats, params, k, None, filter_ctx,
-        );
+        let req = || bm25::TopK::new(k).filter(filter_ctx);
+        let exhaustive = bm25::top_k_exhaustive(&body, &terms, &stats, params, req());
         let mut prune = bm25::PruneStats::default();
-        let pruned = bm25::top_k_pruned_chained_filtered_stats(
-            &body,
-            &terms,
-            &stats,
-            params,
-            k,
-            f64::NEG_INFINITY,
-            None,
-            filter_ctx,
-            &mut prune,
-        );
-        assert_eq!(
-            signature(&exhaustive),
-            signature(&pruned),
-            "k={k}: filtered pruned != filtered exhaustive"
-        );
-        // Seeding with the k-th best must not change the answer.
+        let pruned = bm25::top_k(&body, &terms, &stats, params, req().prune_stats(&mut prune));
+        assert_eq!(signature(&exhaustive), signature(&pruned), "k={k}");
         if let Some(kth) = exhaustive.last() {
-            let seeded = bm25::top_k_pruned_chained_filtered_stats(
-                &body,
-                &terms,
-                &stats,
-                params,
-                k,
-                kth.score,
-                None,
-                filter_ctx,
-                &mut bm25::PruneStats::default(),
-            );
-            assert_eq!(
-                signature(&exhaustive),
-                signature(&seeded),
-                "k={k}: seeded floor changed the filtered answer"
-            );
+            let mut sp = bm25::PruneStats::default();
+            let seeded_req = req().floor(kth.score).prune_stats(&mut sp);
+            let seeded = bm25::top_k(&body, &terms, &stats, params, seeded_req);
+            assert_eq!(signature(&exhaustive), signature(&seeded), "k={k} seeded");
         }
-        // Survivors match a direct evaluation of the tree, and the
-        // filter is not vacuous.
         for d in &pruned {
-            assert_eq!(
-                pred.eval(d.doc_id, &cols),
-                Tri::True,
-                "doc {} survived but does not pass the tree",
-                d.doc_id
-            );
+            assert_eq!(pred.eval(d.doc_id, &cols), Tri::True, "doc {}", d.doc_id);
         }
-        let unfiltered = bm25::top_k_pruned_chained_filtered_stats(
+        let mut up = bm25::PruneStats::default();
+        let unfiltered = bm25::top_k(
             &body,
             &terms,
             &stats,
             params,
-            k,
-            f64::NEG_INFINITY,
-            None,
-            None,
-            &mut bm25::PruneStats::default(),
+            bm25::TopK::new(k).prune_stats(&mut up),
         );
-        assert_ne!(
-            signature(&unfiltered),
-            signature(&pruned),
-            "k={k}: the filter should change the top-k, or this test pins nothing"
-        );
+        assert_ne!(signature(&unfiltered), signature(&pruned), "k={k} vacuous");
     }
 }
 

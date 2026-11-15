@@ -109,7 +109,13 @@ fn assert_scorer_parity(store: &Bm25Store, reader: &Bm25Reader, terms: &[String]
             f64::NEG_INFINITY,
             heap.last().map_or(f64::NEG_INFINITY, |h| h.score),
         ] {
-            let pruned = bm25::top_k_pruned(reader, terms, &stats, params, k, floor);
+            let pruned = bm25::top_k(
+                reader,
+                terms,
+                &stats,
+                params,
+                bm25::TopK::new(k).floor(floor),
+            );
             assert_eq!(
                 sig(&heap),
                 sig(&pruned),

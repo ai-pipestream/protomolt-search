@@ -1,9 +1,7 @@
 //! Signed score ties and echoed live floors preserve exact lexical winners.
 
 use super::HeapEntry;
-use crate::bm25::{
-    self, Bm25Params, CorpusStats, PruneStats, ScoredDoc, ScoringQuery, TopKOptions,
-};
+use crate::bm25::{self, Bm25Params, CorpusStats, PruneStats, ScoredDoc, TopK};
 use crate::postings::{AnalyzedDoc, Bm25Index, Bm25Reader, Bm25Store};
 use crate::scorefn::{ColumnRef, NumericRead, ScoreChain, Stage, StageOp};
 use std::collections::BinaryHeap;
@@ -82,26 +80,26 @@ impl Fixture {
         }
     }
 
-    fn query<'a>(&'a self, columns: &'a ReaderNumerics<'a>) -> ScoringQuery<'a> {
-        ScoringQuery {
-            store: &self.reader,
-            terms: &self.terms,
-            stats: &self.stats,
-            params: Bm25Params::default(),
-            chain: Some((&self.chain, columns)),
-            filter: None,
-        }
-    }
-
-    fn exhaustive(&self, columns: &ReaderNumerics<'_>) -> Vec<ScoredDoc> {
-        bm25::top_k_chained_filtered(
+    fn pruned<'a>(&'a self, columns: &'a ReaderNumerics<'a>, request: TopK<'a>) -> Vec<ScoredDoc> {
+        let request = request.chain(Some((&self.chain, columns)));
+        bm25::top_k(
             &self.reader,
             &self.terms,
             &self.stats,
             Bm25Params::default(),
-            1,
-            Some((&self.chain, columns)),
-            None,
+            request,
+        )
+    }
+
+    fn exhaustive(&self, columns: &ReaderNumerics<'_>) -> Vec<ScoredDoc> {
+        bm25::top_k(
+            &self.reader,
+            &self.terms,
+            &self.stats,
+            Bm25Params::default(),
+            bm25::TopK::new(1)
+                .chain(Some((&self.chain, columns)))
+                .block_max(false),
         )
     }
 }
@@ -158,17 +156,8 @@ fn echoed_negative_live_floor_keeps_later_better_negative_hit() {
         seed
     };
     let mut stats = PruneStats::default();
-    let actual = bm25::top_k_pruned_chained_filtered_stats_streaming(
-        fixture.query(&columns),
-        TopKOptions {
-            k: 1,
-            floor: f64::NEG_INFINITY,
-            block_max: true,
-        },
-        &mut stats,
-        Some(&mut echo),
-        None,
-    );
+    let request = TopK::new(1).prune_stats(&mut stats).live(Some(&mut echo));
+    let actual = fixture.pruned(&columns, request);
     assert_eq!(signature(&actual), signature(&expected));
     assert_eq!(offered.first().copied(), Some((-5.0f32).next_down()));
     assert_eq!(offered.last().copied(), Some((-1.0f32).next_down()));
@@ -237,17 +226,10 @@ fn mmap_signed_zero_scores_keep_the_lower_id_and_raw_score_bits() {
     let mut emitted = Vec::new();
     let mut sink = |doc, score: f32| emitted.push((doc, score.to_bits()));
     let mut stats = PruneStats::default();
-    let actual = bm25::top_k_pruned_chained_filtered_stats_streaming(
-        fixture.query(&columns),
-        TopKOptions {
-            k: 1,
-            floor: f64::NEG_INFINITY,
-            block_max: true,
-        },
-        &mut stats,
-        None,
-        Some(&mut sink),
-    );
+    let request = TopK::new(1)
+        .prune_stats(&mut stats)
+        .candidate(Some(&mut sink));
+    let actual = fixture.pruned(&columns, request);
     assert_eq!(signature(&actual), signature(&expected));
     assert!(emitted.contains(&(0, (-0.0f32).to_bits())));
     assert!(stats.blocks_total > 0);

@@ -681,34 +681,8 @@ fn integer_chain_pruned_matches_exhaustive_bitwise() {
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("integer_chain_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-
-    let n = 3000u32;
-    let tf_a = |d: u32| 1 + (u64::from(d) * 2654435761 % 7) as u32;
-    let cites = |d: u32| i64::from(d) * 48271 % 1000;
-    let mut store = Bm25Store::with_fields(&["body"]).with_integers(&["citations", "filed"]);
-    for doc in 0..n {
-        let mut terms = vec![("a".to_string(), tf_a(doc), Vec::new())];
-        if doc % 3 == 0 {
-            terms.push(("b".to_string(), 1 + doc % 3, Vec::new()));
-        }
-        if doc % 61 == 0 {
-            terms.push(("c".to_string(), 1, Vec::new()));
-        }
-        let len: u32 = terms.iter().map(|(_, tf, _)| tf).sum();
-        store.add_document(doc, ".".to_string(), AnalyzedDoc::body(terms, len));
-        // Every 7th document has no citation count at all.
-        if doc % 7 != 0 {
-            store.set_integer(0, doc, cites(doc));
-        }
-        // A second column whose values live past 2^53, where the cast
-        // to f64 is lossy: the bound must still dominate, because the
-        // cast is monotone even when it rounds.
-        if doc % 4 != 0 {
-            store.set_integer(1, doc, (1i64 << 53) + i64::from(doc));
-        }
-    }
     let path = dir.join("chain.bm25");
-    store.save(&path).unwrap();
+    let stats = build_integer_chain_store(&path);
     let reader = Bm25Reader::open(&path).unwrap();
     let body = reader.field(0);
     let cols = ReaderNumerics(&reader);
@@ -738,39 +712,58 @@ fn integer_chain_pruned_matches_exhaustive_bitwise() {
         ],
     };
     let ctx = Some((&chain, &cols as &dyn NumericRead));
-
-    let stats = CorpusStats {
-        doc_count: u64::from(n),
-        total_doc_length: (0..n).map(|d| u64::from(tf_a(d))).sum::<u64>()
-            + (0..n)
-                .filter(|d| d % 3 == 0)
-                .map(|d| u64::from(1 + d % 3))
-                .sum::<u64>()
-            + (0..n).filter(|d| d % 61 == 0).count() as u64,
-        dfs: vec![n, n.div_ceil(3), n.div_ceil(61)],
-    };
     let terms: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
     let params = Bm25Params::default();
-    let signature = |docs: &[bm25::ScoredDoc]| -> Vec<(u32, u64)> {
+    let sig = |docs: &[bm25::ScoredDoc]| -> Vec<(u32, u64)> {
         docs.iter().map(|d| (d.doc_id, d.score.to_bits())).collect()
     };
     for k in [1usize, 5, 50] {
-        let exhaustive = bm25::top_k_exhaustive_chained(&body, &terms, &stats, params, k, ctx);
-        let pruned =
-            bm25::top_k_pruned_chained(&body, &terms, &stats, params, k, f64::NEG_INFINITY, ctx);
+        let exhaustive =
+            bm25::top_k_exhaustive(&body, &terms, &stats, params, bm25::TopK::new(k).chain(ctx));
+        let pruned = bm25::top_k(&body, &terms, &stats, params, bm25::TopK::new(k).chain(ctx));
         assert_eq!(
-            signature(&exhaustive),
-            signature(&pruned),
-            "k={k}: integer-column pruned != exhaustive"
+            sig(&exhaustive),
+            sig(&pruned),
+            "k={k}: pruned != exhaustive"
         );
         if let Some(kth) = exhaustive.last() {
-            let seeded =
-                bm25::top_k_pruned_chained(&body, &terms, &stats, params, k, kth.score, ctx);
-            assert_eq!(signature(&exhaustive), signature(&seeded), "k={k}: seeded");
+            let q = bm25::TopK::new(k).floor(kth.score).chain(ctx);
+            let seeded = bm25::top_k(&body, &terms, &stats, params, q);
+            assert_eq!(sig(&exhaustive), sig(&seeded), "k={k}: seeded");
         }
     }
-
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn build_integer_chain_store(path: &std::path::Path) -> CorpusStats {
+    let n = 3000u32;
+    let mut total = 0u64;
+    let mut store = Bm25Store::with_fields(&["body"]).with_integers(&["citations", "filed"]);
+    for doc in 0..n {
+        let tf_a = 1 + (u64::from(doc) * 2654435761 % 7) as u32;
+        let mut terms = vec![("a".to_string(), tf_a, Vec::new())];
+        if doc % 3 == 0 {
+            terms.push(("b".to_string(), 1 + doc % 3, Vec::new()));
+        }
+        if doc % 61 == 0 {
+            terms.push(("c".to_string(), 1, Vec::new()));
+        }
+        let len: u32 = terms.iter().map(|(_, tf, _)| tf).sum();
+        total += u64::from(len);
+        store.add_document(doc, ".".to_string(), AnalyzedDoc::body(terms, len));
+        if doc % 7 != 0 {
+            store.set_integer(0, doc, i64::from(doc) * 48271 % 1000);
+        }
+        if doc % 4 != 0 {
+            store.set_integer(1, doc, (1i64 << 53) + i64::from(doc));
+        }
+    }
+    store.save(path).unwrap();
+    CorpusStats {
+        doc_count: u64::from(n),
+        total_doc_length: total,
+        dfs: vec![n, n.div_ceil(3), n.div_ceil(61)],
+    }
 }
 
 /// A chain over an i64 column, distributed: bitwise equal to the

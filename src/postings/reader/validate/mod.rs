@@ -246,8 +246,7 @@ fn validate_field_sections(
     Ok(expected_start)
 }
 
-/// Full structural validation of a v6 or v7 payload (`docs/multi-field.md`;
-/// v7 adds typed and auxiliary columns). Every read is bounds-checked and any
+/// Full structural validation of a v6 or v7 payload (v7 adds typed and auxiliary columns). Every read is bounds-checked and any
 /// malformed offset, count, or invariant returns `InvalidData`: the header,
 /// field table, and (v7) column table, shared-section geometry, text index and
 /// lineage walk, per-field `doc_lengths` sum plus full block-max directory and

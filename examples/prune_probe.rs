@@ -81,6 +81,53 @@ fn show(
     }
 }
 
+struct ProbeQuery<'a> {
+    terms: &'a [String],
+    stats: CorpusStats,
+    params: Bm25Params,
+    k: usize,
+    show_text: bool,
+}
+
+fn run_probes(
+    reader: &Bm25Reader,
+    view: &pipestream_search::postings::FieldView<'_>,
+    fi: usize,
+    q: &ProbeQuery<'_>,
+) {
+    if fi == 0 {
+        let mut p = PruneStats::default();
+        let t = Instant::now();
+        let hits = bm25::top_k(
+            reader,
+            q.terms,
+            &q.stats,
+            q.params,
+            bm25::TopK::new(q.k).prune_stats(&mut p),
+        );
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        let top: Vec<(u32, f64)> = hits.iter().map(|h| (h.doc_id, h.score)).collect();
+        show("single", ms, &p, &top, view, q.show_text);
+    } else {
+        println!("single     skipped: the single-field scorer is field 0 only");
+    }
+    println!();
+
+    let queries = vec![FieldQuery {
+        index: view,
+        terms: q.terms,
+        stats: q.stats.clone(),
+        params: q.params,
+        weight: 1.0,
+    }];
+    let mut p = PruneStats::default();
+    let t = Instant::now();
+    let hits = bm25::top_k_fused(&queries, bm25::TopK::new(q.k).prune_stats(&mut p));
+    let ms = t.elapsed().as_secs_f64() * 1000.0;
+    let top: Vec<(u32, f64)> = hits.iter().map(|h| (h.doc_id, h.score)).collect();
+    show("fused", ms, &p, &top, view, q.show_text);
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = arg("bm25", "");
     if path.is_empty() {
@@ -106,9 +153,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or_else(|| format!("{path}: no field {field:?}"))?;
     let view = reader.field(fi);
 
-    // Local stats unless overridden, and the SAME values into both
-    // scorers: a difference in stats would be a difference in the
-    // question, not in the answer.
     let doc_count: u64 = match arg("n", "").as_str() {
         "" => Bm25Index::doc_count(&view),
         s => s.parse()?,
@@ -143,42 +187,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     println!();
-
-    // The single-field scorer sees the reader itself, which scores as
-    // field 0. Comparing any other field against it would be comparing
-    // two different postings sets.
-    if fi == 0 {
-        let mut p = PruneStats::default();
-        let t = Instant::now();
-        let hits = bm25::top_k_pruned_stats(
-            &reader,
-            &terms,
-            &stats,
+    run_probes(
+        &reader,
+        &view,
+        fi,
+        &ProbeQuery {
+            terms: &terms,
+            stats,
             params,
             k,
-            f64::NEG_INFINITY,
-            &mut p,
-        );
-        let ms = t.elapsed().as_secs_f64() * 1000.0;
-        let top: Vec<(u32, f64)> = hits.iter().map(|h| (h.doc_id, h.score)).collect();
-        show("single", ms, &p, &top, &view, show_text);
-    } else {
-        println!("single     skipped: the single-field scorer is field 0 only");
-    }
-    println!();
-
-    let queries = vec![FieldQuery {
-        index: &view,
-        terms: &terms,
-        stats: stats.clone(),
-        params,
-        weight: 1.0,
-    }];
-    let mut p = PruneStats::default();
-    let t = Instant::now();
-    let hits = bm25::top_k_fused_pruned_stats(&queries, k, f64::NEG_INFINITY, &mut p);
-    let ms = t.elapsed().as_secs_f64() * 1000.0;
-    let top: Vec<(u32, f64)> = hits.iter().map(|h| (h.doc_id, h.score)).collect();
-    show("fused", ms, &p, &top, &view, show_text);
+            show_text,
+        },
+    );
     Ok(())
 }

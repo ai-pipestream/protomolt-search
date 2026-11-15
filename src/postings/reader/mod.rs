@@ -38,13 +38,13 @@ pub(in crate::postings) struct FieldSlice {
     /// directory run offsets.
     run_base: u64,
     /// Start of this field's kind-7 positions section, when the file
-    /// carries one (`docs/phrase-proximity.md`); `None` is a field
+    /// carries one; `None` is a field
     /// without token positions, which refuses phrase and slop by name.
     positions_off: Option<u64>,
     pos_lengths_off: Option<u64>,
     splade_range: Option<(u64, u64)>,
     /// Start of this field's kind-8 sentence section, when the file
-    /// carries one (`docs/highlighting.md`); `None` refuses sentence-mode
+    /// carries one; `None` refuses sentence-mode
     /// snippets by name.
     sentences_off: Option<u64>,
 }
@@ -277,7 +277,7 @@ impl Bm25Reader {
     /// Field `f` as its own [`Bm25Index`]: directory lookups, postings
     /// walks, and impact cursors run against the field's sections;
     /// texts, lineages, and the document count are the file's shared
-    /// ones (`docs/multi-field.md`). Panics when `f` is out of range.
+    /// ones. Panics when `f` is out of range.
     pub fn field(&self, f: usize) -> FieldView<'_> {
         FieldView {
             reader: self,

@@ -36,8 +36,8 @@ pub const FACET_ABSENT: u32 = u32::MAX;
 /// this constant is only used when decoding the old on-disk representation.
 pub const INTEGER_ABSENT: i64 = i64::MIN;
 
-/// The pair marking "this document has no point" in a geo-point column
-/// (`docs/geo-columns.md`). BOTH halves are `NaN`: a geo column has a `NaN`
+/// The pair marking "this document has no point" in a geo-point column.
+/// BOTH halves are `NaN`: a geo column has a `NaN`
 /// to spend on each axis, and spending both keeps the sentinel
 /// unambiguous. A pair with exactly one `NaN` is neither a point nor an
 /// absence — the reader refuses it as corruption rather than guessing

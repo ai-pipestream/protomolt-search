@@ -158,7 +158,7 @@ impl Bm25Store {
     }
 
     /// [`Self::write_v6_to`] with dictionaries in first-seen order — a legacy
-    /// oracle for tests verifying pre-2026-09-02 files (`docs/prefix-terms.md`).
+    /// oracle for tests verifying pre-2026-09-02 files.
     pub fn write_v6_first_seen_dictionaries<W: Write>(&self, w: &mut W) -> io::Result<()> {
         self.write_v6_ordered(w, false)
     }

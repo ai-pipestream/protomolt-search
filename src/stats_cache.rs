@@ -141,16 +141,8 @@ impl StatsCache {
         })
     }
 
-    /// Fused-channel lookup: `Some` only when every requested field and
-    /// every term under it is cached for this node.
-    pub fn lookup_fused(
-        &self,
-        node: usize,
-        fields: &[crate::pb::FieldTerms],
-    ) -> Option<FusedShare> {
-        self.lookup_fused_scoped(node, fields, &VisibilityScope::default())
-    }
-
+    /// Fused-channel lookup under `scope`: `Some` only when every requested
+    /// field and every term under it is cached for this node.
     pub fn lookup_fused_scoped(
         &self,
         node: usize,

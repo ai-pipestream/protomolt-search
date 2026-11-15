@@ -184,24 +184,117 @@ fn floor_palette(oracle: &[FusedDoc], k: usize) -> Vec<f64> {
     floors
 }
 
-/// The bitwise property gate: fused pruned == fused exhaustive
-/// (+floor filter) over random corpora, weights, params, and floors.
+fn two_field_queries<'a>(
+    body: &'a dyn Bm25Index,
+    name: &'a dyn Bm25Index,
+    body_q: (&'a [String], &CorpusStats, Bm25Params, f64),
+    name_q: (&'a [String], &CorpusStats, Bm25Params, f64),
+) -> [FieldQuery<'a>; 2] {
+    [
+        FieldQuery {
+            index: body,
+            terms: body_q.0,
+            stats: body_q.1.clone(),
+            params: body_q.2,
+            weight: body_q.3,
+        },
+        FieldQuery {
+            index: name,
+            terms: name_q.0,
+            stats: name_q.1.clone(),
+            params: name_q.2,
+            weight: name_q.3,
+        },
+    ]
+}
+
+fn check_fused_pruned_round(
+    rng: &mut Lcg,
+    round: u64,
+    wide: bool,
+    vocabs: (&[String], &[String]),
+    store: &Bm25Store,
+    reader: &Bm25Reader,
+) {
+    let k1s = [0.0, 1.2, 2.5];
+    let bs = [0.0, 0.5, 1.0];
+    let weights = [0.0, 0.35, 1.0, 1.75, 2.5];
+    let (body_vocab, name_vocab) = vocabs;
+    for _ in 0..4 {
+        let max_terms = if wide { 6 } else { body_vocab.len().min(6) };
+        let n_terms = 1 + rng.below(max_terms as u64) as usize;
+        let mut body_terms: Vec<String> = body_vocab
+            .iter()
+            .filter(|_| rng.below(2) == 0)
+            .take(n_terms)
+            .cloned()
+            .collect();
+        if body_terms.is_empty() {
+            body_terms.push(body_vocab[0].clone());
+        }
+        let mut name_terms: Vec<String> = name_vocab
+            .iter()
+            .filter(|_| rng.below(2) == 0)
+            .take(4)
+            .cloned()
+            .collect();
+        if name_terms.is_empty() {
+            name_terms.push(name_vocab[0].clone());
+        }
+        let body_stats = field_stats(store, 0, &body_terms);
+        let name_stats = field_stats(store, 1, &name_terms);
+        let body_params = Bm25Params {
+            k1: k1s[rng.below(3) as usize],
+            b: bs[rng.below(3) as usize],
+        };
+        let name_params = Bm25Params {
+            k1: k1s[rng.below(3) as usize],
+            b: bs[rng.below(3) as usize],
+        };
+        let (w_body, w_name) = (
+            weights[rng.below(5) as usize],
+            weights[rng.below(5) as usize],
+        );
+        let k = 1 + rng.below(40) as usize;
+        let s0 = store.field(0);
+        let s1 = store.field(1);
+        let r0 = reader.field(0);
+        let r1 = reader.field(1);
+        let store_fields = two_field_queries(
+            &s0,
+            &s1,
+            (&body_terms, &body_stats, body_params, w_body),
+            (&name_terms, &name_stats, name_params, w_name),
+        );
+        let reader_fields = two_field_queries(
+            &r0,
+            &r1,
+            (&body_terms, &body_stats, body_params, w_body),
+            (&name_terms, &name_stats, name_params, w_name),
+        );
+        let oracle = bm25::top_k_fused_exhaustive(&store_fields, k, None);
+        for floor in floor_palette(&oracle, k) {
+            let want =
+                bm25::top_k_fused_exhaustive(&store_fields, bm25::TopK::new(k).floor(floor), None);
+            let mut prune = PruneStats::default();
+            let got = bm25::top_k_fused(
+                &reader_fields,
+                bm25::TopK::new(k).floor(floor).prune_stats(&mut prune),
+            );
+            assert_eq!(sig(&want), sig(&got), "round {round} k {k} floor {floor:e}");
+        }
+    }
+}
+
+/// The bitwise property gate: fused pruned == fused exhaustive (+floor filter).
 #[test]
 fn fused_pruned_matches_fused_exhaustive_property() {
     let dir = test_dir("prop");
     let mut rng = Lcg::new(0xF05EDB10);
-    let k1s = [0.0, 1.2, 2.5];
-    let bs = [0.0, 0.5, 1.0];
-    let weights = [0.0, 0.35, 1.0, 1.75, 2.5];
     for round in 0..20 {
-        // Every third round is "wide": mid-df terms and wide queries,
-        // so competitive windows form essential/non-essential
-        // partitions rather than resolving by skips alone.
         let wide = round % 3 == 0;
         let n_body_vocab = if wide { 10 } else { 2 + rng.below(20) };
         let body_vocab: Vec<String> = (0..n_body_vocab).map(|i| format!("t{i}")).collect();
-        // The name vocab overlaps the body vocab ("t0", "t1") so shared
-        // terms score in both fields with different postings.
         let name_vocab: Vec<String> = ["t0".to_string(), "t1".to_string()]
             .into_iter()
             .chain((0..4).map(|i| format!("n{i}")))
@@ -212,95 +305,14 @@ fn fused_pruned_matches_fused_exhaustive_property() {
         let path = dir.join(format!("r{round}.bm25"));
         store.save(&path).unwrap();
         let reader = Bm25Reader::open(&path).unwrap();
-        for _ in 0..4 {
-            let max_terms = if wide { 6 } else { body_vocab.len().min(6) };
-            let n_terms = 1 + rng.below(max_terms as u64) as usize;
-            let body_terms: Vec<String> = body_vocab
-                .iter()
-                .filter(|_| rng.below(2) == 0)
-                .take(n_terms)
-                .cloned()
-                .collect();
-            let body_terms = if body_terms.is_empty() {
-                vec![body_vocab[0].clone()]
-            } else {
-                body_terms
-            };
-            let name_terms: Vec<String> = name_vocab
-                .iter()
-                .filter(|_| rng.below(2) == 0)
-                .take(4)
-                .cloned()
-                .collect();
-            let name_terms = if name_terms.is_empty() {
-                vec![name_vocab[0].clone()]
-            } else {
-                name_terms
-            };
-            let body_stats = field_stats(&store, 0, &body_terms);
-            let name_stats = field_stats(&store, 1, &name_terms);
-            let body_params = Bm25Params {
-                k1: k1s[rng.below(3) as usize],
-                b: bs[rng.below(3) as usize],
-            };
-            let name_params = Bm25Params {
-                k1: k1s[rng.below(3) as usize],
-                b: bs[rng.below(3) as usize],
-            };
-            let w_body = weights[rng.below(5) as usize];
-            let w_name = weights[rng.below(5) as usize];
-            let k = 1 + rng.below(40) as usize;
-            let oracle = bm25::top_k_fused_exhaustive(
-                &[
-                    FieldQuery {
-                        index: &store.field(0),
-                        terms: &body_terms,
-                        stats: body_stats.clone(),
-                        params: body_params,
-                        weight: w_body,
-                    },
-                    FieldQuery {
-                        index: &store.field(1),
-                        terms: &name_terms,
-                        stats: name_stats.clone(),
-                        params: name_params,
-                        weight: w_name,
-                    },
-                ],
-                k,
-            );
-            for floor in floor_palette(&oracle, k) {
-                let want = bm25::filter_fused_to_floor(oracle.clone(), floor);
-                let mut prune = PruneStats::default();
-                let got = bm25::top_k_fused_pruned_stats(
-                    &[
-                        FieldQuery {
-                            index: &reader.field(0),
-                            terms: &body_terms,
-                            stats: body_stats.clone(),
-                            params: body_params,
-                            weight: w_body,
-                        },
-                        FieldQuery {
-                            index: &reader.field(1),
-                            terms: &name_terms,
-                            stats: name_stats.clone(),
-                            params: name_params,
-                            weight: w_name,
-                        },
-                    ],
-                    k,
-                    floor,
-                    &mut prune,
-                );
-                assert_eq!(
-                    sig(&want),
-                    sig(&got),
-                    "round {round}, body {body_terms:?} w {w_body} {body_params:?}, \
-                     name {name_terms:?} w {w_name} {name_params:?}, k {k}, floor {floor:e}"
-                );
-            }
-        }
+        check_fused_pruned_round(
+            &mut rng,
+            round,
+            wide,
+            (&body_vocab, &name_vocab),
+            &store,
+            &reader,
+        );
         let _ = std::fs::remove_file(&path);
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -338,7 +350,7 @@ fn fused_pruned_single_field_degenerate_identity() {
     };
     let params = Bm25Params::default();
     for k in [1usize, 7, 40] {
-        let single = bm25::top_k_pruned(&reader, &terms, &stats, params, k, f64::NEG_INFINITY);
+        let single = bm25::top_k(&reader, &terms, &stats, params, k);
         let floors = [
             f64::NEG_INFINITY,
             single.last().map_or(1e9, |h| h.score),
@@ -346,7 +358,7 @@ fn fused_pruned_single_field_degenerate_identity() {
         ];
         for floor in floors {
             let want = bm25::filter_to_floor(single.clone(), floor);
-            let got = bm25::top_k_fused_pruned(
+            let got = bm25::top_k_fused(
                 &[FieldQuery {
                     index: &reader,
                     terms: &terms,
@@ -354,8 +366,7 @@ fn fused_pruned_single_field_degenerate_identity() {
                     params,
                     weight: 1.0,
                 }],
-                k,
-                floor,
+                bm25::TopK::new(k).floor(floor),
             );
             assert_eq!(want.len(), got.len(), "k {k}, floor {floor:e}");
             for (w, g) in want.iter().zip(&got) {
@@ -378,132 +389,85 @@ fn fused_pruned_single_field_degenerate_identity() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Fused tie torture: identical fused scores inside and across blocks
-/// keep exactly the docs the exhaustive path keeps — ties at the floor
-/// survive, and heap displacement is strictly-greater so the smaller
-/// doc id always wins.
-#[test]
-fn fused_ties_at_floor_and_kth_slot() {
-    let dir = test_dir("ties");
+fn check_identical_doc_ties(dir: &std::path::Path) {
     let body_terms = vec!["court".to_string()];
     let name_terms = vec!["smith".to_string()];
     let name_params = Bm25Params { k1: 0.5, b: 0.0 };
-
-    // Corpus A: 400 docs identical in BOTH fields (every fused score
-    // equal, blocks packed with ties).
     let mut store = Bm25Store::with_fields(&["body", "name"]);
     for i in 0..400u32 {
-        store.add_document(
-            i,
-            format!("doc {i}"),
-            AnalyzedDoc {
-                fields: vec![
-                    AnalyzedField {
-                        sentences: None,
-                        terms: vec![("court".to_string(), 2, vec![(0, 4), (10, 14)])],
-                        length: 3,
-                        positions: None,
-                        ..Default::default()
-                    },
-                    AnalyzedField {
-                        sentences: None,
-                        terms: vec![("smith".to_string(), 1, vec![(0, 5)])],
-                        length: 1,
-                        positions: None,
-                        ..Default::default()
-                    },
-                ],
-                ..Default::default()
-            },
-        );
+        let f0 = AnalyzedField {
+            terms: vec![("court".to_string(), 2, vec![(0, 4), (10, 14)])],
+            length: 3,
+            ..Default::default()
+        };
+        let f1 = AnalyzedField {
+            terms: vec![("smith".to_string(), 1, vec![(0, 5)])],
+            length: 1,
+            ..Default::default()
+        };
+        let doc = AnalyzedDoc {
+            fields: vec![f0, f1],
+            ..Default::default()
+        };
+        store.add_document(i, format!("doc {i}"), doc);
     }
     let path = dir.join("a.bm25");
     store.save(&path).unwrap();
     let reader = Bm25Reader::open(&path).unwrap();
     let body_stats = field_stats(&store, 0, &body_terms);
     let name_stats = field_stats(&store, 1, &name_terms);
-    let oracle = bm25::top_k_fused_exhaustive(
-        &[
-            FieldQuery {
-                index: &store.field(0),
-                terms: &body_terms,
-                stats: body_stats.clone(),
-                params: Bm25Params::default(),
-                weight: 1.0,
-            },
-            FieldQuery {
-                index: &store.field(1),
-                terms: &name_terms,
-                stats: name_stats.clone(),
-                params: name_params,
-                weight: 2.0,
-            },
-        ],
-        10,
+    let (s0, s1) = (store.field(0), store.field(1));
+    let sq = two_field_queries(
+        &s0,
+        &s1,
+        (&body_terms, &body_stats, Bm25Params::default(), 1.0),
+        (&name_terms, &name_stats, name_params, 2.0),
     );
+    let oracle = bm25::top_k_fused_exhaustive(&sq, 10, None);
     assert_eq!(oracle.len(), 10);
     let tie_score = oracle[0].score;
     assert!(oracle.iter().all(|h| h.score == tie_score));
-    let want_ids: Vec<u32> = (0..10).collect();
     assert_eq!(
         oracle.iter().map(|h| h.doc_id).collect::<Vec<_>>(),
-        want_ids
+        (0..10).collect::<Vec<_>>()
     );
-    let pruned = |floor: f64| {
-        bm25::top_k_fused_pruned(
-            &[
-                FieldQuery {
-                    index: &reader.field(0),
-                    terms: &body_terms,
-                    stats: body_stats.clone(),
-                    params: Bm25Params::default(),
-                    weight: 1.0,
-                },
-                FieldQuery {
-                    index: &reader.field(1),
-                    terms: &name_terms,
-                    stats: name_stats.clone(),
-                    params: name_params,
-                    weight: 2.0,
-                },
-            ],
-            10,
-            floor,
-        )
-    };
+    let (r0, r1) = (reader.field(0), reader.field(1));
+    let rq = two_field_queries(
+        &r0,
+        &r1,
+        (&body_terms, &body_stats, Bm25Params::default(), 1.0),
+        (&name_terms, &name_stats, name_params, 2.0),
+    );
     for floor in [f64::NEG_INFINITY, tie_score] {
-        let got = pruned(floor);
+        let got = bm25::top_k_fused(&rq, bm25::TopK::new(10).floor(floor));
         assert_eq!(
             sig(&oracle),
             sig(&got),
             "identical-doc corpus, floor {floor:e}"
         );
     }
-    // A hair above the tie: nothing survives.
-    let got = pruned(tie_score + 1e-9);
+    let got = bm25::top_k_fused(&rq, bm25::TopK::new(10).floor(tie_score + 1e-9));
     assert!(
         got.is_empty(),
         "floor above every score must return nothing"
     );
+}
 
-    // Corpus B: the k-th slot ties ACROSS blocks — 12 high docs (name
-    // field present) spread over 300 body-only docs; k=10 keeps the
-    // ten smallest high ids at identical fused scores.
+fn check_cross_block_ties(dir: &std::path::Path) {
+    let body_terms = vec!["court".to_string()];
+    let name_terms = vec!["smith".to_string()];
+    let name_params = Bm25Params { k1: 0.5, b: 0.0 };
     let mut store = Bm25Store::with_fields(&["body", "name"]);
     for i in 0..300u32 {
         let mut fields = vec![AnalyzedField {
-            sentences: None,
             terms: vec![("court".to_string(), 1, vec![(0, 4)])],
             length: 3,
-            positions: None,
             ..Default::default()
         }];
         if i % 25 == 0 {
             fields.push(AnalyzedField {
-                sentences: None,
                 terms: vec![("smith".to_string(), 1, vec![(0, 5)])],
                 length: 1,
-                positions: None,
                 ..Default::default()
             });
         }
@@ -521,57 +485,72 @@ fn fused_ties_at_floor_and_kth_slot() {
     let reader = Bm25Reader::open(&path).unwrap();
     let body_stats = field_stats(&store, 0, &body_terms);
     let name_stats = field_stats(&store, 1, &name_terms);
-    let oracle = bm25::top_k_fused_exhaustive(
-        &[
-            FieldQuery {
-                index: &store.field(0),
-                terms: &body_terms,
-                stats: body_stats.clone(),
-                params: Bm25Params::default(),
-                weight: 1.0,
-            },
-            FieldQuery {
-                index: &store.field(1),
-                terms: &name_terms,
-                stats: name_stats.clone(),
-                params: name_params,
-                weight: 2.0,
-            },
-        ],
-        10,
+    let (s0, s1) = (store.field(0), store.field(1));
+    let sq = two_field_queries(
+        &s0,
+        &s1,
+        (&body_terms, &body_stats, Bm25Params::default(), 1.0),
+        (&name_terms, &name_stats, name_params, 2.0),
     );
+    let oracle = bm25::top_k_fused_exhaustive(&sq, 10, None);
     let want_ids: Vec<u32> = (0..10u32).map(|i| i * 25).collect();
     assert_eq!(
         oracle.iter().map(|h| h.doc_id).collect::<Vec<_>>(),
-        want_ids,
-        "oracle sanity: ten smallest name-carrying ids"
+        want_ids
     );
     assert!(oracle.iter().all(|h| h.score == oracle[0].score));
+    let (r0, r1) = (reader.field(0), reader.field(1));
+    let rq = two_field_queries(
+        &r0,
+        &r1,
+        (&body_terms, &body_stats, Bm25Params::default(), 1.0),
+        (&name_terms, &name_stats, name_params, 2.0),
+    );
     for floor in [f64::NEG_INFINITY, oracle[9].score] {
-        let got = bm25::top_k_fused_pruned(
-            &[
-                FieldQuery {
-                    index: &reader.field(0),
-                    terms: &body_terms,
-                    stats: body_stats.clone(),
-                    params: Bm25Params::default(),
-                    weight: 1.0,
-                },
-                FieldQuery {
-                    index: &reader.field(1),
-                    terms: &name_terms,
-                    stats: name_stats.clone(),
-                    params: name_params,
-                    weight: 2.0,
-                },
-            ],
-            10,
-            floor,
-        );
+        let got = bm25::top_k_fused(&rq, bm25::TopK::new(10).floor(floor));
         assert_eq!(sig(&oracle), sig(&got), "cross-block tie, floor {floor:e}");
     }
+}
 
+/// Fused tie torture: identical fused scores inside and across blocks
+/// keep exactly the docs the exhaustive path keeps — ties at the floor
+/// survive, and heap displacement is strictly-greater so the smaller
+/// doc id always wins.
+#[test]
+fn fused_ties_at_floor_and_kth_slot() {
+    let dir = test_dir("ties");
+    check_identical_doc_ties(&dir);
+    check_cross_block_ties(&dir);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn build_skip_store(path: &std::path::Path) -> Bm25Store {
+    let mut store = Bm25Store::with_fields(&["body", "name"]);
+    for i in 0..3000u32 {
+        let f0 = AnalyzedField {
+            terms: vec![
+                ("court".to_string(), 1 + (i / 128) % 5, vec![(0, 4)]),
+                (format!("rare{}", i % 97), 1, vec![(0, 4)]),
+            ],
+            length: 100 + i % 50,
+            ..Default::default()
+        };
+        let f1 = AnalyzedField {
+            terms: vec![("smith".to_string(), 1 + (i / 128) % 3, vec![(0, 5)])],
+            length: 10 + i % 5,
+            ..Default::default()
+        };
+        store.add_document(
+            i,
+            format!("doc {i}"),
+            AnalyzedDoc {
+                fields: vec![f0, f1],
+                ..Default::default()
+            },
+        );
+    }
+    store.save(path).unwrap();
+    store
 }
 
 /// Fused skip accounting: a seeded two-field query skips most blocks;
@@ -580,41 +559,8 @@ fn fused_ties_at_floor_and_kth_slot() {
 #[test]
 fn fused_blocks_actually_skip() {
     let dir = test_dir("skip");
-    let mut store = Bm25Store::with_fields(&["body", "name"]);
-    let n = 3000u32;
-    for i in 0..n {
-        // Block-correlated tf in both fields (whole 128-posting blocks
-        // share one tf) so block maxes genuinely differ.
-        let fields = vec![
-            AnalyzedField {
-                sentences: None,
-                terms: vec![
-                    ("court".to_string(), 1 + (i / 128) % 5, vec![(0, 4)]),
-                    (format!("rare{}", i % 97), 1, vec![(0, 4)]),
-                ],
-                length: 100 + i % 50,
-                positions: None,
-                ..Default::default()
-            },
-            AnalyzedField {
-                sentences: None,
-                terms: vec![("smith".to_string(), 1 + (i / 128) % 3, vec![(0, 5)])],
-                length: 10 + i % 5,
-                positions: None,
-                ..Default::default()
-            },
-        ];
-        store.add_document(
-            i,
-            format!("doc {i}"),
-            AnalyzedDoc {
-                fields,
-                ..Default::default()
-            },
-        );
-    }
     let path = dir.join("s.bm25");
-    store.save(&path).unwrap();
+    let store = build_skip_store(&path);
     let reader = Bm25Reader::open(&path).unwrap();
 
     let body_terms = vec!["court".to_string()];
@@ -622,103 +568,72 @@ fn fused_blocks_actually_skip() {
     let body_stats = field_stats(&store, 0, &body_terms);
     let name_stats = field_stats(&store, 1, &name_terms);
     let k = 10;
-    let oracle = bm25::top_k_fused_exhaustive(
-        &[
-            FieldQuery {
-                index: &store.field(0),
-                terms: &body_terms,
-                stats: body_stats.clone(),
-                params: Bm25Params::default(),
-                weight: 1.0,
-            },
-            FieldQuery {
-                index: &store.field(1),
-                terms: &name_terms,
-                stats: name_stats.clone(),
-                params: Bm25Params::default(),
-                weight: 0.5,
-            },
-        ],
-        k,
+    let (s0, s1) = (store.field(0), store.field(1));
+    let sq = two_field_queries(
+        &s0,
+        &s1,
+        (&body_terms, &body_stats, Bm25Params::default(), 1.0),
+        (&name_terms, &name_stats, Bm25Params::default(), 0.5),
     );
-    let pruned = |floor: f64, prune: &mut PruneStats| {
-        bm25::top_k_fused_pruned_stats(
-            &[
-                FieldQuery {
-                    index: &reader.field(0),
-                    terms: &body_terms,
-                    stats: body_stats.clone(),
-                    params: Bm25Params::default(),
-                    weight: 1.0,
-                },
-                FieldQuery {
-                    index: &reader.field(1),
-                    terms: &name_terms,
-                    stats: name_stats.clone(),
-                    params: Bm25Params::default(),
-                    weight: 0.5,
-                },
-            ],
-            k,
-            floor,
-            prune,
-        )
-    };
+    let oracle = bm25::top_k_fused_exhaustive(&sq, k, None);
+    let (r0, r1) = (reader.field(0), reader.field(1));
+    let rq = two_field_queries(
+        &r0,
+        &r1,
+        (&body_terms, &body_stats, Bm25Params::default(), 1.0),
+        (&name_terms, &name_stats, Bm25Params::default(), 0.5),
+    );
 
-    // Seeded with the true k-th best (the realistic coordinator case):
-    // most blocks cannot reach the floor.
-    let seed = oracle[k - 1].score;
     let mut seeded = PruneStats::default();
-    let got = pruned(seed, &mut seeded);
+    let got = bm25::top_k_fused(
+        &rq,
+        bm25::TopK::new(k)
+            .floor(oracle[k - 1].score)
+            .prune_stats(&mut seeded),
+    );
     assert_eq!(sig(&oracle), sig(&got), "seeded result diverged");
     let seeded_frac = seeded.blocks_skipped as f64 / seeded.blocks_total as f64;
     assert!(
         seeded_frac > 0.5,
-        "seeded fused query should skip most blocks, got {seeded_frac:.2} ({}/{})",
-        seeded.blocks_skipped,
-        seeded.blocks_total
+        "seeded fused query should skip most blocks, got {seeded_frac:.2}"
     );
 
-    // Same query unseeded: identical result, strictly fewer skips.
     let mut unseeded = PruneStats::default();
-    let got = pruned(f64::NEG_INFINITY, &mut unseeded);
-    assert_eq!(sig(&oracle), sig(&got));
-    assert!(
-        seeded.blocks_skipped > unseeded.blocks_skipped,
-        "seeding must skip strictly more blocks ({} vs {})",
-        seeded.blocks_skipped,
-        unseeded.blocks_skipped
+    let got = bm25::top_k_fused(
+        &rq,
+        bm25::TopK::new(k)
+            .floor(f64::NEG_INFINITY)
+            .prune_stats(&mut unseeded),
     );
+    assert_eq!(sig(&oracle), sig(&got));
+    assert!(seeded.blocks_skipped > unseeded.blocks_skipped);
 
-    // Rare body pair over a single block, unseeded: nothing to skip.
     let rare_terms = vec!["rare3".to_string()];
     let rare_stats = field_stats(&store, 0, &rare_terms);
     let mut rare = PruneStats::default();
-    let got = bm25::top_k_fused_pruned_stats(
+    let got = bm25::top_k_fused(
         &[FieldQuery {
-            index: &reader.field(0),
+            index: &r0,
             terms: &rare_terms,
             stats: rare_stats.clone(),
             params: Bm25Params::default(),
             weight: 1.0,
         }],
-        k,
-        f64::NEG_INFINITY,
-        &mut rare,
+        bm25::TopK::new(k).prune_stats(&mut rare),
     );
     assert_eq!(rare.blocks_skipped, 0, "rare unseeded query must not skip");
     let rare_oracle = bm25::top_k_fused_exhaustive(
         &[FieldQuery {
-            index: &store.field(0),
+            index: &s0,
             terms: &rare_terms,
             stats: rare_stats,
             params: Bm25Params::default(),
             weight: 1.0,
         }],
         k,
+        None,
     );
     assert_eq!(sig(&rare_oracle), sig(&got));
-
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -731,59 +646,30 @@ fn fused_fallbacks_match_exhaustive() {
     let mut rng = Lcg::new(0xFA11BACC);
     let body_vocab: Vec<String> = (0..8).map(|i| format!("t{i}")).collect();
     let name_vocab: Vec<String> = (0..3).map(|i| format!("n{i}")).collect();
-    let corpus = random_two_field_corpus(&mut rng, 120, &body_vocab, &name_vocab, false);
-    let store = build_store(&corpus);
+    let store = build_store(&random_two_field_corpus(
+        &mut rng,
+        120,
+        &body_vocab,
+        &name_vocab,
+        false,
+    ));
     let body_terms = vec!["t0".to_string(), "t3".to_string()];
     let name_terms = vec!["n1".to_string()];
     let body_stats = field_stats(&store, 0, &body_terms);
     let name_stats = field_stats(&store, 1, &name_terms);
     let k = 15;
-    let exhaustive = |w_name: f64| {
-        bm25::top_k_fused_exhaustive(
-            &[
-                FieldQuery {
-                    index: &store.field(0),
-                    terms: &body_terms,
-                    stats: body_stats.clone(),
-                    params: Bm25Params::default(),
-                    weight: 1.0,
-                },
-                FieldQuery {
-                    index: &store.field(1),
-                    terms: &name_terms,
-                    stats: name_stats.clone(),
-                    params: Bm25Params::default(),
-                    weight: w_name,
-                },
-            ],
-            k,
-        )
-    };
+    let (s0, s1) = (store.field(0), store.field(1));
 
-    // Heap store: no impacts anywhere, the whole query falls back.
-    let oracle = exhaustive(2.0);
+    let pos_sq = two_field_queries(
+        &s0,
+        &s1,
+        (&body_terms, &body_stats, Bm25Params::default(), 1.0),
+        (&name_terms, &name_stats, Bm25Params::default(), 2.0),
+    );
+    let oracle = bm25::top_k_fused_exhaustive(&pos_sq, k, None);
     for floor in floor_palette(&oracle, k) {
         let want = bm25::filter_fused_to_floor(oracle.clone(), floor);
-        let got = bm25::top_k_fused_pruned(
-            &[
-                FieldQuery {
-                    index: &store.field(0),
-                    terms: &body_terms,
-                    stats: body_stats.clone(),
-                    params: Bm25Params::default(),
-                    weight: 1.0,
-                },
-                FieldQuery {
-                    index: &store.field(1),
-                    terms: &name_terms,
-                    stats: name_stats.clone(),
-                    params: Bm25Params::default(),
-                    weight: 2.0,
-                },
-            ],
-            k,
-            floor,
-        );
+        let got = bm25::top_k_fused(&pos_sq, bm25::TopK::new(k).floor(floor));
         assert_eq!(
             sig(&want),
             sig(&got),
@@ -791,388 +677,31 @@ fn fused_fallbacks_match_exhaustive() {
         );
     }
 
-    // Reader with impacts but a negative weight: same fallback.
     let path = dir.join("f.bm25");
     store.save(&path).unwrap();
     let reader = Bm25Reader::open(&path).unwrap();
-    let oracle = exhaustive(-1.0);
+    let (r0, r1) = (reader.field(0), reader.field(1));
+    let neg_sq = two_field_queries(
+        &s0,
+        &s1,
+        (&body_terms, &body_stats, Bm25Params::default(), 1.0),
+        (&name_terms, &name_stats, Bm25Params::default(), -1.0),
+    );
+    let neg_rq = two_field_queries(
+        &r0,
+        &r1,
+        (&body_terms, &body_stats, Bm25Params::default(), 1.0),
+        (&name_terms, &name_stats, Bm25Params::default(), -1.0),
+    );
+    let oracle = bm25::top_k_fused_exhaustive(&neg_sq, k, None);
     for floor in [f64::NEG_INFINITY, 0.0] {
         let want = bm25::filter_fused_to_floor(oracle.clone(), floor);
-        let got = bm25::top_k_fused_pruned(
-            &[
-                FieldQuery {
-                    index: &reader.field(0),
-                    terms: &body_terms,
-                    stats: body_stats.clone(),
-                    params: Bm25Params::default(),
-                    weight: 1.0,
-                },
-                FieldQuery {
-                    index: &reader.field(1),
-                    terms: &name_terms,
-                    stats: name_stats.clone(),
-                    params: Bm25Params::default(),
-                    weight: -1.0,
-                },
-            ],
-            k,
-            floor,
-        );
+        let got = bm25::top_k_fused(&neg_rq, bm25::TopK::new(k).floor(floor));
         assert_eq!(
             sig(&want),
             sig(&got),
             "negative-weight fallback, floor {floor:e}"
         );
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Contracts 2 + 3 together on the pruned path: fused pruned scoring
-/// over two shard READERS with per-field merged global stats, merged
-/// by (score desc, global id asc), equals monolithic fused pruned
-/// scoring of the union corpus bit for bit — unseeded, and seeded at
-/// the global k-th best (the coordinator round trip).
-#[test]
-fn fused_pruned_distributed_equals_monolithic() {
-    let dir = test_dir("dist");
-    // The document for global id `g`, identical however sharded.
-    fn doc_for(g: u32) -> AnalyzedDoc {
-        let body = vec![
-            ("rust".to_string(), 1 + g % 3, vec![(g, g + 2)]),
-            (format!("t{}", g % 4), 1, vec![(g + 3, g + 5)]),
-        ];
-        let body_len: u32 = body.iter().map(|t| t.1).sum();
-        let mut fields = vec![AnalyzedField {
-            sentences: None,
-            terms: body,
-            length: body_len,
-            positions: None,
-            ..Default::default()
-        }];
-        if g % 3 != 1 {
-            fields.push(AnalyzedField {
-                sentences: None,
-                terms: vec![
-                    ("smith".to_string(), 1, vec![(0, 5)]),
-                    (format!("n{}", g % 2), 1, vec![]),
-                ],
-                length: 2,
-                positions: None,
-                ..Default::default()
-            });
-        }
-        AnalyzedDoc {
-            fields,
-            ..Default::default()
-        }
-    }
-    fn build(range: std::ops::Range<u32>, offset: u32) -> Bm25Store {
-        let mut store = Bm25Store::with_fields(&["body", "name"]);
-        for g in range {
-            store.add_document(g - offset, format!("doc {g}"), doc_for(g));
-        }
-        store
-    }
-    let monolith = build(0..700, 0);
-    let shards = [(build(0..311, 0), 0u32), (build(311..700, 311), 311u32)];
-
-    let body_terms = vec!["rust".to_string(), "t2".to_string()];
-    let name_terms = vec!["smith".to_string(), "n1".to_string()];
-    let body_params = Bm25Params::default();
-    let name_params = Bm25Params { k1: 0.8, b: 0.3 };
-    let weights = [1.0, 1.7];
-
-    // Per-field global stats from per-shard shares (the TermStats
-    // flow).
-    let global = |f: usize, terms: &[String]| {
-        let shares: Vec<(u64, u64, Vec<u32>)> = shards
-            .iter()
-            .map(|(s, _)| {
-                (
-                    s.doc_count(),
-                    s.field(f).total_doc_length(),
-                    terms.iter().map(|t| s.field(f).df(t)).collect(),
-                )
-            })
-            .collect();
-        bm25::merge_stats(&shares)
-    };
-    let body_stats = global(0, &body_terms);
-    let name_stats = global(1, &name_terms);
-
-    let readers: Vec<Bm25Reader> = std::iter::once(&monolith)
-        .chain(shards.iter().map(|(s, _)| s))
-        .enumerate()
-        .map(|(i, s)| {
-            let path = dir.join(format!("{i}.bm25"));
-            s.save(&path).unwrap();
-            Bm25Reader::open(&path).unwrap()
-        })
-        .collect();
-
-    let k = 12;
-    let run = |reader: &Bm25Reader, floor: f64| {
-        bm25::top_k_fused_pruned(
-            &[
-                FieldQuery {
-                    index: &reader.field(0),
-                    terms: &body_terms,
-                    stats: body_stats.clone(),
-                    params: body_params,
-                    weight: weights[0],
-                },
-                FieldQuery {
-                    index: &reader.field(1),
-                    terms: &name_terms,
-                    stats: name_stats.clone(),
-                    params: name_params,
-                    weight: weights[1],
-                },
-            ],
-            k,
-            floor,
-        )
-    };
-    let merge = |mut hits: Vec<FusedDoc>| {
-        hits.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.doc_id.cmp(&b.doc_id))
-        });
-        hits.truncate(k);
-        hits
-    };
-
-    let want = run(&readers[0], f64::NEG_INFINITY);
-    // Sanity: the pruned monolith equals the exhaustive monolith.
-    let oracle = bm25::top_k_fused_exhaustive(
-        &[
-            FieldQuery {
-                index: &monolith.field(0),
-                terms: &body_terms,
-                stats: body_stats.clone(),
-                params: body_params,
-                weight: weights[0],
-            },
-            FieldQuery {
-                index: &monolith.field(1),
-                terms: &name_terms,
-                stats: name_stats.clone(),
-                params: name_params,
-                weight: weights[1],
-            },
-        ],
-        k,
-    );
-    assert_eq!(sig(&oracle), sig(&want), "monolith pruned vs exhaustive");
-
-    let distributed = |floor: f64| {
-        let hits: Vec<FusedDoc> = readers[1..]
-            .iter()
-            .zip(shards.iter().map(|&(_, off)| off))
-            .flat_map(|(r, off)| {
-                run(r, floor).into_iter().map(move |mut d| {
-                    d.doc_id += off;
-                    d
-                })
-            })
-            .collect();
-        merge(hits)
-    };
-    // Unseeded round trip.
-    let merged = distributed(f64::NEG_INFINITY);
-    assert_eq!(sig(&want), sig(&merged), "unseeded distributed merge");
-    // Seeded at the global k-th best: every boundary tie survives and
-    // the merge reproduces the monolithic top-k exactly.
-    let merged = distributed(want[k - 1].score);
-    assert_eq!(sig(&want), sig(&merged), "seeded distributed merge");
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// A term that lives on ANOTHER shard must not forfeit fused pruning here.
-///
-/// The single-field twin of this gate is
-/// `blockmax.rs::a_term_absent_from_this_shard_does_not_disable_pruning`.
-/// The fused scorer had the same defect and outlived the fix, because
-/// `FieldQuery.stats.dfs` is the GLOBAL df the coordinator computed: a
-/// rare term is non-zero there even on the shards that do not hold it,
-/// those shards have no impact surface to open for it, and the scorer
-/// read that as "this index lacks impacts" and dropped the WHOLE query
-/// to the exhaustive scorer.
-///
-/// Measured on the live 86.6M-chunk fleet before the fix: a two-term
-/// query whose second term existed on exactly one of eight shards took
-/// 3557 ms through the fused route and 10.6 ms after, because the other
-/// seven each walked every posting of the common term. The single-field
-/// route answered the identical query in 6 ms throughout, which is what
-/// made the gap visible at all.
-#[test]
-fn a_term_absent_from_this_shard_does_not_disable_fused_pruning() {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fused_absent_term");
-    std::fs::create_dir_all(&dir).unwrap();
-
-    // This shard holds only "court" in body. "12b6" is elsewhere in the
-    // cluster, so its GLOBAL df is non-zero while its local df is 0.
-    let mut store = Bm25Store::with_fields(&["body", "name"]);
-    for i in 0..2000u32 {
-        let tf = if i % 97 == 0 { 5 } else { 1 };
-        store.add_document(
-            i,
-            format!("doc {i}"),
-            AnalyzedDoc {
-                fields: vec![
-                    AnalyzedField {
-                        sentences: None,
-                        terms: vec![("court".to_string(), tf, vec![(0, 5)])],
-                        length: 4,
-                        positions: None,
-                        ..Default::default()
-                    },
-                    AnalyzedField {
-                        sentences: None,
-                        terms: vec![("smith".to_string(), 1, vec![(0, 5)])],
-                        length: 1,
-                        positions: None,
-                        ..Default::default()
-                    },
-                ],
-                ..Default::default()
-            },
-        );
-    }
-    let path = dir.join("absent.bm25");
-    store.save(&path).unwrap();
-    let reader = Bm25Reader::open(&path).unwrap();
-
-    let body_terms = vec!["court".to_string(), "12b6".to_string()];
-    let name_terms = vec!["smith".to_string()];
-    let params = Bm25Params::default();
-    // Global dfs: the rare body term is present in the CLUSTER.
-    let body_stats = CorpusStats {
-        doc_count: store.doc_count(),
-        total_doc_length: store.field(0).total_doc_length(),
-        dfs: vec![2000, 10],
-    };
-    let name_stats = field_stats(&store, 1, &name_terms);
-
-    fn queries<'a>(
-        body: &'a dyn Bm25Index,
-        name: &'a dyn Bm25Index,
-        body_terms: &'a [String],
-        name_terms: &'a [String],
-        body_stats: &CorpusStats,
-        name_stats: &CorpusStats,
-        params: Bm25Params,
-    ) -> Vec<FieldQuery<'a>> {
-        vec![
-            FieldQuery {
-                index: body,
-                terms: body_terms,
-                stats: body_stats.clone(),
-                params,
-                weight: 1.0,
-            },
-            FieldQuery {
-                index: name,
-                terms: name_terms,
-                stats: name_stats.clone(),
-                params,
-                weight: 2.0,
-            },
-        ]
-    }
-    macro_rules! q {
-        ($body:expr, $name:expr) => {
-            queries(
-                &$body,
-                &$name,
-                &body_terms,
-                &name_terms,
-                &body_stats,
-                &name_stats,
-                params,
-            )
-        };
-    }
-
-    let oracle = bm25::top_k_fused_exhaustive(&q!(store.field(0), store.field(1)), 10);
-    let mut prune = PruneStats::default();
-    let got = bm25::top_k_fused_pruned_stats(
-        &q!(reader.field(0), reader.field(1)),
-        10,
-        f64::NEG_INFINITY,
-        &mut prune,
-    );
-
-    // Correctness first: skipping a locally-absent pair is only valid
-    // because it contributes 0 to every document on this shard.
-    assert_eq!(
-        sig(&oracle),
-        sig(&got),
-        "skipping a locally-absent term must not change a single fused score"
-    );
-
-    // And the point of the fix: the pruned scorer was ENTERED. Only its
-    // candidate loop touches `candidates_evaluated`; the exhaustive
-    // fallback is handed no PruneStats at all, so a non-zero count is a
-    // precise witness of entry. (`blocks_total` is NOT: the setup loop
-    // has already counted the present term's blocks by the time the
-    // absent one triggers the fallback.) Skip effectiveness is a
-    // property of the fixture's score distribution and is gated
-    // elsewhere.
-    assert!(
-        prune.candidates_evaluated > 0,
-        "the fused query fell back to exhaustive despite every PRESENT term having impacts"
-    );
-
-    // A seeded floor must still hold the filtered-oracle contract.
-    let seeded =
-        bm25::top_k_fused_pruned(&q!(reader.field(0), reader.field(1)), 10, oracle[9].score);
-    assert_eq!(
-        sig(&bm25::filter_fused_to_floor(
-            oracle.clone(),
-            oracle[9].score
-        )),
-        sig(&seeded),
-        "a seeded floor must not change the surviving fused hits"
-    );
-
-    // Control: dropping the absent term entirely must walk the same
-    // blocks. If it does not, the absent term is still costing work.
-    let present_only = vec!["court".to_string()];
-    let mut solo = PruneStats::default();
-    let _ = bm25::top_k_fused_pruned_stats(
-        &[
-            FieldQuery {
-                index: &reader.field(0),
-                terms: &present_only,
-                stats: CorpusStats {
-                    doc_count: store.doc_count(),
-                    total_doc_length: store.field(0).total_doc_length(),
-                    dfs: vec![2000],
-                },
-                params,
-                weight: 1.0,
-            },
-            FieldQuery {
-                index: &reader.field(1),
-                terms: &name_terms,
-                stats: name_stats.clone(),
-                params,
-                weight: 2.0,
-            },
-        ],
-        10,
-        f64::NEG_INFINITY,
-        &mut solo,
-    );
-    assert_eq!(
-        prune.blocks_total, solo.blocks_total,
-        "a locally-absent term should add no blocks to walk"
-    );
-
     let _ = std::fs::remove_dir_all(&dir);
 }

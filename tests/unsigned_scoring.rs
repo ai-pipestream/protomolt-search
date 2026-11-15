@@ -51,43 +51,33 @@ const VALUES: [Option<u64>; 8] = [
     Some(u64::MAX - 1),
     Some(u64::MAX),
 ];
+const SCALE_2P63: f64 = 9_223_372_036_854_775_808.0;
 fn ops() -> Vec<StageOp> {
     vec![
         StageOp::AddLinear { weight: -2e-19 },
         StageOp::MultLog { weight: 0.4 },
         StageOp::MultExpDecay {
-            origin: 9_223_372_036_854_775_808.0,
-            scale: 9_223_372_036_854_775_808.0,
+            origin: SCALE_2P63,
+            scale: SCALE_2P63,
         },
     ]
 }
+fn stage_proto(op: pb::ScoreOp, weight: f64, origin: f64, scale: f64) -> pb::ScoreStage {
+    let operation = Some(pb::score_stage::Operation::Op(op as i32));
+    pb::ScoreStage {
+        column: "counter".into(),
+        operation,
+        weight,
+        origin,
+        scale,
+        ..Default::default()
+    }
+}
 fn stages() -> Vec<pb::ScoreStage> {
     vec![
-        pb::ScoreStage {
-            column: "counter".into(),
-            operation: Some(pipestream_search::pb::score_stage::Operation::Op(
-                pb::ScoreOp::AddLinear as i32,
-            )),
-            weight: -2e-19,
-            ..Default::default()
-        },
-        pb::ScoreStage {
-            column: "counter".into(),
-            operation: Some(pipestream_search::pb::score_stage::Operation::Op(
-                pb::ScoreOp::MultLog as i32,
-            )),
-            weight: 0.4,
-            ..Default::default()
-        },
-        pb::ScoreStage {
-            column: "counter".into(),
-            operation: Some(pipestream_search::pb::score_stage::Operation::Op(
-                pb::ScoreOp::MultExpDecay as i32,
-            )),
-            origin: 9_223_372_036_854_775_808.0,
-            scale: 9_223_372_036_854_775_808.0,
-            ..Default::default()
-        },
+        stage_proto(pb::ScoreOp::AddLinear, -2e-19, 0.0, 0.0),
+        stage_proto(pb::ScoreOp::MultLog, 0.4, 0.0, 0.0),
+        stage_proto(pb::ScoreOp::MultExpDecay, 0.0, SCALE_2P63, SCALE_2P63),
     ]
 }
 // Decimal parsing is independent of the integer-to-float cast at the read site.
@@ -106,21 +96,15 @@ fn contribution(stage: &pb::ScoreStage, value: u64) -> f64 {
         _ => unreachable!(),
     }
 }
-#[test]
-fn unsigned_chain_bounds_and_pruning_preserve_the_declared_float_arithmetic() {
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("uint_score_pruning_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let n = 3000u32;
-    let mut total = 0u64;
+fn build_unsigned_pruning_store(path: &std::path::Path) -> CorpusStats {
+    let (n, mut total) = (3000u32, 0u64);
     let mut store = Bm25Store::with_fields(&["body"]).with_unsigned_integers(&["counter", "empty"]);
     for doc in 0..n {
         let mut terms = vec![("a".into(), 1 + doc % 7, vec![])];
-        if doc % 3 == 0 {
-            terms.push(("b".into(), 1, vec![]));
-        }
-        if doc % 61 == 0 {
-            terms.push(("c".into(), 1, vec![]));
+        for (m, t) in [(3, "b"), (61, "c")] {
+            if doc % m == 0 {
+                terms.push((t.into(), 1, vec![]));
+            }
         }
         let len = terms.iter().map(|(_, tf, _)| tf).sum();
         total += u64::from(len);
@@ -129,95 +113,91 @@ fn unsigned_chain_bounds_and_pruning_preserve_the_declared_float_arithmetic() {
             store.set_unsigned_integer(0, doc, v);
         }
     }
-    let path = dir.join("score.bm25");
-    store.save(&path).unwrap();
-    let reader = Bm25Reader::open(&path).unwrap();
-    let cols = Columns(&reader);
-    let body = reader.field(0);
-    let terms: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
-    let stats = CorpusStats {
+    store.save(path).unwrap();
+    CorpusStats {
         doc_count: u64::from(n),
         total_doc_length: total,
         dfs: vec![n, n.div_ceil(3), n.div_ceil(61)],
-    };
-    let mut all = ops();
-    all.push(StageOp::AddLinear { weight: 2e-19 });
-    for op in all.iter().copied() {
+    }
+}
+
+fn assert_unsigned_stage_arithmetic(cols: &Columns<'_>, all_ops: &[StageOp]) {
+    let (col, min_max) = (Some(ColumnRef::UnsignedInteger(0)), (0.0, input(u64::MAX)));
+    for &op in all_ops {
         let stage = Stage {
             op,
-            column: Some(ColumnRef::UnsignedInteger(0)),
-            min_max: (0.0, input(u64::MAX)),
+            column: col,
+            min_max,
         };
         let wire = match op {
-            StageOp::AddLinear { weight } => pb::ScoreStage {
-                weight,
-                ..stages()[0].clone()
-            },
+            StageOp::AddLinear { weight } => stage_proto(pb::ScoreOp::AddLinear, weight, 0.0, 0.0),
             StageOp::MultLog { .. } => stages()[1].clone(),
             _ => stages()[2].clone(),
         };
+        let chain = ScoreChain {
+            stages: vec![stage],
+        };
         for (doc, value) in VALUES.into_iter().enumerate() {
+            let d = doc as u32;
             assert_eq!(
-                stage.input(doc as u32, &cols).map(f64::to_bits),
+                stage.input(d, cols).map(f64::to_bits),
                 value.map(|v| input(v).to_bits())
             );
-            assert_eq!(
-                stage.contribution(doc as u32, &cols).map(f64::to_bits),
-                value.map(|v| contribution(&wire, v).to_bits())
-            );
-            let chain = ScoreChain {
-                stages: vec![stage],
-            };
+            let want_c = value.map(|v| contribution(&wire, v).to_bits());
+            assert_eq!(stage.contribution(d, cols).map(f64::to_bits), want_c);
             for base in [-20.0, -1.0, 0.0, 0.25, 2.0, 20.0] {
-                let expected = value.map_or(base, |v| {
+                let c = value.map(|v| contribution(&wire, v));
+                let expected = c.map_or(base, |c| {
                     if stage.is_additive() {
-                        base + contribution(&wire, v)
+                        base + c
                     } else {
-                        base * contribution(&wire, v)
+                        base * c
                     }
                 });
-                let actual = chain.eval(base, doc as u32, &cols);
+                let actual = chain.eval(base, d, cols);
                 assert_eq!(actual.to_bits(), expected.to_bits());
                 assert!(chain.bound(20.0) >= actual);
             }
         }
     }
-    for ops in [all, ops()] {
+}
+
+#[test]
+fn unsigned_chain_bounds_and_pruning_preserve_the_declared_float_arithmetic() {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("uint_score_pruning_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("score.bm25");
+    let stats = build_unsigned_pruning_store(&path);
+    let reader = Bm25Reader::open(&path).unwrap();
+    let cols = Columns(&reader);
+    let body = reader.field(0);
+    let terms: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+    let p = Bm25Params::default();
+    let mut all = ops();
+    all.push(StageOp::AddLinear { weight: 2e-19 });
+    assert_unsigned_stage_arithmetic(&cols, &all);
+
+    let sig = |hits: &[bm25::ScoredDoc]| -> Vec<(u32, u64)> {
+        hits.iter().map(|h| (h.doc_id, h.score.to_bits())).collect()
+    };
+    let (col, min_max) = (Some(ColumnRef::UnsignedInteger(0)), (0.0, input(u64::MAX)));
+    let mk_stage = |op| Stage {
+        op,
+        column: col,
+        min_max,
+    };
+    for selected in [all, ops()] {
         let chain = ScoreChain {
-            stages: ops
-                .into_iter()
-                .map(|op| Stage {
-                    op,
-                    column: Some(ColumnRef::UnsignedInteger(0)),
-                    min_max: (0.0, input(u64::MAX)),
-                })
-                .collect(),
+            stages: selected.into_iter().map(mk_stage).collect(),
         };
         let ctx = Some((&chain, &cols as &dyn NumericRead));
         for k in [1, 5, 50] {
-            let expected = bm25::top_k_exhaustive_chained(
-                &body,
-                &terms,
-                &stats,
-                Bm25Params::default(),
-                k,
-                ctx,
-            );
-            let sig = |hits: &[bm25::ScoredDoc]| {
-                hits.iter()
-                    .map(|h| (h.doc_id, h.score.to_bits()))
-                    .collect::<Vec<_>>()
-            };
+            let q = bm25::TopK::new(k).chain(ctx);
+            let expected = bm25::top_k_exhaustive(&body, &terms, &stats, p, q);
             for floor in [f64::NEG_INFINITY, expected.last().unwrap().score] {
-                let actual = bm25::top_k_pruned_chained(
-                    &body,
-                    &terms,
-                    &stats,
-                    Bm25Params::default(),
-                    k,
-                    floor,
-                    ctx,
-                );
+                let q = bm25::TopK::new(k).floor(floor).chain(ctx);
+                let actual = bm25::top_k(&body, &terms, &stats, p, q);
                 assert_eq!(sig(&actual), sig(&expected));
             }
         }
@@ -225,11 +205,7 @@ fn unsigned_chain_bounds_and_pruning_preserve_the_declared_float_arithmetic() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 fn value(row: usize) -> Option<u64> {
-    if row < 16 {
-        VALUES[row % 8]
-    } else {
-        None
-    }
+    (row < 16).then(|| VALUES[row % 8]).flatten()
 }
 fn request(stages: Vec<pb::ScoreStage>) -> pb::Bm25SearchRequest {
     pb::Bm25SearchRequest {

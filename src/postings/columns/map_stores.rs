@@ -7,7 +7,7 @@ use super::super::format::{write_u16, write_u32, write_u64};
 use super::stores::dictionary_order;
 use super::FACET_ABSENT;
 
-/// One `map<string, string>` column (`docs/map-columns.md`): interned
+/// One `map<string, string>` column: interned
 /// key and value dictionaries plus per-slot `(key_ord, value_ord)` pair
 /// lists, kept sorted by key ordinal within each document. At most one
 /// value per `(document, key)` — map semantics.

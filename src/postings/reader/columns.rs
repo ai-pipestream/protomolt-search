@@ -102,7 +102,7 @@ impl Bm25Reader {
     }
 
     /// Whether facet field `fi`'s dictionary is in byte order, so an
-    /// ordinal range is a string range (`docs/prefix-terms.md`).
+    /// ordinal range is a string range.
     pub fn facet_dictionary_sorted(&self, fi: usize) -> bool {
         self.facets[fi].sorted
     }

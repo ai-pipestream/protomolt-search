@@ -3,8 +3,8 @@
 use super::super::{Bm25Index, DocLineage, PostingCallback};
 use super::{Bm25Store, FieldStore};
 
-/// One field of a [`Bm25Store`] as its own [`Bm25Index`]
-/// (`docs/multi-field.md`): postings, document lengths, and total
+/// One field of a [`Bm25Store`] as its own [`Bm25Index`]:
+/// postings, document lengths, and total
 /// length come from the field; texts, lineages, and the document count
 /// are the store's shared ones (a document is a document — idf's N is
 /// corpus-wide, never per field).
