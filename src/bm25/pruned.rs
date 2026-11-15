@@ -55,7 +55,7 @@ pub(super) fn run(
             continue;
         }
         let entry = scan.score(doc, controls.chain, prune);
-        if passes(controls.filter, doc) && entry.score >= controls.floor {
+        if passes(controls.filter, doc) && super::ranking::clears(entry.score, controls.floor) {
             if let Some(sink) = candidate.as_mut() {
                 sink(doc, entry.score as f32);
             }

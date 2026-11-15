@@ -6,6 +6,14 @@ pub(super) fn wire_score(score: f64) -> f32 {
     (score as f32) + 0.0
 }
 
+/// Whether `score` is at or above `floor` in ranking order. A floor is a
+/// bound on a k-th best score, and ranks are decided on wire scores, so
+/// the comparison rounds both sides: a document that ties the floor on
+/// the wire is kept even when its f64 sum is a fraction lower.
+pub(super) fn clears(score: f64, floor: f64) -> bool {
+    wire_score(score) >= wire_score(floor)
+}
+
 pub(super) fn compare(a: (u32, f64), b: (u32, f64)) -> Ordering {
     wire_score(b.1)
         .total_cmp(&wire_score(a.1))

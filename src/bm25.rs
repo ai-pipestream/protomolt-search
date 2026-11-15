@@ -649,7 +649,7 @@ pub fn top_k_phrase_exhaustive_filtered(
     )
 }
 
-/// Phrase ranking applies a finite raw score floor before truncating rounded-score ties.
+/// Phrase ranking applies a finite floor on rounded scores, then truncates rounded-score ties.
 pub fn top_k_phrase_exhaustive_filtered_above(
     fields: &[FieldQuery],
     phrase_field: usize,
@@ -700,7 +700,7 @@ pub fn top_k_phrase_exhaustive_filtered_above(
             term_offsets,
         })
         .collect();
-    docs.retain(|doc| !floor.is_finite() || doc.score >= floor);
+    docs.retain(|doc| !floor.is_finite() || ranking::clears(doc.score, floor));
     docs.sort_by(|a, b| ranking::compare((a.doc_id, a.score), (b.doc_id, b.score)));
     docs.truncate(k);
     docs
@@ -767,8 +767,9 @@ pub type CandidateHook<'a> = &'a mut dyn FnMut(u32, f32);
 ///
 /// Ranking compares rounded f32 scores, then document ids; accumulation and
 /// returned scores remain f64. Bounds use the same rounding, and monotonically
-/// increasing document ids preserve the incumbent on a rounded tie. Finite
-/// raw floors filter candidates before ranking; term-order bounds remain sound.
+/// increasing document ids preserve the incumbent on a rounded tie. A finite
+/// floor is compared on the same rounded scores, so a seeded floor at or below
+/// the k-th best returns the unseeded hits; term-order bounds remain sound.
 ///
 /// Falls back to [`top_k`] when any query term lacks impacts (heap
 /// store, v3/v4 files, or more than 128 query terms — the membership
@@ -919,7 +920,7 @@ pub struct ScoringQuery<'a> {
     pub filter: FilterCtx<'a>,
 }
 
-/// Ranking depth, inclusive raw floor, and permission to use impact pruning.
+/// Ranking depth, inclusive floor on rounded scores, and permission to use impact pruning.
 #[derive(Clone, Copy)]
 pub struct TopKOptions {
     pub k: usize,
@@ -971,7 +972,7 @@ fn block_max(
 /// monotone) and full evaluations reproduce the exhaustive scorer's
 /// bits. The skip/heap contract is [`top_k_pruned`]'s verbatim: skips
 /// on `bound <= cutoff`, candidates in doc-id order, strictly-greater
-/// displacement, `score >= floor` keeps ties at a seeded floor.
+/// displacement, a rounded score at the seeded floor is kept.
 ///
 /// Falls back to [`top_k_fused_exhaustive`] (floor-filtered) when any
 /// scored pair lacks impacts (heap store, v3/v4 files), when the pair
@@ -1032,19 +1033,19 @@ pub fn top_k_fused_pruned_filtered_stats_streaming(
 }
 
 /// The seeded-floor contract applied to a fused fallback result: keep
-/// docs with `score >= floor` (ties at the floor survive).
+/// docs whose rounded score is at or above the floor's.
 pub fn filter_fused_to_floor(mut docs: Vec<FusedDoc>, floor: f64) -> Vec<FusedDoc> {
     if floor.is_finite() {
-        docs.retain(|d| d.score >= floor);
+        docs.retain(|d| ranking::clears(d.score, floor));
     }
     docs
 }
 
 /// The seeded-floor contract applied to a fallback result: keep docs
-/// with `score >= floor` (ties at the floor survive).
+/// whose rounded score is at or above the floor's.
 pub fn filter_to_floor(mut docs: Vec<ScoredDoc>, floor: f64) -> Vec<ScoredDoc> {
     if floor.is_finite() {
-        docs.retain(|d| d.score >= floor);
+        docs.retain(|d| ranking::clears(d.score, floor));
     }
     docs
 }

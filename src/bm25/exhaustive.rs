@@ -54,7 +54,7 @@ impl Query<'_> {
             .into_iter()
             .filter(|&(doc_id, _)| passes(filter, doc_id))
             .map(|(doc_id, (score, mask))| (doc_id, finish(score, doc_id), mask))
-            .filter(|(_, score, _)| floor.is_none_or(|floor| *score >= floor))
+            .filter(|(_, score, _)| floor.is_none_or(|floor| super::ranking::clears(*score, floor)))
             .collect();
         super::ranking::sort_truncate(&mut docs, k);
         docs.into_iter()
@@ -101,7 +101,7 @@ impl Query<'_> {
             .into_iter()
             .filter(|&(doc_id, _)| passes(filter, doc_id))
             .map(|(doc_id, (score, tis))| (doc_id, finish(score, doc_id), tis))
-            .filter(|(_, score, _)| floor.is_none_or(|floor| *score >= floor))
+            .filter(|(_, score, _)| floor.is_none_or(|floor| super::ranking::clears(*score, floor)))
             .collect();
         super::ranking::sort_truncate(&mut docs, k);
         docs.into_iter()
@@ -151,7 +151,7 @@ pub(super) fn fused(
             term_offsets,
         })
         .collect();
-    docs.retain(|doc| floor.is_none_or(|floor| doc.score >= floor));
+    docs.retain(|doc| floor.is_none_or(|floor| super::ranking::clears(doc.score, floor)));
     docs.sort_by(|a, b| super::ranking::compare((a.doc_id, a.score), (b.doc_id, b.score)));
     docs.truncate(k);
     docs

@@ -12,11 +12,12 @@ pub(super) struct Cutoff<'a> {
 }
 
 impl Cutoff<'_> {
-    // Rounding is monotone, so a rounded upper bound also bounds wire scores.
+    // Rounding is monotone, so a rounded upper bound also bounds wire scores,
+    // for the floor as for the k-th best.
     // Equal rounded scores cannot replace earlier, smaller document ids.
     pub fn inert(&self, bound: f64) -> bool {
         let bound = self.chain.map_or(bound, |(chain, _)| chain.bound(bound));
-        bound < self.floor
+        !super::ranking::clears(bound, self.floor)
             || self.kth.is_some_and(|kth| {
                 super::ranking::wire_score(bound)
                     .total_cmp(&(kth + 0.0))

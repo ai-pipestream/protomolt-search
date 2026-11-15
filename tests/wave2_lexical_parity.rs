@@ -252,8 +252,10 @@ fn rounded_score_ties_survive_pruning_and_live_floors() {
     );
 }
 
+/// A floor that sits between two f64 sums with one wire score must not
+/// change the winner: the floor is compared on wire scores, as ranks are.
 #[test]
-fn raw_floor_filters_before_rounded_tie_truncation() {
+fn floor_between_rounded_ties_returns_the_unfloored_winner() {
     let dir = Scratch::new();
     let store = store(&["x y", "x"]);
     let path = dir.0.join("floor.bm25");
@@ -273,7 +275,7 @@ fn raw_floor_filters_before_rounded_tie_truncation() {
     let indexes: [&dyn pipestream_search::postings::Bm25Index; 2] = [&store, &reader];
     for index in indexes {
         let flat = bm25::top_k_pruned(index, &terms, &stats, PARAMS, 1, floor);
-        assert_eq!(flat.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(), [1]);
+        assert_eq!(flat.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(), [0]);
         let fields = [FieldQuery {
             index,
             terms: &terms,
@@ -282,7 +284,7 @@ fn raw_floor_filters_before_rounded_tie_truncation() {
             weight: 1.0,
         }];
         let fused = bm25::top_k_fused_pruned(&fields, 1, floor);
-        assert_eq!(fused.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(), [1]);
+        assert_eq!(fused.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(), [0]);
     }
 }
 

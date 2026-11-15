@@ -348,9 +348,9 @@ async fn bm25_query_min_score_seeds_floor() {
     let unseeded = query(&addr_a, 0.0).await;
     assert_eq!(unseeded.len(), 2);
     assert!(unseeded[0].score > unseeded[1].score);
-    // The filter expectation must use the docs' TRUE f64 scores (the
-    // node compares the floor against those, not against the
-    // f32-rounded hit scores). The corpus is known: N=2, avgdl=3.5,
+    // The node compares the floor with the f32 score a hit is returned
+    // with, the same value ranking uses, so `min_score` equal to a hit's
+    // reported score keeps that hit. The corpus is known: N=2, avgdl=3.5,
     // doc0 rust tf=2 dl=4, doc1 rust tf=1 dl=3, k1/b defaults.
     let idf = pipestream_search::bm25::idf(2, 2);
     let params = pipestream_search::bm25::Bm25Params::default();
@@ -364,7 +364,7 @@ async fn bm25_query_min_score_seeds_floor() {
         true_scores
             .iter()
             .enumerate()
-            .filter(|&(_, &s)| s >= f64::from(floor))
+            .filter(|&(_, &s)| s as f32 >= floor)
             .map(|(id, &s)| (id as u64, (s as f32).to_bits()))
             .collect()
     };
