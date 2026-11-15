@@ -50,7 +50,7 @@ pub enum ResolvedLeaf {
         ords: Vec<u32>,
     },
     /// Range over an i64 column, bounds pre-normalized to inclusive
-    /// i64 by [`int_range`]; `lo > hi` is the empty range.
+    /// i64 by [`int_range`](super::int_range); `lo > hi` is the empty range.
     IntRange {
         /// Index into the shard's integer table.
         column: usize,
@@ -59,7 +59,7 @@ pub enum ResolvedLeaf {
         /// Inclusive upper edge.
         hi: i64,
     },
-    /// Range over a u64 column, normalized by [`uint_range`].
+    /// Range over a u64 column, normalized by [`uint_range`](super::uint_range).
     UintRange {
         /// Index into the shard's unsigned integer table.
         column: usize,
