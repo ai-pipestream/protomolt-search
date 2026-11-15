@@ -19,13 +19,13 @@ pub(super) fn parse_clustered_turbovec(
     let clustered_endpoint = opt(
         args,
         "turbovec-coordinator",
-        "TURBOVEC_COORDINATOR",
+        "PIPESTREAM_SEARCH_COORDINATOR",
         clustered_file.and_then(|config| config.coordinator.as_deref()),
     );
     let clustered_nodes = opt(
         args,
         "turbovec-cluster-nodes",
-        "TURBOVEC_CLUSTER_NODES",
+        "PIPESTREAM_SEARCH_CLUSTER_NODES",
         clustered_file
             .and_then(|config| config.nodes.as_ref())
             .map(|nodes| nodes.join(","))
@@ -39,7 +39,7 @@ pub(super) fn parse_clustered_turbovec(
     let clustered_state = opt(
         args,
         "turbovec-cluster-state",
-        "TURBOVEC_CLUSTER_STATE",
+        "PIPESTREAM_SEARCH_CLUSTER_STATE",
         clustered_file.and_then(|config| config.state.as_deref()),
     )
     .map(PathBuf::from);
@@ -47,7 +47,7 @@ pub(super) fn parse_clustered_turbovec(
         || match opt(
             args,
             "allow-ephemeral-turbovec-cluster",
-            "TURBOVEC_ALLOW_EPHEMERAL_CLUSTER",
+            "PIPESTREAM_SEARCH_ALLOW_EPHEMERAL_CLUSTER",
             None,
         ) {
             Some(value) => parse_env_bool(&value),
@@ -125,21 +125,26 @@ pub(super) fn parse_shards(
     let node_listen_default = opt(
         args,
         "node-listen",
-        "TURBOVEC_NODE_LISTEN",
+        "PIPESTREAM_SEARCH_NODE_LISTEN",
         file.node_listen.as_deref(),
     )
     .unwrap_or_else(|| "0.0.0.0:50051".to_string());
-    let cli_index = opt(args, "index", "TURBOVEC_INDEX", file.index.as_deref());
+    let cli_index = opt(
+        args,
+        "index",
+        "PIPESTREAM_SEARCH_INDEX",
+        file.index.as_deref(),
+    );
     let cli_demo = opt(
         args,
         "demo-vectors",
-        "TURBOVEC_DEMO_VECTORS",
+        "PIPESTREAM_SEARCH_DEMO_VECTORS",
         file.demo_vectors.map(|d| d.to_string()).as_deref(),
     );
     let cli_offset = opt(
         args,
         "slot-offset",
-        "TURBOVEC_SLOT_OFFSET",
+        "PIPESTREAM_SEARCH_SLOT_OFFSET",
         file.slot_offset.map(|o| o.to_string()).as_deref(),
     )
     .unwrap_or_else(|| "0".to_string())
@@ -149,14 +154,14 @@ pub(super) fn parse_shards(
     // Write-ahead log: default on for persisted shards, always off for
     // demo shards (they have no index path to log next to). Bucket count
     // is a power of two (max 1024) and caps cheap split granularity.
-    let wal_default = match opt(args, "wal", "TURBOVEC_WAL", None) {
+    let wal_default = match opt(args, "wal", "PIPESTREAM_SEARCH_WAL", None) {
         Some(s) => parse_env_bool(&s),
         None => file.wal.unwrap_or(true),
     };
     let wal_buckets_default = opt(
         args,
         "wal-buckets",
-        "TURBOVEC_WAL_BUCKETS",
+        "PIPESTREAM_SEARCH_WAL_BUCKETS",
         file.wal_buckets.map(|b| b.to_string()).as_deref(),
     )
     .map(|s| {
@@ -178,14 +183,14 @@ pub(super) fn parse_shards(
     // Vocabulary accumulation: default OFF (zero overhead); per-shard file
     // entries may override the process default. Window and top-K sizing is
     // process-wide (see docs/VOCABULARY-INDEX.md).
-    let vocab_default = match opt(args, "vocab", "TURBOVEC_VOCAB", None) {
+    let vocab_default = match opt(args, "vocab", "PIPESTREAM_SEARCH_VOCAB", None) {
         Some(s) => parse_env_bool(&s),
         None => file.vocab.unwrap_or(false),
     };
     let vocab_window_docs = opt(
         args,
         "vocab-window-docs",
-        "TURBOVEC_VOCAB_WINDOW_DOCS",
+        "PIPESTREAM_SEARCH_VOCAB_WINDOW_DOCS",
         file.vocab_window_docs.map(|v| v.to_string()).as_deref(),
     )
     .map(|s| {
@@ -200,7 +205,7 @@ pub(super) fn parse_shards(
     let vocab_top_k = opt(
         args,
         "vocab-top-k",
-        "TURBOVEC_VOCAB_TOP_K",
+        "PIPESTREAM_SEARCH_VOCAB_TOP_K",
         file.vocab_top_k.map(|v| v.to_string()).as_deref(),
     )
     .map(|s| {

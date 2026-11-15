@@ -24,7 +24,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     // The config file sits at the bottom of the precedence stack.
     let file: FileConfig = read_file_config(args)?;
 
-    let role = match opt(args, "role", "TURBOVEC_ROLE", file.role.as_deref())
+    let role = match opt(args, "role", "PIPESTREAM_SEARCH_ROLE", file.role.as_deref())
         .unwrap_or_else(|| "node".to_string())
         .as_str()
     {
@@ -37,7 +37,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     let coord_listen = opt(
         args,
         "coord-listen",
-        "TURBOVEC_COORD_LISTEN",
+        "PIPESTREAM_SEARCH_COORD_LISTEN",
         file.coord_listen.as_deref(),
     )
     .unwrap_or_else(|| "0.0.0.0:50050".to_string())
@@ -47,7 +47,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     let metrics_listen = opt(
         args,
         "metrics-listen",
-        "TURBOVEC_METRICS_LISTEN",
+        "PIPESTREAM_SEARCH_METRICS_LISTEN",
         file.metrics_listen.as_deref(),
     )
     .map(|a| {
@@ -61,7 +61,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     let shard_map_path = opt(
         args,
         "shard-map",
-        "TURBOVEC_SHARD_MAP",
+        "PIPESTREAM_SEARCH_SHARD_MAP",
         file.shard_map.as_deref(),
     )
     .map(PathBuf::from);
@@ -69,7 +69,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     let shard_map_reload_ms = opt(
         args,
         "shard-map-reload-ms",
-        "TURBOVEC_SHARD_MAP_RELOAD_MS",
+        "PIPESTREAM_SEARCH_SHARD_MAP_RELOAD_MS",
         file.shard_map_reload_ms.map(|v| v.to_string()).as_deref(),
     )
     .map(|value| {
@@ -82,13 +82,14 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     if shard_map_reload_ms > 0 && shard_map_path.is_none() {
         return Err("--shard-map-reload-ms requires --shard-map".to_string());
     }
-    let nodes_given = opt(args, "nodes", "TURBOVEC_NODES", None).is_some() || file.nodes.is_some();
+    let nodes_given =
+        opt(args, "nodes", "PIPESTREAM_SEARCH_NODES", None).is_some() || file.nodes.is_some();
     if shard_map.is_some() && nodes_given {
         return Err("--shard-map replaces --nodes; pass exactly one".to_string());
     }
     let node_addrs = match &shard_map {
         Some(map) => normalize_addrs(map.shards.iter().map(|s| s.addr.clone()).collect()),
-        None => match opt(args, "nodes", "TURBOVEC_NODES", None) {
+        None => match opt(args, "nodes", "PIPESTREAM_SEARCH_NODES", None) {
             Some(s) => normalize_addrs(
                 s.split(',')
                     .map(str::trim)
@@ -105,7 +106,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     let dim = opt(
         args,
         "dim",
-        "TURBOVEC_DIM",
+        "PIPESTREAM_SEARCH_DIM",
         file.dim.map(|d| d.to_string()).as_deref(),
     )
     .unwrap_or_else(|| "128".to_string())
@@ -114,7 +115,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     let bit_width = opt(
         args,
         "bit-width",
-        "TURBOVEC_BIT_WIDTH",
+        "PIPESTREAM_SEARCH_BIT_WIDTH",
         file.bit_width.map(|b| b.to_string()).as_deref(),
     )
     .unwrap_or_else(|| "4".to_string())
@@ -123,7 +124,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     let vector_backend = opt(
         args,
         "vector-backend",
-        "TURBOVEC_VECTOR_BACKEND",
+        "PIPESTREAM_SEARCH_VECTOR_BACKEND",
         file.vector_backend.as_deref(),
     )
     .unwrap_or_else(|| crate::vector::EMBEDDED_TURBOVEC.to_string());
@@ -137,33 +138,48 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     let chunk_blocks = opt(
         args,
         "chunk-blocks",
-        "TURBOVEC_CHUNK_BLOCKS",
+        "PIPESTREAM_SEARCH_CHUNK_BLOCKS",
         file.chunk_blocks.map(|c| c.to_string()).as_deref(),
     )
     .unwrap_or_else(|| DEFAULT_CHUNK_BLOCKS.to_string())
     .parse::<usize>()
     .map_err(|e| format!("invalid chunk blocks: {e}"))?;
 
-    let share_floors = match opt(args, "floor-sharing", "TURBOVEC_FLOOR_SHARING", None) {
+    let share_floors = match opt(
+        args,
+        "floor-sharing",
+        "PIPESTREAM_SEARCH_FLOOR_SHARING",
+        None,
+    ) {
         Some(s) => parse_env_bool(&s),
         None => file.floor_sharing.unwrap_or(true),
     };
-    let block_max = match opt(args, "block-max", "TURBOVEC_BLOCK_MAX", None) {
+    let block_max = match opt(args, "block-max", "PIPESTREAM_SEARCH_BLOCK_MAX", None) {
         Some(s) => parse_env_bool(&s),
         None => file.block_max.unwrap_or(true),
     };
-    let segment_pruning = match opt(args, "segment-pruning", "TURBOVEC_SEGMENT_PRUNING", None) {
+    let segment_pruning = match opt(
+        args,
+        "segment-pruning",
+        "PIPESTREAM_SEARCH_SEGMENT_PRUNING",
+        None,
+    ) {
         Some(s) => parse_env_bool(&s),
         None => file.segment_pruning.unwrap_or(true),
     };
-    let shard_pruning = match opt(args, "shard-pruning", "TURBOVEC_SHARD_PRUNING", None) {
+    let shard_pruning = match opt(
+        args,
+        "shard-pruning",
+        "PIPESTREAM_SEARCH_SHARD_PRUNING",
+        None,
+    ) {
         Some(s) => parse_env_bool(&s),
         None => file.shard_pruning.unwrap_or(true),
     };
     let placement_column = opt(
         args,
         "placement-column",
-        "TURBOVEC_PLACEMENT_COLUMN",
+        "PIPESTREAM_SEARCH_PLACEMENT_COLUMN",
         file.placement_column.as_deref(),
     )
     .map(|s| s.trim().to_string())
@@ -171,7 +187,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     let placement_leaf = opt(
         args,
         "placement-leaf",
-        "TURBOVEC_PLACEMENT_LEAF",
+        "PIPESTREAM_SEARCH_PLACEMENT_LEAF",
         file.placement_leaf.map(|v| v.to_string()).as_deref(),
     )
     .map(|s| {
@@ -197,7 +213,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     let placement_tree = match opt(
         args,
         "placement-tree",
-        "TURBOVEC_PLACEMENT_TREE",
+        "PIPESTREAM_SEARCH_PLACEMENT_TREE",
         file.placement_tree.as_deref(),
     )
     .map(|s| s.trim().to_string())
@@ -225,7 +241,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         let path = opt(
             args,
             "derived-columns",
-            "TURBOVEC_DERIVED_COLUMNS",
+            "PIPESTREAM_SEARCH_DERIVED_COLUMNS",
             file.derived_columns.as_deref(),
         )
         .map(|s| s.trim().to_string())
@@ -256,20 +272,20 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         || match opt(
             args,
             "allow-missing-bm25",
-            "TURBOVEC_ALLOW_MISSING_BM25",
+            "PIPESTREAM_SEARCH_ALLOW_MISSING_BM25",
             None,
         ) {
             Some(s) => parse_env_bool(&s),
             None => file.allow_missing_bm25.unwrap_or(false),
         };
-    let coalesce = match opt(args, "coalesce", "TURBOVEC_COALESCE", None) {
+    let coalesce = match opt(args, "coalesce", "PIPESTREAM_SEARCH_COALESCE", None) {
         Some(s) => parse_env_bool(&s),
         None => file.coalesce.unwrap_or(true),
     };
     let scan_parallel = opt(
         args,
         "scan-parallel",
-        "TURBOVEC_SCAN_PARALLEL",
+        "PIPESTREAM_SEARCH_SCAN_PARALLEL",
         file.scan_parallel.map(|v| v.to_string()).as_deref(),
     )
     .map(|s| {
@@ -281,7 +297,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     let rerank_parallel = opt(
         args,
         "rerank-parallel",
-        "TURBOVEC_RERANK_PARALLEL",
+        "PIPESTREAM_SEARCH_RERANK_PARALLEL",
         file.rerank_parallel.map(|v| v.to_string()).as_deref(),
     )
     .map(|s| {
@@ -299,7 +315,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     let floor_delta = opt(
         args,
         "floor-delta",
-        "TURBOVEC_FLOOR_DELTA",
+        "PIPESTREAM_SEARCH_FLOOR_DELTA",
         file.floor_delta.map(|v| v.to_string()).as_deref(),
     )
     .map(|s| {
@@ -318,7 +334,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     let floor_warmup_chunks = opt(
         args,
         "floor-warmup-chunks",
-        "TURBOVEC_FLOOR_WARMUP_CHUNKS",
+        "PIPESTREAM_SEARCH_FLOOR_WARMUP_CHUNKS",
         file.floor_warmup_chunks.map(|v| v.to_string()).as_deref(),
     )
     .map(|s| {
@@ -330,7 +346,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     let floor_min_interval_ms = opt(
         args,
         "floor-min-interval-ms",
-        "TURBOVEC_FLOOR_MIN_INTERVAL_MS",
+        "PIPESTREAM_SEARCH_FLOOR_MIN_INTERVAL_MS",
         file.floor_min_interval_ms.map(|v| v.to_string()).as_deref(),
     )
     .map(|s| {
@@ -350,12 +366,12 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     };
     let shard_deadline_ms = parse_ms(
         "shard-deadline-ms",
-        "TURBOVEC_SHARD_DEADLINE_MS",
+        "PIPESTREAM_SEARCH_SHARD_DEADLINE_MS",
         file.shard_deadline_ms,
     )?;
     let hedge_delay_ms = parse_ms(
         "hedge-delay-ms",
-        "TURBOVEC_HEDGE_DELAY_MS",
+        "PIPESTREAM_SEARCH_HEDGE_DELAY_MS",
         file.hedge_delay_ms,
     )?;
     let replica_addrs: Vec<Option<String>> = match &shard_map {
@@ -373,7 +389,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     let replica_sync_ms = opt(
         args,
         "replica-sync-ms",
-        "TURBOVEC_REPLICA_SYNC_MS",
+        "PIPESTREAM_SEARCH_REPLICA_SYNC_MS",
         file.replica_sync_ms.map(|v| v.to_string()).as_deref(),
     )
     .map(|value| {
@@ -386,7 +402,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     let replica_state_path = opt(
         args,
         "replica-state",
-        "TURBOVEC_REPLICA_STATE",
+        "PIPESTREAM_SEARCH_REPLICA_STATE",
         file.replica_state.as_deref(),
     )
     .map(PathBuf::from)
@@ -476,7 +492,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     let max_message_bytes = opt(
         args,
         "max-message-mib",
-        "TURBOVEC_MAX_MESSAGE_MIB",
+        "PIPESTREAM_SEARCH_MAX_MESSAGE_MIB",
         file.max_message_mib.map(|m| m.to_string()).as_deref(),
     )
     .map(|s| {
@@ -489,14 +505,13 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
 
     let demo_query = flag_present(args, "demo-query")
         || std::env::var("PIPESTREAM_SEARCH_DEMO_QUERY")
-            .or_else(|_| std::env::var("TURBOVEC_DEMO_QUERY"))
             .map(|s| parse_env_bool(&s))
             .unwrap_or(false)
         || file.demo_query.unwrap_or(false);
     let query_dim = opt(
         args,
         "query-dim",
-        "TURBOVEC_QUERY_DIM",
+        "PIPESTREAM_SEARCH_QUERY_DIM",
         file.query_dim.map(|d| d.to_string()).as_deref(),
     )
     .map(|s| {
@@ -532,14 +547,18 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         return Err("--demo-query requires the coordinator or both role".to_string());
     }
 
-    let save_on_shutdown = match opt(args, "save-on-shutdown", "TURBOVEC_SAVE_ON_SHUTDOWN", None) {
+    let save_on_shutdown = match opt(
+        args,
+        "save-on-shutdown",
+        "PIPESTREAM_SEARCH_SAVE_ON_SHUTDOWN",
+        None,
+    ) {
         Some(s) => parse_env_bool(&s),
         None => file.save_on_shutdown.unwrap_or(true),
     };
 
     let stream_search = flag_present(args, "stream-search")
         || std::env::var("PIPESTREAM_SEARCH_STREAM_SEARCH")
-            .or_else(|_| std::env::var("TURBOVEC_STREAM_SEARCH"))
             .map(|s| parse_env_bool(&s))
             .unwrap_or(false)
         || file.stream_search.unwrap_or(false);
@@ -565,18 +584,18 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         };
     let stream_finish_settle_us = parse_window_us(
         "stream-finish-settle-us",
-        "TURBOVEC_STREAM_FINISH_SETTLE_US",
+        "PIPESTREAM_SEARCH_STREAM_FINISH_SETTLE_US",
         file.stream_finish_settle_us,
     )?;
     let stream_finish_deadline_us = parse_window_us(
         "stream-finish-deadline-us",
-        "TURBOVEC_STREAM_FINISH_DEADLINE_US",
+        "PIPESTREAM_SEARCH_STREAM_FINISH_DEADLINE_US",
         file.stream_finish_deadline_us,
     )?;
     let stream_poll_delay_us = match opt(
         args,
         "stream-poll-delay-us",
-        "TURBOVEC_STREAM_POLL_DELAY_US",
+        "PIPESTREAM_SEARCH_STREAM_POLL_DELAY_US",
         None,
     ) {
         Some(raw) => Some(
@@ -614,7 +633,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         opt(
             args,
             "bm25-stream",
-            "TURBOVEC_BM25_STREAM",
+            "PIPESTREAM_SEARCH_BM25_STREAM",
             file.bm25_stream.map(|value| value.to_string()).as_deref(),
         )
         .map(|value| parse_env_bool(&value))
@@ -624,7 +643,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     let max_k = opt(
         args,
         "max-k",
-        "TURBOVEC_MAX_K",
+        "PIPESTREAM_SEARCH_MAX_K",
         file.max_k.map(|v| v.to_string()).as_deref(),
     )
     .map(|s| {
@@ -643,7 +662,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     let signal_batch = opt(
         args,
         "signal-batch",
-        "TURBOVEC_SIGNAL_BATCH",
+        "PIPESTREAM_SEARCH_SIGNAL_BATCH",
         file.signal_batch.map(|v| v.to_string()).as_deref(),
     )
     .map(|s| {
@@ -662,7 +681,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     let max_rerank_bytes = opt(
         args,
         "max-rerank-mib",
-        "TURBOVEC_MAX_RERANK_MIB",
+        "PIPESTREAM_SEARCH_MAX_RERANK_MIB",
         file.max_rerank_mib.map(|v| v.to_string()).as_deref(),
     )
     .map(|s| {
@@ -706,7 +725,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     let analysis_addr = opt(
         args,
         "analysis-addr",
-        "TURBOVEC_ANALYSIS_ADDR",
+        "PIPESTREAM_SEARCH_ANALYSIS_ADDR",
         file.analysis_addr.as_deref(),
     )
     .map(normalize_analysis_backend);
@@ -717,7 +736,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     let bm25_k1 = opt(
         args,
         "bm25-k1",
-        "TURBOVEC_BM25_K1",
+        "PIPESTREAM_SEARCH_BM25_K1",
         file.bm25_k1.map(|v| v.to_string()).as_deref(),
     )
     .map(|s| {
@@ -729,7 +748,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     let bm25_b = opt(
         args,
         "bm25-b",
-        "TURBOVEC_BM25_B",
+        "PIPESTREAM_SEARCH_BM25_B",
         file.bm25_b.map(|v| v.to_string()).as_deref(),
     )
     .map(|s| s.parse::<f32>().map_err(|e| format!("invalid bm25 b: {e}")))

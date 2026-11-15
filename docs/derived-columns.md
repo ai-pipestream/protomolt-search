@@ -36,7 +36,7 @@ disclosure = "inputs"
 ```
 
 A node takes it with `--derived-columns=<file>` (the shard map, or a
-file with just the table; `TURBOVEC_DERIVED_COLUMNS`, config key
+file with just the table; `PIPESTREAM_SEARCH_DERIVED_COLUMNS`, config key
 `derived_columns`) or as the config file's own `[[derived]]` table,
 never both. The coordinator takes the shard map's table.
 

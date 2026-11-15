@@ -40,8 +40,7 @@ Useful settings:
   stream; `false` is the exact unary A/B route.
 - `--max-message-mib` (default 64) caps gRPC messages in both directions.
 
-Every flag also reads an environment variable in two forms, the neutral
-`PIPESTREAM_SEARCH_<NAME>` (checked first) and the legacy `TURBOVEC_<NAME>`, and
+Every flag also reads the environment variable `PIPESTREAM_SEARCH_<NAME>` and
 a config-file key with underscores. Settings resolve CLI flag, environment
 variable, config file, built-in default.
 

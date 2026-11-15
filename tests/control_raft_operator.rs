@@ -801,10 +801,10 @@ fn bootstrap_args(
 fn run_child(args: Vec<String>) -> std::process::Output {
     let mut command = std::process::Command::new(BIN);
     command.args(&args);
-    // The child's config comes from its flags alone: a TURBOVEC_* or
+    // The child's config comes from its flags alone: a
     // PIPESTREAM_SEARCH_* variable of this shell must not leak into it.
     for (key, _) in std::env::vars() {
-        if key.starts_with("TURBOVEC_") || key.starts_with("PIPESTREAM_SEARCH_") {
+        if key.starts_with("PIPESTREAM_SEARCH_") {
             command.env_remove(key);
         }
     }

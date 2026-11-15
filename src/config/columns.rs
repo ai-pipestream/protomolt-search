@@ -25,7 +25,7 @@ pub(super) fn parse_column_fields(
     file: &FileConfig,
     placement_column: &Option<String>,
 ) -> Result<ColumnFields, String> {
-    let bm25_fields = match opt(args, "bm25-fields", "TURBOVEC_BM25_FIELDS", None) {
+    let bm25_fields = match opt(args, "bm25-fields", "PIPESTREAM_SEARCH_BM25_FIELDS", None) {
         Some(s) => s
             .split(',')
             .map(str::trim)
@@ -48,31 +48,36 @@ pub(super) fn parse_column_fields(
         }
     }
 
-    let facet_fields: Vec<String> = match opt(args, "facet-fields", "TURBOVEC_FACET_FIELDS", None) {
-        Some(s) => s
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect(),
-        None => file.facet_fields.clone().unwrap_or_default(),
-    };
-    for (i, name) in facet_fields.iter().enumerate() {
-        if facet_fields[..i].contains(name) {
-            return Err(format!("facet field {name:?} repeats in the facet table"));
-        }
-    }
-
-    let numeric_fields: Vec<String> =
-        match opt(args, "numeric-fields", "TURBOVEC_NUMERIC_FIELDS", None) {
+    let facet_fields: Vec<String> =
+        match opt(args, "facet-fields", "PIPESTREAM_SEARCH_FACET_FIELDS", None) {
             Some(s) => s
                 .split(',')
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .collect(),
-            None => file.numeric_fields.clone().unwrap_or_default(),
+            None => file.facet_fields.clone().unwrap_or_default(),
         };
+    for (i, name) in facet_fields.iter().enumerate() {
+        if facet_fields[..i].contains(name) {
+            return Err(format!("facet field {name:?} repeats in the facet table"));
+        }
+    }
+
+    let numeric_fields: Vec<String> = match opt(
+        args,
+        "numeric-fields",
+        "PIPESTREAM_SEARCH_NUMERIC_FIELDS",
+        None,
+    ) {
+        Some(s) => s
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        None => file.numeric_fields.clone().unwrap_or_default(),
+    };
     for (i, name) in numeric_fields.iter().enumerate() {
         if numeric_fields[..i].contains(name) {
             return Err(format!(
@@ -100,27 +105,27 @@ pub(super) fn parse_column_fields(
     };
     let map_facet_fields = parse_list(
         "map-facet-fields",
-        "TURBOVEC_MAP_FACET_FIELDS",
+        "PIPESTREAM_SEARCH_MAP_FACET_FIELDS",
         &file.map_facet_fields,
     );
     let map_numeric_fields = parse_list(
         "map-numeric-fields",
-        "TURBOVEC_MAP_NUMERIC_FIELDS",
+        "PIPESTREAM_SEARCH_MAP_NUMERIC_FIELDS",
         &file.map_numeric_fields,
     );
     let map_integer_fields = parse_list(
         "map-integer-fields",
-        "PROTOMOLT_MAP_INTEGER_FIELDS",
+        "PIPESTREAM_SEARCH_MAP_INTEGER_FIELDS",
         &file.map_integer_fields,
     );
     let map_unsigned_integer_fields = parse_list(
         "map-unsigned-integer-fields",
-        "PROTOMOLT_MAP_UNSIGNED_INTEGER_FIELDS",
+        "PIPESTREAM_SEARCH_MAP_UNSIGNED_INTEGER_FIELDS",
         &file.map_unsigned_integer_fields,
     );
     let integer_fields = parse_list(
         "integer-fields",
-        "TURBOVEC_INTEGER_FIELDS",
+        "PIPESTREAM_SEARCH_INTEGER_FIELDS",
         &file.integer_fields,
     );
     let unsigned_integer_fields = parse_list(
@@ -128,7 +133,11 @@ pub(super) fn parse_column_fields(
         "PIPESTREAM_SEARCH_UNSIGNED_INTEGER_FIELDS",
         &file.unsigned_integer_fields,
     );
-    let geo_fields = parse_list("geo-fields", "TURBOVEC_GEO_FIELDS", &file.geo_fields);
+    let geo_fields = parse_list(
+        "geo-fields",
+        "PIPESTREAM_SEARCH_GEO_FIELDS",
+        &file.geo_fields,
+    );
     // One name space across all column kinds: the v7 column table
     // refuses duplicates, so the config does too, early and by name.
     // The placement column is an integer column whether or not the

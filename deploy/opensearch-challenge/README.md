@@ -8,8 +8,7 @@ The default OpenSearch opponent is the official 3.8.0 image pinned by digest.
 It uses one shard, the whitespace-plus-lowercase analyzer, Lucene HNSW with
 inner-product scoring, efficient inline k-NN filters, field collapse, and an
 unweighted RRF search pipeline with rank constant 60. Those choices follow the
-retained official documentation under
-`docs/ai-slop/source-reference/opensearch`.
+official OpenSearch 3.8 documentation.
 
 ## Run it
 
@@ -56,9 +55,7 @@ reconstructs the generated judgments exactly.
 The JSONL challenge is intentionally inspectable, but it is not the million-row
 path. For binary provider images, exact threshold discovery at several k
 values, the real CourtListener embedding artifact, and public FP32-rerank phase
-timings, use `examples/exact_rerank_scale.rs`. The measured one-million-vector
-result and reproduction commands are in
-[`turboquant-exact-rerank-scale-1m-2026-09-01.md`](../../docs/ai-slop/turboquant-exact-rerank-scale-1m-2026-09-01.md).
+timings, use `examples/exact_rerank_scale.rs`.
 
 Without `--out`, the runner uses a validated `mktemp` directory and removes
 it on success. `--keep` retains that temporary directory. It refuses occupied

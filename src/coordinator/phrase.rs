@@ -29,8 +29,7 @@ impl CoordinatorServiceImpl {
         let addr = self.analysis_addr.clone().ok_or_else(|| {
             Status::unavailable("no analysis backend configured on the coordinator (analysis_addr)")
         })?;
-        let trace = std::env::var_os("PIPESTREAM_SEARCH_TRACE_BM25").is_some()
-            || std::env::var_os("TURBOVEC_TRACE_BM25").is_some();
+        let trace = std::env::var_os("PIPESTREAM_SEARCH_TRACE_BM25").is_some();
         let started = std::time::Instant::now();
         let plan =
             PhrasePlan::analyze(fields, base, index, &addr, weight_per_token, max_weight).await?;

@@ -59,15 +59,7 @@ pub(super) fn arg_values(args: &[String], key: &str) -> Vec<String> {
 
 /// CLI > env > file, for string-valued options.
 pub(super) fn opt(args: &[String], key: &str, env: &str, file: Option<&str>) -> Option<String> {
-    let neutral_env = env
-        .strip_prefix("TURBOVEC_")
-        .map(|suffix| format!("PIPESTREAM_SEARCH_{suffix}"));
     arg_value(args, key)
-        .or_else(|| {
-            neutral_env
-                .as_deref()
-                .and_then(|name| std::env::var(name).ok())
-        })
         .or_else(|| std::env::var(env).ok())
         .or_else(|| file.map(str::to_string))
 }
