@@ -1,5 +1,6 @@
 //! A trusted local segment transaction and its coherent serving-state switch.
 use super::*;
+mod backup;
 mod maintenance;
 mod rewrite;
 use crate::document_catalog::{DocumentCatalog, ProjectionRecovery};
@@ -27,6 +28,59 @@ struct PreparedServingState {
     exact: Option<ExactVectorStore>,
     bm25: Bm25Shard,
     live: LiveDocs,
+}
+
+type PublicationBackend = Option<(usize, crate::vector::VectorBackendConfig)>;
+
+type PublicationSnapshot = (
+    crate::segments::SegmentCatalog,
+    Arc<OpenedSegmentSet>,
+    LiveDocs,
+    PublicationBackend,
+    Option<crate::postings::StoredBinding>,
+    StatsClaim,
+);
+
+fn read_backend_and_next_claim(
+    guard: &ShardState,
+    exhausted_msg: &'static str,
+) -> Result<(PublicationBackend, StatsClaim), Status> {
+    let backend = guard
+        .index
+        .as_ref()
+        .map(|index| {
+            Ok::<_, Status>((
+                index
+                    .dim_opt()
+                    .ok_or_else(|| Status::failed_precondition("provider has no dimension"))?,
+                index
+                    .backend_config()
+                    .map_err(|error| Status::failed_precondition(error.to_string()))?,
+            ))
+        })
+        .transpose()?;
+    let next = guard
+        .stats_epoch
+        .checked_add(1)
+        .ok_or_else(|| Status::resource_exhausted(exhausted_msg))?;
+    let next_claim = StatsClaim::required(next, &guard.stats_incarnation.bytes()?)?;
+    Ok((backend, next_claim))
+}
+
+fn install_prepared_serving_state(
+    guard: &mut ShardState,
+    prepared: PreparedServingState,
+    stats_epoch: u64,
+) {
+    guard.index = prepared.index;
+    guard.exact_vectors = prepared.exact;
+    guard.multi_res_vectors = prepared.retained;
+    guard.mapped_binding = prepared.bm25.binding().cloned();
+    guard.bm25 = Some(prepared.bm25);
+    guard.live_docs = prepared.live;
+    guard.parents = None;
+    guard.stats_epoch = stats_epoch;
+    guard.files_current = false;
 }
 
 pub(super) fn check_source_live_view(
@@ -258,6 +312,109 @@ impl NodeServiceImpl {
             .map(|(claim, _)| claim)
     }
 
+    fn resolve_projection_declaration(
+        &self,
+        source: SourcePublication<'_>,
+        old_set: &OpenedSegmentSet,
+        backend: &PublicationBackend,
+    ) -> Result<crate::pb::storage::IndexGenerationDeclaration, Status> {
+        use crate::segments::generation;
+        let mut declared = generation::from_store(
+            &heap_store(&self.config).map_err(Status::failed_precondition)?,
+            backend.clone(),
+        )
+        .map_err(Status::failed_precondition)?;
+        if let Some(previous) = old_set.generation_declaration() {
+            generation::check_upgrade(&declared, previous).map_err(Status::failed_precondition)?;
+            declared = previous.clone();
+        } else if !old_set.is_empty() {
+            let previous = generation::from_reader(old_set.bm25(0), backend.clone())
+                .map_err(Status::failed_precondition)?;
+            generation::check_upgrade(&declared, &previous).map_err(Status::failed_precondition)?;
+            declared = previous;
+        }
+        if let Some(staged) = source.candidate.segments().filter(|set| !set.is_empty()) {
+            let mut selected = generation::backend(&declared);
+            if selected.is_none() {
+                if let Some(vector) = (0..staged.len()).find_map(|i| staged.vector(i)) {
+                    selected = Some((
+                        vector.dim_opt().ok_or_else(|| {
+                            Status::failed_precondition("candidate vector dimension is absent")
+                        })?,
+                        vector
+                            .backend_config()
+                            .map_err(|e| Status::failed_precondition(e.to_string()))?,
+                    ));
+                }
+            }
+            let candidate = generation::from_reader(staged.bm25(0), selected)
+                .map_err(Status::failed_precondition)?;
+            generation::check_upgrade(&declared, &candidate)
+                .map_err(Status::failed_precondition)?;
+            declared = candidate;
+        }
+        Ok(declared)
+    }
+
+    fn verify_projection_decision(
+        &self,
+        source: SourcePublication<'_>,
+        catalog: &crate::segments::SegmentCatalog,
+        intent: Option<&ProjectionIntent>,
+    ) -> Result<(), Status> {
+        #[cfg(test)]
+        if FAIL_PROJECTION_DECISION.with(|fail| fail.replace(false)) {
+            self.fence_ingest("injected interruption after activation; reopen for recovery".into());
+            return Err(Status::unavailable(
+                "injected interruption before source decision",
+            ));
+        }
+        match source
+            .catalog
+            .recover_index_publication(source.index_key, catalog)
+        {
+            Ok(ProjectionRecovery::Committed(ref decided)) if Some(decided) == intent => Ok(()),
+            result => {
+                self.fence_ingest(
+                    "source publication activation lacks a matching durable decision; reopen for recovery"
+                        .into(),
+                );
+                Err(match result {
+                    Err(status) => status,
+                    Ok(_) => Status::data_loss(
+                        "source publication resolved a different artifact decision",
+                    ),
+                })
+            }
+        }
+    }
+
+    fn snapshot_for_publication(
+        &self,
+        expected: StatsClaim,
+        catalog_epoch: u64,
+        is_projection: bool,
+    ) -> Result<PublicationSnapshot, Status> {
+        let guard = read_shard(&self.state);
+        if !is_projection {
+            guard.check_legacy_mutation()?;
+        }
+        self.check_segment_publication(&guard, expected, catalog_epoch)?;
+        let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
+            unreachable!()
+        };
+        let (backend, next_claim) =
+            read_backend_and_next_claim(&guard, "publication statistics epoch exhausted")?;
+        Ok((
+            shard.catalog().clone(),
+            shard.snapshot().clone(),
+            guard.live_docs.clone(),
+            backend,
+            guard.mapped_binding.clone(),
+            next_claim,
+        ))
+    }
+
     fn publish_rows_inner(
         &self,
         expected: StatsClaim,
@@ -273,82 +430,17 @@ impl NodeServiceImpl {
             .seal_lock
             .lock()
             .map_err(|_| Status::internal("seal lock poisoned"))?;
-        let (catalog, old_set, old_live, backend, old_binding, next_claim) = {
-            let guard = read_shard(&self.state);
-            if projection.is_none() {
-                guard.check_legacy_mutation()?;
-            }
-            self.check_segment_publication(&guard, expected, catalog_epoch)?;
-            let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
-                unreachable!()
-            };
-            let backend = guard
-                .index
-                .as_ref()
-                .map(|index| {
-                    Ok::<_, Status>((
-                        index.dim_opt().ok_or_else(|| {
-                            Status::failed_precondition("provider has no dimension")
-                        })?,
-                        index
-                            .backend_config()
-                            .map_err(|error| Status::failed_precondition(error.to_string()))?,
-                    ))
-                })
-                .transpose()?;
-            let next = guard.stats_epoch.checked_add(1).ok_or_else(|| {
-                Status::resource_exhausted("publication statistics epoch exhausted")
-            })?;
-            let next_claim = StatsClaim::required(next, &guard.stats_incarnation.bytes()?)?;
-            (
-                shard.catalog().clone(),
-                shard.snapshot().clone(),
-                guard.live_docs.clone(),
-                backend,
-                guard.mapped_binding.clone(),
-                next_claim,
-            )
-        };
+        let (catalog, old_set, old_live, backend, old_binding, next_claim) =
+            self.snapshot_for_publication(expected, catalog_epoch, projection.is_some())?;
         if projection.is_some() {
             check_source_live_view(&old_set, &old_live)?;
         }
         let source_owner = projection
-            .map(|source| source.catalog.index_owner(source.index_key))
+            .map(|s| s.catalog.index_owner(s.index_key))
             .transpose()?;
         let declaration = projection
-            .map(|source| {
-                use crate::segments::generation;
-                // The reviewed configuration supplies even columns with no rows.
-                let mut declared =
-                    generation::from_store(&heap_store(&self.config)?, backend.clone())?;
-                if let Some(previous) = old_set.generation_declaration() {
-                    generation::check_upgrade(&declared, previous)?;
-                    declared = previous.clone();
-                } else if !old_set.is_empty() {
-                    let previous = generation::from_reader(old_set.bm25(0), backend.clone())?;
-                    generation::check_upgrade(&declared, &previous)?;
-                    declared = previous;
-                }
-                if let Some(staged) = source.candidate.segments().filter(|set| !set.is_empty()) {
-                    let mut selected_backend = generation::backend(&declared);
-                    if selected_backend.is_none() {
-                        if let Some(vector) = (0..staged.len()).find_map(|i| staged.vector(i)) {
-                            selected_backend = Some((
-                                vector
-                                    .dim_opt()
-                                    .ok_or("candidate vector dimension is absent")?,
-                                vector.backend_config().map_err(|error| error.to_string())?,
-                            ));
-                        }
-                    }
-                    let candidate = generation::from_reader(staged.bm25(0), selected_backend)?;
-                    generation::check_upgrade(&declared, &candidate)?;
-                    declared = candidate;
-                }
-                Ok::<_, String>(declared)
-            })
-            .transpose()
-            .map_err(Status::failed_precondition)?;
+            .map(|s| self.resolve_projection_declaration(s, &old_set, &backend))
+            .transpose()?;
         let mut prepared_commit = false;
         let prepare = |set: &Arc<OpenedSegmentSet>| {
             let prepared = self.prepare_serving_state(&catalog, set, old_live, backend)?;
@@ -357,36 +449,25 @@ impl NodeServiceImpl {
             {
                 return Err("publication changes the current mapped binding".into());
             }
-            // All expensive preparation happened while queries could still read
-            // the old state. Keep this guard through manifest sync and activation.
             let guard = write_shard(&self.state);
             self.check_segment_publication(&guard, expected, catalog_epoch)
                 .map_err(|status| status.to_string())?;
             prepared_commit = true;
             let intent = projection
-                .map(|source| {
-                    source
-                        .catalog
-                        .prepare_index_publication(
-                            source.index_key,
-                            source.candidate,
-                            &old_set,
-                            set,
-                        )
+                .map(|s| {
+                    s.catalog
+                        .prepare_index_publication(s.index_key, s.candidate, &old_set, set)
                         .map_err(|status| status.to_string())
                 })
                 .transpose()?;
             Ok((guard, prepared, intent))
         };
         let result = match projection {
-            Some(source) => catalog.commit_projection_prepared(
+            Some(s) => catalog.commit_projection_prepared(
                 catalog_epoch,
                 retirements,
                 sources,
-                source
-                    .candidate
-                    .segments()
-                    .and_then(OpenedSegmentSet::binding),
+                s.candidate.segments().and_then(OpenedSegmentSet::binding),
                 source_owner
                     .as_ref()
                     .expect("source publication has an owner"),
@@ -397,55 +478,18 @@ impl NodeServiceImpl {
             ),
             None => catalog.commit_rows_prepared(catalog_epoch, retirements, sources, prepare),
         };
-        let (_, (mut guard, prepared, intent)) = match result {
-            Ok(result) => result,
-            Err(error) => {
-                if prepared_commit {
-                    self.fence_ingest(
-                        "segment publication did not acknowledge its manifest; reopen for recovery"
-                            .into(),
-                    );
-                }
-                return Err(Status::failed_precondition(error));
-            }
-        };
-        // Install the already-prepared fields without fallible work. For source
-        // publication, the journal decision is checked next under this guard.
-        guard.index = prepared.index;
-        guard.exact_vectors = prepared.exact;
-        guard.multi_res_vectors = prepared.retained;
-        guard.mapped_binding = prepared.bm25.binding().cloned();
-        guard.bm25 = Some(prepared.bm25);
-        guard.live_docs = prepared.live;
-        guard.parents = None;
-        guard.stats_epoch = next_claim.epoch;
-        guard.files_current = false;
-        if let Some(source) = projection {
-            #[cfg(test)]
-            if FAIL_PROJECTION_DECISION.with(|fail| fail.replace(false)) {
+        let (_, (mut guard, prepared, intent)) = result.map_err(|error| {
+            if prepared_commit {
                 self.fence_ingest(
-                    "injected interruption after activation; reopen for recovery".into(),
+                    "segment publication did not acknowledge its manifest; reopen for recovery"
+                        .into(),
                 );
-                return Err(Status::unavailable(
-                    "injected interruption before source decision",
-                ));
             }
-            let resolved = source
-                .catalog
-                .recover_index_publication(source.index_key, &catalog);
-            match resolved {
-                Ok(ProjectionRecovery::Committed(ref decided))
-                    if Some(decided) == intent.as_ref() => {}
-                result => {
-                    self.fence_ingest("source publication activation lacks a matching durable decision; reopen for recovery".into());
-                    return Err(match result {
-                        Err(status) => status,
-                        Ok(_) => Status::data_loss(
-                            "source publication resolved a different artifact decision",
-                        ),
-                    });
-                }
-            }
+            Status::failed_precondition(error)
+        })?;
+        install_prepared_serving_state(&mut guard, prepared, next_claim.epoch);
+        if let Some(source) = projection {
+            self.verify_projection_decision(source, &catalog, intent.as_ref())?;
         }
         Ok((next_claim, intent))
     }
@@ -576,64 +620,6 @@ impl NodeServiceImpl {
             bm25: Bm25Shard::Segmented(shard),
             live,
         })
-    }
-}
-
-impl NodeServiceImpl {
-    /// The live catalog and its shared publication fence, admitted for the
-    /// trusted backup owner. Never substitute a second catalog opened by path.
-    pub(crate) fn document_backup_catalog(
-        &self,
-        source: &DocumentCatalog,
-        index_key: &[u8],
-    ) -> Result<crate::segments::SegmentCatalog, Status> {
-        if source.collection()? != self.config.collection {
-            return Err(Status::failed_precondition(
-                "backup source and node collections differ",
-            ));
-        }
-        let owner = source.index_owner(index_key)?;
-        let guard = read_shard(&self.state);
-        let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
-            return Err(Status::failed_precondition(
-                "source backup needs a segmented node",
-            ));
-        };
-        let claim = StatsClaim::required(guard.stats_epoch, &guard.stats_incarnation.bytes()?)?;
-        self.check_segment_publication(&guard, claim, shard.snapshot().epoch())?;
-        check_source_live_view(shard.snapshot(), &guard.live_docs)?;
-        if shard
-            .snapshot()
-            .manifest()
-            .source_owner
-            .as_ref()
-            .map(|o| o.decode())
-            .transpose()
-            .map_err(Status::data_loss)?
-            .is_some_and(|o| o != owner)
-        {
-            return Err(Status::failed_precondition(
-                "backup node belongs to another source owner",
-            ));
-        }
-        Ok(shard.catalog().clone())
-    }
-
-    /// Back up a source authority with exactly one journaled local index. The
-    /// multi-index owner uses DocumentCatalog::capture_backup with every live
-    /// catalog. This is synchronous local storage work, not an administration
-    /// RPC, a serving activation or permission to export a phone's shard.
-    pub fn backup_documents_blocking(
-        &self,
-        source: &DocumentCatalog,
-        index_key: &[u8],
-        destination: &Path,
-        limits: &crate::pb::storage::SourceBackupLimits,
-    ) -> Result<crate::pb::storage::SourceBackupManifest, Status> {
-        let catalog = self.document_backup_catalog(source, index_key)?;
-        source
-            .capture_backup(&[(index_key, &catalog)], limits)?
-            .write_to(destination)
     }
 }
 

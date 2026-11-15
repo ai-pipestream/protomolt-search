@@ -101,9 +101,10 @@ pub(in crate::node) use self::scan::MAX_COALESCE;
 pub(in crate::node) use self::scan::{raise_floor_cell, ScanJob, ScanOutcome, StreamSignals};
 pub(in crate::node) use self::shard::{
     active_artifact_rows, filter_known_flags, int_min_max_as_f64, live_document_count,
-    live_field_stats, projected_value, prune_segments, resolve_shard_filters, uint_min_max_as_f64,
-    unknown_range_counts, validate_lat_lon, EmptyColumns, IngestGuard, ResolvedShardFilters,
-    SegmentPrune, ShardNumericRead,
+    live_field_stats, projected_value, prune_segments, resolve_shard_filters,
+    score_exact_slots_checked, uint_min_max_as_f64, unknown_range_counts, validate_lat_lon,
+    AdmittedDocPass, DocPassSpec, EmptyColumns, IngestGuard, ResolvedShardFilters, SegmentPrune,
+    ShardNumericRead,
 };
 pub(in crate::node) use self::snapshot::stream_file;
 pub(in crate::node) use self::storage::{

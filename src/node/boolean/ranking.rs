@@ -351,27 +351,7 @@ impl NodeServiceImpl {
         }
         let mut products = 0usize;
         if leaf.exact_fp32 {
-            let exact = guard.exact_vectors.as_ref().ok_or_else(|| {
-                Status::failed_precondition(format!(
-                    "FP32 rerank requested for shard slots {}.. but this generation has no \
-                     exact-vector sidecar; rebuild or backfill it",
-                    self.config.slot_offset
-                ))
-            })?;
-            if let Some(index) = guard.index.as_ref() {
-                if exact.len() != index.len() || exact.dim() != index.dim_opt() {
-                    return Err(Status::failed_precondition(format!(
-                        "exact-vector sidecar shape {:?}x{} does not match provider shape {:?}x{}",
-                        exact.dim(),
-                        exact.len(),
-                        index.dim_opt(),
-                        index.len()
-                    )));
-                }
-            }
-            let dim = exact.dim().ok_or_else(|| {
-                Status::failed_precondition("exact-vector sidecar has no dimension")
-            })?;
+            let (exact, dim) = Self::prepare_exact_sidecar(guard, self.config.slot_offset, None)?;
             let parallel = resolved_rerank_parallel(self.config.rerank_parallel);
             let batch = if req.exact_batch == 0 {
                 10_000
@@ -380,20 +360,14 @@ impl NodeServiceImpl {
             };
             for chunk in slots.chunks(batch) {
                 let local: Vec<usize> = chunk.iter().map(|&slot| slot as usize).collect();
-                let predicted = (local.len() as u64)
-                    .checked_mul(dim as u64)
-                    .and_then(|bytes| bytes.checked_mul(4))
-                    .ok_or_else(|| Status::resource_exhausted("FP32 rerank byte count overflow"))?;
-                if req.max_logical_bytes != 0 && predicted > req.max_logical_bytes {
-                    return Err(Status::resource_exhausted(format!(
-                        "FP32 rerank needs {predicted} logical row bytes on this shard, above \
-                         max_logical_bytes={}",
-                        req.max_logical_bytes
-                    )));
-                }
-                let scored = exact
-                    .score_slots_profiled(&leaf.vector, &local, parallel)
-                    .map_err(|e| Status::invalid_argument(e.to_string()))?;
+                let scored = score_exact_slots_checked(
+                    exact,
+                    dim,
+                    &leaf.vector,
+                    &local,
+                    req.max_logical_bytes,
+                    parallel,
+                )?;
                 for (slot, score) in scored.rows {
                     products += 1;
                     each(slot as u32, score);

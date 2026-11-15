@@ -4,15 +4,18 @@ use std::time::Instant;
 
 use tonic::Status;
 
-use crate::exact_vectors::ExactVectorStore;
 use crate::live_docs::LiveDocs;
 use crate::node::{Bm25Shard, NodeServiceImpl, ShardState};
 use crate::pb::{CompactShardRequest, CompactShardResponse};
-use crate::segments::{SegmentCatalog, SegmentMetadata, SegmentSetManifest, SegmentSource};
+use crate::segments::{SegmentCatalog, SegmentMetadata, SegmentSetManifest};
 use crate::vector::VectorIndex;
 
 #[cfg(test)]
 use super::segment_staging_hook;
+use super::shadow::{
+    open_segmented_vectors, stage_compacted_images, verify_compacted_vector_descriptor,
+    StageImagesSpec,
+};
 use super::{
     layout_name, PreparedSegmentCutover, SegmentPreflight, CUTOVER_RETRIES, MAX_TAIL_PASSES,
     PAIRED_APPEND_PAUSE, PAIRED_APPEND_WAIT, STALLED_TAIL_PASSES,
@@ -291,53 +294,14 @@ impl NodeServiceImpl {
             .epoch
             .checked_add(1)
             .ok_or_else(|| Status::out_of_range("compaction staging epoch exhausted"))?;
-        let mut live_paths = Vec::with_capacity(build.images.len());
-        for image in &build.images {
-            if image.num_vectors != 0 && image.num_vectors as usize != image.row_parent_ids.len() {
-                return Err(Status::failed_precondition(format!(
-                    "compaction output {} has {} vectors over {} rows; a segment's artifacts \
-                     cover the same rows",
-                    image.vector_path.display(),
-                    image.num_vectors,
-                    image.row_parent_ids.len()
-                )));
-            }
-            if image.bm25_path.is_none() {
-                return Err(Status::failed_precondition(format!(
-                    "compaction output {} has no BM25 image; the segment layout seals documents",
-                    image.vector_path.display()
-                )));
-            }
-            let path = crate::node::live_docs_sidecar_path(&image.vector_path);
-            LiveDocs::default()
-                .write(&path, image.row_parent_ids.len() as u64)
-                .map_err(|e| Status::internal(format!("write {}: {e}", path.display())))?;
-            live_paths.push(path);
-        }
-        let ids: Vec<String> = (0..build.images.len())
-            .map(|i| format!("cmp-{generation:06}-{i:04}"))
-            .collect();
-        let sources: Vec<SegmentSource<'_>> = build
-            .images
-            .iter()
-            .zip(&ids)
-            .zip(&live_paths)
-            .map(|((image, id), live)| SegmentSource {
-                multi_res_path: image.multi_res_path.as_deref(),
-                segment_id: id,
-                generation,
-                base_label: image.slot_offset,
-                backend_kind: &pre.backend_kind,
-                vector_path: (image.num_vectors > 0).then_some(image.vector_path.as_path()),
-                exact_vector_path: (image.num_vectors > 0)
-                    .then_some(image.exact_vector_path.as_path()),
-                bm25_path: image.bm25_path.as_deref().expect("checked above"),
-                live_docs_path: live,
-                partition_column: Some(&pre.partition),
-            })
-            .collect();
-        let staged = crate::segments::stage_segments(&root, sources)
-            .map_err(|e| Status::internal(format!("stage compacted segments: {e}")))?;
+        let staged = stage_compacted_images(StageImagesSpec {
+            root: &root,
+            images: &build.images,
+            id_generation: generation,
+            source_generation: generation,
+            backend_kind: &pre.backend_kind,
+            partition_column: Some(&pre.partition),
+        })?;
         let opened = (|| -> Result<(), Status> {
             let manifest = SegmentSetManifest {
                 epoch: pre.epoch,
@@ -359,19 +323,12 @@ impl NodeServiceImpl {
             let set = shard.snapshot().clone();
             self.check_shadow_fingerprints(pre.fields.as_ref(), &Bm25Shard::Segmented(shard))?;
             if let Some(first) = (0..set.len()).find_map(|i| set.vector(i)) {
-                let d = first.descriptor();
-                if d.backend_kind != pre.backend_kind
-                    || d.scoring_fingerprint != pre.scoring_fingerprint
-                {
-                    return Err(Status::failed_precondition(format!(
-                        "the compacted segments score under {}/{} but the shard serves {}/{}; \
-                         the catalog's provider state does not reproduce the live generation",
-                        d.backend_kind,
-                        d.scoring_fingerprint,
-                        pre.backend_kind,
-                        pre.scoring_fingerprint
-                    )));
-                }
+                verify_compacted_vector_descriptor(
+                    first,
+                    &pre.backend_kind,
+                    &pre.scoring_fingerprint,
+                    "the catalog's provider state",
+                )?;
             }
             Ok(())
         })();
@@ -382,30 +339,12 @@ impl NodeServiceImpl {
         Ok(staged)
     }
 
-    /// Prepare the cutover with no lock held past a read: the final
-    /// manifest (the rebuilt partitions, then every segment sealed after
-    /// the cutoff, re-based onto the dense row count), the live overlay
-    /// translated onto the new labels, and the shadow serving state
-    /// opened over the prepared catalog. The fence at install re-checks
-    /// the epoch, the overlay revision, and the tail.
-    fn prepare_segment_cutover(
-        &self,
-        pre: &SegmentPreflight,
+    fn rebase_carried_segments(
+        source: &[SegmentMetadata],
+        manifest_now: &SegmentSetManifest,
         build: &crate::reshard::SegmentCompactionBuild,
         staged: &[SegmentMetadata],
-    ) -> Result<PreparedSegmentCutover, Status> {
-        let slot_offset = self.config.slot_offset;
-        let root = crate::node::segments_root(&pre.index_path);
-        let (manifest_now, overlay_now) = {
-            let guard = crate::node::read_shard(&self.state);
-            let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
-                return Err(Status::internal(
-                    "the shard changed layout while a compaction was running",
-                ));
-            };
-            (shard.snapshot().manifest().clone(), guard.live_docs.clone())
-        };
-        let source = &pre.set.manifest().segments;
+    ) -> Result<(Vec<SegmentMetadata>, u64, u64, u64), Status> {
         let s_rows = source
             .iter()
             .try_fold(0u64, |rows, s| rows.checked_add(s.rows))
@@ -442,7 +381,6 @@ impl NodeServiceImpl {
                 rows.checked_add(image.row_parent_ids.len() as u64)
             })
             .ok_or_else(|| Status::internal("compacted row count overflow"))?;
-        // The outputs, then the carried segments re-based onto them.
         let mut segments: Vec<SegmentMetadata> = staged.to_vec();
         let mut base = dense;
         for segment in carried {
@@ -451,35 +389,79 @@ impl NodeServiceImpl {
             base += segment.rows;
             segments.push(rebased);
         }
-        // The live overlay is the tombstone authority. A bit under the
-        // cutoff's rows names a rebuilt row through the id map (absent =
-        // already dead at the cutoff, dropped by the build); a bit above
-        // them names a carried row, shifted by the reclaimed tombstones.
+        Ok((segments, s_rows, total, dense))
+    }
+
+    fn translate_live_overlay(
+        overlay_now: &LiveDocs,
+        id_map: &std::collections::BTreeMap<u64, u64>,
+        slot_offset: u64,
+        s_rows: u64,
+        total: u64,
+        dense: u64,
+    ) -> Result<LiveDocs, Status> {
         let mut overlay = LiveDocs::default();
-        if let Some(words) = overlay_now.words() {
-            for (wi, &word) in words.iter().enumerate() {
-                let mut bits = word;
-                while bits != 0 {
-                    let bit = bits.trailing_zeros() as usize;
-                    bits &= bits - 1;
-                    let label = (wi * 64 + bit) as u64;
-                    if label < s_rows {
-                        let global = slot_offset
-                            .checked_add(label)
-                            .ok_or_else(|| Status::internal("compaction id overflow"))?;
-                        if let Some(&new_local) = build.id_map.get(&global) {
-                            overlay.delete(new_local as usize);
-                        }
-                    } else if label < total {
-                        overlay.delete((dense + (label - s_rows)) as usize);
-                    } else {
-                        return Err(Status::internal(format!(
-                            "the live overlay names row {label}, past the catalog's {total} rows"
-                        )));
+        let Some(words) = overlay_now.words() else {
+            return Ok(overlay);
+        };
+        for (wi, &word) in words.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let label = (wi * 64 + bit) as u64;
+                if label < s_rows {
+                    let global = slot_offset
+                        .checked_add(label)
+                        .ok_or_else(|| Status::internal("compaction id overflow"))?;
+                    if let Some(&new_local) = id_map.get(&global) {
+                        overlay.delete(new_local as usize);
                     }
+                } else if label < total {
+                    overlay.delete((dense + (label - s_rows)) as usize);
+                } else {
+                    return Err(Status::internal(format!(
+                        "the live overlay names row {label}, past the catalog's {total} rows"
+                    )));
                 }
             }
         }
+        Ok(overlay)
+    }
+
+    /// Prepare the cutover with no lock held past a read: the final
+    /// manifest (the rebuilt partitions, then every segment sealed after
+    /// the cutoff, re-based onto the dense row count), the live overlay
+    /// translated onto the new labels, and the shadow serving state
+    /// opened over the prepared catalog. The fence at install re-checks
+    /// the epoch, the overlay revision, and the tail.
+    fn prepare_segment_cutover(
+        &self,
+        pre: &SegmentPreflight,
+        build: &crate::reshard::SegmentCompactionBuild,
+        staged: &[SegmentMetadata],
+    ) -> Result<PreparedSegmentCutover, Status> {
+        let root = crate::node::segments_root(&pre.index_path);
+        let (manifest_now, overlay_now) = {
+            let guard = crate::node::read_shard(&self.state);
+            let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
+                return Err(Status::internal(
+                    "the shard changed layout while a compaction was running",
+                ));
+            };
+            (shard.snapshot().manifest().clone(), guard.live_docs.clone())
+        };
+        let source = &pre.set.manifest().segments;
+        let (segments, s_rows, total, dense) =
+            Self::rebase_carried_segments(source, &manifest_now, build, staged)?;
+        let overlay = Self::translate_live_overlay(
+            &overlay_now,
+            &build.id_map,
+            self.config.slot_offset,
+            s_rows,
+            total,
+            dense,
+        )?;
         let final_manifest = SegmentSetManifest {
             epoch: manifest_now.epoch,
             segments,
@@ -497,25 +479,10 @@ impl NodeServiceImpl {
                 Status::failed_precondition(format!("the compacted set does not open: {e}"))
             })?;
         let set = shard.snapshot().clone();
-        let mut index = None;
-        let mut exact_vectors = None;
-        if let Some(first) = (0..set.len()).find_map(|i| set.vector(i)) {
-            let backend = first
-                .backend_config()
-                .map_err(|e| Status::internal(format!("segment vector backend: {e}")))?;
-            let dim = first
-                .dim_opt()
-                .ok_or_else(|| Status::internal("segment vector image has no dimension"))?;
-            let tail_image = VectorIndex::from_backend_config(dim, &backend)
-                .map_err(|e| Status::internal(format!("segment tail image: {e}")))?;
-            let provider =
-                crate::segmented_vectors::SegmentedProvider::open(set.clone(), tail_image)
-                    .map_err(|e| Status::internal(format!("segment vectors: {e}")))?;
-            index = Some(VectorIndex::from_provider(provider));
-            exact_vectors = Some(ExactVectorStore::from_segments(&set, dim).map_err(|error| {
-                Status::internal(format!("compacted exact-vector view: {error}"))
-            })?);
-        }
+        let (index, exact_vectors) = match open_segmented_vectors(&set)? {
+            Some((vec_index, exact)) => (Some(vec_index), Some(exact)),
+            None => (None, None),
+        };
         Ok(PreparedSegmentCutover {
             multi_res_vectors: set.retained_vectors().map_err(Status::internal)?,
             catalog,

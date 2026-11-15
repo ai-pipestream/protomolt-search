@@ -88,14 +88,44 @@ impl NodeServiceImpl {
                 plan.fingerprint, bind.expected_fingerprint
             )));
         }
+        self.validate_mapped_columns(&extractor)?;
+        if let Some(spec) = &bind.materialize {
+            self.compiled_materialize(spec)?;
+        }
+        // The first bind pins the shard to this plan identity (recorded to
+        // the WAL now, to the store's binding entry at flush); every later
+        // bind must match it exactly.
+        let incoming = crate::postings::StoredBinding {
+            plan_fingerprint: plan.fingerprint.clone(),
+            index_contract: crate::index_contract::from_plan(plan)?,
+            body_path: extractor.body_path().to_string(),
+            materialize_sha: materialize_sha(bind.materialize.as_ref()),
+            analysis_sha: analysis.digest.clone(),
+            analysis_contract: analysis.contract.clone(),
+            vector_binding: prost::Message::encode_to_vec(
+                plan.vector_binding
+                    .as_ref()
+                    .expect("derived vector binding"),
+            ),
+        };
+        let mut guard = write_shard(&self.state);
+        guard.check_legacy_mutation()?;
+        let vector = plan
+            .vector_binding
+            .as_ref()
+            .expect("derived vector binding");
+        self.validate_vector_column_name(&vector.field, guard.bm25.as_ref())?;
+        Self::verify_or_record_mapped_binding(&mut guard, incoming)?;
+        Ok((extractor, analysis))
+    }
+
+    fn validate_mapped_columns(&self, extractor: &crate::mapping::Extractor) -> Result<(), Status> {
         let mut missing: Vec<String> = Vec::new();
-        for field in &plan.fields {
+        for field in &extractor.plan().fields {
             use crate::pb::ColumnFamily;
             let name = &field.name;
             let (table, flag) = if field.family == ColumnFamily::TextField as i32 {
                 if field.path == extractor.body_path() {
-                    // The body is the top-level text; it needs no
-                    // declared column.
                     continue;
                 }
                 if name == "body" {
@@ -129,12 +159,8 @@ impl NodeServiceImpl {
                     "--map-unsigned-integer-fields",
                 )
             } else {
-                // VECTOR is the dense leg; NONE lands nowhere, visibly.
                 continue;
             };
-            // A derived column is the index's to compute
-            // (docs/derived-columns.md): a plan projecting a source
-            // field into it is refused here, by name, not per document.
             if self
                 .config
                 .derived
@@ -158,36 +184,13 @@ impl NodeServiceImpl {
                 missing.join(", ")
             )));
         }
-        if let Some(spec) = &bind.materialize {
-            self.compiled_materialize(spec)?;
-        }
-        // The durable shard-level binding: the FIRST bind pins the
-        // shard to this plan identity (recorded to the WAL now, to the
-        // store's binding entry at flush), and every later bind must
-        // match it exactly. An index only ever pairs with the plan it
-        // was written under; changing the mapping is a rebuild, never a
-        // rebind.
-        let incoming = crate::postings::StoredBinding {
-            plan_fingerprint: plan.fingerprint.clone(),
-            index_contract: crate::index_contract::from_plan(plan)?,
-            body_path: extractor.body_path().to_string(),
-            materialize_sha: materialize_sha(bind.materialize.as_ref()),
-            analysis_sha: analysis.digest.clone(),
-            analysis_contract: analysis.contract.clone(),
-            vector_binding: prost::Message::encode_to_vec(
-                plan.vector_binding
-                    .as_ref()
-                    .expect("derived vector binding"),
-            ),
-        };
-        let mut guard = write_shard(&self.state);
-        guard.check_legacy_mutation()?;
-        let vector = plan
-            .vector_binding
-            .as_ref()
-            .expect("derived vector binding");
-        self.validate_vector_column_name(&vector.field, guard.bm25.as_ref())?;
+        Ok(())
+    }
 
+    fn verify_or_record_mapped_binding(
+        guard: &mut ShardState,
+        incoming: crate::postings::StoredBinding,
+    ) -> Result<(), Status> {
         match &guard.mapped_binding {
             Some(bound) if *bound != incoming => {
                 let mut differs = Vec::new();
@@ -223,30 +226,38 @@ impl NodeServiceImpl {
                     if differs.len() == 1 { "s" } else { "" }
                 )))
             }
-            Some(_) => Ok((extractor, analysis)),
-            None => {
-                if physical_rows(&guard) != 0 {
-                    return Err(Status::failed_precondition(
-                        "cannot bind a mapping to a populated unbound shard; rebuild from original documents",
-                    ));
-                }
-                wal_append_or_degrade(
-                    &mut guard.wal,
-                    wal_record::Op::Bind(crate::pb::wal::LoggedBinding {
-                        plan_fingerprint: incoming.plan_fingerprint.clone(),
-                        body_path: incoming.body_path.clone(),
-                        materialize_sha: incoming.materialize_sha.clone(),
-                        analysis_sha: incoming.analysis_sha.clone(),
-                        analysis_contract: incoming.analysis_contract.clone(),
-                        vector_binding: incoming.vector_binding.clone(),
-                        index_contract: incoming.index_contract.clone(),
-                    }),
-                );
-                guard.mapped_binding = Some(incoming);
-                guard.advance_stats_epoch();
-                Ok((extractor, analysis))
-            }
+            Some(_) => Ok(()),
+            None => Self::record_initial_binding(
+                guard,
+                incoming,
+                "cannot bind a mapping to a populated unbound shard; rebuild from original documents",
+            ),
         }
+    }
+
+    fn record_initial_binding(
+        guard: &mut ShardState,
+        incoming: crate::postings::StoredBinding,
+        populated_err: &'static str,
+    ) -> Result<(), Status> {
+        if physical_rows(guard) != 0 {
+            return Err(Status::failed_precondition(populated_err));
+        }
+        wal_append_or_degrade(
+            &mut guard.wal,
+            wal_record::Op::Bind(crate::pb::wal::LoggedBinding {
+                plan_fingerprint: incoming.plan_fingerprint.clone(),
+                body_path: incoming.body_path.clone(),
+                materialize_sha: incoming.materialize_sha.clone(),
+                analysis_sha: incoming.analysis_sha.clone(),
+                analysis_contract: incoming.analysis_contract.clone(),
+                vector_binding: incoming.vector_binding.clone(),
+                index_contract: incoming.index_contract.clone(),
+            }),
+        );
+        guard.mapped_binding = Some(incoming);
+        guard.advance_stats_epoch();
+        Ok(())
     }
 }
 
@@ -431,25 +442,11 @@ impl NodeServiceImpl {
             ))),
             Some(_) => Ok(true),
             None => {
-                if physical_rows(guard) != 0 {
-                    return Err(Status::failed_precondition(
-                        "cannot apply a WAL mapping binding to a populated unbound shard; install the matching base snapshot",
-                    ));
-                }
-                wal_append_or_degrade(
-                    &mut guard.wal,
-                    wal_record::Op::Bind(crate::pb::wal::LoggedBinding {
-                        plan_fingerprint: incoming.plan_fingerprint.clone(),
-                        body_path: incoming.body_path.clone(),
-                        materialize_sha: incoming.materialize_sha.clone(),
-                        analysis_sha: incoming.analysis_sha.clone(),
-                        analysis_contract: incoming.analysis_contract.clone(),
-                        vector_binding: incoming.vector_binding.clone(),
-                        index_contract: incoming.index_contract.clone(),
-                    }),
-                );
-                guard.mapped_binding = Some(incoming);
-                guard.advance_stats_epoch();
+                Self::record_initial_binding(
+                    guard,
+                    incoming,
+                    "cannot apply a WAL mapping binding to a populated unbound shard; install the matching base snapshot",
+                )?;
                 Ok(false)
             }
         }

@@ -601,6 +601,55 @@ impl NodeServiceImpl {
         .await
     }
 
+    async fn open_analysis_stream_or_refuse(
+        &self,
+        addr: &str,
+        doc: &AddDocumentsRequest,
+    ) -> Result<crate::analyzer::AnalyzeStream, Status> {
+        // Refuse sidecars lacking AnalyzeStream explicitly rather than
+        // falling back to unary per-document RPCs.
+        match crate::analyzer::AnalyzeStream::open_with_vocab(
+            addr,
+            doc.analysis.as_ref(),
+            self.vocab.clone(),
+            self.doc_session_layers(doc),
+        )
+        .await
+        {
+            Ok(session) => Ok(session),
+            Err(status) if status.code() == tonic::Code::Unimplemented => {
+                Err(Status::failed_precondition(format!(
+                    "analysis server at {addr} does not implement AnalyzeStream; \
+                     rebuild turbo-kserve from main. Refusing to ingest on the removed \
+                     unary path."
+                )))
+            }
+            Err(status) => Err(status),
+        }
+    }
+
+    async fn run_ingest_source<'a>(
+        &self,
+        addr: &str,
+        source: &mut IngestSource<'a>,
+    ) -> Result<(u64, u64, u64, u64), Status> {
+        let mut added = 0u64;
+        let mut first_id = 0u64;
+        // One analysis stream covers the whole call; documents apply in
+        // arrival order so ids and WAL order stay deterministic.
+        if let Some(first) = source.next().await? {
+            let session = self
+                .open_analysis_stream_or_refuse(addr, &first.req)
+                .await?;
+            self.ingest_streamed(session, first, source, addr, &mut added, &mut first_id)
+                .await?;
+        }
+        let guard = read_shard(&self.state);
+        let total = guard.bm25.as_ref().map_or(0, |b| b.doc_count());
+        let wal_generation = guard.wal.as_ref().map_or(0, WalWriter::generation);
+        Ok((added, first_id, total, wal_generation))
+    }
+
     pub(super) async fn handle_add_documents(
         &self,
         request: Request<Streaming<AddDocumentsRequest>>,
@@ -617,58 +666,8 @@ impl NodeServiceImpl {
                 stable_routing_key,
                 consumed: false,
             };
-            let mut added = 0u64;
-            let mut first_id = 0u64;
-            // Analysis dominates bulk ingest. One analysis stream covers the
-            // whole call, using either native bounded channels or sidecar flow
-            // control. Documents are applied strictly in arrival order, so ids
-            // and WAL order stay deterministic.
-            //
-            // A sidecar without AnalyzeStream is REFUSED rather than served on
-            // the old per-document unary path. That fallback existed and cost
-            // real debugging time: a stale sidecar silently took it, then its
-            // gRPC server GOAWAYed the connection after ~70 streams, and the
-            // bulk driver died seconds into a multi-hour job with an opaque
-            // "h2 protocol error" while this node logged nothing and stayed
-            // healthy. Degrading quietly turned a one-line version mismatch
-            // into an h2 forensics exercise; failing here names it instead.
-            if let Some(first) = source.next().await? {
-                match crate::analyzer::AnalyzeStream::open_with_vocab(
-                    &addr,
-                    first.req.analysis.as_ref(),
-                    self.vocab.clone(),
-                    self.doc_session_layers(&first.req),
-                )
-                .await
-                {
-                    Ok(session) => {
-                        self.ingest_streamed(
-                            session,
-                            first,
-                            &mut source,
-                            &addr,
-                            &mut added,
-                            &mut first_id,
-                        )
-                        .await?;
-                    }
-                    Err(status) if status.code() == tonic::Code::Unimplemented => {
-                        return Err(Status::failed_precondition(format!(
-                            "analysis server at {addr} does not implement AnalyzeStream; \
-                         rebuild turbo-kserve from main. Refusing to ingest on the removed \
-                         unary path."
-                        )));
-                    }
-                    Err(status) => return Err(status),
-                }
-            }
-            let (total, wal_generation) = {
-                let guard = read_shard(&self.state);
-                (
-                    guard.bm25.as_ref().map_or(0, |b| b.doc_count()),
-                    guard.wal.as_ref().map_or(0, WalWriter::generation),
-                )
-            };
+            let (added, first_id, total, wal_generation) =
+                self.run_ingest_source(&addr, &mut source).await?;
             crate::metrics::add_ingested(added, 0);
             self.seal_if_due().await?;
             Ok(Response::new(AddDocumentsResponse {
@@ -743,8 +742,6 @@ impl NodeServiceImpl {
                 self.bind_mapped(&bind)?
             };
             let fingerprint = extractor.plan().fingerprint.clone();
-            let mut added = 0u64;
-            let mut first_id = 0u64;
             let mut source = IngestSource::Mapped(Box::new(MappedSource {
                 stream: &mut inbound,
                 extractor,
@@ -760,43 +757,8 @@ impl NodeServiceImpl {
                     payload: Vec::new(),
                 },
             }));
-            if let Some(first) = source.next().await? {
-                match crate::analyzer::AnalyzeStream::open_with_vocab(
-                    &addr,
-                    first.req.analysis.as_ref(),
-                    self.vocab.clone(),
-                    self.doc_session_layers(&first.req),
-                )
-                .await
-                {
-                    Ok(session) => {
-                        self.ingest_streamed(
-                            session,
-                            first,
-                            &mut source,
-                            &addr,
-                            &mut added,
-                            &mut first_id,
-                        )
-                        .await?;
-                    }
-                    Err(status) if status.code() == tonic::Code::Unimplemented => {
-                        return Err(Status::failed_precondition(format!(
-                            "analysis server at {addr} does not implement AnalyzeStream; \
-                         rebuild turbo-kserve from main. Refusing to ingest on the removed \
-                         unary path."
-                        )));
-                    }
-                    Err(status) => return Err(status),
-                }
-            }
-            let (total, wal_generation) = {
-                let guard = read_shard(&self.state);
-                (
-                    guard.bm25.as_ref().map_or(0, |b| b.doc_count()),
-                    guard.wal.as_ref().map_or(0, WalWriter::generation),
-                )
-            };
+            let (added, first_id, total, wal_generation) =
+                self.run_ingest_source(&addr, &mut source).await?;
             // Each mapped row carries exactly one vector.
             crate::metrics::add_ingested(added, added);
             let parents = match &source {

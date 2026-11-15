@@ -41,16 +41,16 @@
 //! check and durability is the named residual, closed only by a
 //! storage-side fencing token the catalog does not have yet.
 
-use super::{BudgetPermit, WriteBudget};
+use super::{admit_ingest, extract_network_document, WorkPermit, WriteBudget};
 use crate::document_catalog::{Acceptance, ActiveManagedCatalog, Settlement};
 use crate::metrics::{self, Route};
 use crate::pb::document_write_service_server::{DocumentWriteService, DocumentWriteServiceServer};
 use crate::pb::{
-    AccessAction, DocumentWriteReceipt, DocumentWriteRequest, DocumentWriteServiceLimits,
-    DocumentWriteTarget, GetDocumentWriteTargetRequest,
+    DocumentWriteReceipt, DocumentWriteRequest, DocumentWriteServiceLimits, DocumentWriteTarget,
+    GetDocumentWriteTargetRequest,
 };
 use crate::raft::RaftHost;
-use crate::security::{Permit, Principals};
+use crate::security::Principals;
 use prost::Message;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -65,11 +65,6 @@ struct Inner {
     /// `arm_grant_delay` so a test can age a lease past its interval.
     #[cfg(any(test, feature = "fault-injection"))]
     grant_delay: std::sync::Mutex<Option<std::time::Duration>>,
-}
-
-struct WorkPermit {
-    _principal: Permit,
-    _budget: BudgetPermit,
 }
 
 /// Recover every managed catalog the operator configured, for the serving
@@ -219,36 +214,19 @@ impl HostedDocumentWriteService {
         ),
         Status,
     > {
-        let principal = self.inner.principals.authenticate(request.metadata())?;
-        let access =
-            self.inner
-                .principals
-                .authorize(&principal, collection, AccessAction::Ingest)?;
-        let catalog = self
-            .inner
-            .catalogs
-            .get(collection)
-            .cloned()
-            .ok_or_else(|| Status::not_found("source collection is not configured"))?;
-        let length = request.get_ref().encoded_len();
-        if length > self.inner.budget.max_request_bytes() {
-            return Err(Status::resource_exhausted(
-                "source request exceeds max_request_bytes",
-            ));
-        }
-        let principal_permit = principal.admit_request()?;
-        let budget = self.inner.budget.admit(length)?;
-        if write {
-            principal.admit_ingest(1)?;
-        }
+        let admitted = admit_ingest(
+            &self.inner.principals,
+            &self.inner.catalogs,
+            &self.inner.budget,
+            request,
+            collection,
+            write,
+        )?;
         Ok((
-            principal.name.clone(),
-            catalog,
-            access,
-            WorkPermit {
-                _principal: principal_permit,
-                _budget: budget,
-            },
+            admitted.actor,
+            admitted.catalog,
+            admitted.access,
+            admitted.permit,
         ))
     }
 
@@ -296,15 +274,7 @@ impl HostedDocumentWriteService {
     ) -> Result<Response<DocumentWriteReceipt>, Status> {
         let (actor, catalog, access, permit) =
             self.admit(&request, &request.get_ref().collection, true)?;
-        let document = request
-            .into_inner()
-            .document
-            .ok_or_else(|| Status::invalid_argument("source write is missing document"))?;
-        if document.contract_version != 2 || document.history_id.len() != 16 {
-            return Err(Status::invalid_argument(
-                "network source writes require contract_version 2 and an exact 16-byte history_id",
-            ));
-        }
+        let document = extract_network_document(request)?;
         let lease = self.inner.host.lease(&actor).await?;
         self.handoff().await?;
         let settling = Arc::clone(&catalog);
@@ -391,25 +361,4 @@ impl HostedDocumentWriteService {
     }
 }
 
-#[tonic::async_trait]
-impl DocumentWriteService for HostedDocumentWriteService {
-    async fn get_write_target(
-        &self,
-        request: Request<GetDocumentWriteTargetRequest>,
-    ) -> Result<Response<DocumentWriteTarget>, Status> {
-        metrics::timed(Route::GetDocumentWriteTarget, request, |request| {
-            self.target(request)
-        })
-        .await
-    }
-
-    async fn accept_document(
-        &self,
-        request: Request<DocumentWriteRequest>,
-    ) -> Result<Response<DocumentWriteReceipt>, Status> {
-        metrics::timed(Route::AcceptSourceDocument, request, |request| {
-            self.accept(request)
-        })
-        .await
-    }
-}
+impl_document_write_service!(HostedDocumentWriteService);

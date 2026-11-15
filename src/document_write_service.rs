@@ -8,8 +8,8 @@ use crate::document_catalog::AccessControlledCatalog;
 use crate::metrics::{self, Route};
 use crate::pb::document_write_service_server::{DocumentWriteService, DocumentWriteServiceServer};
 use crate::pb::{
-    AccessAction, DocumentWriteReceipt, DocumentWriteRequest, DocumentWriteServiceLimits,
-    DocumentWriteTarget, GetDocumentWriteTargetRequest,
+    AcceptDocumentRequest, AccessAction, DocumentWriteReceipt, DocumentWriteRequest,
+    DocumentWriteServiceLimits, DocumentWriteTarget, GetDocumentWriteTargetRequest,
 };
 use crate::security::{Permit, Principals};
 use prost::Message;
@@ -17,6 +17,33 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response, Status};
+
+macro_rules! impl_document_write_service {
+    ($ty:ty) => {
+        #[tonic::async_trait]
+        impl DocumentWriteService for $ty {
+            async fn get_write_target(
+                &self,
+                request: Request<GetDocumentWriteTargetRequest>,
+            ) -> Result<Response<DocumentWriteTarget>, Status> {
+                metrics::timed(Route::GetDocumentWriteTarget, request, |request| {
+                    self.target(request)
+                })
+                .await
+            }
+
+            async fn accept_document(
+                &self,
+                request: Request<DocumentWriteRequest>,
+            ) -> Result<Response<DocumentWriteReceipt>, Status> {
+                metrics::timed(Route::AcceptSourceDocument, request, |request| {
+                    self.accept(request)
+                })
+                .await
+            }
+        }
+    };
+}
 
 #[cfg(feature = "raft")]
 pub mod hosted;
@@ -90,6 +117,66 @@ struct WorkPermit {
     _budget: BudgetPermit,
 }
 
+struct AdmittedIngest<C> {
+    #[cfg(feature = "raft")]
+    actor: String,
+    catalog: Arc<C>,
+    access: AccessPermit,
+    permit: WorkPermit,
+}
+
+fn admit_ingest<T: Message, C>(
+    principals: &Principals,
+    catalogs: &BTreeMap<String, Arc<C>>,
+    budget: &WriteBudget,
+    request: &Request<T>,
+    collection: &str,
+    write: bool,
+) -> Result<AdmittedIngest<C>, Status> {
+    let principal = principals.authenticate(request.metadata())?;
+    let access = principals.authorize(&principal, collection, AccessAction::Ingest)?;
+    let catalog = catalogs
+        .get(collection)
+        .cloned()
+        .ok_or_else(|| Status::not_found("source collection is not configured"))?;
+    let length = request.get_ref().encoded_len();
+    if length > budget.max_request_bytes() {
+        return Err(Status::resource_exhausted(
+            "source request exceeds max_request_bytes",
+        ));
+    }
+    let principal_permit = principal.admit_request()?;
+    let budget_permit = budget.admit(length)?;
+    if write {
+        principal.admit_ingest(1)?;
+    }
+    Ok(AdmittedIngest {
+        #[cfg(feature = "raft")]
+        actor: principal.name.clone(),
+        catalog,
+        access,
+        permit: WorkPermit {
+            _principal: principal_permit,
+            _budget: budget_permit,
+        },
+    })
+}
+
+fn extract_network_document(
+    request: Request<DocumentWriteRequest>,
+) -> Result<AcceptDocumentRequest, Status> {
+    let document = request
+        .into_inner()
+        .document
+        .ok_or_else(|| Status::invalid_argument("source write is missing document"))?;
+    if document.contract_version != 2 || document.history_id.len() != 16 {
+        return Err(Status::invalid_argument(
+            "network source writes require contract_version 2 and an exact 16-byte history_id",
+        ));
+    }
+    Ok(document)
+}
+
 /// Host adapter over catalogs that the embedding application has explicitly
 /// opened under Admin permission. Clones share every receiver capacity limit.
 /// Source/history bytes remain in those local catalogs. Exposing this service
@@ -141,36 +228,15 @@ impl DocumentWriteServiceImpl {
         collection: &str,
         write: bool,
     ) -> Result<(Arc<AccessControlledCatalog>, AccessPermit, WorkPermit), Status> {
-        let principal = self.inner.principals.authenticate(request.metadata())?;
-        let access =
-            self.inner
-                .principals
-                .authorize(&principal, collection, AccessAction::Ingest)?;
-        let catalog = self
-            .inner
-            .catalogs
-            .get(collection)
-            .cloned()
-            .ok_or_else(|| Status::not_found("source collection is not configured"))?;
-        let length = request.get_ref().encoded_len();
-        if length > self.inner.budget.max_request_bytes() {
-            return Err(Status::resource_exhausted(
-                "source request exceeds max_request_bytes",
-            ));
-        }
-        let principal_permit = principal.admit_request()?;
-        let budget = self.inner.budget.admit(length)?;
-        if write {
-            principal.admit_ingest(1)?;
-        }
-        Ok((
-            catalog,
-            access,
-            WorkPermit {
-                _principal: principal_permit,
-                _budget: budget,
-            },
-        ))
+        let admitted = admit_ingest(
+            &self.inner.principals,
+            &self.inner.catalogs,
+            &self.inner.budget,
+            request,
+            collection,
+            write,
+        )?;
+        Ok((admitted.catalog, admitted.access, admitted.permit))
     }
 
     async fn target(
@@ -196,15 +262,7 @@ impl DocumentWriteServiceImpl {
     ) -> Result<Response<DocumentWriteReceipt>, Status> {
         let (catalog, access, admission) =
             self.admit(&request, &request.get_ref().collection, true)?;
-        let document = request
-            .into_inner()
-            .document
-            .ok_or_else(|| Status::invalid_argument("source write is missing document"))?;
-        if document.contract_version != 2 || document.history_id.len() != 16 {
-            return Err(Status::invalid_argument(
-                "network source writes require contract_version 2 and an exact 16-byte history_id",
-            ));
-        }
+        let document = extract_network_document(request)?;
         let commit_access = access.clone();
         let result = tokio::task::spawn_blocking(move || {
             // Pin inside the receiving worker, not in the RPC future. Dropping
@@ -221,25 +279,4 @@ impl DocumentWriteServiceImpl {
     }
 }
 
-#[tonic::async_trait]
-impl DocumentWriteService for DocumentWriteServiceImpl {
-    async fn get_write_target(
-        &self,
-        request: Request<GetDocumentWriteTargetRequest>,
-    ) -> Result<Response<DocumentWriteTarget>, Status> {
-        metrics::timed(Route::GetDocumentWriteTarget, request, |request| {
-            self.target(request)
-        })
-        .await
-    }
-
-    async fn accept_document(
-        &self,
-        request: Request<DocumentWriteRequest>,
-    ) -> Result<Response<DocumentWriteReceipt>, Status> {
-        metrics::timed(Route::AcceptSourceDocument, request, |request| {
-            self.accept(request)
-        })
-        .await
-    }
-}
+impl_document_write_service!(DocumentWriteServiceImpl);

@@ -132,6 +132,20 @@ fn open_segmented_layout(
     Ok((index, exact_vectors, Bm25Shard::Segmented(shard)))
 }
 
+fn open_persisted_live_docs(
+    index_path: &Path,
+    generation: Option<&PathBuf>,
+) -> Result<LiveDocs, String> {
+    let live_path = generation.map_or_else(
+        || live_docs_sidecar_path(index_path),
+        |dir| generation_live_docs(dir),
+    );
+    if !probe_path_exists(&live_path, "live-docs sidecar")? {
+        return Ok(LiveDocs::default());
+    }
+    LiveDocs::open(&live_path).map_err(|error| format!("load {}: {error}", live_path.display()))
+}
+
 fn load_persisted_artifacts(
     config: &NodeConfig,
     recovered: &RecoveredOpenPaths,
@@ -140,13 +154,12 @@ fn load_persisted_artifacts(
 ) -> Result<LoadedArtifacts, String> {
     let mut exact_vectors = None;
     let mut bm25 = None;
-    let mut live_docs = LiveDocs::default();
     let Some(index_path) = config.index_path.as_ref() else {
         return Ok(LoadedArtifacts {
             index,
             exact_vectors,
             bm25,
-            live_docs,
+            live_docs: LiveDocs::default(),
         });
     };
     let (_, exact_path, bm25_path) = storage_paths(index_path, recovered.generation.as_ref());
@@ -201,14 +214,7 @@ fn load_persisted_artifacts(
             bm25_path.display()
         ));
     }
-    let live_path = recovered.generation.as_ref().map_or_else(
-        || live_docs_sidecar_path(index_path),
-        |dir| generation_live_docs(dir),
-    );
-    if probe_path_exists(&live_path, "live-docs sidecar")? {
-        live_docs = LiveDocs::open(&live_path)
-            .map_err(|error| format!("load {}: {error}", live_path.display()))?;
-    }
+    let live_docs = open_persisted_live_docs(index_path, recovered.generation.as_ref())?;
     Ok(LoadedArtifacts {
         index,
         exact_vectors,
