@@ -2,28 +2,13 @@ use super::*;
 use crate::node::segments_root;
 use crate::pb::storage::{MaintenanceDecisionKey, MaintenanceIntent};
 
-async fn publish(
-    fixture: &Fixture,
-    version: u64,
-    rows: Option<usize>,
-) -> DocumentProjectionActivation {
-    let (_, candidate) = fixture.stage(KEY, version, rows).await;
-    let node = fixture.node.clone();
-    let source = fixture.source.clone();
-    tokio::task::spawn_blocking(move || {
-        node.publish_document_projection_blocking(&source, INDEX, &candidate)
-    })
-    .await
-    .unwrap()
-    .unwrap()
-}
-fn catalog(fixture: &Fixture) -> SegmentCatalog {
+pub(super) fn catalog(fixture: &Fixture) -> SegmentCatalog {
     SegmentCatalog::open(segments_root(
         fixture.node.config.index_path.as_ref().unwrap(),
     ))
     .unwrap()
 }
-fn next(before: &OpenedSegmentSet, reclaim: bool) -> Arc<OpenedSegmentSet> {
+pub(super) fn next(before: &OpenedSegmentSet, reclaim: bool) -> Arc<OpenedSegmentSet> {
     let mut manifest = before.published_manifest();
     manifest.epoch += 1;
     if reclaim {
@@ -33,7 +18,7 @@ fn next(before: &OpenedSegmentSet, reclaim: bool) -> Arc<OpenedSegmentSet> {
         .unwrap()
         .snapshot()
 }
-fn prepare(
+pub(super) fn prepare(
     fixture: &Fixture,
     before: &OpenedSegmentSet,
     after: &OpenedSegmentSet,
@@ -43,7 +28,7 @@ fn prepare(
         .prepare_index_maintenance(INDEX, before, after, &fixture.root.join("proof"), 1)
         .unwrap()
 }
-fn simulate_manifest_commit(set: &OpenedSegmentSet) -> SegmentCatalog {
+pub(super) fn simulate_manifest_commit(set: &OpenedSegmentSet) -> SegmentCatalog {
     // Crash-window fixture only: runtime publication remains gated until the
     // production owner can join its activation fence to this journal.
     std::fs::write(
@@ -52,15 +37,6 @@ fn simulate_manifest_commit(set: &OpenedSegmentSet) -> SegmentCatalog {
     )
     .unwrap();
     SegmentCatalog::open(set.root()).unwrap()
-}
-fn reopen_source(fixture: &mut Fixture) {
-    let old = std::mem::replace(
-        &mut fixture.source,
-        Arc::new(DocumentCatalog::in_memory("books").unwrap()),
-    );
-    drop(old);
-    fixture.source =
-        Arc::new(DocumentCatalog::open(&fixture.root.join("source.redb"), "books").unwrap());
 }
 async fn reopen_node(fixture: &mut Fixture) -> DocumentProjectionActivation {
     fixture.node = NodeServiceImpl::open(fixture.node.config.clone(), None, false).unwrap();
@@ -73,23 +49,81 @@ async fn reopen_node(fixture: &mut Fixture) -> DocumentProjectionActivation {
         .unwrap()
 }
 
+/// Every operation record of the source, exactly as stored.
+fn operation_records(fixture: &Fixture) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let tx = fixture.source.database.begin_read().unwrap();
+    let records = tx
+        .open_table(OPERATIONS)
+        .unwrap()
+        .iter()
+        .unwrap()
+        .map(|r| {
+            let (key, value) = r.unwrap();
+            (key.value().to_vec(), value.value().to_vec())
+        })
+        .collect::<Vec<_>>();
+    records
+}
+
+/// Prepare one maintenance round on top of `current`, commit its manifest
+/// and recover it across a source reopen. The round's intent chains from
+/// `previous`, is idempotent to prepare and to recover, and leaves
+/// `decision_before` the current source decision. Returns the committed
+/// catalog and the cursor the next round chains from.
+fn commit_maintenance_round(
+    fixture: &mut Fixture,
+    current: &SegmentCatalog,
+    previous: &Option<storage::MaintenanceCursor>,
+    decision_before: &ProjectionIntent,
+) -> (SegmentCatalog, storage::MaintenanceCursor) {
+    let before = current.snapshot();
+    let after = next(&before, false);
+    let intent = prepare(fixture, &before, &after);
+    assert_eq!(&intent.previous, previous);
+    assert_eq!(prepare(fixture, &before, &after), intent);
+    let current = simulate_manifest_commit(&after);
+    fixture.reopen_source();
+    assert_eq!(
+        fixture
+            .source
+            .recover_index_maintenance(INDEX, &current)
+            .unwrap(),
+        MaintenanceRecovery::Committed(intent.clone())
+    );
+    assert_eq!(
+        fixture
+            .source
+            .index_maintenance_decision(INDEX, intent.after_epoch)
+            .unwrap(),
+        Some(intent.clone())
+    );
+    assert_eq!(
+        fixture
+            .source
+            .recover_index_maintenance(INDEX, &current)
+            .unwrap(),
+        MaintenanceRecovery::Idle
+    );
+    assert_eq!(
+        fixture
+            .source
+            .current_index_publication_decision(INDEX, &current)
+            .unwrap(),
+        Some(decision_before.clone())
+    );
+    let cursor = storage::MaintenanceCursor {
+        after_epoch: intent.after_epoch,
+        intent_id: intent.intent_id,
+    };
+    (current, cursor)
+}
+
 #[tokio::test]
 async fn repeated_maintenance_and_source_writes_preserve_source_history_and_identity() {
     let mut fixture = Fixture::new();
-    let activation = publish(&fixture, 1, Some(2)).await;
+    let activation = fixture.publish_through_node(KEY, 1, Some(2)).await;
     let source_before = fixture.source.get(KEY, Some(1)).unwrap();
-    let receipt_bytes = {
-        let tx = fixture.source.database.begin_read().unwrap();
-        tx.open_table(OPERATIONS)
-            .unwrap()
-            .iter()
-            .unwrap()
-            .map(|r| {
-                let (key, value) = r.unwrap();
-                (key.value().to_vec(), value.value().to_vec())
-            })
-            .collect::<Vec<_>>()
-    };
+    let receipt_bytes = operation_records(&fixture);
 
     let decision_before = fixture
         .source
@@ -101,64 +135,17 @@ async fn repeated_maintenance_and_source_writes_preserve_source_history_and_iden
     let mut current = catalog(&fixture);
     let mut previous = None;
     for _ in 0..2 {
-        let before = current.snapshot();
-        let after = next(&before, false);
-        let intent = prepare(&fixture, &before, &after);
-        assert_eq!(intent.previous, previous);
-        assert_eq!(prepare(&fixture, &before, &after), intent);
-        current = simulate_manifest_commit(&after);
-        reopen_source(&mut fixture);
-        assert_eq!(
-            fixture
-                .source
-                .recover_index_maintenance(INDEX, &current)
-                .unwrap(),
-            MaintenanceRecovery::Committed(intent.clone())
-        );
-        assert_eq!(
-            fixture
-                .source
-                .index_maintenance_decision(INDEX, intent.after_epoch)
-                .unwrap(),
-            Some(intent.clone())
-        );
-        assert_eq!(
-            fixture
-                .source
-                .recover_index_maintenance(INDEX, &current)
-                .unwrap(),
-            MaintenanceRecovery::Idle
-        );
-        assert_eq!(
-            fixture
-                .source
-                .current_index_publication_decision(INDEX, &current)
-                .unwrap(),
-            Some(decision_before.clone())
-        );
-        previous = Some(storage::MaintenanceCursor {
-            after_epoch: intent.after_epoch,
-            intent_id: intent.intent_id,
-        });
+        let (committed, cursor) =
+            commit_maintenance_round(&mut fixture, &current, &previous, &decision_before);
+        current = committed;
+        previous = Some(cursor);
     }
     assert_eq!(fixture.source.get(KEY, Some(1)).unwrap(), source_before);
-    {
-        let tx = fixture.source.database.begin_read().unwrap();
-        let after = tx
-            .open_table(OPERATIONS)
-            .unwrap()
-            .iter()
-            .unwrap()
-            .map(|r| {
-                let (key, value) = r.unwrap();
-                (key.value().to_vec(), value.value().to_vec())
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            after, receipt_bytes,
-            "maintenance must preserve exact retry receipts"
-        );
-    }
+    assert_eq!(
+        operation_records(&fixture),
+        receipt_bytes,
+        "maintenance must preserve exact retry receipts"
+    );
     let recovered = reopen_node(&mut fixture).await;
     assert_eq!(recovered.catalog_epoch, current.snapshot().epoch());
     assert_eq!(recovered.accepted_sequence, activation.accepted_sequence);
@@ -172,7 +159,7 @@ async fn repeated_maintenance_and_source_writes_preserve_source_history_and_iden
             .document_key,
         KEY
     );
-    let deletion = publish(&fixture, 2, None).await;
+    let deletion = fixture.publish_through_node(KEY, 2, None).await;
     current = catalog(&fixture);
     let before = current.snapshot();
     let after = next(&before, true);
@@ -192,7 +179,7 @@ async fn repeated_maintenance_and_source_writes_preserve_source_history_and_iden
     assert_eq!(recovered.catalog_epoch, current.snapshot().epoch());
     assert_eq!(recovered.accepted_sequence, deletion.accepted_sequence);
     assert!(current.snapshot().is_empty());
-    let updated = publish(&fixture, 3, Some(1)).await;
+    let updated = fixture.publish_through_node(KEY, 3, Some(1)).await;
     assert_eq!(updated.accepted_sequence, 3);
     assert_eq!(
         fixture.source.index_publication_decision(INDEX, 1).unwrap(),
@@ -208,7 +195,7 @@ async fn repeated_maintenance_and_source_writes_preserve_source_history_and_iden
 #[tokio::test]
 async fn pending_maintenance_blocks_other_publications_and_survives_an_unexpected_manifest() {
     let mut fixture = Fixture::new();
-    publish(&fixture, 1, Some(1)).await;
+    fixture.publish_through_node(KEY, 1, Some(1)).await;
     fixture.source.enable_index_maintenance().unwrap();
     let current = catalog(&fixture);
     let before = current.snapshot();
@@ -248,7 +235,7 @@ async fn pending_maintenance_blocks_other_publications_and_survives_an_unexpecte
     assert_eq!(catalog(&fixture).snapshot().manifest(), before.manifest());
     let unexpected = next(&after, false);
     let foreign = simulate_manifest_commit(&unexpected);
-    reopen_source(&mut fixture);
+    fixture.reopen_source();
     assert!(fixture
         .source
         .recover_index_maintenance(INDEX, &foreign)
@@ -309,7 +296,7 @@ async fn migration_refuses_pending_sources_without_changing_the_old_header() {
 #[tokio::test]
 async fn maintenance_rejects_unproven_rows_and_forged_pruning_before_journaling() {
     let fixture = Fixture::new();
-    publish(&fixture, 1, Some(2)).await;
+    fixture.publish_through_node(KEY, 1, Some(2)).await;
     fixture.source.enable_index_maintenance().unwrap();
     let current = catalog(&fixture);
     let before = current.snapshot();
@@ -342,7 +329,7 @@ async fn maintenance_rejects_unproven_rows_and_forged_pruning_before_journaling(
 #[tokio::test]
 async fn corrupted_maintenance_record_and_header_downgrade_refuse_recovery() {
     let fixture = Fixture::new();
-    publish(&fixture, 1, Some(1)).await;
+    fixture.publish_through_node(KEY, 1, Some(1)).await;
     fixture.source.enable_index_maintenance().unwrap();
     let current = catalog(&fixture);
     let before = current.snapshot();
@@ -396,7 +383,7 @@ async fn corrupted_maintenance_record_and_header_downgrade_refuse_recovery() {
 #[tokio::test]
 async fn maintenance_links_are_checked_even_when_record_checksums_are_recomputed() {
     let fixture = Fixture::new();
-    publish(&fixture, 1, Some(1)).await;
+    fixture.publish_through_node(KEY, 1, Some(1)).await;
     fixture.source.enable_index_maintenance().unwrap();
     let current = catalog(&fixture);
     let before = current.snapshot();
@@ -450,80 +437,4 @@ async fn maintenance_links_are_checked_even_when_record_checksums_are_recomputed
             "{error}"
         );
     }
-}
-
-#[tokio::test]
-async fn checkpoint_keeps_maintenance_anchor_and_unpublished_source_backlog() {
-    let fixture = Fixture::new();
-    publish(&fixture, 1, Some(2)).await;
-    fixture.source.enable_index_maintenance().unwrap();
-    let current = catalog(&fixture);
-    let before = current.snapshot();
-    let after = next(&before, false);
-    let intent = prepare(&fixture, &before, &after);
-    let error = fixture.source.capture_checkpoint(1 << 20).err().unwrap();
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-    assert!(error.message().contains("pending"));
-    let current = simulate_manifest_commit(&after);
-    assert_eq!(
-        fixture
-            .source
-            .recover_index_maintenance(INDEX, &current)
-            .unwrap(),
-        MaintenanceRecovery::Committed(intent.clone())
-    );
-    let (_, _candidate) = fixture.stage(KEY, 2, Some(0)).await;
-    let checkpoint = fixture.source.capture_checkpoint(1 << 20).unwrap();
-    let metadata = checkpoint.metadata();
-    assert_eq!(metadata.header.as_ref().unwrap().accepted_sequence, 2);
-    assert_eq!(metadata.indexes.len(), 1);
-    let state = &metadata.indexes[0];
-    assert_eq!(state.committed_sequence, 1);
-    assert_eq!(state.index_key, INDEX);
-    assert_eq!(
-        state.committed_manifest_sha256,
-        intent.after_manifest_sha256
-    );
-    assert_eq!(
-        state.maintenance_tip.as_ref().unwrap().intent_id,
-        intent.intent_id
-    );
-    let output = fixture.root.join("checkpoint.redb");
-    let info = checkpoint
-        .write_to(
-            &output,
-            &crate::pb::storage::DocumentCatalogCheckpointLimits {
-                batch_bytes: 64 << 10,
-                max_file_bytes: 32 << 20,
-            },
-        )
-        .unwrap();
-    let restored = DocumentCatalog::open(&output, "books").unwrap();
-    assert_eq!(
-        restored
-            .capture_checkpoint(1 << 20)
-            .unwrap()
-            .metadata()
-            .indexes,
-        info.indexes
-    );
-    assert_eq!(
-        restored
-            .index_maintenance_decision(INDEX, intent.after_epoch)
-            .unwrap(),
-        Some(intent)
-    );
-    assert_eq!(
-        restored
-            .current_index_publication_decision(INDEX, &current)
-            .unwrap(),
-        fixture
-            .source
-            .current_index_publication_decision(INDEX, &current)
-            .unwrap()
-    );
-    assert_eq!(
-        restored.get(KEY, Some(2)).unwrap(),
-        fixture.source.get(KEY, Some(2)).unwrap()
-    );
 }

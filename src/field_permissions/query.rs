@@ -69,16 +69,25 @@ impl FieldScope {
         }
         self.fetch_values(&crate::coordinator::compile_projections(projections)?, &[])?;
         if let Some(spec) = highlight {
-            if spec.fields.is_empty() {
-                self.dictionary("body")?;
-            }
-            for field in &spec.fields {
-                self.dictionary(field)?;
-            }
+            self.highlight(spec)?;
         }
         if let Some(aggregate) = aggregate {
             self.query_aggregate(aggregate)?;
         }
+        let hidden_dimensions = self.hidden_dimensions(scorer.as_ref(), *explain)?;
+        Ok(QueryDisclosure {
+            fields: self.clone(),
+            hidden_dimensions,
+        })
+    }
+
+    /// Admit each bounded-value score dimension and name the ones whose
+    /// column the caller may use but not see.
+    fn hidden_dimensions(
+        &self,
+        scorer: Option<&CompositeScorer>,
+        explain: bool,
+    ) -> Result<BTreeSet<String>, Status> {
         let mut hidden_dimensions = BTreeSet::new();
         if let Some(CompositeScorer {
             operation: _,
@@ -97,7 +106,7 @@ impl FieldScope {
                     source.as_ref().and_then(|s| s.source.as_ref())
                 {
                     self.require_use(&stage.column)?;
-                    if *explain {
+                    if explain {
                         self.require_disclose(&stage.column)?;
                     }
                     if !self.can_disclose(&stage.column) {
@@ -106,10 +115,7 @@ impl FieldScope {
                 }
             }
         }
-        Ok(QueryDisclosure {
-            fields: self.clone(),
-            hidden_dimensions,
-        })
+        Ok(hidden_dimensions)
     }
 
     fn selection(&self, node: &SelectionQuery, explain: bool, depth: usize) -> Result<(), Status> {
