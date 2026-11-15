@@ -195,6 +195,7 @@ fn verify_cutover(
     match change {
         Change::LiveSeal => {
             assert_eq!(result.unwrap().rows_after, 2);
+            assert_retired_seals_removed(pre, before_cutover.as_deref().unwrap());
             assert_eq!(
                 fixture
                     .node
@@ -244,6 +245,44 @@ fn verify_cutover(
     );
 }
 
+fn assert_retired_seals_removed(pre: &Preflight, before_cutover: &[u8]) {
+    use std::collections::BTreeSet;
+
+    let root = crate::node::segments_root(&pre.index_path);
+    let before: crate::segments::SegmentSetManifest =
+        serde_json::from_slice(before_cutover).unwrap();
+    assert_eq!(
+        before.segments.len(),
+        2,
+        "the tail sealed after shadow open"
+    );
+    let current = SegmentCatalog::read_manifest(&root).unwrap().unwrap();
+    let expected: BTreeSet<_> = current
+        .segments
+        .iter()
+        .map(|segment| segment.segment_id.clone())
+        .collect();
+    for retired in &before.segments {
+        assert!(
+            !expected.contains(&retired.segment_id),
+            "old segment remains published"
+        );
+    }
+    let actual: BTreeSet<_> = std::fs::read_dir(root.join("segments"))
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            assert!(entry.file_type().unwrap().is_dir());
+            entry.file_name().into_string().unwrap()
+        })
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "closing Flush must retire every replaced seal"
+    );
+    assert!(!marker_path(&pre.index_path).exists());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn caught_up_wal_shadow_accepts_intervening_live_seal() {
     tokio::task::spawn_blocking(|| run_compaction(Change::LiveSeal))
@@ -271,3 +310,6 @@ async fn unserved_shared_catalog_publication_refuses_before_cutover_io() {
         .await
         .unwrap();
 }
+
+#[path = "pending_snapshot_tests.rs"]
+mod pending_snapshot;

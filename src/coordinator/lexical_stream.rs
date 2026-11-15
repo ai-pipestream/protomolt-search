@@ -181,7 +181,7 @@ impl LexicalStream {
             }
         }
         let floor = (self.k > 0 && state.heap.len() == self.k)
-            .then(|| crate::bm25::floor_seed(state.heap.peek().expect("full heap").0.score));
+            .then(|| state.heap.peek().expect("full heap").0.score.next_down());
         let raised = floor.filter(|floor| *floor > *self.floor_tx.borrow());
         if raised.is_some() {
             state.floors_sent += 1;
@@ -258,5 +258,57 @@ pub(super) fn publish_lexical_progress(
                 true
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stream(shard: u32, heap: Arc<Mutex<Bm25StreamHeap>>) -> LexicalStream {
+        let (tx, _) = watch::channel(f32::NEG_INFINITY);
+        LexicalStream {
+            shard,
+            k: 1,
+            received: 0,
+            floor_tx: Arc::new(tx),
+            global_heap: heap,
+        }
+    }
+
+    fn heap() -> Arc<Mutex<Bm25StreamHeap>> {
+        Arc::new(Mutex::new(Bm25StreamHeap {
+            heap: Default::default(),
+            floors_sent: 0,
+            progress: None,
+        }))
+    }
+
+    fn candidate(doc: u64, score: f32) -> Vec<u8> {
+        [doc.to_le_bytes().as_slice(), score.to_le_bytes().as_slice()].concat()
+    }
+
+    #[test]
+    fn negative_candidates_raise_signed_live_floors() {
+        let mut stream = stream(0, heap());
+        for score in [-5.0_f32, -1.0, 0.0] {
+            stream.candidates(&candidate(0, score)).unwrap();
+            assert_eq!(*stream.floor_tx.borrow(), score.next_down());
+        }
+        stream.raise(-100.0);
+        assert_eq!(*stream.floor_tx.borrow(), 0.0_f32.next_down());
+    }
+
+    #[test]
+    fn signed_zero_candidates_tie_by_shard_then_document() {
+        let shared = heap();
+        let mut second = stream(1, shared.clone());
+        second.candidates(&candidate(2, 0.0)).unwrap();
+        let mut first = stream(0, shared.clone());
+        first.candidates(&candidate(9, -0.0)).unwrap();
+        let held = shared.lock().unwrap();
+        let winner = held.heap.peek().unwrap().0;
+        assert_eq!((winner.shard, winner.vector_id), (0, 9));
+        assert_eq!(winner.score.to_bits(), (-0.0_f32).to_bits());
     }
 }

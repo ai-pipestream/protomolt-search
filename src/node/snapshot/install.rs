@@ -2,11 +2,14 @@
 
 use crate::node::*;
 
+#[path = "image_prepare.rs"]
+mod image_prepare;
 #[path = "segment_cutover.rs"]
 mod segment_cutover;
 #[path = "segment_prepare.rs"]
 mod segment_prepare;
 
+use image_prepare::{check_pending_compaction, PreparedImage};
 use segment_prepare::{PreparedSegments, SegmentPaths};
 
 impl NodeServiceImpl {
@@ -99,17 +102,7 @@ impl NodeServiceImpl {
         Ok(())
     }
 
-    /// Validate a received snapshot image and atomically swap it in (the
-    /// blocking half of `InstallSnapshot`). Everything that can fail —
-    /// loading the index, opening all sidecars, the scoring-identity check —
-    /// happens BEFORE the swap, so a rejected install leaves the live
-    /// shard and the on-disk generation untouched.
-    ///
-    /// The swap itself is one directory rename: every generation artifact
-    /// travels inside the staging dir, so the files can never tear. Replacing
-    /// an existing generation renames it aside first; the
-    /// crash window between the two renames is covered by
-    /// [`recover_generation`] at startup.
+    /// Validate every image artifact before replacing the serving generation.
     pub(in crate::node) fn apply_snapshot(
         &self,
         tmp_dir: &Path,
@@ -122,214 +115,20 @@ impl NodeServiceImpl {
             .config
             .index_path
             .as_ref()
-            .expect("handler requires index_path")
-            .clone();
-        let tv_tmp = generation_vector(tmp_dir);
-        let exact_tmp = generation_exact_vectors(tmp_dir);
-        let bm25_tmp = generation_bm25(tmp_dir);
-        let live_tmp = generation_live_docs(tmp_dir);
-
-        let loaded = if tv_tmp.exists() {
-            Some(
-                VectorIndex::load(&self.config.vector_backend, &tv_tmp).map_err(|e| {
-                    Status::invalid_argument(format!(
-                        "snapshot is not a valid vector backend image: {e}"
-                    ))
-                })?,
-            )
-        } else {
-            None
-        };
-        // A snapshot installs only from the same provider state: kind and
-        // scoring fingerprint (calibration included), or the fleet would
-        // score one shard in another space (docs/mmap-vectors.md).
-        if let Some(loaded) = loaded.as_ref() {
-            let incoming = loaded.descriptor();
-            let guard = read_shard(&self.state);
-            let serving_kind = guard
-                .index
-                .as_ref()
-                .map(|index| index.descriptor().backend_kind)
-                .or_else(|| {
-                    guard
-                        .wal
-                        .as_ref()
-                        .map(|wal| wal.manifest().vector_backend.clone())
-                        .filter(|kind| !kind.is_empty())
-                });
-            if let Some(kind) = serving_kind {
-                if kind != incoming.backend_kind {
-                    return Err(Status::failed_precondition(format!(
-                        "snapshot image is a {:?} image but this shard serves {kind:?}; a \
-                         snapshot installs only from the same provider",
-                        incoming.backend_kind
-                    )));
-                }
-            }
-            if let Some(serving) = guard.index.as_ref().map(|index| index.descriptor()) {
-                if serving.scoring_fingerprint != incoming.scoring_fingerprint {
-                    return Err(Status::failed_precondition(format!(
-                        "snapshot image scores under {}/{} but this shard serves {}/{}; a \
-                         snapshot installs only from the same provider state (calibration \
-                         included), or the fleet would score in two spaces",
-                        incoming.backend_kind,
-                        incoming.scoring_fingerprint,
-                        serving.backend_kind,
-                        serving.scoring_fingerprint
-                    )));
-                }
-            }
-        }
-        if with_exact_vectors {
-            let loaded = loaded.as_ref().ok_or_else(|| {
-                Status::invalid_argument("exact vectors require a provider image")
-            })?;
-            let exact = ExactVectorStore::open(&exact_tmp).map_err(|e| {
-                Status::invalid_argument(format!(
-                    "snapshot sidecar is not a valid exact-vector store: {e}"
-                ))
-            })?;
-            exact.verify_payload().map_err(|e| {
-                Status::invalid_argument(format!(
-                    "snapshot exact-vector integrity check failed: {e}"
-                ))
-            })?;
-            if exact.len() != loaded.len() || exact.dim() != loaded.dim_opt() {
-                return Err(Status::invalid_argument(format!(
-                    "snapshot exact-vector shape {:?}x{} does not match provider shape {:?}x{}",
-                    exact.dim(),
-                    exact.len(),
-                    loaded.dim_opt(),
-                    loaded.len()
-                )));
-            }
-        }
-        let incoming_doc_rows = if with_bm25 {
-            // Open-check the sidecar (and drop it again) before the swap;
-            // the live shard re-opens from the generation dir.
-            let store = Bm25Shard::open(&bm25_tmp).map_err(|e| {
-                Status::invalid_argument(format!("snapshot sidecar is not a valid BM25 store: {e}"))
-            })?;
-            // The store's derived-column declaration must be this
-            // shard's before anything swaps (docs/derived-columns.md).
-            check_attached_derived(
-                &self.config,
-                store.derived(),
-                store.doc_count(),
-                "the installed snapshot's store",
-            )
-            .map_err(Status::failed_precondition)?;
-            u64::from(store.next_doc_id())
-        } else {
-            0
-        };
-        let incoming_live_docs = if with_live_docs {
-            LiveDocs::open(&live_tmp).map_err(|e| {
-                Status::invalid_argument(format!("snapshot live-row overlay is invalid: {e}"))
-            })?
-        } else {
-            LiveDocs::default()
-        };
-        if incoming_live_docs.persisted_rows()
-            > (loaded.as_ref().map_or(0, |index| index.len() as u64)).max(incoming_doc_rows)
-        {
-            return Err(Status::invalid_argument(
-                "snapshot live-row overlay exceeds every aligned artifact's row count",
-            ));
-        }
-
-        let incoming_rows = loaded
-            .as_ref()
-            .map_or(0, |index| index.len() as u64)
-            .max(incoming_doc_rows);
-        let retained = crate::multi_res_storage::open_generation(
-            &tmp_dir.join(crate::multi_res::FILE_NAME),
-            incoming_rows,
-            &incoming_live_docs,
-        )
-        .map_err(|error| Status::invalid_argument(format!("snapshot retained vectors: {error}")))?;
-        crate::multi_res_wal::require_coverage(
-            &retained,
-            0..loaded.as_ref().map_or(0, VectorIndex::len),
-            &incoming_live_docs,
-            &self.config.matryoshka_prefix_dims,
-            self.config.matryoshka_active_dim,
-        )
-        .map_err(Status::failed_precondition)?;
-
+            .expect("handler requires index_path");
+        let prepared =
+            PreparedImage::open(self, tmp_dir, with_exact_vectors, with_bm25, with_live_docs)?;
         let mut guard = write_shard(&self.state);
         guard.check_legacy_mutation()?;
-        // Scoring comparability: a shard with a locked backend configuration
-        // only accepts an image with the identical scoring fingerprint.
-        if let (Some(index), Some(loaded)) = (guard.index.as_ref(), loaded.as_ref()) {
-            let current = index.descriptor();
-            let incoming = loaded.descriptor();
-            if current.backend_kind != incoming.backend_kind
-                || current.scoring_fingerprint != incoming.scoring_fingerprint
-            {
-                return Err(Status::failed_precondition(
-                    "snapshot vector backend or scoring fingerprint differs from the \
-                     generation locked on this shard; mixed native scores are not mergeable",
-                ));
-            }
-        }
-
-        if guard.pending_compaction.is_some() {
-            return Err(Status::failed_precondition(
-                "a compaction cutover is pending its closing flush on this shard; call Flush \
-                 before installing a snapshot",
-            ));
-        }
-        let snap = Self::adopt_generation(&path, tmp_dir, true)?;
-
-        guard.bm25 = if with_bm25 {
-            Some(Bm25Shard::open(&generation_bm25(&snap)).map_err(|e| {
-                Status::internal(format!(
-                    "open installed {}: {e}",
-                    generation_bm25(&snap).display()
-                ))
-            })?)
-        } else {
-            // Wholesale replacement: an image without a sidecar replaces
-            // any existing postings store (its ids would describe a
-            // different corpus). The old store's files left with the old
-            // generation.
-            None
-        };
-        guard.exact_vectors = if with_exact_vectors {
-            Some(
-                ExactVectorStore::open(&generation_exact_vectors(&snap)).map_err(|e| {
-                    Status::internal(format!(
-                        "open installed {}: {e}",
-                        generation_exact_vectors(&snap).display()
-                    ))
-                })?,
-            )
-        } else {
-            None
-        };
-        let num_documents = guard.bm25.as_ref().map_or(0, |b| b.doc_count());
-        let num_vectors = loaded.as_ref().map_or(0, |index| index.len() as u64);
-        // Wholesale replace: the image's binding (usually none) is now
-        // the shard's. A stale binding describing replaced columns
-        // would lie.
-        guard.mapped_binding = guard.bm25.as_ref().and_then(|b| b.binding().cloned());
-        guard.index = loaded;
-        guard.multi_res_vectors = retained;
-        guard.live_docs = incoming_live_docs;
-        guard.parents = None;
-        guard.generation = Some(snap.clone());
-        guard.advance_stats_epoch();
-        Self::rotate_wal_after_install(
-            &mut guard,
-            &self.config,
-            &path,
-            (num_vectors, num_documents),
-        )?;
+        prepared.check_provider(&guard)?;
+        check_pending_compaction(&guard)?;
+        let snap = Self::adopt_generation(path, tmp_dir, true)?;
+        let counts = prepared.activate(&mut guard, &snap, with_exact_vectors, with_bm25)?;
+        Self::rotate_wal_after_install(&mut guard, &self.config, path, counts)?;
         Ok(InstallSnapshotResponse {
             path: generation_vector(&snap).display().to_string(),
-            num_vectors,
-            num_documents,
+            num_vectors: counts.0,
+            num_documents: counts.1,
             manifest: None,
         })
     }
@@ -516,6 +315,7 @@ impl NodeServiceImpl {
         let prepared = PreparedSegments::open(&self.config, &staged)?;
         let mut guard = write_shard(&self.state);
         guard.check_legacy_mutation()?;
+        check_pending_compaction(&guard)?;
         prepared.check_provider(&guard)?;
         drop(prepared);
         let result =

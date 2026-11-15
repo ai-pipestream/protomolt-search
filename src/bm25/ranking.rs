@@ -2,8 +2,14 @@
 
 use std::cmp::Ordering;
 
+pub(super) fn wire_score(score: f64) -> f32 {
+    (score as f32) + 0.0
+}
+
 pub(super) fn compare(a: (u32, f64), b: (u32, f64)) -> Ordering {
-    (b.1 as f32).total_cmp(&(a.1 as f32)).then(a.0.cmp(&b.0))
+    wire_score(b.1)
+        .total_cmp(&wire_score(a.1))
+        .then(a.0.cmp(&b.0))
 }
 
 pub(super) fn sort_truncate<T>(docs: &mut Vec<(u32, f64, T)>, k: usize) {
@@ -37,3 +43,7 @@ impl PartialOrd for HeapEntry {
         Some(self.cmp(other))
     }
 }
+
+#[cfg(test)]
+#[path = "ranking_tests.rs"]
+mod tests;

@@ -17,9 +17,11 @@ impl Cutoff<'_> {
     pub fn inert(&self, bound: f64) -> bool {
         let bound = self.chain.map_or(bound, |(chain, _)| chain.bound(bound));
         bound < self.floor
-            || self
-                .kth
-                .is_some_and(|kth| (bound as f32).total_cmp(&kth).is_le())
+            || self.kth.is_some_and(|kth| {
+                super::ranking::wire_score(bound)
+                    .total_cmp(&(kth + 0.0))
+                    .is_le()
+            })
     }
 }
 

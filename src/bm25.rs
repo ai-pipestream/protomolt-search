@@ -722,16 +722,9 @@ pub struct PruneStats {
     pub candidates_evaluated: u64,
 }
 
-/// Mid-scan floor exchange for the streaming lexical protocol
-/// (`docs/block-max.md`, the bidi relay). Called once per outer loop
-/// iteration of the pruned scorer with the scan's current emission-safe
-/// k-th best (`floor_seed`, `None` until the heap fills); the hook may
-/// publish it. It returns the highest external floor currently known,
-/// or `None`. External floors are emission-safe seeds too, so they are
-/// proven lower bounds on the final global k-th best: raising the
-/// cutoff to one mid-scan only strengthens `inert`, which is monotone
-/// in the floor, and ties at the floor keep surviving — the result is
-/// the seeded-floor contract, delivered while the scan runs.
+/// Exchange emission-safe live floors, including negative scores.
+/// The seed is one f32 ULP below the local k-th score, or `None` until full.
+/// The hook returns a monotonic external lower bound, or `None`.
 pub type LiveFloorHook<'a> = &'a mut dyn FnMut(Option<f32>) -> Option<f32>;
 
 /// Compact candidate emission for the coordinator-owned lexical heap.

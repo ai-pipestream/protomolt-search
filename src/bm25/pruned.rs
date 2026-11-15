@@ -3,8 +3,7 @@
 use super::pruned_scan::{Cutoff, Scan};
 use super::ranking::HeapEntry;
 use super::{
-    floor_seed, passes, CandidateHook, ChainCtx, FieldQuery, FilterCtx, LiveFloorHook, PruneStats,
-    TopKOptions,
+    passes, CandidateHook, ChainCtx, FieldQuery, FilterCtx, LiveFloorHook, PruneStats, TopKOptions,
 };
 
 pub(super) struct Controls<'a> {
@@ -29,9 +28,9 @@ pub(super) fn run(
     let mut scan = Scan::new(pairs, count);
     while !scan.pairs.is_empty() {
         let kth = (scan.heap.len() >= controls.k)
-            .then(|| scan.heap.peek().expect("full heap").score as f32);
+            .then(|| super::ranking::wire_score(scan.heap.peek().expect("full heap").score));
         if let Some(hook) = live.as_mut() {
-            if let Some(external) = hook(kth.map(floor_seed)) {
+            if let Some(external) = hook(kth.map(f32::next_down)) {
                 if f64::from(external) > controls.floor {
                     controls.floor = f64::from(external);
                 }

@@ -275,3 +275,14 @@ fn body_phrase_context_preserves_field_analysis_and_expansion_inputs() {
     assert!(field.synonyms_off);
     assert_eq!(query.options().k(), 4);
 }
+
+#[test]
+fn signed_zero_certified_and_unary_winners_share_raw_bits_and_order() {
+    let input = vec![(1, hit(2, 0.0)), (0, hit(9, -0.0))];
+    let unary = finish_bm25_hits(input.clone(), None, 1).unwrap();
+    let streamed = finish_bm25_hits(input, certified(&[(0, 9, -0.0)]), 1).unwrap();
+    assert_eq!(unary[0].doc_id, 9);
+    assert_eq!(streamed[0].doc_id, 9);
+    assert_eq!(unary[0].score.to_bits(), (-0.0_f32).to_bits());
+    assert_eq!(streamed[0].score.to_bits(), unary[0].score.to_bits());
+}

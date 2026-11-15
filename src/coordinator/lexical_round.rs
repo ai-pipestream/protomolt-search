@@ -159,7 +159,14 @@ impl CoordinatorServiceImpl {
     async fn execute_bm25_round(&self, round: PreparedRound<'_>) -> Result<AggregatedHits, Status> {
         let stream_enabled = self.bm25_stream && round.phrase.is_none();
         let relay = stream_enabled
-            .then(|| watch::channel(round.request.min_score))
+            .then(|| {
+                let floor = if round.request.min_score == 0.0 {
+                    f32::NEG_INFINITY
+                } else {
+                    round.request.min_score
+                };
+                watch::channel(floor)
+            })
             .map(|(tx, rx)| (Arc::new(tx), rx));
         let stream_heap = stream_enabled.then(|| {
             Arc::new(Mutex::new(Bm25StreamHeap {
@@ -355,8 +362,8 @@ pub(super) fn finish_bm25_hits(
                 .collect::<Result<_, _>>()?;
     } else {
         all.sort_by(|(sa, a), (sb, b)| {
-            b.score
-                .total_cmp(&a.score)
+            (b.score + 0.0)
+                .total_cmp(&(a.score + 0.0))
                 .then_with(|| sa.cmp(sb))
                 .then_with(|| a.doc_id.cmp(&b.doc_id))
         });

@@ -64,6 +64,10 @@ impl Drop for Server {
 
 async fn serve(path: &Path, slot: u64, texts: &[&str], block_max: bool) -> Server {
     store(texts).save(path).unwrap();
+    serve_image(path, slot, block_max, Vec::new()).await
+}
+
+async fn serve_image(path: &Path, slot: u64, block_max: bool, numerics: Vec<String>) -> Server {
     let node = NodeServiceImpl::new(
         None,
         NodeConfig {
@@ -72,6 +76,7 @@ async fn serve(path: &Path, slot: u64, texts: &[&str], block_max: bool) -> Serve
             bm25_fields: vec!["body".into()],
             layout: Layout::SingleImage,
             block_max,
+            numeric_fields: numerics,
             ..Default::default()
         },
     )
@@ -323,4 +328,122 @@ async fn relay_is_one_configured_shard_for_lexical_ties() {
             }
         }
     }
+}
+
+fn negative_image(path: &Path, adjustment: f64) {
+    let mut store = Bm25Store::with_fields(&["body"]).with_numerics(&["adjustment"]);
+    store
+        .set_analysis_fingerprint(0, analysis_fingerprint(Some(&body_spec())))
+        .unwrap();
+    for id in 0..8192 {
+        store.add_document(
+            id,
+            "x".into(),
+            AnalyzedDoc::body(vec![("x".into(), 1, vec![])], 1),
+        );
+        store.set_numeric(0, id, adjustment);
+    }
+    store.save(path).unwrap();
+}
+
+#[tokio::test]
+async fn negative_score_chains_preserve_unary_streamed_winners() {
+    use pipestream_search::pb::{ScoreOp, ScoreStage};
+    let dir = Scratch::new();
+    let mut servers = Vec::new();
+    for (slot, adjustment) in [(0, -5.0), (8192, -1.0)] {
+        let path = dir.0.join(format!("negative-{slot}.bm25"));
+        negative_image(&path, adjustment);
+        servers.push(serve_image(&path, slot, true, vec!["adjustment".into()]).await);
+    }
+    for floor in [-100.0, 0.0] {
+        let mut signatures = Vec::new();
+        for streaming in [false, true] {
+            let coordinator =
+                CoordinatorServiceImpl::new(servers.iter().map(|s| s.address.clone()).collect())
+                    .with_bm25(Some("native".into()), PARAMS)
+                    .with_bm25_stream(streaming);
+            let mut req = request(1, false);
+            req.min_score = floor;
+            req.score_stages = vec![ScoreStage {
+                column: "adjustment".into(),
+                operation: Some(pipestream_search::pb::score_stage::Operation::Op(
+                    ScoreOp::AddLinear as i32,
+                )),
+                weight: 1.0,
+                ..Default::default()
+            }];
+            let response = SearchService::bm25_search(&coordinator, Request::new(req))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(response.hits.len(), 1);
+            assert_eq!(response.hits[0].doc_id, 8192);
+            assert!(response.hits[0].score < 0.0);
+            signatures.push(signature(&response));
+        }
+        assert_eq!(signatures[0], signatures[1], "floor={floor}");
+    }
+}
+
+#[tokio::test]
+async fn negative_node_stream_publishes_signed_floors() {
+    use pipestream_search::pb::node_service_client::NodeServiceClient;
+    use pipestream_search::pb::{
+        bm25_query_stream_request, bm25_query_stream_response, Bm25QueryRequest,
+        Bm25QueryStreamRequest, ScoreOp, ScoreStage,
+    };
+    let dir = Scratch::new();
+    let path = dir.0.join("signed-floors.bm25");
+    negative_image(&path, -5.0);
+    let server = serve_image(&path, 0, true, vec!["adjustment".into()]).await;
+    let mut client = NodeServiceClient::connect(server.address.clone())
+        .await
+        .unwrap();
+    let request = Bm25QueryRequest {
+        terms: vec!["x".into()],
+        k: 1,
+        global_doc_count: 8192,
+        global_total_doc_length: 8192,
+        global_doc_frequencies: vec![8192],
+        k1: PARAMS.k1 as f32,
+        b: PARAMS.b as f32,
+        min_score: -100.0,
+        analysis_fingerprint: analysis_fingerprint(Some(&body_spec())),
+        score_stages: vec![ScoreStage {
+            column: "adjustment".into(),
+            operation: Some(pipestream_search::pb::score_stage::Operation::Op(
+                ScoreOp::AddLinear as i32,
+            )),
+            weight: 1.0,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let input = tokio_stream::iter([Bm25QueryStreamRequest {
+        payload: Some(bm25_query_stream_request::Payload::Start(request)),
+    }]);
+    let mut stream = client.bm25_query_stream(input).await.unwrap().into_inner();
+    let (mut floors, mut completed) = (0, false);
+    while let Some(message) = stream.message().await.unwrap() {
+        match message.payload.unwrap() {
+            bm25_query_stream_response::Payload::FloorUpdate(update) => {
+                assert!(
+                    update.floor < 0.0 && update.floor.is_finite(),
+                    "{}",
+                    update.floor
+                );
+                floors += 1;
+            }
+            bm25_query_stream_response::Payload::Completion(done) => {
+                assert!(done.completed);
+                let response = done.response.unwrap();
+                assert_eq!(response.hits.len(), 1);
+                assert!(response.hits[0].score < 0.0);
+                completed = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(completed && floors > 0);
 }

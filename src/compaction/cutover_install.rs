@@ -97,14 +97,21 @@ fn prepare_marker(
         .filter(|p| p.exists())
         .collect()
     };
-    if pre.segmented {
+    let replaced_segments = if pre.segmented {
         let root = crate::node::segments_root(&pre.index_path);
         let current = SegmentCatalog::read_manifest(&root)
             .map_err(Status::internal)?
             .unwrap_or_default();
         crate::segments::write_manifest_file(&manifest_backup_path(&root), &current)
             .map_err(Status::internal)?;
-    }
+        current
+            .segments
+            .into_iter()
+            .map(|segment| segment.segment_id)
+            .collect()
+    } else {
+        shadow.replaced.clone()
+    };
     Ok(CommitMarker {
         format: MARKER_FORMAT,
         layout: layout_name(pre.segmented).to_string(),
@@ -115,7 +122,7 @@ fn prepare_marker(
         previous_snapshot,
         legacy_files,
         staged_segments: shadow.staged.iter().map(|s| s.segment_id.clone()).collect(),
-        replaced_segments: shadow.replaced.clone(),
+        replaced_segments,
     })
 }
 

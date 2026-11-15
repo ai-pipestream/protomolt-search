@@ -27,8 +27,8 @@ pub(crate) fn cmp_hits(a: &MergedHit, b: &MergedHit) -> Ordering {
 
 /// BM25's public order is score descending, shard ascending, then document id.
 pub(crate) fn cmp_lexical_hits(a: &MergedHit, b: &MergedHit) -> Ordering {
-    b.score
-        .total_cmp(&a.score)
+    (b.score + 0.0)
+        .total_cmp(&(a.score + 0.0))
         .then_with(|| a.shard.cmp(&b.shard))
         .then_with(|| a.vector_id.cmp(&b.vector_id))
 }
