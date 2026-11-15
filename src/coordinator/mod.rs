@@ -287,12 +287,8 @@ pub struct CoordinatorServiceImpl {
     /// supplies a matching score-space fingerprint and completion
     /// certificate (docs/block-max.md).
     bm25_stream: bool,
-    /// Hard upper bound on any client-facing `k`. A request above it is
-    /// refused (never clamped), and a request that omits `k` (proto3 0)
-    /// runs at exactly this depth. This bounds the coordinator's heap; it is
-    /// not a node quota or scan-completion signal.
-    /// Runtime knobs (`max_k`, the hedge delay) read at request time
-    /// (docs/diagnostics.md); shared by every clone of this coordinator.
+    /// Runtime knobs (`max_k`, hedge delay, shard pruning, signal batch) read
+    /// at request time and shared across clones of this coordinator.
     knobs: Arc<crate::diagnostics::Knobs>,
     /// Hard request-wide logical FP32 row-byte bound for reranking.
     max_rerank_bytes: u64,

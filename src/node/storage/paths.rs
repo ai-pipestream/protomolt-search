@@ -2,9 +2,7 @@
 
 use crate::node::*;
 
-/// The persistence path of a shard's BM25 store: `<index path>.bm25`.
-/// The segment catalog root of a persisted shard: `<index>.segments/`
-/// (`docs/immutable-segments.md`).
+/// The segment catalog root of a persisted shard: `<index>.segments/`.
 pub fn segments_root(index_path: &std::path::Path) -> PathBuf {
     let mut name = index_path
         .file_name()
@@ -69,6 +67,7 @@ pub(crate) fn heap_store(config: &NodeConfig) -> Result<Bm25Store, String> {
     Ok(store)
 }
 
+/// The persistence path of a shard's BM25 store: `<index path>.bm25`.
 pub fn bm25_sidecar_path(index_path: &std::path::Path) -> PathBuf {
     let mut p = index_path.as_os_str().to_owned();
     p.push(".bm25");

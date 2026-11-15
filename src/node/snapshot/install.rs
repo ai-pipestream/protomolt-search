@@ -205,7 +205,7 @@ impl NodeServiceImpl {
 
     /// Verify a staged repository against its manifest and install it
     /// through the layout's install path (the single-image path is the
-    /// same [`Self::apply_snapshot`] the client stream takes). Refuses,
+    /// same `Self::apply_snapshot` the client stream takes). Refuses,
     /// by name and before touching the live shard: a size or digest
     /// mismatch, another shard's slot offset or collection, a layout
     /// this shard cannot adopt.

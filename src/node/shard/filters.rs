@@ -580,23 +580,18 @@ pub(in crate::node) fn prune_segments(
     }
 }
 
-/// Resolve a request's filters for one shard into the predicate the
-/// scorers gate with and the slot allowlist the vector kernel scans
-/// under. With `prune` set and a segmented shard, sealed segments the
-/// predicate cannot match are ruled out from their summaries first
-/// (`docs/segment-pruning.md`): their slots are `false` without a
-/// per-row evaluation, and the counts come back alongside. With
-/// `domain` set, only its slots are evaluated at all — the caller
-/// guarantees membership evaluation never consults the verdict off the domain.
-/// What [`resolve_shard_filters`] hands back: the predicate for the
-/// scorers' heap gate, the slot allowlist for the vector kernel, and
-/// the segment counts.
+/// Resolved shard filter tuple: lexical heap-gate predicate, vector-kernel
+/// slot allowlist, and segment-pruning counts.
 pub(in crate::node) type ResolvedShardFilters = (
     Option<crate::filter::DocFilter<'static>>,
     Option<crate::boolean_bits::Bits>,
     crate::segment_prune::PruneStats,
 );
 
+/// Resolve a request's filters for one shard into its lexical predicate and
+/// vector slot allowlist. With `prune` set on a segmented shard, sealed
+/// segments ruled out by their summaries are skipped before per-row evaluation;
+/// with `domain` set, only domain slots are evaluated.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::node) fn resolve_shard_filters(
     bm25: Option<&Bm25Shard>,

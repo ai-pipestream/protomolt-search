@@ -621,25 +621,8 @@ impl NodeServiceImpl {
         Ok((doc, analyzed))
     }
 
-    /// Derive the proximity payloads (`docs/phrase-proximity.md`) and pin
-    /// the document's durable proximity record: which fields keep token
-    /// positions, and which bigram columns derive from which sources.
-    ///
-    /// Fresh ingest (an empty record) fills both from this node's
-    /// configuration; a record that already names them — a replayed WAL
-    /// entry, a resharded child, a client that copied one — must agree
-    /// with the configuration exactly, or the document refuses by name:
-    /// a column that is positional on some documents and not on others
-    /// is a phrase index that lies about half the corpus.
-    ///
-    /// A positional field needs the analysis to have carried token
-    /// positions (the native tokenizer always does; a sidecar response
-    /// without a token layer cannot), and needs FULL term vectors — a
-    /// scoring-only field has no occurrences to place, so a phrase over
-    /// it could never match and would silently return nothing. Bigram
-    /// columns derive from the source's positions by the same rule.
-    /// Admit a write only for this node's collection (`docs/collections.md`):
-    /// an empty name means "this node's", any other name refuses.
+    /// Admit a write only for this node's collection: an empty name means
+    /// this node's collection, and any other name refuses.
     pub(in crate::node) fn admit_collection(&self, requested: &str) -> Result<(), Status> {
         if requested.is_empty() || requested == self.config.collection {
             return Ok(());
@@ -656,6 +639,10 @@ impl NodeServiceImpl {
         })
     }
 
+    /// Derive token-position and bigram proximity payloads and pin the
+    /// document's durable proximity record. Fresh records fill from node
+    /// configuration; pre-populated records must match configuration and carry
+    /// full positional term vectors.
     pub(in crate::node) fn materialize_proximity(
         &self,
         mut doc: AddDocumentsRequest,

@@ -4,6 +4,7 @@ use crate::node::*;
 
 mod open;
 
+/// The shard-owner gRPC service. Cheap to clone (state is shared).
 #[derive(Clone)]
 pub struct NodeServiceImpl {
     /// Locked shard state; see [`ShardState`].
@@ -556,16 +557,7 @@ impl NodeServiceImpl {
         self
     }
 
-    /// Build the tonic server for this service with explicit message size
-    /// limits (see [`crate::MAX_MESSAGE_BYTES`]). tonic's 4 MiB default
-    /// decoding cap is comfortably above even k=10000 shard responses
-    /// (~160 KiB), but the limit is set explicitly so it never silently
-    /// depends on a library default. NOTE: the cap also bounds AddVectors
-    /// batch messages; clients should keep batches well under it.
-    /// A metrics gauge sampler over this shard's live state
-    /// (`docs/metrics.md`): called at scrape time, reads under the
-    /// state lock, and so can never go stale.
-    /// The knobs this node reads at request time (docs/diagnostics.md).
+    /// The knobs this node reads at request time.
     pub fn knobs(&self) -> &Arc<crate::diagnostics::Knobs> {
         &self.knobs
     }
@@ -714,6 +706,8 @@ impl NodeServiceImpl {
         out
     }
 
+    /// A metrics gauge sampler over this shard's live state: called at scrape
+    /// time under the state lock so reported counts never go stale.
     pub fn metrics_provider(&self) -> crate::metrics::GaugeProvider {
         let state = Arc::clone(&self.state);
         let slot_offset = self.config.slot_offset;
@@ -728,6 +722,8 @@ impl NodeServiceImpl {
         })
     }
 
+    /// Build the tonic server for this service with explicit decoding and
+    /// encoding message size limits (see [`crate::MAX_MESSAGE_BYTES`]).
     pub fn into_server(self, max_message_bytes: usize) -> NodeServiceServer<Self> {
         NodeServiceServer::new(self)
             .max_decoding_message_size(max_message_bytes)
@@ -771,8 +767,6 @@ impl NodeServiceImpl {
         Ok(built)
     }
 
-    /// Persist the index to its configured path, if any. Shared by the
-    /// `Flush` RPC and save-on-shutdown in the binary.
     /// A new provider image for `dim`: wrapped as the tail of a
     /// segmented provider when the shard is segmented, so every row the
     /// node adds joins the catalog's positional space.

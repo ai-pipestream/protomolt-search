@@ -2,24 +2,20 @@
 
 use super::*;
 
-/// Merged global stats for a fused multi-field query, with the per-node
-/// epochs the shares were valid at (parallel to the node list).
-/// Default expansion cap of a [`crate::pb::TermPrefix`] with
-/// `max_expansions` unset (`docs/prefix-terms.md`).
+/// Default expansion cap of a [`crate::pb::TermPrefix`] with `max_expansions` unset.
 pub const DEFAULT_PREFIX_EXPANSIONS: usize = 128;
 
 /// The largest cap a request may ask for; every expansion is a scored
 /// term, and past this a prefix is a scan, not a query.
 pub const MAX_PREFIX_EXPANSIONS: usize = 1024;
 
-/// Suggestions a `Suggest` request returns when `limit` is unset
-/// (`docs/suggest.md`).
 /// Candidates per term a did-you-mean request returns by default.
 pub const DEFAULT_TERM_SUGGEST_LIMIT: usize = 5;
 
 /// The largest edit bound a did-you-mean request may name.
 pub const MAX_TERM_SUGGEST_EDITS: u32 = 2;
 
+/// Suggestions a `Suggest` request returns when `limit` is unset.
 pub const DEFAULT_SUGGEST_LIMIT: usize = 10;
 
 /// The most suggestions one request may ask for.

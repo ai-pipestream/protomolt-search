@@ -49,6 +49,8 @@ pub(super) fn variant_text(variant: &crate::pb::SearchVariant) -> &str {
 }
 
 impl CoordinatorServiceImpl {
+    /// Broadcast one vector backend configuration to every configured shard
+    /// node, reporting per-node outcomes rather than failing fast.
     pub async fn fanout_vector_backend(
         &self,
         req: &BroadcastVectorBackendRequest,

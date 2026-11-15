@@ -2,8 +2,6 @@
 
 use crate::node::*;
 
-/// [`crate::scorefn::NumericRead`] over a searchable shard shape, for
-/// score-chain evaluation during scoring.
 /// Declared families on a node with no lexical store yet. No map keys or
 /// dictionary values exist, but an absent row must not erase a declared type.
 pub(in crate::node) struct EmptyColumns<'a>(pub(in crate::node) &'a NodeConfig);
@@ -58,6 +56,8 @@ impl crate::values::ColumnLookup for EmptyColumns<'_> {
     }
 }
 
+/// [`crate::scorefn::NumericRead`] over a searchable shard shape, for
+/// score-chain evaluation during scoring.
 pub(in crate::node) struct ShardNumericRead<'a>(pub(in crate::node) &'a Bm25Shard);
 
 /// The inverted facet columns of a searchable shard
@@ -200,26 +200,6 @@ impl crate::scorefn::NumericRead for ShardNumericRead<'_> {
     }
 }
 
-/// Resolve one request's filters against one shard: the predicate the
-/// lexical heap gate uses, and the slot allowlist the vector scan uses
-/// (`docs/vector-filters.md`). Both come from the SAME resolved
-/// [`crate::filter::DocFilter`], which is the point — a fused result
-/// cannot mix a filtered half with an unfiltered one when there is one
-/// resolution and one truth.
-///
-/// The rules are the lexical leg's rules, unchanged: absence fails, a
-/// name this shard lacks resolves to absent for every document, and the
-/// coordinator refuses a name NO shard resolves. A shard with no
-/// lexical half therefore has no columns and admits nothing — exact,
-/// since its documents genuinely hold no value — while a shard still
-/// bulk-building refuses, because "no columns yet" is a transient state
-/// and answering it as an empty result would be a silent lie.
-///
-/// `None` allowlist means the request carried no filters, which every
-/// scan path reads as "scan everything". That is deliberately not the
-/// same as an all-true allowlist: an unfiltered scan batches with every
-/// other unfiltered scan and takes a path bit-identical to the one it
-/// took before filters existed.
 /// Render one evaluated projection value onto the wire. Absence is the
 /// unset oneof; string ordinals render against the dictionary the
 /// shard owns.

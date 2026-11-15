@@ -70,8 +70,6 @@ impl Bm25Shard {
         }
     }
 
-    /// Field `f`'s analyzer fingerprint in the active table (0 =
-    /// unknown, which never enforces).
     /// The mapped-plan binding persisted with this shard, if any.
     pub(crate) fn binding(&self) -> Option<&crate::postings::StoredBinding> {
         match self {
@@ -123,6 +121,8 @@ impl Bm25Shard {
         }
     }
 
+    /// Field `f`'s analyzer fingerprint in the active table (`0` = unknown,
+    /// which never enforces).
     pub(crate) fn analysis_fingerprint(&self, f: usize) -> u64 {
         match self {
             Bm25Shard::Building(s) => s.analysis_fingerprint(f),

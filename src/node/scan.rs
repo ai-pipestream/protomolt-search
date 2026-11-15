@@ -272,7 +272,6 @@ pub fn scan_batch_counters() -> (u64, u64) {
     )
 }
 
-/// One shard scan queued for a batched kernel pass.
 /// One completed shard scan, with the handshake flags that let the
 /// coordinator refuse a filter column no shard resolves.
 pub(in crate::node) struct ScanOutcome {
@@ -284,6 +283,7 @@ pub(in crate::node) struct ScanOutcome {
     pub(in crate::node) filter_columns_known: Vec<bool>,
 }
 
+/// One shard scan queued for a batched kernel pass.
 pub(in crate::node) struct ScanJob {
     pub(in crate::node) read_context: Option<crate::pb::VectorReadContext>,
     pub(in crate::node) ready_tx: mpsc::Sender<Result<SearchShardResponse, Status>>,
@@ -564,7 +564,7 @@ pub(in crate::node) fn run_scan_batch(
 impl NodeServiceImpl {
     /// Bind the UDP signal lane on `addr` — the same host:port as the
     /// gRPC listener, UDP namespace — and fold typed floor/cancel datagrams
-    /// into the matching stream state (see [`apply_stream_datagram`]). A
+    /// into the matching stream state (see `apply_stream_datagram`). A
     /// failed bind only loses the fast lane: both signals still travel on
     /// every stream's authoritative gRPC leg.
     #[cfg(feature = "net")]

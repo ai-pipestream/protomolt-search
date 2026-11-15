@@ -24,11 +24,6 @@ pub(super) type AggregatedHits = (
     crate::segment_prune::PruneStats,
 );
 
-/// Merge per-shard column stats: counts and sums add, mins and maxes
-/// fold — additive across shards exactly as facet counts are, so the
-/// coordinator merge is the same positional walk. `mean` is computed
-/// HERE (sum / count) so clients cannot get it wrong; a column NO
-/// shard knows is refused by name, the usual typo rule.
 /// The evaluated values for one candidate set (`fetch_values`).
 pub struct FetchedValues {
     /// Agreed declaration types, including empty nodes and absent candidate values.
@@ -690,6 +685,8 @@ pub(super) fn agg_vt_name(vt: crate::pb::AggregateValueType) -> &'static str {
     }
 }
 
+/// Merge per-shard column stats: counts and sums add, mins and maxes fold,
+/// `mean` is computed at the coordinator, and an unknown column refuses by name.
 pub(super) fn merge_column_stats(
     requested: &[String],
     shard_stats: &[Vec<crate::pb::ColumnStats>],

@@ -23,6 +23,8 @@ pub(super) async fn analyze_query(
         .into_body())
 }
 
+/// Merged global stats for a fused multi-field query, with the per-node
+/// epochs the shares were valid at (parallel to the node list).
 pub(super) struct FusedGlobals {
     pub(super) doc_count: u64,
     /// Per field: global sum of that field's document lengths.

@@ -563,7 +563,7 @@ pub struct NodeConfig {
     /// Heavy-hitter list size per vocabulary channel.
     pub vocab_top_k: usize,
     /// Coalesce concurrent shard scans into batched kernel calls (up to
-    /// [`MAX_COALESCE`] queries share each pass over the packed codes —
+    /// `MAX_COALESCE` queries share each pass over the packed codes —
     /// the scan is bandwidth-bound, so batched queries ride the same
     /// memory traffic). `false` runs one scan per RPC — the A/B
     /// baseline; results are identical either way.

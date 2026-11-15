@@ -66,10 +66,6 @@ impl CoordinatorServiceImpl {
         }
     }
 
-    /// A coordinator whose shard traffic is restricted to the supplied
-    /// in-process channels. Cache misses never fall back to TCP and the UDP
-    /// signal lane is disabled. The labels are diagnostic identities only;
-    /// no address parsing or name resolution occurs.
     /// A coordinator over nodes living in this process, reached through
     /// [`crate::link::NodeLink::Local`]: no network fallback, no UDP lane.
     pub fn with_local_nodes(nodes: Vec<Arc<crate::node::NodeServiceImpl>>) -> Self {

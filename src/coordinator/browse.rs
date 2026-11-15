@@ -30,18 +30,10 @@ pub struct BrowseRows {
 }
 
 impl CoordinatorServiceImpl {
-    /// Push one TQ+ calibration to every configured node (the
-    /// shared-calibration handshake that makes vector scores globally
-    /// comparable). Per-node outcomes are reported, not fail-fast: a
-    /// non-empty shard legitimately refuses (calibration is locked for
-    /// the index lifetime), and the caller needs to know which nodes
-    /// diverged.
-    /// Filter-only browse fan-out (docs/query-api.md): each shard's
-    /// admitted ids above the boundary, merged and truncated to k —
-    /// ascending by id unsorted, by (order-preserving key bits, id)
-    /// under `sort`. The typo rule holds here as on every filtered
-    /// route: a column NO shard knows refuses by name, the sort column
-    /// included.
+    /// Filter-only browse fan-out: each shard's admitted ids above the
+    /// boundary, merged and truncated to `k` — ascending by id unsorted, or
+    /// by `(order-preserving key bits, id)` under `sort`. A column no shard
+    /// knows refuses by name, including sort columns.
     pub async fn fanout_browse(
         &self,
         k: u32,

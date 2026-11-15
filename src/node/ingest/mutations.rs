@@ -250,8 +250,8 @@ impl NodeServiceImpl {
     }
 }
 
-/// The mutation handlers' bodies against a state the caller holds (see
-/// [`NodeServiceImpl::apply_batch_locked`]).
+// The mutation handlers' bodies against a state the caller holds (see
+// `NodeServiceImpl::apply_batch_locked`).
 impl NodeServiceImpl {
     /// Refuse an id-addressed mutation whose ids were issued under
     /// another WAL generation: a compaction or snapshot install

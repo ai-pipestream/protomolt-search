@@ -5,7 +5,6 @@ use crate::node::*;
 #[path = "seal_write.rs"]
 mod seal_write;
 
-/// The shard-owner gRPC service. Cheap to clone (state is shared).
 /// What a seal in flight writes out (`NodeServiceImpl::seal_tail`):
 /// the frozen part's rows and shared artifacts, gathered under the
 /// write lock, written with no lock held.
@@ -273,6 +272,7 @@ impl NodeServiceImpl {
             .map_err(|e| Status::internal(format!("seal task failed: {e}")))?
     }
 
+    /// Persist the index to its configured path, if any. Shared by `Flush` and shutdown.
     pub fn flush_index(&self) -> Result<FlushResponse, Status> {
         let Some(config_path) = self.config.index_path.clone() else {
             let mut guard = write_shard(&self.state);
