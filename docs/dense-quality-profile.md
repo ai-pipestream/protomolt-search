@@ -16,12 +16,10 @@ tool, `tests/dense_quality.rs` the evidence.
 
 The 4-bit TurboQuant selection is exhaustive but quantized. On the OpenSearch
 challenge fixture (100,000 unit vectors, 64 dimensions) its raw recall@10 was
-0.544 and recall@10,000 was 0.892 against HNSW's 1.0
-(`ai-slop/opensearch-challenge-100k-k10000-2026-08-31.md`). Selecting more
+0.544 and recall@10,000 was 0.892 against HNSW's 1.0. Selecting more
 candidates and reranking them from the product-owned FP32 sidecar closes that
 gap: at k = 10,000, 2x candidates recovered at least 99% on every query, 2.62x
-at least 99.9%, and 3.5777x the exact top-10,000
-(`ai-slop/turboquant-exact-rerank-expansion-100k-k10000-2026-08-31.md`).
+at least 99.9%, and 3.5777x the exact top-10,000.
 Those are facts about that fixture. A different embedding model, corpus, or
 `k` needs its own ladder, which is what the profile records.
 
