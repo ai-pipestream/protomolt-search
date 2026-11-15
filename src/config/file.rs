@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 
-use super::args::opt;
+use super::option::Options;
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -201,8 +201,8 @@ pub(super) struct FileShard {
 
 /// The config file at the bottom of the precedence stack, shared by
 /// the serving parse and the local directory commands.
-pub(super) fn read_file_config(args: &[String]) -> Result<FileConfig, String> {
-    match opt(args, "config", "TURBOVEC_CONFIG", None) {
+pub(super) fn read_file_config(options: Options) -> Result<FileConfig, String> {
+    match options.text("config", None) {
         Some(path) => {
             let text =
                 std::fs::read_to_string(&path).map_err(|e| format!("read config {path}: {e}"))?;

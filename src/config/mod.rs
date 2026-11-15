@@ -1,9 +1,10 @@
 //! Cluster configuration: TOML file + environment variables + CLI flags.
 //!
 //! Precedence (highest wins): CLI flag, then environment variable, then
-//! config file, then built-in default. `--config <path>` (or
-//! `PIPESTREAM_SEARCH_CONFIG`) selects the file; every other flag is
-//! `--key=value`. Legacy `TURBOVEC_*` environment names remain fallbacks.
+//! config file, then built-in default. `--config <path>` selects the file;
+//! every other flag is `--key=value` or `--key value`. Each flag's environment
+//! variable is `PIPESTREAM_SEARCH_` plus the flag in upper case with `_` for
+//! `-` (`--shard-map-reload-ms` reads `PIPESTREAM_SEARCH_SHARD_MAP_RELOAD_MS`).
 //!
 //! A `--nodes` membership list is static. A generation-stamped `--shard-map`
 //! is different: the coordinator polls and atomically publishes newer complete
@@ -14,7 +15,7 @@
 //! ```toml
 //! role = "both"                        # node | coordinator | both
 //! coord_listen = "0.0.0.0:50050"
-//! metrics_listen = "127.0.0.1:9100"    # optional Prometheus page (docs/metrics.md)
+//! metrics_listen = "127.0.0.1:9100"    # optional Prometheus page
 //! nodes = ["host-a:50051", "host-b:50051"]  # fan-out order = tie-break order
 //! chunk_blocks = 64
 //! floor_sharing = true
@@ -28,16 +29,24 @@
 
 mod args;
 mod columns;
+mod dataset;
 mod file;
 mod membership;
+mod option;
 mod parse;
+mod phrase;
+mod placement;
 mod raft;
+mod scan;
 mod shard_map;
 mod shards;
 #[cfg(test)]
 mod tests;
 mod tls;
+mod topology;
 mod turbo;
+mod types;
+mod validate;
 
 pub use self::args::normalize_addr;
 pub use self::parse::parse;
@@ -45,6 +54,9 @@ pub use self::raft::{
     parse_raft_local, RaftLocal, RaftManagedCatalog, RaftMapConfig, RaftMemberConfig,
 };
 pub use self::shard_map::{load_placement_tree, load_shard_map, ShardMap, ShardMapShard};
+pub use self::types::{
+    ClusteredTurboVecConfig, CollectionConfig, DemoConfig, NodeMembershipConfig, ShardConfig,
+};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -60,98 +72,6 @@ pub enum Role {
     Both,
 }
 
-/// Demo index shape for `--demo-vectors` (random unit vectors, calibration
-/// fitted on a sample and seeded — the same flow real deployments use).
-#[derive(Debug, Clone, Copy)]
-pub struct DemoConfig {
-    /// Number of random vectors to generate.
-    pub vectors: usize,
-    /// Vector dimensionality.
-    pub dim: usize,
-    /// Quantization bit width (2, 3, or 4).
-    pub bit_width: usize,
-}
-
-/// One shard this process serves (one `NodeService` listener per shard).
-#[derive(Debug, Clone)]
-pub struct ShardConfig {
-    /// Listen address for this shard's `NodeService`.
-    pub listen: SocketAddr,
-    /// Vector provider used to load or construct this shard.
-    pub vector_backend: String,
-    /// Path to a provider-owned vector image. Mutually exclusive with `demo`.
-    pub index_path: Option<PathBuf>,
-    /// Build a random demo index instead of loading one.
-    pub demo: Option<DemoConfig>,
-    /// This shard's global id base (added to local slots).
-    pub slot_offset: u64,
-    /// Lexical analysis backend for AddDocuments: `native` or a sidecar address.
-    pub analysis_addr: Option<String>,
-    /// Keep a write-ahead log at `<index path>.wal/`. Defaults on for
-    /// shards with an index path, off for demo shards.
-    pub wal: bool,
-    /// Number of WAL hash buckets (a power of two, max 1024). Fixed at
-    /// WAL creation; a resumed log keeps its own.
-    pub wal_buckets: u32,
-    /// Accumulate vocabulary statistics inline in this shard's ingest,
-    /// snapshotting to `<index path>.vocab/` (see `docs/VOCABULARY-INDEX.md`).
-    /// Defaults OFF — zero overhead when off. Requires an index path.
-    pub vocab: bool,
-    /// The collection this shard serves (`docs/collections.md`); empty
-    /// for a shard outside any named collection.
-    pub collection: String,
-    /// The id this shard is reported under to the control plane
-    /// (`docs/cluster-control.md`); `slot-<offset>` when unset.
-    pub shard_id: Option<String>,
-    /// The inclusive stable-key hash range the shard covers, when the
-    /// configuration names it; else the plane's records or the published
-    /// topology supply it.
-    pub hash_range: Option<(u64, u64)>,
-}
-
-/// Node membership in the control plane (`--node-id` and friends,
-/// docs/cluster-control.md "Node lifecycle").
-#[derive(Debug, Clone)]
-pub struct NodeMembershipConfig {
-    pub node_id: String,
-    /// The coordinator's ClusterControl endpoint.
-    pub control_addr: String,
-    pub failure_domain: String,
-    /// Where placed replicas live (`<data-dir>/<shard_id>/`).
-    pub data_dir: PathBuf,
-    /// `host:port` other nodes and the coordinator reach this node at;
-    /// the host is what every listener is advertised under. Defaults to
-    /// the first shard listener when that binds a concrete address.
-    pub advertise_addr: Option<String>,
-    /// Where placed replicas listen: an interface and a first port
-    /// (port 0 lets the OS choose). Defaults to the first shard
-    /// listener's interface with port 0.
-    pub replica_listen: Option<SocketAddr>,
-    pub report_ms: u64,
-    pub reconcile_ms: u64,
-    /// Requested lease; 0 takes the plane's policy.
-    pub lease_ms: u64,
-    pub lag_bound: u64,
-}
-
-/// Product-level transport to one distributed TurboVec collection.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClusteredTurboVecConfig {
-    /// The global heap and topology owner execute in this process; only shard
-    /// node calls cross the network.
-    InProcess {
-        /// `turbovec-grpc` node-table entries, including optional index ids,
-        /// replicas, and required durable generations.
-        nodes: Vec<String>,
-        /// Durable coordinator topology. Required unless the operator opts
-        /// into an ephemeral development collection.
-        state: Option<PathBuf>,
-        allow_ephemeral: bool,
-    },
-    /// Reach a separately managed `turbovec-coordinator` process.
-    External { endpoint: String },
-}
-
 /// Full process configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -159,8 +79,8 @@ pub struct Config {
     pub role: Role,
     /// Listen address for `SearchService` (roles coordinator/both).
     pub coord_listen: SocketAddr,
-    /// Listen address for the Prometheus metrics page
-    /// (`docs/metrics.md`). `None` (the default) serves no metrics.
+    /// Listen address for the Prometheus metrics page. `None` (the
+    /// default) serves no metrics.
     /// There is no auth on the page; bind a trusted interface.
     pub metrics_listen: Option<SocketAddr>,
     /// Shard node addresses (`http://host:port`) for the coordinator, in
@@ -181,15 +101,15 @@ pub struct Config {
     /// baseline; results are identical either way.
     pub block_max: bool,
     /// Skip sealed segments a request's filter cannot match, from
-    /// their column summaries (docs/segment-pruning.md). `false` keeps
+    /// their column summaries. `false` keeps
     /// every segment in the scan; the answer is the same either way.
     pub segment_pruning: bool,
     /// Coordinator: skip shards a request's filter cannot match, from
-    /// the placement leaf each shard serves (docs/placement.md).
+    /// the placement leaf each shard serves.
     /// `false` consults every shard; the answer is the same either way.
     pub shard_pruning: bool,
     /// Node: the i64 column each row carries with its placement code
-    /// (`--placement-column`, docs/placement.md). Joins the integer
+    /// (`--placement-column`). Joins the integer
     /// table.
     pub placement_column: Option<String>,
     /// Node: the placement code this shard serves
@@ -202,8 +122,8 @@ pub struct Config {
     /// tree routes to another leaf. Needs `--placement-leaf`.
     pub placement_tree: Option<std::sync::Arc<crate::placement::PinnedLeaf>>,
     /// Node: the index's derived-column declaration
-    /// (`--derived-columns=<file>` or an inline `[[derived]]` table,
-    /// docs/derived-columns.md), compiled; the node checks it against
+    /// (`--derived-columns=<file>` or an inline `[[derived]]` table),
+    /// compiled; the node checks it against
     /// its column tables and pins it to the store, the log and every
     /// segment.
     pub derived: Option<std::sync::Arc<crate::derived::Declaration>>,
@@ -233,7 +153,7 @@ pub struct Config {
     /// (0.0 = publish every raise).
     pub floor_delta: f32,
     /// Publish opportunities a node skips before its first floor goes
-    /// out (0 = publish from the first chunk, the historical behavior).
+    /// out (0 = publish from the first chunk).
     pub floor_warmup_chunks: u32,
     /// Minimum milliseconds between two published floors (0 = no
     /// debounce).
@@ -261,7 +181,7 @@ pub struct Config {
     /// Node: optional per-poll sleep (µs) injected on streaming searches for
     /// straggler fault injection in benchmarks and tests.
     pub stream_poll_delay_us: Option<u64>,
-    /// Coordinator: serve as a RELAY (`docs/relay-coordinators.md`): the
+    /// Coordinator: serve as a RELAY: the
     /// node-facing surface over this coordinator's shard set, presented
     /// to a parent coordinator as one shard. StreamSearch, TermStats,
     /// and Health only; every other node route refuses by name. Needs
@@ -279,17 +199,16 @@ pub struct Config {
     /// returns no hits. Must be at least 1.
     pub max_k: u32,
     /// Coordinator: candidate ids per rescore call when a boolean group
-    /// scores a clause over its surviving ids (`--signal-batch`,
-    /// docs/query-api.md). At least 1.
+    /// scores a clause over its surviving ids (`--signal-batch`).
+    /// At least 1.
     pub signal_batch: u32,
     /// Coordinator-wide logical FP32 payload bound for one rerank request.
     pub max_rerank_bytes: u64,
     /// Optional generation-bound measured candidate-depth profile.
     pub dense_quality_profile: Option<PathBuf>,
-    /// Optional synonym table (`docs/synonyms.md`), a TOML file.
+    /// Optional synonym table, a TOML file.
     pub synonyms: Option<PathBuf>,
-    /// Optional generation-bound dense execution policy for AUTO
-    /// (`docs/dense-execution-policy.md`).
+    /// Optional generation-bound dense execution policy for AUTO.
     pub dense_execution_policy: Option<PathBuf>,
     /// gRPC message size cap applied to clients and servers.
     pub max_message_bytes: usize,
@@ -308,8 +227,8 @@ pub struct Config {
     pub bm25_k1: f32,
     /// BM25 b parameter sent to every shard.
     pub bm25_b: f32,
-    /// The BM25 field table for NEW shard builders
-    /// (`docs/multi-field.md`): "body" first, then the extra indexed
+    /// The BM25 field table for NEW shard builders:
+    /// "body" first, then the extra indexed
     /// fields. Existing `.bm25` files keep the table they were written
     /// with. Documents naming fields outside the table are refused.
     pub bm25_fields: Vec<String>,
@@ -320,12 +239,12 @@ pub struct Config {
     pub facet_fields: Vec<String>,
     /// The numeric field table for NEW shard builders
     /// (`--numeric-fields=decision_date`): f64 columns read by
-    /// score-function chains (docs/score-functions.md). Same rules as
+    /// score-function chains. Same rules as
     /// `facet_fields`; names must not collide with them (the v7 column
     /// table holds both and refuses duplicates).
     pub numeric_fields: Vec<String>,
     /// The map<string, string> column table for NEW shard builders
-    /// (`--map-facet-fields=meta`, docs/map-columns.md). Same rules;
+    /// (`--map-facet-fields=meta`). Same rules;
     /// one name space across all column kinds.
     pub map_facet_fields: Vec<String>,
     /// Optional `concept-id<TAB>surface-form` glossary. When present, the
@@ -340,20 +259,20 @@ pub struct Config {
     /// Request OpenNLP NER and materialize mentions into the entity map.
     pub phrase_ner: bool,
     /// BM25 fields that keep token positions per occurrence
-    /// (`--position-fields=body`, docs/phrase-proximity.md): the opt-in
+    /// (`--position-fields=body`): the opt-in
     /// payload behind exact phrase and proximity queries. Each name must
     /// be in `bm25_fields`. Shards loaded from existing files keep the
     /// declaration they were written with; ingest refuses a positional
     /// field the file never declared.
     pub position_fields: Vec<String>,
     /// Source fields whose adjacent-token pairs are derived into a
-    /// bigram column (`--bigram-fields=body`, docs/phrase-proximity.md).
+    /// bigram column (`--bigram-fields=body`).
     /// The column is the BM25 field named `<source>.bigrams`, which must
     /// be declared in `bm25_fields`; clients never supply it.
     pub bigram_fields: Vec<String>,
     /// Fields whose sentence spans are stored per document for
-    /// server-side snippets (`--sentence-fields=body`,
-    /// docs/highlighting.md). Snippets are cut from stored text, and
+    /// server-side snippets (`--sentence-fields=body`).
+    /// Snippets are cut from stored text, and
     /// only the body's text is stored, so the only legal entry is the
     /// body. Shards loaded from existing files keep the declaration they
     /// were written with; ingest refuses a sentence field the file never
@@ -365,14 +284,14 @@ pub struct Config {
     pub map_integer_fields: Vec<String>,
     pub map_unsigned_integer_fields: Vec<String>,
     /// The i64 column table for NEW shard builders
-    /// (`--integer-fields=citations,filed_at`, docs/range-facets.md):
+    /// (`--integer-fields=citations,filed_at`):
     /// exact integers past 2^53, and where Timestamp ingest lands as
     /// epoch micros. Same rules; one name space across all kinds.
     pub integer_fields: Vec<String>,
     /// Exact u64 columns (--unsigned-integer-fields), with explicit presence.
     pub unsigned_integer_fields: Vec<String>,
     /// The geo-point column table for NEW shard builders
-    /// (`--geo-fields=courthouse`, docs/geo-columns.md): the columns
+    /// (`--geo-fields=courthouse`): the columns
     /// bbox/radius filters and distance-decay stages read. Same rules;
     /// one name space across all kinds.
     pub geo_fields: Vec<String>,
@@ -406,7 +325,7 @@ pub struct Config {
     /// `--control-addr`, `--failure-domain`, `--data-dir`); `None` for a
     /// node that does not register.
     pub membership: Option<NodeMembershipConfig>,
-    /// Named collections this coordinator serves (`docs/collections.md`);
+    /// Named collections this coordinator serves;
     /// empty means the one unnamed dataset described by `node_addrs` and
     /// the top-level knobs. When present, `node_addrs` is empty and every
     /// per-dataset setting lives on the collection.
@@ -414,7 +333,7 @@ pub struct Config {
     /// The collection an unnamed request gets to, when configured; with
     /// named collections and no default, unnamed requests refuse.
     pub default_collection: Option<String>,
-    /// Listener TLS (`docs/security.md`): `--tls-cert`, `--tls-key`, and
+    /// Listener TLS: `--tls-cert`, `--tls-key`, and
     /// the cluster CA (`--tls-client-ca`) client certificates chain to.
     /// Once set, every listener speaks TLS and plaintext is refused.
     pub tls: Option<crate::security::ServerTls>,
@@ -434,14 +353,14 @@ pub struct Config {
     /// The key that authenticates UDP floor and cancel datagrams
     /// (`--udp-hmac-key=<file>`).
     pub udp_hmac_key: Option<crate::security::UdpKey>,
-    /// The layout a NEW persisted shard gets (`--layout=segments|single-image`,
-    /// docs/immutable-segments.md); an existing shard keeps its own.
+    /// The layout a NEW persisted shard gets (`--layout=segments|single-image`);
+    /// an existing shard keeps its own.
     pub layout: crate::node::Layout,
     /// Documents a segmented shard's tail may hold before it seals a
     /// segment on its own (`--seal-tail-docs`); 0 seals on flush only.
     pub seal_tail_docs: u32,
     /// Serve sealed segments' vector images through memory maps
-    /// (`--vector-mmap=true|false`, docs/mmap-vectors.md); on by default.
+    /// (`--vector-mmap=true|false`); on by default.
     pub vector_mmap: bool,
     /// Documents per vocabulary window before automatic rollover (only
     /// relevant to shards with `vocab` enabled).
@@ -466,25 +385,4 @@ pub struct Config {
     pub turbo_model_sha256: Option<String>,
     /// Outbound bearer token attached to remote sidecar gRPC requests.
     pub turbo_bearer_token: Option<String>,
-}
-
-/// Raw TOML file shape; every field optional (file < env < CLI).
-/// One collection's dataset settings (`docs/collections.md`): everything
-/// a coordinator needs that differs per dataset. Knobs not listed here
-/// (limits, streaming, message sizes, the phrase index) are shared.
-#[derive(Debug, Clone)]
-pub struct CollectionConfig {
-    pub name: String,
-    pub node_addrs: Vec<String>,
-    pub replica_addrs: Vec<Option<String>>,
-    pub shard_map: Option<ShardMap>,
-    pub shard_map_path: Option<PathBuf>,
-    pub analysis_addr: Option<String>,
-    pub bm25_k1: f32,
-    pub bm25_b: f32,
-    pub dense_quality_profile: Option<PathBuf>,
-    pub synonyms: Option<PathBuf>,
-    pub dense_execution_policy: Option<PathBuf>,
-    pub replica_state_path: Option<PathBuf>,
-    pub control_state_path: Option<PathBuf>,
 }
