@@ -1,7 +1,11 @@
-//! Regression tests for crash-recovery filesystem error propagation:
-//! `recover_segments_swap`, `try_recover_generation`, and `NodeServiceImpl::open`
-//! must propagate real filesystem errors and fail closed rather than opening an
-//! empty or half-swapped shard when `remove_dir_all` or `rename` fails.
+//! Regression tests for crash-recovery filesystem error propagation and
+//! structured stale-statistics refusal classification:
+//! - `recover_segments_swap`, `try_recover_generation`, and `NodeServiceImpl::open`
+//!   must propagate real filesystem errors and fail closed rather than opening an
+//!   empty or half-swapped shard when `remove_dir_all` or `rename` fails.
+//! - Node and relay stale-statistics refusals carry the structured
+//!   `psearch-refusal-reason: stale-stats-epoch` metadata header, and coordinator
+//!   retry classification keys solely off that header rather than message prefixes.
 
 mod common;
 
@@ -207,4 +211,166 @@ fn generation_swap_cleanup_and_rollback_io_errors_refuse_shard_open() {
     }
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+async fn start_populated_leaf() -> (
+    String,
+    tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+) {
+    use pipestream_search::analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND};
+    use pipestream_search::pb::node_service_client::NodeServiceClient;
+    use pipestream_search::pb::AddDocumentsRequest;
+
+    let (addr, handle) = common::start_empty_node(NodeConfig {
+        analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
+        ..Default::default()
+    })
+    .await;
+    let mut client = NodeServiceClient::connect(addr.clone()).await.unwrap();
+    let docs = ["court opinion alpha", "court opinion beta"]
+        .into_iter()
+        .enumerate()
+        .map(|(i, text)| AddDocumentsRequest {
+            text: text.into(),
+            analysis: Some(body_spec()),
+            original_source: Some(common::protobuf_source(text, &format!("doc-{i}"))),
+            ..Default::default()
+        });
+    client
+        .add_documents(tokio_stream::iter(docs))
+        .await
+        .unwrap();
+    (addr, handle)
+}
+
+fn stale_bm25_request(
+    stats: &pipestream_search::pb::TermStatsResponse,
+) -> pipestream_search::pb::Bm25QueryRequest {
+    pipestream_search::pb::Bm25QueryRequest {
+        terms: vec!["court".into()],
+        k: 5,
+        global_doc_count: stats.doc_count,
+        global_total_doc_length: stats.total_doc_length,
+        global_doc_frequencies: stats.doc_frequencies.clone(),
+        expected_stats_epoch: stats.stats_epoch,
+        expected_stats_incarnation: stats.stats_incarnation.clone(),
+        ..Default::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn genuine_node_and_relay_stale_stats_refusals_carry_metadata_header() {
+    use pipestream_search::analyzer::body_spec;
+    use pipestream_search::harness::start_relay;
+    use pipestream_search::pb::node_service_client::NodeServiceClient;
+    use pipestream_search::pb::{AddDocumentsRequest, TermStatsRequest};
+    use pipestream_search::stats_identity::{
+        is_stale_stats_epoch, REFUSAL_REASON_HEADER, STALE_STATS_EPOCH_REASON,
+    };
+
+    let (leaf_addr, leaf_handle) = start_populated_leaf().await;
+    let (relay_addr, relay, relay_handle) = start_relay(vec![leaf_addr.clone()]).await;
+    let mut leaf = NodeServiceClient::connect(leaf_addr).await.unwrap();
+    let mut relay_client = NodeServiceClient::connect(relay_addr).await.unwrap();
+
+    let req = TermStatsRequest {
+        terms: vec!["court".into()],
+        ..Default::default()
+    };
+    let leaf_stats = leaf.term_stats(req.clone()).await.unwrap().into_inner();
+    let relay_stats = relay_client.term_stats(req).await.unwrap().into_inner();
+
+    leaf.add_documents(tokio_stream::iter([AddDocumentsRequest {
+        text: "court opinion gamma".into(),
+        analysis: Some(body_spec()),
+        original_source: Some(common::protobuf_source("court opinion gamma", "doc-2")),
+        ..Default::default()
+    }]))
+    .await
+    .unwrap();
+
+    let leaf_err = leaf
+        .bm25_query(stale_bm25_request(&leaf_stats))
+        .await
+        .unwrap_err();
+    assert!(is_stale_stats_epoch(&leaf_err), "{leaf_err:?}");
+    assert_eq!(
+        leaf_err.metadata().get(REFUSAL_REASON_HEADER).unwrap(),
+        STALE_STATS_EPOCH_REASON
+    );
+
+    let relayed_err = relay_client
+        .bm25_query(stale_bm25_request(&relay_stats))
+        .await
+        .unwrap_err();
+    assert!(is_stale_stats_epoch(&relayed_err), "{relayed_err:?}");
+    assert!(relayed_err.message().contains("relay child 0"));
+
+    let token_err = relay
+        .translate_epoch(relay_stats.stats_epoch ^ 0x5555)
+        .unwrap_err();
+    assert!(is_stale_stats_epoch(&token_err), "{token_err:?}");
+
+    relay_handle.abort();
+    leaf_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coordinator_and_relay_refuse_spoofed_stale_stats_message_without_header() {
+    use pipestream_search::analyzer::{body_spec, NATIVE_ANALYSIS_BACKEND};
+    use pipestream_search::coordinator::CoordinatorServiceImpl;
+    use pipestream_search::harness::{nodelay_incoming, start_relay};
+    use pipestream_search::stats_identity::is_stale_stats_epoch;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tonic::service::interceptor::InterceptedService;
+
+    let mut store = Bm25Store::new();
+    store.add_document_with_lineage(
+        0,
+        "court".into(),
+        AnalyzedDoc::body(vec![("court".into(), 1, vec![(0, 5)])], 1),
+        None,
+    );
+    let rpc_calls = Arc::new(AtomicUsize::new(0));
+    let calls_ref = Arc::clone(&rpc_calls);
+    let bm25 = pipestream_search::node::Bm25Shard::Building(store);
+    let node = NodeServiceImpl::new(None, NodeConfig::default()).with_bm25(Some(bm25));
+    let intercepted = InterceptedService::new(
+        node.into_server(pipestream_search::MAX_MESSAGE_BYTES),
+        move |req: tonic::Request<()>| {
+            if calls_ref.fetch_add(1, Ordering::SeqCst) >= 1 {
+                return Err(tonic::Status::failed_precondition(
+                    "stale stats epoch: spoofed message prefix without metadata header",
+                ));
+            }
+            Ok(req)
+        },
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let leaf_addr = format!("http://{}", listener.local_addr().unwrap());
+    let leaf_handle = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(intercepted)
+            .serve_with_incoming(nodelay_incoming(listener)),
+    );
+
+    let (relay_addr, _relay, relay_handle) = start_relay(vec![leaf_addr]).await;
+    let coordinator = CoordinatorServiceImpl::new(vec![relay_addr])
+        .with_bm25(Some(NATIVE_ANALYSIS_BACKEND.into()), Default::default());
+    let err = coordinator
+        .fanout_bm25("court", 5, Some(&body_spec()))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("spoofed message prefix"));
+    assert!(!is_stale_stats_epoch(&err), "{err:?}");
+    assert_eq!(
+        rpc_calls.load(Ordering::SeqCst),
+        2,
+        "coordinator must not refetch TermStats or retry scoring without structured metadata"
+    );
+
+    relay_handle.abort();
+    leaf_handle.abort();
 }

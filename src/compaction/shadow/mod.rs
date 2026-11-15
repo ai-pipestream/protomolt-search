@@ -147,36 +147,25 @@ impl NodeServiceImpl {
             append_compacted_row(new_wal, slot_offset, dim, row)
         };
         let derived = crate::node::stored_derived(&self.config);
+        let request = crate::reshard::CompactionRequest {
+            bm25_fields: names.as_deref(),
+            pinned_fingerprints: pins.as_deref(),
+            columns: pre.columns.as_ref(),
+            derived: derived.as_ref(),
+            hnsw_sources: pre.hnsw_sources.as_ref(),
+            ..crate::reshard::CompactionRequest::new(&pre.gen_dir, pre.cutoff_clock, &build_dir)
+        };
         let built = match pre.partition.as_deref() {
-            Some(column) => crate::reshard::compact_log_partitioned_with_sources(
-                &pre.gen_dir,
-                pre.cutoff_clock,
-                &build_dir,
+            Some(column) => crate::reshard::compact_log_partitioned(
+                &request,
                 crate::reshard::PartitionSpec {
                     column,
                     bound: tail_bound,
                 },
-                names.as_deref(),
-                pins.as_deref(),
-                pre.columns.as_ref(),
-                derived.as_ref(),
-                pre.hnsw_sources.as_ref(),
                 analyze,
                 &mut sink,
             ),
-            None => crate::reshard::compact_log_with_sources(
-                &pre.gen_dir,
-                pre.cutoff_clock,
-                &build_dir,
-                pre.segmented,
-                names.as_deref(),
-                pins.as_deref(),
-                pre.columns.as_ref(),
-                derived.as_ref(),
-                pre.hnsw_sources.as_ref(),
-                analyze,
-                &mut sink,
-            ),
+            None => crate::reshard::compact_log(&request, pre.segmented, analyze, &mut sink),
         };
         built.map_err(|e| Status::failed_precondition(format!("compaction build: {e}")))
     }

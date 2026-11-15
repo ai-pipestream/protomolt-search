@@ -12,15 +12,12 @@ pub(crate) const DEFAULT_TEST_FN_LINES: usize = 120;
 pub(crate) const DEFAULT_MAX_PARAMS: usize = 7;
 
 /// Non-increasing file ceiling for the retired `docs/` research dump directory
-/// on the stabilization baseline; shrinks to `0` once removed.
-pub(crate) const MAX_DOCS_RETIRED_DUMP_FILES: usize = 22;
+/// on the stabilization baseline; locked at `0` once removed.
+pub(crate) const MAX_DOCS_RETIRED_DUMP_FILES: usize = 0;
 
 /// Files in `docs/` on the stabilization baseline with remaining links into the
-/// retired research dump; every other file is locked strictly at `0`.
-pub(crate) const DOCS_RETIRED_LINK_RATCHET: &[(&str, usize)] = &[
-    ("docs/dense-quality-profile.md", 2),
-    ("docs/query-api.md", 1),
-];
+/// retired research dump; locked strictly at `0`.
+pub(crate) const DOCS_RETIRED_LINK_RATCHET: &[(&str, usize)] = &[];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ModuleAllowance {
@@ -102,88 +99,49 @@ const fn base(module: &'static str) -> ModuleAllowance {
 /// Non-increasing per-module allowances on the stabilization baseline.
 /// Modules already within every default ceiling are omitted.
 pub(crate) const RATCHET: &[ModuleAllowance] = &[
-    base("crates/protomolt-analyzer/src/lib").comments(1, 0),
-    base("crates/protomolt-embedder/src/lib")
-        .fn_lines(198, 1)
-        .comments(0, 1),
-    base("crates/protomolt-search-embedded/src/mobile").test_fn_lines(145, 1),
     base("crates/protomolt-search-embedded/tests/dependency_gate").comments(1, 0),
     base("crates/protomolt-search-embedded/tests/document_grants").test_fn_lines(126, 1),
-    base("src/analyzer")
-        .fn_lines(159, 7)
-        .params(8, 1)
-        .allows(1, 0)
-        .comments(6, 0),
     base("src/analyzer_wire").fn_lines(90, 1),
-    base("src/authorization").fn_lines(88, 1),
     base("src/bin/console").comments(1, 0),
-    base("src/bm25")
-        .fn_lines(87, 1)
-        .test_fn_lines(136, 2)
-        .params(10, 3)
-        .allows(3, 0)
-        .comments(17, 1),
     base("src/boolean_bits").comments(3, 0),
     base("src/calendar").comments(1, 0),
     base("src/capacity_tiers")
         .fn_lines(366, 4)
         .allows(1, 0)
         .comments(1, 2),
-    base("src/cel")
-        .fn_lines(173, 7)
-        .test_fn_lines(158, 1)
-        .comments(6, 0),
-    base("src/chunked")
-        .fn_lines(194, 2)
-        .params(8, 2)
-        .allows(2, 0)
-        .comments(5, 0),
-    base("src/collections").allows(1, 0).comments(9, 0),
+    base("src/chunked").params(8, 2).allows(2, 0),
     base("src/column_stats").fn_lines(109, 1),
     base("src/compaction")
-        .fn_lines(256, 11)
-        .test_fn_lines(188, 1)
-        .comments(9, 0),
-    base("src/config").fn_lines(1108, 8).comments(40, 0),
-    base("src/console").fn_lines(83, 1).comments(3, 0),
+        .fn_lines(211, 3)
+        .test_fn_lines(188, 1),
     base("src/control_plane")
         .fn_lines(299, 5)
         .test_fn_lines(144, 2)
         .allows(1, 0)
         .comments(8, 0),
     base("src/coordinator")
-        .fn_lines(455, 38)
+        .fn_lines(455, 37)
         .test_fn_lines(177, 4)
         .params(11, 5)
-        .allows(5, 0)
-        .comments(65, 0),
+        .allows(5, 0),
     base("src/demo").fn_lines(112, 1).comments(1, 0),
     base("src/dense_policy").fn_lines(191, 1).comments(5, 0),
-    base("src/derived").fn_lines(92, 1).comments(2, 0),
-    base("src/diagnostics").fn_lines(101, 1).comments(2, 0),
     base("src/document_catalog")
         .fn_lines(275, 19)
         .test_fn_lines(253, 6)
         .comments(9, 0),
-    base("src/document_write_service").comments(1, 0),
     base("src/embedded").fn_lines(90, 1),
-    base("src/exact_vectors").fn_lines(99, 4).comments(1, 0),
     base("src/explain").fn_lines(140, 3).comments(1, 0),
     base("src/facet_rows").comments(1, 0),
     base("src/field_permissions")
         .fn_lines(100, 2)
         .comments(1, 0),
-    base("src/filter")
-        .fn_lines(152, 2)
-        .test_fn_lines(142, 1)
-        .comments(5, 0),
     base("src/filter_bits")
         .params(8, 1)
         .allows(1, 0)
         .comments(1, 0),
     base("src/fusion").fn_lines(98, 1).comments(1, 0),
     base("src/geo").comments(3, 0),
-    base("src/harness").fn_lines(191, 3).comments(1, 0),
     base("src/highlight").fn_lines(138, 1).comments(1, 0),
     base("src/hnsw")
         .fn_lines(409, 17)
@@ -195,34 +153,19 @@ pub(crate) const RATCHET: &[ModuleAllowance] = &[
     base("src/index_definition").fn_lines(128, 1),
     base("src/link").comments(1, 0),
     base("src/live_docs").comments(1, 0),
-    base("src/ltr").fn_lines(123, 2).comments(1, 0),
     base("src/main").fn_lines(602, 3).comments(10, 0),
-    base("src/mapping")
-        .fn_lines(184, 8)
-        .params(8, 1)
-        .allows(1, 0)
-        .comments(1, 0),
-    base("src/metrics").fn_lines(178, 3).comments(12, 0),
     base("src/multi_res").fn_lines(91, 1),
     base("src/node")
-        .fn_lines(867, 53)
+        .fn_lines(854, 35)
         .test_fn_lines(230, 1)
         .params(14, 5)
         .allows(5, 0)
-        .comments(104, 1),
-    base("src/node_agent").fn_lines(452, 4).comments(3, 0),
+        .comments(4, 0),
     base("src/number_rows").comments(1, 0),
     base("src/pb").comments(1, 0),
-    base("src/placement")
-        .fn_lines(113, 4)
-        .params(8, 1)
-        .allows(1, 0)
-        .comments(6, 0),
     base("src/placement_plan").comments(1, 0),
-    base("src/postings").comments(60, 1),
     base("src/protobuf").fn_lines(125, 1),
     base("src/proximity").fn_lines(109, 2).comments(1, 0),
-    base("src/quality").fn_lines(230, 3).comments(2, 0),
     base("src/query")
         .fn_lines(1188, 8)
         .params(12, 2)
@@ -232,23 +175,10 @@ pub(crate) const RATCHET: &[ModuleAllowance] = &[
         .fn_lines(115, 1)
         .test_fn_lines(151, 1),
     base("src/raft")
-        .fn_lines(175, 3)
-        .test_fn_lines(206, 7)
+        .test_fn_lines(206, 4)
         .params(10, 1)
         .allows(1, 0)
-        .comments(17, 2),
-    base("src/reconcile").fn_lines(249, 3).comments(1, 0),
-    base("src/relay")
-        .fn_lines(509, 18)
-        .params(11, 3)
-        .allows(3, 0)
-        .comments(6, 0),
-    base("src/replication").fn_lines(355, 3),
-    base("src/reshard")
-        .fn_lines(1294, 12)
-        .params(16, 16)
-        .allows(18, 0)
-        .comments(42, 0),
+        .comments(2, 0),
     base("src/schema_report").fn_lines(118, 3),
     base("src/scorefn").comments(10, 0),
     base("src/security").comments(2, 0),
@@ -256,16 +186,15 @@ pub(crate) const RATCHET: &[ModuleAllowance] = &[
     base("src/segmented").fn_lines(125, 2).comments(6, 0),
     base("src/segmented_vectors").comments(1, 0),
     base("src/segments")
-        .fn_lines(248, 8)
+        .fn_lines(248, 7)
         .test_fn_lines(260, 1)
-        .params(10, 3)
-        .allows(3, 0)
-        .comments(13, 0),
+        .params(8, 2)
+        .allows(2, 0)
+        .comments(12, 0),
     base("src/sha256").comments(1, 0),
     base("src/snapshot").fn_lines(106, 3).comments(2, 0),
     base("src/snapshot_repository").comments(1, 0),
     base("src/sortkeys").comments(1, 0),
-    base("src/source_archive").fn_lines(84, 1),
     base("src/source_authority")
         .fn_lines(233, 15)
         .test_fn_lines(197, 6)
@@ -276,8 +205,5 @@ pub(crate) const RATCHET: &[ModuleAllowance] = &[
     base("src/stream_signal").comments(1, 0),
     base("src/synonyms").fn_lines(107, 1).comments(1, 0),
     base("src/turbo_bridge").fn_lines(267, 4).comments(1, 0),
-    base("src/values").fn_lines(498, 4).comments(5, 0),
     base("src/vector").comments(6, 0),
-    base("src/vocab").comments(1, 0),
-    base("src/wal").fn_lines(120, 1).comments(5, 0),
 ];

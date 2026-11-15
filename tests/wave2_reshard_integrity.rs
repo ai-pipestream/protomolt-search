@@ -226,7 +226,10 @@ fn refuses_mixed_declarations(tag: &str, run: impl Fn(&Path, &[PathBuf]) -> Resu
 #[test]
 fn a_hash_split_refuses_inputs_under_different_derived_declarations() {
     refuses_mixed_declarations("split-logs", |out, gens| {
-        reshard::split_logs(gens, 1, out, 0, 1 << 20, true, None, &mut analyzer(false)).map(|_| ())
+        let req = reshard::SplitRequest::new(gens, 1, out)
+            .slot_stride(1 << 20)
+            .vectors_only(true);
+        reshard::split_logs_with(&req, &mut analyzer(false)).map(|_| ())
     });
 }
 

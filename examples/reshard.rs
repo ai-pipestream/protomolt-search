@@ -82,9 +82,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => eprintln!("reshard: open-files limit left as is"),
     }
     let analysis_addr = arg("analysis-addr", "http://127.0.0.1:50051");
-    // Vector-only replay skips document analysis and the BM25 sidecars
-    // entirely: shard-count and routing experiments only search the
-    // vector leg, and children shrink from tens of GB to provider images.
     let vectors_only = std::env::args().any(|a| a == "--vectors-only");
     let stable_routing = std::env::args().any(|a| a == "--stable-routing");
     if stable_routing && opt("logs").is_some() {
@@ -92,8 +89,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--stable-routing currently serves one live source; use --log, not --logs".into(),
         );
     }
-    // Child BM25 field table override (docs/multi-field.md): comma list
-    // starting with "body". Absent = derive from the replayed records.
     let bm25_fields: Option<Vec<String>> = opt("bm25-fields").map(|s| {
         s.split(',')
             .map(str::trim)
@@ -101,22 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(str::to_string)
             .collect()
     });
-
-    // The reshard core is synchronous; the sidecar client is async. Bridge
-    // with block_in_place on the multi-thread runtime (same idiom the
-    // court examples use for sync work under tokio). Each batch rides
-    // `--analysis-streams` AnalyzeStreams, paced by the sidecar's flow
-    // control (a sidecar predating the RPC is refused outright, not
-    // quietly downgraded to per-document unary calls that would die deep
-    // into the replay).
-    //
-    // One stream is a pipeline, not a parallel: analysis is the ceiling
-    // on this replay, so raising the count lets the sidecar work on
-    // several documents at once. It cannot change the result -- results
-    // are keyed by sequence and analysis is a pure function of (text,
-    // spec) -- so it is safe to tune against a live sidecar.
     let streams: usize = arg("analysis-streams", "1").parse()?;
-    let addr = analysis_addr.clone();
     let handle = tokio::runtime::Handle::current();
     let mut analyze = move |docs: &[(
         &str,
@@ -125,336 +105,350 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )]|
           -> Result<Vec<AnalyzedDoc>, String> {
         tokio::task::block_in_place(|| {
-            handle.block_on(analyzer::analyze_batch_streams(&addr, docs, streams))
+            handle.block_on(analyzer::analyze_batch_streams(
+                &analysis_addr,
+                docs,
+                streams,
+            ))
         })
-        .map_err(|e| format!("analysis sidecar at {addr}: {e}"))
+        .map_err(|e| format!("analysis sidecar at {analysis_addr}: {e}"))
     };
 
+    let ctx = CliArgs {
+        out_dir: &out_dir,
+        vectors_only,
+        stable_routing,
+        bm25_fields: bm25_fields.as_deref(),
+    };
     if let Some(tree_path) = opt("placement-tree") {
-        let generations = match (opt("logs"), opt("log")) {
-            (Some(logs), _) => logs
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(|s| reshard::resolve_gen(Path::new(s)))
-                .collect::<Result<Vec<_>, _>>()?,
-            (None, Some(log)) => vec![reshard::resolve_gen(Path::new(&log))?],
-            (None, None) => return Err("a re-placement split needs --log or --logs".into()),
-        };
-        if vectors_only {
-            return Err(
-                "a re-placement split evaluates the tree on documents; drop --vectors-only".into(),
-            );
-        }
-        let tree = pipestream_search::config::load_placement_tree(Path::new(&tree_path))?;
-        let placement = pipestream_search::placement::Placement::validate(&tree)?;
-        let children = reshard::tree_children(&placement)?;
-        let slot_base: u64 = arg("slot-base", "0").parse()?;
-        let slot_stride: u64 = arg("slot-stride", "25000000").parse()?;
-        let slot_offsets: Vec<u64> = (0..children.len() as u64)
-            .map(|i| slot_base + i * slot_stride)
-            .collect();
-        for gen in &generations {
-            eprintln!("replaying {}", gen.display());
-        }
-        let layout = match opt("single-image") {
-            Some(bound) => reshard::TreeChildLayout::SingleImage {
-                max_child_rows: bound.parse().map_err(|error| {
-                    format!("--single-image takes the most rows a child may have: {error}")
-                })?,
-            },
-            None => reshard::TreeChildLayout::Segmented,
-        };
-        let spill_bucket_bits = opt("spill-bucket-bits")
-            .map(|bits| bits.parse::<u32>())
-            .transpose()?;
-        // `--from-segments` takes each document's analyzed fields from the
-        // sealed segments beside the logs instead of the analyzer
-        // (docs/replay-from-segments.md); `--cut-column=<integer column>`
-        // with `--cut-rows=<n>` cuts each child's spill by the column's
-        // values so the children come out partitioned.
-        let source = if std::env::args().any(|a| a == "--from-segments") {
-            reshard::TreeRowSource::Segments
-        } else {
-            reshard::TreeRowSource::Logs
-        };
-        let cut = match opt("cut-column") {
-            Some(column) => reshard::SpillCut::Column {
-                column,
-                rows_per_cut: arg("cut-rows", "1000000").parse()?,
-            },
-            None => reshard::SpillCut::Hash,
-        };
-        // `--only-child=<index>` builds one child of the tree and leaves
-        // the others' catalogs as they are (a child redone after a
-        // failed build); the routing pass still covers every child.
-        let only_child = opt("only-child")
-            .map(|index| {
-                index.parse::<usize>().map_err(|error| {
-                    format!("--only-child takes the child's index in leaf order: {error}")
-                })
-            })
-            .transpose()?;
-        // `--build-threads=<n>` seals that many spill buckets at once
-        // under --from-segments; the build's memory is that many
-        // buckets' replays (docs/replay-from-segments.md).
-        let build_threads = arg("build-threads", "1")
-            .parse::<usize>()
-            .map_err(|error| format!("--build-threads takes a thread count: {error}"))?;
-        if build_threads == 0 {
-            return Err("--build-threads takes at least one thread".into());
-        }
-        // `--build-queue=<n>` bounds the sealed-but-unappended bucket
-        // images a threaded build holds; absent, the thread count.
-        let build_queue = opt("build-queue")
-            .map(|n| {
-                n.parse::<usize>()
-                    .map_err(|error| format!("--build-queue takes a depth: {error}"))
-            })
-            .transpose()?;
-        // `--build-memory=<MiB>` budgets the build pass: the spill's
-        // per-bucket row counts at 70 KiB a row must fit it, alone and
-        // times the threads, or the split refuses by name after the
-        // routing pass.
-        let build_memory = opt("build-memory")
-            .map(|mb| {
-                mb.parse::<u64>()
-                    .ok()
-                    .and_then(|mb| mb.checked_mul(1 << 20))
-                    .ok_or_else(|| "--build-memory takes a MiB count".to_string())
-            })
-            .transpose()?;
-        // `--derived-columns=<file>` writes the children under that
-        // declaration (a shard map or a bare [[derived]] table,
-        // docs/derived-columns.md); `--derive=a,b` computes those
-        // columns on every row (a column added to the declaration, or
-        // one whose expression changed). Without the file the children
-        // keep the sources' own declaration.
-        let derived = opt("derived-columns")
-            .map(|path| {
-                pipestream_search::derived::load_declaration(Path::new(&path))
-                    .and_then(|spec| pipestream_search::derived::Declaration::compile(&spec))
-                    .map(std::sync::Arc::new)
-                    .map_err(|error| format!("--derived-columns={path}: {error}"))
-            })
-            .transpose()?;
-        let derive: Vec<String> = opt("derive")
-            .map(|names| {
-                names
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|name| !name.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let placed = reshard::split_placement_tree_logs(
-            &generations,
-            &tree,
-            &out_dir,
-            &slot_offsets,
-            bm25_fields.as_deref(),
-            reshard::TreeSplitOptions {
-                layout,
-                spill_bucket_bits,
-                source,
-                cut,
-                only_child,
-                open_files_limit: None,
-                derived,
-                derive,
-                build_threads,
-                build_queue,
-                build_memory,
-            },
-            &mut analyze,
-        )?;
-        let map = reshard::tree_shard_map_toml(&placed, &tree)?;
-        let map_path = out_dir.join("shard-map.toml");
-        std::fs::write(&map_path, &map)?;
-        eprintln!("wrote {}", map_path.display());
-        eprintln!("{} documents changed code under the new tree", placed.moved);
-        eprintln!(
-            "spill logs of {} buckets; the largest replay held {} rows ({:?})",
-            placed.spill_bucket_count, placed.peak_replay_rows, placed.layout
-        );
-        eprintln!(
-            "analysis: {:?}, {} documents transplanted, largest transpose {} bytes; spill cut {:?}",
-            placed.source, placed.transplanted_rows, placed.peak_transpose_bytes, placed.cut
-        );
-        for (((image, child), rows), segments) in placed
-            .images
-            .children
-            .iter()
-            .zip(&placed.children)
-            .zip(&placed.placed)
-            .zip(&placed.segments)
-        {
-            eprintln!(
-                "child {}: leaf {} (placement {}), {rows} documents, {} vectors, {segments} \
-                 segments, slot_offset {}, hash [{}, {}]",
-                image.vector_path.display(),
-                child.leaf,
-                child.code,
-                image.num_vectors,
-                image.slot_offset,
-                image.hash_lo,
-                image.hash_hi
-            );
-        }
-        println!(
-            "# node config: one [[shards]] block per child; add --placement-column={} \
-                  --placement-leaf=<placement> --placement-tree={} to each\n",
-            tree.column, tree_path
-        );
-        print!("{}", reshard::shards_toml(&placed.images));
-        println!(
-            "\n# coordinator shard map (also written to {})\n",
-            map_path.display()
-        );
-        print!("{map}");
-        return Ok(());
+        return run_placement_tree_reshard(&ctx, &tree_path, &mut analyze);
     }
+    if let Some((output, cutoff)) = run_logs_or_single_reshard(&ctx, &mut analyze)? {
+        write_reshard_outputs(&out_dir, &output, cutoff)?;
+    }
+    Ok(())
+}
 
-    let (output, live_cutoff) = match opt("logs") {
-        Some(logs) => {
-            let generations = logs
+type ReshardErr = Box<dyn std::error::Error>;
+
+struct CliArgs<'a> {
+    out_dir: &'a Path,
+    vectors_only: bool,
+    stable_routing: bool,
+    bm25_fields: Option<&'a [String]>,
+}
+
+fn parse_generations_from_flags() -> Result<Vec<PathBuf>, ReshardErr> {
+    match (opt("logs"), opt("log")) {
+        (Some(logs), _) => Ok(logs
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| reshard::resolve_gen(Path::new(s)))
+            .collect::<Result<Vec<_>, _>>()?),
+        (None, Some(log)) => Ok(vec![reshard::resolve_gen(Path::new(&log))?]),
+        (None, None) => Err("a re-placement split needs --log or --logs".into()),
+    }
+}
+
+fn parse_derived_declaration(
+) -> Result<Option<std::sync::Arc<pipestream_search::derived::Declaration>>, String> {
+    opt("derived-columns")
+        .map(|path| {
+            pipestream_search::derived::load_declaration(Path::new(&path))
+                .and_then(|spec| pipestream_search::derived::Declaration::compile(&spec))
+                .map(std::sync::Arc::new)
+                .map_err(|error| format!("--derived-columns={path}: {error}"))
+        })
+        .transpose()
+}
+
+fn parse_tree_split_options() -> Result<reshard::TreeSplitOptions, ReshardErr> {
+    let layout = match opt("single-image") {
+        Some(bound) => reshard::TreeChildLayout::SingleImage {
+            max_child_rows: bound
+                .parse()
+                .map_err(|e| format!("--single-image takes the most rows a child may have: {e}"))?,
+        },
+        None => reshard::TreeChildLayout::Segmented,
+    };
+    let spill_bucket_bits = opt("spill-bucket-bits")
+        .map(|b| b.parse::<u32>())
+        .transpose()?;
+    let source = if std::env::args().any(|a| a == "--from-segments") {
+        reshard::TreeRowSource::Segments
+    } else {
+        reshard::TreeRowSource::Logs
+    };
+    let cut = match opt("cut-column") {
+        Some(column) => reshard::SpillCut::Column {
+            column,
+            rows_per_cut: arg("cut-rows", "1000000").parse()?,
+        },
+        None => reshard::SpillCut::Hash,
+    };
+    let only_child = opt("only-child")
+        .map(|i| {
+            i.parse::<usize>()
+                .map_err(|e| format!("--only-child takes the child's index in leaf order: {e}"))
+        })
+        .transpose()?;
+    let build_threads = arg("build-threads", "1")
+        .parse::<usize>()
+        .map_err(|e| format!("--build-threads takes a thread count: {e}"))?;
+    if build_threads == 0 {
+        return Err("--build-threads takes at least one thread".into());
+    }
+    let build_queue = opt("build-queue")
+        .map(|n| {
+            n.parse::<usize>()
+                .map_err(|e| format!("--build-queue takes a depth: {e}"))
+        })
+        .transpose()?;
+    let build_memory = opt("build-memory")
+        .map(|mb| {
+            mb.parse::<u64>()
+                .ok()
+                .and_then(|mb| mb.checked_mul(1 << 20))
+                .ok_or_else(|| "--build-memory takes a MiB count".to_string())
+        })
+        .transpose()?;
+    let derived = parse_derived_declaration()?;
+    let derive: Vec<String> = opt("derive")
+        .map(|names| {
+            names
                 .split(',')
                 .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(|s| reshard::resolve_gen(Path::new(s)))
-                .collect::<Result<Vec<_>, _>>()?;
-            // --logs + --split is the general N -> M reshard: the inputs'
-            // union redistributed across M children. --logs alone merges
-            // to one image.
-            match opt("split") {
-                Some(n) => {
-                    let n: usize = n.parse()?;
-                    let slot_base: u64 = arg("slot-base", "0").parse()?;
-                    let slot_stride: u64 = arg("slot-stride", "25000000").parse()?;
-                    (
-                        reshard::split_logs(
-                            &generations,
-                            n,
-                            &out_dir,
-                            slot_base,
-                            slot_stride,
-                            vectors_only,
-                            bm25_fields.as_deref(),
-                            &mut analyze,
-                        )?,
-                        None,
-                    )
-                }
-                None => {
-                    let slot_base = opt("slot-base").map(|s| s.parse::<u64>()).transpose()?;
-                    (
-                        reshard::merge(
-                            &generations,
-                            &out_dir,
-                            slot_base,
-                            vectors_only,
-                            bm25_fields.as_deref(),
-                            &mut analyze,
-                        )?,
-                        None,
-                    )
-                }
-            }
-        }
-        None => {
-            let log = opt("log").ok_or("split requires --log=<wal dir|generation dir>")?;
-            let gen = reshard::resolve_gen(Path::new(&log))?;
-            eprintln!("replaying {}", gen.display());
-            let n: usize = arg("split", "2").parse()?;
-            let slot_base: u64 = arg("slot-base", "0").parse()?;
-            let slot_stride: u64 = arg("slot-stride", "25000000").parse()?;
-            if let Some(column) = opt("placement-column") {
-                // --placement-ranges=lo..=hi,lo..=hi[,default]: one child per
-                // entry, in order; `default` is the child that takes rows with
-                // no code or a code outside every range.
-                let spec = opt("placement-ranges")
-                    .ok_or("a placement split needs --placement-ranges=lo..=hi,...[,default]")?;
-                let mut children = Vec::new();
-                let mut default_child = None;
-                for (i, entry) in spec.split(',').map(str::trim).enumerate() {
-                    if entry == "default" {
-                        default_child = Some(i);
-                        children.push(reshard::PlacementChild::NONE);
-                        continue;
-                    }
-                    let (lo, hi) = entry
-                        .split_once("..=")
-                        .ok_or_else(|| format!("placement range {entry:?} is not lo..=hi"))?;
-                    children.push(reshard::PlacementChild {
-                        lo: lo.trim().parse()?,
-                        hi: hi.trim().parse()?,
-                    });
-                }
-                let slot_offsets: Vec<u64> = (0..children.len() as u64)
-                    .map(|i| slot_base + i * slot_stride)
-                    .collect();
-                let placed = reshard::split_placement_logs(
-                    &[gen],
-                    &column,
-                    &children,
-                    default_child,
-                    &out_dir,
-                    &slot_offsets,
-                    vectors_only,
-                    bm25_fields.as_deref(),
-                    &mut analyze,
-                )?;
-                let map = reshard::placement_shard_map_toml(&placed);
-                let map_path = out_dir.join("shard-map.toml");
-                std::fs::write(&map_path, &map)?;
-                eprintln!("wrote {}", map_path.display());
-                for (child, range) in placed.images.children.iter().zip(&placed.ranges) {
-                    eprintln!(
-                        "child {}: {} vectors, {} documents, slot_offset {}, placement {}..={}",
-                        child.vector_path.display(),
-                        child.num_vectors,
-                        child.num_documents,
-                        child.slot_offset,
-                        range.lo,
-                        range.hi
-                    );
-                }
-                print!("{}", reshard::shards_toml(&placed.images));
-                return Ok(());
-            }
-            if stable_routing {
-                let stable = reshard::split_stable_logs(
-                    &[gen],
-                    n,
-                    &out_dir,
-                    slot_base,
-                    slot_stride,
-                    vectors_only,
-                    bm25_fields.as_deref(),
-                    &mut analyze,
-                )?;
-                let cutoff = stable.source_cutoffs[0];
-                (stable.images, Some(cutoff))
-            } else {
-                (
-                    reshard::split(
-                        &gen,
-                        n,
-                        &out_dir,
-                        slot_base,
-                        slot_stride,
-                        vectors_only,
-                        bm25_fields.as_deref(),
-                        &mut analyze,
-                    )?,
-                    None,
-                )
-            }
-        }
-    };
+                .filter(|n| !n.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(reshard::TreeSplitOptions {
+        layout,
+        spill_bucket_bits,
+        source,
+        cut,
+        only_child,
+        open_files_limit: None,
+        derived,
+        derive,
+        build_threads,
+        build_queue,
+        build_memory,
+    })
+}
 
-    let map = reshard::shard_map_toml(&output);
+fn run_placement_tree_reshard(
+    ctx: &CliArgs<'_>,
+    tree_path: &str,
+    analyze: &mut reshard::Analyzer,
+) -> Result<(), ReshardErr> {
+    let generations = parse_generations_from_flags()?;
+    if ctx.vectors_only {
+        return Err(
+            "a re-placement split evaluates the tree on documents; drop --vectors-only".into(),
+        );
+    }
+    let tree = pipestream_search::config::load_placement_tree(Path::new(tree_path))?;
+    let placement = pipestream_search::placement::Placement::validate(&tree)?;
+    let children = reshard::tree_children(&placement)?;
+    let slot_base: u64 = arg("slot-base", "0").parse()?;
+    let slot_stride: u64 = arg("slot-stride", "25000000").parse()?;
+    let slot_offsets: Vec<u64> = (0..children.len() as u64)
+        .map(|i| slot_base + i * slot_stride)
+        .collect();
+    for gen in &generations {
+        eprintln!("replaying {}", gen.display());
+    }
+    let options = parse_tree_split_options()?;
+    let placed = reshard::split_placement_tree_logs(
+        &generations,
+        &tree,
+        ctx.out_dir,
+        &slot_offsets,
+        ctx.bm25_fields,
+        options,
+        analyze,
+    )?;
+    let map = reshard::tree_shard_map_toml(&placed, &tree)?;
+    let map_path = ctx.out_dir.join("shard-map.toml");
+    std::fs::write(&map_path, &map)?;
+    report_tree_reshard(&placed, &tree.column, tree_path, &map_path, &map);
+    Ok(())
+}
+
+fn report_tree_reshard(
+    placed: &reshard::TreeReshardOutput,
+    column: &str,
+    tree_path: &str,
+    map_path: &Path,
+    map: &str,
+) {
+    eprintln!("wrote {}", map_path.display());
+    eprintln!("{} documents changed code under the new tree", placed.moved);
+    eprintln!(
+        "spill logs of {} buckets; the largest replay held {} rows ({:?})",
+        placed.spill_bucket_count, placed.peak_replay_rows, placed.layout
+    );
+    eprintln!(
+        "analysis: {:?}, {} documents transplanted, largest transpose {} bytes; spill cut {:?}",
+        placed.source, placed.transplanted_rows, placed.peak_transpose_bytes, placed.cut
+    );
+    for (((image, child), rows), segments) in placed
+        .images
+        .children
+        .iter()
+        .zip(&placed.children)
+        .zip(&placed.placed)
+        .zip(&placed.segments)
+    {
+        eprintln!(
+            "child {}: leaf {} (placement {}), {rows} documents, {} vectors, {segments} \
+             segments, slot_offset {}, hash [{}, {}]",
+            image.vector_path.display(),
+            child.leaf,
+            child.code,
+            image.num_vectors,
+            image.slot_offset,
+            image.hash_lo,
+            image.hash_hi
+        );
+    }
+    println!(
+        "# node config: one [[shards]] block per child; add --placement-column={column} \
+         --placement-leaf=<placement> --placement-tree={tree_path} to each\n"
+    );
+    print!("{}", reshard::shards_toml(&placed.images));
+    println!(
+        "\n# coordinator shard map (also written to {})\n",
+        map_path.display()
+    );
+    print!("{map}");
+}
+
+fn run_placement_column_reshard(
+    ctx: &CliArgs<'_>,
+    gen: &PathBuf,
+    column: &str,
+    slot_base: u64,
+    slot_stride: u64,
+    analyze: &mut reshard::Analyzer,
+) -> Result<(), ReshardErr> {
+    let spec = opt("placement-ranges")
+        .ok_or("a placement split needs --placement-ranges=lo..=hi,...[,default]")?;
+    let mut children = Vec::new();
+    let mut default_child = None;
+    for (i, entry) in spec.split(',').map(str::trim).enumerate() {
+        if entry == "default" {
+            default_child = Some(i);
+            children.push(reshard::PlacementChild::NONE);
+            continue;
+        }
+        let (lo, hi) = entry
+            .split_once("..=")
+            .ok_or_else(|| format!("placement range {entry:?} is not lo..=hi"))?;
+        children.push(reshard::PlacementChild {
+            lo: lo.trim().parse()?,
+            hi: hi.trim().parse()?,
+        });
+    }
+    let slot_offsets: Vec<u64> = (0..children.len() as u64)
+        .map(|i| slot_base + i * slot_stride)
+        .collect();
+    let req = reshard::PlacementSplitRequest::new(
+        std::slice::from_ref(gen),
+        column,
+        &children,
+        ctx.out_dir,
+        &slot_offsets,
+    )
+    .default_child(default_child)
+    .vectors_only(ctx.vectors_only)
+    .bm25_fields(ctx.bm25_fields);
+    let placed = reshard::split_placement_logs_with(&req, analyze)?;
+    let map = reshard::placement_shard_map_toml(&placed);
+    let map_path = ctx.out_dir.join("shard-map.toml");
+    std::fs::write(&map_path, &map)?;
+    eprintln!("wrote {}", map_path.display());
+    for (child, range) in placed.images.children.iter().zip(&placed.ranges) {
+        eprintln!(
+            "child {}: {} vectors, {} documents, slot_offset {}, placement {}..={}",
+            child.vector_path.display(),
+            child.num_vectors,
+            child.num_documents,
+            child.slot_offset,
+            range.lo,
+            range.hi
+        );
+    }
+    print!("{}", reshard::shards_toml(&placed.images));
+    Ok(())
+}
+
+fn run_logs_or_single_reshard(
+    ctx: &CliArgs<'_>,
+    analyze: &mut reshard::Analyzer,
+) -> Result<Option<(reshard::ReshardOutput, Option<reshard::WalCutoff>)>, ReshardErr> {
+    if let Some(logs) = opt("logs") {
+        let generations = logs
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| reshard::resolve_gen(Path::new(s)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let output = match opt("split") {
+            Some(n) => {
+                let req = reshard::SplitRequest::new(&generations, n.parse()?, ctx.out_dir)
+                    .slot_base(arg("slot-base", "0").parse()?)
+                    .slot_stride(arg("slot-stride", "25000000").parse()?)
+                    .vectors_only(ctx.vectors_only)
+                    .bm25_fields(ctx.bm25_fields);
+                reshard::split_logs_with(&req, analyze)?
+            }
+            None => {
+                let slot_base = opt("slot-base").map(|s| s.parse::<u64>()).transpose()?;
+                reshard::merge(
+                    &generations,
+                    ctx.out_dir,
+                    slot_base,
+                    ctx.vectors_only,
+                    ctx.bm25_fields,
+                    analyze,
+                )?
+            }
+        };
+        return Ok(Some((output, None)));
+    }
+    let log = opt("log").ok_or("split requires --log=<wal dir|generation dir>")?;
+    let gen = reshard::resolve_gen(Path::new(&log))?;
+    eprintln!("replaying {}", gen.display());
+    let n: usize = arg("split", "2").parse()?;
+    let slot_base: u64 = arg("slot-base", "0").parse()?;
+    let slot_stride: u64 = arg("slot-stride", "25000000").parse()?;
+    if let Some(column) = opt("placement-column") {
+        run_placement_column_reshard(ctx, &gen, &column, slot_base, slot_stride, analyze)?;
+        return Ok(None);
+    }
+    let req = reshard::SplitRequest::new(std::slice::from_ref(&gen), n, ctx.out_dir)
+        .slot_base(slot_base)
+        .slot_stride(slot_stride)
+        .vectors_only(ctx.vectors_only)
+        .bm25_fields(ctx.bm25_fields);
+    if ctx.stable_routing {
+        let stable = reshard::split_stable_logs_with(&req, analyze)?;
+        Ok(Some((stable.images, Some(stable.source_cutoffs[0]))))
+    } else {
+        Ok(Some((reshard::split_logs_with(&req, analyze)?, None)))
+    }
+}
+
+fn write_reshard_outputs(
+    out_dir: &Path,
+    output: &reshard::ReshardOutput,
+    live_cutoff: Option<reshard::WalCutoff>,
+) -> Result<(), ReshardErr> {
+    let map = reshard::shard_map_toml(output);
     let map_path = out_dir.join("shard-map.toml");
     std::fs::write(&map_path, &map)?;
     eprintln!("wrote {}", map_path.display());
@@ -481,7 +475,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     println!("# node config — one [[shards]] block per child\n");
-    print!("{}", reshard::shards_toml(&output));
+    print!("{}", reshard::shards_toml(output));
     println!(
         "\n# coordinator shard map (also written to {})\n",
         map_path.display()

@@ -20,8 +20,7 @@ pub(super) fn floor_token() -> u64 {
 /// statistics and their complete claim; a second mutation returns the refusal.
 /// Never drop the fence to manufacture success under continuous writes.
 pub(crate) fn is_stale_stats(status: &Status) -> bool {
-    status.code() == tonic::Code::FailedPrecondition
-        && status.message().starts_with(crate::node::STALE_STATS_EPOCH)
+    crate::stats_identity::is_stale_stats_epoch(status)
 }
 
 pub(super) struct Bm25StreamHeap {

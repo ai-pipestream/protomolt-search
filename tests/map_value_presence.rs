@@ -244,220 +244,238 @@ async fn verify(addresses: Vec<String>, removed: &[u32], map_key: &str) {
     let _ = top_handle.await;
 }
 
+fn build_map_presence_requests(
+    shard: usize,
+    rows: usize,
+    map_key: &str,
+) -> Vec<pb::AddDocumentsRequest> {
+    (0..rows)
+        .map(|row| {
+            let key = (shard * 3 + row).to_string();
+            pb::AddDocumentsRequest {
+                text: "word".into(),
+                analysis: Some(body_spec()),
+                facets: vec![pb::FacetValue {
+                    field: "id".into(),
+                    value: key.clone(),
+                }],
+                original_source: Some(common::protobuf_source("word", &key)),
+                identity: Some(pb::DocumentIdentity {
+                    document_key: key.into_bytes(),
+                    version: 1,
+                    chunk_ordinal: None,
+                }),
+                map_numerics: if row % 3 == 1 {
+                    Vec::new()
+                } else {
+                    vec![pb::MapNumericEntry {
+                        field: "metrics".into(),
+                        key: map_key.into(),
+                        value: if row % 3 == 0 {
+                            0.0
+                        } else {
+                            (shard * 3 + row) as f64
+                        },
+                    }]
+                },
+                map_facets: if row % 3 == 1 {
+                    Vec::new()
+                } else {
+                    vec![pb::MapFacetEntry {
+                        field: "meta".into(),
+                        key: map_key.into(),
+                        value: if row % 3 == 0 { "" } else { "value" }.into(),
+                    }]
+                },
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
+async fn seed_map_presence_shard(
+    root: &std::path::Path,
+    layout: Layout,
+    shards: usize,
+    shard: usize,
+    map_key: &str,
+) -> (
+    NodeConfig,
+    String,
+    tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+) {
+    let config = NodeConfig {
+        index_path: Some(root.join(format!("{layout:?}-{shards}-{shard}.tv"))),
+        layout,
+        wal: true,
+        slot_offset: (shard * 3) as u64,
+        map_facet_fields: vec!["meta".into()],
+        map_numeric_fields: vec!["metrics".into()],
+        facet_fields: vec!["id".into()],
+        analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
+        ..Default::default()
+    };
+    let (address, server) = common::start_empty_node(config.clone()).await;
+    let mut client = NodeServiceClient::connect(address.clone()).await.unwrap();
+    let rows = if shards == 1 { 6 } else { 3 };
+    let (shift, scale) = common::fit_calibration(16, 4, &common::unit_vectors(64, 16, 134));
+    let backend_req = pipestream_search::harness::embedded_backend_request(16, 4, &shift, &scale);
+    client.configure_vector_backend(backend_req).await.unwrap();
+    let requests = build_map_presence_requests(shard, rows, map_key);
+    let documents = client
+        .add_documents(tokio_stream::iter(requests))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(documents.first_id, config.slot_offset);
+    let vectors = client
+        .add_vectors(tokio_stream::iter([pb::AddVectorsRequest {
+            materialized_rows: Vec::new(),
+            vectors: common::unit_vectors(rows, 16, 135),
+            dim: 16,
+        }]))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(vectors.first_id, documents.first_id);
+    assert_eq!(vectors.added, documents.added);
+    (config, address, server)
+}
+
+fn verify_map_presence_wal_replay(
+    root: &std::path::Path,
+    layout: Layout,
+    shards: usize,
+    shard: usize,
+    config: &NodeConfig,
+    map_key: &str,
+) {
+    let path = config.index_path.as_ref().unwrap();
+    let gen =
+        pipestream_search::reshard::resolve_gen(&pipestream_search::wal::wal_dir(path)).unwrap();
+    let out_dir = root.join(format!("replay-{layout:?}-{shards}-{shard}"));
+    let req =
+        pipestream_search::reshard::SplitRequest::new(std::slice::from_ref(&gen), 1, &out_dir)
+            .slot_base(config.slot_offset)
+            .slot_stride(25_000_000);
+    let output = pipestream_search::reshard::split_logs_with(&req, &mut |docs| {
+        docs.iter()
+            .map(|(text, spec, layers)| {
+                assert!(!layers.dual_cased);
+                pipestream_search::analyzer::analyze_document_native(text, *spec)
+                    .map_err(|error| error.to_string())
+            })
+            .collect()
+    })
+    .unwrap();
+    let child = &output.children[0];
+    let reader = Bm25Reader::open(child.bm25_path.as_ref().unwrap()).unwrap();
+    reader.verify_integrity().unwrap();
+    assert_eq!(child.num_documents, if shards == 1 { 6 } else { 3 });
+    let facet = reader.map_facet_index("meta").unwrap();
+    let facet_key = reader.map_facet_key_ord(facet, map_key).unwrap();
+    let numeric = reader.map_numeric_index("metrics").unwrap();
+    let numeric_key = reader.map_numeric_key_ord(numeric, map_key).unwrap();
+    for (row, id) in child.row_parent_ids.iter().copied().enumerate() {
+        let expected_str = match id % 3 {
+            0 => Some(""),
+            1 => None,
+            _ => Some("value"),
+        };
+        assert_eq!(
+            reader
+                .map_facet_value_ord(facet, facet_key, row as u32)
+                .map(|value| reader.map_facet_value(facet, value)),
+            expected_str
+        );
+        let expected_num = (id % 3 != 1).then_some(if id % 3 == 0 { 0.0 } else { id as f64 });
+        assert_eq!(
+            reader.map_numeric_value(numeric, numeric_key, row as u32),
+            expected_num
+        );
+    }
+}
+
+async fn run_map_presence_case(
+    root: &std::path::Path,
+    layout: Layout,
+    shards: usize,
+    map_key: &str,
+) {
+    let mut configs = Vec::new();
+    let mut addresses = Vec::new();
+    let mut servers = Vec::new();
+    for shard in 0..shards {
+        let (cfg, addr, srv) = seed_map_presence_shard(root, layout, shards, shard, map_key).await;
+        configs.push(cfg);
+        addresses.push(addr);
+        servers.push(srv);
+    }
+    for address in &addresses {
+        NodeServiceClient::connect(address.clone())
+            .await
+            .unwrap()
+            .flush(pb::FlushRequest {})
+            .await
+            .unwrap();
+    }
+    for (shard, config) in configs.iter().enumerate() {
+        verify_map_presence_wal_replay(root, layout, shards, shard, config, map_key);
+    }
+    verify(addresses.clone(), &[], map_key).await;
+    for server in servers.drain(..) {
+        server.abort();
+        let _ = server.await;
+    }
+    addresses.clear();
+    for config in &configs {
+        let (address, server) = common::start_opened_node(config.clone()).await;
+        addresses.push(address);
+        servers.push(server);
+    }
+    verify(addresses.clone(), &[], map_key).await;
+    NodeServiceClient::connect(addresses[0].clone())
+        .await
+        .unwrap()
+        .delete_documents(pb::DeleteDocumentsRequest {
+            doc_ids: vec![2],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    for (shard, address) in addresses.iter().enumerate() {
+        let work_dir = root
+            .join(format!("compact-{layout:?}-{shards}-{shard}"))
+            .display()
+            .to_string();
+        NodeServiceClient::connect(address.clone())
+            .await
+            .unwrap()
+            .compact_shard(pb::CompactShardRequest {
+                work_dir,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    verify(addresses, &[2], map_key).await;
+    for server in servers {
+        server.abort();
+        let _ = server.await;
+    }
+}
+
 #[tokio::test]
 async fn empty_value_and_absent_key_stay_distinct_through_rpc_flush_reopen_and_compaction() {
     let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("map-value-rpc-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     for map_key in ["key", ""] {
-        let root = root.join(if map_key.is_empty() { "empty" } else { "named" });
-        std::fs::create_dir_all(&root).unwrap();
+        let case_root = root.join(if map_key.is_empty() { "empty" } else { "named" });
+        std::fs::create_dir_all(&case_root).unwrap();
         for layout in [Layout::SingleImage, Layout::Segments] {
             for shards in [1, 2] {
-                let mut configs = Vec::new();
-                let mut addresses = Vec::new();
-                let mut servers = Vec::new();
-                for shard in 0..shards {
-                    let config = NodeConfig {
-                        index_path: Some(root.join(format!("{layout:?}-{shards}-{shard}.tv"))),
-                        layout,
-                        wal: true,
-                        slot_offset: (shard * 3) as u64,
-                        map_facet_fields: vec!["meta".into()],
-                        map_numeric_fields: vec!["metrics".into()],
-                        facet_fields: vec!["id".into()],
-                        analysis_addr: Some(NATIVE_ANALYSIS_BACKEND.into()),
-                        ..Default::default()
-                    };
-                    let (address, server) = common::start_empty_node(config.clone()).await;
-                    let mut client = NodeServiceClient::connect(address.clone()).await.unwrap();
-                    let rows = if shards == 1 { 6 } else { 3 };
-                    // Compaction currently requires a locked provider configuration.
-                    let (shift, scale) =
-                        common::fit_calibration(16, 4, &common::unit_vectors(64, 16, 134));
-                    client
-                        .configure_vector_backend(
-                            pipestream_search::harness::embedded_backend_request(
-                                16, 4, &shift, &scale,
-                            ),
-                        )
-                        .await
-                        .unwrap();
-                    let requests = (0..rows)
-                        .map(|row| {
-                            let key = (shard * 3 + row).to_string();
-                            pb::AddDocumentsRequest {
-                                text: "word".into(),
-                                analysis: Some(body_spec()),
-                                facets: vec![pb::FacetValue {
-                                    field: "id".into(),
-                                    value: key.clone(),
-                                }],
-                                original_source: Some(common::protobuf_source("word", &key)),
-                                identity: Some(pb::DocumentIdentity {
-                                    document_key: key.into_bytes(),
-                                    version: 1,
-                                    chunk_ordinal: None,
-                                }),
-                                map_numerics: if row % 3 == 1 {
-                                    Vec::new()
-                                } else {
-                                    vec![pb::MapNumericEntry {
-                                        field: "metrics".into(),
-                                        key: map_key.into(),
-                                        value: if row % 3 == 0 {
-                                            0.0
-                                        } else {
-                                            (shard * 3 + row) as f64
-                                        },
-                                    }]
-                                },
-                                map_facets: if row % 3 == 1 {
-                                    Vec::new()
-                                } else {
-                                    vec![pb::MapFacetEntry {
-                                        field: "meta".into(),
-                                        key: map_key.into(),
-                                        value: if row % 3 == 0 { "" } else { "value" }.into(),
-                                    }]
-                                },
-                                ..Default::default()
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    let documents = client
-                        .add_documents(tokio_stream::iter(requests))
-                        .await
-                        .unwrap()
-                        .into_inner();
-                    assert_eq!(documents.first_id, config.slot_offset);
-                    let vectors = client
-                        .add_vectors(tokio_stream::iter([pb::AddVectorsRequest {
-                            materialized_rows: Vec::new(),
-                            vectors: common::unit_vectors(rows, 16, 135),
-                            dim: 16,
-                        }]))
-                        .await
-                        .unwrap()
-                        .into_inner();
-                    assert_eq!(vectors.first_id, documents.first_id);
-                    assert_eq!(vectors.added, documents.added);
-                    configs.push(config);
-                    addresses.push(address);
-                    servers.push(server);
-                }
-                // Ordering uses sorted dictionaries; flush also tests the empty
-                // string's ordinal rather than treating ordinal zero as missing.
-                for address in &addresses {
-                    NodeServiceClient::connect(address.clone())
-                        .await
-                        .unwrap()
-                        .flush(pb::FlushRequest {})
-                        .await
-                        .unwrap();
-                }
-                // Rebuild from the flushed WAL without reading source images.
-                // Flush is the persistence barrier; accepted writes alone may
-                // still be buffered. Node open does not perform this replay.
-                for (shard, config) in configs.iter().enumerate() {
-                    let path = config.index_path.as_ref().unwrap();
-                    let output = pipestream_search::reshard::split(
-                        &pipestream_search::reshard::resolve_gen(&pipestream_search::wal::wal_dir(
-                            path,
-                        ))
-                        .unwrap(),
-                        1,
-                        &root.join(format!("replay-{layout:?}-{shards}-{shard}")),
-                        config.slot_offset,
-                        25_000_000,
-                        false,
-                        None,
-                        &mut |docs| {
-                            docs.iter()
-                                .map(|(text, spec, layers)| {
-                                    assert!(!layers.dual_cased);
-                                    pipestream_search::analyzer::analyze_document_native(
-                                        text, *spec,
-                                    )
-                                    .map_err(|error| error.to_string())
-                                })
-                                .collect()
-                        },
-                    )
-                    .unwrap();
-                    let child = &output.children[0];
-                    let reader = Bm25Reader::open(child.bm25_path.as_ref().unwrap()).unwrap();
-                    reader.verify_integrity().unwrap();
-                    assert_eq!(child.num_documents, if shards == 1 { 6 } else { 3 });
-                    let facet = reader.map_facet_index("meta").unwrap();
-                    let facet_key = reader.map_facet_key_ord(facet, map_key).unwrap();
-                    let numeric = reader.map_numeric_index("metrics").unwrap();
-                    let numeric_key = reader.map_numeric_key_ord(numeric, map_key).unwrap();
-                    for (row, id) in child.row_parent_ids.iter().copied().enumerate() {
-                        let expected = match id % 3 {
-                            0 => Some(""),
-                            1 => None,
-                            _ => Some("value"),
-                        };
-                        assert_eq!(
-                            reader
-                                .map_facet_value_ord(facet, facet_key, row as u32)
-                                .map(|value| reader.map_facet_value(facet, value)),
-                            expected
-                        );
-                        let expected = if id % 3 == 1 {
-                            None
-                        } else {
-                            Some(if id % 3 == 0 { 0.0 } else { id as f64 })
-                        };
-                        assert_eq!(
-                            reader.map_numeric_value(numeric, numeric_key, row as u32),
-                            expected
-                        );
-                    }
-                }
-                verify(addresses.clone(), &[], map_key).await;
-                for server in servers.drain(..) {
-                    server.abort();
-                    let _ = server.await;
-                }
-                addresses.clear();
-                for config in &configs {
-                    let (address, server) = common::start_opened_node(config.clone()).await;
-                    addresses.push(address);
-                    servers.push(server);
-                }
-                verify(addresses.clone(), &[], map_key).await;
-                // Remove a middle row so compaction moves a present-empty value
-                // into a different physical slot. Query by the retained logical key.
-                NodeServiceClient::connect(addresses[0].clone())
-                    .await
-                    .unwrap()
-                    .delete_documents(pb::DeleteDocumentsRequest {
-                        doc_ids: vec![2],
-                        ..Default::default()
-                    })
-                    .await
-                    .unwrap();
-                for (shard, address) in addresses.iter().enumerate() {
-                    NodeServiceClient::connect(address.clone())
-                        .await
-                        .unwrap()
-                        .compact_shard(pb::CompactShardRequest {
-                            work_dir: root
-                                .join(format!("compact-{layout:?}-{shards}-{shard}"))
-                                .display()
-                                .to_string(),
-                            ..Default::default()
-                        })
-                        .await
-                        .unwrap();
-                }
-                verify(addresses, &[2], map_key).await;
-                for server in servers {
-                    server.abort();
-                    let _ = server.await;
-                }
+                run_map_presence_case(&case_root, layout, shards, map_key).await;
             }
         }
     }

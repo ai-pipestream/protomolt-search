@@ -113,7 +113,45 @@ pub struct PlacementSplitRequest<'a> {
     pub bm25_fields: Option<&'a [String]>,
 }
 
-impl PlacementSplitRequest<'_> {
+impl<'a> PlacementSplitRequest<'a> {
+    /// A placement split of `gens` on `column` into `children` written under `out_dir`.
+    pub fn new(
+        gens: &'a [PathBuf],
+        column: &'a str,
+        children: &'a [PlacementChild],
+        out_dir: &'a Path,
+        slot_offsets: &'a [u64],
+    ) -> Self {
+        Self {
+            gens,
+            column,
+            children,
+            default_child: None,
+            out_dir,
+            slot_offsets,
+            vectors_only: false,
+            bm25_fields: None,
+        }
+    }
+
+    /// Name the fallback child receiving rows without a matching placement code.
+    pub fn default_child(mut self, default_child: Option<usize>) -> Self {
+        self.default_child = default_child;
+        self
+    }
+
+    /// Replay vectors only, omitting document payloads.
+    pub fn vectors_only(mut self, vectors_only: bool) -> Self {
+        self.vectors_only = vectors_only;
+        self
+    }
+
+    /// Supply an explicit BM25 field table instead of deriving it from records.
+    pub fn bm25_fields(mut self, bm25_fields: Option<&'a [String]>) -> Self {
+        self.bm25_fields = bm25_fields;
+        self
+    }
+
     fn check(&self) -> Result<(), String> {
         if self.column.trim().is_empty() {
             return Err("a placement split needs the placement column's name".to_string());

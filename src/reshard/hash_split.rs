@@ -28,7 +28,46 @@ pub struct SplitRequest<'a> {
     pub bm25_fields: Option<&'a [String]>,
 }
 
-impl SplitRequest<'_> {
+impl<'a> SplitRequest<'a> {
+    /// A hash split of `gens` into `n` children written under `out_dir`,
+    /// defaulting to `slot_base = 0`, `slot_stride = 0`, full document replay,
+    /// and BM25 fields derived from the records.
+    pub fn new(gens: &'a [PathBuf], n: usize, out_dir: &'a Path) -> Self {
+        Self {
+            gens,
+            n,
+            out_dir,
+            slot_base: 0,
+            slot_stride: 0,
+            vectors_only: false,
+            bm25_fields: None,
+        }
+    }
+
+    /// Set the base global slot offset for child `0`.
+    pub fn slot_base(mut self, slot_base: u64) -> Self {
+        self.slot_base = slot_base;
+        self
+    }
+
+    /// Set the global slot stride between consecutive children.
+    pub fn slot_stride(mut self, slot_stride: u64) -> Self {
+        self.slot_stride = slot_stride;
+        self
+    }
+
+    /// Replay vectors only, omitting document payloads.
+    pub fn vectors_only(mut self, vectors_only: bool) -> Self {
+        self.vectors_only = vectors_only;
+        self
+    }
+
+    /// Supply an explicit BM25 field table instead of deriving it from records.
+    pub fn bm25_fields(mut self, bm25_fields: Option<&'a [String]>) -> Self {
+        self.bm25_fields = bm25_fields;
+        self
+    }
+
     pub(super) fn require_power_of_two(&self, what: &str) -> Result<(), String> {
         if self.n.is_power_of_two() {
             return Ok(());
