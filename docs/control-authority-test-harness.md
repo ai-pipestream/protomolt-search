@@ -34,7 +34,7 @@ The slice sections below are the dated coordination record. Where they name
 the import, retirement, the legacy plane or chunks, they describe tests that
 were converted or removed as listed here.
 
-## Checkpoint and branch## Checkpoint and branch
+## Checkpoint and branch
 
 - Worktree: `psearch-wt-adversarial` (task worktree of `protomolt-search`).
 - Branch: `test/control-authority-adversarial`.
@@ -208,20 +208,20 @@ reading and a doc-line citation in a comment.
 model, deterministic via a hand-rolled xorshift64
 (`tests/control_adversarial/rng.rs`). Pinned seeds 1..=24 (`0x5EED_0000 + n`,
 printed per seed; `PSEARCH_ADV_SEEDS=<end>` extends the range;
-`PSEARCH_ADV_TRACE_DIR=<dir>` keeps per-seed op traces). Per seed: fresh
-`TestDir`, store, 2-route legacy plane, retire (alice), payload; 60 ops at
-roughly 65% model-guided / 35% adversarial (a non-admin actor, stale
-revisions ±1, ids reused from a 24-id pool, out-of-phase import steps,
-flipped chunk bytes), plus exact (~45%) and mutated (~55%) retries of earlier
-ops at about 15% of steps. Every op runs against the real store and the
-model, comparing `Err(code)` vs `Status`/`Suppressed` and the decision code
-plus both revisions. Mid-trace recovery at op 20 and op 40 (drop store and
-holder, reopen, `recover_legacy_retirement`; a current admin regrants alice
-first as a real compared op if she was revoked). After each reopen and at
-trace end: sampled `decision()` / `control_import_decision()` checks
-(verbatim codes+revisions for admins, `PermissionDenied` for revoked or
-never-granted actors) and deferred verification that suppressed decisions
-reappear verbatim after a regrant. A mismatch panics with the seed, op index,
+`PSEARCH_ADV_TRACE_DIR=<dir>` keeps per-seed op traces). Per seed: a fresh
+`TestDir` and store; 60 ops at roughly 65% model-guided / 35% adversarial (a
+non-admin actor, stale revisions ±1, ids reused from a 24-id pool), plus
+exact (~45%) and mutated (~55%) retries of earlier ops at about 15% of
+steps. The ops are source-authority commands and `ControlInstallCommand`s
+built by `kit::install_command_policy` over `kit::install_state`. Every op
+runs against the real store and the model, comparing `Err(code)` vs
+`Status`/`Suppressed` and the decision code plus both revisions. Mid-trace
+recovery at op 20 and op 40 drops every store clone and reopens with
+`kit::open_store`. After each reopen and at trace end: sampled `decision()` /
+`control_install_decision()` checks (verbatim codes+revisions for admins,
+`PermissionDenied` for revoked or never-granted actors) and deferred
+verification that suppressed decisions reappear verbatim after a regrant.
+A mismatch panics with the seed, op index,
 and the full serialized trace.
 
 Finding of the slice, resolved per protocol: seed `0x5eed0004` op #15 —
@@ -340,31 +340,20 @@ observation values.
 
 The fixture chain, all public API:
 
-1. `kit::legacy_plane_with_cluster(dir)` — a pristine 2-route plane (routes
-   tile the u64 hash space) with two server nodes registered through the
-   `ClusterControl` routes (`node-a`/rack-a, `node-b`/rack-b, the plane's
-   300,000 ms lease maximum, `NodeResidency::Server`) and one ready primary
-   replica reported per route: shard-a on node-a with route 0's exact hash
-   range, shard-b on node-b with route 1's. Registration and reports run on
-   a short-lived in-process tokio runtime; the plane is then reopened with
-   `open_existing` for retirement. Each `report_shard` reconciles and
-   publishes, so the committed topology generation is whatever the plane
-   published — the kit reads it back from the snapshot
-   (`kit::committed_generation`) instead of assuming 1.
-2. Retirement and import with the placement supplement
-   (`kit::placement_supplement`): the in-crate two-leaf tree ("old" with
-   `year < 2020`, "rest") and one route code per route, so derive() names
-   shard-a's leaf "old" and shard-b's leaf "rest" through each route's
-   committed placement code. Copies derive as partial legacy evidence
-   (`complete = false`, zero storage incarnation and coverage).
-3. `configure_capacity` at control revision 6 (the import commits at
-   revision 6: begin 1, three chunks, commit), three server-resident tiers
-   with single-replica minima — every shard has exactly one committed copy —
-   then Register transitions for both reporters and one Report per shard in
-   the current cohort window. The planning instant is fixed at twenty
-   cohorts past the epoch (phase 0), so node eligibility (committed lease
-   expiry must exceed the instant) is deterministic even though the imported
-   leases were captured at wall clock.
+`kit::adapter_fixture(name)` builds it in four steps:
+
+1. `kit::create_store(dir)`, then `kit::run_install` of `kit::cluster_state()`:
+   one bounded install that commits the routes, both server nodes and one
+   ready primary replica per route at control revision 2.
+2. `kit::committed_generation(&store)` reads the committed topology
+   generation back from the snapshot instead of assuming a value.
+3. `configure_capacity` at control revision 2 with
+   `kit::capacity_configuration`.
+4. A Register transition for each reporter (`NODE_A`, `NODE_B`), then one
+   Report per node bound to the committed generation: a scanned observation
+   for `NODE_A` and a silent one for `NODE_B`. The planning instant is the
+   fixed `kit::PLANNING_INSTANT_UNIX_MS`, so node eligibility is
+   deterministic.
 
 Tests (`tests/control_authority_planner.rs`, nine including the env-gated
 worker):
