@@ -109,14 +109,12 @@ fn sealed_total(bm25: Option<&Bm25Shard>) -> u32 {
 }
 
 /// Filter-leaf domain narrowing is the default. Setting
-/// `PIPESTREAM_SEARCH_BOOLEAN_FILTER_FULL_SCAN` (or the TURBOVEC_
-/// alias) forces the pre-narrowing whole-shard column scan — the A/B
-/// baseline. The answer is the same either way; only the cost moves.
+/// `PIPESTREAM_SEARCH_BOOLEAN_FILTER_FULL_SCAN` forces the whole-shard
+/// column scan — the A/B baseline. The answer is the same either way; only the cost moves.
 /// The MUST short-circuit is orthogonal: an empty group skips its
 /// remaining siblings in both modes.
 fn boolean_filter_domain_enabled() -> bool {
     std::env::var_os("PIPESTREAM_SEARCH_BOOLEAN_FILTER_FULL_SCAN").is_none()
-        && std::env::var_os("TURBOVEC_BOOLEAN_FILTER_FULL_SCAN").is_none()
 }
 
 /// The slots a filter leaf's verdict can still decide, per leaf: a row

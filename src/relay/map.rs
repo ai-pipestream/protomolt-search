@@ -28,9 +28,8 @@ pub struct TokenTuple {
     pub epochs: Vec<StatsClaim>,
 }
 
-/// Relay tokens (`docs/relay-coordinators.md`, "The epoch token"): a
-/// nonzero allocation bound to a [`TokenTuple`], reused while the tuple
-/// repeats so a parent's stats cache keeps hitting, replaced the moment
+/// Relay tokens: a nonzero allocation bound to a [`TokenTuple`], reused
+/// while the tuple repeats so a parent's stats cache keeps hitting, replaced the moment
 /// any child's lifetime or epoch moves, and retained for [`RETAINED_TOKENS`]
 /// tuples. The relay's separate 32-byte identity fences a restart; the legacy
 /// numeric clock prefix below is not sufficient to identify a lifetime.
@@ -104,8 +103,7 @@ pub struct MapSnapshot {
     pub map: Arc<RelayMap>,
 }
 
-/// Where a relay's shard map comes from (`docs/relay-coordinators.md`,
-/// "Map interface"). Minimal on purpose: the current reading, and a
+/// Where a relay's shard map comes from. Minimal on purpose: the current reading, and a
 /// receiver whose value changes whenever the current revision does.
 pub trait MapSource: Send + Sync {
     /// The current reading. Cheap; called once per decision.

@@ -4,7 +4,6 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::pb::wal::wal_record;
-use crate::pb::AddDocumentsRequest;
 use crate::wal::{self, RecordReader, WalManifest};
 
 use super::replay::read_gen_manifest;
@@ -189,8 +188,7 @@ fn wal_row_watermark(gen: &Path, bucket_count: u32) -> Result<(u64, BTreeSet<u64
     Ok((watermark, deleted))
 }
 
-/// Open the catalogs beside the logs and check what a child pins
-/// (`docs/replay-from-segments.md`, "The replay").
+/// Open the catalogs beside the logs and check what a child pins.
 pub(crate) fn open_segment_sources(
     gens: &[PathBuf],
 ) -> Result<(Vec<SegmentSourceShard>, SourceTables), String> {
@@ -318,132 +316,6 @@ fn local_labels(
             })
         })
         .collect()
-}
-
-/// The logged document row `row` of `bm25` stands for: its columns,
-/// and with `with_text` its text, lineage, source and identity too.
-pub(crate) fn reconstruct_document(
-    bm25: &crate::postings::Bm25Reader,
-    row: u32,
-    tables: &SourceTables,
-    with_text: bool,
-) -> Result<AddDocumentsRequest, String> {
-    use crate::postings::Bm25Index;
-    let mut doc = AddDocumentsRequest::default();
-    if with_text {
-        let text =
-            Bm25Index::text(bm25, row).ok_or_else(|| format!("row {row} has no stored text"))?;
-        doc.text = text;
-        doc.lineage = Bm25Index::lineage(bm25, row).map(|l| crate::pb::DocLineage {
-            parent_id: l.parent_id,
-            group_id: l.group_id,
-            span_start: l.span_start,
-            span_end: l.span_end,
-        });
-        if let Some((source, ordinal)) = bm25
-            .protobuf_source(row)
-            .map_err(|e| format!("row {row}: read original source: {e}"))?
-        {
-            doc.original_source = Some(source);
-            doc.source_chunk_ordinal = ordinal;
-        }
-        doc.identity = bm25.document_identity(row);
-        doc.position_fields = tables.position_fields.clone();
-        doc.sentence_fields = tables.sentence_fields.clone();
-    }
-    // The store's declaration entry says what the row's derived values
-    // mean (docs/derived-columns.md); a logged form of the row carries it.
-    doc.derived_fingerprint = bm25
-        .derived()
-        .map(|derived| derived.fingerprint.clone())
-        .unwrap_or_default();
-    for (fi, name) in tables.columns.facets.iter().enumerate() {
-        if let Some(ord) = bm25.facet_ord(fi, row) {
-            doc.facets.push(crate::pb::FacetValue {
-                field: name.clone(),
-                value: bm25.facet_value(fi, ord).to_string(),
-            });
-        }
-    }
-    for (ni, name) in tables.columns.numerics.iter().enumerate() {
-        if let Some(value) = bm25.numeric_value(ni, row) {
-            doc.numerics.push(crate::pb::NumericValue {
-                field: name.clone(),
-                value,
-            });
-        }
-    }
-    for (ii, name) in tables.columns.integers.iter().enumerate() {
-        if let Some(value) = bm25.integer_value(ii, row) {
-            doc.integers.push(crate::pb::IntegerValue {
-                field: name.clone(),
-                value,
-            });
-        }
-    }
-    for (ui, name) in tables.columns.unsigned_integers.iter().enumerate() {
-        if let Some(value) = bm25.unsigned_integer_value(ui, row) {
-            doc.unsigned_integers.push(crate::pb::UnsignedIntegerValue {
-                field: name.clone(),
-                value,
-            });
-        }
-    }
-    for (gi, name) in tables.columns.geo.iter().enumerate() {
-        if let Some((lat, lon)) = bm25.geo_value(gi, row) {
-            doc.geo_points.push(crate::pb::GeoPointValue {
-                field: name.clone(),
-                lat,
-                lon,
-            });
-        }
-    }
-    for (ci, name) in tables.columns.map_facets.iter().enumerate() {
-        for (key_ord, key) in bm25.map_facet_keys(ci).iter().enumerate() {
-            if let Some(ord) = bm25.map_facet_value_ord(ci, key_ord as u32, row) {
-                doc.map_facets.push(crate::pb::MapFacetEntry {
-                    field: name.clone(),
-                    key: key.clone(),
-                    value: bm25.map_facet_value(ci, ord).to_string(),
-                });
-            }
-        }
-    }
-    for (ci, name) in tables.columns.map_numerics.iter().enumerate() {
-        for (key_ord, key) in bm25.map_numeric_keys(ci).iter().enumerate() {
-            if let Some(value) = bm25.map_numeric_value(ci, key_ord as u32, row) {
-                doc.map_numerics.push(crate::pb::MapNumericEntry {
-                    field: name.clone(),
-                    key: key.clone(),
-                    value,
-                });
-            }
-        }
-    }
-    for (ci, name) in tables.columns.map_integers.iter().enumerate() {
-        for (key_ord, key) in bm25.map_integer_keys(ci).iter().enumerate() {
-            if let Some(value) = bm25.map_integer_value(ci, key_ord as u32, row) {
-                doc.map_integers.push(crate::pb::MapIntegerEntry {
-                    field: name.clone(),
-                    key: key.clone(),
-                    value,
-                });
-            }
-        }
-    }
-    for (ci, name) in tables.columns.map_unsigned_integers.iter().enumerate() {
-        for (key_ord, key) in bm25.map_unsigned_integer_keys(ci).iter().enumerate() {
-            if let Some(value) = bm25.map_unsigned_integer_value(ci, key_ord as u32, row) {
-                doc.map_unsigned_integers
-                    .push(crate::pb::MapUnsignedIntegerEntry {
-                        field: name.clone(),
-                        key: key.clone(),
-                        value,
-                    });
-            }
-        }
-    }
-    Ok(doc)
 }
 
 /// The exact-vector sidecar of segment `i`, when the segment has vectors.

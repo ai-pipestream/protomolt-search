@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::postings::AnalyzedField;
 
 /// One row's analyzed fields in the spill's analysis sidecar.
-pub(super) fn write_analysis_entry(
+fn write_analysis_entry(
     out: &mut impl std::io::Write,
     id: u64,
     fields: &[AnalyzedField],
@@ -269,6 +269,52 @@ fn parse_field(cursor: &mut Cursor<'_>) -> Result<AnalyzedField, String> {
     };
     field.check_positions()?;
     Ok(field)
+}
+
+/// The analysis sidecars of one spill log, one per bucket, each opened
+/// on its first entry.
+pub(super) struct AnalysisSidecars {
+    writers: Vec<Option<std::io::BufWriter<std::fs::File>>>,
+}
+
+impl AnalysisSidecars {
+    pub(super) fn new(buckets: u32) -> Self {
+        Self {
+            writers: (0..buckets).map(|_| None).collect(),
+        }
+    }
+
+    /// Append one row's fields to bucket `bucket`'s sidecar under
+    /// `spill_dir`.
+    pub(super) fn write(
+        &mut self,
+        spill_dir: &Path,
+        bucket: u32,
+        id: u64,
+        fields: &[AnalyzedField],
+    ) -> Result<(), String> {
+        let slot = &mut self.writers[bucket as usize];
+        if slot.is_none() {
+            let path = analysis_sidecar_path(spill_dir, bucket);
+            let file = std::fs::File::create(&path)
+                .map_err(|error| format!("create {}: {error}", path.display()))?;
+            *slot = Some(std::io::BufWriter::with_capacity(1 << 20, file));
+        }
+        let writer = slot.as_mut().expect("opened above");
+        write_analysis_entry(writer, id, fields)
+            .map_err(|error| format!("spill analysis of {id}: {error}"))
+    }
+
+    /// Flush and close every sidecar.
+    pub(super) fn finish(self) -> Result<(), String> {
+        use std::io::Write;
+        for mut writer in self.writers.into_iter().flatten() {
+            writer
+                .flush()
+                .map_err(|error| format!("flush analysis sidecar: {error}"))?;
+        }
+        Ok(())
+    }
 }
 
 /// The sidecar file of spill bucket `bucket` under a child's spill dir.

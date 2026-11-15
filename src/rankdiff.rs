@@ -158,40 +158,13 @@ pub fn rbo(a: &[u64], b: &[u64], p: f64) -> f64 {
 
 /// Mean score the variant gives up against a ranking you already trust.
 ///
-/// `reference` is (id, score) in reference rank order (normally score
-/// descending); `variant` is the ids the other run returned. At each rank
-/// the reference's own score there is compared with the reference's score
-/// OF THE DOC THE VARIANT PUT THERE, so both sides are measured by the
-/// same yardstick and only the selection differs.
-///
-/// This measures the SET, not the order. Over a sorted reference the
-/// per-rank differences of any reordering of the same documents cancel
-/// exactly, so a pure permutation scores 0 no matter how violently it
-/// reorders. That is the useful half of the division of labour: pair it
-/// with [`rbo`] or [`kendall_tau`], which see order and not score. A
-/// large tau change with zero regret means the variant shuffled
-/// equivalent documents, which is the near-duplicate tie signature; a
-/// large regret means it actually reached for worse ones.
-///
-/// A variant doc the reference never scored is skipped and counted in the
-/// returned `unscored`: it may be genuinely better or genuinely worse and
-/// this measure cannot tell, so it must not be quietly averaged in.
-///
-/// READ THE SIGN ONLY WHEN `unscored` IS 0. The cancellation above needs
-/// the compared ranks to be a permutation of the reference's own prefix.
-/// Skipping unscored ranks breaks that: the surviving comparisons are a
-/// SUBSET, the terms no longer pair off, and the mean can come out
-/// negative without the reference being mis-sorted. A negative mean then
-/// says only that on the ranks where a comparison was possible, the
-/// variant happened to hold documents the reference scored above its own
-/// documents at those positions -- an artifact of which ranks dropped
-/// out, not a claim that the variant beat the reference.
-///
-/// So `unscored` is not a footnote, it is the precondition. At
-/// `unscored == 0` the mean is >= 0 and means what it says; as `unscored`
-/// grows the two arms have diverged past what this measure can judge, and
-/// the ranking-order measures ([`rbo`], [`kendall_tau`]) are what remain
-/// interpretable.
+/// `reference` is (id, score) in reference rank order; `variant` is the
+/// ids the other run returned. At each rank the reference's own score is
+/// compared with the reference's score of the doc the variant put there,
+/// so this measures the selected SET, not the order: a pure permutation
+/// scores 0 (pair it with [`rbo`] or [`kendall_tau`] for order). A variant
+/// doc the reference never scored is skipped and counted in `unscored`;
+/// the mean is >= 0 and meaningful only when `unscored` is 0.
 pub fn score_regret(reference: &[(u64, f32)], variant: &[u64], k: usize) -> ScoreRegret {
     let table: HashMap<u64, f32> = reference.iter().copied().collect();
     let depth = k.min(reference.len()).min(variant.len());

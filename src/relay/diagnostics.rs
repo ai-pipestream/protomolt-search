@@ -10,8 +10,7 @@ use crate::metrics::Route;
 use super::health::merge_shard_layouts;
 use super::RelayService;
 
-/// The relay's `DiagnosticsService` (`docs/diagnostics.md`): the
-/// process's own knobs, metrics, and ring as any coordinator's, and one
+/// The relay's `DiagnosticsService`: the process's own knobs, metrics, and ring as any coordinator's, and one
 /// shard layout for the root, the children's merged
 /// ([`merge_shard_layouts`]). The root asks each shard's address for
 /// its layout, so a relay serves the service on the port the root

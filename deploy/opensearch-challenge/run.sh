@@ -274,7 +274,7 @@ wait_http "http://127.0.0.1:$OS_PORT/_cluster/health?wait_for_status=yellow" ||
 OS_RECOVERY_MS=$(elapsed_ms "$started" "$(ns)")
 
 ENGINE_REV=$(git -C "$REPO" rev-parse HEAD)
-TURBOVEC_REV=$(sed -n '/^name = "turbovec"$/,/^$/p' "$REPO/Cargo.lock" |
+VECTOR_ENGINE_REV=$(sed -n '/^name = "turbovec"$/,/^$/p' "$REPO/Cargo.lock" |
   sed -n 's/.*#\([0-9a-f]\{40\}\).*/\1/p' | head -1)
 OS_IMAGE_ID=$(docker image inspect -f '{{.Id}}' "$OPENSEARCH_IMAGE")
 OS_REPO_DIGEST=$(docker image inspect -f '{{index .RepoDigests 0}}' "$OPENSEARCH_IMAGE")
@@ -286,7 +286,7 @@ jq -n \
   --slurpfile manifest "$WORK/data/manifest.json" \
   --slurpfile proto_ingest "$WORK/protomolt-ingest.json" \
   --slurpfile os_ingest "$WORK/opensearch-ingest.json" \
-  --arg engine_rev "$ENGINE_REV" --arg turbovec_rev "${TURBOVEC_REV:-unknown}" \
+  --arg engine_rev "$ENGINE_REV" --arg turbovec_rev "${VECTOR_ENGINE_REV:-unknown}" \
   --arg os_image "$OPENSEARCH_IMAGE" --arg os_image_id "$OS_IMAGE_ID" \
   --arg os_repo_digest "$OS_REPO_DIGEST" --arg cpu_model "$CPU_MODEL" \
   --arg cpuset "$CPUSET" --arg kernel "$HOST_KERNEL" \

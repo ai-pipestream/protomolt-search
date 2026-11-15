@@ -338,8 +338,6 @@ claim unless `selection_k` covers the corpus. Candidate depth is therefore the
 recall knob, not a hidden expansion factor. The 100,000-vector, k=10,000
 experiment found that the tested corpus needed 35,777 TurboQuant candidates
 for 100% recall; that is evidence for that workload, not a universal default.
-See
-[`turboquant-exact-rerank-expansion-100k-k10000-2026-08-31.md`](ai-slop/turboquant-exact-rerank-expansion-100k-k10000-2026-08-31.md).
 
 Original FP32 rows live in the product generation, one-for-one with provider
 slots. `Flush` writes and reopens the sidecar through mmap; snapshot install

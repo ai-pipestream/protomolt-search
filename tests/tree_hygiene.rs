@@ -34,26 +34,17 @@ const RATCHET: &[(&str, usize)] = &[
     ("src/analyzer.rs", 2_947 + RATCHET_HEADROOM),
     ("src/mapping.rs", 2_695 + RATCHET_HEADROOM),
     ("src/cel.rs", 2_650 + RATCHET_HEADROOM),
-    ("src/wal.rs", 2_367 + RATCHET_HEADROOM),
     ("src/segmented.rs", 2_236 + RATCHET_HEADROOM),
     ("src/placement.rs", 2_122 + RATCHET_HEADROOM),
     ("src/values.rs", 2_117 + RATCHET_HEADROOM),
     ("src/main.rs", 2_010 + RATCHET_HEADROOM),
     ("src/vocab.rs", 1_989 + RATCHET_HEADROOM),
-    ("src/node_agent.rs", 1_964 + RATCHET_HEADROOM),
     ("src/hnsw/merge.rs", 1_942 + RATCHET_HEADROOM),
     ("src/vector.rs", 1_896 + RATCHET_HEADROOM),
     ("src/metrics.rs", 1_774 + RATCHET_HEADROOM),
-    ("src/chunked.rs", 1_759 + RATCHET_HEADROOM),
     ("src/hnsw/mod.rs", 1_735 + RATCHET_HEADROOM),
-    ("src/raft/transport.rs", 1_720 + RATCHET_HEADROOM),
     ("src/source_authority.rs", 1_635 + RATCHET_HEADROOM),
-    ("src/raft/host.rs", 1_584 + RATCHET_HEADROOM),
     ("src/source_authority/capacity.rs", 1_527 + RATCHET_HEADROOM),
-    (
-        "crates/protomolt-search-embedded/src/mobile.rs",
-        1_505 + RATCHET_HEADROOM,
-    ),
 ];
 
 /// The directories walked, relative to the package root.

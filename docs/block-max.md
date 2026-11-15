@@ -299,7 +299,7 @@ to fused multi-field scoring.
 
 The candidate protocol is the default (`bm25_stream = true`). Operators can
 force the legacy unary route with `--bm25-stream=false` or
-`TURBOVEC_BM25_STREAM=false` for an exact A/B comparison. Nodes always serve
+`PIPESTREAM_SEARCH_BM25_STREAM=false` for an exact A/B comparison. Nodes always serve
 the stream RPC. Phrase-aware BM25 currently remains on its unary exact scorer;
 ordinary flat and fused multi-field BM25 use the candidate stream. The earlier
 floor-only relay measurement on the v9 court fleet remains useful historical

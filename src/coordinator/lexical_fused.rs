@@ -55,8 +55,7 @@ impl CoordinatorServiceImpl {
         ),
         Status,
     > {
-        let trace = std::env::var_os("PIPESTREAM_SEARCH_TRACE_BM25").is_some()
-            || std::env::var_os("TURBOVEC_TRACE_BM25").is_some();
+        let trace = std::env::var_os("PIPESTREAM_SEARCH_TRACE_BM25").is_some();
         let started = std::time::Instant::now();
         let analyzed = self.analyze_fused_query(&query, expansions).await?;
         let analyzed_time = started.elapsed();

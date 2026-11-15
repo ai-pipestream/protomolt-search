@@ -92,7 +92,7 @@ and the kernel short-circuits fully masked blocks, as before
 
 ## The flag
 
-`--segment-pruning` (default `true`; `TURBOVEC_SEGMENT_PRUNING`, or
+`--segment-pruning` (default `true`; `PIPESTREAM_SEARCH_SEGMENT_PRUNING`, or
 `segment_pruning` in the config file) turns pruning off on a node, for A/B
 runs and for bisecting a disagreement. With it off every segment is
 evaluated, the `segments_total` counters still report the shard's sealed

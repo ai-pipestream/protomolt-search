@@ -1,89 +1,85 @@
-//! TLS material for the listeners and the outbound client.
+//! The security surface: listener TLS, the outbound client material, bearer
+//! principals, and the UDP datagram key. Files are read here so a missing
+//! certificate refuses at startup, not at the first connection.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use super::args::opt;
 use super::file::FileConfig;
+use super::option::Options;
+use crate::security::{ClientTls, Principals, ServerTls, UdpKey};
 
-/// The security surface (`docs/security.md`): the listener TLS and the
-/// client material. Files are read here so a missing certificate
-/// refuses at startup, not at the first connection.
-pub(super) fn parse_tls(
-    args: &[String],
-    file: &FileConfig,
-) -> Result<
-    (
-        Option<crate::security::ServerTls>,
-        Option<crate::security::ClientTls>,
-    ),
-    String,
-> {
-    // The security surface (docs/security.md). Files are read here so a
-    // missing certificate refuses at startup, not at the first connection.
-    let path_opt = |key: &str, env: &str, file_value: Option<&str>| {
-        opt(args, key, env, file_value).map(PathBuf::from)
-    };
-    let tls_cert = path_opt(
-        "tls-cert",
-        "PIPESTREAM_SEARCH_TLS_CERT",
-        file.tls_cert.as_deref(),
-    );
-    let tls_key = path_opt(
-        "tls-key",
-        "PIPESTREAM_SEARCH_TLS_KEY",
-        file.tls_key.as_deref(),
-    );
-    let tls_client_ca = path_opt(
-        "tls-client-ca",
-        "PIPESTREAM_SEARCH_TLS_CLIENT_CA",
-        file.tls_client_ca.as_deref(),
-    );
-    let tls = match (tls_cert, tls_key) {
-        (Some(cert), Some(key)) => Some(crate::security::ServerTls::load(
-            &cert,
-            &key,
-            tls_client_ca.as_deref(),
-        )?),
-        (None, None) => {
-            if tls_client_ca.is_some() {
-                return Err("--tls-client-ca needs --tls-cert and --tls-key".to_string());
-            }
-            None
+/// Every security option a serving process resolves.
+pub(super) struct Security {
+    pub(super) tls: Option<ServerTls>,
+    pub(super) client_tls: Option<ClientTls>,
+    pub(super) allow_plaintext: bool,
+    pub(super) principals: Option<Arc<Principals>>,
+    pub(super) udp_hmac_key: Option<UdpKey>,
+}
+
+fn path(o: Options, flag: &str, file: Option<&str>) -> Option<PathBuf> {
+    o.text(flag, file).map(PathBuf::from)
+}
+
+/// Listener TLS: a certificate and key, plus the cluster CA client
+/// certificates chain to.
+fn server_tls(o: Options, file: &FileConfig) -> Result<Option<ServerTls>, String> {
+    let cert = path(o, "tls-cert", file.tls_cert.as_deref());
+    let key = path(o, "tls-key", file.tls_key.as_deref());
+    let client_ca = path(o, "tls-client-ca", file.tls_client_ca.as_deref());
+    match (cert, key) {
+        (Some(cert), Some(key)) => Ok(Some(ServerTls::load(&cert, &key, client_ca.as_deref())?)),
+        (None, None) if client_ca.is_some() => {
+            Err("--tls-client-ca needs --tls-cert and --tls-key".to_string())
         }
-        _ => return Err("TLS needs both --tls-cert and --tls-key".to_string()),
-    };
-    let tls_ca = path_opt("tls-ca", "PIPESTREAM_SEARCH_TLS_CA", file.tls_ca.as_deref());
-    let tls_client_cert = path_opt(
-        "tls-client-cert",
-        "PIPESTREAM_SEARCH_TLS_CLIENT_CERT",
-        file.tls_client_cert.as_deref(),
-    );
-    let tls_client_key = path_opt(
-        "tls-client-key",
-        "PIPESTREAM_SEARCH_TLS_CLIENT_KEY",
-        file.tls_client_key.as_deref(),
-    );
-    let tls_domain = opt(
-        args,
-        "tls-domain",
-        "PIPESTREAM_SEARCH_TLS_DOMAIN",
-        file.tls_domain.as_deref(),
-    );
-    let client_tls = match tls_ca {
-        Some(ca) => Some(crate::security::ClientTls::load(
+        (None, None) => Ok(None),
+        _ => Err("TLS needs both --tls-cert and --tls-key".to_string()),
+    }
+}
+
+/// What this process presents and trusts on cluster-internal channels.
+fn client_tls(o: Options, file: &FileConfig) -> Result<Option<ClientTls>, String> {
+    let ca = path(o, "tls-ca", file.tls_ca.as_deref());
+    let cert = path(o, "tls-client-cert", file.tls_client_cert.as_deref());
+    let key = path(o, "tls-client-key", file.tls_client_key.as_deref());
+    let domain = o.text("tls-domain", file.tls_domain.as_deref());
+    match ca {
+        Some(ca) => Ok(Some(ClientTls::load(
             &ca,
-            tls_client_cert.as_deref(),
-            tls_client_key.as_deref(),
-            tls_domain,
-        )?),
-        None => {
-            if tls_client_cert.is_some() || tls_client_key.is_some() || tls_domain.is_some() {
-                return Err(
-                    "--tls-client-cert / --tls-client-key / --tls-domain need --tls-ca".to_string(),
-                );
-            }
-            None
+            cert.as_deref(),
+            key.as_deref(),
+            domain,
+        )?)),
+        None if cert.is_some() || key.is_some() || domain.is_some() => {
+            Err("--tls-client-cert / --tls-client-key / --tls-domain need --tls-ca".to_string())
         }
-    };
-    Ok((tls, client_tls))
+        None => Ok(None),
+    }
+}
+
+/// The listener TLS and the client material, the pair the local directory
+/// commands need as well as the serving roles.
+pub(super) fn parse_tls(
+    o: Options,
+    file: &FileConfig,
+) -> Result<(Option<ServerTls>, Option<ClientTls>), String> {
+    Ok((server_tls(o, file)?, client_tls(o, file)?))
+}
+
+pub(super) fn resolve_security(o: Options, file: &FileConfig) -> Result<Security, String> {
+    let (tls, client_tls) = parse_tls(o, file)?;
+    let principals = path(o, "bearer-tokens", file.bearer_tokens.as_deref())
+        .map(|path| Principals::load(&path).map(Arc::new))
+        .transpose()?;
+    let udp_hmac_key = path(o, "udp-hmac-key", file.udp_hmac_key.as_deref())
+        .map(|path| UdpKey::load(&path))
+        .transpose()?;
+    Ok(Security {
+        tls,
+        client_tls,
+        allow_plaintext: o.switch_or_bare("allow-plaintext", file.allow_plaintext, false),
+        principals,
+        udp_hmac_key,
+    })
 }

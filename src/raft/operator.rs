@@ -1,5 +1,4 @@
-//! Operator surfaces of a networked member (docs/raft-hosting.md,
-//! "Operator configuration"): the peers file that binds node ids to
+//! Operator surfaces of a networked member: the peers file that binds node ids to
 //! certificates, and the host and transport built from `--raft-*`
 //! configuration. Nothing here creates a group; `raft-prepare` creates the
 //! durable state of one member and serving opens existing state only.

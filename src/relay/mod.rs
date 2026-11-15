@@ -1,106 +1,39 @@
-//! Relay coordinators (`docs/relay-coordinators.md`): a coordinator
-//! process that presents itself to its parent as ONE shard.
+//! Relay coordinators: a coordinator process that presents itself to its
+//! parent as ONE shard.
 //!
-//! A relay serves the node-facing surface over its children (ordinary
-//! shard nodes, or further relays) so a root coordinator fanning out to
-//! a few hundred targets can stand over thousands of shards with a level
-//! in between. Nothing new is spoken between levels: the parent calls
-//! `NodeService` routes on the relay exactly as it calls them on a node,
-//! and the relay calls the same routes on its children through the
-//! coordinator's fan-out machinery.
-//!
-//! The scope here is the restricted, read-only surface the 2026-09-05
-//! review cleared (`docs/scale-out-coordination-review-2026-09-05.md`):
-//!
-//! - `StreamSearch`: every qualifying child candidate is forwarded upward
-//!   on one stream, batch bytes untouched (global ids, original scores,
-//!   boundary ties preserved); the parent's monotone floor and its
-//!   cancellation reach every child on the relay's own signed UDP
-//!   sessions plus the gRPC twin; the relay's completion frame is issued
-//!   only after every child's; a child error or a missing terminal
-//!   certificate fails the attempt. The relay keeps no heap
-//!   (`StartStreamSearch` carries a candidate depth, not a k; the relay
-//!   forwards it unchanged) and raises no floor of its own.
-//! - `TermStats`: children's shares summed with checked arithmetic (a
-//!   `u32` document frequency that would overflow refuses by name),
-//!   homogeneous field capabilities required, and the epoch reported as
-//!   a relay token bound to the children's epochs (see [`TokenRegistry`]).
-//! - `Health`: the children's reports merged, served only when the
-//!   children's slot ranges are contiguous so the range the parent
-//!   derives is real. A relay has no WAL and reports none.
-//! - The keyword leg (`Bm25Query`, `Bm25PhraseQuery`, `Bm25QueryStream`,
-//!   `Bm25Rescore`): the root's global statistics travel to each child
-//!   unchanged, the parent's epoch claim (a relay token) is translated
-//!   into each child's recorded claim, candidates and cutoffs pass
-//!   untouched, and the children's terminal responses merge by value
-//!   with checked arithmetic. Column statistics and exact cardinalities
-//!   are refused by name (a fold whose order the root pins, and a union
-//!   of values, are not this level's to compute). `Bm25Rescore` routes
-//!   each candidate id to the child whose slot range holds it.
-//! - `SearchShard` (the unary scan the cascade gates on): one child
-//!   stream per child, the parent's floor raises forwarded down and each
-//!   child's up, the children's terminal lists concatenated in score
-//!   order so the parent's merge and the cascade's score-defined pool
-//!   see the same union they see over leaves.
-//! - `VectorRescore` and `ExactVectorRescore`: each id routed to the
-//!   child whose slot range holds it, an id in no child's range dropped
-//!   as a node drops one outside its own range, hits merged in the order
-//!   a node answers in, byte and page counts summed with a check.
-//! - The bitmap routes (`ResolveFilterBitmap`, `ResolveLexicalBitmap`,
-//!   `ResolveVectorBitmap`): the children's bitmaps laid over the relay's
-//!   one contiguous slot range ([`concat_bitmaps`]), a gap refused by
-//!   name, known-column flags merged through each child's implied
-//!   leaves, and the lexical epoch reported as a relay token.
-//! - The dictionaries (`ExpandTermPrefix`, `SuggestTerms`): the union of
-//!   the children's terms in byte order with df summed, a child past the
-//!   cap or the scan bound making the relay answer as a node past it.
-//!
-//! The relay also serves `DiagnosticsService` on the same port
-//! ([`RelayDiagnostics`]): the root asks each shard's address for its
-//! layout, and the relay answers with its children's merged into one.
-//!
-//! - The fetches by id (`GetDocuments`, `ResolveParents`, `FetchValues`):
-//!   each id routed to the child whose slot range holds it, the answers
-//!   put back in the caller's order (an id repeated answered once per
-//!   occurrence, a foreign id left out, as a node does), the known flags
-//!   and projection types merged, and the read receipt a relay token
-//!   over the children's versions (`read_receipt`).
-//! - `BrowseShard`: every child pages from the same boundary, the rows
-//!   merged in the request's sort order (id order unsorted) and cut to
-//!   `k`, the sort column types agreeing where known.
-//! - The folds (`AggregateShard`, `QuantileCounts` with or without a
-//!   Boolean plan, and `BooleanQuery.aggregate` inside `EvaluateBoolean`):
-//!   the children's partials folded in child order through the root's
-//!   own fold ([`merge_aggregate_shares`]) and answered as one shard's
-//!   partial, the caps applied where the root applies them.
-//!
-//! Every other `NodeService` route refuses UNIMPLEMENTED naming the route
-//! and the relay: no ingest, no administration, and no per-shard fusion
-//! (`HybridShard`: the two-level mode fuses one list per shard at the
-//! root and is partition dependent by design, so a relay standing as one
-//! shard would change the answer).
-//!
-//! The relay never reads its shard map from a file or from the
-//! coordinator's authority directly. It consumes a [`MapSource`]: one
-//! reading at a time, each stamped with the control revision and the
-//! topology generation it came from, plus a change notification. Every
-//! decision (the child set of a stream or a statistics call, the range
-//! `Health` reports, the tuple behind an epoch token) pins the revision
-//! it was made under and refuses by name when that revision is no longer
-//! the current one. Today the source is the coordinator's file-polled
-//! map with its generation as the revision; a replicated control state
-//! implements the same interface behind the relay without touching it.
+//! The parent calls `NodeService` routes on a relay exactly as it calls
+//! them on a node, and the relay answers the read routes by fanning out
+//! to its children (shard nodes or further relays) and merging their
+//! answers exactly. Every write, administration, and per-shard fusion
+//! route refuses UNIMPLEMENTED by name (`refused`). Each decision pins
+//! the [`MapSource`] reading it was made under and refuses by name when
+//! that reading is no longer current.
 
 mod bitmaps;
+mod bm25_legs;
+mod bm25_stream;
+mod boolean;
 mod diagnostics;
+mod fanout;
+mod fetch;
 mod health;
 mod lexical;
 mod map;
+mod merge_browse;
+mod merge_dictionary;
 mod merge_lexical;
+mod merge_util;
+mod merge_values;
+mod rescore;
 mod service;
+mod shard_legs;
+mod shard_scan;
 mod shard_search;
 mod signals;
+mod stream_forward;
+mod stream_identity;
 mod stream_search;
+mod stream_state;
 #[cfg(test)]
 mod tests;
 mod values;
@@ -113,29 +46,24 @@ pub use self::map::{
     CoordinatorMapSource, MapSnapshot, MapSource, RelayMap, TokenRegistry, TokenTuple,
     RETAINED_TOKENS,
 };
-pub use self::merge_lexical::{
-    merge_bm25_responses, merge_boolean_responses, merge_prefix_expansions, merge_suggest_terms,
-    merge_term_stats,
-};
-pub use self::values::{merge_aggregate_shares, merge_browse_pages};
+pub use self::merge_browse::merge_browse_pages;
+pub use self::merge_dictionary::{merge_prefix_expansions, merge_suggest_terms};
+pub use self::merge_lexical::{merge_bm25_responses, merge_boolean_responses, merge_term_stats};
+pub use self::merge_values::merge_aggregate_shares;
 pub use self::vector::merge_vector_backend;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tonic::{Request, Response, Status};
+use tonic::Status;
 
 use crate::coordinator::CoordinatorServiceImpl;
 use crate::node::STALE_STATS_EPOCH;
 use crate::pb::node_service_server::NodeServiceServer;
-use crate::pb::{HealthRequest, HealthResponse};
 use crate::stats_identity::{StatsClaim, StatsIncarnation};
 
-#[cfg(feature = "net")]
-use self::signals::apply_datagram;
 use self::signals::RelaySignals;
-use self::stream_search::child_error;
 
 /// What a relay holds: the base coordinator (links, keys, limits), the
 /// map source, the token registry, the parent-facing signal registry,
@@ -287,145 +215,25 @@ impl RelayService {
         Ok(self.token_tuple(token)?.epochs)
     }
 
-    fn read_receipt<R: crate::visibility::ScopedReadResponse>(
+    /// One request per child with the parent's claim translated into
+    /// that child's, or the stale-epoch refusal when the token is not
+    /// one this relay can translate under the current map.
+    pub(super) fn child_claims(
         &self,
-        pinned: &MapSnapshot,
-        children: Vec<String>,
-        visibility: Option<&crate::pb::DocumentVisibility>,
-        expected: Option<&[StatsClaim]>,
-        shares: &[R],
-    ) -> Result<crate::pb::VectorReadReceipt, Status> {
-        let scope = crate::visibility::VisibilityScope::new(visibility)?;
-        if shares.len() != children.len() || shares.is_empty() {
-            return Err(Status::failed_precondition(
-                "relay read receipt needs every child",
-            ));
+        token: u64,
+        incarnation: &[u8],
+        children: usize,
+    ) -> Result<Vec<StatsClaim>, Status> {
+        self.stats_incarnation.check(token, token, incarnation)?;
+        let claims = self.translate_epoch(token)?;
+        if claims.len() != children {
+            return Err(Status::failed_precondition(format!(
+                "{STALE_STATS_EPOCH}: relay token {token} names {} children and the map has \
+                 {children}; refetch TermStats",
+                claims.len()
+            )));
         }
-        let mut known = vec![false; scope.column_count()];
-        let mut epochs = Vec::with_capacity(shares.len());
-        for (child, share) in shares.iter().enumerate() {
-            let view = share.read_view();
-            scope.validate_echo(view.fingerprint, view.columns_known)?;
-            let claim = StatsClaim::required(view.epoch, view.incarnation)?;
-            if expected.is_some_and(|claims| {
-                claims
-                    .get(child)
-                    .is_none_or(|expected| expected.epoch != 0 && *expected != claim)
-            }) {
-                return Err(Status::failed_precondition(
-                    "relay child read version changed",
-                ));
-            }
-            for (held, present) in known.iter_mut().zip(view.columns_known) {
-                *held |= present;
-            }
-            epochs.push(claim);
-        }
-        self.still_current(pinned, "read receipt")?;
-        let stats_epoch = self
-            .tokens
-            .lock()
-            .expect("relay token registry poisoned")
-            .allocate(TokenTuple {
-                collection: self.collection.clone(),
-                control_revision: pinned.control_revision,
-                topology_generation: pinned.topology_generation,
-                children,
-                epochs,
-            })?;
-        Ok(crate::pb::VectorReadReceipt {
-            vector_binding: None,
-            stats_epoch,
-            stats_incarnation: self.stats_incarnation.bytes()?,
-            visibility_fingerprint: scope.fingerprint().to_vec(),
-            visibility_columns_known: known,
-        })
-    }
-
-    /// Bind the relay's parent-facing UDP signal lane on `addr` (the
-    /// same host:port as its gRPC listener) and fold typed floor and
-    /// cancel datagrams into the matching stream. The same acceptance
-    /// rule as a node's lane: signed when a key is configured, unsigned
-    /// on loopback only.
-    #[cfg(feature = "net")]
-    pub fn spawn_floor_listener(&self, addr: std::net::SocketAddr) {
-        let signals = Arc::clone(&self.signals);
-        let key = self.base.udp_key().cloned();
-        if key.is_none() && !crate::security::is_loopback(&addr) {
-            eprintln!(
-                "relay stream-signal UDP lane on {addr} stays closed: no --udp-hmac-key, and \
-                 unsigned datagrams are accepted on loopback only; signals ride the gRPC streams"
-            );
-            return;
-        }
-        tokio::spawn(async move {
-            let socket = match tokio::net::UdpSocket::bind(addr).await {
-                Ok(socket) => socket,
-                Err(e) => {
-                    eprintln!(
-                        "relay stream-signal UDP bind {addr}: {e}; signals ride the gRPC streams \
-                         only"
-                    );
-                    return;
-                }
-            };
-            let mut buf = [0u8; 64];
-            loop {
-                match socket.recv_from(&mut buf).await {
-                    Ok((n, _peer)) => apply_datagram(&signals, key.as_ref(), &buf[..n]),
-                    Err(_) => continue,
-                }
-            }
-        });
-    }
-
-    /// Every child's health under one map reading, in shard order; a
-    /// child that does not answer fails the call by name.
-    async fn children_health(
-        &self,
-        frozen: &CoordinatorServiceImpl,
-        timeout: Option<Duration>,
-    ) -> Result<Vec<HealthResponse>, Status> {
-        let children = frozen.node_addresses().to_vec();
-        let mut tasks = Vec::with_capacity(children.len());
-        for (shard, addr) in children.iter().enumerate() {
-            let mut link = frozen.node_client(addr)?;
-            let addr = addr.clone();
-            tasks.push(tokio::spawn(async move {
-                let mut request = Request::new(HealthRequest {});
-                if let Some(timeout) = timeout {
-                    request.set_timeout(timeout);
-                }
-                link.health(request)
-                    .await
-                    .map(|r| r.into_inner())
-                    .map_err(|status| {
-                        Status::new(
-                            status.code(),
-                            format!("relay child {shard} ({addr}) health: {}", status.message()),
-                        )
-                    })
-            }));
-        }
-        let mut out = Vec::with_capacity(children.len());
-        for task in tasks {
-            out.push(
-                task.await
-                    .map_err(|e| Status::internal(format!("relay health task: {e}")))??,
-            );
-        }
-        Ok(out)
-    }
-
-    /// The startup check and the `Health` body: the children's reports
-    /// merged into the one shard the parent sees, refused by name when
-    /// the children's slot ranges are not contiguous.
-    pub async fn check_children(&self) -> Result<HealthResponse, Status> {
-        let (pinned, frozen) = self.pin();
-        let reports = self.children_health(&frozen, None).await?;
-        let merged = merge_health(&self.collection, frozen.node_addresses(), &reports)?;
-        self.still_current(&pinned, "Health")?;
-        Ok(merged)
+        Ok(claims)
     }
 }
 
@@ -446,19 +254,6 @@ pub(crate) fn grpc_timeout(metadata: &tonic::metadata::MetadataMap) -> Option<Du
     Some(duration)
 }
 
-fn read_metadata(
-    response: &impl crate::visibility::ScopedReadResponse,
-) -> crate::pb::VectorReadReceipt {
-    let view = response.read_view();
-    crate::pb::VectorReadReceipt {
-        vector_binding: None,
-        stats_epoch: view.epoch,
-        stats_incarnation: view.incarnation.to_vec(),
-        visibility_fingerprint: view.fingerprint.to_vec(),
-        visibility_columns_known: view.columns_known.to_vec(),
-    }
-}
-
 /// The refusal every route outside the relay's scope answers with.
 fn refused(route: &str) -> Status {
     Status::unimplemented(format!(
@@ -469,105 +264,6 @@ fn refused(route: &str) -> Status {
          (ResolveFilterBitmap, ResolveLexicalBitmap, ResolveVectorBitmap), the \
          dictionaries (ExpandTermPrefix, SuggestTerms), the fetches by id (GetDocuments, \
          ResolveParents, FetchValues, BrowseShard), the folds (AggregateShard, \
-         QuantileCounts, EvaluateBoolean); see docs/relay-coordinators.md"
+         QuantileCounts, EvaluateBoolean)"
     ))
-}
-
-/// One request per child (`None` asks that child nothing), the answers
-/// paired with their child index in child order; a child's error is
-/// named by child and address.
-async fn fan_out<Req, Resp, F, Fut>(
-    frozen: &CoordinatorServiceImpl,
-    children: &[String],
-    requests: Vec<Option<Req>>,
-    timeout: Option<Duration>,
-    route: &'static str,
-    call: F,
-) -> Result<Vec<(usize, Resp)>, Status>
-where
-    Req: Send + 'static,
-    Resp: Send + 'static,
-    F: Fn(crate::link::NodeLink, Request<Req>) -> Fut + Clone + Send + 'static,
-    Fut: std::future::Future<Output = Result<Response<Resp>, Status>> + Send + 'static,
-{
-    let mut tasks = Vec::with_capacity(children.len());
-    for (shard, child_req) in requests.into_iter().enumerate() {
-        let Some(child_req) = child_req else {
-            continue;
-        };
-        let link = frozen.node_client(&children[shard])?;
-        let addr = children[shard].clone();
-        let call = call.clone();
-        tasks.push((
-            shard,
-            tokio::spawn(async move {
-                let mut request = Request::new(child_req);
-                if let Some(timeout) = timeout {
-                    request.set_timeout(timeout);
-                }
-                call(link, request)
-                    .await
-                    .map(|r| r.into_inner())
-                    .map_err(|status| child_error(shard, &addr, route, status))
-            }),
-        ));
-    }
-    let mut out = Vec::with_capacity(tasks.len());
-    for (shard, task) in tasks {
-        let share = task
-            .await
-            .map_err(|e| Status::internal(format!("relay {route} task: {e}")))??;
-        out.push((shard, share));
-    }
-    Ok(out)
-}
-
-/// The children's answers put back in the caller's id order, each
-/// occurrence of an id served once, the way a node answers a list that
-/// repeats an id. An id no child answered is absent, as a node leaves
-/// out an id it does not serve.
-fn in_caller_order<T>(ids: &[u64], items: Vec<T>, id_of: impl Fn(&T) -> u64) -> Vec<T> {
-    let mut by_id: HashMap<u64, VecDeque<T>> = HashMap::new();
-    for item in items {
-        by_id.entry(id_of(&item)).or_default().push_back(item);
-    }
-    let mut out = Vec::with_capacity(ids.len());
-    for id in ids {
-        if let Some(item) = by_id.get_mut(id).and_then(VecDeque::pop_front) {
-            out.push(item);
-        }
-    }
-    out
-}
-
-impl RelayService {
-    /// The children, the map they were pinned under, and the parent's
-    /// claim translated per child: the opening every composed unary
-    /// route shares.
-    fn open_children(
-        &self,
-        route: &str,
-        visibility: Option<&crate::pb::DocumentVisibility>,
-        epoch: u64,
-        incarnation: &[u8],
-    ) -> Result<
-        (
-            MapSnapshot,
-            CoordinatorServiceImpl,
-            Vec<String>,
-            Vec<StatsClaim>,
-        ),
-        Status,
-    > {
-        crate::visibility::VisibilityScope::new(visibility)?;
-        let (pinned, frozen) = self.pin();
-        let children = frozen.node_addresses().to_vec();
-        if children.is_empty() {
-            return Err(Status::failed_precondition(format!(
-                "relay: a relay coordinator has no children ({route})"
-            )));
-        }
-        let claims = self.child_claims(epoch, incarnation, children.len())?;
-        Ok((pinned, frozen, children, claims))
-    }
 }

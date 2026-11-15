@@ -22,8 +22,8 @@ new server without regeneration.
 
 ## Preserved compatibility
 
-- `TURBOVEC_*` environment variables remain fallback aliases. New names win
-  when both are present.
+- Environment variables use the one `PIPESTREAM_SEARCH_*` prefix, named after
+  the flag; `TURBOVEC_*` names are not read.
 - Existing configured `.tv` paths still load through `embedded-turbovec`.
 - Snapshot generations use `vector.index`, optional `vectors.f32`, and
   `documents.bm25`. The old `index.tv` / `index.tv.bm25` names are no longer

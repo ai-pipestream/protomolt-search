@@ -125,8 +125,8 @@ code is refused naming both. A node with the column declared and no
 leaf pinned refuses a direct `AddDocuments` without the value, naming
 the column and the flag. The log stores the value in place, so replay
 evaluates no CEL and a reopened shard answers the same browse. The
-flags read `TURBOVEC_PLACEMENT_COLUMN`, `TURBOVEC_PLACEMENT_LEAF`, and
-`TURBOVEC_PLACEMENT_TREE`, and the config-file keys of the same names;
+flags read `PIPESTREAM_SEARCH_PLACEMENT_COLUMN`,
+`PIPESTREAM_SEARCH_PLACEMENT_LEAF`, and `PIPESTREAM_SEARCH_PLACEMENT_TREE`, and the config-file keys of the same names;
 the layout diagnostics report the pinned code and whether the shard's
 segments carry more than one (`placement_mixed`), and the fixed knob
 `placement_tree` names the pinned leaf when a tree is given.
@@ -178,7 +178,7 @@ handshake and returns the shape a consulted fleet returns. The filter
 leaves that excluded a shard count as resolved for the typo rule,
 because the leaf predicate that excluded it named the same column.
 
-`--shard-pruning` (`TURBOVEC_SHARD_PRUNING`, default on) is the A/B
+`--shard-pruning` (`PIPESTREAM_SEARCH_SHARD_PRUNING`, default on) is the A/B
 switch, live afterwards as the coordinator's `shard_pruning` knob
 (`docs/diagnostics.md`). The profile reports `shards_total` and
 `shards_skipped` for the plan's filter next to the segment counters; a
