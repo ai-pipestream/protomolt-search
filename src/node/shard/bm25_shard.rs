@@ -13,7 +13,7 @@ pub enum Bm25Shard {
     /// Disk-spilling bulk builder (fresh persisted shards): bounded heap,
     /// NOT searchable until flushed.
     Spilling(SpillBuilder),
-    /// Disk-resident mmap reader over the v3 file.
+    /// Disk-resident mmap reader over a saved `.bm25` file.
     Resident(Bm25Reader),
     /// The segment catalog plus a heap tail (`docs/immutable-segments.md`):
     /// the default layout of a new persisted shard.
@@ -675,25 +675,8 @@ impl Bm25Shard {
         }
     }
 
-    /// Open a `.bm25` path in the right shape: every reader-supported
-    /// format (v3 through v8) maps disk-resident; only the pre-v3
-    /// formats load into the heap builder (and are upgraded to the
-    /// current format on the next flush). v5/v6 were missing from this
-    /// list once, and v8 repeated the mistake in review, so a
-    /// restarted node heap-loaded its whole postings file — at real
-    /// shard sizes that is the exact failure the resident reader
-    /// exists to prevent. When a format version is added, it goes
-    /// HERE too.
+    /// Open a saved `.bm25` file (`v6` through `v8`) as a disk-resident mmap reader.
     pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
-        let mut magic = [0u8; 8];
-        std::fs::File::open(path)?.read_exact(&mut magic)?;
-        if matches!(
-            &magic,
-            b"TVBM2503" | b"TVBM2504" | b"TVBM2505" | b"TVBM2506" | b"TVBM2507" | b"TVBM2508"
-        ) {
-            Ok(Bm25Shard::Resident(Bm25Reader::open(path)?))
-        } else {
-            Ok(Bm25Shard::Building(Bm25Store::load(path)?))
-        }
+        Bm25Reader::open(path).map(Bm25Shard::Resident)
     }
 }

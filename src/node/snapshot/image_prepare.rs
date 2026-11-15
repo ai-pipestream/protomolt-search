@@ -260,50 +260,55 @@ pub(super) fn check_pending_compaction(guard: &ShardState) -> Result<(), Status>
 mod tests {
     use super::*;
 
+    struct TempDir(PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
-    fn legacy_images_keep_loader_dispatch_and_schema_admission() {
+    fn retired_and_resident_images_enforce_loader_and_schema_admission() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("snapshot-legacy-{}-{unique}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        for version in [1, 2] {
-            let path = root.join(format!("v{version}.bm25"));
-            std::fs::write(&path, legacy_document(version)).unwrap();
-            assert!(Bm25Reader::open(&path).is_err());
-            assert!(matches!(
-                Bm25Shard::open(&path).unwrap(),
-                Bm25Shard::Building(_)
-            ));
-            assert_eq!(
-                check_documents(&NodeConfig::default(), &path, true).unwrap(),
-                1
-            );
-            let config = NodeConfig {
-                facet_fields: vec!["required".into()],
-                ..Default::default()
-            };
-            let error = check_documents(&config, &path, true).unwrap_err();
-            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-            assert!(error.message().contains("column table"), "{error}");
-        }
-        std::fs::remove_dir_all(root).unwrap();
-    }
+        let dir = TempDir(
+            std::env::temp_dir().join(format!("snapshot-bm25-{}-{unique}", std::process::id())),
+        );
+        std::fs::create_dir_all(&dir.0).unwrap();
 
-    fn legacy_document(version: u8) -> Vec<u8> {
-        let mut bytes = format!("TVBM250{version}").into_bytes();
-        bytes.extend_from_slice(&1u32.to_le_bytes()); // One document slot.
-        bytes.extend_from_slice(&0u32.to_le_bytes()); // No analyzed terms.
-        bytes.extend_from_slice(&0u64.to_le_bytes()); // Total field length.
-        bytes.extend_from_slice(&1u32.to_le_bytes()); // One stored text.
-        bytes.extend_from_slice(&6u32.to_le_bytes());
-        bytes.extend_from_slice(b"legacy");
-        if version == 2 {
-            bytes.push(0);
-        } // No lineage.
-        bytes.extend_from_slice(&0u32.to_le_bytes()); // No posting lists.
-        bytes
+        for version in 1..=5u8 {
+            let legacy = dir.0.join(format!("v{version}.bm25"));
+            std::fs::write(&legacy, format!("TVBM250{version}\0\0\0\0\0\0\0\0")).unwrap();
+            assert!(Bm25Shard::open(&legacy).is_err());
+            let err = check_documents(&NodeConfig::default(), &legacy, true).unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        }
+
+        let current = dir.0.join("current.bm25");
+        let mut store = heap_store(&NodeConfig::default()).unwrap();
+        store.add_document(
+            0,
+            "legacy".into(),
+            crate::postings::AnalyzedDoc::body(Vec::new(), 0),
+        );
+        store.save(&current).unwrap();
+        assert!(matches!(
+            Bm25Shard::open(&current).unwrap(),
+            Bm25Shard::Resident(_)
+        ));
+        assert_eq!(
+            check_documents(&NodeConfig::default(), &current, true).unwrap(),
+            1
+        );
+        let mismatched = NodeConfig {
+            facet_fields: vec!["required".into()],
+            ..Default::default()
+        };
+        let error = check_documents(&mismatched, &current, true).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("column table"), "{error}");
     }
 }
