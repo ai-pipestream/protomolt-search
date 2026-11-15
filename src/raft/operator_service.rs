@@ -1,6 +1,5 @@
 //! The Raft operator service: member status, membership changes and
-//! image verification over the member's listener, under cluster trust
-//! (docs/raft-hosting.md, "Operator surface").
+//! image verification over the member's listener, under cluster trust.
 //!
 //! Trust is the cluster-membership check every control route applies: a
 //! client certificate the listener verified against the cluster CA. The

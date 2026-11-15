@@ -52,7 +52,7 @@ impl NodeAgent {
             memory_bytes: memory_bytes(),
             search_threads,
             failure_domain: self.inner.config.failure_domain.clone(),
-            // The process-wide window's rate (docs/bandwidth-budget.md):
+            // The process-wide window's rate:
             // zero is unknown. A server process: the device residency is
             // declared by the phone transport, which does not register
             // through this agent.

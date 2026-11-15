@@ -131,8 +131,7 @@ pub(super) fn spill_manifest(
 }
 
 /// Pass 2: one single-bucket log per cut, with the documents' analyzed
-/// fields in an analysis sidecar beside it, exactly the split's spill
-/// (docs/replay-from-segments.md).
+/// fields in an analysis sidecar beside it, exactly the split's spill.
 pub(super) struct CutSpill<'a> {
     rows: CatalogRows<'a>,
     shape: &'a CatalogShape,

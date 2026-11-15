@@ -1,6 +1,6 @@
 //! Pass 1 of a re-placement split: route each live row under the new
 //! tree into its child's spill log, one WAL bucket (or one source
-//! segment) in memory at a time (`docs/replay-from-segments.md`).
+//! segment) in memory at a time.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;

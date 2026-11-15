@@ -27,7 +27,7 @@ pub(super) struct Replay {
     pub(super) stable_keys: BTreeMap<u64, Vec<u8>>,
     /// global id -> the document's analyzed fields, table order, when
     /// the replay carries a transplant sidecar
-    /// (`docs/replay-from-segments.md`) and the child build takes the
+    /// and the child build takes the
     /// fields from here instead of the analyzer.
     pub(super) analyzed: BTreeMap<u64, Vec<AnalyzedField>>,
 }
@@ -84,11 +84,10 @@ pub(super) fn replay_buckets(
     replay_buckets_through(gen, buckets, bucket_count, dim, vectors_only, u64::MAX, out)
 }
 
-/// [`replay_buckets`] bounded by the generation clock: records past
-/// `upto_clock` are skipped, which is how an online compaction builds
-/// its dense image from a prefix of a log that keeps growing under it
-/// (`docs/mutations.md`). A legacy unclocked record (clock 0) is refused
-/// under a bound, because it cannot be placed against the cutoff.
+/// [`replay_buckets`] bounded by the generation clock: records past `upto_clock`
+/// are skipped, which is how an online compaction builds its dense image from a
+/// prefix of a log that keeps growing under it. A legacy unclocked record (clock 0)
+/// is refused under a bound, because it cannot be placed against the cutoff.
 pub(super) fn replay_buckets_through(
     gen: &Path,
     buckets: std::ops::Range<u32>,
@@ -152,7 +151,7 @@ pub(super) fn require_complete_history(manifest: &WalManifest, what: &Path) -> R
 }
 
 /// The mapped-plan binding carried by the input generations' markers
-/// files (`docs/descriptor-mappings.md` section 4a): every Bind record
+/// files: every Bind record
 /// across every input must agree, because the children are ONE corpus
 /// under ONE plan — contradictory bindings mean the inputs were mapped
 /// under different plans and their columns must not merge. `None` when
@@ -231,7 +230,7 @@ pub fn read_generation_binding(
 /// legitimately differ between inputs; the shape and provider state must not).
 pub(super) fn same_backend_config(a: &WalManifest, b: &WalManifest) -> bool {
     // One dataset, one provider state: generations of two collections
-    // never merge, whatever their vectors look like (docs/collections.md).
+    // never merge, whatever their vectors look like.
     a.collection == b.collection
         && a.dim == b.dim
         && a.backend_config().ok() == b.backend_config().ok()

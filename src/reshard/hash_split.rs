@@ -228,8 +228,7 @@ pub fn split_stable_logs_with(
 }
 
 /// Repartition full-history, generation-clocked WALs by their stable
-/// product keys into children covering the given hash ranges
-/// (`docs/cluster-control.md`, "Shard split"): child `i` receives the
+/// product keys into children covering the given hash ranges: child `i` receives the
 /// rows whose key hash falls in `ranges[i]` and takes `slot_offsets[i]`.
 /// The ranges must tile the source's range without a gap; a live row
 /// whose hash falls outside every range refuses by name, since the

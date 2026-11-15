@@ -94,7 +94,7 @@ use crate::postings::AnalyzedDoc;
 /// exactly like ingest. Tests wire it to the mock sidecar. Split/merge
 /// only re-partitions — term identity must be reproduced EXACTLY as at
 /// ingest, hence the spec round-trip. Multi-field documents
-/// (docs/multi-field.md) flatten into the batch as one entry per field
+/// flatten into the batch as one entry per field
 /// (body first, extras in record order); the caller reassembles.
 pub type Analyzer<'a> = dyn FnMut(&[(&str, Option<&AnalysisSpec>, SessionLayers)]) -> Result<Vec<AnalyzedDoc>, String>
     + 'a;
@@ -232,8 +232,7 @@ impl SegmentedReshardOutput {
     }
 }
 
-/// The layout a partitioned compaction builds (docs/immutable-segments.md
-/// "Partitioned layout"): live rows ordered by an integer column and cut
+/// The layout a partitioned compaction builds: live rows ordered by an integer column and cut
 /// into segments of at most `bound` rows.
 #[derive(Debug, Clone, Copy)]
 pub struct PartitionSpec<'a> {

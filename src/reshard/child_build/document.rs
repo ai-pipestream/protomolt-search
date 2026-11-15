@@ -89,10 +89,9 @@ pub(super) fn assemble_fields(
     Ok(fields)
 }
 
-/// Under a transplant the fields come from the spill's analysis sidecar
-/// (`docs/replay-from-segments.md`); the record carries no extra field
-/// texts, cased field, or phrases then, since those are fields of the
-/// table like any other.
+/// Under a transplant the fields come from the spill's analysis sidecar; the record
+/// carries no extra field texts, cased field, or phrases then, since those are
+/// fields of the table like any other.
 fn transplanted_fields(
     table: &[String],
     local: u32,
@@ -137,7 +136,7 @@ fn analyzed_fields(
     let mut fields = vec![AnalyzedField::default(); table.len()];
     fields[0] = body.into_body();
     // The cased identity came out of the body's one pass; it lands at the
-    // field the record named (docs/dual-cased.md).
+    // field the record named.
     if !doc.cased_field.is_empty() {
         let Some(ci) = position(table, &doc.cased_field) else {
             return Err(format!(
@@ -194,8 +193,7 @@ fn place_phrases(
     Ok(())
 }
 
-/// Proximity payloads (docs/phrase-proximity.md) and sentence spans
-/// (docs/highlighting.md): a field the record keeps them on must have
+/// Proximity payloads and sentence spans: a field the record keeps them on must have
 /// them from the replay analysis; it is refused, never re-indexed
 /// without them.
 fn check_layers(
@@ -338,8 +336,7 @@ pub(super) fn add_document(
     }
     // Reshard replays LOGGED requests, whose quality and geography values
     // were materialized into the ordinary column lists at first ingest, so
-    // there is nothing to derive here (docs/quality-columns.md,
-    // docs/geography-columns.md).
+    // there is nothing to derive here.
     let analyzed = AnalyzedDoc {
         fields,
         ..Default::default()

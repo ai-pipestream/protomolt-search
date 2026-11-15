@@ -19,7 +19,7 @@ pub(crate) fn reconstruct_document(
         restore_text(bm25, row, tables, &mut doc)?;
     }
     // The store's declaration entry says what the row's derived values
-    // mean (docs/derived-columns.md); a logged form of the row carries it.
+    // mean; a logged form of the row carries it.
     doc.derived_fingerprint = bm25
         .derived()
         .map(|derived| derived.fingerprint.clone())

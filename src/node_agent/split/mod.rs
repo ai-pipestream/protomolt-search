@@ -1,4 +1,4 @@
-//! `SPLIT_SHARD` (`docs/cluster-control.md`, "Shard split"): build two
+//! `SPLIT_SHARD`: build two
 //! children covering the source range from the source's own WAL, place
 //! them here on fresh listeners, tail the source's log into them by
 //! stable key until they are within the lag bound, fence ingest on the

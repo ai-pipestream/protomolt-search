@@ -135,8 +135,7 @@ impl<'a> TreePlan<'a> {
         Ok(())
     }
 
-    /// The declaration the children are written under
-    /// (docs/derived-columns.md): the one given, or the sources' own,
+    /// The declaration the children are written under: the one given, or the sources' own,
     /// checked against the sources' tables and the `--derive` list.
     fn resolve_declaration(&self) -> Result<Option<Arc<Declaration>>, String> {
         let declaration: Option<Arc<Declaration>> = match &self.options.derived {

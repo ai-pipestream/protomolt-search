@@ -88,7 +88,7 @@ pub struct HostConfig {
     /// by the verified image.
     pub max_in_snapshot_log_to_keep: u64,
     /// How long a leased admission stays authoritative after the
-    /// linearizable read that granted it (docs/raft-admission.md).
+    /// linearizable read that granted it.
     pub admission_lease_ms: u64,
     /// Clock skew the lease budget tolerates between members.
     pub clock_skew_ms: u64,

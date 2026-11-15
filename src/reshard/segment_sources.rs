@@ -188,8 +188,7 @@ fn wal_row_watermark(gen: &Path, bucket_count: u32) -> Result<(u64, BTreeSet<u64
     Ok((watermark, deleted))
 }
 
-/// Open the catalogs beside the logs and check what a child pins
-/// (`docs/replay-from-segments.md`, "The replay").
+/// Open the catalogs beside the logs and check what a child pins.
 pub(crate) fn open_segment_sources(
     gens: &[PathBuf],
 ) -> Result<(Vec<SegmentSourceShard>, SourceTables), String> {

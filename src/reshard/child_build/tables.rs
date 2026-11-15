@@ -12,9 +12,9 @@ pub(super) struct ChildTables {
     /// Text fields, body first.
     pub(super) fields: Vec<String>,
     pub(super) columns: ColumnTables,
-    /// Fields that keep token positions (docs/phrase-proximity.md).
+    /// Fields that keep token positions.
     pub(super) positions: Vec<String>,
-    /// Fields that keep sentence spans (docs/highlighting.md).
+    /// Fields that keep sentence spans.
     pub(super) sentences: Vec<String>,
 }
 
@@ -49,7 +49,7 @@ impl ChildTables {
     }
 }
 
-/// The child field table (docs/multi-field.md): the caller's fleet table
+/// The child field table: the caller's fleet table
 /// when given, else "body" plus every extra field name in this child's
 /// records in canonical lexical order. First-sight order is not
 /// sufficient: a sparse optional field can first appear after an
@@ -99,9 +99,9 @@ where
 /// The column tables derived from the replayed records (first-seen
 /// order): the WAL is the durable column record, so a field no record
 /// values never reaches the child. Integers and timestamps name the SAME
-/// i64 columns (docs/range-facets.md), so both lists feed one table — a
+/// i64 columns, so both lists feed one table — a
 /// child whose records only ever carried timestamps still gets the
-/// column. Geo columns come from one list (docs/geo-columns.md).
+/// column. Geo columns come from one list.
 fn derive_columns(rows: &Rows) -> ColumnTables {
     ColumnTables {
         facets: first_seen(rows, |doc| doc.facets.iter().map(|v| &v.field)),

@@ -57,7 +57,7 @@ pub const STORE_FILE: &str = "authority.redb";
 pub const LOG_FILE: &str = "raft-log.redb";
 pub const SNAPSHOT_DIR: &str = "raft-snapshots";
 
-/// The transport material of a networked member (docs/raft-hosting.md).
+/// The transport material of a networked member.
 #[cfg(feature = "tls")]
 pub struct ClusterTransport {
     /// Which certificate speaks for which node; this node's own
@@ -83,8 +83,7 @@ struct Listener {
 
 /// Every rise of a peer's rejection count writes one log line naming the
 /// peer, the RPC, the code, the count and the message: one line per peer
-/// per change of count, never per poll (docs/raft-hosting.md, "Operator
-/// surface").
+/// per change of count, never per poll.
 ///
 /// A peer that rejects this node's image by digest names bytes that
 /// differ from what the meta announces. The image was served by length,
@@ -163,8 +162,7 @@ pub struct RaftHost {
     snapshot_rejections: Arc<SnapshotRejections>,
     #[cfg(feature = "tls")]
     isolation: Isolation,
-    /// The caller side of a forwarded lease (docs/raft-admission.md, "A
-    /// lease forwarded from the leader"); `None` without a transport.
+    /// The caller side of a forwarded lease; `None` without a transport.
     #[cfg(feature = "tls")]
     forwarder: Option<super::transport::LeaseForwarder>,
     #[cfg(any(test, feature = "fault-injection"))]
@@ -211,7 +209,7 @@ pub fn inspect_node(
 
 impl RaftHost {
     // -----------------------------------------------------------------
-    // Membership (docs/raft-hosting.md): learner, promotion, removal
+    // Membership: learner, promotion, removal
     // -----------------------------------------------------------------
 }
 

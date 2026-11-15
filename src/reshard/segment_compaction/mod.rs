@@ -1,6 +1,4 @@
-//! Partitioned compaction straight from sealed segments
-//! (docs/replay-from-segments.md, "Partitioned compaction of a catalog
-//! without a log").
+//! Partitioned compaction straight from sealed segments.
 
 mod build;
 mod shape;
@@ -19,7 +17,7 @@ use self::spill::{count_keys, spill_manifest, CatalogRows, CutSpill};
 
 /// The build bounds a compaction from segments accepts: the same knobs a
 /// re-placement split's segmented build takes (`--build-threads`,
-/// `--build-queue`, `--build-memory`, docs/replay-from-segments.md),
+/// `--build-queue`, `--build-memory`),
 /// with the same refusal rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentCompactionOptions {
@@ -65,7 +63,7 @@ pub struct SegmentCompactionBuild {
 }
 
 /// Build the dense partitioned images of one catalog's sealed set without
-/// its log (`docs/replay-from-segments.md`): the row source is the
+/// its log: the row source is the
 /// segments themselves, each document's analyzed fields transposed from
 /// the postings (`FieldView::transpose`), never the analyzer; the live
 /// rows are keyed by `spec.column` and cut into partitions of at most

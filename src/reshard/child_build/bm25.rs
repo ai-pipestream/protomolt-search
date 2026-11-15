@@ -59,8 +59,8 @@ impl Bm25Build<'_> {
             i = end;
         }
         // The children stay bound to the plan the parents were written
-        // under, and to the derived-column declaration (the kind-15 entry,
-        // docs/derived-columns.md); replay must not launder either away.
+        // under, and to the derived-column declaration (the kind-15
+        // entry); replay must not launder either away.
         builder.set_binding(schema.binding.cloned());
         builder.set_derived(schema.derived.cloned());
         builder

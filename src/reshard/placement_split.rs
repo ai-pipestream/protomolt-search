@@ -9,7 +9,7 @@ use super::split_inputs::{create_out_dir, distribute, replay_clocked, SplitInput
 use super::{Analyzer, ReshardOutput, WalCutoff};
 
 /// One child of a placement-keyed split: the inclusive code range it
-/// takes (`docs/placement.md`, "Changing the tree"). A single code is a
+/// takes. A single code is a
 /// range of one; a prefix range takes a subtree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlacementChild {
@@ -94,10 +94,9 @@ pub fn validate_placement_children(
     Ok(())
 }
 
-/// A split of one or more full-history generations into children keyed
-/// by the placement code each logged document carries in `column`
-/// (`docs/placement.md`): child `i` takes the codes in `children[i]` and
-/// `slot_offsets[i]`.
+/// A split of one or more full-history generations into children keyed by the
+/// placement code each logged document carries in `column`: child `i` takes the
+/// codes in `children[i]` and `slot_offsets[i]`.
 #[derive(Debug, Clone, Copy)]
 pub struct PlacementSplitRequest<'a> {
     pub gens: &'a [PathBuf],

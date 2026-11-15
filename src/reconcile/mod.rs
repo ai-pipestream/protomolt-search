@@ -1,5 +1,5 @@
 //! Reconcile a re-placement child against its sources, document for
-//! document (`docs/derived-columns.md`, "Rebuild"): every live source
+//! document: every live source
 //! row the tree sends to the child's leaf appears in the child exactly
 //! once, carried whole (text, lineage, identity, original source, every
 //! column, the FP32 vector), with the placement code rewritten and the

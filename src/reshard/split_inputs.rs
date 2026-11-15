@@ -40,7 +40,7 @@ impl SplitInputs {
 
     /// The schema a split's children are written under: the given BM25
     /// field table, the inputs' binding, and the declaration the log's
-    /// manifest records (docs/derived-columns.md).
+    /// manifest records.
     pub(super) fn schema<'a>(&'a self, bm25_fields: Option<&'a [String]>) -> ChildSchema<'a> {
         ChildSchema {
             bm25_fields,

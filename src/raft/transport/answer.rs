@@ -175,8 +175,7 @@ impl Drop for FinalHandlerDropGuard<'_> {
 }
 
 impl RaftTransportService {
-    /// A member that does not lead asks this node for a lease
-    /// (docs/raft-admission.md, "A lease forwarded from the leader"): the
+    /// A member that does not lead asks this node for a lease: the
     /// read barrier bounded as for a local lease, the vote hold extended
     /// from the instant the request was received, and the position the
     /// barrier read returned for the asker to apply before it grants. A

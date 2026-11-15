@@ -5,8 +5,7 @@ use std::collections::BTreeSet;
 use super::replay::Replay;
 use super::{ChildImage, ReshardOutput};
 
-/// One child of a re-placement split (`docs/placement.md`, "Changing
-/// the tree"): the leaf it serves under the NEW tree and the stable-key
+/// One child of a re-placement split: the leaf it serves under the NEW tree and the stable-key
 /// hash range it takes inside that leaf (the full range on a one-shard
 /// leaf).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,10 +19,9 @@ pub struct TreeChild {
     pub hash_hi: u64,
 }
 
-/// The bytes a spilled row costs the child build while its bucket is
-/// replayed: the conservative end of the documented 40-70 KB band
-/// (docs/replay-from-segments.md): the document text, the transplanted
-/// spans and ordinals, the vector and the FP32 row. The build-memory
+/// The bytes a spilled row costs the child build while its bucket is replayed: the
+/// conservative end of the documented 40-70 KB band: the document text, the
+/// transplanted spans and ordinals, the vector and the FP32 row. The build-memory
 /// budget is checked against it.
 pub const BUILD_BYTES_PER_ROW: u64 = 70 * 1024;
 
@@ -60,9 +58,8 @@ pub struct TreeReshardOutput {
     /// The largest transpose held at once, in bytes (0 under the log
     /// replay): one field of one source segment at a time is the bound.
     pub peak_transpose_bytes: u64,
-    /// The derived-column declaration the children were written under
-    /// (`docs/derived-columns.md`), as the shard map's `[[derived]]`
-    /// table; empty without one.
+    /// The derived-column declaration the children were written under, as the shard
+    /// map's `[[derived]]` table; empty without one.
     pub derived: Vec<crate::derived::DerivedColumnConfig>,
     /// Documents whose fields were transplanted (0 under the log replay).
     pub transplanted_rows: u64,
@@ -71,11 +68,10 @@ pub struct TreeReshardOutput {
 /// How a re-placement split writes each child.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TreeChildLayout {
-    /// A segment catalog per child (`<out>/shard-<i>.tv.segments`,
-    /// `docs/immutable-segments.md`): the child's spill log replays one
-    /// WAL bucket at a time and each non-empty bucket seals as one
-    /// segment, so memory is one bucket's rows plus one segment build,
-    /// and a node starts on the child with `--index=<out>/shard-<i>.tv`.
+    /// A segment catalog per child (`<out>/shard-<i>.tv.segments`): the child's spill
+    /// log replays one WAL bucket at a time and each non-empty bucket seals as one
+    /// segment, so memory is one bucket's rows plus one segment build, and a node
+    /// starts on the child with `--index=<out>/shard-<i>.tv`.
     Segmented,
     /// One image per child, the way the other splits write: the child's
     /// rows are held together while the image is built. The caller states
@@ -93,8 +89,7 @@ pub struct TreeSplitOptions {
     /// bounded the way a replay of one source bucket is. Ignored under
     /// a column cut, whose bucket count the cut plan sets.
     pub spill_bucket_bits: Option<u32>,
-    /// Where each document's analyzed fields come from
-    /// (`docs/replay-from-segments.md`).
+    /// Where each document's analyzed fields come from.
     pub source: TreeRowSource,
     /// How each child's spill is cut into buckets, and so into segments.
     pub cut: SpillCut,
@@ -110,7 +105,7 @@ pub struct TreeSplitOptions {
     /// to see the refusal.
     pub open_files_limit: Option<u64>,
     /// The derived-column declaration the children are written under
-    /// (`--derived-columns`, docs/derived-columns.md); `None` keeps the
+    /// (`--derived-columns`); `None` keeps the
     /// sources' own, from the log's manifest. With a declaration the
     /// sources' column tables must declare every input.
     pub derived: Option<std::sync::Arc<crate::derived::Declaration>>,
@@ -264,7 +259,7 @@ pub fn tree_shard_map_toml(
 }
 
 // ---------------------------------------------------------------------
-// Replay from segments (docs/replay-from-segments.md)
+// Replay from segments
 // ---------------------------------------------------------------------
 
 /// Where a re-placement split takes each document's analyzed fields.

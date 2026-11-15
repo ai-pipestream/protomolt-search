@@ -1,4 +1,4 @@
-//! The tonic Raft transport (docs/raft-hosting.md): the library's vote,
+//! The tonic Raft transport: the library's vote,
 //! append and snapshot operations as typed RPCs (`raft_transport.proto`)
 //! over the cluster's mTLS channels.
 //!

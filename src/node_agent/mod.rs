@@ -1,5 +1,4 @@
-//! Node membership in the control plane (`docs/cluster-control.md`,
-//! "Node lifecycle"): register, renew the lease, report every served
+//! Node membership in the control plane: register, renew the lease, report every served
 //! shard, and run the worker that executes the plan's actions assigned
 //! to this node — `COPY_REPLICA` bootstraps a replica under `--data-dir`
 //! from the primary's `StreamSnapshot` and catches its WAL tail up with

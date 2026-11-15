@@ -17,8 +17,7 @@ use super::{Analyzer, ChildImage, PartitionSpec};
 
 /// [`compact_log`] for the partitioned layout: the dense all-live rows
 /// of ONE generation through the request's cutoff, ordered by
-/// `spec.column` and cut into segments of at most `spec.bound` rows
-/// (docs/immutable-segments.md "Partitioned layout"). Three passes, none
+/// `spec.column` and cut into segments of at most `spec.bound` rows. Three passes, none
 /// holding more than one WAL bucket or one output partition in memory:
 ///
 /// 1. each bucket replays in turn and yields `(key, id)` per live row,

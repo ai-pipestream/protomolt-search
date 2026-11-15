@@ -7,7 +7,7 @@ use super::*;
 /// library refreshes a leader's own vote timer only when its vote changes,
 /// so an established leader would otherwise grant a vote to an up-to-date
 /// candidate at once, and a vote quorum could then avoid every follower
-/// that acknowledged the barrier (docs/raft-admission.md).
+/// that acknowledged the barrier.
 #[derive(Clone)]
 pub struct LeaseHold {
     anchor: Arc<std::sync::RwLock<Option<std::time::Instant>>>,
@@ -67,7 +67,7 @@ impl GrantGate {
 }
 
 impl RaftHost {
-    /// An owned admission lease (docs/raft-admission.md) for work that
+    /// An owned admission lease for work that
     /// cannot run on the calling thread. The lease is anchored before the
     /// read barrier is invoked: the barrier's heartbeats are sent after
     /// that instant, every follower that acknowledges them refreshes its
@@ -116,8 +116,7 @@ impl RaftHost {
         Ok(LeasedAdmission::new(store, principal, lease))
     }
 
-    /// A lease for a member that does not lead (docs/raft-admission.md, "A
-    /// lease forwarded from the leader"): the leader the library names is
+    /// A lease for a member that does not lead: the leader the library names is
     /// asked to run its barrier, and the interval is the one anchored here
     /// before it was asked, so every hop, wait and delay consumes it. The
     /// grant waits until this member has applied the position the leader's

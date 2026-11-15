@@ -22,7 +22,7 @@ use self::plan::{TreePlan, TreeTarget};
 use self::spill::{RoutedRow, SegmentRows, TreeSpill};
 
 /// Split one or more full-history generations under a NEW placement
-/// tree (`docs/placement.md`, "Changing the tree"): the tree is
+/// tree: the tree is
 /// evaluated on each live document's stored values, the way the
 /// coordinator routes at ingest, the placement column is rewritten to
 /// the code the new tree assigns, and the document goes to the child

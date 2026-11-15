@@ -10,13 +10,13 @@ use crate::wal::WalManifest;
 use super::child_build::{child_order, finish_child_ordered, ChildSchema, ChildSlot};
 #[cfg(doc)]
 use super::hash_split::split_logs_with;
-#[cfg(doc)]
-use super::segmented_split::split_logs_segmented_with;
 use super::hnsw_sources::HnswCompactionSources;
 use super::replay::{
     read_gen_manifest, read_gens_binding, replay_buckets_through, require_backend_config,
     require_complete_history, Replay,
 };
+#[cfg(doc)]
+use super::segmented_split::split_logs_segmented_with;
 use super::{Analyzer, ChildImage, ColumnTables};
 
 /// One live row of a compaction's dense image, in the order the sink
@@ -36,7 +36,7 @@ pub struct CompactedRow<'a> {
 }
 
 /// Where a compaction's live rows go besides the image: the rewritten
-/// full-history WAL generation (`docs/mutations.md`). Called once per row
+/// full-history WAL generation. Called once per row
 /// in slot order, before the image is built from the same replay.
 pub type RowSink<'a> = dyn FnMut(CompactedRow<'_>) -> Result<(), String> + 'a;
 
@@ -312,18 +312,17 @@ impl RowCounts {
     }
 }
 
-/// Build the dense all-live image of ONE generation through
-/// `cutoff_clock`, the baseline of an online compaction
-/// (`docs/mutations.md`): the log prefix is replayed with its deletes and
-/// replacements applied, every live row is handed to `sink` in dense slot
-/// order (the rewritten log), and the image is written under `out_dir`.
-/// Local slots start at 0; the caller owns the global offset.
+/// Build the dense all-live image of ONE generation through `cutoff_clock`, the
+/// baseline of an online compaction: the log prefix is replayed with its deletes
+/// and replacements applied, every live row is handed to `sink` in dense slot order
+/// (the rewritten log), and the image is written under `out_dir`. Local slots start
+/// at 0; the caller owns the global offset.
 ///
-/// `segmented` selects the bucket-bounded shape: one sealed image per
-/// non-empty WAL bucket, slots dense across them in bucket order, memory
-/// holding one bucket's replay at a time — the same shape
-/// [`split_logs_segmented_with`] gives a catalog. Otherwise one image over the
-/// whole replay, as [`split_logs_with`] with a factor of one.
+/// `segmented` selects the bucket-bounded shape: one sealed image per non-empty WAL
+/// bucket, slots dense across them in bucket order, memory holding one bucket's
+/// replay at a time — the same shape [`split_logs_segmented_with`] gives a catalog.
+/// Otherwise one image over the whole replay, as [`split_logs_with`] with a factor
+/// of one.
 pub fn compact_log(
     request: &CompactionRequest<'_>,
     segmented: bool,
