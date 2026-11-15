@@ -46,6 +46,7 @@ pub use self::storage::{
     bm25_build_dir, bm25_sidecar_path, exact_vector_sidecar_path, generation_bm25, generation_dir,
     generation_exact_vectors, generation_live_docs, generation_vector, live_docs_sidecar_path,
     recover_generation, recover_segments_swap, refuse_retired_generation, segments_root,
+    try_recover_generation,
 };
 
 pub(crate) use self::aggregate::{agg_op_name, agg_op_of};
@@ -100,9 +101,10 @@ pub(in crate::node) use self::scan::MAX_COALESCE;
 pub(in crate::node) use self::scan::{raise_floor_cell, ScanJob, ScanOutcome, StreamSignals};
 pub(in crate::node) use self::shard::{
     active_artifact_rows, filter_known_flags, int_min_max_as_f64, live_document_count,
-    live_field_stats, projected_value, prune_segments, resolve_shard_filters, uint_min_max_as_f64,
-    unknown_range_counts, validate_lat_lon, EmptyColumns, IngestGuard, ResolvedShardFilters,
-    SegmentPrune, ShardNumericRead,
+    live_field_stats, projected_value, prune_segments, resolve_shard_filters,
+    score_exact_slots_checked, uint_min_max_as_f64, unknown_range_counts, validate_lat_lon,
+    AdmittedDocPass, DocPassSpec, EmptyColumns, IngestGuard, ResolvedShardFilters, SegmentPrune,
+    ShardNumericRead,
 };
 pub(in crate::node) use self::snapshot::stream_file;
 pub(in crate::node) use self::storage::{

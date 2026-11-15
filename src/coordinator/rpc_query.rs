@@ -3,8 +3,7 @@
 use super::*;
 
 impl CoordinatorServiceImpl {
-    /// The public query surface: an adapter over the routes above
-    /// (`docs/query-api.md`, `src/query.rs`). Delegation, never a fork.
+    /// Public unified query adapter delegating to route handlers (`src/query.rs`).
     pub(super) async fn rpc_query(
         &self,
         request: Request<crate::pb::QueryRequest>,
@@ -115,9 +114,7 @@ impl CoordinatorServiceImpl {
             filters.include_rerank_candidate = req.include_rerank_candidate;
             let _ = self.resolve_finish_windows(&filters)?;
             self.check_vector_scan(&filters, req.collapse_parents)?;
-            // The fleet scores in one space or not at all: mixed provider
-            // kinds or fingerprints are refused before any shard is asked
-            // (docs/mmap-vectors.md).
+            // Refuse mixed provider kinds or scoring fingerprints before fan-out.
             if !self.has_clustered_vectors() {
                 self.fleet_vector_identity(true).await?;
             }

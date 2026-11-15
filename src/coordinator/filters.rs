@@ -2,12 +2,8 @@
 
 use super::*;
 
-/// A request's filters after compilation: the geo family verbatim and
-/// the CEL surface compiled ONCE into the predicate IR
-/// (`docs/cel-filters.md`). Every shard receives this same tree and
-/// none ever sees CEL text. Shared by the lexical and vector legs, so
-/// a fused result cannot mix a filtered half with an unfiltered one
-/// (`docs/vector-filters.md`).
+/// Request filters compiled once at the coordinator into geo predicates and a
+/// CEL predicate IR tree shared across lexical and vector legs.
 #[derive(Debug, Clone, Default)]
 pub struct RequestFilters {
     /// `geo_filters` verbatim.
@@ -23,12 +19,10 @@ pub struct RequestFilters {
     /// `patience_hops`).
     pub patience_saturation_ppm: Option<u32>,
     pub patience_hops: Option<u32>,
-    /// Optional coordinator streaming settle and deadline windows in
-    /// microseconds (`docs/hnsw.md`, "Graceful stream close").
+    /// Optional coordinator streaming settle and deadline windows in microseconds.
     pub finish_settle_us: Option<u32>,
     pub finish_deadline_us: Option<u32>,
-    /// Optional shared-floor candidate pruning parameters forwarded to the
-    /// shards (`docs/hnsw.md`, "Shared floor pruning"; `#72`).
+    /// Optional shared-floor candidate pruning parameters forwarded to shards.
     pub floor_prune: Option<bool>,
     pub floor_k: Option<u32>,
     pub parent_floor_share_ppm: Option<u32>,
@@ -48,25 +42,21 @@ pub struct MembershipSet {
     pub epochs: Vec<StatsClaim>,
     pub wire_bytes: u64,
     pub terms: Vec<String>,
-    /// Sealed segments the shards consulted and ruled out while
-    /// resolving this set (docs/segment-pruning.md).
+    /// Sealed segments the shards consulted and ruled out while resolving this set.
     pub prune: crate::segment_prune::PruneStats,
     pub(crate) ranges: Vec<(u64, u64)>,
 }
 
-/// Whose match set the percentile rounds count over: an id allowlist
-/// (the pooled shapes and the public route), or the planned Boolean
-/// tree the shards resolve again per round (`docs/query-api.md`).
+/// Match-set scope for percentile rounds: an explicit ID allowlist or a
+/// planned Boolean tree re-evaluated per round on each shard.
 #[derive(Clone, Copy)]
 pub(crate) enum PercentileScope<'a> {
     Ids(Option<&'a [u64]>),
     Boolean(&'a [Option<crate::pb::BooleanShardRequest>]),
 }
 
-/// One planned `BooleanQuery` ready for the shards (`docs/query-api.md`,
-/// "Recursive boolean execution"): the wire tree with every filter
-/// leaf's full compiled tree, plus what the coordinator keeps beside
-/// it to prune per shard and to apply the typo rules.
+/// Planned `BooleanQuery` prepared for shard fan-out, pairing the wire plan
+/// with compiled filter leaves for per-shard pruning and unknown-column checks.
 pub(crate) struct BooleanFanoutPlan {
     pub root: crate::pb::BooleanPlanGroup,
     pub leaves: Vec<crate::pb::BooleanPlanLeaf>,
@@ -207,9 +197,7 @@ impl FilterKnown {
         }
     }
 
-    /// Count the filter leaves that excluded a shard before fan-out as
-    /// resolved (`docs/placement.md`): the leaf predicate that ruled the
-    /// shard out named the same column, so the column is real.
+    /// Mark filter leaves that excluded a shard via placement pruning as known.
     pub(super) fn merge_pruned(&mut self, mask: Option<&crate::placement::ShardMask>) {
         if let Some(mask) = mask {
             mark_known(&mut self.tree, &mask.known);

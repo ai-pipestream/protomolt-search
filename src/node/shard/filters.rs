@@ -3,11 +3,8 @@
 use crate::node::*;
 
 impl Bm25Shard {
-    /// Resolve validated geo filters against THIS shard's geo table
-    /// (`docs/geo-columns.md`). A column the table lacks resolves to
-    /// `None`, which fails every document — its documents genuinely
-    /// hold no location, so "not inside the region" is the exact
-    /// answer. The coordinator refuses a column NO shard knows.
+    /// Resolve validated geo filters against this shard's geo table; missing
+    /// columns resolve to `None` (matching no documents on this shard).
     pub(in crate::node) fn resolve_geo_filters(
         &self,
         filters: &[crate::pb::GeoFilter],
@@ -36,13 +33,8 @@ impl Bm25Shard {
             .collect()
     }
 
-    /// Resolve a VALIDATED filter tree against this shard's tables
-    /// (`docs/cel-filters.md`): names to table indices, string values
-    /// to dictionary ordinals, number bounds into the resolved
-    /// family's exact domain. A name (or map key) this shard lacks
-    /// resolves to the absent case for every document — exact, the
-    /// same argument as [`Self::resolve_geo_filters`] — and the
-    /// coordinator refuses a leaf NO shard resolves.
+    /// Resolve a validated filter tree against this shard's column tables and
+    /// dictionaries; columns or map keys absent on this shard resolve to empty/absent.
     pub(in crate::node) fn resolve_filter(
         &self,
         expr: &crate::pb::FilterExpr,
@@ -207,16 +199,9 @@ impl Bm25Shard {
         )
     }
 
-    /// Resolve a string range (`min`/`max`, each `(value, exclusive)`)
-    /// or a `prefix` over a facet column (`key` absent) or a map-facet
-    /// value (`docs/prefix-terms.md`), to an ORDINAL RANGE when the
-    /// column's dictionary is in byte order — every file this writer
-    /// produces, checked at open — and to plain ordinal membership on
-    /// the heap builder, whose first-seen dictionary is in heap and
-    /// scanned once per request. A disk-resident dictionary in the
-    /// older first-seen order refuses by name: an ordinal range over
-    /// it would be a lie, and a per-document string walk is the thing
-    /// this predicate exists not to do.
+    /// Resolve a string range or prefix over a facet or map-facet column to a
+    /// contiguous ordinal range when byte-sorted (refusing unordered resident
+    /// files) or to an explicit ordinal set on unsorted heap builders.
     pub(in crate::node) fn resolve_string_predicate(
         &self,
         column: &str,
@@ -505,11 +490,8 @@ impl Bm25Shard {
     }
 }
 
-/// The sealed segments a resolved predicate rules out on one shard
-/// (`docs/segment-pruning.md`): their local slot ranges in catalog
-/// order, the counts, and the admitted-parts mask the postings walks
-/// take (`None` when no part was ruled out, so the unmasked reader
-/// serves and the path is the one it always was).
+/// Sealed segments ruled out by a resolved predicate on one shard: skipped local
+/// slot ranges, prune telemetry, and the admitted-parts mask (`None` when all pass).
 #[derive(Debug, Default)]
 pub(in crate::node) struct SegmentPrune {
     /// `(base, rows)` of every pruned sealed segment, ascending.
@@ -580,23 +562,18 @@ pub(in crate::node) fn prune_segments(
     }
 }
 
-/// Resolve a request's filters for one shard into the predicate the
-/// scorers gate with and the slot allowlist the vector kernel scans
-/// under. With `prune` set and a segmented shard, sealed segments the
-/// predicate cannot match are ruled out from their summaries first
-/// (`docs/segment-pruning.md`): their slots are `false` without a
-/// per-row evaluation, and the counts come back alongside. With
-/// `domain` set, only its slots are evaluated at all — the caller
-/// guarantees membership evaluation never consults the verdict off the domain.
-/// What [`resolve_shard_filters`] hands back: the predicate for the
-/// scorers' heap gate, the slot allowlist for the vector kernel, and
-/// the segment counts.
+/// Resolved shard filter tuple: lexical heap-gate predicate, vector-kernel
+/// slot allowlist, and segment-pruning counts.
 pub(in crate::node) type ResolvedShardFilters = (
     Option<crate::filter::DocFilter<'static>>,
     Option<crate::boolean_bits::Bits>,
     crate::segment_prune::PruneStats,
 );
 
+/// Resolve a request's filters for one shard into its lexical predicate and
+/// vector slot allowlist. With `prune` set on a segmented shard, sealed
+/// segments ruled out by their summaries are skipped before per-row evaluation;
+/// with `domain` set, only domain slots are evaluated.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::node) fn resolve_shard_filters(
     bm25: Option<&Bm25Shard>,

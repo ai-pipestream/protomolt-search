@@ -11,9 +11,8 @@ pub struct TopologyRoute {
     /// range or omit one; mixed/ragged maps are refused. Under a
     /// placement tree the ranges tile the hash space per leaf.
     pub hash_range: Option<(u64, u64)>,
-    /// The placement code this shard serves (`docs/placement.md`);
-    /// required on every route when the map has a tree, refused
-    /// without one.
+    /// Placement leaf code served by this shard (required when the topology has
+    /// a placement tree and refused otherwise).
     pub placement: Option<i64>,
 }
 
@@ -188,8 +187,8 @@ impl CoordinatorServiceImpl {
         self.with_hot_topology_placed(hash_ranges, None)
     }
 
-    /// [`Self::with_hot_topology`] under a placement tree: one code per
-    /// shard, parallel to the addresses (`docs/placement.md`).
+    /// [`Self::with_hot_topology`] under a placement tree, pairing one placement
+    /// code per shard parallel to `node_addrs`.
     pub fn with_hot_topology_placed(
         mut self,
         hash_ranges: Vec<Option<(u64, u64)>>,
@@ -427,10 +426,8 @@ impl CoordinatorServiceImpl {
         Ok((generation, shard))
     }
 
-    /// The shards `filter` cannot match under this generation's placement
-    /// tree (`docs/placement.md`), or `None` when there is no tree, no
-    /// filter, or the `shard_pruning` knob is off. Every fan-out that
-    /// carries a filter asks once and skips the masked shards.
+    /// Compute the shards ruled out by `filter` under this generation's
+    /// placement tree, or `None` when unplaced, unfiltered, or `shard_pruning` is off.
     pub(crate) fn shard_mask(
         &self,
         filter: Option<&crate::pb::FilterExpr>,
@@ -447,11 +444,8 @@ impl CoordinatorServiceImpl {
         ))
     }
 
-    /// The filter tree to send to `shard`: the request's tree with the
-    /// clauses the shard's placement leaf implies removed
-    /// (`docs/placement.md`, "Implied clauses"); the tree as it is with
-    /// no tree, no mask, or nothing implied. Same answer either way, one
-    /// bitmap less to resolve on the shard.
+    /// Return `shard`'s filter tree with clauses implied by its placement leaf
+    /// removed, or the unmodified tree when nothing is implied.
     pub(crate) fn shard_filter_tree(
         filters: &RequestFilters,
         mask: Option<&crate::placement::ShardMask>,

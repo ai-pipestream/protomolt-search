@@ -24,8 +24,7 @@ pub(crate) fn join_fields(
     extras: Vec<(usize, Option<crate::postings::AnalyzedField>)>,
     cased: Option<usize>,
 ) -> Result<crate::postings::AnalyzedDoc, Status> {
-    // The body's cased identity (docs/dual-cased.md) came out of the
-    // same pass; it lands at the field the request named.
+    // Route the body's cased identity from the same analysis pass into `cased`.
     let cased_identity = body.cased.take();
     match (cased, &cased_identity) {
         (Some(_), None) => {
@@ -76,10 +75,8 @@ pub(crate) fn join_fields(
     })
 }
 
-/// The field index `cased_field` names, validated (`docs/dual-cased.md`):
-/// a declared BM25 field other than the body, not derived from the phrase
-/// glossary or a bigram source, with an explicit step-chain body spec to
-/// twin. `None` when the request names none.
+/// Validate `cased_field` as a declared non-body, non-derived BM25 field paired
+/// with a dual-cased step-chain body spec, returning `None` when unset.
 pub(crate) fn cased_field_index(
     config: &NodeConfig,
     phrase_index: Option<&crate::phrases::PhraseIndex>,
@@ -143,11 +140,8 @@ pub(in crate::node) fn geography_wanted(spec: Option<&crate::pb::GeographySpec>)
     })
 }
 
-/// Canonical content hash of a materialize spec — the piece of the
-/// mapped-plan binding covering derived columns, because changing a
-/// materialization expression changes what an index means
-/// (`docs/cel-values.md`). Empty for no spec (and for an empty one,
-/// which asks for nothing).
+/// Canonical content hash of a materialize spec for mapped-plan bindings
+/// (empty when unset or when `columns` is empty).
 pub(crate) fn materialize_sha(spec: Option<&crate::pb::MaterializeSpec>) -> String {
     let Some(spec) = spec else {
         return String::new();
@@ -176,13 +170,8 @@ pub(crate) fn materialize_sha(spec: Option<&crate::pb::MaterializeSpec>) -> Stri
     crate::sha256::to_hex(&hasher.finalize())
 }
 
-/// Fold a document's derived quality scalars into its own `numerics` /
-/// `integers` lists and clear the spec (`docs/quality-columns.md`).
-///
-/// A spec that names columns but whose analysis produced no measurement
-/// is a contract break between the session's options and its responses,
-/// not a document that happens to be clean: a clean document measures
-/// `noise = 0`. It refuses rather than silently writing zeros.
+/// Fold derived quality scalars into `doc.numerics` / `doc.integers` and clear
+/// `doc.quality`, failing if requested quality layers were omitted by analysis.
 fn materialize_quality(
     mut doc: AddDocumentsRequest,
     analyzed: &crate::postings::AnalyzedDoc,
@@ -220,15 +209,8 @@ fn materialize_quality(
     Ok(doc)
 }
 
-/// Fold a document's geography reduction into its own `geo_points` /
-/// `facets` / `numerics` lists and clear the spec
-/// (`docs/geography-columns.md`) — [`materialize_quality`]'s shape
-/// over the geocoding layer, with one deliberate difference: absence
-/// is a legitimate measurement here. A document that mentions no
-/// resolvable place writes NO point and NO confidence (there is no
-/// neutral coordinate; (0,0) is a real place), and no top region vote
-/// writes no country. Filters then treat it by the documented absence
-/// rules instead of finding it "at" a fabricated location.
+/// Fold geocoding results into `doc.geo_points` / `doc.facets` / `doc.numerics`
+/// and clear `doc.geography`, omitting unresolvable coordinates or countries.
 fn materialize_geography(
     mut doc: AddDocumentsRequest,
     analyzed: &crate::postings::AnalyzedDoc,
@@ -329,12 +311,8 @@ impl NodeServiceImpl {
         Ok(columns)
     }
 
-    /// The pinned leaf's predicates (`docs/placement.md`) on a document
-    /// as it arrived, before this shard derives anything: the same
-    /// values the coordinator routes on, its value-dialect columns
-    /// included, and none of the quality or geography columns analysis
-    /// adds later. Runs on live ingest only; a logged record already
-    /// passed, so replay and the compaction shadow skip it.
+    /// Verify pinned placement-leaf predicates against a live-ingest document
+    /// (including value-dialect materialization and index-declared derived columns).
     pub(in crate::node) fn check_placement(
         &self,
         doc: &AddDocumentsRequest,
@@ -369,12 +347,9 @@ impl NodeServiceImpl {
         })
     }
 
-    /// The placement rule (`docs/placement.md`) on a document about to
-    /// be applied. With a leaf pinned, a document without a value for
-    /// the placement column takes the shard's code and one with another
-    /// code is refused by name; with the column declared and no leaf, a
-    /// document must carry the value, which routed ingest guarantees
-    /// and a direct client must supply.
+    /// Enforce placement-column assignment before applying `doc`: populate from
+    /// `placement_leaf` when absent, reject mismatched leaf codes, or require an
+    /// explicit code when `placement_column` is declared without a pinned leaf.
     pub(in crate::node) fn place_document(
         &self,
         mut doc: AddDocumentsRequest,
@@ -413,16 +388,8 @@ impl NodeServiceImpl {
         Ok(doc)
     }
 
-    /// Materialize derived columns (docs/cel-values.md): evaluate each
-    /// declared expression against THIS document's own values and push
-    /// the results into the ordinary `numerics` / `integers` lists, so
-    /// name resolution, the duplicate refusal, the apply, and the WAL
-    /// record all take the path they already take. Runs AFTER the
-    /// quality and geography layers so their derived columns are
-    /// readable inputs. Clearing the spec makes replay exact: the
-    /// logged request carries the values, so replay never evaluates
-    /// twice. An absent result stores nothing (the Kleene rule); a type
-    /// conflict the document exposes refuses loudly.
+    /// Evaluate request and index-declared derived columns into `doc`'s typed
+    /// value lists, clearing `doc.materialize` so WAL replay never re-evaluates.
     pub(in crate::node) fn materialize_columns(
         &self,
         mut doc: AddDocumentsRequest,
@@ -436,10 +403,8 @@ impl NodeServiceImpl {
             let compiled = self.compiled_materialize(&spec)?;
             doc = apply_materialize(doc, &compiled)?;
         }
-        // The index's own declaration (docs/derived-columns.md): a fresh
-        // document is computed and stamped here; a logged record
-        // carries its values and must have been derived under this
-        // declaration.
+        // Compute and stamp index-declared derived columns on fresh documents,
+        // or verify the recorded fingerprint on replayed records.
         if let Some(declaration) = self.config.derived.as_deref() {
             if doc.derived_fingerprint.is_empty() {
                 doc = declaration.apply(doc, stable_key)?;
@@ -455,9 +420,8 @@ impl NodeServiceImpl {
     }
 }
 
-/// Validate and compile one materialize spec (`docs/cel-values.md`):
-/// empty or duplicate names, an unset kind, or an expression that does
-/// not compile all refuse before any document is touched.
+/// Validate and compile one materialize spec, refusing empty or duplicate names,
+/// unset target kinds, or invalid CEL expressions before mutating state.
 pub(crate) fn compile_materialize_spec(
     spec: &crate::pb::MaterializeSpec,
 ) -> Result<Vec<(String, crate::pb::ValueExpr, crate::pb::MaterializeKind)>, Status> {
@@ -621,25 +585,8 @@ impl NodeServiceImpl {
         Ok((doc, analyzed))
     }
 
-    /// Derive the proximity payloads (`docs/phrase-proximity.md`) and pin
-    /// the document's durable proximity record: which fields keep token
-    /// positions, and which bigram columns derive from which sources.
-    ///
-    /// Fresh ingest (an empty record) fills both from this node's
-    /// configuration; a record that already names them — a replayed WAL
-    /// entry, a resharded child, a client that copied one — must agree
-    /// with the configuration exactly, or the document refuses by name:
-    /// a column that is positional on some documents and not on others
-    /// is a phrase index that lies about half the corpus.
-    ///
-    /// A positional field needs the analysis to have carried token
-    /// positions (the native tokenizer always does; a sidecar response
-    /// without a token layer cannot), and needs FULL term vectors — a
-    /// scoring-only field has no occurrences to place, so a phrase over
-    /// it could never match and would silently return nothing. Bigram
-    /// columns derive from the source's positions by the same rule.
-    /// Admit a write only for this node's collection (`docs/collections.md`):
-    /// an empty name means "this node's", any other name refuses.
+    /// Admit a write only for this node's collection: an empty name means
+    /// this node's collection, and any other name refuses.
     pub(in crate::node) fn admit_collection(&self, requested: &str) -> Result<(), Status> {
         if requested.is_empty() || requested == self.config.collection {
             return Ok(());
@@ -656,15 +603,17 @@ impl NodeServiceImpl {
         })
     }
 
+    /// Derive token-position and bigram proximity payloads and pin the
+    /// document's durable proximity record. Fresh records fill from node
+    /// configuration; pre-populated records must match configuration and carry
+    /// full positional term vectors.
     pub(in crate::node) fn materialize_proximity(
         &self,
         mut doc: AddDocumentsRequest,
         mut analyzed: crate::postings::AnalyzedDoc,
     ) -> Result<(AddDocumentsRequest, crate::postings::AnalyzedDoc), Status> {
         use crate::proximity::{bigram_field_name, derive_bigrams};
-        // A shard belongs to only one collection (docs/collections.md):
-        // a document naming another refuses, and an unnamed one is written
-        // with this node's before it is logged, so a replay carries it.
+        // Enforce single-collection membership and stamp unnamed documents before logging.
         self.admit_collection(&doc.collection)?;
         doc.collection = self.config.collection.clone();
         let configured_bigrams: Vec<crate::pb::BigramField> = self
@@ -798,11 +747,8 @@ impl NodeServiceImpl {
             let fi = field_index(name)?;
             require_positions(&analyzed, fi, "positional field")?;
         }
-        // A sentence field needs the sentence layer on every document,
-        // shaped so the query path can trust it: sorted, non-overlapping,
-        // and covering every occurrence (docs/highlighting.md). A
-        // document with terms but no sentence covering them is a broken
-        // analysis contract, refused here, not a snippet-less hit later.
+        // Sentence fields require sorted, non-overlapping sentence spans covering
+        // every indexed occurrence.
         for name in &doc.sentence_fields {
             let fi = field_index(name)?;
             let Some(field) = analyzed.fields.get(fi) else {

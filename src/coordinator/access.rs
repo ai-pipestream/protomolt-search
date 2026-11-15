@@ -253,10 +253,6 @@ impl CoordinatorServiceImpl {
         Ok(())
     }
 
-    /// The pooled channel for `addr`, created lazily on first use.
-    /// `connect_lazy` defers the TCP/HTTP2 handshake to the first RPC and
-    /// transparently reconnects after failures, so one entry serves the
-    /// address for the process lifetime.
     /// Dial a node across the network (the `net` feature): a lazy channel
     /// with the engine's window sizes and the process's client TLS.
     #[cfg(feature = "net")]

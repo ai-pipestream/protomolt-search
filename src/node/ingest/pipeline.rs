@@ -37,23 +37,9 @@ pub(in crate::node) enum FieldEvent {
     StreamFailed(Status),
 }
 
-/// Persistent per-spec [`crate::analyzer::AnalyzeStream`] sessions for
-/// documents' extra fields.
-///
-/// Extra fields used to ride concurrent UNARY `Analyze` calls, one h2
-/// stream per field per document. The asymmetry with the body (which has
-/// always streamed) was deliberate: field texts were captions and titles,
-/// small next to the body, so a dedicated stream bought nothing. That
-/// stops being true with multi-field body columns. A rebuild of 86.6M
-/// chunks carrying `case_name` plus two A/B body columns is ~260M unary
-/// calls against the sidecar, which the rebuild README names as the
-/// ingest throughput ceiling, not shard parallelism. The sidecar's
-/// listener has died under rapid-fire unary traffic before, which is why
-/// `analyzer::shared_channel` exists at all.
-///
-/// Fields on ONE document deliberately carry DIFFERENT specs (that is
-/// what a body column IS), so this holds one session per distinct spec,
-/// opened on first use and reused for the rest of the call.
+/// Persistent per-spec [`crate::analyzer::AnalyzeStream`] sessions for extra
+/// document fields, opened lazily per distinct `AnalysisSpec` and reused across
+/// the ingest call.
 pub(in crate::node) struct FieldStreams {
     pub(in crate::node) addr: String,
     /// Submission handles, one per distinct spec in first-seen order.
@@ -387,10 +373,7 @@ pub(crate) fn session_layers(
         quality: quality_wanted(doc.quality.as_ref()),
         geography: geography_wanted(doc.geography.as_ref()),
         entities: phrase_index.is_some_and(crate::phrases::PhraseIndex::include_ner),
-        // A node that stores sentence spans asks every session for the
-        // layer (docs/highlighting.md): the node's configuration, not
-        // the document, because the document's own record is filled
-        // from that configuration only after analysis is requested.
+        // Request sentence spans whenever the node is configured to store them.
         sentences: !sentence_fields.is_empty(),
         dual_cased: !doc.cased_field.is_empty(),
         nlp_columns: false,
@@ -505,17 +488,8 @@ impl NodeServiceImpl {
         added: &mut u64,
         first_id: &mut u64,
     ) -> Result<(), Status> {
-        // Quality columns are materialized BEFORE anything else looks at
-        // the request (docs/quality-columns.md): the derived values join
-        // the ordinary `numerics` / `integers` lists, so name resolution,
-        // the duplicate-column refusal, the apply, and the WAL record all
-        // take the one path they already took. Clearing the spec is what
-        // makes replay exact — the logged request carries the values, so
-        // replay never calls the sidecar and never derives twice.
-        // Live ingest: the node is the only writer of derived values
-        // (docs/derived-columns.md), so a request that carries one, or
-        // a fingerprint, is refused as forged before anything else
-        // looks at it. Logged records never come through here.
+        // Refuse live requests carrying forged derived column values or
+        // fingerprints before placement checks and column materialization run.
         if let Some(declaration) = self.config.derived.as_deref() {
             declaration.refuse_carried(&doc)?;
         }

@@ -59,6 +59,72 @@ impl NodeServiceImpl {
         .await
     }
 
+    fn resolve_visibility_bits(
+        &self,
+        guard: &ShardState,
+        label_count: usize,
+        view_filter: Option<&crate::pb::FilterExpr>,
+    ) -> Result<Option<crate::boolean_bits::Bits>, Status> {
+        let Some(filter) = view_filter else {
+            return Ok(None);
+        };
+        Ok(resolve_shard_filters(
+            guard.bm25.as_ref(),
+            guard.live_docs.words(),
+            label_count,
+            &[],
+            &[],
+            Some(filter),
+            self.knobs.segment_pruning(),
+            None,
+        )?
+        .1)
+    }
+
+    fn collect_lexical_bitmap(
+        &self,
+        shard: &Bm25Shard,
+        index: &dyn Bm25Index,
+        guard: &ShardState,
+        visible: Option<&crate::boolean_bits::Bits>,
+        label_count: usize,
+        terms: &[String],
+    ) -> (Vec<u8>, crate::segment_prune::PruneStats) {
+        let pruning = self.knobs.segment_pruning();
+        let (masked, prune) = match shard {
+            Bm25Shard::Segmented(segmented) => {
+                let lacking = segmented.parts_lacking_terms(0, terms);
+                let skipped = lacking.iter().filter(|&&lacks| lacks).count() as u32;
+                let stats = crate::segment_prune::PruneStats {
+                    segments_total: lacking.len() as u32,
+                    segments_skipped: if pruning { skipped } else { 0 },
+                };
+                let masked = (pruning && skipped > 0).then(|| {
+                    segmented.masked(lacking.iter().map(|&lacks| !lacks).collect::<Arc<[bool]>>())
+                });
+                (masked, stats)
+            }
+            _ => (None, crate::segment_prune::PruneStats::default()),
+        };
+        let index: &dyn Bm25Index = match masked.as_ref() {
+            Some(masked) => masked,
+            None => index,
+        };
+        let mut bits = vec![0u8; label_count.div_ceil(8)];
+        for term in terms {
+            index.for_each_doc_tf(term, &mut |doc_id, _tf| {
+                let position = doc_id as usize;
+                if position < label_count
+                    && !guard.live_docs.is_deleted(position)
+                    && visible.is_none_or(|allowed| allowed.test(position))
+                {
+                    bits[position / 8] |= 1 << (position % 8);
+                }
+            });
+        }
+        (bits, prune)
+    }
+
     pub(super) async fn handle_resolve_lexical_bitmap(
         &self,
         request: Request<LexicalBitmapRequest>,
@@ -92,62 +158,15 @@ impl NodeServiceImpl {
         })?;
         let label_count = usize::try_from(shard.next_doc_id())
             .map_err(|_| Status::resource_exhausted("lexical row count does not fit usize"))?;
-        let visible = if view_filter.is_some() {
-            resolve_shard_filters(
-                guard.bm25.as_ref(),
-                guard.live_docs.words(),
-                label_count,
-                &[],
-                &[],
-                view_filter,
-                self.knobs.segment_pruning(),
-                None,
-            )?
-            .1
-        } else {
-            None
-        };
-        // A sealed segment none of the terms occur in contributes no
-        // member: the walk skips it and the count says so
-        // (docs/segment-pruning.md). One dictionary lookup per term per
-        // part decides; with pruning off every part is walked.
-        let (masked, prune) = match shard {
-            Bm25Shard::Segmented(segmented) => {
-                let lacking = segmented.parts_lacking_terms(0, &req.terms);
-                let skipped = lacking.iter().filter(|&&lacks| lacks).count() as u32;
-                let stats = crate::segment_prune::PruneStats {
-                    segments_total: lacking.len() as u32,
-                    segments_skipped: if self.knobs.segment_pruning() {
-                        skipped
-                    } else {
-                        0
-                    },
-                };
-                let masked = (self.knobs.segment_pruning() && skipped > 0).then(|| {
-                    segmented.masked(lacking.iter().map(|&lacks| !lacks).collect::<Arc<[bool]>>())
-                });
-                (masked, stats)
-            }
-            _ => (None, crate::segment_prune::PruneStats::default()),
-        };
-        let index: &dyn Bm25Index = match masked.as_ref() {
-            Some(masked) => masked,
-            None => index,
-        };
-        let mut bits = vec![0u8; label_count.div_ceil(8)];
-        for term in req.terms {
-            index.for_each_doc_tf(&term, &mut |doc_id, _tf| {
-                let position = doc_id as usize;
-                if position < label_count
-                    && !guard.live_docs.is_deleted(position)
-                    && visible
-                        .as_ref()
-                        .is_none_or(|allowed| allowed.test(position))
-                {
-                    bits[position / 8] |= 1 << (position % 8);
-                }
-            });
-        }
+        let visible = self.resolve_visibility_bits(&guard, label_count, view_filter)?;
+        let (bits, prune) = self.collect_lexical_bitmap(
+            shard,
+            index,
+            &guard,
+            visible.as_ref(),
+            label_count,
+            &req.terms,
+        );
         Ok(Response::new(MembershipBitmapResponse {
             vector_binding: None,
             visibility_fingerprint: scope.fingerprint().to_vec(),
@@ -177,21 +196,7 @@ impl NodeServiceImpl {
         let (_, visibility_columns_known) =
             filter_known_flags(guard.bm25.as_ref(), &[], view_filter);
         let label_count = guard.index.as_ref().map_or(0, VectorIndex::len);
-        let visible = if view_filter.is_some() {
-            resolve_shard_filters(
-                guard.bm25.as_ref(),
-                guard.live_docs.words(),
-                label_count,
-                &[],
-                &[],
-                view_filter,
-                self.knobs.segment_pruning(),
-                None,
-            )?
-            .1
-        } else {
-            None
-        };
+        let visible = self.resolve_visibility_bits(&guard, label_count, view_filter)?;
         let documents = guard
             .bm25
             .as_ref()
@@ -338,85 +343,81 @@ impl NodeServiceImpl {
                     "bm25 bulk build in progress; Flush before aggregating",
                 ));
             }
-            let mut exprs = Vec::with_capacity(req.exprs.len());
-            for spec in &req.exprs {
-                exprs.push(resolve_rankable(
-                    store,
-                    spec.expr.as_ref(),
-                    &spec.name,
-                    "percentile",
-                )?);
-            }
-            for t in &req.targets {
-                if t.expr_index as usize >= exprs.len() {
-                    return Err(Status::internal(
-                        "quantile target refers past the expression list",
-                    ));
-                }
-            }
-            let doc_filter = crate::filter::DocFilter {
-                deleted: guard.live_docs.words(),
-                geo: store.resolve_geo_filters(&req.geo_filters, &geo_regions),
-                pred: filter
-                    .as_ref()
-                    .map(|f| store.resolve_filter(f))
-                    .transpose()?,
-                phrase: Vec::new(),
-            };
-            let cols = ShardNumericRead(store);
-            let n = u64::from(store.next_doc_id());
-            let prune = prune_segments(
+            let exprs = resolve_quantile_exprs(store, &req.exprs, &req.targets)?;
+            let pass = self.admitted_doc_pass(
+                &guard,
                 store,
-                doc_filter.pred.as_ref(),
-                self.knobs.segment_pruning(),
-            );
-            let id_allowlist = req.restrict_doc_ids.then(|| {
-                req.doc_ids
-                    .iter()
-                    .filter_map(|id| id.checked_sub(self.config.slot_offset))
-                    .filter_map(|local| u32::try_from(local).ok())
-                    .collect::<std::collections::HashSet<_>>()
-            });
-            let mut counts = vec![0u64; req.targets.len()];
-            let mut bits_of = vec![None; exprs.len()];
-            // One admitted-set pass per round: each expression evaluates
-            // once per document, every target reads the cached bits.
-            for doc in prune.admitted_slots(n as u32) {
-                if id_allowlist
-                    .as_ref()
-                    .is_some_and(|allowlist| !allowlist.contains(&doc))
-                {
-                    continue;
-                }
-                if membership.as_ref().is_some_and(|m| !m.test(doc as usize)) {
-                    continue;
-                }
-                if !doc_filter.passes(doc, &cols) {
-                    continue;
-                }
-                for (slot, resolved) in bits_of.iter_mut().zip(&exprs) {
-                    *slot = match resolved {
-                        Some((rv, vtype)) => crate::values::eval(rv, doc, &cols)
-                            .and_then(|v| rankable_bits(v, *vtype)),
-                        None => None,
-                    };
-                }
-                for (count, t) in counts.iter_mut().zip(&req.targets) {
-                    if let Some(bits) = bits_of[t.expr_index as usize] {
-                        if bits <= t.threshold_bits {
-                            *count += 1;
-                        }
-                    }
-                }
-            }
+                DocPassSpec {
+                    geo_filters: &req.geo_filters,
+                    geo_regions: &geo_regions,
+                    filter: filter.as_ref(),
+                    doc_ids: req.restrict_doc_ids.then_some(req.doc_ids.as_slice()),
+                },
+            )?;
+            let counts = count_quantile_targets(&pass, membership.as_ref(), &exprs, &req.targets);
             Ok(Response::new(crate::pb::QuantileCountsResponse {
                 stats_epoch: guard.stats_epoch,
                 stats_incarnation: guard.stats_incarnation.bytes()?,
                 visibility_fingerprint: scope.fingerprint().to_vec(),
-                visibility_columns_known: visibility_columns_known.clone(),
+                visibility_columns_known,
                 counts,
             }))
         })
         .await
     }
+}
+
+type ResolvedQuantileExpr = Option<(crate::values::ResolvedValue, crate::pb::AggregateValueType)>;
+
+fn resolve_quantile_exprs(
+    store: &Bm25Shard,
+    specs: &[crate::pb::CompiledPercentile],
+    targets: &[crate::pb::QuantileTarget],
+) -> Result<Vec<ResolvedQuantileExpr>, Status> {
+    let mut exprs = Vec::with_capacity(specs.len());
+    for spec in specs {
+        exprs.push(resolve_rankable(
+            store,
+            spec.expr.as_ref(),
+            &spec.name,
+            "percentile",
+        )?);
+    }
+    for target in targets {
+        if target.expr_index as usize >= exprs.len() {
+            return Err(Status::internal(
+                "quantile target refers past the expression list",
+            ));
+        }
+    }
+    Ok(exprs)
+}
+
+fn count_quantile_targets(
+    pass: &AdmittedDocPass<'_>,
+    membership: Option<&crate::boolean_bits::Bits>,
+    exprs: &[ResolvedQuantileExpr],
+    targets: &[crate::pb::QuantileTarget],
+) -> Vec<u64> {
+    let mut counts = vec![0u64; targets.len()];
+    let mut bits_of = vec![None; exprs.len()];
+    for doc in pass.prune.admitted_slots(pass.rows) {
+        if !pass.admits(doc, membership) {
+            continue;
+        }
+        for (slot, resolved) in bits_of.iter_mut().zip(exprs) {
+            *slot = match resolved {
+                Some((rv, vtype)) => {
+                    crate::values::eval(rv, doc, &pass.cols).and_then(|v| rankable_bits(v, *vtype))
+                }
+                None => None,
+            };
+        }
+        for (count, t) in counts.iter_mut().zip(targets) {
+            if bits_of[t.expr_index as usize].is_some_and(|bits| bits <= t.threshold_bits) {
+                *count += 1;
+            }
+        }
+    }
+    counts
 }

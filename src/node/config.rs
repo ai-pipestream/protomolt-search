@@ -4,9 +4,8 @@ use crate::node::*;
 
 pub const MAX_RERANK_PARALLEL: usize = 64;
 
-/// The placement column (`docs/placement.md`) is an integer column
-/// whether or not `--integer-fields` names it: every constructor runs
-/// this first so the column table and the catalog agree.
+/// Ensure `config.placement_column` is registered in `integer_fields` so the
+/// column table and catalog agree across all constructors.
 pub(in crate::node) fn declare_placement_column(config: &mut NodeConfig) {
     if let Some(column) = config.placement_column.as_deref() {
         if !config.integer_fields.iter().any(|name| name == column) {
@@ -67,13 +66,9 @@ impl SourceTables {
     }
 }
 
-/// The derived columns (`docs/derived-columns.md`) join the column
-/// tables of their kinds after the declared source columns, in
-/// declaration order, once the declaration is checked against those
-/// source tables: every input names a source column, the static type
-/// matches the kind, and no derived name collides. Every constructor
-/// runs this after the placement column so the tables, the catalog and
-/// the log agree. Idempotent.
+/// Validate `config.derived` against source column tables (verifying source-only
+/// inputs, matching target kinds, and non-colliding names) and append derived
+/// columns in declaration order. Idempotent across constructors.
 pub(in crate::node) fn declare_derived_columns(config: &mut NodeConfig) -> Result<(), String> {
     let Some(declaration) = config.derived.clone() else {
         return Ok(());
@@ -139,7 +134,7 @@ pub(in crate::node) fn check_placement_columns(config: &NodeConfig) -> Result<()
         if !declared {
             return Err(format!(
                 "placement tree: a predicate reads column {column:?}, which this shard \
-                 declares in no table, source or derived (docs/derived-columns.md)"
+                 declares in no table, source or derived"
             ));
         }
     }
@@ -168,8 +163,7 @@ pub(crate) fn check_attached_derived(
         (Some(held), Some(wanted)) if held.fingerprint == wanted.fingerprint() => Ok(()),
         (Some(held), Some(wanted)) => Err(format!(
             "{what} was written under derived-column declaration {:?}, this node declares \
-             {:?}; a changed declaration is a rebuild through the reshard tool \
-             (docs/derived-columns.md)",
+             {:?}; a changed declaration is a rebuild through the reshard tool",
             held.fingerprint,
             wanted.fingerprint()
         )),
@@ -212,13 +206,29 @@ pub(in crate::node) fn validate_column_tables(config: &NodeConfig) -> Result<(),
     Ok(())
 }
 
-/// A node's runtime knobs from its config (docs/diagnostics.md): the
-/// live ones as atomics, the rest listed as read-at-startup.
+/// Build runtime knobs from `config`: live atomics plus startup fixed entries.
 pub(in crate::node) fn node_knobs(config: &NodeConfig) -> crate::diagnostics::Knobs {
-    use crate::diagnostics::{FixedKnob, Knobs, NodeKnobValues};
-    use crate::pb::KnobKind;
+    use crate::diagnostics::{Knobs, NodeKnobValues};
     let process = format!("node:{}", config.slot_offset);
-    let fixed = vec![
+    let mut fixed = core_fixed_knobs(config);
+    fixed.extend(shard_and_placement_fixed_knobs(config));
+    Knobs::node(
+        process,
+        NodeKnobValues {
+            share_floors: config.share_floors,
+            segment_pruning: config.segment_pruning,
+            floor_delta: config.floor_delta,
+            floor_warmup_chunks: config.floor_warmup_chunks,
+            floor_min_interval_ms: config.floor_min_interval_ms,
+        },
+        fixed,
+    )
+}
+
+fn core_fixed_knobs(config: &NodeConfig) -> Vec<crate::diagnostics::FixedKnob> {
+    use crate::diagnostics::FixedKnob;
+    use crate::pb::KnobKind;
+    vec![
         FixedKnob {
             name: "score_splade_max_k",
             kind: KnobKind::Int,
@@ -282,6 +292,13 @@ pub(in crate::node) fn node_knobs(config: &NodeConfig) -> crate::diagnostics::Kn
             value: config.bit_width.to_string(),
             description: "Quantized bits per dimension (--bit-width).",
         },
+    ]
+}
+
+fn shard_and_placement_fixed_knobs(config: &NodeConfig) -> Vec<crate::diagnostics::FixedKnob> {
+    use crate::diagnostics::FixedKnob;
+    use crate::pb::KnobKind;
+    vec![
         FixedKnob {
             name: "slot_offset",
             kind: KnobKind::Int,
@@ -305,7 +322,7 @@ pub(in crate::node) fn node_knobs(config: &NodeConfig) -> crate::diagnostics::Kn
             kind: KnobKind::String,
             value: config.placement_column.clone().unwrap_or_default(),
             description: "The i64 column that holds each row's placement code \
-                          (--placement-column, docs/placement.md).",
+                          (--placement-column).",
         },
         FixedKnob {
             name: "placement_leaf",
@@ -338,7 +355,7 @@ pub(in crate::node) fn node_knobs(config: &NodeConfig) -> crate::diagnostics::Kn
                 })
                 .unwrap_or_default(),
             description: "The index's derived-column declaration as a [[derived]] table \
-                          (--derived-columns, docs/derived-columns.md); empty without one.",
+                          (--derived-columns); empty without one.",
         },
         FixedKnob {
             name: "derived_fingerprint",
@@ -351,18 +368,7 @@ pub(in crate::node) fn node_knobs(config: &NodeConfig) -> crate::diagnostics::Kn
             description: "The declaration's fingerprint, which the store, the log and every \
                           segment of this shard carry.",
         },
-    ];
-    Knobs::node(
-        process,
-        NodeKnobValues {
-            share_floors: config.share_floors,
-            segment_pruning: config.segment_pruning,
-            floor_delta: config.floor_delta,
-            floor_warmup_chunks: config.floor_warmup_chunks,
-            floor_min_interval_ms: config.floor_min_interval_ms,
-        },
-        fixed,
-    )
+    ]
 }
 
 pub(in crate::node) fn resolved_rerank_parallel(configured: usize) -> usize {
@@ -375,8 +381,7 @@ pub(in crate::node) fn resolved_rerank_parallel(configured: usize) -> usize {
     }
 }
 
-/// How a persisted shard lays out its documents and vectors
-/// (`docs/immutable-segments.md`).
+/// Persisted on-disk shard layout for documents and vectors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Layout {
     /// The segment catalog under `<index>.segments/` plus a heap tail
@@ -411,29 +416,16 @@ pub struct NodeConfig {
     /// disabled" baseline for A/B benchmarking. Results are identical
     /// either way; only the cost changes.
     pub block_max: bool,
-    /// Skip sealed segments a request's filter cannot match, from
-    /// their column summaries (`docs/segment-pruning.md`); `false` is the
-    /// A/B switch and changes no answer.
+    /// Skip sealed segments a request's filter cannot match using per-segment
+    /// column summaries (`false` disables pruning without changing results).
     pub segment_pruning: bool,
     /// Minimum improvement over the last PUBLISHED floor before the next
     /// one goes on the wire. 0.0 publishes every raise (the historical
     /// behavior); a small positive delta trades a sliver of pruning
     /// reactivity for far fewer floor messages on real networks.
     pub floor_delta: f32,
-    /// Publish opportunities to SKIP before the first floor goes out.
-    ///
-    /// The scanner offers a floor after every chunk in which its heap is
-    /// full, so on a large shard that is one message per chunk for the
-    /// whole scan. The earliest floors are also the weakest: they prune
-    /// least, yet each one costs a coordinator broadcast to EVERY shard.
-    /// Skipping the first few trades a little early pruning for a large
-    /// cut in messages. 0 keeps the historical behavior.
-    ///
-    /// Measured on the 86.6M-chunk corpus: 42 chunks per shard, so 42
-    /// publishes per shard per query, 336 across the fleet. Note that a
-    /// CANDIDATE-count warmup does not bite at this granularity -- the
-    /// first chunk alone collects ~6,000 candidates, so the heap is full
-    /// almost immediately; chunks are the unit that actually gates.
+    /// Chunk-level floor publish opportunities to skip once the local heap fills
+    /// before broadcasting the first floor (`0` publishes immediately).
     pub floor_warmup_chunks: u32,
     /// Minimum wall time between two published floors, in milliseconds.
     ///
@@ -453,89 +445,57 @@ pub struct NodeConfig {
     /// Lexical analysis backend (`native` or `http://host:port`) for
     /// AddDocuments. `None` makes AddDocuments fail UNAVAILABLE.
     pub analysis_addr: Option<String>,
-    /// The BM25 field table for NEW builders (`docs/multi-field.md`):
-    /// "body" first, then the extra indexed fields. Shards loaded from
-    /// existing `.bm25` files keep the table they were written with;
-    /// documents naming fields outside the active table are refused.
+    /// BM25 field table for new builders (`"body"` first, followed by extra
+    /// indexed fields); loaded shards retain their persisted table.
     pub bm25_fields: Vec<String>,
-    /// The facet field table for NEW builders (dictionary-encoded
-    /// per-doc columns, `docs/plans/track-1-features.md` section 2).
-    /// Same rules as `bm25_fields`: shards loaded from existing files
-    /// keep the table they were written with; documents naming facet
-    /// fields outside the active table are refused. Non-empty makes
-    /// new builders persist as v7.
+    /// Dictionary-encoded facet column table for new builders; loaded shards
+    /// retain their persisted table and unknown fields are refused at ingest.
     pub facet_fields: Vec<String>,
-    /// The numeric field table for NEW builders (f64 columns,
-    /// `docs/score-functions.md`). Same rules as `facet_fields`.
+    /// `f64` numeric column table for new builders.
     pub numeric_fields: Vec<String>,
-    /// The map<string, string> column table for NEW builders
-    /// (`docs/map-columns.md`). Same rules as `facet_fields`.
+    /// `map<string, string>` column table for new builders.
     pub map_facet_fields: Vec<String>,
     /// The map<string, f64> column table for NEW builders. Same rules.
     pub map_numeric_fields: Vec<String>,
     pub map_integer_fields: Vec<String>,
     pub map_unsigned_integer_fields: Vec<String>,
-    /// The i64 column table for NEW builders (`docs/range-facets.md`).
-    /// Same rules as `facet_fields`. Timestamp ingest lands in THESE
-    /// columns as epoch micros — it is sugar, not a kind.
+    /// `i64` column table for new builders (timestamps also land here as epoch micros).
     pub integer_fields: Vec<String>,
     /// Full-domain unsigned numeric columns, distinct from signed columns.
     pub unsigned_integer_fields: Vec<String>,
-    /// The placement column (`docs/placement.md`): the i64 column every
-    /// row carries with its placement code. Declared here it joins the
-    /// integer table, and a direct ingest must carry a value for it or
-    /// have `placement_leaf` fill one in.
+    /// `i64` column holding each row's placement code; joins `integer_fields`
+    /// and is populated from the document or `placement_leaf`.
     pub placement_column: Option<String>,
     /// The placement code this shard serves. Fills the placement column
     /// on a document that lacks it and rejects one that carries another
     /// code. Needs `placement_column`.
     pub placement_leaf: Option<i64>,
-    /// The placement tree the pinned leaf belongs to
-    /// (`--placement-tree`, docs/placement.md): with it the shard checks
-    /// each direct row's values against the predicates on the leaf's
-    /// path and refuses a row the tree routes elsewhere. Needs
-    /// `placement_leaf`.
+    /// Placement tree for `placement_leaf` (`--placement-tree`); verifies
+    /// direct-ingest rows against leaf path predicates.
     pub placement_tree: Option<Arc<crate::placement::PinnedLeaf>>,
-    /// The index's derived columns (`--derived-columns=<file>`,
-    /// docs/derived-columns.md): CEL value columns computed here at
-    /// ingest from each document's own values and stored as ordinary
-    /// typed columns. Their names join the tables of their kinds after
-    /// the declared source columns; the declaration's fingerprint is
-    /// persisted with the store, the log and every segment, and a
-    /// mismatch refuses by name.
+    /// Derived-column declaration (`--derived-columns`): CEL value columns
+    /// evaluated at ingest, appended after source columns of matching kinds, and
+    /// fingerprint-verified across store, WAL, and segments.
     pub derived: Option<Arc<crate::derived::Declaration>>,
-    /// The geo-point column table for NEW builders
-    /// (`docs/geo-columns.md`). Same rules as `facet_fields`; the
-    /// columns geo FILTERS and distance-decay stages read.
+    /// Geo-point column table for new builders, read by geo filters and decay stages.
     pub geo_fields: Vec<String>,
-    /// BM25 fields that keep token positions per occurrence
-    /// (`docs/phrase-proximity.md`), each a name from `bm25_fields`. New
-    /// builders declare them; a shard loaded from a file keeps the
-    /// file's own declaration, and ingest refuses a positional field the
-    /// active file never declared rather than storing a half-positional
-    /// column.
+    /// BM25 fields (subset of `bm25_fields`) that store per-occurrence token
+    /// positions; loaded shards enforce their persisted positional declaration.
     pub position_fields: Vec<String>,
-    /// Fields whose sentence spans are stored per document for
-    /// server-side snippets (`docs/highlighting.md`). Only the body has
-    /// stored text to cut from, so the list is `["body"]` or empty.
+    /// Fields storing per-document sentence spans for server-side snippets
+    /// (`["body"]` or empty).
     pub sentence_fields: Vec<String>,
-    /// The collection this node serves (`docs/collections.md`); empty for
-    /// a node outside any named collection. Reported in health, written
-    /// on every logged document, checked on every bind, and matched
-    /// against the WAL manifest at open.
+    /// Collection served by this node (empty when unnamed), checked on health,
+    /// mapped binds, ingested documents, and WAL open.
     pub collection: String,
-    /// The key that authenticates UDP floor and cancel datagrams
-    /// (`docs/security.md`). With a key, only signed datagrams with a
-    /// fresh sequence are applied; without one, unsigned datagrams are
-    /// accepted on a loopback listener only.
+    /// HMAC key authenticating UDP floor and cancel datagrams; when `None`,
+    /// unsigned datagrams are accepted on loopback listeners only.
     pub udp_hmac_key: Option<crate::security::UdpKey>,
-    /// The layout a NEW persisted shard gets (`docs/immutable-segments.md`).
-    /// An existing shard keeps the layout its files have; nothing
-    /// converts on open.
+    /// On-disk layout for newly created persisted shards; existing shards keep
+    /// the layout of their persisted files.
     pub layout: Layout,
-    /// Serve sealed segments' vector images from their files through
-    /// memory maps (`docs/mmap-vectors.md`); off loads them into memory.
-    /// The tail and single-image shards are owned either way.
+    /// Memory-map sealed segment vector images when `true`, or load into heap
+    /// when `false` (tail and single-image shards remain heap-owned).
     pub vector_mmap: bool,
     /// On a segmented shard, seal the tail into a segment once it holds
     /// this many documents, so a bulk ingest stays bounded in heap
@@ -563,7 +523,7 @@ pub struct NodeConfig {
     /// Heavy-hitter list size per vocabulary channel.
     pub vocab_top_k: usize,
     /// Coalesce concurrent shard scans into batched kernel calls (up to
-    /// [`MAX_COALESCE`] queries share each pass over the packed codes —
+    /// `MAX_COALESCE` queries share each pass over the packed codes —
     /// the scan is bandwidth-bound, so batched queries ride the same
     /// memory traffic). `false` runs one scan per RPC — the A/B
     /// baseline; results are identical either way.

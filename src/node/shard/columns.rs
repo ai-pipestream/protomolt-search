@@ -2,8 +2,6 @@
 
 use crate::node::*;
 
-/// [`crate::scorefn::NumericRead`] over a searchable shard shape, for
-/// score-chain evaluation during scoring.
 /// Declared families on a node with no lexical store yet. No map keys or
 /// dictionary values exist, but an absent row must not erase a declared type.
 pub(in crate::node) struct EmptyColumns<'a>(pub(in crate::node) &'a NodeConfig);
@@ -58,6 +56,8 @@ impl crate::values::ColumnLookup for EmptyColumns<'_> {
     }
 }
 
+/// [`crate::scorefn::NumericRead`] over a searchable shard shape, for
+/// score-chain evaluation during scoring.
 pub(in crate::node) struct ShardNumericRead<'a>(pub(in crate::node) &'a Bm25Shard);
 
 /// The inverted facet columns of a searchable shard
@@ -122,9 +122,7 @@ impl crate::filter_bits::ColumnSets for Bm25Shard {
     }
 }
 
-/// The value-expression resolution surface (`docs/cel-values.md`):
-/// the same name-to-index lookups filters use, packaged as the trait
-/// `values::resolve` consumes.
+/// Value-expression column lookup implementation consumed by `values::resolve`.
 impl crate::values::ColumnLookup for Bm25Shard {
     fn map_integer_index(&self, name: &str) -> Option<usize> {
         Bm25Shard::map_integer_index(self, name)
@@ -200,26 +198,6 @@ impl crate::scorefn::NumericRead for ShardNumericRead<'_> {
     }
 }
 
-/// Resolve one request's filters against one shard: the predicate the
-/// lexical heap gate uses, and the slot allowlist the vector scan uses
-/// (`docs/vector-filters.md`). Both come from the SAME resolved
-/// [`crate::filter::DocFilter`], which is the point — a fused result
-/// cannot mix a filtered half with an unfiltered one when there is one
-/// resolution and one truth.
-///
-/// The rules are the lexical leg's rules, unchanged: absence fails, a
-/// name this shard lacks resolves to absent for every document, and the
-/// coordinator refuses a name NO shard resolves. A shard with no
-/// lexical half therefore has no columns and admits nothing — exact,
-/// since its documents genuinely hold no value — while a shard still
-/// bulk-building refuses, because "no columns yet" is a transient state
-/// and answering it as an empty result would be a silent lie.
-///
-/// `None` allowlist means the request carried no filters, which every
-/// scan path reads as "scan everything". That is deliberately not the
-/// same as an all-true allowlist: an unfiltered scan batches with every
-/// other unfiltered scan and takes a path bit-identical to the one it
-/// took before filters existed.
 /// Render one evaluated projection value onto the wire. Absence is the
 /// unset oneof; string ordinals render against the dictionary the
 /// shard owns.
@@ -244,9 +222,7 @@ pub(in crate::node) fn projected_value(
     crate::pb::ProjectedValue { value }
 }
 
-/// Order-preserving u64 key for an i64 value: offset binary, so the
-/// unsigned comparison of the results matches the signed comparison of
-/// the inputs (docs/query-api.md, sorted browse).
+/// Order-preserving `u64` key for a signed `i64` value via offset binary.
 pub(crate) fn i64_order_bits(x: i64) -> u64 {
     (x as u64) ^ (1u64 << 63)
 }
@@ -311,11 +287,8 @@ pub(crate) struct ScoreStageSpec {
     pub(in crate::node) typed_map: bool,
 }
 
-/// Parse and validate a wire score-stage list into resolved ops plus
-/// their column names — the shard-independent half of chain building
-/// (`docs/score-functions.md`). Refuses unknown ops, empty column
-/// names, and parameters outside each op's admission rule: every
-/// refusal here is a stage whose monotonicity or bound would not hold.
+/// Parse and validate wire score stages into shard-independent stage specs,
+/// refusing unknown ops, empty column names, or out-of-range parameters.
 pub(crate) fn parse_score_stages(
     stages: &[crate::pb::ScoreStage],
 ) -> Result<Vec<ScoreStageSpec>, Status> {

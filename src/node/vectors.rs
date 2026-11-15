@@ -347,11 +347,8 @@ impl NodeServiceImpl {
         self.apply_batch_locked(&mut guard, batch, stable_routing_key)
     }
 
-    /// [`Self::apply_batch`] against a state the caller holds: the live
-    /// shard under its write lock, or the shadow of a compaction that
-    /// tails the same records into its own generation
-    /// (`docs/mutations.md`). One apply function, so the shadow cannot
-    /// drift from what ingest does.
+    /// [`Self::apply_batch`] against a caller-held [`ShardState`] (shared by
+    /// live ingest under the write lock and compaction shadow tailing).
     pub(crate) fn apply_batch_locked(
         &self,
         guard: &mut ShardState,

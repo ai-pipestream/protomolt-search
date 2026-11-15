@@ -1,56 +1,21 @@
-//! Owner writes served by a Raft member through the host's leased admission.
+//! Raft-hosted `DocumentWriteService` adapter with leased leader admission.
 //!
-//! Every admission on this path comes from `RaftHost::lease`. The transport
-//! gate (`Principals::authenticate` and `authorize(.., Ingest)`) stays as
-//! the first check, exactly as on the single-authority service; the
-//! authority admission below is the second and authoritative gate. A
-//! process serves the single-authority service or this one, never both:
-//! the two share the `DocumentWriteService` proto and its `Route` rows, so
-//! clients do not change.
-//!
-//! The lease actor is the transport principal's name. Policy rows in the
-//! authority name actors by that same string, and the decision the source
-//! commit records carries it, so the two gates judge the same actor. This
-//! equivalence is a contract of the deployment: a principal name must mean
-//! the same actor in the bearer principal table and in the authority policy.
-//!
-//! One `AcceptDocument` call, in order: transport gate, request size with
-//! pending and byte permits plus ingest admission on the principal,
-//! `host.lease` on the RPC future, then a blocking worker holding the
-//! lease, the permits and the request, where the grant runs and the
-//! catalog commits. A client that drops its call before the worker exists
-//! drops the lease ungranted and the permits unused, and no row is
-//! written. Once the worker exists it finishes on its own terms: the
-//! library does not cancel a blocking task when its handle is dropped, the
-//! permits are released only when the worker returns, and the grant and
-//! the commit run there whether or not a client is still listening
-//! (`a_client_that_drops_its_call_leaves_the_worker_to_finish_under_its_permits`).
-//! `GetDocumentWriteTarget` follows the same shape.
-//!
-//! Every error from `lease` passes through unchanged: `Unavailable`
-//! naming the leader off-leader, `Unavailable` when no quorum
-//! acknowledged the barrier within the election ceiling, and
-//! `FailedPrecondition` when the interval elapsed before the grant. The
-//! service does not retry, does not forward to the leader, and never
-//! falls back to the local `admission()`, which rejects on a hosted
-//! store anyway.
-//!
-//! No lease check runs after the commit. A write that passed its final
-//! check is durable and fenced by the owner's write epoch, and hiding its
-//! receipt would not make it less durable. A pause between the final
-//! check and durability is the named residual, closed only by a
-//! storage-side fencing token the catalog does not have yet.
+//! Authenticates and authorizes the transport principal first, acquires a
+//! `RaftHost::lease` under that actor identity, and runs the catalog grant and
+//! commit inside a blocking worker that holds the lease and capacity permits
+//! until completion even if the caller drops the RPC future. Lease errors pass
+//! through unchanged without retry or leader forwarding.
 
-use super::{BudgetPermit, WriteBudget};
+use super::{admit_ingest, extract_network_document, WorkPermit, WriteBudget};
 use crate::document_catalog::{Acceptance, ActiveManagedCatalog, Settlement};
 use crate::metrics::{self, Route};
 use crate::pb::document_write_service_server::{DocumentWriteService, DocumentWriteServiceServer};
 use crate::pb::{
-    AccessAction, DocumentWriteReceipt, DocumentWriteRequest, DocumentWriteServiceLimits,
-    DocumentWriteTarget, GetDocumentWriteTargetRequest,
+    DocumentWriteReceipt, DocumentWriteRequest, DocumentWriteServiceLimits, DocumentWriteTarget,
+    GetDocumentWriteTargetRequest,
 };
 use crate::raft::RaftHost;
-use crate::security::{Permit, Principals};
+use crate::security::Principals;
 use prost::Message;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -67,28 +32,10 @@ struct Inner {
     grant_delay: std::sync::Mutex<Option<std::time::Duration>>,
 }
 
-struct WorkPermit {
-    _principal: Permit,
-    _budget: BudgetPermit,
-}
-
-/// Recover every managed catalog the operator configured, for the serving
-/// binary and for tests alike: open each path, recover the managed handle
-/// under the store's applied view, and reject by name a catalog that is
-/// prepared rather than active, one with an authority identity that is not
-/// the member's, or one with an activation the store does not record. The
-/// binding comes from the catalog file's own header, presented byte-exact
-/// to the committed owner row; nothing is reconstructed, and the row is
-/// what admits the handle. A rejection stops the whole recovery with its
-/// cause: no partial service starts on the rest.
-///
-/// Recovery takes no lease. A lease needs a leader, and a member restarts
-/// before any leader exists and serves as a follower most of its life; a
-/// recovery admission (`SourceAuthorityStore::recovery_admission`) opens
-/// the handle on what this replica has applied and admits no write. Every
-/// write on the handle takes its own lease, so a handle opened on a view
-/// the quorum has since moved past is rejected at its first write, by
-/// name, and nothing this function admits reaches a source transaction.
+/// Recover every configured managed catalog against `host`'s applied store view
+/// without taking a leader lease. Rejects prepared-only catalogs, mismatched
+/// collection bindings, and foreign authority identities; any failure aborts
+/// recovery before serving starts.
 pub fn recover_catalogs(
     host: &RaftHost,
     principal: &str,
@@ -219,36 +166,19 @@ impl HostedDocumentWriteService {
         ),
         Status,
     > {
-        let principal = self.inner.principals.authenticate(request.metadata())?;
-        let access =
-            self.inner
-                .principals
-                .authorize(&principal, collection, AccessAction::Ingest)?;
-        let catalog = self
-            .inner
-            .catalogs
-            .get(collection)
-            .cloned()
-            .ok_or_else(|| Status::not_found("source collection is not configured"))?;
-        let length = request.get_ref().encoded_len();
-        if length > self.inner.budget.max_request_bytes() {
-            return Err(Status::resource_exhausted(
-                "source request exceeds max_request_bytes",
-            ));
-        }
-        let principal_permit = principal.admit_request()?;
-        let budget = self.inner.budget.admit(length)?;
-        if write {
-            principal.admit_ingest(1)?;
-        }
+        let admitted = admit_ingest(
+            &self.inner.principals,
+            &self.inner.catalogs,
+            &self.inner.budget,
+            request,
+            collection,
+            write,
+        )?;
         Ok((
-            principal.name.clone(),
-            catalog,
-            access,
-            WorkPermit {
-                _principal: principal_permit,
-                _budget: budget,
-            },
+            admitted.actor,
+            admitted.catalog,
+            admitted.access,
+            admitted.permit,
         ))
     }
 
@@ -296,15 +226,7 @@ impl HostedDocumentWriteService {
     ) -> Result<Response<DocumentWriteReceipt>, Status> {
         let (actor, catalog, access, permit) =
             self.admit(&request, &request.get_ref().collection, true)?;
-        let document = request
-            .into_inner()
-            .document
-            .ok_or_else(|| Status::invalid_argument("source write is missing document"))?;
-        if document.contract_version != 2 || document.history_id.len() != 16 {
-            return Err(Status::invalid_argument(
-                "network source writes require contract_version 2 and an exact 16-byte history_id",
-            ));
-        }
+        let document = extract_network_document(request)?;
         let lease = self.inner.host.lease(&actor).await?;
         self.handoff().await?;
         let settling = Arc::clone(&catalog);
@@ -345,13 +267,9 @@ impl HostedDocumentWriteService {
         result.map(Response::new)
     }
 
-    /// A write whose commit returned durable after its lease lapsed is
-    /// settled under a fresh lease, on a worker holding the call's permits
-    /// (docs/document-writes.md, "Write outcomes"). A settlement that
-    /// cannot be made now, because no lease can be had or the fresh lease
-    /// lapsed before the grant, is `Unavailable` naming the durable
-    /// version: the record stays UNCONFIRMED and the exact retry settles
-    /// it. A fenced settlement is the rejection every retry replays.
+    /// Settle a durable write whose original lease lapsed before commit returned,
+    /// using a fresh lease under the call's existing permits. Returns `Unavailable`
+    /// naming the durable version if no fresh lease can settle it immediately.
     async fn settle(
         &self,
         actor: &str,
@@ -391,25 +309,4 @@ impl HostedDocumentWriteService {
     }
 }
 
-#[tonic::async_trait]
-impl DocumentWriteService for HostedDocumentWriteService {
-    async fn get_write_target(
-        &self,
-        request: Request<GetDocumentWriteTargetRequest>,
-    ) -> Result<Response<DocumentWriteTarget>, Status> {
-        metrics::timed(Route::GetDocumentWriteTarget, request, |request| {
-            self.target(request)
-        })
-        .await
-    }
-
-    async fn accept_document(
-        &self,
-        request: Request<DocumentWriteRequest>,
-    ) -> Result<Response<DocumentWriteReceipt>, Status> {
-        metrics::timed(Route::AcceptSourceDocument, request, |request| {
-            self.accept(request)
-        })
-        .await
-    }
-}
+impl_document_write_service!(HostedDocumentWriteService);

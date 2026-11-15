@@ -2,24 +2,20 @@
 
 use super::*;
 
-/// Merged global stats for a fused multi-field query, with the per-node
-/// epochs the shares were valid at (parallel to the node list).
-/// Default expansion cap of a [`crate::pb::TermPrefix`] with
-/// `max_expansions` unset (`docs/prefix-terms.md`).
+/// Default expansion cap of a [`crate::pb::TermPrefix`] with `max_expansions` unset.
 pub const DEFAULT_PREFIX_EXPANSIONS: usize = 128;
 
 /// The largest cap a request may ask for; every expansion is a scored
 /// term, and past this a prefix is a scan, not a query.
 pub const MAX_PREFIX_EXPANSIONS: usize = 1024;
 
-/// Suggestions a `Suggest` request returns when `limit` is unset
-/// (`docs/suggest.md`).
 /// Candidates per term a did-you-mean request returns by default.
 pub const DEFAULT_TERM_SUGGEST_LIMIT: usize = 5;
 
 /// The largest edit bound a did-you-mean request may name.
 pub const MAX_TERM_SUGGEST_EDITS: u32 = 2;
 
+/// Suggestions a `Suggest` request returns when `limit` is unset.
 pub const DEFAULT_SUGGEST_LIMIT: usize = 10;
 
 /// The most suggestions one request may ask for.
@@ -33,16 +29,10 @@ pub const DEFAULT_SUGGEST_SCAN: usize = 100_000;
 pub const MAX_SUGGEST_SCAN: usize = 1_000_000;
 
 impl CoordinatorServiceImpl {
-    /// Autocomplete over one field's dictionary (`docs/suggest.md`):
-    /// normalize the prefix as a prefix term is normalized (the field's
-    /// char filters, never its stemmer), ask every shard for the terms
-    /// under it with their posting df, union by term summing df, and
-    /// rank by df descending then term bytes ascending. The union IS the
-    /// dictionary one image of the rows would hold and the summed df is
-    /// that image's posting df, so the fleet's answer equals the
-    /// monolith's bitwise. Past `max_scan` on any shard or in the union
-    /// the request refuses naming the count; nothing is truncated to a
-    /// quieter match set.
+    /// Autocomplete over one field's dictionary: normalize the prefix under the
+    /// field's char filters (without stemming), union per-shard dictionary hits
+    /// summing posting `df`, and rank by `(df desc, term asc)`, refusing if any
+    /// shard or the fleet union exceeds `max_scan`.
     pub(super) async fn rpc_suggest(
         &self,
         request: Request<crate::pb::SuggestRequest>,

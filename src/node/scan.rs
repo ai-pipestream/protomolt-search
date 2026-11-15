@@ -85,8 +85,7 @@ pub(in crate::node) fn apply_stream_datagram(
     key: Option<&crate::security::UdpKey>,
     datagram: &[u8],
 ) {
-    // With a key configured only a signed datagram is read at all
-    // (docs/security.md); the plain frame is for loopback lanes.
+    // Require a signed datagram when a key is configured; plain frames are loopback-only.
     let (signal, seq) = match key {
         Some(key) => match crate::stream_signal::decode_signed(key, datagram) {
             Some((signal, seq)) => (Some(signal), Some(seq)),
@@ -152,10 +151,8 @@ pub(in crate::node) struct ScanSample {
     pub(in crate::node) nanos: u64,
 }
 
-/// The node's observed scan rate (`docs/bandwidth-budget.md`): the ratio
-/// of encoded bytes to active kernel time over the recent scans the
-/// window holds. `bytes_per_second` is zero, meaning unknown, below
-/// [`SCAN_WINDOW_MIN_SAMPLES`] or when no active time was observed.
+/// Observed scan throughput over recent windowed scans (`0` until at least
+/// [`SCAN_WINDOW_MIN_SAMPLES`] non-zero kernel passes have been recorded).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ScanRate {
     pub bytes_per_second: u64,
@@ -246,8 +243,7 @@ impl Default for ScanWindow {
     }
 }
 
-/// The process-wide window: one rate per node process, which is what the
-/// lease renewal reports (`docs/bandwidth-budget.md`).
+/// Process-wide scan throughput window reported on lease renewal.
 static SCAN_WINDOW: ScanWindow = ScanWindow::new();
 
 /// The node's observed scan rate for the lease renewal.
@@ -272,7 +268,6 @@ pub fn scan_batch_counters() -> (u64, u64) {
     )
 }
 
-/// One shard scan queued for a batched kernel pass.
 /// One completed shard scan, with the handshake flags that let the
 /// coordinator refuse a filter column no shard resolves.
 pub(in crate::node) struct ScanOutcome {
@@ -284,6 +279,7 @@ pub(in crate::node) struct ScanOutcome {
     pub(in crate::node) filter_columns_known: Vec<bool>,
 }
 
+/// One shard scan queued for a batched kernel pass.
 pub(in crate::node) struct ScanJob {
     pub(in crate::node) read_context: Option<crate::pb::VectorReadContext>,
     pub(in crate::node) ready_tx: mpsc::Sender<Result<SearchShardResponse, Status>>,
@@ -528,8 +524,7 @@ pub(in crate::node) fn run_scan_batch(
             pass_nanos = pass_nanos.saturating_add(pass.nanos);
         },
     );
-    // One sample for the batched scan, whatever the batch size: the
-    // pass over the shard happened once (docs/bandwidth-budget.md).
+    // Record one sample per batched shard pass regardless of batch width.
     observe_scan(pass_bytes, pass_nanos);
     for ((((done, (hits, mut stats)), (geo_columns_known, filter_columns_known)), prune), spec) in
         dones
@@ -564,7 +559,7 @@ pub(in crate::node) fn run_scan_batch(
 impl NodeServiceImpl {
     /// Bind the UDP signal lane on `addr` — the same host:port as the
     /// gRPC listener, UDP namespace — and fold typed floor/cancel datagrams
-    /// into the matching stream state (see [`apply_stream_datagram`]). A
+    /// into the matching stream state (see `apply_stream_datagram`). A
     /// failed bind only loses the fast lane: both signals still travel on
     /// every stream's authoritative gRPC leg.
     #[cfg(feature = "net")]

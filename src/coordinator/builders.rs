@@ -66,10 +66,6 @@ impl CoordinatorServiceImpl {
         }
     }
 
-    /// A coordinator whose shard traffic is restricted to the supplied
-    /// in-process channels. Cache misses never fall back to TCP and the UDP
-    /// signal lane is disabled. The labels are diagnostic identities only;
-    /// no address parsing or name resolution occurs.
     /// A coordinator over nodes living in this process, reached through
     /// [`crate::link::NodeLink::Local`]: no network fallback, no UDP lane.
     pub fn with_local_nodes(nodes: Vec<Arc<crate::node::NodeServiceImpl>>) -> Self {
@@ -153,9 +149,8 @@ impl CoordinatorServiceImpl {
         self.knobs.signal_batch().max(1) as usize
     }
 
-    /// Whether a filtered request skips the shards its placement leaf
-    /// rules out (`docs/placement.md`); `false` is the A/B switch and
-    /// changes no answer. Live afterwards as the `shard_pruning` knob.
+    /// Whether filtered requests skip shards excluded by their placement leaf;
+    /// `false` disables pruning for A/B comparison without changing results.
     pub fn with_shard_pruning(mut self, enabled: bool) -> Self {
         self.rebuild_knobs(
             self.knobs.max_k(),
@@ -266,10 +261,9 @@ impl CoordinatorServiceImpl {
         }
     }
 
-    /// Layouts of this coordinator's shard nodes (docs/diagnostics.md):
-    /// in-process nodes answer directly, remote ones through their own
-    /// diagnostics service; a node without it is listed with the status
-    /// it returned in `layout`.
+    /// Collect layout diagnostics across shard nodes: in-process nodes answer
+    /// directly and remote ones via `DiagnosticsService`, recording RPC errors
+    /// on unserved entries.
     pub async fn shard_diagnostics(
         &self,
         only: Option<u32>,
@@ -409,7 +403,7 @@ impl CoordinatorServiceImpl {
         self
     }
 
-    /// Install the synonym table (`docs/synonyms.md`).
+    /// Install the synonym table.
     pub fn with_synonyms(mut self, table: crate::synonyms::SynonymTable) -> Self {
         self.synonyms = Some(Arc::new(table));
         self
@@ -478,8 +472,8 @@ impl CoordinatorServiceImpl {
         self
     }
 
-    /// The index's derived-column declaration (`docs/derived-columns.md`),
-    /// the shard map's `[[derived]]` table compiled.
+    /// Install the compiled derived-column declaration from the shard map's
+    /// `[[derived]]` table.
     pub fn with_derived(mut self, derived: Option<Arc<crate::derived::Declaration>>) -> Self {
         self.derived = derived;
         self
@@ -503,7 +497,7 @@ impl CoordinatorServiceImpl {
         self
     }
 
-    /// Name the collection this coordinator serves (`docs/collections.md`).
+    /// Name the collection this coordinator serves.
     pub fn with_collection(mut self, name: &str) -> Self {
         self.collection = name.to_string();
         self
@@ -515,23 +509,20 @@ impl CoordinatorServiceImpl {
         &self.collection
     }
 
-    /// TLS material for every channel this coordinator opens to a shard
-    /// (`docs/security.md`).
+    /// TLS material for every channel this coordinator opens to a shard.
     pub fn with_client_tls(mut self, tls: crate::security::ClientTls) -> Self {
         self.client_tls = Some(tls);
         self
     }
 
-    /// The key that signs this coordinator's UDP floor and cancel
-    /// datagrams (`docs/security.md`).
+    /// Key that signs this coordinator's UDP floor and cancel datagrams.
     pub fn with_udp_hmac_key(mut self, key: crate::security::UdpKey) -> Self {
         self.udp_hmac_key = Some(key);
         self
     }
 
-    /// The key that signs this coordinator's UDP datagrams, when one is
-    /// configured (`docs/security.md`); a relay signs its own parent-facing
-    /// lane with the same key.
+    /// Configured UDP datagram signing key; relays sign parent-facing lanes
+    /// with the same key.
     #[cfg(feature = "net")]
     pub(crate) fn udp_key(&self) -> Option<&crate::security::UdpKey> {
         self.udp_hmac_key.as_ref()

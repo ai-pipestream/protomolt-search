@@ -15,8 +15,7 @@ pub enum Bm25Shard {
     Spilling(SpillBuilder),
     /// Disk-resident mmap reader over a saved `.bm25` file.
     Resident(Bm25Reader),
-    /// The segment catalog plus a heap tail (`docs/immutable-segments.md`):
-    /// the default layout of a new persisted shard.
+    /// Segment catalog plus searchable heap tail (default persisted layout).
     Segmented(SegmentedShard),
 }
 
@@ -50,7 +49,7 @@ impl Bm25Shard {
         }
     }
 
-    /// Fields in the active table (`docs/multi-field.md`).
+    /// Number of fields in the active table.
     pub(crate) fn field_count(&self) -> usize {
         match self {
             Bm25Shard::Building(s) => s.field_count(),
@@ -70,8 +69,6 @@ impl Bm25Shard {
         }
     }
 
-    /// Field `f`'s analyzer fingerprint in the active table (0 =
-    /// unknown, which never enforces).
     /// The mapped-plan binding persisted with this shard, if any.
     pub(crate) fn binding(&self) -> Option<&crate::postings::StoredBinding> {
         match self {
@@ -123,6 +120,8 @@ impl Bm25Shard {
         }
     }
 
+    /// Field `f`'s analyzer fingerprint in the active table (`0` = unknown,
+    /// which never enforces).
     pub(crate) fn analysis_fingerprint(&self, f: usize) -> u64 {
         match self {
             Bm25Shard::Building(s) => s.analysis_fingerprint(f),
@@ -132,9 +131,7 @@ impl Bm25Shard {
         }
     }
 
-    /// Whether field `f` keeps token positions (`docs/phrase-proximity.md`)
-    /// in this shard's active storage — the declaration on a builder,
-    /// the kind-7 entry on a file.
+    /// Whether field `f` stores token positions in active storage.
     pub(in crate::node) fn field_has_positions(&self, f: usize) -> bool {
         match self {
             Bm25Shard::Building(s) => s.field_has_positions(f),
@@ -144,9 +141,7 @@ impl Bm25Shard {
         }
     }
 
-    /// Whether field `f` keeps sentence spans (`docs/highlighting.md`)
-    /// in this shard's active storage — the declaration on a builder,
-    /// the kind-8 entry on a file.
+    /// Whether field `f` stores sentence spans in active storage.
     pub(in crate::node) fn field_has_sentences(&self, f: usize) -> bool {
         match self {
             Bm25Shard::Building(s) => s.field_has_sentences(f),
@@ -226,8 +221,7 @@ impl Bm25Shard {
         }
     }
 
-    /// The ordinal of `value` in facet field `fi`'s dictionary, `None`
-    /// when this shard never ingested it (`docs/cel-filters.md`).
+    /// Ordinal of `value` in facet field `fi`'s dictionary, or `None` if absent.
     pub(in crate::node) fn facet_value_ord_of(&self, fi: usize, value: &str) -> Option<u32> {
         match self {
             Bm25Shard::Building(s) => s.facet_value_ord_of(fi, value),
@@ -563,9 +557,8 @@ impl Bm25Shard {
         }
     }
 
-    /// [`Self::field_view`] over the sealed parts `mask` admits on a
-    /// segmented shard (`docs/segment-pruning.md`); the other layouts
-    /// have no parts to skip and serve the plain view.
+    /// [`Self::field_view`] restricted to sealed parts admitted by `mask` on a
+    /// segmented shard (falling back to [`Self::field_view`] on other layouts).
     pub(in crate::node) fn field_view_masked(
         &self,
         f: usize,
@@ -577,11 +570,8 @@ impl Bm25Shard {
         }
     }
 
-    /// Resolve parsed score stages against THIS shard's numeric table
-    /// (`docs/score-functions.md`): the column index when the table
-    /// has it (`None` = every document absent = identity, which is
-    /// exact) and the column's min/max bound metadata. Only called on
-    /// searchable shapes.
+    /// Resolve parsed score stages against this shard's numeric tables and
+    /// min/max bounds (`None` columns evaluate as absent/identity).
     pub(in crate::node) fn resolve_chain(
         &self,
         specs: &[ScoreStageSpec],

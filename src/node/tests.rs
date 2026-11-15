@@ -132,10 +132,8 @@ mod floor_lane_tests {
         assert_eq!(signals.lock().unwrap().len(), 1);
     }
 
-    /// With a key, only a signed datagram with a fresh sequence moves the
-    /// floor (docs/security.md): a plain frame, a foreign key, a damaged
-    /// tag, a replay, and a stale sequence all leave it where it was, so
-    /// a forger cannot cut candidates. The gRPC twin still governs.
+    /// When a key is configured, only validly signed datagrams with strictly
+    /// advancing sequence numbers update the floor.
     #[test]
     fn signed_floor_lane_ignores_forgeries_and_replays() {
         use crate::security::UdpKey;

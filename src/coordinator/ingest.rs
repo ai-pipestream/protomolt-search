@@ -3,9 +3,8 @@
 use super::*;
 
 impl CoordinatorServiceImpl {
-    /// The first message of a routed mapped ingest stream, which must be
-    /// the bind: it names the collection the whole stream writes into
-    /// (`docs/collections.md`).
+    /// Read the opening `RoutedMappedBind` message naming the target collection
+    /// for a routed mapped ingest stream.
     pub async fn routed_bind(
         inbound: &mut (impl tokio_stream::Stream<Item = Result<RoutedIngestMappedRequest, Status>>
                   + Unpin),
@@ -54,10 +53,8 @@ impl CoordinatorServiceImpl {
         let mapped_bind = bind
             .bind
             .ok_or_else(|| Status::invalid_argument("routed mapped bind is missing bind"))?;
-        // Under a placement tree the coordinator evaluates the tree over
-        // each document's own columns and routes inside the leaf it
-        // picks (docs/placement.md); the leaf's shards fill the
-        // placement column from their pinned code.
+        // Evaluate any configured placement tree over each document's columns
+        // to select its target leaf; shards stamp their pinned leaf code.
         let placer = match self.placement.as_ref() {
             Some(placement) => Some(PlacementRouter::new(
                 Arc::clone(placement),

@@ -205,7 +205,7 @@ impl NodeServiceImpl {
 
     /// Verify a staged repository against its manifest and install it
     /// through the layout's install path (the single-image path is the
-    /// same [`Self::apply_snapshot`] the client stream takes). Refuses,
+    /// same `Self::apply_snapshot` the client stream takes). Refuses,
     /// by name and before touching the live shard: a size or digest
     /// mismatch, another shard's slot offset or collection, a layout
     /// this shard cannot adopt.
@@ -327,17 +327,10 @@ impl NodeServiceImpl {
         Ok(result)
     }
 
-    /// The atomic generation swap shared by snapshot install and
-    /// compaction cutover (`docs/mutations.md`): the previous generation
-    /// aside (if any), the staged directory into place, both inside ONE
-    /// directory rename each. The staged dir's own entries are fsynced
-    /// first (the files' sync_all covered bytes and inodes, not the names
-    /// pointing at them), and the parent is fsynced after so the swap
-    /// itself survives a crash; the window between the two renames is
-    /// covered by [`recover_generation`]. With `retire_old` the previous
-    /// generation is removed at once (a snapshot install); a compaction
-    /// keeps it until its closing flush and removes it then. Returns the
-    /// active generation directory.
+    /// Atomically swap `staged` into `<index_path>.generation` for snapshot
+    /// install or compaction cutover, fsyncing directory entries and parent
+    /// metadata (`recover_generation` covers crashes mid-swap). Removes the
+    /// displaced generation immediately when `retire_old` is set.
     pub(crate) fn adopt_generation(
         index_path: &Path,
         staged: &Path,

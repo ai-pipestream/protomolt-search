@@ -13,8 +13,8 @@ pub(super) type FacetedHits = (
     Vec<crate::pb::RangeFacetCounts>,
 );
 
-/// [`FacetedHits`] plus the column aggregations (docs/facets.md):
-/// merged match-set stats and exact distinct-value counts.
+/// [`FacetedHits`] plus merged match-set column stats, exact distinct-value
+/// counts, and segment-pruning telemetry.
 pub(super) type AggregatedHits = (
     Vec<Bm25Hit>,
     Vec<crate::pb::FacetFieldCounts>,
@@ -24,11 +24,6 @@ pub(super) type AggregatedHits = (
     crate::segment_prune::PruneStats,
 );
 
-/// Merge per-shard column stats: counts and sums add, mins and maxes
-/// fold — additive across shards exactly as facet counts are, so the
-/// coordinator merge is the same positional walk. `mean` is computed
-/// HERE (sum / count) so clients cannot get it wrong; a column NO
-/// shard knows is refused by name, the usual typo rule.
 /// The evaluated values for one candidate set (`fetch_values`).
 pub struct FetchedValues {
     /// Agreed declaration types, including empty nodes and absent candidate values.
@@ -45,9 +40,8 @@ pub struct FetchedValues {
     pub epochs: Vec<StatsClaim>,
 }
 
-/// Compile the public projection list (docs/cel-values.md): names
-/// non-empty and request-unique, expressions through the value
-/// front-end, ONCE, here at the coordinator.
+/// Compile the public projection list once at the coordinator, enforcing
+/// non-empty, request-unique names.
 pub(crate) fn compile_projections(
     projections: &[crate::pb::NamedProjection],
 ) -> Result<Vec<crate::pb::CompiledProjection>, Status> {
@@ -78,7 +72,6 @@ pub(crate) fn compile_projections(
 
 /// The compiled aggregate request: everything the fan-out sends and
 /// the merge needs.
-
 #[derive(Clone)]
 pub(crate) struct CompiledAggregate {
     pub(crate) aggregations: Vec<crate::pb::CompiledAggregation>,
@@ -690,6 +683,8 @@ pub(super) fn agg_vt_name(vt: crate::pb::AggregateValueType) -> &'static str {
     }
 }
 
+/// Merge per-shard column stats: counts and sums add, mins and maxes fold,
+/// `mean` is computed at the coordinator, and an unknown column refuses by name.
 pub(super) fn merge_column_stats(
     requested: &[String],
     shard_stats: &[Vec<crate::pb::ColumnStats>],
@@ -697,11 +692,8 @@ pub(super) fn merge_column_stats(
     crate::column_stats::merge(requested, shard_stats)
 }
 
-/// Union per-shard distinct facet values into exact global
-/// cardinalities. Values, not ordinals — ordinals are shard-local —
-/// and exact by construction: the union of exact per-shard distinct
-/// sets is the exact global distinct set. Cost is the value strings on
-/// the wire, which is the caller's explicit choice (docs/facets.md).
+/// Union per-shard distinct facet values into exact global cardinalities
+/// (comparing string values rather than shard-local ordinals).
 pub(super) fn merge_cardinality(
     requested: &[String],
     shard_distinct: &[Vec<crate::pb::FacetDistinct>],
@@ -822,12 +814,8 @@ pub(crate) fn merge_facet_counts(
         .collect()
 }
 
-/// Merge per-shard range-facet counts into global counts
-/// (`docs/range-facets.md`): the positional per-bucket sum — bucket i
-/// means the same interval on every shard, because the coordinator
-/// forwarded one edge list — `known` when at least one shard could
-/// resolve the column, and a column NO shard knows refused, exactly as
-/// for plain facets.
+/// Merge per-shard range-facet counts positionally by bucket, refusing any
+/// column unknown across all shards.
 pub(super) fn merge_range_counts(
     requested: &[crate::pb::RangeFacetField],
     shard_ranges: &[Vec<crate::pb::RangeFacetCounts>],
@@ -835,14 +823,8 @@ pub(super) fn merge_range_counts(
     crate::rangefacet::merge(requested, shard_ranges, true)
 }
 
-/// Refuse a geo-filter column NO shard knows (`docs/geo-columns.md`).
-/// The same typo rule as fields, facets, chains, and range facets, and
-/// the sharpest case of it: a filter over a misspelled column would
-/// remove EVERY document on every shard and return an empty result set
-/// that looks exactly like an honest "nothing matched". A partially
-/// known column is the heterogeneous fleet and is exact — the shards
-/// without it hold documents with no location, and no location is
-/// inside no region.
+/// Refuse a geo-filter column that no shard declares; partially known columns
+/// remain valid across heterogeneous fleets.
 pub(super) fn refuse_unknown_geo_columns(
     filters: &[crate::pb::GeoFilter],
     known: &[bool],

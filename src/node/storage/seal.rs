@@ -5,7 +5,6 @@ use crate::node::*;
 #[path = "seal_write.rs"]
 mod seal_write;
 
-/// The shard-owner gRPC service. Cheap to clone (state is shared).
 /// What a seal in flight writes out (`NodeServiceImpl::seal_tail`):
 /// the frozen part's rows and shared artifacts, gathered under the
 /// write lock, written with no lock held.
@@ -44,19 +43,10 @@ impl NodeServiceImpl {
         }
     }
 
-    /// Seal a segmented shard's tail into a new catalog segment
-    /// (`docs/immutable-segments.md`) in three steps. Under the shard's
-    /// write lock the tail freezes into a read-only part and a fresh
-    /// tail starts after it. With no lock held, the frozen part's
-    /// documents, vectors, FP32 rows, and live bitmap are written,
-    /// hashed, fsynced, and appended to the catalog with one manifest
-    /// swap. Under the write lock again the shard adopts the published
-    /// snapshot. Queries serve the frozen part throughout and ingest
-    /// continues into the new tail. Seals on one shard run one at a
-    /// time, and a seal that failed after freezing is finished by the
-    /// next attempt. The WAL is untouched: sealing changes the on-disk
-    /// layout, not the log's history. Returns whether a segment was
-    /// written.
+    /// Seal a segmented shard's heap tail into a new catalog segment: freeze
+    /// the tail under the write lock, write/hash/fsync segment artifacts and
+    /// publish the manifest unlocked, then republish the new snapshot under the
+    /// write lock without altering WAL history.
     pub(crate) fn seal_tail(&self) -> Result<bool, Status> {
         self.seal_tail_with(false)
     }
@@ -192,11 +182,8 @@ impl NodeServiceImpl {
             .as_ref()
             .map(|i| i.descriptor().backend_kind)
             .unwrap_or_default();
-        // The segment's id is its generation, the published epoch plus
-        // one: monotone across seals AND across a compaction cutover,
-        // which renumbers the catalog and would otherwise let a fresh
-        // `seg-<count>` collide with a replaced directory the closing
-        // flush has not retired yet (docs/mutations.md).
+        // Assign `epoch + 1` as a monotonic segment ID so post-compaction seals
+        // cannot collide with unretired pre-compaction segment directories.
         let generation = shard.snapshot().epoch() + 1;
         Ok(Some(SealPlan {
             retained: multi_res_vectors
@@ -273,6 +260,7 @@ impl NodeServiceImpl {
             .map_err(|e| Status::internal(format!("seal task failed: {e}")))?
     }
 
+    /// Persist the index to its configured path, if any. Shared by `Flush` and shutdown.
     pub fn flush_index(&self) -> Result<FlushResponse, Status> {
         let Some(config_path) = self.config.index_path.clone() else {
             let mut guard = write_shard(&self.state);
@@ -480,9 +468,7 @@ impl NodeServiceImpl {
             || guard.index.is_some()
             || guard.exact_vectors.is_some()
             || guard.bm25.is_some();
-        // A compaction cutover commits here (docs/mutations.md): its
-        // images are on disk now, so the marker that would roll it back
-        // on restart goes, and the generation it replaced with it.
+        // Finalize any pending compaction cutover now that its images are durable.
         if let Some(pending) = guard.pending_compaction.take() {
             pending
                 .complete()

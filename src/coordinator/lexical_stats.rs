@@ -2,13 +2,9 @@
 
 use super::*;
 
-/// Query analysis for one field, or the empty analysis for a
-/// prefix-only query (docs/prefix-terms.md). `cour*` has no text to
-/// analyze — its terms are the expansions alone — so empty text with a
-/// prefix present skips the analyzer rather than refusing. Empty text
-/// with no prefixes keeps the analyzer's refusal: a query with no terms
-/// and no prefixes has nothing to match, and saying so beats an empty
-/// result that looks like a miss.
+/// Analyze query text for one field, returning an empty analysis when text is
+/// empty and prefix expansions are present, while preserving the analyzer's
+/// empty-query refusal when no prefixes are supplied.
 pub(super) async fn analyze_query(
     addr: &str,
     text: &str,
@@ -23,6 +19,8 @@ pub(super) async fn analyze_query(
         .into_body())
 }
 
+/// Merged global stats for a fused multi-field query, with the per-node
+/// epochs the shares were valid at (parallel to the node list).
 pub(super) struct FusedGlobals {
     pub(super) doc_count: u64,
     /// Per field: global sum of that field's document lengths.
@@ -32,8 +30,8 @@ pub(super) struct FusedGlobals {
     pub(super) epochs: Vec<StatsClaim>,
     /// Number of primary shards whose field table contains each field.
     pub(super) known_shards: Vec<usize>,
-    /// Number of primary shards whose field carries token positions
-    /// (docs/phrase-proximity.md); a positional phrase needs every one.
+    /// Number of primary shards whose field carries token positions;
+    /// positional phrase queries require all shards to carry them.
     pub(super) positions_shards: Vec<usize>,
 }
 
@@ -81,15 +79,9 @@ impl CoordinatorServiceImpl {
         .await
     }
 
-    /// Expand every [`crate::pb::TermPrefix`] of `field` across the fleet
-    /// (`docs/prefix-terms.md`) and add the expansions to `terms`. The
-    /// prefix is normalized under the field's char filters (never
-    /// stemmed), every shard answers from its byte-sorted directory, and
-    /// the fleet-wide union is the term list — the same list a monolith
-    /// would expand, so distributed scoring equals monolithic scoring.
-    /// Past the cap on any shard or in the union, the request is
-    /// INVALID_ARGUMENT naming the count: a prefix is never silently
-    /// truncated to a quieter match set.
+    /// Normalize each [`crate::pb::TermPrefix`] under `field`'s char filters,
+    /// union dictionary matches across all shards, and append expansions to
+    /// `terms`, failing with `InvalidArgument` if any shard or the union exceeds `cap`.
     pub(super) async fn expand_prefixes(
         &self,
         field: &str,
@@ -210,12 +202,9 @@ impl CoordinatorServiceImpl {
             .await
     }
 
-    /// [`Self::fused_stats`] where entries from `probe_from` on are
-    /// PROBES: fields the query may route onto if the fleet has them
-    /// (a phrase's bigram column, docs/phrase-proximity.md). A probe no
-    /// shard knows is answered, not refused — the typo rule still
-    /// applies to every entry before `probe_from`, which the caller
-    /// named on purpose.
+    /// [`Self::fused_stats`] where entries from `probe_from` onward are optional
+    /// probe fields (such as bigram columns) that are tolerated when absent
+    /// across all shards, while earlier caller-named fields still refuse on typos.
     pub(super) async fn fused_stats_probing(
         &self,
         stats_fields: &[crate::pb::FieldTerms],

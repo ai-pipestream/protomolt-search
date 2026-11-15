@@ -28,6 +28,24 @@ fn observation(intent: &MaintenanceIntent, claim: StatsClaim) -> DocumentMainten
     }
 }
 
+struct MaintenanceRequest<'a> {
+    source: &'a DocumentCatalog,
+    index_key: &'a [u8],
+    expected: StatsClaim,
+    catalog_epoch: u64,
+    sources: Vec<SegmentSource<'a>>,
+    proof_scratch: &'a Path,
+    proof_batch_rows: usize,
+}
+
+struct MaintenanceSnapshot {
+    owner: crate::pb::storage::SourceIndexOwner,
+    catalog: crate::segments::SegmentCatalog,
+    before: Arc<OpenedSegmentSet>,
+    backend: PublicationBackend,
+    next_claim: StatsClaim,
+}
+
 impl NodeServiceImpl {
     /// Publish rebuilt, immutable segments through the source owner's journal
     /// and one serving-state fence. All live source identities and stored query
@@ -50,78 +68,54 @@ impl NodeServiceImpl {
         proof_scratch: &Path,
         proof_batch_rows: usize,
     ) -> Result<DocumentMaintenanceActivation, Status> {
-        if !(1..=1_048_576).contains(&proof_batch_rows) {
+        self.run_document_maintenance(MaintenanceRequest {
+            source,
+            index_key,
+            expected,
+            catalog_epoch,
+            sources,
+            proof_scratch,
+            proof_batch_rows,
+        })
+    }
+
+    fn validate_maintenance_request(&self, req: &MaintenanceRequest<'_>) -> Result<(), Status> {
+        if !(1..=1_048_576).contains(&req.proof_batch_rows) {
             return Err(Status::invalid_argument(
                 "maintenance proof_batch_rows must be 1..=1048576",
             ));
         }
-        if source.collection()? != self.config.collection {
+        if req.source.collection()? != self.config.collection {
             return Err(Status::failed_precondition(
                 "maintenance source and target collections differ",
             ));
         }
-        let owner = source.index_owner(index_key)?;
-        StatsClaim::required(expected.epoch, &expected.incarnation())?;
-        let (catalog, before, backend, next_claim) = {
-            let guard = read_shard(&self.state);
-            self.check_segment_publication(&guard, expected, catalog_epoch)?;
-            let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
-                unreachable!()
-            };
-            let held = shard.snapshot();
-            if held
-                .manifest()
-                .source_owner
-                .as_ref()
-                .map(|o| o.decode())
-                .transpose()
-                .map_err(Status::data_loss)?
-                .as_ref()
-                != Some(&owner)
-            {
-                return Err(Status::failed_precondition(
-                    "maintenance requires this source history's owned index",
-                ));
-            }
-            check_source_live_view(held, &guard.live_docs)?;
-            let backend = guard
-                .index
-                .as_ref()
-                .map(|index| {
-                    Ok::<_, Status>((
-                        index.dim_opt().ok_or_else(|| {
-                            Status::failed_precondition("provider has no dimension")
-                        })?,
-                        index
-                            .backend_config()
-                            .map_err(|error| Status::failed_precondition(error.to_string()))?,
-                    ))
-                })
-                .transpose()?;
-            let next = guard.stats_epoch.checked_add(1).ok_or_else(|| {
-                Status::resource_exhausted("maintenance statistics epoch exhausted")
-            })?;
-            (
-                shard.catalog().clone(),
-                held.clone(),
-                backend,
-                StatsClaim::required(next, &guard.stats_incarnation.bytes()?)?,
-            )
-        };
-        source
-            .current_index_publication_decision(index_key, &catalog)?
+        StatsClaim::required(req.expected.epoch, &req.expected.incarnation())?;
+        Ok(())
+    }
+
+    fn run_document_maintenance(
+        &self,
+        req: MaintenanceRequest<'_>,
+    ) -> Result<DocumentMaintenanceActivation, Status> {
+        self.validate_maintenance_request(&req)?;
+        let owner = req.source.index_owner(req.index_key)?;
+        let snap = self.snapshot_for_maintenance(owner, req.expected, req.catalog_epoch)?;
+        req.source
+            .current_index_publication_decision(req.index_key, &snap.catalog)?
             .ok_or_else(|| {
                 Status::failed_precondition("maintenance requires a committed source projection")
             })?;
-        let staged = catalog
-            .stage_maintenance(before.clone(), sources)
+        let staged = snap
+            .catalog
+            .stage_maintenance(snap.before.clone(), req.sources)
             .map_err(Status::failed_precondition)?;
-        let verified = source.verify_index_maintenance(
-            index_key,
-            &before,
+        let verified = req.source.verify_index_maintenance(
+            req.index_key,
+            &snap.before,
             staged.snapshot(),
-            proof_scratch,
-            proof_batch_rows,
+            req.proof_scratch,
+            req.proof_batch_rows,
         )?;
         #[cfg(test)]
         if let Some(callback) = AFTER_MAINTENANCE_VERIFIED.with(|hook| hook.borrow_mut().take()) {
@@ -133,56 +127,136 @@ impl NodeServiceImpl {
             .seal_lock
             .lock()
             .map_err(|_| Status::internal("seal lock poisoned"))?;
-        {
-            let guard = read_shard(&self.state);
-            self.check_segment_publication(&guard, expected, catalog_epoch)?;
-            check_source_live_view(&before, &guard.live_docs)?;
-        }
-        source.current_index_publication_decision(index_key, &catalog)?;
-        source.enable_index_maintenance()?;
+        self.recheck_maintenance_fence(&snap, req.expected, req.catalog_epoch)?;
+        req.source
+            .current_index_publication_decision(req.index_key, &snap.catalog)?;
+        req.source.enable_index_maintenance()?;
         let mut journal_prepared = false;
-        let result = catalog.commit_maintenance_prepared(&staged, &owner, |after| {
-            // Compaction renumbers rows: old positional tombstones must not be
-            // carried into the new layout. Its own validated overlays apply.
-            let prepared =
-                self.prepare_serving_state(&catalog, after, LiveDocs::default(), backend)?;
-            let intent = source
-                .prepare_verified_index_maintenance(&verified)
-                .map_err(|status| status.to_string())?;
-            staged.retain_for_recovery();
-            journal_prepared = true;
-            #[cfg(test)]
-            if INTERRUPT_MAINTENANCE.with(|phase| phase.get() == 1) {
-                INTERRUPT_MAINTENANCE.with(|phase| phase.set(0));
-                return Err("injected interruption after maintenance intent".into());
-            }
-            let guard = write_shard(&self.state);
-            self.check_segment_publication(&guard, expected, catalog_epoch)
-                .map_err(|status| status.to_string())?;
-            check_source_live_view(&before, &guard.live_docs)
-                .map_err(|status| status.to_string())?;
-            Ok((guard, prepared, intent))
-        });
-        let (_, (mut guard, prepared, intent)) = match result {
-            Ok(value) => value,
-            Err(error) => {
-                if journal_prepared {
-                    self.fence_ingest(
-                        "maintenance has an unresolved durable intent; reopen for recovery".into(),
-                    );
+        let result = snap
+            .catalog
+            .commit_maintenance_prepared(&staged, &snap.owner, |after| {
+                let prepared = self.prepare_serving_state(
+                    &snap.catalog,
+                    after,
+                    LiveDocs::default(),
+                    snap.backend,
+                )?;
+                let intent = req
+                    .source
+                    .prepare_verified_index_maintenance(&verified)
+                    .map_err(|status| status.to_string())?;
+                staged.retain_for_recovery();
+                journal_prepared = true;
+                #[cfg(test)]
+                if INTERRUPT_MAINTENANCE.with(|phase| phase.get() == 1) {
+                    INTERRUPT_MAINTENANCE.with(|phase| phase.set(0));
+                    return Err("injected interruption after maintenance intent".into());
                 }
-                return Err(Status::failed_precondition(error));
-            }
+                let guard = write_shard(&self.state);
+                self.check_segment_publication(&guard, req.expected, req.catalog_epoch)
+                    .map_err(|status| status.to_string())?;
+                check_source_live_view(&snap.before, &guard.live_docs)
+                    .map_err(|status| status.to_string())?;
+                Ok((guard, prepared, intent))
+            });
+        let intent = self.activate_maintenance_result(
+            result.map(|(_, payload)| payload),
+            journal_prepared,
+            req.source,
+            req.index_key,
+            &snap.catalog,
+            snap.next_claim.epoch,
+        )?;
+        crate::segments::remove_segment_dirs(snap.before.root(), &snap.before.manifest().segments);
+        Ok(observation(&intent, snap.next_claim))
+    }
+
+    fn recheck_maintenance_fence(
+        &self,
+        snap: &MaintenanceSnapshot,
+        expected: StatsClaim,
+        catalog_epoch: u64,
+    ) -> Result<(), Status> {
+        let guard = read_shard(&self.state);
+        self.check_segment_publication(&guard, expected, catalog_epoch)?;
+        check_source_live_view(&snap.before, &guard.live_docs)
+    }
+
+    fn snapshot_for_maintenance(
+        &self,
+        owner: crate::pb::storage::SourceIndexOwner,
+        expected: StatsClaim,
+        catalog_epoch: u64,
+    ) -> Result<MaintenanceSnapshot, Status> {
+        let guard = read_shard(&self.state);
+        self.check_segment_publication(&guard, expected, catalog_epoch)?;
+        let Some(Bm25Shard::Segmented(shard)) = guard.bm25.as_ref() else {
+            unreachable!()
         };
-        guard.index = prepared.index;
-        guard.exact_vectors = prepared.exact;
-        guard.multi_res_vectors = prepared.retained;
-        guard.mapped_binding = prepared.bm25.binding().cloned();
-        guard.bm25 = Some(prepared.bm25);
-        guard.live_docs = prepared.live;
-        guard.parents = None;
-        guard.stats_epoch = next_claim.epoch;
-        guard.files_current = false;
+        let held = shard.snapshot();
+        if held
+            .manifest()
+            .source_owner
+            .as_ref()
+            .map(|o| o.decode())
+            .transpose()
+            .map_err(Status::data_loss)?
+            .as_ref()
+            != Some(&owner)
+        {
+            return Err(Status::failed_precondition(
+                "maintenance requires this source history's owned index",
+            ));
+        }
+        check_source_live_view(held, &guard.live_docs)?;
+        let (backend, next_claim) =
+            read_backend_and_next_claim(&guard, "maintenance statistics epoch exhausted")?;
+        Ok(MaintenanceSnapshot {
+            owner,
+            catalog: shard.catalog().clone(),
+            before: held.clone(),
+            backend,
+            next_claim,
+        })
+    }
+
+    fn activate_maintenance_result(
+        &self,
+        result: Result<
+            (
+                std::sync::RwLockWriteGuard<'_, ShardState>,
+                PreparedServingState,
+                MaintenanceIntent,
+            ),
+            String,
+        >,
+        journal_prepared: bool,
+        source: &DocumentCatalog,
+        index_key: &[u8],
+        catalog: &crate::segments::SegmentCatalog,
+        stats_epoch: u64,
+    ) -> Result<MaintenanceIntent, Status> {
+        let (mut guard, prepared, intent) = result.map_err(|error| {
+            if journal_prepared {
+                self.fence_ingest(
+                    "maintenance has an unresolved durable intent; reopen for recovery".into(),
+                );
+            }
+            Status::failed_precondition(error)
+        })?;
+        install_prepared_serving_state(&mut guard, prepared, stats_epoch);
+        self.verify_maintenance_decision(source, index_key, catalog, &intent)?;
+        drop(guard);
+        Ok(intent)
+    }
+
+    fn verify_maintenance_decision(
+        &self,
+        source: &DocumentCatalog,
+        index_key: &[u8],
+        catalog: &crate::segments::SegmentCatalog,
+        intent: &MaintenanceIntent,
+    ) -> Result<(), Status> {
         #[cfg(test)]
         if INTERRUPT_MAINTENANCE.with(|phase| phase.get() == 2) {
             INTERRUPT_MAINTENANCE.with(|phase| phase.set(0));
@@ -193,26 +267,21 @@ impl NodeServiceImpl {
                 "injected interruption after maintenance activation",
             ));
         }
-        match source.recover_index_maintenance(index_key, &catalog) {
-            Ok(MaintenanceRecovery::Committed(decision)) if decision == intent => {}
+        match source.recover_index_maintenance(index_key, catalog) {
+            Ok(MaintenanceRecovery::Committed(decision)) if &decision == intent => Ok(()),
             outcome => {
                 self.fence_ingest(
                     "maintenance activation lacks a matching durable decision; reopen for recovery"
                         .into(),
                 );
-                return Err(match outcome {
+                Err(match outcome {
                     Err(status) => status,
                     Ok(_) => {
                         Status::data_loss("maintenance resolved a different artifact decision")
                     }
-                });
+                })
             }
         }
-        drop(guard);
-        // Held query snapshots retain their opened images. Reclamation is only
-        // attempted after the source journal acknowledges the committed layout.
-        crate::segments::remove_segment_dirs(before.root(), &before.manifest().segments);
-        Ok(observation(&intent, next_claim))
     }
 
     /// Join a reopened node's exact serving view to source maintenance recovery.

@@ -119,16 +119,9 @@ impl NodeServiceImpl {
         Ok((tail, passes))
     }
 
-    // ----- The from-segments path: a catalog without a WAL -----
-    //
-    // docs/replay-from-segments.md, "Partitioned compaction of a catalog
-    // without a log". The cutoff is the sealed catalog once the current
-    // tail is sealed; the build transplants its live rows through
-    // `reshard::compact_segments_partitioned` (the analyzer never runs);
-    // writes that arrive after the cutoff are caught up by the same seal
-    // ingest uses (`seal_tail`), landing in the live catalog as unordered
-    // segments the cutover carries over; the cutover keeps the
-    // shadow/marker/closing-flush contract of docs/mutations.md.
+    // From-segments compaction for WAL-less catalogs: seal the cutoff tail,
+    // transplant live rows via `reshard::compact_segments_partitioned`, carry
+    // over segments sealed after the cutoff, and swap behind the commit marker.
 
     /// Seal the tail when it holds rows (or a frozen part is waiting on
     /// its publication), waiting out a legacy two-RPC append caught

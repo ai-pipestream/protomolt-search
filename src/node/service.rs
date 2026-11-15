@@ -2,6 +2,9 @@
 
 use crate::node::*;
 
+mod open;
+
+/// The shard-owner gRPC service. Cheap to clone (state is shared).
 #[derive(Clone)]
 pub struct NodeServiceImpl {
     /// Locked shard state; see [`ShardState`].
@@ -14,15 +17,12 @@ pub struct NodeServiceImpl {
     /// shard — every doc logged, none attributable — so the second stream
     /// is refused outright rather than merged.
     pub(in crate::node) ingest_busy: Arc<std::sync::atomic::AtomicBool>,
-    /// A fence on ingest (`docs/cluster-control.md`, "Shard split"): set
-    /// by the node agent when the shard's rows are moving to its split
-    /// children, so no append can land between the children's final
-    /// catch-up and the topology cutover. The reason names the
-    /// children; a fenced shard refuses every ingest stream by name and
-    /// keeps serving queries.
+    /// Ingest fence set by the node agent during shard split cutover so no
+    /// append lands between final child catch-up and topology publication;
+    /// fenced shards refuse ingest streams while continuing to serve queries.
     pub(in crate::node) ingest_fence: Arc<std::sync::Mutex<Option<String>>>,
     pub(crate) config: NodeConfig,
-    /// Runtime knobs read at request time (docs/diagnostics.md).
+    /// Runtime knobs read at request time.
     pub(in crate::node) knobs: Arc<crate::diagnostics::Knobs>,
     /// Shared scan queue for coalesced searches; the scheduler task is
     /// spawned on first use (shared across service clones).
@@ -37,20 +37,15 @@ pub struct NodeServiceImpl {
     /// to every ingest AnalyzeStream. `None` when vocabulary accumulation
     /// is off (the default) or its directory failed to initialize.
     pub(in crate::node) vocab: Option<Arc<crate::vocab::VocabularyListener>>,
-    /// Compiled materialization spec for the current ingest stream
-    /// (docs/cel-values.md): expressions compile once per spec CHANGE,
-    /// never per document — the ingest analog of the query rule.
+    /// Compiled materialization spec cached per distinct spec across ingest.
     pub(in crate::node) materialize_cache: Arc<std::sync::Mutex<Option<CompiledMaterialize>>>,
     /// Optional product-owned phrase vocabulary shared by ingest and query.
     pub(crate) phrase_index: Option<Arc<crate::phrases::PhraseIndex>>,
-    /// Seals on this shard run one at a time; the frozen part of a seal
-    /// in flight is the reason (`docs/immutable-segments.md`).
+    /// Mutex serializing tail seals on this shard while a frozen part is in flight.
     pub(crate) seal_lock: Arc<std::sync::Mutex<()>>,
-    /// One compaction at a time per shard (`docs/mutations.md`): a
-    /// second `CompactShard` refuses by name while this is set.
+    /// Single-compaction gate per shard; concurrent `CompactShard` calls refuse.
     pub(crate) compacting: Arc<std::sync::atomic::AtomicBool>,
-    /// Woken after every flush: the node agent reports the shard to the
-    /// control plane on it (`docs/cluster-control.md`).
+    /// Notification fired after each flush so the node agent reports to the control plane.
     pub(in crate::node) flush_notify: Option<Arc<tokio::sync::Notify>>,
     /// Optional per-poll sleep injected on streaming scans for deterministic
     /// straggler simulation in multi-shard tests and benchmarks.
@@ -101,243 +96,6 @@ fn open_vocab(config: &NodeConfig) -> Option<Arc<crate::vocab::VocabularyListene
 }
 
 impl NodeServiceImpl {
-    /// Open a local shard using the same persisted-generation rules as the
-    /// network server. A missing vector/BM25 image starts an empty shard;
-    /// an unfinished BM25 spill is refused unless the caller explicitly
-    /// allows a vector-only recovery.
-    pub fn open(
-        mut config: NodeConfig,
-        phrase_index: Option<Arc<crate::phrases::PhraseIndex>>,
-        allow_missing_bm25: bool,
-    ) -> Result<Self, String> {
-        declare_placement_column(&mut config);
-        declare_derived_columns(&mut config)?;
-        check_placement_columns(&config)?;
-        validate_column_tables(&config)?;
-        let mut declared_generation = false;
-        if let Some(path) = config.index_path.as_ref() {
-            refuse_retired_generation(path)?;
-            recover_segments_swap(path);
-            if let Some(manifest) =
-                crate::segments::SegmentCatalog::read_manifest(&segments_root(path))?
-            {
-                declared_generation = manifest.generation_declaration.is_some();
-                if let Some(owner) = &manifest.source_owner {
-                    let owner = owner.decode()?;
-                    if owner.collection != config.collection
-                        || config.wal
-                        || config.layout != Layout::Segments
-                        || probe_path_exists(&generation_dir(path), "snapshot generation")?
-                        || probe_path_exists(&generation_old_dir(path), "snapshot backup")?
-                    {
-                        return Err("source-managed index requires its original collection, segmented layout, WAL disabled and no competing snapshot generation".into());
-                    }
-                }
-            }
-        }
-        let generation = match config.index_path.as_ref() {
-            Some(path) => recover_generation(path),
-            None => None,
-        };
-
-        let mut index = match config.index_path.as_ref().filter(|_| !declared_generation) {
-            Some(index_path) => {
-                let path = generation
-                    .as_ref()
-                    .map_or_else(|| index_path.clone(), |dir| generation_vector(dir));
-                if probe_path_exists(&path, "vector index")? {
-                    let mut loaded = VectorIndex::load(&config.vector_backend, &path)
-                        .map_err(|error| format!("load {}: {error}", path.display()))?;
-                    loaded
-                        .prepare()
-                        .map_err(|error| format!("prepare {}: {error}", path.display()))?;
-                    Some(loaded)
-                } else {
-                    None
-                }
-            }
-            None => None,
-        };
-
-        let mut exact_vectors = None;
-        let mut bm25 = None;
-        let mut live_docs = LiveDocs::default();
-        if let Some(index_path) = config.index_path.as_ref() {
-            let (_, exact_path, bm25_path) = storage_paths(index_path, generation.as_ref());
-            let root = segments_root(index_path);
-            let catalog_exists =
-                probe_path_exists(&root.join("segments.json"), "segment catalog manifest")?;
-            // A segment catalog owns its sealed FP32 files. Legacy sidecars
-            // cannot override that view, even when their row counts agree.
-            if probe_path_exists(&exact_path, "exact vector sidecar")?
-                && (!catalog_exists || generation.is_some())
-            {
-                exact_vectors = Some(
-                    ExactVectorStore::open(&exact_path)
-                        .map_err(|error| format!("load {}: {error}", exact_path.display()))?,
-                );
-            }
-            let build_dir = bm25_build_dir(&bm25_path);
-            let build_dir_exists = probe_path_exists(&build_dir, "BM25 build directory")?;
-            if probe_path_exists(&bm25_path, "BM25 sidecar")? {
-                if catalog_exists && generation.is_none() {
-                    return Err(format!(
-                        "{} has both a single-image file and a segment catalog at {}; a shard has \
-                         one layout, and nothing converts on open",
-                        bm25_path.display(),
-                        root.display()
-                    ));
-                }
-                bm25 = Some(
-                    Bm25Shard::open(&bm25_path)
-                        .map_err(|error| format!("load {}: {error}", bm25_path.display()))?,
-                );
-            } else if generation.is_none()
-                && (catalog_exists
-                    || (config.layout == Layout::Segments && !build_dir_exists && index.is_none()))
-            {
-                // The segment layout: an existing catalog, or a fresh
-                // persisted shard under the default. Never a conversion —
-                // a single-image file above took the other branch.
-                let tail = heap_store(&config)?;
-                let shard = SegmentedShard::open_with(&root, tail, config.vector_load())
-                    .map_err(|error| format!("segment catalog {}: {error}", root.display()))?;
-                let set = shard.snapshot().clone();
-                if let Some(owner) = &set.manifest().source_owner {
-                    let owner = owner.decode()?;
-                    if owner.collection != config.collection
-                        || config.wal
-                        || config.layout != Layout::Segments
-                    {
-                        return Err("source-managed index requires its original collection, segmented layout and WAL disabled".into());
-                    }
-                }
-                let declared_backend = set
-                    .generation_declaration()
-                    .and_then(crate::segments::generation::backend);
-                let stored_backend = match (0..set.len()).find_map(|i| set.vector(i)) {
-                    Some(first) => Some((
-                        first
-                            .dim_opt()
-                            .ok_or("segment vector image has no dimension")?,
-                        first
-                            .backend_config()
-                            .map_err(|error| format!("segment vector backend: {error}"))?,
-                    )),
-                    None => None,
-                };
-                if let Some((dim, backend)) = declared_backend.or(stored_backend) {
-                    if declared_generation && backend.backend_kind != config.vector_backend {
-                        return Err(
-                            "generation vector backend differs from node configuration".into()
-                        );
-                    }
-                    exact_vectors = Some(
-                        ExactVectorStore::from_segments(&set, dim)
-                            .map_err(|error| format!("segment exact-vector view: {error}"))?,
-                    );
-                    let tail_image = VectorIndex::from_backend_config(dim, &backend)
-                        .map_err(|error| format!("segment tail image: {error}"))?;
-                    let provider = SegmentedProvider::open(set, tail_image)
-                        .map_err(|error| format!("segment vectors: {error}"))?;
-                    index = Some(VectorIndex::from_provider(provider));
-                } else if declared_generation {
-                    index = None;
-                    exact_vectors = None;
-                } else if index.as_ref().is_some_and(VectorIndex::is_empty) {
-                    // An empty calibrated image is the surviving provider state
-                    // after complete compaction. It cannot adopt retired rows.
-                    exact_vectors = Some(ExactVectorStore::empty(
-                        index.as_ref().and_then(VectorIndex::dim_opt),
-                    ));
-                } else if probe_path_exists(&exact_path, "exact vector sidecar")? {
-                    // Product-owned exact rows can accompany a remote provider.
-                    exact_vectors = Some(
-                        ExactVectorStore::open(&exact_path)
-                            .map_err(|error| format!("load {}: {error}", exact_path.display()))?,
-                    );
-                }
-                bm25 = Some(Bm25Shard::Segmented(shard));
-            } else if build_dir_exists && !allow_missing_bm25 {
-                return Err(format!(
-                    "BM25 build directory {} exists but {} does not. The bulk build was \
-                     interrupted; this shard would answer lexical queries with silence, \
-                     which is indistinguishable from a corpus that genuinely lacks those \
-                     terms. Re-run ingest for this shard, or pass --allow-missing-bm25 to \
-                     serve it vector-only on purpose.",
-                    build_dir.display(),
-                    bm25_path.display()
-                ));
-            }
-            let live_path = generation.as_ref().map_or_else(
-                || live_docs_sidecar_path(index_path),
-                |dir| generation_live_docs(dir),
-            );
-            if probe_path_exists(&live_path, "live-docs sidecar")? {
-                live_docs = LiveDocs::open(&live_path)
-                    .map_err(|error| format!("load {}: {error}", live_path.display()))?;
-            }
-        }
-
-        // The store's declaration entry must be this node's
-        // (docs/derived-columns.md), refused here by name rather than
-        // in the attach below, which panics for the direct constructor.
-        if let Some(store) = bm25.as_ref() {
-            check_attached_derived(&config, store.derived(), store.doc_count(), "the store")?;
-        }
-        // The resumed log's manifest likewise: a disagreement is a
-        // returned error here; `open_wal`'s panic stays the backstop
-        // for the direct constructor.
-        check_wal_tables(index.as_ref(), &config)?;
-        if let Some(idx) = index.as_ref() {
-            if let Some(expected_dim) = config.matryoshka_active_dim {
-                if expected_dim > 0 && idx.dim_opt().is_some_and(|d| d != expected_dim as usize) {
-                    return Err(format!(
-                        "persisted vector index dim {:?} disagrees with configured matryoshka dim {}",
-                        idx.dim_opt(),
-                        expected_dim
-                    ));
-                }
-            }
-        }
-        let mut multi_res_vectors = crate::multi_res::MultiResVectors::default();
-        if let Some(path) = config.index_path.as_ref() {
-            let physical = index.as_ref().map_or(0, VectorIndex::len).max(
-                bm25.as_ref()
-                    .map_or(0, |store| store.next_doc_id() as usize),
-            );
-            let payload = crate::multi_res::storage_path(path, generation.as_ref());
-            multi_res_vectors =
-                if let Some(provider) = index.as_ref().and_then(VectorIndex::as_segmented) {
-                    provider.snapshot().retained_vectors()?
-                } else {
-                    crate::multi_res_storage::open_generation(&payload, physical as u64, &live_docs)
-                        .map_err(|error| {
-                            format!("load retained vectors {}: {error}", payload.display())
-                        })?
-                };
-            crate::multi_res_wal::require_coverage(
-                &multi_res_vectors,
-                (0..index.as_ref().map_or(0, VectorIndex::len)).filter(|&slot| {
-                    exact_vectors
-                        .as_ref()
-                        .is_none_or(|exact| exact.contains_row(slot))
-                }),
-                &live_docs,
-                &config.matryoshka_prefix_dims,
-                config.matryoshka_active_dim,
-            )?;
-        }
-        let service = Self::new(index, config)
-            .with_bm25(bm25)
-            .with_exact_vectors(exact_vectors)?
-            .with_live_docs(live_docs)?
-            .with_phrase_index(phrase_index)
-            .with_generation(generation);
-        write_shard(&service.state).multi_res_vectors = multi_res_vectors;
-        Ok(service)
-    }
-
     /// Wrap an optional preloaded index in a node service.
     pub fn new(index: Option<VectorIndex>, mut config: NodeConfig) -> Self {
         declare_placement_column(&mut config);
@@ -398,8 +156,8 @@ impl NodeServiceImpl {
         self
     }
 
-    /// Inject a per-hop poll delay on streaming searches (used to simulate a
-    /// straggler shard deterministically in tests and benchmarks).
+    /// Inject a per-hop poll delay on streaming searches for deterministic
+    /// straggler simulation in tests and benchmarks.
     pub fn with_stream_poll_delay(mut self, delay: std::time::Duration) -> Self {
         self.stream_poll_delay = Some(delay);
         self
@@ -452,13 +210,7 @@ impl NodeServiceImpl {
         Ok(())
     }
 
-    /// The shard's vocabulary listener, when accumulation is enabled.
-    pub fn vocab_listener(&self) -> Option<Arc<crate::vocab::VocabularyListener>> {
-        self.vocab.clone()
-    }
-
-    /// Seal the live vocabulary window on graceful shutdown (the Rust
-    /// counterpart of the Java listener's JVM shutdown hook). No-op when
+    /// Seal the live vocabulary window on graceful shutdown. No-op when
     /// accumulation is off or the window is empty.
     pub fn snapshot_vocab_on_shutdown(&self) {
         if let Some(vocab) = &self.vocab {
@@ -551,9 +303,7 @@ impl NodeServiceImpl {
             }
         }
         match self.config.index_path.as_ref() {
-            // A new persisted shard under the segment layout: the tail is a
-            // heap store, searchable at once, sealed into the catalog on
-            // flush (docs/immutable-segments.md).
+            // Segmented persisted shard: searchable heap tail sealed into the catalog on flush.
             Some(p) if self.config.layout == Layout::Segments && generation.is_none() => {
                 let root = segments_root(p);
                 let tail = heap_store(&self.config).map_err(Status::failed_precondition)?;
@@ -797,16 +547,7 @@ impl NodeServiceImpl {
         self
     }
 
-    /// Build the tonic server for this service with explicit message size
-    /// limits (see [`crate::MAX_MESSAGE_BYTES`]). tonic's 4 MiB default
-    /// decoding cap is comfortably above even k=10000 shard responses
-    /// (~160 KiB), but the limit is set explicitly so it never silently
-    /// depends on a library default. NOTE: the cap also bounds AddVectors
-    /// batch messages; clients should keep batches well under it.
-    /// A metrics gauge sampler over this shard's live state
-    /// (`docs/metrics.md`): called at scrape time, reads under the
-    /// state lock, and so can never go stale.
-    /// The knobs this node reads at request time (docs/diagnostics.md).
+    /// The knobs this node reads at request time.
     pub fn knobs(&self) -> &Arc<crate::diagnostics::Knobs> {
         &self.knobs
     }
@@ -822,9 +563,8 @@ impl NodeServiceImpl {
         crate::diagnostics::NodeDiagnostics::new(self.clone()).into_server(max_message_bytes)
     }
 
-    /// This shard's layout for `GetShardDiagnostics`
-    /// (docs/diagnostics.md): the catalog's sealed segments with their
-    /// summaries, the tail, rows, tombstones, and the live knob values.
+    /// Collect layout diagnostics for `GetShardDiagnostics`: sealed segments
+    /// and summaries, tail rows, tombstones, and live knob values.
     pub fn shard_diagnostics(
         &self,
         shard: u32,
@@ -955,6 +695,8 @@ impl NodeServiceImpl {
         out
     }
 
+    /// A metrics gauge sampler over this shard's live state: called at scrape
+    /// time under the state lock so reported counts never go stale.
     pub fn metrics_provider(&self) -> crate::metrics::GaugeProvider {
         let state = Arc::clone(&self.state);
         let slot_offset = self.config.slot_offset;
@@ -969,6 +711,8 @@ impl NodeServiceImpl {
         })
     }
 
+    /// Build the tonic server for this service with explicit decoding and
+    /// encoding message size limits (see [`crate::MAX_MESSAGE_BYTES`]).
     pub fn into_server(self, max_message_bytes: usize) -> NodeServiceServer<Self> {
         NodeServiceServer::new(self)
             .max_decoding_message_size(max_message_bytes)
@@ -1012,8 +756,6 @@ impl NodeServiceImpl {
         Ok(built)
     }
 
-    /// Persist the index to its configured path, if any. Shared by the
-    /// `Flush` RPC and save-on-shutdown in the binary.
     /// A new provider image for `dim`: wrapped as the tail of a
     /// segmented provider when the shard is segmented, so every row the
     /// node adds joins the catalog's positional space.
@@ -1027,10 +769,8 @@ impl NodeServiceImpl {
         Self::adopt_layout(bm25, created)
     }
 
-    /// A fresh, empty exact-vector store for this shard: on disk beside
-    /// the generation's sidecar path when the shard persists, so an
-    /// ingest never holds its FP32 rows in heap (`docs/mmap-vectors.md`);
-    /// in memory for an in-memory shard.
+    /// Create an empty exact-vector store: disk-spilling beside the generation
+    /// sidecar path on persisted shards, or heap-backed for in-memory shards.
     pub(in crate::node) fn fresh_exact_store(
         &self,
         generation: Option<&PathBuf>,

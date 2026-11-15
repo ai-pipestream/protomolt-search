@@ -10,8 +10,8 @@ pub(super) struct PlacementRouter {
     pub(super) placement: Arc<crate::placement::Placement>,
     pub(super) extractor: crate::mapping::Extractor,
     pub(super) materialize: Vec<(String, crate::pb::ValueExpr, crate::pb::MaterializeKind)>,
-    /// The index's declaration (`docs/derived-columns.md`), evaluated
-    /// here for routing only: the shard computes and stores its own.
+    /// Index derived-column declaration evaluated locally for routing only;
+    /// each shard computes and persists its own derived values.
     pub(super) derived: Option<Arc<crate::derived::Declaration>>,
 }
 
