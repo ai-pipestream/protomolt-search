@@ -34,6 +34,7 @@ impl Freshness {
         self.refresh = 0;
         Ok(())
     }
+    #[cfg(any(test, feature = "tls"))]
     pub(super) fn check(&self, now: Instant) -> Result<(), Status> {
         if self.exhausted || !self.deadline.is_some_and(|deadline| now < deadline) {
             return Err(Status::unavailable(

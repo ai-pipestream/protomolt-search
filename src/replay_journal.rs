@@ -9,9 +9,11 @@ use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinitio
 use tonic::Status;
 
 use crate::pb::storage::ReplayJournalHeader;
+#[cfg(any(test, feature = "tls"))]
+use crate::pb::ReplayJournalReceipt;
 use crate::pb::{
     ReadReplayJournalRequest, ReadReplayJournalResponse, ReplayAdmissionPolicy, ReplayJournalFrame,
-    ReplayJournalReceipt, ReplayStreamBinding,
+    ReplayStreamBinding,
 };
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("metadata");
@@ -289,6 +291,7 @@ impl ReplayJournal {
         }
         Ok(frame)
     }
+    #[cfg(any(test, feature = "tls"))]
     fn receipt(&self, frame: &ReplayJournalFrame, replayed: bool) -> ReplayJournalReceipt {
         ReplayJournalReceipt {
             binding_sha256: self.digest.clone(),
@@ -332,6 +335,7 @@ impl ReplayJournal {
         self.accept_inner(request.get_ref(), &fingerprint)
     }
 
+    #[cfg(any(test, feature = "tls"))]
     fn accept_inner(
         &self,
         frame: &ReplayJournalFrame,
@@ -526,6 +530,7 @@ impl ReplayJournal {
             && policy.target_write_epoch == self.binding.target_write_epoch
     }
 
+    #[cfg(any(test, feature = "tls"))]
     fn authorize_peer(
         &self,
         policy: Option<&ReplayAdmissionPolicy>,

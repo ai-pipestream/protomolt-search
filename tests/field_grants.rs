@@ -272,7 +272,7 @@ fn policy_versions_and_explicit_field_actions_refuse_ambiguous_grants() {
     for version in [1, 2] {
         let mut p = policy(Some(fields.clone()), false);
         p.format_version = version;
-        assert!(PolicyAuthority::new(p).unwrap_err().contains("format 3"));
+        assert!(PolicyAuthority::new(p).unwrap_err().contains("expected 3"));
     }
     for actions in [vec![], vec![0], vec![100], vec![1, 1]] {
         let mut fields = fields.clone();
