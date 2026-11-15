@@ -96,7 +96,7 @@ concurrency = 0
 ingest_docs_per_sec = 0
 
 [policy]
-format_version = 1
+format_version = 3
 revision = 1
 [[policy.resources]]
 workspace = "fleet"

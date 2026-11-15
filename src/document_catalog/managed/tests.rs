@@ -71,7 +71,7 @@ fn access_policy(include_bob: bool) -> AccessPolicy {
         grants.push(grant("bob", AccessAction::Admin));
     }
     AccessPolicy {
-        format_version: 1,
+        format_version: 3,
         revision: 1,
         resources: vec![CollectionResource {
             workspace: "workspace-a".into(),

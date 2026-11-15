@@ -12,7 +12,7 @@ use tonic::{Code, Request};
 
 fn policy(revision: u64, collections: &[&str]) -> AccessPolicy {
     AccessPolicy {
-        format_version: 1,
+        format_version: 3,
         revision,
         resources: ["a", "b"]
             .into_iter()

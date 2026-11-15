@@ -50,6 +50,15 @@ impl PinnedAccess<'_> {
     }
 }
 
+/// The one access policy format this build reads; any other is refused.
+pub const POLICY_FORMAT: u32 = 3;
+
+fn require_current_format(found: u32) -> Result<(), String> {
+    (found == POLICY_FORMAT).then_some(()).ok_or_else(|| {
+        format!("unsupported access policy format_version {found}; expected {POLICY_FORMAT}")
+    })
+}
+
 #[derive(Debug)]
 struct Policy {
     revision: u64,
@@ -61,12 +70,7 @@ struct Policy {
 
 impl Policy {
     fn validate(input: AccessPolicy) -> Result<Self, String> {
-        if !matches!(input.format_version, 1..=3) {
-            return Err(format!(
-                "unsupported access policy format_version {}; expected 1, 2 or 3",
-                input.format_version
-            ));
-        }
+        require_current_format(input.format_version)?;
         if input.revision == 0 {
             return Err("access policy revision must be nonzero".into());
         }
@@ -110,9 +114,6 @@ impl Policy {
                 }
             }
             if let Some(view) = grant.document_visibility {
-                if input.format_version < 2 {
-                    return Err("document visibility requires access policy format 2".into());
-                }
                 if !actions.contains(&(AccessAction::Search as i32)) {
                     return Err("document visibility requires an explicit search action".into());
                 }
@@ -121,9 +122,6 @@ impl Policy {
                 views.insert((grant.principal.clone(), grant.collection.clone()), view);
             }
             if let Some(permissions) = grant.field_permissions {
-                if input.format_version != 3 {
-                    return Err("field permissions require access policy format 3".into());
-                }
                 if !actions.contains(&(AccessAction::Search as i32)) {
                     return Err("field permissions require an explicit search action".into());
                 }
@@ -535,7 +533,7 @@ mod pin_tests {
 
     fn policy() -> AccessPolicy {
         AccessPolicy {
-            format_version: 1,
+            format_version: POLICY_FORMAT,
             revision: 1,
             resources: vec![CollectionResource {
                 workspace: "workspace".into(),

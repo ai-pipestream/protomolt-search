@@ -9,15 +9,18 @@ use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinitio
 use tonic::Status;
 
 use crate::pb::storage::ReplayJournalHeader;
+#[cfg(any(test, feature = "tls"))]
+use crate::pb::ReplayJournalReceipt;
 use crate::pb::{
     ReadReplayJournalRequest, ReadReplayJournalResponse, ReplayAdmissionPolicy, ReplayJournalFrame,
-    ReplayJournalReceipt, ReplayStreamBinding,
+    ReplayStreamBinding,
 };
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("metadata");
 const FRAMES: TableDefinition<u64, &[u8]> = TableDefinition::new("frames");
-const FORMAT: u32 = 1;
-const AUTHORIZED_FORMAT: u32 = 3;
+const FORMAT: u32 = 3;
+/// The admission record of a journal no authority has decided on yet.
+const NO_DECISION: &[u8] = &[];
 
 mod authority;
 pub use authority::{ReplayAuthorityRefresh, ReplayAuthoritySession, MAX_AUTHORITY_VALIDITY};
@@ -215,6 +218,7 @@ impl ReplayJournal {
                 }
                 .encode_to_vec();
                 meta.insert("header", header.as_slice()).map_err(storage)?;
+                meta.insert("admission", NO_DECISION).map_err(storage)?;
             }
             tx.open_table(FRAMES).map_err(storage)?;
             tx.commit().map_err(storage)?;
@@ -231,7 +235,7 @@ impl ReplayJournal {
         frames: &impl ReadableTable<u64, &'static [u8]>,
     ) -> Result<ReplayJournalHeader, Status> {
         let header: ReplayJournalHeader = decode(bytes)?;
-        if !matches!(header.format_version, FORMAT | AUTHORIZED_FORMAT)
+        if header.format_version != FORMAT
             || header.binding.as_ref() != Some(&self.binding)
             || header.binding_sha256 != self.digest
         {
@@ -287,6 +291,7 @@ impl ReplayJournal {
         }
         Ok(frame)
     }
+    #[cfg(any(test, feature = "tls"))]
     fn receipt(&self, frame: &ReplayJournalFrame, replayed: bool) -> ReplayJournalReceipt {
         ReplayJournalReceipt {
             binding_sha256: self.digest.clone(),
@@ -312,12 +317,6 @@ impl ReplayJournal {
         Ok(header)
     }
 
-    /// Atomically persist the frame and acceptance frontier. An exact retry
-    /// returns its original proof even after later frames have been accepted.
-    pub fn accept(&self, frame: &ReplayJournalFrame) -> Result<ReplayJournalReceipt, Status> {
-        self.accept_inner(frame, None)
-    }
-
     /// Admit an mTLS request using the verified leaf certificate supplied by
     /// tonic's transport. No header, bearer token or caller-supplied digest is
     /// an authenticated peer. The listener must verify its configured client CA.
@@ -333,13 +332,14 @@ impl ReplayJournal {
             Status::unauthenticated("replay requires a verified client certificate")
         })?;
         let fingerprint = hash(b"", certificate.as_ref());
-        self.accept_inner(request.get_ref(), Some(&fingerprint))
+        self.accept_inner(request.get_ref(), &fingerprint)
     }
 
+    #[cfg(any(test, feature = "tls"))]
     fn accept_inner(
         &self,
         frame: &ReplayJournalFrame,
-        peer: Option<&[u8]>,
+        peer: &[u8],
     ) -> Result<ReplayJournalReceipt, Status> {
         validate_frame(&self.digest, frame)?;
         let encoded = frame.encode_to_vec();
@@ -360,9 +360,7 @@ impl ReplayJournal {
             )?;
             let policy = self.read_policy(&header, &meta)?;
             self.authorize_peer(policy.as_ref(), peer, header.admission_fenced)?;
-            if peer.is_some() {
-                authority.check(self.authority_now(), header.format_version)?;
-            }
+            authority.check(self.authority_now())?;
             if frame.sequence <= header.accepted_sequence {
                 let held = self.read_frame(&frames, frame.sequence)?;
                 if held != *frame {
@@ -370,9 +368,7 @@ impl ReplayJournal {
                         "replay sequence already names different content",
                     ));
                 }
-                if peer.is_some() {
-                    authority.check(self.authority_now(), header.format_version)?;
-                }
+                authority.check(self.authority_now())?;
                 return Ok(self.receipt(frame, true));
             }
             if header.accepted_sequence.checked_add(1) != Some(frame.sequence)
@@ -390,9 +386,7 @@ impl ReplayJournal {
             let header = header.encode_to_vec();
             meta.insert("header", header.as_slice()).map_err(storage)?;
         }
-        if peer.is_some() {
-            authority.check(self.authority_now(), AUTHORIZED_FORMAT)?;
-        }
+        authority.check(self.authority_now())?;
         tx.commit().map_err(storage)?;
         Ok(self.receipt(frame, false))
     }
@@ -432,8 +426,6 @@ impl ReplayJournal {
                     }
                     return Ok(());
                 }
-            } else if header.accepted_sequence != 0 {
-                return Err(Status::failed_precondition("cannot authorize a journal with unassigned accepted history; start a new assignment"));
             }
             if header.admission_fenced && policy.enabled && self.matches_live_assignment(policy) {
                 return Err(Status::failed_precondition(
@@ -441,7 +433,6 @@ impl ReplayJournal {
                 ));
             }
             header.admission_fenced |= !self.matches_live_assignment(policy);
-            header.format_version = AUTHORIZED_FORMAT;
             meta.insert("header", header.encode_to_vec().as_slice())
                 .map_err(storage)?;
             meta.insert("admission", policy.encode_to_vec().as_slice())
@@ -496,35 +487,37 @@ impl ReplayJournal {
         header: &ReplayJournalHeader,
         meta: &impl ReadableTable<&'static str, &'static [u8]>,
     ) -> Result<Option<ReplayAdmissionPolicy>, Status> {
-        let stored = meta.get("admission").map_err(storage)?;
-        match (header.format_version, stored) {
-            (FORMAT, None) if !header.admission_fenced => Ok(None),
-            (AUTHORIZED_FORMAT, Some(stored)) => {
-                // Bound allocation before protobuf decode, including tampered files.
-                if stored.value().len() > 8192 {
-                    return Err(Status::data_loss(
-                        "stored replay admission policy exceeds its bound",
-                    ));
-                }
-                let policy: ReplayAdmissionPolicy = decode(stored.value())?;
-                Self::validate_policy(&policy)
-                    .map_err(|e| Status::data_loss(e.message().to_string()))?;
-                if policy.binding_sha256 != self.digest {
-                    return Err(Status::data_loss(
-                        "stored replay policy names another assignment",
-                    ));
-                }
-                if !header.admission_fenced && !self.matches_live_assignment(&policy) {
-                    return Err(Status::data_loss(
-                        "replay policy fencing observation lacks its permanent fence",
-                    ));
-                }
-                Ok(Some(policy))
+        let stored = meta
+            .get("admission")
+            .map_err(storage)?
+            .ok_or_else(|| Status::data_loss("replay journal admission record is missing"))?;
+        if stored.value().is_empty() {
+            if header.admission_fenced || header.accepted_sequence != 0 {
+                return Err(Status::data_loss(
+                    "replay journal holds a fence or history without an authority decision",
+                ));
             }
-            _ => Err(Status::data_loss(
-                "replay journal format and admission policy disagree",
-            )),
+            return Ok(None);
         }
+        // Bound allocation before protobuf decode, including tampered files.
+        if stored.value().len() > 8192 {
+            return Err(Status::data_loss(
+                "stored replay admission policy exceeds its bound",
+            ));
+        }
+        let policy: ReplayAdmissionPolicy = decode(stored.value())?;
+        Self::validate_policy(&policy).map_err(|e| Status::data_loss(e.message().to_string()))?;
+        if policy.binding_sha256 != self.digest {
+            return Err(Status::data_loss(
+                "stored replay policy names another assignment",
+            ));
+        }
+        if !header.admission_fenced && !self.matches_live_assignment(&policy) {
+            return Err(Status::data_loss(
+                "replay policy fencing observation lacks its permanent fence",
+            ));
+        }
+        Ok(Some(policy))
     }
 
     fn matches_live_assignment(&self, policy: &ReplayAdmissionPolicy) -> bool {
@@ -537,33 +530,26 @@ impl ReplayJournal {
             && policy.target_write_epoch == self.binding.target_write_epoch
     }
 
+    #[cfg(any(test, feature = "tls"))]
     fn authorize_peer(
         &self,
         policy: Option<&ReplayAdmissionPolicy>,
-        peer: Option<&[u8]>,
+        peer: &[u8],
         permanently_fenced: bool,
     ) -> Result<(), Status> {
-        match (policy, peer) {
-            (None, None) => Ok(()), // Explicit trusted local kernel, format 1 only.
-            (None, Some(_)) => Err(Status::permission_denied(
-                "replay assignment has no installed authority decision",
-            )),
-            (Some(_), None) => Err(Status::unauthenticated(
-                "authorized replay journal requires a verified peer",
-            )),
-            (Some(policy), Some(peer)) => {
-                if permanently_fenced
-                    || !policy.enabled
-                    || !policy.source_certificate_sha256.iter().any(|p| p == peer)
-                    || !self.matches_live_assignment(policy)
-                {
-                    return Err(Status::permission_denied(
-                        "replay peer or current assignment fencing state is not authorized",
-                    ));
-                }
-                Ok(())
-            }
+        let policy = policy.ok_or_else(|| {
+            Status::permission_denied("replay assignment has no installed authority decision")
+        })?;
+        if permanently_fenced
+            || !policy.enabled
+            || !policy.source_certificate_sha256.iter().any(|p| p == peer)
+            || !self.matches_live_assignment(policy)
+        {
+            return Err(Status::permission_denied(
+                "replay peer or current assignment fencing state is not authorized",
+            ));
         }
+        Ok(())
     }
 
     /// Bounded snapshot pagination. No record can exceed the caller's byte
@@ -639,3 +625,7 @@ impl ReplayJournal {
 
 #[cfg(test)]
 mod admission_tests;
+#[cfg(test)]
+mod journal_recovery_tests;
+#[cfg(test)]
+mod journal_tests;

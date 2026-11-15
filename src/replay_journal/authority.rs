@@ -1,7 +1,7 @@
 //! Process-local authority freshness. A persisted decision is a rollback floor,
 //! not proof that a disconnected receiver still has permission to accept writes.
 
-use super::{ReplayAdmissionPolicy, ReplayJournal, Status, AUTHORIZED_FORMAT};
+use super::{ReplayAdmissionPolicy, ReplayJournal, Status};
 use std::sync::MutexGuard;
 use std::time::{Duration, Instant};
 
@@ -34,11 +34,9 @@ impl Freshness {
         self.refresh = 0;
         Ok(())
     }
-    pub(super) fn check(&self, now: Instant, format: u32) -> Result<(), Status> {
-        if self.exhausted
-            || format != AUTHORIZED_FORMAT
-            || !self.deadline.is_some_and(|deadline| now < deadline)
-        {
+    #[cfg(any(test, feature = "tls"))]
+    pub(super) fn check(&self, now: Instant) -> Result<(), Status> {
+        if self.exhausted || !self.deadline.is_some_and(|deadline| now < deadline) {
             return Err(Status::unavailable(
                 "replay requires a fresh live control-authority decision",
             ));

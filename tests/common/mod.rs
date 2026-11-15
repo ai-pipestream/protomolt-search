@@ -144,7 +144,7 @@ pub fn access_policy(
 ) -> pipestream_search::pb::AccessPolicy {
     use pipestream_search::pb::{AccessPolicy, CollectionGrant, CollectionResource};
     AccessPolicy {
-        format_version: 1,
+        format_version: 3,
         revision: 1,
         resources: collections
             .iter()

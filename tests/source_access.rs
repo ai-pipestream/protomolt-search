@@ -46,7 +46,7 @@ fn binding(workspace: &str) -> SourceResourceBinding {
 
 fn policy(revision: u64, workspace: &str) -> AccessPolicy {
     AccessPolicy {
-        format_version: 1,
+        format_version: 3,
         revision,
         resources: vec![CollectionResource {
             workspace: workspace.into(),

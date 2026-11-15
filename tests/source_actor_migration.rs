@@ -62,7 +62,7 @@ fn policy(revision: u64, admin: bool, writer_a: bool, writer_b: bool) -> AccessP
         }
     }
     AccessPolicy {
-        format_version: 1,
+        format_version: 3,
         revision,
         resources: vec![CollectionResource {
             workspace: "workspace".into(),

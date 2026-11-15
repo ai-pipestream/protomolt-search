@@ -12,9 +12,9 @@ now apply to these same private-shard routes.
 
 ## Protobuf authority contract
 
-`AccessPolicy.format_version = 2` or `3` permits
+`AccessPolicy.format_version = 3` permits
 `CollectionGrant.document_visibility`, a `DocumentVisibility` containing one
-required, validated `FilterExpr`. Format 1 refuses this field. Absent visibility
+required, validated `FilterExpr`. Other format versions are refused. Absent visibility
 retains unrestricted document access; a present but empty message is invalid.
 A restricted grant must include the `SEARCH` action. Any other actions explicitly
 listed on the same grant remain independent; this predicate does not restrict
@@ -23,7 +23,7 @@ writes or administration. No action is implied by another.
 For example, this protobuf text-format policy grants one reader a document view:
 
 ```text
-format_version: 2
+format_version: 3
 revision: 1
 resources { workspace: "phone" collection: "" }
 grants {

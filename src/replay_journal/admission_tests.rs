@@ -87,32 +87,23 @@ fn policy_is_required_for_peers_and_cannot_be_bypassed_locally() {
     let journal = ReplayJournal::create(&dir.path(), binding()).unwrap();
     assert_eq!(
         journal
-            .accept_inner(&frame(), Some(&[10; 32]))
+            .accept_inner(&frame(), &[10; 32])
             .unwrap_err()
             .code(),
         tonic::Code::PermissionDenied
     );
     journal.publish_authorization(&policy(1)).unwrap();
-    assert_eq!(journal.head().unwrap().format_version, AUTHORIZED_FORMAT);
-    assert_eq!(
-        journal.accept(&frame()).unwrap_err().code(),
-        tonic::Code::Unauthenticated
-    );
+    assert_eq!(journal.head().unwrap().format_version, FORMAT);
     assert_eq!(
         journal
-            .accept_inner(&frame(), Some(&[11; 32]))
+            .accept_inner(&frame(), &[11; 32])
             .unwrap_err()
             .code(),
         tonic::Code::PermissionDenied
     );
     assert_eq!(journal.head().unwrap().accepted_sequence, 0);
     let _session = grant_live(&journal, &policy(1));
-    assert!(
-        journal
-            .accept_inner(&frame(), Some(&[10; 32]))
-            .unwrap()
-            .durable
-    );
+    assert!(journal.accept_inner(&frame(), &[10; 32]).unwrap().durable);
 }
 
 #[test]
@@ -147,7 +138,7 @@ fn policy_retries_are_exact_and_rollback_or_authority_replacement_refuses() {
         tonic::Code::FailedPrecondition
     );
     let _session = grant_live(&journal, &policy(2));
-    journal.accept_inner(&frame(), Some(&[10; 32])).unwrap();
+    journal.accept_inner(&frame(), &[10; 32]).unwrap();
 }
 
 #[test]
@@ -158,7 +149,7 @@ fn current_fences_and_device_residency_revoke_even_exact_retries_after_restart()
         journal.publish_authorization(&policy(1)).unwrap();
         let accepted = {
             let _session = grant_live(&journal, &policy(1));
-            journal.accept_inner(&frame(), Some(&[10; 32])).unwrap()
+            journal.accept_inner(&frame(), &[10; 32]).unwrap()
         };
         let mut denied = policy(2);
         match case {
@@ -178,7 +169,7 @@ fn current_fences_and_device_residency_revoke_even_exact_retries_after_restart()
         let journal = ReplayJournal::open(&dir.path(), binding()).unwrap();
         assert_eq!(
             journal
-                .accept_inner(&frame(), Some(&[10; 32]))
+                .accept_inner(&frame(), &[10; 32])
                 .unwrap_err()
                 .code(),
             tonic::Code::PermissionDenied,
@@ -197,7 +188,7 @@ fn current_fences_and_device_residency_revoke_even_exact_retries_after_restart()
         } else {
             let _session = grant_live(&journal, &policy(3));
             assert_eq!(
-                journal.accept_inner(&frame(), Some(&[10; 32])).unwrap(),
+                journal.accept_inner(&frame(), &[10; 32]).unwrap(),
                 ReplayJournalReceipt {
                     replayed: true,
                     ..accepted.clone()
@@ -217,7 +208,7 @@ fn unrelated_policy_revision_does_not_invalidate_an_unchanged_assignment() {
         .unwrap()
         .publish(&policy(100))
         .unwrap();
-    let receipt = journal.accept_inner(&frame(), Some(&[10; 32])).unwrap();
+    let receipt = journal.accept_inner(&frame(), &[10; 32]).unwrap();
     assert!(receipt.accepted && !receipt.searchable);
     assert_eq!(
         journal.head().unwrap().binding.unwrap().topology_revision,
@@ -250,7 +241,7 @@ fn invalid_publication_cannot_replace_an_existing_revocation() {
         );
         assert_eq!(
             journal
-                .accept_inner(&frame(), Some(&[10; 32]))
+                .accept_inner(&frame(), &[10; 32])
                 .unwrap_err()
                 .code(),
             tonic::Code::PermissionDenied
@@ -259,26 +250,15 @@ fn invalid_publication_cannot_replace_an_existing_revocation() {
 }
 
 #[test]
-fn old_local_history_cannot_be_relabelled_as_authorized() {
-    let dir = Directory::new();
-    let journal = ReplayJournal::create(&dir.path(), binding()).unwrap();
-    journal.accept(&frame()).unwrap();
-    assert_eq!(
-        journal
-            .publish_authorization(&policy(1))
-            .unwrap_err()
-            .code(),
-        tonic::Code::FailedPrecondition
-    );
-    assert_eq!(journal.head().unwrap().format_version, FORMAT);
-}
-
-#[test]
-fn missing_policy_or_format_downgrade_never_restores_local_access() {
-    for case in 0..2 {
+fn a_missing_policy_a_retired_format_or_undecided_history_is_refused_on_open() {
+    for case in 0..3 {
         let dir = Directory::new();
         let journal = ReplayJournal::create(&dir.path(), binding()).unwrap();
         journal.publish_authorization(&policy(1)).unwrap();
+        if case == 2 {
+            let _session = grant_live(&journal, &policy(1));
+            journal.accept_inner(&frame(), &[10; 32]).unwrap();
+        }
         drop(journal);
         let db = Database::open(dir.path()).unwrap();
         let tx = db.begin_write().unwrap();
@@ -286,23 +266,22 @@ fn missing_policy_or_format_downgrade_never_restores_local_access() {
             let mut meta = tx.open_table(META).unwrap();
             if case == 0 {
                 meta.remove("admission").unwrap();
+            } else if case == 2 {
+                meta.insert("admission", NO_DECISION).unwrap();
             } else {
                 let mut header: ReplayJournalHeader =
                     decode(meta.get("header").unwrap().unwrap().value()).unwrap();
-                header.format_version = FORMAT;
+                header.format_version = 1;
                 meta.insert("header", header.encode_to_vec().as_slice())
                     .unwrap();
             }
         }
         tx.commit().unwrap();
         drop(db);
-        assert_eq!(
-            ReplayJournal::open(&dir.path(), binding())
-                .err()
-                .unwrap()
-                .code(),
-            tonic::Code::DataLoss
-        );
+        let refused = ReplayJournal::open(&dir.path(), binding()).err().unwrap();
+        use tonic::Code;
+        let expected = [Code::DataLoss, Code::FailedPrecondition, Code::DataLoss];
+        assert_eq!(refused.code(), expected[case]);
     }
 }
 
@@ -318,7 +297,7 @@ fn committed_revocation_fences_all_concurrent_deliveries() {
             let barrier = barrier.clone();
             std::thread::spawn(move || {
                 barrier.wait();
-                journal.accept_inner(&frame(), Some(&[10; 32]))
+                journal.accept_inner(&frame(), &[10; 32])
             })
         })
         .collect();
@@ -464,7 +443,7 @@ fn persisted_allow_decision_is_not_live_authority_after_reopen() {
     let journal = ReplayJournal::open(&dir.path(), binding()).unwrap();
     assert_eq!(
         journal
-            .accept_inner(&frame(), Some(&[10; 32]))
+            .accept_inner(&frame(), &[10; 32])
             .unwrap_err()
             .code(),
         tonic::Code::Unavailable
@@ -481,7 +460,7 @@ fn session_drop_disconnect_and_late_refreshes_cannot_restore_permission() {
     journal.suspend_authorization().unwrap();
     assert_eq!(
         journal
-            .accept_inner(&frame(), Some(&[10; 32]))
+            .accept_inner(&frame(), &[10; 32])
             .unwrap_err()
             .code(),
         tonic::Code::Unavailable
@@ -493,11 +472,11 @@ fn session_drop_disconnect_and_late_refreshes_cannot_restore_permission() {
     assert!(old.begin_refresh(MAX_AUTHORITY_VALIDITY).is_err());
     let current = grant_live(&journal, &policy(2));
     drop(old); // A superseded subscription must not close its replacement.
-    journal.accept_inner(&frame(), Some(&[10; 32])).unwrap();
+    journal.accept_inner(&frame(), &[10; 32]).unwrap();
     drop(current);
     assert_eq!(
         journal
-            .accept_inner(&frame(), Some(&[10; 32]))
+            .accept_inner(&frame(), &[10; 32])
             .unwrap_err()
             .code(),
         tonic::Code::Unavailable
@@ -505,7 +484,7 @@ fn session_drop_disconnect_and_late_refreshes_cannot_restore_permission() {
     let _empty_session = journal.authority_session().unwrap();
     assert_eq!(
         journal
-            .accept_inner(&frame(), Some(&[10; 32]))
+            .accept_inner(&frame(), &[10; 32])
             .unwrap_err()
             .code(),
         tonic::Code::Unavailable
@@ -532,11 +511,11 @@ fn delayed_refresh_uses_request_start_and_expiry_fences_exact_retries() {
     let refresh = session.begin_refresh(Duration::from_secs(10)).unwrap();
     elapsed.store(8, Ordering::SeqCst);
     refresh.publish(&policy(1)).unwrap();
-    journal.accept_inner(&frame(), Some(&[10; 32])).unwrap();
+    journal.accept_inner(&frame(), &[10; 32]).unwrap();
     elapsed.store(10, Ordering::SeqCst);
     assert_eq!(
         journal
-            .accept_inner(&frame(), Some(&[10; 32]))
+            .accept_inner(&frame(), &[10; 32])
             .unwrap_err()
             .code(),
         tonic::Code::Unavailable
@@ -549,7 +528,7 @@ fn delayed_refresh_uses_request_start_and_expiry_fences_exact_retries() {
     );
     assert_eq!(
         journal
-            .accept_inner(&frame(), Some(&[10; 32]))
+            .accept_inner(&frame(), &[10; 32])
             .unwrap_err()
             .code(),
         tonic::Code::Unavailable
@@ -569,7 +548,7 @@ fn superseded_reply_cannot_replace_a_newer_proof_even_with_a_higher_revision() {
         earlier.publish(&policy(100)).unwrap_err().code(),
         tonic::Code::Unavailable
     );
-    journal.accept_inner(&frame(), Some(&[10; 32])).unwrap();
+    journal.accept_inner(&frame(), &[10; 32]).unwrap();
     session
         .begin_refresh(MAX_AUTHORITY_VALIDITY)
         .unwrap()
@@ -595,7 +574,7 @@ fn offline_policy_installation_and_failed_live_replacement_close_permission() {
     );
     assert_eq!(
         journal
-            .accept_inner(&frame(), Some(&[10; 32]))
+            .accept_inner(&frame(), &[10; 32])
             .unwrap_err()
             .code(),
         tonic::Code::Unavailable
@@ -608,7 +587,7 @@ fn offline_policy_installation_and_failed_live_replacement_close_permission() {
     journal.publish_authorization(&policy(1)).unwrap();
     assert_eq!(
         journal
-            .accept_inner(&frame(), Some(&[10; 32]))
+            .accept_inner(&frame(), &[10; 32])
             .unwrap_err()
             .code(),
         tonic::Code::Unavailable
@@ -643,7 +622,7 @@ fn refresh_validity_is_bounded_and_checked_after_waiting_for_admission() {
         let barrier = barrier.clone();
         std::thread::spawn(move || {
             barrier.wait();
-            journal.accept_inner(&frame(), Some(&[10; 32]))
+            journal.accept_inner(&frame(), &[10; 32])
         })
     };
     barrier.wait();

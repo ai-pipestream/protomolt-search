@@ -57,7 +57,7 @@ fn policy(alice_ingests: bool) -> AccessPolicy {
         alice.push(AccessAction::Ingest);
     }
     AccessPolicy {
-        format_version: 1,
+        format_version: 3,
         revision: 1,
         resources: vec![CollectionResource {
             workspace: "workspace-a".into(),

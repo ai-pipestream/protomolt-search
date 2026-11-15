@@ -50,7 +50,7 @@ ingest_docs_per_sec = 500  # 0: unlimited
 admin = false            # diagnostics also require all served collections' admin grants
 
 [policy]
-format_version = 1
+format_version = 3
 revision = 1
 [[policy.resources]]
 workspace = "legal"

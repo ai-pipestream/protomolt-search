@@ -59,7 +59,7 @@ fn grant(principal: &str, collection: &str, action: AccessAction) -> CollectionG
 
 fn policy(revision: u64) -> AccessPolicy {
     AccessPolicy {
-        format_version: 1,
+        format_version: 3,
         revision,
         resources: ["books", "music"]
             .map(|collection| CollectionResource {
