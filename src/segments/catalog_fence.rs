@@ -165,10 +165,13 @@ impl SegmentCatalog {
 
     fn check_serving_snapshot(&self, set: &OpenedSegmentSet) -> Result<(), String> {
         self.check_disk_identity()?;
+        // A catalog before its first publication has the default empty manifest.
+        // The identity check above still rejects a missing published manifest.
+        let durable = Self::read_manifest(&self.root)?.unwrap_or_default();
         if self.publication_is_uncertain()
             || set.root() != self.root
             || set.manifest() != self.snapshot().manifest()
-            || Self::read_manifest(&self.root)?.as_ref() != Some(set.manifest())
+            || &durable != set.manifest()
         {
             return Err("serving snapshot is not the committed catalog generation".into());
         }
@@ -274,5 +277,37 @@ impl SegmentCatalog {
         *current = Arc::clone(&opened);
         *pending = None;
         Ok(opened)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn virgin_catalog_is_current_but_a_missing_publication_is_not() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "catalog-initial-publication-{}-{nonce}",
+            std::process::id()
+        ));
+        let catalog = SegmentCatalog::open(&root).unwrap();
+        assert!(SegmentCatalog::read_manifest(&root).unwrap().is_none());
+        catalog
+            .with_current_snapshot(&catalog.snapshot(), || Ok(()))
+            .unwrap();
+        let published = catalog.commit_current(1).unwrap();
+        catalog
+            .with_current_snapshot(&published, || Ok(()))
+            .unwrap();
+        std::fs::remove_file(SegmentCatalog::manifest_path(&root)).unwrap();
+        let error = catalog
+            .with_current_snapshot(&published, || Ok(()))
+            .unwrap_err();
+        assert!(error.contains("catalog generation changed"), "{error}");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
