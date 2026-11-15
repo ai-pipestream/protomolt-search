@@ -29,6 +29,8 @@ pub use rewrite_proof::{
     proof_batch_rows_for_budget, BATCH_ROW_BYTES, CERTIFICATE_FORMAT, DEFAULT_PROOF_BATCH_ROWS,
     MAX_BATCH_ROWS as MAX_PROOF_BATCH_ROWS,
 };
+mod catalog_fence;
+pub(crate) use catalog_fence::CatalogCutover;
 mod row_update;
 pub use row_update::SegmentRowRetirement;
 
@@ -1024,6 +1026,7 @@ pub struct SegmentCatalog {
     current: Arc<RwLock<Arc<OpenedSegmentSet>>>,
     update: Arc<Mutex<()>>,
     pending_publication: Arc<Mutex<Option<SegmentSetManifest>>>,
+    expected_manifest: Arc<Mutex<Option<SegmentSetManifest>>>,
     /// How every snapshot this catalog publishes serves vector images.
     load: VectorLoad,
 }
@@ -1033,6 +1036,7 @@ impl SegmentCatalog {
         &self,
         owner: Option<&crate::pb::storage::SourceIndexOwner>,
     ) -> Result<(), String> {
+        self.check_disk_identity()?;
         let proposed = owner.map(SegmentSourceOwner::encode).transpose()?;
         let current = self.snapshot();
         let disk = Self::read_manifest(&self.root)?;
@@ -1050,24 +1054,6 @@ impl SegmentCatalog {
             }
         }
         Ok(())
-    }
-
-    pub fn open(root: impl Into<PathBuf>) -> Result<Self, String> {
-        Self::open_with(root, VectorLoad::default())
-    }
-
-    pub fn open_with(root: impl Into<PathBuf>, load: VectorLoad) -> Result<Self, String> {
-        let root = root.into();
-        std::fs::create_dir_all(root.join("segments"))
-            .map_err(|error| format!("mkdir segment root {}: {error}", root.display()))?;
-        let current = OpenedSegmentSet::open_with(root.clone(), load)?;
-        Ok(Self {
-            root,
-            current: Arc::new(RwLock::new(Arc::new(current))),
-            update: Arc::new(Mutex::new(())),
-            pending_publication: Arc::new(Mutex::new(None)),
-            load,
-        })
     }
 
     pub(crate) fn publication_is_uncertain(&self) -> bool {
@@ -1134,49 +1120,6 @@ impl SegmentCatalog {
         record(&current)
     }
 
-    /// A catalog over `root` whose current set is `manifest` — segments
-    /// already staged under `root/segments/` by [`stage_segments`] — with
-    /// NOTHING written to `segments.json`: the shadow of an online
-    /// compaction (`docs/mutations.md`), which serves and tails the log
-    /// in memory until [`Self::commit_current`] publishes it at cutover.
-    /// The live catalog over the same root is untouched until then.
-    pub fn open_staged(
-        root: impl Into<PathBuf>,
-        manifest: SegmentSetManifest,
-        load: VectorLoad,
-    ) -> Result<Self, String> {
-        let root = root.into();
-        let current = OpenedSegmentSet::open_manifest(root.clone(), manifest, load)?;
-        Ok(Self {
-            root,
-            current: Arc::new(RwLock::new(Arc::new(current))),
-            update: Arc::new(Mutex::new(())),
-            pending_publication: Arc::new(Mutex::new(None)),
-            load,
-        })
-    }
-
-    /// Publish the current set as it stands, at `epoch`, by writing
-    /// `segments.json` atomically: the manifest swap of a compaction
-    /// cutover. `epoch` must exceed the set's own, so the on-disk epoch
-    /// sequence stays monotone across the swap.
-    pub fn commit_current(&self, epoch: u64) -> Result<Arc<OpenedSegmentSet>, String> {
-        let _guard = self
-            .update
-            .lock()
-            .map_err(|_| "segment update lock poisoned".to_string())?;
-        let current = self.snapshot();
-        if epoch <= current.epoch() {
-            return Err(format!(
-                "compaction commit epoch {epoch} is not newer than the staged set's {}",
-                current.epoch()
-            ));
-        }
-        let mut manifest = current.published_manifest();
-        manifest.epoch = epoch;
-        self.publish(manifest)
-    }
-
     /// The catalog root's set manifest as written on disk, `None` when the
     /// root has none yet.
     pub fn read_manifest(root: &Path) -> Result<Option<SegmentSetManifest>, String> {
@@ -1234,6 +1177,7 @@ impl SegmentCatalog {
             .update
             .lock()
             .map_err(|_| "segment update lock poisoned".to_string())?;
+        self.check_disk_identity()?;
         let current = self.snapshot();
         match current.binding() {
             Some(held) if held != binding => {
@@ -1260,6 +1204,7 @@ impl SegmentCatalog {
             .update
             .lock()
             .map_err(|_| "segment update lock poisoned".to_string())?;
+        self.check_disk_identity()?;
         validate_segment_id(source.segment_id)?;
         if Self::segment_dir(&self.root, source.segment_id).exists() {
             let manifest = Self::read_manifest(&self.root)?.ok_or_else(|| {
@@ -1560,72 +1505,6 @@ impl SegmentCatalog {
             partition.map(|spec| spec.column.to_string()),
         )?;
         Ok(WalCompactionResult { snapshot, output })
-    }
-
-    fn publish(&self, manifest: SegmentSetManifest) -> Result<Arc<OpenedSegmentSet>, String> {
-        self.check_source_owner(None)?;
-        if self
-            .pending_publication
-            .lock()
-            .map_err(|_| "segment publication lock poisoned".to_string())?
-            .as_ref()
-            .is_some_and(|held| held != &manifest)
-        {
-            return Err(
-                "segment publication is uncertain; retry the same manifest or reopen for recovery"
-                    .into(),
-            );
-        }
-        let current = self.snapshot();
-        let opened = Arc::new(OpenedSegmentSet::open_manifest_reusing(
-            self.root.clone(),
-            manifest,
-            self.load,
-            Some(&current),
-        )?);
-        self.publish_opened(opened)
-    }
-
-    /// The candidate is fully validated before acquiring the final pointer
-    /// lock. After its manifest sync succeeds, publishing this Arc cannot fail.
-    fn publish_opened(
-        &self,
-        opened: Arc<OpenedSegmentSet>,
-    ) -> Result<Arc<OpenedSegmentSet>, String> {
-        self.publish_owned(opened, None)
-    }
-
-    fn publish_owned(
-        &self,
-        opened: Arc<OpenedSegmentSet>,
-        owner: Option<&crate::pb::storage::SourceIndexOwner>,
-    ) -> Result<Arc<OpenedSegmentSet>, String> {
-        self.check_source_owner(owner)?;
-        if opened.manifest().source_owner != owner.map(SegmentSourceOwner::encode).transpose()? {
-            return Err("source-managed index owner cannot be added, changed or removed by a legacy publication".into());
-        }
-        let manifest = opened.manifest();
-        let mut pending = self
-            .pending_publication
-            .lock()
-            .map_err(|_| "segment publication lock poisoned".to_string())?;
-        if pending.as_ref().is_some_and(|held| held != manifest) {
-            return Err(
-                "segment publication is uncertain; retry the same manifest or reopen for recovery"
-                    .into(),
-            );
-        }
-        let mut current = self
-            .current
-            .write()
-            .map_err(|_| "segment catalog lock poisoned".to_string())?;
-        if let Err(error) = write_json_atomic(&self.root.join(SET_FILE), manifest) {
-            *pending = Some(manifest.clone());
-            return Err(error);
-        }
-        *current = Arc::clone(&opened);
-        *pending = None;
-        Ok(opened)
     }
 }
 

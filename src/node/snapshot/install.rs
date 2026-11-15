@@ -2,6 +2,13 @@
 
 use crate::node::*;
 
+#[path = "segment_cutover.rs"]
+mod segment_cutover;
+#[path = "segment_prepare.rs"]
+mod segment_prepare;
+
+use segment_prepare::{PreparedSegments, SegmentPaths};
+
 impl NodeServiceImpl {
     /// Receive one snapshot image into the staging generation directory
     /// (`vector.index`, `vectors.f32`, `documents.bm25`, and `live-docs.bin`
@@ -484,352 +491,40 @@ impl NodeServiceImpl {
         Ok(response)
     }
 
-    /// Install a staged segment-catalog snapshot: validate the catalog
-    /// and the shard-level sidecars, then swap the catalog directory into
-    /// place with one rename (the previous catalog goes aside first, the
-    /// crash window is covered by [`recover_segments_swap`]) and reopen
-    /// the segmented shard over it. The shard-level exact-vector and
-    /// live-row sidecars move after the catalog; a crash between the two
-    /// leaves a catalog whose sidecars disagree with it, which the next
-    /// open refuses by name rather than serving.
+    /// Validate the incoming generation before taking the catalog publication fence.
     pub(in crate::node) fn apply_segment_snapshot(
         &self,
         tmp_dir: &Path,
         manifest: &RepositoryManifest,
     ) -> Result<InstallSnapshotResponse, Status> {
-        read_shard(&self.state).check_legacy_mutation()?;
+        let _seal = self.seal_lock.lock().expect("seal lock poisoned");
+        {
+            let guard = read_shard(&self.state);
+            guard.check_legacy_mutation()?;
+            if self.config.layout != Layout::Segments || guard.generation.is_some() {
+                return Err(Status::failed_precondition(
+                    "segment-catalog snapshots require a segment-layout shard, not --layout=single-image",
+                ));
+            }
+        }
         let path = self
             .config
             .index_path
             .as_ref()
-            .expect("handler requires index_path")
-            .clone();
-        if self.config.layout != Layout::Segments {
-            return Err(Status::failed_precondition(
-                "this shard is configured --layout=single-image; a segment-catalog snapshot \
-                 installs only on a segment-layout shard",
-            ));
-        }
-        {
-            let guard = read_shard(&self.state);
-            if guard.generation.is_some() {
-                return Err(Status::failed_precondition(
-                    "this shard serves an installed single-image generation; a segment-catalog \
-                     snapshot installs only on a segment-layout shard (layouts do not mix)",
-                ));
-            }
-        }
-        let catalog_tmp = tmp_dir.join(CATALOG_DIR);
-        if !catalog_tmp.join("segments.json").exists() {
-            return Err(Status::invalid_argument(
-                "segment-layout snapshot has no catalog/segments.json",
-            ));
-        }
-        let staged = crate::segments::OpenedSegmentSet::open_with(
-            &catalog_tmp,
-            self.config.vector_load(),
-        )
-        .map_err(|e| Status::invalid_argument(format!("snapshot catalog is invalid: {e}")))?;
-        if staged.manifest().source_owner.is_some() {
-            return Err(Status::failed_precondition(
-                "source-managed index snapshots require a coherent source-catalog restore",
-            ));
-        }
-        let incoming = (0..staged.len())
-            .find_map(|i| staged.vector(i))
-            .map(|vector| vector.descriptor());
-        let vector_tmp = tmp_dir.join("vector.index");
-        let exact_tmp = tmp_dir.join("vectors.f32");
-        let live_tmp = tmp_dir.join("live-docs.bin");
-        let plain_image = if vector_tmp.exists() {
-            let mut loaded =
-                VectorIndex::load(&self.config.vector_backend, &vector_tmp).map_err(|e| {
-                    Status::invalid_argument(format!(
-                        "snapshot is not a valid vector backend image: {e}"
-                    ))
-                })?;
-            loaded
-                .prepare()
-                .map_err(|e| Status::invalid_argument(format!("snapshot image: {e}")))?;
-            Some(loaded)
-        } else {
-            None
-        };
-        let incoming = incoming.or_else(|| plain_image.as_ref().map(|i| i.descriptor()));
-        {
-            let guard = read_shard(&self.state);
-            let serving_kind = guard
-                .index
-                .as_ref()
-                .map(|index| index.descriptor().backend_kind)
-                .or_else(|| {
-                    guard
-                        .wal
-                        .as_ref()
-                        .map(|wal| wal.manifest().vector_backend.clone())
-                        .filter(|kind| !kind.is_empty())
-                });
-            if let (Some(kind), Some(incoming)) = (serving_kind, incoming.as_ref()) {
-                if kind != incoming.backend_kind {
-                    return Err(Status::failed_precondition(format!(
-                        "snapshot image is a {:?} image but this shard serves {kind:?}; a \
-                         snapshot installs only from the same provider",
-                        incoming.backend_kind
-                    )));
-                }
-            }
-            if let (Some(serving), Some(incoming)) = (
-                guard.index.as_ref().map(|index| index.descriptor()),
-                incoming.as_ref(),
-            ) {
-                if serving.scoring_fingerprint != incoming.scoring_fingerprint {
-                    return Err(Status::failed_precondition(format!(
-                        "snapshot image scores under {}/{} but this shard serves {}/{}; a \
-                         snapshot installs only from the same provider state (calibration \
-                         included), or the fleet would score in two spaces",
-                        incoming.backend_kind,
-                        incoming.scoring_fingerprint,
-                        serving.backend_kind,
-                        serving.scoring_fingerprint
-                    )));
-                }
-            }
-        }
-        let sealed_vector_rows = staged
-            .manifest()
-            .segments
-            .last()
-            .map(|segment| segment.end_label_exclusive())
-            .transpose()
-            .map_err(Status::invalid_argument)?
-            .map(usize::try_from)
-            .transpose()
-            .map_err(|_| Status::invalid_argument("snapshot physical rows exceed usize"))?
-            .unwrap_or(0);
-        let sealed_dim =
-            (0..staged.len()).find_map(|i| staged.vector(i).and_then(|image| image.dim_opt()));
-        let (vector_rows, vector_dim) = match sealed_dim {
-            Some(dim) => (sealed_vector_rows, Some(dim)),
-            None => (
-                plain_image.as_ref().map_or(0, |image| image.len()),
-                plain_image.as_ref().and_then(|image| image.dim_opt()),
-            ),
-        };
-        if exact_tmp.exists() {
-            let exact = ExactVectorStore::open(&exact_tmp).map_err(|e| {
-                Status::invalid_argument(format!(
-                    "snapshot sidecar is not a valid exact-vector store: {e}"
-                ))
-            })?;
-            if exact.len() != vector_rows || exact.dim() != vector_dim {
-                return Err(Status::invalid_argument(
-                    "snapshot exact-vector sidecar shape disagrees with its provider images",
-                ));
-            }
-            exact.verify_payload().map_err(|e| {
-                Status::invalid_argument(format!(
-                    "snapshot exact-vector integrity check failed: {e}"
-                ))
-            })?;
-        }
-        let incoming_live = if live_tmp.exists() {
-            LiveDocs::open(&live_tmp).map_err(|e| {
-                Status::invalid_argument(format!("snapshot live-row overlay is invalid: {e}"))
-            })?
-        } else {
-            LiveDocs::default()
-        };
-        let staged_rows: u64 = staged
-            .manifest()
-            .segments
-            .iter()
-            .map(|segment| segment.rows)
-            .sum::<u64>()
-            .max(vector_rows as u64);
-        if incoming_live.persisted_rows() > staged_rows {
-            return Err(Status::invalid_argument(
-                "snapshot live-row overlay exceeds every aligned artifact's row count",
-            ));
-        }
-        let has_sealed_vectors = (0..staged.len()).any(|i| staged.vector(i).is_some());
-        let retained = if has_sealed_vectors {
-            staged
-                .retained_vectors()
-                .map_err(Status::invalid_argument)?
-        } else {
-            crate::multi_res_storage::open_generation(
-                &tmp_dir.join(crate::multi_res::FILE_NAME),
-                staged_rows,
-                &incoming_live,
-            )
-            .map_err(|error| {
-                Status::invalid_argument(format!("snapshot retained vectors: {error}"))
-            })?
-        };
-        let vector_ranges: Vec<_> = if has_sealed_vectors {
-            staged
-                .manifest()
-                .segments
-                .iter()
-                .filter(|meta| !meta.vector.file.is_empty())
-                .map(|meta| meta.base_label as usize..(meta.base_label + meta.rows) as usize)
-                .collect()
-        } else {
-            std::iter::once(0..vector_rows).collect()
-        };
-        crate::multi_res_wal::require_coverage(
-            &retained,
-            vector_ranges.into_iter().flatten(),
-            &incoming_live,
-            &self.config.matryoshka_prefix_dims,
-            self.config.matryoshka_active_dim,
-        )
-        .map_err(Status::failed_precondition)?;
-        drop(staged);
-        drop(plain_image);
-
+            .expect("handler requires index_path");
+        let staged = SegmentPaths::staged(tmp_dir);
+        let prepared = PreparedSegments::open(&self.config, &staged)?;
         let mut guard = write_shard(&self.state);
         guard.check_legacy_mutation()?;
-        if let (Some(index), Some(incoming)) = (guard.index.as_ref(), incoming.as_ref()) {
-            let current = index.descriptor();
-            if current.backend_kind != incoming.backend_kind
-                || current.scoring_fingerprint != incoming.scoring_fingerprint
-            {
-                return Err(Status::failed_precondition(
-                    "snapshot vector backend or scoring fingerprint differs from the \
-                     generation locked on this shard; mixed native scores are not mergeable",
-                ));
-            }
-        }
-        let root = segments_root(&path);
-        let old = segments_old_dir(&path);
-        crate::postings::fsync_parent(&catalog_tmp.join("segments.json"))
-            .map_err(|e| Status::internal(format!("fsync staging {}: {e}", tmp_dir.display())))?;
-        let _ = std::fs::remove_dir_all(&old);
-        if root.exists() {
-            std::fs::rename(&root, &old)
-                .map_err(|e| Status::internal(format!("retire {}: {e}", old.display())))?;
-        }
-        if let Err(e) = std::fs::rename(&catalog_tmp, &root) {
-            if old.exists() && !root.exists() {
-                let _ = std::fs::rename(&old, &root);
-            }
-            return Err(Status::internal(format!("install {}: {e}", root.display())));
-        }
-        for (tmp, dst) in [
-            (vector_tmp, path.clone()),
-            (exact_tmp, exact_vector_sidecar_path(&path)),
-            (live_tmp, live_docs_sidecar_path(&path)),
-            (
-                tmp_dir.join(crate::multi_res::FILE_NAME),
-                crate::multi_res::sidecar_path(&path),
-            ),
-            (
-                tmp_dir.join("vectors.multi.json"),
-                crate::multi_res_storage::declaration_path(&crate::multi_res::sidecar_path(&path)),
-            ),
-        ] {
-            if tmp.exists() {
-                std::fs::rename(&tmp, &dst)
-                    .map_err(|e| Status::internal(format!("install {}: {e}", dst.display())))?;
-            } else if dst.exists() {
-                std::fs::remove_file(&dst)
-                    .map_err(|e| Status::internal(format!("retire {}: {e}", dst.display())))?;
-            }
-        }
-        let _ = std::fs::remove_dir_all(&old);
-        let _ = std::fs::remove_dir_all(tmp_dir);
-        crate::postings::fsync_parent(&root)
-            .map_err(|e| Status::internal(format!("fsync {}: {e}", root.display())))?;
-
-        // Reopen over the installed files, the way `open` does at start.
-        let tail = heap_store(&self.config).map_err(Status::failed_precondition)?;
-        let shard = SegmentedShard::open_with(&root, tail, self.config.vector_load())
-            .map_err(|e| Status::internal(format!("open installed catalog: {e}")))?;
-        let set = shard.snapshot().clone();
-        let index = if let Some(first) = (0..set.len()).find_map(|i| set.vector(i)) {
-            let backend = first
-                .backend_config()
-                .map_err(|e| Status::internal(format!("segment vector backend: {e}")))?;
-            let dim = first
-                .dim_opt()
-                .ok_or_else(|| Status::internal("segment vector image has no dimension"))?;
-            let tail_image = VectorIndex::from_backend_config(dim, &backend)
-                .map_err(|e| Status::internal(format!("segment tail image: {e}")))?;
-            let provider = SegmentedProvider::open(set.clone(), tail_image)
-                .map_err(|e| Status::internal(format!("segment vectors: {e}")))?;
-            Some(VectorIndex::from_provider(provider))
-        } else if path.exists() {
-            let mut loaded = VectorIndex::load(&self.config.vector_backend, &path)
-                .map_err(|e| Status::internal(format!("open installed {}: {e}", path.display())))?;
-            loaded
-                .prepare()
-                .map_err(|e| Status::internal(format!("prepare {}: {e}", path.display())))?;
-            Some(loaded)
-        } else {
-            None
-        };
-        let exact_path = exact_vector_sidecar_path(&path);
-        let exact_vectors =
-            if let Some(provider) = index.as_ref().and_then(VectorIndex::as_segmented) {
-                Some(
-                    ExactVectorStore::from_segments(
-                        &set,
-                        provider.tail().dim_opt().ok_or_else(|| {
-                            Status::internal("installed provider has no dimension")
-                        })?,
-                    )
-                    .map_err(|error| {
-                        Status::internal(format!("installed exact-vector view: {error}"))
-                    })?,
-                )
-            } else if exact_path.exists() {
-                Some(ExactVectorStore::open(&exact_path).map_err(|e| {
-                    Status::internal(format!("open installed {}: {e}", exact_path.display()))
-                })?)
-            } else {
-                None
-            };
-        let live_path = live_docs_sidecar_path(&path);
-        let mut live_docs = if live_path.exists() {
-            LiveDocs::open(&live_path).map_err(|e| {
-                Status::internal(format!("open installed {}: {e}", live_path.display()))
-            })?
-        } else {
-            LiveDocs::default()
-        };
-        set.merge_tombstones(&mut live_docs)
-            .map_err(|error| Status::internal(format!("installed segment tombstones: {error}")))?;
-        let num_documents = shard.doc_count();
-        let num_vectors = index.as_ref().map_or(0, |i| i.len() as u64);
-        check_attached_derived(
-            &self.config,
-            shard.derived(),
-            num_documents,
-            "the installed catalog",
-        )
-        .map_err(Status::failed_precondition)?;
-        guard.mapped_binding = shard.binding().cloned();
-        guard.bm25 = Some(Bm25Shard::Segmented(shard));
-        guard.index = index;
-        guard.exact_vectors = exact_vectors;
-        guard.multi_res_vectors = retained;
-        guard.live_docs = live_docs;
-        guard.parents = None;
-        guard.generation = None;
-        guard.advance_stats_epoch();
-        Self::rotate_wal_after_install(
-            &mut guard,
-            &self.config,
-            &path,
-            (num_vectors, num_documents),
-        )?;
-        Ok(InstallSnapshotResponse {
-            path: root.display().to_string(),
-            num_vectors,
-            num_documents,
-            manifest: Some(manifest.to_pb()),
-        })
+        prepared.check_provider(&guard)?;
+        drop(prepared);
+        let result =
+            crate::segments::SegmentCatalog::with_generation_lock(&segments_root(path), || {
+                segment_cutover::install(self, &mut guard, &staged, path, manifest)
+            })
+            .map_err(Status::failed_precondition)??;
+        segment_cutover::cleanup_retired(tmp_dir);
+        Ok(result)
     }
 
     /// The atomic generation swap shared by snapshot install and

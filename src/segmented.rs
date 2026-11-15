@@ -18,6 +18,8 @@
 //! has no impacts until the next flush seals the tail, and the scorer
 //! takes its exact heap path for that query — the same answer, slower.
 
+mod publication;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -902,31 +904,6 @@ impl SegmentedShard {
 
     fn reader(&self, part: usize) -> &crate::postings::Bm25Reader {
         self.set.bm25(part)
-    }
-
-    /// Adopt the catalog snapshot that now contains the frozen part as a
-    /// sealed segment. The tail stays as it is: the set's rows must end
-    /// where the tail begins, or the shard refuses the snapshot and
-    /// keeps serving what it had.
-    pub fn republish(&mut self, set: Arc<OpenedSegmentSet>) -> Result<(), String> {
-        let expected = self.tail_base;
-        let previous = (Arc::clone(&self.set), self.frozen.take());
-        self.set = set;
-        let outcome = match self.rebuild() {
-            Ok(()) if self.tail_base == expected => Ok(()),
-            Ok(()) => Err(format!(
-                "the published set covers {} rows but the tail starts at {expected}; a \
-                 republish must seal exactly the frozen rows",
-                self.tail_base
-            )),
-            Err(error) => Err(error),
-        };
-        if outcome.is_err() {
-            (self.set, self.frozen) = previous;
-            self.rebuild()
-                .expect("the previous snapshot rebuilt before this republish");
-        }
-        outcome
     }
 
     // ---- field table ----
