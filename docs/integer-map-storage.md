@@ -59,8 +59,8 @@ rejection, and segment lifecycle transitions. The section tests in
 `AddDocumentsRequest.map_integers` (tag 27) and `map_unsigned_integers`
 (tag 28) carry named column, string key and exact signed/unsigned value.
 Configure new builders with `--map-integer-fields` and
-`--map-unsigned-integer-fields`, their `PROTOMOLT_MAP_INTEGER_FIELDS` and
-`PROTOMOLT_MAP_UNSIGNED_INTEGER_FIELDS` environment equivalents, or the
+`--map-unsigned-integer-fields`, their `PIPESTREAM_SEARCH_MAP_INTEGER_FIELDS` and
+`PIPESTREAM_SEARCH_MAP_UNSIGNED_INTEGER_FIELDS` environment equivalents, or the
 matching configuration arrays. MobileShardConfig exposes the same arrays at
 29 and 30. These names share the existing column namespace. Unknown columns,
 wrong column families and duplicate document/key entries fail before row
