@@ -391,7 +391,7 @@ fn managed_policy() -> AccessPolicy {
         ..Default::default()
     };
     AccessPolicy {
-        format_version: 1,
+        format_version: 3,
         revision: 1,
         resources: vec![CollectionResource {
             workspace: "workspace-a".into(),

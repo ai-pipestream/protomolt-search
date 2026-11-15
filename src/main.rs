@@ -952,7 +952,7 @@ fn raft_prepare(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         use pipestream_search::raft::{operator, RaftHost};
         let identity = operator::identity(member);
         let policy = pipestream_search::pb::AccessPolicy {
-            format_version: 1,
+            format_version: 3,
             revision: 1,
             resources: Vec::new(),
             grants: Vec::new(),

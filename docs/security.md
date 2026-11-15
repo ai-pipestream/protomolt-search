@@ -71,7 +71,7 @@ ingest_docs_per_sec = 500  # 0: unlimited
 admin = false            # diagnostics also require all served collections' admin grants
 
 [policy]
-format_version = 1
+format_version = 3
 revision = 1
 [[policy.resources]]
 workspace = "legal"
@@ -109,10 +109,10 @@ The product-owned `authorization.proto` defines `AccessPolicy`, workspace-bound
 `CollectionResource`s, exact `CollectionGrant`s and `AccessDecision`. The TOML
 above is a configuration adapter for that protobuf contract. Credentials supply
 identity; they grant no capability by themselves. Empty grants deny access.
-`format_version` is 1 for collection capabilities, or 2 for mandatory document
-visibility, or 3 for [field permissions](field-grants.md). Format 1 refuses a
-document predicate; formats 1/2 refuse field permissions. Future restrictions
-require a new version so older readers reject rather than drop them. The document-grant
+`format_version` is 3, the one format this build reads: collection capabilities,
+mandatory document visibility and [field permissions](field-grants.md). Any other
+value is refused, retired versions included. Future restrictions require a new
+version so older readers reject rather than drop them. The document-grant
 execution and deployment boundaries are in [document grants](document-grants.md).
 Unknown actions, duplicate resources or grants, and grants whose workspace does
 not own the collection are configuration errors. Configuration typos refuse.

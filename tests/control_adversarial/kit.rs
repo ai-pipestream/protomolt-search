@@ -107,7 +107,7 @@ pub fn grant(principal: &str, collection: &str) -> CollectionGrant {
 /// alice and bob are Admins of `test/books`.
 pub fn policy() -> AccessPolicy {
     AccessPolicy {
-        format_version: 1,
+        format_version: 3,
         revision: 1,
         resources: [CollectionResource {
             workspace: WORKSPACE.into(),

@@ -14,7 +14,7 @@ use tonic::{Code, Request};
 fn policy(revision: u64) -> AccessPolicy {
     AccessPolicy {
         revision,
-        format_version: 1,
+        format_version: 3,
         resources: vec![CollectionResource {
             workspace: "work".into(),
             collection: "docs".into(),

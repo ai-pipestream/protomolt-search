@@ -100,7 +100,7 @@ fn named_shards(names: &[&str]) -> Vec<EmbeddedShardConfig> {
 
 fn named_principals() -> Arc<Principals> {
     let policy = AccessPolicy {
-        format_version: 1,
+        format_version: 3,
         revision: 1,
         resources: vec![
             CollectionResource {

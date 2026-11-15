@@ -27,7 +27,7 @@ fn view(value: &str) -> DocumentVisibility {
 
 fn policy() -> AccessPolicy {
     AccessPolicy {
-        format_version: 2,
+        format_version: 3,
         revision: 1,
         resources: vec![CollectionResource {
             workspace: "work".into(),
@@ -175,11 +175,13 @@ fn scores(response: &Bm25SearchResponse) -> Vec<(u64, u32)> {
 
 #[test]
 fn policy_version_and_scope_semantics_are_explicit() {
-    let mut legacy = policy();
-    legacy.format_version = 1;
-    assert!(PolicyAuthority::new(legacy)
-        .unwrap_err()
-        .contains("format 2"));
+    for retired in [1, 2] {
+        let mut legacy = policy();
+        legacy.format_version = retired;
+        assert!(PolicyAuthority::new(legacy)
+            .unwrap_err()
+            .contains("expected 3"));
+    }
     let mut malformed = policy();
     malformed.grants[0].document_visibility = Some(DocumentVisibility::default());
     assert!(PolicyAuthority::new(malformed).is_err());

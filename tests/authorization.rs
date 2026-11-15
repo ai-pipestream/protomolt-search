@@ -15,7 +15,7 @@ use tonic::{Code, Request};
 
 fn policy() -> AccessPolicy {
     AccessPolicy {
-        format_version: 1,
+        format_version: 3,
         revision: 1,
         resources: vec![
             CollectionResource {
@@ -122,7 +122,7 @@ fn grants_are_exact_and_actions_do_not_imply_each_other() {
 #[test]
 fn invalid_policy_cannot_replace_the_current_revision() {
     let authority = PolicyAuthority::new(policy()).unwrap();
-    for format_version in [0, 4, u32::MAX] {
+    for format_version in [0, 1, 2, 4, u32::MAX] {
         let mut unsupported = policy();
         unsupported.format_version = format_version;
         assert!(PolicyAuthority::new(unsupported).is_err());
@@ -437,7 +437,7 @@ fn policy_configuration_is_explicit_and_rejects_typos() {
     assert!(Principals::load(&path)
         .unwrap_err()
         .contains("explicit [policy]"));
-    std::fs::write(&path, format!("{credentials}\n[policy]\nformat_version = 1\nrevision = 1\n[[policy.resources]]\nworkspace = \"workspace-a\"\ncollection = \"a\"\n[[policy.grants]]\nprincipal = \"reader\"\nworkspace = \"workspace-a\"\ncollection = \"a\"\nactions = [\"serach\"]\n")).unwrap();
+    std::fs::write(&path, format!("{credentials}\n[policy]\nformat_version = 3\nrevision = 1\n[[policy.resources]]\nworkspace = \"workspace-a\"\ncollection = \"a\"\n[[policy.grants]]\nprincipal = \"reader\"\nworkspace = \"workspace-a\"\ncollection = \"a\"\nactions = [\"serach\"]\n")).unwrap();
     assert!(Principals::load(&path)
         .unwrap_err()
         .contains("unknown access action"));

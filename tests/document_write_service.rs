@@ -89,7 +89,7 @@ fn policy(revision: u64, writers: &[&str]) -> AccessPolicy {
         },
     ]);
     AccessPolicy {
-        format_version: 1,
+        format_version: 3,
         revision,
         resources: vec![CollectionResource {
             workspace: WORKSPACE.into(),

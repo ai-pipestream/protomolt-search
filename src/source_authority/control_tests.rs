@@ -60,7 +60,7 @@ pub(crate) fn grant(principal: &str, collection: &str) -> CollectionGrant {
 
 pub(crate) fn policy() -> AccessPolicy {
     AccessPolicy {
-        format_version: 1,
+        format_version: 3,
         revision: 1,
         resources: ["books", "music"]
             .map(|collection| CollectionResource {
