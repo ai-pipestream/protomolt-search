@@ -50,7 +50,7 @@ fn registration(id: &str) -> RegisterNodeRequest {
 }
 
 fn arm(plane: &DurableControlPlane, fault: StateWriteFault) {
-    *plane.write_fault.lock().unwrap() = Some(fault);
+    plane.writer.arm(fault);
 }
 
 fn candidate_files(dir: &Directory) -> Vec<PathBuf> {
