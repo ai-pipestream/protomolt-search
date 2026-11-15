@@ -227,8 +227,7 @@ fn measure_ingest_and_seal(
     let dim = fx.rows.dim;
     let rows = ingest_rows.min(fx.rows.rows());
     let dir = scratch_dir("ingest-seal")?;
-    let catalog_root = dir.join("catalog");
-    let catalog = SegmentCatalog::open_with(&catalog_root, VectorLoad::Mapped)?;
+    let catalog = SegmentCatalog::open_with(dir.join("catalog"), VectorLoad::Mapped)?;
     let tail = HnswIndex::new(dim, config)?.into_index();
     let mut provider = SegmentedProvider::open(catalog.snapshot(), tail)?;
     let mut exact = ExactVectorStore::empty(Some(dim));
@@ -252,15 +251,13 @@ fn measure_ingest_and_seal(
     let (bm25_path, live_path) = write_minimal_bm25_and_live(&stage, rows)?;
 
     let seal_start = Instant::now();
-    let fresh = HnswIndex::new(dim, config)?.into_index();
-    let frozen = provider.freeze_tail(fresh, rows)?;
+    let frozen = provider.freeze_tail(HnswIndex::new(dim, config)?.into_index(), rows)?;
     let vector_path = stage.join("vector.index");
     let vec_write_start = Instant::now();
     frozen.write(&vector_path)?;
     let vector_write_s = vec_write_start.elapsed().as_secs_f64();
     let exact_path = stage.join("vectors.f32");
-    let values = exact.row_values(0, rows)?;
-    ExactVectorStore::from_values(dim, values)?.write(&exact_path)?;
+    ExactVectorStore::from_values(dim, exact.row_values(0, rows)?)?.write(&exact_path)?;
     let published = catalog.append(SegmentSource {
         segment_id: "seg-00000001",
         generation: 1,
@@ -268,6 +265,7 @@ fn measure_ingest_and_seal(
         backend_kind: HNSW,
         vector_path: Some(&vector_path),
         exact_vector_path: Some(&exact_path),
+        multi_res_path: None,
         bm25_path: &bm25_path,
         live_docs_path: &live_path,
         partition_column: None,
@@ -279,62 +277,44 @@ fn measure_ingest_and_seal(
 
     eprintln!(
         "tail lifecycle ({rows} rows, batch={batch_rows}, d={dim}): ingest={:.1}ms ({:.0} rows/s), seal={:.1}ms (vector_write={:.1}ms), total={:.1}ms ({:.0} rows/s)",
-        ingest_s * 1e3,
-        rows as f64 / ingest_s,
-        seal_s * 1e3,
-        vector_write_s * 1e3,
-        total_s * 1e3,
-        rows as f64 / total_s,
+        ingest_s * 1e3, rows as f64 / ingest_s, seal_s * 1e3, vector_write_s * 1e3, total_s * 1e3, rows as f64 / total_s,
     );
     Ok(json!({
-        "rows": rows,
-        "dim": dim,
-        "batch_rows": batch_rows,
-        "ingest_ms": ingest_s * 1e3,
-        "ingest_rows_per_s": rows as f64 / ingest_s,
-        "seal_ms": seal_s * 1e3,
-        "vector_write_ms": vector_write_s * 1e3,
-        "total_ms": total_s * 1e3,
-        "total_rows_per_s": rows as f64 / total_s,
+        "rows": rows, "dim": dim, "batch_rows": batch_rows,
+        "ingest_ms": ingest_s * 1e3, "ingest_rows_per_s": rows as f64 / ingest_s,
+        "seal_ms": seal_s * 1e3, "vector_write_ms": vector_write_s * 1e3,
+        "total_ms": total_s * 1e3, "total_rows_per_s": rows as f64 / total_s,
     }))
 }
 
-/// 3. Sealed segments + unsealed heap tail (`0`, `10k`, `100k` rows) QPS & recall.
-#[allow(clippy::too_many_arguments)]
-fn measure_tail_queries(
-    fx: &Fixture,
+struct TailQuerySpec<'a> {
+    fx: &'a Fixture,
     config: HnswConfig,
     sealed_rows: usize,
     segment_rows: usize,
-    tail_sizes: &[usize],
-    ks: &[usize],
-    efs: &[usize],
+    tail_sizes: &'a [usize],
+    ks: &'a [usize],
+    efs: &'a [usize],
     threads: usize,
     min_time: Duration,
-) -> Result<Vec<Value>, Error> {
-    let dim = fx.rows.dim;
-    if sealed_rows > fx.rows.rows() {
-        return Err(format!(
-            "sealed_rows ({sealed_rows}) exceeds fixture rows ({})",
-            fx.rows.rows()
-        )
-        .into());
-    }
-    let dir = scratch_dir("tail-queries")?;
-    let catalog_root = dir.join("catalog");
-    let catalog = SegmentCatalog::open_with(&catalog_root, VectorLoad::Mapped)?;
+}
 
-    // Build and seal the mapped base segments once.
+fn seal_base_segments(
+    spec: &TailQuerySpec<'_>,
+    dir: &std::path::Path,
+    catalog: &SegmentCatalog,
+) -> Result<(), Error> {
+    let dim = spec.fx.rows.dim;
     let mut base_offset = 0usize;
     let mut seg_idx = 0u64;
-    while base_offset < sealed_rows {
-        let len = segment_rows.min(sealed_rows - base_offset);
+    while base_offset < spec.sealed_rows {
+        let len = spec.segment_rows.min(spec.sealed_rows - base_offset);
         seg_idx += 1;
         let stage = dir.join(format!("stage-{seg_idx}"));
         std::fs::create_dir_all(&stage)?;
         let (bm25_path, live_path) = write_minimal_bm25_and_live(&stage, len)?;
-        let slice = &fx.rows.base[base_offset * dim..(base_offset + len) * dim];
-        let mut idx = HnswIndex::new(dim, config)?;
+        let slice = &spec.fx.rows.base[base_offset * dim..(base_offset + len) * dim];
+        let mut idx = HnswIndex::new(dim, spec.config)?;
         idx.add(slice, dim)?;
         idx.prepare()?;
         let vector_path = stage.join("vector.index");
@@ -349,6 +329,7 @@ fn measure_tail_queries(
             backend_kind: HNSW,
             vector_path: Some(&vector_path),
             exact_vector_path: Some(&exact_path),
+            multi_res_path: None,
             bm25_path: &bm25_path,
             live_docs_path: &live_path,
             partition_column: None,
@@ -356,142 +337,159 @@ fn measure_tail_queries(
         let _ = std::fs::remove_dir_all(&stage);
         base_offset += len;
     }
+    Ok(())
+}
 
-    let qn = fx.rows.query_count();
+fn stream_query_top_k(
+    provider: &SegmentedProvider,
+    qv: &[f32],
+    k: usize,
+    stream_ef: usize,
+) -> Result<(TopK, usize, u64), Error> {
+    let opts = VectorSearchOptions::new().with_candidate_depth(stream_ef);
+    let mut top = TopK::new(k);
+    let summary = provider.search_streaming_controlled(
+        qv,
+        opts,
+        &mut |batch| {
+            for (&slot, &score) in batch.slots.iter().zip(batch.scores) {
+                if let Ok(id) = u32::try_from(slot) {
+                    top.push(id, score);
+                }
+            }
+            if top.threshold().is_finite() {
+                VectorStreamControl::RaiseFloor(top.threshold())
+            } else {
+                VectorStreamControl::Continue
+            }
+        },
+        &mut || VectorStreamControl::Continue,
+    )?;
+    Ok((top, summary.emitted, summary.tail_enumerated_rows))
+}
+
+fn measure_unary_points(
+    spec: &TailQuerySpec<'_>,
+    provider: &SegmentedProvider,
+    truth: &[Vec<u32>],
+    k: usize,
+) -> Result<Vec<Value>, Error> {
+    let qn = spec.fx.rows.query_count();
+    let mut unary_points = Vec::new();
+    for &ef in spec.efs {
+        if ef < k {
+            continue;
+        }
+        let mut rec_sum = 0.0;
+        let mut tail_enum_sum = 0u64;
+        for q in 0..qn {
+            let opts = VectorSearchOptions::new().with_candidate_depth(ef);
+            let res = provider.search(spec.fx.rows.query(q), k, opts)?;
+            rec_sum += mean_recall(truth, q, k, res.slots_for_query(0));
+            tail_enum_sum += res.tail_enumerated_rows;
+        }
+        let qps_1c = throughput(qn, 1, spec.min_time, |q| {
+            let opts = VectorSearchOptions::new().with_candidate_depth(ef);
+            let _ = provider.search(spec.fx.rows.query(q), k, opts).unwrap();
+        });
+        let qps_all = throughput(qn, spec.threads, spec.min_time, |q| {
+            let opts = VectorSearchOptions::new().with_candidate_depth(ef);
+            let _ = provider.search(spec.fx.rows.query(q), k, opts).unwrap();
+        });
+        unary_points.push(json!({
+            "ef": ef,
+            "recall_mean": rec_sum / qn as f64,
+            "qps_one_core": qps_1c,
+            "qps_all_cores": qps_all,
+            "tail_enumerated_rows_mean": tail_enum_sum as f64 / qn as f64,
+        }));
+    }
+    Ok(unary_points)
+}
+
+fn measure_streaming_cell(
+    spec: &TailQuerySpec<'_>,
+    provider: &SegmentedProvider,
+    truth: &[Vec<u32>],
+    tail_rows: usize,
+    k: usize,
+) -> Result<Value, Error> {
+    let qn = spec.fx.rows.query_count();
+    let stream_ef = k.max(64);
+    let mut stream_rec_sum = 0.0;
+    let mut emitted_sum = 0usize;
+    let mut stream_tail_enum_sum = 0u64;
+    for q in 0..qn {
+        let (top, emitted, tail_enum) =
+            stream_query_top_k(provider, spec.fx.rows.query(q), k, stream_ef)?;
+        emitted_sum += emitted;
+        stream_tail_enum_sum += tail_enum;
+        let slots: Vec<i64> = top
+            .into_sorted()
+            .into_iter()
+            .map(|(id, _)| i64::from(id))
+            .collect();
+        stream_rec_sum += mean_recall(truth, q, k, &slots);
+    }
+    let stream_qps_all = throughput(qn, spec.threads, spec.min_time, |q| {
+        let _ = stream_query_top_k(provider, spec.fx.rows.query(q), k, stream_ef).unwrap();
+    });
+    eprintln!(
+        "tail queries: sealed={} tail={tail_rows:<6} k={k:<3} stream_ef={stream_ef} stream_qps_{}c={stream_qps_all:7.0} emitted_mean={:.1}",
+        spec.sealed_rows, spec.threads, emitted_sum as f64 / qn as f64,
+    );
+    Ok(json!({
+        "ef": stream_ef,
+        "recall_mean": stream_rec_sum / qn as f64,
+        "qps_all_cores": stream_qps_all,
+        "emitted_mean": emitted_sum as f64 / qn as f64,
+        "tail_enumerated_rows_mean": stream_tail_enum_sum as f64 / qn as f64,
+    }))
+}
+
+/// 3. Sealed segments + unsealed heap tail (`0`, `10k`, `100k` rows) QPS & recall.
+fn measure_tail_queries(spec: &TailQuerySpec<'_>) -> Result<Vec<Value>, Error> {
+    let dim = spec.fx.rows.dim;
+    if spec.sealed_rows > spec.fx.rows.rows() {
+        return Err(format!(
+            "sealed_rows ({}) exceeds fixture rows ({})",
+            spec.sealed_rows,
+            spec.fx.rows.rows()
+        )
+        .into());
+    }
+    let dir = scratch_dir("tail-queries")?;
+    let catalog = SegmentCatalog::open_with(dir.join("catalog"), VectorLoad::Mapped)?;
+    seal_base_segments(spec, &dir, &catalog)?;
+
+    let qn = spec.fx.rows.query_count();
     let mut results = Vec::new();
-    for &tail_rows in tail_sizes {
-        let total_rows = sealed_rows + tail_rows;
-        if total_rows > fx.rows.rows() || total_rows == 0 {
+    for &tail_rows in spec.tail_sizes {
+        let total_rows = spec.sealed_rows + tail_rows;
+        if total_rows > spec.fx.rows.rows() || total_rows == 0 {
             eprintln!(
-                "tail queries: skipping tail_rows={tail_rows} (sealed={sealed_rows} + tail={tail_rows} > fixture={})",
-                fx.rows.rows()
+                "tail queries: skipping tail_rows={tail_rows} (sealed={} + tail={tail_rows} > fixture={})",
+                spec.sealed_rows, spec.fx.rows.rows(),
             );
             continue;
         }
-        let tail = HnswIndex::new(dim, config)?.into_index();
+        let tail = HnswIndex::new(dim, spec.config)?.into_index();
         let mut provider = SegmentedProvider::open(catalog.snapshot(), tail)?;
         if tail_rows > 0 {
-            let tail_slice = &fx.rows.base[sealed_rows * dim..total_rows * dim];
+            let tail_slice = &spec.fx.rows.base[spec.sealed_rows * dim..total_rows * dim];
             provider.add(tail_slice, dim)?;
         }
-
         let mut cells = Vec::new();
-        for &k in ks {
-            let truth = exact_truth(&fx.rows.base, dim, total_rows, &fx.rows.queries, qn, k);
-            let mut unary_points = Vec::new();
-            for &ef in efs {
-                if ef < k {
-                    continue;
-                }
-                let mut rec_sum = 0.0;
-                let mut tail_enum_sum = 0u64;
-                for q in 0..qn {
-                    let qv = fx.rows.query(q);
-                    let opts = VectorSearchOptions::new().with_candidate_depth(ef);
-                    let res = provider.search(qv, k, opts)?;
-                    rec_sum += mean_recall(&truth, q, k, res.slots_for_query(0));
-                    tail_enum_sum += res.tail_enumerated_rows;
-                }
-                let recall = rec_sum / qn as f64;
-                let qps_1c = throughput(qn, 1, min_time, |q| {
-                    let qv = fx.rows.query(q);
-                    let opts = VectorSearchOptions::new().with_candidate_depth(ef);
-                    let _ = provider.search(qv, k, opts).unwrap();
-                });
-                let qps_all = throughput(qn, threads, min_time, |q| {
-                    let qv = fx.rows.query(q);
-                    let opts = VectorSearchOptions::new().with_candidate_depth(ef);
-                    let _ = provider.search(qv, k, opts).unwrap();
-                });
-                unary_points.push(json!({
-                    "ef": ef,
-                    "recall_mean": recall,
-                    "qps_one_core": qps_1c,
-                    "qps_all_cores": qps_all,
-                    "tail_enumerated_rows_mean": tail_enum_sum as f64 / qn as f64,
-                }));
-            }
-
-            // Also measure controlled streaming at ef = max(k, 64) to verify
-            // shared-floor pruning across sealed segments -> unlinked tail.
-            let stream_ef = k.max(64);
-            let mut stream_rec_sum = 0.0;
-            let mut emitted_sum = 0usize;
-            let mut stream_tail_enum_sum = 0u64;
-            for q in 0..qn {
-                let qv = fx.rows.query(q);
-                let opts = VectorSearchOptions::new().with_candidate_depth(stream_ef);
-                let mut top = TopK::new(k);
-                let summary = provider.search_streaming_controlled(
-                    qv,
-                    opts,
-                    &mut |batch| {
-                        for (&slot, &score) in batch.slots.iter().zip(batch.scores) {
-                            if let Ok(id) = u32::try_from(slot) {
-                                top.push(id, score);
-                            }
-                        }
-                        if top.threshold().is_finite() {
-                            VectorStreamControl::RaiseFloor(top.threshold())
-                        } else {
-                            VectorStreamControl::Continue
-                        }
-                    },
-                    &mut || VectorStreamControl::Continue,
-                )?;
-                emitted_sum += summary.emitted;
-                stream_tail_enum_sum += summary.tail_enumerated_rows;
-                let slots: Vec<i64> = top
-                    .into_sorted()
-                    .into_iter()
-                    .map(|(id, _)| i64::from(id))
-                    .collect();
-                stream_rec_sum += mean_recall(&truth, q, k, &slots);
-            }
-            let stream_qps_all = throughput(qn, threads, min_time, |q| {
-                let qv = fx.rows.query(q);
-                let opts = VectorSearchOptions::new().with_candidate_depth(stream_ef);
-                let mut top = TopK::new(k);
-                let _ = provider
-                    .search_streaming_controlled(
-                        qv,
-                        opts,
-                        &mut |batch| {
-                            for (&slot, &score) in batch.slots.iter().zip(batch.scores) {
-                                if let Ok(id) = u32::try_from(slot) {
-                                    top.push(id, score);
-                                }
-                            }
-                            if top.threshold().is_finite() {
-                                VectorStreamControl::RaiseFloor(top.threshold())
-                            } else {
-                                VectorStreamControl::Continue
-                            }
-                        },
-                        &mut || VectorStreamControl::Continue,
-                    )
-                    .unwrap();
-            });
-
-            eprintln!(
-                "tail queries: sealed={sealed_rows} tail={tail_rows:<6} k={k:<3} stream_ef={stream_ef} stream_qps_{threads}c={stream_qps_all:7.0} emitted_mean={:.1}",
-                emitted_sum as f64 / qn as f64
-            );
-            cells.push(json!({
-                "k": k,
-                "unary": unary_points,
-                "streaming": {
-                    "ef": stream_ef,
-                    "recall_mean": stream_rec_sum / qn as f64,
-                    "qps_all_cores": stream_qps_all,
-                    "emitted_mean": emitted_sum as f64 / qn as f64,
-                    "tail_enumerated_rows_mean": stream_tail_enum_sum as f64 / qn as f64,
-                }
-            }));
+        let rows = &spec.fx.rows;
+        for &k in spec.ks {
+            let truth = exact_truth(&rows.base, dim, total_rows, &rows.queries, qn, k);
+            let unary_points = measure_unary_points(spec, &provider, &truth, k)?;
+            let streaming = measure_streaming_cell(spec, &provider, &truth, tail_rows, k)?;
+            cells.push(json!({ "k": k, "unary": unary_points, "streaming": streaming }));
         }
         results.push(json!({
-            "sealed_rows": sealed_rows,
-            "segment_rows": segment_rows,
+            "sealed_rows": spec.sealed_rows,
+            "segment_rows": spec.segment_rows,
             "tail_rows": tail_rows,
             "cells": cells,
         }));
@@ -519,17 +517,12 @@ pub fn command() -> Result<(), Error> {
         ..HnswConfig::default()
     };
     let min_time = Duration::from_millis(arg("min-time-ms", "200").parse()?);
-    let crossover_raw = arg(
-        "crossover-rows",
-        "64,128,256,384,512,768,1024,1536,2048,4096",
-    );
+    let default_crossover = "64,128,256,384,512,768,1024,1536,2048,4096";
+    let crossover_raw = arg("crossover-rows", default_crossover);
     let crossover_sizes = if crossover_raw == "none" || crossover_raw.is_empty() {
         Vec::new()
     } else {
-        list_usize(
-            "crossover-rows",
-            "64,128,256,384,512,768,1024,1536,2048,4096",
-        )?
+        list_usize("crossover-rows", default_crossover)?
     };
     let crossover_efs = list_usize("crossover-ef", "16,32,64")?;
     let ingest_rows: usize = arg("ingest-rows", "20000").parse()?;
@@ -549,32 +542,24 @@ pub fn command() -> Result<(), Error> {
         min_time,
     )?;
     let lifecycle = measure_ingest_and_seal(&fx, config, ingest_rows, batch_rows)?;
-    let tail_queries = measure_tail_queries(
-        &fx,
+    let tail_queries = measure_tail_queries(&TailQuerySpec {
+        fx: &fx,
         config,
         sealed_rows,
         segment_rows,
-        &tail_sizes,
-        &ks,
-        &efs,
+        tail_sizes: &tail_sizes,
+        ks: &ks,
+        efs: &efs,
         threads,
         min_time,
-    )?;
+    })?;
 
     let report = json!({
         "format": "protomolt-ann-tail-bench-v1",
-        "fixture": {
-            "name": fx.name(),
-            "rows": fx.rows.rows(),
-            "dim": fx.rows.dim,
-            "queries": fx.rows.query_count(),
-        },
-        "host": host(),
-        "harness": harness(),
+        "fixture": { "name": fx.name(), "rows": fx.rows.rows(), "dim": fx.rows.dim, "queries": fx.rows.query_count() },
+        "host": host(), "harness": harness(),
         "params": { "m": m, "ef_construction": efc, "threads": threads },
-        "crossover": crossover,
-        "lifecycle": lifecycle,
-        "tail_queries": tail_queries,
+        "crossover": crossover, "lifecycle": lifecycle, "tail_queries": tail_queries,
     });
     write_json(&out, &report)?;
     eprintln!("tail: wrote {}", out.display());
