@@ -12,7 +12,7 @@ pub(in crate::postings) struct FacetSlice {
     pub(in crate::postings) dict: Vec<String>,
     /// Whether `dict` is in strict byte order, checked at open: true
     /// for every file this writer produces, and what makes an ordinal
-    /// range an exact string range (`docs/prefix-terms.md`). A file
+    /// range an exact string range. A file
     /// written with first-seen ordinals refuses string ordering by name.
     pub(in crate::postings) sorted: bool,
     /// Absolute offset of the ords section (`n_slots x u32`).
@@ -32,7 +32,7 @@ pub(in crate::postings) struct NumericSlice {
     pub(in crate::postings) vals_off: u64,
 }
 
-/// Per-map-facet-column read state (`docs/map-columns.md`): both
+/// Per-map-facet-column read state: both
 /// dictionaries decoded eagerly (one entry per distinct key/value);
 /// offsets and pairs sections stay in the map.
 pub(in crate::postings) struct MapFacetSlice {

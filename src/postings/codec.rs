@@ -225,14 +225,14 @@ pub(super) fn push_block_max_posting<D: Write, O: Write, S: Write>(
     Ok(occ_start + offsets.len() as u32)
 }
 
-/// block-max surface (`docs/block-max.md`). Level-0 impact records (one
+/// block-max surface. Level-0 impact records (one
 /// per 128-posting block) are read straight from the map, and
 /// `advance_shallow` first leaps whole level-1 groups (32 blocks = 4096
 /// postings) by their `last_doc_id`, then skips level-0 blocks the same
 /// way, never decoding doc-run entries it passes.
 /// The block-max cursor the scorer drives (`src/bm25.rs`): one file's
 /// skip runs, or a chain of them across the sealed segments of a
-/// segmented shard (`docs/immutable-segments.md`). A chain presents the
+/// segmented shard. A chain presents the
 /// parts as one term: document ids carry each part's base, block and
 /// level-1 group numbers run on cumulatively so the scorer's "did the
 /// block change" caches stay honest, per-block and per-group frontiers

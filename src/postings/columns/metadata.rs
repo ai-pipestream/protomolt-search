@@ -9,8 +9,7 @@ use super::super::format::{
 };
 
 /// The shard-level mapped-plan binding: the identity of the plan this
-/// store's mapped columns were written under (`docs/descriptor-mappings.md`
-/// section 4a). Persisted as a kind-6, kind-12, kind-13, or kind-14 entry of the column
+/// store's mapped columns were written under. Persisted as a kind-6, kind-12, kind-13, or kind-14 entry of the column
 /// table; an index only ever pairs with the plan it was written under,
 /// and a contradiction at bind time is an index compatibility event.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -21,7 +20,7 @@ pub struct StoredBinding {
     pub body_path: String,
     /// SHA-256 over the canonical encoding of the bind's materialize
     /// spec, empty when the bind carried none. Changing materialization
-    /// changes what an index means (`docs/cel-values.md`), so it is
+    /// changes what an index means, so it is
     /// part of the bound identity.
     pub materialize_sha: String,
     /// Complete explicit mapped analysis contract, empty for legacy bindings.
@@ -35,7 +34,7 @@ pub struct StoredBinding {
 }
 
 /// The index's derived-column declaration as a store persists it
-/// (`docs/derived-columns.md`): the kind-17 column-table entry. A store
+///: the kind-17 column-table entry. A store
 /// pairs with one declaration; where it is attached, a differing
 /// fingerprint is an index compatibility event, refused by name.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

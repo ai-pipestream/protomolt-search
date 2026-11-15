@@ -86,7 +86,7 @@ pub(in crate::postings) fn validate_column_names(names: &[&str]) {
     }
 }
 
-/// One `f64` numeric column (`docs/score-functions.md`): per-slot values
+/// One `f64` numeric column: per-slot values
 /// parallel to the shared slot space, `NaN` = the document has no value.
 /// min/max over present values are computed at write time into the v7
 /// column table (the bound metadata score-function chains lift with).
@@ -247,7 +247,7 @@ impl<T: ColumnInteger> IntegerStore<T> {
     }
 }
 
-/// One geo-point column (`docs/geo-columns.md`): per-slot `(lat, lon)`
+/// One geo-point column: per-slot `(lat, lon)`
 /// pairs parallel to the shared slot space, BOTH `NaN` = the document has
 /// no point. The column's bounding box is computed at write time into
 /// the v7 column table, on the pattern kind 1 set: metadata the reader
@@ -338,7 +338,7 @@ impl GeoStore {
 
 /// A dictionary's byte order: `(order, remap)` where `order[new] = old`
 /// and `remap[old] = new`. Every dictionary is written in this order at
-/// flush (`docs/prefix-terms.md`): a reader can then resolve a string
+/// flush: a reader can then resolve a string
 /// range or prefix to ONE ordinal range, while the heap store keeps its
 /// first-seen ordinals and remaps at write time. Byte order is the
 /// order stock CEL compares strings in, so the two never disagree.

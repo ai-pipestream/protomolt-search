@@ -8,7 +8,7 @@ use super::reader::validate_structure_v6;
 #[cfg(doc)]
 use super::Bm25Reader;
 
-/// v6 layout: multi-field (`docs/multi-field.md`). Variable-length
+/// v6 layout: multi-field. Variable-length
 /// header holding an explicit section table (shared `texts` / `text_index` /
 /// `lineages` offsets plus a field table locating each field's
 /// `doc_lengths` / `postings` / `directory` sections); section-internal
@@ -16,19 +16,18 @@ use super::Bm25Reader;
 /// to their section's start so sections survive relocation.
 pub(super) const MAGIC_V6: &[u8; 8] = b"TVBM2506";
 /// v7 layout: v6 plus a kinded per-document column table
-/// (`docs/facets.md`, `docs/score-functions.md`). The header gains a
+///. The header gains a
 /// column table after the field table (u32 n_columns, then per column:
 /// name, u8 kind, kind-specific payload); the column sections follow
 /// the last field group in table order. Kind 0 is a dictionary-encoded
 /// string facet column (u32 n_values, u64 dict_off, u64 ords_off →
 /// dict + ords sections); kind 1 is an f64 numeric column (u64
 /// min_bits, u64 max_bits, u64 vals_off → one n_slots x f64 section,
-/// NaN = absent); kinds 2 and 3 are the map columns
-/// (`docs/map-columns.md`); kind 4 is an i64 column (same three-word
+/// NaN = absent); kinds 2 and 3 are the map columns; kind 4 is an i64 column (same three-word
 /// payload as kind 1, min/max as i64 bits → one n_slots x i64 section,
-/// `i64::MIN` = absent, `docs/range-facets.md`); kind 5 is a geo-point
+/// `i64::MIN` = absent); kind 5 is a geo-point
 /// column (four bbox words + u64 vals_off → one n_slots x (f64, f64)
-/// section, both NaN = absent, `docs/geo-columns.md`). An unknown kind
+/// section, both NaN = absent). An unknown kind
 /// refuses at open by number. A store with NO declared columns still
 /// writes v6, byte-identical to every pre-facet build — the format
 /// break is opt-in per shard.
@@ -39,7 +38,7 @@ pub(super) const COLUMN_KIND_FACET: u8 = 0;
 /// v7 column-table kind: f64 numeric column (NaN = absent).
 pub(super) const COLUMN_KIND_F64: u8 = 1;
 /// v7 column-table kind: map<string, string> column
-/// (`docs/map-columns.md`): key dict + value dict + per-doc
+///: key dict + value dict + per-doc
 /// (key_ord, value_ord) pair lists behind a fixed-stride offsets
 /// section. ONE column regardless of key cardinality — the structural
 /// answer to the field-per-key explosion flattening causes.
@@ -47,7 +46,7 @@ pub(super) const COLUMN_KIND_MAP_FACET: u8 = 2;
 /// v7 column-table kind: map<string, f64> column: key dict WITH
 /// per-key min/max bound metadata + per-doc (key_ord, f64) pair lists.
 pub(super) const COLUMN_KIND_MAP_F64: u8 = 3;
-/// v7 column-table kind: i64 column (`docs/range-facets.md`), a
+/// v7 column-table kind: i64 column, a
 /// fixed-stride per-slot section like kind 1. Exists because f64 stops
 /// being exact past 2^53 and this engine argues from exactness: an id,
 /// a citation count, or an epoch-micros timestamp must come back the
@@ -58,7 +57,7 @@ pub(super) const COLUMN_KIND_I64: u8 = 4;
 pub(super) const COLUMN_KIND_I64_PRESENT: u8 = 10;
 /// Full-domain unsigned integer values with an explicit presence bitmap.
 pub(super) const COLUMN_KIND_U64: u8 = 11;
-/// v7 column-table kind: geo-point column (`docs/geo-columns.md`), a
+/// v7 column-table kind: geo-point column, a
 /// per-slot (lat, lon) f64 pair at a fixed 16 B stride. BOTH halves NaN
 /// means absent; a half-NaN pair is refused at open as corruption,
 /// because a point with one coordinate is not a point. The table entry
@@ -66,7 +65,7 @@ pub(super) const COLUMN_KIND_U64: u8 = 11;
 /// against a full scan at open like every other kind's metadata.
 pub(super) const COLUMN_KIND_GEO: u8 = 5;
 /// Kind 6 is the shard-level mapped-plan BINDING record
-/// (`docs/descriptor-mappings.md` section 4a) — not a column: at most
+/// — not a column: at most
 /// one entry, a pinned name, an inline payload (three length-prefixed
 /// strings: plan fingerprint, bound body path, materialize-spec hash),
 /// and NO sections. Riding the kinded table keeps the binding inside
@@ -85,7 +84,7 @@ pub(super) const COLUMN_KIND_VECTOR_BINDING: u8 = 13;
 pub(super) const COLUMN_KIND_INDEX_BINDING: u8 = 14;
 pub(super) const COLUMN_KIND_MAP_I64: u8 = 15;
 pub(super) const COLUMN_KIND_MAP_U64: u8 = 16;
-/// Kind 17 (`docs/derived-columns.md`): the index's derived-column
+/// Kind 17: the index's derived-column
 /// declaration, one inline entry named `derived-columns`: a u16-length
 /// fingerprint (lowercase hex), then a u32-length canonical
 /// `DerivedColumns` protobuf. A file written under another declaration
@@ -113,7 +112,7 @@ pub(super) fn write_source_entry(
 pub(super) const BINDING_ENTRY_NAME: &str = "plan-binding";
 /// The derived-column declaration's reserved entry name (kind 17).
 pub(super) const DERIVED_ENTRY_NAME: &str = "derived-columns";
-/// Kind 7 (`docs/phrase-proximity.md`): one BM25 field's token
+/// Kind 7: one BM25 field's token
 /// positions, the opt-in payload behind exact phrase and proximity
 /// queries. The entry is named `positions:<field>` (the prefix keeps it
 /// out of the column name space, where a facet may legitimately share
@@ -137,7 +136,7 @@ pub(super) fn positions_section_size(n_terms: u64, total: u64) -> u64 {
     4 + 4 * (n_terms + 1) + 4 * total
 }
 
-/// Kind 8: a field's sentence table (`docs/highlighting.md`), the
+/// Kind 8: a field's sentence table, the
 /// spans server-side snippets are cut at. Entry: the field's name under
 /// [`SENTENCES_ENTRY_PREFIX`], then `u64 off | u64 total`. Section:
 /// `u32 n_slots | (n_slots + 1) x u32 base | total x (u32 start, u32 end)`

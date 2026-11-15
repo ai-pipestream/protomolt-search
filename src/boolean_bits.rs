@@ -139,10 +139,6 @@ impl Bits {
         }
     }
 
-    pub fn clear_all(&mut self) {
-        self.words.iter_mut().for_each(|w| *w = 0);
-    }
-
     /// The set slots, ascending.
     pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
         self.words.iter().enumerate().flat_map(|(wi, &word)| {

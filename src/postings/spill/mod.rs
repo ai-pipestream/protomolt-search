@@ -202,7 +202,7 @@ impl SpillBuilder {
         self
     }
 
-    /// Declare the fields that keep sentence spans per document (`docs/highlighting.md`),
+    /// Declare the fields that keep sentence spans per document,
     /// matching [`Bm25Store::with_sentences`].
     pub fn with_sentence_fields(mut self, names: &[&str]) -> Self {
         assert!(

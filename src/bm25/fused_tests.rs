@@ -3,79 +3,54 @@
 use super::*;
 use crate::postings::{AnalyzedDoc, AnalyzedField, Bm25Index, Bm25Store};
 
+/// One analyzed field from `(term, tf, offsets)` rows and its length.
+fn field(terms: DocRows, length: u32) -> AnalyzedField {
+    AnalyzedField {
+        terms: terms
+            .into_iter()
+            .map(|(term, tf, offsets)| (term.to_string(), tf, offsets))
+            .collect(),
+        length,
+        ..Default::default()
+    }
+}
+
+type DocRows = Vec<(&'static str, u32, Vec<(u32, u32)>)>;
+
+/// A body-and-name document.
+fn two_fields(body: AnalyzedField, name: AnalyzedField) -> AnalyzedDoc {
+    AnalyzedDoc {
+        fields: vec![body, name],
+        ..Default::default()
+    }
+}
+
+/// doc0: body "rust rust search", name "smith"; doc1: body "rust vector
+/// vector", no name; doc2: body "search", name "rust smith".
+fn hand_computed_store() -> Bm25Store {
+    let mut store = Bm25Store::with_fields(&["body", "name"]);
+    let doc0 = two_fields(
+        field(vec![("rust", 2, vec![(0, 4)]), ("search", 1, vec![])], 3),
+        field(vec![("smith", 1, vec![(0, 5)])], 1),
+    );
+    store.add_document(0, "a".to_string(), doc0);
+    let doc1 = field(vec![("rust", 1, vec![]), ("vector", 2, vec![])], 3);
+    store.add_document(1, "b".to_string(), AnalyzedDoc::body(doc1.terms, 3));
+    let doc2 = two_fields(
+        field(vec![("search", 1, vec![])], 1),
+        field(vec![("rust", 1, vec![(0, 4)]), ("smith", 1, vec![])], 2),
+    );
+    store.add_document(2, "c".to_string(), doc2);
+    store
+}
+
 /// Hand-computed fused scores on a two-field corpus, per-field
 /// params and query-time weights included; the expectation is
 /// accumulated in the pinned field-id-then-term-index order, so the
 /// comparison is bitwise. Reweighting reorders without a rebuild.
 #[test]
 fn fused_two_fields_hand_computed() {
-    let mut store = Bm25Store::with_fields(&["body", "name"]);
-    // doc0: body "rust rust search", name "smith"
-    store.add_document(
-        0,
-        "a".to_string(),
-        AnalyzedDoc {
-            cased: None,
-            fields: vec![
-                AnalyzedField {
-                    sentences: None,
-                    terms: vec![
-                        ("rust".into(), 2, vec![(0, 4)]),
-                        ("search".into(), 1, vec![]),
-                    ],
-                    length: 3,
-                    positions: None,
-                    ..Default::default()
-                },
-                AnalyzedField {
-                    sentences: None,
-                    terms: vec![("smith".into(), 1, vec![(0, 5)])],
-                    length: 1,
-                    positions: None,
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        },
-    );
-    // doc1: body "rust vector vector", no name
-    store.add_document(
-        1,
-        "b".to_string(),
-        AnalyzedDoc::body(
-            vec![("rust".into(), 1, vec![]), ("vector".into(), 2, vec![])],
-            3,
-        ),
-    );
-    // doc2: body "search", name "rust smith"
-    store.add_document(
-        2,
-        "c".to_string(),
-        AnalyzedDoc {
-            cased: None,
-            fields: vec![
-                AnalyzedField {
-                    sentences: None,
-                    terms: vec![("search".into(), 1, vec![])],
-                    length: 1,
-                    positions: None,
-                    ..Default::default()
-                },
-                AnalyzedField {
-                    sentences: None,
-                    terms: vec![
-                        ("rust".into(), 1, vec![(0, 4)]),
-                        ("smith".into(), 1, vec![]),
-                    ],
-                    length: 2,
-                    positions: None,
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        },
-    );
-
+    let store = hand_computed_store();
     let body_terms = vec!["rust".to_string()];
     let name_terms = vec!["rust".to_string(), "smith".to_string()];
     let body_params = Bm25Params::default();
@@ -146,51 +121,71 @@ fn fused_two_fields_hand_computed() {
     assert_eq!(hits[2].doc_id, 2);
 }
 
-/// Contract 3 of `docs/multi-field.md` at the store level: fused
+/// The document for global id `g`, identical however the corpus is sharded.
+fn doc_for(g: u32) -> AnalyzedDoc {
+    let body = vec![
+        ("rust".to_string(), 1 + g % 3, vec![(g, g + 2)]),
+        (format!("t{}", g % 4), 1, vec![(g + 3, g + 5)]),
+    ];
+    let length: u32 = body.iter().map(|t| t.1).sum();
+    let mut fields = vec![AnalyzedField {
+        terms: body,
+        length,
+        ..Default::default()
+    }];
+    if g % 3 != 1 {
+        fields.push(AnalyzedField {
+            terms: vec![
+                ("smith".to_string(), 1, vec![(0, 5)]),
+                (format!("n{}", g % 2), 1, vec![]),
+            ],
+            length: 2,
+            ..Default::default()
+        });
+    }
+    AnalyzedDoc {
+        fields,
+        ..Default::default()
+    }
+}
+
+/// A two-field store holding global ids `range`, renumbered from `offset`.
+fn build(range: std::ops::Range<u32>, offset: u32) -> Bm25Store {
+    let mut store = Bm25Store::with_fields(&["body", "name"]);
+    for g in range {
+        store.add_document(g - offset, format!("doc {g}"), doc_for(g));
+    }
+    store
+}
+
+/// Shard results shifted to global ids, merged by (score desc, id asc).
+fn merge_shards(parts: Vec<Vec<FusedDoc>>, offsets: &[u32], k: usize) -> Vec<FusedDoc> {
+    let mut merged: Vec<FusedDoc> = parts
+        .into_iter()
+        .zip(offsets)
+        .flat_map(|(docs, &offset)| {
+            docs.into_iter().map(move |mut d| {
+                d.doc_id += offset;
+                d
+            })
+        })
+        .collect();
+    merged.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.doc_id.cmp(&b.doc_id))
+    });
+    merged.truncate(k);
+    merged
+}
+
+/// Fused
 /// multi-field scoring over two shard stores with per-field GLOBAL
 /// stats, merged by (score desc, global id asc), equals monolithic
 /// fused scoring of the union corpus bit for bit.
 #[test]
 fn fused_distributed_equals_monolithic() {
-    // The document for global id `g`, identical however the corpus
-    // is sharded.
-    fn doc_for(g: u32) -> AnalyzedDoc {
-        let body = vec![
-            ("rust".to_string(), 1 + g % 3, vec![(g, g + 2)]),
-            (format!("t{}", g % 4), 1, vec![(g + 3, g + 5)]),
-        ];
-        let body_len: u32 = body.iter().map(|t| t.1).sum();
-        let mut fields = vec![AnalyzedField {
-            sentences: None,
-            terms: body,
-            length: body_len,
-            positions: None,
-            ..Default::default()
-        }];
-        if g % 3 != 1 {
-            fields.push(AnalyzedField {
-                sentences: None,
-                terms: vec![
-                    ("smith".to_string(), 1, vec![(0, 5)]),
-                    (format!("n{}", g % 2), 1, vec![]),
-                ],
-                length: 2,
-                positions: None,
-                ..Default::default()
-            });
-        }
-        AnalyzedDoc {
-            fields,
-            ..Default::default()
-        }
-    }
-    fn build(range: std::ops::Range<u32>, offset: u32) -> Bm25Store {
-        let mut store = Bm25Store::with_fields(&["body", "name"]);
-        for g in range {
-            store.add_document(g - offset, format!("doc {g}"), doc_for(g));
-        }
-        store
-    }
     let monolith = build(0..50, 0);
     let shards = [(build(0..23, 0), 0u32), (build(23..50, 23), 23u32)];
 
@@ -253,22 +248,9 @@ fn fused_distributed_equals_monolithic() {
     };
 
     let want = run(&monolith);
-    let mut merged: Vec<FusedDoc> = shards
-        .iter()
-        .flat_map(|(s, offset)| {
-            run(s).into_iter().map(move |mut d| {
-                d.doc_id += offset;
-                d
-            })
-        })
-        .collect();
-    merged.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.doc_id.cmp(&b.doc_id))
-    });
-    merged.truncate(k);
+    let parts = shards.iter().map(|(s, _)| run(s)).collect();
+    let offsets: Vec<u32> = shards.iter().map(|(_, offset)| *offset).collect();
+    let merged = merge_shards(parts, &offsets, k);
 
     assert_eq!(want.len(), merged.len());
     for (w, m) in want.iter().zip(&merged) {
@@ -281,37 +263,24 @@ fn fused_distributed_equals_monolithic() {
 #[test]
 fn phrase_group_uses_strongest_nested_concept_without_stacking() {
     let mut store = Bm25Store::with_fields(&["body", "phrases"]);
-    store.add_document(
-        0,
-        "New York City".into(),
-        AnalyzedDoc {
-            cased: None,
-            fields: vec![
-                AnalyzedField {
-                    sentences: None,
-                    terms: vec![
-                        ("new".into(), 1, vec![(0, 3)]),
-                        ("york".into(), 1, vec![(4, 8)]),
-                        ("city".into(), 1, vec![(9, 13)]),
-                    ],
-                    length: 3,
-                    positions: None,
-                    ..Default::default()
-                },
-                AnalyzedField {
-                    sentences: None,
-                    terms: vec![
-                        ("$phrase:nyc".into(), 1, vec![(0, 13)]),
-                        ("$phrase:new-york".into(), 1, vec![(0, 8)]),
-                    ],
-                    length: 2,
-                    positions: None,
-                    ..Default::default()
-                },
+    let doc = two_fields(
+        field(
+            vec![
+                ("new", 1, vec![(0, 3)]),
+                ("york", 1, vec![(4, 8)]),
+                ("city", 1, vec![(9, 13)]),
             ],
-            ..Default::default()
-        },
+            3,
+        ),
+        field(
+            vec![
+                ("$phrase:nyc", 1, vec![(0, 13)]),
+                ("$phrase:new-york", 1, vec![(0, 8)]),
+            ],
+            2,
+        ),
     );
+    store.add_document(0, "New York City".into(), doc);
     let body_terms = vec!["new".to_string(), "york".to_string(), "city".to_string()];
     let phrase_terms = vec!["$phrase:nyc".to_string(), "$phrase:new-york".to_string()];
     let queries = [
@@ -338,42 +307,17 @@ fn phrase_group_uses_strongest_nested_concept_without_stacking() {
             weight: 1.0,
         },
     ];
-    let max_group = top_k_fused_exhaustive(
-        &queries,
-        1,
-        Some(Phrase {
-            field: 1,
-            weights: &[1.0, 1.0],
-        }),
-    );
+    let group = |weights: &'static [f64]| {
+        top_k_fused_exhaustive(&queries, 1, Some(Phrase { field: 1, weights }))
+    };
+    let max_group = group(&[1.0, 1.0]);
     let additive = top_k_fused_exhaustive(&queries, 1, None);
     assert!(max_group[0].score < additive[0].score);
     assert_eq!(max_group[0].term_offsets.len(), 5);
 
-    let full_only = top_k_fused_exhaustive(
-        &queries,
-        1,
-        Some(Phrase {
-            field: 1,
-            weights: &[3.0, 0.0],
-        }),
-    );
-    let prefix_only = top_k_fused_exhaustive(
-        &queries,
-        1,
-        Some(Phrase {
-            field: 1,
-            weights: &[0.0, 2.0],
-        }),
-    );
-    let weighted = top_k_fused_exhaustive(
-        &queries,
-        1,
-        Some(Phrase {
-            field: 1,
-            weights: &[3.0, 2.0],
-        }),
-    );
+    let full_only = group(&[3.0, 0.0]);
+    let prefix_only = group(&[0.0, 2.0]);
+    let weighted = group(&[3.0, 2.0]);
     assert_eq!(
         weighted[0].score.to_bits(),
         full_only[0].score.max(prefix_only[0].score).to_bits()
